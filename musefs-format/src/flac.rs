@@ -137,6 +137,12 @@ pub fn synthesize_layout(scan: &FlacScan, tags: &[TagInput], arts: &[ArtInput]) 
     for art in arts {
         let framing = picture_body_framing(art);
         let body_len = framing.len() as u64 + art.data_len;
+        // FLAC metadata block lengths are 24-bit (max ~16 MiB). Real cover art is far
+        // smaller; enforcing a hard limit at art ingestion is deferred to a later milestone.
+        debug_assert!(
+            body_len <= 0x00FF_FFFF,
+            "FLAC PICTURE block body ({body_len} bytes) exceeds the 24-bit length limit"
+        );
         push_block_header(&mut buf, BLOCK_PICTURE, body_len as usize, idx == last_index);
         buf.extend_from_slice(&framing);
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
