@@ -1,4 +1,4 @@
-use crate::models::{Art, NewArt, TrackArt};
+use crate::models::{Art, ArtMeta, NewArt, TrackArt};
 use crate::{Db, Result};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
@@ -47,6 +47,38 @@ impl Db {
             })),
             None => Ok(None),
         }
+    }
+
+    /// Art row metadata without loading the image blob — used to build synthesis
+    /// inputs at resolve time without materializing art in memory.
+    pub fn get_art_meta(&self, id: i64) -> Result<Option<ArtMeta>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT mime, width, height, byte_len FROM art WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(ArtMeta {
+                mime: r.get(0)?,
+                width: r.get(1)?,
+                height: r.get(2)?,
+                byte_len: r.get(3)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Stream `len` bytes of an art blob starting at `offset` via SQLite
+    /// incremental blob I/O, so image bytes are never fully materialized. The
+    /// caller derives `offset`/`len` from the stored `byte_len`, so a short read
+    /// means the row no longer matches the layout — `read_at_exact` surfaces that
+    /// as an error rather than silently zero-filling.
+    pub fn read_art_chunk(&self, art_id: i64, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let blob =
+            self.conn
+                .blob_open(rusqlite::DatabaseName::Main, "art", "data", art_id, true)?;
+        let mut buf = vec![0u8; len];
+        blob.read_at_exact(&mut buf, offset as usize)?;
+        Ok(buf)
     }
 
     pub fn set_track_art(&self, track_id: i64, items: &[TrackArt]) -> Result<()> {

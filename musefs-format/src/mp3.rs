@@ -1,5 +1,5 @@
 use crate::error::{FormatError, Result};
-use crate::input::{ArtInput, TagInput};
+use crate::input::{ArtInput, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 
 /// Where the MP3 audio frames begin and end (excluding any ID3v2 prefix and
@@ -219,6 +219,25 @@ fn frame_to_key(id: &str) -> Option<&'static str> {
         "TCOM" => "composer",
         _ => return None,
     })
+}
+
+/// Extract all APIC pictures from an MP3's ID3v2 tag as embedded pictures, for
+/// scan-time art ingestion. Returns empty if there is no tag or no pictures.
+pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
+    let tag = match id3::Tag::read_from2(std::io::Cursor::new(data)) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    tag.pictures()
+        .map(|p| EmbeddedPicture {
+            mime: p.mime_type.clone(),
+            picture_type: u8::from(p.picture_type) as u32,
+            description: p.description.clone(),
+            width: 0,
+            height: 0,
+            data: p.data.clone(),
+        })
+        .collect()
 }
 
 /// Read an existing ID3v2 tag from `data` and fold its recognized text frames into

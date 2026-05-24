@@ -5,5 +5,5 @@ mod layout;
 pub mod mp3;
 
 pub use error::{FormatError, Result};
-pub use input::{ArtInput, TagInput};
+pub use input::{ArtInput, EmbeddedPicture, TagInput};
 pub use layout::{RegionLayout, Segment};

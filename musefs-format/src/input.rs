@@ -29,3 +29,15 @@ pub struct ArtInput {
     pub height: u32,
     pub data_len: u64,
 }
+
+/// An embedded picture extracted from a backing file at scan time (a FLAC PICTURE
+/// block or an MP3 APIC frame), before it is content-addressed and stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedPicture {
+    pub mime: String,
+    pub picture_type: u32,
+    pub description: String,
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}

@@ -98,3 +98,64 @@ fn scans_mp3_files_seeding_tracks_and_tags() {
         .iter()
         .any(|tag| tag.key == "title" && tag.value == "Track"));
 }
+
+fn flac_with_picture(comments: &[&str], img: &[u8]) -> Vec<u8> {
+    use common::{flac_block, streaminfo_body, vorbis_comment_body};
+    fn picture_body(pic_type: u32, mime: &str, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&pic_type.to_be_bytes());
+        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(mime.as_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes()); // empty description
+        b.extend_from_slice(&0u32.to_be_bytes()); // width
+        b.extend_from_slice(&0u32.to_be_bytes()); // height
+        b.extend_from_slice(&0u32.to_be_bytes()); // depth
+        b.extend_from_slice(&0u32.to_be_bytes()); // colors
+        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"fLaC");
+    out.extend_from_slice(&flac_block(0, &streaminfo_body(), false));
+    out.extend_from_slice(&flac_block(4, &vorbis_comment_body("v", comments), false));
+    out.extend_from_slice(&flac_block(6, &picture_body(3, "image/png", img), true));
+    out.extend_from_slice(&[0xAAu8; 24]);
+    out
+}
+
+#[test]
+fn scan_ingests_and_dedups_embedded_art() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = vec![0x42u8; 100];
+    std::fs::write(
+        dir.path().join("a.flac"),
+        flac_with_picture(&["TITLE=A"], &img),
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(
+        dir.path().join("sub/b.flac"),
+        flac_with_picture(&["TITLE=B"], &img),
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 2);
+
+    // Both tracks link art, and the identical image is stored once (dedup by sha256).
+    let mut art_ids = std::collections::HashSet::new();
+    for t in &tracks {
+        let ta = db.get_track_art(t.id).unwrap();
+        assert_eq!(ta.len(), 1);
+        assert_eq!(ta[0].picture_type, 3);
+        art_ids.insert(ta[0].art_id);
+    }
+    assert_eq!(art_ids.len(), 1, "identical art should dedup to one row");
+
+    let only = *art_ids.iter().next().unwrap();
+    assert_eq!(db.get_art_meta(only).unwrap().unwrap().byte_len, 100);
+}

@@ -18,8 +18,6 @@ pub enum CoreError {
     IsDir(u64),
     #[error("inode {0} is not a directory")]
     NotADir(u64),
-    #[error("embedded art is not supported in this milestone")]
-    ArtNotSupported,
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

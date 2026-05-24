@@ -24,10 +24,7 @@ pub fn errno(err: &CoreError) -> i32 {
         CoreError::IsDir(_) => libc::EISDIR,
         CoreError::NotADir(_) => libc::ENOTDIR,
         CoreError::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
-        CoreError::BackingChanged(_)
-        | CoreError::Db(_)
-        | CoreError::Format(_)
-        | CoreError::ArtNotSupported => libc::EIO,
+        CoreError::BackingChanged(_) | CoreError::Db(_) | CoreError::Format(_) => libc::EIO,
     }
 }
 
@@ -207,8 +204,6 @@ mod tests {
         assert_eq!(errno(&CoreError::IsDir(7)), libc::EISDIR);
         assert_eq!(errno(&CoreError::NotADir(7)), libc::ENOTDIR);
         assert_eq!(errno(&CoreError::BackingChanged("x".into())), libc::EIO);
-        assert_eq!(errno(&CoreError::ArtNotSupported), libc::EIO);
-
         let io = CoreError::Io(std::io::Error::from_raw_os_error(libc::ENOENT));
         assert_eq!(errno(&io), libc::ENOENT);
         let io_other = CoreError::Io(std::io::Error::other("boom"));

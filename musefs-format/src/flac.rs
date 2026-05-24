@@ -92,7 +92,7 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
     })
 }
 
-use crate::input::{ArtInput, TagInput};
+use crate::input::{ArtInput, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 
 pub(crate) const VENDOR: &str = "musefs";
@@ -236,6 +236,96 @@ fn read_u32_le(data: &[u8], pos: usize) -> Result<u32> {
         data[pos + 2],
         data[pos + 3],
     ]))
+}
+
+fn read_u32_be(data: &[u8], pos: usize) -> Result<u32> {
+    if pos + 4 > data.len() {
+        return Err(FormatError::Malformed);
+    }
+    Ok(u32::from_be_bytes([
+        data[pos],
+        data[pos + 1],
+        data[pos + 2],
+        data[pos + 3],
+    ]))
+}
+
+fn parse_picture_block(body: &[u8]) -> Result<EmbeddedPicture> {
+    let mut pos = 0usize;
+    let picture_type = read_u32_be(body, pos)?;
+    pos += 4;
+    let mime_len = read_u32_be(body, pos)? as usize;
+    pos += 4;
+    let mime_end = pos + mime_len;
+    if mime_end > body.len() {
+        return Err(FormatError::Malformed);
+    }
+    let mime = String::from_utf8_lossy(&body[pos..mime_end]).into_owned();
+    pos = mime_end;
+    let desc_len = read_u32_be(body, pos)? as usize;
+    pos += 4;
+    let desc_end = pos + desc_len;
+    if desc_end > body.len() {
+        return Err(FormatError::Malformed);
+    }
+    let description = String::from_utf8_lossy(&body[pos..desc_end]).into_owned();
+    pos = desc_end;
+    let width = read_u32_be(body, pos)?;
+    pos += 4;
+    let height = read_u32_be(body, pos)?;
+    pos += 4;
+    let _depth = read_u32_be(body, pos)?;
+    pos += 4;
+    let _colors = read_u32_be(body, pos)?;
+    pos += 4;
+    let data_len = read_u32_be(body, pos)? as usize;
+    pos += 4;
+    let data_end = pos + data_len;
+    if data_end > body.len() {
+        return Err(FormatError::Malformed);
+    }
+    Ok(EmbeddedPicture {
+        mime,
+        picture_type,
+        description,
+        width,
+        height,
+        data: body[pos..data_end].to_vec(),
+    })
+}
+
+/// Extract all PICTURE blocks from a complete FLAC file as embedded pictures, for
+/// scan-time art ingestion. Returns an empty vec if there are none.
+pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
+    if data.len() < 4 || &data[0..4] != FLAC_MARKER {
+        return Err(FormatError::NotFlac);
+    }
+    let mut pos = 4usize;
+    let mut out = Vec::new();
+    loop {
+        if pos + 4 > data.len() {
+            return Err(FormatError::Malformed);
+        }
+        let header = data[pos];
+        let is_last = (header & 0x80) != 0;
+        let block_type = header & 0x7F;
+        let len = ((data[pos + 1] as usize) << 16)
+            | ((data[pos + 2] as usize) << 8)
+            | (data[pos + 3] as usize);
+        let body_start = pos + 4;
+        let body_end = body_start + len;
+        if body_end > data.len() {
+            return Err(FormatError::Malformed);
+        }
+        if block_type == BLOCK_PICTURE {
+            out.push(parse_picture_block(&data[body_start..body_end])?);
+        }
+        pos = body_end;
+        if is_last {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 fn parse_vorbis_comment_body(body: &[u8]) -> Result<Vec<(String, String)>> {

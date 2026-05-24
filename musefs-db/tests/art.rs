@@ -1,6 +1,6 @@
 mod common;
 use common::{jpeg, new_track};
-use musefs_db::{Db, TrackArt};
+use musefs_db::{Db, NewArt, TrackArt};
 
 #[test]
 fn identical_bytes_dedup_to_one_row() {
@@ -66,4 +66,30 @@ fn linking_art_bumps_content_version() {
     .unwrap();
 
     assert!(db.track_content_version(track).unwrap() > before);
+}
+
+#[test]
+fn read_art_chunk_streams_a_slice() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .upsert_art(&NewArt {
+            mime: "image/png".to_string(),
+            width: Some(2),
+            height: Some(3),
+            data: vec![10, 11, 12, 13, 14, 15],
+        })
+        .unwrap();
+
+    // A middle slice.
+    assert_eq!(db.read_art_chunk(id, 2, 3).unwrap(), vec![12, 13, 14]);
+    // From the start.
+    assert_eq!(db.read_art_chunk(id, 0, 2).unwrap(), vec![10, 11]);
+
+    // Metadata without loading the blob.
+    let meta = db.get_art_meta(id).unwrap().unwrap();
+    assert_eq!(meta.mime, "image/png");
+    assert_eq!(meta.width, Some(2));
+    assert_eq!(meta.byte_len, 6);
+
+    assert!(db.get_art_meta(999_999).unwrap().is_none());
 }
