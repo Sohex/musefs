@@ -82,11 +82,7 @@ impl Db {
         )?)
     }
 
-    fn query_optional_track(
-        &self,
-        sql: &str,
-        p: impl rusqlite::Params,
-    ) -> Result<Option<Track>> {
+    fn query_optional_track(&self, sql: &str, p: impl rusqlite::Params) -> Result<Option<Track>> {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query(p)?;
         match rows.next()? {

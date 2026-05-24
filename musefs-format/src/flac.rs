@@ -166,7 +166,12 @@ pub fn synthesize_layout(scan: &FlacScan, tags: &[TagInput], arts: &[ArtInput]) 
             body_len <= 0x00FF_FFFF,
             "FLAC PICTURE block body ({body_len} bytes) exceeds the 24-bit length limit"
         );
-        push_block_header(&mut buf, BLOCK_PICTURE, body_len as usize, idx == last_index);
+        push_block_header(
+            &mut buf,
+            BLOCK_PICTURE,
+            body_len as usize,
+            idx == last_index,
+        );
         buf.extend_from_slice(&framing);
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::ArtImage {
@@ -225,7 +230,12 @@ fn read_u32_le(data: &[u8], pos: usize) -> Result<u32> {
     if pos + 4 > data.len() {
         return Err(FormatError::Malformed);
     }
-    Ok(u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]))
+    Ok(u32::from_le_bytes([
+        data[pos],
+        data[pos + 1],
+        data[pos + 2],
+        data[pos + 3],
+    ]))
 }
 
 fn parse_vorbis_comment_body(body: &[u8]) -> Result<Vec<(String, String)>> {

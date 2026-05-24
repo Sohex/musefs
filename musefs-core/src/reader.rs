@@ -51,7 +51,9 @@ impl HeaderCache {
     /// Resolve a track to its synthesized layout, building (and caching) it on a
     /// content-version miss. Validates the backing file's size and mtime first.
     pub fn resolve(&mut self, db: &Db, track_id: i64) -> Result<Arc<ResolvedFile>> {
-        let track = db.get_track(track_id)?.ok_or(CoreError::TrackNotFound(track_id))?;
+        let track = db
+            .get_track(track_id)?
+            .ok_or(CoreError::TrackNotFound(track_id))?;
 
         // Always validate the backing file first — a stale file is an error even
         // on a cache hit, because the audio region may have shifted.

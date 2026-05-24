@@ -14,9 +14,14 @@ fn data_version_changes_after_external_connection_writes() {
     // A separate connection (simulating an external tagger) commits a change.
     {
         let other = Db::open(&path).unwrap();
-        other.replace_tags(track, &[Tag::new("title", "X", 0)]).unwrap();
+        other
+            .replace_tags(track, &[Tag::new("title", "X", 0)])
+            .unwrap();
     }
 
     let v2 = db.data_version().unwrap();
-    assert_ne!(v1, v2, "data_version must change after another connection writes");
+    assert_ne!(
+        v1, v2,
+        "data_version must change after another connection writes"
+    );
 }

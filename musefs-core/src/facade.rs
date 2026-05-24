@@ -38,7 +38,12 @@ pub struct Musefs {
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let tree = Self::build_tree(&db, &config)?;
-        Ok(Musefs { db, config, tree, cache: HeaderCache::new() })
+        Ok(Musefs {
+            db,
+            config,
+            tree,
+            cache: HeaderCache::new(),
+        })
     }
 
     fn build_tree(db: &Db, config: &MountConfig) -> Result<VirtualTree> {
@@ -79,7 +84,12 @@ impl Musefs {
             None => return Err(CoreError::NoEntry(inode)),
             Some(node) => match &node.kind {
                 NodeKind::Dir => {
-                    return Ok(Attr { inode, is_dir: true, size: 0, mtime_secs: 0 })
+                    return Ok(Attr {
+                        inode,
+                        is_dir: true,
+                        size: 0,
+                        mtime_secs: 0,
+                    })
                 }
                 NodeKind::File { track_id } => *track_id,
             },

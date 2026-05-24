@@ -34,8 +34,13 @@ fn replace_overwrites_previous_tags() {
     let db = Db::open_in_memory().unwrap();
     let track = db.upsert_track(&new_track("/m/a.flac")).unwrap();
 
-    db.replace_tags(track, &[Tag::new("title", "Old", 0)]).unwrap();
-    db.replace_tags(track, &[Tag::new("title", "New", 0)]).unwrap();
+    db.replace_tags(track, &[Tag::new("title", "Old", 0)])
+        .unwrap();
+    db.replace_tags(track, &[Tag::new("title", "New", 0)])
+        .unwrap();
 
-    assert_eq!(db.get_tags(track).unwrap(), vec![Tag::new("title", "New", 0)]);
+    assert_eq!(
+        db.get_tags(track).unwrap(),
+        vec![Tag::new("title", "New", 0)]
+    );
 }

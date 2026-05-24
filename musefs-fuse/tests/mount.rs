@@ -73,7 +73,10 @@ fn end_to_end_read_through_mount() {
     let bytes = std::fs::read(&song).unwrap();
     let tag = metaflac::Tag::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
     assert_eq!(
-        tag.vorbis_comments().unwrap().get("TITLE").map(|v| v.as_slice()),
+        tag.vorbis_comments()
+            .unwrap()
+            .get("TITLE")
+            .map(|v| v.as_slice()),
         Some(["Song".to_string()].as_slice())
     );
 

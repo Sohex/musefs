@@ -1,8 +1,8 @@
 mod common;
-use std::collections::BTreeMap;
 use common::make_flac;
 use common::{streaminfo_body, vorbis_comment_body};
-use musefs_core::{scan_directory, Musefs, MountConfig, VirtualTree};
+use musefs_core::{scan_directory, MountConfig, Musefs, VirtualTree};
+use std::collections::BTreeMap;
 
 fn config() -> MountConfig {
     MountConfig {
@@ -13,7 +13,13 @@ fn config() -> MountConfig {
 }
 
 fn scanned_db(dir: &std::path::Path) -> musefs_db::Db {
-    let a = make_flac(&[(0, streaminfo_body()), (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"]))], &[0xAB; 64]);
+    let a = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &[0xAB; 64],
+    );
     std::fs::write(dir.join("a.flac"), &a).unwrap();
     let db = musefs_db::Db::open_in_memory().unwrap();
     // Use an on-disk DB? in-memory is fine; scan writes absolute backing paths.
@@ -47,7 +53,10 @@ fn lookup_getattr_readdir_and_read_through_the_facade() {
     assert_eq!(bytes.len() as u64, fattr.size);
     let tag = metaflac::Tag::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
     assert_eq!(
-        tag.vorbis_comments().unwrap().get("TITLE").map(|v| v.as_slice()),
+        tag.vorbis_comments()
+            .unwrap()
+            .get("TITLE")
+            .map(|v| v.as_slice()),
         Some(["Song".to_string()].as_slice())
     );
 }

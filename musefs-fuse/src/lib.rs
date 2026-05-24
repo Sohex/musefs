@@ -96,14 +96,21 @@ impl Filesystem for MusefsFs {
             None => return reply.error(libc::ENOENT),
         };
         match self.core.getattr(child) {
-            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr, self.uid, self.gid, self.mount_time), 0),
+            Ok(attr) => reply.entry(
+                &TTL,
+                &to_file_attr(&attr, self.uid, self.gid, self.mount_time),
+                0,
+            ),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         match self.core.getattr(ino) {
-            Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr, self.uid, self.gid, self.mount_time)),
+            Ok(attr) => reply.attr(
+                &TTL,
+                &to_file_attr(&attr, self.uid, self.gid, self.mount_time),
+            ),
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -145,7 +152,8 @@ impl Filesystem for MusefsFs {
         // `.` and `..` first, then the children. `offset` is the index already
         // consumed by a previous call; `reply.add` returns true when the buffer
         // is full, at which point we stop and reply.
-        let mut listing: Vec<(u64, fuser::FileType, String)> = Vec::with_capacity(entries.len() + 2);
+        let mut listing: Vec<(u64, fuser::FileType, String)> =
+            Vec::with_capacity(entries.len() + 2);
         listing.push((ino, fuser::FileType::Directory, ".".to_string()));
         listing.push((parent, fuser::FileType::Directory, "..".to_string()));
         for (name, child, is_dir) in entries {
@@ -169,10 +177,7 @@ impl Filesystem for MusefsFs {
 
 /// Read-only mount options tagged with the filesystem name.
 fn mount_options(fs_name: &str) -> Vec<MountOption> {
-    vec![
-        MountOption::RO,
-        MountOption::FSName(fs_name.to_string()),
-    ]
+    vec![MountOption::RO, MountOption::FSName(fs_name.to_string())]
 }
 
 /// Mount `core` at `mountpoint` and block until the filesystem is unmounted.
@@ -189,9 +194,9 @@ pub fn spawn(core: Musefs, mountpoint: &Path, fs_name: &str) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use musefs_core::CoreError;
     use fuser::FileType;
     use musefs_core::Attr;
+    use musefs_core::CoreError;
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -212,7 +217,12 @@ mod tests {
     fn converts_dir_and_file_attrs() {
         let fallback = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
 
-        let dir = Attr { inode: 1, is_dir: true, size: 0, mtime_secs: 0 };
+        let dir = Attr {
+            inode: 1,
+            is_dir: true,
+            size: 0,
+            mtime_secs: 0,
+        };
         let fa = to_file_attr(&dir, 501, 20, fallback);
         assert_eq!(fa.ino, 1);
         assert_eq!(fa.kind, FileType::Directory);
@@ -222,12 +232,20 @@ mod tests {
         // mtime_secs == 0 falls back to the supplied mount time.
         assert_eq!(fa.mtime, fallback);
 
-        let file = Attr { inode: 9, is_dir: false, size: 4096, mtime_secs: 1_700_000_000 };
+        let file = Attr {
+            inode: 9,
+            is_dir: false,
+            size: 4096,
+            mtime_secs: 1_700_000_000,
+        };
         let fa = to_file_attr(&file, 501, 20, fallback);
         assert_eq!(fa.kind, FileType::RegularFile);
         assert_eq!(fa.perm, 0o444);
         assert_eq!(fa.size, 4096);
         assert_eq!(fa.blocks, 8); // 4096 / 512
-        assert_eq!(fa.mtime, SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        assert_eq!(
+            fa.mtime,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
     }
 }

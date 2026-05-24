@@ -37,11 +37,14 @@ mod tests {
             tag("title", "Song", 0),
         ];
         let inputs = tags_to_inputs(&tags);
-        assert_eq!(inputs, vec![
-            TagInput::new("artist", "Alice"),
-            TagInput::new("artist", "Bob"),
-            TagInput::new("title", "Song"),
-        ]);
+        assert_eq!(
+            inputs,
+            vec![
+                TagInput::new("artist", "Alice"),
+                TagInput::new("artist", "Bob"),
+                TagInput::new("title", "Song"),
+            ]
+        );
     }
 
     #[test]

@@ -33,7 +33,11 @@ impl VirtualTree {
         };
         tree.nodes.insert(
             Self::ROOT,
-            Node { parent: Self::ROOT, name: String::new(), kind: NodeKind::Dir },
+            Node {
+                parent: Self::ROOT,
+                name: String::new(),
+                kind: NodeKind::Dir,
+            },
         );
         tree.children.insert(Self::ROOT, BTreeMap::new());
         for (track_id, path) in entries {
@@ -57,7 +61,9 @@ impl VirtualTree {
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
-        self.children.get(&parent).and_then(|c| c.get(name).copied())
+        self.children
+            .get(&parent)
+            .and_then(|c| c.get(name).copied())
     }
 
     pub fn is_dir(&self, inode: u64) -> bool {
@@ -90,7 +96,11 @@ impl VirtualTree {
         let inode = self.alloc();
         self.nodes.insert(
             inode,
-            Node { parent: dir, name: name.clone(), kind: NodeKind::File { track_id } },
+            Node {
+                parent: dir,
+                name: name.clone(),
+                kind: NodeKind::File { track_id },
+            },
         );
         self.children.get_mut(&dir).unwrap().insert(name, inode);
     }
@@ -105,10 +115,17 @@ impl VirtualTree {
         let inode = self.alloc();
         self.nodes.insert(
             inode,
-            Node { parent, name: unique.clone(), kind: NodeKind::Dir },
+            Node {
+                parent,
+                name: unique.clone(),
+                kind: NodeKind::Dir,
+            },
         );
         self.children.insert(inode, BTreeMap::new());
-        self.children.get_mut(&parent).unwrap().insert(unique, inode);
+        self.children
+            .get_mut(&parent)
+            .unwrap()
+            .insert(unique, inode);
         inode
     }
 

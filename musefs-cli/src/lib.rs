@@ -10,7 +10,10 @@ use musefs_core::{MountConfig, Musefs, ScanStats};
 use musefs_db::Db;
 
 #[derive(Parser, Debug)]
-#[command(name = "musefs", about = "Read-only re-tagging FUSE view of a music library")]
+#[command(
+    name = "musefs",
+    about = "Read-only re-tagging FUSE view of a music library"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -44,8 +47,8 @@ pub enum Command {
 
 /// Open (creating/migrating) the DB at `db_path` and scan `backing_dir` into it.
 pub fn run_scan(db_path: &Path, backing_dir: &Path) -> Result<ScanStats> {
-    let db = Db::open(db_path)
-        .with_context(|| format!("opening database at {}", db_path.display()))?;
+    let db =
+        Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let stats = musefs_core::scan_directory(&db, backing_dir)
         .with_context(|| format!("scanning {}", backing_dir.display()))?;
     Ok(stats)
@@ -59,8 +62,8 @@ pub fn run_mount(
     template: String,
     default_fallback: String,
 ) -> Result<()> {
-    let db = Db::open(db_path)
-        .with_context(|| format!("opening database at {}", db_path.display()))?;
+    let db =
+        Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let config = MountConfig {
         template,
         fallbacks: BTreeMap::new(),
@@ -77,11 +80,17 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Scan { backing_dir, db } => {
             let stats = run_scan(&db, &backing_dir)?;
-            println!("scanned {} file(s), skipped {}", stats.scanned, stats.skipped);
+            println!(
+                "scanned {} file(s), skipped {}",
+                stats.scanned, stats.skipped
+            );
             Ok(())
         }
-        Command::Mount { mountpoint, db, template, default_fallback } => {
-            run_mount(&db, &mountpoint, template, default_fallback)
-        }
+        Command::Mount {
+            mountpoint,
+            db,
+            template,
+            default_fallback,
+        } => run_mount(&db, &mountpoint, template, default_fallback),
     }
 }

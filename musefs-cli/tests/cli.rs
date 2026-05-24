@@ -13,10 +13,21 @@ fn parses_scan_and_mount_invocations() {
     }
 
     let cli = Cli::parse_from([
-        "musefs", "mount", "/mnt/x", "--db", "/tmp/m.db", "--template", "$album/$title",
+        "musefs",
+        "mount",
+        "/mnt/x",
+        "--db",
+        "/tmp/m.db",
+        "--template",
+        "$album/$title",
     ]);
     match cli.command {
-        Command::Mount { mountpoint, db, template, default_fallback } => {
+        Command::Mount {
+            mountpoint,
+            db,
+            template,
+            default_fallback,
+        } => {
             assert_eq!(mountpoint.to_str(), Some("/mnt/x"));
             assert_eq!(db.to_str(), Some("/tmp/m.db"));
             assert_eq!(template, "$album/$title");

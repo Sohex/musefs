@@ -22,11 +22,11 @@ impl Db {
              ON CONFLICT(sha256) DO NOTHING",
             params![sha, a.mime, a.width, a.height, a.data.len() as i64, a.data],
         )?;
-        let id = self.conn.query_row(
-            "SELECT id FROM art WHERE sha256 = ?1",
-            params![sha],
-            |r| r.get(0),
-        )?;
+        let id =
+            self.conn
+                .query_row("SELECT id FROM art WHERE sha256 = ?1", params![sha], |r| {
+                    r.get(0)
+                })?;
         Ok(id)
     }
 
@@ -51,7 +51,10 @@ impl Db {
 
     pub fn set_track_art(&self, track_id: i64, items: &[TrackArt]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM track_art WHERE track_id = ?1", params![track_id])?;
+        tx.execute(
+            "DELETE FROM track_art WHERE track_id = ?1",
+            params![track_id],
+        )?;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal)

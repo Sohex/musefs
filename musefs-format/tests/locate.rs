@@ -26,12 +26,19 @@ fn preserves_structural_blocks_but_not_padding() {
     let seektable = vec![0u8; 18];
     let padding = vec![0u8; 32];
     let audio = vec![0x11; 10];
-    let file = make_flac(&[(0, si.clone()), (3, seektable.clone()), (1, padding)], &audio);
+    let file = make_flac(
+        &[(0, si.clone()), (3, seektable.clone()), (1, padding)],
+        &audio,
+    );
 
     let scan = locate_audio(&file).unwrap();
 
     let types: Vec<u8> = scan.preserved.iter().map(|b| b.block_type).collect();
-    assert_eq!(types, vec![0, 3], "STREAMINFO + SEEKTABLE preserved, PADDING dropped");
+    assert_eq!(
+        types,
+        vec![0, 3],
+        "STREAMINFO + SEEKTABLE preserved, PADDING dropped"
+    );
     assert_eq!(scan.preserved[1].body, seektable);
     assert_eq!(scan.audio_length, audio.len() as u64);
 }

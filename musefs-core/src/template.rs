@@ -5,7 +5,13 @@ use std::collections::BTreeMap;
 fn sanitize(value: &str) -> String {
     value
         .chars()
-        .map(|c| if c == '/' || (c as u32) < 0x20 { '_' } else { c })
+        .map(|c| {
+            if c == '/' || (c as u32) < 0x20 {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 

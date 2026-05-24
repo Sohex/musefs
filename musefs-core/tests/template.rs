@@ -1,13 +1,20 @@
-use std::collections::BTreeMap;
 use musefs_core::render_path;
+use std::collections::BTreeMap;
 
 fn fields(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 #[test]
 fn substitutes_dollar_and_braced_fields_and_appends_ext() {
-    let f = fields(&[("albumartist", "Pink Floyd"), ("album", "Animals"), ("title", "Pigs")]);
+    let f = fields(&[
+        ("albumartist", "Pink Floyd"),
+        ("album", "Animals"),
+        ("title", "Pigs"),
+    ]);
     let path = render_path(
         "$albumartist/${album}/$title",
         &f,
@@ -22,7 +29,13 @@ fn substitutes_dollar_and_braced_fields_and_appends_ext() {
 fn missing_field_uses_per_field_fallback_then_default() {
     let f = fields(&[("title", "Untitled Track")]);
     let fallbacks = fields(&[("albumartist", "Unknown Artist")]);
-    let path = render_path("$albumartist/$album/$title", &f, &fallbacks, "Unknown", "flac");
+    let path = render_path(
+        "$albumartist/$album/$title",
+        &f,
+        &fallbacks,
+        "Unknown",
+        "flac",
+    );
     assert_eq!(path, "Unknown Artist/Unknown/Untitled Track.flac");
 }
 

@@ -14,7 +14,10 @@ fn insert_then_get_by_id_and_path() {
     assert_eq!(by_id.audio_offset, 100);
     assert_eq!(by_id.content_version, 0);
 
-    let by_path = db.get_track_by_path("/music/a.flac").unwrap().expect("track by path");
+    let by_path = db
+        .get_track_by_path("/music/a.flac")
+        .unwrap()
+        .expect("track by path");
     assert_eq!(by_path.id, id);
 }
 

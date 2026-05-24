@@ -27,7 +27,11 @@ fn collect_flacs(root: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Res
         if ftype.is_dir() {
             collect_flacs(&path, out)?;
         } else if ftype.is_file()
-            && path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("flac")) == Some(true)
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("flac"))
+                == Some(true)
         {
             out.push(path);
         }
@@ -42,7 +46,10 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut files = Vec::new();
     collect_flacs(root, &mut files)?;
 
-    let mut stats = ScanStats { scanned: 0, skipped: 0 };
+    let mut stats = ScanStats {
+        scanned: 0,
+        skipped: 0,
+    };
     for path in files {
         let bytes = std::fs::read(&path)?;
         let scan = match locate_audio(&bytes) {

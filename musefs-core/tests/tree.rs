@@ -8,7 +8,9 @@ fn builds_directories_and_files_with_lookup() {
         (12, "Pink Floyd/Meddle/Echoes.flac".to_string()),
     ]);
 
-    let artist = tree.lookup(VirtualTree::ROOT, "Pink Floyd").expect("artist dir");
+    let artist = tree
+        .lookup(VirtualTree::ROOT, "Pink Floyd")
+        .expect("artist dir");
     let animals = tree.lookup(artist, "Animals").expect("album dir");
     assert!(tree.is_dir(animals));
 
@@ -41,7 +43,11 @@ fn disambiguates_colliding_file_names() {
 fn root_node_is_a_directory() {
     let tree = VirtualTree::build(&[]);
     assert!(tree.is_dir(VirtualTree::ROOT));
-    assert_eq!(tree.node(VirtualTree::ROOT).map(|n| matches!(n.kind, NodeKind::Dir)), Some(true));
+    assert_eq!(
+        tree.node(VirtualTree::ROOT)
+            .map(|n| matches!(n.kind, NodeKind::Dir)),
+        Some(true)
+    );
 }
 
 #[test]

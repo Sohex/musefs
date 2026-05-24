@@ -4,9 +4,15 @@ use musefs_format::{RegionLayout, Segment};
 fn lengths_sum_segments_and_exclude_audio_from_header() {
     let layout = RegionLayout::new(vec![
         Segment::Inline(vec![0u8; 10]),
-        Segment::ArtImage { art_id: 7, len: 100 },
+        Segment::ArtImage {
+            art_id: 7,
+            len: 100,
+        },
         Segment::Inline(vec![0u8; 5]),
-        Segment::BackingAudio { offset: 200, len: 1000 },
+        Segment::BackingAudio {
+            offset: 200,
+            len: 1000,
+        },
     ]);
 
     assert_eq!(layout.header_len(), 10 + 100 + 5);

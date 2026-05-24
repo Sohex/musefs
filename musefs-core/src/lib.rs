@@ -1,10 +1,10 @@
 mod error;
+mod facade;
 mod mapping;
 mod reader;
 mod scan;
 mod template;
 mod tree;
-mod facade;
 
 pub use error::{CoreError, Result};
 pub use facade::{Attr, MountConfig, Musefs};

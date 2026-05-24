@@ -29,8 +29,24 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
     let front = vec![0x01u8; 900];
     let back = vec![0x02u8; 700];
     let arts = vec![
-        ArtInput { art_id: 1, mime: "image/png".into(), description: "front".into(), picture_type: 3, width: 600, height: 600, data_len: front.len() as u64 },
-        ArtInput { art_id: 2, mime: "image/png".into(), description: "back".into(),  picture_type: 4, width: 600, height: 600, data_len: back.len() as u64 },
+        ArtInput {
+            art_id: 1,
+            mime: "image/png".into(),
+            description: "front".into(),
+            picture_type: 3,
+            width: 600,
+            height: 600,
+            data_len: front.len() as u64,
+        },
+        ArtInput {
+            art_id: 2,
+            mime: "image/png".into(),
+            description: "back".into(),
+            picture_type: 4,
+            width: 600,
+            height: 600,
+            data_len: back.len() as u64,
+        },
     ];
 
     let layout = synthesize_layout(&scan, &tags, &arts);
@@ -46,8 +62,14 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
     let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC");
 
     let vc = tag.vorbis_comments().expect("vorbis comments");
-    assert_eq!(vc.get("TITLE").map(|v| v.as_slice()), Some(["Real Title".to_string()].as_slice()));
-    assert_eq!(vc.get("ALBUM").map(|v| v.as_slice()), Some(["Real Album".to_string()].as_slice()));
+    assert_eq!(
+        vc.get("TITLE").map(|v| v.as_slice()),
+        Some(["Real Title".to_string()].as_slice())
+    );
+    assert_eq!(
+        vc.get("ALBUM").map(|v| v.as_slice()),
+        Some(["Real Album".to_string()].as_slice())
+    );
     assert_eq!(
         vc.get("ARTIST").map(|v| v.as_slice()),
         Some(["Alice".to_string(), "Bob".to_string()].as_slice())

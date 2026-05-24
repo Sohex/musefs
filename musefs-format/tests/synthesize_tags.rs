@@ -19,12 +19,18 @@ fn measured_lengths_match_assembled_bytes() {
     let (file, audio) = fixture();
     let scan = locate_audio(&file).unwrap();
 
-    let tags = vec![TagInput::new("title", "New Title"), TagInput::new("artist", "A")];
+    let tags = vec![
+        TagInput::new("title", "New Title"),
+        TagInput::new("artist", "A"),
+    ];
     let layout = synthesize_layout(&scan, &tags, &[]);
 
     let assembled = resolve_layout(&layout, &file, &HashMap::new());
     assert_eq!(assembled.len() as u64, layout.total_len());
-    assert_eq!(layout.header_len(), assembled.len() as u64 - audio.len() as u64);
+    assert_eq!(
+        layout.header_len(),
+        assembled.len() as u64 - audio.len() as u64
+    );
     assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);
 }
 
@@ -44,7 +50,10 @@ fn metaflac_reads_synthesized_vorbis_comments_and_preserves_streaminfo() {
     let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
 
     let vc = tag.vorbis_comments().expect("vorbis comments present");
-    assert_eq!(vc.get("TITLE").map(|v| v.as_slice()), Some(["New Title".to_string()].as_slice()));
+    assert_eq!(
+        vc.get("TITLE").map(|v| v.as_slice()),
+        Some(["New Title".to_string()].as_slice())
+    );
     assert_eq!(
         vc.get("ARTIST").map(|v| v.as_slice()),
         Some(["First".to_string(), "Second".to_string()].as_slice())
