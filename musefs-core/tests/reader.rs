@@ -59,6 +59,37 @@ fn resolve_caches_until_content_version_changes() {
 }
 
 #[test]
+fn resolve_errors_when_audio_bounds_overrun_the_file() {
+    let (dir, db, _id) = setup();
+    let flac = dir.path().join("song.flac");
+    let meta = std::fs::metadata(&flac).unwrap();
+    let mtime = meta
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Re-upsert the same path with an audio_length that runs past EOF (the offset
+    // is valid, but offset + length exceeds the file size).
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: flac.to_string_lossy().to_string(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: meta.len() as i64 + 1,
+            backing_size: meta.len() as i64,
+            backing_mtime: mtime,
+        })
+        .unwrap();
+
+    let mut cache = HeaderCache::new();
+    assert!(matches!(
+        cache.resolve(&db, id),
+        Err(musefs_core::CoreError::BackingChanged(_))
+    ));
+}
+
+#[test]
 fn resolve_errors_when_backing_file_changes() {
     let (dir, db, id) = setup();
     let mut cache = HeaderCache::new();

@@ -62,11 +62,12 @@ impl HeaderCache {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
-        // Guard the stored audio bounds before any cast/allocation: a negative or
-        // out-of-file offset means the row no longer matches the backing file.
+        // Guard the stored audio bounds before any cast/allocation: a negative
+        // bound, or an audio region that runs past the end of the backing file,
+        // means the row no longer matches the file.
         if track.audio_offset < 0
             || track.audio_length < 0
-            || track.audio_offset as u64 > meta.len()
+            || (track.audio_offset as u64).saturating_add(track.audio_length as u64) > meta.len()
         {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
