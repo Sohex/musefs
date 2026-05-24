@@ -122,7 +122,7 @@ use musefs_format::Segment;
 /// Read `size` bytes starting at virtual `offset` from a resolved file, splicing
 /// inline framing with positioned reads of the backing audio. Returns fewer bytes
 /// (possibly empty) near EOF.
-pub fn read_at(resolved: &ResolvedFile, offset: u64, size: u64) -> Result<Vec<u8>> {
+pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
 
     if offset >= resolved.total_len || size == 0 {
@@ -156,8 +156,9 @@ pub fn read_at(resolved: &ResolvedFile, offset: u64, size: u64) -> Result<Vec<u8
                     f.read_exact_at(&mut buf, bo + within)?;
                     out.extend_from_slice(&buf);
                 }
-                Segment::ArtImage { .. } => {
-                    return Err(CoreError::ArtNotSupported);
+                Segment::ArtImage { art_id, .. } => {
+                    let chunk = db.read_art_chunk(*art_id, within, n)?;
+                    out.extend_from_slice(&chunk);
                 }
             }
         }

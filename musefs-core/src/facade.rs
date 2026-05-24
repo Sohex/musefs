@@ -127,6 +127,6 @@ impl Musefs {
             },
         };
         let resolved = self.cache.resolve(&self.db, track_id)?;
-        read_at(&resolved, offset, size)
+        read_at(&resolved, &self.db, offset, size)
     }
 }

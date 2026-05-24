@@ -36,7 +36,7 @@ fn reading_whole_file_matches_total_len_and_splices_audio() {
     let mut cache = HeaderCache::new();
     let resolved = cache.resolve(&db, id).unwrap();
 
-    let whole = read_at(&resolved, 0, resolved.total_len).unwrap();
+    let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
     assert_eq!(whole.len() as u64, resolved.total_len);
 
     let audio_part = &whole[resolved.layout.header_len() as usize..];
@@ -58,7 +58,7 @@ fn random_offset_and_size_match_the_whole_read() {
     let (_dir, db, id) = setup();
     let mut cache = HeaderCache::new();
     let resolved = cache.resolve(&db, id).unwrap();
-    let whole = read_at(&resolved, 0, resolved.total_len).unwrap();
+    let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
 
     for (off, size) in [
         (0u64, 10u64),
@@ -66,7 +66,7 @@ fn random_offset_and_size_match_the_whole_read() {
         (resolved.total_len - 7, 50),
         (50, 0),
     ] {
-        let got = read_at(&resolved, off, size).unwrap();
+        let got = read_at(&resolved, &db, off, size).unwrap();
         let end = (off + size).min(resolved.total_len) as usize;
         assert_eq!(got, &whole[off as usize..end], "off={off} size={size}");
     }
@@ -77,10 +77,50 @@ fn reading_past_eof_returns_empty() {
     let (_dir, db, id) = setup();
     let mut cache = HeaderCache::new();
     let resolved = cache.resolve(&db, id).unwrap();
-    assert!(read_at(&resolved, resolved.total_len, 100)
+    assert!(read_at(&resolved, &db, resolved.total_len, 100)
         .unwrap()
         .is_empty());
-    assert!(read_at(&resolved, resolved.total_len + 5, 100)
+    assert!(read_at(&resolved, &db, resolved.total_len + 5, 100)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn read_at_streams_art_image_segments() {
+    use musefs_core::{read_at, ResolvedFile};
+    use musefs_format::{RegionLayout, Segment};
+
+    let db = Db::open_in_memory().unwrap();
+    let art = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let art_id = db
+        .upsert_art(&musefs_db::NewArt {
+            mime: "image/png".to_string(),
+            width: None,
+            height: None,
+            data: art.clone(),
+        })
+        .unwrap();
+
+    let layout = RegionLayout::new(vec![
+        Segment::Inline(vec![0xAA, 0xBB]),
+        Segment::ArtImage {
+            art_id,
+            len: art.len() as u64,
+        },
+    ]);
+    let total_len = layout.total_len();
+    let resolved = ResolvedFile {
+        layout,
+        total_len,
+        content_version: 0,
+        backing_path: std::path::PathBuf::from("/unused"),
+        mtime_secs: 0,
+    };
+
+    // Whole read: inline framing then the streamed art bytes.
+    let whole = read_at(&resolved, &db, 0, total_len).unwrap();
+    assert_eq!(whole, vec![0xAA, 0xBB, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+    // A window that lands entirely inside the art segment (offset 4 -> art[2..5]).
+    assert_eq!(read_at(&resolved, &db, 4, 3).unwrap(), vec![3, 4, 5]);
 }
