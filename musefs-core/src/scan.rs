@@ -6,8 +6,8 @@ use musefs_format::{flac, mp3, EmbeddedPicture};
 
 use crate::error::Result;
 
-/// Skip embedded art larger than this. The binding limit is FLAC's 24-bit PICTURE
-/// block length (~16 MiB for the whole block); cover art is far smaller.
+/// Skip embedded art larger than this — ~16 MiB (FLAC's 24-bit PICTURE block
+/// length limit, less 1 KiB for the block framing). Cover art is far smaller.
 const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,10 +123,13 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
         db.replace_tags(track_id, &tags)?;
 
         let mut track_arts = Vec::new();
-        for (ordinal, pic) in probed.pictures.into_iter().enumerate() {
-            if pic.data.len() > MAX_ART_BYTES {
-                continue;
-            }
+        // Filter before enumerating so skipped (oversized) art doesn't leave gaps
+        // in the stored ordinals.
+        let accepted = probed
+            .pictures
+            .into_iter()
+            .filter(|p| p.data.len() <= MAX_ART_BYTES);
+        for (ordinal, pic) in accepted.enumerate() {
             let art_id = db.upsert_art(&NewArt {
                 mime: pic.mime,
                 width: (pic.width != 0).then_some(pic.width as i64),
