@@ -68,3 +68,22 @@ impl Tag {
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Art {
+    pub id: i64,
+    pub sha256: String,
+    pub mime: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub byte_len: i64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackArt {
+    pub art_id: i64,
+    pub picture_type: i64,
+    pub description: String,
+    pub ordinal: i64,
+}
