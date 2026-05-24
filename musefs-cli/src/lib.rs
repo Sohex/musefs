@@ -49,3 +49,42 @@ pub fn run_scan(db_path: &Path, backing_dir: &Path) -> Result<ScanStats> {
         .with_context(|| format!("scanning {}", backing_dir.display()))?;
     Ok(stats)
 }
+
+use std::collections::BTreeMap;
+
+use musefs_core::{MountConfig, Musefs};
+
+/// Build a `Musefs` from the DB at `db_path` and mount it (blocking) at
+/// `mountpoint`.
+pub fn run_mount(
+    db_path: &Path,
+    mountpoint: &Path,
+    template: String,
+    default_fallback: String,
+) -> Result<()> {
+    let db = Db::open(db_path)
+        .with_context(|| format!("opening database at {}", db_path.display()))?;
+    let config = MountConfig {
+        template,
+        fallbacks: BTreeMap::new(),
+        default_fallback,
+    };
+    let core = Musefs::open(db, config).context("building the virtual filesystem")?;
+    musefs_fuse::mount(core, mountpoint, "musefs")
+        .with_context(|| format!("mounting at {}", mountpoint.display()))?;
+    Ok(())
+}
+
+/// Dispatch a parsed CLI invocation.
+pub fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Command::Scan { backing_dir, db } => {
+            let stats = run_scan(&db, &backing_dir)?;
+            println!("scanned {} file(s), skipped {}", stats.scanned, stats.skipped);
+            Ok(())
+        }
+        Command::Mount { mountpoint, db, template, default_fallback } => {
+            run_mount(&db, &mountpoint, template, default_fallback)
+        }
+    }
+}

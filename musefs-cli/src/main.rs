@@ -1,3 +1,9 @@
+use clap::Parser;
+use musefs_cli::{run, Cli};
+
 fn main() {
-    std::process::exit(0);
+    if let Err(e) = run(Cli::parse()) {
+        eprintln!("musefs: {e:#}");
+        std::process::exit(1);
+    }
 }
