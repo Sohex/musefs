@@ -43,3 +43,17 @@ fn root_node_is_a_directory() {
     assert!(tree.is_dir(VirtualTree::ROOT));
     assert_eq!(tree.node(VirtualTree::ROOT).map(|n| matches!(n.kind, NodeKind::Dir)), Some(true));
 }
+
+#[test]
+fn parent_of_root_is_root_and_children_point_back() {
+    let tree = VirtualTree::build(&[(1, "Alice/Song.flac".to_string())]);
+    assert_eq!(tree.parent(VirtualTree::ROOT), Some(VirtualTree::ROOT));
+
+    let alice = tree.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    assert_eq!(tree.parent(alice), Some(VirtualTree::ROOT));
+
+    let song = tree.lookup(alice, "Song.flac").unwrap();
+    assert_eq!(tree.parent(song), Some(alice));
+
+    assert_eq!(tree.parent(99999), None);
+}
