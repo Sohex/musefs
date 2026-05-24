@@ -1,7 +1,9 @@
 mod error;
 mod schema;
+mod models;
 
 pub use error::{DbError, Result};
+pub use models::Format;
 
 use rusqlite::Connection;
 use std::path::Path;
