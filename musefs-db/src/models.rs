@@ -51,3 +51,20 @@ pub struct NewArt {
     pub height: Option<i64>,
     pub data: Vec<u8>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    pub key: String,
+    pub value: String,
+    pub ordinal: i64,
+}
+
+impl Tag {
+    pub fn new(key: &str, value: &str, ordinal: i64) -> Tag {
+        Tag {
+            key: key.to_string(),
+            value: value.to_string(),
+            ordinal,
+        }
+    }
+}
