@@ -94,14 +94,14 @@ impl HeaderCache {
                     audio_length: track.audio_length as u64,
                     preserved: fmeta.preserved,
                 };
-                flac::synthesize_layout(&scan, &inputs, &art_inputs)
+                flac::synthesize_layout(&scan, &inputs, &art_inputs)?
             }
             Format::Mp3 => mp3::synthesize_layout(
                 track.audio_offset as u64,
                 track.audio_length as u64,
                 &inputs,
                 &art_inputs,
-            ),
+            )?,
         };
         let total_len = layout.total_len();
 

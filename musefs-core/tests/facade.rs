@@ -198,3 +198,41 @@ fn serves_flac_with_embedded_art_through_the_facade() {
     assert_eq!(pic.data, img);
     assert_eq!(pic.mime_type, "image/png");
 }
+
+#[test]
+fn serves_mp3_with_embedded_art_through_the_facade() {
+    use id3::TagLike;
+
+    let dir = tempfile::tempdir().unwrap();
+    let img = vec![0xD4u8; 90];
+
+    let mut tag = id3::Tag::new();
+    tag.set_artist("Pix");
+    tag.set_title("Song");
+    tag.add_frame(id3::frame::Picture {
+        mime_type: "image/jpeg".to_string(),
+        picture_type: id3::frame::PictureType::CoverFront,
+        description: String::new(),
+        data: img.clone(),
+    });
+    let mut bytes = Vec::new();
+    tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+    bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+    std::fs::write(dir.path().join("s.mp3"), &bytes).unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let mut fs = Musefs::open(db, config()).unwrap();
+
+    let artist = fs.lookup(VirtualTree::ROOT, "Pix").unwrap();
+    let (_name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let attr = fs.getattr(file_inode).unwrap();
+    let whole = fs.read(file_inode, 0, attr.size).unwrap();
+    assert_eq!(whole.len() as u64, attr.size);
+
+    // The synthesized MP3 carries the embedded APIC picture with the original bytes.
+    let parsed = id3::Tag::read_from2(std::io::Cursor::new(&whole)).unwrap();
+    let pic = parsed.pictures().next().expect("a picture");
+    assert_eq!(pic.data, img);
+    assert_eq!(pic.mime_type, "image/jpeg");
+}

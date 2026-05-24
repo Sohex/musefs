@@ -70,16 +70,16 @@ fn syncsafe(n: u32) -> [u8; 4] {
     ]
 }
 
-fn push_frame_header(out: &mut Vec<u8>, id: &[u8; 4], data_len: usize) {
-    // ID3v2.4 frame sizes are syncsafe (28-bit). Real metadata/art is far smaller;
-    // a hard limit at art ingestion is deferred to a later milestone.
-    debug_assert!(
-        data_len <= 0x0FFF_FFFF,
-        "ID3v2.4 frame data ({data_len} bytes) exceeds the 28-bit syncsafe limit"
-    );
+fn push_frame_header(out: &mut Vec<u8>, id: &[u8; 4], data_len: usize) -> Result<()> {
+    // ID3v2.4 frame sizes are a 28-bit syncsafe field; guard so an oversized frame
+    // is a hard error rather than a silently-truncated (corrupt) tag.
+    if data_len > 0x0FFF_FFFF {
+        return Err(FormatError::TooLarge);
+    }
     out.extend_from_slice(id);
     out.extend_from_slice(&syncsafe(data_len as u32));
     out.extend_from_slice(&[0x00, 0x00]); // frame flags
+    Ok(())
 }
 
 /// Canonical (lowercase) tag key -> ID3v2.4 text frame id. Unknown keys are
@@ -134,7 +134,7 @@ pub fn synthesize_layout(
     audio_length: u64,
     tags: &[TagInput],
     arts: &[ArtInput],
-) -> RegionLayout {
+) -> Result<RegionLayout> {
     // Group consecutive same-key values (the DB returns tags ordered by key).
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for t in tags {
@@ -152,14 +152,14 @@ pub fn synthesize_layout(
         match key_to_frame(key) {
             Some(id) => {
                 let data = text_frame_data(values);
-                push_frame_header(&mut buf, id, data.len());
+                push_frame_header(&mut buf, id, data.len())?;
                 buf.extend_from_slice(&data);
                 frames_len += 10 + data.len() as u64;
             }
             None => {
                 for value in values {
                     let data = txxx_frame_data(key, value);
-                    push_frame_header(&mut buf, b"TXXX", data.len());
+                    push_frame_header(&mut buf, b"TXXX", data.len())?;
                     buf.extend_from_slice(&data);
                     frames_len += 10 + data.len() as u64;
                 }
@@ -170,7 +170,7 @@ pub fn synthesize_layout(
     for art in arts {
         let framing = apic_framing(art);
         let data_len = framing.len() as u64 + art.data_len;
-        push_frame_header(&mut buf, b"APIC", data_len as usize);
+        push_frame_header(&mut buf, b"APIC", data_len as usize)?;
         buf.extend_from_slice(&framing);
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::ArtImage {
@@ -189,10 +189,13 @@ pub fn synthesize_layout(
     header.extend_from_slice(b"ID3");
     header.extend_from_slice(&[0x04, 0x00]); // version 2.4.0
     header.push(0x00); // flags: no unsync / extended header / footer
-    debug_assert!(
-        frames_len <= 0x0FFF_FFFF,
-        "ID3v2.4 tag ({frames_len} bytes) exceeds the 28-bit syncsafe limit"
-    );
+
+    // The total tag size is a 28-bit syncsafe field. Ingestion caps each art well
+    // under this, but guard at the format boundary so an oversized tag (e.g. many
+    // large pictures summing past the limit) is a hard error, not a truncated file.
+    if frames_len > 0x0FFF_FFFF {
+        return Err(FormatError::TooLarge);
+    }
     header.extend_from_slice(&syncsafe(frames_len as u32));
     segments.insert(0, Segment::Inline(header));
 
@@ -201,7 +204,7 @@ pub fn synthesize_layout(
         len: audio_length,
     });
 
-    RegionLayout::new(segments)
+    Ok(RegionLayout::new(segments))
 }
 
 /// ID3v2 text frame id -> canonical (lowercase) tag key. Several legacy date

@@ -37,7 +37,7 @@ fn synthesizes_id3v24_text_frames_and_preserves_audio() {
         TagInput::new("title", "Song"),
         TagInput::new("album", "Record"),
     ];
-    let layout = synthesize_layout(0, audio.len() as u64, &tags, &[]);
+    let layout = synthesize_layout(0, audio.len() as u64, &tags, &[]).unwrap();
 
     // total_len must equal the bytes actually produced (generate-and-measure).
     let bytes = assemble(&layout, &audio, &[]);
@@ -67,7 +67,7 @@ fn synthesizes_apic_with_streamed_image_bytes() {
         height: 0,
         data_len: art_bytes.len() as u64,
     }];
-    let layout = synthesize_layout(0, audio.len() as u64, &tags, &arts);
+    let layout = synthesize_layout(0, audio.len() as u64, &tags, &arts).unwrap();
 
     // The image is a streamed segment, not materialized inline.
     assert!(layout
@@ -102,7 +102,7 @@ fn embedded_size_field_matches_the_frame_region() {
         height: 0,
         data_len: art_bytes.len() as u64,
     }];
-    let layout = synthesize_layout(0, audio.len() as u64, &tags, &arts);
+    let layout = synthesize_layout(0, audio.len() as u64, &tags, &arts).unwrap();
     let bytes = assemble(&layout, &audio, &[(1, &art_bytes)]);
 
     // Verify the 10-byte ID3v2.4 header magic and version/flags.
@@ -124,7 +124,7 @@ fn embedded_size_field_matches_the_frame_region() {
 #[test]
 fn empty_tag_when_no_tags_or_art() {
     let audio = [0xFFu8, 0xFB, 0, 0];
-    let layout = synthesize_layout(0, audio.len() as u64, &[], &[]);
+    let layout = synthesize_layout(0, audio.len() as u64, &[], &[]).unwrap();
 
     // Exactly two segments: the 10-byte inline header and the backing audio.
     assert_eq!(layout.segments.len(), 2);
@@ -150,7 +150,7 @@ fn empty_tag_when_no_tags_or_art() {
 fn unknown_key_becomes_txxx() {
     let audio = [0xFFu8, 0xFB, 0, 0];
     let tags = vec![TagInput::new("mood", "calm")];
-    let layout = synthesize_layout(0, audio.len() as u64, &tags, &[]);
+    let layout = synthesize_layout(0, audio.len() as u64, &tags, &[]).unwrap();
     let bytes = assemble(&layout, &audio, &[]);
 
     let tag = id3::Tag::read_from2(Cursor::new(&bytes)).unwrap();
@@ -168,7 +168,7 @@ fn multi_value_text_frame_round_trips() {
         TagInput::new("artist", "Alice"),
         TagInput::new("artist", "Bob"),
     ];
-    let layout = synthesize_layout(0, audio.len() as u64, &tags, &[]);
+    let layout = synthesize_layout(0, audio.len() as u64, &tags, &[]).unwrap();
     let bytes = assemble(&layout, &audio, &[]);
 
     let tag = id3::Tag::read_from2(Cursor::new(&bytes)).unwrap();
@@ -211,7 +211,7 @@ fn multiple_art_frames_keep_order() {
             data_len: art2.len() as u64,
         },
     ];
-    let layout = synthesize_layout(0, audio.len() as u64, &[], &arts);
+    let layout = synthesize_layout(0, audio.len() as u64, &[], &arts).unwrap();
 
     // The layout must contain ArtImage segments for art_id 1 then 2.
     let art_segs: Vec<i64> = layout
@@ -231,4 +231,44 @@ fn multiple_art_frames_keep_order() {
     assert_eq!(pics.len(), 2, "expected 2 picture frames");
     assert_eq!(pics[0].data, art1);
     assert_eq!(pics[1].data, art2);
+}
+
+#[test]
+fn synthesize_errors_on_oversized_frame() {
+    use musefs_format::FormatError;
+    // A single frame whose data exceeds the 28-bit per-frame syncsafe limit.
+    let arts = vec![ArtInput {
+        art_id: 1,
+        mime: "image/jpeg".to_string(),
+        description: String::new(),
+        picture_type: 3,
+        width: 0,
+        height: 0,
+        data_len: 0x1000_0000, // 256 MiB, over the per-frame limit
+    }];
+    assert_eq!(
+        synthesize_layout(0, 0, &[], &arts),
+        Err(FormatError::TooLarge)
+    );
+}
+
+#[test]
+fn synthesize_errors_when_frames_sum_past_the_tag_limit() {
+    use musefs_format::FormatError;
+    // Each frame is individually under the 28-bit per-frame limit, but together
+    // they push the accumulated tag size over it — exercising the total guard.
+    let art = |id| ArtInput {
+        art_id: id,
+        mime: "image/jpeg".to_string(),
+        description: String::new(),
+        picture_type: id as u32,
+        width: 0,
+        height: 0,
+        data_len: 0x0800_0000, // 128 MiB each; two sum past the 256 MiB tag limit
+    };
+    let arts = vec![art(1), art(2)];
+    assert_eq!(
+        synthesize_layout(0, 0, &[], &arts),
+        Err(FormatError::TooLarge)
+    );
 }
