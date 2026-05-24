@@ -159,3 +159,81 @@ fn scan_ingests_and_dedups_embedded_art() {
     let only = *art_ids.iter().next().unwrap();
     assert_eq!(db.get_art_meta(only).unwrap().unwrap().byte_len, 100);
 }
+
+fn flac_with_pictures(comments: &[&str], pics: &[(u32, &[u8])]) -> Vec<u8> {
+    use common::{flac_block, streaminfo_body, vorbis_comment_body};
+    fn picture_body(pic_type: u32, mime: &str, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&pic_type.to_be_bytes());
+        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(mime.as_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes()); // description
+        b.extend_from_slice(&0u32.to_be_bytes()); // width
+        b.extend_from_slice(&0u32.to_be_bytes()); // height
+        b.extend_from_slice(&0u32.to_be_bytes()); // depth
+        b.extend_from_slice(&0u32.to_be_bytes()); // colors
+        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"fLaC");
+    out.extend_from_slice(&flac_block(0, &streaminfo_body(), false));
+    out.extend_from_slice(&flac_block(
+        4,
+        &vorbis_comment_body("v", comments),
+        pics.is_empty(),
+    ));
+    for (i, (pt, data)) in pics.iter().enumerate() {
+        out.extend_from_slice(&flac_block(
+            6,
+            &picture_body(*pt, "image/png", data),
+            i == pics.len() - 1,
+        ));
+    }
+    out.extend_from_slice(&[0xAAu8; 24]);
+    out
+}
+
+#[test]
+fn scan_clamps_out_of_range_picture_type() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.flac"),
+        flac_with_pictures(&["TITLE=A"], &[(99, &[0x11u8; 40])]),
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+
+    let t = &db.list_tracks().unwrap()[0];
+    let ta = db.get_track_art(t.id).unwrap();
+    assert_eq!(ta.len(), 1);
+    assert_eq!(ta[0].picture_type, 0); // 99 is out of range (0..=20) -> clamped to 0
+    assert_eq!(ta[0].ordinal, 0);
+}
+
+#[test]
+fn scan_filters_oversized_art_without_ordinal_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    // Over MAX_ART_BYTES (16 MiB - 1 KiB) but still within FLAC's 24-bit block limit.
+    let big = vec![0u8; 16_776_500];
+    let small = vec![0x22u8; 50];
+    std::fs::write(
+        dir.path().join("a.flac"),
+        flac_with_pictures(&["TITLE=A"], &[(3, &big), (4, &small)]),
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+
+    let t = &db.list_tracks().unwrap()[0];
+    let ta = db.get_track_art(t.id).unwrap();
+    // The oversized first picture is skipped; the survivor keeps a gapless ordinal 0.
+    assert_eq!(ta.len(), 1);
+    assert_eq!(ta[0].ordinal, 0);
+    assert_eq!(ta[0].picture_type, 4);
+    assert_eq!(db.get_art_meta(ta[0].art_id).unwrap().unwrap().byte_len, 50);
+}
