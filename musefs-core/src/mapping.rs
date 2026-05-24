@@ -29,6 +29,8 @@ pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, String> {
 pub(crate) fn track_art_to_inputs(db: &Db, track_id: i64) -> Result<Vec<ArtInput>> {
     let mut inputs = Vec::new();
     for ta in db.get_track_art(track_id)? {
+        // `track_art.art_id` is a foreign key into `art` (enforced, no ON DELETE),
+        // so the row always exists; the `if let` is defensive, not a real branch.
         if let Some(meta) = db.get_art_meta(ta.art_id)? {
             inputs.push(ArtInput {
                 art_id: ta.art_id,
