@@ -97,9 +97,19 @@ fn vorbis_comment_body(tags: &[TagInput]) -> Vec<u8> {
     out
 }
 
-// Temporary stub; replaced with the real PICTURE framing in Task 4.
-fn picture_body_framing(_art: &ArtInput) -> Vec<u8> {
-    Vec::new()
+fn picture_body_framing(art: &ArtInput) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&art.picture_type.to_be_bytes());
+    out.extend_from_slice(&(art.mime.len() as u32).to_be_bytes());
+    out.extend_from_slice(art.mime.as_bytes());
+    out.extend_from_slice(&(art.description.len() as u32).to_be_bytes());
+    out.extend_from_slice(art.description.as_bytes());
+    out.extend_from_slice(&art.width.to_be_bytes());
+    out.extend_from_slice(&art.height.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // color depth (unknown)
+    out.extend_from_slice(&0u32.to_be_bytes()); // number of colors (non-indexed)
+    out.extend_from_slice(&(art.data_len as u32).to_be_bytes()); // picture data length
+    out
 }
 
 /// Build the ordered segment layout for a synthesized FLAC file:
