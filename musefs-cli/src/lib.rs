@@ -1,11 +1,12 @@
 //! The `musefs` command-line interface: `scan` (ingest a backing directory into a
 //! SQLite store) and `mount` (serve a read-only FUSE view of that store).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use musefs_core::ScanStats;
+use musefs_core::{MountConfig, Musefs, ScanStats};
 use musefs_db::Db;
 
 #[derive(Parser, Debug)]
@@ -49,10 +50,6 @@ pub fn run_scan(db_path: &Path, backing_dir: &Path) -> Result<ScanStats> {
         .with_context(|| format!("scanning {}", backing_dir.display()))?;
     Ok(stats)
 }
-
-use std::collections::BTreeMap;
-
-use musefs_core::{MountConfig, Musefs};
 
 /// Build a `Musefs` from the DB at `db_path` and mount it (blocking) at
 /// `mountpoint`.
