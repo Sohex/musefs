@@ -60,3 +60,41 @@ fn rescanning_is_idempotent() {
     scan_directory(&db, dir.path()).unwrap();
     assert_eq!(db.list_tracks().unwrap().len(), 1);
 }
+
+#[test]
+fn scans_mp3_files_seeding_tracks_and_tags() {
+    use id3::TagLike;
+    use musefs_db::Format;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build an MP3: a real ID3v2.4 tag (via the id3 crate) + a fake audio frame.
+    let mut tag = id3::Tag::new();
+    tag.set_artist("Bob");
+    tag.set_title("Track");
+    let mut bytes = Vec::new();
+    tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+    let audio_len = 8u64;
+    bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4, 5, 6]);
+    let audio_offset = bytes.len() as u64 - audio_len;
+    std::fs::write(dir.path().join("song.mp3"), &bytes).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+    assert_eq!(stats.scanned, 1);
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    let t = &tracks[0];
+    assert_eq!(t.format, Format::Mp3);
+    assert_eq!(t.audio_offset as u64, audio_offset);
+    assert_eq!(t.audio_length, audio_len as i64);
+
+    let tags = db.get_tags(t.id).unwrap();
+    assert!(tags
+        .iter()
+        .any(|tag| tag.key == "artist" && tag.value == "Bob"));
+    assert!(tags
+        .iter()
+        .any(|tag| tag.key == "title" && tag.value == "Track"));
+}

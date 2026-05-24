@@ -106,3 +106,42 @@ fn readdir_distinguishes_a_file_from_an_unknown_inode() {
         other => panic!("expected NoEntry, got {other:?}"),
     }
 }
+
+#[test]
+fn reads_a_synthesized_mp3_through_the_facade() {
+    use id3::TagLike;
+    use std::io::Cursor;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Backing MP3: ID3v2.4 tag (artist=Zoe, title=Old) + a fake audio frame.
+    let mut tag = id3::Tag::new();
+    tag.set_artist("Zoe");
+    tag.set_title("Old");
+    let mut bytes = Vec::new();
+    tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+    let audio = [0xFFu8, 0xFB, 7, 7, 7, 7];
+    bytes.extend_from_slice(&audio);
+    std::fs::write(dir.path().join("song.mp3"), &bytes).unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let mut fs = Musefs::open(db, config()).unwrap();
+
+    // Tree: /Zoe/Old.mp3
+    let artist = fs.lookup(VirtualTree::ROOT, "Zoe").expect("artist dir");
+    let entries = fs.readdir(artist).unwrap();
+    let (name, file_inode, _) = entries.into_iter().next().unwrap();
+    assert_eq!(name, "Old.mp3");
+
+    let attr = fs.getattr(file_inode).unwrap();
+    let whole = fs.read(file_inode, 0, attr.size).unwrap();
+    assert_eq!(whole.len() as u64, attr.size);
+
+    // The synthesized file is a valid ID3v2.4 stream carrying the DB tags, and the
+    // original audio frames are spliced in unchanged at the tail.
+    let parsed = id3::Tag::read_from2(Cursor::new(&whole)).unwrap();
+    assert_eq!(parsed.artist(), Some("Zoe"));
+    assert_eq!(parsed.title(), Some("Old"));
+    assert_eq!(&whole[whole.len() - audio.len()..], &audio);
+}

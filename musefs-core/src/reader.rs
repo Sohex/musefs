@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use musefs_db::Db;
-use musefs_format::flac::{read_metadata, synthesize_layout, FlacScan};
-use musefs_format::RegionLayout;
+use musefs_db::{Db, Format};
+use musefs_format::flac::{self, FlacScan};
+use musefs_format::{mp3, RegionLayout};
 
 use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_inputs;
@@ -62,11 +62,12 @@ impl HeaderCache {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
-        // Guard the stored audio bounds before any cast/allocation: a negative or
-        // out-of-file offset means the row no longer matches the backing file.
+        // Guard the stored audio bounds before any cast/allocation: a negative
+        // bound, or an audio region that runs past the end of the backing file,
+        // means the row no longer matches the file.
         if track.audio_offset < 0
             || track.audio_length < 0
-            || track.audio_offset as u64 > meta.len()
+            || (track.audio_offset as u64).saturating_add(track.audio_length as u64) > meta.len()
         {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
@@ -77,17 +78,30 @@ impl HeaderCache {
             }
         }
 
-        let front = read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
-        let fmeta = read_metadata(&front)?;
         let tags = db.get_tags(track_id)?;
         let inputs = tags_to_inputs(&tags);
 
-        let scan = FlacScan {
-            audio_offset: track.audio_offset as u64,
-            audio_length: track.audio_length as u64,
-            preserved: fmeta.preserved,
+        // FLAC re-reads the front for its preserved structural blocks; MP3 needs no
+        // front read — its ID3v2 tag is regenerated entirely from the DB and the
+        // Xing/LAME info frame travels with the backing audio.
+        let layout = match track.format {
+            Format::Flac => {
+                let front = read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
+                let fmeta = flac::read_metadata(&front)?;
+                let scan = FlacScan {
+                    audio_offset: track.audio_offset as u64,
+                    audio_length: track.audio_length as u64,
+                    preserved: fmeta.preserved,
+                };
+                flac::synthesize_layout(&scan, &inputs, &[])
+            }
+            Format::Mp3 => mp3::synthesize_layout(
+                track.audio_offset as u64,
+                track.audio_length as u64,
+                &inputs,
+                &[],
+            ),
         };
-        let layout = synthesize_layout(&scan, &inputs, &[]);
         let total_len = layout.total_len();
 
         let resolved = Arc::new(ResolvedFile {

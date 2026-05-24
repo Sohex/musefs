@@ -4,7 +4,9 @@ use thiserror::Error;
 pub enum FormatError {
     #[error("not a FLAC stream (missing fLaC marker)")]
     NotFlac,
-    #[error("truncated or malformed FLAC metadata")]
+    #[error("not an MP3 stream (no MPEG frame sync at the audio offset)")]
+    NotMp3,
+    #[error("truncated or malformed metadata")]
     Malformed,
 }
 
