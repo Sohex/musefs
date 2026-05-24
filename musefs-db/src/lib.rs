@@ -33,4 +33,8 @@ impl Db {
     pub fn user_version(&self) -> Result<i64> {
         Ok(self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
     }
+
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
+    }
 }
