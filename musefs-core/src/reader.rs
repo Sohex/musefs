@@ -90,3 +90,55 @@ impl HeaderCache {
         Ok(resolved)
     }
 }
+
+use musefs_format::Segment;
+
+/// Read `size` bytes starting at virtual `offset` from a resolved file, splicing
+/// inline framing with positioned reads of the backing audio. Returns fewer bytes
+/// (possibly empty) near EOF.
+pub fn read_at(resolved: &ResolvedFile, offset: u64, size: u64) -> Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    if offset >= resolved.total_len || size == 0 {
+        return Ok(Vec::new());
+    }
+    let end = offset.saturating_add(size).min(resolved.total_len);
+    let mut out = Vec::with_capacity((end - offset) as usize);
+
+    let mut seg_start = 0u64;
+    let mut backing: Option<std::fs::File> = None;
+
+    for seg in &resolved.layout.segments {
+        let seg_len = seg.len();
+        let seg_end = seg_start + seg_len;
+        let ov_start = offset.max(seg_start);
+        let ov_end = end.min(seg_end);
+        if ov_start < ov_end {
+            let within = ov_start - seg_start;
+            let n = (ov_end - ov_start) as usize;
+            match seg {
+                Segment::Inline(bytes) => {
+                    let w = within as usize;
+                    out.extend_from_slice(&bytes[w..w + n]);
+                }
+                Segment::BackingAudio { offset: bo, .. } => {
+                    if backing.is_none() {
+                        backing = Some(std::fs::File::open(&resolved.backing_path)?);
+                    }
+                    let f = backing.as_ref().unwrap();
+                    let mut buf = vec![0u8; n];
+                    f.read_exact_at(&mut buf, bo + within)?;
+                    out.extend_from_slice(&buf);
+                }
+                Segment::ArtImage { .. } => {
+                    return Err(CoreError::ArtNotSupported);
+                }
+            }
+        }
+        seg_start = seg_end;
+        if seg_start >= end {
+            break;
+        }
+    }
+    Ok(out)
+}
