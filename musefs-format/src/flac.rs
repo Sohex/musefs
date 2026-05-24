@@ -1,5 +1,3 @@
-#![allow(dead_code)] // some block-type constants are first used in later M1 tasks
-
 use crate::error::{FormatError, Result};
 
 pub(crate) const FLAC_MARKER: &[u8; 4] = b"fLaC";
