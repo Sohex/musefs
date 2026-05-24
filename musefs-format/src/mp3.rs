@@ -203,3 +203,42 @@ pub fn synthesize_layout(
 
     RegionLayout::new(segments)
 }
+
+/// ID3v2 text frame id -> canonical (lowercase) tag key. Several legacy date
+/// frames fold to `date`.
+fn frame_to_key(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "TIT2" => "title",
+        "TPE1" => "artist",
+        "TALB" => "album",
+        "TPE2" => "albumartist",
+        "TRCK" => "tracknumber",
+        "TPOS" => "discnumber",
+        "TDRC" | "TYER" => "date",
+        "TCON" => "genre",
+        "TCOM" => "composer",
+        _ => return None,
+    })
+}
+
+/// Read an existing ID3v2 tag from `data` and fold its recognized text frames into
+/// canonical `(key, value)` pairs (keys lowercase). NUL-separated multi-value
+/// frames yield one pair per value. Returns empty if there is no ID3v2 tag.
+pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
+    let tag = match id3::Tag::read_from2(std::io::Cursor::new(data)) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for frame in tag.frames() {
+        let Some(key) = frame_to_key(frame.id()) else {
+            continue;
+        };
+        if let Some(text) = frame.content().text() {
+            for value in text.split('\0').filter(|v| !v.is_empty()) {
+                out.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
