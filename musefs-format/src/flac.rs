@@ -186,3 +186,66 @@ pub fn synthesize_layout(scan: &FlacScan, tags: &[TagInput], arts: &[ArtInput]) 
 
     RegionLayout::new(segments)
 }
+
+/// Read the existing VORBIS_COMMENT block from a complete FLAC file, returning
+/// `(FIELD, value)` pairs in order. Comments without a `=` are skipped. Returns
+/// an empty vec if there is no comment block. Used by the scanner to seed tags.
+pub fn read_vorbis_comments(data: &[u8]) -> Result<Vec<(String, String)>> {
+    if data.len() < 4 || &data[0..4] != FLAC_MARKER {
+        return Err(FormatError::NotFlac);
+    }
+    let mut pos = 4usize;
+    loop {
+        if pos + 4 > data.len() {
+            return Err(FormatError::Malformed);
+        }
+        let header = data[pos];
+        let is_last = (header & 0x80) != 0;
+        let block_type = header & 0x7F;
+        let len = ((data[pos + 1] as usize) << 16)
+            | ((data[pos + 2] as usize) << 8)
+            | (data[pos + 3] as usize);
+        let body_start = pos + 4;
+        let body_end = body_start + len;
+        if body_end > data.len() {
+            return Err(FormatError::Malformed);
+        }
+        if block_type == BLOCK_VORBIS_COMMENT {
+            return parse_vorbis_comment_body(&data[body_start..body_end]);
+        }
+        pos = body_end;
+        if is_last {
+            break;
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn read_u32_le(data: &[u8], pos: usize) -> Result<u32> {
+    if pos + 4 > data.len() {
+        return Err(FormatError::Malformed);
+    }
+    Ok(u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]))
+}
+
+fn parse_vorbis_comment_body(body: &[u8]) -> Result<Vec<(String, String)>> {
+    let vendor_len = read_u32_le(body, 0)? as usize;
+    let mut pos = 4 + vendor_len;
+    let count = read_u32_le(body, pos)? as usize;
+    pos += 4;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let clen = read_u32_le(body, pos)? as usize;
+        pos += 4;
+        let end = pos + clen;
+        if end > body.len() {
+            return Err(FormatError::Malformed);
+        }
+        let comment = std::str::from_utf8(&body[pos..end]).map_err(|_| FormatError::Malformed)?;
+        if let Some((field, value)) = comment.split_once('=') {
+            out.push((field.to_string(), value.to_string()));
+        }
+        pos = end;
+    }
+    Ok(out)
+}
