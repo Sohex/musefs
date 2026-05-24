@@ -145,3 +145,56 @@ fn reads_a_synthesized_mp3_through_the_facade() {
     assert_eq!(parsed.title(), Some("Old"));
     assert_eq!(&whole[whole.len() - audio.len()..], &audio);
 }
+
+#[test]
+fn serves_flac_with_embedded_art_through_the_facade() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = vec![0xC3u8; 120];
+
+    // Build a FLAC with a PICTURE block (type 3 = front cover).
+    fn picture_body(mime: &str, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u32.to_be_bytes()); // front cover
+        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(mime.as_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes()); // description length
+        b.extend_from_slice(&0u32.to_be_bytes()); // width
+        b.extend_from_slice(&0u32.to_be_bytes()); // height
+        b.extend_from_slice(&0u32.to_be_bytes()); // color depth
+        b.extend_from_slice(&0u32.to_be_bytes()); // colors used
+        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+    let mut flac = Vec::new();
+    flac.extend_from_slice(b"fLaC");
+    flac.extend_from_slice(&common::flac_block(0, &common::streaminfo_body(), false));
+    flac.extend_from_slice(&common::flac_block(
+        4,
+        &common::vorbis_comment_body("v", &["ARTIST=Art", "TITLE=Cover"]),
+        false,
+    ));
+    flac.extend_from_slice(&common::flac_block(
+        6,
+        &picture_body("image/png", &img),
+        true,
+    ));
+    flac.extend_from_slice(&[0x5Au8; 40]);
+    std::fs::write(dir.path().join("c.flac"), &flac).unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let mut fs = Musefs::open(db, config()).unwrap();
+
+    let artist = fs.lookup(VirtualTree::ROOT, "Art").unwrap();
+    let (_name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let attr = fs.getattr(file_inode).unwrap();
+    let whole = fs.read(file_inode, 0, attr.size).unwrap();
+    assert_eq!(whole.len() as u64, attr.size);
+
+    // The synthesized FLAC carries the embedded picture with the original bytes.
+    let tag = metaflac::Tag::read_from(&mut std::io::Cursor::new(&whole)).unwrap();
+    let pic = tag.pictures().next().expect("a picture");
+    assert_eq!(pic.data, img);
+    assert_eq!(pic.mime_type, "image/png");
+}
