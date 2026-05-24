@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use musefs_db::{Db, Format, NewTrack, Tag};
-use musefs_format::{flac, mp3};
+use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
+use musefs_format::{flac, mp3, EmbeddedPicture};
 
 use crate::error::Result;
+
+/// Skip embedded art larger than this. The binding limit is FLAC's 24-bit PICTURE
+/// block length (~16 MiB for the whole block); cover art is far smaller.
+const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanStats {
@@ -48,6 +52,7 @@ struct Probed {
     audio_offset: u64,
     audio_length: u64,
     tags: Vec<(String, String)>,
+    pictures: Vec<EmbeddedPicture>,
 }
 
 /// Parse one backing file into a `Probed`, or `None` if it does not parse as a
@@ -60,6 +65,7 @@ fn probe(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_offset: scan.audio_offset,
             audio_length: scan.audio_length,
             tags: flac::read_vorbis_comments(bytes).unwrap_or_default(),
+            pictures: flac::read_pictures(bytes).unwrap_or_default(),
         })
     } else if has_ext(path, "mp3") {
         let bounds = mp3::locate_audio(bytes).ok()?;
@@ -68,6 +74,7 @@ fn probe(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_offset: bounds.audio_offset,
             audio_length: bounds.audio_length,
             tags: mp3::read_tags(bytes),
+            pictures: mp3::read_pictures(bytes),
         })
     } else {
         None
@@ -114,6 +121,32 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
             *ord += 1;
         }
         db.replace_tags(track_id, &tags)?;
+
+        let mut track_arts = Vec::new();
+        for (ordinal, pic) in probed.pictures.into_iter().enumerate() {
+            if pic.data.len() > MAX_ART_BYTES {
+                continue;
+            }
+            let art_id = db.upsert_art(&NewArt {
+                mime: pic.mime,
+                width: (pic.width != 0).then_some(pic.width as i64),
+                height: (pic.height != 0).then_some(pic.height as i64),
+                data: pic.data,
+            })?;
+            // Valid ID3/FLAC picture types are 0..=20; clamp anything out of range.
+            let picture_type = if pic.picture_type <= 20 {
+                pic.picture_type as i64
+            } else {
+                0
+            };
+            track_arts.push(TrackArt {
+                art_id,
+                picture_type,
+                description: pic.description,
+                ordinal: ordinal as i64,
+            });
+        }
+        db.set_track_art(track_id, &track_arts)?;
         stats.scanned += 1;
     }
     Ok(stats)
