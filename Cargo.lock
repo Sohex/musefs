@@ -276,6 +276,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "musefs-core"
+version = "0.1.0"
+dependencies = [
+ "metaflac",
+ "musefs-db",
+ "musefs-format",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "musefs-db"
 version = "0.1.0"
 dependencies = [

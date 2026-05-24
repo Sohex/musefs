@@ -24,10 +24,16 @@ pub struct FlacScan {
     pub preserved: Vec<MetadataBlock>,
 }
 
-/// Parse the FLAC metadata section, returning the audio boundary and the structural
-/// blocks to carry over (STREAMINFO/APPLICATION/SEEKTABLE/CUESHEET). VORBIS_COMMENT,
-/// PICTURE, and PADDING are dropped (regenerated or omitted at synthesis time).
-pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
+/// The metadata region of a FLAC file: where audio begins and the structural
+/// blocks to carry over. Unlike `FlacScan`, this does not include `audio_length`
+/// (which requires the full file size), so it can be computed from the front alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlacMeta {
+    pub audio_offset: u64,
+    pub preserved: Vec<MetadataBlock>,
+}
+
+fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
     if data.len() < 4 || &data[0..4] != FLAC_MARKER {
         return Err(FormatError::NotFlac);
     }
@@ -62,10 +68,27 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
             break;
         }
     }
-    Ok(FlacScan {
+    Ok(FlacMeta {
         audio_offset: pos as u64,
-        audio_length: (data.len() - pos) as u64,
         preserved,
+    })
+}
+
+/// Parse just the FLAC metadata region (the front of the file), recovering the
+/// audio boundary and structural blocks. Use when the audio length is already
+/// known (e.g. stored in a database) and the full file should not be read.
+pub fn read_metadata(data: &[u8]) -> Result<FlacMeta> {
+    parse_blocks(data)
+}
+
+/// Parse the FLAC metadata section of a complete file, returning the audio
+/// boundary, audio length, and the structural blocks to carry over.
+pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
+    let meta = parse_blocks(data)?;
+    Ok(FlacScan {
+        audio_offset: meta.audio_offset,
+        audio_length: data.len() as u64 - meta.audio_offset,
+        preserved: meta.preserved,
     })
 }
 
@@ -162,4 +185,67 @@ pub fn synthesize_layout(scan: &FlacScan, tags: &[TagInput], arts: &[ArtInput]) 
     });
 
     RegionLayout::new(segments)
+}
+
+/// Read the existing VORBIS_COMMENT block from a complete FLAC file, returning
+/// `(FIELD, value)` pairs in order. Comments without a `=` are skipped. Returns
+/// an empty vec if there is no comment block. Used by the scanner to seed tags.
+pub fn read_vorbis_comments(data: &[u8]) -> Result<Vec<(String, String)>> {
+    if data.len() < 4 || &data[0..4] != FLAC_MARKER {
+        return Err(FormatError::NotFlac);
+    }
+    let mut pos = 4usize;
+    loop {
+        if pos + 4 > data.len() {
+            return Err(FormatError::Malformed);
+        }
+        let header = data[pos];
+        let is_last = (header & 0x80) != 0;
+        let block_type = header & 0x7F;
+        let len = ((data[pos + 1] as usize) << 16)
+            | ((data[pos + 2] as usize) << 8)
+            | (data[pos + 3] as usize);
+        let body_start = pos + 4;
+        let body_end = body_start + len;
+        if body_end > data.len() {
+            return Err(FormatError::Malformed);
+        }
+        if block_type == BLOCK_VORBIS_COMMENT {
+            return parse_vorbis_comment_body(&data[body_start..body_end]);
+        }
+        pos = body_end;
+        if is_last {
+            break;
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn read_u32_le(data: &[u8], pos: usize) -> Result<u32> {
+    if pos + 4 > data.len() {
+        return Err(FormatError::Malformed);
+    }
+    Ok(u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]))
+}
+
+fn parse_vorbis_comment_body(body: &[u8]) -> Result<Vec<(String, String)>> {
+    let vendor_len = read_u32_le(body, 0)? as usize;
+    let mut pos = 4 + vendor_len;
+    let count = read_u32_le(body, pos)? as usize;
+    pos += 4;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let clen = read_u32_le(body, pos)? as usize;
+        pos += 4;
+        let end = pos + clen;
+        if end > body.len() {
+            return Err(FormatError::Malformed);
+        }
+        let comment = std::str::from_utf8(&body[pos..end]).map_err(|_| FormatError::Malformed)?;
+        if let Some((field, value)) = comment.split_once('=') {
+            out.push((field.to_string(), value.to_string()));
+        }
+        pos = end;
+    }
+    Ok(out)
 }
