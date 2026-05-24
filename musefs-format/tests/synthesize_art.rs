@@ -79,3 +79,28 @@ fn metaflac_reads_synthesized_picture() {
     assert_eq!(p.height, 500);
     assert_eq!(p.data, image);
 }
+
+#[test]
+fn synthesize_errors_on_oversized_picture() {
+    use musefs_format::flac::FlacScan;
+    use musefs_format::FormatError;
+    let scan = FlacScan {
+        audio_offset: 0,
+        audio_length: 0,
+        preserved: vec![],
+    };
+    // data_len is only a count here (bytes are streamed), so this needs no allocation.
+    let art = ArtInput {
+        art_id: 1,
+        mime: "image/png".to_string(),
+        description: String::new(),
+        picture_type: 3,
+        width: 0,
+        height: 0,
+        data_len: 0x0100_0000, // just over the 24-bit FLAC PICTURE block limit
+    };
+    assert_eq!(
+        synthesize_layout(&scan, &[], &[art]),
+        Err(FormatError::TooLarge)
+    );
+}

@@ -232,3 +232,21 @@ fn multiple_art_frames_keep_order() {
     assert_eq!(pics[0].data, art1);
     assert_eq!(pics[1].data, art2);
 }
+
+#[test]
+fn synthesize_errors_on_oversized_tag() {
+    use musefs_format::FormatError;
+    let arts = vec![ArtInput {
+        art_id: 1,
+        mime: "image/jpeg".to_string(),
+        description: String::new(),
+        picture_type: 3,
+        width: 0,
+        height: 0,
+        data_len: 0x1000_0000, // 256 MiB, over the 28-bit ID3v2.4 tag-size limit
+    }];
+    assert_eq!(
+        synthesize_layout(0, 0, &[], &arts),
+        Err(FormatError::TooLarge)
+    );
+}
