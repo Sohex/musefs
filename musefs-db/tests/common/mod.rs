@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use musefs_db::{Format, NewArt, NewTrack};
 
 pub fn new_track(path: &str) -> NewTrack {
