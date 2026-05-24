@@ -69,6 +69,11 @@ impl Musefs {
         self.tree.lookup(parent, name)
     }
 
+    /// The parent inode of `inode` (root's parent is itself). Forwards to the tree.
+    pub fn parent(&self, inode: u64) -> Option<u64> {
+        self.tree.parent(inode)
+    }
+
     pub fn getattr(&mut self, inode: u64) -> Result<Attr> {
         let track_id = match self.tree.node(inode) {
             None => return Err(CoreError::NoEntry(inode)),

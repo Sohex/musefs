@@ -53,6 +53,18 @@ fn lookup_getattr_readdir_and_read_through_the_facade() {
 }
 
 #[test]
+fn parent_exposes_the_tree_hierarchy() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = scanned_db(dir.path());
+    let fs = Musefs::open(db, config()).unwrap();
+
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    assert_eq!(fs.parent(artist), Some(VirtualTree::ROOT));
+    assert_eq!(fs.parent(VirtualTree::ROOT), Some(VirtualTree::ROOT));
+    assert_eq!(fs.parent(424242), None);
+}
+
+#[test]
 fn refresh_rebuilds_tree_after_new_tracks() {
     let dir = tempfile::tempdir().unwrap();
     let db = scanned_db(dir.path());

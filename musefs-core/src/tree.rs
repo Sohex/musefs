@@ -46,6 +46,12 @@ impl VirtualTree {
         self.nodes.get(&inode)
     }
 
+    /// The parent inode of `inode` (root's parent is itself), or `None` if `inode`
+    /// is unknown. Used by the FUSE layer to emit `..` directory entries.
+    pub fn parent(&self, inode: u64) -> Option<u64> {
+        self.nodes.get(&inode).map(|n| n.parent)
+    }
+
     pub fn children(&self, inode: u64) -> Option<&BTreeMap<String, u64>> {
         self.children.get(&inode)
     }
