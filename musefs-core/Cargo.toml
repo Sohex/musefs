@@ -1,0 +1,13 @@
+[package]
+name = "musefs-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+musefs-db = { path = "../musefs-db" }
+musefs-format = { path = "../musefs-format" }
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+metaflac = "0.2"
