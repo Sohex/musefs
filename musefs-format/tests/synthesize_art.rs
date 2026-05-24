@@ -33,7 +33,7 @@ fn art_becomes_an_artimage_segment_and_lengths_are_exact() {
 
     let image = vec![0x77u8; 1234];
     let art = cover(42, image.len() as u64);
-    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]);
+    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
 
     let art_segs: Vec<&Segment> = layout
         .segments
@@ -63,7 +63,7 @@ fn metaflac_reads_synthesized_picture() {
 
     let image = vec![0x77u8; 1234];
     let art = cover(42, image.len() as u64);
-    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]);
+    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
 
     let mut art_map = HashMap::new();
     art_map.insert(42i64, image.clone());

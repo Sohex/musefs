@@ -49,7 +49,7 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
         },
     ];
 
-    let layout = synthesize_layout(&scan, &tags, &arts);
+    let layout = synthesize_layout(&scan, &tags, &arts).unwrap();
 
     let mut art_map = HashMap::new();
     art_map.insert(1i64, front.clone());

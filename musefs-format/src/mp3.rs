@@ -134,7 +134,7 @@ pub fn synthesize_layout(
     audio_length: u64,
     tags: &[TagInput],
     arts: &[ArtInput],
-) -> RegionLayout {
+) -> Result<RegionLayout> {
     // Group consecutive same-key values (the DB returns tags ordered by key).
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for t in tags {
@@ -189,10 +189,12 @@ pub fn synthesize_layout(
     header.extend_from_slice(b"ID3");
     header.extend_from_slice(&[0x04, 0x00]); // version 2.4.0
     header.push(0x00); // flags: no unsync / extended header / footer
-    debug_assert!(
-        frames_len <= 0x0FFF_FFFF,
-        "ID3v2.4 tag ({frames_len} bytes) exceeds the 28-bit syncsafe limit"
-    );
+                       // The total tag size is a 28-bit syncsafe field. Ingestion caps each art well
+                       // under this, but guard at the format boundary so an oversized tag (e.g. many
+                       // large pictures) is a hard error rather than a silently-truncated file.
+    if frames_len > 0x0FFF_FFFF {
+        return Err(FormatError::TooLarge);
+    }
     header.extend_from_slice(&syncsafe(frames_len as u32));
     segments.insert(0, Segment::Inline(header));
 
@@ -201,7 +203,7 @@ pub fn synthesize_layout(
         len: audio_length,
     });
 
-    RegionLayout::new(segments)
+    Ok(RegionLayout::new(segments))
 }
 
 /// ID3v2 text frame id -> canonical (lowercase) tag key. Several legacy date

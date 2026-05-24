@@ -8,6 +8,8 @@ pub enum FormatError {
     NotMp3,
     #[error("truncated or malformed metadata")]
     Malformed,
+    #[error("synthesized metadata exceeds the format's size limit")]
+    TooLarge,
 }
 
 pub type Result<T> = std::result::Result<T, FormatError>;
