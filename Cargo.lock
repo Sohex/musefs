@@ -454,6 +454,7 @@ dependencies = [
 name = "musefs-core"
 version = "0.1.0"
 dependencies = [
+ "id3",
  "metaflac",
  "musefs-db",
  "musefs-format",
