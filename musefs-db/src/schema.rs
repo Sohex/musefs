@@ -1,5 +1,5 @@
 use crate::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE tracks (
@@ -76,17 +76,17 @@ END;
 
 const MIGRATIONS: &[&str] = &[MIGRATION_V1];
 
-pub fn migrate(conn: &Connection) -> Result<()> {
+pub fn migrate(conn: &mut Connection) -> Result<()> {
     let latest = MIGRATIONS.len() as i64;
     // Fast path: already at the latest version, no transaction needed.
     if conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))? >= latest {
         return Ok(());
     }
-    // Re-read user_version inside the write transaction so the value is
-    // authoritative under the write lock. Two processes opening the same
-    // database concurrently could otherwise both read a stale version and the
-    // second would fail applying DDL the first already committed.
-    let tx = conn.unchecked_transaction()?;
+    // Use an IMMEDIATE transaction so the write lock is acquired up front. The
+    // user_version read below is then authoritative: a second process opening
+    // the same database concurrently blocks here until the first commits, then
+    // sees the updated version and skips re-applying the migration.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as i64;

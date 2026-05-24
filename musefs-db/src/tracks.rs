@@ -9,7 +9,7 @@ fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
     let fmt: String = r.get("format")?;
     let format = Format::parse(&fmt).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            0,
+            usize::MAX,
             rusqlite::types::Type::Text,
             format!("unknown format {fmt}").into(),
         )
