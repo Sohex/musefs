@@ -1,5 +1,6 @@
 mod error;
 pub mod flac;
+pub mod mp3;
 mod input;
 mod layout;
 
