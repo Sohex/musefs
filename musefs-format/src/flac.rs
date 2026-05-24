@@ -70,3 +70,82 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
         preserved,
     })
 }
+
+use crate::input::{ArtInput, TagInput};
+use crate::layout::{RegionLayout, Segment};
+
+pub(crate) const VENDOR: &str = "musefs";
+
+fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usize, is_last: bool) {
+    let first = (if is_last { 0x80 } else { 0 }) | (block_type & 0x7F);
+    out.push(first);
+    out.push(((body_len >> 16) & 0xFF) as u8);
+    out.push(((body_len >> 8) & 0xFF) as u8);
+    out.push((body_len & 0xFF) as u8);
+}
+
+fn vorbis_comment_body(tags: &[TagInput]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(VENDOR.len() as u32).to_le_bytes());
+    out.extend_from_slice(VENDOR.as_bytes());
+    out.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+    for t in tags {
+        let comment = format!("{}={}", t.key.to_ascii_uppercase(), t.value);
+        out.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        out.extend_from_slice(comment.as_bytes());
+    }
+    out
+}
+
+// Temporary stub; replaced with the real PICTURE framing in Task 4.
+fn picture_body_framing(_art: &ArtInput) -> Vec<u8> {
+    Vec::new()
+}
+
+/// Build the ordered segment layout for a synthesized FLAC file:
+/// `fLaC` + preserved structural blocks + a regenerated VORBIS_COMMENT + PICTURE
+/// blocks (one `ArtImage` segment each) + the backing audio.
+pub fn synthesize_layout(scan: &FlacScan, tags: &[TagInput], arts: &[ArtInput]) -> RegionLayout {
+    let num_blocks = scan.preserved.len() + 1 + arts.len(); // preserved + VORBIS_COMMENT + pictures
+    let last_index = num_blocks - 1;
+
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(FLAC_MARKER);
+
+    let mut idx = 0usize;
+
+    for blk in &scan.preserved {
+        push_block_header(&mut buf, blk.block_type, blk.body.len(), idx == last_index);
+        buf.extend_from_slice(&blk.body);
+        idx += 1;
+    }
+
+    let vc = vorbis_comment_body(tags);
+    push_block_header(&mut buf, BLOCK_VORBIS_COMMENT, vc.len(), idx == last_index);
+    buf.extend_from_slice(&vc);
+    idx += 1;
+
+    for art in arts {
+        let framing = picture_body_framing(art);
+        let body_len = framing.len() as u64 + art.data_len;
+        push_block_header(&mut buf, BLOCK_PICTURE, body_len as usize, idx == last_index);
+        buf.extend_from_slice(&framing);
+        segments.push(Segment::Inline(std::mem::take(&mut buf)));
+        segments.push(Segment::ArtImage {
+            art_id: art.art_id,
+            len: art.data_len,
+        });
+        idx += 1;
+    }
+
+    if !buf.is_empty() {
+        segments.push(Segment::Inline(buf));
+    }
+    segments.push(Segment::BackingAudio {
+        offset: scan.audio_offset,
+        len: scan.audio_length,
+    });
+
+    RegionLayout::new(segments)
+}
