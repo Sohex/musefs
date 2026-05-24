@@ -12,4 +12,4 @@ pub use error::{CoreError, Result};
 // pub use reader::{read_at, HeaderCache, ResolvedFile};
 // pub use scan::{scan_directory, ScanStats};
 pub use template::render_path;
-// pub use tree::{Node, NodeKind, VirtualTree};
+pub use tree::{Node, NodeKind, VirtualTree};
