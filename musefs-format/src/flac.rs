@@ -24,10 +24,16 @@ pub struct FlacScan {
     pub preserved: Vec<MetadataBlock>,
 }
 
-/// Parse the FLAC metadata section, returning the audio boundary and the structural
-/// blocks to carry over (STREAMINFO/APPLICATION/SEEKTABLE/CUESHEET). VORBIS_COMMENT,
-/// PICTURE, and PADDING are dropped (regenerated or omitted at synthesis time).
-pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
+/// The metadata region of a FLAC file: where audio begins and the structural
+/// blocks to carry over. Unlike `FlacScan`, this does not include `audio_length`
+/// (which requires the full file size), so it can be computed from the front alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlacMeta {
+    pub audio_offset: u64,
+    pub preserved: Vec<MetadataBlock>,
+}
+
+fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
     if data.len() < 4 || &data[0..4] != FLAC_MARKER {
         return Err(FormatError::NotFlac);
     }
@@ -62,10 +68,27 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
             break;
         }
     }
-    Ok(FlacScan {
+    Ok(FlacMeta {
         audio_offset: pos as u64,
-        audio_length: (data.len() - pos) as u64,
         preserved,
+    })
+}
+
+/// Parse just the FLAC metadata region (the front of the file), recovering the
+/// audio boundary and structural blocks. Use when the audio length is already
+/// known (e.g. stored in a database) and the full file should not be read.
+pub fn read_metadata(data: &[u8]) -> Result<FlacMeta> {
+    parse_blocks(data)
+}
+
+/// Parse the FLAC metadata section of a complete file, returning the audio
+/// boundary, audio length, and the structural blocks to carry over.
+pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
+    let meta = parse_blocks(data)?;
+    Ok(FlacScan {
+        audio_offset: meta.audio_offset,
+        audio_length: data.len() as u64 - meta.audio_offset,
+        preserved: meta.preserved,
     })
 }
 
