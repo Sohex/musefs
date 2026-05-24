@@ -60,6 +60,15 @@ impl HeaderCache {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
+        // Guard the stored audio bounds before any cast/allocation: a negative or
+        // out-of-file offset means the row no longer matches the backing file.
+        if track.audio_offset < 0
+            || track.audio_length < 0
+            || track.audio_offset as u64 > meta.len()
+        {
+            return Err(CoreError::BackingChanged(track.backing_path.clone()));
+        }
+
         if let Some(cached) = self.map.get(&track_id) {
             if cached.content_version == track.content_version {
                 return Ok(cached.clone());

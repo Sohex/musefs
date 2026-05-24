@@ -5,7 +5,6 @@ use musefs_format::TagInput;
 
 /// Convert DB tag rows into the ordered list of synthesis inputs (one per value).
 /// `Db::get_tags` already returns rows ordered by `(key, ordinal)`, so order is preserved.
-#[allow(dead_code)]
 pub(crate) fn tags_to_inputs(tags: &[Tag]) -> Vec<TagInput> {
     tags.iter()
         .map(|t| TagInput::new(&t.key, &t.value))
@@ -14,7 +13,6 @@ pub(crate) fn tags_to_inputs(tags: &[Tag]) -> Vec<TagInput> {
 
 /// Build the field map used for path-template rendering: the first value (lowest
 /// ordinal) of each key. Relies on `Db::get_tags` ordering by `(key, ordinal)`.
-#[allow(dead_code)]
 pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for t in tags {
