@@ -1,0 +1,10 @@
+[package]
+name = "musefs-format"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "1"
+
+[dev-dependencies]
+metaflac = "0.2"
