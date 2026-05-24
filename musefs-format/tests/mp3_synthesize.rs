@@ -234,8 +234,9 @@ fn multiple_art_frames_keep_order() {
 }
 
 #[test]
-fn synthesize_errors_on_oversized_tag() {
+fn synthesize_errors_on_oversized_frame() {
     use musefs_format::FormatError;
+    // A single frame whose data exceeds the 28-bit per-frame syncsafe limit.
     let arts = vec![ArtInput {
         art_id: 1,
         mime: "image/jpeg".to_string(),
@@ -243,8 +244,29 @@ fn synthesize_errors_on_oversized_tag() {
         picture_type: 3,
         width: 0,
         height: 0,
-        data_len: 0x1000_0000, // 256 MiB, over the 28-bit ID3v2.4 tag-size limit
+        data_len: 0x1000_0000, // 256 MiB, over the per-frame limit
     }];
+    assert_eq!(
+        synthesize_layout(0, 0, &[], &arts),
+        Err(FormatError::TooLarge)
+    );
+}
+
+#[test]
+fn synthesize_errors_when_frames_sum_past_the_tag_limit() {
+    use musefs_format::FormatError;
+    // Each frame is individually under the 28-bit per-frame limit, but together
+    // they push the accumulated tag size over it — exercising the total guard.
+    let art = |id| ArtInput {
+        art_id: id,
+        mime: "image/jpeg".to_string(),
+        description: String::new(),
+        picture_type: id as u32,
+        width: 0,
+        height: 0,
+        data_len: 0x0800_0000, // 128 MiB each; two sum past the 256 MiB tag limit
+    };
+    let arts = vec![art(1), art(2)];
     assert_eq!(
         synthesize_layout(0, 0, &[], &arts),
         Err(FormatError::TooLarge)

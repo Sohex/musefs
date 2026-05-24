@@ -6,9 +6,11 @@ use musefs_format::{flac, mp3, EmbeddedPicture};
 
 use crate::error::Result;
 
-/// Skip embedded art larger than this — ~16 MiB (FLAC's 24-bit PICTURE block
-/// length limit, less 1 KiB for the block framing). Cover art is far smaller.
-const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 1024;
+/// Skip embedded art whose image bytes exceed this. The binding limit is FLAC's
+/// 24-bit PICTURE block length (~16 MiB for the whole block); reserve 64 KiB of
+/// headroom so the block framing + mime + description can never push a near-cap
+/// image past the limit at synthesis time. Real cover art is far smaller.
+const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanStats {

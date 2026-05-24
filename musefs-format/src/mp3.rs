@@ -189,9 +189,10 @@ pub fn synthesize_layout(
     header.extend_from_slice(b"ID3");
     header.extend_from_slice(&[0x04, 0x00]); // version 2.4.0
     header.push(0x00); // flags: no unsync / extended header / footer
-                       // The total tag size is a 28-bit syncsafe field. Ingestion caps each art well
-                       // under this, but guard at the format boundary so an oversized tag (e.g. many
-                       // large pictures) is a hard error rather than a silently-truncated file.
+
+    // The total tag size is a 28-bit syncsafe field. Ingestion caps each art well
+    // under this, but guard at the format boundary so an oversized tag (e.g. many
+    // large pictures summing past the limit) is a hard error, not a truncated file.
     if frames_len > 0x0FFF_FFFF {
         return Err(FormatError::TooLarge);
     }
