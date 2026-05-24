@@ -7,7 +7,7 @@ use musefs_format::flac::{self, FlacScan};
 use musefs_format::{mp3, RegionLayout};
 
 use crate::error::{CoreError, Result};
-use crate::mapping::tags_to_inputs;
+use crate::mapping::{tags_to_inputs, track_art_to_inputs};
 
 /// A fully resolved synthesized file: its segment layout, total size, the
 /// content version it was built from, and where the backing audio lives.
@@ -80,6 +80,7 @@ impl HeaderCache {
 
         let tags = db.get_tags(track_id)?;
         let inputs = tags_to_inputs(&tags);
+        let art_inputs = track_art_to_inputs(db, track_id)?;
 
         // FLAC re-reads the front for its preserved structural blocks; MP3 needs no
         // front read — its ID3v2 tag is regenerated entirely from the DB and the
@@ -93,13 +94,13 @@ impl HeaderCache {
                     audio_length: track.audio_length as u64,
                     preserved: fmeta.preserved,
                 };
-                flac::synthesize_layout(&scan, &inputs, &[])
+                flac::synthesize_layout(&scan, &inputs, &art_inputs)
             }
             Format::Mp3 => mp3::synthesize_layout(
                 track.audio_offset as u64,
                 track.audio_length as u64,
                 &inputs,
-                &[],
+                &art_inputs,
             ),
         };
         let total_len = layout.total_len();

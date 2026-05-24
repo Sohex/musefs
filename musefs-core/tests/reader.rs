@@ -102,3 +102,37 @@ fn resolve_errors_when_backing_file_changes() {
         Err(musefs_core::CoreError::BackingChanged(_))
     ));
 }
+
+#[test]
+fn resolve_includes_art_image_segments() {
+    use musefs_db::{NewArt, TrackArt};
+    use musefs_format::Segment;
+
+    let (_dir, db, id) = setup();
+    let art_id = db
+        .upsert_art(&NewArt {
+            mime: "image/png".to_string(),
+            width: None,
+            height: None,
+            data: vec![0x9u8; 80],
+        })
+        .unwrap();
+    db.set_track_art(
+        id,
+        &[TrackArt {
+            art_id,
+            picture_type: 3,
+            description: String::new(),
+            ordinal: 0,
+        }],
+    )
+    .unwrap();
+
+    let mut cache = HeaderCache::new();
+    let resolved = cache.resolve(&db, id).unwrap();
+    assert!(resolved
+        .layout
+        .segments
+        .iter()
+        .any(|s| matches!(s, Segment::ArtImage { art_id: a, len } if *a == art_id && *len == 80)));
+}

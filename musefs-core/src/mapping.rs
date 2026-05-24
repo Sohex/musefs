@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
-use musefs_db::Tag;
-use musefs_format::TagInput;
+use musefs_db::{Db, Tag};
+use musefs_format::{ArtInput, TagInput};
+
+use crate::error::Result;
 
 /// Convert DB tag rows into the ordered list of synthesis inputs (one per value).
 /// `Db::get_tags` already returns rows ordered by `(key, ordinal)`, so order is preserved.
@@ -19,6 +21,27 @@ pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, String> {
         map.entry(t.key.clone()).or_insert_with(|| t.value.clone());
     }
     map
+}
+
+/// Build the synthesis art inputs for a track from `track_art` + art metadata.
+/// Reads metadata only (never the image blob) so resolve stays memory-bounded;
+/// the bytes are streamed at read time.
+pub(crate) fn track_art_to_inputs(db: &Db, track_id: i64) -> Result<Vec<ArtInput>> {
+    let mut inputs = Vec::new();
+    for ta in db.get_track_art(track_id)? {
+        if let Some(meta) = db.get_art_meta(ta.art_id)? {
+            inputs.push(ArtInput {
+                art_id: ta.art_id,
+                mime: meta.mime,
+                description: ta.description,
+                picture_type: ta.picture_type as u32,
+                width: meta.width.unwrap_or(0) as u32,
+                height: meta.height.unwrap_or(0) as u32,
+                data_len: meta.byte_len as u64,
+            });
+        }
+    }
+    Ok(inputs)
 }
 
 #[cfg(test)]
