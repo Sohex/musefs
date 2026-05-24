@@ -22,6 +22,7 @@ pub fn errno(err: &CoreError) -> i32 {
     match err {
         CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => libc::ENOENT,
         CoreError::IsDir(_) => libc::EISDIR,
+        CoreError::NotADir(_) => libc::ENOTDIR,
         CoreError::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
         CoreError::BackingChanged(_)
         | CoreError::Db(_)
@@ -204,6 +205,7 @@ mod tests {
         assert_eq!(errno(&CoreError::NoEntry(7)), libc::ENOENT);
         assert_eq!(errno(&CoreError::TrackNotFound(7)), libc::ENOENT);
         assert_eq!(errno(&CoreError::IsDir(7)), libc::EISDIR);
+        assert_eq!(errno(&CoreError::NotADir(7)), libc::ENOTDIR);
         assert_eq!(errno(&CoreError::BackingChanged("x".into())), libc::EIO);
         assert_eq!(errno(&CoreError::ArtNotSupported), libc::EIO);
 

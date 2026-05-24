@@ -16,6 +16,8 @@ pub enum CoreError {
     NoEntry(u64),
     #[error("inode {0} is a directory")]
     IsDir(u64),
+    #[error("inode {0} is not a directory")]
+    NotADir(u64),
     #[error("embedded art is not supported in this milestone")]
     ArtNotSupported,
 }

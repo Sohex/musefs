@@ -1,7 +1,7 @@
 mod common;
 use common::make_flac;
 use common::{streaminfo_body, vorbis_comment_body};
-use musefs_core::{scan_directory, MountConfig, Musefs, VirtualTree};
+use musefs_core::{scan_directory, CoreError, MountConfig, Musefs, VirtualTree};
 use std::collections::BTreeMap;
 
 fn config() -> MountConfig {
@@ -86,4 +86,23 @@ fn refresh_rebuilds_tree_after_new_tracks() {
     // simply confirm refresh() succeeds and the existing entry is still present.
     fs.refresh().unwrap();
     assert!(fs.lookup(VirtualTree::ROOT, "Alice").is_some());
+}
+
+#[test]
+fn readdir_distinguishes_a_file_from_an_unknown_inode() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = scanned_db(dir.path());
+    let fs = Musefs::open(db, config()).unwrap();
+
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let file = fs.readdir(artist).unwrap()[0].1;
+
+    match fs.readdir(file) {
+        Err(CoreError::NotADir(i)) => assert_eq!(i, file),
+        other => panic!("expected NotADir, got {other:?}"),
+    }
+    match fs.readdir(987654) {
+        Err(CoreError::NoEntry(i)) => assert_eq!(i, 987654),
+        other => panic!("expected NoEntry, got {other:?}"),
+    }
 }

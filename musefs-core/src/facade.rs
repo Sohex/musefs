@@ -105,7 +105,13 @@ impl Musefs {
 
     /// Directory entries as `(name, child_inode, is_dir)`.
     pub fn readdir(&self, inode: u64) -> Result<Vec<(String, u64, bool)>> {
-        let children = self.tree.children(inode).ok_or(CoreError::NoEntry(inode))?;
+        let children = match self.tree.children(inode) {
+            Some(children) => children,
+            // Only directories have a children map; tell apart a known
+            // non-directory (ENOTDIR) from an unknown inode (ENOENT).
+            None if self.tree.node(inode).is_some() => return Err(CoreError::NotADir(inode)),
+            None => return Err(CoreError::NoEntry(inode)),
+        };
         Ok(children
             .iter()
             .map(|(name, &child)| (name.clone(), child, self.tree.is_dir(child)))
