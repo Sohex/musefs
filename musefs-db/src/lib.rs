@@ -1,9 +1,10 @@
 mod error;
 mod schema;
 mod models;
+mod tracks;
 
 pub use error::{DbError, Result};
-pub use models::Format;
+pub use models::{Format, NewArt, NewTrack, Track};
 
 use rusqlite::Connection;
 use std::path::Path;

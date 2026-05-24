@@ -20,3 +20,34 @@ impl Format {
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Track {
+    pub id: i64,
+    pub backing_path: String,
+    pub format: Format,
+    pub audio_offset: i64,
+    pub audio_length: i64,
+    pub backing_size: i64,
+    pub backing_mtime: i64,
+    pub content_version: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewTrack {
+    pub backing_path: String,
+    pub format: Format,
+    pub audio_offset: i64,
+    pub audio_length: i64,
+    pub backing_size: i64,
+    pub backing_mtime: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewArt {
+    pub mime: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub data: Vec<u8>,
+}
