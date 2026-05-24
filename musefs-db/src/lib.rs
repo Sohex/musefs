@@ -6,7 +6,7 @@ mod tags;
 mod tracks;
 
 pub use error::{DbError, Result};
-pub use models::{Art, Format, NewArt, NewTrack, Tag, Track, TrackArt};
+pub use models::{Art, ArtMeta, Format, NewArt, NewTrack, Tag, Track, TrackArt};
 
 use rusqlite::Connection;
 use std::path::Path;

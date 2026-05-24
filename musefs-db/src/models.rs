@@ -81,6 +81,14 @@ pub struct Art {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtMeta {
+    pub mime: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub byte_len: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackArt {
     pub art_id: i64,
     pub picture_type: i64,
