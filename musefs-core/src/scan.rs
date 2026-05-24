@@ -41,18 +41,34 @@ fn collect_audio(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Parse one backing file into `(format, audio_offset, audio_length, raw tags)`,
-/// or `None` if it does not parse as a supported format (and should be skipped).
-#[allow(clippy::type_complexity)]
-fn probe(path: &Path, bytes: &[u8]) -> Option<(Format, u64, u64, Vec<(String, String)>)> {
+/// A backing file parsed into the fields a track row needs, plus its raw
+/// `(key, value)` tags to seed.
+struct Probed {
+    format: Format,
+    audio_offset: u64,
+    audio_length: u64,
+    tags: Vec<(String, String)>,
+}
+
+/// Parse one backing file into a `Probed`, or `None` if it does not parse as a
+/// supported format (and should be skipped).
+fn probe(path: &Path, bytes: &[u8]) -> Option<Probed> {
     if has_ext(path, "flac") {
         let scan = flac::locate_audio(bytes).ok()?;
-        let tags = flac::read_vorbis_comments(bytes).unwrap_or_default();
-        Some((Format::Flac, scan.audio_offset, scan.audio_length, tags))
+        Some(Probed {
+            format: Format::Flac,
+            audio_offset: scan.audio_offset,
+            audio_length: scan.audio_length,
+            tags: flac::read_vorbis_comments(bytes).unwrap_or_default(),
+        })
     } else if has_ext(path, "mp3") {
         let bounds = mp3::locate_audio(bytes).ok()?;
-        let tags = mp3::read_tags(bytes);
-        Some((Format::Mp3, bounds.audio_offset, bounds.audio_length, tags))
+        Some(Probed {
+            format: Format::Mp3,
+            audio_offset: bounds.audio_offset,
+            audio_length: bounds.audio_length,
+            tags: mp3::read_tags(bytes),
+        })
     } else {
         None
     }
@@ -71,7 +87,7 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     };
     for path in files {
         let bytes = std::fs::read(&path)?;
-        let (format, audio_offset, audio_length, raw_tags) = match probe(&path, &bytes) {
+        let probed = match probe(&path, &bytes) {
             Some(p) => p,
             None => {
                 stats.skipped += 1;
@@ -82,16 +98,16 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
         let abs = std::fs::canonicalize(&path)?;
         let track_id = db.upsert_track(&NewTrack {
             backing_path: abs.to_string_lossy().to_string(),
-            format,
-            audio_offset: audio_offset as i64,
-            audio_length: audio_length as i64,
+            format: probed.format,
+            audio_offset: probed.audio_offset as i64,
+            audio_length: probed.audio_length as i64,
             backing_size: meta.len() as i64,
             backing_mtime: mtime_secs(&meta),
         })?;
 
         let mut tags = Vec::new();
         let mut ordinals: HashMap<String, i64> = HashMap::new();
-        for (field, value) in raw_tags {
+        for (field, value) in probed.tags {
             let key = field.to_lowercase();
             let ord = ordinals.entry(key.clone()).or_insert(0);
             tags.push(Tag::new(&key, &value, *ord));
