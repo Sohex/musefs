@@ -102,6 +102,20 @@ def test_oversized_art_skipped(tmp_path, db_path, make_track, fake_item, fake_al
         conn.close()
 
 
+def test_missing_art_file_counts_skipped_not_crash(db_path, make_track, fake_item, fake_album):
+    make_track("/music/a.flac")
+    conn = connect(db_path)
+    try:
+        album = fake_album(artpath=os.fsencode("/no/such/cover.jpg"))
+        item = fake_item(os.fsencode("/music/a.flac"), album=album, title="Song")
+        stats = sync_items(conn, [item])  # must not raise
+        conn.commit()
+        assert stats.skipped_art == 1
+        assert stats.art_linked == 0
+    finally:
+        conn.close()
+
+
 def test_art_deduped_across_items(tmp_path, db_path, make_track, fake_item, fake_album):
     t1 = make_track("/music/a.flac")
     t2 = make_track("/music/b.flac")
@@ -132,5 +146,22 @@ def test_dry_run_writes_nothing(db_path, make_track, fake_item):
         assert conn.execute(
             "SELECT COUNT(*) FROM tags WHERE track_id=?", (tid,)
         ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_dry_run_with_art_writes_nothing(tmp_path, db_path, make_track, fake_item, fake_album):
+    make_track("/music/a.flac")
+    cover = write_cover(tmp_path, "cover.jpg")
+    conn = connect(db_path)
+    try:
+        album = fake_album(artpath=cover)
+        item = fake_item(os.fsencode("/music/a.flac"), album=album, title="Song")
+        stats = sync_items(conn, [item], dry_run=True)
+        conn.rollback()
+        # Counted as "would link", but no art/track_art rows were written.
+        assert stats.art_linked == 1
+        assert conn.execute("SELECT COUNT(*) FROM art").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM track_art").fetchone()[0] == 0
     finally:
         conn.close()

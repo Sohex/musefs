@@ -225,30 +225,35 @@ def _album_art_path(item):
 
 def _prepare_art(conn, artpath, cache, stats, dry_run):
     """Upsert the cover at ``artpath`` and return its art id (cached per run).
-    Returns None if unreadable, or under dry_run a non-None sentinel when the
-    art would be linked."""
-    real = realpath_key(artpath)
-    if real in cache:
-        return cache[real]
+    Returns None if unreadable/oversized, or under dry_run a non-None sentinel
+    when the art would be linked."""
+    # Cache key is the normalized realpath, but open the raw realpath: the art
+    # file only needs to be opened, not matched against the DB, so we must not
+    # apply realpath_key's lossy U+FFFD normalization to the bytes we open (it
+    # would turn a non-UTF-8 path into a different, nonexistent path).
+    key = realpath_key(artpath)
+    if key in cache:
+        return cache[key]
 
     try:
-        with open(os.fsencode(real), "rb") as fh:
+        with open(os.path.realpath(artpath), "rb") as fh:
             data = fh.read()
     except OSError:
-        cache[real] = None
+        stats.skipped_art += 1
+        cache[key] = None
         return None
 
     if len(data) > MAX_ART_BYTES:
         stats.skipped_art += 1
-        cache[real] = None
+        cache[key] = None
         return None
 
     if dry_run:
-        cache[real] = _WOULD_LINK
+        cache[key] = _WOULD_LINK
         return _WOULD_LINK
 
-    art_id = upsert_art(conn, data, sniff_mime(data, real))
-    cache[real] = art_id
+    art_id = upsert_art(conn, data, sniff_mime(data, key))
+    cache[key] = art_id
     return art_id
 
 
@@ -270,7 +275,8 @@ def sync_items(conn, items, *, fields=None, dry_run=False):
 
         if not dry_run:
             replace_tags(conn, track_id, pairs)
-            if art_id is not None and art_id is not _WOULD_LINK:
+            # In the live path art_id is an int or None (never _WOULD_LINK).
+            if art_id is not None:
                 replace_track_art(conn, track_id, art_id)
 
         if art_id is not None:
