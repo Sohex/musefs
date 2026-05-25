@@ -121,3 +121,27 @@ def check_schema_version(conn):
     found = conn.execute("PRAGMA user_version").fetchone()[0]
     if found != EXPECTED_USER_VERSION:
         raise SchemaMismatch(found)
+
+
+def track_id_for_path(conn, key):
+    """Return the track id whose backing_path equals ``key``, or None."""
+    row = conn.execute(
+        "SELECT id FROM tracks WHERE backing_path = ?", (key,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def replace_tags(conn, track_id, pairs):
+    """Replace all tags for a track. Duplicate keys get incrementing ordinals
+    (mirroring musefs scan ingest)."""
+    conn.execute("DELETE FROM tags WHERE track_id = ?", (track_id,))
+    ordinals = {}
+    rows = []
+    for key, value in pairs:
+        ordinal = ordinals.get(key, 0)
+        ordinals[key] = ordinal + 1
+        rows.append((track_id, key, value, ordinal))
+    conn.executemany(
+        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, ?, ?, ?)",
+        rows,
+    )
