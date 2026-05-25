@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beets-musefs"
+version = "0.1.0"
+description = "Sync beets metadata into the musefs SQLite store"
+requires-python = ">=3.9"
+dependencies = ["beets>=1.6"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["beetsplug"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "musefs_bin: tests that shell out to the real `musefs` Rust binary (opt-in)",
+]
+# By default, skip the binary gate; run it explicitly with `-m musefs_bin`.
+addopts = "-m 'not musefs_bin'"

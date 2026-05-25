@@ -1,0 +1,2 @@
+beets>=1.6
+pytest>=7
