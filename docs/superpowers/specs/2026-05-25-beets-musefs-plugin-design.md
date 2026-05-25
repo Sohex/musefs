@@ -207,8 +207,6 @@ musefs:
 - **Unit (`map_fields`)** — direct fields; `track`→`tracknumber`,
   `disc`→`discnumber`; `year`/`month`/`day`→`date` formatting; empty/zero omission;
   `musefs.fields` override applied. No DB needed.
-- **Unit (paths)** — `realpath` keying matches scan's `canonicalize` for a fixture
-  file (incl. a symlinked path).
 - **Unit (mime sniff)** — JPEG/PNG magic-byte detection and extension fallback.
 - **Integration (pytest)** — create a temp DB with the musefs schema
   (`PRAGMA user_version = 1` + the V1 DDL/triggers), insert a fake track row, run
@@ -224,6 +222,38 @@ The integration test embeds a copy of the V1 schema DDL; if it drifts from
 `musefs-db`, the `user_version` guard (§3.3) and this test are the two places it
 surfaces.
 
+### 9.1 Path-matching robustness (gate)
+
+The `realpath`/`canonicalize` agreement (§3.1, §11) is the single silent-failure
+point, so it gets its own test tier that runs against the **real `musefs scan`
+binary** — never a hand-built DB — to prove the plugin's key is byte-identical to
+what scan actually stored. Marked `#[ignore]`-style / opt-in like the FUSE e2e
+since it shells out to a built `musefs` binary; CI builds it first.
+
+The test harness, for each case:
+1. materialises a fixture file under a temp tree,
+2. runs `musefs scan <tree> --db <tmp.db>`,
+3. reads back the stored `backing_path` from `tracks`,
+4. computes the plugin's key from the beets-style item path, and
+5. asserts the two strings are **exactly equal** — and, end to end, that
+   `track_id_for_path(plugin_key)` returns the row scan created.
+
+Cases that must pass (each as the path beets would hand the plugin):
+- plain nested file (`Artist/Album/01 Track.flac`);
+- a **symlinked directory component** in the path (resolved away by both sides);
+- a **symlink to the file** itself;
+- input given as a **relative** path and as a path containing `.`/`..` segments;
+- a **trailing slash** on a parent and other non-normalised forms;
+- **non-ASCII / Unicode** filename (e.g. accented + CJK), and a filename with
+  **spaces and `%`**;
+- (documented, not asserted to match) a path under a **different mount/bind** than
+  the scanned tree — asserts it is reported as `skipped (no row)`, never a silent
+  wrong-row hit.
+
+A failure here is a hard stop, not a warning: if any case mismatches, the keying
+strategy is wrong and must be fixed (e.g. normalise both sides identically) before
+the plugin is usable. The unit-level path test is subsumed by this tier.
+
 ## 10. Explicit non-goals (v1)
 
 - **Picard plugin** — separate effort later.
@@ -238,6 +268,8 @@ surfaces.
 
 `os.path.realpath` (Python) vs `std::fs::canonicalize` (Rust) are expected to
 agree for existing files on Linux, but this is the single point where a mismatch
-would silently cause every item to be "skipped (no row)." The integration/manual
-tests must assert key equality against a real scanned DB to catch any divergence
-early.
+would silently cause every item to be "skipped (no row)." This risk is retired by
+the **§9.1 path-matching gate**, which asserts byte-identical keys against a DB
+produced by the real `musefs scan` binary across symlink, relative/`..`,
+trailing-slash, and Unicode/space cases — a mismatch there is a hard stop on the
+keying strategy, not a warning.
