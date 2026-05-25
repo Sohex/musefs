@@ -54,3 +54,16 @@ def test_extra_field_override():
     pairs = dict(map_fields(it, extra_fields={"comments": "comment"}))
     assert pairs["comment"] == "hi there"
     assert pairs["title"] == "Song"
+
+
+def test_extra_field_overrides_existing_key():
+    # Overriding an existing beets field remaps its destination key.
+    pairs = dict(map_fields(item(title="Song"), extra_fields={"title": "subtitle"}))
+    assert pairs["subtitle"] == "Song"
+    assert "title" not in pairs
+
+
+def test_non_numeric_track_does_not_crash():
+    # A malformed track like "1/12" must not raise; it is dropped, not emitted.
+    pairs = dict(map_fields(item(track="1/12")))
+    assert "tracknumber" not in pairs

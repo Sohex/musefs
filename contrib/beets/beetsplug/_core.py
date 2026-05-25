@@ -22,12 +22,21 @@ DIRECT_FIELDS = {
 }
 
 
+def _to_int(value):
+    """Coerce a beets field to int, tolerating None and non-numeric strings
+    (e.g. a malformed ``"1/12"`` track-of-total) so a bad tag can't abort sync."""
+    try:
+        return int(value or 0)
+    except (ValueError, TypeError):
+        return 0
+
+
 def _format_date(item):
-    year = int(getattr(item, "year", 0) or 0)
+    year = _to_int(getattr(item, "year", 0))
     if not year:
         return None
-    month = int(getattr(item, "month", 0) or 0)
-    day = int(getattr(item, "day", 0) or 0)
+    month = _to_int(getattr(item, "month", 0))
+    day = _to_int(getattr(item, "day", 0))
     if month and day:
         return f"{year:04d}-{month:02d}-{day:02d}"
     return f"{year:04d}"
@@ -52,10 +61,10 @@ def map_fields(item, extra_fields=None):
         if text:
             pairs.append((key, text))
 
-    track = int(getattr(item, "track", 0) or 0)
+    track = _to_int(getattr(item, "track", 0))
     if track:
         pairs.append(("tracknumber", str(track)))
-    disc = int(getattr(item, "disc", 0) or 0)
+    disc = _to_int(getattr(item, "disc", 0))
     if disc:
         pairs.append(("discnumber", str(disc)))
     date = _format_date(item)
