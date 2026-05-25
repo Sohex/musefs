@@ -7,6 +7,7 @@ listeners) is in ``musefs.py``; this module is unit-testable on its own.
 import hashlib
 import os
 import sqlite3
+from dataclasses import dataclass
 
 # Schema version this plugin was written against (musefs schema.rs MIGRATIONS
 # length). The plugin refuses to run against any other version.
@@ -192,3 +193,88 @@ def replace_track_art(conn, track_id, art_id):
         "ordinal) VALUES (?, ?, 3, '', 0)",
         (track_id, art_id),
     )
+
+
+# Sentinel returned by _prepare_art under dry_run: "would link, but not written".
+_WOULD_LINK = object()
+
+
+@dataclass
+class SyncStats:
+    synced: int = 0
+    skipped: int = 0       # item path had no matching track row
+    art_linked: int = 0
+    skipped_art: int = 0   # art file oversized / unreadable
+
+    def summary(self):
+        return (
+            f"synced={self.synced} skipped={self.skipped} "
+            f"art_linked={self.art_linked} skipped_art={self.skipped_art}"
+        )
+
+
+def _album_art_path(item):
+    """Return the album cover path (bytes/str) for an item, or None."""
+    get_album = getattr(item, "get_album", None)
+    album = get_album() if get_album else None
+    if album is None:
+        return None
+    artpath = getattr(album, "artpath", None)
+    return artpath or None
+
+
+def _prepare_art(conn, artpath, cache, stats, dry_run):
+    """Upsert the cover at ``artpath`` and return its art id (cached per run).
+    Returns None if unreadable, or under dry_run a non-None sentinel when the
+    art would be linked."""
+    real = realpath_key(artpath)
+    if real in cache:
+        return cache[real]
+
+    try:
+        with open(os.fsencode(real), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        cache[real] = None
+        return None
+
+    if len(data) > MAX_ART_BYTES:
+        stats.skipped_art += 1
+        cache[real] = None
+        return None
+
+    if dry_run:
+        cache[real] = _WOULD_LINK
+        return _WOULD_LINK
+
+    art_id = upsert_art(conn, data, sniff_mime(data, real))
+    cache[real] = art_id
+    return art_id
+
+
+def sync_items(conn, items, *, fields=None, dry_run=False):
+    """Sync beets items into the musefs DB. Caller controls the transaction
+    (commit on success, rollback for dry runs)."""
+    stats = SyncStats()
+    art_cache = {}
+    for item in items:
+        key = realpath_key(item.path)
+        track_id = track_id_for_path(conn, key)
+        if track_id is None:
+            stats.skipped += 1
+            continue
+
+        pairs = map_fields(item, fields)
+        artpath = _album_art_path(item)
+        art_id = _prepare_art(conn, artpath, art_cache, stats, dry_run) if artpath else None
+
+        if not dry_run:
+            replace_tags(conn, track_id, pairs)
+            if art_id is not None and art_id is not _WOULD_LINK:
+                replace_track_art(conn, track_id, art_id)
+
+        if art_id is not None:
+            stats.art_linked += 1
+        stats.synced += 1
+
+    return stats
