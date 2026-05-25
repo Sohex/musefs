@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from beetsplug._core import connect as musefs_connect
+
 SCHEMA_SQL = (Path(__file__).parent / "schema_v1.sql").read_text()
 
 
@@ -19,13 +21,14 @@ def db_path(tmp_path):
     return str(path)
 
 
-def insert_track(conn, backing_path, fmt="flac"):
+def insert_track(conn, backing_path, fmt="flac", audio_offset=0, audio_length=0,
+                 backing_size=0, backing_mtime=0):
     """Insert a minimal track row (as `musefs scan` would) and return its id."""
     now = int(time.time())
     cur = conn.execute(
         "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
-        "backing_size, backing_mtime, updated_at) VALUES (?, ?, 0, 0, 0, 0, ?)",
-        (backing_path, fmt, now),
+        "backing_size, backing_mtime, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (backing_path, fmt, audio_offset, audio_length, backing_size, backing_mtime, now),
     )
     return cur.lastrowid
 
@@ -61,19 +64,20 @@ class FakeItem:
 
 @pytest.fixture
 def fake_item():
-    return FakeItem
+    return FakeItem  # returns the class; call it directly in tests
 
 
 @pytest.fixture
 def fake_album():
-    return FakeAlbum
+    return FakeAlbum  # returns the class; call it directly in tests
 
 
 @pytest.fixture
 def make_track(db_path):
     """Return a helper that inserts a track row and returns its id."""
     def _make(backing_path, fmt="flac"):
-        conn = sqlite3.connect(db_path)
+        # Use the plugin's connect() so foreign_keys=ON matches real writes.
+        conn = musefs_connect(db_path)
         try:
             tid = insert_track(conn, backing_path, fmt)
             conn.commit()

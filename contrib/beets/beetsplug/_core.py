@@ -108,13 +108,16 @@ class SchemaMismatch(Exception):
 
 def connect(db_path):
     """Open the musefs DB with a busy timeout and foreign keys enabled."""
-    conn = sqlite3.connect(db_path, timeout=5.0)
+    conn = sqlite3.connect(db_path)
+    # 5s busy timeout so a brief write doesn't fail while the FUSE mount reads.
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def check_schema_version(conn):
+    """Raise ``SchemaMismatch`` unless the DB's ``user_version`` matches the
+    version this plugin targets. Call on an open connection from ``connect``."""
     found = conn.execute("PRAGMA user_version").fetchone()[0]
     if found != EXPECTED_USER_VERSION:
         raise SchemaMismatch(found)
