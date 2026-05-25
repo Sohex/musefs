@@ -4,6 +4,7 @@ Everything beets-specific (the BeetsPlugin subclass, commands, event
 listeners) is in ``musefs.py``; this module is unit-testable on its own.
 """
 
+import hashlib
 import os
 import sqlite3
 
@@ -144,4 +145,45 @@ def replace_tags(conn, track_id, pairs):
     conn.executemany(
         "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, ?, ?, ?)",
         rows,
+    )
+
+
+_EXT_MIME = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+}
+
+
+def sniff_mime(data, path):
+    """Detect image mime from magic bytes, falling back to file extension."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    ext = os.path.splitext(path)[1].lower()
+    return _EXT_MIME.get(ext, "application/octet-stream")
+
+
+def upsert_art(conn, data, mime):
+    """Content-address ``data`` by sha256 and return its art id, inserting only
+    if new (mirrors musefs Db::upsert_art)."""
+    sha = hashlib.sha256(data).hexdigest()
+    conn.execute(
+        "INSERT INTO art (sha256, mime, width, height, byte_len, data) "
+        "VALUES (?, ?, NULL, NULL, ?, ?) ON CONFLICT(sha256) DO NOTHING",
+        (sha, mime, len(data), data),
+    )
+    return conn.execute(
+        "SELECT id FROM art WHERE sha256 = ?", (sha,)
+    ).fetchone()[0]
+
+
+def replace_track_art(conn, track_id, art_id):
+    """Set the track's single front-cover art (picture_type 3, ordinal 0)."""
+    conn.execute("DELETE FROM track_art WHERE track_id = ?", (track_id,))
+    conn.execute(
+        "INSERT INTO track_art (track_id, art_id, picture_type, description, "
+        "ordinal) VALUES (?, ?, 3, '', 0)",
+        (track_id, art_id),
     )
