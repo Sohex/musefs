@@ -5,7 +5,25 @@ import pytest
 
 pytest.importorskip("beets")
 
+from beets.library import Item  # noqa: E402
+
+from beetsplug._core import map_fields  # noqa: E402
 from beetsplug.musefs import MusefsPlugin  # noqa: E402
+
+
+def test_map_fields_handles_real_beets_multivalue():
+    # Regression: beets 2.x stores genre/composer as multi-valued genres/
+    # composers (lists), not scalars. FakeItem hid this; a real Item exposes it.
+    it = Item()
+    it.title = "Song"
+    it.genres = ["Rock", "Indie"]
+    it.composers = ["J.S. Bach"]
+    grouped = {}
+    for key, value in map_fields(it):
+        grouped.setdefault(key, []).append(value)
+    assert grouped["title"] == ["Song"]
+    assert grouped["genre"] == ["Rock", "Indie"]  # expanded, not "['Rock', ...]"
+    assert grouped["composer"] == ["J.S. Bach"]
 
 
 class FakeConfigView:

@@ -17,14 +17,29 @@ EXPECTED_USER_VERSION = 1
 MAX_ART_BYTES = 16 * 1024 * 1024 - 64 * 1024
 
 # beets field name -> musefs (Vorbis-lowercase) tag key, for direct copies.
+# beets 2.x exposes genre/composer as the multi-valued `genres`/`composers`
+# (lists); the singular keys are kept for simpler/older items. List values are
+# expanded into one tag per element by _values().
 DIRECT_FIELDS = {
     "title": "title",
     "artist": "artist",
     "albumartist": "albumartist",
     "album": "album",
     "genre": "genre",
+    "genres": "genre",
     "composer": "composer",
+    "composers": "composer",
 }
+
+
+def _values(value):
+    """Normalize a beets field value to a list of non-empty string values.
+    Multi-valued beets fields (genres, composers) arrive as lists; scalars
+    become a single-element list. Avoids stringifying a list as ``['Rock']``."""
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    return [text for v in items if (text := str(v).strip())]
 
 
 def _to_int(value):
@@ -59,11 +74,7 @@ def map_fields(item, extra_fields=None):
 
     pairs = []
     for beets_field, key in fields.items():
-        value = getattr(item, beets_field, None)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
+        for text in _values(getattr(item, beets_field, None)):
             pairs.append((key, text))
 
     track = _to_int(getattr(item, "track", 0))

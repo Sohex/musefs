@@ -47,7 +47,8 @@ class MusefsPlugin(BeetsPlugin):
         query = self._query_from_args(args)
         items = list(lib.items(query))
         stats = self._sync(db_path, items, dry_run=opts.dry_run)
-        self._log.info("musefs: {}", stats.summary())
+        # ui.print_ (not self._log) so the summary always shows, not only at -v.
+        ui.print_(f"musefs: {stats.summary()}")
 
     # --- event listeners -------------------------------------------------
 
