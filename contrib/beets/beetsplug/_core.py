@@ -4,6 +4,8 @@ Everything beets-specific (the BeetsPlugin subclass, commands, event
 listeners) is in ``musefs.py``; this module is unit-testable on its own.
 """
 
+import os
+
 # Schema version this plugin was written against (musefs schema.rs MIGRATIONS
 # length). The plugin refuses to run against any other version.
 EXPECTED_USER_VERSION = 1
@@ -72,3 +74,16 @@ def map_fields(item, extra_fields=None):
         pairs.append(("date", date))
 
     return pairs
+
+
+def realpath_key(path):
+    """Canonical absolute path string matching musefs scan's stored
+    ``backing_path`` (``std::fs::canonicalize`` + ``to_string_lossy``).
+
+    Accepts ``str`` or ``bytes`` (beets stores ``item.path`` as bytes) and
+    always returns ``str`` via the filesystem encoding.
+    """
+    real = os.path.realpath(path)
+    if isinstance(real, bytes):
+        return os.fsdecode(real)
+    return real
