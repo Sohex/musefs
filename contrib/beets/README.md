@@ -44,9 +44,10 @@ musefs mount ~/mnt --db ~/musefs.db \
     --template '$albumartist/$album/$tracknumber - $title'
 ```
 
-After this, `beet modify -w …` and imports auto-sync via event hooks, and the
-mount refreshes on its own. A metadata-only `beet modify` (no `-w`) is picked up
-the next time you run `beet musefs`.
+After this, the event hooks auto-sync on writes and imports specifically:
+`beet modify -w …` (tags written back to the file) and `beet import`. The mount
+then refreshes on its own. Note a metadata-only `beet modify` (no `-w`) does
+**not** trigger a hook — re-run `beet musefs` to pick those edits up.
 
 ## Notes
 
