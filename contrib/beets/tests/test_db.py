@@ -62,13 +62,33 @@ def test_replace_tags_clears_previous(db_path, make_track):
     tid = make_track("/music/a.flac")
     conn = connect(db_path)
     try:
+        # Commit between calls so the second replace acts on *committed* tags —
+        # the real scenario (scan seeds tags, the plugin later replaces them).
         replace_tags(conn, tid, [("title", "Old")])
+        conn.commit()
         replace_tags(conn, tid, [("title", "New")])
         conn.commit()
         vals = conn.execute(
             "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
         ).fetchall()
         assert vals == [("New",)]
+    finally:
+        conn.close()
+
+
+def test_replace_tags_empty_pairs_clears(db_path, make_track):
+    # An item with no mappable fields: replacing with [] clears existing tags.
+    tid = make_track("/music/a.flac")
+    conn = connect(db_path)
+    try:
+        replace_tags(conn, tid, [("title", "Old")])
+        conn.commit()
+        replace_tags(conn, tid, [])
+        conn.commit()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM tags WHERE track_id=?", (tid,)
+        ).fetchone()[0]
+        assert count == 0
     finally:
         conn.close()
 
