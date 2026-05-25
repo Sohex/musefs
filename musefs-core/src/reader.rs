@@ -52,6 +52,11 @@ impl HeaderCache {
         }
     }
 
+    /// Drop all cached resolutions (used when the DB changed underneath the mount).
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
     /// Resolve a track to its layout — a freshly synthesized metadata region in
     /// `Synthesis` mode, or a single whole-backing-file passthrough segment in
     /// `StructureOnly` mode — building (and caching) it on a content-version miss.

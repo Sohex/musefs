@@ -43,13 +43,16 @@ pub struct Musefs {
     config: MountConfig,
     tree: VirtualTree,
     cache: HeaderCache,
+    last_data_version: i64,
 }
 
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let tree = Self::build_tree(&db, &config)?;
+        let last_data_version = db.data_version()?;
         Ok(Musefs {
             cache: HeaderCache::new(config.mode),
+            last_data_version,
             db,
             config,
             tree,
@@ -78,6 +81,21 @@ impl Musefs {
     pub fn refresh(&mut self) -> Result<()> {
         self.tree = Self::build_tree(&self.db, &self.config)?;
         Ok(())
+    }
+
+    /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
+    /// rebuild the tree and drop cached resolutions, then return `true`. The FUSE
+    /// layer calls this on metadata operations so external edits (a scan, a beets
+    /// retag) appear without remounting.
+    pub fn poll_refresh(&mut self) -> Result<bool> {
+        let version = self.db.data_version()?;
+        if version == self.last_data_version {
+            return Ok(false);
+        }
+        self.last_data_version = version;
+        self.tree = Self::build_tree(&self.db, &self.config)?;
+        self.cache.clear();
+        Ok(true)
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
