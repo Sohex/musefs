@@ -52,8 +52,10 @@ impl HeaderCache {
         }
     }
 
-    /// Resolve a track to its synthesized layout, building (and caching) it on a
-    /// content-version miss. Validates the backing file's size and mtime first.
+    /// Resolve a track to its layout — a freshly synthesized metadata region in
+    /// `Synthesis` mode, or a single whole-backing-file passthrough segment in
+    /// `StructureOnly` mode — building (and caching) it on a content-version miss.
+    /// Validates the backing file's size and mtime first.
     pub fn resolve(&mut self, db: &Db, track_id: i64) -> Result<Arc<ResolvedFile>> {
         let track = db
             .get_track(track_id)?
@@ -66,16 +68,6 @@ impl HeaderCache {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
-        // Guard the stored audio bounds before any cast/allocation: a negative
-        // bound, or an audio region that runs past the end of the backing file,
-        // means the row no longer matches the file.
-        if track.audio_offset < 0
-            || track.audio_length < 0
-            || (track.audio_offset as u64).saturating_add(track.audio_length as u64) > meta.len()
-        {
-            return Err(CoreError::BackingChanged(track.backing_path.clone()));
-        }
-
         if let Some(cached) = self.map.get(&track_id) {
             if cached.content_version == track.content_version {
                 return Ok(cached.clone());
@@ -85,6 +77,8 @@ impl HeaderCache {
         let (layout, total_len, mtime_secs_val) = match self.mode {
             Mode::StructureOnly => {
                 // Pure passthrough: the synthesized "file" is the backing file itself.
+                // The stored audio bounds are irrelevant here — the whole file is served
+                // verbatim — so they are not validated in this mode.
                 let layout = RegionLayout::new(vec![Segment::BackingAudio {
                     offset: 0,
                     len: meta.len(),
@@ -92,6 +86,18 @@ impl HeaderCache {
                 (layout, meta.len(), track.backing_mtime)
             }
             Mode::Synthesis => {
+                // Guard the stored audio bounds before any cast/allocation: a negative
+                // bound, or an audio region that runs past the end of the backing file,
+                // means the row no longer matches the file. Only synthesis splices at
+                // these bounds, so the check is scoped to this mode.
+                if track.audio_offset < 0
+                    || track.audio_length < 0
+                    || (track.audio_offset as u64).saturating_add(track.audio_length as u64)
+                        > meta.len()
+                {
+                    return Err(CoreError::BackingChanged(track.backing_path.clone()));
+                }
+
                 let tags = db.get_tags(track_id)?;
                 let inputs = tags_to_inputs(&tags);
                 let art_inputs = track_art_to_inputs(db, track_id)?;
