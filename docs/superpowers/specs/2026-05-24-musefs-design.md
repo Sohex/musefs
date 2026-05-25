@@ -188,6 +188,8 @@ track_art
   then reconciles per-track `content_version` to invalidate exactly the affected
   header caches and tree nodes.
 - `musefs refresh` / SIGHUP force an immediate full rebuild as a manual fallback.
+  (Deferred post-MVP — automatic `data_version` polling shipped in v0.1.0 and
+  covers external edits; see `docs/ROADMAP.md`.)
 
 ## Path templates
 
@@ -294,8 +296,9 @@ connections / a pool.
 - `musefs mount <mountpoint> --db <path> [--config <toml>] [--mode synthesis|structure-only] [--template <str>] [--foreground]`
   — mount the FUSE fs. CLI flags override the TOML config.
 - `musefs refresh <mountpoint>` — force an immediate rebuild of a running mount
-  (locates pid, sends SIGHUP). Rarely needed thanks to automatic `data_version`
-  polling; provided as a deterministic fallback.
+  (locates pid, sends SIGHUP). **Deferred post-MVP** (see `docs/ROADMAP.md`):
+  automatic `data_version` polling shipped in v0.1.0 and covers external edits, so
+  this manual fallback was not built.
 - Unmounting via the standard `fusermount -u`.
 
 ## Testing strategy
@@ -340,8 +343,11 @@ Each milestone is independently testable.
   an MVP requirement, sequenced here only because text synthesis + the mount form
   the foundation it attaches to.
 - **M5 — Structure-only mode + refresh polish:** passthrough mode; `data_version`
-  polling + SIGHUP refresh; `--revalidate`.
+  polling; `--revalidate`. (The explicit `musefs refresh`/SIGHUP command was
+  deferred post-MVP — polling covers it.)
 
 ### Out of MVP (later)
 
-beets/picard plugins, Ogg/Opus, MP4, writable mount + path overrides.
+beets/picard plugins, Ogg/Opus, MP4, writable mount + path overrides, and the
+explicit `musefs refresh`/SIGHUP command. See `docs/ROADMAP.md` for the
+consolidated post-MVP list.
