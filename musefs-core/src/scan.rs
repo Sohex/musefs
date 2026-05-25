@@ -171,10 +171,12 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     Ok(stats)
 }
 
-/// Re-validate an already-scanned library: re-probe only files whose size/mtime
-/// changed since the last scan (skipping unchanged ones so external tag edits in
-/// the DB are preserved), delete tracks whose backing file is gone (cascading
-/// tags/art links), and garbage-collect now-unreferenced art.
+/// Re-validate an already-scanned library subtree: re-probe only files whose
+/// size/mtime changed since the last scan (skipping unchanged ones so external
+/// tag edits in the DB are preserved), then delete tracks **under `root`** whose
+/// backing file is gone (cascading tags/art links) and garbage-collect
+/// now-unreferenced art. Pruning is scoped to `root`, so revalidating one library
+/// root never removes tracks belonging to another.
 pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
     let mut files = Vec::new();
     collect_audio(root, &mut files)?;
@@ -205,11 +207,21 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
         }
     }
 
-    // Prune tracks whose backing file no longer exists (anywhere, not just `root`).
+    // Prune tracks under `root` whose backing file is gone. Scoped to `root` so a
+    // targeted revalidate never touches tracks from a different library root, and
+    // gated on `NotFound` so a transient I/O error (an unreadable mount, a denied
+    // permission) does not delete a track whose file still exists.
+    let canon_root = std::fs::canonicalize(root)?;
     for track in db.list_tracks()? {
-        if std::fs::metadata(&track.backing_path).is_err() {
-            db.delete_track(track.id)?;
-            stats.pruned += 1;
+        if !Path::new(&track.backing_path).starts_with(&canon_root) {
+            continue;
+        }
+        match std::fs::metadata(&track.backing_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                db.delete_track(track.id)?;
+                stats.pruned += 1;
+            }
+            _ => {}
         }
     }
     db.gc_orphan_art()?;

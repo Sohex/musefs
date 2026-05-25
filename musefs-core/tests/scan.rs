@@ -140,6 +140,7 @@ fn revalidate_skips_unchanged_prunes_missing_and_gcs_art() {
 
     let stats = revalidate(&db, dir.path()).unwrap();
     assert_eq!(stats.unchanged, 1); // a.flac (size+mtime match) is skipped
+    assert_eq!(stats.updated, 0); // nothing on disk changed, so nothing re-ingested
     assert_eq!(stats.pruned, 1); // gone.flac's track is removed
 
     let tracks = db.list_tracks().unwrap();
