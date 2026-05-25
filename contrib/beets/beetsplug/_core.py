@@ -5,6 +5,7 @@ listeners) is in ``musefs.py``; this module is unit-testable on its own.
 """
 
 import os
+import sqlite3
 
 # Schema version this plugin was written against (musefs schema.rs MIGRATIONS
 # length). The plugin refuses to run against any other version.
@@ -90,3 +91,30 @@ def realpath_key(path):
     # undecodable bytes. Normalize so a non-UTF-8 path component produces the
     # same key string on both sides instead of silently mismatching.
     return real.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+class SchemaMismatch(Exception):
+    """Raised when the musefs DB schema version differs from what the plugin
+    targets (``EXPECTED_USER_VERSION``)."""
+
+    def __init__(self, found):
+        self.found = found
+        super().__init__(
+            f"musefs DB user_version is {found}, plugin targets "
+            f"{EXPECTED_USER_VERSION}; the musefs and plugin versions have "
+            f"diverged."
+        )
+
+
+def connect(db_path):
+    """Open the musefs DB with a busy timeout and foreign keys enabled."""
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def check_schema_version(conn):
+    found = conn.execute("PRAGMA user_version").fetchone()[0]
+    if found != EXPECTED_USER_VERSION:
+        raise SchemaMismatch(found)
