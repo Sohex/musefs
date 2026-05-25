@@ -4,6 +4,7 @@ to what the real `musefs scan` binary stores in `tracks.backing_path`."""
 import os
 import sqlite3
 import subprocess
+import warnings
 from pathlib import Path
 
 import pytest
@@ -19,17 +20,34 @@ _release = REPO_ROOT / "target" / "release" / "musefs"
 MUSEFS_BIN = _debug if _debug.exists() else _release
 
 # A minimal valid FLAC: 'fLaC' + a STREAMINFO metadata block (last-block flag set,
-# type 0, length 34) of 34 zero bytes. Enough for `musefs scan` to probe.
+# type 0, length 34) of 34 zero bytes. Enough for `musefs scan` to probe. If a
+# future scan prober rejects it (zero rows stored), replace with a real fixture
+# under tests/fixtures/ — _scan() below surfaces scan output to diagnose that.
 MINIMAL_FLAC = b"fLaC" + b"\x80\x00\x00\x22" + b"\x00" * 34
+
+
+def _newest_rs_mtime():
+    newest = 0.0
+    for crate in ("musefs-db", "musefs-format", "musefs-core", "musefs-fuse", "musefs-cli"):
+        src = REPO_ROOT / crate / "src"
+        if src.exists():
+            for rs in src.rglob("*.rs"):
+                newest = max(newest, rs.stat().st_mtime)
+    return newest
 
 
 def _scan(tmp_path, tree):
     db = tmp_path / "musefs.db"
-    subprocess.run(
+    result = subprocess.run(
         [str(MUSEFS_BIN), "scan", str(tree), "--db", str(db)],
-        check=True,
         capture_output=True,
     )
+    if result.returncode != 0:
+        pytest.fail(
+            f"musefs scan exited {result.returncode}\n"
+            f"stdout: {result.stdout.decode(errors='replace')}\n"
+            f"stderr: {result.stderr.decode(errors='replace')}"
+        )
     return str(db)
 
 
@@ -44,7 +62,15 @@ def _stored_paths(db):
 @pytest.fixture(autouse=True)
 def require_binary():
     if not MUSEFS_BIN.exists():
-        pytest.skip(f"musefs binary not built at {MUSEFS_BIN}; run `cargo build -p musefs-cli`")
+        pytest.skip(f"musefs binary not built at {MUSEFS_BIN}; run `cargo build`")
+    # The gate's whole point is catching Rust/Python key divergence; a stale
+    # binary would pass falsely. Warn (don't skip) if it predates the sources.
+    if MUSEFS_BIN.stat().st_mtime < _newest_rs_mtime():
+        warnings.warn(
+            f"{MUSEFS_BIN} is older than the musefs Rust sources; rebuild with "
+            f"`cargo build` before trusting a pass.",
+            stacklevel=2,
+        )
 
 
 def _write_flac(path):
@@ -95,7 +121,8 @@ def test_symlink_to_file(tmp_path):
     link.symlink_to(real)
     db = _scan(tmp_path, tree)
     stored = set(_stored_paths(db))
-    # Both names resolve to the same real file; realpath of either is in the set.
+    # Both names resolve to the same real file and dedup to one canonical row.
+    assert len(stored) == 1
     assert realpath_key(os.fsencode(str(link))) in stored
 
 
