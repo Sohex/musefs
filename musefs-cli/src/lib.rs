@@ -68,6 +68,7 @@ pub fn run_mount(
         template,
         fallbacks: BTreeMap::new(),
         default_fallback,
+        mode: musefs_core::Mode::Synthesis,
     };
     let core = Musefs::open(db, config).context("building the virtual filesystem")?;
     musefs_fuse::mount(core, mountpoint, "musefs")

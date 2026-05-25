@@ -8,12 +8,22 @@ use crate::reader::{read_at, HeaderCache};
 use crate::template::render_path;
 use crate::tree::{NodeKind, VirtualTree};
 
+/// How the mount serves file *contents*. The virtual tree is identical either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Splice a freshly synthesized metadata region in front of the backing audio.
+    Synthesis,
+    /// Pure passthrough: serve the original backing file bytes unchanged.
+    StructureOnly,
+}
+
 /// Per-mount configuration for rendering the virtual hierarchy.
 #[derive(Debug, Clone)]
 pub struct MountConfig {
     pub template: String,
     pub fallbacks: BTreeMap<String, String>,
     pub default_fallback: String,
+    pub mode: Mode,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -39,10 +49,10 @@ impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let tree = Self::build_tree(&db, &config)?;
         Ok(Musefs {
+            cache: HeaderCache::new(config.mode),
             db,
             config,
             tree,
-            cache: HeaderCache::new(),
         })
     }
 

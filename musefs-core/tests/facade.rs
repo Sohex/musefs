@@ -9,6 +9,7 @@ fn config() -> MountConfig {
         template: "$artist/$title".to_string(),
         fallbacks: BTreeMap::new(),
         default_fallback: "Unknown".to_string(),
+        mode: musefs_core::Mode::Synthesis,
     }
 }
 
