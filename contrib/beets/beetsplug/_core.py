@@ -152,6 +152,7 @@ _EXT_MIME = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
+    ".webp": "image/webp",
 }
 
 
@@ -161,13 +162,17 @@ def sniff_mime(data, path):
         return "image/jpeg"
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
+    # WebP: 'RIFF' <4-byte size> 'WEBP' (common in modern fetchart/exports).
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
     ext = os.path.splitext(path)[1].lower()
     return _EXT_MIME.get(ext, "application/octet-stream")
 
 
 def upsert_art(conn, data, mime):
     """Content-address ``data`` by sha256 and return its art id, inserting only
-    if new (mirrors musefs Db::upsert_art)."""
+    if new (mirrors musefs Db::upsert_art). If the sha256 already exists, the
+    stored row (and its mime) is kept and the ``mime`` argument is ignored."""
     sha = hashlib.sha256(data).hexdigest()
     conn.execute(
         "INSERT INTO art (sha256, mime, width, height, byte_len, data) "
