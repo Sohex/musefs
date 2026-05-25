@@ -1,7 +1,7 @@
 mod common;
 use common::{make_flac, streaminfo_body, vorbis_comment_body};
-use musefs_core::scan_directory;
-use musefs_db::Db;
+use musefs_core::{revalidate, scan_directory};
+use musefs_db::{Db, Tag};
 
 #[test]
 fn scans_flac_files_seeding_tracks_and_tags() {
@@ -97,6 +97,56 @@ fn scans_mp3_files_seeding_tracks_and_tags() {
     assert!(tags
         .iter()
         .any(|tag| tag.key == "title" && tag.value == "Track"));
+}
+
+#[test]
+fn revalidate_skips_unchanged_prunes_missing_and_gcs_art() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["TITLE=A"])),
+        ],
+        &[0xAA; 30],
+    );
+    std::fs::write(dir.path().join("a.flac"), &a).unwrap();
+    let gone = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["TITLE=G"])),
+        ],
+        &[0xBB; 30],
+    );
+    std::fs::write(dir.path().join("gone.flac"), &gone).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    assert_eq!(db.list_tracks().unwrap().len(), 2);
+
+    // An external edit to a's tags that a revalidate must NOT clobber (the file is
+    // unchanged on disk, so revalidate should skip re-reading it).
+    let a_id = db
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.backing_path.ends_with("a.flac"))
+        .unwrap()
+        .id;
+    db.replace_tags(a_id, &[Tag::new("title", "Edited", 0)])
+        .unwrap();
+
+    // Delete gone.flac from disk so revalidate prunes its track.
+    std::fs::remove_file(dir.path().join("gone.flac")).unwrap();
+
+    let stats = revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.unchanged, 1); // a.flac (size+mtime match) is skipped
+    assert_eq!(stats.pruned, 1); // gone.flac's track is removed
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    // The skipped file kept its externally-edited tag (not re-seeded from disk).
+    let tags = db.get_tags(tracks[0].id).unwrap();
+    assert!(tags.iter().any(|t| t.key == "title" && t.value == "Edited"));
 }
 
 fn flac_with_picture(comments: &[&str], img: &[u8]) -> Vec<u8> {

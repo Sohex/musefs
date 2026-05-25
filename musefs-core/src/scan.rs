@@ -18,6 +18,13 @@ pub struct ScanStats {
     pub skipped: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevalidateStats {
+    pub updated: u64,
+    pub unchanged: u64,
+    pub pruned: u64,
+}
+
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
@@ -83,6 +90,59 @@ fn probe(path: &Path, bytes: &[u8]) -> Option<Probed> {
     }
 }
 
+/// Upsert a track from a probed backing file: write the track row, replace its
+/// seeded tags, and ingest its embedded art (capped, deduped, clamped).
+fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
+    let track_id = db.upsert_track(&NewTrack {
+        backing_path: abs_path.to_string(),
+        format: probed.format,
+        audio_offset: probed.audio_offset as i64,
+        audio_length: probed.audio_length as i64,
+        backing_size: meta.len() as i64,
+        backing_mtime: mtime_secs(meta),
+    })?;
+
+    let mut tags = Vec::new();
+    let mut ordinals: HashMap<String, i64> = HashMap::new();
+    for (field, value) in probed.tags {
+        let key = field.to_lowercase();
+        let ord = ordinals.entry(key.clone()).or_insert(0);
+        tags.push(Tag::new(&key, &value, *ord));
+        *ord += 1;
+    }
+    db.replace_tags(track_id, &tags)?;
+
+    let mut track_arts = Vec::new();
+    // Filter before enumerating so skipped (oversized) art doesn't leave gaps
+    // in the stored ordinals.
+    let accepted = probed
+        .pictures
+        .into_iter()
+        .filter(|p| p.data.len() <= MAX_ART_BYTES);
+    for (ordinal, pic) in accepted.enumerate() {
+        let art_id = db.upsert_art(&NewArt {
+            mime: pic.mime,
+            width: (pic.width != 0).then_some(pic.width as i64),
+            height: (pic.height != 0).then_some(pic.height as i64),
+            data: pic.data,
+        })?;
+        // Valid ID3/FLAC picture types are 0..=20; clamp anything out of range.
+        let picture_type = if pic.picture_type <= 20 {
+            pic.picture_type as i64
+        } else {
+            0
+        };
+        track_arts.push(TrackArt {
+            art_id,
+            picture_type,
+            description: pic.description,
+            ordinal: ordinal as i64,
+        });
+    }
+    db.set_track_art(track_id, &track_arts)?;
+    Ok(())
+}
+
 /// Walk `root` recursively, inserting/updating a track row for each `.flac`/`.mp3`
 /// file (with audio bounds and validation stamps) and seeding its tags from the
 /// file's existing metadata. Files that fail to parse are skipped.
@@ -105,54 +165,54 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
         };
         let meta = std::fs::metadata(&path)?;
         let abs = std::fs::canonicalize(&path)?;
-        let track_id = db.upsert_track(&NewTrack {
-            backing_path: abs.to_string_lossy().to_string(),
-            format: probed.format,
-            audio_offset: probed.audio_offset as i64,
-            audio_length: probed.audio_length as i64,
-            backing_size: meta.len() as i64,
-            backing_mtime: mtime_secs(&meta),
-        })?;
-
-        let mut tags = Vec::new();
-        let mut ordinals: HashMap<String, i64> = HashMap::new();
-        for (field, value) in probed.tags {
-            let key = field.to_lowercase();
-            let ord = ordinals.entry(key.clone()).or_insert(0);
-            tags.push(Tag::new(&key, &value, *ord));
-            *ord += 1;
-        }
-        db.replace_tags(track_id, &tags)?;
-
-        let mut track_arts = Vec::new();
-        // Filter before enumerating so skipped (oversized) art doesn't leave gaps
-        // in the stored ordinals.
-        let accepted = probed
-            .pictures
-            .into_iter()
-            .filter(|p| p.data.len() <= MAX_ART_BYTES);
-        for (ordinal, pic) in accepted.enumerate() {
-            let art_id = db.upsert_art(&NewArt {
-                mime: pic.mime,
-                width: (pic.width != 0).then_some(pic.width as i64),
-                height: (pic.height != 0).then_some(pic.height as i64),
-                data: pic.data,
-            })?;
-            // Valid ID3/FLAC picture types are 0..=20; clamp anything out of range.
-            let picture_type = if pic.picture_type <= 20 {
-                pic.picture_type as i64
-            } else {
-                0
-            };
-            track_arts.push(TrackArt {
-                art_id,
-                picture_type,
-                description: pic.description,
-                ordinal: ordinal as i64,
-            });
-        }
-        db.set_track_art(track_id, &track_arts)?;
+        ingest(db, &abs.to_string_lossy(), &meta, probed)?;
         stats.scanned += 1;
     }
+    Ok(stats)
+}
+
+/// Re-validate an already-scanned library: re-probe only files whose size/mtime
+/// changed since the last scan (skipping unchanged ones so external tag edits in
+/// the DB are preserved), delete tracks whose backing file is gone (cascading
+/// tags/art links), and garbage-collect now-unreferenced art.
+pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
+    let mut files = Vec::new();
+    collect_audio(root, &mut files)?;
+
+    let mut stats = RevalidateStats {
+        updated: 0,
+        unchanged: 0,
+        pruned: 0,
+    };
+    for path in files {
+        let meta = std::fs::metadata(&path)?;
+        let abs = std::fs::canonicalize(&path)?;
+        let abs_str = abs.to_string_lossy().to_string();
+
+        if let Some(existing) = db.get_track_by_path(&abs_str)? {
+            if existing.backing_size == meta.len() as i64
+                && existing.backing_mtime == mtime_secs(&meta)
+            {
+                stats.unchanged += 1;
+                continue;
+            }
+        }
+
+        let bytes = std::fs::read(&path)?;
+        if let Some(probed) = probe(&path, &bytes) {
+            ingest(db, &abs_str, &meta, probed)?;
+            stats.updated += 1;
+        }
+    }
+
+    // Prune tracks whose backing file no longer exists (anywhere, not just `root`).
+    for track in db.list_tracks()? {
+        if std::fs::metadata(&track.backing_path).is_err() {
+            db.delete_track(track.id)?;
+            stats.pruned += 1;
+        }
+    }
+    db.gc_orphan_art()?;
+
     Ok(stats)
 }
