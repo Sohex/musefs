@@ -31,3 +31,14 @@ def test_symlink_resolved(tmp_path):
     link = tmp_path / "link.flac"
     link.symlink_to(real)
     assert realpath_key(str(link)) == os.path.realpath(str(real))
+
+
+def test_non_utf8_bytes_replaced_like_rust(tmp_path):
+    # A non-UTF-8 filename: Rust's to_string_lossy yields U+FFFD. We must match
+    # that, not surrogate-escape it (\udcff), or the key would silently mismatch.
+    raw = os.fsencode(str(tmp_path)) + b"/\xff.flac"
+    with open(raw, "wb") as fh:
+        fh.write(b"x")
+    key = realpath_key(raw)
+    assert "�" in key
+    assert "\udcff" not in key
