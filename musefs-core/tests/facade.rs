@@ -292,6 +292,8 @@ fn poll_refresh_picks_up_external_db_edits() {
     // Polling notices the external commit and rebuilds the tree.
     assert!(fs.poll_refresh().unwrap());
     assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_some());
+    // The rebuild is additive — the pre-existing entry is still present.
+    assert!(fs.lookup(VirtualTree::ROOT, "Alice").is_some());
     // A second poll with no further change is a no-op.
     assert!(!fs.poll_refresh().unwrap());
 }

@@ -84,16 +84,20 @@ impl Musefs {
     }
 
     /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
-    /// rebuild the tree and drop cached resolutions, then return `true`. The FUSE
-    /// layer calls this on metadata operations so external edits (a scan, a beets
-    /// retag) appear without remounting.
+    /// rebuild the tree and drop cached resolutions, then return `true`; the new
+    /// version stamp is committed only after a successful rebuild. The FUSE layer
+    /// calls this on metadata operations so external edits (a scan, a beets retag)
+    /// appear without remounting.
     pub fn poll_refresh(&mut self) -> Result<bool> {
         let version = self.db.data_version()?;
         if version == self.last_data_version {
             return Ok(false);
         }
+        // Rebuild before committing the new stamp: if build_tree fails, the stamp
+        // stays put so the next poll retries instead of silently serving a stale
+        // tree until the next unrelated external commit bumps data_version again.
+        self.refresh()?;
         self.last_data_version = version;
-        self.tree = Self::build_tree(&self.db, &self.config)?;
         self.cache.clear();
         Ok(true)
     }
