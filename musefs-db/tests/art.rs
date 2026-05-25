@@ -93,3 +93,49 @@ fn read_art_chunk_streams_a_slice() {
 
     assert!(db.get_art_meta(999_999).unwrap().is_none());
 }
+
+#[test]
+fn gc_orphan_art_removes_unreferenced_rows() {
+    let db = Db::open_in_memory().unwrap();
+    let track = db
+        .upsert_track(&musefs_db::NewTrack {
+            backing_path: "/x/a.flac".to_string(),
+            format: musefs_db::Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            backing_size: 0,
+            backing_mtime: 0,
+        })
+        .unwrap();
+    let referenced = db
+        .upsert_art(&NewArt {
+            mime: "image/png".to_string(),
+            width: None,
+            height: None,
+            data: vec![1, 2, 3],
+        })
+        .unwrap();
+    let orphan = db
+        .upsert_art(&NewArt {
+            mime: "image/png".to_string(),
+            width: None,
+            height: None,
+            data: vec![9, 9, 9],
+        })
+        .unwrap();
+    db.set_track_art(
+        track,
+        &[musefs_db::TrackArt {
+            art_id: referenced,
+            picture_type: 3,
+            description: String::new(),
+            ordinal: 0,
+        }],
+    )
+    .unwrap();
+
+    let removed = db.gc_orphan_art().unwrap();
+    assert_eq!(removed, 1);
+    assert!(db.get_art(referenced).unwrap().is_some());
+    assert!(db.get_art(orphan).unwrap().is_none());
+}

@@ -90,4 +90,12 @@ impl Db {
             None => Ok(None),
         }
     }
+
+    /// Delete a track row. Foreign keys cascade to its `tags` and `track_art`
+    /// rows; the referenced `art` rows are left for `gc_orphan_art`.
+    pub fn delete_track(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
 }
