@@ -68,3 +68,15 @@ def test_command_strips_leading_sync_verb():
     assert plugin._query_from_args(["sync", "artist:Band"]) == ["artist:Band"]
     assert plugin._query_from_args(["artist:Band"]) == ["artist:Band"]
     assert plugin._query_from_args([]) == []
+
+
+def test_album_imported_without_db_skips_gracefully(fake_item, fake_album, monkeypatch):
+    # Regression: _on_album_imported must not pass a None db path into _sync
+    # (which would TypeError in os.path.exists). With no db it should warn+skip.
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin, "config", FakeConfigView({"db": None, "fields": {}}), raising=False
+    )
+    album = fake_album(items=[fake_item(os.fsencode("/music/a.flac"), title="X")])
+    plugin._on_album_imported(album=album)  # must not raise
+    plugin._on_album_imported(album=None)   # must not raise
