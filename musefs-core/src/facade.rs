@@ -88,6 +88,11 @@ impl Musefs {
     /// version stamp is committed only after a successful rebuild. The FUSE layer
     /// calls this on metadata operations so external edits (a scan, a beets retag)
     /// appear without remounting.
+    ///
+    /// A rebuild reassigns inodes, so a descriptor held open across a refresh may
+    /// then resolve to a different node (or none). This is bounded by the FUSE
+    /// entry/attr TTL and degrades safely to `ENOENT`; refreshes are rare enough
+    /// (only on external commits) that this is acceptable for a read-only mount.
     pub fn poll_refresh(&mut self) -> Result<bool> {
         let version = self.db.data_version()?;
         if version == self.last_data_version {
