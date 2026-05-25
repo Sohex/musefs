@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use musefs_db::{Db, Format};
 use musefs_format::flac::{self, FlacScan};
-use musefs_format::{mp3, RegionLayout};
+use musefs_format::{mp3, RegionLayout, Segment};
 
 use crate::error::{CoreError, Result};
+use crate::facade::Mode;
 use crate::mapping::{tags_to_inputs, track_art_to_inputs};
 
 /// A fully resolved synthesized file: its segment layout, total size, the
@@ -22,9 +23,9 @@ pub struct ResolvedFile {
 
 /// A per-mount cache of resolved files, keyed by track id and invalidated when a
 /// track's `content_version` changes (the DB bumps it on any tag/art edit).
-#[derive(Default)]
 pub struct HeaderCache {
     map: HashMap<i64, Arc<ResolvedFile>>,
+    mode: Mode,
 }
 
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
@@ -44,12 +45,22 @@ fn read_front(path: &Path, n: u64) -> std::io::Result<Vec<u8>> {
 }
 
 impl HeaderCache {
-    pub fn new() -> HeaderCache {
-        HeaderCache::default()
+    pub fn new(mode: Mode) -> HeaderCache {
+        HeaderCache {
+            map: HashMap::new(),
+            mode,
+        }
     }
 
-    /// Resolve a track to its synthesized layout, building (and caching) it on a
-    /// content-version miss. Validates the backing file's size and mtime first.
+    /// Drop all cached resolutions (used when the DB changed underneath the mount).
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    /// Resolve a track to its layout — a freshly synthesized metadata region in
+    /// `Synthesis` mode, or a single whole-backing-file passthrough segment in
+    /// `StructureOnly` mode — building (and caching) it on a content-version miss.
+    /// Validates the backing file's size and mtime first.
     pub fn resolve(&mut self, db: &Db, track_id: i64) -> Result<Arc<ResolvedFile>> {
         let track = db
             .get_track(track_id)?
@@ -62,62 +73,78 @@ impl HeaderCache {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
-        // Guard the stored audio bounds before any cast/allocation: a negative
-        // bound, or an audio region that runs past the end of the backing file,
-        // means the row no longer matches the file.
-        if track.audio_offset < 0
-            || track.audio_length < 0
-            || (track.audio_offset as u64).saturating_add(track.audio_length as u64) > meta.len()
-        {
-            return Err(CoreError::BackingChanged(track.backing_path.clone()));
-        }
-
         if let Some(cached) = self.map.get(&track_id) {
             if cached.content_version == track.content_version {
                 return Ok(cached.clone());
             }
         }
 
-        let tags = db.get_tags(track_id)?;
-        let inputs = tags_to_inputs(&tags);
-        let art_inputs = track_art_to_inputs(db, track_id)?;
-
-        // FLAC re-reads the front for its preserved structural blocks; MP3 needs no
-        // front read — its ID3v2 tag is regenerated entirely from the DB and the
-        // Xing/LAME info frame travels with the backing audio.
-        let layout = match track.format {
-            Format::Flac => {
-                let front = read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
-                let fmeta = flac::read_metadata(&front)?;
-                let scan = FlacScan {
-                    audio_offset: track.audio_offset as u64,
-                    audio_length: track.audio_length as u64,
-                    preserved: fmeta.preserved,
-                };
-                flac::synthesize_layout(&scan, &inputs, &art_inputs)?
+        let (layout, total_len, mtime_secs_val) = match self.mode {
+            Mode::StructureOnly => {
+                // Pure passthrough: the synthesized "file" is the backing file itself.
+                // The stored audio bounds are irrelevant here — the whole file is served
+                // verbatim — so they are not validated in this mode.
+                let layout = RegionLayout::new(vec![Segment::BackingAudio {
+                    offset: 0,
+                    len: meta.len(),
+                }]);
+                (layout, meta.len(), track.backing_mtime)
             }
-            Format::Mp3 => mp3::synthesize_layout(
-                track.audio_offset as u64,
-                track.audio_length as u64,
-                &inputs,
-                &art_inputs,
-            )?,
+            Mode::Synthesis => {
+                // Guard the stored audio bounds before any cast/allocation: a negative
+                // bound, or an audio region that runs past the end of the backing file,
+                // means the row no longer matches the file. Only synthesis splices at
+                // these bounds, so the check is scoped to this mode.
+                if track.audio_offset < 0
+                    || track.audio_length < 0
+                    || (track.audio_offset as u64).saturating_add(track.audio_length as u64)
+                        > meta.len()
+                {
+                    return Err(CoreError::BackingChanged(track.backing_path.clone()));
+                }
+
+                let tags = db.get_tags(track_id)?;
+                let inputs = tags_to_inputs(&tags);
+                let art_inputs = track_art_to_inputs(db, track_id)?;
+
+                // FLAC re-reads the front for its preserved structural blocks; MP3 needs no
+                // front read — its ID3v2 tag is regenerated entirely from the DB and the
+                // Xing/LAME info frame travels with the backing audio.
+                let layout = match track.format {
+                    Format::Flac => {
+                        let front =
+                            read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
+                        let fmeta = flac::read_metadata(&front)?;
+                        let scan = FlacScan {
+                            audio_offset: track.audio_offset as u64,
+                            audio_length: track.audio_length as u64,
+                            preserved: fmeta.preserved,
+                        };
+                        flac::synthesize_layout(&scan, &inputs, &art_inputs)?
+                    }
+                    Format::Mp3 => mp3::synthesize_layout(
+                        track.audio_offset as u64,
+                        track.audio_length as u64,
+                        &inputs,
+                        &art_inputs,
+                    )?,
+                };
+                let total = layout.total_len();
+                (layout, total, track.backing_mtime.max(track.updated_at))
+            }
         };
-        let total_len = layout.total_len();
 
         let resolved = Arc::new(ResolvedFile {
             layout,
             total_len,
             content_version: track.content_version,
             backing_path: PathBuf::from(&track.backing_path),
-            mtime_secs: track.backing_mtime.max(track.updated_at),
+            mtime_secs: mtime_secs_val,
         });
         self.map.insert(track_id, resolved.clone());
         Ok(resolved)
     }
 }
-
-use musefs_format::Segment;
 
 /// Read `size` bytes starting at virtual `offset` from a resolved file, splicing
 /// inline framing with positioned reads of the backing audio. Returns fewer bytes

@@ -9,6 +9,7 @@ fn config() -> MountConfig {
         template: "$artist/$title".to_string(),
         fallbacks: BTreeMap::new(),
         default_fallback: "Unknown".to_string(),
+        mode: musefs_core::Mode::Synthesis,
     }
 }
 
@@ -235,4 +236,64 @@ fn serves_mp3_with_embedded_art_through_the_facade() {
     let pic = parsed.pictures().next().expect("a picture");
     assert_eq!(pic.data, img);
     assert_eq!(pic.mime_type, "image/jpeg");
+}
+
+#[test]
+fn poll_refresh_picks_up_external_db_edits() {
+    use musefs_db::{Format, NewTrack, Tag};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.db");
+
+    // Seed one track (Alice) and open a mount over the on-disk DB.
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x/a.flac".to_string(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[Tag::new("artist", "Alice", 0), Tag::new("title", "A", 0)],
+        )
+        .unwrap();
+    }
+    let db = musefs_db::Db::open(&db_path).unwrap();
+    let mut fs = Musefs::open(db, config()).unwrap();
+    assert!(fs.lookup(VirtualTree::ROOT, "Alice").is_some());
+    assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_none());
+
+    // A separate connection adds a track (as beets/picard would).
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        let id = db2
+            .upsert_track(&NewTrack {
+                backing_path: "/x/b.flac".to_string(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db2.replace_tags(
+            id,
+            &[Tag::new("artist", "Bob", 0), Tag::new("title", "B", 0)],
+        )
+        .unwrap();
+    }
+
+    // Polling notices the external commit and rebuilds the tree.
+    assert!(fs.poll_refresh().unwrap());
+    assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_some());
+    // The rebuild is additive — the pre-existing entry is still present.
+    assert!(fs.lookup(VirtualTree::ROOT, "Alice").is_some());
+    // A second poll with no further change is a no-op.
+    assert!(!fs.poll_refresh().unwrap());
 }

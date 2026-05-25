@@ -1,6 +1,6 @@
 mod common;
 use common::write_flac;
-use musefs_core::HeaderCache;
+use musefs_core::{read_at, HeaderCache, Mode};
 use musefs_db::{Db, Format, NewTrack, Tag};
 
 fn setup() -> (tempfile::TempDir, Db, i64) {
@@ -34,7 +34,7 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
 #[test]
 fn resolve_builds_layout_and_total_len() {
     let (_dir, db, id) = setup();
-    let mut cache = HeaderCache::new();
+    let mut cache = HeaderCache::new(Mode::Synthesis);
     let resolved = cache.resolve(&db, id).unwrap();
     assert!(resolved.total_len > 0);
     assert_eq!(resolved.total_len, resolved.layout.total_len());
@@ -44,7 +44,7 @@ fn resolve_builds_layout_and_total_len() {
 #[test]
 fn resolve_caches_until_content_version_changes() {
     let (_dir, db, id) = setup();
-    let mut cache = HeaderCache::new();
+    let mut cache = HeaderCache::new(Mode::Synthesis);
     let first = cache.resolve(&db, id).unwrap();
     let first_version = first.content_version;
 
@@ -82,7 +82,7 @@ fn resolve_errors_when_audio_bounds_overrun_the_file() {
         })
         .unwrap();
 
-    let mut cache = HeaderCache::new();
+    let mut cache = HeaderCache::new(Mode::Synthesis);
     assert!(matches!(
         cache.resolve(&db, id),
         Err(musefs_core::CoreError::BackingChanged(_))
@@ -92,7 +92,7 @@ fn resolve_errors_when_audio_bounds_overrun_the_file() {
 #[test]
 fn resolve_errors_when_backing_file_changes() {
     let (dir, db, id) = setup();
-    let mut cache = HeaderCache::new();
+    let mut cache = HeaderCache::new(Mode::Synthesis);
     cache.resolve(&db, id).unwrap();
 
     std::fs::write(dir.path().join("song.flac"), b"fLaC truncated").unwrap();
@@ -128,11 +128,37 @@ fn resolve_includes_art_image_segments() {
     )
     .unwrap();
 
-    let mut cache = HeaderCache::new();
+    let mut cache = HeaderCache::new(Mode::Synthesis);
     let resolved = cache.resolve(&db, id).unwrap();
     assert!(resolved
         .layout
         .segments
         .iter()
         .any(|s| matches!(s, Segment::ArtImage { art_id: a, len } if *a == art_id && *len == 80)));
+}
+
+#[test]
+fn structure_only_resolves_to_whole_backing_file() {
+    use musefs_format::Segment;
+
+    let (dir, db, id) = setup();
+    let backing = dir.path().join("song.flac");
+    let original = std::fs::read(&backing).unwrap();
+
+    let mut cache = HeaderCache::new(Mode::StructureOnly);
+    let resolved = cache.resolve(&db, id).unwrap();
+
+    // Passthrough: one whole-file backing segment, size == the real file.
+    assert_eq!(resolved.total_len, original.len() as u64);
+    assert_eq!(
+        resolved.layout.segments,
+        vec![Segment::BackingAudio {
+            offset: 0,
+            len: original.len() as u64
+        }]
+    );
+
+    // Reading the whole file yields the original bytes unchanged (not synthesized).
+    let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+    assert_eq!(whole, original);
 }

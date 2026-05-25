@@ -121,4 +121,14 @@ impl Db {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// Delete `art` rows no longer referenced by any `track_art`. Returns the
+    /// number of rows removed.
+    pub fn gc_orphan_art(&self) -> Result<usize> {
+        let removed = self.conn.execute(
+            "DELETE FROM art WHERE id NOT IN (SELECT art_id FROM track_art)",
+            [],
+        )?;
+        Ok(removed)
+    }
 }

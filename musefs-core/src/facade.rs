@@ -8,12 +8,22 @@ use crate::reader::{read_at, HeaderCache};
 use crate::template::render_path;
 use crate::tree::{NodeKind, VirtualTree};
 
+/// How the mount serves file *contents*. The virtual tree is identical either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Splice a freshly synthesized metadata region in front of the backing audio.
+    Synthesis,
+    /// Pure passthrough: serve the original backing file bytes unchanged.
+    StructureOnly,
+}
+
 /// Per-mount configuration for rendering the virtual hierarchy.
 #[derive(Debug, Clone)]
 pub struct MountConfig {
     pub template: String,
     pub fallbacks: BTreeMap<String, String>,
     pub default_fallback: String,
+    pub mode: Mode,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -33,16 +43,19 @@ pub struct Musefs {
     config: MountConfig,
     tree: VirtualTree,
     cache: HeaderCache,
+    last_data_version: i64,
 }
 
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let tree = Self::build_tree(&db, &config)?;
+        let last_data_version = db.data_version()?;
         Ok(Musefs {
+            cache: HeaderCache::new(config.mode),
+            last_data_version,
             db,
             config,
             tree,
-            cache: HeaderCache::new(),
         })
     }
 
@@ -68,6 +81,30 @@ impl Musefs {
     pub fn refresh(&mut self) -> Result<()> {
         self.tree = Self::build_tree(&self.db, &self.config)?;
         Ok(())
+    }
+
+    /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
+    /// rebuild the tree and drop cached resolutions, then return `true`; the new
+    /// version stamp is committed only after a successful rebuild. The FUSE layer
+    /// calls this on metadata operations so external edits (a scan, a beets retag)
+    /// appear without remounting.
+    ///
+    /// A rebuild reassigns inodes, so a descriptor held open across a refresh may
+    /// then resolve to a different node (or none). This is bounded by the FUSE
+    /// entry/attr TTL and degrades safely to `ENOENT`; refreshes are rare enough
+    /// (only on external commits) that this is acceptable for a read-only mount.
+    pub fn poll_refresh(&mut self) -> Result<bool> {
+        let version = self.db.data_version()?;
+        if version == self.last_data_version {
+            return Ok(false);
+        }
+        // Rebuild before committing the new stamp: if build_tree fails, the stamp
+        // stays put so the next poll retries instead of silently serving a stale
+        // tree until the next unrelated external commit bumps data_version again.
+        self.refresh()?;
+        self.last_data_version = version;
+        self.cache.clear();
+        Ok(true)
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {

@@ -85,6 +85,7 @@ impl MusefsFs {
 
 impl Filesystem for MusefsFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _ = self.core.poll_refresh();
         let name = match name.to_str() {
             Some(n) => n,
             None => return reply.error(libc::ENOENT),
@@ -104,6 +105,7 @@ impl Filesystem for MusefsFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        let _ = self.core.poll_refresh();
         match self.core.getattr(ino) {
             Ok(attr) => reply.attr(
                 &TTL,
@@ -141,6 +143,7 @@ impl Filesystem for MusefsFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let _ = self.core.poll_refresh();
         let entries = match self.core.readdir(ino) {
             Ok(e) => e,
             Err(e) => return reply.error(errno(&e)),
