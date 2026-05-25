@@ -17,10 +17,12 @@ whose path wasn't scanned is reported as skipped.
 
 ## Install (local / development)
 
-No install needed — point beets at this directory. In your beets `config.yaml`:
+No install needed — point beets at the plugin's `beetsplug` directory. beets adds
+`pluginpath` entries directly to the `beetsplug` package path, so it must be the
+`beetsplug` dir itself (not its parent). In your beets `config.yaml`:
 
 ```yaml
-pluginpath: /path/to/musefs/contrib/beets
+pluginpath: /path/to/musefs/contrib/beets/beetsplug
 plugins: musefs
 musefs:
   db: ~/musefs.db          # path to the musefs SQLite store (required)
