@@ -54,8 +54,7 @@ fn scan_ingests_flacs_into_a_fresh_db() {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("musefs.db");
 
-    let stats = run_scan(&db_path, backing.path()).unwrap();
-    assert_eq!(stats.scanned, 1);
+    run_scan(&db_path, backing.path(), false).unwrap();
 
     // The DB file was created and persists the track.
     let db = musefs_db::Db::open(&db_path).unwrap();
