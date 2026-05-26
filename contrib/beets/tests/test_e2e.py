@@ -342,3 +342,18 @@ def test_e2e_art_external_via_plugin(tmp_path):
     _beet(cfg, env, "musefs")  # plugin syncs album.artpath into track_art
     with _mounted(mnt, db, "$albumartist/$album/$title"):
         _check_mount_art(cfg, env, mnt, hashlib.sha256(cover).hexdigest())
+
+
+def test_e2e_art_precedence_beets_wins(tmp_path):
+    embedded = _make_cover(tmp_path / "embed.png", "red")
+    external = _make_cover(tmp_path / "ext.jpg", "blue")
+    embedded_sha = hashlib.sha256(embedded).hexdigest()
+    external_sha = hashlib.sha256(external).hexdigest()
+    assert embedded_sha != external_sha  # the two covers must be distinguishable
+
+    cfg, env, db, mnt, _ = _imported_library(
+        tmp_path, embed_cover=embedded, external_cover=external)
+    _beet(cfg, env, "musefs")  # scan ingests A, then sync replaces with B
+    with _mounted(mnt, db, "$albumartist/$album/$title"):
+        # beets art (external B) wins; the embedded A must not survive.
+        _check_mount_art(cfg, env, mnt, external_sha)
