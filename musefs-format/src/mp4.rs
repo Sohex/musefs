@@ -800,6 +800,64 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn build_udta_groups_multi_value_text() {
+        // Two consecutive same-key text tags must collapse into ONE ilst atom
+        // carrying REPEATED `data` sub-boxes (iTunes multi-value convention),
+        // not two separate atoms and not a dropped value.
+        let tags = vec![
+            TagInput::new("genre", "Rock"),
+            TagInput::new("genre", "Metal"),
+        ];
+        let (prefix, art_len) = build_udta(&tags, None).unwrap();
+        assert_eq!(art_len, 0);
+
+        // Exactly one `©gen` atom.
+        let gen_count = prefix.windows(4).filter(|w| *w == b"\xa9gen").count();
+        assert_eq!(
+            gen_count, 1,
+            "expected exactly one genre atom, got {gen_count}"
+        );
+
+        // Locate the `©gen` atom header and parse its children: must be two `data`
+        // sub-boxes. The 4-byte kind sits at offset +4 of the box, so back up 4.
+        let kind_at = prefix
+            .windows(4)
+            .position(|w| w == b"\xa9gen")
+            .expect("genre atom present");
+        let atom = read_box(&prefix, kind_at - 4).unwrap();
+        assert_eq!(&atom.kind, b"\xa9gen");
+        let children = child_boxes(atom.payload(&prefix)).unwrap();
+        let data_count = children.iter().filter(|c| &c.kind == b"data").count();
+        assert_eq!(
+            data_count, 2,
+            "expected two data sub-boxes, got {data_count}"
+        );
+
+        // Both values survive into the bytes.
+        assert!(prefix.windows(4).any(|w| w == b"Rock"));
+        assert!(prefix.windows(5).any(|w| w == b"Metal"));
+    }
+
+    #[test]
+    fn build_udta_empty_tags_is_valid() {
+        // A real file with no tags must still yield a structurally valid (empty)
+        // udta, not a malformed box.
+        let (prefix, art_len) = build_udta(&[], None).unwrap();
+        assert_eq!(art_len, 0);
+        let b = read_box(&prefix, 0).unwrap();
+        assert_eq!(&b.kind, b"udta");
+        assert_eq!(b.total_len, prefix.len());
+        // Round-trips as having no tags.
+        let buf = [
+            bx(b"ftyp", b"M4A "),
+            bx(b"moov", &prefix),
+            bx(b"mdat", b"A"),
+        ]
+        .concat();
+        assert!(read_tags(&buf).is_empty());
+    }
+
     fn inline_head(layout: &RegionLayout) -> Vec<u8> {
         match &layout.segments()[0] {
             Segment::Inline(b) => b.clone(),
