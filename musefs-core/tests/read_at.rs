@@ -115,6 +115,7 @@ fn read_at_streams_art_image_segments() {
         content_version: 0,
         backing_path: std::path::PathBuf::from("/unused"),
         mtime_secs: 0,
+        ogg_index: once_cell::sync::OnceCell::new(),
     };
 
     // Whole read: inline framing then the streamed art bytes.

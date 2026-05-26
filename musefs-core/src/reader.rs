@@ -5,10 +5,12 @@ use std::sync::Arc;
 use musefs_db::{Db, Format};
 use musefs_format::flac::{self, FlacScan};
 use musefs_format::{mp3, mp4, RegionLayout, Segment};
+use once_cell::sync::OnceCell;
 
 use crate::error::{CoreError, Result};
 use crate::facade::Mode;
 use crate::mapping::{tags_to_inputs, track_art_to_inputs};
+use crate::ogg_index::{build_index, serve, OggPageIndex};
 
 /// A fully resolved synthesized file: its segment layout, total size, the
 /// content version it was built from, and where the backing audio lives.
@@ -19,6 +21,9 @@ pub struct ResolvedFile {
     pub content_version: i64,
     pub backing_path: PathBuf,
     pub mtime_secs: i64,
+    /// Lazily built on the first read that touches an `OggAudio` segment; guarded
+    /// so concurrent first reads build it once. Empty for non-Ogg files.
+    pub ogg_index: OnceCell<Arc<OggPageIndex>>,
 }
 
 /// A per-mount cache of resolved files, keyed by track id and invalidated when a
@@ -150,6 +155,7 @@ impl HeaderCache {
             content_version: track.content_version,
             backing_path: PathBuf::from(&track.backing_path),
             mtime_secs: mtime_secs_val,
+            ogg_index: OnceCell::new(),
         });
         self.map.insert(track_id, resolved.clone());
         Ok(resolved)
@@ -197,7 +203,23 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
                     let chunk = db.read_art_chunk(*art_id, within, n)?;
                     out.extend_from_slice(&chunk);
                 }
-                Segment::OggAudio { .. } => unreachable!("OggAudio serving lands in Task 14"),
+                Segment::OggAudio {
+                    offset: ao,
+                    seq_delta,
+                    len,
+                } => {
+                    let index = resolved
+                        .ogg_index
+                        .get_or_try_init(|| {
+                            build_index(&resolved.backing_path, *ao, *len, *seq_delta).map(Arc::new)
+                        })?
+                        .clone();
+                    if backing.is_none() {
+                        backing = Some(std::fs::File::open(&resolved.backing_path)?);
+                    }
+                    let f = backing.as_ref().unwrap();
+                    serve(&index, f, *ao, within, within + n as u64, &mut out)?;
+                }
             }
         }
         seg_start = seg_end;
@@ -206,4 +228,72 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod ogg_serve_tests {
+    use super::*;
+    use musefs_format::ogg::page_test_support::lace_packet_pub;
+    use musefs_format::Segment;
+    use std::io::Write;
+
+    #[test]
+    fn read_at_renumbers_audio_and_preserves_payload() {
+        // Build a file: 8 header bytes + two audio pages (seq 3,4).
+        let (mut audio, _) = lace_packet_pub(0x99, 3, false, 10, &vec![0xA1u8; 200]);
+        let (a2, _) = lace_packet_pub(0x99, 4, false, 20, &vec![0xB2u8; 250]);
+        audio.extend_from_slice(&a2);
+        let audio_offset = 8u64;
+        let mut file_bytes = vec![0xFFu8; audio_offset as usize];
+        file_bytes.extend_from_slice(&audio);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.opus");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&file_bytes)
+            .unwrap();
+
+        let layout = RegionLayout::new(vec![
+            Segment::Inline(b"HDRBYTES".to_vec()), // 8 inline header bytes
+            Segment::OggAudio {
+                offset: audio_offset,
+                len: audio.len() as u64,
+                seq_delta: 1, // 3->4, 4->5
+            },
+        ]);
+        let total = layout.total_len();
+        let resolved = ResolvedFile {
+            layout,
+            total_len: total,
+            content_version: 0,
+            backing_path: path.clone(),
+            mtime_secs: 0,
+            ogg_index: OnceCell::new(),
+        };
+
+        // Read the whole virtual file; needs a Db only for ArtImage (unused here).
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let got = read_at(&resolved, &db, 0, total).unwrap();
+        assert_eq!(got.len(), total as usize);
+        assert_eq!(&got[0..8], b"HDRBYTES");
+
+        // The served audio region must have renumbered seqs (4 and 5) and identical
+        // payloads to the source.
+        let served_audio = &got[8..];
+        let h0 = musefs_format::ogg::parse_page(served_audio, 0).unwrap();
+        assert_eq!(h0.seq, 4);
+        let p1_off = h0.total_len();
+        let h1 = musefs_format::ogg::parse_page(served_audio, p1_off).unwrap();
+        assert_eq!(h1.seq, 5);
+        // Payload bytes unchanged.
+        assert!(served_audio[h0.header_len..h0.total_len()]
+            .iter()
+            .all(|&b| b == 0xA1));
+        assert!(
+            served_audio[p1_off + h1.header_len..p1_off + h1.total_len()]
+                .iter()
+                .all(|&b| b == 0xB2)
+        );
+    }
 }

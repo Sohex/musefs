@@ -72,6 +72,52 @@ pub fn build_index(
     Ok(OggPageIndex { pages })
 }
 
+use std::os::unix::fs::FileExt;
+
+/// Serve `[rstart, rend)` (relative to the start of the audio region) into `out`,
+/// splicing patched page headers with verbatim payload bytes read from the backing
+/// file at `audio_offset + region payload position`.
+pub fn serve(
+    index: &OggPageIndex,
+    backing: &std::fs::File,
+    audio_offset: u64,
+    rstart: u64,
+    rend: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    for p in &index.pages {
+        let hlen = p.header.len() as u64;
+        let page_start = p.region_offset;
+        let header_end = page_start + hlen;
+        let payload_end = header_end + p.payload_len;
+        if payload_end <= rstart {
+            continue;
+        }
+        if page_start >= rend {
+            break;
+        }
+        // Header overlap.
+        let hs = rstart.max(page_start);
+        let he = rend.min(header_end);
+        if hs < he {
+            let a = (hs - page_start) as usize;
+            let b = (he - page_start) as usize;
+            out.extend_from_slice(&p.header[a..b]);
+        }
+        // Payload overlap (served from the backing file).
+        let ps = rstart.max(header_end);
+        let pe = rend.min(payload_end);
+        if ps < pe {
+            let within = ps - header_end;
+            let n = (pe - ps) as usize;
+            let mut buf = vec![0u8; n];
+            backing.read_exact_at(&mut buf, audio_offset + p.region_offset + hlen + within)?;
+            out.extend_from_slice(&buf);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
