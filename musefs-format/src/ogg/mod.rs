@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn synthesize_opus_embeds_art_that_round_trips() {
         let mut data = opus_headers();
-        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &vec![0u8; 80]);
+        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 80]);
         data.extend_from_slice(&audio);
         let scan = locate_audio(&data).unwrap();
         let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
