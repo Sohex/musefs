@@ -2,7 +2,14 @@ import sqlite3
 
 import pytest
 
-from beetsplug._core import SchemaMismatch, check_schema_version, connect, replace_tags, track_id_for_path
+from beetsplug._core import (
+    SchemaMismatch,
+    check_schema_version,
+    connect,
+    prune_missing,
+    replace_tags,
+    track_id_for_path,
+)
 
 
 def test_connect_and_version_ok(db_path):
@@ -89,6 +96,27 @@ def test_replace_tags_empty_pairs_clears(db_path, make_track):
             "SELECT COUNT(*) FROM tags WHERE track_id=?", (tid,)
         ).fetchone()[0]
         assert count == 0
+    finally:
+        conn.close()
+
+
+def test_prune_missing_deletes_absent_files_and_cascades(db_path, make_track, tmp_path):
+    present = tmp_path / "here.flac"
+    present.write_bytes(b"x")
+    keep = make_track(str(present))
+    drop = make_track("/no/such/gone.flac")  # file does not exist (moved/deleted)
+    conn = connect(db_path)
+    try:
+        replace_tags(conn, drop, [("title", "Gone")])
+        conn.commit()
+        pruned = prune_missing(conn)
+        conn.commit()
+        assert pruned == 1
+        assert [r[0] for r in conn.execute("SELECT id FROM tracks")] == [keep]
+        # Cascade removed the dropped track's tags.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tags WHERE track_id=?", (drop,)
+        ).fetchone()[0] == 0
     finally:
         conn.close()
 

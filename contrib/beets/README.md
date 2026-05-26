@@ -48,17 +48,24 @@ musefs mount ~/mnt --db ~/musefs.db \
     --template '$albumartist/$album/$tracknumber - $title'
 ```
 
-Imports and tag write-backs also auto-sync via event hooks: `beet import` and
-`beet modify -w …` each scan the touched file and sync it (creating the DB on
-first use). A metadata-only `beet modify` (no `-w`) doesn't fire a hook — re-run
-`beet musefs` to pick those edits up. With `autoscan: no`, run `musefs scan`
-yourself first; the hooks then become best-effort and skip if the DB is missing.
+Imports and tag write-backs auto-sync via event hooks: `beet import` and
+`beet modify -w …` record the touched items and reconcile them once the command
+finishes — when each file's path is final (beets has no move event, and a write
+fires *before* its move). The reconcile scans the new path and prunes the row
+left behind at the old one. A metadata-only `beet modify` (no `-w`) doesn't fire
+a hook — re-run `beet musefs`. With `autoscan: no`, run `musefs scan` yourself
+first; the hooks then skip gracefully if the DB is missing.
 
 ## Notes
 
 - **Cover art:** taken from the album's `artpath` (beets' external cover file).
   beets art wins when present; otherwise any art `musefs scan` ingested from
   embedded pictures is preserved.
+- **Moves & deletes:** every sync (the command and the end-of-command reconcile)
+  prunes track rows whose backing file is no longer present, so renames/moves
+  don't leave stale entries. Caveat: a file that's merely offline at sync time
+  (e.g. an unmounted network share) is also pruned — sync while the library is
+  available.
 - **Orphaned art:** replacing art can orphan old blobs; `musefs scan --revalidate`
   garbage-collects them.
 - **Schema version:** the plugin refuses to run if the DB's `user_version` differs

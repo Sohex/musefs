@@ -20,9 +20,15 @@ class MusefsPlugin(BeetsPlugin):
                 "autoscan": True,  # run `musefs scan` automatically before syncing
             }
         )
-        self.register_listener("after_write", self._on_after_write)
-        self.register_listener("item_imported", self._on_item_imported)
-        self.register_listener("album_imported", self._on_album_imported)
+        # beets has no file-move event, and `after_write` fires *before* a move
+        # (at the old path). So imports/writes are recorded and reconciled once
+        # at cli_exit, when each item's path is final, where we also prune rows
+        # whose backing file has moved away.
+        self._pending = []
+        self.register_listener("after_write", self._record)
+        self.register_listener("item_imported", self._record)
+        self.register_listener("album_imported", self._record_album)
+        self.register_listener("cli_exit", self._reconcile_pending)
 
     # --- command ---------------------------------------------------------
 
@@ -64,21 +70,42 @@ class MusefsPlugin(BeetsPlugin):
             )
             self._run_scan(db_path, targets)
         stats = self._sync(db_path, items, dry_run=opts.dry_run)
+        pruned = 0 if opts.dry_run else self._prune_missing(db_path)
         # ui.print_ (not self._log) so the summary always shows, not only at -v.
-        ui.print_(f"musefs: {stats.summary()}")
+        ui.print_(f"musefs: {stats.summary()} pruned={pruned}")
 
     # --- event listeners -------------------------------------------------
 
-    def _on_after_write(self, item=None, path=None, **kwargs):
-        self._sync_listener([item] if item is not None else [])
+    def _record(self, item=None, **kwargs):
+        if item is not None:
+            self._pending.append(item)
 
-    def _on_item_imported(self, lib=None, item=None, **kwargs):
-        self._sync_listener([item] if item is not None else [])
+    def _record_album(self, album=None, **kwargs):
+        if album is not None:
+            self._pending.extend(album.items())
 
-    def _on_album_imported(self, lib=None, album=None, **kwargs):
-        if album is None:
+    def _reconcile_pending(self, lib=None, **kwargs):
+        """End-of-command reconcile: sync every touched item at its final path,
+        then prune rows whose backing file moved away. Best-effort — a passive
+        hook must never abort the beets operation, so errors become warnings."""
+        pending, self._pending = self._pending, []
+        # Dedup by final on-disk path (an item may fire several events).
+        items = list(
+            {os.fsdecode(i.path): i for i in pending if i is not None}.values()
+        )
+        if not items:
             return
-        self._sync_listener(list(album.items()))
+        db_path = self._db_path()
+        if not db_path:
+            self._log.warning("musefs: no `musefs.db` configured; skipping sync")
+            return
+        try:
+            if self._autoscan():
+                self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
+            self._sync(db_path, items)
+            self._prune_missing(db_path)
+        except ui.UserError as exc:
+            self._log.warning("musefs: {}", exc)
 
     # --- helpers ---------------------------------------------------------
 
@@ -121,23 +148,18 @@ class MusefsPlugin(BeetsPlugin):
                     f"{result.stderr.decode(errors='replace').strip()}"
                 )
 
-    def _sync_listener(self, items):
-        """Sync a listener's affected items. Best-effort: a passive hook must
-        never abort the user's beets operation, so a missing DB / scan failure
-        is downgraded to a warning rather than raised."""
-        items = [i for i in items if i is not None]
-        if not items:
-            return
-        db_path = self._db_path()
-        if not db_path:
-            self._log.warning("musefs: no `musefs.db` configured; skipping sync")
-            return
+    def _prune_missing(self, db_path):
+        """Drop rows whose backing file no longer exists (moved/deleted).
+        Returns the number pruned."""
+        if not os.path.exists(db_path):
+            return 0
+        conn = _core.connect(db_path)
         try:
-            if self._autoscan():
-                self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
-            self._sync(db_path, items)
-        except ui.UserError as exc:
-            self._log.warning("musefs: {}", exc)
+            pruned = _core.prune_missing(conn)
+            conn.commit()
+            return pruned
+        finally:
+            conn.close()
 
     def _sync(self, db_path, items, dry_run=False):
         if not os.path.exists(db_path):
