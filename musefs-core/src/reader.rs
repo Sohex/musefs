@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use musefs_db::{Db, Format};
 use musefs_format::flac::{self, FlacScan};
@@ -50,10 +50,19 @@ struct Shard {
 
 impl Shard {
     fn new(budget: u64) -> Shard {
-        Shard { map: HashMap::new(), head: None, tail: None, bytes: 0, budget }
+        Shard {
+            map: HashMap::new(),
+            head: None,
+            tail: None,
+            bytes: 0,
+            budget,
+        }
     }
     fn unlink(&mut self, key: i64) {
-        let (prev, next) = { let n = &self.map[&key]; (n.prev, n.next) };
+        let (prev, next) = {
+            let n = &self.map[&key];
+            (n.prev, n.next)
+        };
         match prev {
             Some(p) => self.map.get_mut(&p).unwrap().next = next,
             None => self.head = next,
@@ -93,7 +102,14 @@ impl Shard {
             self.bytes -= old_bytes;
             self.map.get_mut(&key).unwrap().value = value;
         } else {
-            self.map.insert(key, LruNode { value, prev: None, next: None });
+            self.map.insert(
+                key,
+                LruNode {
+                    value,
+                    prev: None,
+                    next: None,
+                },
+            );
         }
         self.bytes += add;
         self.push_front(key);
@@ -111,7 +127,12 @@ impl Shard {
         self.bytes = 0;
     }
     fn retain_keys(&mut self, live: &HashSet<i64>) {
-        let dead: Vec<i64> = self.map.keys().copied().filter(|k| !live.contains(k)).collect();
+        let dead: Vec<i64> = self
+            .map
+            .keys()
+            .copied()
+            .filter(|k| !live.contains(k))
+            .collect();
         for k in dead {
             self.unlink(k);
             if let Some(n) = self.map.remove(&k) {
@@ -154,7 +175,9 @@ impl HeaderCache {
     }
     pub fn with_budget(mode: Mode, budget: u64) -> HeaderCache {
         let per_shard = (budget / CACHE_SHARDS as u64).max(1);
-        let shards = (0..CACHE_SHARDS).map(|_| Mutex::new(Shard::new(per_shard))).collect();
+        let shards = (0..CACHE_SHARDS)
+            .map(|_| Mutex::new(Shard::new(per_shard)))
+            .collect();
         HeaderCache { shards, mode }
     }
     fn shard(&self, track_id: i64) -> std::sync::MutexGuard<'_, Shard> {
@@ -170,7 +193,9 @@ impl HeaderCache {
     /// Drop cached resolutions for tracks no longer present (`live` = current ids).
     pub fn retain(&self, live: &HashSet<i64>) {
         for s in &self.shards {
-            s.lock().unwrap_or_else(|p| p.into_inner()).retain_keys(live);
+            s.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain_keys(live);
         }
     }
     /// Resolve a track to its layout, caching on a content-version miss. Validation
@@ -590,8 +615,7 @@ mod resolve_ogg_tests {
 
         let via_open = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
         let file = std::fs::File::open(&resolved.backing_path).unwrap();
-        let via_file =
-            read_at_with_file(&resolved, &db, &file, 0, resolved.total_len).unwrap();
+        let via_file = read_at_with_file(&resolved, &db, &file, 0, resolved.total_len).unwrap();
         assert_eq!(via_open, via_file);
     }
 }
@@ -737,6 +761,47 @@ mod cache_bound_tests {
         let a = cache.resolve(&db, id).unwrap();
         let b = cache.resolve(&db, id).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn resolve_is_safe_under_concurrent_access() {
+        // Many threads resolving the same track exercise the off-lock build race
+        // (concurrent miss → build → insert on one shard) and concurrent gets.
+        // Each thread needs its own connection (Db is !Sync), so use a file-backed
+        // DB and open_readonly per thread.
+        let dir = tempfile::tempdir().unwrap();
+        let flac_path = dir.path().join("a.flac");
+        let (audio_offset, audio_length) = write_flac_local(&flac_path);
+        let db_path = dir.path().join("m.db");
+        let track_id = {
+            let db = Db::open(&db_path).unwrap();
+            let meta = std::fs::metadata(&flac_path).unwrap();
+            db.upsert_track(&NewTrack {
+                backing_path: flac_path.to_string_lossy().to_string(),
+                format: Format::Flac,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len() as i64,
+                backing_mtime: mtime_secs(&meta),
+            })
+            .unwrap()
+        };
+
+        let cache = std::sync::Arc::new(HeaderCache::new(Mode::Synthesis));
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let cache = std::sync::Arc::clone(&cache);
+                let db_path = db_path.clone();
+                s.spawn(move || {
+                    let db = Db::open_readonly(&db_path).unwrap();
+                    for _ in 0..50 {
+                        let r = cache.resolve(&db, track_id).unwrap();
+                        assert!(r.total_len > 0);
+                        assert_eq!(r.content_version, 0);
+                    }
+                });
+            }
+        });
     }
 
     fn write_flac_local(path: &std::path::Path) -> (i64, i64) {

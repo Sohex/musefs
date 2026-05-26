@@ -18,8 +18,8 @@ fn config() -> MountConfig {
 
 fn bench_sequential_read(c: &mut Criterion) {
     let audio_len = 4 * 1024 * 1024usize; // 4 MiB
-    // Bind the buffer so the slice passed to make_flac is not an inline `&vec![...]`
-    // (avoids clippy::useless_vec while keeping the 4 MiB off the stack).
+                                          // Bind the buffer so the slice passed to make_flac is not an inline `&vec![...]`
+                                          // (avoids clippy::useless_vec while keeping the 4 MiB off the stack).
     let audio = vec![0x7E_u8; audio_len];
     let dir = tempfile::tempdir().unwrap();
     let flac = make_flac(
