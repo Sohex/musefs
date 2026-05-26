@@ -541,6 +541,7 @@ dependencies = [
  "metaflac",
  "musefs-core",
  "musefs-db",
+ "musefs-format",
  "ogg",
  "tempfile",
 ]
