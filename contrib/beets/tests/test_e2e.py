@@ -322,3 +322,11 @@ def test_e2e_move_reconcile(tmp_path):
         assert ft["title"] == ["Relocated FLAC"]
         flac_backing = _beet(cfg, env, "ls", "-p", "format:FLAC").strip()
         assert _audio_md5(new) == _audio_md5(flac_backing)
+
+
+def test_e2e_art_embedded_via_scan(tmp_path):
+    cover = _make_cover(tmp_path / "embed.png", "red")
+    cfg, env, db, mnt, _ = _imported_library(tmp_path, embed_cover=cover)
+    _beet(cfg, env, "musefs")  # autoscan ingests the embedded pictures
+    with _mounted(mnt, db, "$albumartist/$album/$title"):
+        _check_mount_art(cfg, env, mnt, hashlib.sha256(cover).hexdigest())
