@@ -47,30 +47,22 @@ never the payloads:
 - **Sequence number:** `new_seq = old_seq + delta`, where
   `delta = new_header_page_count − original_header_page_count` (constant for all
   audio pages).
-- **CRC:** patched algebraically, never recomputed over payload. Ogg's CRC-32
-  (polynomial `0x04c11db7`, init `0`, no input/output reflection, no final XOR)
-  is a **linear map over GF(2)**, so for a fixed-length page:
+- **CRC:** recomputed per page over the patched page bytes. Ogg's CRC-32
+  (polynomial `0x04c11db7`, init `0`, no input/output reflection, no final XOR) is
+  recomputed while each page's bytes sit in the buffered scan described below —
+  over the page header with its patched sequence number plus the unchanged payload
+  — and the resulting 4-byte value is stored in the page index. No payload byte is
+  ever copied into the served output or modified; payloads are served only from
+  `BackingAudio`.
 
-  ```
-  CRC(page_new) = CRC(page_old) XOR CRC(diff)
-  ```
-
-  `CRC(page_old)` is already stored in the page header (read for free while
-  parsing). `diff` is a page-length buffer that is zero except for the 4
-  sequence-number bytes (old XOR new) at offset 18; its CRC depends only on those
-  4 bytes plus the page length (trailing zeros "roll the register forward" via a
-  precomputed `x^(8·n) mod poly` zero-advance operator). No payload byte is ever
-  copied into the served output or modified — the CRC math needs only the 4-byte
-  sequence delta and the page length (a buffered scan reads payload bytes off disk
-  only as a side effect of reaching the next header; see below).
-
-This patch needs each page's stored CRC and its byte boundaries — i.e. the page
-**headers**, not the payloads. But "headers only" is not free: seeking past every
-small payload would cost one syscall per page (thousands per track — pathological
-on an HDD or NAS). So the page index is built with a single **buffered sequential
-pass** over the audio region, and that pass is **deferred to the first `read()`
+Building this index needs each page's boundaries and a fresh CRC. Rather than seek
+past every payload to touch headers only — one syscall per page, thousands per
+track, pathological on an HDD or NAS — the index is built with a single **buffered
+sequential pass** over the audio region: each page's bytes pass through the read
+buffer once, its new CRC is computed there, and only the per-page
+`{offset, length, new_crc}` is kept. The pass is **deferred to the first `read()`
 and cached** — it never runs at `open()`/`stat` (see "Layout sizing, lazy
-indexing, and cache bounds"). CPU is O(pages) with the zero-advance operator.
+indexing, and cache bounds").
 
 All multi-byte Ogg page-header fields (granule, serial, sequence, CRC) are
 little-endian; the CRC patch operates on the raw header byte buffer.
@@ -111,9 +103,8 @@ dependency). Internally decomposed into small, independently testable units:
 1. **`page`** — parse a page header + segment table; build/lace a packet stream
    into pages (precise lacing rules in Synthesis §a); a page walker that hops
    header-to-header.
-2. **`crc`** — Ogg CRC-32, the linear sequence-number CRC patch
-   (`patch_seq_crc`), and the zero-advance operator. Unit-tested against known
-   page vectors.
+2. **`crc`** — Ogg CRC-32 (table-driven; polynomial `0x04c11db7`, init `0`, no
+   reflection, no final XOR). Unit-tested against known page vectors.
 3. **codec detection + header-packet extraction** — locate and reassemble the
    header packets (and, where needed, preserve them).
 4. **per-codec header-region builders** (see below).
@@ -216,7 +207,8 @@ flag are preserved unchanged.
   audio_length`. `open()`/`stat`/`getattr` therefore do **no** audio I/O.
 - **Lazy, cached page index.** The first `read()` that touches the `OggAudio`
   segment triggers one buffered sequential pass over the audio region, recording
-  per-page `{offset, length, old_crc}`. It is cached on the `ResolvedFile`, so the
+  per-page `{offset, length, new_crc}` (the CRC recomputed over the patched page).
+  It is cached on the `ResolvedFile`, so the
   pass runs at most once per file and is invalidated with the rest of the cache on
   `BackingChanged` / `content_version` change. A reader faults those bytes in
   anyway; a pure metadata scan never pays for it.
@@ -259,10 +251,10 @@ flag are preserved unchanged.
 
 ## Testing
 
-- **Unit (`ogg.rs` / `crc`):** CRC test vectors; the linear seq#-CRC patch matches
-  a from-scratch recompute on sample pages; page lacing round-trips (packet →
-  pages → packet), **including a packet whose length is an exact multiple of 255**
-  (terminating-zero case). For each codec, synthesize on a tiny fixture and assert:
+- **Unit (`ogg.rs` / `crc`):** CRC test vectors against known good pages; page
+  lacing round-trips (packet → pages → packet), **including a packet whose length
+  is an exact multiple of 255** (terminating-zero case). For each codec, synthesize
+  on a tiny fixture and assert:
   1. regenerated tags and art decode correctly;
   2. **every** output page CRC validates and sequence numbers are gapless;
   3. audio-payload bytes are byte-identical to the source.
@@ -285,9 +277,9 @@ flag are preserved unchanged.
   at resolve to CRC its pages (deduped across an album via `Arc`-interning), then
   streamed from the DB per read. This preserves the FLAC/MP3 "art not resident"
   property at the cost of re-encoding base64 on each read.
-- **First read pays a one-time sequential index pass** over the audio region
-  (page headers); subsequent reads use the cached index. `open()`/`stat` do no
-  audio I/O.
+- **First read pays a one-time sequential index pass** over the audio region (read
+  once, sequentially, to recompute per-page CRCs; payloads are not retained);
+  subsequent reads use the cached index. `open()`/`stat` do no audio I/O.
 
 ## Out of scope / future
 
