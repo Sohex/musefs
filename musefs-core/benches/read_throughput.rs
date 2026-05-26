@@ -13,6 +13,7 @@ fn config() -> MountConfig {
         fallbacks: BTreeMap::new(),
         default_fallback: "Unknown".to_string(),
         mode: musefs_core::Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
     }
 }
 

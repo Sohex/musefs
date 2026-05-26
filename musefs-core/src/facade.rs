@@ -28,6 +28,9 @@ pub struct MountConfig {
     pub fallbacks: BTreeMap<String, String>,
     pub default_fallback: String,
     pub mode: Mode,
+    /// Minimum time between `data_version` polls; a metadata-op storm within this
+    /// window skips the poll entirely. `Duration::ZERO` disables debouncing.
+    pub poll_interval: std::time::Duration,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -76,12 +79,17 @@ pub struct Musefs {
     /// getattr/lookup without a backing stat or full synthesis. Self-invalidates on
     /// a content_version change.
     size_cache: Mutex<HashMap<i64, SizeEntry>>,
+    /// Timestamp of the last `data_version` poll; gated by `poll_interval`.
+    last_poll: Mutex<std::time::Instant>,
+    /// Minimum time between `data_version` polls (`Duration::ZERO` disables debouncing).
+    poll_interval: std::time::Duration,
 }
 
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let tree = Self::build_tree(&db, &config)?;
         let last_data_version = db.data_version()?;
+        let poll_interval = config.poll_interval;
         Ok(Musefs {
             cache: HeaderCache::new(config.mode),
             last_data_version: AtomicI64::new(last_data_version),
@@ -91,6 +99,8 @@ impl Musefs {
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(0),
             size_cache: Mutex::new(HashMap::new()),
+            last_poll: Mutex::new(std::time::Instant::now()),
+            poll_interval,
         })
     }
 
@@ -145,6 +155,13 @@ impl Musefs {
     /// on its next `resolve`/`getattr` via `content_version`; only vanished tracks
     /// are dropped immediately.
     pub fn poll_refresh(&self) -> Result<bool> {
+        if !self.poll_interval.is_zero() {
+            let mut last = self.last_poll.lock().unwrap_or_else(|p| p.into_inner());
+            if last.elapsed() < self.poll_interval {
+                return Ok(false);
+            }
+            *last = std::time::Instant::now();
+        }
         let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
         if version == self.last_data_version.load(Ordering::Acquire) {
             return Ok(false);

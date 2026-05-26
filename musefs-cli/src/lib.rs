@@ -67,6 +67,9 @@ pub enum Command {
         /// How file contents are served.
         #[arg(long, value_enum, default_value_t = CliMode::Synthesis)]
         mode: CliMode,
+        /// Debounce window (ms) for picking up external DB edits.
+        #[arg(long, default_value_t = 1000)]
+        poll_interval_ms: u64,
     },
 }
 
@@ -102,6 +105,7 @@ pub fn run_mount(
     template: String,
     default_fallback: String,
     mode: musefs_core::Mode,
+    poll_interval_ms: u64,
 ) -> Result<()> {
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
@@ -110,6 +114,7 @@ pub fn run_mount(
         fallbacks: BTreeMap::new(),
         default_fallback,
         mode,
+        poll_interval: std::time::Duration::from_millis(poll_interval_ms),
     };
     let core = Musefs::open(db, config).context("building the virtual filesystem")?;
     musefs_fuse::mount(core, mountpoint, "musefs")
@@ -131,6 +136,14 @@ pub fn run(cli: Cli) -> Result<()> {
             template,
             default_fallback,
             mode,
-        } => run_mount(&db, &mountpoint, template, default_fallback, mode.into()),
+            poll_interval_ms,
+        } => run_mount(
+            &db,
+            &mountpoint,
+            template,
+            default_fallback,
+            mode.into(),
+            poll_interval_ms,
+        ),
     }
 }

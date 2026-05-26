@@ -10,6 +10,7 @@ fn config() -> MountConfig {
         fallbacks: BTreeMap::new(),
         default_fallback: "Unknown".to_string(),
         mode: musefs_core::Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
     }
 }
 
@@ -401,4 +402,54 @@ fn poll_refresh_keeps_unchanged_entries_and_prunes_vanished() {
     let size_after = fs.getattr(inode).unwrap().size;
     assert_eq!(size_before, size_after);
     assert!(fs.lookup(VirtualTree::ROOT, "Ghost").is_some());
+}
+
+#[test]
+fn poll_refresh_debounces_within_interval() {
+    use musefs_db::{Format, NewTrack, Tag};
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x/a.flac".to_string(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[Tag::new("artist", "Alice", 0), Tag::new("title", "A", 0)],
+        )
+        .unwrap();
+    }
+    let cfg = MountConfig {
+        poll_interval: std::time::Duration::from_secs(3600),
+        ..config()
+    };
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        let id = db2
+            .upsert_track(&NewTrack {
+                backing_path: "/x/b.flac".to_string(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db2.replace_tags(
+            id,
+            &[Tag::new("artist", "Bob", 0), Tag::new("title", "B", 0)],
+        )
+        .unwrap();
+    }
+    assert!(!fs.poll_refresh().unwrap()); // debounced (within 1h of open)
+    assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_none());
 }
