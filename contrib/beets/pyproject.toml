@@ -19,6 +19,7 @@ packages = ["beetsplug"]
 testpaths = ["tests"]
 markers = [
     "musefs_bin: tests that shell out to the real `musefs` Rust binary (opt-in)",
+    "e2e: full beets -> musefs -> FUSE-mount end-to-end (opt-in; needs ffmpeg, the musefs binary, and /dev/fuse)",
 ]
-# By default, skip the binary gate; run it explicitly with `-m musefs_bin`.
-addopts = "-m 'not musefs_bin'"
+# By default, skip the opt-in tiers; run them explicitly with `-m musefs_bin` / `-m e2e`.
+addopts = "-m 'not musefs_bin and not e2e'"
