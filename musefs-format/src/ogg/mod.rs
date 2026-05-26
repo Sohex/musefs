@@ -337,6 +337,164 @@ fn picture_prefix(art: &crate::input::ArtInput) -> Vec<u8> {
     out
 }
 
+use crate::ogg::page::PayloadChunk;
+use base64::Engine;
+
+/// One image to embed: its metadata and raw bytes (read transiently at resolve).
+pub struct OggArt<'a> {
+    pub meta: &'a crate::input::ArtInput,
+    pub image: &'a [u8],
+}
+
+fn b64_encode(bytes: &[u8]) -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .encode(bytes)
+        .into_bytes()
+}
+
+/// Build the regenerated header packets as chunk lists, embedding `arts`.
+/// Opus/Vorbis: art goes into the comment packet as `METADATA_BLOCK_PICTURE`
+/// comments (last). OggFLAC: each art is a native PICTURE block packet.
+fn build_packets_with_art(
+    header: &OggHeader,
+    tags: &[TagInput],
+    arts: &[OggArt],
+) -> Result<Vec<Vec<PayloadChunk>>> {
+    match header.codec {
+        Codec::Opus => Ok(vec![
+            vec![PayloadChunk::Bytes(header.packets[0].clone())],
+            comment_packet_chunks(b"OpusTags", tags, arts, false),
+        ]),
+        Codec::Vorbis => Ok(vec![
+            vec![PayloadChunk::Bytes(header.packets[0].clone())],
+            comment_packet_chunks(b"\x03vorbis", tags, arts, true),
+            vec![PayloadChunk::Bytes(header.packets[2].clone())],
+        ]),
+        Codec::OggFlac => oggflac_packets_with_art(header, tags, arts),
+    }
+}
+
+/// Build a VorbisComment-style comment packet (Opus `OpusTags` / Vorbis
+/// `0x03vorbis`) as chunks: a leading `Bytes` chunk (magic + vendor + count + text
+/// comments + each art comment's framing and base64(prefix)), an `Art` chunk per
+/// image (base64 of the image), and — for Vorbis — a trailing framing-bit `Bytes`
+/// chunk.
+fn comment_packet_chunks(
+    magic: &[u8],
+    tags: &[TagInput],
+    arts: &[OggArt],
+    framing_bit: bool,
+) -> Vec<PayloadChunk> {
+    let text_body = crate::vorbiscomment::build(tags); // vendor + count(text) + text comments
+    let vendor_len = u32::from_le_bytes(text_body[0..4].try_into().unwrap()) as usize;
+    let count_pos = 4 + vendor_len;
+    let text_count = u32::from_le_bytes(text_body[count_pos..count_pos + 4].try_into().unwrap());
+    let mut leading = text_body.clone();
+    let new_count = text_count + arts.len() as u32;
+    leading[count_pos..count_pos + 4].copy_from_slice(&new_count.to_le_bytes());
+
+    let mut chunks: Vec<PayloadChunk> = Vec::new();
+    let mut head = magic.to_vec();
+    head.extend_from_slice(&leading);
+
+    const KEY: &[u8] = b"METADATA_BLOCK_PICTURE=";
+    for art in arts {
+        let prefix = picture_prefix(art.meta);
+        let b64_prefix = b64_encode(&prefix);
+        let value_len = KEY.len() + b64_prefix.len() + b64_len(art.meta.data_len) as usize;
+        head.extend_from_slice(&(value_len as u32).to_le_bytes());
+        head.extend_from_slice(KEY);
+        head.extend_from_slice(&b64_prefix);
+        chunks.push(PayloadChunk::Bytes(std::mem::take(&mut head)));
+        chunks.push(PayloadChunk::Art {
+            art_id: art.meta.art_id,
+            out: b64_encode(art.image),
+            base64: true,
+            art_total: art.meta.data_len,
+        });
+    }
+    if framing_bit {
+        head.push(0x01);
+    }
+    if !head.is_empty() {
+        chunks.push(PayloadChunk::Bytes(head));
+    }
+    chunks
+}
+
+/// OggFLAC header packets with art: the text comment packet (no art) plus one
+/// native PICTURE block packet per image. The last metadata-block packet carries
+/// the last-block flag, and packet 0's 16-bit following-packet count is recomputed.
+fn oggflac_packets_with_art(
+    header: &OggHeader,
+    tags: &[TagInput],
+    arts: &[OggArt],
+) -> Result<Vec<Vec<PayloadChunk>>> {
+    if header.packets.is_empty() {
+        return Err(FormatError::Malformed);
+    }
+    let mut structural: Vec<Vec<u8>> = Vec::new();
+    for pkt in header.packets.iter().skip(1) {
+        if !pkt.is_empty() && matches!(pkt[0] & 0x7F, 2 | 3 | 5) {
+            structural.push(pkt.clone());
+        }
+    }
+
+    let vc = crate::vorbiscomment::build(tags);
+    let mut comment = Vec::new();
+    crate::flac::push_block_header(&mut comment, 4, vc.len(), false);
+    comment.extend_from_slice(&vc);
+
+    let following_count = structural.len() + 1 + arts.len();
+    let count = u16::try_from(following_count).map_err(|_| FormatError::TooLarge)?;
+
+    let mut block_packets: Vec<Vec<PayloadChunk>> = Vec::new();
+    for s in &structural {
+        block_packets.push(vec![PayloadChunk::Bytes(s.clone())]);
+    }
+    block_packets.push(vec![PayloadChunk::Bytes(comment)]);
+    for art in arts {
+        let prefix = picture_prefix(art.meta);
+        let body_len = prefix.len() as u64 + art.meta.data_len;
+        if body_len > 0x00FF_FFFF {
+            return Err(FormatError::TooLarge);
+        }
+        let mut blk = Vec::new();
+        crate::flac::push_block_header(&mut blk, 6, body_len as usize, false);
+        blk.extend_from_slice(&prefix);
+        block_packets.push(vec![
+            PayloadChunk::Bytes(blk),
+            PayloadChunk::Art {
+                art_id: art.meta.art_id,
+                out: art.image.to_vec(),
+                base64: false,
+                art_total: art.meta.data_len,
+            },
+        ]);
+    }
+
+    let n = block_packets.len();
+    for (i, bp) in block_packets.iter_mut().enumerate() {
+        if let Some(PayloadChunk::Bytes(b)) = bp.first_mut() {
+            if i + 1 == n {
+                b[0] |= 0x80;
+            } else {
+                b[0] &= 0x7F;
+            }
+        }
+    }
+
+    let mut mapping = header.packets[0].clone();
+    if mapping.len() < 9 {
+        return Err(FormatError::Malformed);
+    }
+    mapping[7..9].copy_from_slice(&count.to_be_bytes());
+
+    let mut out = vec![vec![PayloadChunk::Bytes(mapping)]];
+    out.extend(block_packets);
+    Ok(out)
+}
+
 #[doc(hidden)]
 pub mod page_test_support {
     pub use crate::ogg::page::{build_header as build_header_pub, lace_packet as lace_packet_pub};
