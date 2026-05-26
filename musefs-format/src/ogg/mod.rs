@@ -212,102 +212,33 @@ pub fn read_metadata(front: &[u8]) -> Result<OggHeader> {
 use crate::input::TagInput;
 use crate::layout::{RegionLayout, Segment};
 
-/// Build the regenerated header packets for a codec from the original header
-/// packets and the new text tags. Plan 1 emits text VorbisComments only (no art).
-fn rebuild_header_packets(header: &OggHeader, tags: &[TagInput]) -> Result<Vec<Vec<u8>>> {
-    let vc = crate::vorbiscomment::build(tags);
-    match header.codec {
-        Codec::Opus => {
-            let mut tags_pkt = b"OpusTags".to_vec();
-            tags_pkt.extend_from_slice(&vc);
-            Ok(vec![header.packets[0].clone(), tags_pkt])
-        }
-        Codec::Vorbis => {
-            let mut comment = b"\x03vorbis".to_vec();
-            comment.extend_from_slice(&vc);
-            comment.push(0x01); // framing bit
-            Ok(vec![
-                header.packets[0].clone(),
-                comment,
-                header.packets[2].clone(),
-            ])
-        }
-        Codec::OggFlac => rebuild_oggflac_packets(header, &vc),
-    }
-}
-
-/// Assemble a synthesized layout: regenerated header pages (Inline) + one compact
-/// `OggAudio` segment whose `seq_delta` renumbers the preserved audio pages.
+/// Assemble a synthesized layout: regenerated header pages (with embedded art as
+/// `OggArtSlice` runs) + one compact `OggAudio` segment renumbering the preserved
+/// audio pages. `arts` carries each embedded image's metadata + raw bytes (used
+/// transiently to compute page CRCs; not retained in the layout).
 pub fn synthesize_layout(
     header: &OggHeader,
     audio_offset: u64,
     audio_length: u64,
     tags: &[TagInput],
+    arts: &[OggArt],
 ) -> Result<RegionLayout> {
-    let new_packets = rebuild_header_packets(header, tags)?;
-    let refs: Vec<&[u8]> = new_packets.iter().map(|p| p.as_slice()).collect();
-    let (header_bytes, new_pages) = crate::ogg::page::build_header(header.serial, &refs);
-    let seq_delta = new_pages as i64 - header.header_pages as i64;
-    Ok(RegionLayout::new(vec![
-        Segment::Inline(header_bytes),
-        Segment::OggAudio {
-            offset: audio_offset,
-            len: audio_length,
-            seq_delta,
-        },
-    ]))
-}
-
-/// Rebuild OggFLAC header packets: keep packet 0 (mapping header `0x7F FLAC` +
-/// version + count + `fLaC` + STREAMINFO) but recompute its 16-bit following-packet
-/// count; carry over structural metadata-block packets (APPLICATION=2, SEEKTABLE=3,
-/// CUESHEET=5); drop existing VORBIS_COMMENT/PICTURE/PADDING; append one fresh
-/// VORBIS_COMMENT block. Set the last-metadata-block flag on the final block.
-fn rebuild_oggflac_packets(header: &OggHeader, vc: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if header.packets.is_empty() {
-        return Err(FormatError::Malformed);
+    let packet_chunks = build_packets_with_art(header, tags, arts)?;
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut seq = 0u32;
+    for (i, chunks) in packet_chunks.iter().enumerate() {
+        let (segs, used) =
+            crate::ogg::page::lace_chunks_to_segments(header.serial, seq, i == 0, chunks);
+        segments.extend(segs);
+        seq += used;
     }
-    // Structural blocks to keep (each block packet starts with the 4-byte FLAC
-    // metadata block header; type is the low 7 bits of byte 0).
-    let mut blocks: Vec<Vec<u8>> = Vec::new();
-    for pkt in header.packets.iter().skip(1) {
-        if pkt.is_empty() {
-            continue;
-        }
-        match pkt[0] & 0x7F {
-            2 | 3 | 5 => blocks.push(pkt.clone()), // APPLICATION, SEEKTABLE, CUESHEET
-            _ => {}
-        }
-    }
-
-    // Fresh VORBIS_COMMENT block (type 4): 4-byte header + body.
-    let mut comment = Vec::new();
-    crate::flac::push_block_header(&mut comment, 4, vc.len(), false);
-    comment.extend_from_slice(vc);
-    blocks.push(comment);
-
-    // Normalize the last-metadata-block flag: clear on all but the last, set on the
-    // last. Byte 0 high bit (0x80) is the flag.
-    let n = blocks.len();
-    for (i, b) in blocks.iter_mut().enumerate() {
-        if i + 1 == n {
-            b[0] |= 0x80;
-        } else {
-            b[0] &= 0x7F;
-        }
-    }
-
-    // Rebuild the mapping header (packet 0) with the new following-packet count.
-    let mut mapping = header.packets[0].clone();
-    if mapping.len() < 9 {
-        return Err(FormatError::Malformed);
-    }
-    let count = u16::try_from(blocks.len()).map_err(|_| FormatError::TooLarge)?;
-    mapping[7..9].copy_from_slice(&count.to_be_bytes());
-
-    let mut out = vec![mapping];
-    out.extend(blocks);
-    Ok(out)
+    let seq_delta = seq as i64 - header.header_pages as i64;
+    segments.push(Segment::OggAudio {
+        offset: audio_offset,
+        len: audio_length,
+        seq_delta,
+    });
+    Ok(RegionLayout::new(segments))
 }
 
 /// Build the FLAC PICTURE block *body prefix* (everything before the image data:
@@ -577,28 +508,31 @@ mod tests {
             scan.audio_offset,
             scan.audio_length,
             &[TagInput::new("album", "Geogaddi")],
+            &[],
         )
         .unwrap();
 
-        // Header segment is valid Ogg with regenerated tags; audio segment carries
-        // the original bounds.
-        match &layout.segments()[0] {
-            Segment::Inline(bytes) => {
-                let h = read_header(bytes).unwrap();
-                assert_eq!(h.codec, Codec::Opus);
-                let body = comment_body(Codec::Opus, &h.packets[1]).unwrap();
-                let tags = crate::vorbiscomment::parse(body).unwrap();
-                assert_eq!(tags, vec![("ALBUM".to_string(), "Geogaddi".to_string())]);
+        // Collect all Inline header bytes (one per page) until OggAudio.
+        let mut header_bytes: Vec<u8> = Vec::new();
+        let mut audio_seg = None;
+        for seg in layout.segments() {
+            match seg {
+                Segment::Inline(b) => header_bytes.extend_from_slice(b),
+                Segment::OggAudio { offset, len, .. } => {
+                    audio_seg = Some((*offset, *len));
+                    break;
+                }
+                other => panic!("unexpected segment {other:?}"),
             }
-            other => panic!("expected Inline header, got {other:?}"),
         }
-        match &layout.segments()[1] {
-            Segment::OggAudio { offset, len, .. } => {
-                assert_eq!(*offset, scan.audio_offset);
-                assert_eq!(*len, scan.audio_length);
-            }
-            other => panic!("expected OggAudio, got {other:?}"),
-        }
+        let h = read_header(&header_bytes).unwrap();
+        assert_eq!(h.codec, Codec::Opus);
+        let body = comment_body(Codec::Opus, &h.packets[1]).unwrap();
+        let tags = crate::vorbiscomment::parse(body).unwrap();
+        assert_eq!(tags, vec![("ALBUM".to_string(), "Geogaddi".to_string())]);
+        let (offset, len) = audio_seg.expect("expected OggAudio segment");
+        assert_eq!(offset, scan.audio_offset);
+        assert_eq!(len, scan.audio_length);
     }
 
     fn vorbis_headers_with(setup: &[u8]) -> Vec<u8> {
@@ -637,19 +571,24 @@ mod tests {
             scan.audio_offset,
             scan.audio_length,
             &[TagInput::new("artist", "Autechre")],
+            &[],
         )
         .unwrap();
 
-        if let Segment::Inline(bytes) = &layout.segments()[0] {
-            let h = read_header(bytes).unwrap();
-            assert_eq!(h.codec, Codec::Vorbis);
-            assert_eq!(h.packets[2], setup); // setup preserved byte-for-byte
-            let body = comment_body(Codec::Vorbis, &h.packets[1]).unwrap();
-            let tags = crate::vorbiscomment::parse(body).unwrap();
-            assert_eq!(tags, vec![("ARTIST".to_string(), "Autechre".to_string())]);
-        } else {
-            panic!("expected Inline header");
+        let mut header_bytes: Vec<u8> = Vec::new();
+        for seg in layout.segments() {
+            match seg {
+                Segment::Inline(b) => header_bytes.extend_from_slice(b),
+                Segment::OggAudio { .. } => break,
+                other => panic!("unexpected segment {other:?}"),
+            }
         }
+        let h = read_header(&header_bytes).unwrap();
+        assert_eq!(h.codec, Codec::Vorbis);
+        assert_eq!(h.packets[2], setup); // setup preserved byte-for-byte
+        let body = comment_body(Codec::Vorbis, &h.packets[1]).unwrap();
+        let tags = crate::vorbiscomment::parse(body).unwrap();
+        assert_eq!(tags, vec![("ARTIST".to_string(), "Autechre".to_string())]);
     }
 
     #[test]
@@ -760,32 +699,98 @@ mod tests {
             scan.audio_offset,
             scan.audio_length,
             &[TagInput::new("title", "Kaini Industries")],
+            &[],
         )
         .unwrap();
 
-        if let Segment::Inline(bytes) = &layout.segments()[0] {
-            let h = read_header(bytes).unwrap();
-            assert_eq!(h.codec, Codec::OggFlac);
-            // packet 0 mapping count == number of following blocks (SEEKTABLE + VC == 2)
-            assert_eq!(u16::from_be_bytes([h.packets[0][7], h.packets[0][8]]), 2);
-            // SEEKTABLE preserved
-            assert!(h.packets.iter().skip(1).any(|p| (p[0] & 0x7F) == 3));
-            // exactly one VORBIS_COMMENT, with the new tag, flagged last
-            let vc = h
-                .packets
-                .iter()
-                .skip(1)
-                .find(|p| (p[0] & 0x7F) == 4)
-                .unwrap();
-            assert_eq!(vc[0] & 0x80, 0x80);
-            let tags = crate::vorbiscomment::parse(&vc[4..]).unwrap();
-            assert_eq!(
-                tags,
-                vec![("TITLE".to_string(), "Kaini Industries".to_string())]
-            );
-        } else {
-            panic!("expected Inline header");
+        let mut header_bytes: Vec<u8> = Vec::new();
+        for seg in layout.segments() {
+            match seg {
+                Segment::Inline(b) => header_bytes.extend_from_slice(b),
+                Segment::OggAudio { .. } => break,
+                other => panic!("unexpected segment {other:?}"),
+            }
         }
+        let h = read_header(&header_bytes).unwrap();
+        assert_eq!(h.codec, Codec::OggFlac);
+        // packet 0 mapping count == number of following blocks (SEEKTABLE + VC == 2)
+        assert_eq!(u16::from_be_bytes([h.packets[0][7], h.packets[0][8]]), 2);
+        // SEEKTABLE preserved
+        assert!(h.packets.iter().skip(1).any(|p| (p[0] & 0x7F) == 3));
+        // exactly one VORBIS_COMMENT, with the new tag, flagged last
+        let vc = h
+            .packets
+            .iter()
+            .skip(1)
+            .find(|p| (p[0] & 0x7F) == 4)
+            .unwrap();
+        assert_eq!(vc[0] & 0x80, 0x80);
+        let tags = crate::vorbiscomment::parse(&vc[4..]).unwrap();
+        assert_eq!(
+            tags,
+            vec![("TITLE".to_string(), "Kaini Industries".to_string())]
+        );
+    }
+
+    #[test]
+    fn synthesize_opus_embeds_art_that_round_trips() {
+        let mut data = opus_headers();
+        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &vec![0u8; 80]);
+        data.extend_from_slice(&audio);
+        let scan = locate_audio(&data).unwrap();
+        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+
+        let image: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let meta = crate::input::ArtInput {
+            art_id: 7,
+            mime: "image/jpeg".to_string(),
+            description: String::new(),
+            picture_type: 3,
+            width: 64,
+            height: 64,
+            data_len: image.len() as u64,
+        };
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("title", "Cover")],
+            &[OggArt {
+                meta: &meta,
+                image: &image,
+            }],
+        )
+        .unwrap();
+
+        // Materialize the header region from the layout, expanding OggArtSlice by
+        // re-deriving its bytes from `image` (mirrors what read_at does).
+        let mut bytes = Vec::new();
+        for s in layout.segments() {
+            match s {
+                Segment::Inline(b) => bytes.extend_from_slice(b),
+                Segment::OggArtSlice {
+                    offset,
+                    len,
+                    base64,
+                    art_total,
+                    ..
+                } => {
+                    assert!(*base64);
+                    let w = b64_window(*offset, *len, *art_total);
+                    let raw = &image[w.in_start as usize..(w.in_start + w.in_len) as usize];
+                    bytes.extend_from_slice(&encode_b64_slice(raw, w.skip, *len as usize));
+                }
+                Segment::OggAudio { .. } => break, // header region ends here
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        let pics = read_pictures(&bytes).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert_eq!(pics[0].data, image);
+        let h = read_header(&bytes).unwrap();
+        assert_eq!(h.codec, Codec::Opus);
     }
 
     #[test]
