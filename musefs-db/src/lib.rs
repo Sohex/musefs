@@ -22,7 +22,10 @@ impl Db {
         let p = path.as_ref().to_path_buf();
         let mut conn = Connection::open(&p)?;
         Self::configure(&mut conn, true)?;
-        Ok(Db { conn, path: Some(p) })
+        Ok(Db {
+            conn,
+            path: Some(p),
+        })
     }
 
     pub fn open_in_memory() -> Result<Db> {
@@ -77,7 +80,10 @@ impl Db {
         // No configure()/migrate and no foreign_keys pragma: the schema already
         // exists and no writes are possible on a read-only connection.
         conn.busy_timeout(Duration::from_secs(5))?;
-        Ok(Db { conn, path: Some(p) })
+        Ok(Db {
+            conn,
+            path: Some(p),
+        })
     }
 }
 
