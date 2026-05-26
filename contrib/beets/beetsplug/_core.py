@@ -144,6 +144,20 @@ def track_id_for_path(conn, key):
     return row[0] if row else None
 
 
+def prune_missing(conn):
+    """Delete track rows whose backing file no longer exists on disk (moved,
+    renamed, or deleted), cascading to their tags/art. Returns the number
+    pruned. Reconciles stale rows left behind when an external tool moves a
+    file out from under a previously-scanned path."""
+    gone = [
+        (tid,)
+        for tid, path in conn.execute("SELECT id, backing_path FROM tracks")
+        if not os.path.exists(path)
+    ]
+    conn.executemany("DELETE FROM tracks WHERE id = ?", gone)
+    return len(gone)
+
+
 def replace_tags(conn, track_id, pairs):
     """Replace all tags for a track. Duplicate keys get incrementing ordinals
     (mirroring musefs scan ingest)."""
