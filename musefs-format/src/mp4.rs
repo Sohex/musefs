@@ -33,7 +33,13 @@ impl BoxRef {
     fn end(&self) -> usize {
         self.start + self.total_len
     }
+    /// `buf` must be the same buffer `read_box` parsed this header from — offsets
+    /// are relative to it. The debug assertion catches a wrong-buffer call in tests.
     fn payload<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        debug_assert!(
+            self.end() <= buf.len(),
+            "BoxRef::payload called with a buffer it was not parsed from"
+        );
         &buf[self.payload_start()..self.end()]
     }
 }
