@@ -3,6 +3,9 @@ pub enum Format {
     Flac,
     Mp3,
     M4a,
+    Opus,
+    Vorbis,
+    OggFlac,
 }
 
 impl Format {
@@ -11,6 +14,9 @@ impl Format {
             Format::Flac => "flac",
             Format::Mp3 => "mp3",
             Format::M4a => "m4a",
+            Format::Opus => "opus",
+            Format::Vorbis => "vorbis",
+            Format::OggFlac => "oggflac",
         }
     }
 
@@ -19,6 +25,9 @@ impl Format {
             "flac" => Some(Format::Flac),
             "mp3" => Some(Format::Mp3),
             "m4a" => Some(Format::M4a),
+            "opus" => Some(Format::Opus),
+            "vorbis" => Some(Format::Vorbis),
+            "oggflac" => Some(Format::OggFlac),
             _ => None,
         }
     }
@@ -32,6 +41,18 @@ mod tests {
     fn m4a_round_trips() {
         assert_eq!(Format::M4a.as_str(), "m4a");
         assert_eq!(Format::parse("m4a"), Some(Format::M4a));
+    }
+
+    #[test]
+    fn ogg_codecs_round_trip() {
+        for (f, s) in [
+            (Format::Opus, "opus"),
+            (Format::Vorbis, "vorbis"),
+            (Format::OggFlac, "oggflac"),
+        ] {
+            assert_eq!(f.as_str(), s);
+            assert_eq!(Format::parse(s), Some(f));
+        }
     }
 }
 
