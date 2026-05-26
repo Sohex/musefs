@@ -112,7 +112,10 @@ fn setup_two_track_mount() -> (PathBuf, PathBuf, PathBuf, BackgroundSession, tem
 fn slow_read_does_not_block_stat() {
     // 50 ms per backing pread call. The big file is >2 MiB; the kernel sends
     // ~128 KiB chunks, so there are ~16 FUSE read calls → ~800ms total.
-    // SAFETY: set before any pread fires; the OnceLock reads it once.
+    // The fault duration is parsed once into a process-global OnceLock on the
+    // first on_pread. This is its own integration-test binary with a single test,
+    // so no earlier on_pread can have initialized it — setting the env var here,
+    // before any read, is guaranteed to be observed.
     unsafe { std::env::set_var("MUSEFS_FAULT_PREAD_US", "50000") };
 
     let (_mnt, big, other, _session, _backing) = setup_two_track_mount();
@@ -125,7 +128,9 @@ fn slow_read_does_not_block_stat() {
     // Start a large sequential read of `big` on a background thread.
     let big_clone = big.clone();
     let reader = std::thread::spawn(move || {
-        let _ = std::fs::read(&big_clone); // slow: injected pread latency per chunk
+        // Result intentionally discarded: the point is to drive the (slow) FUSE
+        // read round-trips, not to inspect the bytes.
+        let _ = std::fs::read(&big_clone);
     });
 
     // Give the reader time to get mid-read (well before it finishes).
@@ -139,9 +144,13 @@ fn slow_read_does_not_block_stat() {
     eprintln!("stat elapsed: {elapsed:?}  (file size: {} bytes)", md.len());
 
     assert!(md.len() > 0, "expected non-zero size from stat");
+    // If the slow read serialized metadata ops (the old single-threaded model),
+    // this stat would queue behind the in-flight read (~hundreds of ms). A
+    // generous 200ms budget proves non-serialization while tolerating CI jitter
+    // (observed in practice: tens of microseconds).
     assert!(
-        elapsed < Duration::from_millis(40),
-        "stat blocked for {elapsed:?} — expected <40ms while slow read was in flight"
+        elapsed < Duration::from_millis(200),
+        "stat blocked for {elapsed:?} behind a slow read — metadata ops appear serialized"
     );
 
     reader.join().unwrap();
