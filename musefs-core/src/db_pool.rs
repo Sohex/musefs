@@ -47,10 +47,13 @@ impl DbPool {
     /// before it opened. The poll connection is the original writer Db, kept alive
     /// precisely so it can observe incremental changes from other connections.
     /// For `Shared` pools (in-memory), the single shared connection serves both roles.
+    ///
+    /// Note: `std::sync::Mutex` is not reentrant — do not call `with_poll` from
+    /// inside a `with` closure on the `Shared` variant (it would deadlock).
     pub fn with_poll<R>(&self, f: impl FnOnce(&Db) -> Result<R>) -> Result<R> {
         match self {
-            DbPool::PerThread { poll, .. } => f(&poll.lock().unwrap()),
-            DbPool::Shared(m) => f(&m.lock().unwrap()),
+            DbPool::PerThread { poll, .. } => f(&poll.lock().unwrap_or_else(|p| p.into_inner())),
+            DbPool::Shared(m) => f(&m.lock().unwrap_or_else(|p| p.into_inner())),
         }
     }
 
@@ -68,7 +71,7 @@ impl DbPool {
                 f(slot.as_ref().unwrap())
             }),
             DbPool::Shared(m) => {
-                let db = m.lock().unwrap();
+                let db = m.lock().unwrap_or_else(|p| p.into_inner());
                 f(&db)
             }
         }

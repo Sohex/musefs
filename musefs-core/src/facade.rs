@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use musefs_db::Db;
@@ -91,6 +90,17 @@ impl Musefs {
         Ok(())
     }
 
+    // Lock order: when both are needed, acquire a DbPool connection
+    // (`pool.with`/`with_poll`) FIRST, then `self.cache`. Never call into the
+    // pool while holding the cache lock — that would invert the order and can
+    // deadlock once the worker pool runs these concurrently.
+
+    /// Lock the header cache, recovering from a poisoned mutex (a worker that
+    /// panicked mid-resolve must not permanently break the mount).
+    fn cache(&self) -> std::sync::MutexGuard<'_, HeaderCache> {
+        self.cache.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
     /// rebuild the tree and drop cached resolutions, then return `true`; the new
     /// version stamp is committed only after a successful rebuild. The FUSE layer
@@ -101,11 +111,11 @@ impl Musefs {
         if version == self.last_data_version.load(Ordering::Acquire) {
             return Ok(false);
         }
-        // Rebuild before committing the new stamp: if build_tree fails, the stamp
-        // stays put so the next poll retries instead of serving a stale tree.
+        // Rebuild + drop cached resolutions BEFORE committing the new stamp, so a
+        // concurrent reader that sees the new version also sees fresh state.
         self.refresh()?;
+        self.cache().clear();
         self.last_data_version.store(version, Ordering::Release);
-        self.cache.lock().unwrap().clear();
         Ok(true)
     }
 
@@ -175,7 +185,9 @@ impl Musefs {
             }
         };
         self.pool.with(|db| {
-            let resolved = self.cache.lock().unwrap().resolve(db, track_id)?;
+            let resolved = self.cache().resolve(db, track_id)?;
+            // `resolve` returns an `Arc`, so the cache lock is already released
+            // here; the backing read runs without serializing other operations.
             read_at(&resolved, db, offset, size)
         })
     }
