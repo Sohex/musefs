@@ -79,7 +79,7 @@ pub fn read_header(data: &[u8]) -> Result<OggHeader> {
 }
 
 /// Strip a codec's comment-packet prefix, returning the VorbisComment body slice.
-fn comment_body<'a>(codec: Codec, packet: &'a [u8]) -> Result<&'a [u8]> {
+fn comment_body(codec: Codec, packet: &[u8]) -> Result<&[u8]> {
     let prefix = match codec {
         Codec::Opus => 8,    // "OpusTags"
         Codec::Vorbis => 7,  // 0x03 "vorbis"
@@ -313,7 +313,7 @@ mod tests {
     fn locate_audio_reports_bounds() {
         let mut data = opus_headers();
         let header_len = data.len();
-        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &vec![0u8; 120]);
+        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 120]);
         data.extend_from_slice(&audio);
 
         let scan = locate_audio(&data).unwrap();
@@ -326,7 +326,7 @@ mod tests {
     fn reads_opus_header() {
         let mut data = opus_headers();
         // Append one audio page so audio_offset lands before EOF.
-        let (audio, _) = lace_packet(0x1234, 2, false, 960, &vec![0u8; 100]);
+        let (audio, _) = lace_packet(0x1234, 2, false, 960, &[0u8; 100]);
         let header_len = data.len();
         data.extend_from_slice(&audio);
 
@@ -346,7 +346,7 @@ mod tests {
         tags_pkt.extend_from_slice(&body);
         let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
         let (mut data, _) = crate::ogg::page::build_header(7, &[&head, &tags_pkt]);
-        let (audio, _) = crate::ogg::page::lace_packet(7, 2, false, 960, &vec![0u8; 50]);
+        let (audio, _) = crate::ogg::page::lace_packet(7, 2, false, 960, &[0u8; 50]);
         data.extend_from_slice(&audio);
 
         let tags = read_tags(&data).unwrap();
@@ -357,7 +357,7 @@ mod tests {
     fn synthesize_opus_emits_valid_header_and_audio_segment() {
         let mut data = opus_headers();
         let scan = locate_audio({
-            let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &vec![0u8; 80]);
+            let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 80]);
             data.extend_from_slice(&audio);
             &data
         })
@@ -415,7 +415,7 @@ mod tests {
     fn synthesize_vorbis_preserves_setup_and_rewrites_comment() {
         let setup = b"\x05vorbis-SETUP-CODEBOOKS-PLACEHOLDER".to_vec();
         let mut data = vorbis_headers_with(&setup);
-        let (audio, _) = crate::ogg::page::lace_packet(55, 99, false, 1024, &vec![0u8; 64]);
+        let (audio, _) = crate::ogg::page::lace_packet(55, 99, false, 1024, &[0u8; 64]);
         data.extend_from_slice(&audio);
 
         let scan = locate_audio(&data).unwrap();
@@ -476,7 +476,7 @@ mod tests {
         tags_pkt.extend_from_slice(&body);
         let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
         let (mut data, _) = crate::ogg::page::build_header(7, &[&head, &tags_pkt]);
-        let (audio, _) = crate::ogg::page::lace_packet(7, 2, false, 960, &vec![0u8; 50]);
+        let (audio, _) = crate::ogg::page::lace_packet(7, 2, false, 960, &[0u8; 50]);
         data.extend_from_slice(&audio);
 
         let pics = read_pictures(&data).unwrap();
@@ -490,7 +490,7 @@ mod tests {
         // for our framing test).
         let mut streaminfo = Vec::new();
         crate::flac::push_block_header(&mut streaminfo, 0, 34, false);
-        streaminfo.extend(std::iter::repeat(0u8).take(34));
+        streaminfo.extend(std::iter::repeat_n(0u8, 34));
 
         // Mapping header packet: 0x7F "FLAC" v1.0 count "fLaC" STREAMINFO.
         let mut mapping = vec![0x7F];
@@ -504,7 +504,7 @@ mod tests {
         // A SEEKTABLE block (type 3, structural — must be preserved).
         let mut seektable = Vec::new();
         crate::flac::push_block_header(&mut seektable, 3, 18, false);
-        seektable.extend(std::iter::repeat(0xEEu8).take(18));
+        seektable.extend(std::iter::repeat_n(0xEEu8, 18));
 
         // An existing VORBIS_COMMENT (type 4, last) to be replaced.
         let mut old_vc = Vec::new();
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn synthesize_oggflac_keeps_seektable_replaces_comment_and_count() {
         let mut data = oggflac_headers();
-        let (audio, _) = crate::ogg::page::lace_packet(77, 3, false, 4096, &vec![0u8; 64]);
+        let (audio, _) = crate::ogg::page::lace_packet(77, 3, false, 4096, &[0u8; 64]);
         data.extend_from_slice(&audio);
 
         let scan = locate_audio(&data).unwrap();

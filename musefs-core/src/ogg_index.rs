@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(idx.pages[0].region_offset, 0);
         // Reconstruct page 0 and confirm its seq shifted to 7.
         let mut full = idx.pages[0].header.clone();
-        full.extend(std::iter::repeat(1u8).take(idx.pages[0].payload_len as usize));
+        full.extend(std::iter::repeat_n(1u8, idx.pages[0].payload_len as usize));
         let h = parse_page(&full, 0).unwrap();
         assert_eq!(h.seq, 7);
     }

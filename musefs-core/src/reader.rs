@@ -306,7 +306,7 @@ mod ogg_serve_tests {
     #[test]
     fn read_at_renumbers_audio_and_preserves_payload() {
         // Build a file: 8 header bytes + two audio pages (seq 3,4).
-        let (mut audio, _) = lace_packet_pub(0x99, 3, false, 10, &vec![0xA1u8; 200]);
+        let (mut audio, _) = lace_packet_pub(0x99, 3, false, 10, &[0xA1u8; 200]);
         let (a2, _) = lace_packet_pub(0x99, 4, false, 20, &vec![0xB2u8; 250]);
         audio.extend_from_slice(&a2);
         let audio_offset = 8u64;

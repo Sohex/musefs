@@ -42,15 +42,17 @@ fn read_packets(bytes: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn find_one_file(root: &std::path::Path) -> std::path::PathBuf {
-    for e in std::fs::read_dir(root).unwrap() {
-        let e = e.unwrap();
-        let p = e.path();
-        if e.file_type().unwrap().is_dir() {
-            return find_one_file(&p);
-        }
-        return p;
+    let entry = std::fs::read_dir(root)
+        .unwrap()
+        .next()
+        .expect("non-empty dir")
+        .unwrap();
+    let p = entry.path();
+    if entry.file_type().unwrap().is_dir() {
+        find_one_file(&p)
+    } else {
+        p
     }
-    panic!("no file found under {root:?}");
 }
 
 fn config() -> MountConfig {

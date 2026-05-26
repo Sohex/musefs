@@ -282,7 +282,7 @@ mod ogg_probe_tests {
         let mut tags = b"OpusTags".to_vec();
         tags.extend_from_slice(&vorbis_body_empty());
         let (mut bytes, _) = build_header_pub(0x1234, &[&head, &tags]);
-        let (audio, _) = lace_packet_pub(0x1234, 2, false, 960, &vec![0u8; 100]);
+        let (audio, _) = lace_packet_pub(0x1234, 2, false, 960, &[0u8; 100]);
         bytes.extend_from_slice(&audio);
 
         let dir = tempfile::tempdir().unwrap();

@@ -6,7 +6,6 @@ pub const CAPTURE: &[u8; 4] = b"OggS";
 /// Header-type flag bits.
 pub const FLAG_CONTINUED: u8 = 0x01;
 pub const FLAG_BOS: u8 = 0x02;
-pub const FLAG_EOS: u8 = 0x04;
 
 /// A parsed Ogg page header (the 27 fixed bytes + the segment table) plus the
 /// derived payload length. Multi-byte fields are little-endian on disk.
@@ -220,7 +219,7 @@ mod tests {
         p.push(2); // seg_count
         p.push(0x10);
         p.push(0x20); // segment table => payload 0x30
-        p.extend(std::iter::repeat(0xAB).take(0x30));
+        p.extend(std::iter::repeat_n(0xAB, 0x30));
         p
     }
 
