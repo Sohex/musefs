@@ -296,7 +296,27 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
                     let f = backing.as_ref().unwrap();
                     serve(&index, f, *ao, within, within + n as u64, &mut out)?;
                 }
-                Segment::OggArtSlice { .. } => unreachable!("OggArtSlice serving lands in Task 8"),
+                Segment::OggArtSlice {
+                    art_id,
+                    offset,
+                    base64,
+                    art_total,
+                    ..
+                } => {
+                    if *base64 {
+                        // Output base64 chars [offset+within, +n) of base64(image).
+                        let w =
+                            musefs_format::ogg::b64_window(*offset + within, n as u64, *art_total);
+                        let raw = db.read_art_chunk(*art_id, w.in_start, w.in_len as usize)?;
+                        out.extend_from_slice(&musefs_format::ogg::encode_b64_slice(
+                            &raw, w.skip, n,
+                        ));
+                    } else {
+                        // Raw image bytes (OggFLAC PICTURE block).
+                        let chunk = db.read_art_chunk(*art_id, *offset + within, n)?;
+                        out.extend_from_slice(&chunk);
+                    }
+                }
             }
         }
         seg_start = seg_end;
@@ -438,6 +458,98 @@ mod resolve_ogg_tests {
         assert!(tags
             .iter()
             .any(|(k, v)| k == "TITLE" && v == "Telephasic Workshop"));
+    }
+}
+
+#[cfg(test)]
+mod ogg_art_serve_tests {
+    use super::*;
+
+    #[test]
+    fn read_at_serves_base64_art_slice_matching_full_encode() {
+        let image: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        // Compute full base64 via the format crate (base64 is not a direct dep of musefs-core).
+        let full_b64 = musefs_format::ogg::encode_b64_slice(
+            &image,
+            0,
+            musefs_format::ogg::b64_len(image.len() as u64) as usize,
+        );
+
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let art_id = db
+            .upsert_art(&musefs_db::NewArt {
+                mime: "image/png".to_string(),
+                width: Some(1),
+                height: Some(1),
+                data: image.clone(),
+            })
+            .unwrap();
+
+        let layout = RegionLayout::new(vec![
+            Segment::Inline(b"HEAD".to_vec()),
+            Segment::OggArtSlice {
+                art_id,
+                offset: 0,
+                len: full_b64.len() as u64,
+                base64: true,
+                art_total: image.len() as u64,
+            },
+            Segment::Inline(b"XY".to_vec()),
+        ]);
+        let total = layout.total_len();
+        let resolved = ResolvedFile {
+            layout,
+            total_len: total,
+            content_version: 0,
+            backing_path: std::path::PathBuf::from("/dev/null"),
+            mtime_secs: 0,
+            ogg_index: once_cell::sync::OnceCell::new(),
+            cache_bytes: 0,
+        };
+
+        // Full read.
+        let got = read_at(&resolved, &db, 0, total).unwrap();
+        let mut want = b"HEAD".to_vec();
+        want.extend_from_slice(&full_b64);
+        want.extend_from_slice(b"XY");
+        assert_eq!(got, want);
+
+        // Partial read straddling into the middle of the art slice (non-4-aligned).
+        let part = read_at(&resolved, &db, 7, 23).unwrap();
+        assert_eq!(part, want[7..30]);
+    }
+
+    #[test]
+    fn read_at_serves_raw_art_slice() {
+        let image: Vec<u8> = (0..300u32).map(|i| (i % 256) as u8).collect();
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let art_id = db
+            .upsert_art(&musefs_db::NewArt {
+                mime: "image/png".to_string(),
+                width: None,
+                height: None,
+                data: image.clone(),
+            })
+            .unwrap();
+        let layout = RegionLayout::new(vec![Segment::OggArtSlice {
+            art_id,
+            offset: 0,
+            len: image.len() as u64,
+            base64: false,
+            art_total: image.len() as u64,
+        }]);
+        let total = layout.total_len();
+        let resolved = ResolvedFile {
+            layout,
+            total_len: total,
+            content_version: 0,
+            backing_path: std::path::PathBuf::from("/dev/null"),
+            mtime_secs: 0,
+            ogg_index: once_cell::sync::OnceCell::new(),
+            cache_bytes: 0,
+        };
+        let got = read_at(&resolved, &db, 10, 50).unwrap();
+        assert_eq!(got, image[10..60]);
     }
 }
 
