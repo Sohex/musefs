@@ -10,3 +10,4 @@ mod vorbiscomment;
 pub use error::{FormatError, Result};
 pub use input::{ArtInput, EmbeddedPicture, TagInput};
 pub use layout::{RegionLayout, Segment};
+pub use ogg::{Codec, OggHeader, OggScan};

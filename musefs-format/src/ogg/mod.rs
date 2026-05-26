@@ -158,6 +158,32 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
     Ok(out)
 }
 
+/// Audio bounds + codec from a complete file, for the scanner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OggScan {
+    pub codec: Codec,
+    pub audio_offset: u64,
+    pub audio_length: u64,
+}
+
+pub fn locate_audio(data: &[u8]) -> Result<OggScan> {
+    let header = read_header(data)?;
+    if header.audio_offset > data.len() as u64 {
+        return Err(FormatError::Malformed);
+    }
+    Ok(OggScan {
+        codec: header.codec,
+        audio_offset: header.audio_offset,
+        audio_length: data.len() as u64 - header.audio_offset,
+    })
+}
+
+/// The header region parsed from the front of the file (`[0, audio_offset)`), for
+/// synthesis. Identical to `read_header` but named to mirror `flac::read_metadata`.
+pub fn read_metadata(front: &[u8]) -> Result<OggHeader> {
+    read_header(front)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +194,19 @@ mod tests {
         let tags = b"OpusTags\x06\x00\x00\x00musefs\x00\x00\x00\x00".to_vec();
         let (bytes, _) = build_header(0x1234, &[&head, &tags]);
         bytes
+    }
+
+    #[test]
+    fn locate_audio_reports_bounds() {
+        let mut data = opus_headers();
+        let header_len = data.len();
+        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &vec![0u8; 120]);
+        data.extend_from_slice(&audio);
+
+        let scan = locate_audio(&data).unwrap();
+        assert_eq!(scan.codec, Codec::Opus);
+        assert_eq!(scan.audio_offset, header_len as u64);
+        assert_eq!(scan.audio_length, (data.len() - header_len) as u64);
     }
 
     #[test]
