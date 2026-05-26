@@ -301,6 +301,10 @@ fn text_atom(kind: &[u8; 4], values: &[&str]) -> Vec<u8> {
 }
 
 fn number_atom(kind: &[u8; 4], n: u16, width: usize) -> Vec<u8> {
+    debug_assert!(
+        width >= 4,
+        "number_atom width must hold the 4-byte reserved+value prefix"
+    );
     let mut data = 0u32.to_be_bytes().to_vec(); // type 0 = binary
     data.extend_from_slice(&0u32.to_be_bytes()); // locale
     let mut body = vec![0u8, 0];
@@ -386,6 +390,13 @@ fn build_udta(tags: &[TagInput], art: Option<&ArtInput>) -> Result<(Vec<u8>, u64
     udta.extend_from_slice(b"meta");
     udta.extend_from_slice(&meta);
     let udta_size = 8 + udta.len() as u64 + art_len;
+
+    // MP4 box sizes are 32-bit. udta encloses all the inner boxes, so guarding
+    // its size bounds them all; refuse oversized metadata at the format boundary
+    // rather than emit a silently-truncated (corrupt) size field.
+    if udta_size > u32::MAX as u64 {
+        return Err(FormatError::TooLarge);
+    }
 
     let mut out = (udta_size as u32).to_be_bytes().to_vec();
     out.extend_from_slice(b"udta");
@@ -634,14 +645,22 @@ mod tests {
 
     #[test]
     fn build_udta_no_art_round_trips() {
-        let tags = vec![TagInput::new("title", "Song"), TagInput::new("tracknumber", "5")];
+        let tags = vec![
+            TagInput::new("title", "Song"),
+            TagInput::new("tracknumber", "5"),
+        ];
         let (prefix, art_len) = build_udta(&tags, None).unwrap();
         assert_eq!(art_len, 0);
         let b = read_box(&prefix, 0).unwrap();
         assert_eq!(&b.kind, b"udta");
         assert_eq!(b.total_len, prefix.len());
         // Wrap in a moov and read back through our own reader.
-        let buf = [bx(b"ftyp", b"M4A "), bx(b"moov", &prefix), bx(b"mdat", b"A")].concat();
+        let buf = [
+            bx(b"ftyp", b"M4A "),
+            bx(b"moov", &prefix),
+            bx(b"mdat", b"A"),
+        ]
+        .concat();
         let tags = read_tags(&buf);
         assert!(tags.contains(&("title".into(), "Song".into())));
         assert!(tags.contains(&("tracknumber".into(), "5".into())));
@@ -650,8 +669,13 @@ mod tests {
     #[test]
     fn build_udta_with_art_reserves_size_without_image() {
         let art = ArtInput {
-            art_id: 1, mime: "image/png".into(), description: String::new(),
-            picture_type: 3, width: 0, height: 0, data_len: 100,
+            art_id: 1,
+            mime: "image/png".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 100,
         };
         let (prefix, art_len) = build_udta(&[TagInput::new("title", "T")], Some(&art)).unwrap();
         assert_eq!(art_len, 100);
@@ -660,5 +684,22 @@ mod tests {
         assert_eq!(declared, prefix.len() + 100);
         // The prefix ends right after the covr/data header (image streams next).
         assert!(prefix.windows(4).any(|w| w == b"covr"));
+    }
+
+    #[test]
+    fn build_udta_rejects_oversize_art() {
+        let art = ArtInput {
+            art_id: 1,
+            mime: "image/jpeg".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: u32::MAX as u64 + 1,
+        };
+        assert!(matches!(
+            build_udta(&[TagInput::new("title", "T")], Some(&art)),
+            Err(FormatError::TooLarge)
+        ));
     }
 }
