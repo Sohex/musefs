@@ -50,7 +50,7 @@ fn lookup_getattr_readdir_and_read_through_the_facade() {
     assert!(fattr.size > 0);
 
     // Reading the whole file yields a valid FLAC whose TITLE is the synthesized value.
-    let bytes = fs.read(file_inode, 0, fattr.size).unwrap();
+    let bytes = fs.read(file_inode, 0, 0, fattr.size).unwrap();
     assert_eq!(bytes.len() as u64, fattr.size);
     let tag = metaflac::Tag::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
     assert_eq!(
@@ -136,7 +136,7 @@ fn reads_a_synthesized_mp3_through_the_facade() {
     assert_eq!(name, "Old.mp3");
 
     let attr = fs.getattr(file_inode).unwrap();
-    let whole = fs.read(file_inode, 0, attr.size).unwrap();
+    let whole = fs.read(file_inode, 0, 0, attr.size).unwrap();
     assert_eq!(whole.len() as u64, attr.size);
 
     // The synthesized file is a valid ID3v2.4 stream carrying the DB tags, and the
@@ -169,7 +169,7 @@ fn reads_a_synthesized_m4a_through_the_facade() {
     assert_eq!(name, "Orig M4A.m4a");
 
     let attr = fs.getattr(file_inode).unwrap();
-    let whole = fs.read(file_inode, 0, attr.size).unwrap();
+    let whole = fs.read(file_inode, 0, 0, attr.size).unwrap();
     assert_eq!(whole.len() as u64, attr.size);
 
     // The original audio frames are spliced in verbatim at the tail of the
@@ -224,7 +224,7 @@ fn serves_flac_with_embedded_art_through_the_facade() {
     let artist = fs.lookup(VirtualTree::ROOT, "Art").unwrap();
     let (_name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
     let attr = fs.getattr(file_inode).unwrap();
-    let whole = fs.read(file_inode, 0, attr.size).unwrap();
+    let whole = fs.read(file_inode, 0, 0, attr.size).unwrap();
     assert_eq!(whole.len() as u64, attr.size);
 
     // The synthesized FLAC carries the embedded picture with the original bytes.
@@ -262,7 +262,7 @@ fn serves_mp3_with_embedded_art_through_the_facade() {
     let artist = fs.lookup(VirtualTree::ROOT, "Pix").unwrap();
     let (_name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
     let attr = fs.getattr(file_inode).unwrap();
-    let whole = fs.read(file_inode, 0, attr.size).unwrap();
+    let whole = fs.read(file_inode, 0, 0, attr.size).unwrap();
     assert_eq!(whole.len() as u64, attr.size);
 
     // The synthesized MP3 carries the embedded APIC picture with the original bytes.
@@ -330,4 +330,26 @@ fn poll_refresh_picks_up_external_db_edits() {
     assert!(fs.lookup(VirtualTree::ROOT, "Alice").is_some());
     // A second poll with no further change is a no-op.
     assert!(!fs.poll_refresh().unwrap());
+}
+
+#[test]
+fn open_handle_read_and_release_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = scanned_db(dir.path());
+    let fs = Musefs::open(db, config()).unwrap();
+
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let size = fs.getattr(file_inode).unwrap().size;
+
+    let fh = fs.open_handle(file_inode).unwrap();
+    assert!(fh != 0);
+    let via_handle = fs.read(file_inode, fh, 0, size).unwrap();
+    let via_fallback = fs.read(file_inode, 0, 0, size).unwrap();
+    assert_eq!(via_handle, via_fallback);
+    assert_eq!(via_handle.len() as u64, size);
+
+    fs.release_handle(fh);
+    let after = fs.read(file_inode, fh, 0, size).unwrap(); // unknown fh → fallback
+    assert_eq!(after, via_fallback);
 }

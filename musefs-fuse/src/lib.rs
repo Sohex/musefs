@@ -145,7 +145,7 @@ impl Filesystem for MusefsFs {
         }
         let core = Arc::clone(&self.core);
         self.pool
-            .execute(move || match core.read(ino, offset as u64, size as u64) {
+            .execute(move || match core.read(ino, 0, offset as u64, size as u64) {
                 Ok(bytes) => reply.data(&bytes),
                 Err(e) => reply.error(errno(&e)),
             });

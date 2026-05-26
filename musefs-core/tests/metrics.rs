@@ -41,7 +41,7 @@ fn baseline_one_open_per_read_call() {
     let mut off = 0u64;
     let mut reads = 0u64;
     while off < size {
-        let got = fs.read(file_inode, off, chunk).unwrap();
+        let got = fs.read(file_inode, 0, off, chunk).unwrap();
         if got.is_empty() {
             break;
         }

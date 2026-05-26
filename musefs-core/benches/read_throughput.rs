@@ -49,7 +49,7 @@ fn bench_sequential_read(c: &mut Criterion) {
         b.iter(|| {
             let mut off = 0u64;
             while off < size {
-                let got = criterion::black_box(fs.read(file_inode, off, chunk).unwrap());
+                let got = criterion::black_box(fs.read(file_inode, 0, off, chunk).unwrap());
                 if got.is_empty() {
                     break;
                 }

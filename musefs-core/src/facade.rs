@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -8,7 +8,7 @@ use musefs_db::Db;
 use crate::db_pool::DbPool;
 use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
-use crate::reader::{read_at, HeaderCache};
+use crate::reader::{read_at, read_at_with_file, HeaderCache, ResolvedFile};
 use crate::template::render_path;
 use crate::tree::{NodeKind, VirtualTree};
 
@@ -39,6 +39,13 @@ pub struct Attr {
     pub mtime_secs: i64,
 }
 
+/// An open file handle: the resolved layout and a backing fd opened (and
+/// validated) once at `open`, reused for every `read` on this handle.
+struct Handle {
+    resolved: Arc<ResolvedFile>,
+    file: Arc<std::fs::File>,
+}
+
 /// The composed read-only filesystem: the store, the rendered tree, and the
 /// lazy synthesis cache. All methods take `&self`; the tree is swapped
 /// atomically on refresh, the cache is mutex-guarded, and the data-version
@@ -50,6 +57,8 @@ pub struct Musefs {
     tree: ArcSwap<VirtualTree>,
     cache: Mutex<HeaderCache>,
     last_data_version: AtomicI64,
+    handles: Mutex<HashMap<u64, Arc<Handle>>>,
+    next_fh: AtomicU64,
 }
 
 impl Musefs {
@@ -62,6 +71,8 @@ impl Musefs {
             tree: ArcSwap::from_pointee(tree),
             pool: DbPool::new(db)?,
             config,
+            handles: Mutex::new(HashMap::new()),
+            next_fh: AtomicU64::new(0),
         })
     }
 
@@ -99,6 +110,10 @@ impl Musefs {
     /// panicked mid-resolve must not permanently break the mount).
     fn cache(&self) -> std::sync::MutexGuard<'_, HeaderCache> {
         self.cache.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Handle>>> {
+        self.handles.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
@@ -173,7 +188,17 @@ impl Musefs {
             .collect())
     }
 
-    pub fn read(&self, inode: u64, offset: u64, size: u64) -> Result<Vec<u8>> {
+    pub fn read(&self, inode: u64, fh: u64, offset: u64, size: u64) -> Result<Vec<u8>> {
+        // Fast path: serve from the per-handle fd + cached layout (no open/stat).
+        if fh != 0 {
+            let handle = self.handles().get(&fh).cloned();
+            if let Some(h) = handle {
+                return self
+                    .pool
+                    .with(|db| read_at_with_file(&h.resolved, db, &h.file, offset, size));
+            }
+        }
+        // Fallback (no prior open, or unknown handle): resolve by inode and open.
         let track_id = {
             let tree = self.tree.load();
             match tree.node(inode) {
@@ -186,11 +211,35 @@ impl Musefs {
         };
         self.pool.with(|db| {
             let resolved = self.cache().resolve(db, track_id)?;
-            // `resolve` returns an `Arc`, so the cache lock is released before the
-            // backing read. In the PerThread (file-backed) pool that read also runs
-            // on a thread-local connection, so it doesn't serialize other workers;
-            // the Shared (in-memory) pool does hold its single db mutex across it.
             read_at(&resolved, db, offset, size)
         })
+    }
+
+    /// Open a file handle: resolve + validate the layout and open the backing fd
+    /// once, store it, and return a non-zero handle id. Subsequent `read`s with
+    /// this handle reuse the fd (no per-read open/stat).
+    pub fn open_handle(&self, inode: u64) -> Result<u64> {
+        let track_id = {
+            let tree = self.tree.load();
+            match tree.node(inode) {
+                None => return Err(CoreError::NoEntry(inode)),
+                Some(node) => match &node.kind {
+                    NodeKind::Dir => return Err(CoreError::IsDir(inode)),
+                    NodeKind::File { track_id } => *track_id,
+                },
+            }
+        };
+        let resolved = self.pool.with(|db| self.cache().resolve(db, track_id))?;
+        crate::metrics::on_open();
+        let file = std::fs::File::open(&resolved.backing_path)?;
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1; // never 0
+        self.handles()
+            .insert(fh, Arc::new(Handle { resolved, file: Arc::new(file) }));
+        Ok(fh)
+    }
+
+    /// Drop an open handle (closes its backing fd when the last reference goes).
+    pub fn release_handle(&self, fh: u64) {
+        self.handles().remove(&fh);
     }
 }
