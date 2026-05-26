@@ -115,6 +115,88 @@ fn mount_and_validate(src: &std::path::Path) {
     drop(session);
 }
 
+/// Generate a fixture with an attached cover image (a tiny PNG) via ffmpeg.
+/// Returns the cover bytes if encoding succeeded, else None (skip).
+fn make_fixture_with_cover(
+    dir: &std::path::Path,
+    audio_name: &str,
+    codec_args: &[&str],
+) -> Option<(std::path::PathBuf, Vec<u8>)> {
+    // 1x1 PNG.
+    let png: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let cover = dir.join("cover.png");
+    std::fs::write(&cover, png).ok()?;
+    let out = dir.join(audio_name);
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=48000:cl=stereo",
+        "-t",
+        "0.3",
+    ]);
+    cmd.args(["-i"]);
+    cmd.arg(&cover);
+    cmd.args(["-map", "0:a", "-map", "1:v"]);
+    cmd.args(codec_args);
+    cmd.args([
+        "-metadata",
+        "title=Cover",
+        "-disposition:v",
+        "attached_pic",
+        "-y",
+    ]);
+    cmd.arg(&out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false) && out.exists();
+    if ok {
+        Some((out, png.to_vec()))
+    } else {
+        None
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse + libfuse + ffmpeg; run with --ignored"]
+fn opus_read_through_preserves_embedded_art() {
+    let backing = tempfile::tempdir().unwrap();
+    let Some((src, _cover)) =
+        make_fixture_with_cover(backing.path(), "in.opus", &["-c:a", "libopus"])
+    else {
+        eprintln!("ffmpeg/libopus unavailable; skipping");
+        return;
+    };
+
+    // The source's own embedded art (as the scanner will ingest it).
+    let source_bytes = std::fs::read(&src).unwrap();
+    let src_pics = musefs_format::ogg::read_pictures(&source_bytes).unwrap();
+    assert!(!src_pics.is_empty(), "fixture should carry a cover");
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    musefs_core::scan_directory(&db, backing.path()).unwrap();
+    let fs = musefs_core::Musefs::open(db, config()).unwrap();
+    let mountpoint = tempfile::tempdir().unwrap();
+    let session = musefs_fuse::spawn(fs, mountpoint.path(), "musefs-ogg-art").unwrap();
+
+    let mounted = std::fs::read(find_one_file(mountpoint.path())).unwrap();
+    // All pages valid (read_packets panics on bad CRC).
+    let _ = read_packets(&mounted);
+    // The synthesized file carries the same image bytes as the source.
+    let out_pics = musefs_format::ogg::read_pictures(&mounted).unwrap();
+    assert_eq!(out_pics.len(), 1);
+    assert_eq!(out_pics[0].data, src_pics[0].data);
+
+    drop(session);
+}
+
 #[test]
 #[ignore = "requires /dev/fuse + libfuse + ffmpeg; run with --ignored"]
 fn opus_read_through_validates_pages_and_audio() {
