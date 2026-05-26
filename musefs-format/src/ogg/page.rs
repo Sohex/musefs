@@ -33,6 +33,9 @@ pub fn parse_page(buf: &[u8], pos: usize) -> Result<PageHeader> {
     if pos + 27 > buf.len() || &buf[pos..pos + 4] != CAPTURE {
         return Err(FormatError::Malformed);
     }
+    if buf[pos + 4] != 0 {
+        return Err(FormatError::Malformed);
+    }
     let header_type = buf[pos + 5];
     let granule = u64::from_le_bytes(buf[pos + 6..pos + 14].try_into().unwrap());
     let serial = u32::from_le_bytes(buf[pos + 14..pos + 18].try_into().unwrap());
@@ -241,6 +244,13 @@ mod tests {
     fn rejects_bad_capture() {
         let mut p = hand_page();
         p[0] = b'X';
+        assert_eq!(parse_page(&p, 0), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn rejects_nonzero_version() {
+        let mut p = hand_page();
+        p[4] = 1; // bad version
         assert_eq!(parse_page(&p, 0), Err(FormatError::Malformed));
     }
 

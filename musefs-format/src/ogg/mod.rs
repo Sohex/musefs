@@ -46,6 +46,25 @@ pub struct OggHeader {
     pub audio_offset: u64,
 }
 
+/// Reject multiplexed/chained Ogg: within the header region every page must share
+/// the first page's serial and only the first page may carry BOS.
+fn validate_single_bitstream(data: &[u8], audio_offset: u64, serial: u32) -> Result<()> {
+    let mut pos = 0usize;
+    let mut first = true;
+    while (pos as u64) < audio_offset {
+        let h = crate::ogg::page::parse_page(data, pos)?;
+        if h.serial != serial {
+            return Err(FormatError::Malformed);
+        }
+        if !first && (h.header_type & crate::ogg::page::FLAG_BOS) != 0 {
+            return Err(FormatError::Malformed);
+        }
+        first = false;
+        pos += h.total_len();
+    }
+    Ok(())
+}
+
 /// Parse the header region from the front of a logical bitstream. `data` may be the
 /// whole file or just `[0, audio_offset)`; either way parsing stops once all header
 /// packets are reassembled.
@@ -69,12 +88,14 @@ pub fn read_header(data: &[u8]) -> Result<OggHeader> {
         return Err(FormatError::Malformed);
     }
     let last = pkts.last().unwrap();
+    let audio_offset = last.end_offset as u64;
+    validate_single_bitstream(data, audio_offset, serial)?;
     Ok(OggHeader {
         codec,
         serial,
         packets: pkts.iter().map(|p| p.data.clone()).collect(),
         header_pages: last.pages_through_end,
-        audio_offset: last.end_offset as u64,
+        audio_offset,
     })
 }
 
@@ -514,6 +535,27 @@ mod tests {
 
         let (bytes, _) = crate::ogg::page::build_header(77, &[&mapping, &seektable, &old_vc]);
         bytes
+    }
+
+    #[test]
+    fn rejects_multiplexed_second_bitstream() {
+        // Two BOS pages with DIFFERENT serials at the start => multiplexed; must reject.
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let (mut data, _) = crate::ogg::page::lace_packet(0x1111, 0, true, 0, &head);
+        // A second logical stream's BOS page (different serial).
+        let (other, _) = crate::ogg::page::lace_packet(
+            0x2222,
+            0,
+            true,
+            0,
+            b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".as_ref(),
+        );
+        data.extend_from_slice(&other);
+        // Some audio after, so audio_offset (if it were accepted) is past these pages.
+        let (audio, _) = crate::ogg::page::lace_packet(0x1111, 1, false, 960, &[0u8; 50]);
+        data.extend_from_slice(&audio);
+        assert!(read_header(&data).is_err());
+        assert!(locate_audio(&data).is_err());
     }
 
     #[test]
