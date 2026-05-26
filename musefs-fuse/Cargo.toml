@@ -13,4 +13,5 @@ musefs-core = { path = "../musefs-core" }
 tempfile = "3"
 metaflac = "0.2"
 musefs-db = { path = "../musefs-db" }
+musefs-format = { path = "../musefs-format" }
 ogg = "0.9"
