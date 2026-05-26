@@ -51,6 +51,14 @@ struct Handle {
     file: std::fs::File,
 }
 
+/// A cached file size/attr entry: validated at `content_version`.
+#[derive(Clone, Copy)]
+struct SizeEntry {
+    content_version: i64,
+    total_len: u64,
+    mtime_secs: i64,
+}
+
 /// The composed read-only filesystem: the store, the rendered tree, and the
 /// lazy synthesis cache. All methods take `&self`; the tree is swapped
 /// atomically on refresh, the cache is internally sharded (each shard mutex-guarded),
@@ -64,10 +72,10 @@ pub struct Musefs {
     last_data_version: AtomicI64,
     handles: Mutex<HashMap<u64, Arc<Handle>>>,
     next_fh: AtomicU64,
-    /// (content_version, total_len, mtime_secs) keyed by track id. Tiny entries,
-    /// effectively unbounded; serves getattr/lookup without a backing stat or full
-    /// synthesis. Self-invalidates on a content_version change.
-    size_cache: Mutex<HashMap<i64, (i64, u64, i64)>>,
+    /// `SizeEntry` keyed by track id. Tiny entries, effectively unbounded; serves
+    /// getattr/lookup without a backing stat or full synthesis. Self-invalidates on
+    /// a content_version change.
+    size_cache: Mutex<HashMap<i64, SizeEntry>>,
 }
 
 impl Musefs {
@@ -111,15 +119,19 @@ impl Musefs {
         Ok(())
     }
 
-    // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) before any
-    // cache shard lock. The header cache is internally sharded; `resolve` does its
-    // stat/synthesis off-lock and locks a shard only for the get/insert.
+    // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) FIRST, then
+    // any of the in-memory locks (`size_cache`, the header cache's shards, `handles`).
+    // Those in-memory locks are independent siblings and are each held only briefly
+    // (a map get/insert) — never across a pool/DB call. Never acquire one of them and
+    // then call back into the pool (it would invert this order). The header cache is
+    // internally sharded; `resolve` does its stat/synthesis off-lock and locks a shard
+    // only for the get/insert.
 
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Handle>>> {
         self.handles.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn size_cache(&self) -> std::sync::MutexGuard<'_, HashMap<i64, (i64, u64, i64)>> {
+    fn size_cache(&self) -> std::sync::MutexGuard<'_, HashMap<i64, SizeEntry>> {
         self.size_cache.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -137,6 +149,9 @@ impl Musefs {
         // concurrent reader that sees the new version also sees fresh state.
         self.refresh()?;
         self.cache.clear();
+        // Also drop stale size entries (a deleted track's id can be reused).
+        // Task 3.3 replaces both wholesale clears with live-set pruning.
+        self.size_cache().clear();
         self.last_data_version.store(version, Ordering::Release);
         Ok(true)
     }
@@ -173,20 +188,24 @@ impl Musefs {
             let track = db
                 .get_track(track_id)?
                 .ok_or(CoreError::TrackNotFound(track_id))?;
-            if let Some(&(cv, len, mt)) = self.size_cache().get(&track_id) {
-                if cv == track.content_version {
-                    return Ok((len, mt)); // hit: no backing stat, no synthesis
+            if let Some(e) = self.size_cache().get(&track_id).copied() {
+                if e.content_version == track.content_version {
+                    // Hit: no backing stat, no synthesis. NOTE: a backing file
+                    // changed in place without a rescan would leave mtime/size
+                    // stale until the next scan bumps content_version — acceptable
+                    // for a read-only mount (reads still validate at open()).
+                    return Ok((e.total_len, e.mtime_secs));
                 }
             }
             // Miss: full resolve (validates via stat, builds + caches the layout).
             let resolved = self.cache.resolve(db, track_id)?;
             self.size_cache().insert(
                 track_id,
-                (
-                    track.content_version,
-                    resolved.total_len,
-                    resolved.mtime_secs,
-                ),
+                SizeEntry {
+                    content_version: track.content_version,
+                    total_len: resolved.total_len,
+                    mtime_secs: resolved.mtime_secs,
+                },
             );
             Ok((resolved.total_len, resolved.mtime_secs))
         })?;
