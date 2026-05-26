@@ -1,5 +1,33 @@
 use std::collections::{BTreeMap, HashMap};
 
+/// Assigns stable inodes keyed by rendered path, persisted across tree rebuilds:
+/// an unchanged path keeps its inode, a new path gets a fresh one, and a retired
+/// inode is never recycled (a stale FUSE handle can't alias a different node).
+#[derive(Debug, Default)]
+pub struct InodeAllocator {
+    paths: HashMap<String, u64>,
+    next: u64,
+}
+
+impl InodeAllocator {
+    pub fn new() -> InodeAllocator {
+        let mut paths = HashMap::new();
+        paths.insert(String::new(), VirtualTree::ROOT); // root path "" -> inode 1
+        InodeAllocator { paths, next: 2 }
+    }
+    /// The inode for `path` (the disambiguated path from root), reused if seen
+    /// before, else freshly allocated.
+    fn intern(&mut self, path: &str) -> u64 {
+        if let Some(&ino) = self.paths.get(path) {
+            return ino;
+        }
+        let ino = self.next;
+        self.next += 1;
+        self.paths.insert(path.to_string(), ino);
+        ino
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeKind {
     Dir,
@@ -19,17 +47,21 @@ pub struct Node {
 pub struct VirtualTree {
     nodes: HashMap<u64, Node>,
     children: HashMap<u64, BTreeMap<String, u64>>,
-    next_inode: u64,
 }
 
 impl VirtualTree {
     pub const ROOT: u64 = 1;
 
     pub fn build(entries: &[(i64, String)]) -> VirtualTree {
+        VirtualTree::build_with(entries, &mut InodeAllocator::new())
+    }
+
+    /// Build the tree assigning inodes via `alloc` (keyed by rendered path), so
+    /// inodes are stable across rebuilds that reuse the same allocator.
+    pub fn build_with(entries: &[(i64, String)], alloc: &mut InodeAllocator) -> VirtualTree {
         let mut tree = VirtualTree {
             nodes: HashMap::new(),
             children: HashMap::new(),
-            next_inode: 2,
         };
         tree.nodes.insert(
             Self::ROOT,
@@ -41,7 +73,7 @@ impl VirtualTree {
         );
         tree.children.insert(Self::ROOT, BTreeMap::new());
         for (track_id, path) in entries {
-            tree.insert_file(*track_id, path);
+            tree.insert_file(*track_id, path, alloc);
         }
         tree
     }
@@ -77,23 +109,21 @@ impl VirtualTree {
         }
     }
 
-    fn alloc(&mut self) -> u64 {
-        let inode = self.next_inode;
-        self.next_inode += 1;
-        inode
-    }
-
-    fn insert_file(&mut self, track_id: i64, path: &str) {
+    fn insert_file(&mut self, track_id: i64, path: &str, alloc: &mut InodeAllocator) {
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         if comps.is_empty() {
             return;
         }
         let mut dir = Self::ROOT;
+        let mut dir_path = String::new();
         for comp in &comps[..comps.len() - 1] {
-            dir = self.ensure_dir(dir, comp);
+            let (child, child_path) = self.ensure_dir(dir, &dir_path, comp, alloc);
+            dir = child;
+            dir_path = child_path;
         }
         let name = self.disambiguate(dir, comps[comps.len() - 1]);
-        let inode = self.alloc();
+        let full = join_path(&dir_path, &name);
+        let inode = alloc.intern(&full);
         self.nodes.insert(
             inode,
             Node {
@@ -105,14 +135,21 @@ impl VirtualTree {
         self.children.get_mut(&dir).unwrap().insert(name, inode);
     }
 
-    fn ensure_dir(&mut self, parent: u64, name: &str) -> u64 {
+    fn ensure_dir(
+        &mut self,
+        parent: u64,
+        parent_path: &str,
+        name: &str,
+        alloc: &mut InodeAllocator,
+    ) -> (u64, String) {
         if let Some(&existing) = self.children[&parent].get(name) {
             if self.is_dir(existing) {
-                return existing;
+                return (existing, join_path(parent_path, name));
             }
         }
         let unique = self.disambiguate(parent, name);
-        let inode = self.alloc();
+        let full = join_path(parent_path, &unique);
+        let inode = alloc.intern(&full);
         self.nodes.insert(
             inode,
             Node {
@@ -126,7 +163,7 @@ impl VirtualTree {
             .get_mut(&parent)
             .unwrap()
             .insert(unique, inode);
-        inode
+        (inode, full)
     }
 
     /// Return `name` if free in `dir`, else append ` (k)` before the extension.
@@ -161,5 +198,52 @@ impl VirtualTree {
                 NodeKind::Dir => None,
             })
             .collect()
+    }
+}
+
+/// Join a parent path and a child name with `/`, treating an empty parent as root.
+fn join_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_with_keeps_inodes_stable_across_rebuilds() {
+        let mut alloc = InodeAllocator::new();
+        let t1 = VirtualTree::build_with(&[(10, "Alice/Song.flac".into())], &mut alloc);
+        let alice1 = t1.lookup(VirtualTree::ROOT, "Alice").unwrap();
+        let song1 = t1.lookup(alice1, "Song.flac").unwrap();
+        let t2 = VirtualTree::build_with(
+            &[
+                (10, "Alice/Song.flac".into()),
+                (20, "Bob/Other.flac".into()),
+            ],
+            &mut alloc,
+        );
+        let alice2 = t2.lookup(VirtualTree::ROOT, "Alice").unwrap();
+        let song2 = t2.lookup(alice2, "Song.flac").unwrap();
+        assert_eq!(alice1, alice2);
+        assert_eq!(song1, song2);
+        let bob2 = t2.lookup(VirtualTree::ROOT, "Bob").unwrap();
+        assert!(bob2 != alice2 && bob2 != song2);
+    }
+
+    #[test]
+    fn build_with_does_not_recycle_a_vanished_inode() {
+        let mut alloc = InodeAllocator::new();
+        let t1 = VirtualTree::build_with(&[(10, "Gone/X.flac".into())], &mut alloc);
+        let gone = t1.lookup(VirtualTree::ROOT, "Gone").unwrap();
+        let x = t1.lookup(gone, "X.flac").unwrap();
+        let t2 = VirtualTree::build_with(&[(20, "New/Y.flac".into())], &mut alloc);
+        let new = t2.lookup(VirtualTree::ROOT, "New").unwrap();
+        let y = t2.lookup(new, "Y.flac").unwrap();
+        assert!(new != gone && new != x && y != gone && y != x);
     }
 }

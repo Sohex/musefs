@@ -519,3 +519,58 @@ fn poll_refresh_single_flights_concurrent_callers() {
     assert_eq!(trues, 1, "single-flight: exactly one caller rebuilds");
     assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_some());
 }
+
+#[test]
+fn inode_is_stable_across_refresh() {
+    use musefs_db::{Format, NewTrack, Tag};
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[Tag::new("artist", "Alice", 0), Tag::new("title", "A", 0)],
+        )
+        .unwrap();
+    }
+    let cfg = MountConfig {
+        poll_interval: std::time::Duration::ZERO,
+        ..config()
+    };
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+    let alice = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, song_before, _) = fs.readdir(alice).unwrap().into_iter().next().unwrap();
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        let id = db2
+            .upsert_track(&NewTrack {
+                backing_path: "/x/b.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db2.replace_tags(
+            id,
+            &[Tag::new("artist", "Bob", 0), Tag::new("title", "B", 0)],
+        )
+        .unwrap();
+    }
+    assert!(fs.poll_refresh().unwrap());
+    let alice_after = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, song_after, _) = fs.readdir(alice_after).unwrap().into_iter().next().unwrap();
+    assert_eq!(alice, alice_after);
+    assert_eq!(song_before, song_after);
+}

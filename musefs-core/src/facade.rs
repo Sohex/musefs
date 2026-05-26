@@ -10,7 +10,7 @@ use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
 use crate::reader::{read_at, read_at_with_file, HeaderCache, ResolvedFile};
 use crate::template::render_path;
-use crate::tree::{NodeKind, VirtualTree};
+use crate::tree::{InodeAllocator, NodeKind, VirtualTree};
 
 /// How the mount serves file *contents*. The virtual tree is identical either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,11 +96,15 @@ pub struct Musefs {
     /// Single-flight guard: only the thread that flips this `false → true`
     /// performs the rebuild; concurrent callers see it set and return immediately.
     refreshing: AtomicBool,
+    /// Persistent path→inode allocator: carries stable inodes across tree rebuilds
+    /// so open FUSE handles continue to resolve to the same node after a refresh.
+    inodes: Mutex<InodeAllocator>,
 }
 
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
-        let tree = Self::build_tree(&db, &config)?;
+        let mut alloc = InodeAllocator::new();
+        let tree = Self::build_tree(&db, &config, &mut alloc)?;
         let last_data_version = db.data_version()?;
         let poll_interval = config.poll_interval;
         Ok(Musefs {
@@ -115,10 +119,15 @@ impl Musefs {
             last_poll: Mutex::new(std::time::Instant::now()),
             poll_interval,
             refreshing: AtomicBool::new(false),
+            inodes: Mutex::new(alloc),
         })
     }
 
-    fn build_tree(db: &Db, config: &MountConfig) -> Result<VirtualTree> {
+    fn build_tree(
+        db: &Db,
+        config: &MountConfig,
+        alloc: &mut InodeAllocator,
+    ) -> Result<VirtualTree> {
         let tracks = db.list_tracks()?;
         let mut tags_by_track = db.tags_grouped()?;
         let mut entries = Vec::with_capacity(tracks.len());
@@ -134,23 +143,28 @@ impl Musefs {
             );
             entries.push((t.id, path));
         }
-        Ok(VirtualTree::build(&entries))
+        Ok(VirtualTree::build_with(&entries, alloc))
     }
 
     /// Rebuild the tree from the current DB contents (used after external edits).
     pub fn refresh(&self) -> Result<()> {
-        let tree = self.pool.with(|db| Self::build_tree(db, &self.config))?;
+        let tree = self.pool.with(|db| {
+            let mut alloc = self.inodes.lock().unwrap_or_else(|p| p.into_inner());
+            Self::build_tree(db, &self.config, &mut alloc)
+        })?;
         self.tree.store(Arc::new(tree));
         Ok(())
     }
 
     // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) FIRST, then
-    // any of the in-memory locks (`size_cache`, the header cache's shards, `handles`).
+    // any of the in-memory locks (`inodes`, `size_cache`, the header cache's shards,
+    // `handles`). `inodes` is held inside `pool.with` during `refresh` — that is the
+    // one intentional exception where a pool connection is held around an in-memory
+    // lock; all other in-memory locks must never be held while calling into the pool.
     // Those in-memory locks are independent siblings and are each held only briefly
-    // (a map get/insert) — never across a pool/DB call. Never acquire one of them and
-    // then call back into the pool (it would invert this order). The header cache is
-    // internally sharded; `resolve` does its stat/synthesis off-lock and locks a shard
-    // only for the get/insert.
+    // (a map get/insert) — never across a pool/DB call (except `inodes` as above).
+    // The header cache is internally sharded; `resolve` does its stat/synthesis
+    // off-lock and locks a shard only for the get/insert.
 
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Handle>>> {
         self.handles.lock().unwrap_or_else(|p| p.into_inner())
