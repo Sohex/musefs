@@ -1,10 +1,14 @@
 //! FUSE filesystem binding for musefs: translates VFS calls into `musefs-core`
-//! operations. Mounted single-threaded (fuser's session loop), matching the
-//! `&mut self` read path in `musefs_core::Musefs`.
+//! operations. fuser dispatches on a single thread; blocking operations are
+//! offloaded onto a bounded worker pool and answered via the `Send` reply
+//! objects, so a slow backing read cannot stall metadata operations.
 
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+use threadpool::ThreadPool;
 
 use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
@@ -61,11 +65,13 @@ pub fn to_file_attr(attr: &Attr, uid: u32, gid: u32, fallback_mtime: SystemTime)
     }
 }
 
-/// A `fuser::Filesystem` that serves a `musefs_core::Musefs`. Owns the core
-/// (and thus the DB + header cache); all core methods take `&self`, so the
-/// struct is `Sync`-ready for future multi-threaded fuser workers.
+/// A `fuser::Filesystem` that serves a `musefs_core::Musefs`. fuser dispatches
+/// on one thread; blocking ops (read/getattr/lookup-attr) are offloaded to a
+/// bounded worker pool and answered via the `Send` reply objects, so a slow
+/// backing read never stalls the dispatch thread or unrelated metadata ops.
 pub struct MusefsFs {
-    core: Musefs,
+    core: Arc<Musefs>,
+    pool: ThreadPool,
     uid: u32,
     gid: u32,
     mount_time: SystemTime,
@@ -73,8 +79,14 @@ pub struct MusefsFs {
 
 impl MusefsFs {
     pub fn new(core: Musefs) -> MusefsFs {
+        // Work is I/O-bound (especially on NFS), so oversize the pool vs CPUs.
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            * 2;
         MusefsFs {
-            core,
+            core: Arc::new(core),
+            pool: ThreadPool::new(workers),
             // SAFETY: getuid/getgid are always-successful libc calls.
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -90,29 +102,28 @@ impl Filesystem for MusefsFs {
             Some(n) => n,
             None => return reply.error(libc::ENOENT),
         };
+        // Inode resolution is an in-memory tree read; the attr (which may touch
+        // the DB/disk) is computed on the worker pool.
         let child = match self.core.lookup(parent, name) {
             Some(ino) => ino,
             None => return reply.error(libc::ENOENT),
         };
-        match self.core.getattr(child) {
-            Ok(attr) => reply.entry(
-                &TTL,
-                &to_file_attr(&attr, self.uid, self.gid, self.mount_time),
-                0,
-            ),
+        let core = Arc::clone(&self.core);
+        let (uid, gid, mt) = (self.uid, self.gid, self.mount_time);
+        self.pool.execute(move || match core.getattr(child) {
+            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr, uid, gid, mt), 0),
             Err(e) => reply.error(errno(&e)),
-        }
+        });
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         let _ = self.core.poll_refresh();
-        match self.core.getattr(ino) {
-            Ok(attr) => reply.attr(
-                &TTL,
-                &to_file_attr(&attr, self.uid, self.gid, self.mount_time),
-            ),
+        let core = Arc::clone(&self.core);
+        let (uid, gid, mt) = (self.uid, self.gid, self.mount_time);
+        self.pool.execute(move || match core.getattr(ino) {
+            Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr, uid, gid, mt)),
             Err(e) => reply.error(errno(&e)),
-        }
+        });
     }
 
     fn read(
@@ -129,10 +140,12 @@ impl Filesystem for MusefsFs {
         if offset < 0 {
             return reply.error(libc::EINVAL);
         }
-        match self.core.read(ino, offset as u64, size as u64) {
-            Ok(bytes) => reply.data(&bytes),
-            Err(e) => reply.error(errno(&e)),
-        }
+        let core = Arc::clone(&self.core);
+        self.pool
+            .execute(move || match core.read(ino, offset as u64, size as u64) {
+                Ok(bytes) => reply.data(&bytes),
+                Err(e) => reply.error(errno(&e)),
+            });
     }
 
     fn readdir(
