@@ -76,6 +76,48 @@ pub fn read_header(data: &[u8]) -> Result<OggHeader> {
     })
 }
 
+/// Strip a codec's comment-packet prefix, returning the VorbisComment body slice.
+fn comment_body<'a>(codec: Codec, packet: &'a [u8]) -> Result<&'a [u8]> {
+    let prefix = match codec {
+        Codec::Opus => 8,    // "OpusTags"
+        Codec::Vorbis => 7,  // 0x03 "vorbis"
+        Codec::OggFlac => 4, // FLAC metadata block header (type + 24-bit length)
+    };
+    if packet.len() < prefix {
+        return Err(FormatError::Malformed);
+    }
+    Ok(&packet[prefix..])
+}
+
+/// The index of the comment packet within the reassembled header packets.
+fn comment_packet_index(header: &OggHeader) -> usize {
+    match header.codec {
+        Codec::Opus => 1,
+        Codec::Vorbis => 1,
+        // OggFLAC: packet 0 is the mapping header; the VORBIS_COMMENT block is
+        // whichever following packet has block type 4.
+        Codec::OggFlac => header
+            .packets
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, p)| !p.is_empty() && (p[0] & 0x7F) == 4)
+            .map(|(i, _)| i)
+            .unwrap_or(0),
+    }
+}
+
+/// Read existing `(FIELD, value)` tags from a complete file. Empty if none.
+pub fn read_tags(data: &[u8]) -> Result<Vec<(String, String)>> {
+    let header = read_header(data)?;
+    let idx = comment_packet_index(&header);
+    if idx == 0 {
+        return Ok(Vec::new()); // no comment packet present
+    }
+    let body = comment_body(header.codec, &header.packets[idx])?;
+    crate::vorbiscomment::parse(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +144,20 @@ mod tests {
         assert_eq!(h.packets.len(), 2);
         assert_eq!(h.audio_offset, header_len as u64);
         assert_eq!(h.header_pages, 2);
+    }
+
+    #[test]
+    fn read_tags_opus() {
+        // Build an OpusTags packet with one real comment via the shared builder.
+        let body = crate::vorbiscomment::build(&[crate::input::TagInput::new("title", "Sun")]);
+        let mut tags_pkt = b"OpusTags".to_vec();
+        tags_pkt.extend_from_slice(&body);
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let (mut data, _) = crate::ogg::page::build_header(7, &[&head, &tags_pkt]);
+        let (audio, _) = crate::ogg::page::lace_packet(7, 2, false, 960, &vec![0u8; 50]);
+        data.extend_from_slice(&audio);
+
+        let tags = read_tags(&data).unwrap();
+        assert_eq!(tags, vec![("TITLE".to_string(), "Sun".to_string())]);
     }
 }
