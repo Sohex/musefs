@@ -100,7 +100,12 @@ impl MusefsFs {
 
 impl Filesystem for MusefsFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let _ = self.core.poll_refresh();
+        {
+            let core = Arc::clone(&self.core);
+            self.pool.execute(move || {
+                let _ = core.poll_refresh();
+            });
+        }
         let name = match name.to_str() {
             Some(n) => n,
             None => return reply.error(libc::ENOENT),
@@ -120,7 +125,12 @@ impl Filesystem for MusefsFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        let _ = self.core.poll_refresh();
+        {
+            let core = Arc::clone(&self.core);
+            self.pool.execute(move || {
+                let _ = core.poll_refresh();
+            });
+        }
         let core = Arc::clone(&self.core);
         let (uid, gid, mt) = (self.uid, self.gid, self.mount_time);
         self.pool.execute(move || match core.getattr(ino) {
@@ -183,7 +193,12 @@ impl Filesystem for MusefsFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let _ = self.core.poll_refresh();
+        {
+            let core = Arc::clone(&self.core);
+            self.pool.execute(move || {
+                let _ = core.poll_refresh();
+            });
+        }
         let entries = match self.core.readdir(ino) {
             Ok(e) => e,
             Err(e) => return reply.error(errno(&e)),

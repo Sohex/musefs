@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -83,6 +83,9 @@ pub struct Musefs {
     last_poll: Mutex<std::time::Instant>,
     /// Minimum time between `data_version` polls (`Duration::ZERO` disables debouncing).
     poll_interval: std::time::Duration,
+    /// Single-flight guard: only the thread that flips this `false → true`
+    /// performs the rebuild; concurrent callers see it set and return immediately.
+    refreshing: AtomicBool,
 }
 
 impl Musefs {
@@ -101,6 +104,7 @@ impl Musefs {
             size_cache: Mutex::new(HashMap::new()),
             last_poll: Mutex::new(std::time::Instant::now()),
             poll_interval,
+            refreshing: AtomicBool::new(false),
         })
     }
 
@@ -155,6 +159,10 @@ impl Musefs {
     /// Unchanged cache entries stay warm — a changed track self-invalidates lazily
     /// on its next `resolve`/`getattr` via `content_version`; only vanished tracks
     /// are dropped immediately.
+    ///
+    /// Single-flighted: if a rebuild is already in progress (another caller flipped
+    /// `refreshing`), concurrent callers return `Ok(false)` immediately rather than
+    /// duplicating the O(library) rebuild work.
     pub fn poll_refresh(&self) -> Result<bool> {
         if !self.poll_interval.is_zero() {
             let mut last = self.last_poll.lock().unwrap_or_else(|p| p.into_inner());
@@ -167,16 +175,27 @@ impl Musefs {
         if version == self.last_data_version.load(Ordering::Acquire) {
             return Ok(false);
         }
-        // Rebuild the tree, then prune caches to the live track set: unchanged
-        // entries stay warm (a changed track self-invalidates on its next resolve
-        // via content_version); vanished tracks are dropped. Commit the stamp only
-        // after a successful rebuild.
-        self.refresh()?;
-        let live = self.tree.load().track_ids();
-        self.cache.retain(&live);
-        self.size_cache().retain(|k, _| live.contains(k));
-        self.last_data_version.store(version, Ordering::Release);
-        Ok(true)
+        // Single-flight: only the caller that flips the flag false->true rebuilds;
+        // concurrent callers see it's being handled and return without duplicating
+        // the O(library) work.
+        if self
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        // Always clear the flag, even on an early `?` return from the rebuild.
+        let result = (|| {
+            self.refresh()?;
+            let live = self.tree.load().track_ids();
+            self.cache.retain(&live);
+            self.size_cache().retain(|k, _| live.contains(k));
+            self.last_data_version.store(version, Ordering::Release);
+            Ok(true)
+        })();
+        self.refreshing.store(false, Ordering::Release);
+        result
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {

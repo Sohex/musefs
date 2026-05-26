@@ -453,3 +453,69 @@ fn poll_refresh_debounces_within_interval() {
     assert!(!fs.poll_refresh().unwrap()); // debounced (within 1h of open)
     assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_none());
 }
+
+#[test]
+fn poll_refresh_single_flights_concurrent_callers() {
+    use musefs_db::{Format, NewTrack, Tag};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[Tag::new("artist", "Alice", 0), Tag::new("title", "A", 0)],
+        )
+        .unwrap();
+    }
+    let cfg = MountConfig {
+        poll_interval: std::time::Duration::ZERO,
+        ..config()
+    };
+    let fs = Arc::new(Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap());
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        let id = db2
+            .upsert_track(&NewTrack {
+                backing_path: "/x/b.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db2.replace_tags(
+            id,
+            &[Tag::new("artist", "Bob", 0), Tag::new("title", "B", 0)],
+        )
+        .unwrap();
+    }
+    let trues: usize = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let fs = Arc::clone(&fs);
+                s.spawn(move || {
+                    if fs.poll_refresh().unwrap() {
+                        1usize
+                    } else {
+                        0
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+    assert_eq!(trues, 1, "single-flight: exactly one caller rebuilds");
+    assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_some());
+}
