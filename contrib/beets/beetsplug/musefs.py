@@ -1,6 +1,7 @@
 """beets plugin: sync canonical beets metadata into the musefs SQLite store."""
 
 import os
+import subprocess
 
 from beets import ui
 from beets.plugins import BeetsPlugin
@@ -11,7 +12,14 @@ from beetsplug import _core
 class MusefsPlugin(BeetsPlugin):
     def __init__(self):
         super().__init__()
-        self.config.add({"db": None, "fields": {}})
+        self.config.add(
+            {
+                "db": None,
+                "fields": {},
+                "bin": "musefs",   # musefs executable (PATH name or full path)
+                "autoscan": True,  # run `musefs scan` automatically before syncing
+            }
+        )
         self.register_listener("after_write", self._on_after_write)
         self.register_listener("item_imported", self._on_item_imported)
         self.register_listener("album_imported", self._on_album_imported)
@@ -46,6 +54,15 @@ class MusefsPlugin(BeetsPlugin):
 
         query = self._query_from_args(args)
         items = list(lib.items(query))
+        if self._autoscan() and not opts.dry_run:
+            # Full sync: one scan of the music dir. Query: scan only the matched
+            # files, so non-matched rows aren't re-seeded from their files.
+            targets = (
+                [os.fsdecode(i.path) for i in items]
+                if query
+                else [os.fsdecode(lib.directory)]
+            )
+            self._run_scan(db_path, targets)
         stats = self._sync(db_path, items, dry_run=opts.dry_run)
         # ui.print_ (not self._log) so the summary always shows, not only at -v.
         ui.print_(f"musefs: {stats.summary()}")
@@ -75,8 +92,39 @@ class MusefsPlugin(BeetsPlugin):
     def _fields(self):
         return self.config["fields"].get(dict) or {}
 
+    def _autoscan(self):
+        return bool(self.config["autoscan"].get(bool))
+
+    def _bin(self):
+        return self.config["bin"].get(str) or "musefs"
+
+    def _run_scan(self, db_path, targets):
+        """Run `musefs scan <target> --db <db>` for each target (file or dir).
+        Creates the DB if missing and fills the structural columns the plugin
+        can't compute itself. Raises ui.UserError on failure."""
+        binary = self._bin()
+        for target in targets:
+            try:
+                result = subprocess.run(
+                    [binary, "scan", target, "--db", db_path],
+                    capture_output=True,
+                )
+            except FileNotFoundError:
+                raise ui.UserError(
+                    f"musefs: binary '{binary}' not found; set `musefs.bin` to "
+                    f"the musefs executable path"
+                )
+            if result.returncode != 0:
+                raise ui.UserError(
+                    f"musefs: `{binary} scan` failed for {target} "
+                    f"(exit {result.returncode}):\n"
+                    f"{result.stderr.decode(errors='replace').strip()}"
+                )
+
     def _sync_listener(self, items):
-        """Sync a listener's affected items, skipping gracefully if unconfigured."""
+        """Sync a listener's affected items. Best-effort: a passive hook must
+        never abort the user's beets operation, so a missing DB / scan failure
+        is downgraded to a warning rather than raised."""
         items = [i for i in items if i is not None]
         if not items:
             return
@@ -84,12 +132,18 @@ class MusefsPlugin(BeetsPlugin):
         if not db_path:
             self._log.warning("musefs: no `musefs.db` configured; skipping sync")
             return
-        self._sync(db_path, items)
+        try:
+            if self._autoscan():
+                self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
+            self._sync(db_path, items)
+        except ui.UserError as exc:
+            self._log.warning("musefs: {}", exc)
 
     def _sync(self, db_path, items, dry_run=False):
         if not os.path.exists(db_path):
             raise ui.UserError(
-                f"musefs: DB not found at {db_path}; run `musefs scan` first"
+                f"musefs: DB not found at {db_path}; enable `musefs.autoscan` "
+                f"or run `musefs scan` first"
             )
         conn = _core.connect(db_path)
         try:
