@@ -113,9 +113,10 @@ dependency). Internally decomposed into small, independently testable units:
 7. **`synthesize_layout`** — assemble the `RegionLayout`.
 8. **page index + sizing** — analytic `st_size` (no page walk) and the lazily
    built, cached audio-page index that backs the `OggAudio` segment.
-9. **streaming art encoder** — on-the-fly base64 (Opus/Vorbis) or raw (OggFLAC)
-   art emission from the SQLite blob at read time, with base64-quantum page
-   alignment.
+9. **streaming art (`OggArtSlice`)** — Plan 2. Synthesis emits per-art-page
+   `OggArtSlice { art_id, b64_offset, b64_len, encoding }` segments (no art bytes
+   in the layout); `read_at` serves them by encoding the bounded input window for
+   the requested base64 range (constant memory). OggFLAC carries raw PICTURE bytes.
 
 ### Shared VorbisComment / metadata-block helpers
 
@@ -170,25 +171,37 @@ the common case, not an edge case, so the page builder must implement it exactly
   first page of a multi-page packet); **EOS (0x04)** only on the last page (audio
   region). Header-page granule = 0.
 
-#### Embedded art
+#### Embedded art (slice-based incremental streaming) — Plan 2
 
-Art is included via a **streaming** segment so it is never held in the cached
-layout:
+Art is never resident in the cached layout and is served with **constant memory
+per read**. This matters because the FUSE adapter serializes every operation
+through one `&mut Musefs`, so per-read work directly bounds library-scan
+throughput; constant-work reads keep a full-library scan cheap on any backing
+filesystem (SSD/HDD/NFS), since art bytes come from the local SQLite store, not
+the backing audio path.
 
-- At resolve, the art's base64 (Opus/Vorbis) or raw bytes (OggFLAC) are
-  materialized **transiently** only to compute the enclosing page CRCs, then
-  dropped. Page CRCs can't be shared across tracks (each file's per-stream serial
-  number differs), but the materialized art bytes can be **`Arc`-interned by
-  `art_id`** so concurrent resolves of an album share one copy.
-- Page payload boundaries within the art region are aligned to the base64 quantum
-  (4 output chars / 3 source bytes) — and the `METADATA_BLOCK_PICTURE` structure
-  prefix is padded to a 3-byte multiple — so each page's chunk encodes
-  independently and `read()` can serve an arbitrary sub-range by mapping output
-  offsets to 3-byte source groups read incrementally from the DB blob.
-- The cached layout stores only the page framing + precomputed CRCs plus the
-  streaming-art segment (a new `Segment` variant, `OggArt { art_id, encoding }`,
-  where `encoding` is base64 for Opus/Vorbis or raw for OggFLAC); the image bytes
-  live only in the DB and are re-encoded per read.
+- **Synthesis builds the comment/metadata packet with the art included** —
+  Opus/Vorbis: a `METADATA_BLOCK_PICTURE=<base64>` comment (placed last);
+  OggFLAC: a native PICTURE metadata-block packet — laces it into pages with the
+  **normal** lacer (no special alignment), and computes each page's CRC. The full
+  art bytes are needed transiently here only to CRC the art-bearing pages, then
+  dropped. Resolve is serialized (the cache is `&mut`), so this transient is
+  bounded to one copy at a time.
+- **The layout stores no art bytes.** Where a page's payload consists of art
+  characters, the layout holds a `Segment::OggArtSlice { art_id, b64_offset,
+  b64_len, encoding }` instead of `Inline` bytes — `b64_offset`/`b64_len` are
+  positions within the art's full base64 string (Opus/Vorbis), or raw byte
+  positions when `encoding` is raw (OggFLAC's PICTURE block). Page headers and any
+  non-art payload remain `Inline` with CRCs baked in.
+- **Read serves incrementally via base64 positional arithmetic.** base64 output
+  chars `[o, o+L)` depend only on input bytes `[⌊o/4⌋·3 .. ⌈(o+L)/4⌉·3)`. To serve
+  a requested sub-range of an `OggArtSlice`, `read_at` computes that bounded input
+  window, reads exactly those bytes via `db.read_art_chunk` (a small local-DB
+  incremental blob read), base64-encodes them, and trims the ≤3 leading/trailing
+  chars to land on `[o, o+L)`. Memory and CPU are O(requested bytes). No
+  page-payload alignment is required: the 4-char quantum is reconciled by
+  arithmetic at read time, not by constraining the lacing — so no padding comment
+  and no constrained page sizes (pages lace normally).
 
 ### (b) Renumbered audio region
 
@@ -273,19 +286,22 @@ flag are preserved unchanged.
 
 ## Tradeoffs and limitations
 
-- **Art is never held in the cached layout.** It is materialized only transiently
-  at resolve to CRC its pages (deduped across an album via `Arc`-interning), then
-  streamed from the DB per read. This preserves the FLAC/MP3 "art not resident"
-  property at the cost of re-encoding base64 on each read.
+- **Art is never held in the cached layout** (Plan 2). It is materialized only
+  transiently at resolve to CRC its pages, then served incrementally from the DB
+  per read (O(requested bytes), constant memory). This preserves the FLAC/MP3 "art
+  not resident" property; resolve's transient is bounded to one copy because the
+  cache is `&mut` (serialized).
 - **First read pays a one-time sequential index pass** over the audio region (read
   once, sequentially, to recompute per-page CRCs; payloads are not retained);
   subsequent reads use the cached index. `open()`/`stat` do no audio I/O.
 
 ## Out of scope / future
 
-- Chained / multiplexed Ogg.
 - FLAC-in-Ogg with a non-standard mapping version (only the `0x7F "FLAC"` 1.x
   mapping is handled).
+
+(Chained / multiplexed Ogg is rejected at probe — implemented in Plan 1. Embedded
+art is delivered in Plan 2 via slice-based incremental streaming, above.)
 
 ## Documentation fixes (incidental)
 
