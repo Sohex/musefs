@@ -59,12 +59,18 @@ never the payloads:
   parsing). `diff` is a page-length buffer that is zero except for the 4
   sequence-number bytes (old XOR new) at offset 18; its CRC depends only on those
   4 bytes plus the page length (trailing zeros "roll the register forward" via a
-  precomputed `x^(8·n) mod poly` zero-advance operator). No payload byte is read,
-  copied, or modified.
+  precomputed `x^(8·n) mod poly` zero-advance operator). No payload byte is ever
+  copied into the served output or modified — the CRC math needs only the 4-byte
+  sequence delta and the page length (a buffered scan reads payload bytes off disk
+  only as a side effect of reaching the next header; see below).
 
-Consequently the audio region is built by walking page **headers** only — each
-header's segment table gives the payload length, so we hop header-to-header. I/O
-is O(number of pages); CPU is O(pages) with the zero-advance operator.
+This patch needs each page's stored CRC and its byte boundaries — i.e. the page
+**headers**, not the payloads. But "headers only" is not free: seeking past every
+small payload would cost one syscall per page (thousands per track — pathological
+on an HDD or NAS). So the page index is built with a single **buffered sequential
+pass** over the audio region, and that pass is **deferred to the first `read()`
+and cached** — it never runs at `open()`/`stat` (see "Layout sizing, lazy
+indexing, and cache bounds"). CPU is O(pages) with the zero-advance operator.
 
 All multi-byte Ogg page-header fields (granule, serial, sequence, CRC) are
 little-endian; the CRC patch operates on the raw header byte buffer.
@@ -78,7 +84,6 @@ byte-identical.
 **Out (v1):**
 - Chained or multiplexed Ogg (more than one logical bitstream — e.g. video+audio,
   or concatenated streams). Detected at probe and **not ingested**.
-- A streaming (non-materialized) art segment for Ogg (see Tradeoffs).
 
 ## Data model and detection
 
@@ -103,9 +108,9 @@ byte-identical.
 A new `musefs-format/src/ogg.rs`, hand-rolled like `flac.rs`/`mp3.rs` (no decoder
 dependency). Internally decomposed into small, independently testable units:
 
-1. **`page`** — parse a page header + segment table; build a page (lace a packet
-   stream into pages with correct segment tables, BOS/continuation/EOS flags,
-   granule, serial); a page walker that hops header-to-header.
+1. **`page`** — parse a page header + segment table; build/lace a packet stream
+   into pages (precise lacing rules in Synthesis §a); a page walker that hops
+   header-to-header.
 2. **`crc`** — Ogg CRC-32, the linear sequence-number CRC patch
    (`patch_seq_crc`), and the zero-advance operator. Unit-tested against known
    page vectors.
@@ -115,6 +120,11 @@ dependency). Internally decomposed into small, independently testable units:
 5. **`locate_audio`** — returns `audio_offset` + codec (used by `scan.rs`).
 6. **`read_tags` / `read_pictures`** — extract existing metadata at scan time.
 7. **`synthesize_layout`** — assemble the `RegionLayout`.
+8. **page index + sizing** — analytic `st_size` (no page walk) and the lazily
+   built, cached audio-page index that backs the `OggAudio` segment.
+9. **streaming art encoder** — on-the-fly base64 (Opus/Vorbis) or raw (OggFLAC)
+   art emission from the SQLite blob at read time, with base64-quantum page
+   alignment.
 
 ### Shared VorbisComment / metadata-block helpers
 
@@ -150,23 +160,79 @@ Codec-specific reconstruction, then laced into fresh pages numbered `0, 1, …`:
   count.** Lace one metadata block per Ogg packet, last block's
   last-metadata-block flag set.
 
-These few pages have their CRCs computed normally. This is the **only** place art
-is materialized in memory.
+These few pages have their CRCs computed at build time (the art bytes must exist
+to CRC the page — see "Embedded art" below).
+
+#### Page lacing rules
+
+Once an art-bearing comment/metadata packet is megabytes, lacing across pages is
+the common case, not an edge case, so the page builder must implement it exactly:
+
+- A page's segment table holds at most **255** lacing values, so a page carries
+  at most **255 × 255 = 65 025** payload bytes; larger packets span many pages.
+- A packet of length `L` laces as `⌊L/255⌋` values of `255` followed by one value
+  of `L mod 255`. If `L` is an exact multiple of 255, a **terminating `0` lacing
+  value** is required to signal packet end — omitting it silently corrupts the
+  stream.
+- Header-type flags: **BOS (0x02)** only on the logical bitstream's first page;
+  **continued (0x01)** set on every page that begins mid-packet (i.e. all but the
+  first page of a multi-page packet); **EOS (0x04)** only on the last page (audio
+  region). Header-page granule = 0.
+
+#### Embedded art
+
+Art is included via a **streaming** segment so it is never held in the cached
+layout:
+
+- At resolve, the art's base64 (Opus/Vorbis) or raw bytes (OggFLAC) are
+  materialized **transiently** only to compute the enclosing page CRCs, then
+  dropped. Page CRCs can't be shared across tracks (each file's per-stream serial
+  number differs), but the materialized art bytes can be **`Arc`-interned by
+  `art_id`** so concurrent resolves of an album share one copy.
+- Page payload boundaries within the art region are aligned to the base64 quantum
+  (4 output chars / 3 source bytes) — and the `METADATA_BLOCK_PICTURE` structure
+  prefix is padded to a 3-byte multiple — so each page's chunk encodes
+  independently and `read()` can serve an arbitrary sub-range by mapping output
+  offsets to 3-byte source groups read incrementally from the DB blob.
+- The cached layout stores only the page framing + precomputed CRCs plus the
+  streaming-art segment (a new `Segment` variant, `OggArt { art_id, encoding }`,
+  where `encoding` is base64 for Opus/Vorbis or raw for OggFLAC); the image bytes
+  live only in the DB and are re-encoded per read.
 
 ### (b) Renumbered audio region
 
-For each original audio page: `Inline`(page header — 27 bytes + segment table,
-with patched sequence number and patched CRC) + `BackingAudio`(payload). `delta`
-and CRC patch as described in Background. Granule, serial, and EOS flag are
-preserved unchanged. No new `Segment` variant is required; `ArtImage` is not used
-for Ogg.
+Represented as a single compact segment, `OggAudio { offset, len, seq_delta }`
+(new `Segment` variant) — **not** ~2 entries per page. At `read()` it is backed
+by the lazily built, cached page index: payload bytes are served straight from
+the backing file, and only the 8 changed header bytes per page (sequence number
+at offset 18, patched CRC at offset 22) are overlaid. Granule, serial, and EOS
+flag are preserved unchanged.
+
+## Layout sizing, lazy indexing, and cache bounds
+
+- **`st_size` is analytic — no page walk at `open()`.** Renumbering patches bytes
+  in place and never changes a page's size, so the audio region's byte length is
+  exactly the unchanged `audio_length`. `st_size = header_region_len +
+  audio_length`. `open()`/`stat`/`getattr` therefore do **no** audio I/O.
+- **Lazy, cached page index.** The first `read()` that touches the `OggAudio`
+  segment triggers one buffered sequential pass over the audio region, recording
+  per-page `{offset, length, old_crc}`. It is cached on the `ResolvedFile`, so the
+  pass runs at most once per file and is invalidated with the rest of the cache on
+  `BackingChanged` / `content_version` change. A reader faults those bytes in
+  anyway; a pure metadata scan never pays for it.
+- **Byte-size-bounded `HeaderCache`.** Eviction must be by **total cached bytes**
+  (LRU), not entry count. Once any format embeds materialized data, counting
+  entries is unsafe; with art streamed (above) the cached layout is small, but the
+  byte bound is the general safety net.
 
 ## Wiring
 
 - **`reader.rs`** resolve: add `Format::Opus | Format::Vorbis | Format::OggFlac =>
   ogg::synthesize_layout(...)` arms. Like FLAC, this re-reads `[0, audio_offset)`
-  from the backing file to reconstruct preserved header structures, then walks
-  the audio page headers.
+  to reconstruct preserved header structures and builds the regenerated header
+  pages; it computes `st_size` analytically and emits the compact `OggAudio`
+  segment **without** walking the audio pages (that happens lazily on first
+  `read()`).
 - **`scan.rs`:** probe arms + extraction (audio bounds via `locate_audio`, tags,
   pictures) → upsert, mirroring the FLAC path.
 
@@ -184,10 +250,17 @@ for Ogg.
 
 - **Unit (`ogg.rs` / `crc`):** CRC test vectors; the linear seq#-CRC patch matches
   a from-scratch recompute on sample pages; page lacing round-trips (packet →
-  pages → packet). For each codec, synthesize on a tiny fixture and assert:
+  pages → packet), **including a packet whose length is an exact multiple of 255**
+  (terminating-zero case). For each codec, synthesize on a tiny fixture and assert:
   1. regenerated tags and art decode correctly;
   2. **every** output page CRC validates and sequence numbers are gapless;
   3. audio-payload bytes are byte-identical to the source.
+- **Multi-page art:** a **>100 KB** art fixture to force multi-page lacing of the
+  metadata packet; assert the streamed base64 round-trips and page CRCs validate.
+- **No-I/O `stat`:** assert `open()`/`getattr` returns the correct `st_size`
+  without reading the audio region (the page index stays unbuilt until a `read()`).
+- **Cache bound:** opening a many-track album with embedded art stays under the
+  configured `HeaderCache` byte budget (art not duplicated per track).
 - **e2e (`musefs-fuse`, `#[ignore]`):** mount → read a synthesized `.opus`,
   `.ogg`, and OggFLAC file → validate with a demuxer. Add dev-dependencies (the
   `ogg` crate for page/CRC validation; optionally `lewton`/`symphonia` to confirm
@@ -197,18 +270,19 @@ for Ogg.
 
 ## Tradeoffs and limitations
 
-- **Art is materialized** in the cached layout for Ogg (inside the regenerated
-  header pages), unlike FLAC/MP3 streaming `ArtImage`. Bounded by image size ×
-  cached entries. A streaming-art segment variant (raw bytes for OggFLAC PICTURE;
-  base64 for Opus/Vorbis) is a possible later optimization; OggFLAC's native
-  PICTURE block makes it the cleanest candidate.
-- Resolve reads the header region plus all page **headers** (not payloads) —
-  heavier than FLAC/MP3 but small I/O, and cached in `HeaderCache`.
+- **Art is never held in the cached layout.** It is materialized only transiently
+  at resolve to CRC its pages (deduped across an album via `Arc`-interning), then
+  streamed from the DB per read. This preserves the FLAC/MP3 "art not resident"
+  property at the cost of re-encoding base64 on each read.
+- **First read pays a one-time sequential index pass** over the audio region
+  (page headers); subsequent reads use the cached index. `open()`/`stat` do no
+  audio I/O.
 
 ## Out of scope / future
 
 - Chained / multiplexed Ogg.
-- Streaming (non-materialized) art segment for Ogg.
+- FLAC-in-Ogg with a non-standard mapping version (only the `0x7F "FLAC"` 1.x
+  mapping is handled).
 
 ## Documentation fixes (incidental)
 
