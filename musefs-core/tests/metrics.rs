@@ -22,6 +22,7 @@ fn config() -> MountConfig {
 
 #[test]
 fn baseline_one_open_per_read_call() {
+    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let flac = make_flac(
         &[
@@ -41,7 +42,6 @@ fn baseline_one_open_per_read_call() {
     assert_eq!(name, "Song.flac");
     let size = fs.getattr(file_inode).unwrap().size;
 
-    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     metrics::reset();
     // Read the file in 16 KiB chunks (the access pattern a streaming player produces).
     let chunk = 16 * 1024u64;
@@ -68,6 +68,7 @@ fn baseline_one_open_per_read_call() {
 
 #[test]
 fn handle_reuses_one_open_and_no_per_read_stat() {
+    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let flac = make_flac(
         &[
@@ -86,7 +87,6 @@ fn handle_reuses_one_open_and_no_per_read_stat() {
     let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
     let size = fs.getattr(file_inode).unwrap().size;
 
-    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fh = fs.open_handle(file_inode).unwrap();
     metrics::reset(); // measure only the reads, not open_handle's resolve+open
     let chunk = 16 * 1024u64;
@@ -143,7 +143,6 @@ fn layout_cache_survives_unrelated_refresh() {
     let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let dir = tempfile::tempdir().unwrap();
-    let backing = dir.path().join("a.flac");
     let bytes = make_flac(
         &[
             (0, streaminfo_body()),
@@ -151,7 +150,7 @@ fn layout_cache_survives_unrelated_refresh() {
         ],
         &[0xCD; 8192],
     );
-    std::fs::write(&backing, &bytes).unwrap();
+    std::fs::write(dir.path().join("a.flac"), &bytes).unwrap();
     let db_path = dir.path().join("m.db");
     {
         let db = musefs_db::Db::open(&db_path).unwrap();
@@ -193,6 +192,7 @@ fn layout_cache_survives_unrelated_refresh() {
     let s = metrics::snapshot();
     fs.release_handle(fh2);
 
+    // (resolve still fires one on_stat even on a cache hit — backing validation; not asserted here)
     assert_eq!(
         s.opens, 1,
         "warm cache: only the handle fd open, no re-synthesis open"
