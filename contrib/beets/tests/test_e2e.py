@@ -67,7 +67,11 @@ def _env(tmp_path):
 
 
 def _write_config(tmp_path, library, db, fetchart=False):
-    plugins = "musefs, fetchart" if fetchart else "musefs"
+    plugins_block = (
+        "plugins:\n"
+        "  - musefs\n"
+        "  - fetchart\n"
+    ) if fetchart else "plugins: musefs\n"
     fetchart_block = (
         "fetchart:\n"
         "  auto: yes\n"
@@ -78,7 +82,7 @@ def _write_config(tmp_path, library, db, fetchart=False):
         f"directory: {library}\n"
         f"library: {tmp_path / 'beets_lib.db'}\n"
         f"pluginpath: {BEETSPLUG_DIR}\n"
-        f"plugins: {plugins}\n"
+        f"{plugins_block}"
         f"musefs:\n"
         f"  db: {db}\n"
         f"  bin: {MUSEFS}\n"
@@ -328,5 +332,13 @@ def test_e2e_art_embedded_via_scan(tmp_path):
     cover = _make_cover(tmp_path / "embed.png", "red")
     cfg, env, db, mnt, _ = _imported_library(tmp_path, embed_cover=cover)
     _beet(cfg, env, "musefs")  # autoscan ingests the embedded pictures
+    with _mounted(mnt, db, "$albumartist/$album/$title"):
+        _check_mount_art(cfg, env, mnt, hashlib.sha256(cover).hexdigest())
+
+
+def test_e2e_art_external_via_plugin(tmp_path):
+    cover = _make_cover(tmp_path / "ext.jpg", "green")
+    cfg, env, db, mnt, _ = _imported_library(tmp_path, external_cover=cover)
+    _beet(cfg, env, "musefs")  # plugin syncs album.artpath into track_art
     with _mounted(mnt, db, "$albumartist/$album/$title"):
         _check_mount_art(cfg, env, mnt, hashlib.sha256(cover).hexdigest())
