@@ -1,6 +1,13 @@
 //! Optional syscall/query counters and per-syscall latency injection for
 //! benchmarking. Zero-cost when the `metrics` feature is off: every hook
 //! compiles to an empty inline fn, so call sites stay unconditional and clean.
+//!
+//! Counting scope: `on_open`/`on_stat` count every backing-file open and
+//! metadata syscall on any read path. `on_pread` counts bytes served from
+//! `BackingAudio` segments (the FLAC/MP3/M4A audio path); the Ogg audio path's
+//! internal positioned reads (via the page server) and art-blob reads are
+//! tracked by call count (`on_open`/`on_art_chunk`) but are not byte-counted.
+//! `on_open` fires on the open *attempt* (a failed open is still a syscall).
 
 pub use imp::*;
 
