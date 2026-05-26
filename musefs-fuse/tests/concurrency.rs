@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use fuser::BackgroundSession;
-use musefs_core::{scan_directory, MountConfig, Mode, Musefs};
+use musefs_core::{scan_directory, Mode, MountConfig, Musefs};
 
 // ---------------------------------------------------------------------------
 // Minimal proven FLAC fixture (mirrors tests/mount.rs exactly)
@@ -72,7 +72,13 @@ fn config() -> MountConfig {
 /// Returns (mountpoint, big_file_path, other_file_path, session, _backing_dir).
 /// The backing `TempDir` is returned to keep it alive for the duration of the
 /// mount (backing files must outlive the mount, mirroring tests/mount.rs).
-fn setup_two_track_mount() -> (PathBuf, PathBuf, PathBuf, BackgroundSession, tempfile::TempDir) {
+fn setup_two_track_mount() -> (
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    BackgroundSession,
+    tempfile::TempDir,
+) {
     let backing = tempfile::tempdir().unwrap();
 
     // Big FLAC: >= 2 MiB of audio payload so a 50ms/chunk read stays in-flight

@@ -64,6 +64,10 @@ pub struct Musefs {
     last_data_version: AtomicI64,
     handles: Mutex<HashMap<u64, Arc<Handle>>>,
     next_fh: AtomicU64,
+    /// (content_version, total_len, mtime_secs) keyed by track id. Tiny entries,
+    /// effectively unbounded; serves getattr/lookup without a backing stat or full
+    /// synthesis. Self-invalidates on a content_version change.
+    size_cache: Mutex<HashMap<i64, (i64, u64, i64)>>,
 }
 
 impl Musefs {
@@ -78,6 +82,7 @@ impl Musefs {
             config,
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(0),
+            size_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -112,6 +117,10 @@ impl Musefs {
 
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Handle>>> {
         self.handles.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn size_cache(&self) -> std::sync::MutexGuard<'_, HashMap<i64, (i64, u64, i64)>> {
+        self.size_cache.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
@@ -159,12 +168,33 @@ impl Musefs {
                 },
             }
         };
-        let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
+        let (size, mtime_secs) = self.pool.with(|db| {
+            // Cheap, indexed: the current content_version drives lazy invalidation.
+            let track = db
+                .get_track(track_id)?
+                .ok_or(CoreError::TrackNotFound(track_id))?;
+            if let Some(&(cv, len, mt)) = self.size_cache().get(&track_id) {
+                if cv == track.content_version {
+                    return Ok((len, mt)); // hit: no backing stat, no synthesis
+                }
+            }
+            // Miss: full resolve (validates via stat, builds + caches the layout).
+            let resolved = self.cache.resolve(db, track_id)?;
+            self.size_cache().insert(
+                track_id,
+                (
+                    track.content_version,
+                    resolved.total_len,
+                    resolved.mtime_secs,
+                ),
+            );
+            Ok((resolved.total_len, resolved.mtime_secs))
+        })?;
         Ok(Attr {
             inode,
             is_dir: false,
-            size: resolved.total_len,
-            mtime_secs: resolved.mtime_secs,
+            size,
+            mtime_secs,
         })
     }
 

@@ -109,3 +109,30 @@ fn handle_reuses_one_open_and_no_per_read_stat() {
     assert_eq!(s.stats, 0, "no per-read stat() on the handle path");
     assert_eq!(s.pread_bytes, 64 * 1024, "audio body read exactly once");
 }
+
+#[test]
+fn getattr_size_cache_hit_skips_stat() {
+    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let flac = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &[0xCD; 4096],
+    );
+    std::fs::write(dir.path().join("a.flac"), &flac).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+
+    let first = fs.getattr(file_inode).unwrap(); // miss → resolve → stat
+    metrics::reset();
+    let second = fs.getattr(file_inode).unwrap(); // hit → size cache, no stat
+    let s = metrics::snapshot();
+
+    assert_eq!(first.size, second.size);
+    assert_eq!(s.stats, 0, "a warm getattr must not stat the backing file");
+}

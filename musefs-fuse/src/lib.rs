@@ -167,11 +167,12 @@ impl Filesystem for MusefsFs {
             return reply.error(libc::EINVAL);
         }
         let core = Arc::clone(&self.core);
-        self.pool
-            .execute(move || match core.read(ino, fh, offset as u64, size as u64) {
+        self.pool.execute(
+            move || match core.read(ino, fh, offset as u64, size as u64) {
                 Ok(bytes) => reply.data(&bytes),
                 Err(e) => reply.error(errno(&e)),
-            });
+            },
+        );
     }
 
     fn readdir(
