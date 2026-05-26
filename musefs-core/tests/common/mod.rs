@@ -55,7 +55,6 @@ pub fn write_flac(path: &Path, comments: &[&str], audio: &[u8]) -> (i64, i64) {
     (audio_offset, audio.len() as i64)
 }
 
-
 /// Build a 32-bit-size box: [size][type][payload].
 fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
@@ -102,7 +101,10 @@ pub fn minimal_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     stco.extend_from_slice(&1u32.to_be_bytes());
     stco.extend_from_slice(&0u32.to_be_bytes());
     let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
-    let trak = bx(b"trak", &bx(b"mdia", &[bx(b"hdlr", &soun_hdlr), minf].concat()));
+    let trak = bx(
+        b"trak",
+        &bx(b"mdia", &[bx(b"hdlr", &soun_hdlr), minf].concat()),
+    );
     let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak, udta].concat());
     let ftyp = bx(b"ftyp", b"M4A isom");
     let mdat = bx(b"mdat", mdat_payload);

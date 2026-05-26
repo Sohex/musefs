@@ -123,17 +123,12 @@ fn scans_mp3_files_seeding_tracks_and_tags() {
         .any(|tag| tag.key == "title" && tag.value == "Track"));
 }
 
-
 #[test]
 fn scans_m4a_files_seeding_tracks() {
     use musefs_db::Format;
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("a.m4a"),
-        common::minimal_m4a(b"AUDIODATA"),
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("a.m4a"), common::minimal_m4a(b"AUDIODATA")).unwrap();
 
     let db = Db::open_in_memory().unwrap();
     let stats = scan_directory(&db, dir.path()).unwrap();

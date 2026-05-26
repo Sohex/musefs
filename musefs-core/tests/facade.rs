@@ -147,7 +147,6 @@ fn reads_a_synthesized_mp3_through_the_facade() {
     assert_eq!(&whole[whole.len() - audio.len()..], &audio);
 }
 
-
 #[test]
 fn reads_a_synthesized_m4a_through_the_facade() {
     let dir = tempfile::tempdir().unwrap();
@@ -162,7 +161,9 @@ fn reads_a_synthesized_m4a_through_the_facade() {
     let mut fs = Musefs::open(db, config()).unwrap();
 
     // Tree: /Orig Artist/Orig M4A.m4a
-    let artist = fs.lookup(VirtualTree::ROOT, "Orig Artist").expect("artist dir");
+    let artist = fs
+        .lookup(VirtualTree::ROOT, "Orig Artist")
+        .expect("artist dir");
     let entries = fs.readdir(artist).unwrap();
     let (name, file_inode, _) = entries.into_iter().next().unwrap();
     assert_eq!(name, "Orig M4A.m4a");
