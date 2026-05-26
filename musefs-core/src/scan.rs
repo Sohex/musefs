@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
-use musefs_format::{flac, mp3, mp4, EmbeddedPicture};
+use musefs_format::{flac, mp3, mp4, ogg, EmbeddedPicture};
 
 use crate::error::Result;
 
@@ -51,7 +51,10 @@ fn collect_audio(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
             && (has_ext(&path, "flac")
                 || has_ext(&path, "mp3")
                 || has_ext(&path, "m4a")
-                || has_ext(&path, "m4b"))
+                || has_ext(&path, "m4b")
+                || has_ext(&path, "ogg")
+                || has_ext(&path, "oga")
+                || has_ext(&path, "opus"))
         {
             out.push(path);
         }
@@ -98,6 +101,20 @@ fn probe(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_length: bounds.audio_length,
             tags: mp4::read_tags(bytes),
             pictures: mp4::read_pictures(bytes),
+        })
+    } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
+        let scan = ogg::locate_audio(bytes).ok()?;
+        let format = match scan.codec {
+            ogg::Codec::Opus => Format::Opus,
+            ogg::Codec::Vorbis => Format::Vorbis,
+            ogg::Codec::OggFlac => Format::OggFlac,
+        };
+        Some(Probed {
+            format,
+            audio_offset: scan.audio_offset,
+            audio_length: scan.audio_length,
+            tags: ogg::read_tags(bytes).unwrap_or_default(),
+            pictures: ogg::read_pictures(bytes).unwrap_or_default(),
         })
     } else {
         None
@@ -249,4 +266,34 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
     db.gc_orphan_art()?;
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod ogg_probe_tests {
+    use super::*;
+    use musefs_format::ogg::page_test_support::{
+        build_header_pub, lace_packet_pub, vorbis_body_empty,
+    };
+    use std::io::Write;
+
+    #[test]
+    fn probe_detects_opus_and_seeds_tags() {
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&vorbis_body_empty());
+        let (mut bytes, _) = build_header_pub(0x1234, &[&head, &tags]);
+        let (audio, _) = lace_packet_pub(0x1234, 2, false, 960, &vec![0u8; 100]);
+        bytes.extend_from_slice(&audio);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.opus");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+
+        let probed = probe(&path, &bytes).expect("opus should probe");
+        assert_eq!(probed.format, Format::Opus);
+        assert_eq!(probed.audio_offset, (bytes.len() - audio.len()) as u64);
+    }
 }
