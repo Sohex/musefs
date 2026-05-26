@@ -5,6 +5,7 @@ mod layout;
 pub mod mp3;
 pub mod mp4;
 pub mod ogg;
+mod vorbiscomment;
 
 pub use error::{FormatError, Result};
 pub use input::{ArtInput, EmbeddedPicture, TagInput};

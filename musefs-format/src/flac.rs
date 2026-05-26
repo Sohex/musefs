@@ -95,27 +95,12 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
 use crate::input::{ArtInput, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 
-pub(crate) const VENDOR: &str = "musefs";
-
-fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usize, is_last: bool) {
+pub(crate) fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usize, is_last: bool) {
     let first = (if is_last { 0x80 } else { 0 }) | (block_type & 0x7F);
     out.push(first);
     out.push(((body_len >> 16) & 0xFF) as u8);
     out.push(((body_len >> 8) & 0xFF) as u8);
     out.push((body_len & 0xFF) as u8);
-}
-
-fn vorbis_comment_body(tags: &[TagInput]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(VENDOR.len() as u32).to_le_bytes());
-    out.extend_from_slice(VENDOR.as_bytes());
-    out.extend_from_slice(&(tags.len() as u32).to_le_bytes());
-    for t in tags {
-        let comment = format!("{}={}", t.key.to_ascii_uppercase(), t.value);
-        out.extend_from_slice(&(comment.len() as u32).to_le_bytes());
-        out.extend_from_slice(comment.as_bytes());
-    }
-    out
 }
 
 fn picture_body_framing(art: &ArtInput) -> Vec<u8> {
@@ -156,7 +141,7 @@ pub fn synthesize_layout(
         idx += 1;
     }
 
-    let vc = vorbis_comment_body(tags);
+    let vc = crate::vorbiscomment::build(tags);
     push_block_header(&mut buf, BLOCK_VORBIS_COMMENT, vc.len(), idx == last_index);
     buf.extend_from_slice(&vc);
     idx += 1;
@@ -220,7 +205,7 @@ pub fn read_vorbis_comments(data: &[u8]) -> Result<Vec<(String, String)>> {
             return Err(FormatError::Malformed);
         }
         if block_type == BLOCK_VORBIS_COMMENT {
-            return parse_vorbis_comment_body(&data[body_start..body_end]);
+            return crate::vorbiscomment::parse(&data[body_start..body_end]);
         }
         pos = body_end;
         if is_last {
@@ -230,19 +215,7 @@ pub fn read_vorbis_comments(data: &[u8]) -> Result<Vec<(String, String)>> {
     Ok(Vec::new())
 }
 
-fn read_u32_le(data: &[u8], pos: usize) -> Result<u32> {
-    if pos + 4 > data.len() {
-        return Err(FormatError::Malformed);
-    }
-    Ok(u32::from_le_bytes([
-        data[pos],
-        data[pos + 1],
-        data[pos + 2],
-        data[pos + 3],
-    ]))
-}
-
-fn read_u32_be(data: &[u8], pos: usize) -> Result<u32> {
+pub(crate) fn read_u32_be(data: &[u8], pos: usize) -> Result<u32> {
     if pos + 4 > data.len() {
         return Err(FormatError::Malformed);
     }
@@ -254,7 +227,7 @@ fn read_u32_be(data: &[u8], pos: usize) -> Result<u32> {
     ]))
 }
 
-fn parse_picture_block(body: &[u8]) -> Result<EmbeddedPicture> {
+pub(crate) fn parse_picture_block(body: &[u8]) -> Result<EmbeddedPicture> {
     let mut pos = 0usize;
     let picture_type = read_u32_be(body, pos)?;
     pos += 4;
@@ -328,28 +301,6 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
         if is_last {
             break;
         }
-    }
-    Ok(out)
-}
-
-fn parse_vorbis_comment_body(body: &[u8]) -> Result<Vec<(String, String)>> {
-    let vendor_len = read_u32_le(body, 0)? as usize;
-    let mut pos = 4 + vendor_len;
-    let count = read_u32_le(body, pos)? as usize;
-    pos += 4;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        let clen = read_u32_le(body, pos)? as usize;
-        pos += 4;
-        let end = pos + clen;
-        if end > body.len() {
-            return Err(FormatError::Malformed);
-        }
-        let comment = std::str::from_utf8(&body[pos..end]).map_err(|_| FormatError::Malformed)?;
-        if let Some((field, value)) = comment.split_once('=') {
-            out.push((field.to_string(), value.to_string()));
-        }
-        pos = end;
     }
     Ok(out)
 }
