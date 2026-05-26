@@ -17,6 +17,7 @@ fn assemble(layout: &RegionLayout, audio: &[u8], arts: &[(i64, &[u8])]) -> Vec<u
                 out.extend_from_slice(bytes);
             }
             Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
+            Segment::OggArtSlice { .. } => unreachable!("OggArtSlice only in ogg synthesis"),
         }
     }
     out

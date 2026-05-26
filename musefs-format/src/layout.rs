@@ -15,6 +15,18 @@ pub enum Segment {
         len: u64,
         seq_delta: i64,
     },
+    /// A run of an embedded picture's serialized bytes, served lazily from the art
+    /// store (never stored in the layout). When `base64`, the run is `len` chars of
+    /// `base64(image)` starting at output offset `offset`; otherwise it is `len`
+    /// raw image bytes starting at raw offset `offset`. `art_total` is the raw image
+    /// byte length (needed to clip the final base64 group).
+    OggArtSlice {
+        art_id: i64,
+        offset: u64,
+        len: u64,
+        base64: bool,
+        art_total: u64,
+    },
 }
 
 impl Segment {
@@ -24,6 +36,7 @@ impl Segment {
             Segment::ArtImage { len, .. } => *len,
             Segment::BackingAudio { len, .. } => *len,
             Segment::OggAudio { len, .. } => *len,
+            Segment::OggArtSlice { len, .. } => *len,
         }
     }
 

@@ -286,6 +286,7 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
                     let f = backing.as_ref().unwrap();
                     serve(&index, f, *ao, within, within + n as u64, &mut out)?;
                 }
+                Segment::OggArtSlice { .. } => unreachable!("OggArtSlice serving lands in Task 8"),
             }
         }
         seg_start = seg_end;
