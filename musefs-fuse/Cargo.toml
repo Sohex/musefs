@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+metrics = ["musefs-core/metrics"]
+
 [dependencies]
 fuser = "0.14"
 libc = "0.2"
