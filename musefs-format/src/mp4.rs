@@ -176,6 +176,108 @@ pub fn read_structure(buf: &[u8]) -> Result<Mp4Scan> {
     })
 }
 
+fn atom_to_key(kind: &[u8; 4]) -> Option<&'static str> {
+    Some(match kind {
+        b"\xa9nam" => "title",
+        b"\xa9ART" => "artist",
+        b"aART" => "albumartist",
+        b"\xa9alb" => "album",
+        b"\xa9gen" => "genre",
+        b"\xa9day" => "date",
+        b"\xa9wrt" => "composer",
+        _ => return None,
+    })
+}
+
+/// Locate `moov/udta/meta/ilst`; `meta` is a FullBox (4 version/flags bytes before
+/// its children). Returns the ilst payload range absolute within `buf`.
+fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
+    let moov = find_box(buf, b"moov").ok()??;
+    let mp = moov.payload(buf);
+    let base = moov.payload_start();
+    let (up, ul) = find_path(mp, &[b"udta"]).ok()??;
+    let udta = &mp[up..up + ul];
+    let meta = find_box(udta, b"meta").ok()??;
+    let meta_children = udta.get(meta.payload_start() + 4..meta.end())?;
+    let il = find_box(meta_children, b"ilst").ok()??;
+    let start = base + up + meta.payload_start() + 4 + il.payload_start();
+    Some((start, il.total_len - il.header_len))
+}
+
+pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
+    let (start, len) = match ilst_region(buf) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let ilst = &buf[start..start + len];
+    let mut out = Vec::new();
+    for atom in child_boxes(ilst).unwrap_or_default() {
+        let inner = atom.payload(ilst);
+        let data = match find_box(inner, b"data") {
+            Ok(Some(d)) => d,
+            _ => continue,
+        };
+        let dp = data.payload(inner);
+        if dp.len() < 8 {
+            continue;
+        }
+        let value = &dp[8..]; // skip [type 4][locale 4]
+        if let Some(key) = atom_to_key(&atom.kind) {
+            if let Ok(s) = std::str::from_utf8(value) {
+                out.push((key.to_string(), s.to_string()));
+            }
+        } else if &atom.kind == b"trkn" && value.len() >= 4 {
+            out.push((
+                "tracknumber".into(),
+                u16::from_be_bytes([value[2], value[3]]).to_string(),
+            ));
+        } else if &atom.kind == b"disk" && value.len() >= 4 {
+            out.push((
+                "discnumber".into(),
+                u16::from_be_bytes([value[2], value[3]]).to_string(),
+            ));
+        }
+    }
+    out
+}
+
+pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
+    let (start, len) = match ilst_region(buf) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let ilst = &buf[start..start + len];
+    let mut out = Vec::new();
+    for atom in child_boxes(ilst).unwrap_or_default() {
+        if &atom.kind != b"covr" {
+            continue;
+        }
+        let inner = atom.payload(ilst);
+        let data = match find_box(inner, b"data") {
+            Ok(Some(d)) => d,
+            _ => continue,
+        };
+        let dp = data.payload(inner);
+        if dp.len() < 8 {
+            continue;
+        }
+        let mime = match u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]) {
+            13 => "image/jpeg",
+            14 => "image/png",
+            _ => continue,
+        };
+        out.push(EmbeddedPicture {
+            mime: mime.to_string(),
+            picture_type: 3,
+            description: String::new(),
+            width: 0,
+            height: 0,
+            data: dp[8..].to_vec(),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +423,67 @@ mod tests {
         assert_eq!(&s.mdat_header[4..8], b"mdat");
         assert_eq!(s.mdat_payload_len, 9);
         assert_eq!(&buf[s.mdat_payload_offset as usize..][..9], b"AUDIODATA");
+    }
+
+    fn data_atom(type_code: u32, value: &[u8]) -> Vec<u8> {
+        let mut p = type_code.to_be_bytes().to_vec();
+        p.extend_from_slice(&0u32.to_be_bytes()); // locale
+        p.extend_from_slice(value);
+        bx(b"data", &p)
+    }
+
+    /// Accepted file with udta/meta/ilst injected (meta is a FullBox).
+    fn mp4_with_ilst(ilst_atoms: &[u8], moov_first: bool) -> Vec<u8> {
+        let ilst = bx(b"ilst", ilst_atoms);
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend_from_slice(b"mdir");
+        hdlr.extend_from_slice(b"appl");
+        hdlr.extend_from_slice(&[0u8; 9]);
+        let mut meta = vec![0u8; 4]; // FullBox version/flags
+        meta.extend(bx(b"hdlr", &hdlr));
+        meta.extend(ilst);
+        let udta = bx(b"udta", &bx(b"meta", &meta));
+
+        let mut hdlr_p = vec![0u8; 8];
+        hdlr_p.extend_from_slice(b"soun");
+        hdlr_p.extend_from_slice(&[0u8; 12]);
+        let mut stco = vec![0u8; 4];
+        stco.extend_from_slice(&1u32.to_be_bytes());
+        stco.extend_from_slice(&0u32.to_be_bytes());
+        let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+        let trak = bx(b"trak", &bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat()));
+        let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak, udta].concat());
+        let ftyp = bx(b"ftyp", b"M4A ");
+        let mdat = bx(b"mdat", b"AUDIO");
+        if moov_first {
+            [ftyp, moov, mdat].concat()
+        } else {
+            [ftyp, mdat, moov].concat()
+        }
+    }
+
+    #[test]
+    fn reads_text_and_track_tags() {
+        let atoms = [
+            bx(b"\xa9nam", &data_atom(1, b"Song")),
+            bx(b"aART", &data_atom(1, b"Band")),
+            bx(b"trkn", &data_atom(0, &[0, 0, 0, 3, 0, 0, 0, 0])),
+        ]
+        .concat();
+        let buf = mp4_with_ilst(&atoms, true);
+        let tags = read_tags(&buf);
+        assert!(tags.contains(&("title".into(), "Song".into())));
+        assert!(tags.contains(&("albumartist".into(), "Band".into())));
+        assert!(tags.contains(&("tracknumber".into(), "3".into())));
+    }
+
+    #[test]
+    fn reads_cover_art() {
+        let jpeg = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3];
+        let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, &jpeg)), false);
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert_eq!(pics[0].data, jpeg);
     }
 }
