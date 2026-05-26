@@ -77,6 +77,7 @@ pub fn resolve_layout(
                 let l = *len as usize;
                 out.extend_from_slice(&backing[o..o + l]);
             }
+            Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
         }
     }
     out

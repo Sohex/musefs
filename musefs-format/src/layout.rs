@@ -7,6 +7,14 @@ pub enum Segment {
     ArtImage { art_id: i64, len: u64 },
     /// A run of the original backing file's audio frames.
     BackingAudio { offset: u64, len: u64 },
+    /// A run of original audio pages served with each page's sequence number
+    /// shifted by `seq_delta` and its CRC recomputed. The byte length is unchanged
+    /// (renumbering patches in place), so `len` equals the backing audio length.
+    OggAudio {
+        offset: u64,
+        len: u64,
+        seq_delta: i64,
+    },
 }
 
 impl Segment {
@@ -15,6 +23,7 @@ impl Segment {
             Segment::Inline(b) => b.len() as u64,
             Segment::ArtImage { len, .. } => *len,
             Segment::BackingAudio { len, .. } => *len,
+            Segment::OggAudio { len, .. } => *len,
         }
     }
 
@@ -49,7 +58,7 @@ impl RegionLayout {
     pub fn header_len(&self) -> u64 {
         self.segments
             .iter()
-            .filter(|s| !matches!(s, Segment::BackingAudio { .. }))
+            .filter(|s| !matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }))
             .map(|s| s.len())
             .sum()
     }

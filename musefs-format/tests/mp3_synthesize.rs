@@ -16,6 +16,7 @@ fn assemble(layout: &RegionLayout, audio: &[u8], arts: &[(i64, &[u8])]) -> Vec<u
                 let bytes = arts.iter().find(|(id, _)| id == art_id).unwrap().1;
                 out.extend_from_slice(bytes);
             }
+            Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
         }
     }
     out

@@ -15,6 +15,7 @@ fn materialize(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {
                 out.extend_from_slice(&backing[*offset as usize..(*offset + *len) as usize]);
             }
             Segment::ArtImage { .. } => unreachable!("no art in this fixture"),
+            Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
         }
     }
     out

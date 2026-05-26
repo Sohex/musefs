@@ -184,6 +184,59 @@ pub fn read_metadata(front: &[u8]) -> Result<OggHeader> {
     read_header(front)
 }
 
+use crate::input::TagInput;
+use crate::layout::{RegionLayout, Segment};
+
+/// Build the regenerated header packets for a codec from the original header
+/// packets and the new text tags. Plan 1 emits text VorbisComments only (no art).
+fn rebuild_header_packets(header: &OggHeader, tags: &[TagInput]) -> Result<Vec<Vec<u8>>> {
+    let vc = crate::vorbiscomment::build(tags);
+    match header.codec {
+        Codec::Opus => {
+            let mut tags_pkt = b"OpusTags".to_vec();
+            tags_pkt.extend_from_slice(&vc);
+            Ok(vec![header.packets[0].clone(), tags_pkt])
+        }
+        Codec::Vorbis => {
+            let mut comment = b"\x03vorbis".to_vec();
+            comment.extend_from_slice(&vc);
+            comment.push(0x01); // framing bit
+            Ok(vec![
+                header.packets[0].clone(),
+                comment,
+                header.packets[2].clone(),
+            ])
+        }
+        Codec::OggFlac => rebuild_oggflac_packets(header, &vc),
+    }
+}
+
+/// Assemble a synthesized layout: regenerated header pages (Inline) + one compact
+/// `OggAudio` segment whose `seq_delta` renumbers the preserved audio pages.
+pub fn synthesize_layout(
+    header: &OggHeader,
+    audio_offset: u64,
+    audio_length: u64,
+    tags: &[TagInput],
+) -> Result<RegionLayout> {
+    let new_packets = rebuild_header_packets(header, tags)?;
+    let refs: Vec<&[u8]> = new_packets.iter().map(|p| p.as_slice()).collect();
+    let (header_bytes, new_pages) = crate::ogg::page::build_header(header.serial, &refs);
+    let seq_delta = new_pages as i64 - header.header_pages as i64;
+    Ok(RegionLayout::new(vec![
+        Segment::Inline(header_bytes),
+        Segment::OggAudio {
+            offset: audio_offset,
+            len: audio_length,
+            seq_delta,
+        },
+    ]))
+}
+
+fn rebuild_oggflac_packets(_header: &OggHeader, _vc: &[u8]) -> Result<Vec<Vec<u8>>> {
+    Err(FormatError::Malformed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +291,46 @@ mod tests {
 
         let tags = read_tags(&data).unwrap();
         assert_eq!(tags, vec![("TITLE".to_string(), "Sun".to_string())]);
+    }
+
+    #[test]
+    fn synthesize_opus_emits_valid_header_and_audio_segment() {
+        let mut data = opus_headers();
+        let scan = locate_audio({
+            let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &vec![0u8; 80]);
+            data.extend_from_slice(&audio);
+            &data
+        })
+        .unwrap();
+        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("album", "Geogaddi")],
+        )
+        .unwrap();
+
+        // Header segment is valid Ogg with regenerated tags; audio segment carries
+        // the original bounds.
+        match &layout.segments()[0] {
+            Segment::Inline(bytes) => {
+                let h = read_header(bytes).unwrap();
+                assert_eq!(h.codec, Codec::Opus);
+                let body = comment_body(Codec::Opus, &h.packets[1]).unwrap();
+                let tags = crate::vorbiscomment::parse(body).unwrap();
+                assert_eq!(tags, vec![("ALBUM".to_string(), "Geogaddi".to_string())]);
+            }
+            other => panic!("expected Inline header, got {other:?}"),
+        }
+        match &layout.segments()[1] {
+            Segment::OggAudio { offset, len, .. } => {
+                assert_eq!(*offset, scan.audio_offset);
+                assert_eq!(*len, scan.audio_length);
+            }
+            other => panic!("expected OggAudio, got {other:?}"),
+        }
     }
 
     #[test]
