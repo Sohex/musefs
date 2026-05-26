@@ -40,12 +40,16 @@ fn bench_sequential_read(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("sequential_read");
     group.throughput(Throughput::Bytes(size));
+    let chunk = 128 * 1024u64;
+    // Steady-state (warm header-cache) sequential throughput: the first iteration
+    // populates the cache; subsequent ones measure the hot read path. The audio
+    // payload is filler bytes — BackingAudio is served verbatim regardless of
+    // content, so this measures the splice/serve mechanism, not audio parsing.
     group.bench_function("flac_128k_chunks", |b| {
         b.iter(|| {
-            let chunk = 128 * 1024u64;
             let mut off = 0u64;
             while off < size {
-                let got = fs.read(file_inode, off, chunk).unwrap();
+                let got = criterion::black_box(fs.read(file_inode, off, chunk).unwrap());
                 if got.is_empty() {
                     break;
                 }
