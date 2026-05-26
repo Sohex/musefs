@@ -33,18 +33,35 @@ fn samples(bytes: &[u8]) -> Vec<Vec<u8>> {
 
 #[test]
 fn synthesized_m4a_decodes_via_independent_parser() {
+    // Fixture generated with:
+    //   ffmpeg -f lavfi -i "sine=frequency=440:duration=1" -c:a aac -b:a 64k \
+    //     -metadata title="Orig" tests/fixtures/sample.m4a
     let original = std::fs::read("tests/fixtures/sample.m4a").unwrap();
     let scan = mp4::read_structure(&original).unwrap();
     let layout = mp4::synthesize_layout(
         &scan,
-        &[TagInput::new("title", "Rewritten"), TagInput::new("artist", "AA")],
+        &[
+            TagInput::new("title", "Rewritten"),
+            TagInput::new("artist", "AA"),
+        ],
         &[],
     )
     .unwrap();
     let synth = materialize(&layout, &original);
 
     // Independent parser reads samples through OUR patched offsets; must match.
-    assert_eq!(samples(&synth), samples(&original), "patched chunk offsets are wrong");
+    // Guard against a vacuous `[] == []` pass if a fixture/parser change ever
+    // yields zero samples — that would silently mask an offset regression.
+    let original_samples = samples(&original);
+    assert!(
+        !original_samples.is_empty(),
+        "oracle parsed zero samples — fixture or parser is broken"
+    );
+    assert_eq!(
+        samples(&synth),
+        original_samples,
+        "patched chunk offsets are wrong"
+    );
 
     // Our own reader sees the rewritten tags in the synthesized output.
     let tags = mp4::read_tags(&synth);
