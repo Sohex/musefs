@@ -66,7 +66,7 @@ pub fn parse_page(buf: &[u8], pos: usize) -> Result<PageHeader> {
 /// Encode `payload_len` as Ogg lacing values: ⌊L/255⌋ values of 255 followed by
 /// one value of L mod 255. When L is a multiple of 255 this appends a terminating
 /// 0, which is required to signal the packet's end.
-fn lacing_values(payload_len: usize) -> Vec<u8> {
+pub(crate) fn lacing_values(payload_len: usize) -> Vec<u8> {
     let mut v = vec![255u8; payload_len / 255];
     v.push((payload_len % 255) as u8);
     v
@@ -206,6 +206,163 @@ pub fn patch_page_header(page: &[u8], new_seq: u32) -> Result<Vec<u8>> {
     Ok(full)
 }
 
+use crate::layout::Segment;
+
+/// One span of a packet's payload during chunk-aware lacing.
+pub(crate) enum PayloadChunk {
+    /// Literal bytes copied verbatim into the layout as `Inline`.
+    Bytes(Vec<u8>),
+    /// An art run. `out` holds the run's full OUTPUT bytes (base64(image) when
+    /// `base64`, else raw image) — used here only to compute page CRCs and lengths,
+    /// then dropped; the layout stores an `OggArtSlice` referencing `art_id` so the
+    /// bytes are re-derived at read time. `art_total` is the raw image length.
+    Art {
+        art_id: i64,
+        out: Vec<u8>,
+        base64: bool,
+        art_total: u64,
+    },
+}
+
+impl PayloadChunk {
+    fn out_len(&self) -> usize {
+        match self {
+            PayloadChunk::Bytes(b) => b.len(),
+            PayloadChunk::Art { out, .. } => out.len(),
+        }
+    }
+}
+
+/// Lace one packet (described as a chunk list) into pages starting at sequence
+/// `seq_start`, emitting layout segments: page headers + literal payload as
+/// `Inline` (CRCs baked in), and art runs as `OggArtSlice` (no bytes stored). The
+/// art `out` bytes are materialized only to compute page CRCs, then dropped.
+/// Returns `(segments, pages_used)`.
+pub(crate) fn lace_chunks_to_segments(
+    serial: u32,
+    seq_start: u32,
+    bos: bool,
+    chunks: &[PayloadChunk],
+) -> (Vec<Segment>, u32) {
+    let total: usize = chunks.iter().map(|c| c.out_len()).sum();
+    let laces = lacing_values(total);
+
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut seq = seq_start;
+    let mut lace_pos = 0usize;
+    let mut payload_pos = 0usize; // absolute position within the packet payload
+    let mut first = true;
+
+    while first || lace_pos < laces.len() {
+        let seg_count = (laces.len() - lace_pos).min(255);
+        let table = &laces[lace_pos..lace_pos + seg_count];
+        let page_payload: usize = table.iter().map(|&b| b as usize).sum();
+
+        let mut header_type = 0u8;
+        if bos && first {
+            header_type |= FLAG_BOS;
+        }
+        if !first {
+            header_type |= FLAG_CONTINUED;
+        }
+
+        // Assemble full page bytes (with art materialized) to compute the CRC.
+        let mut page = Vec::with_capacity(27 + seg_count + page_payload);
+        page.extend_from_slice(CAPTURE);
+        page.push(0);
+        page.push(header_type);
+        page.extend_from_slice(&0u64.to_le_bytes()); // granule 0 (header page)
+        page.extend_from_slice(&serial.to_le_bytes());
+        page.extend_from_slice(&seq.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
+        page.push(seg_count as u8);
+        page.extend_from_slice(table);
+        copy_payload(&mut page, chunks, payload_pos, page_payload);
+        let crc = crc32(&page);
+        page[22..26].copy_from_slice(&crc.to_le_bytes());
+
+        let header_len = 27 + seg_count;
+        emit_segments(
+            &mut segments,
+            &page[..header_len],
+            chunks,
+            payload_pos,
+            page_payload,
+        );
+
+        payload_pos += page_payload;
+        lace_pos += seg_count;
+        seq += 1;
+        first = false;
+    }
+    (segments, seq - seq_start)
+}
+
+/// Append payload bytes `[p0, p0+plen)` (in packet-payload coordinates) into `dst`
+/// by copying from the chunk list (materializing art `out`).
+fn copy_payload(dst: &mut Vec<u8>, chunks: &[PayloadChunk], p0: usize, plen: usize) {
+    let end = p0 + plen;
+    let mut cs = 0usize;
+    for c in chunks {
+        let ce = cs + c.out_len();
+        let os = p0.max(cs);
+        let oe = end.min(ce);
+        if os < oe {
+            let bytes: &[u8] = match c {
+                PayloadChunk::Bytes(b) => b,
+                PayloadChunk::Art { out, .. } => out,
+            };
+            dst.extend_from_slice(&bytes[os - cs..oe - cs]);
+        }
+        cs = ce;
+    }
+}
+
+/// Emit the page header + payload `[p0, p0+plen)` as layout segments: `Inline` for
+/// the header and literal byte spans, `OggArtSlice` for art spans.
+fn emit_segments(
+    segments: &mut Vec<Segment>,
+    header: &[u8],
+    chunks: &[PayloadChunk],
+    p0: usize,
+    plen: usize,
+) {
+    let end = p0 + plen;
+    let mut buf: Vec<u8> = header.to_vec();
+    let mut cs = 0usize;
+    for c in chunks {
+        let ce = cs + c.out_len();
+        let os = p0.max(cs);
+        let oe = end.min(ce);
+        if os < oe {
+            match c {
+                PayloadChunk::Bytes(b) => buf.extend_from_slice(&b[os - cs..oe - cs]),
+                PayloadChunk::Art {
+                    art_id,
+                    base64,
+                    art_total,
+                    ..
+                } => {
+                    if !buf.is_empty() {
+                        segments.push(Segment::Inline(std::mem::take(&mut buf)));
+                    }
+                    segments.push(Segment::OggArtSlice {
+                        art_id: *art_id,
+                        offset: (os - cs) as u64,
+                        len: (oe - os) as u64,
+                        base64: *base64,
+                        art_total: *art_total,
+                    });
+                }
+            }
+        }
+        cs = ce;
+    }
+    if !buf.is_empty() {
+        segments.push(Segment::Inline(buf));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +497,82 @@ mod tests {
         let mut z = full.clone();
         z[22..26].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(crc32(&z), h1.crc);
+    }
+
+    use crate::layout::Segment;
+
+    // Reconstruct the laced byte stream from segments, expanding OggArtSlice from a
+    // provided art output map, so we can validate framing/CRCs end to end.
+    fn flatten(segments: &[Segment], art_out: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for s in segments {
+            match s {
+                Segment::Inline(b) => v.extend_from_slice(b),
+                Segment::OggArtSlice {
+                    offset,
+                    len,
+                    base64,
+                    ..
+                } => {
+                    assert!(*base64);
+                    v.extend_from_slice(&art_out[*offset as usize..(*offset + *len) as usize]);
+                }
+                other => panic!("unexpected segment {other:?}"),
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn chunk_lacer_splits_art_across_pages_and_crcs_validate() {
+        // A packet: 50 literal bytes, then a 70_000-byte art run (spans pages), then
+        // 10 trailing literal bytes.
+        let head = vec![0xA0u8; 50];
+        let art_out: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let tail = vec![0xB0u8; 10];
+        let chunks = vec![
+            PayloadChunk::Bytes(head.clone()),
+            PayloadChunk::Art {
+                art_id: 42,
+                out: art_out.clone(),
+                base64: true,
+                art_total: 12345,
+            },
+            PayloadChunk::Bytes(tail.clone()),
+        ];
+        let (segments, pages) = lace_chunks_to_segments(0x1234, 0, true, &chunks);
+        assert!(pages >= 2, "art run should span multiple pages");
+
+        // Reassemble the packet payload and confirm it equals head ++ art ++ tail.
+        let flat = flatten(&segments, &art_out);
+        // Walk pages: validate CRC + collect payloads.
+        let mut pos = 0usize;
+        let mut payload = Vec::new();
+        let mut seq_expected = 0u32;
+        while pos < flat.len() {
+            let h = parse_page(&flat, pos).unwrap();
+            assert_eq!(h.seq, seq_expected);
+            seq_expected += 1;
+            // CRC self-check.
+            let mut z = flat[pos..pos + h.total_len()].to_vec();
+            z[22..26].copy_from_slice(&0u32.to_le_bytes());
+            assert_eq!(crc32(&z), h.crc);
+            payload.extend_from_slice(&flat[pos + h.header_len..pos + h.total_len()]);
+            pos += h.total_len();
+        }
+        let mut expected = head.clone();
+        expected.extend_from_slice(&art_out);
+        expected.extend_from_slice(&tail);
+        assert_eq!(payload, expected);
+
+        // The art bytes must be carried by OggArtSlice segments (not Inline).
+        let art_served: u64 = segments
+            .iter()
+            .filter_map(|s| match s {
+                Segment::OggArtSlice { len, .. } => Some(*len),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(art_served, art_out.len() as u64);
     }
 }
