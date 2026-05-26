@@ -233,8 +233,56 @@ pub fn synthesize_layout(
     ]))
 }
 
-fn rebuild_oggflac_packets(_header: &OggHeader, _vc: &[u8]) -> Result<Vec<Vec<u8>>> {
-    Err(FormatError::Malformed)
+/// Rebuild OggFLAC header packets: keep packet 0 (mapping header `0x7F FLAC` +
+/// version + count + `fLaC` + STREAMINFO) but recompute its 16-bit following-packet
+/// count; carry over structural metadata-block packets (APPLICATION=2, SEEKTABLE=3,
+/// CUESHEET=5); drop existing VORBIS_COMMENT/PICTURE/PADDING; append one fresh
+/// VORBIS_COMMENT block. Set the last-metadata-block flag on the final block.
+fn rebuild_oggflac_packets(header: &OggHeader, vc: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if header.packets.is_empty() {
+        return Err(FormatError::Malformed);
+    }
+    // Structural blocks to keep (each block packet starts with the 4-byte FLAC
+    // metadata block header; type is the low 7 bits of byte 0).
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    for pkt in header.packets.iter().skip(1) {
+        if pkt.is_empty() {
+            continue;
+        }
+        match pkt[0] & 0x7F {
+            2 | 3 | 5 => blocks.push(pkt.clone()), // APPLICATION, SEEKTABLE, CUESHEET
+            _ => {}
+        }
+    }
+
+    // Fresh VORBIS_COMMENT block (type 4): 4-byte header + body.
+    let mut comment = Vec::new();
+    crate::flac::push_block_header(&mut comment, 4, vc.len(), false);
+    comment.extend_from_slice(vc);
+    blocks.push(comment);
+
+    // Normalize the last-metadata-block flag: clear on all but the last, set on the
+    // last. Byte 0 high bit (0x80) is the flag.
+    let n = blocks.len();
+    for (i, b) in blocks.iter_mut().enumerate() {
+        if i + 1 == n {
+            b[0] |= 0x80;
+        } else {
+            b[0] &= 0x7F;
+        }
+    }
+
+    // Rebuild the mapping header (packet 0) with the new following-packet count.
+    let mut mapping = header.packets[0].clone();
+    if mapping.len() < 9 {
+        return Err(FormatError::Malformed);
+    }
+    let count = u16::try_from(blocks.len()).map_err(|_| FormatError::TooLarge)?;
+    mapping[7..9].copy_from_slice(&count.to_be_bytes());
+
+    let mut out = vec![mapping];
+    out.extend(blocks);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -423,5 +471,79 @@ mod tests {
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].mime, "image/png");
         assert_eq!(pics[0].data, b"PNG");
+    }
+
+    fn oggflac_headers() -> Vec<u8> {
+        // STREAMINFO block (type 0): 4-byte header + 34-byte body (zeros are fine
+        // for our framing test).
+        let mut streaminfo = Vec::new();
+        crate::flac::push_block_header(&mut streaminfo, 0, 34, false);
+        streaminfo.extend(std::iter::repeat(0u8).take(34));
+
+        // Mapping header packet: 0x7F "FLAC" v1.0 count "fLaC" STREAMINFO.
+        let mut mapping = vec![0x7F];
+        mapping.extend_from_slice(b"FLAC");
+        mapping.push(1);
+        mapping.push(0);
+        mapping.extend_from_slice(&2u16.to_be_bytes()); // count: SEEKTABLE + VORBIS_COMMENT
+        mapping.extend_from_slice(b"fLaC");
+        mapping.extend_from_slice(&streaminfo);
+
+        // A SEEKTABLE block (type 3, structural — must be preserved).
+        let mut seektable = Vec::new();
+        crate::flac::push_block_header(&mut seektable, 3, 18, false);
+        seektable.extend(std::iter::repeat(0xEEu8).take(18));
+
+        // An existing VORBIS_COMMENT (type 4, last) to be replaced.
+        let mut old_vc = Vec::new();
+        let body = crate::vorbiscomment::build(&[crate::input::TagInput::new("x", "old")]);
+        crate::flac::push_block_header(&mut old_vc, 4, body.len(), true);
+        old_vc.extend_from_slice(&body);
+
+        let (bytes, _) = crate::ogg::page::build_header(77, &[&mapping, &seektable, &old_vc]);
+        bytes
+    }
+
+    #[test]
+    fn synthesize_oggflac_keeps_seektable_replaces_comment_and_count() {
+        let mut data = oggflac_headers();
+        let (audio, _) = crate::ogg::page::lace_packet(77, 3, false, 4096, &vec![0u8; 64]);
+        data.extend_from_slice(&audio);
+
+        let scan = locate_audio(&data).unwrap();
+        assert_eq!(scan.codec, Codec::OggFlac);
+        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("title", "Kaini Industries")],
+        )
+        .unwrap();
+
+        if let Segment::Inline(bytes) = &layout.segments()[0] {
+            let h = read_header(bytes).unwrap();
+            assert_eq!(h.codec, Codec::OggFlac);
+            // packet 0 mapping count == number of following blocks (SEEKTABLE + VC == 2)
+            assert_eq!(u16::from_be_bytes([h.packets[0][7], h.packets[0][8]]), 2);
+            // SEEKTABLE preserved
+            assert!(h.packets.iter().skip(1).any(|p| (p[0] & 0x7F) == 3));
+            // exactly one VORBIS_COMMENT, with the new tag, flagged last
+            let vc = h
+                .packets
+                .iter()
+                .skip(1)
+                .find(|p| (p[0] & 0x7F) == 4)
+                .unwrap();
+            assert_eq!(vc[0] & 0x80, 0x80);
+            let tags = crate::vorbiscomment::parse(&vc[4..]).unwrap();
+            assert_eq!(
+                tags,
+                vec![("TITLE".to_string(), "Kaini Industries".to_string())]
+            );
+        } else {
+            panic!("expected Inline header");
+        }
     }
 }
