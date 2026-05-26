@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,13 +30,101 @@ pub struct ResolvedFile {
     pub cache_bytes: u64,
 }
 
-/// A per-mount cache of resolved files, keyed by track id and invalidated when a
-/// track's `content_version` changes (the DB bumps it on any tag/art edit).
-pub struct HeaderCache {
-    map: HashMap<i64, Arc<ResolvedFile>>,
-    order: Vec<i64>, // LRU order, least-recent first
+const CACHE_SHARDS: usize = 16;
+
+struct LruNode {
+    value: Arc<ResolvedFile>,
+    prev: Option<i64>,
+    next: Option<i64>,
+}
+
+/// One LRU shard: a hand-rolled O(1) doubly-linked list keyed by track id with a
+/// byte budget. `head` = most-recently-used, `tail` = least.
+struct Shard {
+    map: HashMap<i64, LruNode>,
+    head: Option<i64>,
+    tail: Option<i64>,
     bytes: u64,
     budget: u64,
+}
+
+impl Shard {
+    fn new(budget: u64) -> Shard {
+        Shard { map: HashMap::new(), head: None, tail: None, bytes: 0, budget }
+    }
+    fn unlink(&mut self, key: i64) {
+        let (prev, next) = { let n = &self.map[&key]; (n.prev, n.next) };
+        match prev {
+            Some(p) => self.map.get_mut(&p).unwrap().next = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(nx) => self.map.get_mut(&nx).unwrap().prev = prev,
+            None => self.tail = prev,
+        }
+        let n = self.map.get_mut(&key).unwrap();
+        n.prev = None;
+        n.next = None;
+    }
+    fn push_front(&mut self, key: i64) {
+        let old = self.head;
+        self.map.get_mut(&key).unwrap().next = old;
+        if let Some(h) = old {
+            self.map.get_mut(&h).unwrap().prev = Some(key);
+        }
+        self.head = Some(key);
+        if self.tail.is_none() {
+            self.tail = Some(key);
+        }
+    }
+    fn get(&mut self, key: i64) -> Option<Arc<ResolvedFile>> {
+        if !self.map.contains_key(&key) {
+            return None;
+        }
+        self.unlink(key);
+        self.push_front(key);
+        Some(self.map[&key].value.clone())
+    }
+    fn insert(&mut self, key: i64, value: Arc<ResolvedFile>) {
+        let add = value.cache_bytes;
+        if let Some(old_bytes) = self.map.get(&key).map(|n| n.value.cache_bytes) {
+            // Key exists: unlink from LRU list first (needs &mut self), then update.
+            self.unlink(key);
+            self.bytes -= old_bytes;
+            self.map.get_mut(&key).unwrap().value = value;
+        } else {
+            self.map.insert(key, LruNode { value, prev: None, next: None });
+        }
+        self.bytes += add;
+        self.push_front(key);
+        while self.bytes > self.budget && self.map.len() > 1 {
+            let lru = self.tail.unwrap();
+            self.unlink(lru);
+            let n = self.map.remove(&lru).unwrap();
+            self.bytes -= n.value.cache_bytes;
+        }
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.head = None;
+        self.tail = None;
+        self.bytes = 0;
+    }
+    fn retain_keys(&mut self, live: &HashSet<i64>) {
+        let dead: Vec<i64> = self.map.keys().copied().filter(|k| !live.contains(k)).collect();
+        for k in dead {
+            self.unlink(k);
+            if let Some(n) = self.map.remove(&k) {
+                self.bytes -= n.value.cache_bytes;
+            }
+        }
+    }
+}
+
+/// A per-mount cache of resolved files, sharded for concurrency and keyed by track
+/// id; an entry self-invalidates when the track's `content_version` changes.
+pub struct HeaderCache {
+    shards: Vec<Mutex<Shard>>,
     mode: Mode,
 }
 
@@ -63,55 +152,31 @@ impl HeaderCache {
     pub fn new(mode: Mode) -> HeaderCache {
         HeaderCache::with_budget(mode, DEFAULT_CACHE_BUDGET)
     }
-
     pub fn with_budget(mode: Mode, budget: u64) -> HeaderCache {
-        HeaderCache {
-            map: HashMap::new(),
-            order: Vec::new(),
-            bytes: 0,
-            budget,
-            mode,
-        }
+        let per_shard = (budget / CACHE_SHARDS as u64).max(1);
+        let shards = (0..CACHE_SHARDS).map(|_| Mutex::new(Shard::new(per_shard))).collect();
+        HeaderCache { shards, mode }
     }
-
+    fn shard(&self, track_id: i64) -> std::sync::MutexGuard<'_, Shard> {
+        let idx = (track_id as u64 % CACHE_SHARDS as u64) as usize;
+        self.shards[idx].lock().unwrap_or_else(|p| p.into_inner())
+    }
     /// Drop all cached resolutions (used when the DB changed underneath the mount).
-    pub fn clear(&mut self) {
-        self.map.clear();
-        self.order.clear();
-        self.bytes = 0;
-    }
-
-    fn touch(&mut self, track_id: i64) {
-        if let Some(pos) = self.order.iter().position(|&k| k == track_id) {
-            self.order.remove(pos);
-        }
-        self.order.push(track_id);
-    }
-
-    fn evict_to_budget(&mut self) {
-        while self.bytes > self.budget && self.order.len() > 1 {
-            let victim = self.order.remove(0);
-            if let Some(old) = self.map.remove(&victim) {
-                self.bytes = self.bytes.saturating_sub(old.cache_bytes);
-            }
+    pub fn clear(&self) {
+        for s in &self.shards {
+            s.lock().unwrap_or_else(|p| p.into_inner()).clear();
         }
     }
-
-    fn store(&mut self, track_id: i64, resolved: Arc<ResolvedFile>) {
-        if let Some(old) = self.map.remove(&track_id) {
-            self.bytes = self.bytes.saturating_sub(old.cache_bytes);
+    /// Drop cached resolutions for tracks no longer present (`live` = current ids).
+    pub fn retain(&self, live: &HashSet<i64>) {
+        for s in &self.shards {
+            s.lock().unwrap_or_else(|p| p.into_inner()).retain_keys(live);
         }
-        self.bytes += resolved.cache_bytes;
-        self.map.insert(track_id, resolved);
-        self.touch(track_id);
-        self.evict_to_budget();
     }
-
-    /// Resolve a track to its layout — a freshly synthesized metadata region in
-    /// `Synthesis` mode, or a single whole-backing-file passthrough segment in
-    /// `StructureOnly` mode — building (and caching) it on a content-version miss.
-    /// Validates the backing file's size and mtime first.
-    pub fn resolve(&mut self, db: &Db, track_id: i64) -> Result<Arc<ResolvedFile>> {
+    /// Resolve a track to its layout, caching on a content-version miss. Validation
+    /// (`stat`) and synthesis run WITHOUT holding the shard lock; the lock is taken
+    /// only briefly for the cache get and insert.
+    pub fn resolve(&self, db: &Db, track_id: i64) -> Result<Arc<ResolvedFile>> {
         let track = db
             .get_track(track_id)?
             .ok_or(CoreError::TrackNotFound(track_id))?;
@@ -124,14 +189,22 @@ impl HeaderCache {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
-        if let Some(cached) = self.map.get(&track_id) {
-            if cached.content_version == track.content_version {
-                let hit = cached.clone();
-                self.touch(track_id);
+        if let Some(hit) = self.shard(track_id).get(track_id) {
+            if hit.content_version == track.content_version {
                 return Ok(hit);
             }
         }
-
+        let resolved = self.build(db, &track, &meta)?;
+        self.shard(track_id).insert(track_id, resolved.clone());
+        Ok(resolved)
+    }
+    /// Build a `ResolvedFile` for `track` (synthesis or passthrough). No lock held.
+    fn build(
+        &self,
+        db: &Db,
+        track: &musefs_db::Track,
+        meta: &std::fs::Metadata,
+    ) -> Result<Arc<ResolvedFile>> {
         let (layout, total_len, mtime_secs_val) = match self.mode {
             Mode::StructureOnly => {
                 // Pure passthrough: the synthesized "file" is the backing file itself.
@@ -156,9 +229,9 @@ impl HeaderCache {
                     return Err(CoreError::BackingChanged(track.backing_path.clone()));
                 }
 
-                let tags = db.get_tags(track_id)?;
+                let tags = db.get_tags(track.id)?;
                 let inputs = tags_to_inputs(&tags);
-                let art_inputs = track_art_to_inputs(db, track_id)?;
+                let art_inputs = track_art_to_inputs(db, track.id)?;
 
                 // FLAC re-reads the front for its preserved structural blocks; MP3 needs no
                 // front read — its ID3v2 tag is regenerated entirely from the DB and the
@@ -226,7 +299,7 @@ impl HeaderCache {
                 _ => 0,
             })
             .sum();
-        let resolved = Arc::new(ResolvedFile {
+        Ok(Arc::new(ResolvedFile {
             layout,
             total_len,
             content_version: track.content_version,
@@ -234,9 +307,7 @@ impl HeaderCache {
             mtime_secs: mtime_secs_val,
             ogg_index: OnceCell::new(),
             cache_bytes,
-        });
-        self.store(track_id, resolved.clone());
-        Ok(resolved)
+        }))
     }
 }
 
@@ -479,7 +550,7 @@ mod resolve_ogg_tests {
         db.replace_tags(track_id, &[Tag::new("title", "Telephasic Workshop", 0)])
             .unwrap();
 
-        let mut cache = HeaderCache::new(Mode::Synthesis);
+        let cache = HeaderCache::new(Mode::Synthesis);
         let resolved = cache.resolve(&db, track_id).unwrap();
         let out = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
 
@@ -514,7 +585,7 @@ mod resolve_ogg_tests {
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap();
-        let mut cache = HeaderCache::new(Mode::Synthesis);
+        let cache = HeaderCache::new(Mode::Synthesis);
         let resolved = cache.resolve(&db, track_id).unwrap();
 
         let via_open = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
@@ -620,29 +691,79 @@ mod ogg_art_serve_tests {
 #[cfg(test)]
 mod cache_bound_tests {
     use super::*;
+    use musefs_db::{Db, Format, NewTrack};
 
-    fn entry(bytes: u64) -> Arc<ResolvedFile> {
+    fn entry(content_version: i64, inline_len: usize) -> Arc<ResolvedFile> {
         Arc::new(ResolvedFile {
-            layout: RegionLayout::new(vec![Segment::Inline(vec![0u8; bytes as usize])]),
-            total_len: bytes,
-            content_version: 0,
-            backing_path: std::path::PathBuf::from("/dev/null"),
+            layout: RegionLayout::new(vec![Segment::Inline(vec![0u8; inline_len])]),
+            total_len: inline_len as u64,
+            content_version,
+            backing_path: std::path::PathBuf::from("/nonexistent"),
             mtime_secs: 0,
             ogg_index: once_cell::sync::OnceCell::new(),
-            cache_bytes: bytes,
+            cache_bytes: inline_len as u64,
         })
     }
 
     #[test]
-    fn evicts_least_recently_used_over_byte_budget() {
-        let mut c = HeaderCache::with_budget(Mode::Synthesis, 250);
-        c.store(1, entry(100));
-        c.store(2, entry(100));
-        c.touch(1); // 1 is now most-recent
-        c.store(3, entry(100)); // total would be 300 > 250 => evict LRU (2)
-        assert!(c.map.contains_key(&1));
-        assert!(!c.map.contains_key(&2));
-        assert!(c.map.contains_key(&3));
-        assert!(c.bytes <= 250);
+    fn shard_evicts_least_recently_used_over_byte_budget() {
+        let mut shard = Shard::new(100);
+        shard.insert(1, entry(0, 60));
+        shard.insert(2, entry(0, 60)); // 120 > 100 → evict LRU key 1
+        assert!(shard.get(1).is_none());
+        assert!(shard.get(2).is_some());
+        shard.insert(3, entry(0, 60)); // evicts the now-LRU entry
+        assert!(shard.get(3).is_some());
+    }
+
+    #[test]
+    fn header_cache_resolve_caches_by_content_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        let (audio_offset, audio_length) = write_flac_local(&path);
+        let db = Db::open_in_memory().unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: Format::Flac,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len() as i64,
+                backing_mtime: mtime_secs(&meta),
+            })
+            .unwrap();
+        let cache = HeaderCache::new(Mode::Synthesis); // NOTE: not `mut` — resolve is &self now
+        let a = cache.resolve(&db, id).unwrap();
+        let b = cache.resolve(&db, id).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    fn write_flac_local(path: &std::path::Path) -> (i64, i64) {
+        fn block(bt: u8, body: &[u8], last: bool) -> Vec<u8> {
+            let mut v = vec![(if last { 0x80 } else { 0 }) | (bt & 0x7F)];
+            let n = body.len();
+            v.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+            v.extend_from_slice(body);
+            v
+        }
+        let mut si = vec![
+            0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0xC4, 0x42, 0xF0,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        si.extend_from_slice(&[0u8; 16]);
+        let mut vc = Vec::new();
+        let vendor = b"x";
+        vc.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        vc.extend_from_slice(vendor);
+        vc.extend_from_slice(&0u32.to_le_bytes());
+        let mut out = b"fLaC".to_vec();
+        out.extend(block(0, &si, false));
+        out.extend(block(4, &vc, true));
+        let audio = [0xABu8; 256];
+        let audio_offset = out.len() as i64;
+        out.extend_from_slice(&audio);
+        std::fs::write(path, &out).unwrap();
+        (audio_offset, audio.len() as i64)
     }
 }

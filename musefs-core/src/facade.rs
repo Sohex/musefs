@@ -53,14 +53,14 @@ struct Handle {
 
 /// The composed read-only filesystem: the store, the rendered tree, and the
 /// lazy synthesis cache. All methods take `&self`; the tree is swapped
-/// atomically on refresh, the cache is mutex-guarded, and the data-version
-/// stamp is atomic. This makes `Musefs` `Sync`, so the FUSE layer can later
-/// share it across a worker pool.
+/// atomically on refresh, the cache is internally sharded (each shard mutex-guarded),
+/// and the data-version stamp is atomic. This makes `Musefs` `Sync`, so the FUSE
+/// layer can later share it across a worker pool.
 pub struct Musefs {
     pool: DbPool,
     config: MountConfig,
     tree: ArcSwap<VirtualTree>,
-    cache: Mutex<HeaderCache>,
+    cache: HeaderCache,
     last_data_version: AtomicI64,
     handles: Mutex<HashMap<u64, Arc<Handle>>>,
     next_fh: AtomicU64,
@@ -71,7 +71,7 @@ impl Musefs {
         let tree = Self::build_tree(&db, &config)?;
         let last_data_version = db.data_version()?;
         Ok(Musefs {
-            cache: Mutex::new(HeaderCache::new(config.mode)),
+            cache: HeaderCache::new(config.mode),
             last_data_version: AtomicI64::new(last_data_version),
             tree: ArcSwap::from_pointee(tree),
             pool: DbPool::new(db)?,
@@ -106,16 +106,9 @@ impl Musefs {
         Ok(())
     }
 
-    // Lock order: when both are needed, acquire a DbPool connection
-    // (`pool.with`/`with_poll`) FIRST, then `self.cache`. Never call into the
-    // pool while holding the cache lock — that would invert the order and can
-    // deadlock once the worker pool runs these concurrently.
-
-    /// Lock the header cache, recovering from a poisoned mutex (a worker that
-    /// panicked mid-resolve must not permanently break the mount).
-    fn cache(&self) -> std::sync::MutexGuard<'_, HeaderCache> {
-        self.cache.lock().unwrap_or_else(|p| p.into_inner())
-    }
+    // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) before any
+    // cache shard lock. The header cache is internally sharded; `resolve` does its
+    // stat/synthesis off-lock and locks a shard only for the get/insert.
 
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Handle>>> {
         self.handles.lock().unwrap_or_else(|p| p.into_inner())
@@ -134,7 +127,7 @@ impl Musefs {
         // Rebuild + drop cached resolutions BEFORE committing the new stamp, so a
         // concurrent reader that sees the new version also sees fresh state.
         self.refresh()?;
-        self.cache().clear();
+        self.cache.clear();
         self.last_data_version.store(version, Ordering::Release);
         Ok(true)
     }
@@ -168,7 +161,7 @@ impl Musefs {
         };
         let resolved = self
             .pool
-            .with(|db| self.cache().resolve(db, track_id))?;
+            .with(|db| self.cache.resolve(db, track_id))?;
         Ok(Attr {
             inode,
             is_dir: false,
@@ -215,7 +208,7 @@ impl Musefs {
             }
         };
         self.pool.with(|db| {
-            let resolved = self.cache().resolve(db, track_id)?;
+            let resolved = self.cache.resolve(db, track_id)?;
             read_at(&resolved, db, offset, size)
         })
     }
@@ -234,7 +227,7 @@ impl Musefs {
                 },
             }
         };
-        let resolved = self.pool.with(|db| self.cache().resolve(db, track_id))?;
+        let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1; // never 0

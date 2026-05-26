@@ -33,7 +33,7 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
 #[test]
 fn reading_whole_file_matches_total_len_and_splices_audio() {
     let (_dir, db, id) = setup();
-    let mut cache = HeaderCache::new(Mode::Synthesis);
+    let cache = HeaderCache::new(Mode::Synthesis);
     let resolved = cache.resolve(&db, id).unwrap();
 
     let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
@@ -56,7 +56,7 @@ fn reading_whole_file_matches_total_len_and_splices_audio() {
 #[test]
 fn random_offset_and_size_match_the_whole_read() {
     let (_dir, db, id) = setup();
-    let mut cache = HeaderCache::new(Mode::Synthesis);
+    let cache = HeaderCache::new(Mode::Synthesis);
     let resolved = cache.resolve(&db, id).unwrap();
     let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
 
@@ -75,7 +75,7 @@ fn random_offset_and_size_match_the_whole_read() {
 #[test]
 fn reading_past_eof_returns_empty() {
     let (_dir, db, id) = setup();
-    let mut cache = HeaderCache::new(Mode::Synthesis);
+    let cache = HeaderCache::new(Mode::Synthesis);
     let resolved = cache.resolve(&db, id).unwrap();
     assert!(read_at(&resolved, &db, resolved.total_len, 100)
         .unwrap()
