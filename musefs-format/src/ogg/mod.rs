@@ -333,6 +333,57 @@ mod tests {
         }
     }
 
+    fn vorbis_headers_with(setup: &[u8]) -> Vec<u8> {
+        // Minimal-but-shaped Vorbis ID header (30 bytes from 0x01"vorbis").
+        let mut id = b"\x01vorbis".to_vec();
+        id.extend_from_slice(&0u32.to_le_bytes()); // version
+        id.push(2); // channels
+        id.extend_from_slice(&44100u32.to_le_bytes()); // sample rate
+        id.extend_from_slice(&0u32.to_le_bytes()); // bitrate max
+        id.extend_from_slice(&128000u32.to_le_bytes()); // nominal
+        id.extend_from_slice(&0u32.to_le_bytes()); // min
+        id.push(0xB8); // blocksizes
+        id.push(0x01); // framing bit
+        let mut comment = b"\x03vorbis".to_vec();
+        comment.extend_from_slice(&crate::vorbiscomment::build(&[]));
+        comment.push(0x01);
+        let (bytes, _) = crate::ogg::page::build_header(55, &[&id, &comment, setup]);
+        bytes
+    }
+
+    #[test]
+    fn synthesize_vorbis_preserves_setup_and_rewrites_comment() {
+        let setup = b"\x05vorbis-SETUP-CODEBOOKS-PLACEHOLDER".to_vec();
+        let mut data = vorbis_headers_with(&setup);
+        let (audio, _) = crate::ogg::page::lace_packet(55, 99, false, 1024, &vec![0u8; 64]);
+        data.extend_from_slice(&audio);
+
+        let scan = locate_audio(&data).unwrap();
+        assert_eq!(scan.codec, Codec::Vorbis);
+        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+        // The original setup packet (3rd header packet) must be carried through.
+        assert_eq!(header.packets[2], setup);
+
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("artist", "Autechre")],
+        )
+        .unwrap();
+
+        if let Segment::Inline(bytes) = &layout.segments()[0] {
+            let h = read_header(bytes).unwrap();
+            assert_eq!(h.codec, Codec::Vorbis);
+            assert_eq!(h.packets[2], setup); // setup preserved byte-for-byte
+            let body = comment_body(Codec::Vorbis, &h.packets[1]).unwrap();
+            let tags = crate::vorbiscomment::parse(body).unwrap();
+            assert_eq!(tags, vec![("ARTIST".to_string(), "Autechre".to_string())]);
+        } else {
+            panic!("expected Inline header");
+        }
+    }
+
     #[test]
     fn read_pictures_opus_decodes_metadata_block_picture() {
         use base64::Engine;
