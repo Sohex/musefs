@@ -22,7 +22,7 @@ fn baseline_one_open_per_read_call() {
             (0, streaminfo_body()),
             (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
         ],
-        &vec![0xCD; 64 * 1024],
+        &[0xCD; 64 * 1024],
     );
     std::fs::write(dir.path().join("a.flac"), &flac).unwrap();
 
@@ -31,7 +31,8 @@ fn baseline_one_open_per_read_call() {
     let mut fs = Musefs::open(db, config()).unwrap();
 
     let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
-    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let (name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    assert_eq!(name, "Song.flac");
     let size = fs.getattr(file_inode).unwrap().size;
 
     metrics::reset();
@@ -53,7 +54,7 @@ fn baseline_one_open_per_read_call() {
     // read() call. A later phase will reduce this to ~1 open per file.
     assert!(reads >= 2, "expected a multi-chunk read, got {reads}");
     assert_eq!(s.opens, reads, "currently one open() per read() call");
-    // pread_bytes only counts BackingAudio segments (not Inline metadata).
-    // The 64 KiB audio body must have been read in full.
-    assert!(s.pread_bytes >= 64 * 1024, "backing audio bytes were read");
+    // The 64 KiB audio body is read exactly once across the chunked reads; the
+    // inline FLAC header is an Inline segment and is not pread-counted.
+    assert_eq!(s.pread_bytes, 64 * 1024, "audio body read exactly once");
 }
