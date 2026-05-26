@@ -28,7 +28,7 @@ fn baseline_one_open_per_read_call() {
 
     let db = musefs_db::Db::open_in_memory().unwrap();
     scan_directory(&db, dir.path()).unwrap();
-    let mut fs = Musefs::open(db, config()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
 
     let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
     let (name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();

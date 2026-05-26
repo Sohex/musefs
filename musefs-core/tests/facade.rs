@@ -32,7 +32,7 @@ fn scanned_db(dir: &std::path::Path) -> musefs_db::Db {
 fn lookup_getattr_readdir_and_read_through_the_facade() {
     let dir = tempfile::tempdir().unwrap();
     let db = scanned_db(dir.path());
-    let mut fs = Musefs::open(db, config()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
 
     // Tree: /Alice/Song.flac
     let artist = fs.lookup(VirtualTree::ROOT, "Alice").expect("artist dir");
@@ -78,7 +78,7 @@ fn parent_exposes_the_tree_hierarchy() {
 fn refresh_rebuilds_tree_after_new_tracks() {
     let dir = tempfile::tempdir().unwrap();
     let db = scanned_db(dir.path());
-    let mut fs = Musefs::open(db, config()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
     assert!(fs.lookup(VirtualTree::ROOT, "Alice").is_some());
     assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_none());
 
@@ -127,7 +127,7 @@ fn reads_a_synthesized_mp3_through_the_facade() {
 
     let db = musefs_db::Db::open_in_memory().unwrap();
     scan_directory(&db, dir.path()).unwrap();
-    let mut fs = Musefs::open(db, config()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
 
     // Tree: /Zoe/Old.mp3
     let artist = fs.lookup(VirtualTree::ROOT, "Zoe").expect("artist dir");
@@ -158,7 +158,7 @@ fn reads_a_synthesized_m4a_through_the_facade() {
 
     let db = musefs_db::Db::open_in_memory().unwrap();
     scan_directory(&db, dir.path()).unwrap();
-    let mut fs = Musefs::open(db, config()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
 
     // Tree: /Orig Artist/Orig M4A.m4a
     let artist = fs
@@ -219,7 +219,7 @@ fn serves_flac_with_embedded_art_through_the_facade() {
 
     let db = musefs_db::Db::open_in_memory().unwrap();
     scan_directory(&db, dir.path()).unwrap();
-    let mut fs = Musefs::open(db, config()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
 
     let artist = fs.lookup(VirtualTree::ROOT, "Art").unwrap();
     let (_name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
@@ -257,7 +257,7 @@ fn serves_mp3_with_embedded_art_through_the_facade() {
 
     let db = musefs_db::Db::open_in_memory().unwrap();
     scan_directory(&db, dir.path()).unwrap();
-    let mut fs = Musefs::open(db, config()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
 
     let artist = fs.lookup(VirtualTree::ROOT, "Pix").unwrap();
     let (_name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
@@ -299,7 +299,7 @@ fn poll_refresh_picks_up_external_db_edits() {
         .unwrap();
     }
     let db = musefs_db::Db::open(&db_path).unwrap();
-    let mut fs = Musefs::open(db, config()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
     assert!(fs.lookup(VirtualTree::ROOT, "Alice").is_some());
     assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_none());
 

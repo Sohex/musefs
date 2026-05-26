@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
 
+use arc_swap::ArcSwap;
 use musefs_db::Db;
 
 use crate::error::{CoreError, Result};
@@ -35,15 +39,17 @@ pub struct Attr {
     pub mtime_secs: i64,
 }
 
-/// The composed read-only filesystem: the store, the rendered tree, and the lazy
-/// synthesis cache. Methods take `&mut self` (the cache mutates); the FUSE layer
-/// mounts this single-threaded.
+/// The composed read-only filesystem: the store, the rendered tree, and the
+/// lazy synthesis cache. All methods take `&self`; the tree is swapped
+/// atomically on refresh, the cache is mutex-guarded, and the data-version
+/// stamp is atomic. This makes `Musefs` `Sync`, so the FUSE layer can later
+/// share it across a worker pool.
 pub struct Musefs {
     db: Db,
     config: MountConfig,
-    tree: VirtualTree,
-    cache: HeaderCache,
-    last_data_version: i64,
+    tree: ArcSwap<VirtualTree>,
+    cache: Mutex<HeaderCache>,
+    last_data_version: AtomicI64,
 }
 
 impl Musefs {
@@ -51,11 +57,11 @@ impl Musefs {
         let tree = Self::build_tree(&db, &config)?;
         let last_data_version = db.data_version()?;
         Ok(Musefs {
-            cache: HeaderCache::new(config.mode),
-            last_data_version,
+            cache: Mutex::new(HeaderCache::new(config.mode)),
+            last_data_version: AtomicI64::new(last_data_version),
+            tree: ArcSwap::from_pointee(tree),
             db,
             config,
-            tree,
         })
     }
 
@@ -78,8 +84,9 @@ impl Musefs {
     }
 
     /// Rebuild the tree from the current DB contents (used after external edits).
-    pub fn refresh(&mut self) -> Result<()> {
-        self.tree = Self::build_tree(&self.db, &self.config)?;
+    pub fn refresh(&self) -> Result<()> {
+        let tree = Self::build_tree(&self.db, &self.config)?;
+        self.tree.store(Arc::new(tree));
         Ok(())
     }
 
@@ -88,50 +95,47 @@ impl Musefs {
     /// version stamp is committed only after a successful rebuild. The FUSE layer
     /// calls this on metadata operations so external edits (a scan, a beets retag)
     /// appear without remounting.
-    ///
-    /// A rebuild reassigns inodes, so a descriptor held open across a refresh may
-    /// then resolve to a different node (or none). This is bounded by the FUSE
-    /// entry/attr TTL and degrades safely to `ENOENT`; refreshes are rare enough
-    /// (only on external commits) that this is acceptable for a read-only mount.
-    pub fn poll_refresh(&mut self) -> Result<bool> {
+    pub fn poll_refresh(&self) -> Result<bool> {
         let version = self.db.data_version()?;
-        if version == self.last_data_version {
+        if version == self.last_data_version.load(Ordering::Acquire) {
             return Ok(false);
         }
         // Rebuild before committing the new stamp: if build_tree fails, the stamp
-        // stays put so the next poll retries instead of silently serving a stale
-        // tree until the next unrelated external commit bumps data_version again.
+        // stays put so the next poll retries instead of serving a stale tree.
         self.refresh()?;
-        self.last_data_version = version;
-        self.cache.clear();
+        self.last_data_version.store(version, Ordering::Release);
+        self.cache.lock().unwrap().clear();
         Ok(true)
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
-        self.tree.lookup(parent, name)
+        self.tree.load().lookup(parent, name)
     }
 
     /// The parent inode of `inode` (root's parent is itself). Forwards to the tree.
     pub fn parent(&self, inode: u64) -> Option<u64> {
-        self.tree.parent(inode)
+        self.tree.load().parent(inode)
     }
 
-    pub fn getattr(&mut self, inode: u64) -> Result<Attr> {
-        let track_id = match self.tree.node(inode) {
-            None => return Err(CoreError::NoEntry(inode)),
-            Some(node) => match &node.kind {
-                NodeKind::Dir => {
-                    return Ok(Attr {
-                        inode,
-                        is_dir: true,
-                        size: 0,
-                        mtime_secs: 0,
-                    })
-                }
-                NodeKind::File { track_id } => *track_id,
-            },
+    pub fn getattr(&self, inode: u64) -> Result<Attr> {
+        let track_id = {
+            let tree = self.tree.load();
+            match tree.node(inode) {
+                None => return Err(CoreError::NoEntry(inode)),
+                Some(node) => match &node.kind {
+                    NodeKind::Dir => {
+                        return Ok(Attr {
+                            inode,
+                            is_dir: true,
+                            size: 0,
+                            mtime_secs: 0,
+                        })
+                    }
+                    NodeKind::File { track_id } => *track_id,
+                },
+            }
         };
-        let resolved = self.cache.resolve(&self.db, track_id)?;
+        let resolved = self.cache.lock().unwrap().resolve(&self.db, track_id)?;
         Ok(Attr {
             inode,
             is_dir: false,
@@ -142,28 +146,34 @@ impl Musefs {
 
     /// Directory entries as `(name, child_inode, is_dir)`.
     pub fn readdir(&self, inode: u64) -> Result<Vec<(String, u64, bool)>> {
-        let children = match self.tree.children(inode) {
+        let tree = self.tree.load();
+        let children = match tree.children(inode) {
             Some(children) => children,
             // Only directories have a children map; tell apart a known
             // non-directory (ENOTDIR) from an unknown inode (ENOENT).
-            None if self.tree.node(inode).is_some() => return Err(CoreError::NotADir(inode)),
+            None if tree.node(inode).is_some() => return Err(CoreError::NotADir(inode)),
             None => return Err(CoreError::NoEntry(inode)),
         };
         Ok(children
             .iter()
-            .map(|(name, &child)| (name.clone(), child, self.tree.is_dir(child)))
+            .map(|(name, &child)| (name.clone(), child, tree.is_dir(child)))
             .collect())
     }
 
-    pub fn read(&mut self, inode: u64, offset: u64, size: u64) -> Result<Vec<u8>> {
-        let track_id = match self.tree.node(inode) {
-            None => return Err(CoreError::NoEntry(inode)),
-            Some(node) => match &node.kind {
-                NodeKind::Dir => return Err(CoreError::IsDir(inode)),
-                NodeKind::File { track_id } => *track_id,
-            },
+    pub fn read(&self, inode: u64, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let track_id = {
+            let tree = self.tree.load();
+            match tree.node(inode) {
+                None => return Err(CoreError::NoEntry(inode)),
+                Some(node) => match &node.kind {
+                    NodeKind::Dir => return Err(CoreError::IsDir(inode)),
+                    NodeKind::File { track_id } => *track_id,
+                },
+            }
         };
-        let resolved = self.cache.resolve(&self.db, track_id)?;
+        // Resolve under the lock, then drop it so the backing-file read runs
+        // without serializing other operations (resolve returns an Arc).
+        let resolved = self.cache.lock().unwrap().resolve(&self.db, track_id)?;
         read_at(&resolved, &self.db, offset, size)
     }
 }

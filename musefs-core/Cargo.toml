@@ -8,6 +8,7 @@ license = "MIT"
 metrics = []
 
 [dependencies]
+arc-swap = "1"
 musefs-db = { path = "../musefs-db" }
 musefs-format = { path = "../musefs-format" }
 once_cell = "1"

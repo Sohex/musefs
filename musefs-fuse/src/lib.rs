@@ -62,8 +62,8 @@ pub fn to_file_attr(attr: &Attr, uid: u32, gid: u32, fallback_mtime: SystemTime)
 }
 
 /// A `fuser::Filesystem` that serves a `musefs_core::Musefs`. Owns the core
-/// (and thus the DB + header cache); fuser drives it single-threaded, so the
-/// `&mut self` core methods are safe.
+/// (and thus the DB + header cache); all core methods take `&self`, so the
+/// struct is `Sync`-ready for future multi-threaded fuser workers.
 pub struct MusefsFs {
     core: Musefs,
     uid: u32,
