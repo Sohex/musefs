@@ -120,12 +120,6 @@ impl Shard {
             self.bytes -= n.value.cache_bytes;
         }
     }
-    fn clear(&mut self) {
-        self.map.clear();
-        self.head = None;
-        self.tail = None;
-        self.bytes = 0;
-    }
     fn retain_keys(&mut self, live: &HashSet<i64>) {
         let dead: Vec<i64> = self
             .map
@@ -183,12 +177,6 @@ impl HeaderCache {
     fn shard(&self, track_id: i64) -> std::sync::MutexGuard<'_, Shard> {
         let idx = (track_id as u64 % CACHE_SHARDS as u64) as usize;
         self.shards[idx].lock().unwrap_or_else(|p| p.into_inner())
-    }
-    /// Drop all cached resolutions (used when the DB changed underneath the mount).
-    pub fn clear(&self) {
-        for s in &self.shards {
-            s.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        }
     }
     /// Drop cached resolutions for tracks no longer present (`live` = current ids).
     pub fn retain(&self, live: &HashSet<i64>) {
