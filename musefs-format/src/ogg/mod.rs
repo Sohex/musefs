@@ -310,6 +310,33 @@ fn rebuild_oggflac_packets(header: &OggHeader, vc: &[u8]) -> Result<Vec<Vec<u8>>
     Ok(out)
 }
 
+/// Build the FLAC PICTURE block *body prefix* (everything before the image data:
+/// type, mime, description, dimensions, depth, colors, data-length) for `art`,
+/// padding the description with spaces so the prefix length is a multiple of 3.
+/// This makes `base64(prefix ++ image) == base64(prefix) ++ base64(image)`, so the
+/// image's base64 is an independent substring that can be served incrementally.
+/// The declared data-length field is the true image length (`art.data_len`).
+fn picture_prefix(art: &crate::input::ArtInput) -> Vec<u8> {
+    // Unpadded prefix length = 4(type)+4(mimelen)+mime +4(desclen)+desc
+    //   +4(w)+4(h)+4(depth)+4(colors)+4(datalen) = 32 + mime + desc.
+    let base = 32 + art.mime.len() + art.description.len();
+    let pad = (3 - base % 3) % 3;
+    let description = format!("{}{}", art.description, " ".repeat(pad));
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&art.picture_type.to_be_bytes());
+    out.extend_from_slice(&(art.mime.len() as u32).to_be_bytes());
+    out.extend_from_slice(art.mime.as_bytes());
+    out.extend_from_slice(&(description.len() as u32).to_be_bytes());
+    out.extend_from_slice(description.as_bytes());
+    out.extend_from_slice(&art.width.to_be_bytes());
+    out.extend_from_slice(&art.height.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // depth
+    out.extend_from_slice(&0u32.to_be_bytes()); // colors
+    out.extend_from_slice(&(art.data_len as u32).to_be_bytes()); // image data length
+    out
+}
+
 #[doc(hidden)]
 pub mod page_test_support {
     pub use crate::ogg::page::{build_header as build_header_pub, lace_packet as lace_packet_pub};
@@ -601,5 +628,30 @@ mod tests {
         } else {
             panic!("expected Inline header");
         }
+    }
+
+    #[test]
+    fn picture_prefix_is_3_aligned_and_declares_image_len() {
+        let art = crate::input::ArtInput {
+            art_id: 1,
+            mime: "image/png".to_string(), // 9 -> base = 32+9+0 = 41 -> pad 1
+            description: String::new(),
+            picture_type: 3,
+            width: 1,
+            height: 1,
+            data_len: 12345,
+        };
+        let p = picture_prefix(&art);
+        assert_eq!(p.len() % 3, 0);
+        // datalen is the last 4 bytes (big-endian) and equals the true image length.
+        let dl = u32::from_be_bytes(p[p.len() - 4..].try_into().unwrap());
+        assert_eq!(dl, 12345);
+        // Reusing the existing FLAC picture parser proves the framing is valid:
+        // parse_picture_block expects the body (prefix + image); append dummy image.
+        let mut body = p.clone();
+        body.extend(std::iter::repeat_n(0u8, 12345));
+        let pic = crate::flac::parse_picture_block(&body).unwrap();
+        assert_eq!(pic.mime, "image/png");
+        assert_eq!(pic.picture_type, 3);
     }
 }
