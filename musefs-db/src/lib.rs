@@ -14,19 +14,21 @@ use std::time::Duration;
 
 pub struct Db {
     conn: Connection,
+    path: Option<std::path::PathBuf>,
 }
 
 impl Db {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Db> {
-        let mut conn = Connection::open(path)?;
+        let p = path.as_ref().to_path_buf();
+        let mut conn = Connection::open(&p)?;
         Self::configure(&mut conn, true)?;
-        Ok(Db { conn })
+        Ok(Db { conn, path: Some(p) })
     }
 
     pub fn open_in_memory() -> Result<Db> {
         let mut conn = Connection::open_in_memory()?;
         Self::configure(&mut conn, false)?;
-        Ok(Db { conn })
+        Ok(Db { conn, path: None })
     }
 
     /// Apply shared connection pragmas, then migrate. `wal` enables write-ahead
@@ -56,6 +58,21 @@ impl Db {
         Ok(self
             .conn
             .pragma_query_value(None, "data_version", |r| r.get(0))?)
+    }
+
+    /// The backing file path, or `None` for an in-memory database.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Open an additional read-only connection to an existing file-backed DB.
+    /// WAL (set by the writer) lets these run concurrently without blocking.
+    /// No migration is run — the schema already exists and the connection is RO.
+    pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Db> {
+        let p = path.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Db { conn, path: Some(p) })
     }
 }
 
@@ -92,5 +109,25 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .unwrap();
         assert_ne!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn open_readonly_can_read_a_file_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        {
+            let w = Db::open(&path).unwrap();
+            assert!(w.path().is_some());
+        }
+        let r = Db::open_readonly(&path).unwrap();
+        // A read-only connection can run a read pragma without error.
+        assert!(r.data_version().is_ok());
+        assert_eq!(r.path().unwrap(), path.as_path());
+    }
+
+    #[test]
+    fn in_memory_has_no_path() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.path().is_none());
     }
 }
