@@ -44,3 +44,23 @@ fn replace_overwrites_previous_tags() {
         vec![Tag::new("title", "New", 0)]
     );
 }
+
+#[test]
+fn tags_grouped_returns_all_tags_by_track() {
+    let db = Db::open_in_memory().unwrap();
+    let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+    let b = db.upsert_track(&new_track("/b.flac")).unwrap();
+    db.replace_tags(
+        a,
+        &[Tag::new("artist", "Alice", 0), Tag::new("title", "A", 0)],
+    )
+    .unwrap();
+    db.replace_tags(b, &[Tag::new("artist", "Bob", 0)]).unwrap();
+
+    let grouped = db.tags_grouped().unwrap();
+    assert_eq!(grouped.get(&a).map(|v| v.len()), Some(2));
+    assert_eq!(grouped.get(&b).map(|v| v.len()), Some(1));
+    // grouping must match per-track get_tags exactly (same order).
+    assert_eq!(grouped.get(&a), Some(&db.get_tags(a).unwrap()));
+    assert_eq!(grouped.get(&b), Some(&db.get_tags(b).unwrap()));
+}

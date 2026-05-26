@@ -106,9 +106,10 @@ impl Musefs {
 
     fn build_tree(db: &Db, config: &MountConfig) -> Result<VirtualTree> {
         let tracks = db.list_tracks()?;
+        let mut tags_by_track = db.tags_grouped()?;
         let mut entries = Vec::with_capacity(tracks.len());
         for t in &tracks {
-            let tags = db.get_tags(t.id)?;
+            let tags = tags_by_track.remove(&t.id).unwrap_or_default();
             let fields = tags_to_fields(&tags);
             let path = render_path(
                 &config.template,
