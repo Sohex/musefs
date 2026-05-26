@@ -186,6 +186,24 @@ pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
     Ok(out)
 }
 
+/// Given the full bytes of one page, return just its header bytes (length
+/// `header_len`) with the sequence number set to `new_seq` and the CRC recomputed
+/// over the patched page. The payload is read (to recompute the CRC) but not
+/// returned — callers splice it verbatim from the backing file.
+pub fn patch_page_header(page: &[u8], new_seq: u32) -> Result<Vec<u8>> {
+    let h = parse_page(page, 0)?;
+    if page.len() < h.total_len() {
+        return Err(FormatError::Malformed);
+    }
+    let mut full = page[..h.total_len()].to_vec();
+    full[18..22].copy_from_slice(&new_seq.to_le_bytes());
+    full[22..26].copy_from_slice(&0u32.to_le_bytes());
+    let crc = crc32(&full);
+    full[22..26].copy_from_slice(&crc.to_le_bytes());
+    full.truncate(h.header_len);
+    Ok(full)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +313,23 @@ mod tests {
         assert_eq!(pkts[1].data, big);
         assert_eq!(pkts[1].pages_through_end, 3);
         assert_eq!(pkts[1].end_offset, bytes.len());
+    }
+
+    #[test]
+    fn patch_page_header_updates_seq_and_crc() {
+        let packet = vec![0x42u8; 300];
+        let (page, _) = lace_packet(0xCAFE, 10, false, 7, &packet);
+        let patched = patch_page_header(&page, 12).unwrap();
+        let h0 = parse_page(&page, 0).unwrap();
+        assert_eq!(patched.len(), h0.header_len);
+        // Reassemble a full page from the patched header + original payload and
+        // verify the parsed seq and a self-consistent CRC.
+        let mut full = patched.clone();
+        full.extend_from_slice(&page[h0.header_len..h0.total_len()]);
+        let h1 = parse_page(&full, 0).unwrap();
+        assert_eq!(h1.seq, 12);
+        let mut z = full.clone();
+        z[22..26].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(crc32(&z), h1.crc);
     }
 }
