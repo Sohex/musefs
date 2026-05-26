@@ -204,6 +204,8 @@ fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
     Some((start, il.total_len - il.header_len))
 }
 
+/// Lenient: returns empty / skips any malformed atom and never errors — this only
+/// seeds metadata from existing files, so a missing or garbled tag must simply be absent.
 pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     let (start, len) = match ilst_region(buf) {
         Some(r) => r,
@@ -241,6 +243,8 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     out
 }
 
+/// Lenient: returns empty / skips any malformed atom and never errors — this only
+/// seeds cover art from existing files, so a missing or garbled picture must simply be absent.
 pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
     let (start, len) = match ilst_region(buf) {
         Some(r) => r,
@@ -451,7 +455,10 @@ mod tests {
         stco.extend_from_slice(&1u32.to_be_bytes());
         stco.extend_from_slice(&0u32.to_be_bytes());
         let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
-        let trak = bx(b"trak", &bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat()));
+        let trak = bx(
+            b"trak",
+            &bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat()),
+        );
         let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak, udta].concat());
         let ftyp = bx(b"ftyp", b"M4A ");
         let mdat = bx(b"mdat", b"AUDIO");
@@ -485,5 +492,32 @@ mod tests {
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].mime, "image/jpeg");
         assert_eq!(pics[0].data, jpeg);
+    }
+
+    #[test]
+    fn read_side_never_panics_on_garbage() {
+        // Empty buffer.
+        assert!(read_tags(&[]).is_empty());
+        assert!(read_pictures(&[]).is_empty());
+
+        // Random non-MP4 bytes.
+        let garbage = b"not an mp4 file at all............";
+        assert!(read_tags(garbage).is_empty());
+        assert!(read_pictures(garbage).is_empty());
+
+        // Valid moov but no udta/meta/ilst.
+        let no_ilst = mk_mp4(true, b"AUDIO", &[0]);
+        assert!(read_tags(&no_ilst).is_empty());
+        assert!(read_pictures(&no_ilst).is_empty());
+
+        // A meta FullBox whose payload is shorter than the 4 version/flags bytes it
+        // needs: exercises the `udta.get(meta.payload_start()+4..meta.end())?` guard.
+        let truncated_meta = bx(b"udta", &bx(b"meta", &[0u8, 0]));
+        let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), truncated_meta].concat());
+        let ftyp = bx(b"ftyp", b"M4A ");
+        let mdat = bx(b"mdat", b"AUDIO");
+        let lying = [ftyp, moov, mdat].concat();
+        assert!(read_tags(&lying).is_empty());
+        assert!(read_pictures(&lying).is_empty());
     }
 }
