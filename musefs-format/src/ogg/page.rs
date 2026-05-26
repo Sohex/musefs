@@ -138,6 +138,54 @@ pub fn build_header(serial: u32, packets: &[&[u8]]) -> (Vec<u8>, u32) {
     (out, seq)
 }
 
+/// A packet reassembled from one or more pages, plus the byte offset just past
+/// the page on which it completed (used to locate where audio begins).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadPacket {
+    pub data: Vec<u8>,
+    pub end_offset: usize,
+    pub pages_through_end: u32,
+}
+
+/// Reassemble up to `want` packets from the pages starting at `data[0]`. Stops as
+/// soon as `want` packets have completed (audio for Opus/Vorbis/OggFLAC begins on
+/// a fresh page after the header packets). A packet ends at the first lacing value
+/// < 255.
+pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
+    let mut out: Vec<ReadPacket> = Vec::new();
+    let mut pos = 0usize;
+    let mut pages = 0u32;
+    let mut cur: Vec<u8> = Vec::new();
+    while out.len() < want {
+        let h = parse_page(data, pos)?;
+        pages += 1;
+        let table_start = pos + 27;
+        let mut payload_pos = h.header_len;
+        for i in 0..h.seg_count as usize {
+            let lace = data[table_start + i] as usize;
+            let seg_start = pos + payload_pos;
+            let seg_end = seg_start + lace;
+            if seg_end > data.len() {
+                return Err(FormatError::Malformed);
+            }
+            cur.extend_from_slice(&data[seg_start..seg_end]);
+            payload_pos += lace;
+            if lace < 255 {
+                out.push(ReadPacket {
+                    data: std::mem::take(&mut cur),
+                    end_offset: pos + h.total_len(),
+                    pages_through_end: pages,
+                });
+                if out.len() == want {
+                    break;
+                }
+            }
+        }
+        pos += h.total_len();
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +278,22 @@ mod tests {
         assert_eq!(p1.header_type & FLAG_BOS, 0);
         assert_eq!(p0.seq, 0);
         assert_eq!(p1.seq, 1);
+    }
+
+    #[test]
+    fn read_packets_reassembles_multipage_packet() {
+        // One small packet, then one packet that spans two pages.
+        let small = vec![7u8; 5];
+        let big = vec![9u8; 70_000];
+        let (mut bytes, _) = lace_packet(3, 0, true, 0, &small);
+        let (b2, _) = lace_packet(3, 1, false, 0, &big);
+        bytes.extend_from_slice(&b2);
+
+        let pkts = read_packets(&bytes, 2).unwrap();
+        assert_eq!(pkts.len(), 2);
+        assert_eq!(pkts[0].data, small);
+        assert_eq!(pkts[1].data, big);
+        assert_eq!(pkts[1].pages_through_end, 3);
+        assert_eq!(pkts[1].end_offset, bytes.len());
     }
 }
