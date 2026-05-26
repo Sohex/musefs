@@ -147,6 +147,11 @@ impl Musefs {
     }
 
     /// Rebuild the tree from the current DB contents (used after external edits).
+    ///
+    /// Not single-flighted: do not run concurrently with `poll_refresh` (or another
+    /// `refresh`) — two overlapping rebuilds can publish a stale tree. The production
+    /// path goes through `poll_refresh`, which guards entry with the `refreshing` CAS;
+    /// this entry point exists for forced, unconditional rebuilds (e.g. tests).
     pub fn refresh(&self) -> Result<()> {
         let tree = self.pool.with(|db| {
             let mut alloc = self.inodes.lock().unwrap_or_else(|p| p.into_inner());

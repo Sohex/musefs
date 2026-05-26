@@ -58,10 +58,34 @@ fn parses_mode_and_revalidate_flags() {
         _ => panic!("expected mount"),
     }
 
-    // Mode defaults to synthesis.
+    // Mode defaults to synthesis; poll interval defaults to 1000ms.
     let cli = Cli::parse_from(["musefs", "mount", "/mnt/x", "--db", "/tmp/m.db"]);
     match cli.command {
-        Command::Mount { mode, .. } => assert_eq!(mode, CliMode::Synthesis),
+        Command::Mount {
+            mode,
+            poll_interval_ms,
+            ..
+        } => {
+            assert_eq!(mode, CliMode::Synthesis);
+            assert_eq!(poll_interval_ms, 1000); // default
+        }
+        _ => panic!("expected mount"),
+    }
+
+    // --poll-interval-ms is parsed.
+    let cli = Cli::parse_from([
+        "musefs",
+        "mount",
+        "/mnt/x",
+        "--db",
+        "/tmp/m.db",
+        "--poll-interval-ms",
+        "500",
+    ]);
+    match cli.command {
+        Command::Mount {
+            poll_interval_ms, ..
+        } => assert_eq!(poll_interval_ms, 500),
         _ => panic!("expected mount"),
     }
 
