@@ -46,6 +46,18 @@ pub(crate) fn track_art_to_inputs(db: &Db, track_id: i64) -> Result<Vec<ArtInput
     Ok(inputs)
 }
 
+/// Read each embedded image's raw bytes for synthesis (Ogg needs the bytes to
+/// compute page CRCs at resolve). Parallel to `track_art_to_inputs`; returns the
+/// same order. Only the Ogg synthesis path calls this — FLAC/MP3/MP4 stream art
+/// via `ArtImage` and never materialize it.
+pub(crate) fn track_art_images(db: &Db, inputs: &[ArtInput]) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::with_capacity(inputs.len());
+    for a in inputs {
+        out.push(db.read_art_chunk(a.art_id, 0, a.data_len as usize)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

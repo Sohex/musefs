@@ -193,11 +193,21 @@ impl HeaderCache {
                         let front =
                             read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
                         let header = musefs_format::ogg::read_metadata(&front)?;
+                        let art_images = crate::mapping::track_art_images(db, &art_inputs)?;
+                        let arts: Vec<musefs_format::ogg::OggArt> = art_inputs
+                            .iter()
+                            .zip(art_images.iter())
+                            .map(|(meta, image)| musefs_format::ogg::OggArt {
+                                meta,
+                                image: image.as_slice(),
+                            })
+                            .collect();
                         musefs_format::ogg::synthesize_layout(
                             &header,
                             track.audio_offset as u64,
                             track.audio_length as u64,
                             &inputs,
+                            &arts,
                         )?
                     }
                 };
