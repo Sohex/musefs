@@ -12,7 +12,7 @@ use threadpool::ThreadPool;
 
 use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, Request,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
 };
 use musefs_core::Attr;
 use musefs_core::CoreError;
@@ -129,11 +129,34 @@ impl Filesystem for MusefsFs {
         });
     }
 
+    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let core = Arc::clone(&self.core);
+        self.pool.execute(move || match core.open_handle(ino) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(e) => reply.error(errno(&e)),
+        });
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Cheap (a map remove); no need to offload to the pool.
+        self.core.release_handle(fh);
+        reply.ok();
+    }
+
     fn read(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -145,7 +168,7 @@ impl Filesystem for MusefsFs {
         }
         let core = Arc::clone(&self.core);
         self.pool
-            .execute(move || match core.read(ino, 0, offset as u64, size as u64) {
+            .execute(move || match core.read(ino, fh, offset as u64, size as u64) {
                 Ok(bytes) => reply.data(&bytes),
                 Err(e) => reply.error(errno(&e)),
             });
