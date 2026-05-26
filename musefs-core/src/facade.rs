@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use arc_swap::ArcSwap;
 use musefs_db::Db;
 
+use crate::db_pool::DbPool;
 use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
 use crate::reader::{read_at, HeaderCache};
@@ -45,7 +46,7 @@ pub struct Attr {
 /// stamp is atomic. This makes `Musefs` `Sync`, so the FUSE layer can later
 /// share it across a worker pool.
 pub struct Musefs {
-    db: Db,
+    pool: DbPool,
     config: MountConfig,
     tree: ArcSwap<VirtualTree>,
     cache: Mutex<HeaderCache>,
@@ -60,7 +61,7 @@ impl Musefs {
             cache: Mutex::new(HeaderCache::new(config.mode)),
             last_data_version: AtomicI64::new(last_data_version),
             tree: ArcSwap::from_pointee(tree),
-            db,
+            pool: DbPool::new(db)?,
             config,
         })
     }
@@ -85,7 +86,7 @@ impl Musefs {
 
     /// Rebuild the tree from the current DB contents (used after external edits).
     pub fn refresh(&self) -> Result<()> {
-        let tree = Self::build_tree(&self.db, &self.config)?;
+        let tree = self.pool.with(|db| Self::build_tree(db, &self.config))?;
         self.tree.store(Arc::new(tree));
         Ok(())
     }
@@ -96,7 +97,7 @@ impl Musefs {
     /// calls this on metadata operations so external edits (a scan, a beets retag)
     /// appear without remounting.
     pub fn poll_refresh(&self) -> Result<bool> {
-        let version = self.db.data_version()?;
+        let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
         if version == self.last_data_version.load(Ordering::Acquire) {
             return Ok(false);
         }
@@ -135,7 +136,9 @@ impl Musefs {
                 },
             }
         };
-        let resolved = self.cache.lock().unwrap().resolve(&self.db, track_id)?;
+        let resolved = self
+            .pool
+            .with(|db| self.cache.lock().unwrap().resolve(db, track_id))?;
         Ok(Attr {
             inode,
             is_dir: false,
@@ -171,9 +174,9 @@ impl Musefs {
                 },
             }
         };
-        // Resolve under the lock, then drop it so the backing-file read runs
-        // without serializing other operations (resolve returns an Arc).
-        let resolved = self.cache.lock().unwrap().resolve(&self.db, track_id)?;
-        read_at(&resolved, &self.db, offset, size)
+        self.pool.with(|db| {
+            let resolved = self.cache.lock().unwrap().resolve(db, track_id)?;
+            read_at(&resolved, db, offset, size)
+        })
     }
 }
