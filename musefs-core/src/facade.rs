@@ -186,8 +186,10 @@ impl Musefs {
         };
         self.pool.with(|db| {
             let resolved = self.cache().resolve(db, track_id)?;
-            // `resolve` returns an `Arc`, so the cache lock is already released
-            // here; the backing read runs without serializing other operations.
+            // `resolve` returns an `Arc`, so the cache lock is released before the
+            // backing read. In the PerThread (file-backed) pool that read also runs
+            // on a thread-local connection, so it doesn't serialize other workers;
+            // the Shared (in-memory) pool does hold its single db mutex across it.
             read_at(&resolved, db, offset, size)
         })
     }

@@ -86,6 +86,9 @@ impl MusefsFs {
             * 2;
         MusefsFs {
             core: Arc::new(core),
+            // NOTE: ThreadPool's job queue is unbounded; under a read storm against
+            // slow backing storage, queued jobs (each holding a reply handle) can
+            // accumulate. A bounded queue / back-pressure is a future tuning item.
             pool: ThreadPool::new(workers),
             // SAFETY: getuid/getgid are always-successful libc calls.
             uid: unsafe { libc::getuid() },
