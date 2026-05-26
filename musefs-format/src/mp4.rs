@@ -60,7 +60,12 @@ fn read_box(buf: &[u8], pos: usize) -> Result<BoxRef> {
     if total < header_len || pos + total > buf.len() {
         return Err(FormatError::Malformed);
     }
-    Ok(BoxRef { kind, start: pos, header_len, total_len: total })
+    Ok(BoxRef {
+        kind,
+        start: pos,
+        header_len,
+        total_len: total,
+    })
 }
 
 fn child_boxes(buf: &[u8]) -> Result<Vec<BoxRef>> {
@@ -178,7 +183,10 @@ mod tests {
         let mut hdlr_payload = vec![0u8; 8];
         hdlr_payload.extend_from_slice(b"soun");
         hdlr_payload.extend_from_slice(&[0u8; 12]);
-        let moov = bx(b"moov", &bx(b"trak", &bx(b"mdia", &bx(b"hdlr", &hdlr_payload))));
+        let moov = bx(
+            b"moov",
+            &bx(b"trak", &bx(b"mdia", &bx(b"hdlr", &hdlr_payload))),
+        );
 
         let m = find_box(&moov, b"moov").unwrap().unwrap();
         let (start, len) = find_path(m.payload(&moov), &[b"trak", b"mdia", b"hdlr"])
@@ -210,7 +218,11 @@ mod tests {
         let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak].concat());
         let mdat = bx(b"mdat", mdat_payload);
         let ftyp = bx(b"ftyp", b"M4A isom");
-        if moov_first { [ftyp, moov, mdat].concat() } else { [ftyp, mdat, moov].concat() }
+        if moov_first {
+            [ftyp, moov, mdat].concat()
+        } else {
+            [ftyp, mdat, moov].concat()
+        }
     }
 
     #[test]
@@ -240,5 +252,42 @@ mod tests {
         let video_moov = bx(b"moov", &bx(b"trak", &bx(b"mdia", &bx(b"hdlr", &hdlr_p))));
         let vbuf = [bx(b"ftyp", b"M4A "), video_moov, bx(b"mdat", b"Z")].concat();
         assert!(locate_audio(&vbuf).is_err());
+    }
+
+    /// A `soun` trak built the way `mk_mp4` does (hdlr + minf/stbl/stco), for
+    /// reuse when hand-assembling a moov to exercise a specific reject branch.
+    fn soun_trak() -> Vec<u8> {
+        let mut stco = vec![0u8; 4];
+        stco.extend_from_slice(&1u32.to_be_bytes());
+        stco.extend_from_slice(&0u32.to_be_bytes());
+        let mut hdlr_p = vec![0u8; 8];
+        hdlr_p.extend_from_slice(b"soun");
+        hdlr_p.extend_from_slice(&[0u8; 12]);
+        let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+        let mdia = bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat());
+        bx(b"trak", &mdia)
+    }
+
+    #[test]
+    fn rejects_mvex_in_moov() {
+        // A moov carrying an mvex box (movie-extends header => fragmented) is
+        // rejected even though it otherwise holds a single valid soun trak.
+        let moov = bx(
+            b"moov",
+            &[bx(b"mvhd", &[0u8; 8]), bx(b"mvex", b"\x00"), soun_trak()].concat(),
+        );
+        let buf = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", b"X")].concat();
+        assert!(locate_audio(&buf).is_err());
+    }
+
+    #[test]
+    fn rejects_multi_trak() {
+        // Two trak children in moov is rejected (musefs serves single-track audio).
+        let moov = bx(
+            b"moov",
+            &[bx(b"mvhd", &[0u8; 8]), soun_trak(), soun_trak()].concat(),
+        );
+        let buf = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", b"X")].concat();
+        assert!(locate_audio(&buf).is_err());
     }
 }
