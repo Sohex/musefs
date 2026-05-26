@@ -860,6 +860,63 @@ mod tests {
         assert_eq!(moov.end(), head.len() - scan.mdat_header.len());
     }
 
+    /// Like `mk_mp4` but the soun trak's stbl carries a `co64` (8-byte offsets)
+    /// box instead of an `stco`. moov-first, since that's all this exercises.
+    fn mk_mp4_co64(mdat_payload: &[u8], co64_entries: &[u64]) -> Vec<u8> {
+        let mut co64 = vec![0u8; 4];
+        co64.extend_from_slice(&(co64_entries.len() as u32).to_be_bytes());
+        for e in co64_entries {
+            co64.extend_from_slice(&e.to_be_bytes());
+        }
+        let mut hdlr_p = vec![0u8; 8];
+        hdlr_p.extend_from_slice(b"soun");
+        hdlr_p.extend_from_slice(&[0u8; 12]);
+        let minf = bx(b"minf", &bx(b"stbl", &bx(b"co64", &co64)));
+        let mdia = bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat());
+        let trak = bx(b"trak", &mdia);
+        let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak].concat());
+        let mdat = bx(b"mdat", mdat_payload);
+        let ftyp = bx(b"ftyp", b"M4A isom");
+        [ftyp, moov, mdat].concat()
+    }
+
+    fn first_co64(head: &[u8]) -> Vec<u64> {
+        let moov = find_moov_in_head(head);
+        let mp = moov.payload(head);
+        let (sp, sl) = find_path(mp, &[b"trak", b"mdia", b"minf", b"stbl", b"co64"])
+            .unwrap()
+            .unwrap();
+        let co64 = &mp[sp..sp + sl];
+        let count = u32::from_be_bytes(co64[4..8].try_into().unwrap()) as usize;
+        (0..count)
+            .map(|i| u64::from_be_bytes(co64[8 + i * 8..16 + i * 8].try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn synthesize_patches_co64() {
+        let buf = mk_mp4_co64(b"AUDIODATA", &[42, 100]);
+        let scan = read_structure(&buf).unwrap();
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "New")], &[]).unwrap();
+
+        match layout.segments().last().unwrap() {
+            Segment::BackingAudio { offset, len } => {
+                assert_eq!(*offset, scan.mdat_payload_offset);
+                assert_eq!(*len, scan.mdat_payload_len);
+            }
+            _ => panic!("expected BackingAudio tail"),
+        }
+        let head = inline_head(&layout);
+        // mdat payload is served as the BackingAudio tail, so its new position is
+        // exactly where the head ends; co64 offsets shift by the same delta.
+        let new_mdat = head.len() as u64;
+        let delta = new_mdat - scan.mdat_payload_offset;
+        assert_eq!(first_co64(&head), vec![42 + delta, 100 + delta]);
+        // The new file head re-parses as a valid moov of the declared size.
+        let moov = find_moov_in_head(&head);
+        assert_eq!(moov.end(), head.len() - scan.mdat_header.len());
+    }
+
     #[test]
     fn synthesize_with_art_splits_for_streaming() {
         let buf = mk_mp4(false, b"AUDIODATA", &[0]);
