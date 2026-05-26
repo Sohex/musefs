@@ -1,6 +1,8 @@
+mod b64;
 mod crc;
 mod page;
 
+pub use b64::{b64_len, b64_window, encode_b64_slice, B64Window};
 pub use page::{parse_page, patch_page_header, PageHeader};
 
 use crate::error::{FormatError, Result};
