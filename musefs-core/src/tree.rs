@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 /// Assigns stable inodes keyed by rendered path, persisted across tree rebuilds:
 /// an unchanged path keeps its inode, a new path gets a fresh one, and a retired
 /// inode is never recycled (a stale FUSE handle can't alias a different node).
-#[derive(Debug, Default)]
+/// The map grows monotonically with the universe of distinct paths ever rendered.
+#[derive(Debug)]
 pub struct InodeAllocator {
     paths: HashMap<String, u64>,
     next: u64,
