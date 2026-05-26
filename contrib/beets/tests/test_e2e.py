@@ -131,8 +131,8 @@ def _mounted(mnt, db, template):
 
 
 def _imported_library(tmp_path):
-    """Generate a FLAC + MP3, import them into a fresh beets library (as-is).
-    Returns (cfg, env, db, mnt, library)."""
+    """Generate a FLAC, MP3, and M4A, import them into a fresh beets library
+    (as-is). Returns (cfg, env, db, mnt, library)."""
     src = tmp_path / "src"
     library = tmp_path / "library"
     mnt = tmp_path / "mnt"
@@ -163,6 +163,7 @@ def test_e2e_import_retag_mount_playback(tmp_path):
           "title=New FLAC", "artist=New Artist", "albumartist=AA", "album=New Album")
     _beet(cfg, env, "modify", "-W", "-M", "-y", "format:MP3",
           "title=New MP3", "artist=New Artist", "albumartist=AA", "album=New Album")
+    # beets classifies m4a/AAC audio with format "AAC" (not "M4A"/"MP4").
     _beet(cfg, env, "modify", "-W", "-M", "-y", "format:AAC",
           "title=New M4A", "artist=New Artist", "albumartist=AA", "album=New Album")
 
