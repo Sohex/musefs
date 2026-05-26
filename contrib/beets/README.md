@@ -6,14 +6,14 @@ a re-tagged view of your library without rewriting any audio.
 
 ## How it fits together
 
-- `musefs scan` owns track rows and the structural columns (audio offsets, size,
-  mtime). Run it first; it also seeds tags/art from the files' embedded metadata.
-- This plugin overwrites the **tags** (and **cover art**, when beets has it) of
-  rows that scan already created, keyed by each file's canonical real path.
-- musefs's auto-refresh picks the changes up live — no remount.
-
-The plugin **never** creates rows or touches structural columns. A beets item
-whose path wasn't scanned is reported as skipped.
+- The plugin owns the **tags** (and **cover art**, when beets has it) of each
+  track, keyed by the file's canonical real path.
+- The structural columns (audio offsets, size, mtime) can only come from musefs
+  probing the file, so the plugin runs `musefs scan` for you (via the `bin`
+  config) before syncing — it never tries to compute those itself.
+- `beet musefs` scans the library and then syncs; the import/write hooks scan
+  just the touched file and then sync. musefs's auto-refresh shows changes live —
+  no remount, and **no separate scan step**.
 
 ## Install (local / development)
 
@@ -26,6 +26,10 @@ pluginpath: /path/to/musefs/contrib/beets/beetsplug
 plugins: musefs
 musefs:
   db: ~/musefs.db          # path to the musefs SQLite store (required)
+  bin: musefs              # musefs executable for auto-scan; use a full path if
+                           # not on $PATH, e.g. /path/to/musefs/target/release/musefs
+  # autoscan: yes          # default; runs `musefs scan` for you. Set `no` to
+  #                        # manage scanning yourself (hooks then best-effort).
   # fields:                # optional: map extra beets fields to musefs keys
   #   comments: comment
 ```
@@ -33,23 +37,22 @@ musefs:
 ## Workflow (test drive)
 
 ```bash
-# 1. Probe the library; create rows + structural columns + seed metadata.
-musefs scan ~/music --db ~/musefs.db
-
-# 2. Overwrite tags/art from beets (whole library, or a query).
+# Sync beets metadata into the store. Auto-scans the library first (creating the
+# DB if needed) — no separate `musefs scan` step.
 beet musefs                      # everything
-beet musefs albumartist:"Boards of Canada"   # a subset
+beet musefs albumartist:"Boards of Canada"   # a subset (scans just those files)
 beet musefs -n                   # dry run: report counts, write nothing
 
-# 3. Mount the re-tagged view.
+# Mount the re-tagged view.
 musefs mount ~/mnt --db ~/musefs.db \
     --template '$albumartist/$album/$tracknumber - $title'
 ```
 
-After this, the event hooks auto-sync on writes and imports specifically:
-`beet modify -w …` (tags written back to the file) and `beet import`. The mount
-then refreshes on its own. Note a metadata-only `beet modify` (no `-w`) does
-**not** trigger a hook — re-run `beet musefs` to pick those edits up.
+Imports and tag write-backs also auto-sync via event hooks: `beet import` and
+`beet modify -w …` each scan the touched file and sync it (creating the DB on
+first use). A metadata-only `beet modify` (no `-w`) doesn't fire a hook — re-run
+`beet musefs` to pick those edits up. With `autoscan: no`, run `musefs scan`
+yourself first; the hooks then become best-effort and skip if the DB is missing.
 
 ## Notes
 

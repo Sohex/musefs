@@ -143,12 +143,20 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     Ok(())
 }
 
-/// Walk `root` recursively, inserting/updating a track row for each `.flac`/`.mp3`
-/// file (with audio bounds and validation stamps) and seeding its tags from the
-/// file's existing metadata. Files that fail to parse are skipped.
+/// Insert/update a track row for each `.flac`/`.mp3` file under `root` (with
+/// audio bounds and validation stamps), seeding its tags from the file's
+/// existing metadata. `root` may be a single audio file (only that file is
+/// scanned) or a directory (walked recursively). Files that fail to parse are
+/// skipped.
 pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut files = Vec::new();
-    collect_audio(root, &mut files)?;
+    if root.is_file() {
+        if has_ext(root, "flac") || has_ext(root, "mp3") {
+            files.push(root.to_path_buf());
+        }
+    } else {
+        collect_audio(root, &mut files)?;
+    }
 
     let mut stats = ScanStats {
         scanned: 0,

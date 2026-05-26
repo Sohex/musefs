@@ -41,8 +41,9 @@ class FakeConfigView:
 
 
 class FakeLib:
-    def __init__(self, items):
+    def __init__(self, items, directory=b"/music"):
         self._items = items
+        self.directory = directory  # beets stores the music dir as bytes
 
     def items(self, query):
         return self._items
@@ -98,3 +99,88 @@ def test_album_imported_without_db_skips_gracefully(fake_item, fake_album, monke
     album = fake_album(items=[fake_item(os.fsencode("/music/a.flac"), title="X")])
     plugin._on_album_imported(album=album)  # must not raise
     plugin._on_album_imported(album=None)   # must not raise
+
+
+def _autoscan_plugin(db_path, monkeypatch):
+    """A plugin with autoscan on, config pointed at db_path, and _run_scan
+    replaced by a recorder (so tests don't need the real musefs binary)."""
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin, "config",
+        FakeConfigView({"db": db_path, "fields": {}, "autoscan": True}),
+        raising=False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        plugin, "_run_scan", lambda db, targets: calls.append(list(targets))
+    )
+    return plugin, calls
+
+
+def _musefs_cmd(plugin, argv):
+    cmd = next(c for c in plugin.commands() if c.name == "musefs")
+    opts, args = cmd.parser.parse_args(argv)
+    return cmd, opts, args
+
+
+def test_command_autoscan_scans_matched_files(db_path, make_track, fake_item, monkeypatch):
+    make_track("/music/a.flac")
+    plugin, calls = _autoscan_plugin(db_path, monkeypatch)
+    cmd, opts, args = _musefs_cmd(plugin, ["title:Song"])  # a query -> matched files
+    lib = FakeLib([fake_item(os.fsencode("/music/a.flac"), title="Song")])
+    cmd.func(lib, opts, args)
+
+    assert calls == [["/music/a.flac"]]  # scanned the matched file, not the dir
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT value FROM tags WHERE key='title'"
+        ).fetchone()[0] == "Song"
+    finally:
+        conn.close()
+
+
+def test_command_full_sync_scans_directory(db_path, fake_item, monkeypatch):
+    plugin, calls = _autoscan_plugin(db_path, monkeypatch)
+    cmd, opts, args = _musefs_cmd(plugin, [])  # no query == full sync
+    lib = FakeLib([fake_item(os.fsencode("/music/a.flac"))], directory=b"/music")
+    cmd.func(lib, opts, args)
+
+    assert calls == [["/music"]]  # one scan of the whole music directory
+
+
+def test_command_dry_run_skips_autoscan(db_path, fake_item, monkeypatch):
+    plugin, calls = _autoscan_plugin(db_path, monkeypatch)
+    cmd, opts, args = _musefs_cmd(plugin, ["-n"])
+    lib = FakeLib([fake_item(os.fsencode("/music/a.flac"))])
+    cmd.func(lib, opts, args)
+
+    assert calls == []  # dry-run must not mutate the DB via scan
+
+
+def test_hook_autoscans_then_syncs(db_path, make_track, fake_item, monkeypatch):
+    make_track("/music/a.flac")
+    plugin, calls = _autoscan_plugin(db_path, monkeypatch)
+    plugin._on_item_imported(item=fake_item(os.fsencode("/music/a.flac"), title="Song"))
+
+    assert calls == [["/music/a.flac"]]
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT value FROM tags WHERE key='title'"
+        ).fetchone()[0] == "Song"
+    finally:
+        conn.close()
+
+
+def test_hook_best_effort_on_scan_failure(db_path, fake_item, monkeypatch):
+    from beets import ui
+
+    plugin, _ = _autoscan_plugin(db_path, monkeypatch)
+
+    def boom(db, targets):
+        raise ui.UserError("scan blew up")
+
+    monkeypatch.setattr(plugin, "_run_scan", boom)
+    # A passive hook must swallow the error (warn), never abort the beets op.
+    plugin._on_after_write(item=fake_item(os.fsencode("/music/a.flac"), title="X"))
