@@ -353,3 +353,52 @@ fn open_handle_read_and_release_roundtrip() {
     let after = fs.read(file_inode, fh, 0, size).unwrap(); // unknown fh → fallback
     assert_eq!(after, via_fallback);
 }
+
+#[test]
+fn poll_refresh_keeps_unchanged_entries_and_prunes_vanished() {
+    use musefs_db::{Format, NewTrack, Tag};
+    let dir = tempfile::tempdir().unwrap();
+    let backing = dir.path().join("a.flac");
+    let bytes = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &[0xAB; 64],
+    );
+    std::fs::write(&backing, &bytes).unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let size_before = fs.getattr(inode).unwrap().size;
+
+    // Unrelated external commit bumps data_version without changing Alice's track.
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        let id = db2
+            .upsert_track(&NewTrack {
+                backing_path: "/x/ghost.mp3".to_string(),
+                format: Format::Mp3,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db2.replace_tags(
+            id,
+            &[Tag::new("artist", "Ghost", 0), Tag::new("title", "G", 0)],
+        )
+        .unwrap();
+    }
+    assert!(fs.poll_refresh().unwrap());
+
+    let size_after = fs.getattr(inode).unwrap().size;
+    assert_eq!(size_before, size_after);
+    assert!(fs.lookup(VirtualTree::ROOT, "Ghost").is_some());
+}

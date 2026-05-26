@@ -136,22 +136,27 @@ impl Musefs {
     }
 
     /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
-    /// rebuild the tree and drop cached resolutions, then return `true`; the new
-    /// version stamp is committed only after a successful rebuild. The FUSE layer
-    /// calls this on metadata operations so external edits (a scan, a beets retag)
-    /// appear without remounting.
+    /// rebuild the tree and prune cached resolutions to the live track set, then
+    /// return `true`; the new version stamp is committed only after a successful
+    /// rebuild. The FUSE layer calls this on metadata operations so external edits
+    /// (a scan, a beets retag) appear without remounting.
+    ///
+    /// Unchanged cache entries stay warm — a changed track self-invalidates lazily
+    /// on its next `resolve`/`getattr` via `content_version`; only vanished tracks
+    /// are dropped immediately.
     pub fn poll_refresh(&self) -> Result<bool> {
         let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
         if version == self.last_data_version.load(Ordering::Acquire) {
             return Ok(false);
         }
-        // Rebuild + drop cached resolutions BEFORE committing the new stamp, so a
-        // concurrent reader that sees the new version also sees fresh state.
+        // Rebuild the tree, then prune caches to the live track set: unchanged
+        // entries stay warm (a changed track self-invalidates on its next resolve
+        // via content_version); vanished tracks are dropped. Commit the stamp only
+        // after a successful rebuild.
         self.refresh()?;
-        self.cache.clear();
-        // Also drop stale size entries (a deleted track's id can be reused).
-        // Task 3.3 replaces both wholesale clears with live-set pruning.
-        self.size_cache().clear();
+        let live = self.tree.load().track_ids();
+        self.cache.retain(&live);
+        self.size_cache().retain(|k, _| live.contains(k));
         self.last_data_version.store(version, Ordering::Release);
         Ok(true)
     }

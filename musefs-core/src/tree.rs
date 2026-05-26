@@ -151,4 +151,15 @@ impl VirtualTree {
             k += 1;
         }
     }
+
+    /// All track ids referenced by file nodes (used to prune stale cache entries).
+    pub fn track_ids(&self) -> std::collections::HashSet<i64> {
+        self.nodes
+            .values()
+            .filter_map(|n| match &n.kind {
+                NodeKind::File { track_id } => Some(*track_id),
+                NodeKind::Dir => None,
+            })
+            .collect()
+    }
 }
