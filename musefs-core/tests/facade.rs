@@ -147,6 +147,39 @@ fn reads_a_synthesized_mp3_through_the_facade() {
     assert_eq!(&whole[whole.len() - audio.len()..], &audio);
 }
 
+
+#[test]
+fn reads_a_synthesized_m4a_through_the_facade() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Backing M4A: moov-first with ilst (title="Orig M4A", artist="Orig Artist")
+    // and an mdat carrying verbatim audio.
+    let audio = b"AUDIODATA";
+    std::fs::write(dir.path().join("song.m4a"), common::minimal_m4a(audio)).unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let mut fs = Musefs::open(db, config()).unwrap();
+
+    // Tree: /Orig Artist/Orig M4A.m4a
+    let artist = fs.lookup(VirtualTree::ROOT, "Orig Artist").expect("artist dir");
+    let entries = fs.readdir(artist).unwrap();
+    let (name, file_inode, _) = entries.into_iter().next().unwrap();
+    assert_eq!(name, "Orig M4A.m4a");
+
+    let attr = fs.getattr(file_inode).unwrap();
+    let whole = fs.read(file_inode, 0, attr.size).unwrap();
+    assert_eq!(whole.len() as u64, attr.size);
+
+    // The original audio frames are spliced in verbatim at the tail of the
+    // synthesized stream.
+    assert!(
+        whole.windows(audio.len()).any(|w| w == audio),
+        "synthesized m4a should contain the verbatim audio payload"
+    );
+    assert_eq!(&whole[whole.len() - audio.len()..], audio);
+}
+
 #[test]
 fn serves_flac_with_embedded_art_through_the_facade() {
     let dir = tempfile::tempdir().unwrap();

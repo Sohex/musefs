@@ -2,6 +2,7 @@
 pub enum Format {
     Flac,
     Mp3,
+    M4a,
 }
 
 impl Format {
@@ -9,6 +10,7 @@ impl Format {
         match self {
             Format::Flac => "flac",
             Format::Mp3 => "mp3",
+            Format::M4a => "m4a",
         }
     }
 
@@ -16,8 +18,20 @@ impl Format {
         match s {
             "flac" => Some(Format::Flac),
             "mp3" => Some(Format::Mp3),
+            "m4a" => Some(Format::M4a),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Format;
+
+    #[test]
+    fn m4a_round_trips() {
+        assert_eq!(Format::M4a.as_str(), "m4a");
+        assert_eq!(Format::parse("m4a"), Some(Format::M4a));
     }
 }
 

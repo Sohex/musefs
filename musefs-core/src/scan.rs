@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
-use musefs_format::{flac, mp3, EmbeddedPicture};
+use musefs_format::{flac, mp3, mp4, EmbeddedPicture};
 
 use crate::error::Result;
 
@@ -47,7 +47,12 @@ fn collect_audio(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
             collect_audio(&path, out)?;
-        } else if ftype.is_file() && (has_ext(&path, "flac") || has_ext(&path, "mp3")) {
+        } else if ftype.is_file()
+            && (has_ext(&path, "flac")
+                || has_ext(&path, "mp3")
+                || has_ext(&path, "m4a")
+                || has_ext(&path, "m4b"))
+        {
             out.push(path);
         }
     }
@@ -84,6 +89,15 @@ fn probe(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_length: bounds.audio_length,
             tags: mp3::read_tags(bytes),
             pictures: mp3::read_pictures(bytes),
+        })
+    } else if has_ext(path, "m4a") || has_ext(path, "m4b") {
+        let bounds = mp4::locate_audio(bytes).ok()?;
+        Some(Probed {
+            format: Format::M4a,
+            audio_offset: bounds.audio_offset,
+            audio_length: bounds.audio_length,
+            tags: mp4::read_tags(bytes),
+            pictures: mp4::read_pictures(bytes),
         })
     } else {
         None

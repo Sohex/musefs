@@ -123,6 +123,32 @@ fn scans_mp3_files_seeding_tracks_and_tags() {
         .any(|tag| tag.key == "title" && tag.value == "Track"));
 }
 
+
+#[test]
+fn scans_m4a_files_seeding_tracks() {
+    use musefs_db::Format;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.m4a"),
+        common::minimal_m4a(b"AUDIODATA"),
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+    assert_eq!(stats.scanned, 1);
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].format, Format::M4a);
+
+    let tags = db.get_tags(tracks[0].id).unwrap();
+    assert!(tags
+        .iter()
+        .any(|t| t.key == "title" && t.value == "Orig M4A"));
+}
+
 #[test]
 fn revalidate_skips_unchanged_prunes_missing_and_gcs_art() {
     let dir = tempfile::tempdir().unwrap();
