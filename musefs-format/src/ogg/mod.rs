@@ -289,7 +289,12 @@ fn rebuild_oggflac_packets(header: &OggHeader, vc: &[u8]) -> Result<Vec<Vec<u8>>
 
 #[doc(hidden)]
 pub mod page_test_support {
-    pub use crate::ogg::page::lace_packet as lace_packet_pub;
+    pub use crate::ogg::page::{build_header as build_header_pub, lace_packet as lace_packet_pub};
+
+    /// An empty VorbisComment body (vendor + zero comments), for fixtures.
+    pub fn vorbis_body_empty() -> Vec<u8> {
+        crate::vorbiscomment::build(&[])
+    }
 }
 
 #[cfg(test)]

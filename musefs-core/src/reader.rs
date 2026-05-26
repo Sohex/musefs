@@ -189,6 +189,17 @@ impl HeaderCache {
                         let scan = mp4::read_structure(&bytes)?;
                         mp4::synthesize_layout(&scan, &inputs, &art_inputs)?
                     }
+                    Format::Opus | Format::Vorbis | Format::OggFlac => {
+                        let front =
+                            read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
+                        let header = musefs_format::ogg::read_metadata(&front)?;
+                        musefs_format::ogg::synthesize_layout(
+                            &header,
+                            track.audio_offset as u64,
+                            track.audio_length as u64,
+                            &inputs,
+                        )?
+                    }
                 };
                 let total = layout.total_len();
                 (layout, total, track.backing_mtime.max(track.updated_at))
@@ -351,6 +362,71 @@ mod ogg_serve_tests {
                 .iter()
                 .all(|&b| b == 0xB2)
         );
+    }
+}
+
+#[cfg(test)]
+mod resolve_ogg_tests {
+    use super::*;
+    use musefs_db::{Db, Format, NewTrack, Tag};
+    use musefs_format::ogg::page_test_support::lace_packet_pub;
+    use std::io::Write;
+
+    fn build_opus_file(path: &std::path::Path) -> (u64, u64) {
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&musefs_format::ogg::page_test_support::vorbis_body_empty());
+        let (mut bytes, pages) =
+            musefs_format::ogg::page_test_support::build_header_pub(0x1234, &[&head, &tags]);
+        let audio_offset = bytes.len() as u64;
+        let _ = pages;
+        let (audio, _) = lace_packet_pub(0x1234, 2, false, 960, &vec![0x7Eu8; 400]);
+        bytes.extend_from_slice(&audio);
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        (audio_offset, bytes.len() as u64 - audio_offset)
+    }
+
+    #[test]
+    fn resolves_and_reads_opus_with_identical_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("track.opus");
+        let (audio_offset, audio_length) = build_opus_file(&path);
+        let original = std::fs::read(&path).unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let track_id = db
+            .upsert_track(&NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: Format::Opus,
+                audio_offset: audio_offset as i64,
+                audio_length: audio_length as i64,
+                backing_size: meta.len() as i64,
+                backing_mtime: mtime_secs(&meta),
+            })
+            .unwrap();
+        db.replace_tags(track_id, &[Tag::new("title", "Telephasic Workshop", 0)])
+            .unwrap();
+
+        let mut cache = HeaderCache::new(Mode::Synthesis);
+        let resolved = cache.resolve(&db, track_id).unwrap();
+        let out = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+
+        // The synthesized audio region (after the regenerated header) must be the
+        // original audio pages, byte-identical (seq_delta==0 here since the original
+        // OpusTags is also an empty-comment musefs-style header of equal page count).
+        let header = musefs_format::ogg::read_header(&out).unwrap();
+        let synth_audio = &out[header.audio_offset as usize..];
+        assert_eq!(synth_audio, &original[audio_offset as usize..]);
+
+        // Tags were rewritten.
+        let tags = musefs_format::ogg::read_tags(&out).unwrap();
+        assert!(tags
+            .iter()
+            .any(|(k, v)| k == "TITLE" && v == "Telephasic Workshop"));
     }
 }
 
