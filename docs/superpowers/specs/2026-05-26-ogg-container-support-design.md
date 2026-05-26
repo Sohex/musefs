@@ -220,6 +220,17 @@ flag are preserved unchanged.
   pass runs at most once per file and is invalidated with the rest of the cache on
   `BackingChanged` / `content_version` change. A reader faults those bytes in
   anyway; a pure metadata scan never pays for it.
+- **Concurrency guard.** `fuser` services reads on multiple threads, and tools
+  like `cp`/`rsync` fan out concurrent reads at different offsets immediately
+  after `open()` — so several threads will fault on the empty index at once. The
+  index must be guarded so exactly **one** thread runs the pass while the others
+  block until it is populated (no thundering herd of duplicate disk passes). The
+  build is fallible (I/O), so the guard needs **fallible init** —
+  `once_cell::sync::OnceCell::get_or_try_init`, or a `Mutex<Option<Arc<PageIndex>>>`
+  populated under the lock. Plain `std::sync::OnceLock::get_or_init` is unsuitable:
+  its closure cannot return `Result`, and a cached error must not poison the file
+  permanently — a transient failure must leave the slot unset for the next `read()`
+  to retry.
 - **Byte-size-bounded `HeaderCache`.** Eviction must be by **total cached bytes**
   (LRU), not entry count. Once any format embeds materialized data, counting
   entries is unsafe; with art streamed (above) the cached layout is small, but the
