@@ -52,6 +52,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 
 fn read_front(path: &Path, n: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
+    crate::metrics::on_open();
     let mut f = std::fs::File::open(path)?;
     let mut buf = vec![0u8; n as usize];
     f.read_exact(&mut buf)?;
@@ -117,6 +118,7 @@ impl HeaderCache {
 
         // Always validate the backing file first — a stale file is an error even
         // on a cache hit, because the audio region may have shifted.
+        crate::metrics::on_stat();
         let meta = std::fs::metadata(&track.backing_path)?;
         if meta.len() != track.backing_size as u64 || mtime_secs(&meta) != track.backing_mtime {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
@@ -268,15 +270,18 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
                 }
                 Segment::BackingAudio { offset: bo, .. } => {
                     if backing.is_none() {
+                        crate::metrics::on_open();
                         backing = Some(std::fs::File::open(&resolved.backing_path)?);
                     }
                     let f = backing.as_ref().unwrap();
                     let mut buf = vec![0u8; n];
                     f.read_exact_at(&mut buf, bo + within)?;
+                    crate::metrics::on_pread(n as u64);
                     out.extend_from_slice(&buf);
                 }
                 Segment::ArtImage { art_id, .. } => {
                     let chunk = db.read_art_chunk(*art_id, within, n)?;
+                    crate::metrics::on_art_chunk();
                     out.extend_from_slice(&chunk);
                 }
                 Segment::OggAudio {
@@ -291,6 +296,7 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
                         })?
                         .clone();
                     if backing.is_none() {
+                        crate::metrics::on_open();
                         backing = Some(std::fs::File::open(&resolved.backing_path)?);
                     }
                     let f = backing.as_ref().unwrap();
@@ -308,12 +314,14 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
                         let w =
                             musefs_format::ogg::b64_window(*offset + within, n as u64, *art_total);
                         let raw = db.read_art_chunk(*art_id, w.in_start, w.in_len as usize)?;
+                        crate::metrics::on_art_chunk();
                         out.extend_from_slice(&musefs_format::ogg::encode_b64_slice(
                             &raw, w.skip, n,
                         ));
                     } else {
                         // Raw image bytes (OggFLAC PICTURE block).
                         let chunk = db.read_art_chunk(*art_id, *offset + within, n)?;
+                        crate::metrics::on_art_chunk();
                         out.extend_from_slice(&chunk);
                     }
                 }
