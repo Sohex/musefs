@@ -26,6 +26,17 @@ modifying or duplicating the original audio bytes.
 - **CLI:** `musefs scan` and `musefs mount` with `--mode`, `--template`,
   `--default-fallback`, and `--revalidate`.
 
+### Delivered since v0.1.0
+
+- **beets plugin** (`contrib/beets/`) — syncs beets' canonical tags and cover
+  art into the SQLite store, keyed by each file's real path, so a live mount
+  presents the re-tagged view with no remount and no audio rewrite. It
+  auto-scans via the `musefs` binary (no separate `scan` step; `musefs scan`
+  also gained single-file support), reconciles file moves/renames (pruning rows
+  whose backing file is gone), and runs both as a `beet musefs` command and via
+  import/write hooks. Verified end-to-end (beets import + retag + FUSE mount)
+  with byte-identical audio.
+
 ---
 
 ## Post-MVP (explicitly deferred)
@@ -49,9 +60,9 @@ boundary stays explicit; none are half-built in the codebase.
 
 ### Distribution / integration
 
-- **beets / picard plugins as shipped artifacts** — the MVP defines and targets
-  the SQLite *contract* these tools write to, but does not ship the plugins
-  themselves.
+- **picard plugin as a shipped artifact** — the SQLite *contract* is a target
+  for picard too, but only the **beets** plugin ships today (see "Delivered
+  since v0.1.0"). A picard plugin is not yet built.
 
 ### Operations
 
