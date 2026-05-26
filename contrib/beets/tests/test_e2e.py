@@ -6,6 +6,7 @@ ffmpeg, the built `musefs` binary, `/dev/fuse` + fusermount, and beets.
 Run with: `python -m pytest -m e2e`
 """
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -18,6 +19,9 @@ import pytest
 
 pytest.importorskip("beets")
 import mutagen  # noqa: E402
+from mutagen.flac import FLAC, Picture  # noqa: E402
+from mutagen.id3 import APIC, ID3, ID3NoHeaderError  # noqa: E402
+from mutagen.mp4 import MP4, MP4Cover  # noqa: E402
 
 pytestmark = pytest.mark.e2e
 
@@ -62,17 +66,24 @@ def _env(tmp_path):
     return env
 
 
-def _write_config(tmp_path, library, db):
+def _write_config(tmp_path, library, db, fetchart=False):
+    plugins = "musefs, fetchart" if fetchart else "musefs"
+    fetchart_block = (
+        "fetchart:\n"
+        "  auto: yes\n"
+        "  sources: filesystem\n"
+    ) if fetchart else ""
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         f"directory: {library}\n"
         f"library: {tmp_path / 'beets_lib.db'}\n"
         f"pluginpath: {BEETSPLUG_DIR}\n"
-        f"plugins: musefs\n"
+        f"plugins: {plugins}\n"
         f"musefs:\n"
         f"  db: {db}\n"
         f"  bin: {MUSEFS}\n"
         f"  autoscan: yes\n"
+        f"{fetchart_block}"
         f"import:\n"
         f"  copy: yes\n"
         f"  write: no\n"
@@ -100,6 +111,83 @@ def _audio_md5(path):
         check=True, capture_output=True,
     ).stdout.decode()
     return out.strip()
+
+
+def _make_cover(path, color):
+    """Generate a small real image at `path` (extension picks the codec via
+    ffmpeg) and return its bytes. Distinct colors yield distinct sha256s."""
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"color=c={color}:s=64x64", "-frames:v", "1", str(path)],
+        check=True, capture_output=True,
+    )
+    return Path(path).read_bytes()
+
+
+def _embed_cover(path, cover_bytes, mime):
+    """Embed `cover_bytes` as a front cover (type 3) into the audio file at
+    `path` with mutagen, so the stored picture payload is byte-identical to
+    `cover_bytes`."""
+    p = str(path)
+    if p.endswith(".flac"):
+        flac = FLAC(p)
+        pic = Picture()
+        pic.type = 3
+        pic.mime = mime
+        pic.data = cover_bytes
+        flac.add_picture(pic)
+        flac.save()
+    elif p.endswith(".mp3"):
+        try:
+            tags = ID3(p)
+        except ID3NoHeaderError:
+            tags = ID3()
+        tags.add(APIC(encoding=3, mime=mime, type=3, desc="", data=cover_bytes))
+        tags.save(p)
+    elif p.endswith(".m4a"):
+        fmt = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
+        mp4 = MP4(p)
+        mp4["covr"] = [MP4Cover(cover_bytes, imageformat=fmt)]
+        mp4.save()
+    else:
+        raise ValueError(f"unsupported audio for art embed: {path}")
+
+
+def _served_cover(path):
+    """Extract the raw front-cover image bytes from a (served) audio file."""
+    p = str(path)
+    if p.endswith(".flac"):
+        pics = FLAC(p).pictures
+        assert pics, f"no FLAC picture in {path}"
+        return bytes(pics[0].data)
+    if p.endswith(".mp3"):
+        apics = ID3(p).getall("APIC")
+        assert apics, f"no MP3 APIC in {path}"
+        return bytes(apics[0].data)
+    if p.endswith(".m4a"):
+        covrs = MP4(p).tags.get("covr") or []
+        assert covrs, f"no M4A covr in {path}"
+        return bytes(covrs[0])
+    raise ValueError(f"unsupported audio for art extract: {path}")
+
+
+def _check_mount_art(cfg, env, mnt, expected_cover_sha):
+    """For each served format under the default `Test AA/Orig Album` tree, assert
+    title, byte-faithful audio, and that the served front cover's sha256 equals
+    `expected_cover_sha`."""
+    specs = [
+        (mnt / "Test AA" / "Orig Album" / "Orig FLAC.flac", "format:FLAC", "Orig FLAC"),
+        (mnt / "Test AA" / "Orig Album" / "Orig MP3.mp3", "format:MP3", "Orig MP3"),
+        (mnt / "Test AA" / "Orig Album" / "Orig M4A.m4a", "format:AAC", "Orig M4A"),
+    ]
+    for vpath, fquery, title in specs:
+        assert vpath.exists(), sorted(p.name for p in mnt.rglob("*"))
+        tags = mutagen.File(str(vpath), easy=True)
+        assert tags["title"] == [title]
+        backing = _beet(cfg, env, "ls", "-p", fquery).strip()
+        assert _audio_md5(str(vpath)) == _audio_md5(backing)
+        served_sha = hashlib.sha256(_served_cover(vpath)).hexdigest()
+        assert served_sha == expected_cover_sha, f"{vpath.name}: cover sha mismatch"
 
 
 @contextmanager
@@ -130,16 +218,21 @@ def _mounted(mnt, db, template):
             proc.kill()
 
 
-def _imported_library(tmp_path):
+def _imported_library(tmp_path, *, embed_cover=None, external_cover=None):
     """Generate a FLAC, MP3, and M4A, import them into a fresh beets library
-    (as-is). Returns (cfg, env, db, mnt, library)."""
+    (as-is). Returns (cfg, env, db, mnt, library).
+
+    embed_cover: PNG bytes embedded as a front cover into every source file
+        (exercises musefs scan's embedded-art ingestion).
+    external_cover: JPEG bytes written as `cover.jpg` in the source album dir,
+        with fetchart enabled so beets sets album.artpath (exercises the plugin
+        sync art path)."""
     src = tmp_path / "src"
     library = tmp_path / "library"
     mnt = tmp_path / "mnt"
     for d in (src, library, mnt):
         d.mkdir()
     db = tmp_path / "musefs.db"
-    cfg = _write_config(tmp_path, library, db)
     env = _env(tmp_path)
 
     _ffmpeg_gen(src / "a.flac", 440, title="Orig FLAC", artist="Orig",
@@ -148,6 +241,14 @@ def _imported_library(tmp_path):
                 album="Orig Album", album_artist="Test AA")
     _ffmpeg_gen(src / "c.m4a", 550, title="Orig M4A", artist="Orig",
                 album="Orig Album", album_artist="Test AA")
+
+    if embed_cover is not None:
+        for name in ("a.flac", "b.mp3", "c.m4a"):
+            _embed_cover(src / name, embed_cover, "image/png")
+    if external_cover is not None:
+        (src / "cover.jpg").write_bytes(external_cover)
+
+    cfg = _write_config(tmp_path, library, db, fetchart=external_cover is not None)
     _beet(cfg, env, "import", "-A", "-q", str(src))
     return cfg, env, db, mnt, library
 
