@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+metrics = []
+
 [dependencies]
 musefs-db = { path = "../musefs-db" }
 musefs-format = { path = "../musefs-format" }
@@ -14,3 +17,8 @@ thiserror = "1"
 tempfile = "3"
 metaflac = "0.2"
 id3 = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "read_throughput"
+harness = false

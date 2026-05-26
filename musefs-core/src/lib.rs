@@ -1,6 +1,7 @@
 mod error;
 mod facade;
 mod mapping;
+pub mod metrics;
 mod ogg_index;
 mod reader;
 mod scan;
