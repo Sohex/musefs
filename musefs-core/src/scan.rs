@@ -40,6 +40,17 @@ fn has_ext(path: &Path, ext: &str) -> bool {
         == Some(true)
 }
 
+/// True if `path` has an extension for a format the scanner can probe.
+fn is_supported_audio(path: &Path) -> bool {
+    has_ext(path, "flac")
+        || has_ext(path, "mp3")
+        || has_ext(path, "m4a")
+        || has_ext(path, "m4b")
+        || has_ext(path, "ogg")
+        || has_ext(path, "oga")
+        || has_ext(path, "opus")
+}
+
 fn collect_audio(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -47,15 +58,7 @@ fn collect_audio(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
             collect_audio(&path, out)?;
-        } else if ftype.is_file()
-            && (has_ext(&path, "flac")
-                || has_ext(&path, "mp3")
-                || has_ext(&path, "m4a")
-                || has_ext(&path, "m4b")
-                || has_ext(&path, "ogg")
-                || has_ext(&path, "oga")
-                || has_ext(&path, "opus"))
-        {
+        } else if ftype.is_file() && is_supported_audio(&path) {
             out.push(path);
         }
     }
@@ -174,15 +177,15 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     Ok(())
 }
 
-/// Insert/update a track row for each `.flac`/`.mp3` file under `root` (with
-/// audio bounds and validation stamps), seeding its tags from the file's
-/// existing metadata. `root` may be a single audio file (only that file is
-/// scanned) or a directory (walked recursively). Files that fail to parse are
-/// skipped.
+/// Insert/update a track row for each supported audio file (FLAC, MP3, M4A,
+/// Opus, Vorbis, FLAC-in-Ogg) under `root` (with audio bounds and validation
+/// stamps), seeding its tags from the file's existing metadata. `root` may be
+/// a single audio file (only that file is scanned) or a directory (walked
+/// recursively). Files that fail to parse are skipped.
 pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut files = Vec::new();
     if root.is_file() {
-        if has_ext(root, "flac") || has_ext(root, "mp3") {
+        if is_supported_audio(root) {
             files.push(root.to_path_buf());
         }
     } else {
@@ -295,5 +298,25 @@ mod ogg_probe_tests {
         let probed = probe(&path, &bytes).expect("opus should probe");
         assert_eq!(probed.format, Format::Opus);
         assert_eq!(probed.audio_offset, (bytes.len() - audio.len()) as u64);
+    }
+
+    #[test]
+    fn scan_single_opus_file_ingests_it() {
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&vorbis_body_empty());
+        let (mut bytes, _) = build_header_pub(0x1234, &[&head, &tags]);
+        let (audio, _) = lace_packet_pub(0x1234, 2, false, 960, &[0u8; 100]);
+        bytes.extend_from_slice(&audio);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.opus");
+        std::io::Write::write_all(&mut std::fs::File::create(&path).unwrap(), &bytes).unwrap();
+
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        // Pass the FILE path directly (not the directory).
+        let stats = crate::scan_directory(&db, &path).unwrap();
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.skipped, 0);
     }
 }

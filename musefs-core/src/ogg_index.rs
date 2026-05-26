@@ -69,6 +69,9 @@ pub fn build_index(
         });
         consumed += old.total_len() as u64;
     }
+    if consumed != audio_length {
+        return Err(CoreError::from(musefs_format::FormatError::Malformed));
+    }
     Ok(OggPageIndex { pages })
 }
 
