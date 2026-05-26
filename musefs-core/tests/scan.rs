@@ -44,6 +44,30 @@ fn scans_flac_files_seeding_tracks_and_tags() {
 }
 
 #[test]
+fn scans_a_single_file_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["TITLE=Solo"])),
+        ],
+        &[0xAA; 30],
+    );
+    let path = dir.path().join("solo.flac");
+    std::fs::write(&path, &a).unwrap();
+    // A sibling in the same dir that must NOT be scanned when targeting a file.
+    std::fs::write(dir.path().join("other.flac"), &a).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, &path).unwrap();
+    assert_eq!(stats.scanned, 1);
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert!(tracks[0].backing_path.ends_with("solo.flac"));
+}
+
+#[test]
 fn rescanning_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let a = make_flac(
