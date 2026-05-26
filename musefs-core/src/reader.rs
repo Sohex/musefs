@@ -24,14 +24,23 @@ pub struct ResolvedFile {
     /// Lazily built on the first read that touches an `OggAudio` segment; guarded
     /// so concurrent first reads build it once. Empty for non-Ogg files.
     pub ogg_index: OnceCell<Arc<OggPageIndex>>,
+    /// Approximate resident bytes this entry costs the cache (sum of `Inline`
+    /// segment bytes; backing/art/ogg-audio bytes are not resident).
+    pub cache_bytes: u64,
 }
 
 /// A per-mount cache of resolved files, keyed by track id and invalidated when a
 /// track's `content_version` changes (the DB bumps it on any tag/art edit).
 pub struct HeaderCache {
     map: HashMap<i64, Arc<ResolvedFile>>,
+    order: Vec<i64>, // LRU order, least-recent first
+    bytes: u64,
+    budget: u64,
     mode: Mode,
 }
+
+/// Default resident-bytes budget for the header cache (64 MiB).
+pub const DEFAULT_CACHE_BUDGET: u64 = 64 * 1024 * 1024;
 
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
@@ -51,8 +60,15 @@ fn read_front(path: &Path, n: u64) -> std::io::Result<Vec<u8>> {
 
 impl HeaderCache {
     pub fn new(mode: Mode) -> HeaderCache {
+        HeaderCache::with_budget(mode, DEFAULT_CACHE_BUDGET)
+    }
+
+    pub fn with_budget(mode: Mode, budget: u64) -> HeaderCache {
         HeaderCache {
             map: HashMap::new(),
+            order: Vec::new(),
+            bytes: 0,
+            budget,
             mode,
         }
     }
@@ -60,6 +76,34 @@ impl HeaderCache {
     /// Drop all cached resolutions (used when the DB changed underneath the mount).
     pub fn clear(&mut self) {
         self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+
+    fn touch(&mut self, track_id: i64) {
+        if let Some(pos) = self.order.iter().position(|&k| k == track_id) {
+            self.order.remove(pos);
+        }
+        self.order.push(track_id);
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.bytes > self.budget && self.order.len() > 1 {
+            let victim = self.order.remove(0);
+            if let Some(old) = self.map.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(old.cache_bytes);
+            }
+        }
+    }
+
+    fn store(&mut self, track_id: i64, resolved: Arc<ResolvedFile>) {
+        if let Some(old) = self.map.remove(&track_id) {
+            self.bytes = self.bytes.saturating_sub(old.cache_bytes);
+        }
+        self.bytes += resolved.cache_bytes;
+        self.map.insert(track_id, resolved);
+        self.touch(track_id);
+        self.evict_to_budget();
     }
 
     /// Resolve a track to its layout — a freshly synthesized metadata region in
@@ -80,7 +124,9 @@ impl HeaderCache {
 
         if let Some(cached) = self.map.get(&track_id) {
             if cached.content_version == track.content_version {
-                return Ok(cached.clone());
+                let hit = cached.clone();
+                self.touch(track_id);
+                return Ok(hit);
             }
         }
 
@@ -149,6 +195,14 @@ impl HeaderCache {
             }
         };
 
+        let cache_bytes = layout
+            .segments()
+            .iter()
+            .map(|s| match s {
+                Segment::Inline(b) => b.len() as u64,
+                _ => 0,
+            })
+            .sum();
         let resolved = Arc::new(ResolvedFile {
             layout,
             total_len,
@@ -156,8 +210,9 @@ impl HeaderCache {
             backing_path: PathBuf::from(&track.backing_path),
             mtime_secs: mtime_secs_val,
             ogg_index: OnceCell::new(),
+            cache_bytes,
         });
-        self.map.insert(track_id, resolved.clone());
+        self.store(track_id, resolved.clone());
         Ok(resolved)
     }
 }
@@ -270,6 +325,7 @@ mod ogg_serve_tests {
             backing_path: path.clone(),
             mtime_secs: 0,
             ogg_index: OnceCell::new(),
+            cache_bytes: 8,
         };
 
         // Read the whole virtual file; needs a Db only for ArtImage (unused here).
@@ -295,5 +351,35 @@ mod ogg_serve_tests {
                 .iter()
                 .all(|&b| b == 0xB2)
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_bound_tests {
+    use super::*;
+
+    fn entry(bytes: u64) -> Arc<ResolvedFile> {
+        Arc::new(ResolvedFile {
+            layout: RegionLayout::new(vec![Segment::Inline(vec![0u8; bytes as usize])]),
+            total_len: bytes,
+            content_version: 0,
+            backing_path: std::path::PathBuf::from("/dev/null"),
+            mtime_secs: 0,
+            ogg_index: once_cell::sync::OnceCell::new(),
+            cache_bytes: bytes,
+        })
+    }
+
+    #[test]
+    fn evicts_least_recently_used_over_byte_budget() {
+        let mut c = HeaderCache::with_budget(Mode::Synthesis, 250);
+        c.store(1, entry(100));
+        c.store(2, entry(100));
+        c.touch(1); // 1 is now most-recent
+        c.store(3, entry(100)); // total would be 300 > 250 => evict LRU (2)
+        assert!(c.map.contains_key(&1));
+        assert!(!c.map.contains_key(&2));
+        assert!(c.map.contains_key(&3));
+        assert!(c.bytes <= 250);
     }
 }
