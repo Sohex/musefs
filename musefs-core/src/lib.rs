@@ -1,6 +1,7 @@
 mod error;
 mod facade;
 mod mapping;
+mod ogg_index;
 mod reader;
 mod scan;
 mod template;

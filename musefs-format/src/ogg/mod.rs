@@ -1,6 +1,8 @@
 mod crc;
 mod page;
 
+pub use page::{parse_page, patch_page_header, PageHeader};
+
 use crate::error::{FormatError, Result};
 
 /// The codec carried inside an Ogg logical bitstream that we synthesize.
@@ -283,6 +285,11 @@ fn rebuild_oggflac_packets(header: &OggHeader, vc: &[u8]) -> Result<Vec<Vec<u8>>
     let mut out = vec![mapping];
     out.extend(blocks);
     Ok(out)
+}
+
+#[doc(hidden)]
+pub mod page_test_support {
+    pub use crate::ogg::page::lace_packet as lace_packet_pub;
 }
 
 #[cfg(test)]

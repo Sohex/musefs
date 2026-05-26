@@ -197,6 +197,7 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
                     let chunk = db.read_art_chunk(*art_id, within, n)?;
                     out.extend_from_slice(&chunk);
                 }
+                Segment::OggAudio { .. } => unreachable!("OggAudio serving lands in Task 14"),
             }
         }
         seg_start = seg_end;

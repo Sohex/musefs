@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 musefs-db = { path = "../musefs-db" }
 musefs-format = { path = "../musefs-format" }
+once_cell = "1"
 thiserror = "1"
 
 [dev-dependencies]
