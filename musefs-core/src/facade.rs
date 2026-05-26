@@ -148,7 +148,7 @@ impl Musefs {
         };
         let resolved = self
             .pool
-            .with(|db| self.cache.lock().unwrap().resolve(db, track_id))?;
+            .with(|db| self.cache().resolve(db, track_id))?;
         Ok(Attr {
             inode,
             is_dir: false,
