@@ -11,3 +11,4 @@ id3 = "1"
 [dev-dependencies]
 metaflac = "0.2"
 mp4 = "0.14"
+crc = "3"
