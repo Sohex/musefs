@@ -118,6 +118,46 @@ pub fn read_tags(data: &[u8]) -> Result<Vec<(String, String)>> {
     crate::vorbiscomment::parse(body)
 }
 
+use crate::input::EmbeddedPicture;
+
+/// Extract embedded pictures from a complete file for scan-time ingestion.
+///
+/// Opus/Vorbis carry art as a base64 `METADATA_BLOCK_PICTURE` comment whose decoded
+/// bytes are a FLAC PICTURE block body; OggFLAC carries native PICTURE block
+/// packets (block type 6). Plan 1 only *reads* art (to seed the DB); synthesis does
+/// not yet re-embed it.
+pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
+    use base64::Engine;
+    let header = read_header(data)?;
+    let mut out = Vec::new();
+    match header.codec {
+        Codec::Opus | Codec::Vorbis => {
+            let idx = comment_packet_index(&header);
+            if idx == 0 {
+                return Ok(out);
+            }
+            let body = comment_body(header.codec, &header.packets[idx])?;
+            for (field, value) in crate::vorbiscomment::parse(body)? {
+                if field.eq_ignore_ascii_case("METADATA_BLOCK_PICTURE") {
+                    let raw = base64::engine::general_purpose::STANDARD
+                        .decode(value.as_bytes())
+                        .map_err(|_| FormatError::Malformed)?;
+                    out.push(crate::flac::parse_picture_block(&raw)?);
+                }
+            }
+        }
+        Codec::OggFlac => {
+            for pkt in header.packets.iter().skip(1) {
+                if !pkt.is_empty() && (pkt[0] & 0x7F) == 6 {
+                    // Strip the 4-byte FLAC metadata block header.
+                    out.push(crate::flac::parse_picture_block(&pkt[4..])?);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +199,46 @@ mod tests {
 
         let tags = read_tags(&data).unwrap();
         assert_eq!(tags, vec![("TITLE".to_string(), "Sun".to_string())]);
+    }
+
+    #[test]
+    fn read_pictures_opus_decodes_metadata_block_picture() {
+        use base64::Engine;
+        // A minimal FLAC PICTURE block body: type=3, mime="image/png", empty desc,
+        // 1x1, depth 0, colors 0, data="PNG".
+        let mut pic = Vec::new();
+        pic.extend_from_slice(&3u32.to_be_bytes());
+        let mime = b"image/png";
+        pic.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        pic.extend_from_slice(mime);
+        pic.extend_from_slice(&0u32.to_be_bytes()); // desc len
+        pic.extend_from_slice(&1u32.to_be_bytes()); // width
+        pic.extend_from_slice(&1u32.to_be_bytes()); // height
+        pic.extend_from_slice(&0u32.to_be_bytes()); // depth
+        pic.extend_from_slice(&0u32.to_be_bytes()); // colors
+        let img = b"PNG";
+        pic.extend_from_slice(&(img.len() as u32).to_be_bytes());
+        pic.extend_from_slice(img);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&pic);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&(crate::vorbiscomment::VENDOR.len() as u32).to_le_bytes());
+        body.extend_from_slice(crate::vorbiscomment::VENDOR.as_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes()); // one comment
+        let comment = format!("METADATA_BLOCK_PICTURE={}", b64);
+        body.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        body.extend_from_slice(comment.as_bytes());
+
+        let mut tags_pkt = b"OpusTags".to_vec();
+        tags_pkt.extend_from_slice(&body);
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let (mut data, _) = crate::ogg::page::build_header(7, &[&head, &tags_pkt]);
+        let (audio, _) = crate::ogg::page::lace_packet(7, 2, false, 960, &vec![0u8; 50]);
+        data.extend_from_slice(&audio);
+
+        let pics = read_pictures(&data).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/png");
+        assert_eq!(pics[0].data, b"PNG");
     }
 }
