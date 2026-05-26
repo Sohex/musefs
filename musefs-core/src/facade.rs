@@ -41,9 +41,14 @@ pub struct Attr {
 
 /// An open file handle: the resolved layout and a backing fd opened (and
 /// validated) once at `open`, reused for every `read` on this handle.
+///
+/// A handle intentionally outlives `poll_refresh`: it keeps serving the layout
+/// (and backing path) it was opened with, even if a rescan changes the track,
+/// until `release`. This is consistent POSIX-like open-fd snapshot behavior and
+/// is bounded by the FUSE descriptor's lifetime.
 struct Handle {
     resolved: Arc<ResolvedFile>,
-    file: Arc<std::fs::File>,
+    file: std::fs::File,
 }
 
 /// The composed read-only filesystem: the store, the rendered tree, and the
@@ -234,7 +239,7 @@ impl Musefs {
         let file = std::fs::File::open(&resolved.backing_path)?;
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1; // never 0
         self.handles()
-            .insert(fh, Arc::new(Handle { resolved, file: Arc::new(file) }));
+            .insert(fh, Arc::new(Handle { resolved, file }));
         Ok(fh)
     }
 
