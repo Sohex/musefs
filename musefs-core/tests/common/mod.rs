@@ -54,3 +54,59 @@ pub fn write_flac(path: &Path, comments: &[&str], audio: &[u8]) -> (i64, i64) {
     std::fs::write(path, &bytes).unwrap();
     (audio_offset, audio.len() as i64)
 }
+
+/// Build a 32-bit-size box: [size][type][payload].
+fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+    v.extend_from_slice(kind);
+    v.extend_from_slice(payload);
+    v
+}
+
+/// An ilst `data` atom: [size]["data"][type 4][locale 4][value].
+fn m4a_data_atom(type_code: u32, value: &[u8]) -> Vec<u8> {
+    let mut p = type_code.to_be_bytes().to_vec();
+    p.extend_from_slice(&0u32.to_be_bytes()); // locale
+    p.extend_from_slice(value);
+    bx(b"data", &p)
+}
+
+/// Build a minimal valid, moov-first M4A that musefs-format accepts:
+/// `ftyp`, a `moov` with `mvhd` + one `soun` `trak` (whose `stbl` has a 1-entry
+/// `stco`) + `udta/meta/ilst` carrying `©nam` = "Orig M4A" and `©ART` =
+/// "Orig Artist", followed by an `mdat` with the given verbatim payload.
+/// Mirrors the box layout of `musefs-format/src/mp4.rs`'s `mp4_with_ilst` test
+/// helper (meta is a FullBox; the soun hdlr payload is `soun`).
+pub fn minimal_m4a(mdat_payload: &[u8]) -> Vec<u8> {
+    let ilst_atoms = [
+        bx(b"\xa9nam", &m4a_data_atom(1, b"Orig M4A")),
+        bx(b"\xa9ART", &m4a_data_atom(1, b"Orig Artist")),
+    ]
+    .concat();
+    let ilst = bx(b"ilst", &ilst_atoms);
+
+    let mut meta_hdlr = vec![0u8; 8];
+    meta_hdlr.extend_from_slice(b"mdir");
+    meta_hdlr.extend_from_slice(b"appl");
+    meta_hdlr.extend_from_slice(&[0u8; 9]);
+    let mut meta = vec![0u8; 4]; // FullBox version/flags
+    meta.extend(bx(b"hdlr", &meta_hdlr));
+    meta.extend(ilst);
+    let udta = bx(b"udta", &bx(b"meta", &meta));
+
+    let mut soun_hdlr = vec![0u8; 8];
+    soun_hdlr.extend_from_slice(b"soun");
+    soun_hdlr.extend_from_slice(&[0u8; 12]);
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&0u32.to_be_bytes());
+    let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+    let trak = bx(
+        b"trak",
+        &bx(b"mdia", &[bx(b"hdlr", &soun_hdlr), minf].concat()),
+    );
+    let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak, udta].concat());
+    let ftyp = bx(b"ftyp", b"M4A isom");
+    let mdat = bx(b"mdat", mdat_payload);
+    [ftyp, moov, mdat].concat()
+}

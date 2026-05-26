@@ -59,7 +59,6 @@ impl Db {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::Db;

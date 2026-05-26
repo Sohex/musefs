@@ -10,6 +10,8 @@ pub enum FormatError {
     Malformed,
     #[error("synthesized metadata exceeds the format's size limit")]
     TooLarge,
+    #[error("not a supported MP4/M4A file")]
+    NotMp4,
 }
 
 pub type Result<T> = std::result::Result<T, FormatError>;

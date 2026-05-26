@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use musefs_db::{Db, Format};
 use musefs_format::flac::{self, FlacScan};
-use musefs_format::{mp3, RegionLayout, Segment};
+use musefs_format::{mp3, mp4, RegionLayout, Segment};
 
 use crate::error::{CoreError, Result};
 use crate::facade::Mode;
@@ -128,6 +128,16 @@ impl HeaderCache {
                         &inputs,
                         &art_inputs,
                     )?,
+                    Format::M4a => {
+                        // The `moov` box may sit at EOF, so the whole file is read and
+                        // parsed; the resulting layout's leading inline `head` ends in a
+                        // deliberately truncated `mdat` header whose payload is the
+                        // backing-audio tail. The generic segment server consumes the
+                        // layout as-is — it never re-parses `head` as a complete MP4.
+                        let bytes = std::fs::read(&track.backing_path)?;
+                        let scan = mp4::read_structure(&bytes)?;
+                        mp4::synthesize_layout(&scan, &inputs, &art_inputs)?
+                    }
                 };
                 let total = layout.total_len();
                 (layout, total, track.backing_mtime.max(track.updated_at))

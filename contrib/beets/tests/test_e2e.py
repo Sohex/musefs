@@ -48,6 +48,8 @@ def _ffmpeg_gen(path, freq, **tags):
            "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=1"]
     if str(path).endswith(".mp3"):
         cmd += ["-c:a", "libmp3lame", "-q:a", "5"]
+    elif str(path).endswith(".m4a"):
+        cmd += ["-c:a", "aac", "-b:a", "64k"]
     for key, value in tags.items():
         cmd += ["-metadata", f"{key}={value}"]
     cmd.append(str(path))
@@ -129,8 +131,8 @@ def _mounted(mnt, db, template):
 
 
 def _imported_library(tmp_path):
-    """Generate a FLAC + MP3, import them into a fresh beets library (as-is).
-    Returns (cfg, env, db, mnt, library)."""
+    """Generate a FLAC, MP3, and M4A, import them into a fresh beets library
+    (as-is). Returns (cfg, env, db, mnt, library)."""
     src = tmp_path / "src"
     library = tmp_path / "library"
     mnt = tmp_path / "mnt"
@@ -143,6 +145,8 @@ def _imported_library(tmp_path):
     _ffmpeg_gen(src / "a.flac", 440, title="Orig FLAC", artist="Orig",
                 album="Orig Album", album_artist="Test AA")
     _ffmpeg_gen(src / "b.mp3", 330, title="Orig MP3", artist="Orig",
+                album="Orig Album", album_artist="Test AA")
+    _ffmpeg_gen(src / "c.m4a", 550, title="Orig M4A", artist="Orig",
                 album="Orig Album", album_artist="Test AA")
     _beet(cfg, env, "import", "-A", "-q", str(src))
     return cfg, env, db, mnt, library
@@ -159,18 +163,24 @@ def test_e2e_import_retag_mount_playback(tmp_path):
           "title=New FLAC", "artist=New Artist", "albumartist=AA", "album=New Album")
     _beet(cfg, env, "modify", "-W", "-M", "-y", "format:MP3",
           "title=New MP3", "artist=New Artist", "albumartist=AA", "album=New Album")
+    # beets classifies m4a/AAC audio with format "AAC" (not "M4A"/"MP4").
+    _beet(cfg, env, "modify", "-W", "-M", "-y", "format:AAC",
+          "title=New M4A", "artist=New Artist", "albumartist=AA", "album=New Album")
 
     # Backing paths (modify -M kept them put) for the audio-integrity check.
     flac_backing = _beet(cfg, env, "ls", "-p", "format:FLAC").strip()
     mp3_backing = _beet(cfg, env, "ls", "-p", "format:MP3").strip()
+    m4a_backing = _beet(cfg, env, "ls", "-p", "format:AAC").strip()
 
     _beet(cfg, env, "musefs")  # auto-scan + sync the changed tags
 
     with _mounted(mnt, db, "$albumartist/$album/$title"):
         flac = mnt / "AA" / "New Album" / "New FLAC.flac"
         mp3 = mnt / "AA" / "New Album" / "New MP3.mp3"
+        m4a = mnt / "AA" / "New Album" / "New M4A.m4a"
         assert flac.exists(), sorted(p.name for p in mnt.rglob("*"))
         assert mp3.exists()
+        assert m4a.exists()
 
         ft = mutagen.File(str(flac), easy=True)
         assert ft["title"] == ["New FLAC"]
@@ -182,9 +192,14 @@ def test_e2e_import_retag_mount_playback(tmp_path):
         assert mt["title"] == ["New MP3"]
         assert mt["album"] == ["New Album"]
 
+        at = mutagen.File(str(m4a), easy=True)
+        assert at["title"] == ["New M4A"]
+        assert at["album"] == ["New Album"]
+
         # Audio served byte-faithfully: decoded PCM identical to the backing file.
         assert _audio_md5(flac) == _audio_md5(flac_backing)
         assert _audio_md5(mp3) == _audio_md5(mp3_backing)
+        assert _audio_md5(m4a) == _audio_md5(m4a_backing)
 
 
 def test_e2e_move_reconcile(tmp_path):
