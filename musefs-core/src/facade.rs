@@ -62,6 +62,16 @@ struct SizeEntry {
     mtime_secs: i64,
 }
 
+/// Resets a single-flight flag on drop, so a panic (or early return) during a
+/// rebuild can't leave `refreshing` stuck `true` and permanently disable refresh.
+struct RefreshGuard<'a>(&'a AtomicBool);
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The composed read-only filesystem: the store, the rendered tree, and the
 /// lazy synthesis cache. All methods take `&self`; the tree is swapped
 /// atomically on refresh, the cache is internally sharded (each shard mutex-guarded),
@@ -185,17 +195,14 @@ impl Musefs {
         {
             return Ok(false);
         }
-        // Always clear the flag, even on an early `?` return from the rebuild.
-        let result = (|| {
-            self.refresh()?;
-            let live = self.tree.load().track_ids();
-            self.cache.retain(&live);
-            self.size_cache().retain(|k, _| live.contains(k));
-            self.last_data_version.store(version, Ordering::Release);
-            Ok(true)
-        })();
-        self.refreshing.store(false, Ordering::Release);
-        result
+        // The guard clears `refreshing` on every exit path (incl. panic).
+        let _guard = RefreshGuard(&self.refreshing);
+        self.refresh()?;
+        let live = self.tree.load().track_ids();
+        self.cache.retain(&live);
+        self.size_cache().retain(|k, _| live.contains(k));
+        self.last_data_version.store(version, Ordering::Release);
+        Ok(true)
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
