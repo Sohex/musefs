@@ -155,6 +155,27 @@ pub fn locate_audio(buf: &[u8]) -> Result<Mp4Bounds> {
     })
 }
 
+/// Everything `synthesize_layout` needs, read from the backing file once.
+#[derive(Debug, Clone)]
+pub struct Mp4Scan {
+    pub ftyp: Vec<u8>,
+    pub moov: Vec<u8>,
+    pub mdat_header: Vec<u8>,
+    pub mdat_payload_offset: u64,
+    pub mdat_payload_len: u64,
+}
+
+pub fn read_structure(buf: &[u8]) -> Result<Mp4Scan> {
+    let (ftyp, moov, mdat) = locate(buf)?;
+    Ok(Mp4Scan {
+        ftyp: buf[ftyp.start..ftyp.end()].to_vec(),
+        moov: buf[moov.start..moov.end()].to_vec(),
+        mdat_header: buf[mdat.start..mdat.payload_start()].to_vec(),
+        mdat_payload_offset: mdat.payload_start() as u64,
+        mdat_payload_len: (mdat.total_len - mdat.header_len) as u64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +310,16 @@ mod tests {
         );
         let buf = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", b"X")].concat();
         assert!(locate_audio(&buf).is_err());
+    }
+
+    #[test]
+    fn reads_structure_parts() {
+        let buf = mk_mp4(false, b"AUDIODATA", &[0]); // moov last
+        let s = read_structure(&buf).unwrap();
+        assert_eq!(&s.ftyp[4..8], b"ftyp");
+        assert_eq!(&s.moov[4..8], b"moov");
+        assert_eq!(&s.mdat_header[4..8], b"mdat");
+        assert_eq!(s.mdat_payload_len, 9);
+        assert_eq!(&buf[s.mdat_payload_offset as usize..][..9], b"AUDIODATA");
     }
 }
