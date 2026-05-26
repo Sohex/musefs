@@ -1,6 +1,6 @@
 # musefs Roadmap
 
-## Status: v0.1.0 — MVP complete
+## Status: MVP complete; formats and integrations extended since
 
 musefs is a read-only passthrough FUSE filesystem that presents a virtually
 reorganized, re-tagged view of a music library backed by a SQLite store, without
@@ -36,6 +36,21 @@ modifying or duplicating the original audio bytes.
   whose backing file is gone), and runs both as a `beet musefs` command and via
   import/write hooks. Verified end-to-end (beets import + retag + FUSE mount)
   with byte-identical audio.
+- **M4A / M4B (MP4):** metadata synthesized by rebuilding the `moov` atom and
+  patching `stco`/`co64` chunk offsets so the `mdat` audio is served
+  byte-identically. Embedded art included.
+- **Ogg container — Opus, Vorbis, and FLAC-in-Ogg:** re-tagged VorbisComments
+  (Opus `OpusTags`, Vorbis comment header, OggFLAC native blocks) plus embedded
+  cover art, with audio served byte-identically. Because a resized metadata
+  header changes the Ogg page count, the original audio pages are served verbatim
+  except for their page sequence numbers and CRCs, which are patched in place; the
+  per-page index is built lazily on first read (constant-memory, cached) so
+  `open()`/`stat` do no audio I/O. Cover art is re-embedded without ever holding
+  the image in the cached layout — read serves any base64 window from a bounded
+  input range, so a full-library scan stays cheap on SSD/HDD/NFS. Multiplexed or
+  chained Ogg (more than one logical bitstream) is detected at scan and skipped.
+  Verified end-to-end (real FUSE mount + independent demux) for all three codecs,
+  including byte-identical cover-art round-trips.
 
 ---
 
@@ -46,9 +61,10 @@ boundary stays explicit; none are half-built in the codebase.
 
 ### Formats
 
-- **Ogg/Opus** — deferred. Comment changes can force whole-file rewrites for some
-  containers, so the synthesis-and-splice model needs design work here.
-- **MP4 / M4A** — deferred (atom-based container; non-trivial to splice).
+- All currently targeted formats (FLAC, MP3, M4A/M4B, and Ogg Opus/Vorbis/
+  FLAC-in-Ogg) are delivered — see above. Remaining edges: FLAC-in-Ogg only
+  handles the standard `0x7F "FLAC"` 1.x mapping, and chained/multiplexed Ogg is
+  intentionally skipped rather than synthesized.
 
 ### Editing / writability
 
@@ -74,6 +90,7 @@ boundary stays explicit; none are half-built in the codebase.
 
 ---
 
-*This roadmap reflects the project state as of the v0.1.0 tag. The original design
-spec lives at `docs/superpowers/specs/2026-05-24-musefs-design.md`; per-milestone
-implementation plans are under `docs/superpowers/plans/`.*
+*The original design spec lives at
+`docs/superpowers/specs/2026-05-24-musefs-design.md`; the Ogg container work is
+specced at `docs/superpowers/specs/2026-05-26-ogg-container-support-design.md`.
+Per-milestone implementation plans are under `docs/superpowers/plans/`.*
