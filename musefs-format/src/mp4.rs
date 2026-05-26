@@ -282,6 +282,117 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
     out
 }
 
+fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+    v.extend_from_slice(kind);
+    v.extend_from_slice(payload);
+    v
+}
+
+fn text_atom(kind: &[u8; 4], values: &[&str]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    for v in values {
+        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data.extend_from_slice(v.as_bytes());
+        inner.extend(boxed(b"data", &data));
+    }
+    boxed(kind, &inner)
+}
+
+fn number_atom(kind: &[u8; 4], n: u16, width: usize) -> Vec<u8> {
+    let mut data = 0u32.to_be_bytes().to_vec(); // type 0 = binary
+    data.extend_from_slice(&0u32.to_be_bytes()); // locale
+    let mut body = vec![0u8, 0];
+    body.extend_from_slice(&n.to_be_bytes());
+    body.resize(width, 0);
+    data.extend_from_slice(&body);
+    boxed(kind, &boxed(b"data", &data))
+}
+
+fn meta_key(key: &str) -> Option<&'static [u8; 4]> {
+    Some(match key {
+        "title" => b"\xa9nam",
+        "artist" => b"\xa9ART",
+        "albumartist" => b"aART",
+        "album" => b"\xa9alb",
+        "genre" => b"\xa9gen",
+        "date" => b"\xa9day",
+        "composer" => b"\xa9wrt",
+        _ => return None,
+    })
+}
+
+/// Build `udta` up to (not including) the cover image bytes. Returns (prefix,
+/// art_len). No art → prefix is the complete udta, art_len 0. All enclosing box
+/// sizes include art_len so the image can stream right after the prefix.
+fn build_udta(tags: &[TagInput], art: Option<&ArtInput>) -> Result<(Vec<u8>, u64)> {
+    // Group consecutive same-key text values (DB returns tags ordered by key).
+    let mut text: Vec<(&str, Vec<&str>)> = Vec::new();
+    for t in tags {
+        if meta_key(&t.key).is_some() {
+            match text.last_mut() {
+                Some(g) if g.0 == t.key => g.1.push(&t.value),
+                _ => text.push((&t.key, vec![&t.value])),
+            }
+        }
+    }
+
+    let mut ilst = Vec::new();
+    for (key, values) in &text {
+        ilst.extend(text_atom(meta_key(key).unwrap(), values));
+    }
+    for t in tags {
+        if t.key == "tracknumber" {
+            if let Ok(n) = t.value.parse::<u16>() {
+                ilst.extend(number_atom(b"trkn", n, 8));
+            }
+        } else if t.key == "discnumber" {
+            if let Ok(n) = t.value.parse::<u16>() {
+                ilst.extend(number_atom(b"disk", n, 6));
+            }
+        }
+    }
+
+    let mut hdlr_body = vec![0u8; 8];
+    hdlr_body.extend_from_slice(b"mdir");
+    hdlr_body.extend_from_slice(b"appl");
+    hdlr_body.extend_from_slice(&[0u8; 9]);
+    let hdlr = boxed(b"hdlr", &hdlr_body);
+
+    let art_len = art.map(|a| a.data_len).unwrap_or(0);
+
+    if let Some(a) = art {
+        let type_code: u32 = if a.mime == "image/png" { 14 } else { 13 };
+        let data_size = 8 + 8 + a.data_len; // data header + type + locale + image
+        let covr_size = 8 + data_size;
+        ilst.extend_from_slice(&(covr_size as u32).to_be_bytes());
+        ilst.extend_from_slice(b"covr");
+        ilst.extend_from_slice(&(data_size as u32).to_be_bytes());
+        ilst.extend_from_slice(b"data");
+        ilst.extend_from_slice(&type_code.to_be_bytes());
+        ilst.extend_from_slice(&0u32.to_be_bytes()); // locale; image streams next
+    }
+
+    let ilst_size = 8 + ilst.len() as u64 + art_len;
+    let mut meta = 0u32.to_be_bytes().to_vec(); // FullBox version/flags
+    meta.extend_from_slice(&hdlr);
+    meta.extend_from_slice(&(ilst_size as u32).to_be_bytes());
+    meta.extend_from_slice(b"ilst");
+    meta.extend_from_slice(&ilst);
+    let meta_size = 8 + meta.len() as u64 + art_len;
+
+    let mut udta = (meta_size as u32).to_be_bytes().to_vec();
+    udta.extend_from_slice(b"meta");
+    udta.extend_from_slice(&meta);
+    let udta_size = 8 + udta.len() as u64 + art_len;
+
+    let mut out = (udta_size as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(b"udta");
+    out.extend_from_slice(&udta);
+    Ok((out, art_len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +630,35 @@ mod tests {
         let lying = [ftyp, moov, mdat].concat();
         assert!(read_tags(&lying).is_empty());
         assert!(read_pictures(&lying).is_empty());
+    }
+
+    #[test]
+    fn build_udta_no_art_round_trips() {
+        let tags = vec![TagInput::new("title", "Song"), TagInput::new("tracknumber", "5")];
+        let (prefix, art_len) = build_udta(&tags, None).unwrap();
+        assert_eq!(art_len, 0);
+        let b = read_box(&prefix, 0).unwrap();
+        assert_eq!(&b.kind, b"udta");
+        assert_eq!(b.total_len, prefix.len());
+        // Wrap in a moov and read back through our own reader.
+        let buf = [bx(b"ftyp", b"M4A "), bx(b"moov", &prefix), bx(b"mdat", b"A")].concat();
+        let tags = read_tags(&buf);
+        assert!(tags.contains(&("title".into(), "Song".into())));
+        assert!(tags.contains(&("tracknumber".into(), "5".into())));
+    }
+
+    #[test]
+    fn build_udta_with_art_reserves_size_without_image() {
+        let art = ArtInput {
+            art_id: 1, mime: "image/png".into(), description: String::new(),
+            picture_type: 3, width: 0, height: 0, data_len: 100,
+        };
+        let (prefix, art_len) = build_udta(&[TagInput::new("title", "T")], Some(&art)).unwrap();
+        assert_eq!(art_len, 100);
+        // The udta size field accounts for the 100 streamed image bytes.
+        let declared = u32::from_be_bytes(prefix[0..4].try_into().unwrap()) as usize;
+        assert_eq!(declared, prefix.len() + 100);
+        // The prefix ends right after the covr/data header (image streams next).
+        assert!(prefix.windows(4).any(|w| w == b"covr"));
     }
 }
