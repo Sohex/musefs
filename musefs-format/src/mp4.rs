@@ -96,6 +96,60 @@ fn find_path(buf: &[u8], path: &[&[u8; 4]]) -> Result<Option<(usize, usize)>> {
     Ok(last)
 }
 
+/// Audio payload bounds within the backing file (the verbatim `mdat` payload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mp4Bounds {
+    pub audio_offset: u64,
+    pub audio_length: u64,
+}
+
+/// Validate the supported shape; return the ftyp/moov/mdat boxes (absolute offsets
+/// in `buf`). Rejects fragmented, video, multi-track, and multi-`mdat` files.
+fn locate(buf: &[u8]) -> Result<(BoxRef, BoxRef, BoxRef)> {
+    let top = child_boxes(buf).map_err(|_| FormatError::NotMp4)?;
+    if top.iter().any(|b| &b.kind == b"moof") {
+        return Err(FormatError::NotMp4);
+    }
+    let one = |kind: &[u8; 4]| -> Result<BoxRef> {
+        let mut it = top.iter().filter(|b| &b.kind == kind);
+        let first = it.next().copied().ok_or(FormatError::NotMp4)?;
+        if it.next().is_some() {
+            return Err(FormatError::NotMp4);
+        }
+        Ok(first)
+    };
+    let ftyp = one(b"ftyp")?;
+    let moov = one(b"moov")?;
+    let mdat = one(b"mdat")?;
+
+    let moov_payload = moov.payload(buf);
+    if find_box(moov_payload, b"mvex")?.is_some() {
+        return Err(FormatError::NotMp4);
+    }
+    let traks: Vec<_> = child_boxes(moov_payload)?
+        .into_iter()
+        .filter(|b| &b.kind == b"trak")
+        .collect();
+    if traks.len() != 1 {
+        return Err(FormatError::NotMp4);
+    }
+    let trak = traks[0].payload(moov_payload);
+    let (hp, hl) = find_path(trak, &[b"mdia", b"hdlr"])?.ok_or(FormatError::NotMp4)?;
+    if trak[hp..hp + hl].get(8..12) != Some(b"soun") {
+        return Err(FormatError::NotMp4);
+    }
+    Ok((ftyp, moov, mdat))
+}
+
+/// Parse the file and return the `mdat` payload bounds, or an error to skip it.
+pub fn locate_audio(buf: &[u8]) -> Result<Mp4Bounds> {
+    let (_ftyp, _moov, mdat) = locate(buf)?;
+    Ok(Mp4Bounds {
+        audio_offset: mdat.payload_start() as u64,
+        audio_length: (mdat.total_len - mdat.header_len) as u64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +191,54 @@ mod tests {
     fn rejects_truncated_box() {
         let buf = [0u8, 0, 0, 99, b'm', b'o', b'o', b'v']; // claims 99, only 8 present
         assert!(child_boxes(&buf).is_err());
+    }
+
+    /// Minimal accepted MP4: ftyp, then (per `moov_first`) moov(one soun trak with
+    /// an stco) and mdat. `mdat_payload` is the verbatim audio.
+    fn mk_mp4(moov_first: bool, mdat_payload: &[u8], stco_entries: &[u32]) -> Vec<u8> {
+        let mut stco = vec![0u8; 4];
+        stco.extend_from_slice(&(stco_entries.len() as u32).to_be_bytes());
+        for e in stco_entries {
+            stco.extend_from_slice(&e.to_be_bytes());
+        }
+        let mut hdlr_p = vec![0u8; 8];
+        hdlr_p.extend_from_slice(b"soun");
+        hdlr_p.extend_from_slice(&[0u8; 12]);
+        let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+        let mdia = bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat());
+        let trak = bx(b"trak", &mdia);
+        let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak].concat());
+        let mdat = bx(b"mdat", mdat_payload);
+        let ftyp = bx(b"ftyp", b"M4A isom");
+        if moov_first { [ftyp, moov, mdat].concat() } else { [ftyp, mdat, moov].concat() }
+    }
+
+    #[test]
+    fn locates_audio_moov_first_and_last() {
+        for moov_first in [true, false] {
+            let buf = mk_mp4(moov_first, b"AUDIODATA", &[0]);
+            let b = locate_audio(&buf).unwrap();
+            assert_eq!(b.audio_length, 9);
+            assert_eq!(&buf[b.audio_offset as usize..][..9], b"AUDIODATA");
+        }
+    }
+
+    #[test]
+    fn rejects_fragmented_video_and_multi_mdat() {
+        let base = mk_mp4(true, b"X", &[0]);
+        let mut frag = base.clone();
+        frag.extend(bx(b"moof", b"\x00"));
+        assert!(locate_audio(&frag).is_err());
+
+        let mut two = base.clone();
+        two.extend(bx(b"mdat", b"Y"));
+        assert!(locate_audio(&two).is_err());
+
+        let mut hdlr_p = vec![0u8; 8];
+        hdlr_p.extend_from_slice(b"vide");
+        hdlr_p.extend_from_slice(&[0u8; 12]);
+        let video_moov = bx(b"moov", &bx(b"trak", &bx(b"mdia", &bx(b"hdlr", &hdlr_p))));
+        let vbuf = [bx(b"ftyp", b"M4A "), video_moov, bx(b"mdat", b"Z")].concat();
+        assert!(locate_audio(&vbuf).is_err());
     }
 }
