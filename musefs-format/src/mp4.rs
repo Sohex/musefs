@@ -404,6 +404,103 @@ fn build_udta(tags: &[TagInput], art: Option<&ArtInput>) -> Result<(Vec<u8>, u64
     Ok((out, art_len))
 }
 
+/// Patch every `stco` (4-byte) or `co64` (8-byte) chunk offset in `kept` (moov
+/// children minus udta) by `delta`. Errors if a 32-bit offset would overflow.
+fn patch_chunk_offsets(kept: &mut [u8], delta: i64) -> Result<()> {
+    let (range, entry) = match find_path(kept, &[b"trak", b"mdia", b"minf", b"stbl", b"stco"])? {
+        Some(r) => (r, 4usize),
+        None => match find_path(kept, &[b"trak", b"mdia", b"minf", b"stbl", b"co64"])? {
+            Some(r) => (r, 8usize),
+            None => return Err(FormatError::Malformed),
+        },
+    };
+    let (start, len) = range;
+    let count = be_u32(kept, start + 4)? as usize;
+    for i in 0..count {
+        let pos = start + 8 + i * entry;
+        if pos + entry > start + len {
+            return Err(FormatError::Malformed);
+        }
+        if entry == 4 {
+            let v = be_u32(kept, pos)? as i64 + delta;
+            if v < 0 || v > u32::MAX as i64 {
+                return Err(FormatError::TooLarge);
+            }
+            kept[pos..pos + 4].copy_from_slice(&(v as u32).to_be_bytes());
+        } else {
+            let v = be_u64(kept, pos)? as i64 + delta;
+            if v < 0 {
+                return Err(FormatError::Malformed);
+            }
+            kept[pos..pos + 8].copy_from_slice(&(v as u64).to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// Regenerate a re-tagged `moov` and produce the serving layout
+/// `[ftyp][regenerated moov][mdat header][mdat payload]`. The mdat payload is
+/// served verbatim, merely relocated, so every chunk offset shifts by a constant
+/// `delta`. Patching only offset VALUES (never box sizes) means `new_moov_size`
+/// is computable before `delta` — no circular dependency. With cover art the
+/// layout splits so the image streams from the DB blob at read time.
+pub fn synthesize_layout(
+    scan: &Mp4Scan,
+    tags: &[TagInput],
+    arts: &[ArtInput],
+) -> Result<RegionLayout> {
+    let moov_payload_start = read_box(&scan.moov, 0)?.payload_start();
+    let moov_payload = &scan.moov[moov_payload_start..];
+    let mut kept = Vec::new();
+    for b in child_boxes(moov_payload)? {
+        if &b.kind != b"udta" {
+            kept.extend_from_slice(&moov_payload[b.start..b.end()]);
+        }
+    }
+
+    let art = arts.first();
+    let (udta_prefix, art_len) = build_udta(tags, art)?;
+    let udta_total = udta_prefix.len() as u64 + art_len;
+
+    let new_moov_size = 8 + kept.len() as u64 + udta_total;
+    // MP4 box sizes are 32-bit; mirror build_udta's guard so a moov that grows
+    // past u32 (e.g. huge art) errors at the format boundary rather than emitting
+    // a truncated, corrupt size field.
+    if new_moov_size > u32::MAX as u64 {
+        return Err(FormatError::TooLarge);
+    }
+    let new_mdat_payload_pos =
+        scan.ftyp.len() as u64 + new_moov_size + scan.mdat_header.len() as u64;
+    let delta = new_mdat_payload_pos as i64 - scan.mdat_payload_offset as i64;
+
+    patch_chunk_offsets(&mut kept, delta)?;
+
+    let mut head = Vec::new();
+    head.extend_from_slice(&scan.ftyp);
+    head.extend_from_slice(&(new_moov_size as u32).to_be_bytes());
+    head.extend_from_slice(b"moov");
+    head.extend_from_slice(&kept);
+    head.extend_from_slice(&udta_prefix);
+
+    let mut segments = Vec::new();
+    if let Some(a) = art {
+        segments.push(Segment::Inline(head));
+        segments.push(Segment::ArtImage {
+            art_id: a.art_id,
+            len: a.data_len,
+        });
+        segments.push(Segment::Inline(scan.mdat_header.clone()));
+    } else {
+        head.extend_from_slice(&scan.mdat_header);
+        segments.push(Segment::Inline(head));
+    }
+    segments.push(Segment::BackingAudio {
+        offset: scan.mdat_payload_offset,
+        len: scan.mdat_payload_len,
+    });
+    Ok(RegionLayout::new(segments))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,5 +798,100 @@ mod tests {
             build_udta(&[TagInput::new("title", "T")], Some(&art)),
             Err(FormatError::TooLarge)
         ));
+    }
+
+    fn inline_head(layout: &RegionLayout) -> Vec<u8> {
+        match &layout.segments()[0] {
+            Segment::Inline(b) => b.clone(),
+            _ => panic!("expected Inline head"),
+        }
+    }
+    /// Locate `moov` by reading complete boxes from the front, stopping before
+    /// the trailing `mdat` header (whose declared size includes the payload that
+    /// is *not* present in the synthesized head — it streams as BackingAudio).
+    fn find_moov_in_head(head: &[u8]) -> BoxRef {
+        let mut pos = 0;
+        loop {
+            let b = read_box(head, pos).unwrap();
+            if &b.kind == b"moov" {
+                return b;
+            }
+            pos = b.end();
+        }
+    }
+    fn first_stco(head: &[u8]) -> Vec<u32> {
+        let moov = find_moov_in_head(head);
+        let mp = moov.payload(head);
+        let (sp, sl) = find_path(mp, &[b"trak", b"mdia", b"minf", b"stbl", b"stco"])
+            .unwrap()
+            .unwrap();
+        let stco = &mp[sp..sp + sl];
+        let count = u32::from_be_bytes(stco[4..8].try_into().unwrap()) as usize;
+        (0..count)
+            .map(|i| u32::from_be_bytes(stco[8 + i * 4..12 + i * 4].try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn synthesize_no_art_patches_stco() {
+        let buf = mk_mp4(true, b"AUDIODATA", &[42, 100]);
+        let scan = read_structure(&buf).unwrap();
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "New")], &[]).unwrap();
+
+        match layout.segments().last().unwrap() {
+            Segment::BackingAudio { offset, len } => {
+                assert_eq!(*offset, scan.mdat_payload_offset);
+                assert_eq!(*len, scan.mdat_payload_len);
+            }
+            _ => panic!("expected BackingAudio tail"),
+        }
+        let head = inline_head(&layout);
+        // The synthesized head is [ftyp][moov][mdat header]; the mdat payload is
+        // served verbatim as the BackingAudio tail, so its new position is exactly
+        // where the head ends.
+        let new_mdat = head.len() as u64;
+        let delta = new_mdat - scan.mdat_payload_offset;
+        assert_eq!(
+            first_stco(&head),
+            vec![42 + delta as u32, 100 + delta as u32]
+        );
+        // The new file head re-parses as a valid moov of the declared size.
+        let moov = find_moov_in_head(&head);
+        assert_eq!(moov.end(), head.len() - scan.mdat_header.len());
+    }
+
+    #[test]
+    fn synthesize_with_art_splits_for_streaming() {
+        let buf = mk_mp4(false, b"AUDIODATA", &[0]);
+        let scan = read_structure(&buf).unwrap();
+        let art = ArtInput {
+            art_id: 7,
+            mime: "image/jpeg".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 50,
+        };
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
+        let segs = layout.segments();
+        assert!(matches!(segs[1], Segment::ArtImage { art_id: 7, len: 50 }));
+        assert!(matches!(segs[2], Segment::Inline(_))); // mdat header
+        assert!(matches!(segs.last().unwrap(), Segment::BackingAudio { .. }));
+    }
+
+    #[test]
+    fn synthesize_handles_zero_length_mdat() {
+        let buf = mk_mp4(true, b"", &[0]); // empty mdat payload
+        let scan = read_structure(&buf).unwrap();
+        assert_eq!(scan.mdat_payload_len, 0);
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "Z")], &[]).unwrap();
+        match layout.segments().last().unwrap() {
+            Segment::BackingAudio { offset, len } => {
+                assert_eq!(*offset, scan.mdat_payload_offset);
+                assert_eq!(*len, 0);
+            }
+            _ => panic!("expected BackingAudio tail"),
+        }
     }
 }

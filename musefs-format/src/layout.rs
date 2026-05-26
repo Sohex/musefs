@@ -35,6 +35,11 @@ impl RegionLayout {
         RegionLayout { segments }
     }
 
+    /// The ordered segments composing the synthesized virtual file.
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+
     /// Total size of the synthesized virtual file in bytes.
     pub fn total_len(&self) -> u64 {
         self.segments.iter().map(Segment::len).sum()
