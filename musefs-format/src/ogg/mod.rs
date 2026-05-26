@@ -292,15 +292,27 @@ fn build_packets_with_art(
     arts: &[OggArt],
 ) -> Result<Vec<Vec<PayloadChunk>>> {
     match header.codec {
-        Codec::Opus => Ok(vec![
-            vec![PayloadChunk::Bytes(header.packets[0].clone())],
-            comment_packet_chunks(b"OpusTags", tags, arts, false),
-        ]),
-        Codec::Vorbis => Ok(vec![
-            vec![PayloadChunk::Bytes(header.packets[0].clone())],
-            comment_packet_chunks(b"\x03vorbis", tags, arts, true),
-            vec![PayloadChunk::Bytes(header.packets[2].clone())],
-        ]),
+        Codec::Opus | Codec::Vorbis => {
+            // VorbisComment value length is a 32-bit field; guard against overflow
+            // for absurdly large images (cover art is far below this).
+            for a in arts {
+                if b64_len(a.meta.data_len) > u32::MAX as u64 {
+                    return Err(FormatError::TooLarge);
+                }
+            }
+            if header.codec == Codec::Opus {
+                Ok(vec![
+                    vec![PayloadChunk::Bytes(header.packets[0].clone())],
+                    comment_packet_chunks(b"OpusTags", tags, arts, false),
+                ])
+            } else {
+                Ok(vec![
+                    vec![PayloadChunk::Bytes(header.packets[0].clone())],
+                    comment_packet_chunks(b"\x03vorbis", tags, arts, true),
+                    vec![PayloadChunk::Bytes(header.packets[2].clone())],
+                ])
+            }
+        }
         Codec::OggFlac => oggflac_packets_with_art(header, tags, arts),
     }
 }
@@ -791,6 +803,149 @@ mod tests {
         assert_eq!(pics[0].data, image);
         let h = read_header(&bytes).unwrap();
         assert_eq!(h.codec, Codec::Opus);
+    }
+
+    // Materialize the header region of a synthesized layout into bytes, expanding
+    // each OggArtSlice from `images` (art_id -> raw image), mirroring read_at.
+    fn materialize_header(layout: &RegionLayout, images: &[(i64, &[u8])]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for s in layout.segments() {
+            match s {
+                Segment::Inline(b) => bytes.extend_from_slice(b),
+                Segment::OggArtSlice {
+                    art_id,
+                    offset,
+                    len,
+                    base64,
+                    art_total,
+                } => {
+                    let img = images.iter().find(|(id, _)| id == art_id).expect("image").1;
+                    if *base64 {
+                        let w = b64_window(*offset, *len, *art_total);
+                        let raw = &img[w.in_start as usize..(w.in_start + w.in_len) as usize];
+                        bytes.extend_from_slice(&encode_b64_slice(raw, w.skip, *len as usize));
+                    } else {
+                        bytes.extend_from_slice(&img[*offset as usize..(*offset + *len) as usize]);
+                    }
+                }
+                Segment::OggAudio { .. } => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        bytes
+    }
+
+    fn art_input(art_id: i64, mime: &str, len: usize) -> crate::input::ArtInput {
+        crate::input::ArtInput {
+            art_id,
+            mime: mime.to_string(),
+            description: String::new(),
+            picture_type: 3,
+            width: 10,
+            height: 10,
+            data_len: len as u64,
+        }
+    }
+
+    #[test]
+    fn synthesize_vorbis_embeds_art_that_round_trips() {
+        let setup = b"\x05vorbis-SETUP".to_vec();
+        let mut data = vorbis_headers_with(&setup);
+        let (audio, _) = crate::ogg::page::lace_packet(55, 99, false, 1024, &[0u8; 64]);
+        data.extend_from_slice(&audio);
+        let scan = locate_audio(&data).unwrap();
+        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+
+        let image: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let meta = art_input(11, "image/png", image.len());
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("artist", "X")],
+            &[OggArt {
+                meta: &meta,
+                image: &image,
+            }],
+        )
+        .unwrap();
+
+        let bytes = materialize_header(&layout, &[(11, &image)]);
+        let h = read_header(&bytes).unwrap();
+        assert_eq!(h.codec, Codec::Vorbis);
+        assert_eq!(h.packets[2], setup); // setup preserved
+        let pics = read_pictures(&bytes).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].data, image);
+    }
+
+    #[test]
+    fn synthesize_oggflac_embeds_art_that_round_trips() {
+        let mut data = oggflac_headers();
+        let (audio, _) = crate::ogg::page::lace_packet(77, 3, false, 4096, &[0u8; 64]);
+        data.extend_from_slice(&audio);
+        let scan = locate_audio(&data).unwrap();
+        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+
+        let image: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let meta = art_input(22, "image/png", image.len());
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("title", "Y")],
+            &[OggArt {
+                meta: &meta,
+                image: &image,
+            }],
+        )
+        .unwrap();
+
+        let bytes = materialize_header(&layout, &[(22, &image)]);
+        let h = read_header(&bytes).unwrap();
+        assert_eq!(h.codec, Codec::OggFlac);
+        let pics = read_pictures(&bytes).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].data, image);
+    }
+
+    #[test]
+    fn synthesize_opus_embeds_multiple_images() {
+        let mut data = opus_headers();
+        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 64]);
+        data.extend_from_slice(&audio);
+        let scan = locate_audio(&data).unwrap();
+        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+
+        let img_a: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let img_b: Vec<u8> = (0..1500u32).map(|i| ((i * 3) % 251) as u8).collect();
+        let meta_a = art_input(1, "image/png", img_a.len());
+        let meta_b = art_input(2, "image/jpeg", img_b.len());
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("title", "Multi")],
+            &[
+                OggArt {
+                    meta: &meta_a,
+                    image: &img_a,
+                },
+                OggArt {
+                    meta: &meta_b,
+                    image: &img_b,
+                },
+            ],
+        )
+        .unwrap();
+
+        let bytes = materialize_header(&layout, &[(1, &img_a), (2, &img_b)]);
+        let h = read_header(&bytes).unwrap();
+        assert_eq!(h.codec, Codec::Opus);
+        let pics = read_pictures(&bytes).unwrap();
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].data, img_a);
+        assert_eq!(pics[1].data, img_b);
     }
 
     #[test]
