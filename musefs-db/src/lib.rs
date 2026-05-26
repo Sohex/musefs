@@ -9,12 +9,12 @@ pub use error::{DbError, Result};
 pub use models::{Art, ArtMeta, Format, NewArt, NewTrack, Tag, Track, TrackArt};
 
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub struct Db {
     conn: Connection,
-    path: Option<std::path::PathBuf>,
+    path: Option<PathBuf>,
 }
 
 impl Db {
@@ -68,9 +68,14 @@ impl Db {
     /// Open an additional read-only connection to an existing file-backed DB.
     /// WAL (set by the writer) lets these run concurrently without blocking.
     /// No migration is run — the schema already exists and the connection is RO.
+    /// Note: even with `SQLITE_OPEN_READ_ONLY`, SQLite needs write access to the
+    /// directory (to create/use the `-shm` wal-index) when the DB is in WAL mode;
+    /// a strictly read-only DB directory will make this fail.
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Db> {
         let p = path.as_ref().to_path_buf();
         let conn = Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // No configure()/migrate and no foreign_keys pragma: the schema already
+        // exists and no writes are possible on a read-only connection.
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(Db { conn, path: Some(p) })
     }
