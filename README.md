@@ -186,6 +186,29 @@ cargo clippy --all-targets
 cargo fmt
 ```
 
+### Fuzzing & property tests
+
+Property-based tests (`proptest`) assert the byte-identical audio invariant and
+tag round-trips, and run as part of `cargo test`. Coverage-guided fuzzing
+(`cargo-fuzz`, requires a nightly toolchain) hammers every format parser and the
+byte-level primitives for panics, hangs, and OOM:
+
+```bash
+cargo test -p musefs-format --features fuzzing   # format-layer property tests
+cargo install cargo-fuzz                         # one-time
+cargo +nightly fuzz run flac                     # or mp3|mp4|ogg|wav|ogg_page|b64|vorbiscomment
+cargo +nightly fuzz coverage flac                # confirm coverage reaches the parser
+```
+
+An independent-reader interop test confirms the wider ecosystem (`mutagen`) reads
+the tags musefs synthesizes, across all five formats:
+
+```bash
+pip install -r tests/interop/requirements.txt
+MUSEFS_INTEROP_DIR=/tmp/i cargo test -p musefs-core --test interop_emit -- --ignored emit_interop_fixtures
+MUSEFS_INTEROP_DIR=/tmp/i python -m pytest tests/interop
+```
+
 The FUSE end-to-end tests perform real mounts and are `#[ignore]`d by default; run
 them with `--ignored` on a host that has `/dev/fuse`.
 
