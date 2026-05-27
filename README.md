@@ -12,7 +12,9 @@ audio frames are served straight from your original files; only the
 metadata/header region is synthesized on the fly.
 
 > **Status:** MVP complete and extended. FLAC, MP3, M4A, and Ogg
-> (Opus / Vorbis / FLAC-in-Ogg) are supported, with embedded cover art. See
+> (Opus / Vorbis / FLAC-in-Ogg) are supported, with embedded cover art, and the
+> filesystem has been through a performance/concurrency pass hardening it for
+> real-world player/media-manager access and large libraries on HDD/SSD/NFS. See
 > [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's in scope and what's explicitly
 > deferred (writable mounts, a shipped picard plugin).
 
@@ -55,6 +57,14 @@ within each file. Editing happens there; the mounted view reflects it.
 - **Maintenance** — `scan --revalidate` skips unchanged files (preserving
   external tag edits), prunes tracks whose backing file is gone, and garbage-
   collects orphaned art.
+- **Concurrent & cache-friendly** — blocking reads run on a worker pool, so a slow
+  backing read (NFS, spun-down HDD) never stalls metadata operations; synthesized
+  layouts, file sizes, and headers are cached and invalidated lazily on external
+  edits, and inodes stay stable across refreshes. Kernel read-ahead, background
+  depth, the entry/attr cache TTL, the refresh poll interval, and page-cache
+  retention are all tunable per backing store (see [Tuning](#tuning)). With
+  `--keep-cache`, an external re-tag automatically drops the affected kernel page
+  cache, so cached bytes never go stale.
 
 ## Requirements
 
@@ -96,6 +106,19 @@ musefs scan /path/to/music --db library.db --revalidate
 ```
 
 Run `musefs <command> --help` for the full flag list.
+
+### Tuning
+
+`mount` accepts optional performance flags, all with sensible defaults — tune them
+to your backing store:
+
+| Flag | Default | What it does |
+| ---- | ------- | ------------ |
+| `--poll-interval-ms` | `1000` | Debounce window for detecting external DB edits. |
+| `--attr-ttl-ms` | `1000` | How long the kernel may trust cached entry/attr lookups before re-validating. Higher cuts `lookup`/`getattr` traffic; bounds how fast external edits become visible. |
+| `--max-readahead-kib` | `512` | Kernel read-ahead window. Larger hides HDD/NFS latency during sequential playback. |
+| `--max-background` | `64` | Max outstanding background (read-ahead/async) requests the kernel keeps in flight. |
+| `--keep-cache` | off | Keep the kernel page cache across opens. External re-tags auto-invalidate the affected inodes on refresh, so cached bytes are dropped when content changes. |
 
 ## Project layout
 

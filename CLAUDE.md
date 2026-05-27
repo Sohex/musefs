@@ -95,14 +95,21 @@ Two version counters drive correctness and freshness — keep them distinct:
   errors with `BackingChanged` if they drifted.
 - **`data_version`** (`PRAGMA data_version`, whole-DB). `Musefs::poll_refresh`
   compares it to `last_data_version`; on a change it rebuilds the virtual tree and
-  clears the header cache, then commits the new stamp **only after** a successful
-  rebuild. The FUSE layer calls `poll_refresh` on metadata ops (e.g. `lookup`,
-  `readdir`), so external edits appear **without remounting**.
+  prunes the header/size caches to the live track set (unchanged entries stay
+  warm; a changed track self-invalidates lazily via `content_version`), then
+  commits the new stamp **only after** a successful rebuild. The FUSE layer fires
+  `poll_refresh` on metadata ops (e.g. `lookup`, `readdir`) off the dispatch
+  thread, so external edits appear **without remounting**. Polling is debounced
+  (`--poll-interval-ms`) and rebuilds are single-flighted, so a metadata-op storm
+  costs at most one rebuild per interval.
 
-A tree rebuild **reassigns inodes**, so a descriptor held open across a refresh
-may resolve to a different node or none; this is bounded by the FUSE entry/attr
-TTL and degrades to `ENOENT`. Refreshes are rare (only on external commits), so
-this is acceptable for a read-only mount.
+Inodes are **stable across rebuilds**: a persistent path→inode allocator
+(`tree.rs`) reuses an unchanged rendered path's inode and never recycles a retired
+one, so a descriptor held open across a refresh keeps resolving to the same node
+(a path that vanished degrades to `ENOENT`, bounded by the entry/attr TTL). When
+mounted with `--keep-cache`, `poll_refresh_notify` reports the inodes whose
+`content_version` rose and the FUSE layer drops their kernel page cache
+(`inval_inode`), so a re-tagged file never serves stale cached bytes.
 
 ## Virtual tree and templates
 

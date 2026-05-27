@@ -1,6 +1,6 @@
 # musefs Roadmap
 
-## Status: MVP complete; formats and integrations extended since
+## Status: MVP complete; formats, integrations, and a performance/concurrency pass delivered since
 
 musefs is a read-only passthrough FUSE filesystem that presents a virtually
 reorganized, re-tagged view of a music library backed by a SQLite store, without
@@ -51,6 +51,41 @@ modifying or duplicating the original audio bytes.
   chained Ogg (more than one logical bitstream) is detected at scan and skipped.
   Verified end-to-end (real FUSE mount + independent demux) for all three codecs,
   including byte-identical cover-art round-trips.
+- **Performance, concurrency & caching (optimization pass — all phases complete):**
+  a phased pass hardening the filesystem for real-world media-manager and player
+  access patterns across HDD/SSD/NFS backing stores. All eight phases (0–7) are
+  merged to `main`:
+  - **Phase 0 — Baselines:** `criterion` micro-benches so every later phase ships
+    a before/after delta.
+  - **Phase 1 — Concurrency:** fuser's single dispatch thread offloads blocking
+    reads/`getattr`s to a bounded worker pool and replies from the workers, so a
+    slow backing read never stalls metadata ops; the virtual tree is swapped
+    lock-free (`ArcSwap`) and each worker opens its own read-only WAL connection.
+  - **Phase 2 — Per-handle I/O:** one file open per `open()`/handle, with reads
+    keyed by file handle — no per-read `stat`/re-open.
+  - **Phase 3 — Caching:** a sharded, byte-bounded O(1) LRU header-layout cache
+    plus a size/attr cache, invalidated lazily per track on `content_version`
+    change (vanished tracks pruned on refresh).
+  - **Phase 4 — Refresh:** `data_version` polling is debounced
+    (`--poll-interval-ms`); the tree-build tag query is batched (drops the N+1);
+    rebuilds are single-flighted and run off the dispatch thread; and inodes are
+    stable across rebuilds (a persistent path→inode allocator), so an open handle
+    survives an external edit.
+  - **Phase 5 — Kernel/mount tuning:** `Filesystem::init` raises read-ahead and
+    background depth and negotiates async-read / parallel-dirops; the entry/attr
+    TTL is configurable (`--attr-ttl-ms`), as are `--max-readahead-kib` and
+    `--max-background`.
+  - **Phase 6 — Bounded memory:** M4A/M4B resolves stream the `moov` atom from
+    disk by seeking, never reading the (potentially hundreds-of-MB) `mdat`
+    payload — removing the per-resolve memory spike on large audiobooks.
+  - **Phase 7 — Safe aggressive caching:** an opt-in `--keep-cache` keeps the
+    kernel page cache across opens; an external re-tag auto-invalidates the
+    affected inodes on refresh (via the FUSE notifier), so cached bytes are never
+    stale. Supersedes the previously-deferred manual `drop_caches` caveat.
+
+  Byte-identical audio held throughout; each phase shipped subagent-driven with
+  spec + code-quality + final review and the full `#[ignore]` e2e mount suite
+  green on `/dev/fuse`.
 
 ---
 
@@ -92,5 +127,7 @@ boundary stays explicit; none are half-built in the codebase.
 
 *The original design spec lives at
 `docs/superpowers/specs/2026-05-24-musefs-design.md`; the Ogg container work is
-specced at `docs/superpowers/specs/2026-05-26-ogg-container-support-design.md`.
-Per-milestone implementation plans are under `docs/superpowers/plans/`.*
+specced at `docs/superpowers/specs/2026-05-26-ogg-container-support-design.md`;
+the performance/concurrency pass is specced at
+`docs/superpowers/specs/2026-05-26-optimization-pass-design.md`. Per-milestone
+implementation plans are under `docs/superpowers/plans/`.*
