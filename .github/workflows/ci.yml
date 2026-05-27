@@ -26,6 +26,27 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Property tests (fuzzing feature)
+        run: cargo test -p musefs-format --features fuzzing
+
+  interop:
+    # Property 5: an independent ecosystem reader (mutagen) reads the tags we
+    # synthesize. Emits synthesized files via reader::read_at (no FUSE mount),
+    # then reads them back with mutagen. Builds only musefs-core, so no libfuse.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install mutagen + pytest
+        run: pip install -r tests/interop/requirements.txt pytest
+      - name: Emit synthesized fixtures
+        run: MUSEFS_INTEROP_DIR="$RUNNER_TEMP/interop" cargo test -p musefs-core --test interop_emit -- --ignored emit_interop_fixtures
+      - name: mutagen interop assertions
+        run: MUSEFS_INTEROP_DIR="$RUNNER_TEMP/interop" python -m pytest tests/interop -v
 
   e2e:
     runs-on: ubuntu-latest
