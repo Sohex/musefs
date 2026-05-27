@@ -574,3 +574,70 @@ fn inode_is_stable_across_refresh() {
     assert_eq!(alice, alice_after);
     assert_eq!(song_before, song_after);
 }
+
+#[test]
+fn poll_refresh_notify_reports_changed_track_inode() {
+    use musefs_db::Tag;
+    let dir = tempfile::tempdir().unwrap();
+    // Two backing files -> two tracks: Alice/Song and Bob/Tune.
+    for (name, artist, title) in [("a.flac", "Alice", "Song"), ("b.flac", "Bob", "Tune")] {
+        let bytes = make_flac(
+            &[
+                (0, streaminfo_body()),
+                (
+                    4,
+                    vorbis_comment_body(
+                        "v",
+                        &[&format!("ARTIST={artist}"), &format!("TITLE={title}")],
+                    ),
+                ),
+            ],
+            &[0xAB; 64],
+        );
+        std::fs::write(dir.path().join(name), &bytes).unwrap();
+    }
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let alice = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let alice_song = fs.lookup(alice, "Song.flac").unwrap();
+
+    // Find Alice's track id (scan assigns ids by discovery order).
+    let alice_id = musefs_db::Db::open(&db_path)
+        .unwrap()
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.backing_path.ends_with("a.flac"))
+        .unwrap()
+        .id;
+
+    // External edit: retag Alice WITHOUT moving her (same artist/title, extra
+    // album tag) so her path/inode is stable but content_version bumps.
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        db2.replace_tags(
+            alice_id,
+            &[
+                Tag::new("artist", "Alice", 0),
+                Tag::new("title", "Song", 0),
+                Tag::new("album", "New", 0),
+            ],
+        )
+        .unwrap();
+    }
+
+    let mut changed = Vec::new();
+    assert!(fs.poll_refresh_notify(|ino| changed.push(ino)).unwrap());
+    assert_eq!(changed, vec![alice_song], "only Alice's inode changed");
+    // Inode stayed stable across the refresh.
+    assert_eq!(
+        fs.lookup(fs.lookup(VirtualTree::ROOT, "Alice").unwrap(), "Song.flac")
+            .unwrap(),
+        alice_song
+    );
+}

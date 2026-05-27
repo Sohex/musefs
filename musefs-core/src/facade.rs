@@ -99,12 +99,15 @@ pub struct Musefs {
     /// Persistent path→inode allocator: carries stable inodes across tree rebuilds
     /// so open FUSE handles continue to resolve to the same node after a refresh.
     inodes: Mutex<InodeAllocator>,
+    /// Last-seen `content_version` per track, snapshotted on each rebuild, used to
+    /// report which inodes changed so the FUSE layer can drop stale kernel cache.
+    versions: Mutex<HashMap<i64, i64>>,
 }
 
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let mut alloc = InodeAllocator::new();
-        let tree = Self::build_tree(&db, &config, &mut alloc)?;
+        let (tree, versions) = Self::build_tree(&db, &config, &mut alloc)?;
         let last_data_version = db.data_version()?;
         let poll_interval = config.poll_interval;
         Ok(Musefs {
@@ -120,6 +123,7 @@ impl Musefs {
             poll_interval,
             refreshing: AtomicBool::new(false),
             inodes: Mutex::new(alloc),
+            versions: Mutex::new(versions),
         })
     }
 
@@ -127,11 +131,13 @@ impl Musefs {
         db: &Db,
         config: &MountConfig,
         alloc: &mut InodeAllocator,
-    ) -> Result<VirtualTree> {
+    ) -> Result<(VirtualTree, HashMap<i64, i64>)> {
         let tracks = db.list_tracks()?;
         let mut tags_by_track = db.tags_grouped()?;
         let mut entries = Vec::with_capacity(tracks.len());
+        let mut versions = HashMap::with_capacity(tracks.len());
         for t in &tracks {
+            versions.insert(t.id, t.content_version);
             let tags = tags_by_track.remove(&t.id).unwrap_or_default();
             let fields = tags_to_fields(&tags);
             let path = render_path(
@@ -143,7 +149,7 @@ impl Musefs {
             );
             entries.push((t.id, path));
         }
-        Ok(VirtualTree::build_with(&entries, alloc))
+        Ok((VirtualTree::build_with(&entries, alloc), versions))
     }
 
     /// Rebuild the tree from the current DB contents (used after external edits).
@@ -153,12 +159,20 @@ impl Musefs {
     /// path goes through `poll_refresh`, which guards entry with the `refreshing` CAS;
     /// this entry point exists for forced, unconditional rebuilds (e.g. tests).
     pub fn refresh(&self) -> Result<()> {
-        let tree = self.pool.with(|db| {
+        let versions = self.rebuild()?;
+        *self.versions.lock().unwrap_or_else(|p| p.into_inner()) = versions;
+        Ok(())
+    }
+
+    /// Rebuild + publish the tree; returns the current `track_id -> content_version`
+    /// map (the caller decides whether/how to diff it).
+    fn rebuild(&self) -> Result<HashMap<i64, i64>> {
+        let (tree, versions) = self.pool.with(|db| {
             let mut alloc = self.inodes.lock().unwrap_or_else(|p| p.into_inner());
             Self::build_tree(db, &self.config, &mut alloc)
         })?;
         self.tree.store(Arc::new(tree));
-        Ok(())
+        Ok(versions)
     }
 
     // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) FIRST, then
@@ -179,20 +193,20 @@ impl Musefs {
         self.size_cache.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
-    /// rebuild the tree and prune cached resolutions to the live track set, then
-    /// return `true`; the new version stamp is committed only after a successful
-    /// rebuild. The FUSE layer calls this on metadata operations so external edits
-    /// (a scan, a beets retag) appear without remounting.
-    ///
-    /// Unchanged cache entries stay warm — a changed track self-invalidates lazily
-    /// on its next `resolve`/`getattr` via `content_version`; only vanished tracks
-    /// are dropped immediately.
-    ///
-    /// Single-flighted: if a rebuild is already in progress (another caller flipped
-    /// `refreshing`), concurrent callers return `Ok(false)` immediately rather than
-    /// duplicating the O(library) rebuild work.
+    /// See `poll_refresh_notify`; this is the no-callback form.
     pub fn poll_refresh(&self) -> Result<bool> {
+        self.poll_refresh_notify(|_| {})
+    }
+
+    /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
+    /// rebuild the tree, prune cached resolutions to the live track set, invoke
+    /// `on_changed(inode)` for every inode whose track's `content_version` rose
+    /// (its served bytes changed but its path/inode is stable), then return `true`.
+    /// The version stamp is committed only after a successful rebuild.
+    ///
+    /// Single-flighted: if a rebuild is already in progress, concurrent callers
+    /// return `Ok(false)` immediately.
+    pub fn poll_refresh_notify(&self, mut on_changed: impl FnMut(u64)) -> Result<bool> {
         if !self.poll_interval.is_zero() {
             let mut last = self.last_poll.lock().unwrap_or_else(|p| p.into_inner());
             if last.elapsed() < self.poll_interval {
@@ -216,10 +230,30 @@ impl Musefs {
         }
         // The guard clears `refreshing` on every exit path (incl. panic).
         let _guard = RefreshGuard(&self.refreshing);
-        self.refresh()?;
+
+        let old_versions = self
+            .versions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let new_versions = self.rebuild()?;
         let live = self.tree.load().track_ids();
         self.cache.retain(&live);
         self.size_cache().retain(|k, _| live.contains(k));
+
+        // A track whose content_version rose but whose path (inode) is unchanged has
+        // stale served bytes; report its inode so the caller can drop the kernel page
+        // cache. New/removed tracks have no cache to drop.
+        let tree = self.tree.load();
+        for (tid, ver) in &new_versions {
+            if old_versions.get(tid).is_some_and(|old| old != ver) {
+                if let Some(ino) = tree.inode_of_track(*tid) {
+                    on_changed(ino);
+                }
+            }
+        }
+        *self.versions.lock().unwrap_or_else(|p| p.into_inner()) = new_versions;
+
         self.last_data_version.store(version, Ordering::Release);
         Ok(true)
     }
