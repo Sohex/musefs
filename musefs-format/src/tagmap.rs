@@ -301,4 +301,20 @@ mod tests {
             Some("musicbrainz_albumid")
         );
     }
+
+    #[test]
+    fn no_duplicate_native_codes() {
+        for (i, a) in VOCAB.iter().enumerate() {
+            for b in &VOCAB[i + 1..] {
+                assert_ne!(a.id3, b.id3, "duplicate ID3 slot: {} / {}", a.key, b.key);
+                assert_ne!(a.mp4, b.mp4, "duplicate MP4 slot: {} / {}", a.key, b.key);
+                assert!(
+                    !a.vorbis.eq_ignore_ascii_case(b.vorbis),
+                    "duplicate Vorbis field: {} / {}",
+                    a.key,
+                    b.key
+                );
+            }
+        }
+    }
 }

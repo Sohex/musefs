@@ -195,6 +195,61 @@ fn revalidate_skips_unchanged_prunes_missing_and_gcs_art() {
     assert!(tags.iter().any(|t| t.key == "title" && t.value == "Edited"));
 }
 
+#[test]
+fn scans_flac_with_many_mixed_tags_into_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let comments = [
+        "TITLE=Song",
+        "ARTIST=A",
+        "ARTIST=B", // multi-value artist
+        "ALBUM=Alb",
+        "ALBUMARTIST=VA",
+        "DATE=2020",
+        "GENRE=Electronic",
+        "TRACKNUMBER=3",
+        "REPLAYGAIN_TRACK_GAIN=-6.5 dB",
+        "MUSICBRAINZ_ALBUMID=abc-123",
+        "MYCUSTOMFIELD=custom", // user-defined: not in vocabulary, kept verbatim
+    ];
+    let flac = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &comments)),
+        ],
+        &[0xAA; 30],
+    );
+    std::fs::write(dir.path().join("many.flac"), &flac).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let track = &db.list_tracks().unwrap()[0];
+    let tags = db.get_tags(track.id).unwrap();
+
+    // Known Vorbis fields fold to canonical lowercase keys.
+    let has = |k: &str, v: &str| tags.iter().any(|t| t.key == k && t.value == v);
+    assert!(has("title", "Song"));
+    assert!(has("albumartist", "VA"));
+    assert!(has("date", "2020"));
+    assert!(has("genre", "Electronic"));
+    assert!(has("tracknumber", "3"));
+    assert!(has("replaygain_track_gain", "-6.5 dB"));
+    assert!(has("musicbrainz_albumid", "abc-123"));
+
+    // A user-defined field keeps its verbatim (uppercase) key.
+    assert!(has("MYCUSTOMFIELD", "custom"));
+
+    // Multi-value artist: both values survive as separate ordinals under "artist".
+    let artists: Vec<&str> = tags
+        .iter()
+        .filter(|t| t.key == "artist")
+        .map(|t| t.value.as_str())
+        .collect();
+    assert!(
+        artists.contains(&"A") && artists.contains(&"B"),
+        "artists: {artists:?}"
+    );
+}
+
 fn flac_with_picture(comments: &[&str], img: &[u8]) -> Vec<u8> {
     use common::{flac_block, streaminfo_body, vorbis_comment_body};
     fn picture_body(pic_type: u32, mime: &str, data: &[u8]) -> Vec<u8> {
