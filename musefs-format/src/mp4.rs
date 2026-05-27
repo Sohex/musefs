@@ -6,7 +6,7 @@
 use crate::error::{FormatError, Result};
 use crate::input::{ArtInput, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 
 fn be_u32(b: &[u8], pos: usize) -> Result<u32> {
     let s = b.get(pos..pos + 4).ok_or(FormatError::Malformed)?;
@@ -229,6 +229,77 @@ pub fn read_structure(buf: &[u8]) -> Result<Mp4Scan> {
         mdat_header: buf[mdat.start..mdat.payload_start()].to_vec(),
         mdat_payload_offset: mdat.payload_start() as u64,
         mdat_payload_len: (mdat.total_len - mdat.header_len) as u64,
+    })
+}
+
+/// Read the structural boxes (`ftyp`, `moov`, and the `mdat` header) by seeking,
+/// **never** reading the `mdat` payload — for audiobooks that payload is hundreds
+/// of MB and is served from the backing file at read time. Produces an `Mp4Scan`
+/// byte-identical to `read_structure` on the same file, so synthesis is unchanged.
+///
+/// The header walk reads only 8 bytes per top-level box (16 for a 64-bit
+/// largesize), so it skips over the `mdat` payload to reach a trailing `moov`.
+pub fn read_structure_from<R: Read + Seek>(
+    r: &mut R,
+    file_len: u64,
+) -> std::result::Result<Mp4Scan, Mp4ScanError> {
+    fn region<R: Read + Seek>(r: &mut R, off: u64, len: usize) -> io::Result<Vec<u8>> {
+        r.seek(SeekFrom::Start(off))?;
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    // (start_offset, header) for each box we care about.
+    let mut ftyp: Option<(u64, BoxHeader)> = None;
+    let mut moov: Option<(u64, BoxHeader)> = None;
+    let mut mdat: Option<(u64, BoxHeader)> = None;
+    let mut dup = false;
+
+    let mut pos = 0u64;
+    while pos + 8 <= file_len {
+        // Read exactly the header — 8 bytes, plus 8 more only for a largesize box.
+        // This guarantees we never touch a box's payload (notably mdat's).
+        let first8 = region(r, pos, 8)?;
+        let size32 = u32::from_be_bytes(first8[0..4].try_into().unwrap());
+        let hdr = if size32 == 1 {
+            let mut h = first8;
+            h.extend_from_slice(&region(r, pos + 8, 8)?);
+            h
+        } else {
+            first8
+        };
+        let bh = box_header(&hdr, file_len - pos)?;
+        let total = bh.total_len;
+        match &bh.kind {
+            b"moof" => return Err(FormatError::NotMp4.into()),
+            b"ftyp" => dup |= ftyp.replace((pos, bh)).is_some(),
+            b"moov" => dup |= moov.replace((pos, bh)).is_some(),
+            b"mdat" => dup |= mdat.replace((pos, bh)).is_some(),
+            _ => {}
+        }
+        pos += total;
+    }
+    if dup {
+        return Err(FormatError::NotMp4.into());
+    }
+
+    let (ftyp_s, ftyp_h) = ftyp.ok_or(FormatError::NotMp4)?;
+    let (moov_s, moov_h) = moov.ok_or(FormatError::NotMp4)?;
+    let (mdat_s, mdat_h) = mdat.ok_or(FormatError::NotMp4)?;
+
+    let ftyp_bytes = region(r, ftyp_s, ftyp_h.total_len as usize)?;
+    let moov_bytes = region(r, moov_s, moov_h.total_len as usize)?;
+    let mdat_header = region(r, mdat_s, mdat_h.header_len as usize)?;
+
+    validate_moov(&moov_bytes[moov_h.header_len as usize..])?;
+
+    Ok(Mp4Scan {
+        ftyp: ftyp_bytes,
+        moov: moov_bytes,
+        mdat_header,
+        mdat_payload_offset: mdat_s + mdat_h.header_len,
+        mdat_payload_len: mdat_h.total_len - mdat_h.header_len,
     })
 }
 
@@ -1104,5 +1175,58 @@ mod tests {
         assert_eq!(box_header(&h, 100), Err(FormatError::Malformed));
         // header shorter than 8 bytes.
         assert_eq!(box_header(&[0u8; 4], 1000), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn read_structure_from_matches_buffer_path() {
+        // Both moov-first and moov-last (moov-last is the audiobook spike case).
+        for moov_first in [true, false] {
+            let buf = mk_mp4(moov_first, &vec![0xABu8; 4096], &[0]);
+            let from_buf = read_structure(&buf).unwrap();
+            let mut cur = std::io::Cursor::new(buf.clone());
+            let from_stream = read_structure_from(&mut cur, buf.len() as u64).unwrap();
+            assert_eq!(from_stream, from_buf);
+        }
+    }
+
+    #[test]
+    fn read_structure_from_never_reads_mdat_payload() {
+        // moov LAST: reaching it requires skipping the mdat payload.
+        let buf = mk_mp4(false, &vec![0xCDu8; 100_000], &[0]);
+        let scan = read_structure(&buf).unwrap();
+        let pay_start = scan.mdat_payload_offset;
+        let pay_end = pay_start + scan.mdat_payload_len;
+
+        // A reader that records every byte range it is asked to read.
+        struct Tracking {
+            inner: std::io::Cursor<Vec<u8>>,
+            touched: Vec<(u64, u64)>,
+        }
+        impl std::io::Read for Tracking {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                let off = self.inner.position();
+                let n = std::io::Read::read(&mut self.inner, b)?;
+                self.touched.push((off, off + n as u64));
+                Ok(n)
+            }
+        }
+        impl std::io::Seek for Tracking {
+            fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(p)
+            }
+        }
+
+        let mut tr = Tracking {
+            inner: std::io::Cursor::new(buf.clone()),
+            touched: Vec::new(),
+        };
+        let from_stream = read_structure_from(&mut tr, buf.len() as u64).unwrap();
+        assert_eq!(from_stream, scan);
+        for (s, e) in &tr.touched {
+            assert!(
+                *e <= pay_start || *s >= pay_end,
+                "read [{s},{e}) overlaps mdat payload [{pay_start},{pay_end})"
+            );
+        }
     }
 }
