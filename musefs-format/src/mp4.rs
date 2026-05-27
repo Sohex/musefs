@@ -6,6 +6,7 @@
 use crate::error::{FormatError, Result};
 use crate::input::{ArtInput, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
+use std::io;
 
 fn be_u32(b: &[u8], pos: usize) -> Result<u32> {
     let s = b.get(pos..pos + 4).ok_or(FormatError::Malformed)?;
@@ -42,6 +43,51 @@ impl BoxRef {
         );
         &buf[self.payload_start()..self.end()]
     }
+}
+
+/// A parsed box header (the payload need not be in memory). Public so the core
+/// reader can reason about box bounds while seeking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoxHeader {
+    pub kind: [u8; 4],
+    pub header_len: u64, // 8, or 16 for a 64-bit largesize
+    pub total_len: u64,  // header + payload
+}
+
+/// Parse a box header from `hdr` (>= 8 bytes; >= 16 if it uses a 64-bit
+/// largesize). `remaining` is the byte count from this box's start to EOF, used
+/// to resolve a `size == 0` ("extends to end") box.
+pub fn box_header(hdr: &[u8], remaining: u64) -> Result<BoxHeader> {
+    let size32 = be_u32(hdr, 0)? as u64;
+    let kind: [u8; 4] = hdr
+        .get(4..8)
+        .ok_or(FormatError::Malformed)?
+        .try_into()
+        .unwrap();
+    let (header_len, total_len) = match size32 {
+        1 => (16u64, be_u64(hdr, 8)?),
+        0 => (8u64, remaining),
+        n => (8u64, n),
+    };
+    if total_len < header_len || total_len > remaining {
+        return Err(FormatError::Malformed);
+    }
+    Ok(BoxHeader {
+        kind,
+        header_len,
+        total_len,
+    })
+}
+
+/// Error from the seeking MP4 reader: an IO failure reading the file, or a
+/// structural/format problem. Kept distinct so the core layer can map IO to
+/// `CoreError::Io` (preserving errno) and format to `CoreError::Format`.
+#[derive(Debug, thiserror::Error)]
+pub enum Mp4ScanError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Format(#[from] FormatError),
 }
 
 fn read_box(buf: &[u8], pos: usize) -> Result<BoxRef> {
@@ -108,6 +154,28 @@ pub struct Mp4Bounds {
     pub audio_length: u64,
 }
 
+/// Validate the internal `moov` shape: no fragmentation (`mvex`), exactly one
+/// track, and that track is audio (`soun`). `moov_payload` is the bytes inside
+/// the `moov` box (after its header).
+fn validate_moov(moov_payload: &[u8]) -> Result<()> {
+    if find_box(moov_payload, b"mvex")?.is_some() {
+        return Err(FormatError::NotMp4);
+    }
+    let traks: Vec<_> = child_boxes(moov_payload)?
+        .into_iter()
+        .filter(|b| &b.kind == b"trak")
+        .collect();
+    if traks.len() != 1 {
+        return Err(FormatError::NotMp4);
+    }
+    let trak = traks[0].payload(moov_payload);
+    let (hp, hl) = find_path(trak, &[b"mdia", b"hdlr"])?.ok_or(FormatError::NotMp4)?;
+    if trak[hp..hp + hl].get(8..12) != Some(b"soun") {
+        return Err(FormatError::NotMp4);
+    }
+    Ok(())
+}
+
 /// Validate the supported shape; return the ftyp/moov/mdat boxes (absolute offsets
 /// in `buf`). Rejects fragmented, video, multi-track, and multi-`mdat` files.
 fn locate(buf: &[u8]) -> Result<(BoxRef, BoxRef, BoxRef)> {
@@ -127,22 +195,7 @@ fn locate(buf: &[u8]) -> Result<(BoxRef, BoxRef, BoxRef)> {
     let moov = one(b"moov")?;
     let mdat = one(b"mdat")?;
 
-    let moov_payload = moov.payload(buf);
-    if find_box(moov_payload, b"mvex")?.is_some() {
-        return Err(FormatError::NotMp4);
-    }
-    let traks: Vec<_> = child_boxes(moov_payload)?
-        .into_iter()
-        .filter(|b| &b.kind == b"trak")
-        .collect();
-    if traks.len() != 1 {
-        return Err(FormatError::NotMp4);
-    }
-    let trak = traks[0].payload(moov_payload);
-    let (hp, hl) = find_path(trak, &[b"mdia", b"hdlr"])?.ok_or(FormatError::NotMp4)?;
-    if trak[hp..hp + hl].get(8..12) != Some(b"soun") {
-        return Err(FormatError::NotMp4);
-    }
+    validate_moov(moov.payload(buf))?;
     Ok((ftyp, moov, mdat))
 }
 
@@ -156,7 +209,7 @@ pub fn locate_audio(buf: &[u8]) -> Result<Mp4Bounds> {
 }
 
 /// Everything `synthesize_layout` needs, read from the backing file once.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Mp4Scan {
     pub ftyp: Vec<u8>,
     pub moov: Vec<u8>,
@@ -1008,5 +1061,43 @@ mod tests {
             }
             _ => panic!("expected BackingAudio tail"),
         }
+    }
+
+    #[test]
+    fn box_header_parses_8_byte_16_byte_and_size0() {
+        // 8-byte header: size 16, type "moov".
+        let mut h = 16u32.to_be_bytes().to_vec();
+        h.extend_from_slice(b"moov");
+        let bh = box_header(&h, 1000).unwrap();
+        assert_eq!(&bh.kind, b"moov");
+        assert_eq!(bh.header_len, 8);
+        assert_eq!(bh.total_len, 16);
+
+        // 64-bit largesize: size32==1, then u64 size = 40.
+        let mut h = 1u32.to_be_bytes().to_vec();
+        h.extend_from_slice(b"mdat");
+        h.extend_from_slice(&40u64.to_be_bytes());
+        let bh = box_header(&h, 1000).unwrap();
+        assert_eq!(bh.header_len, 16);
+        assert_eq!(bh.total_len, 40);
+
+        // size32==0 means "extends to EOF" -> total_len == remaining.
+        let mut h = 0u32.to_be_bytes().to_vec();
+        h.extend_from_slice(b"mdat");
+        let bh = box_header(&h, 500).unwrap();
+        assert_eq!(bh.header_len, 8);
+        assert_eq!(bh.total_len, 500);
+    }
+
+    #[test]
+    fn box_header_rejects_impossible_sizes() {
+        // total_len < header_len.
+        let mut h = 4u32.to_be_bytes().to_vec();
+        h.extend_from_slice(b"moov");
+        assert_eq!(box_header(&h, 1000), Err(FormatError::Malformed));
+        // total_len > remaining.
+        let mut h = 2000u32.to_be_bytes().to_vec();
+        h.extend_from_slice(b"moov");
+        assert_eq!(box_header(&h, 100), Err(FormatError::Malformed));
     }
 }
