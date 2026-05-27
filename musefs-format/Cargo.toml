@@ -11,11 +11,17 @@ thiserror = "1"
 id3 = "1"
 base64 = "0.22"
 
+[features]
+# Exposes pure check helpers + minimal-file fixtures for proptest, the fuzz
+# crate, and musefs-core's tests. Off by default.
+fuzzing = []
+
 [dev-dependencies]
 metaflac = "0.2"
 mp4 = "0.14"
 crc = "3"
 hound = "3"
+proptest = "1"
 
 [lints]
 workspace = true

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["musefs-db", "musefs-format", "musefs-core", "musefs-fuse", "musefs-cli"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.2.0"

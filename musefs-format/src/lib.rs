@@ -9,6 +9,9 @@ mod tagmap;
 mod vorbiscomment;
 pub mod wav;
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzz_check;
+
 pub use error::{FormatError, Result};
 pub use input::{ArtInput, EmbeddedPicture, TagInput};
 pub use layout::{RegionLayout, Segment};
