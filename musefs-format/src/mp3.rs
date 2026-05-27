@@ -97,7 +97,8 @@ fn txxx_frame_data(desc: &str, value: &str) -> Vec<u8> {
 }
 
 /// COMM/USLT share a body layout: `[enc][lang(3)][descriptor NUL][text]`. We
-/// write UTF-8 with an unknown language and empty descriptor (see Limitations).
+/// write UTF-8 with an unknown language (`XXX`) and empty descriptor; the
+/// original language code and descriptor are not preserved on round-trip.
 fn comm_like_frame_data(value: &str) -> Vec<u8> {
     let mut d = vec![ENC_UTF8];
     d.extend_from_slice(b"XXX"); // language: unknown
@@ -184,6 +185,7 @@ pub(crate) fn build_id3v2_segments(
                 }
             }
             None if is_id3_text_frame_id(key) => {
+                // safe: is_id3_text_frame_id guarantees key is exactly 4 bytes
                 let id: [u8; 4] = key.as_bytes().try_into().unwrap();
                 let data = text_frame_data(values);
                 push_frame_header(&mut buf, &id, data.len())?;
