@@ -27,7 +27,8 @@ currently no fuzzing or property-based testing in the workspace.
 - The byte-identical invariant asserted across arbitrary parseable inputs, at two
   depths (structural layout and real spliced read).
 - Tag round-trip: tags serialized into a synthesized metadata region reparse to
-  the same logical tags.
+  the same logical tags (our parser), and an independent ecosystem reader
+  (mutagen) reads the same tags back across all five formats.
 - CI that catches broken targets per-PR and runs coverage-guided fuzzing on a
   schedule.
 - All project documentation updated.
@@ -175,6 +176,18 @@ harness for that reason.
    `layout.total_len()`. This exercises the real splice, including Ogg CRC
    recomputation and page renumbering. Bounded proptest only — too heavy per case
    to be a libFuzzer target.
+5. **Independent-reader interop ("anything we emit, the ecosystem can read").**
+   Property 3 proves *our* parser reads what we emit; this proves an independent,
+   real-world reader does. mutagen is chosen as the ground truth because it covers
+   all five formats uniformly (FLAC/MP3/MP4/Ogg/WAV, including ID3 in WAV), where
+   independent Rust crates are patchy (`hound` ignores WAV tags, the `mp4` crate's
+   `ilst` support is partial). Because mutagen is Python and too slow to drive
+   per-proptest-case, this runs as a **batch interop test**: a Rust helper builds
+   layouts for a representative set of files across all five formats with known
+   tags/art and assembles each (via `reader::read_at`) to a temp output file plus
+   a manifest of expected tags; a pytest reads each output with mutagen and
+   asserts the tags match. This complements, not replaces, the per-case Rust
+   self-roundtrip (Property 3).
 
 ## Seed corpus
 
@@ -193,6 +206,11 @@ reproducible. Regeneration is documented.
   run under the existing `cargo test --workspace` with no toolchain change —
   only the new dev-dependencies. proptest case counts are left at sensible
   bounded defaults.
+- **Per-PR interop job (Property 5).** A job that sets up Python + `mutagen`
+  (reusing the Python tooling pattern already in `contrib/beets/`), runs the Rust
+  helper to emit the synthesized fixture files + manifest, then runs the pytest
+  that reads them with mutagen and asserts tags. Does not require `/dev/fuse` (the
+  helper assembles via `reader::read_at`, no mount).
 - **New `fuzz.yml`.**
   - *PR / push job:* `dtolnay/rust-toolchain@nightly` + `cargo-fuzz`,
     `cargo fuzz build` for all targets, then a few-second smoke run per target
@@ -257,6 +275,7 @@ All project documentation is updated as part of this work:
 | `musefs-format` primitives | cargo-fuzz targets | panic-freedom + primitive invariants | scheduled CI + per-PR smoke |
 | `musefs-format` | proptest | Property A + tag round-trip (structured inputs) | `cargo test` (per PR) |
 | `musefs-core` | proptest | Property B (end-to-end read fidelity) | `cargo test` (per PR) |
+| `musefs-core` + Python | Rust emit + pytest/mutagen batch | Property 5 (independent-reader interop) | interop job (per PR) |
 
 ## Risks and mitigations
 
