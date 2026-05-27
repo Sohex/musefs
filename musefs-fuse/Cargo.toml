@@ -8,7 +8,7 @@ license = "MIT"
 metrics = ["musefs-core/metrics"]
 
 [dependencies]
-fuser = "0.14"
+fuser = { version = "0.14", features = ["abi-7-31"] }
 libc = "0.2"
 musefs-core = { path = "../musefs-core" }
 threadpool = "1"

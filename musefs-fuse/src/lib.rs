@@ -18,7 +18,44 @@ use musefs_core::Attr;
 use musefs_core::CoreError;
 use musefs_core::Musefs;
 
-const TTL: Duration = Duration::from_secs(1);
+/// Fuse-layer mount knobs: kernel tuning + page-cache policy. Distinct from
+/// `musefs_core::MountConfig`, which governs how the virtual tree is rendered.
+#[derive(Debug, Clone)]
+pub struct FuseConfig {
+    /// Entry/attr cache lifetime the kernel may trust before re-validating.
+    /// Longer cuts `lookup`/`getattr` traffic but bounds how fast external DB
+    /// edits become visible (the existing freshness trade-off).
+    pub ttl: Duration,
+    /// Kernel read-ahead window in bytes (clamped to the kernel's max).
+    pub max_readahead: u32,
+    /// Max outstanding background (readahead/async) requests the kernel queues;
+    /// also bounds the work in flight to the worker pool.
+    pub max_background: u16,
+    /// Keep the kernel page cache across opens (`FOPEN_KEEP_CACHE`). Safe only
+    /// for static libraries: after an external re-tag the kernel may serve stale
+    /// cached bytes until the cache is dropped (`drop_caches`) or remount.
+    pub keep_cache: bool,
+}
+
+impl Default for FuseConfig {
+    fn default() -> FuseConfig {
+        FuseConfig {
+            ttl: Duration::from_secs(1),
+            max_readahead: 512 * 1024,
+            max_background: 64,
+            keep_cache: false,
+        }
+    }
+}
+
+/// `FOPEN_*` flags for an `open` reply, derived from the cache policy.
+fn open_flags(keep_cache: bool) -> u32 {
+    if keep_cache {
+        fuser::consts::FOPEN_KEEP_CACHE
+    } else {
+        0
+    }
+}
 
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
 /// underlying errno when present; everything structural collapses to `EIO`.
@@ -75,10 +112,11 @@ pub struct MusefsFs {
     uid: u32,
     gid: u32,
     mount_time: SystemTime,
+    config: FuseConfig,
 }
 
 impl MusefsFs {
-    pub fn new(core: Musefs) -> MusefsFs {
+    pub fn new(core: Musefs, config: FuseConfig) -> MusefsFs {
         // Work is I/O-bound (especially on NFS), so oversize the pool vs CPUs.
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -86,14 +124,15 @@ impl MusefsFs {
             * 2;
         MusefsFs {
             core: Arc::new(core),
-            // NOTE: ThreadPool's job queue is unbounded; under a read storm against
-            // slow backing storage, queued jobs (each holding a reply handle) can
-            // accumulate. A bounded queue / back-pressure is a future tuning item.
+            // The kernel keeps at most `max_background` async/readahead requests
+            // in flight (set in `init`), so this pool's queue depth is bounded in
+            // practice even though `ThreadPool`'s queue is nominally unbounded.
             pool: ThreadPool::new(workers),
             // SAFETY: getuid/getgid are always-successful libc calls.
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             mount_time: SystemTime::now(),
+            config,
         }
     }
 }
@@ -117,9 +156,9 @@ impl Filesystem for MusefsFs {
             None => return reply.error(libc::ENOENT),
         };
         let core = Arc::clone(&self.core);
-        let (uid, gid, mt) = (self.uid, self.gid, self.mount_time);
+        let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
         self.pool.execute(move || match core.getattr(child) {
-            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr, uid, gid, mt), 0),
+            Ok(attr) => reply.entry(&ttl, &to_file_attr(&attr, uid, gid, mt), 0),
             Err(e) => reply.error(errno(&e)),
         });
     }
@@ -132,17 +171,18 @@ impl Filesystem for MusefsFs {
             });
         }
         let core = Arc::clone(&self.core);
-        let (uid, gid, mt) = (self.uid, self.gid, self.mount_time);
+        let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
         self.pool.execute(move || match core.getattr(ino) {
-            Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr, uid, gid, mt)),
+            Ok(attr) => reply.attr(&ttl, &to_file_attr(&attr, uid, gid, mt)),
             Err(e) => reply.error(errno(&e)),
         });
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         let core = Arc::clone(&self.core);
+        let flags = open_flags(self.config.keep_cache);
         self.pool.execute(move || match core.open_handle(ino) {
-            Ok(fh) => reply.opened(fh, 0),
+            Ok(fh) => reply.opened(fh, flags),
             Err(e) => reply.error(errno(&e)),
         });
     }
@@ -236,15 +276,42 @@ fn mount_options(fs_name: &str) -> Vec<MountOption> {
     vec![MountOption::RO, MountOption::FSName(fs_name.to_string())]
 }
 
-/// Mount `core` at `mountpoint` and block until the filesystem is unmounted.
+/// Mount `core` at `mountpoint` with default fuse tuning, blocking until unmounted.
 pub fn mount(core: Musefs, mountpoint: &Path, fs_name: &str) -> std::io::Result<()> {
-    fuser::mount2(MusefsFs::new(core), mountpoint, &mount_options(fs_name))
+    mount_with(core, mountpoint, fs_name, FuseConfig::default())
 }
 
-/// Mount `core` in a background session, returning a handle whose `Drop`
-/// unmounts. Used for tests and embedding.
+/// Mount `core` at `mountpoint` with explicit fuse tuning, blocking until unmounted.
+pub fn mount_with(
+    core: Musefs,
+    mountpoint: &Path,
+    fs_name: &str,
+    config: FuseConfig,
+) -> std::io::Result<()> {
+    fuser::mount2(
+        MusefsFs::new(core, config),
+        mountpoint,
+        &mount_options(fs_name),
+    )
+}
+
+/// Background-session mount with default tuning; the handle's `Drop` unmounts.
 pub fn spawn(core: Musefs, mountpoint: &Path, fs_name: &str) -> std::io::Result<BackgroundSession> {
-    fuser::spawn_mount2(MusefsFs::new(core), mountpoint, &mount_options(fs_name))
+    spawn_with(core, mountpoint, fs_name, FuseConfig::default())
+}
+
+/// Background-session mount with explicit tuning; the handle's `Drop` unmounts.
+pub fn spawn_with(
+    core: Musefs,
+    mountpoint: &Path,
+    fs_name: &str,
+    config: FuseConfig,
+) -> std::io::Result<BackgroundSession> {
+    fuser::spawn_mount2(
+        MusefsFs::new(core, config),
+        mountpoint,
+        &mount_options(fs_name),
+    )
 }
 
 #[cfg(test)]
@@ -302,5 +369,20 @@ mod tests {
             fa.mtime,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
         );
+    }
+
+    #[test]
+    fn fuse_config_default_is_conservative() {
+        let c = FuseConfig::default();
+        assert_eq!(c.ttl, Duration::from_secs(1));
+        assert_eq!(c.max_readahead, 512 * 1024);
+        assert_eq!(c.max_background, 64);
+        assert!(!c.keep_cache);
+    }
+
+    #[test]
+    fn open_flags_sets_keep_cache_bit_only_when_enabled() {
+        assert_eq!(open_flags(false), 0);
+        assert_eq!(open_flags(true), fuser::consts::FOPEN_KEEP_CACHE);
     }
 }
