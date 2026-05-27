@@ -28,8 +28,9 @@ pub struct FuseConfig {
     pub ttl: Duration,
     /// Kernel read-ahead window in bytes (clamped to the kernel's max).
     pub max_readahead: u32,
-    /// Max outstanding background (readahead/async) requests the kernel queues;
-    /// also bounds the work in flight to the worker pool.
+    /// Max outstanding background (readahead/async) requests the kernel queues.
+    /// Caps that class of work delivered to the pool; foreground reads are
+    /// bounded only by client concurrency, not by this.
     pub max_background: u16,
     /// Keep the kernel page cache across opens (`FOPEN_KEEP_CACHE`). Safe only
     /// for static libraries: after an external re-tag the kernel may serve stale
@@ -124,9 +125,10 @@ impl MusefsFs {
             * 2;
         MusefsFs {
             core: Arc::new(core),
-            // The kernel keeps at most `max_background` async/readahead requests
-            // in flight (set in `init`), so this pool's queue depth is bounded in
-            // practice even though `ThreadPool`'s queue is nominally unbounded.
+            // `ThreadPool`'s queue is unbounded. `max_background` (set in `init`)
+            // caps the kernel's *background/readahead* requests, bounding that
+            // class of work; foreground reads are bounded only by client
+            // concurrency, so a wide parallel read storm can still queue jobs.
             pool: ThreadPool::new(workers),
             // SAFETY: getuid/getgid are always-successful libc calls.
             uid: unsafe { libc::getuid() },
