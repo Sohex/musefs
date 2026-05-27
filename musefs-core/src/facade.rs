@@ -157,7 +157,9 @@ impl Musefs {
     /// Not single-flighted: do not run concurrently with `poll_refresh` (or another
     /// `refresh`) — two overlapping rebuilds can publish a stale tree. The production
     /// path goes through `poll_refresh`, which guards entry with the `refreshing` CAS;
-    /// this entry point exists for forced, unconditional rebuilds (e.g. tests).
+    /// this entry point exists for forced, unconditional rebuilds (e.g. tests). It
+    /// also refreshes the `content_version` snapshot, so it must not race a
+    /// `poll_refresh` whose change-diff relies on that snapshot.
     pub fn refresh(&self) -> Result<()> {
         let versions = self.rebuild()?;
         *self.versions.lock().unwrap_or_else(|p| p.into_inner()) = versions;
@@ -237,14 +239,15 @@ impl Musefs {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let new_versions = self.rebuild()?;
-        let live = self.tree.load().track_ids();
+        // Single load: we hold `refreshing`, so no other thread can swap the tree.
+        let tree = self.tree.load();
+        let live = tree.track_ids();
         self.cache.retain(&live);
         self.size_cache().retain(|k, _| live.contains(k));
 
         // A track whose content_version rose but whose path (inode) is unchanged has
         // stale served bytes; report its inode so the caller can drop the kernel page
         // cache. New/removed tracks have no cache to drop.
-        let tree = self.tree.load();
         for (tid, ver) in &new_versions {
             if old_versions.get(tid).is_some_and(|old| old != ver) {
                 if let Some(ino) = tree.inode_of_track(*tid) {
