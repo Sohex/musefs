@@ -181,3 +181,40 @@ fn end_to_end_read_through_mount_wav() {
     drop(session); // unmounts
     drop(backing);
 }
+
+#[test]
+#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse -- --ignored"]
+fn concurrent_spawns_do_not_race() {
+    use std::sync::{Arc, Barrier};
+
+    // Many threads mount at once, maximizing overlap of the fusermount3 fd-passing
+    // handshake. That handshake forks/execs and is not safe to run concurrently
+    // from one process (it races the fd table: "fd N is not a socket"), so without
+    // serialization at least one spawn fails intermittently. A clean run proves the
+    // handshake is serialized.
+    let n = 8;
+    let barrier = Arc::new(Barrier::new(n));
+    let handles: Vec<_> = (0..n)
+        .map(|i| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let backing = tempfile::tempdir().unwrap();
+                let flac = make_flac(&["ARTIST=Alice", "TITLE=Song"], &[0xAB; 64]);
+                std::fs::write(backing.path().join("a.flac"), &flac).unwrap();
+                let db = musefs_db::Db::open_in_memory().unwrap();
+                scan_directory(&db, backing.path()).unwrap();
+                let fs = Musefs::open(db, config()).unwrap();
+                let mountpoint = tempfile::tempdir().unwrap();
+
+                barrier.wait(); // release all threads into spawn() together
+                let session = musefs_fuse::spawn(fs, mountpoint.path(), "musefs-race")
+                    .unwrap_or_else(|e| panic!("mount {i} raced: {e}"));
+                drop(session); // unmounts
+                drop(backing);
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("a concurrent mount thread panicked (race)");
+    }
+}

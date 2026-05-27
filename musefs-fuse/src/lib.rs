@@ -5,7 +5,7 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use threadpool::ThreadPool;
@@ -308,6 +308,28 @@ fn mount_options(fs_name: &str) -> Vec<MountOption> {
     vec![MountOption::RO, MountOption::FSName(fs_name.to_string())]
 }
 
+/// Serializes the fusermount3 mount handshake (`Session::new`). That handshake
+/// forks/execs `fusermount3` and passes the `/dev/fuse` fd back over a socket;
+/// fork and the file-descriptor table are process-global, so two mounts running
+/// it concurrently from one process race the fd table ("file descriptor N is not
+/// a socket, can't send fuse fd"). The CLI mounts once per process, but library
+/// embedders — and the parallel mount tests — can mount concurrently, so guard
+/// the setup. The lock covers only mount establishment, never the session's
+/// lifetime, so it does not serialize filesystem operations.
+static MOUNT_SETUP: Mutex<()> = Mutex::new(());
+
+/// Establish a mounted `Session`, serializing the racy fusermount3 handshake.
+fn new_session(
+    fs: MusefsFs,
+    mountpoint: &Path,
+    fs_name: &str,
+) -> std::io::Result<Session<MusefsFs>> {
+    // Recover from a poisoned lock: it guards only ordering, so a prior panic
+    // during a mount leaves no inconsistent state to protect against.
+    let _guard = MOUNT_SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    Session::new(fs, mountpoint, &mount_options(fs_name))
+}
+
 /// Mount `core` at `mountpoint` with default fuse tuning, blocking until unmounted.
 pub fn mount(core: Musefs, mountpoint: &Path, fs_name: &str) -> std::io::Result<()> {
     mount_with(core, mountpoint, fs_name, FuseConfig::default())
@@ -322,7 +344,7 @@ pub fn mount_with(
 ) -> std::io::Result<()> {
     let fs = MusefsFs::new(core, config);
     let cell = fs.notifier_cell();
-    let mut session = Session::new(fs, mountpoint, &mount_options(fs_name))?;
+    let mut session = new_session(fs, mountpoint, fs_name)?;
     let _ = cell.set(session.notifier());
     session.run()
 }
@@ -341,7 +363,7 @@ pub fn spawn_with(
 ) -> std::io::Result<BackgroundSession> {
     let fs = MusefsFs::new(core, config);
     let cell = fs.notifier_cell();
-    let session = Session::new(fs, mountpoint, &mount_options(fs_name))?;
+    let session = new_session(fs, mountpoint, fs_name)?;
     // Set the notifier BEFORE `spawn()` starts the dispatch thread, so the first
     // request can't observe an empty cell. `session.notifier()` and the spawned
     // session's notifier clone the same channel sender, so they're equivalent.
