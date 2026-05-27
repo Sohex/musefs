@@ -122,10 +122,7 @@ pub struct MusefsFs {
 impl MusefsFs {
     pub fn new(core: Musefs, config: FuseConfig) -> MusefsFs {
         // Work is I/O-bound (especially on NFS), so oversize the pool vs CPUs.
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            * 2;
+        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2;
         MusefsFs {
             core: Arc::new(core),
             // `ThreadPool`'s queue is unbounded. `max_background` (set in `init`)
@@ -187,15 +184,13 @@ impl Filesystem for MusefsFs {
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         self.fire_poll_refresh();
-        let name = match name.to_str() {
-            Some(n) => n,
-            None => return reply.error(libc::ENOENT),
+        let Some(name) = name.to_str() else {
+            return reply.error(libc::ENOENT);
         };
         // Inode resolution is an in-memory tree read; the attr (which may touch
         // the DB/disk) is computed on the worker pool.
-        let child = match self.core.lookup(parent, name) {
-            Some(ino) => ino,
-            None => return reply.error(libc::ENOENT),
+        let Some(child) = self.core.lookup(parent, name) else {
+            return reply.error(libc::ENOENT);
         };
         let core = Arc::clone(&self.core);
         let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
@@ -326,7 +321,9 @@ fn new_session(
 ) -> std::io::Result<Session<MusefsFs>> {
     // Recover from a poisoned lock: it guards only ordering, so a prior panic
     // during a mount leaves no inconsistent state to protect against.
-    let _guard = MOUNT_SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = MOUNT_SETUP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     Session::new(fs, mountpoint, &mount_options(fs_name))
 }
 

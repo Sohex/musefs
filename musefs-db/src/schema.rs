@@ -1,7 +1,7 @@
 use crate::Result;
 use rusqlite::{Connection, TransactionBehavior};
 
-const MIGRATION_V1: &str = r#"
+const MIGRATION_V1: &str = r"
 CREATE TABLE tracks (
     id              INTEGER PRIMARY KEY,
     backing_path    TEXT NOT NULL UNIQUE,
@@ -72,7 +72,7 @@ CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
                       updated_at = CAST(strftime('%s','now') AS INTEGER)
     WHERE id = OLD.track_id;
 END;
-"#;
+";
 
 const MIGRATIONS: &[&str] = &[MIGRATION_V1];
 

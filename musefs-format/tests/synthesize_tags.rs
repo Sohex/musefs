@@ -51,11 +51,11 @@ fn metaflac_reads_synthesized_vorbis_comments_and_preserves_streaminfo() {
 
     let vc = tag.vorbis_comments().expect("vorbis comments present");
     assert_eq!(
-        vc.get("TITLE").map(|v| v.as_slice()),
+        vc.get("TITLE").map(std::vec::Vec::as_slice),
         Some(["New Title".to_string()].as_slice())
     );
     assert_eq!(
-        vc.get("ARTIST").map(|v| v.as_slice()),
+        vc.get("ARTIST").map(std::vec::Vec::as_slice),
         Some(["First".to_string(), "Second".to_string()].as_slice())
     );
 

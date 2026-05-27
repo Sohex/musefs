@@ -24,7 +24,7 @@ fn assemble(layout: &RegionLayout, audio: &[u8], arts: &[(i64, &[u8])]) -> Vec<u
             Segment::Inline(b) => out.extend_from_slice(b),
             Segment::BackingAudio { .. } => out.extend_from_slice(audio),
             Segment::ArtImage { art_id, .. } => {
-                out.extend_from_slice(arts.iter().find(|(id, _)| id == art_id).unwrap().1)
+                out.extend_from_slice(arts.iter().find(|(id, _)| id == art_id).unwrap().1);
             }
             other => unreachable!("unexpected segment in WAV layout: {other:?}"),
         }

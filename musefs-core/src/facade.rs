@@ -162,7 +162,10 @@ impl Musefs {
     /// `poll_refresh` whose change-diff relies on that snapshot.
     pub fn refresh(&self) -> Result<()> {
         let versions = self.rebuild()?;
-        *self.versions.lock().unwrap_or_else(|p| p.into_inner()) = versions;
+        *self
+            .versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = versions;
         Ok(())
     }
 
@@ -170,7 +173,10 @@ impl Musefs {
     /// map (the caller decides whether/how to diff it).
     fn rebuild(&self) -> Result<HashMap<i64, i64>> {
         let (tree, versions) = self.pool.with(|db| {
-            let mut alloc = self.inodes.lock().unwrap_or_else(|p| p.into_inner());
+            let mut alloc = self
+                .inodes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::build_tree(db, &self.config, &mut alloc)
         })?;
         self.tree.store(Arc::new(tree));
@@ -188,11 +194,15 @@ impl Musefs {
     // off-lock and locks a shard only for the get/insert.
 
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Handle>>> {
-        self.handles.lock().unwrap_or_else(|p| p.into_inner())
+        self.handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn size_cache(&self) -> std::sync::MutexGuard<'_, HashMap<i64, SizeEntry>> {
-        self.size_cache.lock().unwrap_or_else(|p| p.into_inner())
+        self.size_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// See `poll_refresh_notify`; this is the no-callback form.
@@ -210,7 +220,10 @@ impl Musefs {
     /// return `Ok(false)` immediately.
     pub fn poll_refresh_notify(&self, mut on_changed: impl FnMut(u64)) -> Result<bool> {
         if !self.poll_interval.is_zero() {
-            let mut last = self.last_poll.lock().unwrap_or_else(|p| p.into_inner());
+            let mut last = self
+                .last_poll
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if last.elapsed() < self.poll_interval {
                 return Ok(false);
             }
@@ -236,7 +249,7 @@ impl Musefs {
         let old_versions = self
             .versions
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let new_versions = self.rebuild()?;
         // Single load: we hold `refreshing`, so no other thread can swap the tree.
@@ -255,7 +268,10 @@ impl Musefs {
                 }
             }
         }
-        *self.versions.lock().unwrap_or_else(|p| p.into_inner()) = new_versions;
+        *self
+            .versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_versions;
 
         self.last_data_version.store(version, Ordering::Release);
         Ok(true)

@@ -19,3 +19,6 @@ metaflac = "0.2"
 musefs-db = { path = "../musefs-db" }
 musefs-format = { path = "../musefs-format" }
 ogg = "0.9"
+
+[lints]
+workspace = true

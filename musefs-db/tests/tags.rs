@@ -58,8 +58,8 @@ fn tags_grouped_returns_all_tags_by_track() {
     db.replace_tags(b, &[Tag::new("artist", "Bob", 0)]).unwrap();
 
     let grouped = db.tags_grouped().unwrap();
-    assert_eq!(grouped.get(&a).map(|v| v.len()), Some(2));
-    assert_eq!(grouped.get(&b).map(|v| v.len()), Some(1));
+    assert_eq!(grouped.get(&a).map(std::vec::Vec::len), Some(2));
+    assert_eq!(grouped.get(&b).map(std::vec::Vec::len), Some(1));
     // grouping must match per-track get_tags exactly (same order).
     assert_eq!(grouped.get(&a), Some(&db.get_tags(a).unwrap()));
     assert_eq!(grouped.get(&b), Some(&db.get_tags(b).unwrap()));

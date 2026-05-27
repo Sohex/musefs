@@ -150,8 +150,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn read_front(path: &Path, n: u64) -> std::io::Result<Vec<u8>> {
@@ -176,13 +175,15 @@ impl HeaderCache {
     }
     fn shard(&self, track_id: i64) -> std::sync::MutexGuard<'_, Shard> {
         let idx = (track_id as u64 % CACHE_SHARDS as u64) as usize;
-        self.shards[idx].lock().unwrap_or_else(|p| p.into_inner())
+        self.shards[idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// Drop cached resolutions for tracks no longer present (`live` = current ids).
     pub fn retain(&self, live: &HashSet<i64>) {
         for s in &self.shards {
             s.lock()
-                .unwrap_or_else(|p| p.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retain_keys(live);
         }
     }

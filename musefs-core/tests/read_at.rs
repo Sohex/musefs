@@ -48,7 +48,7 @@ fn reading_whole_file_matches_total_len_and_splices_audio() {
         tag.vorbis_comments()
             .unwrap()
             .get("TITLE")
-            .map(|v| v.as_slice()),
+            .map(std::vec::Vec::as_slice),
         Some(["Real".to_string()].as_slice())
     );
 }
