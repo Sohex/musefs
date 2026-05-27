@@ -81,9 +81,9 @@ pub enum Command {
         /// Max outstanding background (readahead/async) requests the kernel queues.
         #[arg(long, default_value_t = 64)]
         max_background: u16,
-        /// Keep the kernel page cache across opens. Best for static libraries;
-        /// after an external re-tag the kernel may serve stale bytes until the
-        /// cache is dropped (`drop_caches`) or the mount is replaced.
+        /// Keep the kernel page cache across opens. External re-tags auto-invalidate
+        /// the affected inodes on refresh, so cached bytes are dropped when content
+        /// changes.
         #[arg(long)]
         keep_cache: bool,
     },
