@@ -308,19 +308,6 @@ pub fn read_structure_from<R: Read + Seek>(
     })
 }
 
-fn atom_to_key(kind: &[u8; 4]) -> Option<&'static str> {
-    Some(match kind {
-        b"\xa9nam" => "title",
-        b"\xa9ART" => "artist",
-        b"aART" => "albumartist",
-        b"\xa9alb" => "album",
-        b"\xa9gen" => "genre",
-        b"\xa9day" => "date",
-        b"\xa9wrt" => "composer",
-        _ => return None,
-    })
-}
-
 /// Locate `moov/udta/meta/ilst`; `meta` is a FullBox (4 version/flags bytes before
 /// its children). Returns the ilst payload range absolute within `buf`.
 fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
@@ -336,8 +323,40 @@ fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
     Some((start, il.total_len - il.header_len))
 }
 
+/// Parse a `----` freeform atom payload into `(key, value)`. Folds (mean, name)
+/// to a canonical key via the vocabulary, else keys on the verbatim `name`. Only
+/// the first `data` atom is read (multi-value freeform is rare). None if malformed.
+fn read_freeform(inner: &[u8]) -> Option<(String, String)> {
+    let name_box = find_box(inner, b"name").ok()??;
+    let data_box = find_box(inner, b"data").ok()??;
+    let np = name_box.payload(inner);
+    let dp = data_box.payload(inner);
+    if np.len() < 4 || dp.len() < 8 {
+        return None;
+    }
+    let name = std::str::from_utf8(&np[4..]).ok()?;
+    let value = std::str::from_utf8(&dp[8..]).ok()?;
+    let mean = find_box(inner, b"mean")
+        .ok()
+        .flatten()
+        .map_or("com.apple.iTunes", |m| {
+            let p = m.payload(inner);
+            if p.len() >= 4 {
+                std::str::from_utf8(&p[4..]).unwrap_or("com.apple.iTunes")
+            } else {
+                "com.apple.iTunes"
+            }
+        });
+    let key = crate::tagmap::mp4_freeform_to_key(mean, name)
+        .map_or_else(|| name.to_string(), str::to_string);
+    Some((key, value.to_string()))
+}
+
 /// Lenient: returns empty / skips any malformed atom and never errors — this only
-/// seeds metadata from existing files, so a missing or garbled tag must simply be absent.
+/// seeds metadata from existing files, so a missing or garbled tag must simply be
+/// absent. Text atoms map via the vocabulary; `trkn`/`disk` yield track/disc
+/// numbers; `----` freeform atoms key on their name (folded when known). Other
+/// atoms are skipped.
 pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     let Some((start, len)) = ilst_region(buf) else {
         return Vec::new();
@@ -346,6 +365,12 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for atom in child_boxes(ilst).unwrap_or_default() {
         let inner = atom.payload(ilst);
+        if &atom.kind == b"----" {
+            if let Some(pair) = read_freeform(inner) {
+                out.push(pair);
+            }
+            continue;
+        }
         let Ok(Some(data)) = find_box(inner, b"data") else {
             continue;
         };
@@ -354,7 +379,7 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
             continue;
         }
         let value = &dp[8..]; // skip [type 4][locale 4]
-        if let Some(key) = atom_to_key(&atom.kind) {
+        if let Some(key) = crate::tagmap::mp4_atom_to_key(&atom.kind) {
             if let Ok(s) = std::str::from_utf8(value) {
                 out.push((key.to_string(), s.to_string()));
             }
@@ -1229,6 +1254,25 @@ mod tests {
                 "read [{s},{e}) overlaps mdat payload [{pay_start},{pay_end})"
             );
         }
+    }
+
+    #[test]
+    fn read_freeform_extracts_name_and_value() {
+        // Build a minimal `----` atom: mean + name + data(UTF-8).
+        let mut mean_body = 0u32.to_be_bytes().to_vec();
+        mean_body.extend_from_slice(b"com.apple.iTunes");
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(b"MusicBrainz Album Id");
+        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data.extend_from_slice(b"abc-123");
+        let mut inner = boxed(b"mean", &mean_body);
+        inner.extend(boxed(b"name", &name_body));
+        inner.extend(boxed(b"data", &data));
+
+        let (key, value) = read_freeform(&inner).unwrap();
+        assert_eq!(key, "musicbrainz_albumid"); // folded via vocabulary
+        assert_eq!(value, "abc-123");
     }
 
     #[test]
