@@ -104,3 +104,132 @@ pub fn read_structure(front: &[u8]) -> Result<WavScan> {
 
     Ok(WavScan { fmt, fact })
 }
+
+use crate::input::{ArtInput, TagInput};
+use crate::layout::{RegionLayout, Segment};
+
+/// Canonical (lowercase) tag key -> RIFF `INFO` subchunk FourCC. INFO is the
+/// broad-compatibility surface with a small vocabulary; richer fields
+/// (albumartist, disc, MusicBrainz ids) ride only in the `id3 ` chunk.
+fn info_fourcc(key: &str) -> Option<&'static [u8; 4]> {
+    Some(match key {
+        "title" => b"INAM",
+        "artist" => b"IART",
+        "album" => b"IPRD",
+        "date" => b"ICRD",
+        "genre" => b"IGNR",
+        "comment" => b"ICMT",
+        "tracknumber" => b"ITRK",
+        _ => return None,
+    })
+}
+
+/// Build the `LIST`/`INFO` chunk payload (`"INFO"` + subchunks) from the first
+/// value of each mappable tag key, in first-seen order. Returns `None` when no
+/// tag maps to an INFO field (so the chunk is omitted entirely).
+fn build_info_payload(tags: &[TagInput]) -> Option<Vec<u8>> {
+    let mut entries: Vec<(&'static [u8; 4], &str)> = Vec::new();
+    let mut used: Vec<&str> = Vec::new();
+    for t in tags {
+        if used.contains(&t.key.as_str()) {
+            continue;
+        }
+        if let Some(cc) = info_fourcc(&t.key) {
+            used.push(t.key.as_str());
+            entries.push((cc, t.value.as_str()));
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"INFO");
+    for (cc, value) in entries {
+        let mut v = value.as_bytes().to_vec();
+        v.push(0x00); // INFO values are NUL-terminated
+        payload.extend_from_slice(cc);
+        payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&v);
+        if v.len() % 2 == 1 {
+            payload.push(0x00); // word-align
+        }
+    }
+    Some(payload)
+}
+
+/// Push a fully-inline chunk (`fourcc + LE size + payload + word-align pad`).
+fn push_inline_chunk(segments: &mut Vec<Segment>, id: &[u8; 4], payload: &[u8]) {
+    let mut chunk = Vec::with_capacity(8 + payload.len() + 1);
+    chunk.extend_from_slice(id);
+    chunk.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    chunk.extend_from_slice(payload);
+    if payload.len() % 2 == 1 {
+        chunk.push(0x00);
+    }
+    segments.push(Segment::Inline(chunk));
+}
+
+/// Build the synthesized WAV region: a fresh `RIFF`/`WAVE` front carrying the
+/// preserved `fmt `/`fact`, a native `LIST`/`INFO` chunk, and an embedded `id3 `
+/// chunk (full ID3v2 + APIC art), followed by the untouched `data` payload as a
+/// `BackingAudio` segment. Every length is known up front, so the `RIFF` and
+/// chunk size fields are byte-exact.
+pub fn synthesize_layout(
+    scan: &WavScan,
+    audio_offset: u64,
+    audio_length: u64,
+    tags: &[TagInput],
+    arts: &[ArtInput],
+) -> Result<RegionLayout> {
+    if audio_length > u32::MAX as u64 {
+        return Err(FormatError::TooLarge); // RF64 territory; out of scope
+    }
+
+    let mut segments: Vec<Segment> = Vec::new();
+
+    push_inline_chunk(&mut segments, b"fmt ", &scan.fmt);
+    if let Some(fact) = &scan.fact {
+        push_inline_chunk(&mut segments, b"fact", fact);
+    }
+    if let Some(info) = build_info_payload(tags) {
+        push_inline_chunk(&mut segments, b"LIST", &info);
+    }
+
+    // Embedded `id3 ` chunk: 8-byte chunk header + the ID3v2 tag segments, padded.
+    let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, arts)?;
+    let mut id3_head = Vec::with_capacity(8);
+    id3_head.extend_from_slice(b"id3 ");
+    id3_head.extend_from_slice(&(tag_len as u32).to_le_bytes());
+    segments.push(Segment::Inline(id3_head));
+    segments.extend(tag_segments);
+    if tag_len % 2 == 1 {
+        segments.push(Segment::Inline(vec![0x00]));
+    }
+
+    // `data` chunk: header + the original payload (BackingAudio) + word-align pad.
+    let mut data_head = Vec::with_capacity(8);
+    data_head.extend_from_slice(b"data");
+    data_head.extend_from_slice(&(audio_length as u32).to_le_bytes());
+    segments.push(Segment::Inline(data_head));
+    segments.push(Segment::BackingAudio {
+        offset: audio_offset,
+        len: audio_length,
+    });
+    if audio_length % 2 == 1 {
+        segments.push(Segment::Inline(vec![0x00]));
+    }
+
+    // RIFF size = (everything after the 8-byte "RIFF"+size prefix) = body + "WAVE".
+    let body_len: u64 = segments.iter().map(Segment::len).sum();
+    let riff_size = body_len + 4;
+    if riff_size > u32::MAX as u64 {
+        return Err(FormatError::TooLarge);
+    }
+    let mut header = Vec::with_capacity(12);
+    header.extend_from_slice(b"RIFF");
+    header.extend_from_slice(&(riff_size as u32).to_le_bytes());
+    header.extend_from_slice(b"WAVE");
+    segments.insert(0, Segment::Inline(header));
+
+    Ok(RegionLayout::new(segments))
+}
