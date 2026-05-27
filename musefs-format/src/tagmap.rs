@@ -111,7 +111,7 @@ const VOCAB: &[Entry] = &[
     Entry {
         key: "copyright",
         id3: Id3Slot::Text(b"TCOP"),
-        mp4: Mp4Slot::Freeform("com.apple.iTunes", "copyright"),
+        mp4: Mp4Slot::Freeform("com.apple.iTunes", "COPYRIGHT"),
         vorbis: "COPYRIGHT",
     },
     Entry {
@@ -192,7 +192,9 @@ pub(crate) fn key_to_id3(key: &str) -> Option<Id3Slot> {
     VOCAB.iter().find(|e| e.key == k).map(|e| e.id3)
 }
 
-/// MP4 text atom -> canonical key, for `Text` slots only.
+/// MP4 text atom -> canonical key, for `Text` slots only. `Number` atoms
+/// (`trkn`/`disk`) are intentionally excluded: the scan path decodes their binary
+/// track/disc value positionally rather than through this lookup.
 pub(crate) fn mp4_atom_to_key(atom: &[u8; 4]) -> Option<&'static str> {
     VOCAB.iter().find_map(|e| match e.mp4 {
         Mp4Slot::Text(a) if a == atom => Some(e.key),
@@ -267,6 +269,24 @@ mod tests {
         for e in VOCAB {
             assert_eq!(vorbis_to_key(e.vorbis), Some(e.key));
             assert_eq!(key_to_vorbis(e.key), Some(e.vorbis));
+        }
+    }
+
+    #[test]
+    fn key_to_slot_round_trips() {
+        for e in VOCAB {
+            assert_eq!(
+                key_to_id3(e.key),
+                Some(e.id3),
+                "key_to_id3 failed for {}",
+                e.key
+            );
+            assert_eq!(
+                key_to_mp4(e.key),
+                Some(e.mp4),
+                "key_to_mp4 failed for {}",
+                e.key
+            );
         }
     }
 
