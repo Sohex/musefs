@@ -106,7 +106,10 @@ fn read_box(buf: &[u8], pos: usize) -> Result<BoxRef> {
         n => (8usize, n),
     };
     let total = total as usize;
-    if total < header_len || pos + total > buf.len() {
+    let Some(end) = pos.checked_add(total) else {
+        return Err(FormatError::Malformed);
+    };
+    if total < header_len || end > buf.len() {
         return Err(FormatError::Malformed);
     }
     Ok(BoxRef {
@@ -1344,6 +1347,23 @@ mod tests {
                 "missing {expected:?} in {tags:?}"
             );
         }
+    }
+
+    #[test]
+    fn read_box_rejects_overflowing_extended_size() {
+        // The extended-size path (size32 == 1) reads a 64-bit box length from
+        // untrusted input. Before the checked_add fix, `pos + total` overflowed
+        // usize in debug (panic) or wrapped silently in release (accepting a
+        // bogus length). This test feeds size32=1 with a u64::MAX extended size
+        // and asserts the parser returns an error rather than panicking.
+        // Bytes: [00 00 00 01] (size32=1) + b"moov" + [FF FF FF FF FF FF FF FF] (u64::MAX)
+        let mut bytes = 1u32.to_be_bytes().to_vec(); // size32 = 1 → extended-size
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes()); // huge 64-bit size
+        assert!(
+            read_structure(&bytes).is_err(),
+            "must return an error, not panic"
+        );
     }
 
     #[test]
