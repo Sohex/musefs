@@ -1,8 +1,10 @@
 [package]
 name = "musefs-core"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+description = "Orchestration for musefs: virtual tree, tag resolution, and scanning."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 metrics = []
