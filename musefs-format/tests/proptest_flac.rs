@@ -33,9 +33,8 @@ proptest! {
         let scan = flac::locate_audio(&file).unwrap();
         let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
         let arts: Vec<ArtInput> = Vec::new();
-        let layout = match flac::synthesize_layout(&scan, &taginputs, &arts) {
-            Ok(l) => l,
-            Err(_) => return Ok(()),
+        let Ok(layout) = flac::synthesize_layout(&scan, &taginputs, &arts) else {
+            return Ok(());
         };
         let mut front = Vec::new();
         for seg in layout.segments() {
