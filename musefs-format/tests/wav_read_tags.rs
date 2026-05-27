@@ -67,7 +67,10 @@ fn id3_payload_with_picture() -> Vec<u8> {
 fn reads_info_only() {
     let wav = build_wav(&[
         (b"fmt ", fmt_pcm_16bit_mono()),
-        (b"LIST", info_payload(&[(b"INAM", "Info Title"), (b"IART", "Info Artist")])),
+        (
+            b"LIST",
+            info_payload(&[(b"INAM", "Info Title"), (b"IART", "Info Artist")]),
+        ),
         (b"data", vec![0u8; 4]),
     ]);
     let tags = read_tags(&wav);
@@ -95,7 +98,10 @@ fn merges_with_id3_winning_and_info_filling_gaps() {
     // id3 has title+artist; INFO has artist (loses) + genre (fills a gap).
     let wav = build_wav(&[
         (b"fmt ", fmt_pcm_16bit_mono()),
-        (b"LIST", info_payload(&[(b"IART", "Info Artist"), (b"IGNR", "Ambient")])),
+        (
+            b"LIST",
+            info_payload(&[(b"IART", "Info Artist"), (b"IGNR", "Ambient")]),
+        ),
         (b"data", vec![0u8; 4]),
         (b"id3 ", id3_payload_with_picture()),
     ]);

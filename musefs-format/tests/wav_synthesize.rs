@@ -37,8 +37,14 @@ fn synthesizes_valid_riff_and_preserves_audio() {
     // 4 little-endian i16 PCM samples = 8 bytes of audio payload.
     let samples: Vec<i16> = vec![1000, -1000, 32000, -32000];
     let audio: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let scan = WavScan { fmt: fmt_pcm_16bit_mono(), fact: None };
-    let tags = vec![TagInput::new("title", "Wave Song"), TagInput::new("artist", "Alice")];
+    let scan = WavScan {
+        fmt: fmt_pcm_16bit_mono(),
+        fact: None,
+    };
+    let tags = vec![
+        TagInput::new("title", "Wave Song"),
+        TagInput::new("artist", "Alice"),
+    ];
 
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[]).unwrap();
     let bytes = assemble(&layout, &audio, &[]);
@@ -65,7 +71,10 @@ fn synthesizes_valid_riff_and_preserves_audio() {
 fn embeds_full_fidelity_id3_tag_with_art() {
     let audio = vec![0u8; 8];
     let art_bytes = vec![0xCAu8; 120];
-    let scan = WavScan { fmt: fmt_pcm_16bit_mono(), fact: None };
+    let scan = WavScan {
+        fmt: fmt_pcm_16bit_mono(),
+        fact: None,
+    };
     let tags = vec![
         TagInput::new("title", "Cover Test"),
         TagInput::new("albumartist", "Various"), // no INFO field -> id3 only
@@ -93,7 +102,10 @@ fn embeds_full_fidelity_id3_tag_with_art() {
     let pos = find_chunk(&bytes, b"id3 ").expect("an id3 chunk");
     let tag = id3::Tag::read_from2(Cursor::new(&bytes[pos.0..pos.0 + pos.1])).unwrap();
     assert_eq!(tag.title(), Some("Cover Test"));
-    assert_eq!(tag.get("TPE2").and_then(|f| f.content().text()), Some("Various"));
+    assert_eq!(
+        tag.get("TPE2").and_then(|f| f.content().text()),
+        Some("Various")
+    );
     let pic = tag.pictures().next().expect("a picture frame");
     assert_eq!(pic.data, art_bytes);
 }
@@ -101,8 +113,14 @@ fn embeds_full_fidelity_id3_tag_with_art() {
 #[test]
 fn emits_native_info_chunk_for_mapped_tags() {
     let audio = vec![0u8; 8];
-    let scan = WavScan { fmt: fmt_pcm_16bit_mono(), fact: None };
-    let tags = vec![TagInput::new("title", "Hello"), TagInput::new("artist", "Bob")];
+    let scan = WavScan {
+        fmt: fmt_pcm_16bit_mono(),
+        fact: None,
+    };
+    let tags = vec![
+        TagInput::new("title", "Hello"),
+        TagInput::new("artist", "Bob"),
+    ];
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[]).unwrap();
     let bytes = assemble(&layout, &audio, &[]);
 
@@ -119,7 +137,10 @@ fn emits_native_info_chunk_for_mapped_tags() {
 #[test]
 fn pads_odd_data_payload_to_word_boundary() {
     let audio = vec![0xABu8; 7]; // odd length
-    let scan = WavScan { fmt: fmt_pcm_16bit_mono(), fact: None };
+    let scan = WavScan {
+        fmt: fmt_pcm_16bit_mono(),
+        fact: None,
+    };
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &[], &[]).unwrap();
     let bytes = assemble(&layout, &audio, &[]);
     // File length is even and total_len accounts for the pad byte.
@@ -127,13 +148,21 @@ fn pads_odd_data_payload_to_word_boundary() {
     assert_eq!(bytes.len() as u64, layout.total_len());
     // The `data` chunk size field still reports the true (odd) payload length.
     let (off, _) = find_chunk(&bytes, b"data").expect("a data chunk");
-    let size = u32::from_le_bytes([bytes[off - 4], bytes[off - 3], bytes[off - 2], bytes[off - 1]]);
+    let size = u32::from_le_bytes([
+        bytes[off - 4],
+        bytes[off - 3],
+        bytes[off - 2],
+        bytes[off - 1],
+    ]);
     assert_eq!(size, 7);
 }
 
 #[test]
 fn rejects_audio_over_32bit() {
-    let scan = WavScan { fmt: fmt_pcm_16bit_mono(), fact: None };
+    let scan = WavScan {
+        fmt: fmt_pcm_16bit_mono(),
+        fact: None,
+    };
     let res = synthesize_layout(&scan, 0, (u32::MAX as u64) + 1, &[], &[]);
     assert_eq!(res, Err(musefs_format::FormatError::TooLarge));
 }
@@ -141,10 +170,15 @@ fn rejects_audio_over_32bit() {
 /// Find the first chunk with `id`, returning `(payload_offset, payload_len)`.
 /// Skips the 12-byte RIFF header when present, else starts at 0.
 fn find_chunk(buf: &[u8], id: &[u8; 4]) -> Option<(usize, usize)> {
-    let mut pos = if buf.len() >= 12 && &buf[0..4] == b"RIFF" { 12 } else { 0 };
+    let mut pos = if buf.len() >= 12 && &buf[0..4] == b"RIFF" {
+        12
+    } else {
+        0
+    };
     while pos + 8 <= buf.len() {
         let cid = &buf[pos..pos + 4];
-        let size = u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as usize;
+        let size =
+            u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as usize;
         if cid == id {
             return Some((pos + 8, size));
         }

@@ -652,7 +652,10 @@ mod resolve_ogg_tests {
         bytes.extend_from_slice(&body);
 
         let audio_offset = (bytes.len() - data.len()) as u64;
-        std::fs::File::create(path).unwrap().write_all(&bytes).unwrap();
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
         (audio_offset, data.len() as u64, data)
     }
 
@@ -685,7 +688,8 @@ mod resolve_ogg_tests {
         // to the original audio.
         let bounds = musefs_format::wav::locate_audio(&out).unwrap();
         assert_eq!(
-            &out[bounds.audio_offset as usize..(bounds.audio_offset + bounds.audio_length) as usize],
+            &out[bounds.audio_offset as usize
+                ..(bounds.audio_offset + bounds.audio_length) as usize],
             original_data.as_slice()
         );
 

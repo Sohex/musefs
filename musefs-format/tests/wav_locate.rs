@@ -46,7 +46,10 @@ fn locate_finds_data_bounds() {
 
 #[test]
 fn locate_rejects_non_wave_and_rf64() {
-    assert_eq!(locate_audio(b"not a riff file at all"), Err(FormatError::NotWav));
+    assert_eq!(
+        locate_audio(b"not a riff file at all"),
+        Err(FormatError::NotWav)
+    );
     let mut rf64 = build_wav(&[(b"fmt ", fmt_pcm_16bit_mono()), (b"data", vec![0u8; 4])]);
     rf64[0..4].copy_from_slice(b"RF64");
     assert_eq!(locate_audio(&rf64), Err(FormatError::NotWav));

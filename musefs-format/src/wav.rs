@@ -41,7 +41,8 @@ fn walk_chunks(buf: &[u8]) -> Vec<([u8; 4], usize, u64)> {
     while pos + 8 <= buf.len() {
         let mut id = [0u8; 4];
         id.copy_from_slice(&buf[pos..pos + 4]);
-        let size = u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as u64;
+        let size =
+            u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as u64;
         let payload_offset = pos + 8;
         out.push((id, payload_offset, size));
         let advance = 8u64 + size + (size & 1); // word-align: pad odd payloads
@@ -267,7 +268,8 @@ fn read_info_tags(body: &[u8]) -> Vec<(String, String)> {
     while pos + 8 <= body.len() {
         let mut id = [0u8; 4];
         id.copy_from_slice(&body[pos..pos + 4]);
-        let size = u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]]) as usize;
+        let size = u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]])
+            as usize;
         let val_start = pos + 8;
         let val_end = val_start.saturating_add(size).min(body.len());
         if let Some(key) = info_to_key(&id) {

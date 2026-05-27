@@ -364,7 +364,10 @@ mod wav_probe_tests {
         let bytes = build_wav();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("song.wav");
-        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
 
         let probed = probe(&path, &bytes).expect("wav should probe");
         assert_eq!(probed.format, Format::Wav);
@@ -376,7 +379,10 @@ mod wav_probe_tests {
         let bytes = build_wav();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("single.wav");
-        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
 
         let db = musefs_db::Db::open_in_memory().unwrap();
         let stats = crate::scan_directory(&db, &path).unwrap();
