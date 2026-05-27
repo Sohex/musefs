@@ -80,8 +80,7 @@ fn keep_cache_mount_reflects_retag_after_refresh() {
         ..Default::default()
     };
     let mountpoint = tempfile::tempdir().unwrap();
-    let session =
-        musefs_fuse::spawn_with(fs, mountpoint.path(), "musefs-keepcache", cfg).unwrap();
+    let session = musefs_fuse::spawn_with(fs, mountpoint.path(), "musefs-keepcache", cfg).unwrap();
 
     let song = mountpoint.path().join("Alice").join("Song.flac");
 
@@ -91,8 +90,7 @@ fn keep_cache_mount_reflects_retag_after_refresh() {
 
     // Verify initial tags read correctly.
     {
-        let tag =
-            metaflac::Tag::read_from(&mut std::io::Cursor::new(&original_bytes)).unwrap();
+        let tag = metaflac::Tag::read_from(&mut std::io::Cursor::new(&original_bytes)).unwrap();
         assert_eq!(
             tag.vorbis_comments()
                 .unwrap()

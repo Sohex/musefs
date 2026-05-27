@@ -32,9 +32,9 @@ pub struct FuseConfig {
     /// Caps that class of work delivered to the pool; foreground reads are
     /// bounded only by client concurrency, not by this.
     pub max_background: u16,
-    /// Keep the kernel page cache across opens (`FOPEN_KEEP_CACHE`). Safe only
-    /// for static libraries: after an external re-tag the kernel may serve stale
-    /// cached bytes until the cache is dropped (`drop_caches`) or remount.
+    /// Keep the kernel page cache across opens (`FOPEN_KEEP_CACHE`). An external
+    /// re-tag auto-invalidates the affected inode on refresh (`poll_refresh_notify`
+    /// → `inval_inode`), so cached bytes are dropped when content changes.
     pub keep_cache: bool,
 }
 
