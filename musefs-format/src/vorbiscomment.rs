@@ -41,7 +41,7 @@ fn read_u32_le(data: &[u8], pos: usize) -> Result<u32> {
 /// without a `=` are skipped. Known Vorbis field names are folded to their
 /// canonical (lowercase) key via the vocabulary; unknown fields are kept verbatim.
 /// Trailing bytes after the comment list (e.g. a Vorbis framing bit) are ignored.
-pub(crate) fn parse(body: &[u8]) -> Result<Vec<(String, String)>> {
+pub fn parse(body: &[u8]) -> Result<Vec<(String, String)>> {
     let vendor_len = read_u32_le(body, 0)? as usize;
     let mut pos = 4 + vendor_len;
     let count = read_u32_le(body, pos)? as usize;
