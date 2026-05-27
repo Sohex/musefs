@@ -268,13 +268,19 @@ impl HeaderCache {
                         &art_inputs,
                     )?,
                     Format::M4a => {
-                        // The `moov` box may sit at EOF, so the whole file is read and
-                        // parsed; the resulting layout's leading inline `head` ends in a
-                        // deliberately truncated `mdat` header whose payload is the
-                        // backing-audio tail. The generic segment server consumes the
-                        // layout as-is — it never re-parses `head` as a complete MP4.
-                        let bytes = std::fs::read(&track.backing_path)?;
-                        let scan = mp4::read_structure(&bytes)?;
+                        // Read only the structural boxes (ftyp/moov/mdat header) by
+                        // seeking — never the (potentially hundreds-of-MB) mdat payload,
+                        // which is served from the backing file at read time. The `moov`
+                        // box may sit at EOF; the streaming reader skips the mdat payload
+                        // to reach it. The resulting layout's leading inline `head` ends
+                        // in a deliberately truncated `mdat` header whose payload is the
+                        // backing-audio tail.
+                        let mut f = std::fs::File::open(&track.backing_path)?;
+                        let len = f.metadata()?.len();
+                        let scan = mp4::read_structure_from(&mut f, len).map_err(|e| match e {
+                            mp4::Mp4ScanError::Io(io) => CoreError::Io(io),
+                            mp4::Mp4ScanError::Format(fe) => CoreError::Format(fe),
+                        })?;
                         mp4::synthesize_layout(&scan, &inputs, &art_inputs)?
                     }
                     Format::Opus | Format::Vorbis | Format::OggFlac => {
