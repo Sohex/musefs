@@ -1,4 +1,6 @@
 use crate::error::{FormatError, Result};
+use crate::input::EmbeddedPicture;
+use std::collections::HashSet;
 
 /// The served audio bounds of a WAV: the `data` chunk's payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,4 +234,87 @@ pub fn synthesize_layout(
     segments.insert(0, Segment::Inline(header));
 
     Ok(RegionLayout::new(segments))
+}
+
+/// RIFF `INFO` subchunk FourCC -> canonical (lowercase) tag key. Inverse of
+/// `info_fourcc`.
+fn info_to_key(id: &[u8; 4]) -> Option<&'static str> {
+    Some(match id {
+        b"INAM" => "title",
+        b"IART" => "artist",
+        b"IPRD" => "album",
+        b"ICRD" => "date",
+        b"IGNR" => "genre",
+        b"ICMT" => "comment",
+        b"ITRK" => "tracknumber",
+        _ => return None,
+    })
+}
+
+/// Find the embedded ID3v2 tag chunk payload, accepting `id3 ` or `ID3 ` casing.
+fn find_id3_chunk<'a>(buf: &'a [u8], chunks: &[([u8; 4], usize, u64)]) -> Option<&'a [u8]> {
+    let &(_, off, len) = chunks
+        .iter()
+        .find(|(id, _, _)| id == b"id3 " || id == b"ID3 ")?;
+    chunk_slice(buf, off, len)
+}
+
+/// Parse `LIST`/`INFO` subchunks into canonical `(key, value)` pairs. `body` is the
+/// INFO payload after the leading `"INFO"` FourCC.
+fn read_info_tags(body: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 8 <= body.len() {
+        let mut id = [0u8; 4];
+        id.copy_from_slice(&body[pos..pos + 4]);
+        let size = u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]]) as usize;
+        let val_start = pos + 8;
+        let val_end = val_start.saturating_add(size).min(body.len());
+        if let Some(key) = info_to_key(&id) {
+            let raw = String::from_utf8_lossy(&body[val_start..val_end]);
+            let value = raw.trim_end_matches('\0').to_string();
+            if !value.is_empty() {
+                out.push((key.to_string(), value));
+            }
+        }
+        pos = val_start + size + (size & 1);
+    }
+    out
+}
+
+/// Read WAV tags for scan-time seeding: an embedded `id3 ` chunk (full ID3v2) and a
+/// `LIST`/`INFO` chunk, merged per field with id3 taking precedence and INFO filling
+/// gaps. Walks chunk headers without reading the `data` payload.
+pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
+    let chunks = walk_chunks(buf);
+
+    let from_id3 = find_id3_chunk(buf, &chunks)
+        .map(crate::mp3::read_tags)
+        .unwrap_or_default();
+
+    let from_info = chunks
+        .iter()
+        .find(|(id, _, _)| id == b"LIST")
+        .and_then(|&(_, off, len)| chunk_slice(buf, off, len))
+        .filter(|slice| slice.len() >= 4 && &slice[0..4] == b"INFO")
+        .map(|slice| read_info_tags(&slice[4..]))
+        .unwrap_or_default();
+
+    let id3_keys: HashSet<&str> = from_id3.iter().map(|(k, _)| k.as_str()).collect();
+    let mut out = from_id3.clone();
+    for (k, v) in from_info {
+        if !id3_keys.contains(k.as_str()) {
+            out.push((k, v));
+        }
+    }
+    out
+}
+
+/// Read embedded pictures for scan-time art ingestion. Pictures live only in the
+/// embedded `id3 ` chunk (INFO has no picture mechanism).
+pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
+    let chunks = walk_chunks(buf);
+    find_id3_chunk(buf, &chunks)
+        .map(crate::mp3::read_pictures)
+        .unwrap_or_default()
 }
