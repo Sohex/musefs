@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime};
 use threadpool::ThreadPool;
 
 use fuser::{
-    BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
+    BackgroundSession, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
 };
 use musefs_core::Attr;
 use musefs_core::CoreError;
@@ -140,6 +140,20 @@ impl MusefsFs {
 }
 
 impl Filesystem for MusefsFs {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+        // All tuning is best-effort and must never abort the mount: the setters
+        // clamp to the kernel-supported range (returning the nearest legal value
+        // on Err), so we discard their results.
+        let _ = config.set_max_readahead(self.config.max_readahead);
+        let _ = config.set_max_background(self.config.max_background);
+        // `add_capabilities` is all-or-nothing — a single unsupported bit drops
+        // the rest — so request them individually. ASYNC_READ is already on by
+        // default; PARALLEL_DIROPS may be unsupported on older kernels (ignored).
+        let _ = config.add_capabilities(fuser::consts::FUSE_ASYNC_READ);
+        let _ = config.add_capabilities(fuser::consts::FUSE_PARALLEL_DIROPS);
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         {
             let core = Arc::clone(&self.core);
