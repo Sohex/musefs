@@ -29,15 +29,13 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case(ext))
-        == Some(true)
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
 /// True if `path` has an extension for a format the scanner can probe.
@@ -208,12 +206,9 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     };
     for path in files {
         let bytes = std::fs::read(&path)?;
-        let probed = match probe(&path, &bytes) {
-            Some(p) => p,
-            None => {
-                stats.skipped += 1;
-                continue;
-            }
+        let Some(probed) = probe(&path, &bytes) else {
+            stats.skipped += 1;
+            continue;
         };
         let meta = std::fs::metadata(&path)?;
         let abs = std::fs::canonicalize(&path)?;

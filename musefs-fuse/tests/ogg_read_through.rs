@@ -26,8 +26,7 @@ fn make_fixture(path: &std::path::Path, codec_args: &[&str]) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
         && path.exists()
 }
 
@@ -157,7 +156,7 @@ fn make_fixture_with_cover(
     cmd.arg(&out)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let ok = cmd.status().map(|s| s.success()).unwrap_or(false) && out.exists();
+    let ok = cmd.status().is_ok_and(|s| s.success()) && out.exists();
     if ok {
         Some((out, png.to_vec()))
     } else {

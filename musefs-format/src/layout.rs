@@ -33,10 +33,10 @@ impl Segment {
     pub fn len(&self) -> u64 {
         match self {
             Segment::Inline(b) => b.len() as u64,
-            Segment::ArtImage { len, .. } => *len,
-            Segment::BackingAudio { len, .. } => *len,
-            Segment::OggAudio { len, .. } => *len,
-            Segment::OggArtSlice { len, .. } => *len,
+            Segment::ArtImage { len, .. }
+            | Segment::BackingAudio { len, .. }
+            | Segment::OggAudio { len, .. }
+            | Segment::OggArtSlice { len, .. } => *len,
         }
     }
 
@@ -72,7 +72,7 @@ impl RegionLayout {
         self.segments
             .iter()
             .filter(|s| !matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }))
-            .map(|s| s.len())
+            .map(Segment::len)
             .sum()
     }
 }

@@ -78,7 +78,7 @@ fn end_to_end_read_through_mount() {
         tag.vorbis_comments()
             .unwrap()
             .get("TITLE")
-            .map(|v| v.as_slice()),
+            .map(std::vec::Vec::as_slice),
         Some(["Song".to_string()].as_slice())
     );
 

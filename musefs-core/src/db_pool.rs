@@ -52,8 +52,10 @@ impl DbPool {
     /// inside a `with` closure on the `Shared` variant (it would deadlock).
     pub fn with_poll<R>(&self, f: impl FnOnce(&Db) -> Result<R>) -> Result<R> {
         match self {
-            DbPool::PerThread { poll, .. } => f(&poll.lock().unwrap_or_else(|p| p.into_inner())),
-            DbPool::Shared(m) => f(&m.lock().unwrap_or_else(|p| p.into_inner())),
+            DbPool::PerThread { poll, .. } => f(&poll
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)),
+            DbPool::Shared(m) => f(&m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)),
         }
     }
 
@@ -71,7 +73,7 @@ impl DbPool {
                 f(slot.as_ref().unwrap())
             }),
             DbPool::Shared(m) => {
-                let db = m.lock().unwrap_or_else(|p| p.into_inner());
+                let db = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 f(&db)
             }
         }

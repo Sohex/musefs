@@ -117,8 +117,7 @@ fn comment_body(codec: Codec, packet: &[u8]) -> Result<&[u8]> {
 /// The index of the comment packet within the reassembled header packets.
 fn comment_packet_index(header: &OggHeader) -> usize {
     match header.codec {
-        Codec::Opus => 1,
-        Codec::Vorbis => 1,
+        Codec::Opus | Codec::Vorbis => 1,
         // OggFLAC: packet 0 is the mapping header; the VORBIS_COMMENT block is
         // whichever following packet has block type 4.
         Codec::OggFlac => header
@@ -127,8 +126,7 @@ fn comment_packet_index(header: &OggHeader) -> usize {
             .enumerate()
             .skip(1)
             .find(|(_, p)| !p.is_empty() && (p[0] & 0x7F) == 4)
-            .map(|(i, _)| i)
-            .unwrap_or(0),
+            .map_or(0, |(i, _)| i),
     }
 }
 
@@ -554,7 +552,7 @@ mod tests {
         id.push(2); // channels
         id.extend_from_slice(&44100u32.to_le_bytes()); // sample rate
         id.extend_from_slice(&0u32.to_le_bytes()); // bitrate max
-        id.extend_from_slice(&128000u32.to_le_bytes()); // nominal
+        id.extend_from_slice(&128_000u32.to_le_bytes()); // nominal
         id.extend_from_slice(&0u32.to_le_bytes()); // min
         id.push(0xB8); // blocksizes
         id.push(0x01); // framing bit
@@ -627,7 +625,7 @@ mod tests {
         body.extend_from_slice(&(crate::vorbiscomment::VENDOR.len() as u32).to_le_bytes());
         body.extend_from_slice(crate::vorbiscomment::VENDOR.as_bytes());
         body.extend_from_slice(&1u32.to_le_bytes()); // one comment
-        let comment = format!("METADATA_BLOCK_PICTURE={}", b64);
+        let comment = format!("METADATA_BLOCK_PICTURE={b64}");
         body.extend_from_slice(&(comment.len() as u32).to_le_bytes());
         body.extend_from_slice(comment.as_bytes());
 

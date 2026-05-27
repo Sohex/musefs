@@ -34,9 +34,8 @@ fn riff_wave_start(buf: &[u8]) -> Result<usize> {
 /// front-only buffer.
 fn walk_chunks(buf: &[u8]) -> Vec<([u8; 4], usize, u64)> {
     let mut out = Vec::new();
-    let mut pos = match riff_wave_start(buf) {
-        Ok(p) => p,
-        Err(_) => return out,
+    let Ok(mut pos) = riff_wave_start(buf) else {
+        return out;
     };
     while pos + 8 <= buf.len() {
         let mut id = [0u8; 4];

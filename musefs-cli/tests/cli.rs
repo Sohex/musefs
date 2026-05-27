@@ -11,7 +11,7 @@ fn parses_scan_and_mount_invocations() {
             assert_eq!(backing_dir.to_str(), Some("/music"));
             assert_eq!(db.to_str(), Some("/tmp/m.db"));
         }
-        _ => panic!("expected scan"),
+        Command::Mount { .. } => panic!("expected scan"),
     }
 
     let cli = Cli::parse_from([
@@ -36,7 +36,7 @@ fn parses_scan_and_mount_invocations() {
             assert_eq!(template, "$album/$title");
             assert_eq!(default_fallback, "Unknown"); // default applied
         }
-        _ => panic!("expected mount"),
+        Command::Scan { .. } => panic!("expected mount"),
     }
 }
 
@@ -55,7 +55,7 @@ fn parses_mode_and_revalidate_flags() {
     ]);
     match cli.command {
         Command::Mount { mode, .. } => assert_eq!(mode, CliMode::StructureOnly),
-        _ => panic!("expected mount"),
+        Command::Scan { .. } => panic!("expected mount"),
     }
 
     // Mode defaults to synthesis; tuning knobs have conservative defaults.
@@ -77,7 +77,7 @@ fn parses_mode_and_revalidate_flags() {
             assert_eq!(max_background, 64); // default
             assert!(!keep_cache); // default off
         }
-        _ => panic!("expected mount"),
+        Command::Scan { .. } => panic!("expected mount"),
     }
 
     // Tuning flags parse to their given values.
@@ -112,7 +112,7 @@ fn parses_mode_and_revalidate_flags() {
             assert_eq!(max_background, 128);
             assert!(keep_cache);
         }
-        _ => panic!("expected mount"),
+        Command::Scan { .. } => panic!("expected mount"),
     }
 
     // Scan --revalidate flag.
@@ -126,11 +126,11 @@ fn parses_mode_and_revalidate_flags() {
     ]);
     match cli.command {
         Command::Scan { revalidate, .. } => assert!(revalidate),
-        _ => panic!("expected scan"),
+        Command::Mount { .. } => panic!("expected scan"),
     }
     let cli = Cli::parse_from(["musefs", "scan", "/music", "--db", "/tmp/m.db"]);
     match cli.command {
         Command::Scan { revalidate, .. } => assert!(!revalidate),
-        _ => panic!("expected scan"),
+        Command::Mount { .. } => panic!("expected scan"),
     }
 }

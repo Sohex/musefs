@@ -244,7 +244,7 @@ pub(crate) fn lace_chunks_to_segments(
     bos: bool,
     chunks: &[PayloadChunk],
 ) -> (Vec<Segment>, u32) {
-    let total: usize = chunks.iter().map(|c| c.out_len()).sum();
+    let total: usize = chunks.iter().map(PayloadChunk::out_len).sum();
     let laces = lacing_values(total);
 
     let mut segments: Vec<Segment> = Vec::new();

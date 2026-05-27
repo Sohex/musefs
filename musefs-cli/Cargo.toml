@@ -17,3 +17,6 @@ musefs-fuse = { path = "../musefs-fuse" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

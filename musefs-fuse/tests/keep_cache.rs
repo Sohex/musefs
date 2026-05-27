@@ -95,7 +95,7 @@ fn keep_cache_mount_reflects_retag_after_refresh() {
             tag.vorbis_comments()
                 .unwrap()
                 .get("TITLE")
-                .map(|v| v.as_slice()),
+                .map(std::vec::Vec::as_slice),
             Some(["Song".to_string()].as_slice())
         );
     }
@@ -153,7 +153,7 @@ fn keep_cache_mount_reflects_retag_after_refresh() {
         tag.vorbis_comments()
             .unwrap()
             .get("ALBUM")
-            .map(|v| v.as_slice()),
+            .map(std::vec::Vec::as_slice),
         Some(["Rev".to_string()].as_slice()),
         "synthesized FLAC should contain the new album tag"
     );

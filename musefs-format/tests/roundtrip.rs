@@ -63,15 +63,15 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
 
     let vc = tag.vorbis_comments().expect("vorbis comments");
     assert_eq!(
-        vc.get("TITLE").map(|v| v.as_slice()),
+        vc.get("TITLE").map(std::vec::Vec::as_slice),
         Some(["Real Title".to_string()].as_slice())
     );
     assert_eq!(
-        vc.get("ALBUM").map(|v| v.as_slice()),
+        vc.get("ALBUM").map(std::vec::Vec::as_slice),
         Some(["Real Album".to_string()].as_slice())
     );
     assert_eq!(
-        vc.get("ARTIST").map(|v| v.as_slice()),
+        vc.get("ARTIST").map(std::vec::Vec::as_slice),
         Some(["Alice".to_string(), "Bob".to_string()].as_slice())
     );
 

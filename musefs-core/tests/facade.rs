@@ -58,7 +58,7 @@ fn lookup_getattr_readdir_and_read_through_the_facade() {
         tag.vorbis_comments()
             .unwrap()
             .get("TITLE")
-            .map(|v| v.as_slice()),
+            .map(std::vec::Vec::as_slice),
         Some(["Song".to_string()].as_slice())
     );
 }
@@ -72,7 +72,7 @@ fn parent_exposes_the_tree_hierarchy() {
     let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
     assert_eq!(fs.parent(artist), Some(VirtualTree::ROOT));
     assert_eq!(fs.parent(VirtualTree::ROOT), Some(VirtualTree::ROOT));
-    assert_eq!(fs.parent(424242), None);
+    assert_eq!(fs.parent(424_242), None);
 }
 
 #[test]
@@ -103,8 +103,8 @@ fn readdir_distinguishes_a_file_from_an_unknown_inode() {
         Err(CoreError::NotADir(i)) => assert_eq!(i, file),
         other => panic!("expected NotADir, got {other:?}"),
     }
-    match fs.readdir(987654) {
-        Err(CoreError::NoEntry(i)) => assert_eq!(i, 987654),
+    match fs.readdir(987_654) {
+        Err(CoreError::NoEntry(i)) => assert_eq!(i, 987_654),
         other => panic!("expected NoEntry, got {other:?}"),
     }
 }
@@ -428,7 +428,7 @@ fn poll_refresh_debounces_within_interval() {
         .unwrap();
     }
     let cfg = MountConfig {
-        poll_interval: std::time::Duration::from_secs(3600),
+        poll_interval: std::time::Duration::from_hours(1),
         ..config()
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
@@ -505,13 +505,7 @@ fn poll_refresh_single_flights_concurrent_callers() {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let fs = Arc::clone(&fs);
-                s.spawn(move || {
-                    if fs.poll_refresh().unwrap() {
-                        1usize
-                    } else {
-                        0
-                    }
-                })
+                s.spawn(move || usize::from(fs.poll_refresh().unwrap()))
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).sum()

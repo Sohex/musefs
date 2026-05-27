@@ -238,9 +238,8 @@ fn frame_to_key(id: &str) -> Option<&'static str> {
 /// Extract all APIC pictures from an MP3's ID3v2 tag as embedded pictures, for
 /// scan-time art ingestion. Returns empty if there is no tag or no pictures.
 pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
-    let tag = match id3::Tag::read_from2(std::io::Cursor::new(data)) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
+    let Ok(tag) = id3::Tag::read_from2(std::io::Cursor::new(data)) else {
+        return Vec::new();
     };
     tag.pictures()
         .map(|p| EmbeddedPicture {
@@ -258,9 +257,8 @@ pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
 /// canonical `(key, value)` pairs (keys lowercase). NUL-separated multi-value
 /// frames yield one pair per value. Returns empty if there is no ID3v2 tag.
 pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
-    let tag = match id3::Tag::read_from2(std::io::Cursor::new(data)) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
+    let Ok(tag) = id3::Tag::read_from2(std::io::Cursor::new(data)) else {
+        return Vec::new();
     };
     let mut out = Vec::new();
     for frame in tag.frames() {

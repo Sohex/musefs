@@ -1,3 +1,28 @@
 [workspace]
 resolver = "2"
 members = ["musefs-db", "musefs-format", "musefs-core", "musefs-fuse", "musefs-cli"]
+
+# Curated clippy policy: pedantic on, minus the groups that are intentional or
+# stylistic in this codebase. Inherited by each crate via `[lints] workspace = true`.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# Explicit `as` casts are deliberate throughout the byte/offset arithmetic
+# (audio bounds, chunk sizes, FUSE inode/size fields); flagging every one is noise.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+
+# Doc conventions this project does not adopt.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+
+# Opinionated; not adopted.
+must_use_candidate = "allow"
+too_many_lines = "allow"        # function-length lint; not worth refactoring for
+similar_names = "allow"         # flags legitimately-distinct nearby bindings
+inline_always = "allow"         # a few deliberate hot-path annotations
+trivially_copy_pass_by_ref = "allow" # `&[u8; 4]` FourCCs read better than `*b"..."` call sites
+items_after_statements = "allow"     # helper structs/consts defined adjacent to their use

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# musefs pre-commit hook: formatting + curated clippy gate.
+#
+# Canonical (version-controlled) copy. `.git/hooks/pre-commit` symlinks here so
+# the hook is active locally. To enable in a fresh clone, run one of:
+#   ln -sf ../../.githooks/pre-commit .git/hooks/pre-commit
+#   git config core.hooksPath .githooks
+#
+# The clippy lint policy (pedantic, minus intentional/noisy groups) lives in the
+# root Cargo.toml under [workspace.lints]; this hook just denies any warning.
+set -euo pipefail
+
+echo "pre-commit: cargo fmt --check"
+if ! cargo fmt --all -- --check; then
+    echo "✗ formatting: run 'cargo fmt' and re-stage." >&2
+    exit 1
+fi
+
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+if ! cargo clippy --all-targets --quiet -- -D warnings; then
+    echo "✗ clippy: fix the warnings above and re-stage." >&2
+    exit 1
+fi
+
+echo "✓ pre-commit checks passed"

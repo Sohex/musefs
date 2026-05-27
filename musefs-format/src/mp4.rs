@@ -139,9 +139,8 @@ fn find_path(buf: &[u8], path: &[&[u8; 4]]) -> Result<Option<(usize, usize)>> {
     let mut last = None;
     for kind in path {
         let region = &buf[base..];
-        let b = match find_box(region, kind)? {
-            Some(b) => b,
-            None => return Ok(None),
+        let Some(b) = find_box(region, kind)? else {
+            return Ok(None);
         };
         let ps = base + b.payload_start();
         last = Some((ps, b.total_len - b.header_len));
@@ -340,17 +339,15 @@ fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
 /// Lenient: returns empty / skips any malformed atom and never errors — this only
 /// seeds metadata from existing files, so a missing or garbled tag must simply be absent.
 pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
-    let (start, len) = match ilst_region(buf) {
-        Some(r) => r,
-        None => return Vec::new(),
+    let Some((start, len)) = ilst_region(buf) else {
+        return Vec::new();
     };
     let ilst = &buf[start..start + len];
     let mut out = Vec::new();
     for atom in child_boxes(ilst).unwrap_or_default() {
         let inner = atom.payload(ilst);
-        let data = match find_box(inner, b"data") {
-            Ok(Some(d)) => d,
-            _ => continue,
+        let Ok(Some(data)) = find_box(inner, b"data") else {
+            continue;
         };
         let dp = data.payload(inner);
         if dp.len() < 8 {
@@ -379,9 +376,8 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
 /// Lenient: returns empty / skips any malformed atom and never errors — this only
 /// seeds cover art from existing files, so a missing or garbled picture must simply be absent.
 pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
-    let (start, len) = match ilst_region(buf) {
-        Some(r) => r,
-        None => return Vec::new(),
+    let Some((start, len)) = ilst_region(buf) else {
+        return Vec::new();
     };
     let ilst = &buf[start..start + len];
     let mut out = Vec::new();
@@ -390,9 +386,8 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
             continue;
         }
         let inner = atom.payload(ilst);
-        let data = match find_box(inner, b"data") {
-            Ok(Some(d)) => d,
-            _ => continue,
+        let Ok(Some(data)) = find_box(inner, b"data") else {
+            continue;
         };
         let dp = data.payload(inner);
         if dp.len() < 8 {
@@ -497,7 +492,7 @@ fn build_udta(tags: &[TagInput], art: Option<&ArtInput>) -> Result<(Vec<u8>, u64
     hdlr_body.extend_from_slice(&[0u8; 9]);
     let hdlr = boxed(b"hdlr", &hdlr_body);
 
-    let art_len = art.map(|a| a.data_len).unwrap_or(0);
+    let art_len = art.map_or(0, |a| a.data_len);
 
     if let Some(a) = art {
         let type_code: u32 = if a.mime == "image/png" { 14 } else { 13 };
