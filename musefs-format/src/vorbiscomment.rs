@@ -8,14 +8,17 @@ use crate::input::TagInput;
 pub(crate) const VENDOR: &str = "musefs";
 
 /// Build a VorbisComment body: vendor string then count then `KEY=value` comments.
-/// Lengths are 32-bit little-endian; keys are upper-cased.
+/// Lengths are 32-bit little-endian. Known canonical keys are mapped to their
+/// Vorbis field name via the vocabulary; unknown keys are upper-cased.
 pub(crate) fn build(tags: &[TagInput]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(VENDOR.len() as u32).to_le_bytes());
     out.extend_from_slice(VENDOR.as_bytes());
     out.extend_from_slice(&(tags.len() as u32).to_le_bytes());
     for t in tags {
-        let comment = format!("{}={}", t.key.to_ascii_uppercase(), t.value);
+        let field = crate::tagmap::key_to_vorbis(&t.key)
+            .map_or_else(|| t.key.to_ascii_uppercase(), str::to_string);
+        let comment = format!("{field}={}", t.value);
         out.extend_from_slice(&(comment.len() as u32).to_le_bytes());
         out.extend_from_slice(comment.as_bytes());
     }
@@ -34,9 +37,10 @@ fn read_u32_le(data: &[u8], pos: usize) -> Result<u32> {
     ]))
 }
 
-/// Parse a VorbisComment body into `(FIELD, value)` pairs in order. Comments
-/// without a `=` are skipped. Trailing bytes after the comment list (e.g. a Vorbis
-/// framing bit) are ignored.
+/// Parse a VorbisComment body into `(key, value)` pairs in order. Comments
+/// without a `=` are skipped. Known Vorbis field names are folded to their
+/// canonical (lowercase) key via the vocabulary; unknown fields are kept verbatim.
+/// Trailing bytes after the comment list (e.g. a Vorbis framing bit) are ignored.
 pub(crate) fn parse(body: &[u8]) -> Result<Vec<(String, String)>> {
     let vendor_len = read_u32_le(body, 0)? as usize;
     let mut pos = 4 + vendor_len;
@@ -52,7 +56,9 @@ pub(crate) fn parse(body: &[u8]) -> Result<Vec<(String, String)>> {
         }
         let comment = std::str::from_utf8(&body[pos..end]).map_err(|_| FormatError::Malformed)?;
         if let Some((field, value)) = comment.split_once('=') {
-            out.push((field.to_string(), value.to_string()));
+            let key = crate::tagmap::vorbis_to_key(field)
+                .map_or_else(|| field.to_string(), str::to_string);
+            out.push((key, value.to_string()));
         }
         pos = end;
     }
@@ -75,9 +81,23 @@ mod tests {
         assert_eq!(
             parsed,
             vec![
-                ("ARTIST".to_string(), "Boards of Canada".to_string()),
-                ("TITLE".to_string(), "Roygbiv".to_string()),
+                ("artist".to_string(), "Boards of Canada".to_string()),
+                ("title".to_string(), "Roygbiv".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn parse_canonicalizes_known_fields_and_preserves_unknown() {
+        let tags = vec![
+            TagInput::new("albumartist", "VA"),
+            TagInput::new("custom_thing", "x"),
+        ];
+        let body = build(&tags);
+        let parsed = parse(&body).unwrap();
+        // build upper-cases unknown keys; parse folds known fields to canonical,
+        // keeps unknown verbatim.
+        assert_eq!(parsed[0], ("albumartist".to_string(), "VA".to_string()));
+        assert_eq!(parsed[1], ("CUSTOM_THING".to_string(), "x".to_string()));
     }
 }

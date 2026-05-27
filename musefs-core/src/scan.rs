@@ -146,8 +146,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
 
     let mut tags = Vec::new();
     let mut ordinals: HashMap<String, i64> = HashMap::new();
-    for (field, value) in probed.tags {
-        let key = field.to_lowercase();
+    for (key, value) in probed.tags {
         let ord = ordinals.entry(key.clone()).or_insert(0);
         tags.push(Tag::new(&key, &value, *ord));
         *ord += 1;

@@ -68,6 +68,38 @@ within each file. Editing happens there; the mounted view reflects it.
   `--keep-cache`, an external re-tag automatically drops the affected kernel page
   cache, so cached bytes never go stale.
 
+## Tag handling
+
+musefs preserves the tags it reads from a backing file when it synthesizes the
+served file (always in the same format — it never converts between formats).
+
+**Round-trips losslessly:**
+
+- All text tags. Common fields use a shared canonical vocabulary (so
+  `$albumartist`, `$date`, etc. work the same regardless of source format);
+  everything else round-trips through the format's extension slot — ID3 `TXXX`,
+  MP4 `----` freeform, or a raw Vorbis field — keyed by its own name. Unmapped
+  standard ID3 text frames round-trip by their frame id.
+- Comments and lyrics (text content).
+- User-defined keys keep their original casing (e.g. `MusicBrainz Album Id`).
+
+**Known limitations (lossy edges):**
+
+- All ID3v2.x tags are normalized to **ID3v2.4** on synthesis. Legacy date
+  frames (`TYER`, `TDAT`) fold to `date` and are re-emitted as `TDRC`.
+- ID3 `COMM`/`USLT` language code and short description are not preserved; they
+  are written back with language `XXX` and an empty description. Multiple
+  comments/lyrics distinguished only by those collapse to one.
+- MP4 `----` `mean` is normalized to `com.apple.iTunes` on write.
+- Binary / extended frames are **not** round-tripped and are dropped on scan:
+  ID3 `POPM` (ratings), `UFID`, and other non-text frames; MP4 binary atoms
+  beyond `trkn`/`disk` (e.g. `tmpo`, `cpil`). Embedded cover art is handled by a
+  separate dedicated path, not the tag path.
+- Multi-value MP4 `----` freeform tags round-trip only their first value.
+- If several source tags map to one canonical key (e.g. a `TXXX` whose
+  description is `comment` alongside a real `COMM` frame), they merge into a
+  single multi-value tag and are re-emitted via that key's native slot.
+
 ## Requirements
 
 - Rust (2021 edition) and Cargo.

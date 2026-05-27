@@ -15,10 +15,13 @@ pub(crate) fn tags_to_inputs(tags: &[Tag]) -> Vec<TagInput> {
 
 /// Build the field map used for path-template rendering: the first value (lowest
 /// ordinal) of each key. Relies on `Db::get_tags` ordering by `(key, ordinal)`.
+/// Keys are ASCII-lowercased so a `$field` placeholder resolves regardless of the
+/// stored key's case (unlike `tags_to_inputs`, which passes keys verbatim to synthesis).
 pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for t in tags {
-        map.entry(t.key.clone()).or_insert_with(|| t.value.clone());
+        map.entry(t.key.to_ascii_lowercase())
+            .or_insert_with(|| t.value.clone());
     }
     map
 }
@@ -94,5 +97,16 @@ mod tests {
         let fields = tags_to_fields(&tags);
         assert_eq!(fields.get("artist").map(String::as_str), Some("Alice"));
         assert_eq!(fields.get("album").map(String::as_str), Some("X"));
+    }
+
+    #[test]
+    fn tags_to_fields_lowercases_keys_for_template_lookup() {
+        let tags = vec![
+            Tag::new("MyRating", "5", 0), // verbatim user-defined key
+            Tag::new("albumartist", "VA", 0),
+        ];
+        let fields = tags_to_fields(&tags);
+        assert_eq!(fields.get("myrating").map(String::as_str), Some("5"));
+        assert_eq!(fields.get("albumartist").map(String::as_str), Some("VA"));
     }
 }

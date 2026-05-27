@@ -308,19 +308,6 @@ pub fn read_structure_from<R: Read + Seek>(
     })
 }
 
-fn atom_to_key(kind: &[u8; 4]) -> Option<&'static str> {
-    Some(match kind {
-        b"\xa9nam" => "title",
-        b"\xa9ART" => "artist",
-        b"aART" => "albumartist",
-        b"\xa9alb" => "album",
-        b"\xa9gen" => "genre",
-        b"\xa9day" => "date",
-        b"\xa9wrt" => "composer",
-        _ => return None,
-    })
-}
-
 /// Locate `moov/udta/meta/ilst`; `meta` is a FullBox (4 version/flags bytes before
 /// its children). Returns the ilst payload range absolute within `buf`.
 fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
@@ -336,8 +323,47 @@ fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
     Some((start, il.total_len - il.header_len))
 }
 
+/// Parse a `----` freeform atom payload into `(key, value)`. Folds (mean, name)
+/// to a canonical key via the vocabulary, else keys on the verbatim `name`. Only
+/// the first `data` atom is read (multi-value freeform is rare). None if malformed.
+fn read_freeform(inner: &[u8]) -> Option<(String, String)> {
+    let name_box = find_box(inner, b"name").ok()??;
+    let data_box = find_box(inner, b"data").ok()??;
+    let np = name_box.payload(inner);
+    let dp = data_box.payload(inner);
+    if np.len() < 4 || dp.len() < 8 {
+        return None;
+    }
+    // The `data` box is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text.
+    // Binary-typed freeform values are not text tags, so skip them.
+    let type_code = u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]);
+    if type_code != 1 {
+        return None;
+    }
+    // name/mean payloads start with a 4-byte FullBox [version 1][flags 3] prefix.
+    let name = std::str::from_utf8(&np[4..]).ok()?;
+    let value = std::str::from_utf8(&dp[8..]).ok()?;
+    let mean = find_box(inner, b"mean")
+        .ok()
+        .flatten()
+        .map_or("com.apple.iTunes", |m| {
+            let p = m.payload(inner);
+            if p.len() >= 4 {
+                std::str::from_utf8(&p[4..]).unwrap_or("com.apple.iTunes")
+            } else {
+                "com.apple.iTunes"
+            }
+        });
+    let key = crate::tagmap::mp4_freeform_to_key(mean, name)
+        .map_or_else(|| name.to_string(), str::to_string);
+    Some((key, value.to_string()))
+}
+
 /// Lenient: returns empty / skips any malformed atom and never errors — this only
-/// seeds metadata from existing files, so a missing or garbled tag must simply be absent.
+/// seeds metadata from existing files, so a missing or garbled tag must simply be
+/// absent. Text atoms map via the vocabulary; `trkn`/`disk` yield track/disc
+/// numbers; `----` freeform atoms key on their name (folded when known). Other
+/// atoms are skipped.
 pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     let Some((start, len)) = ilst_region(buf) else {
         return Vec::new();
@@ -346,6 +372,12 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for atom in child_boxes(ilst).unwrap_or_default() {
         let inner = atom.payload(ilst);
+        if &atom.kind == b"----" {
+            if let Some(pair) = read_freeform(inner) {
+                out.push(pair);
+            }
+            continue;
+        }
         let Ok(Some(data)) = find_box(inner, b"data") else {
             continue;
         };
@@ -354,7 +386,7 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
             continue;
         }
         let value = &dp[8..]; // skip [type 4][locale 4]
-        if let Some(key) = atom_to_key(&atom.kind) {
+        if let Some(key) = crate::tagmap::mp4_atom_to_key(&atom.kind) {
             if let Ok(s) = std::str::from_utf8(value) {
                 out.push((key.to_string(), s.to_string()));
             }
@@ -442,47 +474,53 @@ fn number_atom(kind: &[u8; 4], n: u16, width: usize) -> Vec<u8> {
     boxed(kind, &boxed(b"data", &data))
 }
 
-fn meta_key(key: &str) -> Option<&'static [u8; 4]> {
-    Some(match key {
-        "title" => b"\xa9nam",
-        "artist" => b"\xa9ART",
-        "albumartist" => b"aART",
-        "album" => b"\xa9alb",
-        "genre" => b"\xa9gen",
-        "date" => b"\xa9day",
-        "composer" => b"\xa9wrt",
-        _ => return None,
-    })
+/// Emit a `----` freeform atom: a `mean` and `name` sub-box (each with a 4-byte
+/// FullBox prefix) followed by one UTF-8 `data` sub-box per value. Note that the
+/// scan path (`read_freeform`) only recovers the first value on read-back, so
+/// multi-value freeform tags round-trip only their first value.
+fn freeform_atom(mean: &str, name: &str, values: &[&str]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    let mut mean_body = 0u32.to_be_bytes().to_vec(); // version/flags
+    mean_body.extend_from_slice(mean.as_bytes());
+    inner.extend(boxed(b"mean", &mean_body));
+    let mut name_body = 0u32.to_be_bytes().to_vec();
+    name_body.extend_from_slice(name.as_bytes());
+    inner.extend(boxed(b"name", &name_body));
+    for v in values {
+        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data.extend_from_slice(v.as_bytes());
+        inner.extend(boxed(b"data", &data));
+    }
+    boxed(b"----", &inner)
 }
 
 /// Build `udta` up to (not including) the cover image bytes. Returns (prefix,
 /// art_len). No art → prefix is the complete udta, art_len 0. All enclosing box
 /// sizes include art_len so the image can stream right after the prefix.
 fn build_udta(tags: &[TagInput], art: Option<&ArtInput>) -> Result<(Vec<u8>, u64)> {
-    // Group consecutive same-key text values (DB returns tags ordered by key).
-    let mut text: Vec<(&str, Vec<&str>)> = Vec::new();
+    // Group consecutive same-key values (the DB returns tags ordered by key).
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
     for t in tags {
-        if meta_key(&t.key).is_some() {
-            match text.last_mut() {
-                Some(g) if g.0 == t.key => g.1.push(&t.value),
-                _ => text.push((&t.key, vec![&t.value])),
-            }
+        match groups.last_mut() {
+            Some(g) if g.0 == t.key => g.1.push(&t.value),
+            _ => groups.push((&t.key, vec![&t.value])),
         }
     }
 
     let mut ilst = Vec::new();
-    for (key, values) in &text {
-        ilst.extend(text_atom(meta_key(key).unwrap(), values));
-    }
-    for t in tags {
-        if t.key == "tracknumber" {
-            if let Ok(n) = t.value.parse::<u16>() {
-                ilst.extend(number_atom(b"trkn", n, 8));
+    for (key, values) in &groups {
+        match crate::tagmap::key_to_mp4(key) {
+            Some(crate::tagmap::Mp4Slot::Text(atom)) => ilst.extend(text_atom(atom, values)),
+            Some(crate::tagmap::Mp4Slot::Number(atom, width)) => {
+                if let Ok(n) = values.first().copied().unwrap_or("").parse::<u16>() {
+                    ilst.extend(number_atom(atom, n, width));
+                }
             }
-        } else if t.key == "discnumber" {
-            if let Ok(n) = t.value.parse::<u16>() {
-                ilst.extend(number_atom(b"disk", n, 6));
+            Some(crate::tagmap::Mp4Slot::Freeform(mean, name)) => {
+                ilst.extend(freeform_atom(mean, name, values));
             }
+            None => ilst.extend(freeform_atom("com.apple.iTunes", key, values)),
         }
     }
 
@@ -1227,6 +1265,83 @@ mod tests {
             assert!(
                 *e <= pay_start || *s >= pay_end,
                 "read [{s},{e}) overlaps mdat payload [{pay_start},{pay_end})"
+            );
+        }
+    }
+
+    #[test]
+    fn read_freeform_extracts_name_and_value() {
+        // Build a minimal `----` atom: mean + name + data(UTF-8).
+        let mut mean_body = 0u32.to_be_bytes().to_vec();
+        mean_body.extend_from_slice(b"com.apple.iTunes");
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(b"MusicBrainz Album Id");
+        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data.extend_from_slice(b"abc-123");
+        let mut inner = boxed(b"mean", &mean_body);
+        inner.extend(boxed(b"name", &name_body));
+        inner.extend(boxed(b"data", &data));
+
+        let (key, value) = read_freeform(&inner).unwrap();
+        assert_eq!(key, "musicbrainz_albumid"); // folded via vocabulary
+        assert_eq!(value, "abc-123");
+    }
+
+    #[test]
+    fn read_freeform_unknown_name_passes_through_verbatim() {
+        let mut mean_body = 0u32.to_be_bytes().to_vec();
+        mean_body.extend_from_slice(b"com.apple.iTunes");
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(b"My Custom Field");
+        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data.extend_from_slice(b"hello");
+        let mut inner = boxed(b"mean", &mean_body);
+        inner.extend(boxed(b"name", &name_body));
+        inner.extend(boxed(b"data", &data));
+
+        let (key, value) = read_freeform(&inner).unwrap();
+        assert_eq!(key, "My Custom Field"); // not in vocabulary -> verbatim name
+        assert_eq!(value, "hello");
+    }
+
+    #[test]
+    fn read_freeform_skips_binary_typed_data() {
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(b"My Custom Field");
+        let mut data = 0u32.to_be_bytes().to_vec(); // type 0 = binary, not text
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data.extend_from_slice(&[0xff, 0x00, 0x01]);
+        let mut inner = boxed(b"name", &name_body);
+        inner.extend(boxed(b"data", &data));
+
+        assert!(read_freeform(&inner).is_none()); // binary-typed data is skipped
+    }
+
+    #[test]
+    fn build_udta_round_trips_freeform_and_vocabulary() {
+        let tags = vec![
+            TagInput::new("title", "Song"),
+            TagInput::new("tracknumber", "3"),
+            TagInput::new("MyRating", "5"), // user-defined -> ----
+            TagInput::new("musicbrainz_albumid", "abc-123"), // vocabulary -> ----
+        ];
+        let (udta, _art_len) = build_udta(&tags, None).unwrap();
+        // build_udta returns a full `udta` box; read_tags expects a buffer containing
+        // moov/udta/meta/ilst, so wrap udta in a minimal moov for the round trip.
+        let moov = boxed(b"moov", &udta);
+
+        let tags = read_tags(&moov);
+        for expected in [
+            ("title", "Song"),
+            ("tracknumber", "3"),
+            ("MyRating", "5"),
+            ("musicbrainz_albumid", "abc-123"),
+        ] {
+            assert!(
+                tags.contains(&(expected.0.to_string(), expected.1.to_string())),
+                "missing {expected:?} in {tags:?}"
             );
         }
     }

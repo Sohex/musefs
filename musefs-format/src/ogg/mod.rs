@@ -499,7 +499,7 @@ mod tests {
         data.extend_from_slice(&audio);
 
         let tags = read_tags(&data).unwrap();
-        assert_eq!(tags, vec![("TITLE".to_string(), "Sun".to_string())]);
+        assert_eq!(tags, vec![("title".to_string(), "Sun".to_string())]);
     }
 
     #[test]
@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(h.codec, Codec::Opus);
         let body = comment_body(Codec::Opus, &h.packets[1]).unwrap();
         let tags = crate::vorbiscomment::parse(body).unwrap();
-        assert_eq!(tags, vec![("ALBUM".to_string(), "Geogaddi".to_string())]);
+        assert_eq!(tags, vec![("album".to_string(), "Geogaddi".to_string())]);
         let (offset, len) = audio_seg.expect("expected OggAudio segment");
         assert_eq!(offset, scan.audio_offset);
         assert_eq!(len, scan.audio_length);
@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(h.packets[2], setup); // setup preserved byte-for-byte
         let body = comment_body(Codec::Vorbis, &h.packets[1]).unwrap();
         let tags = crate::vorbiscomment::parse(body).unwrap();
-        assert_eq!(tags, vec![("ARTIST".to_string(), "Autechre".to_string())]);
+        assert_eq!(tags, vec![("artist".to_string(), "Autechre".to_string())]);
     }
 
     #[test]
@@ -738,7 +738,7 @@ mod tests {
         let tags = crate::vorbiscomment::parse(&vc[4..]).unwrap();
         assert_eq!(
             tags,
-            vec![("TITLE".to_string(), "Kaini Industries".to_string())]
+            vec![("title".to_string(), "Kaini Industries".to_string())]
         );
     }
 
