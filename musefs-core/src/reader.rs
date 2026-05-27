@@ -285,6 +285,9 @@ impl HeaderCache {
                         })?;
                         mp4::synthesize_layout(&scan, &inputs, &art_inputs)?
                     }
+                    Format::Wav => {
+                        todo!("WAV synthesis not yet implemented")
+                    }
                     Format::Opus | Format::Vorbis | Format::OggFlac => {
                         let front =
                             read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;

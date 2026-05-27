@@ -6,6 +6,7 @@ pub enum Format {
     Opus,
     Vorbis,
     OggFlac,
+    Wav,
 }
 
 impl Format {
@@ -17,6 +18,7 @@ impl Format {
             Format::Opus => "opus",
             Format::Vorbis => "vorbis",
             Format::OggFlac => "oggflac",
+            Format::Wav => "wav",
         }
     }
 
@@ -28,6 +30,7 @@ impl Format {
             "opus" => Some(Format::Opus),
             "vorbis" => Some(Format::Vorbis),
             "oggflac" => Some(Format::OggFlac),
+            "wav" => Some(Format::Wav),
             _ => None,
         }
     }
@@ -53,6 +56,12 @@ mod tests {
             assert_eq!(f.as_str(), s);
             assert_eq!(Format::parse(s), Some(f));
         }
+    }
+
+    #[test]
+    fn wav_round_trips() {
+        assert_eq!(Format::Wav.as_str(), "wav");
+        assert_eq!(Format::parse("wav"), Some(Format::Wav));
     }
 }
 
