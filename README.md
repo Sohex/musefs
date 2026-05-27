@@ -4,15 +4,15 @@ A read-only passthrough FUSE filesystem that presents a virtually reorganized,
 re-tagged view of a music library — without modifying or duplicating a single
 byte of the original audio.
 
-Point musefs at a directory of FLAC, MP3, M4A, or Ogg (Opus / Vorbis /
-FLAC-in-Ogg) files, edit tags and organization in a SQLite store (directly, or
+Point musefs at a directory of FLAC, MP3, M4A, Ogg (Opus / Vorbis /
+FLAC-in-Ogg), or WAV files, edit tags and organization in a SQLite store (directly, or
 out-of-band via tools like beets/picard), and mount a clean
 `$albumartist/$album/$title` tree whose files carry the corrected metadata. The
 audio frames are served straight from your original files; only the
 metadata/header region is synthesized on the fly.
 
-> **Status:** MVP complete and extended. FLAC, MP3, M4A, and Ogg
-> (Opus / Vorbis / FLAC-in-Ogg) are supported, with embedded cover art, and the
+> **Status:** MVP complete and extended. FLAC, MP3, M4A, Ogg
+> (Opus / Vorbis / FLAC-in-Ogg), and WAV are supported, with embedded cover art, and the
 > filesystem has been through a performance/concurrency pass hardening it for
 > real-world player/media-manager access and large libraries on HDD/SSD/NFS. See
 > [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's in scope and what's explicitly
@@ -39,11 +39,13 @@ within each file. Editing happens there; the mounted view reflects it.
 
 ## Features
 
-- **FLAC, MP3, M4A, and Ogg (Opus / Vorbis / FLAC-in-Ogg)** — metadata synthesized
-  from the DB and spliced in front of byte-identical backing audio. M4A rebuilds
-  the `moov` atom (patching chunk offsets); Ogg renumbers audio pages and
-  recomputes their CRCs so the audio frames stay untouched. Multiplexed/chained
-  Ogg is detected and skipped.
+- **FLAC, MP3, M4A, Ogg (Opus / Vorbis / FLAC-in-Ogg), and WAV** — metadata
+  synthesized from the DB and spliced in front of byte-identical backing audio. M4A
+  rebuilds the `moov` atom (patching chunk offsets); Ogg renumbers audio pages and
+  recomputes their CRCs so the audio frames stay untouched; WAV regenerates the
+  RIFF front (a native `LIST`/`INFO` chunk plus an embedded `id3 ` chunk for full
+  ID3v2 + art) ahead of the verbatim `data` payload. Multiplexed/chained Ogg is
+  detected and skipped.
 - **Embedded art** — re-embedded into the served file and streamed from the
   content-addressed, deduplicated blob store (never buffered whole in memory),
   including Ogg cover art served as incremental base64.
@@ -127,7 +129,7 @@ A layered Cargo workspace:
 | Crate           | Responsibility                                              |
 | --------------- | ----------------------------------------------------------- |
 | `musefs-db`     | SQLite store: schema, migrations, tracks/tags/art access    |
-| `musefs-format` | FLAC/MP3/MP4/Ogg byte surgery: metadata synthesis + layout    |
+| `musefs-format` | FLAC/MP3/MP4/Ogg/WAV byte surgery: metadata synthesis + layout |
 | `musefs-core`   | Orchestration: virtual tree, file resolution, scanning      |
 | `musefs-fuse`   | Thin FUSE adapter (fuser)                                   |
 | `musefs-cli`    | `musefs` command-line entrypoint (clap)                     |

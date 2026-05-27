@@ -32,8 +32,9 @@ cargo run -p musefs-cli -- mount <mountpoint> --db <db_path> \
     [--mode synthesis|structure-only]
 ```
 
-The `end_to_end_read_through_mount` test in `musefs-fuse` is `#[ignore]`d because
-it performs a real mount; it only runs with `--ignored` and requires `/dev/fuse`.
+The FUSE end-to-end tests in `musefs-fuse` (e.g. `end_to_end_read_through_mount`)
+are `#[ignore]`d because they perform real mounts; they only run with `--ignored`
+and require `/dev/fuse`.
 
 ## Crate layout and dependency direction
 
@@ -41,7 +42,7 @@ A strict layered workspace; dependencies point one way only:
 
 ```
 musefs-db   ─┐                 SQLite store + schema/migrations (source of truth)
-musefs-format┘← (db)           format byte-surgery: FLAC/MP3 metadata synthesis + layout
+musefs-format┘← (db)           format byte-surgery: FLAC/MP3/MP4/Ogg/WAV metadata synthesis + layout
         ↑
 musefs-core ← (db, format)     orchestration: virtual tree, resolution, scanning
         ↑
@@ -63,17 +64,27 @@ A synthesized virtual file is a `RegionLayout`: an ordered list of `Segment`s
 - `ArtImage { art_id, len }` — only the *length* is known here; image bytes are
   streamed from the DB blob at read time, never held in memory.
 - `BackingAudio { offset, len }` — a run of the **original** file's audio frames.
+- `OggAudio { offset, len, seq_delta }` — original Ogg audio pages served with each
+  page's sequence number shifted by `seq_delta` and its CRC recomputed in place (a
+  resized header changes the page count); the served byte length is unchanged.
+- `OggArtSlice { art_id, offset, len, base64, art_total }` — an Ogg cover-art window
+  served lazily from the blob store, base64-encoded incrementally at read time.
 
 `reader::read_at` walks the segments and serves a byte range by splicing: inline
 bytes are copied, art is read in chunks via `db.read_art_chunk`, and backing
-audio is served with positioned `read_exact_at` against the original file. This is
+audio is served with positioned `read_exact_at` against the original file (Ogg
+audio pages are renumbered and CRC-patched in place, never recopied). This is
 how "no audio bytes copied" holds end to end.
 
 Two mount **modes** (`musefs_core::Mode`):
 - `Synthesis` (default) — generate a fresh metadata region from the DB and splice
   it before the backing audio. FLAC re-reads the file's front for preserved
   structural blocks; MP3 regenerates the ID3v2 tag entirely from the DB (the
-  Xing/LAME info frame travels with the audio).
+  Xing/LAME info frame travels with the audio); M4A rebuilds the `moov` atom and
+  patches `stco`/`co64` chunk offsets; Ogg renumbers audio pages and recomputes
+  per-page CRCs; WAV regenerates the RIFF front (a native `LIST`/`INFO` chunk plus
+  an embedded `id3 ` chunk for full ID3v2 + art) ahead of the verbatim `data`
+  payload.
 - `StructureOnly` — a single whole-file `BackingAudio` segment; the original bytes
   are served verbatim under the templated tree. Stored audio bounds are not
   validated in this mode because the whole file is served.
@@ -132,5 +143,7 @@ tracks whose backing file is gone, and GC orphaned art. `--revalidate` selects i
 - Errors: each crate has its own `error.rs` with a `thiserror` enum; `core` wraps
   lower layers in `CoreError`. The CLI is the only `anyhow` consumer.
 - Adding a format: implement probe + `synthesize_layout` in `musefs-format`
-  (mirror `flac.rs`/`mp3.rs`), returning a `RegionLayout`; wire it into the
-  `match track.format` arms in `reader::HeaderCache::resolve` and into `scan.rs`.
+  (mirror an existing module — `flac.rs`, `mp3.rs`, `mp4.rs`, `ogg/`, `wav.rs`),
+  returning a `RegionLayout`; add the variant to `musefs-db`'s `Format` enum, then
+  wire it into the `match track.format` arms in `reader::HeaderCache::resolve` and
+  into `scan.rs`.
