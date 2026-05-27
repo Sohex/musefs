@@ -49,9 +49,12 @@ impl BoxRef {
 /// reader can reason about box bounds while seeking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoxHeader {
+    /// The 4-byte box type, e.g. `*b"moov"`.
     pub kind: [u8; 4],
-    pub header_len: u64, // 8, or 16 for a 64-bit largesize
-    pub total_len: u64,  // header + payload
+    /// 8, or 16 for a 64-bit largesize.
+    pub header_len: u64,
+    /// Total box length: header + payload.
+    pub total_len: u64,
 }
 
 /// Parse a box header from `hdr` (>= 8 bytes; >= 16 if it uses a 64-bit
@@ -1099,5 +1102,7 @@ mod tests {
         let mut h = 2000u32.to_be_bytes().to_vec();
         h.extend_from_slice(b"moov");
         assert_eq!(box_header(&h, 100), Err(FormatError::Malformed));
+        // header shorter than 8 bytes.
+        assert_eq!(box_header(&[0u8; 4], 1000), Err(FormatError::Malformed));
     }
 }
