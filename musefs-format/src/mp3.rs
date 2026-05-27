@@ -218,23 +218,6 @@ pub fn synthesize_layout(
     Ok(RegionLayout::new(segments))
 }
 
-/// ID3v2 text frame id -> canonical (lowercase) tag key. Several legacy date
-/// frames fold to `date`.
-fn frame_to_key(id: &str) -> Option<&'static str> {
-    Some(match id {
-        "TIT2" => "title",
-        "TPE1" => "artist",
-        "TALB" => "album",
-        "TPE2" => "albumartist",
-        "TRCK" => "tracknumber",
-        "TPOS" => "discnumber",
-        "TDRC" | "TYER" => "date",
-        "TCON" => "genre",
-        "TCOM" => "composer",
-        _ => return None,
-    })
-}
-
 /// Extract all APIC pictures from an MP3's ID3v2 tag as embedded pictures, for
 /// scan-time art ingestion. Returns empty if there is no tag or no pictures.
 pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
@@ -253,23 +236,72 @@ pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
         .collect()
 }
 
-/// Read an existing ID3v2 tag from `data` and fold its recognized text frames into
-/// canonical `(key, value)` pairs (keys lowercase). NUL-separated multi-value
-/// frames yield one pair per value. Returns empty if there is no ID3v2 tag.
+/// Read an existing ID3v2 tag and fold it into canonical `(key, value)` pairs.
+/// Text frames map via the vocabulary (NUL-separated multi-value yields one pair
+/// per value); unmapped text frames pass through keyed by their frame id; `TXXX`
+/// frames key on their description (folded to canonical when known); `COMM`/`USLT`
+/// yield `comment`/`lyrics` (text only). Other/binary frames are skipped.
 pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
     let Ok(tag) = id3::Tag::read_from2(std::io::Cursor::new(data)) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for frame in tag.frames() {
-        let Some(key) = frame_to_key(frame.id()) else {
-            continue;
-        };
-        if let Some(text) = frame.content().text() {
+        let content = frame.content();
+        if let Some(et) = content.extended_text() {
+            let key = crate::tagmap::id3_txxx_to_key(&et.description)
+                .map_or_else(|| et.description.clone(), str::to_string);
+            out.push((key, et.value.clone()));
+        } else if let Some(c) = content.comment() {
+            out.push(("comment".to_string(), c.text.clone()));
+        } else if let Some(l) = content.lyrics() {
+            out.push(("lyrics".to_string(), l.text.clone()));
+        } else if let Some(text) = content.text() {
+            let key = crate::tagmap::id3_text_to_key(frame.id())
+                .map_or_else(|| frame.id().to_string(), str::to_string);
             for value in text.split('\0').filter(|v| !v.is_empty()) {
-                out.push((key.to_string(), value.to_string()));
+                out.push((key.clone(), value.to_string()));
             }
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_tags;
+
+    #[test]
+    fn read_tags_captures_txxx_comm_uslt_and_unmapped_text() {
+        use id3::frame::{Comment, ExtendedText, Lyrics};
+        use id3::{Tag, TagLike, Version}; // TagLike brings set_text/add_frame into scope
+
+        let mut tag = Tag::new();
+        tag.set_text("TIT2", "Song");
+        tag.set_text("TBPM", "120"); // standard frame, not in vocabulary
+        tag.add_frame(ExtendedText {
+            description: "MOOD".into(),
+            value: "happy".into(),
+        });
+        tag.add_frame(Comment {
+            lang: "eng".into(),
+            description: String::new(),
+            text: "nice".into(),
+        });
+        tag.add_frame(Lyrics {
+            lang: "eng".into(),
+            description: String::new(),
+            text: "la la".into(),
+        });
+
+        let mut buf = Vec::new();
+        tag.write_to(&mut buf, Version::Id3v24).unwrap();
+
+        let tags = read_tags(&buf);
+        assert!(tags.contains(&("title".to_string(), "Song".to_string())));
+        assert!(tags.contains(&("TBPM".to_string(), "120".to_string())));
+        assert!(tags.contains(&("MOOD".to_string(), "happy".to_string())));
+        assert!(tags.contains(&("comment".to_string(), "nice".to_string())));
+        assert!(tags.contains(&("lyrics".to_string(), "la la".to_string())));
+    }
 }
