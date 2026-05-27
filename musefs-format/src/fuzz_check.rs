@@ -6,15 +6,23 @@ use crate::layout::{RegionLayout, Segment};
 
 /// Property A — the synthesized layout serves the backing audio range
 /// `[audio_offset, audio_offset + audio_length)` exactly once, contiguously,
-/// with no metadata segment after audio, and the served length is
-/// `header_len + audio_length`. Holds for every format and any tags/art.
+/// with no backing-audio run split by a non-audio segment, and the served
+/// length is `header_len + audio_length`. Non-audio segments (e.g. a WAV
+/// RIFF word-align pad) may precede or follow the contiguous backing run;
+/// what is forbidden is a non-audio segment that interrupts the run (which
+/// would corrupt the served audio). Holds for every format and any tags/art.
 pub fn assert_backing_covers_audio(audio_offset: u64, audio_length: u64, layout: &RegionLayout) {
     let mut expected = audio_offset;
     let mut covered = 0u64;
     let mut seen_backing = false;
+    let mut backing_ended = false;
     for seg in layout.segments() {
         match seg {
             Segment::BackingAudio { offset, len } | Segment::OggAudio { offset, len, .. } => {
+                assert!(
+                    !backing_ended,
+                    "backing audio run is split by a non-backing segment"
+                );
                 assert_eq!(
                     *offset, expected,
                     "backing segment not contiguous at {expected}"
@@ -23,7 +31,11 @@ pub fn assert_backing_covers_audio(audio_offset: u64, audio_length: u64, layout:
                 covered += *len;
                 seen_backing = true;
             }
-            _ => assert!(!seen_backing, "metadata segment after backing audio"),
+            _ => {
+                if seen_backing {
+                    backing_ended = true;
+                }
+            }
         }
     }
     assert!(seen_backing, "no backing audio segment present");
@@ -260,6 +272,37 @@ mod tests {
             offset: 101,
             len: 50,
         }]);
+        assert_backing_covers_audio(100, 50, &layout);
+    }
+
+    #[test]
+    fn accepts_trailing_pad_after_backing() {
+        // WAV appends a 1-byte RIFF word-align pad after an odd-sized data chunk.
+        let layout = RegionLayout::new(vec![
+            Segment::Inline(vec![0u8; 8]),
+            Segment::BackingAudio {
+                offset: 100,
+                len: 1,
+            },
+            Segment::Inline(vec![0x00]),
+        ]);
+        assert_backing_covers_audio(100, 1, &layout);
+    }
+
+    #[test]
+    #[should_panic(expected = "split")]
+    fn rejects_backing_split_by_metadata() {
+        let layout = RegionLayout::new(vec![
+            Segment::BackingAudio {
+                offset: 100,
+                len: 25,
+            },
+            Segment::Inline(vec![0xFF]),
+            Segment::BackingAudio {
+                offset: 125,
+                len: 25,
+            },
+        ]);
         assert_backing_covers_audio(100, 50, &layout);
     }
 }
