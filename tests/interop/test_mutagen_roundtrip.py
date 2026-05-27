@@ -1,66 +1,22 @@
 import json
 import os
-import struct
 
 import mutagen
 import mutagen.id3
-
-
-def _m4a_read_ilst_tag(path, key):
-    """Low-level ilst reader for minimal M4A fixtures that lack mdhd.
-
-    mutagen's MP4 parser requires the mdhd (Media Header) atom to open a file.
-    The minimal test fixture omits mdhd because it is not needed by musefs's
-    synthesis path. The tags themselves are correctly placed in moov/udta/meta/ilst;
-    this helper walks that path directly without going through MPEGStreamInfo.
-    """
-    atom_map = {"title": b"\xa9nam", "artist": b"\xa9ART"}
-    target = atom_map.get(key)
-    if target is None:
-        return None
-
-    data = open(path, "rb").read()
-
-    def find_atom(buf, name):
-        pos = 0
-        while pos + 8 <= len(buf):
-            size = struct.unpack(">I", buf[pos : pos + 4])[0]
-            if size < 8:
-                break
-            atom_name = buf[pos + 4 : pos + 8]
-            if atom_name == name:
-                return buf[pos + 8 : pos + size]
-            pos += size
-        return None
-
-    moov = find_atom(data, b"moov")
-    if moov is None:
-        return None
-    udta = find_atom(moov, b"udta")
-    if udta is None:
-        return None
-    meta = find_atom(udta, b"meta")
-    if meta is None:
-        return None
-    # meta is a FullBox — skip 4 bytes of version/flags
-    ilst = find_atom(meta[4:], b"ilst")
-    if ilst is None:
-        return None
-    item = find_atom(ilst, target)
-    if item is None:
-        return None
-    # item payload is one or more 'data' atoms; first data atom:
-    # [size 4][b'data' 4][type 4][locale 4][value ...]
-    if len(item) < 16 or item[4:8] != b"data":
-        return None
-    return item[16:].decode("utf-8", errors="replace")
+import mutagen.mp4
 
 
 def _read_tag(path, key):
-    # M4A: use low-level ilst reader because the minimal fixture lacks mdhd,
-    # which mutagen's MP4 parser requires to open the file.
+    # M4A: read via real mutagen.mp4.MP4 (the interop fixture includes mdhd +
+    # stsd so mutagen's stream-info parser can open the file).
     if path.endswith(".m4a"):
-        return _m4a_read_ilst_tag(path, key)
+        atom = {"\xa9nam": "\xa9nam", "\xa9ART": "\xa9ART",
+                "title": "\xa9nam", "artist": "\xa9ART"}.get(key)
+        if atom is None:
+            return None
+        f = mutagen.mp4.MP4(path)
+        v = f.tags.get(atom) if f.tags else None
+        return str(v[0]) if v else None
 
     # MP3: mutagen.File requires valid MPEG frames; fall back to ID3 directly.
     if path.endswith(".mp3"):
