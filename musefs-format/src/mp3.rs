@@ -241,6 +241,8 @@ pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
 /// per value); unmapped text frames pass through keyed by their frame id; `TXXX`
 /// frames key on their description (folded to canonical when known); `COMM`/`USLT`
 /// yield `comment`/`lyrics` (text only). Other/binary frames are skipped.
+/// Multiple `COMM` or `USLT` frames (e.g. one per language) each emit a separate
+/// pair; their language and description fields are not preserved.
 pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
     let Ok(tag) = id3::Tag::read_from2(std::io::Cursor::new(data)) else {
         return Vec::new();
@@ -257,8 +259,9 @@ pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
         } else if let Some(l) = content.lyrics() {
             out.push(("lyrics".to_string(), l.text.clone()));
         } else if let Some(text) = content.text() {
-            let key = crate::tagmap::id3_text_to_key(frame.id())
-                .map_or_else(|| frame.id().to_string(), str::to_string);
+            let id = frame.id();
+            let key =
+                crate::tagmap::id3_text_to_key(id).map_or_else(|| id.to_string(), str::to_string);
             for value in text.split('\0').filter(|v| !v.is_empty()) {
                 out.push((key.clone(), value.to_string()));
             }
@@ -283,6 +286,10 @@ mod tests {
             description: "MOOD".into(),
             value: "happy".into(),
         });
+        tag.add_frame(ExtendedText {
+            description: "REPLAYGAIN_TRACK_GAIN".into(),
+            value: "-6.5 dB".into(),
+        });
         tag.add_frame(Comment {
             lang: "eng".into(),
             description: String::new(),
@@ -301,6 +308,7 @@ mod tests {
         assert!(tags.contains(&("title".to_string(), "Song".to_string())));
         assert!(tags.contains(&("TBPM".to_string(), "120".to_string())));
         assert!(tags.contains(&("MOOD".to_string(), "happy".to_string())));
+        assert!(tags.contains(&("replaygain_track_gain".to_string(), "-6.5 dB".to_string())));
         assert!(tags.contains(&("comment".to_string(), "nice".to_string())));
         assert!(tags.contains(&("lyrics".to_string(), "la la".to_string())));
     }
