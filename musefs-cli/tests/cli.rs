@@ -58,34 +58,56 @@ fn parses_mode_and_revalidate_flags() {
         _ => panic!("expected mount"),
     }
 
-    // Mode defaults to synthesis; poll interval defaults to 1000ms.
+    // Mode defaults to synthesis; tuning knobs have conservative defaults.
     let cli = Cli::parse_from(["musefs", "mount", "/mnt/x", "--db", "/tmp/m.db"]);
     match cli.command {
         Command::Mount {
             mode,
             poll_interval_ms,
+            attr_ttl_ms,
+            max_readahead_kib,
+            max_background,
+            keep_cache,
             ..
         } => {
             assert_eq!(mode, CliMode::Synthesis);
             assert_eq!(poll_interval_ms, 1000); // default
+            assert_eq!(attr_ttl_ms, 1000); // default
+            assert_eq!(max_readahead_kib, 512); // default
+            assert_eq!(max_background, 64); // default
+            assert!(!keep_cache); // default off
         }
         _ => panic!("expected mount"),
     }
 
-    // --poll-interval-ms is parsed.
+    // Tuning flags parse to their given values.
     let cli = Cli::parse_from([
         "musefs",
         "mount",
         "/mnt/x",
         "--db",
         "/tmp/m.db",
-        "--poll-interval-ms",
-        "500",
+        "--attr-ttl-ms",
+        "2000",
+        "--max-readahead-kib",
+        "1024",
+        "--max-background",
+        "128",
+        "--keep-cache",
     ]);
     match cli.command {
         Command::Mount {
-            poll_interval_ms, ..
-        } => assert_eq!(poll_interval_ms, 500),
+            attr_ttl_ms,
+            max_readahead_kib,
+            max_background,
+            keep_cache,
+            ..
+        } => {
+            assert_eq!(attr_ttl_ms, 2000);
+            assert_eq!(max_readahead_kib, 1024);
+            assert_eq!(max_background, 128);
+            assert!(keep_cache);
+        }
         _ => panic!("expected mount"),
     }
 

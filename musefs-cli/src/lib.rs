@@ -70,6 +70,22 @@ pub enum Command {
         /// Debounce window (ms) for picking up external DB edits.
         #[arg(long, default_value_t = 1000)]
         poll_interval_ms: u64,
+        /// Entry/attr cache TTL (ms) the kernel may trust before re-validating.
+        /// Higher cuts lookup/getattr traffic but slows visibility of DB edits.
+        #[arg(long, default_value_t = 1000)]
+        attr_ttl_ms: u64,
+        /// Kernel read-ahead window (KiB). Larger hides HDD/NFS latency while
+        /// streaming; clamped to the kernel maximum at mount.
+        #[arg(long, default_value_t = 512)]
+        max_readahead_kib: u32,
+        /// Max outstanding background (readahead/async) requests the kernel queues.
+        #[arg(long, default_value_t = 64)]
+        max_background: u16,
+        /// Keep the kernel page cache across opens. Best for static libraries;
+        /// after an external re-tag the kernel may serve stale bytes until the
+        /// cache is dropped (`drop_caches`) or the mount is replaced.
+        #[arg(long)]
+        keep_cache: bool,
     },
 }
 
@@ -99,6 +115,7 @@ pub fn run_scan(db_path: &Path, backing_dir: &Path, revalidate: bool) -> Result<
 
 /// Build a `Musefs` from the DB at `db_path` and mount it (blocking) at
 /// `mountpoint`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_mount(
     db_path: &Path,
     mountpoint: &Path,
@@ -106,6 +123,10 @@ pub fn run_mount(
     default_fallback: String,
     mode: musefs_core::Mode,
     poll_interval_ms: u64,
+    attr_ttl_ms: u64,
+    max_readahead_kib: u32,
+    max_background: u16,
+    keep_cache: bool,
 ) -> Result<()> {
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
@@ -116,8 +137,14 @@ pub fn run_mount(
         mode,
         poll_interval: std::time::Duration::from_millis(poll_interval_ms),
     };
+    let fuse_config = musefs_fuse::FuseConfig {
+        ttl: std::time::Duration::from_millis(attr_ttl_ms),
+        max_readahead: max_readahead_kib.saturating_mul(1024),
+        max_background,
+        keep_cache,
+    };
     let core = Musefs::open(db, config).context("building the virtual filesystem")?;
-    musefs_fuse::mount(core, mountpoint, "musefs")
+    musefs_fuse::mount_with(core, mountpoint, "musefs", fuse_config)
         .with_context(|| format!("mounting at {}", mountpoint.display()))?;
     Ok(())
 }
@@ -137,6 +164,10 @@ pub fn run(cli: Cli) -> Result<()> {
             default_fallback,
             mode,
             poll_interval_ms,
+            attr_ttl_ms,
+            max_readahead_kib,
+            max_background,
+            keep_cache,
         } => run_mount(
             &db,
             &mountpoint,
@@ -144,6 +175,10 @@ pub fn run(cli: Cli) -> Result<()> {
             default_fallback,
             mode.into(),
             poll_interval_ms,
+            attr_ttl_ms,
+            max_readahead_kib,
+            max_background,
+            keep_cache,
         ),
     }
 }
