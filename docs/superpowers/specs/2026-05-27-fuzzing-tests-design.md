@@ -122,6 +122,27 @@ One comprehensive target per format, plus primitive targets, in
   - `vorbiscomment` — parse an arbitrary comment block.
   - `tagmap` — the canonical-vocabulary mapping functions.
 
+## Fuzzer runtime constraints
+
+Media parsers (chunk-based MP4, frame-based MP3) are prone to pathological slow
+paths on zero-length frames and large declared allocations; letting libFuzzer
+generate multi-megabyte inputs causes false-positive timeouts and slow execution
+without improving structural coverage. Inputs are therefore capped two ways:
+
+- **Per-harness size guard (authoritative).** Each `fuzz_target!` early-returns
+  on oversized input (`if data.len() > MAX_INPUT { return; }`), with `MAX_INPUT`
+  in the 64–128 KiB range. This travels with the code and is enforced regardless
+  of how the target is invoked. 64–128 KiB is ample to reach full structural
+  coverage of these parsers.
+- **CI invocation flags.** The fuzz CI jobs additionally pass libFuzzer runtime
+  flags — `-max_len`, `-rss_limit_mb`, `-timeout` — on the command line (after
+  `--`), so generation, memory, and hang limits are explicit in CI.
+
+Note: `cargo-fuzz` has no `[target.<name>]` table in `fuzz/Cargo.toml` for
+libFuzzer flags — targets are auto-discovered (or declared as `[[bin]]`) and
+runtime flags are passed on the command line. The size cap is enforced in the
+harness for that reason.
+
 ## Properties
 
 1. **Panic-freedom.** No panic / abort / OOM / hang on any input, on every
@@ -136,11 +157,17 @@ One comprehensive target per format, plus primitive targets, in
      (renumbering patches page sequence numbers and CRCs in place).
    This is pure (operates on the parsed scan + the layout) and runs in both the
    fuzz targets and proptest.
-3. **Tag round-trip.** Tags serialized into the synthesized metadata region
-   reparse to the same logical tags, modulo documented normalization (casing and
-   multi-value ordering rules per `tagmap`/`mapping`). Primarily a proptest with
+3. **Tag round-trip (normalization fixed-point).** ID3v2 and MP4 metadata are
+   historically messy — musefs normalizes on parse (e.g. version coercion,
+   duplicate/deprecated frame handling), so the raw bytes of a fuzzer-generated
+   "technically parseable" tag are not preserved verbatim, and asserting raw
+   preservation would produce false failures. The property is therefore stated as
+   idempotence of normalization: let `N0` be the normalized internal tag set from
+   the first parse; serialize `N0` into a metadata region, reparse and normalize
+   to `N1`; assert `N0 == N1`. The comparison is over the normalized internal
+   representation, never the original raw tag bytes. Primarily a proptest with
    structured inputs; also asserted in the per-format fuzz targets where a parsed
-   file already provides a comment block.
+   file already provides a comment/tag block.
 4. **End-to-end read fidelity (Property B).** A `musefs-core` proptest builds a
    temporary SQLite DB and backing file, runs `reader::read_at` over the full
    virtual file, and asserts that the audio sub-range of the output bytes equals
@@ -151,8 +178,10 @@ One comprehensive target per format, plus primitive targets, in
 
 ## Seed corpus
 
-A small, regenerable seed corpus under `fuzz/corpus/<target>/`. A helper (a small
-binary or documented `cargo` invocation in the `fuzz/` crate) writes minimal
+A small, regenerable seed corpus under `fuzz/corpus/<target>/`. Generation is an
+explicit binary in the fuzz crate — `[[bin]] name = "generate_seeds"`, run via
+`cargo run --bin generate_seeds` — so it stays compiled and refactored alongside
+the fuzz targets rather than bit-rotting as a loose script. It writes minimal
 valid files for each format using the existing dev-dep encoders (`metaflac`,
 `mp4`, `hound`) plus hand-built minimal Ogg/MP3 inputs. Seeds are kept tiny
 (a few KB each) and committed so coverage-guided runs start warm and CI is
@@ -169,9 +198,15 @@ reproducible. Regeneration is documented.
     `cargo fuzz build` for all targets, then a few-second smoke run per target
     (`-runs=` or `-max_total_time=`) to catch broken targets quickly.
   - *Scheduled job:* a weekly cron mirroring `audit.yml`. Each target runs
-    time-boxed (a few minutes each) against the committed corpus; the corpus is
-    persisted/accumulated across runs via the Actions cache. On any crash, the
-    reproducing input is uploaded as an artifact and the job fails.
+    time-boxed (a few minutes each, with `-max_len`/`-rss_limit_mb`/`-timeout`
+    passed on the command line) against the corpus. On any crash, the reproducing
+    input is uploaded as an artifact and the job fails.
+  - *Corpus accumulation across runs.* `actions/cache` is immutable per key — a
+    static key restores but never re-saves an updated corpus. The corpus is
+    therefore cached under a **dynamic key** (`fuzz-corpus-${{ github.run_id }}`)
+    with `restore-keys: fuzz-corpus-` to restore the most recent prior corpus.
+    `cargo fuzz cmin <target>` runs before save to minimize the corpus and stop
+    the cache ballooning over weeks of scheduled runs.
 
 ## Findings and triage
 
@@ -190,6 +225,11 @@ During implementation, each property is validated by planting a known-bad case
 confirming the structural assertion trips; likewise a planted byte alteration
 must trip the end-to-end read property. This confirmation is part of the
 implementation for each target/property, not a separate optional step.
+
+Additionally, `cargo fuzz coverage <target>` (llvm-cov HTML report) is run
+locally during development to confirm the fuzzer penetrates past early
+magic-byte checks into the real parsing logic — a target that never gets past a
+format-marker check is effectively dead despite running clean.
 
 ## Documentation updates
 
