@@ -474,6 +474,10 @@ fn number_atom(kind: &[u8; 4], n: u16, width: usize) -> Vec<u8> {
     boxed(kind, &boxed(b"data", &data))
 }
 
+/// Emit a `----` freeform atom: a `mean` and `name` sub-box (each with a 4-byte
+/// FullBox prefix) followed by one UTF-8 `data` sub-box per value. Note that the
+/// scan path (`read_freeform`) only recovers the first value on read-back, so
+/// multi-value freeform tags round-trip only their first value.
 fn freeform_atom(mean: &str, name: &str, values: &[&str]) -> Vec<u8> {
     let mut inner = Vec::new();
     let mut mean_body = 0u32.to_be_bytes().to_vec(); // version/flags
