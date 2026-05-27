@@ -5,14 +5,14 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use threadpool::ThreadPool;
 
 use fuser::{
-    BackgroundSession, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
+    BackgroundSession, FileAttr, FileType, Filesystem, KernelConfig, MountOption, Notifier,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
 };
 use musefs_core::Attr;
 use musefs_core::CoreError;
@@ -114,6 +114,9 @@ pub struct MusefsFs {
     gid: u32,
     mount_time: SystemTime,
     config: FuseConfig,
+    // Set once, right after the session is created (the fs is moved into the
+    // session, so the notifier can only be obtained afterward via this shared cell).
+    notifier: Arc<OnceLock<Notifier>>,
 }
 
 impl MusefsFs {
@@ -135,6 +138,32 @@ impl MusefsFs {
             gid: unsafe { libc::getgid() },
             mount_time: SystemTime::now(),
             config,
+            notifier: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn notifier_cell(&self) -> Arc<OnceLock<Notifier>> {
+        Arc::clone(&self.notifier)
+    }
+
+    /// Fire `poll_refresh` on the worker pool (off the dispatch thread). When
+    /// keep-cache is enabled, also drop the kernel page cache for every inode whose
+    /// content changed, so an external re-tag never serves stale cached bytes.
+    fn fire_poll_refresh(&self) {
+        let core = Arc::clone(&self.core);
+        if self.config.keep_cache {
+            let notifier = Arc::clone(&self.notifier);
+            self.pool.execute(move || {
+                let _ = core.poll_refresh_notify(|ino| {
+                    if let Some(n) = notifier.get() {
+                        let _ = n.inval_inode(ino, 0, 0);
+                    }
+                });
+            });
+        } else {
+            self.pool.execute(move || {
+                let _ = core.poll_refresh();
+            });
         }
     }
 }
@@ -157,12 +186,7 @@ impl Filesystem for MusefsFs {
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        {
-            let core = Arc::clone(&self.core);
-            self.pool.execute(move || {
-                let _ = core.poll_refresh();
-            });
-        }
+        self.fire_poll_refresh();
         let name = match name.to_str() {
             Some(n) => n,
             None => return reply.error(libc::ENOENT),
@@ -182,12 +206,7 @@ impl Filesystem for MusefsFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        {
-            let core = Arc::clone(&self.core);
-            self.pool.execute(move || {
-                let _ = core.poll_refresh();
-            });
-        }
+        self.fire_poll_refresh();
         let core = Arc::clone(&self.core);
         let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
         self.pool.execute(move || match core.getattr(ino) {
@@ -251,12 +270,7 @@ impl Filesystem for MusefsFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        {
-            let core = Arc::clone(&self.core);
-            self.pool.execute(move || {
-                let _ = core.poll_refresh();
-            });
-        }
+        self.fire_poll_refresh();
         let entries = match self.core.readdir(ino) {
             Ok(e) => e,
             Err(e) => return reply.error(errno(&e)),
@@ -306,11 +320,11 @@ pub fn mount_with(
     fs_name: &str,
     config: FuseConfig,
 ) -> std::io::Result<()> {
-    fuser::mount2(
-        MusefsFs::new(core, config),
-        mountpoint,
-        &mount_options(fs_name),
-    )
+    let fs = MusefsFs::new(core, config);
+    let cell = fs.notifier_cell();
+    let mut session = Session::new(fs, mountpoint, &mount_options(fs_name))?;
+    let _ = cell.set(session.notifier());
+    session.run()
 }
 
 /// Background-session mount with default tuning; the handle's `Drop` unmounts.
@@ -325,11 +339,12 @@ pub fn spawn_with(
     fs_name: &str,
     config: FuseConfig,
 ) -> std::io::Result<BackgroundSession> {
-    fuser::spawn_mount2(
-        MusefsFs::new(core, config),
-        mountpoint,
-        &mount_options(fs_name),
-    )
+    let fs = MusefsFs::new(core, config);
+    let cell = fs.notifier_cell();
+    let session = Session::new(fs, mountpoint, &mount_options(fs_name))?;
+    let bg = session.spawn()?;
+    let _ = cell.set(bg.notifier());
+    Ok(bg)
 }
 
 #[cfg(test)]
