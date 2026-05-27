@@ -5,7 +5,6 @@ mod layout;
 pub mod mp3;
 pub mod mp4;
 pub mod ogg;
-#[allow(dead_code)]
 mod tagmap;
 mod vorbiscomment;
 pub mod wav;

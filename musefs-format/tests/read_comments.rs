@@ -12,9 +12,9 @@ fn reads_existing_comments_including_multivalue() {
     assert_eq!(
         comments,
         vec![
-            ("TITLE".to_string(), "Song".to_string()),
-            ("ARTIST".to_string(), "Alice".to_string()),
-            ("ARTIST".to_string(), "Bob".to_string()),
+            ("title".to_string(), "Song".to_string()),
+            ("artist".to_string(), "Alice".to_string()),
+            ("artist".to_string(), "Bob".to_string()),
         ]
     );
 }
@@ -33,6 +33,6 @@ fn skips_comment_without_equals_sign() {
     let file = make_flac(&[(0, si), (4, vc)], &[0u8; 4]);
     assert_eq!(
         read_vorbis_comments(&file).unwrap(),
-        vec![("TITLE".to_string(), "Ok".to_string())]
+        vec![("title".to_string(), "Ok".to_string())]
     );
 }
