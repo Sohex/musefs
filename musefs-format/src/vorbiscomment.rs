@@ -46,7 +46,7 @@ pub fn parse(body: &[u8]) -> Result<Vec<(String, String)>> {
     let mut pos = 4 + vendor_len;
     let count = read_u32_le(body, pos)? as usize;
     pos += 4;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(body.len() / 4));
     for _ in 0..count {
         let clen = read_u32_le(body, pos)? as usize;
         pos += 4;
@@ -85,6 +85,15 @@ mod tests {
                 ("title".to_string(), "Roygbiv".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn parse_rejects_bogus_huge_count_without_oom() {
+        // vendor_len = 0, then count = u32::MAX, then no comment data.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // vendor_len = 0
+        body.extend_from_slice(&u32::MAX.to_le_bytes()); // count ~= 4 billion; cap prevents OOM
+        assert!(parse(&body).is_err());
     }
 
     #[test]
