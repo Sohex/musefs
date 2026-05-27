@@ -262,6 +262,8 @@ pub fn read_structure_from<R: Read + Seek>(
         // This guarantees we never touch a box's payload (notably mdat's).
         let first8 = region(r, pos, 8)?;
         let size32 = u32::from_be_bytes(first8[0..4].try_into().unwrap());
+        // A largesize box needs 8 more header bytes; if the file is truncated
+        // mid-header this read surfaces as Mp4ScanError::Io (UnexpectedEof).
         let hdr = if size32 == 1 {
             let mut h = first8;
             h.extend_from_slice(&region(r, pos + 8, 8)?);
@@ -288,8 +290,12 @@ pub fn read_structure_from<R: Read + Seek>(
     let (moov_s, moov_h) = moov.ok_or(FormatError::NotMp4)?;
     let (mdat_s, mdat_h) = mdat.ok_or(FormatError::NotMp4)?;
 
-    let ftyp_bytes = region(r, ftyp_s, ftyp_h.total_len as usize)?;
-    let moov_bytes = region(r, moov_s, moov_h.total_len as usize)?;
+    // `try_from` rather than `as usize`: on a 32-bit target an oversized box would
+    // truncate silently; a box larger than `usize` is malformed for our purposes.
+    let ftyp_len = usize::try_from(ftyp_h.total_len).map_err(|_| FormatError::Malformed)?;
+    let moov_len = usize::try_from(moov_h.total_len).map_err(|_| FormatError::Malformed)?;
+    let ftyp_bytes = region(r, ftyp_s, ftyp_len)?;
+    let moov_bytes = region(r, moov_s, moov_len)?;
     let mdat_header = region(r, mdat_s, mdat_h.header_len as usize)?;
 
     validate_moov(&moov_bytes[moov_h.header_len as usize..])?;
@@ -1228,5 +1234,33 @@ mod tests {
                 "read [{s},{e}) overlaps mdat payload [{pay_start},{pay_end})"
             );
         }
+    }
+
+    #[test]
+    fn read_structure_from_handles_largesize_mdat() {
+        // Re-encode a normal fixture's mdat with a 64-bit largesize header (the
+        // real >4GB audiobook shape) and confirm both readers agree.
+        fn largesize_mdat(payload: &[u8]) -> Vec<u8> {
+            let total = 16 + payload.len() as u64;
+            let mut v = 1u32.to_be_bytes().to_vec(); // size32 == 1
+            v.extend_from_slice(b"mdat");
+            v.extend_from_slice(&total.to_be_bytes()); // 64-bit largesize
+            v.extend_from_slice(payload);
+            v
+        }
+        let normal = mk_mp4(true, &[0xABu8; 64], &[0]); // [ftyp][moov][mdat]
+        let scan = read_structure(&normal).unwrap();
+        let payload_start = scan.mdat_payload_offset as usize;
+        let mdat_box_start = payload_start - scan.mdat_header.len(); // normal 8-byte header
+        let payload = normal[payload_start..].to_vec();
+        let mut buf = normal[..mdat_box_start].to_vec(); // ftyp + moov
+        buf.extend(largesize_mdat(&payload));
+
+        let from_buf = read_structure(&buf).unwrap();
+        let mut cur = std::io::Cursor::new(buf.clone());
+        let from_stream = read_structure_from(&mut cur, buf.len() as u64).unwrap();
+        assert_eq!(from_stream, from_buf);
+        assert_eq!(from_stream.mdat_header.len(), 16); // largesize header
+        assert_eq!(from_stream.mdat_payload_len, payload.len() as u64);
     }
 }
