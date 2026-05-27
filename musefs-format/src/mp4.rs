@@ -334,6 +334,13 @@ fn read_freeform(inner: &[u8]) -> Option<(String, String)> {
     if np.len() < 4 || dp.len() < 8 {
         return None;
     }
+    // The `data` box is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text.
+    // Binary-typed freeform values are not text tags, so skip them.
+    let type_code = u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]);
+    if type_code != 1 {
+        return None;
+    }
+    // name/mean payloads start with a 4-byte FullBox [version 1][flags 3] prefix.
     let name = std::str::from_utf8(&np[4..]).ok()?;
     let value = std::str::from_utf8(&dp[8..]).ok()?;
     let mean = find_box(inner, b"mean")
@@ -1273,6 +1280,37 @@ mod tests {
         let (key, value) = read_freeform(&inner).unwrap();
         assert_eq!(key, "musicbrainz_albumid"); // folded via vocabulary
         assert_eq!(value, "abc-123");
+    }
+
+    #[test]
+    fn read_freeform_unknown_name_passes_through_verbatim() {
+        let mut mean_body = 0u32.to_be_bytes().to_vec();
+        mean_body.extend_from_slice(b"com.apple.iTunes");
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(b"My Custom Field");
+        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data.extend_from_slice(b"hello");
+        let mut inner = boxed(b"mean", &mean_body);
+        inner.extend(boxed(b"name", &name_body));
+        inner.extend(boxed(b"data", &data));
+
+        let (key, value) = read_freeform(&inner).unwrap();
+        assert_eq!(key, "My Custom Field"); // not in vocabulary -> verbatim name
+        assert_eq!(value, "hello");
+    }
+
+    #[test]
+    fn read_freeform_skips_binary_typed_data() {
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(b"My Custom Field");
+        let mut data = 0u32.to_be_bytes().to_vec(); // type 0 = binary, not text
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data.extend_from_slice(&[0xff, 0x00, 0x01]);
+        let mut inner = boxed(b"name", &name_body);
+        inner.extend(boxed(b"data", &data));
+
+        assert!(read_freeform(&inner).is_none()); // binary-typed data is skipped
     }
 
     #[test]
