@@ -48,6 +48,7 @@ pub struct Node {
 pub struct VirtualTree {
     nodes: HashMap<u64, Node>,
     children: HashMap<u64, BTreeMap<String, u64>>,
+    track_to_inode: HashMap<i64, u64>,
 }
 
 impl VirtualTree {
@@ -63,6 +64,7 @@ impl VirtualTree {
         let mut tree = VirtualTree {
             nodes: HashMap::new(),
             children: HashMap::new(),
+            track_to_inode: HashMap::new(),
         };
         tree.nodes.insert(
             Self::ROOT,
@@ -110,6 +112,11 @@ impl VirtualTree {
         }
     }
 
+    /// The inode of the file node serving `track_id`, if present.
+    pub fn inode_of_track(&self, track_id: i64) -> Option<u64> {
+        self.track_to_inode.get(&track_id).copied()
+    }
+
     fn insert_file(&mut self, track_id: i64, path: &str, alloc: &mut InodeAllocator) {
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         if comps.is_empty() {
@@ -125,6 +132,7 @@ impl VirtualTree {
         let name = self.disambiguate(dir, comps[comps.len() - 1]);
         let full = join_path(&dir_path, &name);
         let inode = alloc.intern(&full);
+        self.track_to_inode.insert(track_id, inode);
         self.nodes.insert(
             inode,
             Node {
@@ -234,6 +242,16 @@ mod tests {
         assert_eq!(song1, song2);
         let bob2 = t2.lookup(VirtualTree::ROOT, "Bob").unwrap();
         assert!(bob2 != alice2 && bob2 != song2);
+    }
+
+    #[test]
+    fn inode_of_track_maps_file_nodes() {
+        let t = VirtualTree::build(&[(10, "Alice/Song.flac".into()), (20, "Bob/Tune.flac".into())]);
+        let alice = t.lookup(VirtualTree::ROOT, "Alice").unwrap();
+        let song = t.lookup(alice, "Song.flac").unwrap();
+        assert_eq!(t.inode_of_track(10), Some(song));
+        assert!(t.inode_of_track(20).is_some());
+        assert_eq!(t.inode_of_track(999), None);
     }
 
     #[test]
