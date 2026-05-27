@@ -87,6 +87,8 @@ fn parses_mode_and_revalidate_flags() {
         "/mnt/x",
         "--db",
         "/tmp/m.db",
+        "--poll-interval-ms",
+        "500",
         "--attr-ttl-ms",
         "2000",
         "--max-readahead-kib",
@@ -97,12 +99,14 @@ fn parses_mode_and_revalidate_flags() {
     ]);
     match cli.command {
         Command::Mount {
+            poll_interval_ms,
             attr_ttl_ms,
             max_readahead_kib,
             max_background,
             keep_cache,
             ..
         } => {
+            assert_eq!(poll_interval_ms, 500);
             assert_eq!(attr_ttl_ms, 2000);
             assert_eq!(max_readahead_kib, 1024);
             assert_eq!(max_background, 128);
