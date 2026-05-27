@@ -276,7 +276,9 @@ impl HeaderCache {
                         // in a deliberately truncated `mdat` header whose payload is the
                         // backing-audio tail.
                         let mut f = std::fs::File::open(&track.backing_path)?;
-                        let len = f.metadata()?.len();
+                        // `meta` was validated against the tracked size/mtime above,
+                        // so reuse it rather than issuing a second fstat.
+                        let len = meta.len();
                         let scan = mp4::read_structure_from(&mut f, len).map_err(|e| match e {
                             mp4::Mp4ScanError::Io(io) => CoreError::Io(io),
                             mp4::Mp4ScanError::Format(fe) => CoreError::Format(fe),
