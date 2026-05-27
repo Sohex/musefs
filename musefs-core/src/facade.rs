@@ -202,7 +202,7 @@ impl Musefs {
 
     /// Cheap check for external DB commits via `PRAGMA data_version`. On a change,
     /// rebuild the tree, prune cached resolutions to the live track set, invoke
-    /// `on_changed(inode)` for every inode whose track's `content_version` rose
+    /// `on_changed(inode)` for every inode whose track's `content_version` changed
     /// (its served bytes changed but its path/inode is stable), then return `true`.
     /// The version stamp is committed only after a successful rebuild.
     ///
@@ -245,9 +245,9 @@ impl Musefs {
         self.cache.retain(&live);
         self.size_cache().retain(|k, _| live.contains(k));
 
-        // A track whose content_version rose but whose path (inode) is unchanged has
-        // stale served bytes; report its inode so the caller can drop the kernel page
-        // cache. New/removed tracks have no cache to drop.
+        // A track whose content_version changed (DB triggers only increment it) but
+        // whose path (inode) is unchanged has stale served bytes; report its inode so
+        // the caller can drop the kernel page cache. New/removed tracks have none.
         for (tid, ver) in &new_versions {
             if old_versions.get(tid).is_some_and(|old| old != ver) {
                 if let Some(ino) = tree.inode_of_track(*tid) {
