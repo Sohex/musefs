@@ -1,0 +1,61 @@
+[package]
+name = "musefs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "generate_seeds"
+path = "src/bin/generate_seeds.rs"
+test = false
+doc = false
+bench = false
+
+# Per-format fuzz targets (added below). Each needs test=false, doc=false, bench=false.
+[[bin]]
+name = "flac"
+path = "fuzz_targets/flac.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mp3"
+path = "fuzz_targets/mp3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mp4"
+path = "fuzz_targets/mp4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ogg"
+path = "fuzz_targets/ogg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wav"
+path = "fuzz_targets/wav.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
