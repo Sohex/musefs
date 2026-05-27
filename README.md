@@ -1,5 +1,7 @@
 # musefs
 
+[![CI](https://github.com/Sohex/musefs/actions/workflows/ci.yml/badge.svg)](https://github.com/Sohex/musefs/actions/workflows/ci.yml)
+
 A read-only passthrough FUSE filesystem that presents a virtually reorganized,
 re-tagged view of a music library — without modifying or duplicating a single
 byte of the original audio.
@@ -112,6 +114,12 @@ cargo build --release
 ```
 
 The binary is `musefs` (the `musefs-cli` crate).
+
+Or install the `musefs` binary directly from the repository:
+
+```bash
+cargo install --git https://github.com/Sohex/musefs musefs-cli
+```
 
 ## Usage
 

@@ -1,8 +1,10 @@
 [package]
 name = "musefs-db"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+description = "SQLite store and schema for musefs (tracks, tags, content-addressed art)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled", "blob"] }

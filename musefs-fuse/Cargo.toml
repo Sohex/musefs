@@ -1,8 +1,10 @@
 [package]
 name = "musefs-fuse"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+description = "FUSE adapter for musefs (fuser)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 metrics = ["musefs-core/metrics"]

@@ -1,8 +1,12 @@
 [package]
 name = "musefs-cli"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+description = "musefs command-line interface: scan a music library and mount a re-tagged virtual view."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["fuse", "music", "metadata", "filesystem", "audio"]
+categories = ["filesystem", "multimedia::audio", "command-line-utilities"]
 
 [[bin]]
 name = "musefs"
