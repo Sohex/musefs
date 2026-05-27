@@ -146,8 +146,17 @@ cargo clippy --all-targets
 cargo fmt
 ```
 
-The FUSE end-to-end test performs a real mount and is `#[ignore]`d by default; run
-it with `--ignored` on a host that has `/dev/fuse`.
+The FUSE end-to-end tests perform real mounts and are `#[ignore]`d by default; run
+them with `--ignored` on a host that has `/dev/fuse`.
+
+A pre-commit hook (`.githooks/pre-commit`) runs `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings`. The lint policy — `clippy::pedantic`
+minus a few intentional/noisy groups — lives in the root `Cargo.toml` under
+`[workspace.lints]`. Enable the hook in a fresh clone with:
+
+```bash
+git config core.hooksPath .githooks
+```
 
 ## License
 
