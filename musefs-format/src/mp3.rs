@@ -255,9 +255,116 @@ pub fn synthesize_layout(
     Ok(RegionLayout::new(segments))
 }
 
+/// Returns false when `data` begins with an ID3v2 tag whose declared frame sizes
+/// could drive an unbounded allocation in the `id3` crate (which eagerly
+/// `with_capacity`s a frame's declared size — and ID3v2.3 frame sizes are plain
+/// 32-bit, up to 4 GiB). When false, callers skip ID3 parsing (yielding no tags
+/// for that file) rather than risk an OOM. Conservative: tags using an extended
+/// header or unsynchronisation, a malformed synchsafe body/frame-size field
+/// (any byte with high bit set), or an unrecognised major version are skipped
+/// (those files lose scan-time tag extraction, but cannot OOM the scanner).
+/// Files without an ID3v2 tag return true (the id3 crate handles them cheaply).
+fn id3v2_alloc_safe(data: &[u8]) -> bool {
+    if data.len() < 10 || &data[0..3] != b"ID3" {
+        return true;
+    }
+    let major = data[3];
+    if !matches!(major, 2..=4) {
+        return false;
+    }
+    let flags = data[5];
+    // Extended header (0x40) and unsynchronisation (0x80) complicate frame
+    // bounds; skip rather than risk mis-validating.
+    if flags & 0xC0 != 0 {
+        return false;
+    }
+    // A well-formed synchsafe integer has the high bit clear in every byte.  If
+    // any byte has the high bit set the field is malformed; the id3 crate may
+    // not mask those bits, producing a body size much larger than our
+    // spec-correct synchsafe decode and walking frames we have not validated.
+    // Reject such tags conservatively rather than risk mis-validating bounds.
+    if data[6] | data[7] | data[8] | data[9] >= 0x80 {
+        return false;
+    }
+    let body = synchsafe_decode(&data[6..10]) as usize;
+    let Some(tag_end) = 10usize.checked_add(body) else {
+        return false;
+    };
+    if tag_end > data.len() {
+        return false;
+    }
+    let header_len = if major == 2 { 6 } else { 10 };
+    // Walk frames over the entire remaining buffer (not just [10, tag_end)):
+    // the id3 crate does not consistently stop at the declared tag body and
+    // can walk and allocate from bytes beyond tag_end.  Any incomplete frame
+    // header visible in data (i.e. pos + header_len <= data.len()) is also
+    // validated.  We still reject if a frame's declared size exceeds tag_end.
+    let scan_end = data.len();
+    let mut pos = 10usize;
+    while pos + header_len <= scan_end {
+        // A zero first id byte marks the start of the padding region.
+        if data[pos] == 0 {
+            break;
+        }
+        // CHAP and CTOC frames contain embedded sub-frames; the id3 crate
+        // allocates based on those sub-frame sizes, creating a recursive OOM
+        // vector.  Reject tags containing either frame type (v2.3/v2.4 only;
+        // v2.2 uses 3-byte frame ids and never defines chapter frames).
+        if major != 2 && (&data[pos..pos + 4] == b"CHAP" || &data[pos..pos + 4] == b"CTOC") {
+            return false;
+        }
+        let size = if major == 2 {
+            ((data[pos + 3] as usize) << 16)
+                | ((data[pos + 4] as usize) << 8)
+                | (data[pos + 5] as usize)
+        } else if major == 3 {
+            // ID3v2.3: plain 32-bit big-endian frame size.
+            // Frame flags at pos+8..pos+10: reject any non-zero flags.  The id3
+            // crate handles COMPRESSION (0x0080) by subtracting 4 from the size
+            // (panicking if size < 4), and ENCRYPTION/GROUPING_IDENTITY by
+            // returning errors; rejecting all non-zero frame flags avoids those
+            // paths entirely.
+            if data[pos + 8] != 0 || data[pos + 9] != 0 {
+                return false;
+            }
+            u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                as usize
+        } else {
+            // ID3v2.4: synchsafe frame size.  Reject if any byte has its high
+            // bit set (malformed synchsafe), for the same reason as the body.
+            // Also reject non-zero frame flags for the same reasons as v2.3.
+            if data[pos + 4] | data[pos + 5] | data[pos + 6] | data[pos + 7] >= 0x80 {
+                return false;
+            }
+            if data[pos + 8] != 0 || data[pos + 9] != 0 {
+                return false;
+            }
+            synchsafe_decode(&data[pos + 4..pos + 8]) as usize
+        };
+        let data_start = pos + header_len;
+        // Reject if the frame header itself extends past the declared tag body,
+        // or if the frame payload claims more bytes than the remaining body.
+        // The id3 crate would otherwise attempt to subtract or allocate with
+        // an invalid size, causing a panic or OOM.
+        if data_start > tag_end || size > tag_end - data_start {
+            return false;
+        }
+        pos = data_start + size;
+        // Stop once we have walked past the declared tag body: any subsequent
+        // bytes are audio or trailing tags, not ID3v2 frames.
+        if pos >= tag_end {
+            break;
+        }
+    }
+    true
+}
+
 /// Extract all APIC pictures from an MP3's ID3v2 tag as embedded pictures, for
 /// scan-time art ingestion. Returns empty if there is no tag or no pictures.
 pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
+    if !id3v2_alloc_safe(data) {
+        return Vec::new();
+    }
     let Ok(tag) = id3::Tag::read_from2(std::io::Cursor::new(data)) else {
         return Vec::new();
     };
@@ -281,6 +388,9 @@ pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
 /// Multiple `COMM` or `USLT` frames (e.g. one per language) each emit a separate
 /// pair; their language and description fields are not preserved.
 pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
+    if !id3v2_alloc_safe(data) {
+        return Vec::new();
+    }
     let Ok(tag) = id3::Tag::read_from2(std::io::Cursor::new(data)) else {
         return Vec::new();
     };
@@ -309,9 +419,104 @@ pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_id3v2_segments, read_tags};
+    use super::{build_id3v2_segments, id3v2_alloc_safe, read_tags};
     use crate::input::TagInput;
     use crate::layout::Segment;
+
+    /// Build a minimal ID3v2.3 tag with a single frame whose declared size
+    /// overflows the tag bounds, and assert the guard rejects it.
+    #[test]
+    fn id3v2_guard_rejects_oversized_v23_frame() {
+        // Tag header: b"ID3" major=3 rev=0 flags=0
+        // Synchsafe body size encoding 10 (= one 10-byte frame header, no payload):
+        //   syncsafe(10) = [0, 0, 0, 0x0A]
+        // Frame: id=TIT2 (4 bytes), size=0xFFFF_FFFF (4 bytes, plain BE), flags=0x00 0x00
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"ID3");
+        bytes.push(0x03); // major version 2.3
+        bytes.push(0x00); // revision
+        bytes.push(0x00); // flags: no extended header, no unsync
+                          // synchsafe body = 10 (covers exactly one 10-byte frame header)
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x0A]);
+        // Frame header: id "TIT2", size 0xFFFF_FFFF (big-endian, plain 32-bit)
+        bytes.extend_from_slice(b"TIT2");
+        bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        bytes.extend_from_slice(&[0x00, 0x00]); // frame flags
+
+        assert!(
+            !id3v2_alloc_safe(&bytes),
+            "guard should reject frame claiming more bytes than the tag holds"
+        );
+        // Must return quickly without OOM and produce no tags.
+        assert!(
+            read_tags(&bytes).is_empty(),
+            "read_tags must return empty for unsafe tag"
+        );
+    }
+
+    /// Write a real ID3v2.4 tag via the id3 crate and confirm the guard allows it
+    /// and that read_tags extracts the expected values.
+    #[test]
+    fn id3v2_guard_allows_valid_tag() {
+        use id3::{Tag, TagLike, Version};
+
+        let mut tag = Tag::new();
+        tag.set_text("TIT2", "Hello");
+        tag.set_text("TPE1", "Artist");
+        let mut buf = Vec::new();
+        tag.write_to(&mut buf, Version::Id3v24).unwrap();
+
+        assert!(
+            id3v2_alloc_safe(&buf),
+            "guard should allow a well-formed tag written by the id3 crate"
+        );
+        let tags = read_tags(&buf);
+        assert!(
+            tags.contains(&("title".to_string(), "Hello".to_string())),
+            "missing title in {tags:?}"
+        );
+        assert!(
+            tags.contains(&("artist".to_string(), "Artist".to_string())),
+            "missing artist in {tags:?}"
+        );
+    }
+
+    /// Replay fuzz-discovered crash artifacts: tags that would OOM the id3 crate.
+    /// The guard must reject all of them and return empty without allocating.
+    #[test]
+    fn read_tags_handles_oom_crash_input_safely() {
+        // Artifact 1 (oom-a9b766b...): 30-byte ID3v2.3 tag with flags=0xf0
+        // (extended header + unsync bits set).  Guard rejects via flags & 0xC0.
+        // xxd fuzz/artifacts/mp3/oom-a9b766b841c2a964e72b01f31c174f25bf11b2d2
+        const CRASH1: &[u8] = &[
+            0x49, 0x44, 0x33, // "ID3"
+            0x03, 0xf0, // major=3, flags=0xf0 (extended header + unsync)
+            0x00, 0x00, 0xf9, 0x2d, // synchsafe body size
+            0x49, 0x50, 0x4c, 0x53, // frame id "IPLS"
+            0x00, 0xf9, 0x3d, 0x02, // frame size (big-endian)
+            0x00, 0x2d, 0x01, 0x00, // frame flags + data
+            0x00, 0x03, 0x00, 0x49, 0x07, 0x10, 0xff, 0x07, 0xfe,
+        ];
+        // Artifact 2 (oom-54f1f5e1...): 26-byte ID3v2.3 tag with a malformed
+        // synchsafe body field (data[9]=0x80, high bit set).  The id3 crate
+        // treated the raw value as 128, walked the oversized IPLS frame, and
+        // OOMed.  Guard rejects via the high-bit check on body bytes.
+        // xxd fuzz/artifacts/mp3/oom-54f1f5e197c4aa191f4aac77bc263939a4e4ee83
+        const CRASH2: &[u8] = &[
+            0x49, 0x44, 0x33, // "ID3"
+            0x03, 0x00, // major=3, flags=0 (no extended header / unsync)
+            0x00, 0x00, 0x00, 0x80, // body bytes: data[9]=0x80 — malformed synchsafe
+            0x0a, 0x27, 0x2f, 0x00, // frame id (partial)
+            0xff, 0xee, 0x01, 0x00, // frame size declares ~4 GB
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x2f,
+        ];
+        for (i, crash) in [CRASH1, CRASH2].iter().enumerate() {
+            assert!(
+                read_tags(crash).is_empty(),
+                "read_tags must be safe on crash artifact {i}"
+            );
+        }
+    }
 
     #[test]
     fn read_tags_captures_txxx_comm_uslt_and_unmapped_text() {
