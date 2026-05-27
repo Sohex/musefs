@@ -8,8 +8,9 @@ modifying or duplicating the original audio bytes.
 
 ### Delivered in v0.1.0
 
-- **Formats:** FLAC and MP3 — metadata synthesized on the fly from the DB and
-  spliced in front of the byte-identical backing audio (no audio bytes copied).
+- **Formats:** FLAC, MP3, M4A/M4B, Ogg Opus/Vorbis/FLAC-in-Ogg, and WAV —
+  metadata synthesized on the fly from the DB and spliced in front of the
+  byte-identical backing audio (no audio bytes copied).
 - **Embedded art:** synthesized into the served file and streamed (never
   materialized in memory), content-addressed and deduplicated in the store.
 - **Virtual tree:** beets-style `$field` / `${field}` path templates with
@@ -51,6 +52,10 @@ modifying or duplicating the original audio bytes.
   chained Ogg (more than one logical bitstream) is detected at scan and skipped.
   Verified end-to-end (real FUSE mount + independent demux) for all three codecs,
   including byte-identical cover-art round-trips.
+- **WAV (RIFF/WAVE):** the `data` chunk payload is served verbatim, with a
+  synthesized front carrying a native `LIST`/`INFO` chunk and an embedded `id3 `
+  chunk (full ID3v2 + art). Verified end-to-end (real FUSE mount + byte-identical
+  data payload + tag round-trip).
 - **Performance, concurrency & caching (optimization pass — all phases complete):**
   a phased pass hardening the filesystem for real-world media-manager and player
   access patterns across HDD/SSD/NFS backing stores. All eight phases (0–7) are
@@ -96,10 +101,15 @@ boundary stays explicit; none are half-built in the codebase.
 
 ### Formats
 
-- All currently targeted formats (FLAC, MP3, M4A/M4B, and Ogg Opus/Vorbis/
-  FLAC-in-Ogg) are delivered — see above. Remaining edges: FLAC-in-Ogg only
-  handles the standard `0x7F "FLAC"` 1.x mapping, and chained/multiplexed Ogg is
-  intentionally skipped rather than synthesized.
+- All currently targeted formats (FLAC, MP3, M4A/M4B, Ogg Opus/Vorbis/
+  FLAC-in-Ogg, and WAV) are delivered — see above. Remaining edges: FLAC-in-Ogg
+  only handles the standard `0x7F "FLAC"` 1.x mapping, and chained/multiplexed
+  Ogg is intentionally skipped rather than synthesized.
+- **WAV (RIFF/WAVE)** is delivered: the `data` chunk payload is served verbatim,
+  with a synthesized front carrying a native `LIST`/`INFO` chunk and an embedded
+  `id3 ` chunk (full ID3v2 + art). Out of scope: RF64/BW64 (>4 GiB), preserving
+  non-essential chunks (`bext`/`cue`/`smpl`), and seek-based scanning of large
+  files.
 
 ### Editing / writability
 

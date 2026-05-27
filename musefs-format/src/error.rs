@@ -12,6 +12,8 @@ pub enum FormatError {
     TooLarge,
     #[error("not a supported MP4/M4A file")]
     NotMp4,
+    #[error("not a supported WAV/RIFF file")]
+    NotWav,
 }
 
 pub type Result<T> = std::result::Result<T, FormatError>;

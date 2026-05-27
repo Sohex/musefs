@@ -125,16 +125,15 @@ fn apic_framing(art: &ArtInput) -> Vec<u8> {
     d
 }
 
-/// Build the synthesized region for an MP3: a fresh ID3v2.4 tag (text frames +
-/// APIC frames, with image bytes streamed as `ArtImage` segments) followed by the
-/// backing audio. The header's syncsafe size is measured from the generated
-/// frames, so the reported size matches the bytes produced exactly.
-pub fn synthesize_layout(
-    audio_offset: u64,
-    audio_length: u64,
+/// Build the ID3v2.4 tag region for `tags`/`arts`: an inline 10-byte header
+/// followed by text/`TXXX` frames and `APIC` frames whose image bytes are
+/// streamed as `ArtImage` segments. Returns the segments (no backing audio) and
+/// the total tag length (`10 + frames_len`). Shared by MP3 synthesis and the WAV
+/// `id3 ` chunk.
+pub(crate) fn build_id3v2_segments(
     tags: &[TagInput],
     arts: &[ArtInput],
-) -> Result<RegionLayout> {
+) -> Result<(Vec<Segment>, u64)> {
     // Group consecutive same-key values (the DB returns tags ordered by key).
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for t in tags {
@@ -199,11 +198,23 @@ pub fn synthesize_layout(
     header.extend_from_slice(&syncsafe(frames_len as u32));
     segments.insert(0, Segment::Inline(header));
 
+    Ok((segments, 10 + frames_len))
+}
+
+/// Build the synthesized region for an MP3: a fresh ID3v2.4 tag (text frames +
+/// APIC frames, with image bytes streamed as `ArtImage` segments) followed by the
+/// backing audio.
+pub fn synthesize_layout(
+    audio_offset: u64,
+    audio_length: u64,
+    tags: &[TagInput],
+    arts: &[ArtInput],
+) -> Result<RegionLayout> {
+    let (mut segments, _tag_len) = build_id3v2_segments(tags, arts)?;
     segments.push(Segment::BackingAudio {
         offset: audio_offset,
         len: audio_length,
     });
-
     Ok(RegionLayout::new(segments))
 }
 

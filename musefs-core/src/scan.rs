@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
-use musefs_format::{flac, mp3, mp4, ogg, EmbeddedPicture};
+use musefs_format::{flac, mp3, mp4, ogg, wav, EmbeddedPicture};
 
 use crate::error::Result;
 
@@ -49,6 +49,7 @@ fn is_supported_audio(path: &Path) -> bool {
         || has_ext(path, "ogg")
         || has_ext(path, "oga")
         || has_ext(path, "opus")
+        || has_ext(path, "wav")
 }
 
 fn collect_audio(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -118,6 +119,15 @@ fn probe(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_length: scan.audio_length,
             tags: ogg::read_tags(bytes).unwrap_or_default(),
             pictures: ogg::read_pictures(bytes).unwrap_or_default(),
+        })
+    } else if has_ext(path, "wav") {
+        let bounds = wav::locate_audio(bytes).ok()?;
+        Some(Probed {
+            format: Format::Wav,
+            audio_offset: bounds.audio_offset,
+            audio_length: bounds.audio_length,
+            tags: wav::read_tags(bytes),
+            pictures: wav::read_pictures(bytes),
         })
     } else {
         None
@@ -315,6 +325,66 @@ mod ogg_probe_tests {
 
         let db = musefs_db::Db::open_in_memory().unwrap();
         // Pass the FILE path directly (not the directory).
+        let stats = crate::scan_directory(&db, &path).unwrap();
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.skipped, 0);
+    }
+}
+
+#[cfg(test)]
+mod wav_probe_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn build_wav() -> Vec<u8> {
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&44_100u32.to_le_bytes());
+        fmt.extend_from_slice(&88_200u32.to_le_bytes());
+        fmt.extend_from_slice(&2u16.to_le_bytes());
+        fmt.extend_from_slice(&16u16.to_le_bytes());
+
+        let data = vec![0u8; 16];
+        let mut body = Vec::new();
+        for (id, payload) in [(b"fmt ", &fmt), (b"data", &data)] {
+            body.extend_from_slice(id);
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+        }
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn probe_detects_wav() {
+        let bytes = build_wav();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.wav");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+
+        let probed = probe(&path, &bytes).expect("wav should probe");
+        assert_eq!(probed.format, Format::Wav);
+        assert_eq!(probed.audio_length, 16);
+    }
+
+    #[test]
+    fn scan_single_wav_file_ingests_it() {
+        let bytes = build_wav();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.wav");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+
+        let db = musefs_db::Db::open_in_memory().unwrap();
         let stats = crate::scan_directory(&db, &path).unwrap();
         assert_eq!(stats.scanned, 1);
         assert_eq!(stats.skipped, 0);
