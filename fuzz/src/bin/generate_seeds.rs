@@ -13,6 +13,8 @@ fn main() {
     write("mp3", "seed0", &fixtures::mp3());
     write("mp4", "seed0", &fixtures::m4a(&[9u8; 32]));
     write("ogg", "seed0", &fixtures::ogg_opus());
+    write("ogg_page", "seed0", &fixtures::ogg_opus());
+    write("vorbiscomment", "seed0", &fixtures::ogg_opus());
     write(
         "wav",
         "seed0",

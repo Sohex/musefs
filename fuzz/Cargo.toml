@@ -58,4 +58,25 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ogg_page"
+path = "fuzz_targets/ogg_page.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "b64"
+path = "fuzz_targets/b64.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vorbiscomment"
+path = "fuzz_targets/vorbiscomment.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
