@@ -141,9 +141,11 @@ impl MusefsFs {
 
 impl Filesystem for MusefsFs {
     fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
-        // All tuning is best-effort and must never abort the mount: the setters
-        // clamp to the kernel-supported range (returning the nearest legal value
-        // on Err), so we discard their results.
+        // All tuning is best-effort and must never abort the mount. On Err these
+        // setters leave the config unchanged (the nearest legal value comes back
+        // as the Err payload, not written) — and for max_readahead the unchanged
+        // value is the kernel's advertised max, so an over-large request still
+        // yields that max. We discard the results regardless.
         let _ = config.set_max_readahead(self.config.max_readahead);
         let _ = config.set_max_background(self.config.max_background);
         // `add_capabilities` is all-or-nothing — a single unsupported bit drops
