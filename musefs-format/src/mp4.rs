@@ -474,47 +474,49 @@ fn number_atom(kind: &[u8; 4], n: u16, width: usize) -> Vec<u8> {
     boxed(kind, &boxed(b"data", &data))
 }
 
-fn meta_key(key: &str) -> Option<&'static [u8; 4]> {
-    Some(match key {
-        "title" => b"\xa9nam",
-        "artist" => b"\xa9ART",
-        "albumartist" => b"aART",
-        "album" => b"\xa9alb",
-        "genre" => b"\xa9gen",
-        "date" => b"\xa9day",
-        "composer" => b"\xa9wrt",
-        _ => return None,
-    })
+fn freeform_atom(mean: &str, name: &str, values: &[&str]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    let mut mean_body = 0u32.to_be_bytes().to_vec(); // version/flags
+    mean_body.extend_from_slice(mean.as_bytes());
+    inner.extend(boxed(b"mean", &mean_body));
+    let mut name_body = 0u32.to_be_bytes().to_vec();
+    name_body.extend_from_slice(name.as_bytes());
+    inner.extend(boxed(b"name", &name_body));
+    for v in values {
+        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data.extend_from_slice(v.as_bytes());
+        inner.extend(boxed(b"data", &data));
+    }
+    boxed(b"----", &inner)
 }
 
 /// Build `udta` up to (not including) the cover image bytes. Returns (prefix,
 /// art_len). No art → prefix is the complete udta, art_len 0. All enclosing box
 /// sizes include art_len so the image can stream right after the prefix.
 fn build_udta(tags: &[TagInput], art: Option<&ArtInput>) -> Result<(Vec<u8>, u64)> {
-    // Group consecutive same-key text values (DB returns tags ordered by key).
-    let mut text: Vec<(&str, Vec<&str>)> = Vec::new();
+    // Group consecutive same-key values (the DB returns tags ordered by key).
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
     for t in tags {
-        if meta_key(&t.key).is_some() {
-            match text.last_mut() {
-                Some(g) if g.0 == t.key => g.1.push(&t.value),
-                _ => text.push((&t.key, vec![&t.value])),
-            }
+        match groups.last_mut() {
+            Some(g) if g.0 == t.key => g.1.push(&t.value),
+            _ => groups.push((&t.key, vec![&t.value])),
         }
     }
 
     let mut ilst = Vec::new();
-    for (key, values) in &text {
-        ilst.extend(text_atom(meta_key(key).unwrap(), values));
-    }
-    for t in tags {
-        if t.key == "tracknumber" {
-            if let Ok(n) = t.value.parse::<u16>() {
-                ilst.extend(number_atom(b"trkn", n, 8));
+    for (key, values) in &groups {
+        match crate::tagmap::key_to_mp4(key) {
+            Some(crate::tagmap::Mp4Slot::Text(atom)) => ilst.extend(text_atom(atom, values)),
+            Some(crate::tagmap::Mp4Slot::Number(atom, width)) => {
+                if let Ok(n) = values.first().copied().unwrap_or("").parse::<u16>() {
+                    ilst.extend(number_atom(atom, n, width));
+                }
             }
-        } else if t.key == "discnumber" {
-            if let Ok(n) = t.value.parse::<u16>() {
-                ilst.extend(number_atom(b"disk", n, 6));
+            Some(crate::tagmap::Mp4Slot::Freeform(mean, name)) => {
+                ilst.extend(freeform_atom(mean, name, values));
             }
+            None => ilst.extend(freeform_atom("com.apple.iTunes", key, values)),
         }
     }
 
@@ -1311,6 +1313,33 @@ mod tests {
         inner.extend(boxed(b"data", &data));
 
         assert!(read_freeform(&inner).is_none()); // binary-typed data is skipped
+    }
+
+    #[test]
+    fn build_udta_round_trips_freeform_and_vocabulary() {
+        let tags = vec![
+            TagInput::new("title", "Song"),
+            TagInput::new("tracknumber", "3"),
+            TagInput::new("MyRating", "5"), // user-defined -> ----
+            TagInput::new("musicbrainz_albumid", "abc-123"), // vocabulary -> ----
+        ];
+        let (udta, _art_len) = build_udta(&tags, None).unwrap();
+        // build_udta returns a full `udta` box; read_tags expects a buffer containing
+        // moov/udta/meta/ilst, so wrap udta in a minimal moov for the round trip.
+        let moov = boxed(b"moov", &udta);
+
+        let tags = read_tags(&moov);
+        for expected in [
+            ("title", "Song"),
+            ("tracknumber", "3"),
+            ("MyRating", "5"),
+            ("musicbrainz_albumid", "abc-123"),
+        ] {
+            assert!(
+                tags.contains(&(expected.0.to_string(), expected.1.to_string())),
+                "missing {expected:?} in {tags:?}"
+            );
+        }
     }
 
     #[test]
