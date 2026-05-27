@@ -82,23 +82,6 @@ fn push_frame_header(out: &mut Vec<u8>, id: &[u8; 4], data_len: usize) -> Result
     Ok(())
 }
 
-/// Canonical (lowercase) tag key -> ID3v2.4 text frame id. Unknown keys are
-/// written as `TXXX` user-defined frames.
-fn key_to_frame(key: &str) -> Option<&'static [u8; 4]> {
-    Some(match key {
-        "title" => b"TIT2",
-        "artist" => b"TPE1",
-        "album" => b"TALB",
-        "albumartist" => b"TPE2",
-        "tracknumber" => b"TRCK",
-        "discnumber" => b"TPOS",
-        "date" => b"TDRC",
-        "genre" => b"TCON",
-        "composer" => b"TCOM",
-        _ => return None,
-    })
-}
-
 fn text_frame_data(values: &[String]) -> Vec<u8> {
     let mut d = vec![ENC_UTF8];
     d.extend_from_slice(values.join("\0").as_bytes());
@@ -111,6 +94,27 @@ fn txxx_frame_data(desc: &str, value: &str) -> Vec<u8> {
     d.push(0x00);
     d.extend_from_slice(value.as_bytes());
     d
+}
+
+/// COMM/USLT share a body layout: `[enc][lang(3)][descriptor NUL][text]`. We
+/// write UTF-8 with an unknown language and empty descriptor (see Limitations).
+fn comm_like_frame_data(value: &str) -> Vec<u8> {
+    let mut d = vec![ENC_UTF8];
+    d.extend_from_slice(b"XXX"); // language: unknown
+    d.push(0x00); // empty content descriptor, NUL-terminated
+    d.extend_from_slice(value.as_bytes());
+    d
+}
+
+/// True if `key` is shaped like an ID3v2 text frame id (`T` + 3 upper/digit),
+/// excluding `TXXX` itself. Used to round-trip unmapped standard text frames.
+fn is_id3_text_frame_id(key: &str) -> bool {
+    key.len() == 4
+        && key != "TXXX"
+        && key.starts_with('T')
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
 /// APIC frame data up to (but excluding) the image bytes:
@@ -148,10 +152,41 @@ pub(crate) fn build_id3v2_segments(
     let mut frames_len: u64 = 0;
 
     for (key, values) in &groups {
-        match key_to_frame(key) {
-            Some(id) => {
+        match crate::tagmap::key_to_id3(key) {
+            Some(crate::tagmap::Id3Slot::Text(id)) => {
                 let data = text_frame_data(values);
                 push_frame_header(&mut buf, id, data.len())?;
+                buf.extend_from_slice(&data);
+                frames_len += 10 + data.len() as u64;
+            }
+            Some(crate::tagmap::Id3Slot::Txxx(desc)) => {
+                for value in values {
+                    let data = txxx_frame_data(desc, value);
+                    push_frame_header(&mut buf, b"TXXX", data.len())?;
+                    buf.extend_from_slice(&data);
+                    frames_len += 10 + data.len() as u64;
+                }
+            }
+            Some(crate::tagmap::Id3Slot::Comment) => {
+                for value in values {
+                    let data = comm_like_frame_data(value);
+                    push_frame_header(&mut buf, b"COMM", data.len())?;
+                    buf.extend_from_slice(&data);
+                    frames_len += 10 + data.len() as u64;
+                }
+            }
+            Some(crate::tagmap::Id3Slot::Lyrics) => {
+                for value in values {
+                    let data = comm_like_frame_data(value);
+                    push_frame_header(&mut buf, b"USLT", data.len())?;
+                    buf.extend_from_slice(&data);
+                    frames_len += 10 + data.len() as u64;
+                }
+            }
+            None if is_id3_text_frame_id(key) => {
+                let id: [u8; 4] = key.as_bytes().try_into().unwrap();
+                let data = text_frame_data(values);
+                push_frame_header(&mut buf, &id, data.len())?;
                 buf.extend_from_slice(&data);
                 frames_len += 10 + data.len() as u64;
             }
@@ -272,7 +307,9 @@ pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_tags;
+    use super::{build_id3v2_segments, read_tags};
+    use crate::input::TagInput;
+    use crate::layout::Segment;
 
     #[test]
     fn read_tags_captures_txxx_comm_uslt_and_unmapped_text() {
@@ -311,5 +348,38 @@ mod tests {
         assert!(tags.contains(&("replaygain_track_gain".to_string(), "-6.5 dB".to_string())));
         assert!(tags.contains(&("comment".to_string(), "nice".to_string())));
         assert!(tags.contains(&("lyrics".to_string(), "la la".to_string())));
+    }
+
+    #[test]
+    fn synthesize_round_trips_arbitrary_id3_tags() {
+        let tags = vec![
+            TagInput::new("title", "Song"),
+            TagInput::new("TBPM", "120"),     // unmapped standard frame
+            TagInput::new("MyRating", "5"),   // user-defined -> TXXX
+            TagInput::new("comment", "nice"), // -> COMM
+            TagInput::new("lyrics", "la la"), // -> USLT
+            TagInput::new("replaygain_track_gain", "-3.21 dB"), // -> TXXX (fixed desc)
+        ];
+        let (segments, _len) = build_id3v2_segments(&tags, &[]).unwrap();
+        let mut buf = Vec::new();
+        for seg in &segments {
+            if let Segment::Inline(bytes) = seg {
+                buf.extend_from_slice(bytes);
+            }
+        }
+        let read = read_tags(&buf);
+        for expected in [
+            ("title", "Song"),
+            ("TBPM", "120"),
+            ("MyRating", "5"),
+            ("comment", "nice"),
+            ("lyrics", "la la"),
+            ("replaygain_track_gain", "-3.21 dB"),
+        ] {
+            assert!(
+                read.contains(&(expected.0.to_string(), expected.1.to_string())),
+                "missing {expected:?} in {read:?}"
+            );
+        }
     }
 }
