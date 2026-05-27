@@ -597,11 +597,12 @@ mod resolve_ogg_tests {
         let synth_audio = &out[header.audio_offset as usize..];
         assert_eq!(synth_audio, &original[audio_offset as usize..]);
 
-        // Tags were rewritten.
+        // Tags were rewritten. `ogg::read_tags` now returns canonical lowercase
+        // keys for known Vorbis fields (Tasks 1–6 changed the format layer).
         let tags = musefs_format::ogg::read_tags(&out).unwrap();
         assert!(tags
             .iter()
-            .any(|(k, v)| k == "TITLE" && v == "Telephasic Workshop"));
+            .any(|(k, v)| k == "title" && v == "Telephasic Workshop"));
     }
 
     #[test]

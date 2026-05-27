@@ -18,7 +18,8 @@ pub(crate) fn tags_to_inputs(tags: &[Tag]) -> Vec<TagInput> {
 pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for t in tags {
-        map.entry(t.key.clone()).or_insert_with(|| t.value.clone());
+        map.entry(t.key.to_lowercase())
+            .or_insert_with(|| t.value.clone());
     }
     map
 }
@@ -94,5 +95,16 @@ mod tests {
         let fields = tags_to_fields(&tags);
         assert_eq!(fields.get("artist").map(String::as_str), Some("Alice"));
         assert_eq!(fields.get("album").map(String::as_str), Some("X"));
+    }
+
+    #[test]
+    fn tags_to_fields_lowercases_keys_for_template_lookup() {
+        let tags = vec![
+            Tag::new("MyRating", "5", 0), // verbatim user-defined key
+            Tag::new("albumartist", "VA", 0),
+        ];
+        let fields = tags_to_fields(&tags);
+        assert_eq!(fields.get("myrating"), Some(&"5".to_string()));
+        assert_eq!(fields.get("albumartist"), Some(&"VA".to_string()));
     }
 }
