@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use musefs_db::{Db, Format};
 use musefs_format::flac::{self, FlacScan};
-use musefs_format::{mp3, mp4, RegionLayout, Segment};
+use musefs_format::{mp3, mp4, wav, RegionLayout, Segment};
 use once_cell::sync::OnceCell;
 
 use crate::error::{CoreError, Result};
@@ -286,7 +286,18 @@ impl HeaderCache {
                         mp4::synthesize_layout(&scan, &inputs, &art_inputs)?
                     }
                     Format::Wav => {
-                        todo!("WAV synthesis not yet implemented")
+                        // Read only the front (RIFF header + fmt/fact); the data
+                        // payload is served from the backing file at read time.
+                        let front =
+                            read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
+                        let scan = wav::read_structure(&front)?;
+                        wav::synthesize_layout(
+                            &scan,
+                            track.audio_offset as u64,
+                            track.audio_length as u64,
+                            &inputs,
+                            &art_inputs,
+                        )?
                     }
                     Format::Opus | Format::Vorbis | Format::OggFlac => {
                         let front =
@@ -616,6 +627,71 @@ mod resolve_ogg_tests {
         let file = std::fs::File::open(&resolved.backing_path).unwrap();
         let via_file = read_at_with_file(&resolved, &db, &file, 0, resolved.total_len).unwrap();
         assert_eq!(via_open, via_file);
+    }
+
+    fn build_wav_file(path: &std::path::Path) -> (u64, u64, Vec<u8>) {
+        use std::io::Write;
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&44_100u32.to_le_bytes());
+        fmt.extend_from_slice(&88_200u32.to_le_bytes());
+        fmt.extend_from_slice(&2u16.to_le_bytes());
+        fmt.extend_from_slice(&16u16.to_le_bytes());
+
+        let data: Vec<u8> = (0..32u8).collect();
+        let mut body = Vec::new();
+        for (id, payload) in [(&b"fmt "[..], &fmt[..]), (&b"data"[..], &data[..])] {
+            body.extend_from_slice(id);
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+        }
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(&body);
+
+        let audio_offset = (bytes.len() - data.len()) as u64;
+        std::fs::File::create(path).unwrap().write_all(&bytes).unwrap();
+        (audio_offset, data.len() as u64, data)
+    }
+
+    #[test]
+    fn resolves_and_reads_wav_with_identical_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("track.wav");
+        let (audio_offset, audio_length, original_data) = build_wav_file(&path);
+
+        let db = Db::open_in_memory().unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let track_id = db
+            .upsert_track(&NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: Format::Wav,
+                audio_offset: audio_offset as i64,
+                audio_length: audio_length as i64,
+                backing_size: meta.len() as i64,
+                backing_mtime: mtime_secs(&meta),
+            })
+            .unwrap();
+        db.replace_tags(track_id, &[Tag::new("title", "Wave One", 0)])
+            .unwrap();
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let resolved = cache.resolve(&db, track_id).unwrap();
+        let out = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+
+        // The synthesized output is a valid WAV; its data payload is byte-identical
+        // to the original audio.
+        let bounds = musefs_format::wav::locate_audio(&out).unwrap();
+        assert_eq!(
+            &out[bounds.audio_offset as usize..(bounds.audio_offset + bounds.audio_length) as usize],
+            original_data.as_slice()
+        );
+
+        // The title was synthesized into the embedded id3 chunk.
+        let tags = musefs_format::wav::read_tags(&out);
+        assert!(tags.contains(&("title".to_string(), "Wave One".to_string())));
     }
 }
 
