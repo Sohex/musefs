@@ -265,8 +265,15 @@ pub fn synthesize_layout(
 /// (those files lose scan-time tag extraction, but cannot OOM the scanner).
 /// Files without an ID3v2 tag return true (the id3 crate handles them cheaply).
 fn id3v2_alloc_safe(data: &[u8]) -> bool {
+    // id3::Tag::read_from2 scans forward to locate a tag, so handing it any
+    // buffer that is not a validated ID3v2 tag at offset 0 risks the unbounded
+    // allocation we are guarding against. Only parse when an ID3v2 header is at
+    // offset 0 (and its frames validate, below). Trade-off: scan-time tag
+    // extraction for ID3v1-only files (no leading ID3v2 header) is skipped;
+    // ID3v1 is legacy/fixed-size and tags can be populated via the DB
+    // (beets/picard) regardless.
     if data.len() < 10 || &data[0..3] != b"ID3" {
-        return true;
+        return false;
     }
     let major = data[3];
     if !matches!(major, 2..=4) {
@@ -451,6 +458,45 @@ mod tests {
         assert!(
             read_tags(&bytes).is_empty(),
             "read_tags must return empty for unsafe tag"
+        );
+    }
+
+    /// A buffer that does not start with "ID3" must be rejected by the guard.
+    /// id3::Tag::read_from2 scans forward to locate a tag, so any non-ID3-prefixed
+    /// buffer is unsafe regardless of what bytes appear later.
+    #[test]
+    fn id3v2_guard_rejects_non_id3_prefixed() {
+        // Plain non-ID3 bytes.
+        assert!(
+            !id3v2_alloc_safe(b"RIFF....just not an id3 tag...."),
+            "guard must reject buffer not starting with ID3"
+        );
+        assert!(
+            read_tags(b"RIFF....just not an id3 tag....").is_empty(),
+            "read_tags must return empty for non-ID3-prefixed buffer"
+        );
+
+        // The WAV crash vector: "RIFF..." body whose bytes do not start with "ID3"
+        // but contain a nested ID3v2.3 tag with a TDA frame declaring ~4 GiB.
+        // Extracted from fuzz/artifacts/wav/oom-4a21767820d5f05328f01d975fb6d3314f3fb902:
+        // the ID3 chunk body starts at offset 0x18 and begins with "RIFF".
+        const RIFF_BODY: &[u8] = &[
+            0x52, 0x49, 0x46, 0x46, 0x32, 0x00, 0x00, 0x00, // "RIFF2..."
+            0x57, 0x41, 0x56, 0x45, // "WAVE"
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4c, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x49, 0x44, 0x33, 0x20, // nested "ID3 " fourcc
+            0x15, 0x00, 0x00, 0x00, // chunk size = 21
+            0x49, 0x44, 0x33, // "ID3" — nested tag starts here
+            0x03, 0x00, 0x00, 0x00, 0xf7, 0x00, 0x00, 0x54, 0x44, 0x41, 0x03, 0xf6, 0x00, 0x00,
+            0x00, // TDA frame size = 0xF600_0000 (~4 GiB)
+        ];
+        assert!(
+            !id3v2_alloc_safe(RIFF_BODY),
+            "guard must reject RIFF-prefixed buffer (WAV crash vector)"
+        );
+        assert!(
+            read_tags(RIFF_BODY).is_empty(),
+            "read_tags must return empty for RIFF-prefixed buffer"
         );
     }
 
