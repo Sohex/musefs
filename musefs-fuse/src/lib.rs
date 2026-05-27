@@ -342,9 +342,11 @@ pub fn spawn_with(
     let fs = MusefsFs::new(core, config);
     let cell = fs.notifier_cell();
     let session = Session::new(fs, mountpoint, &mount_options(fs_name))?;
-    let bg = session.spawn()?;
-    let _ = cell.set(bg.notifier());
-    Ok(bg)
+    // Set the notifier BEFORE `spawn()` starts the dispatch thread, so the first
+    // request can't observe an empty cell. `session.notifier()` and the spawned
+    // session's notifier clone the same channel sender, so they're equivalent.
+    let _ = cell.set(session.notifier());
+    session.spawn()
 }
 
 #[cfg(test)]

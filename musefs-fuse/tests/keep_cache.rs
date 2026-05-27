@@ -119,7 +119,8 @@ fn keep_cache_mount_reflects_retag_after_refresh() {
 
     // 5. Trigger metadata ops so the FUSE layer fires poll_refresh_notify +
     //    inval_inode. Poll_interval is ZERO so any metadata op triggers a check.
-    //    invalidation is async (pool thread), so retry briefly.
+    //    invalidation is async (pool thread), so retry briefly. 1s (20×50ms) is
+    //    ample: the pool fires within ~1ms and the kernel cache drop is synchronous.
     let new_bytes = {
         let mut result = None;
         for _ in 0..20 {
