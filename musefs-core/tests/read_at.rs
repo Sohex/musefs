@@ -114,6 +114,7 @@ fn read_at_streams_art_image_segments() {
         total_len,
         content_version: 0,
         backing_path: std::path::PathBuf::from("/unused"),
+        backing_size: 0,
         mtime_secs: 0,
         ogg_index: once_cell::sync::OnceCell::new(),
         cache_bytes: 0,

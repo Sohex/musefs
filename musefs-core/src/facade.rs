@@ -395,10 +395,32 @@ impl Musefs {
                 },
             }
         };
-        let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
+        let (resolved, track) = self.pool.with(|db| {
+            let track = db
+                .get_track(track_id)?
+                .ok_or(CoreError::TrackNotFound(track_id))?;
+            let resolved = self.cache.resolve(db, track_id)?;
+            Ok((resolved, track))
+        })?;
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1; // never 0
+        let meta = file.metadata()?;
+        if meta.len() != track.backing_size as u64 {
+            return Err(CoreError::BackingChanged(
+                resolved.backing_path.to_string_lossy().to_string(),
+            ));
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs() as i64);
+        if mtime != track.backing_mtime {
+            return Err(CoreError::BackingChanged(
+                resolved.backing_path.to_string_lossy().to_string(),
+            ));
+        }
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
         self.handles()
             .insert(fh, Arc::new(Handle { resolved, file }));
         Ok(fh)
