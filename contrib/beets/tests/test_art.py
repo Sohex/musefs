@@ -45,19 +45,15 @@ def test_replace_track_art_links_front_cover(db_path, make_track):
     conn = connect(db_path)
     try:
         art_id = upsert_art(conn, JPEG, "image/jpeg")
-        before = conn.execute(
-            "SELECT content_version FROM tracks WHERE id=?", (tid,)
-        ).fetchone()[0]
+        before = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         replace_track_art(conn, tid, art_id)
         conn.commit()
         row = conn.execute(
-            "SELECT art_id, picture_type, description, ordinal FROM track_art "
-            "WHERE track_id=?", (tid,)
+            "SELECT art_id, picture_type, description, ordinal FROM track_art WHERE track_id=?",
+            (tid,),
         ).fetchone()
         assert row == (art_id, 3, "", 0)
-        after = conn.execute(
-            "SELECT content_version FROM tracks WHERE id=?", (tid,)
-        ).fetchone()[0]
+        after = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         assert after > before
     finally:
         conn.close()
@@ -71,18 +67,12 @@ def test_replace_track_art_replaces_existing(db_path, make_track):
         second = upsert_art(conn, PNG, "image/png")
         replace_track_art(conn, tid, first)
         conn.commit()
-        before = conn.execute(
-            "SELECT content_version FROM tracks WHERE id=?", (tid,)
-        ).fetchone()[0]
+        before = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         replace_track_art(conn, tid, second)
         conn.commit()
-        rows = conn.execute(
-            "SELECT art_id FROM track_art WHERE track_id=?", (tid,)
-        ).fetchall()
+        rows = conn.execute("SELECT art_id FROM track_art WHERE track_id=?", (tid,)).fetchall()
         assert rows == [(second,)]  # exactly one row, now pointing at the new art
-        after = conn.execute(
-            "SELECT content_version FROM tracks WHERE id=?", (tid,)
-        ).fetchone()[0]
+        after = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         assert after > before
     finally:
         conn.close()

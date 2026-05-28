@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from beetsplug._core import realpath_key, track_id_for_path, connect
+from beetsplug._core import connect, realpath_key, track_id_for_path
 
 pytestmark = pytest.mark.musefs_bin
 
@@ -78,11 +78,14 @@ def _write_flac(path):
     path.write_bytes(MINIMAL_FLAC)
 
 
-@pytest.mark.parametrize("rel", [
-    "Artist/Album/01 Track.flac",
-    "Accénted/テスト/01.flac",   # accented + CJK
-    "Spaced Out/cover %20 thing/02 song.flac",     # spaces and percent
-])
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "Artist/Album/01 Track.flac",
+        "Accénted/テスト/01.flac",  # accented + CJK
+        "Spaced Out/cover %20 thing/02 song.flac",  # spaces and percent
+    ],
+)
 def test_plain_paths_match(tmp_path, rel):
     tree = tmp_path / "music"
     _write_flac(tree / rel)

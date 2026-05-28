@@ -5,8 +5,17 @@ from beetsplug._core import map_fields
 
 def item(**kw):
     base = dict(
-        title="", artist="", albumartist="", album="", genre="", composer="",
-        track=0, disc=0, year=0, month=0, day=0,
+        title="",
+        artist="",
+        albumartist="",
+        album="",
+        genre="",
+        composer="",
+        track=0,
+        disc=0,
+        year=0,
+        month=0,
+        day=0,
     )
     base.update(kw)
     return SimpleNamespace(**base)

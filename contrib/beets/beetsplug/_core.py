@@ -106,7 +106,7 @@ def realpath_key(path):
     return real.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
-class SchemaMismatch(Exception):
+class SchemaMismatch(Exception):  # noqa: N818
     """Raised when the musefs DB schema version differs from what the plugin
     targets (``EXPECTED_USER_VERSION``)."""
 
@@ -138,22 +138,29 @@ def check_schema_version(conn):
 
 def track_id_for_path(conn, key):
     """Return the track id whose backing_path equals ``key``, or None."""
-    row = conn.execute(
-        "SELECT id FROM tracks WHERE backing_path = ?", (key,)
-    ).fetchone()
+    row = conn.execute("SELECT id FROM tracks WHERE backing_path = ?", (key,)).fetchone()
     return row[0] if row else None
 
 
-def prune_missing(conn):
-    """Delete track rows whose backing file no longer exists on disk (moved,
-    renamed, or deleted), cascading to their tags/art. Returns the number
-    pruned. Reconciles stale rows left behind when an external tool moves a
-    file out from under a previously-scanned path."""
-    gone = [
-        (tid,)
-        for tid, path in conn.execute("SELECT id, backing_path FROM tracks")
-        if not os.path.exists(path)
-    ]
+def prune_missing(conn, track_ids=None):
+    """Delete track rows whose backing file no longer exists on disk.
+
+    When ``track_ids`` is provided, only those tracks are checked and
+    potentially pruned. Otherwise, every track in the database is checked.
+    Returns the number pruned.
+    """
+    if track_ids is not None:
+        gone = []
+        for tid in track_ids:
+            row = conn.execute("SELECT backing_path FROM tracks WHERE id=?", (tid,)).fetchone()
+            if row is not None and not os.path.exists(row[0]):
+                gone.append((tid,))
+    else:
+        gone = [
+            (tid,)
+            for tid, path in conn.execute("SELECT id, backing_path FROM tracks")
+            if not os.path.exists(path)
+        ]
     conn.executemany("DELETE FROM tracks WHERE id = ?", gone)
     return len(gone)
 
@@ -205,9 +212,7 @@ def upsert_art(conn, data, mime):
         "VALUES (?, ?, NULL, NULL, ?, ?) ON CONFLICT(sha256) DO NOTHING",
         (sha, mime, len(data), data),
     )
-    return conn.execute(
-        "SELECT id FROM art WHERE sha256 = ?", (sha,)
-    ).fetchone()[0]
+    return conn.execute("SELECT id FROM art WHERE sha256 = ?", (sha,)).fetchone()[0]
 
 
 def replace_track_art(conn, track_id, art_id):
@@ -227,9 +232,9 @@ _WOULD_LINK = object()
 @dataclass
 class SyncStats:
     synced: int = 0
-    skipped: int = 0       # item path had no matching track row
+    skipped: int = 0  # item path had no matching track row
     art_linked: int = 0
-    skipped_art: int = 0   # art file oversized / unreadable
+    skipped_art: int = 0  # art file oversized / unreadable
 
     def summary(self):
         return (

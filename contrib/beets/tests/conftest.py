@@ -1,4 +1,3 @@
-import os
 import sqlite3
 import time
 from pathlib import Path
@@ -21,8 +20,9 @@ def db_path(tmp_path):
     return str(path)
 
 
-def insert_track(conn, backing_path, fmt="flac", audio_offset=0, audio_length=0,
-                 backing_size=0, backing_mtime=0):
+def insert_track(
+    conn, backing_path, fmt="flac", audio_offset=0, audio_length=0, backing_size=0, backing_mtime=0
+):
     """Insert a minimal track row (as `musefs scan` would) and return its id."""
     now = int(time.time())
     cur = conn.execute(
@@ -75,6 +75,7 @@ def fake_album():
 @pytest.fixture
 def make_track(db_path):
     """Return a helper that inserts a track row and returns its id."""
+
     def _make(backing_path, fmt="flac"):
         # Use the plugin's connect() so foreign_keys=ON matches real writes.
         conn = musefs_connect(db_path)
@@ -84,4 +85,5 @@ def make_track(db_path):
             return tid
         finally:
             conn.close()
+
     return _make

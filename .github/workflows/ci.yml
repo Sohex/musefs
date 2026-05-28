@@ -51,6 +51,24 @@ jobs:
       - name: mutagen interop assertions
         run: MUSEFS_INTEROP_DIR="$RUNNER_TEMP/interop" python -m pytest tests/interop -v
 
+  beets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check contrib/beets/ tests/interop/
+      - name: Format check
+        run: ruff format --check contrib/beets/ tests/interop/
+      - name: Install beets
+        run: pip install -e contrib/beets
+      - name: Test
+        run: python -m pytest contrib/beets/tests -v
+
   e2e:
     runs-on: ubuntu-latest
     steps:

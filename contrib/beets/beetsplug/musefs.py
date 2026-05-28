@@ -12,14 +12,12 @@ from beetsplug import _core
 class MusefsPlugin(BeetsPlugin):
     def __init__(self):
         super().__init__()
-        self.config.add(
-            {
-                "db": None,
-                "fields": {},
-                "bin": "musefs",   # musefs executable (PATH name or full path)
-                "autoscan": True,  # run `musefs scan` automatically before syncing
-            }
-        )
+        self.config.add({
+            "db": None,
+            "fields": {},
+            "bin": "musefs",  # musefs executable (PATH name or full path)
+            "autoscan": True,  # run `musefs scan` automatically before syncing
+        })
         # beets has no file-move event, and `after_write` fires *before* a move
         # (at the old path). So imports/writes are recorded and reconciled once
         # at cli_exit, when each item's path is final, where we also prune rows
@@ -35,11 +33,17 @@ class MusefsPlugin(BeetsPlugin):
     def commands(self):
         cmd = ui.Subcommand("musefs", help="sync beets metadata into the musefs DB")
         cmd.parser.add_option(
-            "--db", dest="db", default=None,
+            "--db",
+            dest="db",
+            default=None,
             help="path to the musefs SQLite store (overrides config)",
         )
         cmd.parser.add_option(
-            "-n", "--dry-run", dest="dry_run", action="store_true", default=False,
+            "-n",
+            "--dry-run",
+            dest="dry_run",
+            action="store_true",
+            default=False,
             help="report what would change without writing",
         )
         cmd.func = self._command
@@ -64,9 +68,7 @@ class MusefsPlugin(BeetsPlugin):
             # Full sync: one scan of the music dir. Query: scan only the matched
             # files, so non-matched rows aren't re-seeded from their files.
             targets = (
-                [os.fsdecode(i.path) for i in items]
-                if query
-                else [os.fsdecode(lib.directory)]
+                [os.fsdecode(i.path) for i in items] if query else [os.fsdecode(lib.directory)]
             )
             self._run_scan(db_path, targets)
         stats = self._sync(db_path, items, dry_run=opts.dry_run)
@@ -90,9 +92,7 @@ class MusefsPlugin(BeetsPlugin):
         hook must never abort the beets operation, so errors become warnings."""
         pending, self._pending = self._pending, []
         # Dedup by final on-disk path (an item may fire several events).
-        items = list(
-            {os.fsdecode(i.path): i for i in pending if i is not None}.values()
-        )
+        items = list({os.fsdecode(i.path): i for i in pending if i is not None}.values())
         if not items:
             return
         db_path = self._db_path()
@@ -148,14 +148,15 @@ class MusefsPlugin(BeetsPlugin):
                     f"{result.stderr.decode(errors='replace').strip()}"
                 )
 
-    def _prune_missing(self, db_path):
+    def _prune_missing(self, db_path, track_ids=None):
         """Drop rows whose backing file no longer exists (moved/deleted).
+        When ``track_ids`` is provided, only those tracks are checked.
         Returns the number pruned."""
         if not os.path.exists(db_path):
             return 0
         conn = _core.connect(db_path)
         try:
-            pruned = _core.prune_missing(conn)
+            pruned = _core.prune_missing(conn, track_ids)
             conn.commit()
             return pruned
         finally:
@@ -170,9 +171,7 @@ class MusefsPlugin(BeetsPlugin):
         conn = _core.connect(db_path)
         try:
             _core.check_schema_version(conn)
-            stats = _core.sync_items(
-                conn, items, fields=self._fields(), dry_run=dry_run
-            )
+            stats = _core.sync_items(conn, items, fields=self._fields(), dry_run=dry_run)
             if dry_run:
                 conn.rollback()
             else:

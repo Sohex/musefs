@@ -10,8 +10,12 @@ def _read_tag(path, key):
     # M4A: read via real mutagen.mp4.MP4 (the interop fixture includes mdhd +
     # stsd so mutagen's stream-info parser can open the file).
     if path.endswith(".m4a"):
-        atom = {"\xa9nam": "\xa9nam", "\xa9ART": "\xa9ART",
-                "title": "\xa9nam", "artist": "\xa9ART"}.get(key)
+        atom = {
+            "\xa9nam": "\xa9nam",
+            "\xa9ART": "\xa9ART",
+            "title": "\xa9nam",
+            "artist": "\xa9ART",
+        }.get(key)
         if atom is None:
             return None
         f = mutagen.mp4.MP4(path)
