@@ -10,24 +10,39 @@ CI, Python tooling, coverage, and local development gates.
 The cleanup should optimize for lowest review risk rather than the fewest pull
 requests. Each pull request should have a narrow ownership boundary, close its
 listed issues, and include focused verification for the behavior it changes.
+Coverage should be established early so later behavior PRs can benefit from the
+additional signal.
 
 ## PR Sequence
 
-Work will proceed in seven dependency-ordered pull requests:
+Work will proceed in eight dependency-ordered pull requests:
 
-1. `core-db-read-safety`: close #4 and #5.
-2. `refresh-invalidation-observability`: close #6, #7, and #8.
-3. `ogg-hardening-cache-accounting`: close #9, #10, and #16.
-4. `layout-mp4-contracts`: close #15 and #17.
-5. `interop-db-contract`: close #11 and #14.
-6. `beets-python-quality`: close #12, #13, and #19.
-7. `ci-dev-hardening`: close #2, #18, #20, and #21.
+1. `coverage-baseline`: close #21.
+2. `core-db-read-safety`: close #4 and #5.
+3. `refresh-invalidation-observability`: close #6, #7, and #8.
+4. `ogg-hardening-cache-accounting`: close #9, #10, and #16.
+5. `layout-mp4-contracts`: close #15 and #17.
+6. `interop-db-contract`: close #11 and #14.
+7. `beets-python-quality`: close #12, #13, and #19.
+8. `ci-dev-hardening`: close #2, #18, and #20.
 
 Later PRs may broaden CI coverage, but each behavior-changing PR must include
 its own targeted tests. No later PR should be responsible for proving the
 correctness of behavior introduced earlier.
 
-## PR 1: Core DB Read Safety
+## PR 1: Coverage Baseline
+
+This PR adds coverage reporting before the behavior cleanup starts.
+
+Coverage reporting should use `cargo-llvm-cov` and upload to Codecov. Required
+Codecov setup, tokens, and local limitations should be documented. Coverage
+should not require ignored FUSE tests unless they are configured as a separate
+explicit job.
+
+This PR should avoid unrelated workflow hardening. Pinning third-party actions,
+pre-commit changes, and CLI test seams belong to PR 8.
+
+## PR 2: Core DB Read Safety
 
 This PR fixes two high-risk correctness bugs in the core read path.
 
@@ -37,22 +52,26 @@ database path while preserving the existing per-thread read-only connection
 model.
 
 Open handles must validate the metadata of the file descriptor that was actually
-opened before the handle is cached. The check should compare size and mtime
-against the resolved backing-file contract, so a path replacement between
-resolve and open does not serve bytes from a file that does not match the cached
-layout.
+opened before the handle is cached. The implementation must use metadata from
+the opened descriptor, such as `File::metadata()`/`fstat`, not a path-based
+`stat` after opening. The check should compare size and mtime against the
+resolved backing-file contract, so a path replacement between resolve and open
+does not serve bytes from a file that does not match the cached layout.
 
 Verification should include a same-thread two-pool regression test and a focused
 open-handle metadata validation test that proves a mismatched opened descriptor
 is rejected before it can be cached.
 
-## PR 2: Refresh Invalidation Observability
+## PR 3: Refresh Invalidation Observability
 
 This PR owns refresh retry semantics, keep-cache invalidation correctness, and
 visible FUSE failure reporting.
 
 Failed refresh attempts must not consume the debounce window. The successful
 data-version stamp should remain committed only after a successful rebuild.
+Retries must still be bounded by a small backoff or equivalent retry limiter so
+a persistently unreadable or corrupt database cannot trigger a tight refresh
+loop on every metadata operation.
 
 Keep-cache invalidation must handle path-changing retags. When a changed track
 moves to a new rendered path, the stale old inode must be reported for kernel
@@ -66,7 +85,7 @@ staleness.
 Verification should cover failed-refresh retry behavior and path-changing retag
 invalidation behavior without requiring real FUSE failure injection.
 
-## PR 3: Ogg Hardening And Cache Accounting
+## PR 4: Ogg Hardening And Cache Accounting
 
 This PR keeps Ogg-specific hardening in one reviewable unit.
 
@@ -83,7 +102,7 @@ The Ogg invariant must be documented and tested precisely: original packet
 payload bytes are preserved, while Ogg page sequence numbers and CRCs may be
 patched intentionally.
 
-## PR 4: Layout And MP4 Contracts
+## PR 5: Layout And MP4 Contracts
 
 This PR clarifies format-layer contracts without changing MP4 behavior.
 
@@ -97,7 +116,7 @@ README must document this as an intentional current limitation: MP4/M4A embeds
 only the first cover image when multiple images are available. Tests should lock
 that behavior so it remains deliberate.
 
-## PR 5: Interop And DB Contract
+## PR 6: Interop And DB Contract
 
 This PR strengthens public contract tests for external writers and independent
 readers.
@@ -107,15 +126,20 @@ scanner-owned and which fields external writers may safely update. External
 tools such as Beets should remain on the scanner path for structural rows unless
 a future design explicitly expands the contract.
 
+Documentation must be backed by at least one lightweight contract test that
+mimics an external writer attempting to mutate a scanner-owned structural field.
+The test should prove the application handles the row gracefully, or prove that
+SQLite constraints/triggers reject the mutation if enforcement is added.
+
 The independent-reader interop test should verify synthesized outputs preserve
 the source audio payload, not only that synthesized tags are readable. The
 manifest or fixtures should include enough per-format audio payload metadata to
 compare source and synthesized audio bytes while respecting the Ogg page-header
 patching model.
 
-This PR should not broaden Beets CI; that belongs to PR 6.
+This PR should not broaden Beets CI; that belongs to PR 7.
 
-## PR 6: Beets Python Quality
+## PR 7: Beets Python Quality
 
 This PR handles Python integration and Beets contract coverage as one unit.
 
@@ -132,7 +156,7 @@ lint and format-check commands documented.
 This PR may adjust Python style and plugin tests. It should avoid unrelated Rust
 workflow changes.
 
-## PR 7: CI And Development Hardening
+## PR 8: CI And Development Hardening
 
 This PR finishes repository workflow hardening.
 
@@ -140,18 +164,16 @@ All GitHub Actions `uses:` references in the workflows should be pinned to full
 commit SHAs, and every `actions/checkout` step should set
 `persist-credentials: false`.
 
-Coverage reporting should use `cargo-llvm-cov` and upload to Codecov. Required
-Codecov setup, tokens, and local limitations should be documented. Coverage
-should not require ignored FUSE tests unless they are configured as a separate
-explicit job.
-
 The CLI should gain a pure test seam for converting parsed mount flags into
 `MountConfig` and `FuseConfig` without mounting. The local pre-commit hook should
 enforce the normal local passing test gate and document what it runs.
 
 ## Verification Gates
 
-PRs 1 through 5 should run at least:
+PR 1 should verify the coverage command locally where possible and document any
+Codecov upload behavior that requires repository-side setup.
+
+PRs 2 through 6 should run at least:
 
 ```bash
 cargo fmt --check
@@ -167,13 +189,12 @@ cargo test -p musefs-format --features fuzzing
 cargo test -p musefs-core --test interop_emit
 ```
 
-PR 6 should run the Python lint/test gate introduced in that PR. Rust checks are
+PR 7 should run the Python lint/test gate introduced in that PR. Rust checks are
 required if Rust files change.
 
-PR 7 should verify workflow YAML statically where possible, run the local hook
+PR 8 should verify workflow YAML statically where possible, run the local hook
 command directly, and run CLI tests for the mount-config seam. Codecov upload
-may require GitHub/Codecov repository setup and should be documented if it
-cannot be fully verified locally.
+is already covered by PR 1.
 
 ## Guardrails
 
