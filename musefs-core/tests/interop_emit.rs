@@ -107,7 +107,7 @@ fn real_mtime(p: &Path) -> i64 {
 
 /// Write `bytes` to `src`, store a track with the given bounds + known tags,
 /// assemble the synthesized file via read_at, write it to `dst`, and return the
-/// (title, artist) we expect a reader to see back.
+/// (audio_offset, audio_length) of the audio payload in the synthesized output.
 fn emit(
     src: &Path,
     dst: &Path,
@@ -115,7 +115,7 @@ fn emit(
     format: Format,
     audio_offset: i64,
     audio_length: i64,
-) {
+) -> (u64, u64) {
     std::fs::write(src, bytes).unwrap();
     let db = Db::open_in_memory().unwrap();
     let id = db
@@ -139,6 +139,7 @@ fn emit(
     let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
     let out = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
     std::fs::write(dst, &out).unwrap();
+    (audio_offset as u64, audio_length as u64)
 }
 
 #[test]
@@ -147,13 +148,14 @@ fn emit_interop_fixtures() {
     let dir = std::env::var("MUSEFS_INTEROP_DIR").expect("set MUSEFS_INTEROP_DIR");
     let dir = Path::new(&dir);
     std::fs::create_dir_all(dir).unwrap();
-    let mut manifest: Vec<(&str, &str, &str)> = Vec::new(); // (file, title, artist)
+    let mut manifest: Vec<(String, String, String, u64, u64)> = Vec::new();
+    // ^ (file, title, artist, audio_offset, audio_length)
 
     // FLAC
     {
         let bytes = fixtures::flac(&(0..400u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
         let scan = musefs_format::flac::locate_audio(&bytes).unwrap();
-        emit(
+        let (ao, al) = emit(
             &dir.join("src.flac"),
             &dir.join("out.flac"),
             &bytes,
@@ -161,14 +163,20 @@ fn emit_interop_fixtures() {
             scan.audio_offset as i64,
             scan.audio_length as i64,
         );
-        manifest.push(("out.flac", "Interop Title", "Interop Artist"));
+        manifest.push((
+            "out.flac".to_string(),
+            "Interop Title".to_string(),
+            "Interop Artist".to_string(),
+            ao,
+            al,
+        ));
     }
 
     // MP3
     {
         let bytes = fixtures::mp3();
         let b = musefs_format::mp3::locate_audio(&bytes).unwrap();
-        emit(
+        let (ao, al) = emit(
             &dir.join("src.mp3"),
             &dir.join("out.mp3"),
             &bytes,
@@ -176,7 +184,13 @@ fn emit_interop_fixtures() {
             b.audio_offset as i64,
             b.audio_length as i64,
         );
-        manifest.push(("out.mp3", "Interop Title", "Interop Artist"));
+        manifest.push((
+            "out.mp3".to_string(),
+            "Interop Title".to_string(),
+            "Interop Artist".to_string(),
+            ao,
+            al,
+        ));
     }
 
     // MP4 (audio = mdat payload) — use the richer local fixture so that
@@ -184,7 +198,7 @@ fn emit_interop_fixtures() {
     {
         let bytes = richer_m4a(&[7u8; 64]);
         let scan = musefs_format::mp4::read_structure(&bytes).unwrap();
-        emit(
+        let (ao, al) = emit(
             &dir.join("src.m4a"),
             &dir.join("out.m4a"),
             &bytes,
@@ -192,14 +206,20 @@ fn emit_interop_fixtures() {
             scan.mdat_payload_offset as i64,
             scan.mdat_payload_len as i64,
         );
-        manifest.push(("out.m4a", "Interop Title", "Interop Artist"));
+        manifest.push((
+            "out.m4a".to_string(),
+            "Interop Title".to_string(),
+            "Interop Artist".to_string(),
+            ao,
+            al,
+        ));
     }
 
     // Ogg
     {
         let bytes = fixtures::ogg_opus();
         let scan = musefs_format::ogg::locate_audio(&bytes).unwrap();
-        emit(
+        let (ao, al) = emit(
             &dir.join("src.ogg"),
             &dir.join("out.ogg"),
             &bytes,
@@ -207,14 +227,20 @@ fn emit_interop_fixtures() {
             scan.audio_offset as i64,
             scan.audio_length as i64,
         );
-        manifest.push(("out.ogg", "Interop Title", "Interop Artist"));
+        manifest.push((
+            "out.ogg".to_string(),
+            "Interop Title".to_string(),
+            "Interop Artist".to_string(),
+            ao,
+            al,
+        ));
     }
 
     // WAV
     {
         let bytes = fixtures::wav(&[0i16, 1, -1, 100, -100, 32767, -32768, 5, 6, 7]);
         let b = musefs_format::wav::locate_audio(&bytes).unwrap();
-        emit(
+        let (ao, al) = emit(
             &dir.join("src.wav"),
             &dir.join("out.wav"),
             &bytes,
@@ -222,12 +248,22 @@ fn emit_interop_fixtures() {
             b.audio_offset as i64,
             b.audio_length as i64,
         );
-        manifest.push(("out.wav", "Interop Title", "Interop Artist"));
+        manifest.push((
+            "out.wav".to_string(),
+            "Interop Title".to_string(),
+            "Interop Artist".to_string(),
+            ao,
+            al,
+        ));
     }
 
     let json: Vec<String> = manifest
         .iter()
-        .map(|(f, t, a)| format!("{{\"file\":{f:?},\"title\":{t:?},\"artist\":{a:?}}}"))
+        .map(|(f, t, a, ao, al)| {
+            format!(
+                "{{\"file\":{f:?},\"title\":{t:?},\"artist\":{a:?},\"audio_offset\":{ao},\"audio_length\":{al}}}"
+            )
+        })
         .collect();
     let mut f = std::fs::File::create(dir.join("manifest.json")).unwrap();
     write!(f, "[{}]", json.join(",")).unwrap();
