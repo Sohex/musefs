@@ -22,4 +22,16 @@ if ! cargo clippy --all-targets --quiet -- -D warnings; then
     exit 1
 fi
 
+echo "pre-commit: ruff check"
+if ! ruff check contrib/beets/ tests/interop/; then
+    echo "✗ ruff check: fix the warnings above and re-stage." >&2
+    exit 1
+fi
+
+echo "pre-commit: ruff format --check"
+if ! ruff format --check contrib/beets/ tests/interop/; then
+    echo "✗ ruff format: run 'ruff format' and re-stage." >&2
+    exit 1
+fi
+
 echo "✓ pre-commit checks passed"
