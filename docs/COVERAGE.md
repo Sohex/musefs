@@ -6,15 +6,8 @@ Coverage uses `cargo-llvm-cov` and uploads to Codecov.
 
 ```bash
 cargo install cargo-llvm-cov
-cargo llvm-cov --workspace --exclude musefs-fuse --open
-cargo llvm-cov --workspace --exclude musefs-fuse --lcov --output-path lcov.info
-```
-
-FUSE e2e tests are excluded because they require `/dev/fuse` and libfuse at runtime.
-Run them separately when needed:
-
-```bash
-cargo llvm-cov --package musefs-fuse -- --ignored
+cargo llvm-cov --workspace --open
+cargo llvm-cov --workspace --lcov --output-path lcov.info
 ```
 
 ## CI Setup
