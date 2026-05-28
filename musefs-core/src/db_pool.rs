@@ -6,24 +6,44 @@
 //! - In-memory DB (tests) cannot be reopened by path, so a single connection is
 //!   shared behind a mutex.
 //!
-//! Assumes one `DbPool` per process (one mount): the thread-local read
-//! connection is keyed by thread, not by pool/path.
+//! Each thread opens a read connection per unique database path, so
+//! multiple mounts (or test DBs) on the same thread don't collide.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use musefs_db::Db;
 
 use crate::error::Result;
 
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
 pub enum DbPool {
-    PerThread { path: PathBuf, poll: Mutex<Db> },
+    PerThread {
+        id: u64,
+        path: PathBuf,
+        poll: Mutex<Db>,
+    },
     Shared(Arc<Mutex<Db>>),
 }
 
+impl Drop for DbPool {
+    fn drop(&mut self) {
+        if let DbPool::PerThread { id, path, .. } = self {
+            let id = *id;
+            let path = path.clone();
+            PER_PATH.with(|cell| {
+                cell.borrow_mut().remove(&(path, id));
+            });
+        }
+    }
+}
+
 thread_local! {
-    static LOCAL: RefCell<Option<Db>> = const { RefCell::new(None) };
+    static PER_PATH: RefCell<HashMap<(PathBuf, u64), Db>> = RefCell::new(HashMap::new());
 }
 
 impl DbPool {
@@ -33,6 +53,7 @@ impl DbPool {
     pub fn new(db: Db) -> Result<DbPool> {
         match db.path() {
             Some(p) => Ok(DbPool::PerThread {
+                id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
                 path: p.to_path_buf(),
                 poll: Mutex::new(db),
             }),
@@ -62,15 +83,14 @@ impl DbPool {
     /// Run `f` with a read connection.
     pub fn with<R>(&self, f: impl FnOnce(&Db) -> Result<R>) -> Result<R> {
         match self {
-            DbPool::PerThread { path, .. } => LOCAL.with(|cell| {
+            DbPool::PerThread { id, path, .. } => PER_PATH.with(|cell| {
+                let mut map = cell.borrow_mut();
+                if let std::collections::hash_map::Entry::Vacant(e) = map.entry((path.clone(), *id))
                 {
-                    let mut slot = cell.borrow_mut();
-                    if slot.is_none() {
-                        *slot = Some(Db::open_readonly(path)?);
-                    }
+                    let db = Db::open_readonly(path)?;
+                    e.insert(db);
                 }
-                let slot = cell.borrow();
-                f(slot.as_ref().unwrap())
+                f(map.get(&(path.clone(), *id)).unwrap())
             }),
             DbPool::Shared(m) => {
                 let db = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -93,6 +113,31 @@ mod tests {
         let v = pool.with(|db| Ok(db.data_version()?)).unwrap();
         let v2 = pool.with(|db| Ok(db.data_version()?)).unwrap();
         assert_eq!(v, v2);
+    }
+
+    #[test]
+    fn same_thread_two_pools_keyed_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.db");
+        let path_b = dir.path().join("b.db");
+        Db::open(&path_a).unwrap();
+        Db::open(&path_b).unwrap();
+
+        let pool_a = DbPool::new(Db::open(&path_a).unwrap()).unwrap();
+        let pool_b = DbPool::new(Db::open(&path_b).unwrap()).unwrap();
+
+        pool_a
+            .with(|db| {
+                assert_eq!(db.path().unwrap(), path_a);
+                Ok(())
+            })
+            .unwrap();
+        pool_b
+            .with(|db| {
+                assert_eq!(db.path().unwrap(), path_b);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

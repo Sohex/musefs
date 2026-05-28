@@ -72,6 +72,23 @@ impl Drop for RefreshGuard<'_> {
     }
 }
 
+fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Result<()> {
+    let meta = file.metadata()?;
+    if meta.len() != resolved.backing_size || mtime_secs(&meta) != resolved.backing_mtime_secs {
+        return Err(CoreError::BackingChanged(
+            resolved.backing_path.to_string_lossy().to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// The composed read-only filesystem: the store, the rendered tree, and the
 /// lazy synthesis cache. All methods take `&self`; the tree is swapped
 /// atomically on refresh, the cache is internally sharded (each shard mutex-guarded),
@@ -398,7 +415,8 @@ impl Musefs {
         let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1; // never 0
+        validate_opened_backing(&file, &resolved)?;
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
         self.handles()
             .insert(fh, Arc::new(Handle { resolved, file }));
         Ok(fh)
@@ -407,5 +425,40 @@ impl Musefs {
     /// Drop an open handle (closes its backing fd when the last reference goes).
     pub fn release_handle(&self, fh: u64) {
         self.handles().remove(&fh);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use musefs_format::{RegionLayout, Segment};
+    use once_cell::sync::OnceCell;
+
+    #[test]
+    fn validate_opened_backing_rejects_mismatched_descriptor_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected_path = dir.path().join("expected.flac");
+        let replacement_path = dir.path().join("replacement.flac");
+        std::fs::write(&expected_path, [1_u8; 8]).unwrap();
+        std::fs::write(&replacement_path, [2_u8; 16]).unwrap();
+        let expected_meta = std::fs::metadata(&expected_path).unwrap();
+        let replacement = std::fs::File::open(&replacement_path).unwrap();
+
+        let resolved = ResolvedFile {
+            layout: RegionLayout::new(vec![Segment::BackingAudio { offset: 0, len: 8 }]),
+            total_len: 8,
+            content_version: 1,
+            backing_path: expected_path,
+            backing_size: expected_meta.len(),
+            backing_mtime_secs: mtime_secs(&expected_meta),
+            mtime_secs: mtime_secs(&expected_meta),
+            ogg_index: OnceCell::new(),
+            cache_bytes: 0,
+        };
+
+        assert!(matches!(
+            validate_opened_backing(&replacement, &resolved),
+            Err(CoreError::BackingChanged(_))
+        ));
     }
 }
