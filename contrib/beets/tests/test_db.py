@@ -48,18 +48,14 @@ def test_replace_tags_writes_rows_and_bumps_version(db_path, make_track):
     tid = make_track("/music/a.flac")
     conn = connect(db_path)
     try:
-        before = conn.execute(
-            "SELECT content_version FROM tracks WHERE id=?", (tid,)
-        ).fetchone()[0]
+        before = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         replace_tags(conn, tid, [("title", "Song"), ("artist", "Band")])
         conn.commit()
         rows = conn.execute(
             "SELECT key, value, ordinal FROM tags WHERE track_id=? ORDER BY key", (tid,)
         ).fetchall()
         assert rows == [("artist", "Band", 0), ("title", "Song", 0)]
-        after = conn.execute(
-            "SELECT content_version FROM tracks WHERE id=?", (tid,)
-        ).fetchone()[0]
+        after = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         assert after > before
     finally:
         conn.close()
@@ -92,10 +88,27 @@ def test_replace_tags_empty_pairs_clears(db_path, make_track):
         conn.commit()
         replace_tags(conn, tid, [])
         conn.commit()
-        count = conn.execute(
-            "SELECT COUNT(*) FROM tags WHERE track_id=?", (tid,)
-        ).fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM tags WHERE track_id=?", (tid,)).fetchone()[0]
         assert count == 0
+    finally:
+        conn.close()
+
+
+def test_prune_missing_respects_scope(db_path, make_track, tmp_path):
+    present = tmp_path / "here.flac"
+    present.write_bytes(b"x")
+    keep = make_track(str(present))
+    missing_related = make_track("/no/such/related.flac")
+    missing_unrelated = make_track("/no/such/unrelated.flac")
+    conn = connect(db_path)
+    try:
+        pruned = prune_missing(conn, track_ids=[missing_related])
+        conn.commit()
+        assert pruned == 1
+        remaining = {r[0] for r in conn.execute("SELECT id FROM tracks")}
+        assert keep in remaining
+        assert missing_related not in remaining
+        assert missing_unrelated in remaining
     finally:
         conn.close()
 
@@ -114,9 +127,9 @@ def test_prune_missing_deletes_absent_files_and_cascades(db_path, make_track, tm
         assert pruned == 1
         assert [r[0] for r in conn.execute("SELECT id FROM tracks")] == [keep]
         # Cascade removed the dropped track's tags.
-        assert conn.execute(
-            "SELECT COUNT(*) FROM tags WHERE track_id=?", (drop,)
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM tags WHERE track_id=?", (drop,)).fetchone()[0] == 0
+        )
     finally:
         conn.close()
 
@@ -128,8 +141,8 @@ def test_replace_tags_duplicate_keys_get_distinct_ordinals(db_path, make_track):
         replace_tags(conn, tid, [("genre", "Rock"), ("genre", "Indie")])
         conn.commit()
         rows = conn.execute(
-            "SELECT value, ordinal FROM tags WHERE track_id=? AND key='genre' "
-            "ORDER BY ordinal", (tid,)
+            "SELECT value, ordinal FROM tags WHERE track_id=? AND key='genre' ORDER BY ordinal",
+            (tid,),
         ).fetchall()
         assert rows == [("Rock", 0), ("Indie", 1)]
     finally:

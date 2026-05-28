@@ -47,9 +47,19 @@ def _require_tools():
 
 # --- helpers ---------------------------------------------------------------
 
+
 def _ffmpeg_gen(path, freq, **tags):
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=1"]
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency={freq}:duration=1",
+    ]
     if str(path).endswith(".mp3"):
         cmd += ["-c:a", "libmp3lame", "-q:a", "5"]
     elif str(path).endswith(".m4a"):
@@ -67,16 +77,8 @@ def _env(tmp_path):
 
 
 def _write_config(tmp_path, library, db, fetchart=False):
-    plugins_block = (
-        "plugins:\n"
-        "  - musefs\n"
-        "  - fetchart\n"
-    ) if fetchart else "plugins: musefs\n"
-    fetchart_block = (
-        "fetchart:\n"
-        "  auto: yes\n"
-        "  sources: filesystem\n"
-    ) if fetchart else ""
+    plugins_block = ("plugins:\n  - musefs\n  - fetchart\n") if fetchart else "plugins: musefs\n"
+    fetchart_block = ("fetchart:\n  auto: yes\n  sources: filesystem\n") if fetchart else ""
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         f"directory: {library}\n"
@@ -110,9 +112,21 @@ def _audio_md5(path):
     """MD5 of the decoded audio stream (proves byte-faithful audio independent
     of container/metadata framing)."""
     out = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
-         "-map", "0:a", "-f", "md5", "-"],
-        check=True, capture_output=True,
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:a",
+            "-f",
+            "md5",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
     ).stdout.decode()
     return out.strip()
 
@@ -121,9 +135,22 @@ def _make_cover(path, color):
     """Generate a small real image at `path` (extension picks the codec via
     ffmpeg) and return its bytes. Distinct colors yield distinct sha256s."""
     subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "lavfi", "-i", f"color=c={color}:s=64x64", "-frames:v", "1", str(path)],
-        check=True, capture_output=True,
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={color}:s=64x64",
+            "-frames:v",
+            "1",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
     )
     return Path(path).read_bytes()
 
@@ -198,7 +225,8 @@ def _check_mount_art(cfg, env, mnt, expected_cover_sha):
 def _mounted(mnt, db, template):
     proc = subprocess.Popen(
         [MUSEFS, "mount", str(mnt), "--db", str(db), "--template", template],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     try:
         deadline = time.time() + 10
@@ -207,8 +235,7 @@ def _mounted(mnt, db, template):
                 break
             if proc.poll() is not None:
                 raise AssertionError(
-                    "musefs mount exited early: "
-                    + proc.stderr.read().decode(errors="replace")
+                    "musefs mount exited early: " + proc.stderr.read().decode(errors="replace")
                 )
             time.sleep(0.05)
         else:
@@ -239,12 +266,30 @@ def _imported_library(tmp_path, *, embed_cover=None, external_cover=None):
     db = tmp_path / "musefs.db"
     env = _env(tmp_path)
 
-    _ffmpeg_gen(src / "a.flac", 440, title="Orig FLAC", artist="Orig",
-                album="Orig Album", album_artist="Test AA")
-    _ffmpeg_gen(src / "b.mp3", 330, title="Orig MP3", artist="Orig",
-                album="Orig Album", album_artist="Test AA")
-    _ffmpeg_gen(src / "c.m4a", 550, title="Orig M4A", artist="Orig",
-                album="Orig Album", album_artist="Test AA")
+    _ffmpeg_gen(
+        src / "a.flac",
+        440,
+        title="Orig FLAC",
+        artist="Orig",
+        album="Orig Album",
+        album_artist="Test AA",
+    )
+    _ffmpeg_gen(
+        src / "b.mp3",
+        330,
+        title="Orig MP3",
+        artist="Orig",
+        album="Orig Album",
+        album_artist="Test AA",
+    )
+    _ffmpeg_gen(
+        src / "c.m4a",
+        550,
+        title="Orig M4A",
+        artist="Orig",
+        album="Orig Album",
+        album_artist="Test AA",
+    )
 
     if embed_cover is not None:
         for name in ("a.flac", "b.mp3", "c.m4a"):
@@ -259,18 +304,52 @@ def _imported_library(tmp_path, *, embed_cover=None, external_cover=None):
 
 # --- tests -----------------------------------------------------------------
 
+
 def test_e2e_import_retag_mount_playback(tmp_path):
     cfg, env, db, mnt, library = _imported_library(tmp_path)
 
     # Retag in the beets DB only (no file write, no move) so the divergence is
     # real: files keep their original embedded tags; the mount must show beets'.
-    _beet(cfg, env, "modify", "-W", "-M", "-y", "format:FLAC",
-          "title=New FLAC", "artist=New Artist", "albumartist=AA", "album=New Album")
-    _beet(cfg, env, "modify", "-W", "-M", "-y", "format:MP3",
-          "title=New MP3", "artist=New Artist", "albumartist=AA", "album=New Album")
+    _beet(
+        cfg,
+        env,
+        "modify",
+        "-W",
+        "-M",
+        "-y",
+        "format:FLAC",
+        "title=New FLAC",
+        "artist=New Artist",
+        "albumartist=AA",
+        "album=New Album",
+    )
+    _beet(
+        cfg,
+        env,
+        "modify",
+        "-W",
+        "-M",
+        "-y",
+        "format:MP3",
+        "title=New MP3",
+        "artist=New Artist",
+        "albumartist=AA",
+        "album=New Album",
+    )
     # beets classifies m4a/AAC audio with format "AAC" (not "M4A"/"MP4").
-    _beet(cfg, env, "modify", "-W", "-M", "-y", "format:AAC",
-          "title=New M4A", "artist=New Artist", "albumartist=AA", "album=New Album")
+    _beet(
+        cfg,
+        env,
+        "modify",
+        "-W",
+        "-M",
+        "-y",
+        "format:AAC",
+        "title=New M4A",
+        "artist=New Artist",
+        "albumartist=AA",
+        "album=New Album",
+    )
 
     # Backing paths (modify -M kept them put) for the audio-integrity check.
     flac_backing = _beet(cfg, env, "ls", "-p", "format:FLAC").strip()
@@ -352,7 +431,8 @@ def test_e2e_art_precedence_beets_wins(tmp_path):
     assert embedded_sha != external_sha  # the two covers must be distinguishable
 
     cfg, env, db, mnt, _ = _imported_library(
-        tmp_path, embed_cover=embedded, external_cover=external)
+        tmp_path, embed_cover=embedded, external_cover=external
+    )
     _beet(cfg, env, "musefs")  # scan ingests A, then sync replaces with B
     with _mounted(mnt, db, "$albumartist/$album/$title"):
         # beets art (external B) wins; the embedded A must not survive.
