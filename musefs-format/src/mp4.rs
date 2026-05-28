@@ -667,7 +667,7 @@ pub fn synthesize_layout(
         offset: scan.mdat_payload_offset,
         len: scan.mdat_payload_len,
     });
-    Ok(RegionLayout::new(segments))
+    RegionLayout::validated(segments).map_err(|_| FormatError::InvalidLayout)
 }
 
 #[cfg(test)]

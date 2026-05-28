@@ -14,6 +14,8 @@ pub enum FormatError {
     NotMp4,
     #[error("not a supported WAV/RIFF file")]
     NotWav,
+    #[error("synthesized region layout violates producer invariants")]
+    InvalidLayout,
 }
 
 pub type Result<T> = std::result::Result<T, FormatError>;

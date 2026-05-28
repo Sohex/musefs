@@ -14,7 +14,7 @@ pub mod fuzz_check;
 
 pub use error::{FormatError, Result};
 pub use input::{ArtInput, EmbeddedPicture, TagInput};
-pub use layout::{RegionLayout, Segment};
+pub use layout::{LayoutError, RegionLayout, Segment};
 pub use ogg::{Codec, OggHeader, OggScan};
 
 // tagmap is pure &str→key mapping with no byte parsing and is already exercised

@@ -238,7 +238,7 @@ pub fn synthesize_layout(
         len: audio_length,
         seq_delta,
     });
-    Ok(RegionLayout::new(segments))
+    RegionLayout::validated(segments).map_err(|_| FormatError::InvalidLayout)
 }
 
 /// Build the FLAC PICTURE block *body prefix* (everything before the image data:

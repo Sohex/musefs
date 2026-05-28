@@ -1,3 +1,12 @@
+/// Validation errors discovered in a layout at synthesis time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutError {
+    /// A segment reported zero length.
+    EmptySegment,
+    /// Total length overflowed u64.
+    TotalOverflow,
+}
+
 /// One contiguous run of bytes in a synthesized virtual file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
@@ -57,6 +66,12 @@ impl RegionLayout {
         RegionLayout { segments }
     }
 
+    pub fn validated(segments: Vec<Segment>) -> Result<RegionLayout, LayoutError> {
+        let layout = RegionLayout::new(segments);
+        layout.validate()?;
+        Ok(layout)
+    }
+
     /// The ordered segments composing the synthesized virtual file.
     pub fn segments(&self) -> &[Segment] {
         &self.segments
@@ -74,5 +89,21 @@ impl RegionLayout {
             .filter(|s| !matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }))
             .map(Segment::len)
             .sum()
+    }
+
+    /// Validate basic producer invariants. Returns `Ok(())` if the layout is
+    /// structurally sound (no empty metadata segments, lengths don't overflow).
+    /// Zero-length backing audio is valid for formats that can represent an
+    /// empty media payload.
+    pub fn validate(&self) -> Result<(), LayoutError> {
+        let mut total: u64 = 0;
+        for seg in &self.segments {
+            let len = seg.len();
+            if len == 0 && !matches!(seg, Segment::BackingAudio { .. } | Segment::OggAudio { .. }) {
+                return Err(LayoutError::EmptySegment);
+            }
+            total = total.checked_add(len).ok_or(LayoutError::TotalOverflow)?;
+        }
+        Ok(())
     }
 }
