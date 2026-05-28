@@ -81,7 +81,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 
 fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Result<()> {
     let meta = file.metadata()?;
-    if meta.len() != resolved.backing_size || mtime_secs(&meta) != resolved.mtime_secs {
+    if meta.len() != resolved.backing_size || mtime_secs(&meta) != resolved.backing_mtime_secs {
         return Err(CoreError::BackingChanged(
             resolved.backing_path.to_string_lossy().to_string(),
         ));
@@ -450,6 +450,7 @@ mod tests {
             content_version: 1,
             backing_path: expected_path,
             backing_size: expected_meta.len(),
+            backing_mtime_secs: mtime_secs(&expected_meta),
             mtime_secs: mtime_secs(&expected_meta),
             ogg_index: OnceCell::new(),
             cache_bytes: 0,

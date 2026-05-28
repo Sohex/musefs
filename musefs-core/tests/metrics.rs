@@ -174,6 +174,7 @@ fn layout_cache_survives_unrelated_refresh() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
+                backing_mtime_secs: 0,
                 backing_mtime: 0,
             })
             .unwrap();

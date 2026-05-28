@@ -12,19 +12,38 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use musefs_db::Db;
 
 use crate::error::Result;
 
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
 pub enum DbPool {
-    PerThread { path: PathBuf, poll: Mutex<Db> },
+    PerThread {
+        id: u64,
+        path: PathBuf,
+        poll: Mutex<Db>,
+    },
     Shared(Arc<Mutex<Db>>),
 }
 
+impl Drop for DbPool {
+    fn drop(&mut self) {
+        if let DbPool::PerThread { id, path, .. } = self {
+            let id = *id;
+            let path = path.clone();
+            PER_PATH.with(|cell| {
+                cell.borrow_mut().remove(&(path, id));
+            });
+        }
+    }
+}
+
 thread_local! {
-    static PER_PATH: RefCell<HashMap<PathBuf, Db>> = RefCell::new(HashMap::new());
+    static PER_PATH: RefCell<HashMap<(PathBuf, u64), Db>> = RefCell::new(HashMap::new());
 }
 
 impl DbPool {
@@ -34,6 +53,7 @@ impl DbPool {
     pub fn new(db: Db) -> Result<DbPool> {
         match db.path() {
             Some(p) => Ok(DbPool::PerThread {
+                id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
                 path: p.to_path_buf(),
                 poll: Mutex::new(db),
             }),
@@ -63,13 +83,14 @@ impl DbPool {
     /// Run `f` with a read connection.
     pub fn with<R>(&self, f: impl FnOnce(&Db) -> Result<R>) -> Result<R> {
         match self {
-            DbPool::PerThread { path, .. } => PER_PATH.with(|cell| {
+            DbPool::PerThread { id, path, .. } => PER_PATH.with(|cell| {
                 let mut map = cell.borrow_mut();
-                if !map.contains_key(path) {
+                if let std::collections::hash_map::Entry::Vacant(e) = map.entry((path.clone(), *id))
+                {
                     let db = Db::open_readonly(path)?;
-                    map.insert(path.clone(), db);
+                    e.insert(db);
                 }
-                f(map.get(path).unwrap())
+                f(map.get(&(path.clone(), *id)).unwrap())
             }),
             DbPool::Shared(m) => {
                 let db = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
