@@ -113,6 +113,35 @@ pub fn run_scan(db_path: &Path, backing_dir: &Path, revalidate: bool) -> Result<
     Ok(())
 }
 
+/// Parse mount CLI flags into `MountConfig` and `FuseConfig`. Pure function —
+/// no DB access, no mounting. Exported for unit testing.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_mount_config(
+    template: String,
+    default_fallback: String,
+    mode: musefs_core::Mode,
+    poll_interval_ms: u64,
+    attr_ttl_ms: u64,
+    max_readahead_kib: u32,
+    max_background: u16,
+    keep_cache: bool,
+) -> (MountConfig, musefs_fuse::FuseConfig) {
+    let config = MountConfig {
+        template,
+        fallbacks: BTreeMap::new(),
+        default_fallback,
+        mode,
+        poll_interval: std::time::Duration::from_millis(poll_interval_ms),
+    };
+    let fuse_config = musefs_fuse::FuseConfig {
+        ttl: std::time::Duration::from_millis(attr_ttl_ms),
+        max_readahead: max_readahead_kib.saturating_mul(1024),
+        max_background,
+        keep_cache,
+    };
+    (config, fuse_config)
+}
+
 /// Build a `Musefs` from the DB at `db_path` and mount it (blocking) at
 /// `mountpoint`.
 #[allow(clippy::too_many_arguments)]
@@ -130,19 +159,16 @@ pub fn run_mount(
 ) -> Result<()> {
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
-    let config = MountConfig {
+    let (config, fuse_config) = parse_mount_config(
         template,
-        fallbacks: BTreeMap::new(),
         default_fallback,
         mode,
-        poll_interval: std::time::Duration::from_millis(poll_interval_ms),
-    };
-    let fuse_config = musefs_fuse::FuseConfig {
-        ttl: std::time::Duration::from_millis(attr_ttl_ms),
-        max_readahead: max_readahead_kib.saturating_mul(1024),
+        poll_interval_ms,
+        attr_ttl_ms,
+        max_readahead_kib,
         max_background,
         keep_cache,
-    };
+    );
     let core = Musefs::open(db, config).context("building the virtual filesystem")?;
     musefs_fuse::mount_with(core, mountpoint, "musefs", fuse_config)
         .with_context(|| format!("mounting at {}", mountpoint.display()))?;
