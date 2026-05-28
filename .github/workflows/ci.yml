@@ -65,7 +65,7 @@ jobs:
       - name: Format check
         run: ruff format --check contrib/beets/ tests/interop/
       - name: Install beets
-        run: pip install -e contrib/beets
+        run: pip install -e "contrib/beets[test]"
       - name: Test
         run: python -m pytest contrib/beets/tests -v
 
