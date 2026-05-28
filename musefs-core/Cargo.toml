@@ -20,7 +20,7 @@ thiserror = "1"
 tempfile = "3"
 metaflac = "0.2"
 id3 = "1"
-criterion = "0.5"
+criterion = "0.8"
 proptest = "1"
 rusqlite = { version = "0.31", features = ["bundled", "blob"] }
 musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
