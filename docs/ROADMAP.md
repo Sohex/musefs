@@ -97,9 +97,11 @@ modifying or duplicating the original audio bytes.
   the byte-identical audio guarantee, and tag round-trip — an end-to-end read
   fidelity property, and a `mutagen` interop check that an independent reader
   sees the tags we synthesize. The fuzzers run per-PR (build + smoke) and on a
-  weekly schedule with an accumulating corpus; fuzzing already caught and fixed
-  an OOM/DoS in VorbisComment parsing (unbounded `Vec::with_capacity` on an
-  untrusted count).
+  weekly schedule with an accumulating corpus. Fuzzing already caught and fixed
+  three robustness bugs: an MP4 box-bounds integer overflow (a release-build
+  silent wrap), an `id3`-crate unbounded allocation reachable via MP3 and WAV's
+  embedded `id3 ` chunk, and an unbounded `Vec::with_capacity` in VorbisComment
+  parsing — all DoS-class issues on adversarial files.
 
 ---
 
