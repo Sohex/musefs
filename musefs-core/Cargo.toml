@@ -22,7 +22,7 @@ metaflac = "0.2"
 id3 = "1"
 criterion = "0.8"
 proptest = "1"
-rusqlite = { version = "0.31", features = ["bundled", "blob"] }
+rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
 
 [[bench]]
