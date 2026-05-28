@@ -2,6 +2,7 @@ mod common;
 use musefs_core::{read_at, HeaderCache, Mode};
 use musefs_db::{Db, Format, NewTrack, Tag};
 use musefs_format::fuzz_check::fixtures;
+use musefs_format::Segment;
 use std::io::Write;
 use std::path::Path;
 
@@ -105,9 +106,37 @@ fn real_mtime(p: &Path) -> i64 {
         .as_secs() as i64
 }
 
+#[derive(Debug)]
+struct ManifestRow {
+    file: &'static str,
+    source_file: &'static str,
+    title: &'static str,
+    artist: &'static str,
+    source_audio_offset: u64,
+    source_audio_length: u64,
+    synth_audio_offset: u64,
+    synth_audio_length: u64,
+    ogg_payload_only: bool,
+}
+
+fn synthesized_audio_range(layout: &musefs_format::RegionLayout) -> (u64, u64) {
+    let mut output_offset = 0u64;
+    for segment in layout.segments() {
+        let len = segment.len();
+        if matches!(
+            segment,
+            Segment::BackingAudio { .. } | Segment::OggAudio { .. }
+        ) {
+            return (output_offset, len);
+        }
+        output_offset += len;
+    }
+    panic!("synthesized layout has no audio segment");
+}
+
 /// Write `bytes` to `src`, store a track with the given bounds + known tags,
 /// assemble the synthesized file via read_at, write it to `dst`, and return the
-/// (audio_offset, audio_length) of the audio payload in the synthesized output.
+/// output byte range of the audio payload in the synthesized file.
 fn emit(
     src: &Path,
     dst: &Path,
@@ -137,9 +166,10 @@ fn emit(
     )
     .unwrap();
     let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
+    let synth_audio = synthesized_audio_range(&resolved.layout);
     let out = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
     std::fs::write(dst, &out).unwrap();
-    (audio_offset as u64, audio_length as u64)
+    synth_audio
 }
 
 #[test]
@@ -148,8 +178,7 @@ fn emit_interop_fixtures() {
     let dir = std::env::var("MUSEFS_INTEROP_DIR").expect("set MUSEFS_INTEROP_DIR");
     let dir = Path::new(&dir);
     std::fs::create_dir_all(dir).unwrap();
-    let mut manifest: Vec<(String, String, String, u64, u64)> = Vec::new();
-    // ^ (file, title, artist, audio_offset, audio_length)
+    let mut manifest: Vec<ManifestRow> = Vec::new();
 
     // FLAC
     {
@@ -163,13 +192,17 @@ fn emit_interop_fixtures() {
             scan.audio_offset as i64,
             scan.audio_length as i64,
         );
-        manifest.push((
-            "out.flac".to_string(),
-            "Interop Title".to_string(),
-            "Interop Artist".to_string(),
-            ao,
-            al,
-        ));
+        manifest.push(ManifestRow {
+            file: "out.flac",
+            source_file: "src.flac",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: scan.audio_offset,
+            source_audio_length: scan.audio_length,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: false,
+        });
     }
 
     // MP3
@@ -184,13 +217,17 @@ fn emit_interop_fixtures() {
             b.audio_offset as i64,
             b.audio_length as i64,
         );
-        manifest.push((
-            "out.mp3".to_string(),
-            "Interop Title".to_string(),
-            "Interop Artist".to_string(),
-            ao,
-            al,
-        ));
+        manifest.push(ManifestRow {
+            file: "out.mp3",
+            source_file: "src.mp3",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: b.audio_offset,
+            source_audio_length: b.audio_length,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: false,
+        });
     }
 
     // MP4 (audio = mdat payload) — use the richer local fixture so that
@@ -206,13 +243,17 @@ fn emit_interop_fixtures() {
             scan.mdat_payload_offset as i64,
             scan.mdat_payload_len as i64,
         );
-        manifest.push((
-            "out.m4a".to_string(),
-            "Interop Title".to_string(),
-            "Interop Artist".to_string(),
-            ao,
-            al,
-        ));
+        manifest.push(ManifestRow {
+            file: "out.m4a",
+            source_file: "src.m4a",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: scan.mdat_payload_offset,
+            source_audio_length: scan.mdat_payload_len,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: false,
+        });
     }
 
     // Ogg
@@ -227,13 +268,17 @@ fn emit_interop_fixtures() {
             scan.audio_offset as i64,
             scan.audio_length as i64,
         );
-        manifest.push((
-            "out.ogg".to_string(),
-            "Interop Title".to_string(),
-            "Interop Artist".to_string(),
-            ao,
-            al,
-        ));
+        manifest.push(ManifestRow {
+            file: "out.ogg",
+            source_file: "src.ogg",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: scan.audio_offset,
+            source_audio_length: scan.audio_length,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: true,
+        });
     }
 
     // WAV
@@ -248,20 +293,33 @@ fn emit_interop_fixtures() {
             b.audio_offset as i64,
             b.audio_length as i64,
         );
-        manifest.push((
-            "out.wav".to_string(),
-            "Interop Title".to_string(),
-            "Interop Artist".to_string(),
-            ao,
-            al,
-        ));
+        manifest.push(ManifestRow {
+            file: "out.wav",
+            source_file: "src.wav",
+            title: "Interop Title",
+            artist: "Interop Artist",
+            source_audio_offset: b.audio_offset,
+            source_audio_length: b.audio_length,
+            synth_audio_offset: ao,
+            synth_audio_length: al,
+            ogg_payload_only: false,
+        });
     }
 
     let json: Vec<String> = manifest
         .iter()
-        .map(|(f, t, a, ao, al)| {
+        .map(|row| {
             format!(
-                "{{\"file\":{f:?},\"title\":{t:?},\"artist\":{a:?},\"audio_offset\":{ao},\"audio_length\":{al}}}"
+                "{{\"file\":{file:?},\"source_file\":{source_file:?},\"title\":{title:?},\"artist\":{artist:?},\"source_audio_offset\":{source_audio_offset},\"source_audio_length\":{source_audio_length},\"synth_audio_offset\":{synth_audio_offset},\"synth_audio_length\":{synth_audio_length},\"ogg_payload_only\":{ogg_payload_only}}}",
+                file = row.file,
+                source_file = row.source_file,
+                title = row.title,
+                artist = row.artist,
+                source_audio_offset = row.source_audio_offset,
+                source_audio_length = row.source_audio_length,
+                synth_audio_offset = row.synth_audio_offset,
+                synth_audio_length = row.synth_audio_length,
+                ogg_payload_only = row.ogg_payload_only,
             )
         })
         .collect();

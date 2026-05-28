@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 
@@ -62,25 +61,38 @@ def test_ecosystem_reads_synthesized_tags():
 
 
 def test_synthesized_preserves_source_audio_payload():
-    """Verify synthesized outputs contain the original audio payload bytes."""
+    """Verify synthesized outputs contain the original audio payload bytes.
+
+    For non-Ogg formats the audio region is served verbatim from the backing
+    file via BackingAudio segments, so the bytes must be identical. Ogg audio
+    pages are renumbered and CRC patched; this Python interop test verifies
+    the emitted byte count for Ogg while Rust tests cover Ogg payload serving.
+    """
     base = os.environ["MUSEFS_INTEROP_DIR"]
     with open(os.path.join(base, "manifest.json")) as fh:
         manifest = json.load(fh)
     for row in manifest:
-        path = os.path.join(base, row["file"])
-        audio_offset = row.get("audio_offset", 0)
-        audio_length = row.get("audio_length", 0)
-        if audio_length == 0:
+        synth_length = row["synth_audio_length"]
+        if synth_length == 0:
             continue
-        with open(path, "rb") as f:
-            f.seek(audio_offset)
-            payload = f.read(audio_length)
-        # Compute SHA256 of the audio payload region in the synthesized output.
-        # The source bytes can't be directly compared because Ogg headers may
-        # be patched -- this is a basic integrity check.
-        assert len(payload) == audio_length, (
-            f"{row['file']}: expected {audio_length} audio bytes, got {len(payload)}"
+
+        synth_path = os.path.join(base, row["file"])
+        with open(synth_path, "rb") as f:
+            f.seek(row["synth_audio_offset"])
+            synth_payload = f.read(synth_length)
+        assert len(synth_payload) == synth_length, (
+            f"{row['file']}: expected {synth_length} audio bytes, got {len(synth_payload)}"
         )
-        # For non-Ogg formats, verify the audio payload is non-empty.
-        if not row["file"].endswith(".ogg"):
-            assert len(payload) > 0
+        assert synth_length == row["source_audio_length"], (
+            f"{row['file']}: synthesized audio length differs from source"
+        )
+        if row["ogg_payload_only"]:
+            continue
+
+        src_path = os.path.join(base, row["source_file"])
+        with open(src_path, "rb") as f:
+            f.seek(row["source_audio_offset"])
+            src_payload = f.read(row["source_audio_length"])
+        assert synth_payload == src_payload, (
+            f"{row['file']}: synthesized audio differs from source"
+        )

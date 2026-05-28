@@ -29,3 +29,8 @@ remove structural rows.
   `track_art.art_id` → `art.id`
 - `ON DELETE CASCADE` on `tracks` → `tags`, `track_art`
 - Triggers bump `tracks.content_version` on tag/art changes
+
+External tools must not rely on SQLite constraints to protect scanner-owned
+columns. If an external writer mutates structural `tracks` fields anyway,
+`musefs` treats the row as untrusted input and returns a controlled
+backing/layout error when the row no longer matches the backing file.
