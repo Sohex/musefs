@@ -45,7 +45,19 @@ fn valid_layout_passes_validation() {
 }
 
 #[test]
-fn empty_backing_segment_fails_validation() {
+fn empty_backing_segment_passes_validation() {
     let layout = RegionLayout::new(vec![Segment::BackingAudio { offset: 0, len: 0 }]);
-    assert_eq!(layout.validate(), Err(LayoutError::EmptySegment));
+    assert!(layout.validate().is_ok());
+}
+
+#[test]
+fn total_overflow_detected() {
+    let layout = RegionLayout::new(vec![
+        Segment::BackingAudio {
+            offset: 0,
+            len: u64::MAX,
+        },
+        Segment::BackingAudio { offset: 0, len: 1 },
+    ]);
+    assert_eq!(layout.validate(), Err(LayoutError::TotalOverflow));
 }

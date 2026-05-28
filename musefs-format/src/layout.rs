@@ -66,6 +66,12 @@ impl RegionLayout {
         RegionLayout { segments }
     }
 
+    pub fn validated(segments: Vec<Segment>) -> Result<RegionLayout, LayoutError> {
+        let layout = RegionLayout::new(segments);
+        layout.validate()?;
+        Ok(layout)
+    }
+
     /// The ordered segments composing the synthesized virtual file.
     pub fn segments(&self) -> &[Segment] {
         &self.segments
@@ -86,13 +92,14 @@ impl RegionLayout {
     }
 
     /// Validate basic producer invariants. Returns `Ok(())` if the layout is
-    /// structurally sound (no empty segments, lengths don't overflow). This is
-    /// a lightweight check — not against schema — for testing and debugging.
+    /// structurally sound (no empty metadata segments, lengths don't overflow).
+    /// Zero-length backing audio is valid for formats that can represent an
+    /// empty media payload.
     pub fn validate(&self) -> Result<(), LayoutError> {
         let mut total: u64 = 0;
         for seg in &self.segments {
             let len = seg.len();
-            if len == 0 {
+            if len == 0 && !matches!(seg, Segment::BackingAudio { .. } | Segment::OggAudio { .. }) {
                 return Err(LayoutError::EmptySegment);
             }
             total = total.checked_add(len).ok_or(LayoutError::TotalOverflow)?;

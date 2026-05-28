@@ -178,7 +178,7 @@ pub fn synthesize_layout(
         len: scan.audio_length,
     });
 
-    Ok(RegionLayout::new(segments))
+    RegionLayout::validated(segments).map_err(|_| FormatError::InvalidLayout)
 }
 
 /// Read the existing VORBIS_COMMENT block from a complete FLAC file, returning

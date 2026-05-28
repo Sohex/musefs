@@ -233,7 +233,7 @@ pub fn synthesize_layout(
     header.extend_from_slice(b"WAVE");
     segments.insert(0, Segment::Inline(header));
 
-    Ok(RegionLayout::new(segments))
+    RegionLayout::validated(segments).map_err(|_| FormatError::InvalidLayout)
 }
 
 /// RIFF `INFO` subchunk FourCC -> canonical (lowercase) tag key. Inverse of

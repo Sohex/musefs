@@ -3,7 +3,7 @@
 //! samples read through OUR patched chunk offsets are byte-identical to the
 //! originals — proving the offset surgery.
 
-use musefs_format::{mp4, RegionLayout, Segment, TagInput};
+use musefs_format::{mp4, ArtInput, RegionLayout, Segment, TagInput};
 use std::io::Cursor;
 
 fn materialize(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {
@@ -69,4 +69,35 @@ fn synthesized_m4a_decodes_via_independent_parser() {
     let tags = mp4::read_tags(&synth);
     assert!(tags.contains(&("title".into(), "Rewritten".into())));
     assert!(tags.contains(&("artist".into(), "AA".into())));
+}
+
+#[test]
+fn m4a_synthesis_uses_only_first_cover_art() {
+    let original = std::fs::read("tests/fixtures/sample.m4a").unwrap();
+    let scan = mp4::read_structure(&original).unwrap();
+
+    let art1 = ArtInput {
+        art_id: 1,
+        mime: "image/jpeg".to_string(),
+        description: "cover".to_string(),
+        picture_type: 3,
+        width: 0,
+        height: 0,
+        data_len: 100,
+    };
+    let art2 = ArtInput {
+        art_id: 2,
+        mime: "image/png".to_string(),
+        description: "back".to_string(),
+        picture_type: 0,
+        width: 0,
+        height: 0,
+        data_len: 200,
+    };
+
+    let layout_single = mp4::synthesize_layout(&scan, &[], std::slice::from_ref(&art1)).unwrap();
+    let layout_both = mp4::synthesize_layout(&scan, &[], &[art1, art2]).unwrap();
+
+    // Both layouts must be identical — the second art input is ignored.
+    assert_eq!(layout_single, layout_both);
 }
