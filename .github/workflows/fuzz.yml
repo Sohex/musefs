@@ -15,6 +15,9 @@ concurrency:
   group: fuzz-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   smoke:
     # Per-PR: build all targets + a few seconds each to catch broken targets.

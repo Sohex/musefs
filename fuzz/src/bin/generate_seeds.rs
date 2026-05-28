@@ -3,7 +3,11 @@ use std::fs;
 use std::path::Path;
 
 fn write(target: &str, name: &str, bytes: &[u8]) {
-    let dir = Path::new("fuzz/corpus").join(target);
+    // Root the corpus path at the fuzz crate (CARGO_MANIFEST_DIR) so the
+    // generator works regardless of the caller's working directory.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("corpus")
+        .join(target);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join(name), bytes).unwrap();
 }
