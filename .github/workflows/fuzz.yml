@@ -1,0 +1,83 @@
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - 'musefs-format/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 5 * * 1'  # Mondays 05:00 UTC
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    # Per-PR: build all targets + a few seconds each to catch broken targets.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'fuzz'
+      - name: Install cargo-fuzz
+        # Not --locked: cargo-fuzz's pinned Cargo.lock has an old rustix that
+        # fails to compile on current nightly; let cargo resolve newer deps.
+        run: cargo install cargo-fuzz
+      - name: Build targets
+        run: cargo +nightly fuzz build
+      - name: Smoke-run each target
+        run: |
+          for t in flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment; do
+            echo "== $t =="
+            cargo +nightly fuzz run "$t" -- -max_len=131072 -rss_limit_mb=2048 -max_total_time=15
+          done
+
+  scheduled:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [flac, mp3, mp4, ogg, wav, ogg_page, b64, vorbiscomment]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'fuzz'
+      - name: Install cargo-fuzz
+        # Not --locked: cargo-fuzz's pinned Cargo.lock has an old rustix that
+        # fails to compile on current nightly; let cargo resolve newer deps.
+        run: cargo install cargo-fuzz
+      # actions/cache is immutable per key, so a static key restores but never
+      # re-saves an updated corpus. Use a dynamic key (always new) with a
+      # restore-keys prefix to restore the most recent prior corpus, so coverage
+      # accumulates across scheduled runs.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_len=131072 -rss_limit_mb=2048 -timeout=25 -max_total_time=180
+      - name: Minimize corpus
+        if: always()
+        run: cargo +nightly fuzz cmin ${{ matrix.target }} -- -max_len=131072
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

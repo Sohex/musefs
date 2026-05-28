@@ -25,6 +25,22 @@ cargo test -p musefs-fuse -- --ignored   # FUSE end-to-end; needs /dev/fuse + li
 cargo clippy --all-targets               # lint
 cargo fmt                                # format
 
+# Property tests (proptest): byte-identical invariant + tag round-trip. The
+# format-layer proptests need the `fuzzing` feature; `cargo test --workspace`
+# also runs them via feature unification.
+cargo test -p musefs-format --features fuzzing
+cargo test -p musefs-core --test proptest_read_fidelity
+
+# Coverage-guided fuzzing (needs nightly + cargo-fuzz; the fuzz/ crate is
+# excluded from the workspace):
+cargo +nightly fuzz run <flac|mp3|mp4|ogg|wav|ogg_page|b64|vorbiscomment>
+cargo +nightly fuzz coverage <target>     # confirm coverage reaches the parser
+cargo run --manifest-path fuzz/Cargo.toml --bin generate_seeds  # (re)build seeds
+
+# Independent-reader (mutagen) interop — Property 5:
+MUSEFS_INTEROP_DIR=/tmp/i cargo test -p musefs-core --test interop_emit -- --ignored emit_interop_fixtures
+MUSEFS_INTEROP_DIR=/tmp/i python -m pytest tests/interop
+
 # Run the CLI (binary is `musefs`):
 cargo run -p musefs-cli -- scan <backing_dir> --db <db_path> [--revalidate]
 cargo run -p musefs-cli -- mount <mountpoint> --db <db_path> \
@@ -146,4 +162,7 @@ tracks whose backing file is gone, and GC orphaned art. `--revalidate` selects i
   (mirror an existing module — `flac.rs`, `mp3.rs`, `mp4.rs`, `ogg/`, `wav.rs`),
   returning a `RegionLayout`; add the variant to `musefs-db`'s `Format` enum, then
   wire it into the `match track.format` arms in `reader::HeaderCache::resolve` and
-  into `scan.rs`.
+  into `scan.rs`. Then extend the test surface: add a
+  `fuzz_check::fixtures::<fmt>()` minimal file, a `fuzz/fuzz_targets/<fmt>.rs`
+  target with a seed in `generate_seeds`, a `musefs-format/tests/proptest_<fmt>.rs`,
+  and a manifest row in `musefs-core/tests/interop_emit.rs`.

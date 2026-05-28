@@ -21,6 +21,8 @@ tempfile = "3"
 metaflac = "0.2"
 id3 = "1"
 criterion = "0.5"
+proptest = "1"
+musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
 
 [[bench]]
 name = "read_throughput"

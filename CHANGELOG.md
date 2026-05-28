@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Fuzzing & property tests:** coverage-guided `cargo-fuzz` targets for every
+  format parser (FLAC, MP3, MP4, Ogg, WAV) and the byte-level primitives (Ogg
+  page parsing, base64 windowing, VorbisComment), plus `proptest` invariants —
+  panic-freedom, the byte-identical audio guarantee, and tag round-trip — an
+  end-to-end read-fidelity property, and a `mutagen` interop test asserting an
+  independent reader sees the tags we synthesize.
+
+### Fixed
+
+- **VorbisComment parse OOM (DoS):** a crafted comment block declaring a huge
+  entry count made `Vec::with_capacity` attempt a multi-gigabyte allocation; the
+  pre-allocation is now bounded by the readable byte count. Found by the new
+  `vorbiscomment` fuzz target.
+
 ## [0.2.0] - 2026-05-27
 
 First public release.

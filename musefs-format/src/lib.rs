@@ -9,7 +9,16 @@ mod tagmap;
 mod vorbiscomment;
 pub mod wav;
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzz_check;
+
 pub use error::{FormatError, Result};
 pub use input::{ArtInput, EmbeddedPicture, TagInput};
 pub use layout::{RegionLayout, Segment};
 pub use ogg::{Codec, OggHeader, OggScan};
+
+// tagmap is pure &str→key mapping with no byte parsing and is already exercised
+// indirectly by the per-format fuzz targets (which pass arbitrary tag keys through
+// synthesize_layout), so no dedicated tagmap fuzz target is needed.
+#[cfg(feature = "fuzzing")]
+pub use vorbiscomment::parse as parse_vorbis_comment;

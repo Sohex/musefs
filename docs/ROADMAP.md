@@ -91,6 +91,15 @@ modifying or duplicating the original audio bytes.
   Byte-identical audio held throughout; each phase shipped subagent-driven with
   spec + code-quality + final review and the full `#[ignore]` e2e mount suite
   green on `/dev/fuse`.
+- **Fuzzing & property tests:** coverage-guided `cargo-fuzz` targets for every
+  format parser (FLAC/MP3/MP4/Ogg/WAV) and the byte-level primitives (Ogg page,
+  base64 windowing, VorbisComment), plus `proptest` invariants — panic-freedom,
+  the byte-identical audio guarantee, and tag round-trip — an end-to-end read
+  fidelity property, and a `mutagen` interop check that an independent reader
+  sees the tags we synthesize. The fuzzers run per-PR (build + smoke) and on a
+  weekly schedule with an accumulating corpus; fuzzing already caught and fixed
+  an OOM/DoS in VorbisComment parsing (unbounded `Vec::with_capacity` on an
+  untrusted count).
 
 ---
 
