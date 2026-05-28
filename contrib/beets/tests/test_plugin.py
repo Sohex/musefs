@@ -64,14 +64,13 @@ def _autoscan_plugin(db_path, monkeypatch):
     recorder (so tests don't need the real musefs binary)."""
     plugin = MusefsPlugin()
     monkeypatch.setattr(
-        plugin, "config",
+        plugin,
+        "config",
         FakeConfigView({"db": db_path, "fields": {}, "autoscan": True}),
         raising=False,
     )
     calls = []
-    monkeypatch.setattr(
-        plugin, "_run_scan", lambda db, targets: calls.append(list(targets))
-    )
+    monkeypatch.setattr(plugin, "_run_scan", lambda db, targets: calls.append(list(targets)))
     return plugin, calls
 
 
@@ -104,14 +103,23 @@ def test_command_run_syncs(db_path, make_track, fake_item, tmp_path, monkeypatch
 
     conn = sqlite3.connect(db_path)
     try:
-        assert conn.execute(
-            "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
-        ).fetchone()[0] == "Song"
+        assert (
+            conn.execute(
+                "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
+            ).fetchone()[0]
+            == "Song"
+        )
     finally:
         conn.close()
 
 
-def test_command_autoscan_scans_matched_files(db_path, make_track, fake_item, tmp_path, monkeypatch):
+def test_command_autoscan_scans_matched_files(
+    db_path,
+    make_track,
+    fake_item,
+    tmp_path,
+    monkeypatch,
+):
     real, tid, item = _real_track(tmp_path, make_track, fake_item, title="Song")
     plugin, calls = _autoscan_plugin(db_path, monkeypatch)
     cmd, opts, args = _musefs_cmd(plugin, ["title:Song"])  # a query -> matched files
@@ -120,9 +128,7 @@ def test_command_autoscan_scans_matched_files(db_path, make_track, fake_item, tm
     assert calls == [[real]]  # scanned the matched file, not the directory
     conn = sqlite3.connect(db_path)
     try:
-        assert conn.execute(
-            "SELECT value FROM tags WHERE key='title'"
-        ).fetchone()[0] == "Song"
+        assert conn.execute("SELECT value FROM tags WHERE key='title'").fetchone()[0] == "Song"
     finally:
         conn.close()
 
@@ -144,39 +150,72 @@ def test_command_dry_run_skips_autoscan(db_path, fake_item, monkeypatch):
     assert calls == []  # dry-run must not mutate the DB via scan
 
 
-def test_command_prunes_missing_rows(db_path, make_track, fake_item, monkeypatch):
+def test_command_query_preserves_unrelated_missing_rows(
+    db_path,
+    make_track,
+    fake_item,
+    tmp_path,
+    monkeypatch,
+):
+    make_track("/gone/x.flac")  # a stale row: its backing file does not exist
+    real, _tid, item = _real_track(tmp_path, make_track, fake_item, title="Song")
+    plugin, _ = _autoscan_plugin(db_path, monkeypatch)
+    cmd, opts, args = _musefs_cmd(plugin, ["title:Song"])
+    cmd.func(FakeLib([item]), opts, args)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
+        assert "/gone/x.flac" in paths
+        assert real in paths
+    finally:
+        conn.close()
+
+
+def test_command_full_sync_prunes_missing_rows(db_path, make_track, fake_item, monkeypatch):
     make_track("/gone/x.flac")  # a stale row: its backing file does not exist
     plugin, _ = _autoscan_plugin(db_path, monkeypatch)
-    cmd, opts, args = _musefs_cmd(plugin, ["q"])
+    cmd, opts, args = _musefs_cmd(plugin, [])
     cmd.func(FakeLib([fake_item(os.fsencode("/music/a.flac"))]), opts, args)
 
     conn = sqlite3.connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
-        assert "/gone/x.flac" not in paths  # pruned because the file is gone
+        assert "/gone/x.flac" not in paths
     finally:
         conn.close()
 
 
-def test_reconcile_at_cli_exit_syncs_recorded_items(db_path, make_track, fake_item, tmp_path, monkeypatch):
+def test_reconcile_at_cli_exit_syncs_recorded_items(
+    db_path,
+    make_track,
+    fake_item,
+    tmp_path,
+    monkeypatch,
+):
     real, tid, item = _real_track(tmp_path, make_track, fake_item, title="Song")
     plugin, calls = _autoscan_plugin(db_path, monkeypatch)
-    plugin._record(item=item)     # an import/write hook fired during the command
-    plugin._reconcile_pending()   # cli_exit
+    plugin._record(item=item)  # an import/write hook fired during the command
+    plugin._reconcile_pending()  # cli_exit
 
     assert calls == [[real]]
     conn = sqlite3.connect(db_path)
     try:
-        assert conn.execute(
-            "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
-        ).fetchone()[0] == "Song"
+        assert (
+            conn.execute(
+                "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
+            ).fetchone()[0]
+            == "Song"
+        )
     finally:
         conn.close()
 
 
 def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_path, monkeypatch):
-    # A previously-scanned file moved away (stale row); the item now lives at a
-    # new real path. Reconcile syncs the new path and prunes the stale row.
+    # Reconcile uses scoped prune (track_ids from synced items only), so a
+    # stale row from a previous run is NOT cleaned up here — orphan cleanup is
+    # `_command`'s job (full-table prune). Reconcile only prunes the synced
+    # item's backing path if it moved away.
     make_track("/old/moved-away.flac")  # stale: file gone
     real, tid, item = _real_track(tmp_path, make_track, fake_item, title="Now")
     plugin, _ = _autoscan_plugin(db_path, monkeypatch)
@@ -186,11 +225,15 @@ def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_pat
     conn = sqlite3.connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
-        assert "/old/moved-away.flac" not in paths  # stale row pruned
-        assert real in paths                         # new path kept + synced
-        assert conn.execute(
-            "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
-        ).fetchone()[0] == "Now"
+        # Stale row survives reconcile — scoped prune only checks synced items.
+        assert "/old/moved-away.flac" in paths
+        assert real in paths  # new path kept + synced
+        assert (
+            conn.execute(
+                "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
+            ).fetchone()[0]
+            == "Now"
+        )
     finally:
         conn.close()
 
@@ -199,13 +242,11 @@ def test_reconcile_without_db_skips_gracefully(fake_item, fake_album, monkeypatc
     # Regression: reconcile must not pass a None db path downstream. With no db
     # configured it should warn + skip, never raise (which would abort beets).
     plugin = MusefsPlugin()
-    monkeypatch.setattr(
-        plugin, "config", FakeConfigView({"db": None, "fields": {}}), raising=False
-    )
+    monkeypatch.setattr(plugin, "config", FakeConfigView({"db": None, "fields": {}}), raising=False)
     plugin._record_album(album=fake_album(items=[fake_item(os.fsencode("/music/a.flac"))]))
-    plugin._reconcile_pending()       # must not raise
+    plugin._reconcile_pending()  # must not raise
     plugin._record_album(album=None)  # records nothing
-    plugin._reconcile_pending()       # no-op
+    plugin._reconcile_pending()  # no-op
 
 
 def test_reconcile_best_effort_on_scan_failure(db_path, fake_item, monkeypatch):
