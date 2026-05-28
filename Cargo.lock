@@ -791,6 +791,7 @@ version = "0.2.0"
 dependencies = [
  "fuser",
  "libc",
+ "log",
  "metaflac",
  "musefs-core",
  "musefs-db",
