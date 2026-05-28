@@ -983,6 +983,37 @@ mod tests {
     }
 
     #[test]
+    fn sum_overflow_art_value_rejected_by_build_packets() {
+        // data_len and prefix individually fit in u32, but the full value
+        // (key + b64(prefix) + b64(data)) exceeds u32::MAX.
+        let meta = crate::input::ArtInput {
+            art_id: 0,
+            mime: "image/png".to_string(),
+            description: "x".repeat(256),
+            data_len: 3_221_225_470, // b64_len = 4_294_967_294 < u32::MAX
+            picture_type: 3,
+            width: 0,
+            height: 0,
+        };
+        let art = OggArt {
+            meta: &meta,
+            image: &[],
+        };
+        let header = OggHeader {
+            codec: Codec::Vorbis,
+            serial: 0,
+            packets: vec![vec![], vec![], vec![]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let result = build_packets_with_art(&header, &[], &[art]);
+        assert!(
+            result.is_err(),
+            "expected Err when key + b64(prefix) + b64(data) overflows u32"
+        );
+    }
+
+    #[test]
     fn picture_prefix_is_3_aligned_and_declares_image_len() {
         let art = crate::input::ArtInput {
             art_id: 1,
