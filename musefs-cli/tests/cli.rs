@@ -134,3 +134,64 @@ fn parses_mode_and_revalidate_flags() {
         Command::Mount { .. } => panic!("expected scan"),
     }
 }
+
+use musefs_cli::parse_mount_config;
+use musefs_core::Mode;
+use std::time::Duration;
+
+#[test]
+fn parse_mount_config_defaults_are_sensible() {
+    let (config, fuse_config) = parse_mount_config(
+        "$artist/$title".to_string(),
+        "Unknown".to_string(),
+        Mode::Synthesis,
+        1000,
+        1000,
+        512,
+        64,
+        false,
+    );
+    assert_eq!(config.template, "$artist/$title");
+    assert_eq!(config.default_fallback, "Unknown");
+    assert_eq!(config.mode, Mode::Synthesis);
+    assert_eq!(config.poll_interval, Duration::from_secs(1));
+    assert!(config.fallbacks.is_empty());
+    assert!(!fuse_config.keep_cache);
+    assert_eq!(fuse_config.ttl, Duration::from_secs(1));
+    assert_eq!(fuse_config.max_readahead, 512 * 1024);
+    assert_eq!(fuse_config.max_background, 64);
+}
+
+#[test]
+fn parse_mount_config_keep_cache_sets_flag() {
+    let (config, fuse_config) = parse_mount_config(
+        "$title".to_string(),
+        "Unknown".to_string(),
+        Mode::StructureOnly,
+        250,
+        5000,
+        256,
+        32,
+        true,
+    );
+    assert_eq!(config.mode, Mode::StructureOnly);
+    assert_eq!(config.poll_interval, Duration::from_millis(250));
+    assert!(fuse_config.keep_cache);
+    assert_eq!(fuse_config.ttl, Duration::from_secs(5));
+    assert_eq!(fuse_config.max_background, 32);
+}
+
+#[test]
+fn parse_mount_config_saturating_readahead() {
+    let (_, fuse_config) = parse_mount_config(
+        "$title".to_string(),
+        "Unknown".to_string(),
+        Mode::Synthesis,
+        1000,
+        1000,
+        u32::MAX,
+        64,
+        false,
+    );
+    assert_eq!(fuse_config.max_readahead, u32::MAX);
+}
