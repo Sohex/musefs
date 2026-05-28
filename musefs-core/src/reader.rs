@@ -13,6 +13,16 @@ use crate::facade::Mode;
 use crate::mapping::{tags_to_inputs, track_art_to_inputs};
 use crate::ogg_index::{build_index, serve, OggPageIndex};
 
+const OGG_MIN_PAGE_BYTES: u64 = 27;
+const OGG_INDEX_BYTES_PER_PAGE: u64 = 128;
+
+fn estimated_ogg_index_bytes(audio_length: u64) -> u64 {
+    let estimated_pages = audio_length
+        .saturating_div(OGG_MIN_PAGE_BYTES)
+        .saturating_add(1);
+    estimated_pages.saturating_mul(OGG_INDEX_BYTES_PER_PAGE)
+}
+
 /// A fully resolved synthesized file: its segment layout, total size, the
 /// content version it was built from, and where the backing audio lives.
 #[derive(Debug)]
@@ -336,7 +346,13 @@ impl HeaderCache {
                 Segment::Inline(b) => b.len() as u64,
                 _ => 0,
             })
-            .sum();
+            .sum::<u64>()
+            + match track.format {
+                Format::Opus | Format::Vorbis | Format::OggFlac => {
+                    estimated_ogg_index_bytes(track.audio_length as u64)
+                }
+                _ => 0,
+            };
         Ok(Arc::new(ResolvedFile {
             layout,
             total_len,
@@ -831,6 +847,19 @@ mod cache_bound_tests {
         assert!(shard.get(2).is_some());
         shard.insert(3, entry(0, 60)); // evicts the now-LRU entry
         assert!(shard.get(3).is_some());
+    }
+
+    #[test]
+    fn ogg_index_estimate_accounts_page_dense_files() {
+        assert_eq!(estimated_ogg_index_bytes(0), OGG_INDEX_BYTES_PER_PAGE);
+        assert_eq!(
+            estimated_ogg_index_bytes(OGG_MIN_PAGE_BYTES),
+            OGG_INDEX_BYTES_PER_PAGE * 2
+        );
+        assert!(
+            estimated_ogg_index_bytes(8 * 1024) > OGG_INDEX_BYTES_PER_PAGE * 100,
+            "8 KiB of tiny Ogg pages must cost far more than one average page"
+        );
     }
 
     #[test]
