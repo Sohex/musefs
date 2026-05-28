@@ -14,7 +14,7 @@ FUSE e2e tests are excluded because they require `/dev/fuse` and libfuse at runt
 Run them separately when needed:
 
 ```bash
-cargo llvm-cov run -- cargo test -p musefs-fuse -- --ignored
+cargo llvm-cov --package musefs-fuse -- --ignored
 ```
 
 ## CI Setup
