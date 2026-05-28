@@ -1,3 +1,12 @@
+/// Validation errors discovered in a layout at synthesis time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutError {
+    /// A segment reported zero length.
+    EmptySegment,
+    /// Total length overflowed u64.
+    TotalOverflow,
+}
+
 /// One contiguous run of bytes in a synthesized virtual file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
@@ -74,5 +83,20 @@ impl RegionLayout {
             .filter(|s| !matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }))
             .map(Segment::len)
             .sum()
+    }
+
+    /// Validate basic producer invariants. Returns `Ok(())` if the layout is
+    /// structurally sound (no empty segments, lengths don't overflow). This is
+    /// a lightweight check — not against schema — for testing and debugging.
+    pub fn validate(&self) -> Result<(), LayoutError> {
+        let mut total: u64 = 0;
+        for seg in &self.segments {
+            let len = seg.len();
+            if len == 0 {
+                return Err(LayoutError::EmptySegment);
+            }
+            total = total.checked_add(len).ok_or(LayoutError::TotalOverflow)?;
+        }
+        Ok(())
     }
 }
