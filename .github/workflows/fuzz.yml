@@ -23,9 +23,13 @@ jobs:
     # Per-PR: build all targets + a few seconds each to catch broken targets.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           workspaces: 'fuzz'
       - name: Install cargo-fuzz
@@ -49,9 +53,13 @@ jobs:
       matrix:
         target: [flac, mp3, mp4, ogg, wav, ogg_page, b64, vorbiscomment]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           workspaces: 'fuzz'
       - name: Install cargo-fuzz
@@ -63,7 +71,7 @@ jobs:
       # restore-keys prefix to restore the most recent prior corpus, so coverage
       # accumulates across scheduled runs.
       - name: Restore corpus
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -76,7 +84,7 @@ jobs:
         run: cargo +nightly fuzz cmin ${{ matrix.target }} -- -max_len=131072
       - name: Upload crashes
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
