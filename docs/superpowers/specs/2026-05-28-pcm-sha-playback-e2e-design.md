@@ -24,16 +24,18 @@ Add a dedicated ignored Rust test at
 `musefs-fuse/tests/playback_pcm.rs`, rather than expanding the existing
 `mount.rs` or `ogg_read_through.rs` files.
 
-The test generates one short deterministic source file per supported served
-format:
+The test generates one short deterministic source file per supported codec and
+container, and it records the served extension explicitly:
 
-- FLAC (`.flac`)
-- MP3 (`.mp3`)
-- M4A/AAC (`.m4a`)
-- Opus-in-Ogg (`.opus`)
-- Vorbis-in-Ogg (`.ogg`)
-- FLAC-in-Ogg (`.oga`)
-- WAV (`.wav`)
+| Codec/container | Source extension | Served extension |
+| --- | --- | --- |
+| FLAC | `.flac` | `.flac` |
+| MP3 | `.mp3` | `.mp3` |
+| M4A/AAC | `.m4a` | `.m4a` |
+| Opus-in-Ogg | `.opus` | `.opus` |
+| Vorbis-in-Ogg | `.ogg` | `.vorbis` |
+| FLAC-in-Ogg | `.oga` | `.oggflac` |
+| WAV | `.wav` | `.wav` |
 
 Each source file carries tags that scan into a unique mounted path. The test
 then scans the backing directory into an in-memory DB, opens musefs in synthesis
@@ -75,6 +77,11 @@ change the audible audio stream when it regenerates metadata.
 
 - `make_audio_fixture(path, codec_args, tags)`: runs `ffmpeg` with a short sine
   or generated-audio source, explicit encoder/container args, and metadata.
+  This intentionally duplicates the small helper shape in
+  `ogg_read_through.rs` for now because Rust integration tests do not share a
+  common module today. Do not refactor `ogg_read_through.rs` as part of this
+  feature; extract shared FUSE test helpers only if a later cleanup justifies
+  the extra module boundary.
 - `pcm_sha256(path)`: decodes the first audio stream to canonical PCM and
   returns a SHA-256 hex string.
 - `mount_and_validate(cases)`: scans the backing directory, mounts musefs, and
@@ -83,14 +90,25 @@ change the audible audio stream when it regenerates metadata.
 The Rust test should use a table of cases containing:
 
 - source filename
-- expected mounted extension/path
+- served extension and full expected mounted path
 - title and artist tags
 - ffmpeg codec/container args
 
+The initial codec argument sketches are:
+
+- Opus-in-Ogg: `-c:a libopus`
+- Vorbis-in-Ogg: `-c:a libvorbis`
+- FLAC-in-Ogg: `-c:a flac -f ogg`
+
+The remaining formats use the same straightforward choices as the existing E2E
+fixtures: FLAC defaults or `-c:a flac`, MP3 `-c:a libmp3lame`, M4A/AAC
+`-c:a aac`, and WAV `-c:a pcm_s16le`.
+
 ### Python Helpers
 
-- Replace or supplement `_audio_md5` with `_audio_sha256`, using the same
-  canonical ffmpeg decode as the Rust helper.
+- Keep `_audio_md5` unchanged for the existing Beets tests that already use
+  ffmpeg's `-f md5` output. Add a new `_audio_sha256` helper for the all-format
+  playback test, using the same canonical ffmpeg decode as the Rust helper.
 - Extend audio generation so the all-format playback test can create FLAC,
   MP3, M4A/AAC, Opus-in-Ogg, Vorbis-in-Ogg, FLAC-in-Ogg, and WAV sources.
 - Query Beets for each imported backing path by format/title, then compare that
@@ -115,9 +133,10 @@ If ffmpeg itself is unavailable, skip the whole playback test. If every format
 case is skipped, skip the test with a message that calls out missing codec
 support. CI must be configured so the full case list runs.
 
-Mounted path lookup should use deterministic expected paths. A wrong path or
-tag synthesis result should fail clearly instead of being hidden by a recursive
-"first file" search.
+Mounted path lookup must use deterministic expected paths built from the
+template, tags, and served extension. Do not reuse the `find_one_file` pattern
+from `ogg_read_through.rs`; a wrong path, served extension, or tag synthesis
+result should fail clearly instead of being hidden by a recursive search.
 
 ## Test Assertions
 
@@ -147,6 +166,11 @@ run:
 ```bash
 cargo test -p musefs-fuse -- --ignored
 ```
+
+Installing `ffmpeg` also activates the existing ignored
+`ogg_read_through.rs` codec tests in CI. That is desired: the E2E job should
+exercise both the existing Ogg page/payload validation and the new PCM playback
+validation.
 
 The Beets playback E2E remains opt-in under the existing `pytest.mark.e2e`
 mechanism. Document or preserve the manual command:
