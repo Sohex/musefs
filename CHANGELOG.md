@@ -21,6 +21,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entry count made `Vec::with_capacity` attempt a multi-gigabyte allocation; the
   pre-allocation is now bounded by the readable byte count. Found by the new
   `vorbiscomment` fuzz target.
+- **MP4 box-bounds integer overflow:** an untrusted 64-bit extended box size made
+  the box-bounds check (`pos + total`) overflow `usize` — a panic in debug and a
+  silent wrap in release that accepted a bogus box length. The addition is now
+  checked. Found by the `mp4` fuzz target.
+- **ID3v2 parsing unbounded allocation (DoS):** the `id3` crate eagerly allocates
+  a frame's declared size (ID3v2.3 frame sizes are plain 32-bit, up to 4 GiB), so
+  a crafted tag could exhaust memory at scan time — via an MP3 or a WAV embedded
+  `id3 ` chunk. Parsing is now gated on validated ID3v2 frame bounds and an
+  ID3v2 tag at offset 0 (the `id3` reader scans forward). Found by the `mp3` and
+  `wav` fuzz targets.
 
 ## [0.2.0] - 2026-05-27
 
