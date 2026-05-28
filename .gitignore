@@ -1,2 +1,6 @@
 /target
 /.claude/
+
+# Python bytecode (interop tests)
+__pycache__/
+*.pyc
