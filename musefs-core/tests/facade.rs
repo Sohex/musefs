@@ -804,3 +804,44 @@ fn poll_refresh_notify_reports_old_inode_for_path_changing_retag() {
     );
     assert_ne!(old_inode, new_inode);
 }
+
+#[test]
+fn poll_refresh_notify_invalidates_old_inode_for_removed_track() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &[0xAB; 64],
+    );
+    std::fs::write(dir.path().join("a.flac"), &bytes).unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+    let alice = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let old_inode = fs.lookup(alice, "Song.flac").unwrap();
+    let track_id = musefs_db::Db::open(&db_path)
+        .unwrap()
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .id;
+
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        db2.delete_track(track_id).unwrap();
+    }
+
+    let mut changed = Vec::new();
+    assert!(fs.poll_refresh_notify(|ino| changed.push(ino)).unwrap());
+    assert!(
+        changed.contains(&old_inode),
+        "old inode should be invalidated after track removal"
+    );
+}
