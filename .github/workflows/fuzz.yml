@@ -71,7 +71,7 @@ jobs:
       # restore-keys prefix to restore the most recent prior corpus, so coverage
       # accumulates across scheduled runs.
       - name: Restore corpus
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
