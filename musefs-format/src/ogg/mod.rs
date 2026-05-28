@@ -15,6 +15,8 @@ pub enum Codec {
     OggFlac,
 }
 
+const METADATA_BLOCK_PICTURE_KEY: &[u8] = b"METADATA_BLOCK_PICTURE=";
+
 fn detect_codec(first_packet: &[u8]) -> Result<Codec> {
     if first_packet.len() >= 8 && &first_packet[0..8] == b"OpusHead" {
         Ok(Codec::Opus)
@@ -292,9 +294,16 @@ fn build_packets_with_art(
     match header.codec {
         Codec::Opus | Codec::Vorbis => {
             // VorbisComment value length is a 32-bit field; guard against overflow
-            // for absurdly large images (cover art is far below this).
+            // for absurdly large images (cover art is far below this). The full
+            // value includes the key, base64 of the picture prefix, and base64 of
+            // the image; any one of these alone may fit in u32 but the sum may not.
             for a in arts {
-                if b64_len(a.meta.data_len) > u32::MAX as u64 {
+                let prefix = picture_prefix(a.meta);
+                let b64_prefix_len = b64_len(prefix.len() as u64);
+                let value_len = METADATA_BLOCK_PICTURE_KEY.len() as u64
+                    + b64_prefix_len
+                    + b64_len(a.meta.data_len);
+                if value_len > u32::MAX as u64 {
                     return Err(FormatError::TooLarge);
                 }
             }
@@ -338,13 +347,14 @@ fn comment_packet_chunks(
     let mut head = magic.to_vec();
     head.extend_from_slice(&leading);
 
-    const KEY: &[u8] = b"METADATA_BLOCK_PICTURE=";
     for art in arts {
         let prefix = picture_prefix(art.meta);
         let b64_prefix = b64_encode(&prefix);
-        let value_len = KEY.len() + b64_prefix.len() + b64_len(art.meta.data_len) as usize;
+        let value_len = METADATA_BLOCK_PICTURE_KEY.len()
+            + b64_prefix.len()
+            + b64_len(art.meta.data_len) as usize;
         head.extend_from_slice(&(value_len as u32).to_le_bytes());
-        head.extend_from_slice(KEY);
+        head.extend_from_slice(METADATA_BLOCK_PICTURE_KEY);
         head.extend_from_slice(&b64_prefix);
         chunks.push(PayloadChunk::Bytes(std::mem::take(&mut head)));
         chunks.push(PayloadChunk::Art {
@@ -944,6 +954,32 @@ mod tests {
         assert_eq!(pics.len(), 2);
         assert_eq!(pics[0].data, img_a);
         assert_eq!(pics[1].data, img_b);
+    }
+
+    #[test]
+    fn oversized_full_art_value_rejected_by_build_packets() {
+        let meta = crate::input::ArtInput {
+            art_id: 0,
+            mime: "image/jpeg".to_string(),
+            description: String::new(),
+            data_len: u32::MAX as u64,
+            picture_type: 3,
+            width: 0,
+            height: 0,
+        };
+        let art = OggArt {
+            meta: &meta,
+            image: &[],
+        };
+        let header = OggHeader {
+            codec: Codec::Vorbis,
+            serial: 0,
+            packets: vec![vec![], vec![], vec![]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let result = build_packets_with_art(&header, &[], &[art]);
+        assert!(result.is_err(), "expected Err for oversized art");
     }
 
     #[test]

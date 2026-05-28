@@ -13,6 +13,9 @@ use crate::facade::Mode;
 use crate::mapping::{tags_to_inputs, track_art_to_inputs};
 use crate::ogg_index::{build_index, serve, OggPageIndex};
 
+const OGG_AVG_PAGE_BYTES: u64 = 8192;
+const OGG_INDEX_BYTES_PER_PAGE: u64 = 100;
+
 /// A fully resolved synthesized file: its segment layout, total size, the
 /// content version it was built from, and where the backing audio lives.
 #[derive(Debug)]
@@ -336,7 +339,16 @@ impl HeaderCache {
                 Segment::Inline(b) => b.len() as u64,
                 _ => 0,
             })
-            .sum();
+            .sum::<u64>()
+            + match track.format {
+                Format::Opus | Format::Vorbis | Format::OggFlac => {
+                    let estimated_pages = (track.audio_length as u64)
+                        .saturating_div(OGG_AVG_PAGE_BYTES)
+                        .max(1);
+                    estimated_pages.saturating_mul(OGG_INDEX_BYTES_PER_PAGE)
+                }
+                _ => 0,
+            };
         Ok(Arc::new(ResolvedFile {
             layout,
             total_len,
