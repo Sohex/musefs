@@ -12,6 +12,7 @@ metrics = ["musefs-core/metrics"]
 [dependencies]
 fuser = { version = "0.14", features = ["abi-7-31"] }
 libc = "0.2"
+log = "0.4"
 musefs-core = { path = "../musefs-core" }
 threadpool = "1"
 

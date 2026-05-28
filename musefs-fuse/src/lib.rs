@@ -151,15 +151,21 @@ impl MusefsFs {
         if self.config.keep_cache {
             let notifier = Arc::clone(&self.notifier);
             self.pool.execute(move || {
-                let _ = core.poll_refresh_notify(|ino| {
+                if let Err(e) = core.poll_refresh_notify(|ino| {
                     if let Some(n) = notifier.get() {
-                        let _ = n.inval_inode(ino, 0, 0);
+                        if let Err(inval_err) = n.inval_inode(ino, 0, 0) {
+                            log::warn!("inval_inode({ino}) failed: {inval_err}");
+                        }
                     }
-                });
+                }) {
+                    log::warn!("poll_refresh_notify failed: {e}");
+                }
             });
         } else {
             self.pool.execute(move || {
-                let _ = core.poll_refresh();
+                if let Err(e) = core.poll_refresh() {
+                    log::warn!("poll_refresh failed: {e}");
+                }
             });
         }
     }

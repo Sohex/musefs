@@ -236,15 +236,15 @@ impl Musefs {
     /// Single-flighted: if a rebuild is already in progress, concurrent callers
     /// return `Ok(false)` immediately.
     pub fn poll_refresh_notify(&self, mut on_changed: impl FnMut(u64)) -> Result<bool> {
-        if !self.poll_interval.is_zero() {
-            let mut last = self
+        if !self.poll_interval.is_zero()
+            && self
                 .last_poll
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if last.elapsed() < self.poll_interval {
-                return Ok(false);
-            }
-            *last = std::time::Instant::now();
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .elapsed()
+                < self.poll_interval
+        {
+            return Ok(false);
         }
         let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
         if version == self.last_data_version.load(Ordering::Acquire) {
@@ -263,21 +263,21 @@ impl Musefs {
         // The guard clears `refreshing` on every exit path (incl. panic).
         let _guard = RefreshGuard(&self.refreshing);
 
+        let old_tree = self.tree.load_full();
         let old_versions = self
             .versions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let new_versions = self.rebuild()?;
-        // Single load: we hold `refreshing`, so no other thread can swap the tree.
+        // Load the (newly rebuilt) tree. The Guard is held only across in-memory
+        // cache ops, so no blocking or I/O occurs under the pin.
         let tree = self.tree.load();
         let live = tree.track_ids();
         self.cache.retain(&live);
         self.size_cache().retain(|k, _| live.contains(k));
 
-        // A track whose content_version changed (DB triggers only increment it) but
-        // whose path (inode) is unchanged has stale served bytes; report its inode so
-        // the caller can drop the kernel page cache. New/removed tracks have none.
+        // Invalidates inodes for content-changed tracks (path is stable, bytes changed).
         for (tid, ver) in &new_versions {
             if old_versions.get(tid).is_some_and(|old| old != ver) {
                 if let Some(ino) = tree.inode_of_track(*tid) {
@@ -285,12 +285,40 @@ impl Musefs {
                 }
             }
         }
+
+        // Invalidates old inodes for tracks whose path changed or were removed.
+        for (tid, old_ver) in &old_versions {
+            if !new_versions.contains_key(tid) {
+                // Track was removed — invalidate its old inode.
+                if let Some(ino) = old_tree.inode_of_track(*tid) {
+                    on_changed(ino);
+                }
+            } else if new_versions.get(tid) != Some(old_ver) {
+                // Content changed AND path may have changed — invalidate old inode.
+                let old_ino = old_tree.inode_of_track(*tid);
+                let new_ino = tree.inode_of_track(*tid);
+                if old_ino != new_ino {
+                    if let Some(ino) = old_ino {
+                        on_changed(ino);
+                    }
+                }
+            }
+        }
+
         *self
             .versions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = new_versions;
 
         self.last_data_version.store(version, Ordering::Release);
+
+        if !self.poll_interval.is_zero() {
+            *self
+                .last_poll
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+        }
+
         Ok(true)
     }
 
