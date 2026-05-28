@@ -42,10 +42,16 @@ class FakeAlbum:
         return self._items
 
 
+_fake_item_counter = 0
+
+
 class FakeItem:
     """Minimal stand-in for a beets Item: attribute reads + get_album()."""
 
     def __init__(self, path, album=None, **fields):
+        global _fake_item_counter
+        _fake_item_counter += 1
+        self.id = _fake_item_counter
         self.path = path  # bytes, like beets
         self._album = album
         for k in ("title", "artist", "albumartist", "album", "genre", "composer"):

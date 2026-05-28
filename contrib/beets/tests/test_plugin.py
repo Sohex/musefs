@@ -150,16 +150,38 @@ def test_command_dry_run_skips_autoscan(db_path, fake_item, monkeypatch):
     assert calls == []  # dry-run must not mutate the DB via scan
 
 
-def test_command_prunes_missing_rows(db_path, make_track, fake_item, monkeypatch):
+def test_command_query_preserves_unrelated_missing_rows(
+    db_path,
+    make_track,
+    fake_item,
+    tmp_path,
+    monkeypatch,
+):
+    make_track("/gone/x.flac")  # a stale row: its backing file does not exist
+    real, _tid, item = _real_track(tmp_path, make_track, fake_item, title="Song")
+    plugin, _ = _autoscan_plugin(db_path, monkeypatch)
+    cmd, opts, args = _musefs_cmd(plugin, ["title:Song"])
+    cmd.func(FakeLib([item]), opts, args)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
+        assert "/gone/x.flac" in paths
+        assert real in paths
+    finally:
+        conn.close()
+
+
+def test_command_full_sync_prunes_missing_rows(db_path, make_track, fake_item, monkeypatch):
     make_track("/gone/x.flac")  # a stale row: its backing file does not exist
     plugin, _ = _autoscan_plugin(db_path, monkeypatch)
-    cmd, opts, args = _musefs_cmd(plugin, ["q"])
+    cmd, opts, args = _musefs_cmd(plugin, [])
     cmd.func(FakeLib([fake_item(os.fsencode("/music/a.flac"))]), opts, args)
 
     conn = sqlite3.connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
-        assert "/gone/x.flac" not in paths  # pruned because the file is gone
+        assert "/gone/x.flac" not in paths
     finally:
         conn.close()
 
@@ -190,8 +212,10 @@ def test_reconcile_at_cli_exit_syncs_recorded_items(
 
 
 def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_path, monkeypatch):
-    # A previously-scanned file moved away (stale row); the item now lives at a
-    # new real path. Reconcile syncs the new path and prunes the stale row.
+    # Reconcile uses scoped prune (track_ids from synced items only), so a
+    # stale row from a previous run is NOT cleaned up here — orphan cleanup is
+    # `_command`'s job (full-table prune). Reconcile only prunes the synced
+    # item's backing path if it moved away.
     make_track("/old/moved-away.flac")  # stale: file gone
     real, tid, item = _real_track(tmp_path, make_track, fake_item, title="Now")
     plugin, _ = _autoscan_plugin(db_path, monkeypatch)
@@ -201,7 +225,8 @@ def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_pat
     conn = sqlite3.connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
-        assert "/old/moved-away.flac" not in paths  # stale row pruned
+        # Stale row survives reconcile — scoped prune only checks synced items.
+        assert "/old/moved-away.flac" in paths
         assert real in paths  # new path kept + synced
         assert (
             conn.execute(
