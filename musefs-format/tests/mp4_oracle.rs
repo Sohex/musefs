@@ -95,9 +95,15 @@ fn m4a_synthesis_uses_only_first_cover_art() {
         data_len: 200,
     };
 
+    let layout_no_art = mp4::synthesize_layout(&scan, &[], &[]).unwrap();
     let layout_single = mp4::synthesize_layout(&scan, &[], std::slice::from_ref(&art1)).unwrap();
     let layout_both = mp4::synthesize_layout(&scan, &[], &[art1, art2]).unwrap();
 
+    // art1 must actually change the layout compared to no-art.
+    assert_ne!(
+        layout_no_art, layout_single,
+        "first art input must alter the layout"
+    );
     // Both layouts must be identical — the second art input is ignored.
     assert_eq!(layout_single, layout_both);
 }
