@@ -71,6 +71,7 @@ def test_synthesized_preserves_source_audio_payload():
     base = os.environ["MUSEFS_INTEROP_DIR"]
     with open(os.path.join(base, "manifest.json")) as fh:
         manifest = json.load(fh)
+    assert manifest, "manifest.json is empty — emit_interop_fixtures may have failed"
     for row in manifest:
         synth_length = row["synth_audio_length"]
         if synth_length == 0:
