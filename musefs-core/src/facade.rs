@@ -89,6 +89,16 @@ fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Res
     Ok(())
 }
 
+fn retry_backoff_for(poll_interval: std::time::Duration) -> std::time::Duration {
+    if poll_interval.is_zero() {
+        std::time::Duration::ZERO
+    } else {
+        poll_interval
+            .min(std::time::Duration::from_secs(1))
+            .max(std::time::Duration::from_millis(100))
+    }
+}
+
 /// The composed read-only filesystem: the store, the rendered tree, and the
 /// lazy synthesis cache. All methods take `&self`; the tree is swapped
 /// atomically on refresh, the cache is internally sharded (each shard mutex-guarded),
@@ -108,8 +118,11 @@ pub struct Musefs {
     size_cache: Mutex<HashMap<i64, SizeEntry>>,
     /// Timestamp of the last `data_version` poll; gated by `poll_interval`.
     last_poll: Mutex<std::time::Instant>,
+    /// Timestamp of the last failed refresh attempt; used to prevent tight retry loops.
+    last_failed_refresh: Mutex<Option<std::time::Instant>>,
     /// Minimum time between `data_version` polls (`Duration::ZERO` disables debouncing).
     poll_interval: std::time::Duration,
+    refresh_retry_backoff: std::time::Duration,
     /// Single-flight guard: only the thread that flips this `false → true`
     /// performs the rebuild; concurrent callers see it set and return immediately.
     refreshing: AtomicBool,
@@ -119,6 +132,7 @@ pub struct Musefs {
     /// Last-seen `content_version` per track, snapshotted on each rebuild, used to
     /// report which inodes changed so the FUSE layer can drop stale kernel cache.
     versions: Mutex<HashMap<i64, i64>>,
+    force_rebuild_error: AtomicBool,
 }
 
 impl Musefs {
@@ -137,10 +151,13 @@ impl Musefs {
             next_fh: AtomicU64::new(0),
             size_cache: Mutex::new(HashMap::new()),
             last_poll: Mutex::new(std::time::Instant::now()),
+            last_failed_refresh: Mutex::new(None),
             poll_interval,
+            refresh_retry_backoff: retry_backoff_for(poll_interval),
             refreshing: AtomicBool::new(false),
             inodes: Mutex::new(alloc),
             versions: Mutex::new(versions),
+            force_rebuild_error: AtomicBool::new(false),
         })
     }
 
@@ -189,6 +206,11 @@ impl Musefs {
     /// Rebuild + publish the tree; returns the current `track_id -> content_version`
     /// map (the caller decides whether/how to diff it).
     fn rebuild(&self) -> Result<HashMap<i64, i64>> {
+        if self.force_rebuild_error.load(Ordering::Acquire) {
+            return Err(CoreError::BackingChanged(
+                "forced refresh failure".to_string(),
+            ));
+        }
         let (tree, versions) = self.pool.with(|db| {
             let mut alloc = self
                 .inodes
@@ -246,8 +268,18 @@ impl Musefs {
         {
             return Ok(false);
         }
+        if let Some(last_failed) = *self
+            .last_failed_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            if last_failed.elapsed() < self.refresh_retry_backoff {
+                return Ok(false);
+            }
+        }
         let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
         if version == self.last_data_version.load(Ordering::Acquire) {
+            self.stamp_successful_poll();
             return Ok(false);
         }
         // Single-flight: only the caller that flips the flag false->true rebuilds;
@@ -269,7 +301,17 @@ impl Musefs {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let new_versions = self.rebuild()?;
+        let new_versions = match self.rebuild() {
+            Ok(versions) => versions,
+            Err(err) => {
+                *self
+                    .last_failed_refresh
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(std::time::Instant::now());
+                return Err(err);
+            }
+        };
         // Load the (newly rebuilt) tree. The Guard is held only across in-memory
         // cache ops, so no blocking or I/O occurs under the pin.
         let tree = self.tree.load();
@@ -311,15 +353,27 @@ impl Musefs {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = new_versions;
 
         self.last_data_version.store(version, Ordering::Release);
+        self.stamp_successful_poll();
 
+        Ok(true)
+    }
+
+    fn stamp_successful_poll(&self) {
         if !self.poll_interval.is_zero() {
             *self
                 .last_poll
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
         }
+        *self
+            .last_failed_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 
-        Ok(true)
+    #[doc(hidden)]
+    pub fn force_rebuild_errors_for_test(&self, fail: bool) {
+        self.force_rebuild_error.store(fail, Ordering::Release);
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {

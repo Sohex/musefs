@@ -455,6 +455,119 @@ fn poll_refresh_debounces_within_interval() {
 }
 
 #[test]
+fn unchanged_refresh_poll_consumes_debounce_window() {
+    use musefs_db::{Format, NewTrack, Tag};
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x/a.flac".to_string(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[Tag::new("artist", "Alice", 0), Tag::new("title", "A", 0)],
+        )
+        .unwrap();
+    }
+    let cfg = MountConfig {
+        poll_interval: std::time::Duration::from_millis(20),
+        ..config()
+    };
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    assert!(!fs.poll_refresh().unwrap());
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        let id = db2
+            .upsert_track(&NewTrack {
+                backing_path: "/x/b.flac".to_string(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db2.replace_tags(
+            id,
+            &[Tag::new("artist", "Bob", 0), Tag::new("title", "B", 0)],
+        )
+        .unwrap();
+    }
+    assert!(
+        !fs.poll_refresh().unwrap(),
+        "unchanged poll should have reset the debounce window"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    assert!(fs.poll_refresh().unwrap());
+}
+
+#[test]
+fn failed_refresh_retries_after_backoff_not_every_call() {
+    use musefs_db::{Format, NewTrack, Tag};
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x/a.flac".to_string(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[Tag::new("artist", "Alice", 0), Tag::new("title", "A", 0)],
+        )
+        .unwrap();
+    }
+    let cfg = MountConfig {
+        poll_interval: std::time::Duration::from_millis(20),
+        ..config()
+    };
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        let id = db2
+            .upsert_track(&NewTrack {
+                backing_path: "/x/b.flac".to_string(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db2.replace_tags(
+            id,
+            &[Tag::new("artist", "Bob", 0), Tag::new("title", "B", 0)],
+        )
+        .unwrap();
+    }
+    fs.force_rebuild_errors_for_test(true);
+    assert!(fs.poll_refresh().is_err());
+    assert!(
+        !fs.poll_refresh().unwrap(),
+        "immediate retry should be suppressed by refresh failure backoff"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(110));
+    assert!(fs.poll_refresh().is_err());
+}
+
+#[test]
 fn poll_refresh_single_flights_concurrent_callers() {
     use musefs_db::{Format, NewTrack, Tag};
     use std::sync::Arc;
@@ -634,4 +747,60 @@ fn poll_refresh_notify_reports_changed_track_inode() {
             .unwrap(),
         alice_song
     );
+}
+
+#[test]
+fn poll_refresh_notify_reports_old_inode_for_path_changing_retag() {
+    use musefs_db::Tag;
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &[0xAB; 64],
+    );
+    std::fs::write(dir.path().join("a.flac"), &bytes).unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+    let alice = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let old_inode = fs.lookup(alice, "Song.flac").unwrap();
+    let track_id = musefs_db::Db::open(&db_path)
+        .unwrap()
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .id;
+
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        db2.replace_tags(
+            track_id,
+            &[
+                Tag::new("artist", "Alice", 0),
+                Tag::new("title", "Moved", 0),
+            ],
+        )
+        .unwrap();
+    }
+
+    let mut changed = Vec::new();
+    assert!(fs.poll_refresh_notify(|ino| changed.push(ino)).unwrap());
+    let alice_after = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let new_inode = fs.lookup(alice_after, "Moved.flac").unwrap();
+    assert!(
+        changed.contains(&old_inode),
+        "old inode should be invalidated"
+    );
+    assert!(
+        changed.contains(&new_inode),
+        "new inode should be invalidated"
+    );
+    assert_ne!(old_inode, new_inode);
 }
