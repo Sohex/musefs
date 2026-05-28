@@ -72,7 +72,11 @@ class MusefsPlugin(BeetsPlugin):
             )
             self._run_scan(db_path, targets)
         stats = self._sync(db_path, items, dry_run=opts.dry_run)
-        pruned = 0 if opts.dry_run else self._prune_missing(db_path)
+        if opts.dry_run:
+            pruned = 0
+        else:
+            prune_items = items if query else None
+            pruned = self._prune_missing(db_path, items=prune_items)
         # ui.print_ (not self._log) so the summary always shows, not only at -v.
         ui.print_(f"musefs: {stats.summary()} pruned={pruned}")
 
@@ -103,7 +107,7 @@ class MusefsPlugin(BeetsPlugin):
             if self._autoscan():
                 self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
             self._sync(db_path, items)
-            self._prune_missing(db_path)
+            self._prune_missing(db_path, items=items)
         except ui.UserError as exc:
             self._log.warning("musefs: {}", exc)
 
@@ -148,14 +152,25 @@ class MusefsPlugin(BeetsPlugin):
                     f"{result.stderr.decode(errors='replace').strip()}"
                 )
 
-    def _prune_missing(self, db_path, track_ids=None):
+    @staticmethod
+    def _track_ids_for_items(conn, items):
+        ids = []
+        for item in items:
+            key = _core.realpath_key(item.path)
+            track_id = _core.track_id_for_path(conn, key)
+            if track_id is not None:
+                ids.append(track_id)
+        return ids
+
+    def _prune_missing(self, db_path, items=None):
         """Drop rows whose backing file no longer exists (moved/deleted).
-        When ``track_ids`` is provided, only those tracks are checked.
+        When ``items`` is provided, only their musefs track rows are checked.
         Returns the number pruned."""
         if not os.path.exists(db_path):
             return 0
         conn = _core.connect(db_path)
         try:
+            track_ids = None if items is None else self._track_ids_for_items(conn, items)
             pruned = _core.prune_missing(conn, track_ids)
             conn.commit()
             return pruned
