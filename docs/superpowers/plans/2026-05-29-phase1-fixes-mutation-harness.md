@@ -171,14 +171,15 @@ Use a global replace of the exact string `conn = sqlite3.connect(db_path)` →
 `conn = connect(db_path)` within `test_plugin.py`. Leave the `import sqlite3` line
 intact only if another `sqlite3.` reference remains; otherwise remove it.
 
-- [ ] **Step 3: Check whether `import sqlite3` is now unused**
+- [ ] **Step 3: Delete the now-unused `import sqlite3`**
 
-Run:
+After the 6 replacements, no `sqlite3.` references remain in the file, so the
+import is dead (ruff would flag F401). Delete the `import sqlite3` line (line 2)
+at the top of `test_plugin.py`. Confirm nothing is left behind:
 ```bash
-cd contrib/beets && grep -n "sqlite3\." tests/test_plugin.py
+cd contrib/beets && grep -n "sqlite3" tests/test_plugin.py
 ```
-If no matches remain, delete the `import sqlite3` line at the top of
-`test_plugin.py` (ruff would flag F401 otherwise).
+Expected: no matches.
 
 - [ ] **Step 4: Run the full beets suite + lint**
 
@@ -256,7 +257,11 @@ cap, and a no-`set -e` loop so one crate's failure doesn't abort the rest.
 
 - [ ] **Step 1: Write the script**
 
-Create `scripts/mutants.sh`:
+The `scripts/` directory does not exist yet; create it first:
+```bash
+mkdir -p scripts
+```
+Then create `scripts/mutants.sh`:
 ```bash
 #!/usr/bin/env bash
 # Run cargo-mutants over the three logic-bearing crates with a disk budget that
@@ -304,12 +309,10 @@ run_crate() {
   local tmp
   tmp="$(mktemp -d "$SCRATCH_PARENT/${crate}.XXXXXX")"
   echo "== mutants: $crate (scratch: $tmp) =="
-  local list_flag=""
-  [ "${MUTANTS_LIST:-0}" = "1" ] && list_flag="--list"
-  TMPDIR="$tmp" cargo mutants -p "$crate" \
-    --jobs 1 \
-    --output "$out" \
-    $list_flag "$@"
+  local args=(-p "$crate" --jobs 1 --output "$out")
+  [ "${MUTANTS_LIST:-0}" = "1" ] && args+=(--list)
+  args+=("$@")
+  TMPDIR="$tmp" cargo mutants "${args[@]}"
   local rc=$?
   rm -rf "$tmp"
   return "$rc"
@@ -420,6 +423,9 @@ on:
   schedule:
     - cron: '0 4 * * 1'  # Mondays 04:00 UTC
   workflow_dispatch:
+  # Deliberately NO `push: branches: [main]`. fuzz.yml has one to warm its corpus
+  # cache; a mutation campaign has no corpus to warm and takes hours, so running
+  # it on every merge to main is pure cost. Schedule + manual dispatch suffice.
 
 concurrency:
   group: mutants-${{ github.ref }}
@@ -602,7 +608,12 @@ mutants.yml CI run.
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 3: Trigger the CI campaign and wait**
+> **Steps 3–5 are a post-merge follow-up.** They require `mutants.yml` to exist
+> on a pushed branch and a real (hours-long) CI campaign to finish, so they
+> cannot complete inside the implementation session. The skeleton (Steps 1–2)
+> lands with phase 1; filling it is tracked as follow-up work after merge.
+
+- [ ] **Step 3 (follow-up): Trigger the CI campaign and wait**
 
 After the branch with `mutants.yml` is pushed, trigger the `full` job via
 `workflow_dispatch` (Actions → Mutants → Run workflow) on that branch. The run
@@ -611,7 +622,7 @@ runs uncapped per crate in parallel). Wait for all three matrix legs to finish.
 
 Expected: three `mutants-<crate>` artifacts available on the run.
 
-- [ ] **Step 4: Fill the inventory from the artifacts**
+- [ ] **Step 4 (follow-up): Fill the inventory from the artifacts**
 
 Download each `mutants-<crate>` artifact and transcribe its
 `caught.txt`/`missed.txt`/`unviable.txt`/`timeout.txt` into the per-crate tables.
@@ -619,7 +630,7 @@ Tag each surviving mutant with its remediation phase (2 = ogg/ogg_index, 3 =
 flac/mp3/mp4/wav non-ogg, 4 = reader/scan/facade/tree/db). Set the **Run:** line
 to the run URL + date.
 
-- [ ] **Step 5: Commit the filled inventory**
+- [ ] **Step 5 (follow-up): Commit the filled inventory**
 
 ```bash
 git add docs/superpowers/specs/test-audit-remediation/2026-05-29-mutation-inventory.md
@@ -664,5 +675,6 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - [ ] `MUTANTS_LIST=1 scripts/mutants.sh musefs-db` → lists mutants, exit 0 (Task 5)
 - [ ] `git check-ignore mutants.out.old/` → printed (Task 4)
 - [ ] `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/mutants.yml'))"` → OK (Task 6)
-- [ ] Inventory doc exists and is filled from a real CI run (Task 7)
+- [ ] Inventory doc *skeleton* exists and is committed (Task 7 Steps 1–2)
+- [ ] **Follow-up (post-merge):** inventory filled from a real dispatched CI run (Task 7 Steps 3–5)
 - [ ] Tracking doc shows Phase 1 done (Task 8)
