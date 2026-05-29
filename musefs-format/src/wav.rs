@@ -379,4 +379,33 @@ mod tests {
         assert_eq!(buf.len(), 11);
         assert_eq!(riff_wave_start(&buf), Err(FormatError::NotWav));
     }
+
+    /// Build a minimal `RIFF/WAVE` buffer from `(fourcc, payload)` chunks in order,
+    /// padding odd payloads to a word boundary (the on-disk RIFF layout).
+    fn wav(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, payload) in chunks {
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                body.push(0x00);
+            }
+        }
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn walk_chunks_advances_past_each_payload() {
+        // :47 the `8 + size (+ size&1)` advance. An odd first payload forces the
+        // word-align term to matter; a wrong advance (either `+ → -`) lands off the
+        // next header, so the second chunk is lost or misread.
+        let buf = wav(&[(b"AAAA", vec![0x11; 3]), (b"data", vec![0xBB; 8])]);
+        let ids: Vec<[u8; 4]> = walk_chunks(&buf).iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![*b"AAAA", *b"data"]);
+    }
 }
