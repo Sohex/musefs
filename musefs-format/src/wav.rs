@@ -443,4 +443,27 @@ mod tests {
         let bounds = locate_audio(&buf).unwrap();
         assert_eq!(bounds.audio_length, 8);
     }
+
+    #[test]
+    fn info_fourcc_emits_each_mapped_key() {
+        // :119-124 arm deletions: each key must map to its INFO FourCC. A deleted
+        // arm makes the key unmapped → no payload (single-tag input → None).
+        let cases: [(&str, &[u8; 4]); 6] = [
+            ("artist", b"IART"),
+            ("album", b"IPRD"),
+            ("date", b"ICRD"),
+            ("genre", b"IGNR"),
+            ("comment", b"ICMT"),
+            ("tracknumber", b"ITRK"),
+        ];
+        for (key, cc) in cases {
+            let payload =
+                build_info_payload(&[TagInput::new(key, "X")]).expect("INFO payload for {key}");
+            assert!(
+                payload.windows(4).any(|w| w == &cc[..]),
+                "key {key} must emit FourCC {:?}",
+                std::str::from_utf8(cc).unwrap()
+            );
+        }
+    }
 }
