@@ -1708,4 +1708,43 @@ mod tests {
         let mut kept = bx(b"trak", &bx(b"mdia", &bx(b"minf", &stbl)));
         assert!(patch_chunk_offsets(&mut kept, 0).is_ok());
     }
+
+    #[test]
+    fn synthesize_new_moov_size_exactly_u32_max_is_ok() {
+        // `if new_moov_size > u32::MAX` is strict. new_moov_size == u32::MAX must be
+        // accepted; `> -> ==`/`>= ` reject the exact boundary. data_len (the art size)
+        // is reserved as a number, so the boundary is cheap.
+        fn art(data_len: u64) -> ArtInput {
+            ArtInput {
+                art_id: 1,
+                mime: "image/jpeg".into(),
+                description: String::new(),
+                picture_type: 3,
+                width: 0,
+                height: 0,
+                data_len,
+            }
+        }
+        let buf = mk_mp4(true, b"AUDIO", &[0]);
+        let scan = read_structure(&buf).unwrap();
+        let tags = [TagInput::new("title", "T")];
+
+        // Synthesize once with a 1-byte art. The head is [ftyp][moov], where the moov
+        // box header declares new_moov_size = overhead + 1. The actual moov bytes in the
+        // head are new_moov_size - 1 (the art is a separate ArtImage segment). So the
+        // head length = ftyp.len() + (overhead + 1 - 1) = ftyp.len() + overhead.
+        let layout1 = synthesize_layout(&scan, &tags, &[art(1)]).unwrap();
+        let head_len = inline_head(&layout1).len();
+        let overhead = (head_len as u64) - (scan.ftyp.len() as u64);
+        let max_len = u32::MAX as u64 - overhead;
+
+        assert!(max_len > 0, "overhead {overhead} must be < u32::MAX");
+        // Boundary accepted
+        assert!(synthesize_layout(&scan, &tags, &[art(max_len)]).is_ok());
+        // Boundary+1 rejected
+        assert!(matches!(
+            synthesize_layout(&scan, &tags, &[art(max_len + 1)]),
+            Err(FormatError::TooLarge)
+        ));
+    }
 }
