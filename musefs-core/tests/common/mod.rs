@@ -81,6 +81,34 @@ pub fn write_m4a(path: &Path, audio: &[u8]) -> (i64, i64) {
     (audio_offset, audio.len() as i64)
 }
 
+/// Write a minimal valid PCM WAV (`fmt ` + `data`) to `path`, returning
+/// (audio_offset, audio_length) of the `data` payload. Tags are applied via the DB
+/// by the caller (mirrors how `write_flac` is paired with `replace_tags`).
+pub fn write_wav(path: &Path, audio: &[u8]) -> (i64, i64) {
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    fmt.extend_from_slice(&1u16.to_le_bytes()); // mono
+    fmt.extend_from_slice(&44_100u32.to_le_bytes()); // sample rate
+    fmt.extend_from_slice(&88_200u32.to_le_bytes()); // byte rate
+    fmt.extend_from_slice(&2u16.to_le_bytes()); // block align
+    fmt.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+
+    let mut body = Vec::new();
+    for (id, payload) in [(&b"fmt "[..], &fmt[..]), (&b"data"[..], audio)] {
+        body.extend_from_slice(id);
+        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(payload);
+    }
+    let mut bytes = b"RIFF".to_vec();
+    bytes.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(&body);
+
+    let audio_offset = (bytes.len() - audio.len()) as i64;
+    std::fs::write(path, &bytes).unwrap();
+    (audio_offset, audio.len() as i64)
+}
+
 /// Build a 32-bit-size box: [size][type][payload].
 fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
