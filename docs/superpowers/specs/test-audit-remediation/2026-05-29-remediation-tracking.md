@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; phases 3d, 4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; Phase 3d (WAV) complete; phase 4 pending
 
 ## Guiding principle: verify, don't trust
 
@@ -117,8 +117,12 @@ Findings #5, #16.
   *nonempty* art wins in `mp4.rs::synthesize_layout`, mirroring the FLAC fix), and
   finding #5 broadened onto the M4A synthesis path (`write_m4a` helper + four
   `proptest_read_fidelity` M4A cases: backing-audio identity, partial windows,
-  header seam, art window). WAV (3d) remains the only open non-FLAC read-fidelity
-  dimension.
+  header seam, art window).
+- **3d done** — WAV survivors killed (24 kills; equivalents: `walk_chunks:49`
+  guard-to-true, `synthesize_layout:186` `> → ==` and `> → >=`,
+  `synthesize_layout:227` `> → >=`); finding #16 resolved by **skipping zero-byte
+  art in WAV synthesis** (mirrors FLAC's skip); finding #5 broadened on WAV
+  (read-fidelity proptests: preserve-backing, partial-windows, header-seam, art-window).
 - broaden `proptest_read_fidelity` (random offsets, header/audio boundary, art,
   non-FLAC) (#5)
 - zero-byte art boundary (#16)

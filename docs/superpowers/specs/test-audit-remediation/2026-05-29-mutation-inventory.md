@@ -367,32 +367,32 @@ the rightmost column of each survivor table.
 | `ogg/page.rs:298` | replace - with + in lace_chunks_to_segments | missed → **killed** (phase 2) | 2 |
 | `ogg/page.rs:310` | replace < with <= in copy_payload | missed → **equivalent** | 2 |
 | `ogg/page.rs:337` | replace < with <= in emit_segments | missed → **equivalent** (no fixture aligns an art chunk to a page boundary, so `os == oe` never reaches the Art arm; hand-apply stays green) | 2 |
-| `wav.rs:24` | replace < with == in riff_wave_start | missed | 3 |
-| `wav.rs:24` | replace < with <= in riff_wave_start | missed | 3 |
-| `wav.rs:47` | replace + with - in walk_chunks | missed | 3 |
-| `wav.rs:49` | replace match guard next <= buf.len() as u64 with true in walk_chunks | missed | 3 |
-| `wav.rs:67` | replace == with != in locate_audio | missed | 3 |
-| `wav.rs:71` | replace > with < in locate_audio | missed | 3 |
-| `wav.rs:119` | delete match arm "artist" in info_fourcc | missed | 3 |
-| `wav.rs:120` | delete match arm "album" in info_fourcc | missed | 3 |
-| `wav.rs:121` | delete match arm "date" in info_fourcc | missed | 3 |
-| `wav.rs:122` | delete match arm "genre" in info_fourcc | missed | 3 |
-| `wav.rs:123` | delete match arm "comment" in info_fourcc | missed | 3 |
-| `wav.rs:124` | delete match arm "tracknumber" in info_fourcc | missed | 3 |
-| `wav.rs:155` | replace % with / in build_info_payload | missed | 3 |
-| `wav.rs:155` | replace % with + in build_info_payload | missed | 3 |
-| `wav.rs:155` | replace == with != in build_info_payload | missed | 3 |
-| `wav.rs:168` | replace % with / in push_inline_chunk | missed | 3 |
-| `wav.rs:168` | replace % with + in push_inline_chunk | missed | 3 |
-| `wav.rs:186` | replace > with == in synthesize_layout | missed | 3 |
-| `wav.rs:186` | replace > with >= in synthesize_layout | missed | 3 |
-| `wav.rs:207` | replace % with / in synthesize_layout | missed | 3 |
-| `wav.rs:207` | replace % with + in synthesize_layout | missed | 3 |
-| `wav.rs:227` | replace > with == in synthesize_layout | missed | 3 |
-| `wav.rs:227` | replace > with >= in synthesize_layout | missed | 3 |
-| `wav.rs:245` | delete match arm b"IPRD" in info_to_key | missed | 3 |
-| `wav.rs:246` | delete match arm b"ICRD" in info_to_key | missed | 3 |
-| `wav.rs:248` | delete match arm b"ICMT" in info_to_key | missed | 3 |
-| `wav.rs:249` | delete match arm b"ITRK" in info_to_key | missed | 3 |
-| `wav.rs:300` | replace && with \|\| in read_tags | missed | 3 |
+| `wav.rs:24` | replace < with == in riff_wave_start | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:24` | replace < with <= in riff_wave_start | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:47` | replace + with - in walk_chunks | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:49` | replace match guard next <= buf.len() as u64 with true in walk_chunks | missed → **equivalent** | 3 |
+| `wav.rs:67` | replace == with != in locate_audio | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:71` | replace > with < in locate_audio | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:119` | delete match arm "artist" in info_fourcc | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:120` | delete match arm "album" in info_fourcc | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:121` | delete match arm "date" in info_fourcc | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:122` | delete match arm "genre" in info_fourcc | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:123` | delete match arm "comment" in info_fourcc | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:124` | delete match arm "tracknumber" in info_fourcc | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:155` | replace % with / in build_info_payload | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:155` | replace % with + in build_info_payload | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:155` | replace == with != in build_info_payload | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:168` | replace % with / in push_inline_chunk | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:168` | replace % with + in push_inline_chunk | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:186` | replace > with == in synthesize_layout | missed → **equivalent** | 3 |
+| `wav.rs:186` | replace > with >= in synthesize_layout | missed → **equivalent** | 3 |
+| `wav.rs:207` | replace % with / in synthesize_layout | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:207` | replace % with + in synthesize_layout | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:227` | replace > with == in synthesize_layout | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:227` | replace > with >= in synthesize_layout | missed → **equivalent** | 3 |
+| `wav.rs:245` | delete match arm b"IPRD" in info_to_key | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:246` | delete match arm b"ICRD" in info_to_key | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:248` | delete match arm b"ICMT" in info_to_key | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:249` | delete match arm b"ITRK" in info_to_key | missed → **killed (phase 3d)** | 3 |
+| `wav.rs:300` | replace && with \|\| in read_tags | missed → **killed (phase 3d)** | 3 |
 
