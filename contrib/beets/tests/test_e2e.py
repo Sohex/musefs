@@ -141,7 +141,7 @@ def _env(tmp_path):
 
 def _write_config(tmp_path, library, db, fetchart=False):
     plugins_block = ("plugins:\n  - musefs\n  - fetchart\n") if fetchart else "plugins: musefs\n"
-    fetchart_block = ("fetchart:\n  auto: yes\n  sources: filesystem\n") if fetchart else ""
+    fetchart_block = ("fetchart:\n  auto: yes\n  sources:\n    - filesystem\n") if fetchart else ""
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         f"directory: {library}\n"
@@ -390,6 +390,12 @@ def _imported_library(tmp_path, *, embed_cover=None, external_cover=None):
 
     cfg = _write_config(tmp_path, library, db, fetchart=external_cover is not None)
     _beet(cfg, env, "import", "-A", "-q", str(src))
+
+    if external_cover is not None:
+        album_dir = library / "Test AA" / "Orig Album"
+        (album_dir / "cover.jpg").write_bytes(external_cover)
+        _beet(cfg, env, "fetchart", "-f")
+
     return cfg, env, db, mnt, library
 
 
