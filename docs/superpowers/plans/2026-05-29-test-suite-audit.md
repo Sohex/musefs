@@ -212,9 +212,13 @@ Run:
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo test --workspace 2>&1 | tee /tmp/musefs-audit/surface-workspace.log
-cargo test --workspace -- --list 2>/dev/null | grep -c ': test$' | tee /tmp/musefs-audit/surface-workspace-count.log
+# Count tests ACTUALLY RUN (passed+failed), not --list: libtest --list also counts
+# #[ignore]d tests, which cargo test --workspace does not run. Sum the run summaries:
+grep -E '^test result:' /tmp/musefs-audit/surface-workspace.log \
+  | awk '{p+=$4; f+=$6; ig+=$8} END{printf "ran(passed+failed)=%d passed=%d failed=%d ignored(not run)=%d\n", p+f, p, f, ig}' \
+  | tee /tmp/musefs-audit/surface-workspace-count.log
 ```
-Expected: all green; the count is the unique category-(a) test count. **Record this number; do not reuse the spec's stale ~275.**
+Expected: all green; the printed `ran(passed+failed)` is the unique category-(a) count (the `proptest!` blocks each count as one libtest case, and the `fuzzing` proptests are included via feature unification; the `ignored` figure is reported separately, not added). **Record this number; do not reuse the spec's stale ~275.**
 
 - [ ] **Step 2: FUSE e2e + metrics-gated runs (category b)**
 
@@ -259,12 +263,16 @@ for i in 1 2 3; do
   echo "=== Tier-1 non-e2e run $i ===" | tee -a /tmp/musefs-audit/flaky-core.log
   cargo test -p musefs-core --test read_at --test reader --test proptest_read_fidelity \
     --test facade --test tree --test external_contract 2>&1 | tee -a /tmp/musefs-audit/flaky-core.log
+  # The ogg_index Tier-1 test is an inline #[cfg(test)] in the lib, NOT an integration
+  # test file — it must be run explicitly or the gate can falsely pass while it flakes:
+  cargo test -p musefs-core --lib build_index_renumbers_and_preserves_payload_length \
+    2>&1 | tee -a /tmp/musefs-audit/flaky-core.log
   cargo test -p musefs-format --features fuzzing --test layout --test roundtrip \
     --test synthesize_tags --test synthesize_art --test proptest_flac --test proptest_mp3 \
     --test proptest_mp4 --test proptest_ogg --test proptest_wav 2>&1 | tee -a /tmp/musefs-audit/flaky-format.log
 done
 ```
-Expected: identical pass results all 3 runs. Any test that varies → record as **flaky** (`file:line`) in §4.
+Expected: identical pass results all 3 runs (including the `ogg_index` lib test). Any test that varies → record as **flaky** (`file:line`) in §4.
 
 - [ ] **Step 2: Run the Tier-1 e2e mounts 3×, at both thread settings**
 
@@ -294,13 +302,15 @@ done
 ```
 Expected: record any instability as a **Tier-2** flakiness finding; note whether it looks like a real concurrency bug or `METRICS_LOCK`/atomic-counter test-harness contention. This does **not** trip the gate.
 
-- [ ] **Step 4: Evaluate the red-test gate (§5)**
+- [ ] **Step 4: Record the red-test gate decision (§5) — but finish Phase A regardless**
+
+The gate halts **Phase B/C only**, not Phase A. The rest of Phase A (beets, schema parity, fuzz, coverage — Tasks 6–8) must still run and be recorded, because the halt report in Task 13 depends on those §2–§8 sections being filled.
 
 Decision:
-- **If any Tier-1 test failed or was flaky** in Steps 1–2 → set §5 to **TRIP**, set the report's deliverable type to "red-test halt report", and **skip Tasks 10–11 (Phase B/C)**; go to Task 13.
-- **Else** → set §5 to **PASS** and continue to Task 6.
+- **If any Tier-1 test failed or was flaky** in Steps 1–2 → set §5 to **TRIP** and set the report's deliverable type to "red-test halt report".
+- **Else** → set §5 to **PASS**.
 
-Record the decision and its evidence (`file:line` of any offending test) in §5.
+Record the decision and its evidence (`file:line` of any offending test) in §5. **Then continue to Task 6 either way.** The actual branch (Phase B/C vs. halt-report assembly) is taken at Task 9, Step 3 — after Phase A is fully recorded and committed.
 
 ---
 
@@ -337,15 +347,20 @@ Expected: record `passed/failed/skipped` per invocation **and the skip reason** 
 
 Run:
 ```bash
-# Strip the trailing PRAGMA user_version line the Rust migration deliberately omits, then compare.
-grep -v -i 'PRAGMA user_version' contrib/beets/tests/schema_v1.sql \
-  | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | grep -v '^$' | sort > /tmp/musefs-audit/schema-fixture.norm
-# Extract MIGRATION_V1 body from schema.rs (between the raw-string delimiters) and normalize the same way.
-sed -n '/const MIGRATION_V1/,/";/p' musefs-db/src/schema.rs \
-  | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | grep -v '^$' | sort > /tmp/musefs-audit/schema-prod.norm
+# Normalizer: drop SQL line-comments (-- ...), collapse whitespace, drop blanks, sort.
+norm() { sed -E 's/--.*$//; s/[[:space:]]+/ /g; s/^ //; s/ $//' | grep -v '^$' | sort; }
+# Fixture: also strip the trailing PRAGMA user_version the Rust migration deliberately omits.
+grep -v -i 'PRAGMA user_version' contrib/beets/tests/schema_v1.sql | norm > /tmp/musefs-audit/schema-fixture.norm
+# Production: print ONLY the raw-string body — start after the `const MIGRATION_V1 ... r"` line,
+# stop before the closing `";` line — so the `const`/delimiter lines never enter the diff.
+awk '
+  /const MIGRATION_V1/ {f=1; next}
+  f && /^[[:space:]]*";[[:space:]]*$/ {f=0; next}
+  f {print}
+' musefs-db/src/schema.rs | norm > /tmp/musefs-audit/schema-prod.norm
 diff /tmp/musefs-audit/schema-fixture.norm /tmp/musefs-audit/schema-prod.norm | tee /tmp/musefs-audit/schema-diff.log
 ```
-Expected: the `sort`+normalize diff highlights only genuine statement differences (this is a coarse comparison — read the diff by eye, ignoring the Rust string delimiters/`const` line and ordering noise; the goal is to spot a missing/renamed column, table, or trigger). **If real drift exists**, record a **high-severity (P0)** finding in §8 and §11, mark beets results suspect, and add a "schema drift-detection test" backlog item. If clean, state so explicitly.
+Expected: with comments and the Rust `const`/`r"`/`";` delimiters stripped, the diff should be near-empty for an in-sync schema. It remains a coarse comparison (sorted lines) — read it by eye; the goal is to spot a missing/renamed column, table, trigger, or index. **If real drift exists**, record a **high-severity (P0)** finding in §8 and §11, mark beets results suspect, and add a "schema drift-detection test" backlog item. If clean, state so explicitly.
 
 ---
 
