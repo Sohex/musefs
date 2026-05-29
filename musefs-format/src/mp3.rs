@@ -656,4 +656,57 @@ mod tests {
             assert_eq!(synchsafe_decode(&syncsafe(n)), n);
         }
     }
+
+    #[test]
+    fn locate_audio_no_id3_starts_at_zero() {
+        // >=10 bytes, not "ID3": original skips the ID3 block (audio at 0). The
+        // `&& -> ||` mutant enters the block, decodes garbage, and returns Err — so
+        // this unwrap kills it. Frame sync 0xFF 0xFB at offset 0.
+        let data = [0xFF, 0xFB, 0x90, 0x00, 0, 0, 0, 0, 0, 0];
+        let b = locate_audio(&data).unwrap();
+        assert_eq!(b.audio_offset, 0);
+        assert_eq!(b.audio_length, 10);
+    }
+
+    #[test]
+    fn locate_audio_skips_id3v2_then_finds_sync() {
+        // "ID3" v2.4, flags=0, synchsafe body=4 -> tag_len=14. Sync at offset 14.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ID3");
+        data.extend_from_slice(&[0x04, 0x00, 0x00]); // major, rev, flags
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]); // synchsafe body=4
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // 4 body bytes
+        data.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]); // audio sync at 14
+        let b = locate_audio(&data).unwrap();
+        assert_eq!(b.audio_offset, 14);
+        assert_eq!(b.audio_length, 4);
+    }
+
+    #[test]
+    fn locate_audio_honors_footer_flag() {
+        // footer flag (0x10) adds 10 to tag_len. body=0 -> tag_len = 10+0+10 = 20.
+        // Sync at offset 20. The `+= -> -=`/`*=` mutant computes the wrong tag_len
+        // and the sync check lands on the wrong byte -> Err (kills the `+=`).
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ID3");
+        data.extend_from_slice(&[0x04, 0x00, 0x10]); // flags: footer present
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // synchsafe body=0
+        data.extend_from_slice(&[0u8; 10]); // 10-byte footer region
+        data.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]); // sync at offset 20
+        let b = locate_audio(&data).unwrap();
+        assert_eq!(b.audio_offset, 20);
+    }
+
+    #[test]
+    fn locate_audio_requires_frame_sync() {
+        // data[0]=0xFF but data[1] lacks the 0xE0 sync bits: original rejects
+        // (NotMp3). The `|| -> &&` mutant accepts (only rejects if ALL conditions
+        // hold). The `+ -> *` on data[audio_offset+1] would read data[0] instead of
+        // data[1]; with distinct bytes the sync decision flips.
+        let data = [0xFF, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0];
+        assert_eq!(locate_audio(&data), Err(FormatError::NotMp3));
+        // 1-byte buffer: original NotMp3 (audio_offset+1 >= len). The `+ -> *`
+        // mutant computes 0*1=0 >= 1 = false, falls through, and panics on data[1].
+        assert_eq!(locate_audio(&[0xFF]), Err(FormatError::NotMp3));
+    }
 }
