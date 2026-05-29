@@ -627,7 +627,10 @@ pub fn synthesize_layout(
         }
     }
 
-    let art = arts.first();
+    // Skip zero-byte art (mirrors flac.rs finding #16): an empty ArtImage segment
+    // fails layout validation (EmptySegment), making the track unreadable. Pick the
+    // first art with real bytes rather than merely the first art.
+    let art = arts.iter().find(|a| a.data_len > 0);
     let (udta_prefix, art_len) = build_udta(tags, art)?;
     let udta_total = udta_prefix.len() as u64 + art_len;
 
@@ -1165,6 +1168,73 @@ mod tests {
     }
 
     #[test]
+    fn synthesize_skips_zero_length_art() {
+        // A zero-byte art must be skipped at synthesis (mirrors flac.rs finding
+        // #16): an ArtImage { len: 0 } segment fails layout validation
+        // (EmptySegment), making the track unreadable. The track must still
+        // synthesize with its tags, just without a cover-art segment or covr box.
+        let buf = mk_mp4(false, b"AUDIODATA", &[0]);
+        let scan = read_structure(&buf).unwrap();
+        let art = ArtInput {
+            art_id: 7,
+            mime: "image/jpeg".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 0,
+        };
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
+        let segs = layout.segments();
+        assert!(
+            !segs.iter().any(|s| matches!(s, Segment::ArtImage { .. })),
+            "zero-byte art must not emit an ArtImage segment"
+        );
+        let Segment::Inline(head) = &segs[0] else {
+            panic!("first segment should be the inline head");
+        };
+        assert!(
+            head.windows(4).all(|w| w != b"covr"),
+            "no covr box should be emitted for zero-byte art"
+        );
+        assert!(matches!(segs.last().unwrap(), Segment::BackingAudio { .. }));
+    }
+
+    #[test]
+    fn synthesize_picks_first_nonempty_art() {
+        // With a zero-byte art ahead of a real one, the real art must still be
+        // served (the first nonempty art wins, not merely the first art).
+        let buf = mk_mp4(false, b"AUDIODATA", &[0]);
+        let scan = read_structure(&buf).unwrap();
+        let empty = ArtInput {
+            art_id: 1,
+            mime: "image/jpeg".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 0,
+        };
+        let real = ArtInput {
+            art_id: 9,
+            mime: "image/png".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 40,
+        };
+        let layout =
+            synthesize_layout(&scan, &[TagInput::new("title", "T")], &[empty, real]).unwrap();
+        let segs = layout.segments();
+        assert!(
+            segs.iter()
+                .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len: 40 })),
+            "the first nonempty art must be served"
+        );
+    }
+
+    #[test]
     fn synthesize_handles_zero_length_mdat() {
         let buf = mk_mp4(true, b"", &[0]); // empty mdat payload
         let scan = read_structure(&buf).unwrap();
@@ -1392,5 +1462,359 @@ mod tests {
         assert_eq!(from_stream, from_buf);
         assert_eq!(from_stream.mdat_header.len(), 16); // largesize header
         assert_eq!(from_stream.mdat_payload_len, payload.len() as u64);
+    }
+
+    #[test]
+    fn box_header_accepts_empty_payload_box() {
+        // total_len == header_len (an 8-byte box, no payload) must be accepted.
+        // `< -> <=` would make the equal case reject.
+        let mut h = 8u32.to_be_bytes().to_vec();
+        h.extend_from_slice(b"free");
+        let bh = box_header(&h, 1000).unwrap();
+        assert_eq!(bh.header_len, 8);
+        assert_eq!(bh.total_len, 8);
+    }
+
+    #[test]
+    fn read_box_size0_extends_to_end_from_offset() {
+        // A size-0 box ("extends to EOF") at pos > 0: total_len must be
+        // buf.len() - pos. `- -> +` (buf.len() + pos) and `- -> /` (buf.len() / pos)
+        // both diverge. The box is placed at pos = 8 with pos + 8 <= buf.len() so the
+        // be_u32 size read and the kind slice both succeed BEFORE the size-0 branch.
+        let mut buf = bx(b"free", b""); // 8-byte box at pos 0
+        buf.extend_from_slice(&0u32.to_be_bytes()); // size32 = 0 at pos 8
+        buf.extend_from_slice(b"mdat"); // kind at pos 12..16
+        buf.extend_from_slice(b"AUDIOPAYLOAD"); // 12 payload bytes
+        assert_eq!(buf.len(), 28);
+        let b = read_box(&buf, 8).unwrap();
+        assert_eq!(&b.kind, b"mdat");
+        assert_eq!(b.total_len, buf.len() - 8); // 20
+    }
+
+    #[test]
+    fn read_structure_from_rejects_box_overrunning_eof() {
+        // box_header's `remaining` arg is `file_len - pos`. Inflating the mdat box's
+        // declared size past the bytes remaining must be rejected. `- -> +` inflates
+        // `remaining` to `file_len + pos`, wrongly accepting the overrun (returns Ok).
+        let mut buf = mk_mp4(true, b"AUDIO", &[0]); // [ftyp][moov][mdat], mdat last
+        let scan = read_structure(&buf).unwrap();
+        let mdat_start = (scan.mdat_payload_offset - scan.mdat_header.len() as u64) as usize;
+        let real = u32::from_be_bytes(buf[mdat_start..mdat_start + 4].try_into().unwrap());
+        buf[mdat_start..mdat_start + 4].copy_from_slice(&(real + 100).to_be_bytes());
+        let mut cur = std::io::Cursor::new(buf.clone());
+        assert!(read_structure_from(&mut cur, buf.len() as u64).is_err());
+    }
+
+    #[test]
+    fn read_structure_from_rejects_moof() {
+        // A `moof` (fragmented MP4) top-level box must be rejected via the seeking
+        // path. Deleting the `b"moof"` match arm drops it to `_ => {}` and accepts.
+        let mut buf = mk_mp4(true, b"AUDIO", &[0]);
+        buf.extend(bx(b"moof", b"\x00\x00\x00\x00"));
+        let mut cur = std::io::Cursor::new(buf.clone());
+        assert!(read_structure_from(&mut cur, buf.len() as u64).is_err());
+    }
+
+    #[test]
+    fn read_structure_from_rejects_duplicate_top_level_boxes() {
+        // Each `dup |= X.replace(..).is_some()` accumulates a duplicate. `|= -> &=`
+        // can never set `dup` (it starts false), so a duplicate box is wrongly
+        // accepted. One duplicated box per kind isolates each of the three `|=` lines.
+        let dup = |extra: Vec<u8>| {
+            let mut buf = mk_mp4(true, b"AUDIO", &[0]);
+            buf.extend(extra);
+            let mut cur = std::io::Cursor::new(buf.clone());
+            read_structure_from(&mut cur, buf.len() as u64).is_err()
+        };
+        assert!(dup(bx(b"ftyp", b"M4A isom")), "duplicate ftyp must reject"); // ftyp |= line
+                                                                              // duplicate moov: reuse the moov from a fresh fixture so it is structurally valid.
+        let extra_moov = {
+            let other = mk_mp4(true, b"AUDIO", &[0]);
+            let s = read_structure(&other).unwrap();
+            s.moov
+        };
+        assert!(dup(extra_moov), "duplicate moov must reject"); // moov |= line
+        assert!(dup(bx(b"mdat", b"Y")), "duplicate mdat must reject"); // mdat |= line
+    }
+
+    #[test]
+    fn read_freeform_accepts_minimal_name_and_data() {
+        // name payload == 4 (empty name) and data payload == 8 (empty value) is the
+        // boundary of `np.len() < 4 || dp.len() < 8`. Both operands at the boundary,
+        // so flipping EITHER `<` to `==`/`<=` makes that side true -> None.
+        let name_body = 0u32.to_be_bytes().to_vec(); // exactly 4 bytes
+        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale -> dp.len() == 8
+        let mut inner = boxed(b"name", &name_body);
+        inner.extend(boxed(b"data", &data));
+        let (key, value) = read_freeform(&inner).unwrap();
+        assert_eq!(key, ""); // empty name, not in vocabulary -> verbatim ""
+        assert_eq!(value, "");
+    }
+
+    #[test]
+    fn read_freeform_short_name_returns_none() {
+        // name payload 3 bytes (< 4) with a valid 8-byte data payload. `|| -> &&`
+        // makes `true && false == false`, falling through to `&np[4..]` (out of bounds
+        // -> panic).
+        let name_body = vec![0u8, 0, 0]; // 3 bytes
+        let mut data = 1u32.to_be_bytes().to_vec();
+        data.extend_from_slice(&0u32.to_be_bytes());
+        let mut inner = boxed(b"name", &name_body);
+        inner.extend(boxed(b"data", &data));
+        assert!(read_freeform(&inner).is_none());
+    }
+
+    #[test]
+    fn read_freeform_mean_payload_exactly_4_uses_empty_mean() {
+        // mean payload == 4 (FullBox prefix, empty mean). `p.len() >= 4` must take the
+        // utf8 branch (mean ""), so the vocabulary does NOT fold the iTunes name.
+        // `>= -> <` falls to the default "com.apple.iTunes" mean and wrongly folds.
+        let mean_body = vec![0u8, 0, 0, 0]; // exactly 4 bytes
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(b"MusicBrainz Album Id");
+        let mut data = 1u32.to_be_bytes().to_vec();
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(b"abc-123");
+        let mut inner = boxed(b"mean", &mean_body);
+        inner.extend(boxed(b"name", &name_body));
+        inner.extend(boxed(b"data", &data));
+        let (key, value) = read_freeform(&inner).unwrap();
+        assert_eq!(key, "MusicBrainz Album Id"); // empty mean -> not folded
+        assert_eq!(value, "abc-123");
+    }
+
+    #[test]
+    fn read_tags_data_payload_exactly_8_is_read() {
+        // A `data` payload of exactly 8 bytes (type+locale, empty value) is the
+        // boundary of `dp.len() < 8`. The (empty) value must be read; `< -> ==`/`<= `
+        // would skip it.
+        let atoms = bx(b"\xa9nam", &data_atom(1, b"")); // dp.len() == 8
+        let buf = mp4_with_ilst(&atoms, true);
+        assert!(read_tags(&buf).contains(&("title".into(), String::new())));
+    }
+
+    #[test]
+    fn read_tags_disk_exact_4_byte_value_yields_discnumber() {
+        // disk atom, value exactly 4 bytes: `kind == disk` (== branch) `&&`
+        // `value.len() >= 4` (>= branch). Kills `== -> !=` (mutant skips a real disk)
+        // and `>= -> <` (mutant skips the boundary length).
+        let atoms = bx(b"disk", &data_atom(0, &[0, 0, 0, 2])); // disc 2, value len 4
+        let buf = mp4_with_ilst(&atoms, true);
+        assert!(read_tags(&buf).contains(&("discnumber".into(), "2".into())));
+    }
+
+    #[test]
+    fn read_tags_disk_short_value_is_skipped() {
+        // disk with a value shorter than 4 bytes: the guard is false. `&& -> ||`
+        // makes it true and indexes value[2]/value[3] out of bounds (panic).
+        let atoms = bx(b"disk", &data_atom(0, &[0, 0])); // value len 2
+        let buf = mp4_with_ilst(&atoms, true);
+        assert!(!read_tags(&buf).iter().any(|(k, _)| k == "discnumber"));
+    }
+
+    #[test]
+    fn read_tags_trkn_short_value_is_skipped() {
+        // trkn with a value shorter than 4 bytes: `kind == trkn && value.len() >= 4`
+        // is false. `&& -> ||` makes it true and indexes value[2]/value[3] (panic).
+        let atoms = bx(b"trkn", &data_atom(0, &[0, 0])); // value len 2
+        let buf = mp4_with_ilst(&atoms, true);
+        assert!(!read_tags(&buf).iter().any(|(k, _)| k == "tracknumber"));
+    }
+
+    #[test]
+    fn read_pictures_data_payload_exactly_8_is_read() {
+        // covr/data payload of exactly 8 bytes (type+locale, empty image) is the
+        // boundary of `dp.len() < 8`; the (empty) picture must be read.
+        let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, b"")), true);
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert!(pics[0].data.is_empty());
+    }
+
+    #[test]
+    fn read_pictures_recognizes_png() {
+        // A covr `data` atom with type code 14 is PNG. Deleting the `14 =>` match arm
+        // drops it to `_ => continue` and yields no picture.
+        let png = [0x89, b'P', b'N', b'G', 1, 2, 3];
+        let buf = mp4_with_ilst(&bx(b"covr", &data_atom(14, &png)), false);
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/png");
+        assert_eq!(pics[0].data, png);
+    }
+
+    #[test]
+    fn build_udta_png_art_uses_type_code_14() {
+        // PNG art => covr/data type code 14; JPEG => 13. `== -> !=` flips them.
+        for (mime, expected) in [("image/png", 14u32), ("image/jpeg", 13u32)] {
+            let art = ArtInput {
+                art_id: 1,
+                mime: mime.into(),
+                description: String::new(),
+                picture_type: 3,
+                width: 0,
+                height: 0,
+                data_len: 10,
+            };
+            let (prefix, _) = build_udta(&[TagInput::new("title", "T")], Some(&art)).unwrap();
+            // covr layout: [covr_size u32]["covr"][data_size u32]["data"][type u32][locale u32]
+            let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
+            assert_eq!(&prefix[cpos + 8..cpos + 12], b"data");
+            let type_code = u32::from_be_bytes(prefix[cpos + 12..cpos + 16].try_into().unwrap());
+            assert_eq!(type_code, expected, "mime {mime}");
+        }
+    }
+
+    #[test]
+    fn build_udta_art_box_sizes_are_exact() {
+        // data_size = 8 + 8 + data_len; covr_size = 8 + data_size. The `+ -> -`/`+ -> *`
+        // mutations change the emitted box sizes.
+        let art = ArtInput {
+            art_id: 1,
+            mime: "image/jpeg".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 10,
+        };
+        let (prefix, _) = build_udta(&[TagInput::new("title", "T")], Some(&art)).unwrap();
+        let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
+        let covr_size = u32::from_be_bytes(prefix[cpos - 4..cpos].try_into().unwrap());
+        let data_size = u32::from_be_bytes(prefix[cpos + 4..cpos + 8].try_into().unwrap());
+        assert_eq!(data_size, 8 + 8 + 10); // 26
+        assert_eq!(covr_size, 8 + data_size); // 34
+    }
+
+    #[test]
+    fn build_udta_udta_size_exactly_u32_max_is_ok() {
+        // The guard is `udta_size > u32::MAX` (strict). udta_size == u32::MAX must be
+        // accepted; `> -> >=` rejects the exact boundary. data_len is reserved as a
+        // number (no image bytes), so the boundary is cheap to hit.
+        fn art(data_len: u64) -> ArtInput {
+            ArtInput {
+                art_id: 1,
+                mime: "image/jpeg".into(),
+                description: String::new(),
+                picture_type: 3,
+                width: 0,
+                height: 0,
+                data_len,
+            }
+        }
+        // Derive the fixed overhead: with data_len 0, udta_size == overhead.
+        let (p0, _) = build_udta(&[TagInput::new("title", "T")], Some(&art(0))).unwrap();
+        let overhead = u32::from_be_bytes(p0[0..4].try_into().unwrap()) as u64;
+        let max_len = u32::MAX as u64 - overhead;
+
+        let (p_max, art_len) =
+            build_udta(&[TagInput::new("title", "T")], Some(&art(max_len))).unwrap();
+        assert_eq!(art_len, max_len);
+        assert_eq!(
+            u32::from_be_bytes(p_max[0..4].try_into().unwrap()),
+            u32::MAX
+        );
+
+        assert!(matches!(
+            build_udta(&[TagInput::new("title", "T")], Some(&art(max_len + 1))),
+            Err(FormatError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn patch_chunk_offsets_stco_overflow_and_underflow_boundaries() {
+        // kept = a single soun trak with one stco entry (offset 0). v = 0 + delta is
+        // guarded by `v < 0 || v > u32::MAX`. Boundary deltas pin every guard mutant;
+        // delta 0 (accepted) also pins the `:590` `+ -> *` bound at i = 0.
+        let mut k = soun_trak();
+        assert!(patch_chunk_offsets(&mut k, 0).is_ok()); // v == 0
+
+        let mut k = soun_trak();
+        assert!(patch_chunk_offsets(&mut k, u32::MAX as i64).is_ok()); // v == u32::MAX
+
+        let mut k = soun_trak();
+        assert!(matches!(
+            patch_chunk_offsets(&mut k, u32::MAX as i64 + 1), // v == u32::MAX + 1
+            Err(FormatError::TooLarge)
+        ));
+
+        let mut k = soun_trak();
+        assert!(matches!(
+            patch_chunk_offsets(&mut k, -1), // v == -1
+            Err(FormatError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn patch_chunk_offsets_rejects_count_past_table() {
+        // stco declares 2 entries but only 1 entry's bytes are present (followed by an
+        // unrelated `free` box for padding). `pos + entry > start + len` must reject
+        // the 2nd entry. `+ -> -` shrinks the bound and reads into the `free` box
+        // instead of erroring (returns Ok).
+        let mut stco = vec![0u8; 4]; // version/flags
+        stco.extend_from_slice(&2u32.to_be_bytes()); // count = 2 (a lie)
+        stco.extend_from_slice(&0u32.to_be_bytes()); // only 1 entry present
+        let stbl = bx(
+            b"stbl",
+            &[bx(b"stco", &stco), bx(b"free", &[0u8; 8])].concat(),
+        );
+        let mut kept = bx(b"trak", &bx(b"mdia", &bx(b"minf", &stbl)));
+        assert!(matches!(
+            patch_chunk_offsets(&mut kept, 0),
+            Err(FormatError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn patch_chunk_offsets_co64_zero_offset_is_ok() {
+        // co64 path guard is `v < 0`. offset 0 + delta 0 => v == 0 must be accepted;
+        // `< -> ==`/`<= ` reject the boundary.
+        let mut co64 = vec![0u8; 4]; // version/flags
+        co64.extend_from_slice(&1u32.to_be_bytes()); // count 1
+        co64.extend_from_slice(&0u64.to_be_bytes()); // offset 0
+        let stbl = bx(b"stbl", &bx(b"co64", &co64));
+        let mut kept = bx(b"trak", &bx(b"mdia", &bx(b"minf", &stbl)));
+        assert!(patch_chunk_offsets(&mut kept, 0).is_ok());
+    }
+
+    #[test]
+    fn synthesize_new_moov_size_exactly_u32_max_is_ok() {
+        // `if new_moov_size > u32::MAX` is strict. new_moov_size == u32::MAX must be
+        // accepted; `> -> ==`/`>= ` reject the exact boundary. data_len (the art size)
+        // is reserved as a number, so the boundary is cheap.
+        fn art(data_len: u64) -> ArtInput {
+            ArtInput {
+                art_id: 1,
+                mime: "image/jpeg".into(),
+                description: String::new(),
+                picture_type: 3,
+                width: 0,
+                height: 0,
+                data_len,
+            }
+        }
+        let buf = mk_mp4(true, b"AUDIO", &[0]);
+        let scan = read_structure(&buf).unwrap();
+        let tags = [TagInput::new("title", "T")];
+
+        // Synthesize once with a 1-byte art. The head is [ftyp][moov], where the moov
+        // box header declares new_moov_size = overhead + 1. The actual moov bytes in the
+        // head are new_moov_size - 1 (the art is a separate ArtImage segment). So the
+        // head length = ftyp.len() + (overhead + 1 - 1) = ftyp.len() + overhead.
+        let layout1 = synthesize_layout(&scan, &tags, &[art(1)]).unwrap();
+        let head_len = inline_head(&layout1).len();
+        let overhead = (head_len as u64) - (scan.ftyp.len() as u64);
+        let max_len = u32::MAX as u64 - overhead;
+
+        assert!(max_len > 0, "overhead {overhead} must be < u32::MAX");
+        // Boundary accepted
+        assert!(synthesize_layout(&scan, &tags, &[art(max_len)]).is_ok());
+        // Boundary+1 rejected
+        assert!(matches!(
+            synthesize_layout(&scan, &tags, &[art(max_len + 1)]),
+            Err(FormatError::TooLarge)
+        ));
     }
 }

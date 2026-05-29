@@ -274,50 +274,50 @@ the rightmost column of each survivor table.
 | `mp3.rs:356` | replace > with >= in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
 | `mp3.rs:356` | replace - with + in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
 | `mp3.rs:362` | replace >= with < in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
-| `mp4.rs:35` | replace BoxRef::end -> usize with 0 | timeout | 3 |
-| `mp4.rs:35` | replace BoxRef::end -> usize with 1 | timeout | 3 |
-| `mp4.rs:35` | replace + with * in BoxRef::end | timeout | 3 |
-| `mp4.rs:75` | replace < with <= in box_header | missed | 3 |
-| `mp4.rs:105` | replace - with + in read_box | missed | 3 |
-| `mp4.rs:105` | replace - with / in read_box | missed | 3 |
-| `mp4.rs:276` | replace - with + in read_structure_from | missed | 3 |
-| `mp4.rs:279` | delete match arm b"moof" in read_structure_from | missed | 3 |
-| `mp4.rs:280` | replace \|= with &= in read_structure_from | missed | 3 |
-| `mp4.rs:281` | replace \|= with &= in read_structure_from | missed | 3 |
-| `mp4.rs:282` | replace \|= with &= in read_structure_from | missed | 3 |
-| `mp4.rs:285` | replace += with *= in read_structure_from | timeout | 3 |
-| `mp4.rs:337` | replace < with == in read_freeform | missed | 3 |
-| `mp4.rs:337` | replace < with <= in read_freeform | missed | 3 |
-| `mp4.rs:337` | replace \|\| with && in read_freeform | missed | 3 |
-| `mp4.rs:337` | replace < with == in read_freeform | missed | 3 |
-| `mp4.rs:337` | replace < with <= in read_freeform | missed | 3 |
-| `mp4.rs:354` | replace >= with < in read_freeform | missed | 3 |
-| `mp4.rs:388` | replace < with == in read_tags | missed | 3 |
-| `mp4.rs:388` | replace < with <= in read_tags | missed | 3 |
-| `mp4.rs:396` | replace && with \|\| in read_tags | missed | 3 |
-| `mp4.rs:401` | replace == with != in read_tags | missed | 3 |
-| `mp4.rs:401` | replace && with \|\| in read_tags | missed | 3 |
-| `mp4.rs:401` | replace >= with < in read_tags | missed | 3 |
-| `mp4.rs:428` | replace < with == in read_pictures | missed | 3 |
-| `mp4.rs:428` | replace < with <= in read_pictures | missed | 3 |
-| `mp4.rs:433` | delete match arm 14 in read_pictures | missed | 3 |
-| `mp4.rs:539` | replace == with != in build_udta | missed | 3 |
-| `mp4.rs:540` | replace + with - in build_udta | missed | 3 |
-| `mp4.rs:540` | replace + with * in build_udta | missed | 3 |
-| `mp4.rs:540` | replace + with * in build_udta | missed | 3 |
-| `mp4.rs:541` | replace + with * in build_udta | missed | 3 |
-| `mp4.rs:566` | replace > with >= in build_udta | missed | 3 |
-| `mp4.rs:590` | replace + with - in patch_chunk_offsets | missed | 3 |
-| `mp4.rs:590` | replace + with * in patch_chunk_offsets | missed | 3 |
-| `mp4.rs:595` | replace < with == in patch_chunk_offsets | missed | 3 |
-| `mp4.rs:595` | replace < with <= in patch_chunk_offsets | missed | 3 |
-| `mp4.rs:595` | replace \|\| with && in patch_chunk_offsets | missed | 3 |
-| `mp4.rs:595` | replace > with == in patch_chunk_offsets | missed | 3 |
-| `mp4.rs:595` | replace > with >= in patch_chunk_offsets | missed | 3 |
-| `mp4.rs:601` | replace < with == in patch_chunk_offsets | missed | 3 |
-| `mp4.rs:601` | replace < with <= in patch_chunk_offsets | missed | 3 |
-| `mp4.rs:638` | replace > with == in synthesize_layout | missed | 3 |
-| `mp4.rs:638` | replace > with >= in synthesize_layout | missed | 3 |
+| `mp4.rs:35` | replace BoxRef::end -> usize with 0 | timeout → **timeout-detected** | 3 |
+| `mp4.rs:35` | replace BoxRef::end -> usize with 1 | timeout → **timeout-detected** | 3 |
+| `mp4.rs:35` | replace + with * in BoxRef::end | timeout → **timeout-detected** | 3 |
+| `mp4.rs:75` | replace < with <= in box_header | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:105` | replace - with + in read_box | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:105` | replace - with / in read_box | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:276` | replace - with + in read_structure_from | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:279` | delete match arm b"moof" in read_structure_from | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:280` | replace \|= with &= in read_structure_from | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:281` | replace \|= with &= in read_structure_from | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:282` | replace \|= with &= in read_structure_from | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:285` | replace += with *= in read_structure_from | timeout → **timeout-detected** | 3 |
+| `mp4.rs:337` | replace < with == in read_freeform | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:337` | replace < with <= in read_freeform | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:337` | replace \|\| with && in read_freeform | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:337` | replace < with == in read_freeform | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:337` | replace < with <= in read_freeform | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:354` | replace >= with < in read_freeform | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:388` | replace < with == in read_tags | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:388` | replace < with <= in read_tags | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:396` | replace && with \|\| in read_tags | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:401` | replace == with != in read_tags | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:401` | replace && with \|\| in read_tags | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:401` | replace >= with < in read_tags | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:428` | replace < with == in read_pictures | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:428` | replace < with <= in read_pictures | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:433` | delete match arm 14 in read_pictures | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:539` | replace == with != in build_udta | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:540` | replace + with - in build_udta | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:540` | replace + with * in build_udta | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:540` | replace + with * in build_udta | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:541` | replace + with * in build_udta | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:566` | replace > with >= in build_udta | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:590` | replace + with - in patch_chunk_offsets | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:590` | replace + with * in patch_chunk_offsets | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:595` | replace < with == in patch_chunk_offsets | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:595` | replace < with <= in patch_chunk_offsets | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:595` | replace \|\| with && in patch_chunk_offsets | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:595` | replace > with == in patch_chunk_offsets | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:595` | replace > with >= in patch_chunk_offsets | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:601` | replace < with == in patch_chunk_offsets | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:601` | replace < with <= in patch_chunk_offsets | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:638` | replace > with == in synthesize_layout | missed → **killed** (phase 3c) | 3 |
+| `mp4.rs:638` | replace > with >= in synthesize_layout | missed → **killed** (phase 3c) | 3 |
 | `ogg/b64.rs:26` | replace - with + in b64_window | missed → **killed** (phase 2) | 2 |
 | `ogg/b64.rs:26` | replace - with / in b64_window | missed → **killed** (phase 2) | 2 |
 | `ogg/b64.rs:26` | replace / with * in b64_window | missed → **killed** (phase 2) | 2 |

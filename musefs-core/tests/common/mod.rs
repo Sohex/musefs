@@ -70,6 +70,17 @@ pub fn write_mp3(path: &Path, audio: &[u8]) -> (i64, i64) {
     (audio_offset, audio.len() as i64)
 }
 
+/// Write a minimal moov-first M4A (see `minimal_m4a`) to `path`, returning
+/// (audio_offset, audio_length) for the verbatim trailing `mdat` payload. M4A
+/// synthesis re-scans the file's structural boxes and serves the mdat payload
+/// verbatim, so the stored bounds need only satisfy the reader's size guard.
+pub fn write_m4a(path: &Path, audio: &[u8]) -> (i64, i64) {
+    let bytes = minimal_m4a(audio);
+    let audio_offset = (bytes.len() - audio.len()) as i64;
+    std::fs::write(path, &bytes).unwrap();
+    (audio_offset, audio.len() as i64)
+}
+
 /// Build a 32-bit-size box: [size][type][payload].
 fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
@@ -123,5 +134,18 @@ pub fn minimal_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak, udta].concat());
     let ftyp = bx(b"ftyp", b"M4A isom");
     let mdat = bx(b"mdat", mdat_payload);
-    [ftyp, moov, mdat].concat()
+    let mut out = [ftyp, moov, mdat].concat();
+    // Point the single `stco` chunk offset at the real `mdat` payload start. A real
+    // M4A's chunk offsets are absolute file positions; leaving it 0 means a retag
+    // that shrinks the `moov` patches the offset below zero and synthesis fails
+    // (TooLarge). With the true offset, the patched value lands at the new payload
+    // position. The first `stco` occurrence is the box type (it precedes `mdat`).
+    let mdat_payload_offset = (out.len() - mdat_payload.len()) as u32;
+    let stco = out
+        .windows(4)
+        .position(|w| w == b"stco")
+        .expect("stco present");
+    let entry = stco + 4 + 4 + 4; // past "stco" type + version/flags + entry count
+    out[entry..entry + 4].copy_from_slice(&mdat_payload_offset.to_be_bytes());
+    out
 }

@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); phases 3c/3d, 4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; phases 3d, 4 pending
 
 ## Guiding principle: verify, don't trust
 
@@ -108,6 +108,17 @@ Findings #5, #16.
   (their sub-phases) or filter empty art once at ingestion (`scan.rs`); finding #5
   broadened on FLAC (partial/seam/art windows), with the non-FLAC dimension tracked
   into 3b/3c/3d.
+- **3c done** — MP4 survivors killed (40 missed → killed, 4 timeout →
+  timeout-detected; no equivalents). Covers `box_header`, `read_box`,
+  `read_structure_from`, `read_freeform`, `read_tags`, `read_pictures`,
+  `build_udta`, `patch_chunk_offsets`, `synthesize_layout`. The `|` mutants
+  (`read_structure_from` `|= → &=` dup-accumulators) are killed, not equivalent.
+  Finding #16 resolved for MP4 by **skipping zero-byte art at synthesis** (the first
+  *nonempty* art wins in `mp4.rs::synthesize_layout`, mirroring the FLAC fix), and
+  finding #5 broadened onto the M4A synthesis path (`write_m4a` helper + four
+  `proptest_read_fidelity` M4A cases: backing-audio identity, partial windows,
+  header seam, art window). WAV (3d) remains the only open non-FLAC read-fidelity
+  dimension.
 - broaden `proptest_read_fidelity` (random offsets, header/audio boundary, art,
   non-FLAC) (#5)
 - zero-byte art boundary (#16)
@@ -116,7 +127,8 @@ Findings #5, #16.
   `synchsafe_decode` and v2.2 24-bit decode (note: disjoint `| → &` are killed,
   not equivalent). Production change: finding #16 zero-byte-art skip applied to
   `mp3.rs::build_id3v2_segments` (mirrors the FLAC fix; also covers the WAV `id3 `
-  chunk, which shares this builder). #16 still open for mp4/ogg. Finding #5: the
+  chunk, which shares this builder). #16 still open for ogg (mp4 closed in 3c).
+  Finding #5: the
   MP3 read-fidelity dimension is now done — added `write_mp3` to the core test
   harness and ported the four `proptest_read_fidelity` invariants (whole-audio,
   partial windows, header seam, art window) to MP3; the WAV/MP4 dimensions land in
