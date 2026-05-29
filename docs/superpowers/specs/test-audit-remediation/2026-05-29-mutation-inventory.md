@@ -85,9 +85,9 @@ the rightmost column of each survivor table.
 | `facade.rs:458` | replace != with == in Musefs::read | missed | 4 |
 | `facade.rs:487` | replace Musefs::open_handle -> Result<u64> with Ok(1) | missed | 4 |
 | `facade.rs:509` | replace Musefs::release_handle with () | missed | 4 |
-| `ogg_index.rs:105` | replace < with <= in serve | missed | 2 |
-| `ogg_index.rs:113` | replace < with <= in serve | missed | 2 |
-| `ogg_index.rs:117` | replace + with - in serve | missed | 2 |
+| `ogg_index.rs:105` | replace < with <= in serve | missed → **equivalent** | 2 |
+| `ogg_index.rs:113` | replace < with <= in serve | missed → **equivalent** | 2 |
+| `ogg_index.rs:117` | replace + with - in serve | missed → **killed** (phase 2) | 2 |
 | `reader.rs:114` | replace -= with += in Shard::insert | missed | 4 |
 | `reader.rs:114` | replace -= with /= in Shard::insert | missed | 4 |
 | `reader.rs:128` | replace > with >= in Shard::insert | missed | 4 |
@@ -315,55 +315,55 @@ the rightmost column of each survivor table.
 | `mp4.rs:601` | replace < with <= in patch_chunk_offsets | missed | 3 |
 | `mp4.rs:638` | replace > with == in synthesize_layout | missed | 3 |
 | `mp4.rs:638` | replace > with >= in synthesize_layout | missed | 3 |
-| `ogg/b64.rs:26` | replace - with + in b64_window | missed | 2 |
-| `ogg/b64.rs:26` | replace - with / in b64_window | missed | 2 |
-| `ogg/b64.rs:26` | replace / with * in b64_window | missed | 2 |
-| `ogg/mod.rs:25` | replace && with \|\| in detect_codec | missed | 2 |
-| `ogg/mod.rs:36` | replace < with == in oggflac_following_packets | missed | 2 |
-| `ogg/mod.rs:36` | replace < with <= in oggflac_following_packets | missed | 2 |
-| `ogg/mod.rs:113` | replace < with == in comment_body | missed | 2 |
-| `ogg/mod.rs:113` | replace < with <= in comment_body | missed | 2 |
-| `ogg/mod.rs:121` | replace comment_packet_index -> usize with 1 | missed | 2 |
-| `ogg/mod.rs:130` | delete ! in comment_packet_index | missed | 2 |
-| `ogg/mod.rs:130` | replace && with \|\| in comment_packet_index | missed | 2 |
-| `ogg/mod.rs:130` | replace & with \| in comment_packet_index | missed | 2 |
-| `ogg/mod.rs:130` | replace & with ^ in comment_packet_index | missed | 2 |
-| `ogg/mod.rs:130` | replace == with != in comment_packet_index | missed | 2 |
-| `ogg/mod.rs:196` | replace > with == in locate_audio | missed | 2 |
-| `ogg/mod.rs:196` | replace > with >= in locate_audio | missed | 2 |
-| `ogg/mod.rs:233` | replace += with *= in synthesize_layout | missed | 2 |
-| `ogg/mod.rs:235` | replace - with + in synthesize_layout | missed | 2 |
-| `ogg/mod.rs:235` | replace - with / in synthesize_layout | missed | 2 |
-| `ogg/mod.rs:254` | replace % with + in picture_prefix | missed | 2 |
-| `ogg/mod.rs:304` | replace + with * in build_packets_with_art | missed | 2 |
-| `ogg/mod.rs:305` | replace + with * in build_packets_with_art | missed | 2 |
-| `ogg/mod.rs:306` | replace > with >= in build_packets_with_art | missed | 2 |
-| `ogg/mod.rs:409` | replace + with * in oggflac_packets_with_art | missed | 2 |
-| `ogg/mod.rs:410` | replace > with == in oggflac_packets_with_art | missed | 2 |
-| `ogg/mod.rs:410` | replace > with >= in oggflac_packets_with_art | missed | 2 |
-| `ogg/mod.rs:439` | replace < with == in oggflac_packets_with_art | missed | 2 |
-| `ogg/mod.rs:439` | replace < with <= in oggflac_packets_with_art | missed | 2 |
+| `ogg/b64.rs:26` | replace - with + in b64_window | missed → **killed** (phase 2) | 2 |
+| `ogg/b64.rs:26` | replace - with / in b64_window | missed → **killed** (phase 2) | 2 |
+| `ogg/b64.rs:26` | replace / with * in b64_window | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:25` | replace && with \|\| in detect_codec | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:36` | replace < with == in oggflac_following_packets | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:36` | replace < with <= in oggflac_following_packets | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:113` | replace < with == in comment_body | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:113` | replace < with <= in comment_body | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:121` | replace comment_packet_index -> usize with 1 | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:130` | delete ! in comment_packet_index | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:130` | replace && with \|\| in comment_packet_index | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:130` | replace & with \| in comment_packet_index | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:130` | replace & with ^ in comment_packet_index | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:130` | replace == with != in comment_packet_index | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:196` | replace > with == in locate_audio | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:196` | replace > with >= in locate_audio | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:233` | replace += with *= in synthesize_layout | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:235` | replace - with + in synthesize_layout | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:235` | replace - with / in synthesize_layout | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:254` | replace % with + in picture_prefix | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:304` | replace + with * in build_packets_with_art | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:305` | replace + with * in build_packets_with_art | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:306` | replace > with >= in build_packets_with_art | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:409` | replace + with * in oggflac_packets_with_art | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:410` | replace > with == in oggflac_packets_with_art | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:410` | replace > with >= in oggflac_packets_with_art | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:439` | replace < with == in oggflac_packets_with_art | missed → **killed** (phase 2) | 2 |
+| `ogg/mod.rs:439` | replace < with <= in oggflac_packets_with_art | missed → **killed** (phase 2) | 2 |
 | `ogg/mod.rs:455` | replace page_test_support::vorbis_body_empty -> Vec<u8> with vec![] | missed | 2 |
 | `ogg/mod.rs:455` | replace page_test_support::vorbis_body_empty -> Vec<u8> with vec![0] | missed | 2 |
 | `ogg/mod.rs:455` | replace page_test_support::vorbis_body_empty -> Vec<u8> with vec![1] | missed | 2 |
-| `ogg/page.rs:33` | replace > with == in parse_page | missed | 2 |
-| `ogg/page.rs:33` | replace > with >= in parse_page | missed | 2 |
-| `ogg/page.rs:47` | replace > with == in parse_page | missed | 2 |
-| `ogg/page.rs:47` | replace > with >= in parse_page | missed | 2 |
-| `ogg/page.rs:93` | replace < with == in lace_packet | timeout | 2 |
-| `ogg/page.rs:93` | replace < with <= in lace_packet | timeout | 2 |
-| `ogg/page.rs:122` | replace += with *= in lace_packet | missed | 2 |
-| `ogg/page.rs:181` | replace == with != in read_packets | missed | 2 |
-| `ogg/page.rs:197` | replace < with > in patch_page_header | missed | 2 |
-| `ogg/page.rs:256` | replace < with == in lace_chunks_to_segments | timeout | 2 |
-| `ogg/page.rs:256` | replace < with <= in lace_chunks_to_segments | timeout | 2 |
-| `ogg/page.rs:263` | replace \|= with &= in lace_chunks_to_segments | missed | 2 |
-| `ogg/page.rs:265` | delete ! in lace_chunks_to_segments | missed | 2 |
-| `ogg/page.rs:266` | replace \|= with &= in lace_chunks_to_segments | missed | 2 |
-| `ogg/page.rs:294` | replace += with *= in lace_chunks_to_segments | timeout | 2 |
-| `ogg/page.rs:298` | replace - with + in lace_chunks_to_segments | missed | 2 |
-| `ogg/page.rs:310` | replace < with <= in copy_payload | missed | 2 |
-| `ogg/page.rs:337` | replace < with <= in emit_segments | missed | 2 |
+| `ogg/page.rs:33` | replace > with == in parse_page | missed → **equivalent** | 2 |
+| `ogg/page.rs:33` | replace > with >= in parse_page | missed → **equivalent** | 2 |
+| `ogg/page.rs:47` | replace > with == in parse_page | missed → **equivalent** | 2 |
+| `ogg/page.rs:47` | replace > with >= in parse_page | missed → **equivalent** | 2 |
+| `ogg/page.rs:93` | replace < with == in lace_packet | timeout → **timeout-detected** | 2 |
+| `ogg/page.rs:93` | replace < with <= in lace_packet | timeout → **timeout-detected** | 2 |
+| `ogg/page.rs:122` | replace += with *= in lace_packet | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:181` | replace == with != in read_packets | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:197` | replace < with > in patch_page_header | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:256` | replace < with == in lace_chunks_to_segments | timeout → **timeout-detected** | 2 |
+| `ogg/page.rs:256` | replace < with <= in lace_chunks_to_segments | timeout → **timeout-detected** | 2 |
+| `ogg/page.rs:263` | replace \|= with &= in lace_chunks_to_segments | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:265` | delete ! in lace_chunks_to_segments | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:266` | replace \|= with &= in lace_chunks_to_segments | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:294` | replace += with *= in lace_chunks_to_segments | timeout → **timeout-detected** | 2 |
+| `ogg/page.rs:298` | replace - with + in lace_chunks_to_segments | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:310` | replace < with <= in copy_payload | missed → **equivalent** | 2 |
+| `ogg/page.rs:337` | replace < with <= in emit_segments | missed → **killed** (phase 2) | 2 |
 | `wav.rs:24` | replace < with == in riff_wave_start | missed | 3 |
 | `wav.rs:24` | replace < with <= in riff_wave_start | missed | 3 |
 | `wav.rs:47` | replace + with - in walk_chunks | missed | 3 |

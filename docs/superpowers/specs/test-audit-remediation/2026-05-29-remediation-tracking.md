@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); phases 2–4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); phases 3–4 pending
 
 ## Guiding principle: verify, don't trust
 
@@ -81,7 +81,7 @@ close the beets FK correctness gap (A2), and produce the data phases 2–4 consu
   (no `Default for Db`; `Ok(Default::default())` unviables).
 - **D. This tracking doc.**
 
-### Phase 2 — Ogg hardening  ⟶ STATUS: pending phase 1
+### Phase 2 — Ogg hardening  ⟶ STATUS: complete
 
 P1 + all Ogg-related P2 + Ogg mutant kills. Findings #1, #2, #3, #4, #7, #8, #14.
 
