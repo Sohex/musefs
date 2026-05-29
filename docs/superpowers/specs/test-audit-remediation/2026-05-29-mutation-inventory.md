@@ -159,51 +159,51 @@ the rightmost column of each survivor table.
 
 | File:line | Mutation | Kind | Phase |
 |-----------|----------|------|------:|
-| `flac.rs:37` | replace < with == in parse_blocks | missed | 3 |
-| `flac.rs:37` | replace < with <= in parse_blocks | missed | 3 |
-| `flac.rs:43` | replace + with - in parse_blocks | missed | 3 |
-| `flac.rs:43` | replace > with == in parse_blocks | missed | 3 |
-| `flac.rs:43` | replace > with >= in parse_blocks | missed | 3 |
-| `flac.rs:49` | replace << with >> in parse_blocks | missed | 3 |
-| `flac.rs:50` | replace \| with ^ in parse_blocks | missed | 3 |
-| `flac.rs:51` | replace \| with ^ in parse_blocks | missed | 3 |
-| `flac.rs:99` | replace \| with ^ in push_block_header | missed | 3 |
-| `flac.rs:101` | replace >> with << in push_block_header | missed | 3 |
-| `flac.rs:155` | replace > with >= in synthesize_layout | missed | 3 |
-| `flac.rs:188` | replace < with == in read_vorbis_comments | missed | 3 |
-| `flac.rs:188` | replace < with <= in read_vorbis_comments | missed | 3 |
-| `flac.rs:188` | replace \|\| with && in read_vorbis_comments | missed | 3 |
-| `flac.rs:193` | replace + with - in read_vorbis_comments | missed | 3 |
-| `flac.rs:193` | replace > with == in read_vorbis_comments | missed | 3 |
-| `flac.rs:193` | replace > with >= in read_vorbis_comments | missed | 3 |
-| `flac.rs:199` | replace << with >> in read_vorbis_comments | missed | 3 |
-| `flac.rs:200` | replace \| with & in read_vorbis_comments | missed | 3 |
-| `flac.rs:200` | replace \| with ^ in read_vorbis_comments | missed | 3 |
-| `flac.rs:200` | replace << with >> in read_vorbis_comments | missed | 3 |
-| `flac.rs:201` | replace \| with ^ in read_vorbis_comments | missed | 3 |
-| `flac.rs:204` | replace > with == in read_vorbis_comments | missed | 3 |
-| `flac.rs:204` | replace > with >= in read_vorbis_comments | missed | 3 |
-| `flac.rs:219` | replace > with == in read_u32_be | missed | 3 |
-| `flac.rs:219` | replace > with >= in read_u32_be | missed | 3 |
-| `flac.rs:224` | replace + with * in read_u32_be | missed | 3 |
-| `flac.rs:237` | replace > with == in parse_picture_block | missed | 3 |
-| `flac.rs:237` | replace > with >= in parse_picture_block | missed | 3 |
-| `flac.rs:245` | replace > with == in parse_picture_block | missed | 3 |
-| `flac.rs:245` | replace > with >= in parse_picture_block | missed | 3 |
-| `flac.rs:261` | replace > with < in parse_picture_block | missed | 3 |
-| `flac.rs:277` | replace < with == in read_pictures | missed | 3 |
-| `flac.rs:277` | replace < with <= in read_pictures | missed | 3 |
-| `flac.rs:277` | replace \|\| with && in read_pictures | missed | 3 |
-| `flac.rs:283` | replace + with - in read_pictures | missed | 3 |
-| `flac.rs:283` | replace > with == in read_pictures | missed | 3 |
-| `flac.rs:283` | replace > with >= in read_pictures | missed | 3 |
-| `flac.rs:289` | replace << with >> in read_pictures | missed | 3 |
-| `flac.rs:290` | replace \| with & in read_pictures | missed | 3 |
-| `flac.rs:290` | replace \| with ^ in read_pictures | missed | 3 |
-| `flac.rs:290` | replace << with >> in read_pictures | missed | 3 |
-| `flac.rs:291` | replace \| with ^ in read_pictures | missed | 3 |
-| `flac.rs:294` | replace > with == in read_pictures | missed | 3 |
-| `flac.rs:294` | replace > with >= in read_pictures | missed | 3 |
+| `flac.rs:37` | replace < with == in parse_blocks | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:37` | replace < with <= in parse_blocks | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:43` | replace + with - in parse_blocks | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:43` | replace > with == in parse_blocks | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:43` | replace > with >= in parse_blocks | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:49` | replace << with >> in parse_blocks | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:50` | replace \| with ^ in parse_blocks | missed → **equivalent** | 3 |
+| `flac.rs:51` | replace \| with ^ in parse_blocks | missed → **equivalent** | 3 |
+| `flac.rs:99` | replace \| with ^ in push_block_header | missed → **equivalent** | 3 |
+| `flac.rs:101` | replace >> with << in push_block_header | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:155` | replace > with >= in synthesize_layout | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:188` | replace < with == in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:188` | replace < with <= in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:188` | replace \|\| with && in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:193` | replace + with - in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:193` | replace > with == in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:193` | replace > with >= in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:199` | replace << with >> in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:200` | replace \| with & in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:200` | replace \| with ^ in read_vorbis_comments | missed → **equivalent** | 3 |
+| `flac.rs:200` | replace << with >> in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:201` | replace \| with ^ in read_vorbis_comments | missed → **equivalent** | 3 |
+| `flac.rs:204` | replace > with == in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:204` | replace > with >= in read_vorbis_comments | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:219` | replace > with == in read_u32_be | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:219` | replace > with >= in read_u32_be | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:224` | replace + with * in read_u32_be | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:237` | replace > with == in parse_picture_block | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:237` | replace > with >= in parse_picture_block | missed → **equivalent** | 3 |
+| `flac.rs:245` | replace > with == in parse_picture_block | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:245` | replace > with >= in parse_picture_block | missed → **equivalent** | 3 |
+| `flac.rs:261` | replace > with < in parse_picture_block | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:277` | replace < with == in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:277` | replace < with <= in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:277` | replace \|\| with && in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:283` | replace + with - in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:283` | replace > with == in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:283` | replace > with >= in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:289` | replace << with >> in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:290` | replace \| with & in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:290` | replace \| with ^ in read_pictures | missed → **equivalent** | 3 |
+| `flac.rs:290` | replace << with >> in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:291` | replace \| with ^ in read_pictures | missed → **equivalent** | 3 |
+| `flac.rs:294` | replace > with == in read_pictures | missed → **killed** (phase 3a) | 3 |
+| `flac.rs:294` | replace > with >= in read_pictures | missed → **killed** (phase 3a) | 3 |
 | `mp3.rs:16` | replace << with >> in synchsafe_decode | missed | 3 |
 | `mp3.rs:17` | replace \| with & in synchsafe_decode | missed | 3 |
 | `mp3.rs:17` | replace \| with ^ in synchsafe_decode | missed | 3 |

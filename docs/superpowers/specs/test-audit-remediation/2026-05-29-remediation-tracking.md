@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); phases 3–4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; phases 3b–3d, 4 pending
 
 ## Guiding principle: verify, don't trust
 
@@ -96,10 +96,18 @@ P1 + all Ogg-related P2 + Ogg mutant kills. Findings #1, #2, #3, #4, #8, #14
 - EOS preservation, reframed from "FLAG_EOS handling" (#14)
 - kill surviving `ogg/` + `ogg_index` mutants (from phase-1 inventory)
 
-### Phase 3 — Format-layer coverage & mutants (non-Ogg)  ⟶ STATUS: pending
+### Phase 3 — Format-layer coverage & mutants (non-Ogg)  ⟶ STATUS: in progress
 
 Findings #5, #16.
 
+- **3a done** — FLAC survivors killed (equivalents: disjoint-bitfield `| → ^` at
+  `:50/:51/:99/:200/:201/:290/:291` and inclusive-bound `> → >=` at
+  `parse_picture_block:237/:245`); finding #16 resolved by **skipping zero-byte art
+  at FLAC synthesis** (small production fix in `flac.rs::synthesize_layout`), with a
+  cross-cutting follow-up noted: apply the same skip to mp3/mp4/ogg/wav synthesis
+  (their sub-phases) or filter empty art once at ingestion (`scan.rs`); finding #5
+  broadened on FLAC (partial/seam/art windows), with the non-FLAC dimension tracked
+  into 3b/3c/3d.
 - broaden `proptest_read_fidelity` (random offsets, header/audio boundary, art,
   non-FLAC) (#5)
 - zero-byte art boundary (#16)
