@@ -1466,4 +1466,112 @@ mod tests {
         assert!(dup(extra_moov), "duplicate moov must reject"); // moov |= line
         assert!(dup(bx(b"mdat", b"Y")), "duplicate mdat must reject"); // mdat |= line
     }
+
+    #[test]
+    fn read_freeform_accepts_minimal_name_and_data() {
+        // name payload == 4 (empty name) and data payload == 8 (empty value) is the
+        // boundary of `np.len() < 4 || dp.len() < 8`. Both operands at the boundary,
+        // so flipping EITHER `<` to `==`/`<=` makes that side true -> None.
+        let name_body = 0u32.to_be_bytes().to_vec(); // exactly 4 bytes
+        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+        data.extend_from_slice(&0u32.to_be_bytes()); // locale -> dp.len() == 8
+        let mut inner = boxed(b"name", &name_body);
+        inner.extend(boxed(b"data", &data));
+        let (key, value) = read_freeform(&inner).unwrap();
+        assert_eq!(key, ""); // empty name, not in vocabulary -> verbatim ""
+        assert_eq!(value, "");
+    }
+
+    #[test]
+    fn read_freeform_short_name_returns_none() {
+        // name payload 3 bytes (< 4) with a valid 8-byte data payload. `|| -> &&`
+        // makes `true && false == false`, falling through to `&np[4..]` (out of bounds
+        // -> panic).
+        let name_body = vec![0u8, 0, 0]; // 3 bytes
+        let mut data = 1u32.to_be_bytes().to_vec();
+        data.extend_from_slice(&0u32.to_be_bytes());
+        let mut inner = boxed(b"name", &name_body);
+        inner.extend(boxed(b"data", &data));
+        assert!(read_freeform(&inner).is_none());
+    }
+
+    #[test]
+    fn read_freeform_mean_payload_exactly_4_uses_empty_mean() {
+        // mean payload == 4 (FullBox prefix, empty mean). `p.len() >= 4` must take the
+        // utf8 branch (mean ""), so the vocabulary does NOT fold the iTunes name.
+        // `>= -> <` falls to the default "com.apple.iTunes" mean and wrongly folds.
+        let mean_body = vec![0u8, 0, 0, 0]; // exactly 4 bytes
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(b"MusicBrainz Album Id");
+        let mut data = 1u32.to_be_bytes().to_vec();
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(b"abc-123");
+        let mut inner = boxed(b"mean", &mean_body);
+        inner.extend(boxed(b"name", &name_body));
+        inner.extend(boxed(b"data", &data));
+        let (key, value) = read_freeform(&inner).unwrap();
+        assert_eq!(key, "MusicBrainz Album Id"); // empty mean -> not folded
+        assert_eq!(value, "abc-123");
+    }
+
+    #[test]
+    fn read_tags_data_payload_exactly_8_is_read() {
+        // A `data` payload of exactly 8 bytes (type+locale, empty value) is the
+        // boundary of `dp.len() < 8`. The (empty) value must be read; `< -> ==`/`<= `
+        // would skip it.
+        let atoms = bx(b"\xa9nam", &data_atom(1, b"")); // dp.len() == 8
+        let buf = mp4_with_ilst(&atoms, true);
+        assert!(read_tags(&buf).contains(&("title".into(), String::new())));
+    }
+
+    #[test]
+    fn read_tags_disk_exact_4_byte_value_yields_discnumber() {
+        // disk atom, value exactly 4 bytes: `kind == disk` (== branch) `&&`
+        // `value.len() >= 4` (>= branch). Kills `== -> !=` (mutant skips a real disk)
+        // and `>= -> <` (mutant skips the boundary length).
+        let atoms = bx(b"disk", &data_atom(0, &[0, 0, 0, 2])); // disc 2, value len 4
+        let buf = mp4_with_ilst(&atoms, true);
+        assert!(read_tags(&buf).contains(&("discnumber".into(), "2".into())));
+    }
+
+    #[test]
+    fn read_tags_disk_short_value_is_skipped() {
+        // disk with a value shorter than 4 bytes: the guard is false. `&& -> ||`
+        // makes it true and indexes value[2]/value[3] out of bounds (panic).
+        let atoms = bx(b"disk", &data_atom(0, &[0, 0])); // value len 2
+        let buf = mp4_with_ilst(&atoms, true);
+        assert!(!read_tags(&buf).iter().any(|(k, _)| k == "discnumber"));
+    }
+
+    #[test]
+    fn read_tags_trkn_short_value_is_skipped() {
+        // trkn with a value shorter than 4 bytes: `kind == trkn && value.len() >= 4`
+        // is false. `&& -> ||` makes it true and indexes value[2]/value[3] (panic).
+        let atoms = bx(b"trkn", &data_atom(0, &[0, 0])); // value len 2
+        let buf = mp4_with_ilst(&atoms, true);
+        assert!(!read_tags(&buf).iter().any(|(k, _)| k == "tracknumber"));
+    }
+
+    #[test]
+    fn read_pictures_data_payload_exactly_8_is_read() {
+        // covr/data payload of exactly 8 bytes (type+locale, empty image) is the
+        // boundary of `dp.len() < 8`; the (empty) picture must be read.
+        let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, b"")), true);
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert!(pics[0].data.is_empty());
+    }
+
+    #[test]
+    fn read_pictures_recognizes_png() {
+        // A covr `data` atom with type code 14 is PNG. Deleting the `14 =>` match arm
+        // drops it to `_ => continue` and yields no picture.
+        let png = [0x89, b'P', b'N', b'G', 1, 2, 3];
+        let buf = mp4_with_ilst(&bx(b"covr", &data_atom(14, &png)), false);
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/png");
+        assert_eq!(pics[0].data, png);
+    }
 }
