@@ -359,4 +359,24 @@ mod tests {
             "read_pictures must not OOM on WAV crash artifact"
         );
     }
+
+    #[test]
+    fn riff_wave_start_accepts_exactly_twelve_bytes() {
+        // :24 `< → <=`: a valid 12-byte RIFF/WAVE buffer must be accepted.
+        // The `<=` mutant computes `12 <= 12` (true) and wrongly rejects it.
+        let buf = b"RIFF\0\0\0\0WAVE".to_vec();
+        assert_eq!(buf.len(), 12);
+        assert_eq!(riff_wave_start(&buf), Ok(12));
+    }
+
+    #[test]
+    fn riff_wave_start_rejects_eleven_byte_riff_without_panic() {
+        // :24 `< → ==`: an 11-byte buffer that starts with "RIFF". The original
+        // short-circuits on `len < 12` → NotWav. The `==` mutant computes
+        // `11 == 12` (false), falls through, and indexes `buf[8..12]` on an 11-byte
+        // slice → panic. Asserting the clean Err kills it (panic ≠ Err).
+        let buf = b"RIFF\0\0\0\0WAV".to_vec();
+        assert_eq!(buf.len(), 11);
+        assert_eq!(riff_wave_start(&buf), Err(FormatError::NotWav));
+    }
 }
