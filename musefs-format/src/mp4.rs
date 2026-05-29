@@ -1652,4 +1652,60 @@ mod tests {
             Err(FormatError::TooLarge)
         ));
     }
+
+    #[test]
+    fn patch_chunk_offsets_stco_overflow_and_underflow_boundaries() {
+        // kept = a single soun trak with one stco entry (offset 0). v = 0 + delta is
+        // guarded by `v < 0 || v > u32::MAX`. Boundary deltas pin every guard mutant;
+        // delta 0 (accepted) also pins the `:590` `+ -> *` bound at i = 0.
+        let mut k = soun_trak();
+        assert!(patch_chunk_offsets(&mut k, 0).is_ok()); // v == 0
+
+        let mut k = soun_trak();
+        assert!(patch_chunk_offsets(&mut k, u32::MAX as i64).is_ok()); // v == u32::MAX
+
+        let mut k = soun_trak();
+        assert!(matches!(
+            patch_chunk_offsets(&mut k, u32::MAX as i64 + 1), // v == u32::MAX + 1
+            Err(FormatError::TooLarge)
+        ));
+
+        let mut k = soun_trak();
+        assert!(matches!(
+            patch_chunk_offsets(&mut k, -1), // v == -1
+            Err(FormatError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn patch_chunk_offsets_rejects_count_past_table() {
+        // stco declares 2 entries but only 1 entry's bytes are present (followed by an
+        // unrelated `free` box for padding). `pos + entry > start + len` must reject
+        // the 2nd entry. `+ -> -` shrinks the bound and reads into the `free` box
+        // instead of erroring (returns Ok).
+        let mut stco = vec![0u8; 4]; // version/flags
+        stco.extend_from_slice(&2u32.to_be_bytes()); // count = 2 (a lie)
+        stco.extend_from_slice(&0u32.to_be_bytes()); // only 1 entry present
+        let stbl = bx(
+            b"stbl",
+            &[bx(b"stco", &stco), bx(b"free", &[0u8; 8])].concat(),
+        );
+        let mut kept = bx(b"trak", &bx(b"mdia", &bx(b"minf", &stbl)));
+        assert!(matches!(
+            patch_chunk_offsets(&mut kept, 0),
+            Err(FormatError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn patch_chunk_offsets_co64_zero_offset_is_ok() {
+        // co64 path guard is `v < 0`. offset 0 + delta 0 => v == 0 must be accepted;
+        // `< -> ==`/`<= ` reject the boundary.
+        let mut co64 = vec![0u8; 4]; // version/flags
+        co64.extend_from_slice(&1u32.to_be_bytes()); // count 1
+        co64.extend_from_slice(&0u64.to_be_bytes()); // offset 0
+        let stbl = bx(b"stbl", &bx(b"co64", &co64));
+        let mut kept = bx(b"trak", &bx(b"mdia", &bx(b"minf", &stbl)));
+        assert!(patch_chunk_offsets(&mut kept, 0).is_ok());
+    }
 }
