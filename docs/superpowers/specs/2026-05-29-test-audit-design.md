@@ -19,11 +19,13 @@ feature), the mutagen interop suite, the beets-plugin pytest suite, and the
 cargo-fuzz targets — with `cargo-llvm-cov` coverage wired to Codecov in CI. The
 job is to find the gaps and weak spots, not to bootstrap testing from nothing.
 
-**Counting methodology.** Test counts vary by surface, so Phase A reports them
-per category rather than as one number: (a) `cargo test --workspace` default
-count; (b) `#[ignore]`d tests (FUSE e2e, interop emitter) run explicitly; (c)
-proptest/`fuzzing`-feature tests; (d) beets pytest count; (e) cargo-fuzz target
-count. Any single headline figure in the report names which categories it sums.
+**Counting methodology.** Phase A reports counts per category, never one number:
+(a) `cargo test --workspace`; (b) `#[ignore]`d and feature-gated Rust tests run
+explicitly (FUSE e2e, the `--features metrics` concurrency test, interop emitter,
+`--features fuzzing` proptests); (c) beets pytest — split out, since default
+`python -m pytest` excludes the `musefs_bin`/`e2e` markers, so its count is lower
+than the file count and the marked runs add to it; (d) cargo-fuzz targets. Any
+headline figure names which categories it sums.
 
 ## Scope decisions
 
@@ -135,17 +137,23 @@ With `cargo-mutants` installed (Phase 0), run it **scoped** to the risk-critical
 files (whole-workspace mutation is too slow). Surviving mutants — code mutated
 without any test failing — are the sharpest signal of weak or missing assertions.
 
-- Targets: `musefs-format` (synthesis, `ogg/`, format parsers) and `musefs-core`
+- Targets: `musefs-format` (synthesis, `ogg/`, format parsers); `musefs-core`
   (`reader.rs`, `tree.rs`, `scan.rs`, `facade.rs`, and `ogg_index.rs` — central to
   Tier-1 Ogg read correctness: lazy page indexing, sequence renumbering, CRC
-  patching, payload serving).
+  patching, payload serving); and `musefs-db` (`schema.rs`, triggers,
+  change-detection) — the foundation every tier builds on, where a silent schema
+  or `content_version`-trigger bug corrupts everything above it. The `musefs-db`
+  run uses the plain test command (no extra features).
 - **Concrete bounds** (mutation on format parsers can otherwise run for hours):
   scope each invocation with `--file` globs to the target list above (never the
   whole workspace); set `--timeout-multiplier 2.0` plus a `--minimum-test-timeout`
   floor; and cap wall-clock per crate at **~30 min** (`timeout 1800 cargo
   mutants ...`). If a crate hits the cap, record it as a **partial** run (mutants
   tested / total) rather than failing — partial mutation data is still useful and
-  the report says so.
+  the report says so. **`musefs-format` is the likeliest to hit the cap** (large
+  files — `mp4.rs` ~1,400 lines, `ogg/mod.rs` ~1,040 — plus the slow `--features
+  fuzzing` proptests in its test command); budget it first and expect a partial
+  run there before the others.
 - **Test command / features.** A default `cargo-mutants` run uses a plain
   `cargo test` and would miss `musefs-format`'s `--features fuzzing` proptests —
   the strongest checks on exactly the format code under audit — inflating the
@@ -154,6 +162,10 @@ without any test failing — are the sharpest signal of weak or missing assertio
   proptests participate in killing mutants. The report records the exact
   `cargo-mutants` invocation (features included) per crate.
 - Record surviving mutants with `file:line` and the mutation applied.
+- **Flakiness caveat.** A mutant "caught" by a flaky test is unreliable (it may
+  have failed for an unrelated reason). If Phase A flagged any flaky test in a
+  mutation-target crate, note it here and treat that crate's killed-mutant counts
+  as lower-confidence; re-run a suspect mutant before trusting a "caught" result.
 
 ### Phase C — Judgment review (edge cases + structural quality)
 
@@ -167,6 +179,21 @@ Phase B survivors. Look for:
 - Untested error paths.
 - Determinism and isolation issues (shared temp state, ordering dependence,
   reliance on wall-clock or filesystem timing).
+
+Two specific spots to inspect by name:
+
+- **`ogg_index.rs` has no dedicated test file** — it's exercised only transitively
+  (via `facade.rs` / the `ogg_read_through.rs` e2e and `read_at.rs`). Confirm
+  whether its CRC/renumber/index logic is meaningfully asserted anywhere directly;
+  if not, its Phase-B mutant results are hard to attribute and a dedicated unit
+  test is a likely P0/P1 backlog item.
+- **`proptest_read_fidelity.rs` is ~47 lines** — thin for the Tier-1 read-fidelity
+  property. Assess whether it actually spans segment variants, offsets, and
+  partial reads, or just a happy path, independent of what Phase B reports.
+
+Findings are recorded uniformly as **`file:line` — description — severity
+(P0/P1/P2)**, so Phase C output drops straight into the report's findings and
+backlog sections.
 
 ## Risk-weighted surface (where depth goes)
 
@@ -185,6 +212,10 @@ Phase B survivors. Look for:
   swap, per-handle I/O.
 - **Scan / revalidate:** upsert, prune of gone backing files, orphaned-art GC,
   preservation of external tag edits.
+- **DB schema & triggers (`musefs-db`):** the store is the cross-tool contract;
+  the `content_version`/`updated_at` triggers and change detection underpin
+  freshness for every tier above. A silent trigger or schema bug is high-blast-
+  radius, hence Tier-2 rather than survey-only.
 - **beets plugin (`contrib/beets/`):** the plugin writes the SQLite store that is
   the cross-tool contract, so its correctness matters. Audit the pytest suite for
   the path-matching gate, tag/art sync, file move/rename reconciliation, and the
