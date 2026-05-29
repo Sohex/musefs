@@ -25,7 +25,14 @@ else
   SCRATCH_PARENT="$ROOT/.mutants-tmp"; OWN_PARENT=1
 fi
 mkdir -p "$SCRATCH_PARENT"
-cleanup() { [ "$OWN_PARENT" = 1 ] && rm -rf "$SCRATCH_PARENT"; }
+CREATED_TMPS=()
+cleanup() {
+  # Remove every per-crate scratch child we created, even on abnormal exit and
+  # even when the caller owns SCRATCH_PARENT (OWN_PARENT=0).
+  [ "${#CREATED_TMPS[@]}" -gt 0 ] && rm -rf "${CREATED_TMPS[@]}"
+  # Remove the parent only if we created it.
+  [ "$OWN_PARENT" = 1 ] && rm -rf "$SCRATCH_PARENT"
+}
 trap cleanup EXIT
 
 OUT_ROOT="$ROOT/mutants-out"
@@ -42,7 +49,11 @@ run_crate() {
   local crate="$1"; shift
   local out="$OUT_ROOT/$crate"
   local tmp
-  tmp="$(mktemp -d "$SCRATCH_PARENT/${crate}.XXXXXX")"
+  tmp="$(mktemp -d "$SCRATCH_PARENT/${crate}.XXXXXX")" || {
+    echo "mutants: mktemp -d failed under $SCRATCH_PARENT" >&2
+    return 1
+  }
+  CREATED_TMPS+=("$tmp")
   echo "== mutants: $crate (scratch: $tmp) =="
   local args=(-p "$crate" --jobs 1 --output "$out")
   [ "${MUTANTS_LIST:-0}" = "1" ] && args+=(--list)
