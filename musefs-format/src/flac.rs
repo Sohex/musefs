@@ -331,4 +331,78 @@ mod tests {
         push_block_header(&mut last, BLOCK_VORBIS_COMMENT, 0, true);
         assert_eq!(last, vec![0x80 | BLOCK_VORBIS_COMMENT, 0x00, 0x00, 0x00]);
     }
+
+    /// One FLAC metadata block: 4-byte header (last-flag, type, 24-bit BE length)
+    /// + body, built independently of production framing so a mutation in
+    ///   `push_block_header` cannot mask a fixture. `len_override` lets a test claim a
+    ///   length different from `body.len()`.
+    fn raw_block(block_type: u8, body: &[u8], last: bool, len_override: Option<usize>) -> Vec<u8> {
+        let n = len_override.unwrap_or(body.len());
+        let mut v = vec![(if last { 0x80 } else { 0 }) | (block_type & 0x7F)];
+        v.push((n >> 16) as u8);
+        v.push((n >> 8) as u8);
+        v.push(n as u8);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// `fLaC` + the given blocks (no audio).
+    fn flac_with(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = b"fLaC".to_vec();
+        for b in blocks {
+            f.extend_from_slice(b);
+        }
+        f
+    }
+
+    #[test]
+    fn parse_blocks_rejects_short_and_wrong_marker() {
+        // :37 `< -> ==`: 3-byte input -> original short-circuits NotFlac; the mutant
+        // evaluates &data[0..4] on 3 bytes -> panic. Asserting Err(NotFlac) kills it.
+        assert_eq!(parse_blocks(b"fLa"), Err(FormatError::NotFlac));
+        // :37 `< -> <=`: a 4-byte fLaC-only file. Original proceeds then hits the
+        // loop guard -> Malformed; the `<=` mutant short-circuits to NotFlac.
+        assert_eq!(parse_blocks(b"fLaC"), Err(FormatError::Malformed));
+        assert_eq!(parse_blocks(b"XXXX____"), Err(FormatError::NotFlac));
+    }
+
+    #[test]
+    fn parse_blocks_guards_truncated_block_header() {
+        // 5 bytes: marker + 1 header byte. Original: pos+4=8 > 5 -> Malformed.
+        // :43 `+ -> -` (0 > 5 false) and `> -> ==` (8 == 5 false) both fall through
+        // and panic reading data[5..8].
+        assert_eq!(parse_blocks(b"fLaC\x80"), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn parse_blocks_accepts_header_flush_with_end() {
+        // Single last STREAMINFO, empty body, no audio: the final header occupies the
+        // last 4 bytes, so pos+4 == data.len() at the loop guard. Original (`>`)
+        // proceeds and returns audio_offset == len; the :43 `> -> >=` mutant rejects.
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, None)]);
+        let meta = parse_blocks(&file).unwrap();
+        assert_eq!(meta.audio_offset, 8);
+    }
+
+    #[test]
+    fn parse_blocks_decodes_24bit_length_high_byte() {
+        // STREAMINFO header claims length 0x010000 (high byte set) over an empty body.
+        // Original: len = 65536 -> body_end > data.len() -> Malformed.
+        // :49 `<<16 -> >>16`: (0x01 >> 16) = 0 -> len = 0 -> body fits -> Ok.
+        // (:50/:51 `| -> ^` are equivalent here: the shifted bytes are disjoint.)
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0000))]);
+        assert_eq!(parse_blocks(&file), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn parse_blocks_preserves_structural_blocks() {
+        // Positive decode: a normal STREAMINFO (34-byte body) + audio boundary.
+        let si = vec![0xAA; 34];
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &si, true, None)]);
+        let meta = parse_blocks(&file).unwrap();
+        assert_eq!(meta.audio_offset, 4 + 4 + 34);
+        assert_eq!(meta.preserved.len(), 1);
+        assert_eq!(meta.preserved[0].block_type, BLOCK_STREAMINFO);
+        assert_eq!(meta.preserved[0].body, si);
+    }
 }
