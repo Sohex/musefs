@@ -16,6 +16,10 @@
 #        MUTANTS_CANARY set to 1 to cargo-CHECK mutants without running tests
 #                       (--check): a fast CI canary that still exercises the real
 #                       source-copy + scratch + output pipeline.
+#        MUTANTS_SHARD  "INDEX/COUNT" (0-based, e.g. 0/4) to test only one shard
+#                       of the generated mutants. Applies to EVERY crate in this
+#                       invocation, so pair it with a single crate arg. CI uses it
+#                       to split the long musefs-format leg across matrix jobs.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -72,6 +76,7 @@ run_crate() {
   local args=(-p "$crate" --jobs 1 --output "$out")
   [ "${MUTANTS_LIST:-0}" = "1" ] && args+=(--list)
   [ "${MUTANTS_CANARY:-0}" = "1" ] && args+=(--check)
+  [ -n "${MUTANTS_SHARD:-}" ] && args+=(--shard "$MUTANTS_SHARD")
   args+=("$@")
   TMPDIR="$tmp" cargo mutants "${args[@]}"
   local rc=$?
