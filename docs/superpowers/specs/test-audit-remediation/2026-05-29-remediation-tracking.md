@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 in brainstorm/spec
+**Status:** Phase 1 implemented (inventory fill pending post-merge CI run); phases 2–4 pending
 
 ## Guiding principle: verify, don't trust
 
@@ -65,7 +65,8 @@ close the beets FK correctness gap (A2), and produce the data phases 2–4 consu
     7.3 GB free, `target/` ~5.6 GB).
   - `.github/workflows/mutants.yml` — PR job: `cargo mutants --in-diff` on
     changed Rust files. Scheduled (cron) + `workflow_dispatch` job: full per-crate
-    matrix, `llvm-tools-preview`, no time cap, uploads survivor reports.
+    matrix on **stable** (cargo-mutants needs no nightly/llvm-tools), no time cap,
+    uploads survivor reports.
 - **C. Verified survivor inventory** —
   `docs/superpowers/specs/test-audit-remediation/2026-05-29-mutation-inventory.md`,
   seeded from a manually dispatched CI run (GitHub runner has disk headroom;

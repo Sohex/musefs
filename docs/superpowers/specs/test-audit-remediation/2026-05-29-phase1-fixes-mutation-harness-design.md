@@ -149,9 +149,11 @@ doc's Scope section). Responsibilities:
     pass rather than an error.
 - **Scheduled + dispatchable job** (`schedule` cron, e.g. weekly like fuzz, plus
   `workflow_dispatch`): per-crate matrix (`musefs-db`, `musefs-core`,
-  `musefs-format`), install `cargo-mutants` and `llvm-tools-preview`, run via
-  `scripts/mutants.sh`, upload per-crate survivor reports as artifacts. GitHub
-  runners have the disk headroom local does not.
+  `musefs-format`) on the **stable** toolchain (cargo-mutants needs neither
+  nightly nor `llvm-tools-preview` — those are coverage/fuzz tooling; stable also
+  matches the in-diff job and avoids unrelated nightly breakage), install
+  `cargo-mutants`, run via `scripts/mutants.sh`, upload per-crate survivor reports
+  as artifacts. GitHub runners have the disk headroom local does not.
 
 `workflow_dispatch` is what we trigger to seed the initial inventory (Component C)
 without touching local disk.
