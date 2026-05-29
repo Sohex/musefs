@@ -55,6 +55,27 @@ jobs:
           fi
           cargo mutants --in-diff mutants.diff -j1
 
+  canary:
+    # Per-PR: exercise the REAL scripts/mutants.sh pipeline (out-of-repo scratch,
+    # source-tree copy, --output dir, report) cheaply via --check on the smallest
+    # crate. Catches the copy-recursion / output-dir class of bugs the --list
+    # smoke test can't (list mode neither copies the tree nor creates output).
+    # cargo-check only, no test runs, so it stays fast.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants
+      - name: Canary (check-only) run of the harness
+        run: MUTANTS_CANARY=1 scripts/mutants.sh musefs-db
+
   full:
     # Scheduled or manually dispatched: full per-crate campaign.
     if: github.event_name != 'pull_request'

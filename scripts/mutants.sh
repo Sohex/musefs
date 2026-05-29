@@ -12,7 +12,10 @@
 #                     gets copied into itself recursively ("File name too long").
 #                     On a host whose /tmp is too small (e.g. a tmpfs), point this
 #                     at a roomy directory outside the repo.
-#        MUTANTS_LIST set to 1 to only enumerate mutants (no build/run)
+#        MUTANTS_LIST   set to 1 to only enumerate mutants (no build/run)
+#        MUTANTS_CANARY set to 1 to cargo-CHECK mutants without running tests
+#                       (--check): a fast CI canary that still exercises the real
+#                       source-copy + scratch + output pipeline.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -68,6 +71,7 @@ run_crate() {
   echo "== mutants: $crate (scratch: $tmp) =="
   local args=(-p "$crate" --jobs 1 --output "$out")
   [ "${MUTANTS_LIST:-0}" = "1" ] && args+=(--list)
+  [ "${MUTANTS_CANARY:-0}" = "1" ] && args+=(--check)
   args+=("$@")
   TMPDIR="$tmp" cargo mutants "${args[@]}"
   local rc=$?
