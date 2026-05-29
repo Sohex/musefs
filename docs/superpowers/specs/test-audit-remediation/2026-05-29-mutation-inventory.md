@@ -35,12 +35,19 @@ pattern, below) and are not survivors.
 ## Tool limitations to revisit (phase 4)
 
 - `musefs-db` mutation is **not** vacuous (40/62 caught), but 20 mutants are
-  unviable because they replace a body with `Ok(Default::default())` and `Db` has
-  no `Default` — concentrated in `tags.rs` (8), `tracks.rs` (5), `lib.rs` (4),
-  `art.rs` (3). Implementing `Default for Db` (phase 4) would make those viable
-  and likely surface more survivors.
+  unviable because they replace a body with `Ok(Default::default())`. Only
+  `lib.rs`'s `Db`-returning fns need `Db: Default`; the `tags`/`tracks`/`art`
+  unviables need `Default` on the model structs (`Track`/`Art`/`ArtMeta`/`Tag`/
+  `TrackArt`) and `Format`. These are now unblocked behind the `mutants` feature
+  (PR 1), with the survivor sweep in PR 2 — concentrated in `tags.rs` (8),
+  `tracks.rs` (5), `lib.rs` (4), `art.rs` (3).
 - A few `musefs-format` / `musefs-core` mutants share the same
   `Ok(Default::default())` unviable pattern.
+
+- **Framing corrections for #11 / #12:** finding #11's "concurrent-deletion race"
+  does not exist (`gc_orphan_art` is a single `DELETE … WHERE id NOT IN`);
+  finding #12's "GROUP BY assembly" is actually Rust-side `HashMap` grouping
+  (the SQL has no `GROUP BY`). Tests target the real gaps accordingly.
 
 ## Phase routing
 
@@ -63,8 +70,8 @@ the rightmost column of each survivor table.
 
 | File:line | Mutation | Kind | Phase |
 |-----------|----------|------|------:|
-| `lib.rs:55` | replace Db::user_version -> Result<i64> with Ok(1) | missed | 4 |
-| `schema.rs:93` | replace < with <= in migrate | missed | 4 |
+| `lib.rs:55` | replace Db::user_version -> Result<i64> with Ok(1) | missed → **killed** (phase 4b) | 4 |
+| `schema.rs:93` | replace < with <= in migrate | missed → **equivalent** | 4 |
 
 ## musefs-core
 

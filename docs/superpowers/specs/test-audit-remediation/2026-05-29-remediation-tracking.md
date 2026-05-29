@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; Phase 3d (WAV) complete; phase 4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; Phase 3d (WAV) complete; Phase 4b PR 1 landed (mutants feature + user_version kill + #10/#11/#12 coverage + framing corrections); Phase 4b PR 2 pending (newly-viable survivor sweep, gated on dispatched campaign); Phase 4a pending
 
 ## Guiding principle: verify, don't trust
 
@@ -139,17 +139,24 @@ Findings #5, #16.
   partial windows, header seam, art window) to MP3; the WAV/MP4 dimensions land in
   their own phases.
 
-### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: pending
+### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: in progress
 
 Findings #9, #10, #11, #12, #15.
 
+- **4b PR 1 landed** — `mutants` feature gating model `Default` derives + `Default
+  for Db` (in-memory, unmigrated); `user_version` Ok(1) mutant killed; coverage
+  tests for #10 (upsert conflict columns), #11 (shared-art GC + set_track_art
+  replace), #12 (tags_grouped empty + ordering); framing corrections for #11
+  (no concurrent-deletion race) and #12 (Rust-side HashMap, not SQL GROUP BY);
+  `schema.rs` `< → <=` confirmed equivalent; campaign script + CI leg wired with
+  `--features mutants`. Inventory annotations updated.
+- **4b PR 2 pending** — newly-viable survivor sweep (20 unblocked mutants),
+  gated on the dispatched campaign artifact.
 - scan probe fallbacks (#9) + scan mutants
 - reader.rs header-cache survivors
 - facade glue survivors
 - tree.rs disambiguate timeouts (suspected infinite-loop path)
-- db tracks/art/tags SQL-branch coverage (#10, #11, #12)
 - document the ESTALE gap (#15)
-- decide on `Default for Db` to make db mutation testing viable
 
 ## Finding → phase map
 
