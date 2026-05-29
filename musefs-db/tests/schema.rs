@@ -19,3 +19,12 @@ fn migration_is_idempotent_across_reopen() {
     let db2 = Db::open(&path).unwrap();
     assert_eq!(db2.user_version().unwrap(), 1);
 }
+
+#[cfg(feature = "mutants")]
+#[test]
+fn default_db_is_unmigrated_version_zero() {
+    // Kills `Db::user_version -> Ok(1)`: Default opens an UNMIGRATED in-memory
+    // connection, so user_version is 0, distinct from the always-migrated 1.
+    let db = Db::default();
+    assert_eq!(db.user_version().unwrap(), 0);
+}
