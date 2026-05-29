@@ -13,23 +13,27 @@ handling**, and produce a single report whose closing section is a prioritized
 remediation backlog ready to execute later.
 
 This is an audit of an *already-substantial* suite: ~259 Rust tests run by
-`cargo test --workspace`, plus separate surfaces that the default run excludes —
-`#[ignore]`d FUSE e2e tests, proptest invariants (some behind the `fuzzing`
-feature), the mutagen interop suite, the beets-plugin pytest suite, and the
-cargo-fuzz targets — with `cargo-llvm-cov` coverage wired to Codecov in CI. The
-job is to find the gaps and weak spots, not to bootstrap testing from nothing.
+`cargo test --workspace` — which **already includes the `fuzzing`-gated format
+proptests** via workspace feature unification (`musefs-core`'s dev-dependency
+enables `musefs-format/fuzzing`, `musefs-core/Cargo.toml:26`) — plus separate
+surfaces the default run excludes: `#[ignore]`d FUSE e2e tests, the mutagen
+interop suite, the beets-plugin pytest suite, and the cargo-fuzz targets, with
+`cargo-llvm-cov` coverage wired to Codecov in CI. The job is to find the gaps and
+weak spots, not to bootstrap testing from nothing.
 
 **Counting methodology.** Phase A reports counts per category, never one number:
-(a) `cargo test --workspace`; (b) `#[ignore]`d and feature-gated Rust tests run
-explicitly (FUSE e2e, the `--features metrics` concurrency test, interop emitter,
-`--features fuzzing` proptests); (c) beets pytest — split out, since default
+(a) `cargo test --workspace` (this already counts the `fuzzing` proptests — they
+are *not* a separate additive category); (b) `#[ignore]`d and metrics-gated Rust
+tests run explicitly (FUSE e2e, the `--features metrics` concurrency + core
+metrics tests, interop emitter); (c) beets pytest — split out, since default
 `python -m pytest` excludes the `musefs_bin`/`e2e` markers, so its count is lower
 than the file count and the marked runs add to it; (d) cargo-fuzz targets.
 **Count tests unique to each surface, never the raw invocation totals** — the
-invocations overlap (`-p musefs-format --features fuzzing` reruns the ordinary
-format tests; the `--features metrics` FUSE run reruns the ignored FUSE tests
-alongside `concurrency.rs`), so summing raw totals double-counts. Any headline
-figure names which categories it sums and uses unique counts.
+explicit runs overlap with the workspace run (running `-p musefs-format --features
+fuzzing` or `-p musefs-core --test proptest_read_fidelity` reruns tests already in
+(a); the `--features metrics` runs rerun other tests alongside the gated ones), so
+summing raw totals double-counts. Any headline figure names which categories it
+sums and uses unique counts.
 
 ## Scope decisions
 
@@ -89,8 +93,12 @@ Run the full test surface and record current state:
   metrics` run enables core's feature as a dependency but does **not** run core's
   metrics integration tests. Without this the Tier-2 concurrency/perf surface is
   missing from the baseline.
-- `cargo test -p musefs-format --features fuzzing` and
-  `cargo test -p musefs-core --test proptest_read_fidelity` (proptests).
+- The `fuzzing`-gated format proptests and `proptest_read_fidelity` **already run
+  under `cargo test --workspace` above** (feature unification). Running
+  `cargo test -p musefs-format --features fuzzing` /
+  `cargo test -p musefs-core --test proptest_read_fidelity` in isolation is
+  optional (useful only to time or debug them alone) and must **not** be added to
+  the workspace count.
 - mutagen interop suite, two steps sharing one temp dir `$D`:
   `MUSEFS_INTEROP_DIR=$D cargo test -p musefs-core --test interop_emit -- --ignored
   emit_interop_fixtures`, then `MUSEFS_INTEROP_DIR=$D python -m pytest
@@ -133,19 +141,29 @@ Run the full test surface and record current state:
   blocked (Phase 0), record it as not-measured and move on.
 - `cargo-llvm-cov` over the workspace excluding `musefs-fuse`, matching CI.
   Capture per-crate and per-module line + region coverage. **This is "default CI
-  Rust coverage":** it instruments the plain `cargo test` run, so it does *not*
-  reflect `#[ignore]`d e2e tests or the `--features fuzzing` format proptests.
-  Coverage numbers in the report are labeled as such. (Optional, time permitting:
-  a second `--features fuzzing` coverage profile for `musefs-format` to show what
-  the proptests add; only if it's cheap — it is not required for the scorecard.)
+  Rust coverage":** it instruments the `cargo test --workspace` run, so it
+  **includes** the `fuzzing`-gated format proptests (feature unification) but does
+  *not* reflect `#[ignore]`d e2e tests (they don't run by default) or the
+  `musefs-fuse` crate (excluded). Coverage numbers in the report are labeled with
+  exactly this basis.
 
 **Flakiness detection.** The gate and Phase B's caveat both depend on knowing
-which tests are flaky, so Phase A must actually look: run the **Tier-1** set
-(byte-identical invariant + resolution/freshness, including the relevant
-`#[ignore]`d e2e tests) **3× total** and the Tier-1 e2e mounts at varying
-`--test-threads` (e.g. 1 and the default) to surface ordering/timing
-nondeterminism. Any test not stable across all runs is recorded as **flaky**
-(`file:line`), feeding both the gate and the Phase B confidence note.
+which tests are flaky, so Phase A must actually look. **The implementation plan
+must enumerate the exact Tier-1 test set (file + test names) as its first step**,
+then run it **3× total** (e2e mounts also at `--test-threads=1` and the default)
+to surface ordering/timing nondeterminism. Concrete starting set to enumerate from
+(not exhaustive — the plan finalizes it):
+  - Byte-identical / read path: `musefs-core/tests/read_at.rs`,
+    `tests/reader.rs`, `tests/proptest_read_fidelity.rs`;
+    `musefs-format/tests/layout.rs`, `proptest_*.rs`, `synthesize_*.rs`,
+    `roundtrip.rs`; the `ogg_index.rs` inline test.
+  - Resolution / freshness: the `facade.rs` / `tests/facade.rs` tests for
+    `poll_refresh`, `content_version`, `BackingChanged`; `tests/tree.rs` for inode
+    stability.
+  - Tier-1 e2e (`--ignored`): `musefs-fuse/tests/mount.rs`,
+    `ogg_read_through.rs`, `keep_cache.rs`, `playback_pcm.rs`.
+Any test not stable across all runs is recorded as **flaky** (`file:line`),
+feeding both the gate and the Phase B confidence note.
 
 **Red-test gate.** If any **Tier-1** test fails or is flaky in this phase,
 **halt and report before Phase B/C.** Mutation results are meaningless against a
@@ -292,10 +310,11 @@ coverage exists and note gaps; go deep only if something looks alarming.
 For each area the report scores three dimensions explicitly:
 
 - **Coverage** — uncovered lines/regions from default CI Rust coverage
-  (`cargo-llvm-cov`, plain `cargo test`; does not include `#[ignore]`d e2e or
-  `--features fuzzing` proptests — labeled as such, see Phase A). For FUSE-only
-  areas, scored by e2e evidence instead (see FUSE coverage strategy); for the
-  beets plugin, by `pytest-cov` over `beetsplug/`. The report states the basis.
+  (`cargo-llvm-cov` over `cargo test --workspace`; **includes** the `fuzzing`
+  proptests via feature unification, **excludes** `#[ignore]`d e2e and the
+  `musefs-fuse` crate — see Phase A). For FUSE-only areas, scored by e2e evidence
+  instead (see FUSE coverage strategy); for the beets plugin, by `pytest-cov` over
+  `beetsplug/`. The report states the basis.
 - **Quality** — surviving mutants from Phase B plus assertion-strength notes.
 - **Edge cases** — a checklist of boundary/adversarial conditions, each marked
   covered / partial / missing. Seed checklist (extend per area): empty /
@@ -319,6 +338,16 @@ the `docs/audits/` directory, which does not yet exist), structured as:
 4. **Prioritized remediation backlog (P0/P1/P2)** — each item names the target
    test file and exactly what to add or fix. This section *is* the remediation
    plan.
+
+**Alternate deliverable if the red-test gate trips.** When a Tier-1 test fails or
+is flaky in Phase A, Phases B/C don't run, so the full mutation-backed scorecard
+can't exist. The report is then written as a **"red-test halt report"** at the
+same path: executive summary + the Phase A results obtained so far (coverage
+table, fuzz/beets/interop status) + the failing/flaky tests with `file:line` and
+repro + a **narrowed P0 backlog** whose first items are "make Tier-1 green/stable"
+(Phases B/C deferred until then). The scorecard's Quality column reads "blocked —
+suite not green"; the report says explicitly that mutation/judgment depth was not
+reached. This satisfies the deliverable contract without faking a scorecard.
 
 ## Sequencing note
 
