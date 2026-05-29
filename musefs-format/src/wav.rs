@@ -198,6 +198,9 @@ pub fn synthesize_layout(
     }
 
     // Embedded `id3 ` chunk: 8-byte chunk header + the ID3v2 tag segments, padded.
+    // `build_id3v2_segments` already skips degenerate zero-byte art (finding #16) —
+    // an empty `ArtImage { len: 0 }` would fail `RegionLayout::validate` and brick
+    // the track — so WAV inherits that handling by delegating to it.
     let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, arts)?;
     let mut id3_head = Vec::with_capacity(8);
     id3_head.extend_from_slice(b"id3 ");
@@ -322,7 +325,7 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_pictures, read_tags};
+    use super::*;
 
     /// Regression for the fuzz-discovered WAV OOM vector
     /// (fuzz/artifacts/wav/oom-4a21767820d5f05328f01d975fb6d3314f3fb902):
@@ -359,4 +362,277 @@ mod tests {
             "read_pictures must not OOM on WAV crash artifact"
         );
     }
+
+    #[test]
+    fn riff_wave_start_accepts_exactly_twelve_bytes() {
+        // :24 `< → <=`: a valid 12-byte RIFF/WAVE buffer must be accepted.
+        // The `<=` mutant computes `12 <= 12` (true) and wrongly rejects it.
+        let buf = b"RIFF\0\0\0\0WAVE".to_vec();
+        assert_eq!(buf.len(), 12);
+        assert_eq!(riff_wave_start(&buf), Ok(12));
+    }
+
+    #[test]
+    fn riff_wave_start_rejects_eleven_byte_riff_without_panic() {
+        // :24 `< → ==`: an 11-byte buffer that starts with "RIFF". The original
+        // short-circuits on `len < 12` → NotWav. The `==` mutant computes
+        // `11 == 12` (false), falls through, and indexes `buf[8..12]` on an 11-byte
+        // slice → panic. Asserting the clean Err kills it (panic ≠ Err).
+        let buf = b"RIFF\0\0\0\0WAV".to_vec();
+        assert_eq!(buf.len(), 11);
+        assert_eq!(riff_wave_start(&buf), Err(FormatError::NotWav));
+    }
+
+    /// Build a minimal `RIFF/WAVE` buffer from `(fourcc, payload)` chunks in order,
+    /// padding odd payloads to a word boundary (the on-disk RIFF layout).
+    fn wav(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, payload) in chunks {
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                body.push(0x00);
+            }
+        }
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn walk_chunks_advances_past_each_payload() {
+        // :47 the `8 + size (+ size&1)` advance. An odd first payload forces the
+        // word-align term to matter; a wrong advance (either `+ → -`) lands off the
+        // next header, so the second chunk is lost or misread.
+        let buf = wav(&[(b"AAAA", vec![0x11; 3]), (b"data", vec![0xBB; 8])]);
+        let ids: Vec<[u8; 4]> = walk_chunks(&buf).iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![*b"AAAA", *b"data"]);
+    }
+
+    /// A 16-byte PCM `fmt ` payload: mono, 44.1 kHz, 16-bit.
+    fn fmt_pcm() -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&44_100u32.to_le_bytes());
+        f.extend_from_slice(&88_200u32.to_le_bytes());
+        f.extend_from_slice(&2u16.to_le_bytes());
+        f.extend_from_slice(&16u16.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn locate_requires_fmt_chunk() {
+        // :67 `== → !=`: a data-only WAV (no `fmt `). Original: `any(id == "fmt ")`
+        // is false → NotWav. The `!=` mutant is true (the data chunk is != "fmt ")
+        // → has_fmt, so it returns Ok/Malformed instead of NotWav.
+        let buf = wav(&[(b"data", vec![0x11; 8])]);
+        assert_eq!(locate_audio(&buf), Err(FormatError::NotWav));
+    }
+
+    #[test]
+    fn locate_accepts_data_with_trailing_chunk() {
+        // :71 `> → <`: a valid WAV with a chunk AFTER `data`, so off+len < buf.len.
+        // Original `off+len > buf.len` is false → Ok. The `<` mutant is true →
+        // Malformed.
+        let buf = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"data", vec![0x11; 8]),
+            (b"junk", vec![0x00; 4]),
+        ]);
+        let bounds = locate_audio(&buf).unwrap();
+        assert_eq!(bounds.audio_length, 8);
+    }
+
+    #[test]
+    fn info_fourcc_emits_each_mapped_key() {
+        // :119-124 arm deletions: each key must map to its INFO FourCC. A deleted
+        // arm makes the key unmapped → no payload (single-tag input → None).
+        let cases: [(&str, &[u8; 4]); 6] = [
+            ("artist", b"IART"),
+            ("album", b"IPRD"),
+            ("date", b"ICRD"),
+            ("genre", b"IGNR"),
+            ("comment", b"ICMT"),
+            ("tracknumber", b"ITRK"),
+        ];
+        for (key, cc) in cases {
+            let payload = build_info_payload(&[TagInput::new(key, "X")])
+                .unwrap_or_else(|| panic!("INFO payload for {key}"));
+            assert!(
+                payload.windows(4).any(|w| w == &cc[..]),
+                "key {key} must emit FourCC {:?}",
+                std::str::from_utf8(cc).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn build_info_payload_word_aligns_values() {
+        // :155 `v.len() % 2 == 1`. v = value bytes + NUL.
+        // Value "a"  -> v.len()=2 (even, NO pad). Kills `% → /` (2/2==1 pads) and
+        //               `== → !=` (2%2=0 != 1 pads).
+        // Value "ab" -> v.len()=3 (odd, padded). Kills `% → +` (3+2 != 1, no pad).
+        let even = build_info_payload(&[TagInput::new("title", "a")]).unwrap();
+        // "INFO"(4) + "INAM"(4) + len(4) + "a\0"(2) = 14, no pad.
+        assert_eq!(even.len(), 14);
+
+        let odd = build_info_payload(&[TagInput::new("title", "ab")]).unwrap();
+        // "INFO"(4) + "INAM"(4) + len(4) + "ab\0"(3) + pad(1) = 16.
+        assert_eq!(odd.len(), 16);
+    }
+
+    #[test]
+    fn push_inline_chunk_word_aligns_payload() {
+        // :168 `payload.len() % 2 == 1`.
+        // Even payload (len 2): NO pad. Kills `% → /` (2/2==1 pads).
+        let mut segs = Vec::new();
+        push_inline_chunk(&mut segs, b"test", &[0xAA, 0xBB]);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].len(), 10); // "test"(4) + len(4) + payload(2)
+
+        // Odd payload (len 3): padded. Kills `% → +` (3+2 != 1, no pad).
+        let mut segs2 = Vec::new();
+        push_inline_chunk(&mut segs2, b"test", &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(segs2[0].len(), 12); // 4 + 4 + 3 + pad(1)
+    }
+
+    /// An `INFO` payload: `"INFO"` FourCC + NUL-terminated, word-aligned subchunks.
+    fn info_payload(pairs: &[(&[u8; 4], &str)]) -> Vec<u8> {
+        let mut p = b"INFO".to_vec();
+        for (cc, val) in pairs {
+            let mut v = val.as_bytes().to_vec();
+            v.push(0x00);
+            p.extend_from_slice(*cc);
+            p.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            p.extend_from_slice(&v);
+            if v.len() % 2 == 1 {
+                p.push(0x00);
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn info_to_key_decodes_each_mapped_fourcc() {
+        // :245-249 arm deletions: each INFO FourCC must decode to its tag key.
+        let cases: [(&[u8; 4], &str, &str); 4] = [
+            (b"IPRD", "album", "Anthology"),
+            (b"ICRD", "date", "1999"),
+            (b"ICMT", "comment", "Nice"),
+            (b"ITRK", "tracknumber", "3"),
+        ];
+        for (cc, key, val) in cases {
+            let buf = wav(&[
+                (b"fmt ", fmt_pcm()),
+                (b"LIST", info_payload(&[(cc, val)])),
+                (b"data", vec![0x00; 4]),
+            ]);
+            let tags = read_tags(&buf);
+            assert!(
+                tags.contains(&(key.to_string(), val.to_string())),
+                "FourCC {:?} must decode to {key}",
+                std::str::from_utf8(cc).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn read_tags_rejects_short_list_without_panic() {
+        // :300 `&& → ||`: a LIST chunk with a <4-byte payload. Original
+        // short-circuits (`len >= 4` false → no INFO, empty). The `||` mutant
+        // evaluates `&slice[0..4]` on the 2-byte slice → panic. Asserting the clean
+        // empty result kills it (panic ≠ empty).
+        let buf = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", vec![0x49, 0x4E]), // "IN" — 2 bytes, < 4
+            (b"data", vec![0x00; 4]),
+        ]);
+        assert!(read_tags(&buf).is_empty());
+    }
+
+    /// Byte offset, in the assembled stream, of the first `Inline` segment whose
+    /// first four bytes are `fourcc`. Used to assert RIFF word-alignment.
+    fn inline_offset_of(layout: &RegionLayout, fourcc: &[u8; 4]) -> u64 {
+        let mut off = 0u64;
+        for s in &layout.segments {
+            if let Segment::Inline(b) = s {
+                if b.len() >= 4 && &b[0..4] == fourcc {
+                    return off;
+                }
+            }
+            off += s.len();
+        }
+        panic!("no inline chunk starting with {fourcc:?}");
+    }
+
+    #[test]
+    fn synthesize_word_aligns_embedded_id3_chunk() {
+        // :207 `tag_len % 2 == 1` — the pad after the `id3 ` chunk. When tag_len is
+        // odd, the original pads so the following `data` chunk starts on an even
+        // byte (RIFF word-alignment). Both mutants (`/`, `+`) drop that pad for odd
+        // tag_len, landing `data` on an odd offset.
+        //
+        // Find tags whose ID3v2 tag_len is odd (parity depends on id3 framing, so
+        // discover it rather than hard-code). "albumartist" maps to id3 only (no
+        // INFO/LIST chunk), keeping the layout simple.
+        let mut tags = Vec::new();
+        let mut tag_len = 0u64;
+        for n in 1..64 {
+            let cand = vec![TagInput::new("albumartist", &"x".repeat(n))];
+            let (_, tl) = crate::mp3::build_id3v2_segments(&cand, &[]).unwrap();
+            if tl % 2 == 1 {
+                tags = cand;
+                tag_len = tl;
+                break;
+            }
+        }
+        assert_eq!(tag_len % 2, 1, "expected to find an odd-length id3 tag");
+
+        let scan = WavScan {
+            fmt: fmt_pcm(),
+            fact: None,
+        };
+        let layout = synthesize_layout(&scan, 0, 8, &tags, &[]).unwrap();
+        assert_eq!(
+            inline_offset_of(&layout, b"data") % 2,
+            0,
+            "the data chunk must be word-aligned"
+        );
+    }
+
+    #[test]
+    fn synthesize_rejects_riff_size_overflow() {
+        // :227 `> → ==`. `BackingAudio` is virtual (no real allocation), so we can
+        // pass `audio_length == u32::MAX`: it PASSES the :186 guard (`> u32::MAX` is
+        // false) but makes `riff_size > u32::MAX`. Original `>` → TooLarge; the `==`
+        // mutant (`riff_size == u32::MAX`) is false (riff_size is strictly greater),
+        // so it wrongly proceeds and returns Ok with a truncated size.
+        //
+        // NOTE — this must use exactly u32::MAX, not the existing
+        // `rejects_audio_over_32bit` test's `u32::MAX + 1`: that larger value is
+        // caught by the :186 guard first and never reaches :227.
+        let scan = WavScan {
+            fmt: fmt_pcm(),
+            fact: None,
+        };
+        let res = synthesize_layout(&scan, 0, u32::MAX as u64, &[], &[]);
+        assert_eq!(res, Err(FormatError::TooLarge));
+    }
+
+    // Documented EQUIVALENT mutants in this file (no test targets them; each was
+    // confirmed by hand-apply — the relevant test stays green under the mutation):
+    //  * walk_chunks:49  guard `next <= buf.len()` → `true`. When `next > buf.len()`
+    //    the mutant sets `pos = next`, but the `while pos + 8 <= buf.len()` test is
+    //    then immediately false, so the output Vec is identical to the original's
+    //    `break` (the header was pushed before the advance).
+    //  * synthesize_layout:186  `audio_length > u32::MAX` (both `==` and `>=`).
+    //    `body_len >= audio_length`, so whenever this would fire, `riff_size`
+    //    overflows and the :227 guard returns the identical TooLarge.
+    //  * synthesize_layout:227  `> → >=` only. Every synthesized chunk is
+    //    word-aligned, so `riff_size` is always even; `riff_size == u32::MAX` (odd)
+    //    is unreachable, the only point where `>` and `>=` differ.
 }
