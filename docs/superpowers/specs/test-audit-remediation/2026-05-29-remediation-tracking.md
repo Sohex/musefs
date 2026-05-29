@@ -116,9 +116,11 @@ Findings #5, #16.
   `synchsafe_decode` and v2.2 24-bit decode (note: disjoint `| → &` are killed,
   not equivalent). Production change: finding #16 zero-byte-art skip applied to
   `mp3.rs::build_id3v2_segments` (mirrors the FLAC fix; also covers the WAV `id3 `
-  chunk, which shares this builder). #16 still open for mp4/ogg; the non-FLAC #5
-  read-fidelity proptest dimension remains deferred (no `write_mp3` core fixture
-  yet).
+  chunk, which shares this builder). #16 still open for mp4/ogg. Finding #5: the
+  MP3 read-fidelity dimension is now done — added `write_mp3` to the core test
+  harness and ported the four `proptest_read_fidelity` invariants (whole-audio,
+  partial windows, header seam, art window) to MP3; the WAV/MP4 dimensions land in
+  their own phases.
 
 ### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: pending
 
