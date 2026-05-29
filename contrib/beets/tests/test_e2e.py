@@ -32,6 +32,58 @@ _RELEASE = REPO_ROOT / "target" / "release" / "musefs"
 MUSEFS = str(_DEBUG if _DEBUG.exists() else _RELEASE)
 BEET = os.path.join(os.path.dirname(sys.executable), "beet")
 
+PLAYBACK_FORMATS = [
+    {
+        "filename": "a.flac",
+        "freq": 330,
+        "title": "PCM FLAC",
+        "query": "title:PCM FLAC",
+        "served_ext": "flac",
+    },
+    {
+        "filename": "b.mp3",
+        "freq": 440,
+        "title": "PCM MP3",
+        "query": "title:PCM MP3",
+        "served_ext": "mp3",
+    },
+    {
+        "filename": "c.m4a",
+        "freq": 550,
+        "title": "PCM M4A",
+        "query": "title:PCM M4A",
+        "served_ext": "m4a",
+    },
+    {
+        "filename": "d.opus",
+        "freq": 660,
+        "title": "PCM Opus",
+        "query": "title:PCM Opus",
+        "served_ext": "opus",
+    },
+    {
+        "filename": "e.ogg",
+        "freq": 770,
+        "title": "PCM Vorbis",
+        "query": "title:PCM Vorbis",
+        "served_ext": "vorbis",
+    },
+    {
+        "filename": "f.oga",
+        "freq": 880,
+        "title": "PCM OggFLAC",
+        "query": "title:PCM OggFLAC",
+        "served_ext": "oggflac",
+    },
+    {
+        "filename": "g.wav",
+        "freq": 990,
+        "title": "PCM WAV",
+        "query": "title:PCM WAV",
+        "served_ext": "wav",
+    },
+]
+
 
 @pytest.fixture(autouse=True)
 def _require_tools():
@@ -60,10 +112,21 @@ def _ffmpeg_gen(path, freq, **tags):
         "-i",
         f"sine=frequency={freq}:duration=1",
     ]
-    if str(path).endswith(".mp3"):
+    suffix = str(path).lower()
+    if suffix.endswith(".flac"):
+        cmd += ["-c:a", "flac"]
+    elif suffix.endswith(".mp3"):
         cmd += ["-c:a", "libmp3lame", "-q:a", "5"]
-    elif str(path).endswith(".m4a"):
+    elif suffix.endswith(".m4a"):
         cmd += ["-c:a", "aac", "-b:a", "64k"]
+    elif suffix.endswith(".opus"):
+        cmd += ["-c:a", "libopus"]
+    elif suffix.endswith(".ogg"):
+        cmd += ["-c:a", "libvorbis"]
+    elif suffix.endswith(".oga"):
+        cmd += ["-c:a", "flac", "-f", "ogg"]
+    elif suffix.endswith(".wav"):
+        cmd += ["-c:a", "pcm_s16le"]
     for key, value in tags.items():
         cmd += ["-metadata", f"{key}={value}"]
     cmd.append(str(path))
@@ -129,6 +192,34 @@ def _audio_md5(path):
         capture_output=True,
     ).stdout.decode()
     return out.strip()
+
+
+def _audio_sha256(path):
+    """SHA-256 of canonical decoded PCM used by the all-format playback E2E."""
+    out = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:a:0",
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    return hashlib.sha256(out).hexdigest()
 
 
 def _make_cover(path, color):
@@ -302,6 +393,37 @@ def _imported_library(tmp_path, *, embed_cover=None, external_cover=None):
     return cfg, env, db, mnt, library
 
 
+def _imported_playback_library(tmp_path):
+    """Generate all supported playback formats and import them into beets."""
+    src = tmp_path / "src"
+    library = tmp_path / "library"
+    mnt = tmp_path / "mnt"
+    for d in (src, library, mnt):
+        d.mkdir()
+    db = tmp_path / "musefs.db"
+    env = _env(tmp_path)
+
+    for spec in PLAYBACK_FORMATS:
+        _ffmpeg_gen(
+            src / spec["filename"],
+            spec["freq"],
+            title=spec["title"],
+            artist="PCM Artist",
+            album="PCM Album",
+            album_artist="PCM Album Artist",
+        )
+
+    cfg = _write_config(tmp_path, library, db)
+    _beet(cfg, env, "import", "-A", "-q", str(src))
+
+    imported = []
+    for spec in PLAYBACK_FORMATS:
+        paths = _beet(cfg, env, "ls", "-p", spec["query"]).splitlines()
+        if len(paths) == 1:
+            imported.append(spec)
+    return cfg, env, db, mnt, imported
+
+
 # --- tests -----------------------------------------------------------------
 
 
@@ -405,6 +527,30 @@ def test_e2e_move_reconcile(tmp_path):
         assert ft["title"] == ["Relocated FLAC"]
         flac_backing = _beet(cfg, env, "ls", "-p", "format:FLAC").strip()
         assert _audio_md5(new) == _audio_md5(flac_backing)
+
+
+def test_e2e_all_formats_pcm_sha_playback(tmp_path):
+    cfg, env, db, mnt, imported = _imported_playback_library(tmp_path)
+    _beet(cfg, env, "musefs")
+
+    with _mounted(mnt, db, "$albumartist/$album/$title"):
+        for spec in imported:
+            mounted = (
+                mnt / "PCM Album Artist" / "PCM Album" / f"{spec['title']}.{spec['served_ext']}"
+            )
+            assert mounted.exists(), sorted(str(p.relative_to(mnt)) for p in mnt.rglob("*"))
+
+            tags = mutagen.File(str(mounted), easy=True)
+            assert tags is not None, f"mutagen could not open {mounted}"
+            assert tags["title"] == [spec["title"]]
+
+            backing_paths = _beet(cfg, env, "ls", "-p", spec["query"]).splitlines()
+            assert backing_paths, f"no beets backing path for {spec['query']}"
+            assert len(backing_paths) == 1, (
+                f"expected one beets backing path for {spec['query']}, got {backing_paths!r}"
+            )
+            backing = backing_paths[0]
+            assert _audio_sha256(mounted) == _audio_sha256(backing)
 
 
 def test_e2e_art_embedded_via_scan(tmp_path):
