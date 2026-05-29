@@ -212,10 +212,9 @@ def test_reconcile_at_cli_exit_syncs_recorded_items(
 
 
 def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_path, monkeypatch):
-    # Reconcile uses scoped prune (track_ids from synced items only), so a
-    # stale row from a previous run is NOT cleaned up here — orphan cleanup is
-    # `_command`'s job (full-table prune). Reconcile only prunes the synced
-    # item's backing path if it moved away.
+    # Reconcile uses a full-table prune so stale rows from renames/moves
+    # (whose backing file no longer exists) are cleaned up even though the
+    # pending items only carry the new path.
     make_track("/old/moved-away.flac")  # stale: file gone
     real, tid, item = _real_track(tmp_path, make_track, fake_item, title="Now")
     plugin, _ = _autoscan_plugin(db_path, monkeypatch)
@@ -225,8 +224,7 @@ def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_pat
     conn = sqlite3.connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
-        # Stale row survives reconcile — scoped prune only checks synced items.
-        assert "/old/moved-away.flac" in paths
+        assert "/old/moved-away.flac" not in paths  # stale row pruned
         assert real in paths  # new path kept + synced
         assert (
             conn.execute(
