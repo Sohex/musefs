@@ -140,7 +140,13 @@ fn pcm_sha256(path: &Path) -> String {
         path.display(),
         String::from_utf8_lossy(&output.stderr)
     );
-    format!("{:x}", Sha256::digest(&output.stdout))
+    let digest = Sha256::digest(&output.stdout);
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn mounted_path(mountpoint: &Path, case: PlaybackCase) -> PathBuf {
