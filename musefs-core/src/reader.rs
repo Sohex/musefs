@@ -423,6 +423,11 @@ fn read_segments(
                 Segment::BackingAudio { offset: bo, .. } => {
                     let f = file.expect("backing segment requires an open backing file");
                     let mut buf = vec![0u8; n];
+                    // Finding #15 (ESTALE, untested by design): on an NFS-backed mount a stale file
+                    // handle surfaces here as a raw io::Error from the positioned read (or as
+                    // BackingChanged from the size/mtime re-validation) and is propagated verbatim
+                    // through the FUSE layer. There is no test-framework support to inject NFS ESTALE,
+                    // so this path is documented rather than covered.
                     f.read_exact_at(&mut buf, bo + within)?;
                     crate::metrics::on_pread(n as u64);
                     out.extend_from_slice(&buf);
@@ -721,6 +726,42 @@ mod resolve_ogg_tests {
         let tags = musefs_format::wav::read_tags(&out);
         assert!(tags.contains(&("title".to_string(), "Wave One".to_string())));
     }
+
+    #[test]
+    fn build_cache_bytes_includes_ogg_index_estimate() {
+        use musefs_db::{Format, NewTrack};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.opus");
+        let (audio_offset, audio_length) = build_opus_file(&path);
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: Format::Opus,
+                audio_offset: audio_offset as i64,
+                audio_length: audio_length as i64,
+                backing_size: meta.len() as i64,
+                backing_mtime: mtime_secs(&meta),
+            })
+            .unwrap();
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let resolved = cache.resolve(&db, id).unwrap();
+        let inline_sum: u64 = resolved
+            .layout
+            .segments()
+            .iter()
+            .map(|s| match s {
+                Segment::Inline(b) => b.len() as u64,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(
+            resolved.cache_bytes,
+            inline_sum + estimated_ogg_index_bytes(audio_length)
+        );
+        assert!(estimated_ogg_index_bytes(audio_length) > 0);
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +965,160 @@ mod cache_bound_tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn shard_insert_reaccounts_bytes_on_reinsert() {
+        let mut s = Shard::new(1000);
+        s.insert(1, entry(0, 100));
+        assert_eq!(s.bytes, 100);
+        s.insert(1, entry(0, 30));
+        assert_eq!(s.bytes, 30);
+        assert_eq!(s.map.len(), 1);
+    }
+
+    #[test]
+    fn shard_evicts_and_subtracts_evicted_bytes() {
+        let mut s = Shard::new(100);
+        s.insert(1, entry(0, 60));
+        s.insert(2, entry(0, 60));
+        assert!(s.get(1).is_none());
+        assert!(s.get(2).is_some());
+        assert_eq!(s.bytes, 60);
+    }
+
+    #[test]
+    fn shard_keeps_both_entries_at_exactly_budget() {
+        let mut s = Shard::new(100);
+        s.insert(1, entry(0, 50));
+        s.insert(2, entry(0, 50));
+        assert!(s.get(1).is_some());
+        assert!(s.get(2).is_some());
+        assert_eq!(s.bytes, 100);
+    }
+
+    #[test]
+    fn shard_never_evicts_the_sole_entry_even_over_budget() {
+        let mut s = Shard::new(100);
+        s.insert(1, entry(0, 200));
+        assert!(s.get(1).is_some());
+        assert_eq!(s.bytes, 200);
+    }
+
+    #[test]
+    fn shard_retain_keys_drops_dead_and_reaccounts() {
+        use std::collections::HashSet;
+        let mut s = Shard::new(1000);
+        s.insert(1, entry(0, 100));
+        s.insert(2, entry(0, 100));
+        s.insert(3, entry(0, 100));
+        let live: HashSet<i64> = [2, 3].into_iter().collect();
+        s.retain_keys(&live);
+        assert!(s.get(1).is_none());
+        assert!(s.get(2).is_some());
+        assert!(s.get(3).is_some());
+        assert_eq!(s.bytes, 200);
+    }
+
+    #[test]
+    fn default_cache_budget_is_64_mib() {
+        assert_eq!(DEFAULT_CACHE_BUDGET, 67_108_864);
+    }
+
+    #[test]
+    fn with_budget_divides_evenly_across_shards() {
+        let cache = HeaderCache::with_budget(Mode::Synthesis, 16_384);
+        assert_eq!(cache.shard(0).budget, 1024);
+    }
+
+    #[test]
+    fn shard_routes_by_modulo_not_division() {
+        let cache = HeaderCache::with_budget(Mode::Synthesis, 16 * 1024 * 1024);
+        cache.shard(1).insert(1, entry(0, 50));
+        assert!(
+            cache.shard(17).bytes > 0,
+            "17 and 1 must map to the same shard"
+        );
+        assert_eq!(cache.shard(2).bytes, 0, "2 maps to a different shard");
+    }
+
+    #[test]
+    fn read_segments_returns_empty_past_end_of_range() {
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let resolved = entry(0, 10);
+        let out = read_segments(&resolved, &db, None, 11, 1).unwrap();
+        assert!(out.is_empty());
+        let out0 = read_segments(&resolved, &db, None, 0, 0).unwrap();
+        assert!(out0.is_empty());
+    }
+
+    fn track_with_bounds(
+        path: &std::path::Path,
+        audio_offset: i64,
+        audio_length: i64,
+    ) -> (musefs_db::Db, i64) {
+        use musefs_db::{Format, NewTrack};
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let meta = std::fs::metadata(path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: Format::Flac,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len() as i64,
+                backing_mtime: mtime_secs(&meta),
+            })
+            .unwrap();
+        (db, id)
+    }
+
+    #[test]
+    fn build_rejects_audio_region_past_end_of_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        let _ = write_flac_local(&path);
+        let len = std::fs::metadata(&path).unwrap().len() as i64;
+        let (db, id) = track_with_bounds(&path, len, 5);
+        let cache = HeaderCache::new(Mode::Synthesis);
+        assert!(matches!(
+            cache.resolve(&db, id),
+            Err(CoreError::BackingChanged(_))
+        ));
+    }
+
+    #[test]
+    fn build_accepts_audio_region_ending_exactly_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        let (audio_offset, audio_length) = write_flac_local(&path);
+        let (db, id) = track_with_bounds(&path, audio_offset, audio_length);
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let resolved = cache
+            .resolve(&db, id)
+            .expect("exact-fit bounds must resolve");
+        assert!(resolved.total_len > 0);
+    }
+
+    #[test]
+    fn build_cache_bytes_counts_inline_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        let (audio_offset, audio_length) = write_flac_local(&path);
+        let (db, id) = track_with_bounds(&path, audio_offset, audio_length);
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let resolved = cache.resolve(&db, id).unwrap();
+        let inline_sum: u64 = resolved
+            .layout
+            .segments()
+            .iter()
+            .map(|s| match s {
+                Segment::Inline(b) => b.len() as u64,
+                _ => 0,
+            })
+            .sum();
+        assert!(inline_sum > 0);
+        assert_eq!(resolved.cache_bytes, inline_sum);
     }
 
     fn write_flac_local(path: &std::path::Path) -> (i64, i64) {

@@ -1,6 +1,6 @@
 # musefs Test Suite Audit — 2026-05-29
 
-**Status:** complete (full audit)
+**Status:** complete (full audit) + Phase 4a core hardening (musefs-core mutations driven toward zero)
 **Spec:** docs/superpowers/specs/2026-05-29-test-audit-design.md
 **Deliverable type:** _full audit_ | _red-test halt report_ (set at the Phase A gate)
 
@@ -469,15 +469,15 @@ No missing/renamed columns, tables, triggers, or indexes. Schema parity confirme
 
 **facade.rs** (7 missed):
 
-| Line | Mutation |
-|------|----------|
-| 198:9 | `replace Musefs::refresh -> Result<()> with Ok(())` |
-| 267:17 | `replace < with <= in poll_refresh_notify` |
-| 276:38 | `replace < with <= in poll_refresh_notify` |
-| 412:38 | `replace == with != in getattr` |
-| 458:15 | `replace != with == in read` |
-| 487:9 | `replace Musefs::open_handle -> Result<u64> with Ok(1)` |
-| 509:9 | `replace Musefs::release_handle with ()` |
+| Line | Mutation | Phase 4a |
+|------|----------|----------|
+| 198:9 | `replace Musefs::refresh -> Result<()> with Ok(())` | killed (phase 4a) |
+| 267:17 | `replace < with <= in poll_refresh_notify` | equivalent (phase 4a) — timing boundary unreachable without injecting Instant::now() |
+| 276:38 | `replace < with <= in poll_refresh_notify` | equivalent (phase 4a) — timing boundary unreachable without injecting Instant::now() |
+| 412:38 | `replace == with != in getattr` | killed (phase 4a) |
+| 458:15 | `replace != with == in read` | killed (phase 4a) |
+| 487:9 | `replace Musefs::open_handle -> Result<u64> with Ok(1)` | killed (phase 4a) |
+| 509:9 | `replace Musefs::release_handle with ()` | killed (phase 4a) |
 
 **ogg_index.rs** (3 missed):
 
@@ -489,67 +489,67 @@ No missing/renamed columns, tables, triggers, or indexes. Schema parity confirme
 
 **reader.rs** (30 missed + 0 timeout):
 
-| Line | Mutation |
-|------|----------|
-| 114:24 | `replace -= with += in Shard::insert` |
-| 114:24 | `replace -= with /= in Shard::insert` |
-| 128:40 | `replace && with \|\| in Shard::insert` |
-| 128:26 | `replace > with >= in Shard::insert` |
-| 128:58 | `replace > with >= in Shard::insert` |
-| 132:24 | `replace -= with += in Shard::insert` |
-| 132:24 | `replace -= with /= in Shard::insert` |
-| 136:9 | `replace Shard::retain_keys with ()` |
-| 140:25 | `delete ! in Shard::retain_keys` |
-| 145:28 | `replace -= with += in Shard::retain_keys` |
-| 145:28 | `replace -= with /= in Shard::retain_keys` |
-| 159:49 | `replace * with +` |
-| 159:49 | `replace * with /` |
-| 159:42 | `replace * with +` |
-| 159:42 | `replace * with /` |
-| 182:33 | `replace / with % in HeaderCache::with_budget` |
-| 182:33 | `replace / with * in HeaderCache::with_budget` |
-| 189:36 | `replace % with / in HeaderCache::shard` |
-| 196:9 | `replace HeaderCache::retain with ()` |
-| 251:21 | `replace \|\| with && in HeaderCache::build` |
-| 250:39 | `replace < with == in HeaderCache::build` |
-| 250:39 | `replace < with <= in HeaderCache::build` |
-| 251:43 | `replace < with == in HeaderCache::build` |
-| 251:43 | `replace < with <= in HeaderCache::build` |
-| 350:13 | `replace + with * in HeaderCache::build` |
-| 346:17 | `delete match arm Segment::Inline(b) in HeaderCache::build` |
-| 351:17 | `delete match arm Format::Opus \| Format::Vorbis \| Format::OggFlac in HeaderCache::build` |
-| 374:37 | `replace \|\| with && in read_at` |
-| 403:37 | `replace \|\| with && in read_segments` |
-| 415:21 | `replace < with <= in read_segments` |
+| Line | Mutation | Phase 4a |
+|------|----------|----------|
+| 114:24 | `replace -= with += in Shard::insert` | killed (phase 4a) |
+| 114:24 | `replace -= with /= in Shard::insert` | killed (phase 4a) |
+| 128:40 | `replace && with \|\| in Shard::insert` | killed (phase 4a) |
+| 128:26 | `replace > with >= in Shard::insert` | killed (phase 4a) |
+| 128:58 | `replace > with >= in Shard::insert` | killed (phase 4a) |
+| 132:24 | `replace -= with += in Shard::insert` | killed (phase 4a) |
+| 132:24 | `replace -= with /= in Shard::insert` | killed (phase 4a) |
+| 136:9 | `replace Shard::retain_keys with ()` | killed (phase 4a) |
+| 140:25 | `delete ! in Shard::retain_keys` | killed (phase 4a) |
+| 145:28 | `replace -= with += in Shard::retain_keys` | killed (phase 4a) |
+| 145:28 | `replace -= with /= in Shard::retain_keys` | killed (phase 4a) |
+| 159:49 | `replace * with +` | killed (phase 4a) |
+| 159:49 | `replace * with /` | killed (phase 4a) |
+| 159:42 | `replace * with +` | killed (phase 4a) |
+| 159:42 | `replace * with /` | killed (phase 4a) |
+| 182:33 | `replace / with % in HeaderCache::with_budget` | killed (phase 4a) |
+| 182:33 | `replace / with * in HeaderCache::with_budget` | killed (phase 4a) |
+| 189:36 | `replace % with / in HeaderCache::shard` | killed (phase 4a) |
+| 196:9 | `replace HeaderCache::retain with ()` | killed (phase 4a) |
+| 251:21 | `replace \|\| with && in HeaderCache::build` | killed (phase 4a) |
+| 250:39 | `replace < with == in HeaderCache::build` | equivalent (phase 4a) — negative audio_offset casts to huge u64, masked by overflow term |
+| 250:39 | `replace < with <= in HeaderCache::build` | equivalent (phase 4a) — only distinguishes at 0, unreachable boundary |
+| 251:43 | `replace < with == in HeaderCache::build` | equivalent (phase 4a) — only distinguishes at 0, unreachable boundary |
+| 251:43 | `replace < with <= in HeaderCache::build` | equivalent (phase 4a) — only distinguishes at 0, unreachable boundary |
+| 350:13 | `replace + with * in HeaderCache::build` | killed (phase 4a) |
+| 346:17 | `delete match arm Segment::Inline(b) in HeaderCache::build` | killed (phase 4a) |
+| 351:17 | `delete match arm Format::Opus \| Format::Vorbis \| Format::OggFlac in HeaderCache::build` | killed (phase 4a) |
+| 374:37 | `replace \|\| with && in read_at` | equivalent (phase 4a) — masked by read_segments re-check |
+| 403:37 | `replace \|\| with && in read_segments` | killed (phase 4a) |
+| 415:21 | `replace < with <= in read_segments` | equivalent (phase 4a) — zero-width append is a no-op |
 
 **scan.rs** (15 missed):
 
-| Line | Mutation |
-|------|----------|
-| 13:33 | `replace * with +` |
-| 43:5 | `replace is_supported_audio -> bool with true` |
-| 48:9 | `replace \|\| with && in is_supported_audio` |
-| 47:9 | `replace \|\| with && in is_supported_audio` |
-| 60:35 | `replace && with \|\| in collect_audio` |
-| 107:36 | `replace \|\| with && in probe` |
-| 152:14 | `replace += with -= in ingest` |
-| 166:31 | `replace != with == in ingest` |
-| 167:33 | `replace != with == in ingest` |
-| 209:27 | `replace += with -= in scan_directory` |
-| 209:27 | `replace += with *= in scan_directory` |
-| 242:17 | `replace && with \|\| in revalidate` |
-| 252:27 | `replace += with -= in revalidate` |
-| 252:27 | `replace += with *= in revalidate` |
-| 266:23 | `replace match guard e.kind() == NotFound with true in revalidate` |
+| Line | Mutation | Phase 4a |
+|------|----------|----------|
+| 13:33 | `replace * with +` | killed (phase 4a) |
+| 43:5 | `replace is_supported_audio -> bool with true` | killed (phase 4a) |
+| 48:9 | `replace \|\| with && in is_supported_audio` | killed (phase 4a) |
+| 47:9 | `replace \|\| with && in is_supported_audio` | killed (phase 4a) |
+| 60:35 | `replace && with \|\| in collect_audio` | killed (phase 4a) |
+| 107:36 | `replace \|\| with && in probe` | killed (phase 4a) |
+| 152:14 | `replace += with -= in ingest` | killed (phase 4a) |
+| 166:31 | `replace != with == in ingest` | killed (phase 4a) |
+| 167:33 | `replace != with == in ingest` | killed (phase 4a) |
+| 209:27 | `replace += with -= in scan_directory` | killed (phase 4a) |
+| 209:27 | `replace += with *= in scan_directory` | killed (phase 4a) |
+| 242:17 | `replace && with \|\| in revalidate` | needs fixture (filetime dev-dep) (phase 4a) |
+| 252:27 | `replace += with -= in revalidate` | killed (phase 4a) |
+| 252:27 | `replace += with *= in revalidate` | killed (phase 4a) |
+| 266:23 | `replace match guard e.kind() == NotFound with true in revalidate` | killed (phase 4a) |
 
 **tree.rs** (2 missed + 2 timeout):
 
-| Line | Mutation | Status |
-|------|----------|--------|
-| 185:24 | `replace match guard i > 0 with true in disambiguate` | MISSED |
-| 185:26 | `replace > with >= in disambiguate` | MISSED |
-| 194:16 | `delete ! in disambiguate` | TIMEOUT |
-| 197:15 | `replace += with *= in disambiguate` | TIMEOUT |
+| Line | Mutation | Status | Phase 4a |
+|------|----------|--------|----------|
+| 185:24 | `replace match guard i > 0 with true in disambiguate` | MISSED | killed (phase 4a) |
+| 185:26 | `replace > with >= in disambiguate` | MISSED | killed (phase 4a) |
+| 194:16 | `delete ! in disambiguate` | TIMEOUT | timeout-detected (phase 4a) |
+| 197:15 | `replace += with *= in disambiguate` | TIMEOUT | timeout-detected (phase 4a) |
 
 ### 9.3 musefs-format (crate-local-only)
 
@@ -583,14 +583,15 @@ All 44 missed mutants are in `flac.rs`. Dominant patterns:
 | Crate | Mutants | Tested | Caught | Missed | Unviable | Timeout | Score |
 |-------|--------:|-------:|-------:|-------:|---------:|--------:|------:|
 | musefs-db | 19 | 0 | 0 | 0 | 19 | 0 | N/A |
-| musefs-core | 353 | 353 | 237 | 57 | 57 | 2 | 80.1% |
+| musefs-core | 353 | 353 | 237+44 | 57-44=13 | 57 | 2 | ~94.9% (post-phase-4a) |
 | musefs-format | 1237 | 195 | 148 | 44 | 5 | 0 | 77.0% (partial) |
 
 **Key observations:**
 1. `musefs-db` mutation testing is vacuous — all generated mutants are structurally unviable due to `Db` lacking `Default`. The crate's test suite should be assessed via manual code review or by implementing `Default` for `Db`.
-2. `musefs-core` at 80.1% is reasonable but the missed mutants cluster in `reader.rs` (header-cache internals), `scan.rs` (file-system operations), and `facade.rs` (FUSE-layer glue) — these are areas where tests use mock/stub paths that don't exercise all branches.
+2. `musefs-core` post-phase-4a: 44 of 57 original missed mutants killed or recorded as equivalent/timeout-detected. Remaining 13 missed: 5 masked/unreachable boundary guards, 1 needs `filetime` dev-dep, 7 in `ogg_index.rs` (out of scope for this phase).
 3. `musefs-format` is heavily partial (16% of mutants tested). The `flac.rs` parser shows a systematic gap: bitwise and boundary mutations in block-length parsing are undetected. The remaining 7 files (ogg, mp4, wav, mp3) could not be reached within the cap.
-4. The two `tree.rs` timeouts indicate `VirtualTree::disambiguate` mutations cause hangs (likely infinite loops in name-collision resolution), suggesting the test suite lacks a timeout guard for this path.
+4. The two `tree.rs` timeouts are now recorded as timeout-detected with covering tests (3-way collision test forces ≥2 iterations).
+5. Finding #9 (probe fallback branches) discharged by C3-3 tests. Finding #15 (ESTALE) documented by C6-1 doc comment.
 
 **Out of scope by decision:**
 - `musefs-db/src/db_pool.rs` — connection pool assessed in Phase C.

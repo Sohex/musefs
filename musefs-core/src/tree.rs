@@ -265,4 +265,36 @@ mod tests {
         let y = t2.lookup(new, "Y.flac").unwrap();
         assert!(new != gone && new != x && y != gone && y != x);
     }
+
+    #[test]
+    fn disambiguate_keeps_dotfile_whole_and_splits_normal_ext() {
+        let t = VirtualTree::build(&[
+            (10, "D/.hidden".into()),
+            (20, "D/.hidden".into()),
+            (30, "D/a.ext".into()),
+            (40, "D/a.ext".into()),
+        ]);
+        let d = t.lookup(VirtualTree::ROOT, "D").unwrap();
+        assert!(t.lookup(d, ".hidden").is_some());
+        assert!(t.lookup(d, ".hidden (2)").is_some());
+        assert!(
+            t.lookup(d, " (2).hidden").is_none(),
+            "must not split at the index-0 dot"
+        );
+        assert!(t.lookup(d, "a.ext").is_some());
+        assert!(t.lookup(d, "a (2).ext").is_some());
+    }
+
+    #[test]
+    fn disambiguate_resolves_three_way_collision() {
+        let t = VirtualTree::build(&[
+            (10, "D/song.flac".into()),
+            (20, "D/song.flac".into()),
+            (30, "D/song.flac".into()),
+        ]);
+        let d = t.lookup(VirtualTree::ROOT, "D").unwrap();
+        assert!(t.lookup(d, "song.flac").is_some());
+        assert!(t.lookup(d, "song (2).flac").is_some());
+        assert!(t.lookup(d, "song (3).flac").is_some());
+    }
 }
