@@ -854,6 +854,8 @@ fn reads_m4b_alias() {
     std::fs::write(dir.path().join("book.m4b"), &bytes).unwrap();
     let db = musefs_db::Db::open_in_memory().unwrap();
     scan_directory(&db, dir.path()).unwrap();
+    let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+    assert_eq!(track.format, musefs_db::Format::M4a);
     let fs = Musefs::open(db, config()).unwrap();
     let artist = fs.lookup(VirtualTree::ROOT, "Orig Artist").unwrap();
     let entries = fs.readdir(artist).unwrap();

@@ -583,7 +583,7 @@ All 44 missed mutants are in `flac.rs`. Dominant patterns:
 | Crate | Mutants | Tested | Caught | Missed | Unviable | Timeout | Score |
 |-------|--------:|-------:|-------:|-------:|---------:|--------:|------:|
 | musefs-db | 19 | 0 | 0 | 0 | 19 | 0 | N/A |
-| musefs-core | 353 | 353 | 237+44 | 57-44=13 | 57 | 2 | ~92.9% (post-phase-4a) |
+| musefs-core | 353 | 353 | 237+44 | 57-44=13 | 57 | 2 | ~94.9% (post-phase-4a) |
 | musefs-format | 1237 | 195 | 148 | 44 | 5 | 0 | 77.0% (partial) |
 
 **Key observations:**
