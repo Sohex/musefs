@@ -322,7 +322,7 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_pictures, read_tags};
+    use super::*;
 
     /// Regression for the fuzz-discovered WAV OOM vector
     /// (fuzz/artifacts/wav/oom-4a21767820d5f05328f01d975fb6d3314f3fb902):
