@@ -128,15 +128,35 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn build_index_errors_when_audio_length_is_not_on_a_page_boundary() {
+        // One 300-byte packet -> one page of total_len T. Passing audio_length = T-5
+        // makes the loop read the whole page (consumed = T) then exit with
+        // consumed != audio_length.
+        let (bytes, _) = lace_packet_pub(0xABCD, 0, false, 0, &vec![7u8; 300]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.ogg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let short = bytes.len() as u64 - 5;
+        let err = build_index(&path, 0, short, 0);
+        assert!(
+            err.is_err(),
+            "expected Err on non-page-boundary audio_length"
+        );
+    }
+
+    #[test]
     fn build_index_renumbers_and_preserves_payload_length() {
-        // Two audio pages at seq 5 and 6; shift by +2 => 7 and 8.
+        use musefs_format::ogg::{parse_page, PageHeader};
+        const FLAG_CONTINUED: u8 = 0x01; // not re-exported from musefs_format::ogg
         let (mut bytes, _) = lace_packet_pub(0xABCD, 5, false, 100, &vec![1u8; 300]);
         let (b2, _) = lace_packet_pub(0xABCD, 6, false, 200, &vec![2u8; 70_000]);
         bytes.extend_from_slice(&b2);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audio.ogg");
-        // Prefix 16 bytes of "header" so audio_offset is non-zero.
         let mut file_bytes = vec![0u8; 16];
         file_bytes.extend_from_slice(&bytes);
         std::fs::File::create(&path)
@@ -146,12 +166,35 @@ mod tests {
 
         let idx = build_index(&path, 16, bytes.len() as u64, 2).unwrap();
         assert_eq!(idx.pages.len(), 3); // 1 small page + 2 from the big packet
-        assert_eq!(idx.pages[0].region_offset, 0);
-        // Reconstruct page 0 and confirm its seq shifted to 7.
-        let mut full = idx.pages[0].header.clone();
-        full.extend(std::iter::repeat_n(1u8, idx.pages[0].payload_len as usize));
-        let h = parse_page(&full, 0).unwrap();
-        assert_eq!(h.seq, 7);
+
+        // Contiguous region offsets summing to audio_length.
+        let mut expected_off = 0u64;
+        for p in &idx.pages {
+            assert_eq!(p.region_offset, expected_off);
+            expected_off += p.header.len() as u64 + p.payload_len;
+        }
+        assert_eq!(expected_off, bytes.len() as u64);
+
+        // Parse each patched header (append its payload so parse sees a full page),
+        // assert seq renumbering, payload_len match, and a self-consistent CRC.
+        let mut prev_seq: Option<u32> = None;
+        for (i, p) in idx.pages.iter().enumerate() {
+            let mut full = p.header.clone();
+            full.extend(std::iter::repeat_n(0u8, p.payload_len as usize));
+            let h: PageHeader = parse_page(&full, 0).unwrap();
+            assert_eq!(h.payload_len as u64, p.payload_len);
+            // seqs are old+2 and strictly increasing: page 0 -> 7, pages 1&2 -> 8,9.
+            if let Some(prev) = prev_seq {
+                assert_eq!(h.seq, prev + 1);
+            } else {
+                assert_eq!(h.seq, 7);
+            }
+            prev_seq = Some(h.seq);
+            // The continuation page of the big packet carries FLAG_CONTINUED.
+            if i == 2 {
+                assert_eq!(h.header_type & FLAG_CONTINUED, FLAG_CONTINUED);
+            }
+        }
     }
 
     use std::os::unix::fs::FileExt;
