@@ -16,14 +16,34 @@
 
 - **Hand-apply (for mutant kills, Tasks 2–11):** the production code is already
   correct, so the new test PASSES first. Then apply the exact mutation, run the
-  single test, confirm it FAILS, revert, confirm it PASSES again. While a mutation
-  is applied, run **only the single targeted test**, never `--workspace`. Revert with
-  `git checkout -- musefs-format/src/wav.rs` immediately.
+  single test, confirm it FAILS, revert, confirm it PASSES again.
 - **Red-green TDD (for the C2 production change, Task 12):** the test FAILS first
   (current code bricks the track), then the fix makes it pass.
 
-**Line numbers drift.** Each task names the **code pattern** to locate; confirm the
-current line before hand-applying.
+### Canonical step order for every kill task (Tasks 2–11) — READ THIS
+
+The new test and the production code under mutation **live in the same file**
+(`musefs-format/src/wav.rs`). `git checkout -- musefs-format/src/wav.rs` reverts the
+*entire file* — both the mutation **and** any uncommitted test. So the test **must be
+committed before any hand-apply.** Each kill task therefore runs in this order,
+regardless of how the steps happen to be numbered:
+
+1. Add the test (and any first-use helper) to `mod tests`.
+2. Run the single test → confirm **PASS** (production is correct).
+3. **Commit the test now** — before touching any production line.
+4. Hand-apply one mutation to the *committed* code, run **only that single test**
+   (never `--workspace` while a mutation is live), confirm **FAIL**.
+5. `git checkout -- musefs-format/src/wav.rs` → this reverts only the mutation
+   (the test is committed and survives). Repeat step 4 for each remaining mutation.
+6. Re-run the test → confirm **PASS** again. No second commit is needed.
+
+Within each task below, the **Commit** step is listed after the hand-apply steps for
+readability, but you perform it at point 3 above — immediately after the test passes.
+
+**Line numbers are hints, not exact locations.** They are pinned to the phase-1
+inventory and drift as the file changes (this plan's own edits move them). Locate
+each target by the **code pattern** named in the task; the `:NN` reference is only a
+starting hint. Confirm the current line before hand-applying.
 
 ---
 
@@ -700,8 +720,13 @@ Revert: `git checkout -- musefs-format/src/wav.rs`
 
 - [ ] **Step 4: Confirm each documented equivalent stays green under its mutation**
 
-For each, apply the mutation, run the full wav unit suite, confirm **PASS** (proving
-no existing test distinguishes it → equivalent), then revert:
+The spec already argues each of these is equivalent; this step is **cheap insurance,
+not a hard gate** — it catches a wrong equivalence claim before the next mutants
+campaign flags it as a survivor. Each cycle is ~one `cargo test` run, so do them
+unless time-constrained; if you skip any, note it in the commit message so the next
+campaign's result is interpreted correctly. For each, apply the mutation, run the
+full wav unit suite, confirm **PASS** (proving no test distinguishes it → its
+behaviour is identical), then revert:
 - `walk_chunks:49`: change the match-guard `Some(next) if next <= buf.len() as u64` to `Some(next) if true` → run `cargo test -p musefs-format --lib wav::tests` → PASS.
 - `synthesize_layout:186` `> → >=`: change `if audio_length > u32::MAX as u64` to `>=` → PASS.
 - `synthesize_layout:186` `> → ==`: change it to `==` → PASS.
@@ -813,13 +838,23 @@ fn keeps_real_art_when_mixed_with_empty() {
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL (red)**
+- [ ] **Step 2: Run — expect FAIL (red). This run is the assumption gate.**
 
 Run: `cargo test -p musefs-format --test wav_synthesize skips_zero_byte_art keeps_real_art_when_mixed_with_empty`
-Expected: FAIL. `skips_zero_byte_art` fails with `Err(InvalidLayout)` on `.unwrap()`
+Expected: FAIL — `skips_zero_byte_art` fails with `Err(InvalidLayout)` on `.unwrap()`
 (the zero-byte art becomes `ArtImage { len: 0 }`, which `RegionLayout::validate`
-rejects as `EmptySegment`). If instead it PASSES, stop — the assumption is wrong and
-no production change is needed; re-verify against the current `synthesize_layout`.
+rejects as `EmptySegment`).
+
+**This red run is the gate for the whole task: it proves the bricking the fix is
+meant to remove.** Decide based on the result, do not assume:
+- **FAIL as expected** → the gap is real; proceed to Step 3 (apply the fix).
+- **`skips_zero_byte_art` PASSES** → the assumption is wrong (current code already
+  tolerates empty art). Do **not** make a production change. Keep the two tests as
+  regression guards, skip Step 3, and commit them in Step 5 with a message noting the
+  fix was unnecessary; then flag this to the reviewer.
+
+(The source was read during planning and confirmed to push `ArtImage { len: 0 }`
+unconditionally, so FAIL is expected — but verify, don't trust.)
 
 - [ ] **Step 3: Apply the WAV-local filter in `synthesize_layout`**
 
@@ -898,8 +933,9 @@ pub fn write_wav(path: &Path, audio: &[u8]) -> (i64, i64) {
 - [ ] **Step 2: Confirm the crate's tests still compile**
 
 Run: `cargo test -p musefs-core --test proptest_read_fidelity --no-run`
-Expected: compiles (the helper is `pub` in a `#![allow(dead_code)]` module, so being
-unused yet is fine).
+Expected: compiles. The helper being unused for now is fine because
+`musefs-core/tests/common/mod.rs` starts with `#![allow(dead_code)]` (confirmed at
+line 1), so no `dead_code` warning fires even under `clippy -D warnings`.
 
 - [ ] **Step 3: Commit**
 
@@ -1110,10 +1146,13 @@ block (before its closing brace):
 - [ ] **Step 3: Run the property suite — expect PASS**
 
 Run: `cargo test -p musefs-core --test proptest_read_fidelity`
-Expected: PASS (all 8 properties — 4 FLAC + 4 WAV). If `wav_read_at_art_window_serves_blob`
-ever fails the `expect("layout has an ArtImage segment")`, that means WAV art is not
-producing an `ArtImage` segment — investigate `synthesize_layout` / Task 12 before
-proceeding.
+Expected: PASS (all 8 properties — 4 FLAC + 4 WAV).
+
+The `expect("layout has an ArtImage segment")` is **not** a leap of faith: Task 12's
+`keeps_real_art_when_mixed_with_empty` already asserts that real WAV art produces a
+`Segment::ArtImage`, so by the time this task runs the behaviour is established. If
+it nonetheless fails here, that is a genuine regression in `synthesize_layout` —
+stop and investigate rather than weakening the assertion.
 
 - [ ] **Step 4: Commit**
 
@@ -1133,8 +1172,22 @@ git commit -m "test(core): broaden read-fidelity proptests to WAV (#5)"
 - [ ] **Step 1: Annotate the `wav.rs` rows in the inventory**
 
 In `2026-05-29-mutation-inventory.md`, append a status to each `wav.rs` survivor row
-in the `musefs-format` survivor table, matching the 3a `flac.rs` convention
-(`missed → **killed (phase 3d)**` or `missed → **equivalent**`). Specifically:
+in the `musefs-format` survivor table, matching the 3a `flac.rs` convention **exactly**
+— edit the `Kind` column in place from `missed` to `missed → **killed (phase 3d)**`
+or `missed → **equivalent**`, leaving the trailing `| 3 |` phase column untouched.
+For example, the row:
+
+```
+| `wav.rs:24` | replace < with == in riff_wave_start | missed | 3 |
+```
+
+becomes:
+
+```
+| `wav.rs:24` | replace < with == in riff_wave_start | missed → **killed (phase 3d)** | 3 |
+```
+
+Specifically:
 
 - `wav.rs:24` (×2), `:47`, `:67`, `:71`, `:155` (×3), `:168` (×2), `:207` (×2),
   `:245`, `:246`, `:248`, `:249`, `:300`, and the six `:119`–`:124` arm rows, plus
