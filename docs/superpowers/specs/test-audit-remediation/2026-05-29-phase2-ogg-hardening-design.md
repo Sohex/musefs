@@ -12,7 +12,7 @@ Close the Ogg unit-test gaps and drive the **44 real Ogg mutation survivors**
 `ogg_index.rs` 3 — excluding 3 test-support survivors) toward zero, and stand up
 the independent Ogg audio oracle the format/core suites currently lack.
 
-**All changes are additive: tests, one dev-dependency, and one named constant.**
+**All changes are additive: tests, two dev-dependencies, and one named constant.**
 No production logic changes, so the byte-identity invariant is untouched.
 
 ## Guiding principle: verify, don't trust
@@ -69,6 +69,14 @@ killable (a payload-only read at non-zero `within` reads wrong bytes). When the
 hand-apply step in the method above yields identical behavior, mark the survivor
 **equivalent** in the inventory rather than forcing a contrived test.
 
+## Implementation ordering
+
+C1 → C2 → C3 → C4, C5, C6 (independent, parallelizable) → C7.
+
+C1 builds the `serve()` test fixtures (temp file + `OggPageIndex` + `serve()`
+calls) that C3's oracle plugs into. C2 extends C1's existing test. C4–C6 are
+independent of each other and of C1–C3. C7 is the wrap-up pass.
+
 ## Components
 
 ### C1 — `serve()` unit tests (findings #1, #8)
@@ -103,20 +111,22 @@ Same module.
 
 ### C3 — Independent Ogg oracle, "Both" (finding #2)
 
-Add the RustAudio **`ogg`** crate as a `dev-dependency` of `musefs-core`. Oracle
+Add the RustAudio **`ogg`** crate (`ogg = "0.9"`, matching `musefs-fuse`) and
+the **`crc`** crate (`crc = "3"`, matching `musefs-format`) as `dev-dependencies`
+of `musefs-core`. Oracle
 lives **in-crate** in `ogg_index.rs`'s `#[cfg(test)] mod tests` (dev-deps are
 available to `#[cfg(test)]`, and `serve`/`build_index` are crate-visible there —
 no production visibility change).
 
 A helper takes full `serve()` output (the entire renumbered audio region) and:
 
-1. **Structural decode (third-party):** feed the bytes to `ogg`'s page reader;
-   assert it reads every page without error (the crate validates page CRCs on
-   read).
-2. **Independent CRC (hand-written):** for each page in the served stream,
-   recompute the CRC-32/Ogg with a second, independent implementation (not
-   `musefs-format::ogg::crc`) and compare to the embedded CRC field; assert each
-   page's `seq == original_seq + seq_delta` and that seqs are monotonic.
+1. **Structural decode (third-party):** feed the bytes to `ogg::PacketReader`;
+   assert it reads every packet without error (the crate validates page CRCs
+   during packet reassembly).
+2. **Independent CRC (via the `crc` crate):** for each page in the served stream,
+   recompute the CRC-32/Ogg with the `crc` crate (not `musefs-format::ogg::crc`)
+   and compare to the embedded CRC field; assert each page's
+   `seq == original_seq + seq_delta` and that seqs are monotonic.
 
 Exercised across **Vorbis, Opus, and OggFLAC** streams built from existing
 `page_test_support` helpers (`build_header`, `lace_packet`) plus minimal
@@ -142,7 +152,8 @@ Targeted tests (kill the listed survivors):
   (`delete !`), `:294` (timeout), `:298` (`- → +`).
 - `copy_payload`: `:310` (`< → <=`).
 - `emit_segments`: `:337` (`< → <=`).
-- Boundary fixtures at the 255-lacing-value and 65 025-byte payload limits.
+- **Boundary fixtures (required):** tests at the 255-lacing-value and 65 025-byte
+  payload limits, asserting correct lacing encoding and multi-page spanning.
 - **EOS preservation:** a page with `header_type | FLAG_EOS` run through
   `parse_page` → `patch_page_header` (renumber) asserts the EOS bit (and full
   `header_type`) is preserved and the CRC recomputed.
@@ -158,8 +169,8 @@ comments + cover art across codecs.
 
 - `detect_codec`: `:25` (`&& → ||`) — include a non-matching codec case.
 - `oggflac_following_packets`: `:36`.
-- `comment_body`: `:113`; `comment_packet_index`: `:121`, `:130` (several bitwise
-  and `delete !`).
+- `comment_body`: `:113`; `comment_packet_index`: `:121`, `:130` (5 survivors:
+  `delete !`, `&& → ||`, `& → |`, `& → ^`, `== → !=`).
 - `locate_audio`: `:196`.
 - `synthesize_layout`: `:233` (`+= → *=`), `:235`.
 - `picture_prefix`: `:254` (`% → +`).
@@ -209,7 +220,10 @@ No new error paths. C2 asserts the existing `FormatError::Malformed` mapping on 
 | C1 | `cargo test -p musefs-core ogg_index` — serve() byte-identity across all read shapes; `:117` hand-apply goes red |
 | C2 | consume-mismatch returns `Err(Malformed)`; multi-page assertions pass |
 | C3 | `ogg` crate decodes `serve()` output for Vorbis/Opus/OggFLAC; independent CRC + seq checks pass |
-| C4 | `cargo test -p musefs-format --features fuzzing ogg::page` green; EOS bit preserved; listed `:line` mutations hand-apply red |
-| C5 | `cargo test -p musefs-format --features fuzzing ogg` green; listed mutations hand-apply red |
+| C4 | `cargo test -p musefs-format ogg::page` green; EOS bit preserved; listed `:line` mutations hand-apply red |
+| C5 | `cargo test -p musefs-format ogg` green; listed mutations hand-apply red |
 | C6 | `b64_window` boundary tests; `:26` mutations hand-apply red |
 | Whole | next full mutants campaign shows Ogg survivor counts dropped (excluding documented equivalents) |
+
+The existing Ogg proptest (`cargo test -p musefs-format --features fuzzing`) must
+also remain green after all changes.
