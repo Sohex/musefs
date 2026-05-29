@@ -87,7 +87,7 @@ by reading the source.
 | `push_block_header` | :101 (`>>16`→`<<16`) | 24-bit length emit | in-module: `body_len = 0x123456`, assert emitted bytes |
 | `synthesize_layout` | :155 (`>`→`>=`) | 24-bit TooLarge guard | exact-boundary test at `body_len == 0x00FF_FFFF` |
 | `read_vorbis_comments` | :188 (`<`→`==`/`<=`, `\|\|`→`&&`), :193 (`+`→`-`, `>`→`==`/`>=`), :199 (`<<16`→`>>16`), :200 (`\|`→`&`, `<<8`→`>>8`), :204 (`>`→`==`/`>=`) | block-walk + length decode | crafted fixtures + malformed-path |
-| `parse_picture_block` | :237 (`>`→`==`/`>=`), :245 (`>`→`==`/`>=`), :261 (`>`→`<`) | mime/desc/data bounds | in-module: picture bodies truncated at each boundary |
+| `parse_picture_block` | :237 (`>`→`==` kill; `>=` **equiv**), :245 (`>`→`==` kill; `>=` **equiv**), :261 (`>`→`<`) | mime/desc/data bounds | in-module: over-length field → panic kills `==`; trailing-byte body kills `:261`; `>=` equivalent (see below) |
 | `read_pictures` | :277 (`<`→`==`/`<=`, `\|\|`→`&&`), :283 (`+`→`-`, `>`→`==`/`>=`), :289 (`<<16`→`>>16`), :290 (`\|`→`&`, `<<8`→`>>8`), :294 (`>`→`==`/`>=`) | block-walk + length decode | crafted fixtures + malformed-path |
 
 ### Kill mechanism: panic-vs-`Err` for the short-input guards
@@ -134,8 +134,17 @@ Likewise `push_block_header:99` — `(if is_last {0x80} else {0}) | (block_type 
 **equivalent**.
 
 The sibling `| → &` mutations on the same lines (`:200`, `:290`) are **not**
-equivalent (AND of disjoint ranges = 0) and **are** killed. Each equivalence is
-re-confirmed by hand-apply (the test stays green under `^`) before being recorded.
+equivalent (AND of disjoint ranges = 0) and **are** killed.
+
+**Inclusive-bound `> → >=` in `parse_picture_block` (`:237`, `:245`) are also
+equivalent** (refinement found during planning). The only input that distinguishes
+`>` from `>=` is `*_end == body.len()`; there the original proceeds and immediately
+fails at the *next* `read_u32_be` (zero bytes remain) → `Err(Malformed)`, identical
+to the mutant's direct `Err(Malformed)`. Their `> → ==` siblings remain killable
+(an `*_end > len` input makes `==` fall through to an out-of-bounds slice → panic).
+
+Each equivalence is re-confirmed by hand-apply (the test stays green under the
+mutation) before being recorded.
 
 ## Components
 
