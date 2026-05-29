@@ -405,4 +405,68 @@ mod tests {
         assert_eq!(meta.preserved[0].block_type, BLOCK_STREAMINFO);
         assert_eq!(meta.preserved[0].body, si);
     }
+
+    /// A VORBIS_COMMENT body: u32-LE vendor length, vendor, u32-LE count, then each
+    /// comment as u32-LE length + bytes.
+    fn vc_body(vendor: &str, comments: &[&str]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        v.extend_from_slice(vendor.as_bytes());
+        v.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for c in comments {
+            v.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            v.extend_from_slice(c.as_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn read_vorbis_comments_returns_pairs_and_guards_marker() {
+        // Happy path: VC block is the last block with no audio, so body_end == len.
+        // This also pins :204 (`>` -> `==`/`>=`): the mutant would reject (Malformed)
+        // and the unwrap below would panic.
+        let vc = vc_body("v", &["TITLE=Hi", "ARTIST=Me"]);
+        let file = flac_with(&[raw_block(BLOCK_VORBIS_COMMENT, &vc, true, None)]);
+        let got = read_vorbis_comments(&file).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("title".to_string(), "Hi".to_string()),
+                ("artist".to_string(), "Me".to_string()),
+            ]
+        );
+        // :188 `< -> ==` and `|| -> &&`: 3-byte input -> original NotFlac via
+        // short-circuit; both mutants force &data[0..4] -> panic.
+        assert_eq!(read_vorbis_comments(b"fLa"), Err(FormatError::NotFlac));
+        // :188 `< -> <=`: 4-byte fLaC -> original Malformed; mutant NotFlac.
+        assert_eq!(read_vorbis_comments(b"fLaC"), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn read_vorbis_comments_guards_block_walk() {
+        // :193 `+ -> -` and `> -> ==`: truncated header -> original Malformed,
+        // mutants fall through and panic.
+        assert_eq!(
+            read_vorbis_comments(b"fLaC\x80"),
+            Err(FormatError::Malformed)
+        );
+        // :193 `> -> >=`: a non-VC last block flush with end -> original returns the
+        // empty vec; the `>=` mutant rejects at the loop guard.
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, None)]);
+        assert_eq!(read_vorbis_comments(&file).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn read_vorbis_comments_decodes_24bit_length() {
+        // :199 `<<16 -> >>16` AND :200 `| -> &`: high length byte set over a short
+        // body. Original len = 0x10000 -> Malformed. `>>16` -> len 0 -> Ok; `&` ->
+        // (0x10000 & 0) -> len 0 -> Ok. Either mutant returns Ok instead of Malformed.
+        let hi = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0000))]);
+        assert_eq!(read_vorbis_comments(&hi), Err(FormatError::Malformed));
+        // :200 `<<8 -> >>8`: mid length byte set, high byte 0. Original len = 0x100
+        // -> Malformed; `>>8` -> len 0 -> Ok.
+        let mid = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x00_0100))]);
+        assert_eq!(read_vorbis_comments(&mid), Err(FormatError::Malformed));
+        // (:200 `| -> ^` and :201 `| -> ^` are equivalent: disjoint shifted bytes.)
+    }
 }
