@@ -926,6 +926,81 @@ mod cache_bound_tests {
         });
     }
 
+    #[test]
+    fn shard_insert_reaccounts_bytes_on_reinsert() {
+        let mut s = Shard::new(1000);
+        s.insert(1, entry(0, 100));
+        assert_eq!(s.bytes, 100);
+        s.insert(1, entry(0, 30));
+        assert_eq!(s.bytes, 30);
+        assert_eq!(s.map.len(), 1);
+    }
+
+    #[test]
+    fn shard_evicts_and_subtracts_evicted_bytes() {
+        let mut s = Shard::new(100);
+        s.insert(1, entry(0, 60));
+        s.insert(2, entry(0, 60));
+        assert!(s.get(1).is_none());
+        assert!(s.get(2).is_some());
+        assert_eq!(s.bytes, 60);
+    }
+
+    #[test]
+    fn shard_keeps_both_entries_at_exactly_budget() {
+        let mut s = Shard::new(100);
+        s.insert(1, entry(0, 50));
+        s.insert(2, entry(0, 50));
+        assert!(s.get(1).is_some());
+        assert!(s.get(2).is_some());
+        assert_eq!(s.bytes, 100);
+    }
+
+    #[test]
+    fn shard_never_evicts_the_sole_entry_even_over_budget() {
+        let mut s = Shard::new(100);
+        s.insert(1, entry(0, 200));
+        assert!(s.get(1).is_some());
+        assert_eq!(s.bytes, 200);
+    }
+
+    #[test]
+    fn shard_retain_keys_drops_dead_and_reaccounts() {
+        use std::collections::HashSet;
+        let mut s = Shard::new(1000);
+        s.insert(1, entry(0, 100));
+        s.insert(2, entry(0, 100));
+        s.insert(3, entry(0, 100));
+        let live: HashSet<i64> = [2, 3].into_iter().collect();
+        s.retain_keys(&live);
+        assert!(s.get(1).is_none());
+        assert!(s.get(2).is_some());
+        assert!(s.get(3).is_some());
+        assert_eq!(s.bytes, 200);
+    }
+
+    #[test]
+    fn default_cache_budget_is_64_mib() {
+        assert_eq!(DEFAULT_CACHE_BUDGET, 67_108_864);
+    }
+
+    #[test]
+    fn with_budget_divides_evenly_across_shards() {
+        let cache = HeaderCache::with_budget(Mode::Synthesis, 16_384);
+        assert_eq!(cache.shard(0).budget, 1024);
+    }
+
+    #[test]
+    fn shard_routes_by_modulo_not_division() {
+        let cache = HeaderCache::with_budget(Mode::Synthesis, 16 * 1024 * 1024);
+        cache.shard(1).insert(1, entry(0, 50));
+        assert!(
+            cache.shard(17).bytes > 0,
+            "17 and 1 must map to the same shard"
+        );
+        assert_eq!(cache.shard(2).bytes, 0, "2 maps to a different shard");
+    }
+
     fn write_flac_local(path: &std::path::Path) -> (i64, i64) {
         fn block(bt: u8, body: &[u8], last: bool) -> Vec<u8> {
             let mut v = vec![(if last { 0x80 } else { 0 }) | (bt & 0x7F)];
