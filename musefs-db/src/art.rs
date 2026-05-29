@@ -73,9 +73,7 @@ impl Db {
     /// means the row no longer matches the layout — `read_at_exact` surfaces that
     /// as an error rather than silently zero-filling.
     pub fn read_art_chunk(&self, art_id: i64, offset: u64, len: usize) -> Result<Vec<u8>> {
-        let blob =
-            self.conn
-                .blob_open(rusqlite::DatabaseName::Main, "art", "data", art_id, true)?;
+        let blob = self.conn.blob_open("main", "art", "data", art_id, true)?;
         let mut buf = vec![0u8; len];
         blob.read_at_exact(&mut buf, offset as usize)?;
         Ok(buf)
