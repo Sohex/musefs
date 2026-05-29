@@ -61,7 +61,7 @@ test and recorded as caught-by-timeout.
 
 ## Test placement
 
-`mp4.rs` **already has** a `#[cfg(test)] mod tests` (31 tests, already
+`mp4.rs` **already has** a `#[cfg(test)] mod tests` (30 tests, already
 `use super::*`, with local fixture helpers `bx`, `mk_mp4`, `mk_mp4_co64`,
 `soun_trak`, `mp4_with_ilst`, `data_atom`, `inline_head`, `first_stco`,
 `first_co64`, plus direct use of the production `boxed`/`text_atom`/etc.). 3c
@@ -144,9 +144,15 @@ multi-box walk path" — never an apply-and-rerun (which would hang the suite).
 
 ### C1 — box primitives (`box_header`, `read_box`, `BoxRef::end`)
 
-In-module unit tests: `box_header` with an empty-payload box (`size == header_len`,
-e.g. an 8-byte box) must return Ok (kills `<→<=`); a size-0 box parsed at a nonzero
-`pos` asserts `total_len == buf.len() - pos` (kills `read_box`'s `-→+`/`-→/`).
+In-module unit tests: `box_header` with an empty-payload box (`total_len ==
+header_len`, e.g. an 8-byte box) must return Ok (kills `<→<=`); a size-0 box parsed
+at a nonzero `pos` asserts `total_len == buf.len() - pos` (kills `read_box`'s
+`-→+`/`-→/`). **Buffer layout for the size-0 kill must be explicit:** place the box
+at a `pos` with `pos + 8 <= buf.len()` (so the `be_u32` size read and the `kind`
+slice both succeed *before* the size-0 branch — otherwise the test fails on a
+`Malformed` from the bounds check rather than on the mutated arithmetic), with the
+four size bytes at `pos` zeroed; then assert the exact `total_len == buf.len() -
+pos` so `-→+` (`buf.len() + pos`) and `-→/` (`buf.len() / pos`) both diverge.
 Confirm an existing multi-box walk test covers the `BoxRef::end` timeouts; record
 the three as timeout-detected.
 
@@ -197,12 +203,22 @@ forced.
 
 ## Test budget (for chunking the plan)
 
-Rough new/strengthened-test counts so the plan can split into bite-sized tasks:
+Rough new/strengthened-test counts so the plan can split into bite-sized tasks.
+**These counts assume boundary-pair tests each kill multiple mutants** — e.g. a
+single `patch_chunk_offsets` test that drives one patched offset to *both* `0` and
+`u32::MAX` exercises all five mutants on `v < 0 || v > u32::MAX` at once, and one
+oversize-by-one variant covers the corresponding `==`/`>=`/`&&`. Without that
+sharing the counts would be roughly double. (Mirrors 3b's "several branches share a
+base fixture mutated minimally.")
 
-- C1 box primitives: ~3–4 tests (+ confirm/record 3 timeouts).
-- C2 `read_structure_from`: ~4–5 tests (over-large box, `moof`, dup ×3; + confirm/record 1 timeout).
-- C3 metadata read: ~10–12 tests (the bulk of the `<`/`||`/`&&`/arm survivors).
-- C4 synthesis: ~10–12 tests (png type, size arithmetic, the two `u32::MAX` guards, stco/co64 bounds).
+- C1 box primitives (~3 missed survivors): ~3–4 tests (+ confirm/record 3 timeouts).
+- C2 `read_structure_from` (~5 missed survivors): ~4–5 tests (over-large box, `moof`, dup ×3; + confirm/record 1 timeout).
+- C3 metadata read (~12 missed survivors): ~10–12 tests (the bulk of the `<`/`||`/`&&`/arm survivors).
+- C4 synthesis (**17 missed survivors** — `build_udta` 6, `patch_chunk_offsets` 9,
+  `synthesize_layout` 2): ~12–14 tests. This is the densest component; the plan
+  should split it per-function (a `build_udta` task, a `patch_chunk_offsets` task,
+  a `synthesize_layout` task) and lean on boundary-pair tests, or the count creeps
+  toward one-test-per-mutant.
 
 Total ≈ 30–40 new/strengthened tests, plus 4 timeout records.
 
