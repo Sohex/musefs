@@ -1574,4 +1574,82 @@ mod tests {
         assert_eq!(pics[0].mime, "image/png");
         assert_eq!(pics[0].data, png);
     }
+
+    #[test]
+    fn build_udta_png_art_uses_type_code_14() {
+        // PNG art => covr/data type code 14; JPEG => 13. `== -> !=` flips them.
+        for (mime, expected) in [("image/png", 14u32), ("image/jpeg", 13u32)] {
+            let art = ArtInput {
+                art_id: 1,
+                mime: mime.into(),
+                description: String::new(),
+                picture_type: 3,
+                width: 0,
+                height: 0,
+                data_len: 10,
+            };
+            let (prefix, _) = build_udta(&[TagInput::new("title", "T")], Some(&art)).unwrap();
+            // covr layout: [covr_size u32]["covr"][data_size u32]["data"][type u32][locale u32]
+            let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
+            assert_eq!(&prefix[cpos + 8..cpos + 12], b"data");
+            let type_code = u32::from_be_bytes(prefix[cpos + 12..cpos + 16].try_into().unwrap());
+            assert_eq!(type_code, expected, "mime {mime}");
+        }
+    }
+
+    #[test]
+    fn build_udta_art_box_sizes_are_exact() {
+        // data_size = 8 + 8 + data_len; covr_size = 8 + data_size. The `+ -> -`/`+ -> *`
+        // mutations change the emitted box sizes.
+        let art = ArtInput {
+            art_id: 1,
+            mime: "image/jpeg".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 10,
+        };
+        let (prefix, _) = build_udta(&[TagInput::new("title", "T")], Some(&art)).unwrap();
+        let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
+        let covr_size = u32::from_be_bytes(prefix[cpos - 4..cpos].try_into().unwrap());
+        let data_size = u32::from_be_bytes(prefix[cpos + 4..cpos + 8].try_into().unwrap());
+        assert_eq!(data_size, 8 + 8 + 10); // 26
+        assert_eq!(covr_size, 8 + data_size); // 34
+    }
+
+    #[test]
+    fn build_udta_udta_size_exactly_u32_max_is_ok() {
+        // The guard is `udta_size > u32::MAX` (strict). udta_size == u32::MAX must be
+        // accepted; `> -> >=` rejects the exact boundary. data_len is reserved as a
+        // number (no image bytes), so the boundary is cheap to hit.
+        fn art(data_len: u64) -> ArtInput {
+            ArtInput {
+                art_id: 1,
+                mime: "image/jpeg".into(),
+                description: String::new(),
+                picture_type: 3,
+                width: 0,
+                height: 0,
+                data_len,
+            }
+        }
+        // Derive the fixed overhead: with data_len 0, udta_size == overhead.
+        let (p0, _) = build_udta(&[TagInput::new("title", "T")], Some(&art(0))).unwrap();
+        let overhead = u32::from_be_bytes(p0[0..4].try_into().unwrap()) as u64;
+        let max_len = u32::MAX as u64 - overhead;
+
+        let (p_max, art_len) =
+            build_udta(&[TagInput::new("title", "T")], Some(&art(max_len))).unwrap();
+        assert_eq!(art_len, max_len);
+        assert_eq!(
+            u32::from_be_bytes(p_max[0..4].try_into().unwrap()),
+            u32::MAX
+        );
+
+        assert!(matches!(
+            build_udta(&[TagInput::new("title", "T")], Some(&art(max_len + 1))),
+            Err(FormatError::TooLarge)
+        ));
+    }
 }
