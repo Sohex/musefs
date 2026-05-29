@@ -204,6 +204,12 @@ pub(crate) fn build_id3v2_segments(
     }
 
     for art in arts {
+        if art.data_len == 0 {
+            // Skip degenerate empty art: an `ArtImage { len: 0 }` segment fails
+            // `RegionLayout::validate` (`EmptySegment`) and would make the whole
+            // track unreadable at serve time (finding #16).
+            continue;
+        }
         let framing = apic_framing(art);
         let data_len = framing.len() as u64 + art.data_len;
         push_frame_header(&mut buf, b"APIC", data_len as usize)?;
@@ -780,9 +786,10 @@ mod tests {
         assert!(build_id3v2_segments(&[], &[mk(16)]).is_ok());
         // Exact boundary: compute the APIC framing overhead, then place
         // frames_len exactly on 0x0FFF_FFFF (one byte under must succeed) and
-        // 0x1_0000_0000 (must error). This pins the `> -> >=` mutation.
-        let (_, total_at_zero) = build_id3v2_segments(&[], &[mk(0)]).unwrap();
-        let overhead = total_at_zero - 10; // frames_len when data_len=0
+        // 0x1_0000_0000 (must error). This pins the `> -> >=` mutation. The
+        // baseline art uses data_len=1 (not 0) because zero-byte art is skipped.
+        let (_, total_at_one) = build_id3v2_segments(&[], &[mk(1)]).unwrap();
+        let overhead = total_at_one - 10 - 1; // frames_len = overhead + data_len
         let boundary_data_len = 0x0FFF_FFFF - overhead;
         assert!(
             build_id3v2_segments(&[], &[mk(boundary_data_len)]).is_ok(),
@@ -792,6 +799,67 @@ mod tests {
             build_id3v2_segments(&[], &[mk(boundary_data_len + 1)]).err(),
             Some(FormatError::TooLarge),
             "one byte past boundary must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_id3v2_segments_skips_zero_byte_art() {
+        // A zero-byte APIC would emit `Segment::ArtImage { len: 0 }`, which
+        // `RegionLayout::validate` rejects as `EmptySegment` -> the whole track
+        // becomes unreadable at serve time. Degenerate empty art must be skipped
+        // at synthesis (mirrors the FLAC fix for finding #16).
+        let empty = ArtInput {
+            art_id: 1,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 0,
+        };
+        let (segments, _len) = build_id3v2_segments(&[], &[empty]).unwrap();
+        assert!(
+            !segments
+                .iter()
+                .any(|s| matches!(s, Segment::ArtImage { .. })),
+            "zero-byte art must not emit an ArtImage segment"
+        );
+        let mut buf = Vec::new();
+        for seg in &segments {
+            if let Segment::Inline(b) = seg {
+                buf.extend_from_slice(b);
+            }
+        }
+        assert!(
+            !buf.windows(4).any(|w| w == b"APIC"),
+            "zero-byte art must not emit an APIC frame"
+        );
+    }
+
+    #[test]
+    fn build_id3v2_segments_keeps_real_art_when_mixed_with_empty() {
+        // An empty art alongside a real one: only the non-empty art is emitted.
+        let mk = |art_id: i64, data_len: u64| ArtInput {
+            art_id,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len,
+        };
+        let (segments, _len) = build_id3v2_segments(&[], &[mk(1, 0), mk(2, 16)]).unwrap();
+        let art_segs: Vec<_> = segments
+            .iter()
+            .filter_map(|s| match s {
+                Segment::ArtImage { art_id, len } => Some((*art_id, *len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            art_segs,
+            vec![(2_i64, 16_u64)],
+            "only the non-empty art should be emitted"
         );
     }
 

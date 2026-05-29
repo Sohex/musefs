@@ -114,7 +114,11 @@ Findings #5, #16.
 - kill flac/mp3/mp4/wav boundary + bitwise survivors (from phase-1 inventory)
 - 3b done — MP3 survivors killed; equivalents = disjoint-shift `| → ^` in
   `synchsafe_decode` and v2.2 24-bit decode (note: disjoint `| → &` are killed,
-  not equivalent); no production change
+  not equivalent). Production change: finding #16 zero-byte-art skip applied to
+  `mp3.rs::build_id3v2_segments` (mirrors the FLAC fix; also covers the WAV `id3 `
+  chunk, which shares this builder). #16 still open for mp4/ogg; the non-FLAC #5
+  read-fidelity proptest dimension remains deferred (no `write_mp3` core fixture
+  yet).
 
 ### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: pending
 
