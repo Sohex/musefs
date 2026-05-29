@@ -536,4 +536,18 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn read_tags_rejects_short_list_without_panic() {
+        // :300 `&& → ||`: a LIST chunk with a <4-byte payload. Original
+        // short-circuits (`len >= 4` false → no INFO, empty). The `||` mutant
+        // evaluates `&slice[0..4]` on the 2-byte slice → panic. Asserting the clean
+        // empty result kills it (panic ≠ empty).
+        let buf = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"LIST", vec![0x49, 0x4E]), // "IN" — 2 bytes, < 4
+            (b"data", vec![0x00; 4]),
+        ]);
+        assert!(read_tags(&buf).is_empty());
+    }
 }
