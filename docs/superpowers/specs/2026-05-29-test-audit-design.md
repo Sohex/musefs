@@ -39,19 +39,20 @@ count. Any single headline figure in the report names which categories it sums.
 
 ### Phase 0 — Tooling preflight (reproducible setup)
 
-Mutation and fuzz tooling is not all present in the environment, so the
-implementation plan must make setup explicit and reproducible before any phase
-that depends on it:
+The plan must make setup explicit and reproducible before any phase that depends
+on it. For every tool: **detect presence, record the version, install only if
+missing** (don't assume the install state captured here is still true — it drifts).
+The report lists the actual resolved version of each tool used.
 
-- `cargo-llvm-cov` — already installed; verify on PATH (`~/.cargo/bin`) with
-  `cargo llvm-cov --version`. No install needed.
-- `cargo-mutants` — **not installed.** Install the confirmed-current pin with
-  `cargo install cargo-mutants --version 27.0.0 --locked`. The plan verifies and
-  records the resolved version (`cargo mutants --version`) in the report.
-- `cargo-fuzz` — **not installed.** Install with `cargo install cargo-fuzz`
-  **without** `--locked` (matching `.github/workflows/fuzz.yml`, whose comment
-  notes the pinned `rustix` fails to compile on current nightly). Requires the
-  `nightly` toolchain (present).
+- `cargo-llvm-cov` — present at design time; `cargo llvm-cov --version` (ensure
+  `~/.cargo/bin` on PATH). Install only if absent.
+- `cargo-fuzz` — present at design time (`cargo-fuzz 0.13.1`); record the version.
+  If absent, install with `cargo install cargo-fuzz` **without** `--locked`
+  (matching `.github/workflows/fuzz.yml`, whose comment notes the pinned `rustix`
+  fails to compile on current nightly). Requires the `nightly` toolchain (present).
+- `cargo-mutants` — absent at design time. If still absent, install the
+  confirmed-current pin with `cargo install cargo-mutants --version 27.0.0
+  --locked`. Record the resolved version (`cargo mutants --version`).
 - **beets plugin venv.** `contrib/beets/requirements.txt` pins `beets` + `pytest`
   only — **no `pytest-cov`** and no mutagen. Phase 0 builds the venv from that
   file, then additionally installs `pytest-cov` (for `beetsplug/` coverage) and
@@ -72,6 +73,10 @@ Run the full test surface and record current state:
 - `cargo test --workspace` (default suite).
 - `cargo test -p musefs-fuse -- --ignored` (FUSE e2e; `/dev/fuse` is available in
   this environment).
+- `cargo test -p musefs-fuse --features metrics -- --ignored --test-threads=1`
+  **separately** — `concurrency.rs` is `#![cfg(feature = "metrics")]` and is
+  silently absent from the plain run above. The audit must not cite concurrency
+  e2e evidence without this run.
 - `cargo test -p musefs-format --features fuzzing` and
   `cargo test -p musefs-core --test proptest_read_fidelity` (proptests).
 - mutagen interop suite, two steps sharing one temp dir `$D`:
@@ -79,20 +84,28 @@ Run the full test surface and record current state:
   emit_interop_fixtures`, then `MUSEFS_INTEROP_DIR=$D python -m pytest
   tests/interop/test_mutagen_roundtrip.py` (in the Phase-0 venv with
   `mutagen==1.47.0`). `$D` is a fresh temp dir, not a tracked path.
-- **beets plugin suite** (`contrib/beets/`, run in the Phase-0 venv):
-  `python -m pytest` (unit + integration), `python -m pytest -m musefs_bin`
-  (path-gate vs the real `musefs` binary), and `python -m pytest -m e2e`
-  (beets → mount → playback). Record pass state and, when `pytest-cov` is
-  available, `--cov=beetsplug` line coverage.
+- **beets plugin suite** (`contrib/beets/`, run in the Phase-0 venv): first
+  `cargo build -p musefs-cli` so the `musefs_bin` and `e2e` suites don't auto-skip
+  on a missing binary. Then `python -m pytest` (unit + integration),
+  `python -m pytest -m musefs_bin` (path-gate vs the real binary), and
+  `python -m pytest -m e2e` (beets → mount → playback). **Skips count as not-run,
+  not pass:** record `passed/failed/skipped` per invocation and, for any skip,
+  the reason (missing `beet`, `fusermount`, `ffmpeg`, `/dev/fuse`, or binary). An
+  all-skipped suite is reported as "not exercised," never as green. Add
+  `--cov=beetsplug` when `pytest-cov` is available.
 - **Fuzz smoke surface** (mirrors `.github/workflows/fuzz.yml` per-PR job):
   `cargo +nightly fuzz build`, then each target
   (`flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment`) run with the CI bounds
   `-max_len=131072 -rss_limit_mb=2048 -max_total_time=15` (15 s/target, per
   `fuzz.yml:45`). Goal is to confirm every target still builds and reaches its
   parser, not a full campaign. Record any broken/unreachable target.
-- `cargo-llvm-cov` (installed; ensure `~/.cargo/bin` on PATH) over the workspace
-  excluding `musefs-fuse`, matching CI. Capture per-crate and per-module line +
-  region coverage.
+- `cargo-llvm-cov` over the workspace excluding `musefs-fuse`, matching CI.
+  Capture per-crate and per-module line + region coverage. **This is "default CI
+  Rust coverage":** it instruments the plain `cargo test` run, so it does *not*
+  reflect `#[ignore]`d e2e tests or the `--features fuzzing` format proptests.
+  Coverage numbers in the report are labeled as such. (Optional, time permitting:
+  a second `--features fuzzing` coverage profile for `musefs-format` to show what
+  the proptests add; only if it's cheap — it is not required for the scorecard.)
 
 **Red-test gate.** If any **Tier-1** test (byte-identical invariant or
 resolution/freshness, including the relevant `#[ignore]`d e2e tests) fails or is
@@ -108,9 +121,10 @@ covered there (e.g. `poll_refresh_notify` / the inode allocator); the thin
 `musefs-fuse` adapter glue — `--keep-cache` `inval_inode` dispatch, worker-pool
 offload wiring — is scored instead by **e2e evidence**: presence and assertion
 strength of the relevant `#[ignore]`d mount tests (`keep_cache.rs`,
-`concurrency.rs`, `ogg_read_through.rs`, `playback_pcm.rs`), confirmed green on
-`/dev/fuse` in Phase A. The report states this scoring basis explicitly per
-FUSE-only area rather than implying a coverage number exists.
+`concurrency.rs` — only via the `--features metrics` run above —
+`ogg_read_through.rs`, `playback_pcm.rs`), confirmed green on `/dev/fuse` in
+Phase A. The report states this scoring basis explicitly per FUSE-only area
+rather than implying a coverage number exists.
 
 Output of Phase A: a coverage table, the fuzz-smoke result, the beets suite
 result, and a note of any currently failing or flaky tests.
@@ -132,6 +146,13 @@ without any test failing — are the sharpest signal of weak or missing assertio
   mutants ...`). If a crate hits the cap, record it as a **partial** run (mutants
   tested / total) rather than failing — partial mutation data is still useful and
   the report says so.
+- **Test command / features.** A default `cargo-mutants` run uses a plain
+  `cargo test` and would miss `musefs-format`'s `--features fuzzing` proptests —
+  the strongest checks on exactly the format code under audit — inflating the
+  surviving-mutant count. Pass the feature through (`--features fuzzing` for the
+  `musefs-format` run, e.g. via `cargo mutants ... -- --features fuzzing`) so the
+  proptests participate in killing mutants. The report records the exact
+  `cargo-mutants` invocation (features included) per crate.
 - Record surviving mutants with `file:line` and the mutation applied.
 
 ### Phase C — Judgment review (edge cases + structural quality)
@@ -177,7 +198,9 @@ coverage exists and note gaps; go deep only if something looks alarming.
 
 For each area the report scores three dimensions explicitly:
 
-- **Coverage** — uncovered lines/regions from `cargo-llvm-cov`. For FUSE-only
+- **Coverage** — uncovered lines/regions from default CI Rust coverage
+  (`cargo-llvm-cov`, plain `cargo test`; does not include `#[ignore]`d e2e or
+  `--features fuzzing` proptests — labeled as such, see Phase A). For FUSE-only
   areas, scored by e2e evidence instead (see FUSE coverage strategy); for the
   beets plugin, by `pytest-cov` over `beetsplug/`. The report states the basis.
 - **Quality** — surviving mutants from Phase B plus assertion-strength notes.
