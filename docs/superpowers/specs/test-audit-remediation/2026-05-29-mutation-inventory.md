@@ -204,76 +204,76 @@ the rightmost column of each survivor table.
 | `flac.rs:291` | replace \| with ^ in read_pictures | missed → **equivalent** | 3 |
 | `flac.rs:294` | replace > with == in read_pictures | missed → **killed** (phase 3a) | 3 |
 | `flac.rs:294` | replace > with >= in read_pictures | missed → **killed** (phase 3a) | 3 |
-| `mp3.rs:16` | replace << with >> in synchsafe_decode | missed | 3 |
-| `mp3.rs:17` | replace \| with & in synchsafe_decode | missed | 3 |
-| `mp3.rs:17` | replace \| with ^ in synchsafe_decode | missed | 3 |
-| `mp3.rs:17` | replace << with >> in synchsafe_decode | missed | 3 |
-| `mp3.rs:18` | replace \| with ^ in synchsafe_decode | missed | 3 |
-| `mp3.rs:19` | replace \| with ^ in synchsafe_decode | missed | 3 |
-| `mp3.rs:30` | replace && with \|\| in locate_audio | missed | 3 |
-| `mp3.rs:35` | replace += with -= in locate_audio | missed | 3 |
-| `mp3.rs:35` | replace += with *= in locate_audio | missed | 3 |
-| `mp3.rs:49` | replace + with * in locate_audio | missed | 3 |
-| `mp3.rs:51` | replace \|\| with && in locate_audio | missed | 3 |
-| `mp3.rs:51` | replace + with * in locate_audio | missed | 3 |
-| `mp3.rs:66` | replace >> with << in syncsafe | missed | 3 |
-| `mp3.rs:67` | replace >> with << in syncsafe | missed | 3 |
-| `mp3.rs:76` | replace > with == in push_frame_header | missed | 3 |
-| `mp3.rs:76` | replace > with >= in push_frame_header | missed | 3 |
-| `mp3.rs:113` | replace is_id3_text_frame_id -> bool with false | missed | 3 |
-| `mp3.rs:114` | replace != with == in is_id3_text_frame_id | missed | 3 |
-| `mp3.rs:118` | replace \|\| with && in is_id3_text_frame_id | missed | 3 |
-| `mp3.rs:187` | replace match guard is_id3_text_frame_id(key) with false in build_id3v2_segments | missed | 3 |
-| `mp3.rs:232` | replace > with >= in build_id3v2_segments | missed | 3 |
-| `mp3.rs:275` | replace < with == in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:275` | replace < with <= in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:275` | replace \|\| with && in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:293` | replace \| with & in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:293` | replace \| with ^ in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:293` | replace \| with & in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:293` | replace \| with ^ in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:293` | replace \| with & in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:293` | replace \| with ^ in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:311` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:320` | replace != with == in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:320` | replace \|\| with && in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:324` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:324` | replace + with * in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:324` | replace << with >> in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:325` | replace \| with & in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:325` | replace \| with ^ in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:325` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:325` | replace + with * in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:325` | replace << with >> in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:326` | replace \| with & in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:326` | replace \| with ^ in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:326` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:326` | replace + with * in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:327` | replace == with != in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:334` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:334` | replace != with == in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:334` | replace \|\| with && in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:334` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:334` | replace != with == in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:337` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:337` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:337` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:337` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace \| with & in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace \| with ^ in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace \| with & in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace \| with ^ in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace \| with & in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace \| with ^ in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:343` | replace + with - in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:346` | replace \|\| with && in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:356` | replace > with == in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:356` | replace > with >= in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:356` | replace - with + in id3v2_alloc_safe | missed | 3 |
-| `mp3.rs:362` | replace >= with < in id3v2_alloc_safe | missed | 3 |
+| `mp3.rs:16` | replace << with >> in synchsafe_decode | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:17` | replace \| with & in synchsafe_decode | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:17` | replace \| with ^ in synchsafe_decode | missed → **equivalent** | 3 |
+| `mp3.rs:17` | replace << with >> in synchsafe_decode | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:18` | replace \| with ^ in synchsafe_decode | missed → **equivalent** | 3 |
+| `mp3.rs:19` | replace \| with ^ in synchsafe_decode | missed → **equivalent** | 3 |
+| `mp3.rs:30` | replace && with \|\| in locate_audio | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:35` | replace += with -= in locate_audio | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:35` | replace += with *= in locate_audio | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:49` | replace + with * in locate_audio | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:51` | replace \|\| with && in locate_audio | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:51` | replace + with * in locate_audio | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:66` | replace >> with << in syncsafe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:67` | replace >> with << in syncsafe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:76` | replace > with == in push_frame_header | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:76` | replace > with >= in push_frame_header | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:113` | replace is_id3_text_frame_id -> bool with false | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:114` | replace != with == in is_id3_text_frame_id | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:118` | replace \|\| with && in is_id3_text_frame_id | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:187` | replace match guard is_id3_text_frame_id(key) with false in build_id3v2_segments | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:232` | replace > with >= in build_id3v2_segments | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:275` | replace < with == in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:275` | replace < with <= in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:275` | replace \|\| with && in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:293` | replace \| with & in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:293` | replace \| with ^ in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:293` | replace \| with & in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:293` | replace \| with ^ in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:293` | replace \| with & in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:293` | replace \| with ^ in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:311` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:320` | replace != with == in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:320` | replace \|\| with && in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:324` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:324` | replace + with * in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:324` | replace << with >> in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:325` | replace \| with & in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:325` | replace \| with ^ in id3v2_alloc_safe | missed → **equivalent** | 3 |
+| `mp3.rs:325` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:325` | replace + with * in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:325` | replace << with >> in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:326` | replace \| with & in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:326` | replace \| with ^ in id3v2_alloc_safe | missed → **equivalent** | 3 |
+| `mp3.rs:326` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:326` | replace + with * in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:327` | replace == with != in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:334` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:334` | replace != with == in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:334` | replace \|\| with && in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:334` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:334` | replace != with == in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:337` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:337` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:337` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:337` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace \| with & in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace \| with ^ in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace \| with & in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace \| with ^ in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace \| with & in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace \| with ^ in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:343` | replace + with - in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:346` | replace \|\| with && in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:356` | replace > with == in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:356` | replace > with >= in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:356` | replace - with + in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
+| `mp3.rs:362` | replace >= with < in id3v2_alloc_safe | missed → **killed** (phase 3b) | 3 |
 | `mp4.rs:35` | replace BoxRef::end -> usize with 0 | timeout | 3 |
 | `mp4.rs:35` | replace BoxRef::end -> usize with 1 | timeout | 3 |
 | `mp4.rs:35` | replace + with * in BoxRef::end | timeout | 3 |

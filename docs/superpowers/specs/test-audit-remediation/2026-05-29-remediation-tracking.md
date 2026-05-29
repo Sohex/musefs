@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; phases 3b–3d, 4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); phases 3c/3d, 4 pending
 
 ## Guiding principle: verify, don't trust
 
@@ -112,6 +112,9 @@ Findings #5, #16.
   non-FLAC) (#5)
 - zero-byte art boundary (#16)
 - kill flac/mp3/mp4/wav boundary + bitwise survivors (from phase-1 inventory)
+- 3b done — MP3 survivors killed; equivalents = disjoint-shift `| → ^` in
+  `synchsafe_decode` and v2.2 24-bit decode (note: disjoint `| → &` are killed,
+  not equivalent); no production change
 
 ### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: pending
 
