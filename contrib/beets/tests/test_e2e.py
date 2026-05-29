@@ -87,6 +87,7 @@ PLAYBACK_FORMATS = [
 
 @pytest.fixture(autouse=True)
 def _require_tools():
+    """Skip the test when required external tools are missing."""
     if not (_DEBUG.exists() or _RELEASE.exists()):
         pytest.skip(f"musefs binary not built (looked in {_DEBUG}, {_RELEASE})")
     if not (os.path.exists("/dev/fuse") and shutil.which("fusermount")):
@@ -101,6 +102,7 @@ def _require_tools():
 
 
 def _ffmpeg_gen(path, freq, **tags):
+    """Generate an audio fixture with ffmpeg using codec-specific args."""
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -134,12 +136,14 @@ def _ffmpeg_gen(path, freq, **tags):
 
 
 def _env(tmp_path):
+    """Return a copy of os.environ with BEETSDIR isolated to tmp_path."""
     env = dict(os.environ)
     env["BEETSDIR"] = str(tmp_path)  # isolate from any real beets config
     return env
 
 
 def _write_config(tmp_path, library, db, fetchart=False):
+    """Write a beets config.yaml pointing at the musefs plugin."""
     plugins_block = ("plugins:\n  - musefs\n  - fetchart\n") if fetchart else "plugins: musefs\n"
     fetchart_block = ("fetchart:\n  auto: yes\n  sources:\n    - filesystem\n") if fetchart else ""
     cfg = tmp_path / "config.yaml"
@@ -161,6 +165,7 @@ def _write_config(tmp_path, library, db, fetchart=False):
 
 
 def _beet(cfg, env, *args):
+    """Run a beet subcommand and return stdout, raising on failure."""
     result = subprocess.run([BEET, "-c", str(cfg), *args], capture_output=True, env=env)
     if result.returncode != 0:
         raise AssertionError(
@@ -314,6 +319,7 @@ def _check_mount_art(cfg, env, mnt, expected_cover_sha):
 
 @contextmanager
 def _mounted(mnt, db, template):
+    """Context manager that mounts via musefs and unmounts on exit."""
     proc = subprocess.Popen(
         [MUSEFS, "mount", str(mnt), "--db", str(db), "--template", template],
         stdout=subprocess.PIPE,
@@ -427,6 +433,7 @@ def _imported_playback_library(tmp_path):
         paths = _beet(cfg, env, "ls", "-p", spec["query"]).splitlines()
         if len(paths) == 1:
             imported.append(spec)
+    assert imported, "no playback formats were imported successfully"
     return cfg, env, db, mnt, imported
 
 
@@ -434,6 +441,7 @@ def _imported_playback_library(tmp_path):
 
 
 def test_e2e_import_retag_mount_playback(tmp_path):
+    """Retag in beets, mount, verify tags and audio."""
     cfg, env, db, mnt, library = _imported_library(tmp_path)
 
     # Retag in the beets DB only (no file write, no move) so the divergence is
@@ -515,6 +523,7 @@ def test_e2e_import_retag_mount_playback(tmp_path):
 
 
 def test_e2e_move_reconcile(tmp_path):
+    """Rename via beets modify, verify mount reflects the move."""
     cfg, env, db, mnt, library = _imported_library(tmp_path)
     _beet(cfg, env, "musefs")  # initial sync (original tags)
 
@@ -536,6 +545,7 @@ def test_e2e_move_reconcile(tmp_path):
 
 
 def test_e2e_all_formats_pcm_sha_playback(tmp_path):
+    """Verify all formats decode to same PCM SHA."""
     cfg, env, db, mnt, imported = _imported_playback_library(tmp_path)
     _beet(cfg, env, "musefs")
 
@@ -560,6 +570,7 @@ def test_e2e_all_formats_pcm_sha_playback(tmp_path):
 
 
 def test_e2e_art_embedded_via_scan(tmp_path):
+    """Verify embedded art survives scan and mount."""
     cover = _make_cover(tmp_path / "embed.png", "red")
     cfg, env, db, mnt, _ = _imported_library(tmp_path, embed_cover=cover)
     _beet(cfg, env, "musefs")  # autoscan ingests the embedded pictures
@@ -568,6 +579,7 @@ def test_e2e_art_embedded_via_scan(tmp_path):
 
 
 def test_e2e_art_external_via_plugin(tmp_path):
+    """Verify external cover.jpg is synced via plugin."""
     cover = _make_cover(tmp_path / "ext.jpg", "green")
     cfg, env, db, mnt, _ = _imported_library(tmp_path, external_cover=cover)
     _beet(cfg, env, "musefs")  # plugin syncs album.artpath into track_art
@@ -576,6 +588,7 @@ def test_e2e_art_external_via_plugin(tmp_path):
 
 
 def test_e2e_art_precedence_beets_wins(tmp_path):
+    """Verify beets art wins over embedded art."""
     embedded = _make_cover(tmp_path / "embed.png", "red")
     external = _make_cover(tmp_path / "ext.jpg", "blue")
     embedded_sha = hashlib.sha256(embedded).hexdigest()

@@ -7,6 +7,7 @@ import mutagen.mp4
 
 
 def _read_tag(path, key):
+    """Read a single tag value from an audio file using mutagen."""
     # M4A: read via real mutagen.mp4.MP4 (the interop fixture includes mdhd +
     # stsd so mutagen's stream-info parser can open the file).
     if path.endswith(".m4a"):
@@ -52,6 +53,7 @@ def _read_tag(path, key):
 
 
 def test_ecosystem_reads_synthesized_tags():
+    """Verify mutagen reads synthesized tags from fixtures."""
     base = os.environ["MUSEFS_INTEROP_DIR"]
     with open(os.path.join(base, "manifest.json")) as fh:
         manifest = json.load(fh)
