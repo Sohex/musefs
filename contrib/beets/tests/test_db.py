@@ -147,3 +147,20 @@ def test_replace_tags_duplicate_keys_get_distinct_ordinals(db_path, make_track):
         assert rows == [("Rock", 0), ("Indie", 1)]
     finally:
         conn.close()
+
+
+def test_connect_enables_foreign_keys_unlike_raw_sqlite(db_path):
+    # Raw sqlite3 connections default foreign_keys OFF; _core.connect() turns
+    # them ON. Test code that opens raw connections silently loses FK
+    # enforcement, so it must route through connect() (audit finding #6).
+    raw = sqlite3.connect(db_path)
+    try:
+        assert raw.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+    finally:
+        raw.close()
+
+    conn = connect(db_path)
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    finally:
+        conn.close()

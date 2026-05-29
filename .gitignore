@@ -5,3 +5,9 @@
 # Python bytecode (interop tests)
 __pycache__/
 *.pyc
+
+# cargo-mutants scratch + reports
+.mutants-tmp/
+mutants-out/
+mutants.out/
+mutants.out.old/
