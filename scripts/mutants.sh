@@ -102,7 +102,7 @@ crates=("$@")
 for crate in "${crates[@]}"; do
   case "$crate" in
     musefs-db)
-      run_crate musefs-db --test-workspace=true \
+      run_crate musefs-db --test-workspace=true --features mutants \
         --file musefs-db/src/schema.rs \
         --file musefs-db/src/lib.rs \
         --file musefs-db/src/tracks.rs \
