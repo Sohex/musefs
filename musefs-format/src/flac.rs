@@ -126,7 +126,10 @@ pub fn synthesize_layout(
     tags: &[TagInput],
     arts: &[ArtInput],
 ) -> Result<RegionLayout> {
-    let num_blocks = scan.preserved.len() + 1 + arts.len(); // preserved + VORBIS_COMMENT + pictures
+    // exclude zero-byte art: an empty PICTURE block is meaningless and would fail
+    // layout validation (EmptySegment), making the track unreadable.
+    let nonempty_art = arts.iter().filter(|a| a.data_len > 0).count();
+    let num_blocks = scan.preserved.len() + 1 + nonempty_art; // preserved + VORBIS_COMMENT + pictures
     let last_index = num_blocks - 1;
 
     let mut segments: Vec<Segment> = Vec::new();
@@ -147,6 +150,9 @@ pub fn synthesize_layout(
     idx += 1;
 
     for art in arts {
+        if art.data_len == 0 {
+            continue; // skip degenerate empty art (see nonempty_art above)
+        }
         let framing = picture_body_framing(art);
         let body_len = framing.len() as u64 + art.data_len;
         // FLAC metadata block lengths are 24-bit (max ~16 MiB). Ingestion caps art
