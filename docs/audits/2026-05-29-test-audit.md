@@ -656,11 +656,11 @@ All 44 missed mutants are in `flac.rs`. Dominant patterns:
 | 7 | `musefs-format/src/ogg/crc.rs:53` | CRC unit test has only 1 test (`matches_independent_reference`); no test for single-byte input, max-byte (0xFF) input, or specific patterns that exercise different polynomial tap paths; 53.1% line coverage is partly const-table inflation | P2 |
 | 8 | `musefs-core/src/ogg_index.rs:83` | No test for `serve()` boundary conditions: header-only read, payload-only read, read spanning header+payload, empty result, read past end of audio region | P2 |
 | 9 | `musefs-core/src/scan.rs:79` | `probe()` fallback paths for malformed inputs (truncated headers, invalid magic) not tested at unit level; 87.7% line coverage leaves error branches uncovered | P2 |
-| 10 | `musefs-db/tracks.rs` | `delete_track` cascade paths and `upsert` conflict-resolution branches have region gaps (85.5% line, 80.6% region); SQL error branches untested | P2 |
-| 11 | `musefs-db/art.rs` | `gc_orphan_art` concurrent-deletion race paths and `linking_art` edge cases partially covered (81.1% region) | P2 |
-| 12 | `musefs-db/tags.rs` | Multi-value tag grouping and empty-set edge cases leave region gaps in `GROUP BY` assembly paths (80.2% region) | P2 |
+| 10 | `musefs-db/src/tracks.rs:31` | `delete_track` cascade paths and `upsert` conflict-resolution branches have region gaps (85.5% line, 80.6% region); SQL error branches untested | P2 |
+| 11 | `musefs-db/src/art.rs:125` | `gc_orphan_art` concurrent-deletion race paths and `linking_art` edge cases partially covered (81.1% region) | P2 |
+| 12 | `musefs-db/src/tags.rs:38` | Multi-value tag grouping and empty-set edge cases leave region gaps in `GROUP BY` assembly paths (80.2% region) | P2 |
 | 13 | `musefs-core/tests/metrics.rs:177` | Compile error: `NewTrack` has no field `backing_mtime_secs` (renamed to `backing_mtime`); all 4 metrics tests blocked | P2 |
-| 14 | `musefs-format/src/ogg/mod.rs` | No test for EOS (end-of-stream) flag behavior in Ogg pages | P2 |
+| 14 | `musefs-format/src/ogg/page.rs:6` | No test for EOS (end-of-stream) flag behavior in Ogg pages; `FLAG_EOS` is not defined or handled in the parser | P2 |
 | 15 | (no file) | No test for NFS-style `ESTALE` error on backing file read; FUSE mount would propagate raw io::Error | P2 |
 | 16 | (no file) | No test for zero-byte embedded art (empty image); code handles it but no explicit boundary test | P2 |
 
