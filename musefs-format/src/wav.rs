@@ -462,8 +462,8 @@ mod tests {
             ("tracknumber", b"ITRK"),
         ];
         for (key, cc) in cases {
-            let payload =
-                build_info_payload(&[TagInput::new(key, "X")]).expect("INFO payload for {key}");
+            let payload = build_info_payload(&[TagInput::new(key, "X")])
+                .unwrap_or_else(|| panic!("INFO payload for {key}"));
             assert!(
                 payload.windows(4).any(|w| w == &cc[..]),
                 "key {key} must emit FourCC {:?}",
