@@ -13,9 +13,12 @@ dimensions finding #5 calls out (partial reads, header/audio boundary spanning,
 art-segment serving), and add the zero-byte embedded-art boundary test (finding
 #16).
 
-**All changes are additive: tests only. No production logic changes and no new
-dependencies**, so the byte-identity invariant is untouched. (Phase 2 needed one
-named constant; 3a needs none.)
+**Changes are additive: tests only, no new dependencies** — with one possible
+exception. The C5 zero-byte-art spike could surface a genuine production bug in the
+FLAC framing/guard logic; if so it gets a small, scoped fix (see C5). **Either way
+the byte-identity invariant is untouched** — no change in 3a touches the positioned
+audio reads, only metadata-block framing. (Phase 2 needed one named constant; 3a
+needs none unless the spike forces a fix.)
 
 This is the first slice of Phase 3 (Format-layer coverage & mutants, non-Ogg),
 which is decomposed into per-format sub-phases: **3a FLAC** (this doc), 3b MP3,
@@ -54,10 +57,18 @@ applied.
   `parse_picture_block` — **not** reachable from integration tests (separate crate).
 
 The bit-level kills need precise byte control, which is cleanest with direct calls.
-So the bulk of 3a lives in a new `#[cfg(test)] mod tests` inside `flac.rs` (mirrors
-Phase 2's in-module tests in `page.rs`/`mod.rs`/`b64.rs`), with the `pub`-function
-work strengthening the existing `flac_pictures.rs` / `read_comments.rs` integration
-tests where they already exercise the path.
+**All `flac.rs` mutant kills live in one new `#[cfg(test)] mod tests` inside
+`flac.rs`** (mirrors Phase 2's in-module tests in `page.rs`/`mod.rs`/`b64.rs`). A
+`#[cfg(test)] mod tests` with `use super::*` can call every survivor function
+directly — `pub`, `pub(crate)`, and private alike — so there is no reason to split
+kills across integration files. The existing integration tests (`flac_pictures.rs`,
+`read_comments.rs`, `layout.rs`, `locate.rs`, `proptest_flac.rs`) stay **unchanged**;
+they provide end-to-end coverage but are not the vehicle for any mutant kill in 3a.
+This keeps the kill→test mapping unambiguous (one module owns it) and avoids
+redundant or gap-prone work across files.
+
+The only 3a tests *outside* `flac.rs` are the cross-cutting C4 (`proptest_read_fidelity.rs`,
+in `musefs-core`) and C5 (`synthesize_art.rs`, in `musefs-format/tests`).
 
 **Approach considered and rejected:** integration-tests-only. The private helpers
 (`parse_blocks`, `read_u32_be`, `parse_picture_block`) are only reachable
@@ -78,6 +89,23 @@ by reading the source.
 | `read_vorbis_comments` | :188 (`<`→`==`/`<=`, `\|\|`→`&&`), :193 (`+`→`-`, `>`→`==`/`>=`), :199 (`<<16`→`>>16`), :200 (`\|`→`&`, `<<8`→`>>8`), :204 (`>`→`==`/`>=`) | block-walk + length decode | crafted fixtures + malformed-path |
 | `parse_picture_block` | :237 (`>`→`==`/`>=`), :245 (`>`→`==`/`>=`), :261 (`>`→`<`) | mime/desc/data bounds | in-module: picture bodies truncated at each boundary |
 | `read_pictures` | :277 (`<`→`==`/`<=`, `\|\|`→`&&`), :283 (`+`→`-`, `>`→`==`/`>=`), :289 (`<<16`→`>>16`), :290 (`\|`→`&`, `<<8`→`>>8`), :294 (`>`→`==`/`>=`) | block-walk + length decode | crafted fixtures + malformed-path |
+
+### Kill mechanism: panic-vs-`Err` for the short-input guards
+
+Some bound mutations kill by **panic-vs-`Err` divergence**, not a clean value
+comparison — the test must assert the *clean* `Err` and the mutation turns it into
+an out-of-bounds panic. Note this in the test so the mechanism is readable:
+
+- `parse_blocks:37` / `read_vorbis_comments:188` / `read_pictures:277`,
+  `< → ==` variant: with a **3-byte** input the original short-circuits
+  (`len < 4` true → `Err(NotFlac)`); the `==` mutant evaluates `3 == 4` → false →
+  falls through to `&data[0..4]` → **panic**. The test asserts `Err(NotFlac)` on a
+  3-byte input; the kill is panic ≠ Err.
+- The `< → <=` variant of the same lines kills cleanly by value: a **4-byte**
+  `fLaC`-only input gives original `Err(Malformed)` (loop reaches `pos+4 > len`)
+  vs. mutant `Err(NotFlac)` (`4 <= 4` short-circuits).
+- The `|| → &&` variant (`:188`, `:277`) likewise kills via panic-vs-`Err` on a
+  3-byte input (`&&` forces evaluation of `data[0..4]`).
 
 ### "Shift kills" technique (`<<16`/`<<8` → `>>`)
 
@@ -121,9 +149,10 @@ truncated headers, and the shift-kill malformed fixtures.
 
 `read_vorbis_comments` (:188, :193, :199, :200 `&`, :204; record :200 `^`/:201
 equiv), `parse_picture_block` (:237, :245, :261), `read_pictures` (:277, :283,
-:289, :290 `&`, :294; record :290 `^`/:291 equiv). In-module for the private
-`parse_picture_block`; strengthen `flac_pictures.rs` / `read_comments.rs` for the
-`pub` walkers where they already build real fixtures.
+:289, :290 `&`, :294; record :290 `^`/:291 equiv). **All in-module** — the test
+module calls `read_vorbis_comments`/`read_pictures` (`pub`) and `parse_picture_block`
+(`pub(crate)`) directly via `use super::*`, with crafted FLAC byte arrays. The
+existing `flac_pictures.rs` / `read_comments.rs` integration tests are not touched.
 
 ### C3 — `synthesize_layout:155` boundary
 
@@ -136,27 +165,71 @@ original returns `Ok` (boundary is inclusive-valid), `>=` mutant returns
 
 ### C4 — Finding #5: broaden `proptest_read_fidelity` (FLAC)
 
-`musefs-core/tests/proptest_read_fidelity.rs` today reads only `[0, total_len)`
-with no art. Broaden, on FLAC:
+`musefs-core/tests/proptest_read_fidelity.rs` today has one property
+(`read_at_preserves_backing_audio`) that reads only `[0, total_len)` with no art.
+Broaden on FLAC with these named properties, each asserting served bytes equal the
+corresponding slice of an independently-assembled `whole` (the existing
+`read_at(&resolved, &db, 0, total_len)` output is the reference):
 
-- **Partial reads:** random `(offset, size)` windows; assert the served bytes equal
-  the corresponding slice of an independently-assembled whole.
-- **Header/audio boundary spanning:** windows straddling `header_len` (the
-  Inline→BackingAudio seam).
-- **Art-segment serving:** build a track with embedded art (an `ArtImage` segment)
-  and assert partial reads across the art window serve the blob bytes correctly.
+- **`read_at_partial_windows_match_whole`** — strategy: `offset in 0..=total_len`,
+  `size in 0..=(total_len - offset)` (or clamp `offset+size` to `total_len`); assert
+  `read_at(.., offset, size) == whole[offset..offset+size]` and the returned length
+  equals `size`. Covers arbitrary partial reads, empty reads, and tail reads.
+- **`read_at_windows_spanning_header_seam`** — strategy: pick windows that straddle
+  `resolved.layout.header_len()` (e.g. `start in 0..header_len`, `end in
+  header_len..total_len`); assert equality with `whole[start..end]`. Pins the
+  Inline→BackingAudio seam.
+- **`read_at_art_window_serves_blob`** — uses the new art fixture (below); strategy:
+  windows overlapping the `ArtImage` segment's byte range; assert the served bytes
+  match the inserted art blob at the right offsets and that audio after the art is
+  still byte-identical.
+
+**Art-fixture sub-task (non-trivial — its own task in the plan).** `write_flac`
+produces tags only; there is no art helper. Add `build_with_art(...)` in this test
+file that, after `upsert_track` + `replace_tags`:
+
+1. `let art_id = db.upsert_art(&NewArt { mime: "image/jpeg".into(), width: Some(8),
+   height: Some(8), data: <blob> })?;`
+2. `db.set_track_art(track_id, &[TrackArt { art_id, picture_type: 3, description:
+   "front".into(), ordinal: 0 }])?;`
+
+`HeaderCache::resolve` then emits an `ArtImage` segment via
+`mapping::track_art_to_inputs`, and `read_at` serves the blob through
+`db.read_art_chunk`. **Reference the existing `musefs-core/tests/reader.rs` and
+`tests/read_at.rs`**, which already insert and link art this way — follow their
+pattern rather than inventing one. Keep `ProptestConfig::with_cases` modest (≤64,
+matching the existing property) since each case does DB + file I/O.
 
 Non-FLAC formats are deferred to 3b/3c/3d (their fixtures don't exist in
-`musefs-core/tests/common` yet).
+`musefs-core/tests/common` yet); 3a does not add `write_mp3/mp4/wav`.
 
 ### C5 — Finding #16: zero-byte embedded art
 
 Extend `musefs-format/tests/synthesize_art.rs`: synthesize a picture with
-`data_len == 0` and assert the boundary behavior — a valid zero-length PICTURE
-block (the `ArtImage` segment has `len: 0`, the layout round-trips, and
-`metaflac` reads a picture with empty data). Pins the `data_len == 0` edge that
-the survivor bounds (`parse_picture_block:261`, the `data_end > body.len()` guard)
-depend on.
+`data_len == 0` and assert the boundary behavior. Pins the `data_len == 0` edge
+that the survivor bounds (`parse_picture_block:261`, the `data_end > body.len()`
+guard) depend on.
+
+**Unverified assumption + contingency (verify-don't-trust).** The spec *expects*
+zero-length art to be a valid zero-length PICTURE block: `ArtImage { len: 0 }`, the
+layout round-trips, and `metaflac` reads a picture with empty `data`. This is
+**not yet verified** — `metaflac` might reject empty picture data, or
+`picture_body_framing` / `synthesize_layout` might have an off-by-one at
+`data_len == 0`. The plan's **first C5 step is a verification spike** (write the
+test, observe actual behavior) with two branches:
+
+- **Assumption holds:** assert the round-trip + `metaflac` empty-data read. Pure
+  test addition, no production change — the "tests-only" claim stands.
+- **Assumption fails (production bug surfaced):** this is a real defect, not a test
+  artifact. Fix it as a **scoped production change** to the framing/guard logic in
+  `flac.rs` (e.g. the length-field emit or the `data_end` bound) and document the
+  exception to "tests-only" in the inventory. **The byte-identity invariant is
+  unaffected either way** — the fix touches metadata-block framing, never the
+  positioned audio reads. If the correct behavior turns out to be *rejecting*
+  zero-byte art (`Err(...)`), the test asserts that error instead, and ingestion's
+  art handling is noted as the enforcement point.
+
+Either branch is acceptable; the spike decides which, and 3a records the outcome.
 
 ### C6 — inventory + tracking docs
 
@@ -170,6 +243,14 @@ non-FLAC #5 coverage tracked into 3b/3c/3d).
 C1 → C2 → C3 (the in-`flac.rs` kills, building the test module incrementally) →
 C4, C5 (independent of each other and of C1–C3) → C6 (wrap-up).
 
+**Re-verify line numbers before each component.** All survivor references are
+pinned to exact `flac.rs` line numbers from the phase-1 inventory; any intervening
+edit shifts them. At the start of each component, locate the target by its **code
+pattern** (named in the verified-findings table — e.g. "the `<< 16` in the 24-bit
+length decode", "the `data_end > body.len()` guard in `parse_picture_block`") and
+confirm the current line before applying the hand-apply mutation. The pattern is
+the source of truth; the line number is a convenience that may drift.
+
 ## Error handling
 
 No new error paths. The kills assert the existing `FormatError::{NotFlac,
@@ -182,6 +263,6 @@ Malformed, TooLarge}` mappings on crafted inputs; nothing in production changes.
 | C1 | `cargo test -p musefs-format --features fuzzing flac` green; :219/:224/:37/:43/:49/:101 hand-apply red; :50/:51/:99 stay green under `^` (equivalent) |
 | C2 | listed `read_vorbis_comments`/`parse_picture_block`/`read_pictures` mutations hand-apply red; `| → ^` rows recorded equivalent |
 | C3 | boundary test at `0x00FF_FFFF` passes; `> → >=` hand-apply red |
-| C4 | `cargo test -p musefs-core proptest_read_fidelity` green; partial-read / boundary / art windows covered |
-| C5 | zero-byte art test passes; round-trips via `metaflac` |
+| C4 | `cargo test -p musefs-core proptest_read_fidelity` green; the three named properties (`read_at_partial_windows_match_whole`, `read_at_windows_spanning_header_seam`, `read_at_art_window_serves_blob`) pass with the art fixture |
+| C5 | spike resolved and outcome recorded: either the zero-byte-art round-trip + `metaflac` empty-data read passes (tests-only), or the scoped framing/guard fix lands with the test asserting the corrected behavior |
 | Whole | `cargo test --workspace` + `--features fuzzing` + `clippy -D warnings` + `fmt --check` green; next full mutants campaign shows `flac.rs` survivors dropped (excluding documented equivalents) |
