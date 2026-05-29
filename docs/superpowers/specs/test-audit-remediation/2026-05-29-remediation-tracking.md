@@ -58,9 +58,11 @@ close the beets FK correctness gap (A2), and produce the data phases 2–4 consu
     assertion. Audit's "add PRAGMA to `db_path` fixture" is ineffective — that
     connection is a throwaway and the pragma is per-connection. Finding #6.
 - **B. Mutation harness** (mirrors `fuzz.yml`)
-  - `scripts/mutants.sh` — canonical invocation: `TMPDIR` off the `/tmp` tmpfs,
-    `--jobs 1`, `cargo clean` first, one crate at a time, build dir removed
-    between crates (local disk is tight: 7.3 GB free, `target/` ~5.6 GB).
+  - `scripts/mutants.sh` — canonical invocation: per-crate `TMPDIR` child off the
+    `/tmp` tmpfs (cargo-mutants 27.0.0 has no `--target-dir`), `--jobs 1`, one
+    crate at a time with its scratch removed before the next — never `cargo
+    clean`, so the primary `target/` dep cache stays warm (local disk is tight:
+    7.3 GB free, `target/` ~5.6 GB).
   - `.github/workflows/mutants.yml` — PR job: `cargo mutants --in-diff` on
     changed Rust files. Scheduled (cron) + `workflow_dispatch` job: full per-crate
     matrix, `llvm-tools-preview`, no time cap, uploads survivor reports.

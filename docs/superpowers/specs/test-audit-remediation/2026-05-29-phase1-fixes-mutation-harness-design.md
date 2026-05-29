@@ -83,14 +83,16 @@ doc's Scope section). Responsibilities:
   reasons, but the script and the spec record 27.0.0 as the known-good version
   for reproducibility; bump deliberately.
 - Set `TMPDIR` to a path off the `/tmp` tmpfs (the audit exhausted the 3.9 GB
-  tmpfs). Accept an override env var; default to a repo-local `.mutants-tmp/`
-  that callers can place on the roomiest volume.
-- **Disk budget without nuking the dep cache:** do *not* `cargo clean` the working
-  `target/`. Instead give cargo-mutants its own isolated build dir
-  (`--target-dir target/mutants` or equivalent under `TMPDIR`) and `rm -rf` that
-  dir between crates. Peak extra disk is one isolated tree at a time, and the
-  primary `target/` (with its compiled deps, ~minutes to rebuild) is left intact.
-  (Local disk is tight: 7.3 GB free, `target/` ~5.6 GB.)
+  tmpfs). cargo-mutants 27.0.0 has **no `--target-dir`** flag; it builds inside a
+  copy of the workspace under `TMPDIR`. Treat an `MUTANTS_TMP` env var as a
+  *parent* scratch dir (default repo-local `.mutants-tmp/`), and point `TMPDIR` at
+  a unique `mktemp -d` child per crate.
+- **Disk budget without nuking the dep cache:** never `cargo clean` the working
+  `target/`. Per-crate, build under the unique `TMPDIR` child and `rm -rf` that
+  child before the next crate, so peak extra disk is one build tree at a time and
+  the primary `target/` (compiled deps, ~minutes to rebuild) is left intact.
+  Cleanup must only remove children the script created — never a caller-provided
+  `MUTANTS_TMP` parent. (Local disk is tight: 7.3 GB free, `target/` ~5.6 GB.)
 - Run **one crate at a time**, `--jobs 1`, so peak disk is a single mutants tree.
 - **Error-handling contract:** run with `set -uo pipefail` but **not** `set -e` on
   the per-crate loop — a non-zero exit from one crate (surviving mutants, or a
@@ -136,12 +138,12 @@ doc's Scope section). Responsibilities:
   trigger keeps CLI/FUSE-only PRs from running the job at all; `--in-diff` then
   constrains mutation to the changed lines within those crates — so no extra
   `-p`/`--package` filtering is needed. `--in-diff` requires a concrete diff file
-  and PR checkouts are shallow, so the job materializes the diff against the merge
-  base with the lighter targeted fetch (not a full `fetch-depth: 0` history):
-  - `actions/checkout`, then `git fetch --depth=1 origin $GITHUB_BASE_REF` to pull
-    just the base ref into the shallow clone.
-  - `git diff FETCH_HEAD...HEAD -- '*.rs' > mutants.diff` to capture the changed
-    Rust lines on the merge-base three-dot range.
+  and the three-dot range needs the merge base present, so the job uses
+  `actions/checkout` with `fetch-depth: 0` (full history — a shallow clone often
+  lacks the merge base and the diff then fails):
+  - `git diff "$BASE_SHA...HEAD" -- '*.rs' > mutants.diff`, where `BASE_SHA` is
+    `github.event.pull_request.base.sha`, capturing the changed Rust lines on the
+    merge-base three-dot range.
   - `cargo mutants --in-diff mutants.diff -j1`.
   - If `mutants.diff` is empty (no in-scope Rust changes), the job is a no-op
     pass rather than an error.

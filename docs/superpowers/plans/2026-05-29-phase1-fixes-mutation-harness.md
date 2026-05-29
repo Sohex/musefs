@@ -117,7 +117,7 @@ def test_connect_enables_foreign_keys_unlike_raw_sqlite(db_path):
 
 Run:
 ```bash
-cd contrib/beets && python -m pytest tests/test_db.py::test_connect_enables_foreign_keys_unlike_raw_sqlite -v
+cd contrib/beets && .venv/bin/python -m pytest tests/test_db.py::test_connect_enables_foreign_keys_unlike_raw_sqlite -v
 ```
 Expected: PASS (this is a characterization test — it documents existing correct
 `connect()` behavior and the raw-connection default; both assertions hold today).
@@ -184,7 +184,7 @@ If no matches remain, delete the `import sqlite3` line at the top of
 
 Run:
 ```bash
-cd contrib/beets && python -m pytest && ruff check tests/test_plugin.py
+cd contrib/beets && .venv/bin/python -m pytest && ruff check tests/test_plugin.py
 ```
 Expected: all tests pass; ruff reports no errors.
 
@@ -266,37 +266,53 @@ Create `scripts/mutants.sh`:
 # see the remediation tracking doc).
 #
 # Usage: scripts/mutants.sh [crate ...]   (default: all three in-scope crates)
-# Env:   MUTANTS_TMP  scratch dir off the /tmp tmpfs (default: ./.mutants-tmp)
+# Env:   MUTANTS_TMP  scratch PARENT dir off the /tmp tmpfs (default: ./.mutants-tmp).
+#                     cargo-mutants builds inside a unique child we create here;
+#                     a caller-provided parent is never deleted, only our children.
 #        MUTANTS_LIST set to 1 to only enumerate mutants (no build/run)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-export TMPDIR="${MUTANTS_TMP:-$ROOT/.mutants-tmp}"
-mkdir -p "$TMPDIR"
-trap 'rm -rf "$TMPDIR"' EXIT
+# Scratch parent. If the caller supplied MUTANTS_TMP we treat it as a shared
+# parent and must NOT remove it on exit (could be /tmp or another shared dir);
+# we only ever remove the unique children we mktemp inside it. Our own default
+# repo-local parent we do clean up.
+if [ -n "${MUTANTS_TMP:-}" ]; then
+  SCRATCH_PARENT="$MUTANTS_TMP"; OWN_PARENT=0
+else
+  SCRATCH_PARENT="$ROOT/.mutants-tmp"; OWN_PARENT=1
+fi
+mkdir -p "$SCRATCH_PARENT"
+cleanup() { [ "$OWN_PARENT" = 1 ] && rm -rf "$SCRATCH_PARENT"; }
+trap cleanup EXIT
 
-TARGET_DIR="$TMPDIR/target"
 OUT_ROOT="$ROOT/mutants-out"
 
 # Per-crate args. --test-workspace=true for musefs-db: its dependents' tests are
 # cheap to build, so workspace-wide checking buys stronger mutant detection.
 # =false for core/format: workspace mode pulls in criterion/proptest scratch
 # builds that blew the disk/time budget in the audit; crate-local tests suffice.
+#
+# cargo-mutants 27.0.0 has no --target-dir; it builds inside a copy of the tree
+# under TMPDIR. We point TMPDIR at a unique per-crate child so peak disk is one
+# build tree at a time, removed before the next crate.
 run_crate() {
   local crate="$1"; shift
   local out="$OUT_ROOT/$crate"
-  echo "== mutants: $crate =="
-  rm -rf "$TARGET_DIR"
+  local tmp
+  tmp="$(mktemp -d "$SCRATCH_PARENT/${crate}.XXXXXX")"
+  echo "== mutants: $crate (scratch: $tmp) =="
   local list_flag=""
   [ "${MUTANTS_LIST:-0}" = "1" ] && list_flag="--list"
-  cargo mutants -p "$crate" \
+  TMPDIR="$tmp" cargo mutants -p "$crate" \
     --jobs 1 \
-    --target-dir "$TARGET_DIR" \
     --output "$out" \
     $list_flag "$@"
-  return $?
+  local rc=$?
+  rm -rf "$tmp"
+  return "$rc"
 }
 
 status=0
@@ -421,6 +437,9 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          # Full history so the merge base for the three-dot diff is present;
+          # a shallow clone often lacks it and `git diff base...HEAD` then fails.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
@@ -430,9 +449,10 @@ jobs:
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).
         run: cargo install cargo-mutants
       - name: Build the merge-base diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          git fetch --depth=1 origin "$GITHUB_BASE_REF"
-          git diff FETCH_HEAD...HEAD -- '*.rs' > mutants.diff
+          git diff "$BASE_SHA...HEAD" -- '*.rs' > mutants.diff
           echo "Changed Rust lines:"; wc -l mutants.diff
       - name: Mutate changed lines
         run: |
@@ -477,7 +497,7 @@ jobs:
 
 Run:
 ```bash
-python -c "import yaml; yaml.safe_load(open('.github/workflows/mutants.yml'))" && echo OK
+python3 -c "import yaml; yaml.safe_load(open('.github/workflows/mutants.yml'))" && echo OK
 ```
 Expected: `OK` (no YAML parse error).
 
@@ -640,9 +660,9 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ## Final verification
 
 - [ ] `cargo test -p musefs-core --features metrics --test metrics -- --test-threads=1` → 4 pass (Task 1)
-- [ ] `cd contrib/beets && python -m pytest` → all green, incl. the FK characterization test (Tasks 2–3)
+- [ ] `cd contrib/beets && .venv/bin/python -m pytest` → all green, incl. the FK characterization test (Tasks 2–3)
 - [ ] `MUTANTS_LIST=1 scripts/mutants.sh musefs-db` → lists mutants, exit 0 (Task 5)
 - [ ] `git check-ignore mutants.out.old/` → printed (Task 4)
-- [ ] `python -c "import yaml; yaml.safe_load(open('.github/workflows/mutants.yml'))"` → OK (Task 6)
+- [ ] `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/mutants.yml'))"` → OK (Task 6)
 - [ ] Inventory doc exists and is filled from a real CI run (Task 7)
 - [ ] Tracking doc shows Phase 1 done (Task 8)
