@@ -27,7 +27,28 @@ weak spots in that suite, not to bootstrap testing from nothing.
   implementation plan (written next via the writing-plans skill) that executes the
   audit phases.
 
-## Methodology — three phases
+## Methodology — phases
+
+### Phase 0 — Tooling preflight (reproducible setup)
+
+Mutation and fuzz tooling is not all present in the environment, so the
+implementation plan must make setup explicit and reproducible before any phase
+that depends on it:
+
+- `cargo-llvm-cov` — already installed; verify on PATH (`~/.cargo/bin`) with
+  `cargo llvm-cov --version`. No install needed.
+- `cargo-mutants` — **not installed.** Install a pinned version with
+  `cargo install cargo-mutants --version <pin> --locked` (record the exact pin in
+  the report so the run is reproducible). Verify with `cargo mutants --version`.
+- `cargo-fuzz` — **not installed.** Install with `cargo install cargo-fuzz`
+  **without** `--locked` (matching `.github/workflows/fuzz.yml`, whose comment
+  notes the pinned `rustix` fails to compile on current nightly). Requires the
+  `nightly` toolchain (present).
+- **Network-unavailable fallback:** if `cargo install` cannot reach the registry,
+  the dependent phase is marked **blocked** in the report (not silently skipped):
+  Phase B emits "mutation testing blocked — cargo-mutants unavailable" and Phase A
+  emits the same for the fuzz smoke surface, and the affected scorecard cells read
+  "not measured (tooling unavailable)". The coverage and judgment phases still run.
 
 ### Phase A — Ground truth (empirical baseline)
 
@@ -40,21 +61,43 @@ Run the full test surface and record current state:
   `cargo test -p musefs-core --test proptest_read_fidelity` (proptests).
 - mutagen interop suite (`MUSEFS_INTEROP_DIR=... cargo test ... -- --ignored
   emit_interop_fixtures` then `python -m pytest tests/interop`).
+- **beets plugin suite** (`contrib/beets/`): `python -m pytest` (unit +
+  integration), `python -m pytest -m musefs_bin` (path-gate vs the real `musefs`
+  binary), and `python -m pytest -m e2e` (beets → mount → playback). Record pass
+  state and, where practical, `pytest-cov` line coverage for `beetsplug/`.
+- **Fuzz smoke surface** (mirrors `.github/workflows/fuzz.yml` per-PR job):
+  `cargo +nightly fuzz build`, then a short run of each target
+  (`flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment`) with a bounded
+  `-max_total_time`. Goal is to confirm every target still builds and reaches its
+  parser, not a full fuzzing campaign. Record any broken/unreachable target.
 - `cargo-llvm-cov` (installed; ensure `~/.cargo/bin` on PATH) over the workspace
   excluding `musefs-fuse`, matching CI. Capture per-crate and per-module line +
   region coverage.
 
-Output of Phase A: a coverage table and a note of any currently failing or flaky
-tests.
+**FUSE coverage strategy.** `cargo-llvm-cov` excludes `musefs-fuse` (real mounts
+don't instrument cleanly), so FUSE-only behaviors are **not** scored by
+line/region coverage. Most of the underlying logic lives in `musefs-core` and is
+covered there (e.g. `poll_refresh_notify` / the inode allocator); the thin
+`musefs-fuse` adapter glue — `--keep-cache` `inval_inode` dispatch, worker-pool
+offload wiring — is scored instead by **e2e evidence**: presence and assertion
+strength of the relevant `#[ignore]`d mount tests (`keep_cache.rs`,
+`concurrency.rs`, `ogg_read_through.rs`, `playback_pcm.rs`), confirmed green on
+`/dev/fuse` in Phase A. The report states this scoring basis explicitly per
+FUSE-only area rather than implying a coverage number exists.
+
+Output of Phase A: a coverage table, the fuzz-smoke result, the beets suite
+result, and a note of any currently failing or flaky tests.
 
 ### Phase B — Mutation testing (test quality)
 
-`cargo install cargo-mutants`, then run it **scoped** to the risk-critical files
-(whole-workspace mutation is too slow). Surviving mutants — code mutated without
-any test failing — are the sharpest signal of weak or missing assertions.
+With `cargo-mutants` installed (Phase 0), run it **scoped** to the risk-critical
+files (whole-workspace mutation is too slow). Surviving mutants — code mutated
+without any test failing — are the sharpest signal of weak or missing assertions.
 
 - Targets: `musefs-format` (synthesis, `ogg/`, format parsers) and `musefs-core`
-  (`reader.rs`, `tree.rs`, `scan.rs`, `facade.rs`).
+  (`reader.rs`, `tree.rs`, `scan.rs`, `facade.rs`, and `ogg_index.rs` — central to
+  Tier-1 Ogg read correctness: lazy page indexing, sequence renumbering, CRC
+  patching, payload serving).
 - Bounded with a per-mutant timeout multiplier and `--file` globs to keep runtime
   practical. Record surviving mutants with `file:line` and the mutation applied.
 
@@ -88,6 +131,11 @@ Phase B survivors. Look for:
   swap, per-handle I/O.
 - **Scan / revalidate:** upsert, prune of gone backing files, orphaned-art GC,
   preservation of external tag edits.
+- **beets plugin (`contrib/beets/`):** the plugin writes the SQLite store that is
+  the cross-tool contract, so its correctness matters. Audit the pytest suite for
+  the path-matching gate, tag/art sync, file move/rename reconciliation, and the
+  e2e (beets → mount → playback) path. Scored by `pytest` pass state and
+  `pytest-cov` over `beetsplug/` (not Rust coverage).
 
 **Tier 3 — survey only:** CLI arg parsing, template rendering, mapping. Confirm
 coverage exists and note gaps; go deep only if something looks alarming.
@@ -96,7 +144,9 @@ coverage exists and note gaps; go deep only if something looks alarming.
 
 For each area the report scores three dimensions explicitly:
 
-- **Coverage** — uncovered lines/regions from `cargo-llvm-cov`.
+- **Coverage** — uncovered lines/regions from `cargo-llvm-cov`. For FUSE-only
+  areas, scored by e2e evidence instead (see FUSE coverage strategy); for the
+  beets plugin, by `pytest-cov` over `beetsplug/`. The report states the basis.
 - **Quality** — surviving mutants from Phase B plus assertion-strength notes.
 - **Edge cases** — a checklist of boundary/adversarial conditions, each marked
   covered / partial / missing. Seed checklist (extend per area): empty /
@@ -121,7 +171,7 @@ One markdown report at `docs/audits/2026-05-29-test-audit.md`, structured as:
 ## Sequencing note
 
 The audit's findings do not exist until the audit runs. The implementation plan
-written next (via writing-plans) is therefore a plan to **execute Phases A–C and
+written next (via writing-plans) is therefore a plan to **execute Phases 0–C and
 produce the report**; the report's backlog section is the remediation deliverable.
 
 ## Non-goals
