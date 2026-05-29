@@ -114,6 +114,11 @@ public build. The name mirrors `musefs-format`'s existing `fuzzing` feature
   leg's `--features fuzzing`. The PR `--in-diff` gate in `mutants.yml` calls
   cargo-mutants directly without the feature; that is acceptable (fast best-effort
   gate) and noted, not fixed here.
+- Add **both** a `cargo clippy -p musefs-db --features mutants --all-targets -D
+  warnings` step **and** a `cargo test -p musefs-db --features mutants` step to
+  `ci.yml`'s `check` job. The clippy step is required because the existing repo-wide
+  Clippy step runs without the feature, so the gated `Default` code would otherwise
+  never be linted in CI.
 
 Tests that depend on these `Default`s are themselves `#[cfg(feature = "mutants")]`
 and run via `cargo test -p musefs-db --features mutants` — added alongside the
@@ -196,10 +201,11 @@ Add:
 ### B4 — finding #11 (art), reframed: `tests/art.rs`
 
 Existing coverage: sha256 dedup, get data+len, set/get track_art, linking bumps
-`content_version`, `read_art_chunk` slice, gc removes unreferenced. Add:
+`content_version`, `read_art_chunk` slice, gc removes unreferenced **including the
+`removed == 1` return value and that the referenced row survives**
+(`gc_orphan_art_removes_unreferenced_rows`). That single-reference keep/remove case
+is therefore **not** re-added. Add only the genuinely-new gaps:
 
-- `gc_orphan_art` **keeps** still-referenced art (the `NOT IN` negative case) and
-  returns the **exact** removed count.
 - Art shared by two tracks survives until **both** unlink it (delete one track or
   re-`set_track_art` to drop the link; assert the art row persists, then gc only
   after the last reference is gone).
@@ -281,12 +287,12 @@ limitation, not defects). The byte-identity invariant is not in this layer.
 
 | Component | Check |
 |-----------|-------|
-| B1 | `mutants` feature compiles; `impl Default for Db` yields version 0; gated model `Default`s present; `scripts/mutants.sh` db leg passes `--features mutants`; CI runs `cargo test -p musefs-db --features mutants` |
+| B1 | `mutants` feature compiles; `impl Default for Db` yields version 0; gated model `Default`s present; `scripts/mutants.sh` db leg passes `--features mutants`; CI runs both `cargo clippy -p musefs-db --features mutants …` and `cargo test -p musefs-db --features mutants` |
 | B2 | `user_version` test red under `→ Ok(1)` (feature-gated); `schema.rs:93` confirmed equivalent by hand-apply |
 | B3 | `delete_track`-leaves-art and `upsert_track` all-columns tests added and green; error-branch audit recorded |
 | B4 | gc-keeps-referenced + exact-count, shared-art-survives, `set_track_art` relink/unlink/reorder, `upsert_art` dedup tests added |
 | B5 | `tags_grouped` empty/single-multi/multi-track/ordering tests added |
 | B6 (PR 2) | every newly-viable db survivor killed or recorded equivalent (from the dispatched campaign's artifact) |
 | B7 | framing + known-mutant annotations land in PR 1; final survivor annotations + Phase 4 completion land in PR 2 |
-| PR 1 | `cargo test --workspace` + `--features fuzzing` + `cargo test -p musefs-db --features mutants` + `clippy --all-targets -D warnings` + `fmt --check` green; campaign dispatched on the branch |
+| PR 1 | `cargo test --workspace` + `--features fuzzing` + `cargo test -p musefs-db --features mutants` + `clippy --all-targets -D warnings` + `clippy -p musefs-db --features mutants` + `fmt --check` green; campaign dispatched on the branch |
 | PR 2 | the dispatched db campaign shows the 2 known + the 20 unblocked killed or documented-equivalent |
