@@ -408,4 +408,39 @@ mod tests {
         let ids: Vec<[u8; 4]> = walk_chunks(&buf).iter().map(|(id, _, _)| *id).collect();
         assert_eq!(ids, vec![*b"AAAA", *b"data"]);
     }
+
+    /// A 16-byte PCM `fmt ` payload: mono, 44.1 kHz, 16-bit.
+    fn fmt_pcm() -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&44_100u32.to_le_bytes());
+        f.extend_from_slice(&88_200u32.to_le_bytes());
+        f.extend_from_slice(&2u16.to_le_bytes());
+        f.extend_from_slice(&16u16.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn locate_requires_fmt_chunk() {
+        // :67 `== → !=`: a data-only WAV (no `fmt `). Original: `any(id == "fmt ")`
+        // is false → NotWav. The `!=` mutant is true (the data chunk is != "fmt ")
+        // → has_fmt, so it returns Ok/Malformed instead of NotWav.
+        let buf = wav(&[(b"data", vec![0x11; 8])]);
+        assert_eq!(locate_audio(&buf), Err(FormatError::NotWav));
+    }
+
+    #[test]
+    fn locate_accepts_data_with_trailing_chunk() {
+        // :71 `> → <`: a valid WAV with a chunk AFTER `data`, so off+len < buf.len.
+        // Original `off+len > buf.len` is false → Ok. The `<` mutant is true →
+        // Malformed.
+        let buf = wav(&[
+            (b"fmt ", fmt_pcm()),
+            (b"data", vec![0x11; 8]),
+            (b"junk", vec![0x00; 4]),
+        ]);
+        let bounds = locate_audio(&buf).unwrap();
+        assert_eq!(bounds.audio_length, 8);
+    }
 }
