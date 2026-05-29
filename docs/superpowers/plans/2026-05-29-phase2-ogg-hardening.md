@@ -302,9 +302,14 @@ on the continuation page, and contiguous offsets.
 ```bash
 cargo test -p musefs-core ogg_index
 ```
-Expected: PASS. Hand-apply `:131`-area expectations are covered by Task 3's CRC
-oracle; here verify the FLAG_CONTINUED assertion bites by flipping the `i == 2`
-branch expectation mentally (no code mutation needed — this closes #4's gap).
+Expected: PASS. This task targets findings **#3 and #4** (coverage of the
+`build_index` error path and per-page invariants); `build_index` itself has **no
+named survivors** in the inventory (its only core survivors are the three `serve`
+mutations handled in Task 1). So there is no `build_index` mutation to hand-apply
+here — the deliverable is the new error test (Step 2, whose guard you already
+hand-apply-verified) plus the strengthened all-page assertions (`FLAG_CONTINUED`,
+`payload_len`, contiguous offsets). Per-page CRC validity is asserted by Task 3's
+oracle.
 
 ```bash
 git add musefs-core/src/ogg_index.rs
@@ -348,7 +353,7 @@ Expected: builds; no new lockfile churn beyond enabling the dev-deps for this cr
         refin: false,
         refout: false,
         xorout: 0x0000_0000,
-        check: 0x0000_0000, // unused; we never call .check()
+        check: 0x0000_0000, // CRC-32/Ogg check value (zero-input residue); we never call .check()
         residue: 0x0000_0000,
     };
 
@@ -583,13 +588,16 @@ truncated-table case must fail. Revert each.
 - [ ] **Step 4: Strengthen `lace_chunks_to_segments` flag + payload assertions (`:263`, `:265`, `:266`, `:298`, `:122`)**
 
 The existing `chunk_lacer_splits_art_across_pages_and_crcs_validate` walks pages and
-checks CRCs but never asserts `header_type`. Add these assertions inside its page
-walk loop (right after `assert_eq!(h.seq, seq_expected);`):
+checks CRCs but never asserts `header_type`. In its page-walk loop `seq_expected`
+is 0 on the first iteration and is incremented later in the body, so capture
+`is_first` **before** the increment. Insert this immediately after
+`let h = parse_page(&flat, pos).unwrap();`:
 
 ```rust
             // Flag-bit kills: BOS only on the first page, FLAG_CONTINUED on every
             // later page (kills :263 |=->&= on BOS, :266 on CONTINUED, :265 delete !).
-            if seq_expected == 1 {
+            let is_first = seq_expected == 0;
+            if is_first {
                 assert_eq!(h.header_type & FLAG_BOS, FLAG_BOS);
                 assert_eq!(h.header_type & FLAG_CONTINUED, 0);
             } else {
@@ -598,14 +606,33 @@ walk loop (right after `assert_eq!(h.seq, seq_expected);`):
             }
 ```
 
-(The loop increments `seq_expected` after this block, so the first iteration sees
-`seq_expected == 0`; adjust: capture `let is_first = seq_expected == 0;` before the
-`seq_expected += 1;` and branch on `is_first`.)
-
 The payload-equality assertion at the end of that test (`assert_eq!(payload,
 expected)`) already pins `:122`/`:298` (payload positions); confirm via hand-apply:
 change `:298` `oe - os` neighbourhood `- -> +` and `:122` `payload_pos += ... -> *=`
 and verify the payload assertion fails.
+
+`copy_payload:310` (`if os < oe` → `<=`) and `emit_segments:337` (`if os < oe` →
+`<=`) both gate an empty-overlap branch. Handle each with the hand-apply method:
+
+- `:310`: with `<=`, when `os == oe` the copy slices `&bytes[os-cs..oe-cs]` (empty)
+  → no-op → identical output. Run the chunk_lacer test under the mutation; if it
+  stays green, this is an **equivalent mutant** — record it in Task 7. Do not
+  contrive a test.
+- `:337`: with `<=`, an `os == oe` at an **art-chunk** boundary is NOT a no-op — the
+  `Art` arm flushes `buf` and pushes a zero-length `OggArtSlice`, changing the
+  segment structure. Add this assertion to the chunk_lacer test so the spurious
+  slice is caught:
+  ```rust
+      // No OggArtSlice may be zero-length (kills emit_segments:337 < -> <=).
+      assert!(segments.iter().all(|s| !matches!(s, Segment::OggArtSlice { len: 0, .. })));
+  ```
+  Hand-apply `:337` `< -> <=` and rerun. If the current fixture's chunk boundaries
+  never align exactly with a page boundary (so `os == oe` never occurs at the art
+  chunk), the assertion may stay green under the mutant; in that case add a second
+  fixture whose art run begins exactly at a page boundary (art chunk length a
+  multiple of 65 025 after a head chunk filling the remainder of a page), or record
+  `:337` as equivalent if no aligned case is reachable. Document the outcome in
+  Task 7.
 
 - [ ] **Step 5: `read_packets` `:181` and `patch_page_header` `:197`**
 
@@ -758,24 +785,30 @@ module has `use super::*;`, so call them directly.
     }
 ```
 
-- [ ] **Step 3: `locate_audio` (`:196`) — audio_offset past EOF errors**
+- [ ] **Step 3: `locate_audio` (`:196`) — empty audio region is accepted**
+
+The `:196` guard is `if header.audio_offset > data.len()`. After a successful
+`read_header`, `audio_offset` is the end offset of a page that was parsed *within*
+`data`, so it is always `<= data.len()` — the `>` branch is unreachable, which is
+why truncation cannot trigger it. The reachable discriminator is
+`audio_offset == data.len()` (a header-only file, no audio): the original `>` is
+false → `Ok` with `audio_length == 0`, whereas the `> -> ==` and `> -> >=` mutants
+both fire and wrongly return `Err`.
 
 ```rust
     #[test]
-    fn locate_audio_rejects_header_longer_than_data() {
-        // A valid header but truncate the buffer so audio_offset > data.len().
-        let file = opus_headers(); // header pages only; audio_offset == file.len()
-        let truncated = &file[..file.len() - 1];
-        assert!(locate_audio(truncated).is_err()); // kills :196 > -> ==/>=
+    fn locate_audio_accepts_empty_audio_region() {
+        // opus_headers() is header pages only: audio_offset == data.len(). The
+        // original `>` yields Ok (audio_length 0); the :196 `==`/`>=` mutants reject.
+        let file = opus_headers();
+        let scan = locate_audio(&file).unwrap();
+        assert_eq!(scan.codec, Codec::Opus);
+        assert_eq!(scan.audio_offset, file.len() as u64);
+        assert_eq!(scan.audio_length, 0);
     }
 ```
-NOTE: `opus_headers()` ends exactly at the audio boundary, so on the full buffer
-`audio_offset == data.len()` (the `>` boundary). Truncating by one byte makes
-`audio_offset > data.len()`. If `read_header` errors first on the truncated buffer
-the test still passes (it asserts `is_err()`); to specifically pin `:196`, instead
-append one audio page to `opus_headers()` and truncate into it so `read_header`
-still succeeds but `audio_offset > data.len()`. Use the `build_codec_file`-style
-fixture from the existing mod tests if needed.
+Hand-apply `:196` `> -> >=` (then `> -> ==`): `locate_audio(&opus_headers())` must
+go from `Ok` to `Err`, so the `.unwrap()` panics → test fails. Revert each.
 
 - [ ] **Step 4: `synthesize_layout` (`:233`, `:235`), `picture_prefix` (`:254`), art builders (`:304`–`:306`, `:409`–`:439`)**
 
@@ -783,18 +816,40 @@ Most of these are already exercised by existing tests (`synthesize_opus_…`,
 `picture_prefix_is_3_aligned_…`, `oversized_full_art_value_rejected_…`) yet
 survived — strengthen the assertions:
 
-- `:254` picture_prefix `% -> +`: the existing `picture_prefix_is_3_aligned…`
-  asserts `prefix.len() % 3 == 0`. Add an assertion that the **declared
-  description length** equals `art.description.len() + pad` for a description whose
-  base length is NOT 3-aligned, so the `(3 - base % 3) % 3` padding is pinned:
+- `:254` picture_prefix outer `% 3 -> + 3`: `pad = (3 - base % 3) % 3`. The inner
+  `base % 3 -> base + 3` mutation underflows `usize` and panics (already caught by
+  any call), so the survivor is the **outer** `% 3`. It diverges only when
+  `base % 3 == 0`: original `pad = (3 - 0) % 3 = 0`, mutant `pad = (3 - 0) + 3 = 6`.
+  The prefix length stays 3-aligned under both (6 is a multiple of 3), so
+  `prefix.len() % 3 == 0` does **not** kill it — the **declared description-length
+  field** does (it becomes `desc.len() + 6` instead of `desc.len()`). Add a new
+  test with `base % 3 == 0` (`32 % 3 == 2`, so make `mime.len() + desc.len() ≡ 1
+  (mod 3)`; `mime="image/png"` (9) + `description="x"` (1) → `base = 42`):
   ```rust
-      // base = 32 + mime.len() + desc.len(); choose lengths so base % 3 == 1.
-      // Then pad must be 2 and prefix length stays a multiple of 3.
-      assert_eq!(prefix.len() % 3, 0);
+      #[test]
+      fn picture_prefix_declared_desc_len_pins_padding() {
+          let art = crate::input::ArtInput {
+              art_id: 1,
+              mime: "image/png".into(),   // 9
+              description: "x".into(),     // 1 -> base = 42, 42 % 3 == 0 -> pad 0
+              picture_type: 3,
+              width: 1,
+              height: 1,
+              data_len: 100,
+          };
+          let prefix = picture_prefix(&art);
+          assert_eq!(prefix.len() % 3, 0);
+          // Declared description length lives at offset 8 + mime.len() (after
+          // type[4] + mimelen[4] + mime). pad = declared - desc.len() must be 0..=2.
+          let off = 8 + art.mime.len();
+          let declared = u32::from_be_bytes(prefix[off..off + 4].try_into().unwrap());
+          let pad = declared - art.description.len() as u32;
+          assert!(pad <= 2, "pad must be 0..=2, got {pad}");
+          assert_eq!(pad, 0, "base % 3 == 0 implies pad 0");
+      }
   ```
-  Hand-apply `:254` `% -> +`; the 3-alignment assertion must fail for the chosen
-  lengths. Pick `mime`/`description` lengths making `base % 3 == 1` so `+` vs `%`
-  diverge.
+  Hand-apply `:254` outer `% -> +`: `pad` becomes 6 → `declared` becomes 7 → the
+  `pad <= 2` / `pad == 0` assertions fail. Revert.
 
 - `:233` `seq += used` `+= -> *=` and `:235` `seq - header_pages` `- -> +`/`/`:
   add to `synthesize_opus_emits_valid_header_and_audio_segment` (or a new test)
@@ -897,6 +952,11 @@ In the musefs-core survivor table, append a `Kind`/note for the equivalents and 
 a short "Ogg equivalent mutants" note section:
 - `ogg_index.rs:105`, `ogg_index.rs:113` → **equivalent** (empty-overlap no-op;
   confirmed by hand-apply in Task 1).
+- `ogg/page.rs:310` (copy_payload) → **equivalent** if Task 4 confirmed it (empty
+  slice no-op). Record the hand-apply outcome.
+- `ogg/page.rs:337` (emit_segments) → killed by the zero-length-`OggArtSlice`
+  assertion if Task 4 reached an aligned case; otherwise **equivalent**. Record
+  which.
 - `ogg/page.rs:93`, `ogg/page.rs:256`, `ogg/page.rs:294` → **detected-by-timeout**
   (loop/allocation blow-up; not silent survivors).
 
