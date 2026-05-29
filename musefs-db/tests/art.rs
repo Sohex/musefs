@@ -139,3 +139,77 @@ fn gc_orphan_art_removes_unreferenced_rows() {
     assert!(db.get_art(referenced).unwrap().is_some());
     assert!(db.get_art(orphan).unwrap().is_none());
 }
+
+#[test]
+fn shared_art_survives_until_last_reference_gone() {
+    let db = Db::open_in_memory().unwrap();
+    let t1 = db.upsert_track(&new_track("/m/a.flac")).unwrap();
+    let t2 = db.upsert_track(&new_track("/m/b.flac")).unwrap();
+    let art = db.upsert_art(&jpeg(vec![7, 7, 7])).unwrap();
+    let link = |ord| TrackArt {
+        art_id: art,
+        picture_type: 3,
+        description: String::new(),
+        ordinal: ord,
+    };
+    db.set_track_art(t1, &[link(0)]).unwrap();
+    db.set_track_art(t2, &[link(0)]).unwrap();
+
+    // Drop one reference: still linked by t2 => survives gc.
+    db.set_track_art(t1, &[]).unwrap();
+    assert_eq!(db.gc_orphan_art().unwrap(), 0);
+    assert!(db.get_art(art).unwrap().is_some());
+
+    // Drop the last reference: now an orphan.
+    db.set_track_art(t2, &[]).unwrap();
+    assert_eq!(db.gc_orphan_art().unwrap(), 1);
+    assert!(db.get_art(art).unwrap().is_none());
+}
+
+#[test]
+fn set_track_art_replaces_links() {
+    let db = Db::open_in_memory().unwrap();
+    let t = db.upsert_track(&new_track("/m/a.flac")).unwrap();
+    let a = db.upsert_art(&jpeg(vec![1])).unwrap();
+    let b = db.upsert_art(&jpeg(vec![2])).unwrap();
+
+    db.set_track_art(
+        t,
+        &[
+            TrackArt {
+                art_id: a,
+                picture_type: 3,
+                description: "front".to_string(),
+                ordinal: 0,
+            },
+            TrackArt {
+                art_id: b,
+                picture_type: 4,
+                description: "back".to_string(),
+                ordinal: 1,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.get_track_art(t).unwrap().len(), 2);
+
+    // Replace: a single, re-described link (relink + reorder).
+    db.set_track_art(
+        t,
+        &[TrackArt {
+            art_id: b,
+            picture_type: 3,
+            description: "now-front".to_string(),
+            ordinal: 0,
+        }],
+    )
+    .unwrap();
+    let got = db.get_track_art(t).unwrap();
+    assert_eq!(got.len(), 1, "old links are cleared before insert");
+    assert_eq!(got[0].art_id, b);
+    assert_eq!(got[0].description, "now-front");
+
+    // Empty items clears all links.
+    db.set_track_art(t, &[]).unwrap();
+    assert!(db.get_track_art(t).unwrap().is_empty());
+}
