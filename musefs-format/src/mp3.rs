@@ -847,4 +847,30 @@ mod tests {
         assert!(!id3v2_alloc_safe(&id3v2(0x04, 0x40, 0, &[])));
         assert!(!id3v2_alloc_safe(&id3v2(0x04, 0x80, 0, &[])));
     }
+
+    #[test]
+    fn alloc_safe_rejects_high_bit_in_body_size() {
+        // Two body-size bytes with the high bit set: OR = 0x80 (reject). The
+        // `| -> ^` mutant gives 0x80^0x80 = 0 (accept); `| -> &` gives 0x80&0x80&0&0
+        // = 0 (accept). Built by hand because `ss()` would clear the high bits.
+        let tag = vec![b'I', b'D', b'3', 0x04, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00];
+        assert!(!id3v2_alloc_safe(&tag));
+        // Single high-bit byte still rejected (pins the `>= 0x80` comparison).
+        let tag1 = vec![b'I', b'D', b'3', 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80];
+        assert!(!id3v2_alloc_safe(&tag1));
+    }
+
+    #[test]
+    fn alloc_safe_rejects_high_bit_in_v24_frame_size() {
+        // v2.4 frame size is synchsafe; two size bytes with the high bit set must be
+        // rejected (whole-byte OR check on data[pos+4..pos+8]). The frame is 10 bytes
+        // (4 id + 4 size + 2 flags), so body=10 makes tag_end == len (20): the walk
+        // is entered (NOT short-circuited by `tag_end > data.len()`) and the high-bit
+        // check fires.
+        let mut frame = b"TIT2".to_vec();
+        frame.extend_from_slice(&[0x80, 0x80, 0x00, 0x00]); // size bytes, two high bits
+        frame.extend_from_slice(&[0x00, 0x00]); // frame flags
+        let tag = id3v2(0x04, 0x00, 10, &frame);
+        assert!(!id3v2_alloc_safe(&tag));
+    }
 }
