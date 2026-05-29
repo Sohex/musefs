@@ -426,9 +426,7 @@ pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_id3v2_segments, id3v2_alloc_safe, read_tags};
-    use crate::input::TagInput;
-    use crate::layout::Segment;
+    use super::*;
 
     /// Build a minimal ID3v2.3 tag with a single frame whose declared size
     /// overflows the tag bounds, and assert the guard rejects it.
@@ -633,6 +631,29 @@ mod tests {
                 read.contains(&(expected.0.to_string(), expected.1.to_string())),
                 "missing {expected:?} in {read:?}"
             );
+        }
+    }
+
+    #[test]
+    fn synchsafe_decode_assembles_7bit_groups() {
+        // (1<<21)|(2<<14)|(3<<7)|4
+        assert_eq!(synchsafe_decode(&[0x01, 0x02, 0x03, 0x04]), 0x0020_8184);
+        // high bit of each byte masked (& 0x7F): 0xFF -> 0x7F per group.
+        assert_eq!(synchsafe_decode(&[0xFF, 0xFF, 0xFF, 0xFF]), 0x0FFF_FFFF);
+        // only the top group set -> pins the `<<21` (kills `<<21 -> >>21`).
+        assert_eq!(synchsafe_decode(&[0x7F, 0x00, 0x00, 0x00]), 0x0FE0_0000);
+        // only the second group set -> pins the `<<14` (kills `<<14 -> >>14`).
+        assert_eq!(synchsafe_decode(&[0x00, 0x7F, 0x00, 0x00]), 0x001F_C000);
+    }
+
+    #[test]
+    fn syncsafe_encodes_and_round_trips() {
+        // pins the `>>21` and `>>14` group extraction.
+        assert_eq!(syncsafe(0x0FE0_0000), [0x7F, 0x00, 0x00, 0x00]);
+        assert_eq!(syncsafe(0x001F_C000), [0x00, 0x7F, 0x00, 0x00]);
+        // round-trip over the full 28-bit range pins every group boundary.
+        for n in [0u32, 1, 127, 128, 0x0123_4567, 0x0FFF_FFFF] {
+            assert_eq!(synchsafe_decode(&syncsafe(n)), n);
         }
     }
 }
