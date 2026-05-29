@@ -863,3 +863,164 @@ fn reads_m4b_alias() {
     assert!(!attr.is_dir);
     assert!(attr.size > 0);
 }
+
+#[test]
+fn refresh_picks_up_externally_added_track() {
+    use musefs_db::{Format, NewTrack, Tag};
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[Tag::new("artist", "Alice", 0), Tag::new("title", "A", 0)],
+        )
+        .unwrap();
+    }
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+    assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_none());
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        let id = db2
+            .upsert_track(&NewTrack {
+                backing_path: "/x/b.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db2.replace_tags(
+            id,
+            &[Tag::new("artist", "Bob", 0), Tag::new("title", "B", 0)],
+        )
+        .unwrap();
+    }
+    fs.refresh().unwrap();
+    assert!(
+        fs.lookup(VirtualTree::ROOT, "Bob").is_some(),
+        "refresh must rebuild the tree"
+    );
+}
+
+#[test]
+fn open_handle_returns_distinct_ids_and_rejects_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = scanned_db(dir.path());
+    let fs = Musefs::open(db, config()).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+
+    let fh1 = fs.open_handle(file_inode).unwrap();
+    let fh2 = fs.open_handle(file_inode).unwrap();
+    assert_ne!(fh1, fh2, "each open must yield a fresh handle id");
+    assert!(fh1 != 0 && fh2 != 0);
+
+    assert!(matches!(fs.open_handle(artist), Err(CoreError::IsDir(_))));
+}
+
+#[test]
+fn read_uses_cached_handle_after_backing_grows() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let db = scanned_db(dir.path());
+    let fs = Musefs::open(db, config()).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let size = fs.getattr(file_inode).unwrap().size;
+
+    let fh = fs.open_handle(file_inode).unwrap();
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("a.flac"))
+            .unwrap();
+        f.write_all(&[0u8; 64]).unwrap();
+    }
+    let via_handle = fs.read(file_inode, fh, 0, size).unwrap();
+    assert_eq!(via_handle.len() as u64, size);
+}
+
+#[test]
+fn release_handle_forces_fallback_on_next_read() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let db = scanned_db(dir.path());
+    let fs = Musefs::open(db, config()).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let size = fs.getattr(file_inode).unwrap().size;
+
+    let fh = fs.open_handle(file_inode).unwrap();
+    fs.release_handle(fh);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("a.flac"))
+            .unwrap();
+        f.write_all(&[0u8; 64]).unwrap();
+    }
+    assert!(matches!(
+        fs.read(file_inode, fh, 0, size),
+        Err(CoreError::BackingChanged(_))
+    ));
+}
+
+#[test]
+fn getattr_reresolves_size_after_content_version_bump() {
+    use common::{make_flac, streaminfo_body, vorbis_comment_body};
+    use musefs_db::Tag;
+    let dir = tempfile::tempdir().unwrap();
+    let backing = dir.path().join("a.flac");
+    let bytes = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &[0xAB; 64],
+    );
+    std::fs::write(&backing, &bytes).unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+    let alice = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let inode = fs.lookup(alice, "Song.flac").unwrap();
+    let size_before = fs.getattr(inode).unwrap().size;
+
+    let track_id = musefs_db::Db::open(&db_path)
+        .unwrap()
+        .list_tracks()
+        .unwrap()[0]
+        .id;
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        db2.replace_tags(
+            track_id,
+            &[
+                Tag::new("artist", "Alice", 0),
+                Tag::new("title", "Song", 0),
+                Tag::new("album", &"X".repeat(500), 0),
+            ],
+        )
+        .unwrap();
+    }
+    let size_after = fs.getattr(inode).unwrap().size;
+    assert!(
+        size_after > size_before,
+        "size must reflect the larger retagged header"
+    );
+}
