@@ -109,12 +109,28 @@ Run the full test surface and record current state:
   `musefs_bin` and `e2e` runs (pytest-cov resets the data file each run otherwise,
   so the cell would reflect only the last invocation). Alternatively report each
   invocation's coverage separately — but never a single number from one run.
+- **Schema-parity check.** The beets suite builds its temp DB from a hand-copied
+  fixture, `contrib/beets/tests/schema_v1.sql`, *not* from production
+  `musefs-db/src/schema.rs` (`MIGRATION_V1`). Diff the two (normalized for
+  whitespace/formatting); if they've drifted, every beets test validates against a
+  phantom contract — record it as a high-severity finding and treat the beets
+  results as suspect until reconciled. A drift-detection test is a likely backlog
+  item.
 - **Fuzz smoke surface** (mirrors `.github/workflows/fuzz.yml` per-PR job):
   `cargo +nightly fuzz build`, then each target
   (`flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment`) run with the CI bounds
   `-max_len=131072 -rss_limit_mb=2048 -max_total_time=15` (15 s/target, per
   `fuzz.yml:45`). Goal is to confirm every target still builds and reaches its
   parser, not a full campaign. Record any broken/unreachable target.
+- **Fuzz corpus health** (the corpus has grown to ~8,800 entries across 8
+  targets). Beyond the smoke run: (a) `cargo +nightly fuzz coverage <target>` on a
+  representative subset to confirm the corpus actually reaches the parser/synthesis
+  code it's meant to (per `CLAUDE.md`), flagging any target whose coverage looks
+  shallow; (b) note corpus size per target and whether it would benefit from
+  minimization (`cargo +nightly fuzz cmin <target>`) to drop redundant entries —
+  recommended as a backlog item, not run destructively here. This is a
+  **time-boxed survey**, not a full coverage campaign; if the nightly tooling is
+  blocked (Phase 0), record it as not-measured and move on.
 - `cargo-llvm-cov` over the workspace excluding `musefs-fuse`, matching CI.
   Capture per-crate and per-module line + region coverage. **This is "default CI
   Rust coverage":** it instruments the plain `cargo test` run, so it does *not*
@@ -123,12 +139,19 @@ Run the full test surface and record current state:
   a second `--features fuzzing` coverage profile for `musefs-format` to show what
   the proptests add; only if it's cheap — it is not required for the scorecard.)
 
-**Red-test gate.** If any **Tier-1** test (byte-identical invariant or
-resolution/freshness, including the relevant `#[ignore]`d e2e tests) fails or is
-flaky in this phase, **halt and report before Phase B/C.** Mutation results are
-meaningless against a suite that isn't green — a mutant "caught" by an
-already-failing test tells us nothing. A Tier-2/Tier-3 or tooling-blocked failure
-is recorded and the audit continues, noting reduced confidence for that area.
+**Flakiness detection.** The gate and Phase B's caveat both depend on knowing
+which tests are flaky, so Phase A must actually look: run the **Tier-1** set
+(byte-identical invariant + resolution/freshness, including the relevant
+`#[ignore]`d e2e tests) **3× total** and the Tier-1 e2e mounts at varying
+`--test-threads` (e.g. 1 and the default) to surface ordering/timing
+nondeterminism. Any test not stable across all runs is recorded as **flaky**
+(`file:line`), feeding both the gate and the Phase B confidence note.
+
+**Red-test gate.** If any **Tier-1** test fails or is flaky in this phase,
+**halt and report before Phase B/C.** Mutation results are meaningless against a
+suite that isn't green — a mutant "caught" by an already-failing test tells us
+nothing. A Tier-2/Tier-3 or tooling-blocked failure is recorded and the audit
+continues, noting reduced confidence for that area.
 
 **FUSE coverage strategy.** `cargo-llvm-cov` excludes `musefs-fuse` (real mounts
 don't instrument cleanly), so FUSE-only behaviors are **not** scored by
@@ -167,7 +190,12 @@ without any test failing — are the sharpest signal of weak or missing assertio
   the report says so. **`musefs-format` is the likeliest to hit the cap** (large
   files — `mp4.rs` ~1,400 lines, `ogg/mod.rs` ~1,040 — plus the slow `--features
   fuzzing` proptests in its test command); budget it first and expect a partial
-  run there before the others.
+  run there before the others. **Order files within `musefs-format` by Tier-1
+  risk so a cap-truncated run still covers what matters:** the byte-surgery /
+  offset-patching paths first — `ogg/` (page renumber + CRC), then `mp4.rs`
+  (`stco`/`co64` patching), then `flac.rs` / `wav.rs` / `mp3.rs` — and lower-risk
+  helpers last. Compilation overhead (~5–10 min before any mutant runs) comes out
+  of the 30-min budget, so the priority ordering is what guarantees signal.
 - **Test command / features.** A default `cargo-mutants` run uses a plain
   `cargo test` and would miss `musefs-format`'s `--features fuzzing` proptests —
   the strongest checks on exactly the format code under audit — inflating the
@@ -206,6 +234,12 @@ Phase B survivors. Look for:
 - Untested error paths.
 - Determinism and isolation issues (shared temp state, ordering dependence,
   reliance on wall-clock or filesystem timing).
+
+**Form your own candidates first.** Before reading the two named callouts below,
+independently list the thinly-tested Tier-1/Tier-2 paths *you* would prioritize
+(from the Phase A coverage table and Phase B survivors). The callouts are prior
+knowledge, not the full set — treating them as the answer risks anchoring and
+missing other gaps. Reconcile your list against them afterward.
 
 Two specific spots to inspect by name:
 
