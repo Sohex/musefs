@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 implemented (inventory fill pending post-merge CI run); phases 2–4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); phases 2–4 pending
 
 ## Guiding principle: verify, don't trust
 
@@ -44,7 +44,13 @@ Phase 1 ──> Phase 2 (Ogg)
         └─> Phase 4 (Core & DB)
 ```
 
-### Phase 1 — Quick fixes & mutation-discovery harness  ⟶ STATUS: implemented (inventory fill pending post-merge CI run)
+### Phase 1 — Quick fixes & mutation-discovery harness  ⟶ STATUS: complete
+
+**Survivor inventory seeded** from CI run 26632110192 (db 5m / core 16m /
+format 1h56m): 297 survivors (286 missed + 11 timeout) routed to phases 2–4 in
+`2026-05-29-mutation-inventory.md`. Follow-up flagged: sub-shard `musefs-format`
+(`--shard k/n`) — it was 75% of the run's wall-clock as a single serial leg.
+
 
 Fix the `metrics` compile error (A1, unblocks `cargo test --features metrics`),
 close the beets FK correctness gap (A2), and produce the data phases 2–4 consume.
