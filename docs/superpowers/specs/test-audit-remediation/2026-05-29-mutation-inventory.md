@@ -11,8 +11,10 @@
 1. Trigger the campaign: GitHub → Actions → **Mutants** → **Run workflow**
    (`workflow_dispatch`), or wait for the Monday cron.
 2. Download the `mutants-<crate>` artifacts from the run.
-3. Transcribe `caught.txt` / `missed.txt` / `unviable.txt` / `timeout.txt` per
-   crate into the tables below.
+3. In each artifact the per-result lists live under `<crate>/mutants.out/`
+   (cargo-mutants writes `caught.txt` / `missed.txt` / `unviable.txt` /
+   `timeout.txt` into a `mutants.out/` subdir of the `--output` dir). Transcribe
+   those per crate into the tables below.
 
 ## Tool limitations to revisit (phase 4)
 
