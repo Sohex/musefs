@@ -1393,4 +1393,31 @@ mod tests {
         assert_eq!(from_stream.mdat_header.len(), 16); // largesize header
         assert_eq!(from_stream.mdat_payload_len, payload.len() as u64);
     }
+
+    #[test]
+    fn box_header_accepts_empty_payload_box() {
+        // total_len == header_len (an 8-byte box, no payload) must be accepted.
+        // `< -> <=` would make the equal case reject.
+        let mut h = 8u32.to_be_bytes().to_vec();
+        h.extend_from_slice(b"free");
+        let bh = box_header(&h, 1000).unwrap();
+        assert_eq!(bh.header_len, 8);
+        assert_eq!(bh.total_len, 8);
+    }
+
+    #[test]
+    fn read_box_size0_extends_to_end_from_offset() {
+        // A size-0 box ("extends to EOF") at pos > 0: total_len must be
+        // buf.len() - pos. `- -> +` (buf.len() + pos) and `- -> /` (buf.len() / pos)
+        // both diverge. The box is placed at pos = 8 with pos + 8 <= buf.len() so the
+        // be_u32 size read and the kind slice both succeed BEFORE the size-0 branch.
+        let mut buf = bx(b"free", b""); // 8-byte box at pos 0
+        buf.extend_from_slice(&0u32.to_be_bytes()); // size32 = 0 at pos 8
+        buf.extend_from_slice(b"mdat"); // kind at pos 12..16
+        buf.extend_from_slice(b"AUDIOPAYLOAD"); // 12 payload bytes
+        assert_eq!(buf.len(), 28);
+        let b = read_box(&buf, 8).unwrap();
+        assert_eq!(&b.kind, b"mdat");
+        assert_eq!(b.total_len, buf.len() - 8); // 20
+    }
 }
