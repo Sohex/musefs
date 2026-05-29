@@ -478,11 +478,11 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
         .unwrap();
     }
     let cfg = MountConfig {
-        poll_interval: std::time::Duration::from_millis(20),
+        poll_interval: std::time::Duration::from_millis(100),
         ..config()
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(25));
+    std::thread::sleep(std::time::Duration::from_millis(150));
     assert!(!fs.poll_refresh().unwrap());
     {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
@@ -506,7 +506,7 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
         !fs.poll_refresh().unwrap(),
         "unchanged poll should have reset the debounce window"
     );
-    std::thread::sleep(std::time::Duration::from_millis(25));
+    std::thread::sleep(std::time::Duration::from_millis(150));
     assert!(fs.poll_refresh().unwrap());
 }
 
