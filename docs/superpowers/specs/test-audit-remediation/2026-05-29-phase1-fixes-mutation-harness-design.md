@@ -54,9 +54,11 @@ their own connection. The actual gap is in `test_plugin.py`, which opens raw
 `sqlite3.connect(db_path)` at 6 sites (115, 141, 181, 197, 219, 242), bypassing
 FK enforcement. `_core.connect()` already enables FK (`_core.py:127`).
 
-**Fix:** route those 6 raw connections through `beetsplug._core.connect()` (import
-it in the test module). Add one regression assertion that a `connect()`-opened
-connection reports `PRAGMA foreign_keys` = 1.
+**Fix:** route those 6 raw connections through `beetsplug._core.connect()`.
+`test_plugin.py:10` currently imports only `map_fields`; extend it to
+`from beetsplug._core import connect, map_fields`, then replace each
+`sqlite3.connect(db_path)` with `connect(db_path)`. Add one regression assertion
+that a `connect()`-opened connection reports `PRAGMA foreign_keys` = 1.
 
 **Verification:**
 ```
@@ -76,22 +78,42 @@ logic-bearing crates only — `musefs-db`, `musefs-core`, `musefs-format`;
 `musefs-cli` and `musefs-fuse` are out of scope by decision (see the tracking
 doc's Scope section). Responsibilities:
 
+- **Version pin:** invoke a known-good `cargo-mutants` (the audit used 27.0.0).
+  Like `fuzz.yml` with `cargo-fuzz`, CI installs it unpinned for nightly-compat
+  reasons, but the script and the spec record 27.0.0 as the known-good version
+  for reproducibility; bump deliberately.
 - Set `TMPDIR` to a path off the `/tmp` tmpfs (the audit exhausted the 3.9 GB
   tmpfs). Accept an override env var; default to a repo-local `.mutants-tmp/`
   that callers can place on the roomiest volume.
-- `cargo clean` the working `target/` before starting (local disk: 7.3 GB free,
-  `target/` ~5.6 GB — a full mutants build tree is ~5.6 GB and will not coexist
-  with the existing one).
-- Run **one crate at a time**, `--jobs 1`, removing each crate's build dir before
-  the next, so peak disk is a single tree.
-- Per-crate invocation captures the audit's env learnings:
-  - `musefs-db` — `--test-workspace=true`, files `schema.rs`, `lib.rs` (and
-    `tracks.rs`, `art.rs`, `tags.rs` for the full sweep).
-  - `musefs-core` — `--test-workspace=false`, files `reader.rs`, `tree.rs`,
+- **Disk budget without nuking the dep cache:** do *not* `cargo clean` the working
+  `target/`. Instead give cargo-mutants its own isolated build dir
+  (`--target-dir target/mutants` or equivalent under `TMPDIR`) and `rm -rf` that
+  dir between crates. Peak extra disk is one isolated tree at a time, and the
+  primary `target/` (with its compiled deps, ~minutes to rebuild) is left intact.
+  (Local disk is tight: 7.3 GB free, `target/` ~5.6 GB.)
+- Run **one crate at a time**, `--jobs 1`, so peak disk is a single mutants tree.
+- **Error-handling contract:** run with `set -uo pipefail` but **not** `set -e` on
+  the per-crate loop — a non-zero exit from one crate (surviving mutants, or a
+  build failure) must **not** abort the remaining crates. Collect every crate's
+  result, then exit non-zero at the end if any crate had survivors or errored, so
+  CI still flags failure while the inventory stays complete. (Setup steps before
+  the loop *do* fail fast.)
+- Per-crate invocation captures the audit's env learnings. `--test-workspace`
+  controls whether each mutant is checked against the **whole workspace** test
+  suite (`true`, stronger detection) or only the **mutated crate's own** tests
+  (`false`, far cheaper to build/run):
+  - `musefs-db` — `--test-workspace=true`: its dependents' tests are cheap to
+    build, so workspace-wide checking buys stronger detection within budget.
+    Files `schema.rs`, `lib.rs` (and `tracks.rs`, `art.rs`, `tags.rs` for the
+    full sweep).
+  - `musefs-core` — `--test-workspace=false`: workspace mode drags in
+    criterion/proptest scratch builds that blew the disk/time budget in the audit;
+    crate-local tests already cover its logic. Files `reader.rs`, `tree.rs`,
     `scan.rs`, `facade.rs`, `ogg_index.rs`.
-  - `musefs-format` — `--test-workspace=false --features fuzzing`, all format
-    files including the 7 the audit never reached (`ogg/mod.rs`, `ogg/page.rs`,
-    `ogg/crc.rs`, `ogg/b64.rs`, `mp4.rs`, `wav.rs`, `mp3.rs`, plus `flac.rs`).
+  - `musefs-format` — `--test-workspace=false --features fuzzing`, same rationale
+    as core. All format files including the 7 the audit never reached
+    (`ogg/mod.rs`, `ogg/page.rs`, `ogg/crc.rs`, `ogg/b64.rs`, `mp4.rs`, `wav.rs`,
+    `mp3.rs`, plus `flac.rs`).
 - Emit per-crate survivor reports into a fixed, predictable location —
   `--output mutants-out/<crate>/` — for collection. cargo-mutants' default output
   dir is `mutants.out/` (and it rotates a prior run to `mutants.out.old/`); the
@@ -108,18 +130,19 @@ doc's Scope section). Responsibilities:
 
 ### B2. `.github/workflows/mutants.yml`
 
-- **PR job** (`pull_request` on Rust paths): runs `cargo mutants --in-diff` over
-  only the lines changed in the PR — fast, gates regressions in touched code
-  without the full matrix. `--in-diff` requires a concrete diff file, and PR
-  checkouts are shallow, so the job must explicitly materialize the diff against
-  the merge base:
-  - `actions/checkout` with `fetch-depth: 0` (or `git fetch origin
-    $GITHUB_BASE_REF` to fetch the base ref into the shallow clone).
-  - `git diff origin/$GITHUB_BASE_REF...HEAD -- '*.rs' > mutants.diff` to capture
-    the changed Rust lines on the merge-base three-dot range.
-  - `cargo mutants --in-diff mutants.diff -j1` (constrained to the three in-scope
-    crates via `-p`/`--package` filters or path globs, so CLI/FUSE changes don't
-    trigger out-of-scope mutation).
+- **PR job** — gated by a `paths:` trigger on the three in-scope crates'
+  sources (`musefs-db/**`, `musefs-core/**`, `musefs-format/**`,
+  `.github/workflows/mutants.yml`), mirroring how `fuzz.yml` scopes by path. The
+  trigger keeps CLI/FUSE-only PRs from running the job at all; `--in-diff` then
+  constrains mutation to the changed lines within those crates — so no extra
+  `-p`/`--package` filtering is needed. `--in-diff` requires a concrete diff file
+  and PR checkouts are shallow, so the job materializes the diff against the merge
+  base with the lighter targeted fetch (not a full `fetch-depth: 0` history):
+  - `actions/checkout`, then `git fetch --depth=1 origin $GITHUB_BASE_REF` to pull
+    just the base ref into the shallow clone.
+  - `git diff FETCH_HEAD...HEAD -- '*.rs' > mutants.diff` to capture the changed
+    Rust lines on the merge-base three-dot range.
+  - `cargo mutants --in-diff mutants.diff -j1`.
   - If `mutants.diff` is empty (no in-scope Rust changes), the job is a no-op
     pass rather than an error.
 - **Scheduled + dispatchable job** (`schedule` cron, e.g. weekly like fuzz, plus
@@ -168,7 +191,9 @@ per phase.
 
 ## Sequencing
 
-1. Component A (independent, lands immediately — unblocks CI).
+1. Component A (independent, lands immediately). A1 unblocks `cargo test
+   --features metrics` (a compile error today); A2 closes a correctness gap in
+   the beets tests (not a build blocker).
 2. Component B (script + workflow).
 3. Component C (dispatch CI run, collect artifacts, write inventory) — the long
    pole; depends on B.

@@ -46,7 +46,8 @@ Phase 1 ──> Phase 2 (Ogg)
 
 ### Phase 1 — Quick fixes & mutation-discovery harness  ⟶ STATUS: spec
 
-Unblock the suite and produce the data phases 2–4 consume.
+Fix the `metrics` compile error (A1, unblocks `cargo test --features metrics`),
+close the beets FK correctness gap (A2), and produce the data phases 2–4 consume.
 
 - **A. Corrected quick fixes**
   - `metrics.rs:177` — delete stale `backing_mtime_secs: 0,` (audit said
