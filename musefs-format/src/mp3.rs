@@ -709,4 +709,89 @@ mod tests {
         // mutant computes 0*1=0 >= 1 = false, falls through, and panics on data[1].
         assert_eq!(locate_audio(&[0xFF]), Err(FormatError::NotMp3));
     }
+
+    #[test]
+    fn push_frame_header_size_boundary_is_inclusive() {
+        // ID3v2.4 frame size is a 28-bit syncsafe field; the guard rejects
+        // data_len > 0x0FFF_FFFF. 0x0FFF_FFFF is the inclusive max (Ok); +1 errors.
+        let mut out = Vec::new();
+        assert!(push_frame_header(&mut out, b"TIT2", 0x0FFF_FFFF).is_ok());
+        let mut over = Vec::new();
+        assert_eq!(
+            push_frame_header(&mut over, b"TIT2", 0x1000_0000),
+            Err(FormatError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn is_id3_text_frame_id_classifies_text_frames() {
+        assert!(is_id3_text_frame_id("TPE1")); // T + 3 upper/digit, not TXXX
+        assert!(is_id3_text_frame_id("TIT2"));
+        assert!(!is_id3_text_frame_id("TXXX")); // excluded (kills `!= -> ==`)
+        assert!(!is_id3_text_frame_id("COMM")); // not T-prefixed
+        assert!(!is_id3_text_frame_id("TPE")); // wrong length
+        assert!(!is_id3_text_frame_id("Txx1")); // lowercase -> false
+    }
+
+    #[test]
+    fn build_id3v2_segments_emits_standard_text_frame_as_itself() {
+        // A 4-char T-frame key (TPE1) must round-trip as a TPE1 frame, not TXXX.
+        // The `is_id3_text_frame_id` match-guard `-> false` mutant would route it to
+        // the TXXX branch, so read_tags would surface it under a different key.
+        let tags = vec![TagInput::new("TPE1", "Band")];
+        let (segments, _len) = build_id3v2_segments(&tags, &[]).unwrap();
+        let mut buf = Vec::new();
+        for seg in &segments {
+            if let Segment::Inline(b) = seg {
+                buf.extend_from_slice(b);
+            }
+        }
+        // The literal frame id "TPE1" must appear in the emitted tag bytes.
+        assert!(
+            buf.windows(4).any(|w| w == b"TPE1"),
+            "TPE1 frame not emitted: routed elsewhere"
+        );
+        // And it round-trips to the mapped key (artist), not a TXXX user field.
+        let read = read_tags(&buf);
+        assert!(
+            read.contains(&("artist".to_string(), "Band".to_string())),
+            "got {read:?}"
+        );
+    }
+
+    #[test]
+    fn build_id3v2_segments_rejects_oversized_total_tag() {
+        // The total-tag guard rejects frames_len > 0x0FFF_FFFF. An APIC art whose
+        // data_len (a count, not allocated) pushes the total just over the limit
+        // must error; one byte under must succeed.
+        let mk = |data_len: u64| ArtInput {
+            art_id: 1,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len,
+        };
+        assert_eq!(
+            build_id3v2_segments(&[], &[mk(0x1000_0000)]).err(),
+            Some(FormatError::TooLarge)
+        );
+        assert!(build_id3v2_segments(&[], &[mk(16)]).is_ok());
+        // Exact boundary: compute the APIC framing overhead, then place
+        // frames_len exactly on 0x0FFF_FFFF (one byte under must succeed) and
+        // 0x1_0000_0000 (must error). This pins the `> -> >=` mutation.
+        let (_, total_at_zero) = build_id3v2_segments(&[], &[mk(0)]).unwrap();
+        let overhead = total_at_zero - 10; // frames_len when data_len=0
+        let boundary_data_len = 0x0FFF_FFFF - overhead;
+        assert!(
+            build_id3v2_segments(&[], &[mk(boundary_data_len)]).is_ok(),
+            "exact boundary (frames_len == 0x0FFF_FFFF) should be accepted"
+        );
+        assert_eq!(
+            build_id3v2_segments(&[], &[mk(boundary_data_len + 1)]).err(),
+            Some(FormatError::TooLarge),
+            "one byte past boundary must be rejected"
+        );
+    }
 }
