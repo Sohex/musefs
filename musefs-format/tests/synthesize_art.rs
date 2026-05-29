@@ -104,3 +104,67 @@ fn synthesize_errors_on_oversized_picture() {
         Err(FormatError::TooLarge)
     );
 }
+
+#[test]
+fn zero_byte_art_is_skipped_so_the_track_still_serves() {
+    let (file, audio) = fixture();
+    let scan = locate_audio(&file).unwrap();
+
+    // A picture with no image data is degenerate; synthesis must skip it rather than
+    // emit an empty PICTURE block (which would fail layout validation and brick the
+    // track).
+    let art = cover(7, 0); // data_len == 0
+    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
+
+    // No ArtImage segment was emitted.
+    assert!(!layout
+        .segments
+        .iter()
+        .any(|s| matches!(s, Segment::ArtImage { .. })));
+
+    // The track still round-trips: header + verbatim audio (no art bytes needed).
+    let art_map = HashMap::new();
+    let assembled = resolve_layout(&layout, &file, &art_map);
+    assert_eq!(assembled.len() as u64, layout.total_len());
+    assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);
+
+    // metaflac sees a valid FLAC with zero pictures.
+    let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
+    assert_eq!(tag.pictures().count(), 0);
+}
+
+#[test]
+fn zero_byte_art_skipped_among_valid_art_keeps_block_framing_valid() {
+    // Guards the `is_last` flag: filtering the empty art must not leave the final
+    // real PICTURE block without its last-block bit. metaflac parsing the whole
+    // chain validates that.
+    let (file, _audio) = fixture();
+    let scan = locate_audio(&file).unwrap();
+    let image = vec![0x55u8; 64];
+    let empty = cover(1, 0);
+    let real = cover(2, image.len() as u64);
+    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[empty, real]).unwrap();
+
+    let art_segs: Vec<_> = layout
+        .segments
+        .iter()
+        .filter(|s| matches!(s, Segment::ArtImage { .. }))
+        .collect();
+    assert_eq!(art_segs.len(), 1);
+
+    let mut art_map = HashMap::new();
+    art_map.insert(2i64, image.clone());
+    let assembled = resolve_layout(&layout, &file, &art_map);
+
+    // Re-parse the synthesized chain: locate_audio follows the last-block flag, so
+    // if the empty art were miscounted (leaving the final real block without its
+    // last-block bit) the walk would run past the metadata into the audio frames
+    // and fail. This pins the `data_len > 0` filter against `>= 0`.
+    let rescan = locate_audio(&assembled).expect("synthesized FLAC must parse");
+    assert_eq!(rescan.audio_offset, layout.header_len());
+
+    let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
+    let pics: Vec<_> = tag.pictures().collect();
+    assert_eq!(pics.len(), 1);
+    assert_eq!(pics[0].data, image);
+}
