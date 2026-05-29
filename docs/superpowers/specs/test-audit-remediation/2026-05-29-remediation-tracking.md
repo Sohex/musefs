@@ -113,7 +113,12 @@ Findings #5, #16.
   `read_structure_from`, `read_freeform`, `read_tags`, `read_pictures`,
   `build_udta`, `patch_chunk_offsets`, `synthesize_layout`. The `|` mutants
   (`read_structure_from` `|= → &=` dup-accumulators) are killed, not equivalent.
-  Finding #5 non-FLAC read-fidelity dimension still tracked separately.
+  Finding #16 resolved for MP4 by **skipping zero-byte art at synthesis** (the first
+  *nonempty* art wins in `mp4.rs::synthesize_layout`, mirroring the FLAC fix), and
+  finding #5 broadened onto the M4A synthesis path (`write_m4a` helper + four
+  `proptest_read_fidelity` M4A cases: backing-audio identity, partial windows,
+  header seam, art window). WAV (3d) remains the only open non-FLAC read-fidelity
+  dimension.
 - broaden `proptest_read_fidelity` (random offsets, header/audio boundary, art,
   non-FLAC) (#5)
 - zero-byte art boundary (#16)
@@ -122,7 +127,8 @@ Findings #5, #16.
   `synchsafe_decode` and v2.2 24-bit decode (note: disjoint `| → &` are killed,
   not equivalent). Production change: finding #16 zero-byte-art skip applied to
   `mp3.rs::build_id3v2_segments` (mirrors the FLAC fix; also covers the WAV `id3 `
-  chunk, which shares this builder). #16 still open for mp4/ogg. Finding #5: the
+  chunk, which shares this builder). #16 still open for ogg (mp4 closed in 3c).
+  Finding #5: the
   MP3 read-fidelity dimension is now done — added `write_mp3` to the core test
   harness and ported the four `proptest_read_fidelity` invariants (whole-audio,
   partial windows, header seam, art window) to MP3; the WAV/MP4 dimensions land in
