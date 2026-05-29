@@ -24,8 +24,12 @@ job is to find the gaps and weak spots, not to bootstrap testing from nothing.
 explicitly (FUSE e2e, the `--features metrics` concurrency test, interop emitter,
 `--features fuzzing` proptests); (c) beets pytest — split out, since default
 `python -m pytest` excludes the `musefs_bin`/`e2e` markers, so its count is lower
-than the file count and the marked runs add to it; (d) cargo-fuzz targets. Any
-headline figure names which categories it sums.
+than the file count and the marked runs add to it; (d) cargo-fuzz targets.
+**Count tests unique to each surface, never the raw invocation totals** — the
+invocations overlap (`-p musefs-format --features fuzzing` reruns the ordinary
+format tests; the `--features metrics` FUSE run reruns the ignored FUSE tests
+alongside `concurrency.rs`), so summing raw totals double-counts. Any headline
+figure names which categories it sums and uses unique counts.
 
 ## Scope decisions
 
@@ -79,6 +83,12 @@ Run the full test surface and record current state:
   **separately** — `concurrency.rs` is `#![cfg(feature = "metrics")]` and is
   silently absent from the plain run above. The audit must not cite concurrency
   e2e evidence without this run.
+- `cargo test -p musefs-core --features metrics --test metrics -- --test-threads=1`
+  **separately** — `musefs-core/tests/metrics.rs` is `#![cfg(feature = "metrics")]`
+  under `musefs-core`'s *own* `metrics` feature; the `musefs-fuse --features
+  metrics` run enables core's feature as a dependency but does **not** run core's
+  metrics integration tests. Without this the Tier-2 concurrency/perf surface is
+  missing from the baseline.
 - `cargo test -p musefs-format --features fuzzing` and
   `cargo test -p musefs-core --test proptest_read_fidelity` (proptests).
 - mutagen interop suite, two steps sharing one temp dir `$D`:
@@ -93,8 +103,12 @@ Run the full test surface and record current state:
   `python -m pytest -m e2e` (beets → mount → playback). **Skips count as not-run,
   not pass:** record `passed/failed/skipped` per invocation and, for any skip,
   the reason (missing `beet`, `fusermount`, `ffmpeg`, `/dev/fuse`, or binary). An
-  all-skipped suite is reported as "not exercised," never as green. Add
-  `--cov=beetsplug` when `pytest-cov` is available.
+  all-skipped suite is reported as "not exercised," never as green. For coverage
+  when `pytest-cov` is available, the three invocations span the surface: pass
+  `--cov=beetsplug` on the first and `--cov=beetsplug --cov-append` on the
+  `musefs_bin` and `e2e` runs (pytest-cov resets the data file each run otherwise,
+  so the cell would reflect only the last invocation). Alternatively report each
+  invocation's coverage separately — but never a single number from one run.
 - **Fuzz smoke surface** (mirrors `.github/workflows/fuzz.yml` per-PR job):
   `cargo +nightly fuzz build`, then each target
   (`flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment`) run with the CI bounds
@@ -161,6 +175,19 @@ without any test failing — are the sharpest signal of weak or missing assertio
   `musefs-format` run, e.g. via `cargo mutants ... -- --features fuzzing`) so the
   proptests participate in killing mutants. The report records the exact
   `cargo-mutants` invocation (features included) per crate.
+- **Test selection — confidence vs. runtime, decided per crate.** By default
+  `cargo-mutants` runs only the mutated crate's own tests
+  (<https://mutants.rs/workspaces.html>), which misses cross-crate contract
+  breakage caught only by dependent crates' tests. Resolve this deliberately:
+  - `musefs-db` and `musefs-core` — run **workspace/dependent tests**
+    (`--test-workspace=true`). These are the shared-contract crates: a `musefs-db`
+    schema/trigger mutation or a `musefs-core` resolution mutation is often caught
+    only by a downstream crate's test, so crate-local mutation would overstate
+    survivors. Confidence wins here.
+  - `musefs-format` — stay **crate-local** (default `--test-workspace=false`),
+    since it's the runtime bottleneck (above) and its own proptests are the
+    strongest oracle anyway. The report **labels `musefs-format` mutation results
+    as crate-local-only** so they aren't read as workspace-wide.
 - Record surviving mutants with `file:line` and the mutation applied.
 - **Flakiness caveat.** A mutant "caught" by a flaky test is unreliable (it may
   have failed for an unrelated reason). If Phase A flagged any flaky test in a
@@ -182,11 +209,12 @@ Phase B survivors. Look for:
 
 Two specific spots to inspect by name:
 
-- **`ogg_index.rs` has no dedicated test file** — it's exercised only transitively
-  (via `facade.rs` / the `ogg_read_through.rs` e2e and `read_at.rs`). Confirm
-  whether its CRC/renumber/index logic is meaningfully asserted anywhere directly;
-  if not, its Phase-B mutant results are hard to attribute and a dedicated unit
-  test is a likely P0/P1 backlog item.
+- **`ogg_index.rs` has one inline unit test** (`ogg_index.rs:124`,
+  `build_index_renumbers_and_preserves_payload_length`) — a single case, plus
+  transitive exercise via `facade.rs` / `ogg_read_through.rs` / `read_at.rs`.
+  Assess whether that one case is *sufficient* for Tier-1 Ogg correctness (does it
+  cover continued pages, multi-page packets, EOS, CRC edge cases?); thin direct
+  coverage is a likely backlog item, but do not claim "no direct test exists."
 - **`proptest_read_fidelity.rs` is ~47 lines** — thin for the Tier-1 read-fidelity
   property. Assess whether it actually spans segment variants, offsets, and
   partial reads, or just a happy path, independent of what Phase B reports.
