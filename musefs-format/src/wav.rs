@@ -600,4 +600,36 @@ mod tests {
             "the data chunk must be word-aligned"
         );
     }
+
+    #[test]
+    fn synthesize_rejects_riff_size_overflow() {
+        // :227 `> → ==`. `BackingAudio` is virtual (no real allocation), so we can
+        // pass `audio_length == u32::MAX`: it PASSES the :186 guard (`> u32::MAX` is
+        // false) but makes `riff_size > u32::MAX`. Original `>` → TooLarge; the `==`
+        // mutant (`riff_size == u32::MAX`) is false (riff_size is strictly greater),
+        // so it wrongly proceeds and returns Ok with a truncated size.
+        //
+        // NOTE — this must use exactly u32::MAX, not the existing
+        // `rejects_audio_over_32bit` test's `u32::MAX + 1`: that larger value is
+        // caught by the :186 guard first and never reaches :227.
+        let scan = WavScan {
+            fmt: fmt_pcm(),
+            fact: None,
+        };
+        let res = synthesize_layout(&scan, 0, u32::MAX as u64, &[], &[]);
+        assert_eq!(res, Err(FormatError::TooLarge));
+    }
+
+    // Documented EQUIVALENT mutants in this file (no test targets them; each was
+    // confirmed by hand-apply — the relevant test stays green under the mutation):
+    //  * walk_chunks:49  guard `next <= buf.len()` → `true`. When `next > buf.len()`
+    //    the mutant sets `pos = next`, but the `while pos + 8 <= buf.len()` test is
+    //    then immediately false, so the output Vec is identical to the original's
+    //    `break` (the header was pushed before the advance).
+    //  * synthesize_layout:186  `audio_length > u32::MAX` (both `==` and `>=`).
+    //    `body_len >= audio_length`, so whenever this would fire, `riff_size`
+    //    overflows and the :227 guard returns the identical TooLarge.
+    //  * synthesize_layout:227  `> → >=` only. Every synthesized chunk is
+    //    word-aligned, so `riff_size` is always even; `riff_size == u32::MAX` (odd)
+    //    is unreachable, the only point where `>` and `>=` differ.
 }
