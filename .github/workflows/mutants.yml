@@ -1,0 +1,87 @@
+name: Mutants
+
+on:
+  pull_request:
+    paths:
+      - 'musefs-db/**'
+      - 'musefs-core/**'
+      - 'musefs-format/**'
+      - 'scripts/mutants.sh'
+      - '.github/workflows/mutants.yml'
+  schedule:
+    - cron: '0 4 * * 1'  # Mondays 04:00 UTC
+  workflow_dispatch:
+  # Deliberately NO `push: branches: [main]`. fuzz.yml has one to warm its corpus
+  # cache; a mutation campaign has no corpus to warm and takes hours, so running
+  # it on every merge to main is pure cost. Schedule + manual dispatch suffice.
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  in-diff:
+    # Per-PR: mutate only the lines changed in this PR. Fast gate.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          # Full history so the merge base for the three-dot diff is present;
+          # a shallow clone often lacks it and `git diff base...HEAD` then fails.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Install cargo-mutants
+        # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
+        # known-good version is 27.0.0 (documented in scripts/mutants.sh).
+        run: cargo install cargo-mutants
+      - name: Build the merge-base diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff "$BASE_SHA...HEAD" -- '*.rs' > mutants.diff
+          echo "Changed Rust lines:"; wc -l mutants.diff
+      - name: Mutate changed lines
+        run: |
+          if [ ! -s mutants.diff ]; then
+            echo "No in-scope Rust changes; nothing to mutate."; exit 0
+          fi
+          cargo mutants --in-diff mutants.diff -j1
+
+  full:
+    # Scheduled or manually dispatched: full per-crate campaign.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [musefs-db, musefs-core, musefs-format]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Install cargo-mutants
+        # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
+        # known-good version is 27.0.0 (documented in scripts/mutants.sh).
+        run: cargo install cargo-mutants
+      - name: Run mutation campaign
+        run: scripts/mutants.sh ${{ matrix.crate }}
+      - name: Upload survivor report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mutants-${{ matrix.crate }}
+          path: mutants-out/${{ matrix.crate }}
+          if-no-files-found: warn
