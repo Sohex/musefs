@@ -481,4 +481,19 @@ mod tests {
         // "INFO"(4) + "INAM"(4) + len(4) + "ab\0"(3) + pad(1) = 16.
         assert_eq!(odd.len(), 16);
     }
+
+    #[test]
+    fn push_inline_chunk_word_aligns_payload() {
+        // :168 `payload.len() % 2 == 1`.
+        // Even payload (len 2): NO pad. Kills `% → /` (2/2==1 pads).
+        let mut segs = Vec::new();
+        push_inline_chunk(&mut segs, b"test", &[0xAA, 0xBB]);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].len(), 10); // "test"(4) + len(4) + payload(2)
+
+        // Odd payload (len 3): padded. Kills `% → +` (3+2 != 1, no pad).
+        let mut segs2 = Vec::new();
+        push_inline_chunk(&mut segs2, b"test", &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(segs2[0].len(), 12); // 4 + 4 + 3 + pad(1)
+    }
 }
