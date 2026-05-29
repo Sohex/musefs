@@ -48,6 +48,11 @@ OUT_ROOT="$ROOT/mutants-out"
 run_crate() {
   local crate="$1"; shift
   local out="$OUT_ROOT/$crate"
+  # cargo-mutants' --output does a plain mkdir of the leaf, not mkdir -p, so the
+  # parent must already exist (a real run fails with "create output parent
+  # directory ... No such file or directory" otherwise; --list never creates it,
+  # which is why the list-only smoke test missed this).
+  mkdir -p "$out"
   local tmp
   tmp="$(mktemp -d "$SCRATCH_PARENT/${crate}.XXXXXX")" || {
     echo "mutants: mktemp -d failed under $SCRATCH_PARENT" >&2
