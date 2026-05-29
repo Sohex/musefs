@@ -47,6 +47,11 @@ test, or — if the mutation provably produces identical behavior — record it 
 **equivalent mutant** instead of forcing a contrived test. Never leave a mutation
 applied.
 
+While a mutation is applied, run **only the single targeted test**
+(`cargo test -p musefs-format <test_name>`), never `cargo test --workspace` — a
+live mutation can break unrelated tests and obscure the kill signal. Revert
+(`git checkout -- musefs-format/src/wav.rs`) immediately after step 2.
+
 ## Test placement
 
 `wav.rs` already has a small in-module `#[cfg(test)] mod tests` (the fuzz-discovered
@@ -68,6 +73,18 @@ kills across integration files. The existing integration tests (`wav_locate.rs`,
 `wav_read_tags.rs`, `wav_synthesize.rs`, `proptest_wav.rs`) stay **unchanged**;
 they provide end-to-end coverage but are not the vehicle for any mutant kill in 3d.
 This keeps the kill→test mapping unambiguous (one module owns it).
+
+The module's current import is narrow — `use super::{read_pictures, read_tags}`.
+C1 **widens it to `use super::*`** so the expanded tests can call the private
+helpers (`walk_chunks`, `build_info_payload`, `push_inline_chunk`, `info_fourcc`,
+`info_to_key`, `riff_wave_start`) and `synthesize_layout` directly.
+
+**Out of scope (noted, not fixed):** the integration files duplicate
+`fmt_pcm_16bit_mono()` and `build_wav()` helpers (copy-pasted across
+`wav_locate.rs`, `wav_read_tags.rs`, `wav_synthesize.rs`). 3d leaves these files
+unchanged and does **not** consolidate the helpers — that de-duplication is
+unrelated test-tidy tech debt for a separate pass, called out here only to prevent
+future confusion.
 
 The only 3d tests *outside* `wav.rs` are the cross-cutting C3 (`proptest_read_fidelity.rs`
 in `musefs-core`) and C2's assertion (`wav_synthesize.rs`, which is the natural home
@@ -102,6 +119,18 @@ the table is the source of truth.
 | `synthesize_layout:227` | `>`→`==`, `>`→`>=` (in `riff_size > u32::MAX`) | RIFF size overflow | **killable** — `BackingAudio` is virtual (no real 4 GB allocation), so pass an `audio_length` chosen relative to the known inline overhead: `riff_size == u32::MAX` exactly distinguishes `>=` (orig `Ok`, mutant `TooLarge`); `riff_size > u32::MAX` (with `audio_length == u32::MAX`, so `:186` passes) distinguishes `==` (orig `TooLarge`, mutant proceeds → `Ok` with a truncated size) |
 | `info_to_key:245-249` | delete arms `IPRD`→album, `ICRD`→date, `ICMT`→comment, `ITRK`→tracknumber | INFO FourCC → tag-key (inverse) | `read_tags` on a WAV carrying a `LIST/INFO` with each FourCC → assert the `(key, value)` pair returns. (`INAM`/`IART`/`IGNR` already covered) |
 | `read_tags:300` | `&&`→`\|\|` (in `slice.len() >= 4 && &slice[0..4] == b"INFO"`) | INFO body validation | a `LIST` chunk whose payload is **<4 bytes**: orig short-circuits (`len >= 4` false → filter false → empty `from_info`); mutant `\|\|` evaluates `&slice[0..4]` on the short slice → **panic** (panic-vs-empty) |
+
+### Excluded: `synthesize_layout:220` (the fourth `% 2 == 1` word-align)
+
+`synthesize_layout:220` (`if audio_length % 2 == 1` — the `data`-chunk pad) is the
+same `% 2 == 1` pattern as `:155`/`:168`/`:207` but is **not in the survivor
+inventory**: the existing `pads_odd_data_payload_to_word_boundary` test
+(`wav_synthesize.rs:138`) already exercises an odd-length `data` payload, so its
+`%`→`/`/`%`→`+` mutants are caught. It is therefore out of 3d scope. (The three
+*surviving* `% 2` sites differ only in that no existing test feeds them an
+odd-length INFO value / inline payload / id3 `tag_len`.) Re-verify this assumption
+against the next mutants campaign; if `:220` ever surfaces as a survivor it folds
+into C1 with the same word-align strategy.
 
 ### Kill mechanism: panic-vs-`Err`/empty for the short-input guards
 
@@ -158,7 +187,9 @@ table:
   (4 arm-deletions, exercised through `read_tags`), `read_tags:300`
   (<4-byte `LIST` → panic-vs-empty).
 - **Word-align:** `build_info_payload:155` (`/`,`+`,`!=`), `push_inline_chunk:168`
-  (`/`,`+`), `synthesize_layout:207` (id3 pad → even-`data`-offset assertion).
+  (`/`,`+`), `synthesize_layout:207` (id3 pad → even-`data`-offset assertion). The
+  fourth `% 2` site, `synthesize_layout:220`, is **excluded** — already caught (see
+  the exclusion note above).
 - **Overflow:** `synthesize_layout:227` (`>=` at exact `u32::MAX`, `==` above it,
   via virtual `BackingAudio`).
 
@@ -185,23 +216,33 @@ itself is left untouched — mp3-direct synthesis gets its own skip in 3b.
 **Byte-identity is unaffected** — the filter only decides whether an empty APIC is
 emitted, never the positioned `data` reads.
 
-`musefs-format/tests/wav_synthesize.rs` gains a test asserting: a zero-byte art →
-no `ArtImage` segment, the layout is valid and round-trips, and the served audio is
-byte-identical; plus a mixed case (empty + real art) confirming the surviving APIC
-is preserved. (No WAV art mutation survivor exists — this is robustness coverage,
-not a kill.)
+**Red-green ordering (this is a production behaviour change, not a mutant kill, so
+it follows TDD, not the hand-apply method).** First add the `wav_synthesize.rs`
+test asserting the desired behaviour — a zero-byte art → no `ArtImage` segment, the
+layout is valid and round-trips, served audio byte-identical — and **run it against
+unmodified `wav.rs` to watch it fail** (today it returns `Err(InvalidLayout)`, so
+the assertion is red). Then apply the `data_len == 0` filter and rerun to green. Add
+the mixed case (empty + real art) confirming the surviving APIC is preserved. (No
+WAV art mutation survivor exists — this is robustness coverage, not a kill.)
 
 **Cross-cutting status:** this resolves #16 for WAV. mp3/mp4 remain for 3b/3c (or a
 single ingestion-level filter in `scan.rs`, the alternative the 3a doc recorded).
 
 ### C3 — finding #5: broaden `proptest_read_fidelity` (WAV)
 
-`musefs-core/tests/proptest_read_fidelity.rs` currently exercises the three 3a
-properties (`read_at_partial_windows_match_whole`,
-`read_at_windows_spanning_header_seam`, `read_at_art_window_serves_blob`) on FLAC
-only. Add WAV variants of the same three, each asserting served bytes equal the
-corresponding slice of the independently-assembled `whole`
-(`read_at(&resolved, &db, 0, total_len)`).
+`musefs-core/tests/proptest_read_fidelity.rs` currently has **four** properties on
+FLAC only: the original baseline `read_at_preserves_backing_audio` (the whole-file
+`[0, total_len)` read, finding #5's starting point) plus the three 3a-added
+windowed ones (`read_at_partial_windows_match_whole`,
+`read_at_windows_spanning_header_seam`, `read_at_art_window_serves_blob`). **Add WAV
+variants of all four**, each asserting served bytes equal the corresponding slice of
+the independently-assembled `whole` (`read_at(&resolved, &db, 0, total_len)`).
+
+The whole-file `preserves_backing_audio` variant is technically subsumed by
+`partial_windows` (which generates `offset=0, size=total_len`), but it is the
+canonical statement of the byte-identity invariant for WAV and is cheap, so it is
+included for parity with the FLAC set and as the clearest regression guard rather
+than relying on a subsuming property.
 
 **Fixture sub-task (non-trivial — its own task in the plan).**
 `musefs-core/tests/common/mod.rs` has only `make_flac`/`write_flac`; there is no WAV
@@ -244,7 +285,7 @@ degenerate input (the track becomes readable instead of bricked).
 | Component | Check |
 |-----------|-------|
 | C1 | `cargo test -p musefs-format --features fuzzing wav` green; the killable rows (`riff_wave_start:24`, `walk_chunks:47`, `locate_audio:67/:71`, `info_fourcc` 6 arms, `info_to_key` 4 arms, `read_tags:300`, `build_info_payload:155`, `push_inline_chunk:168`, `synthesize_layout:207/:227`) hand-apply red |
-| C1 (equiv) | `walk_chunks:49` and `synthesize_layout:186` (×2) stay green under their mutation; recorded equivalent with justification |
-| C2 | `wav::synthesize_layout` skips zero-byte art; the `wav_synthesize.rs` test asserts no `ArtImage` segment, valid round-trip, byte-identical audio, and the mixed empty+real case preserves the real APIC; existing non-empty-art tests still pass |
-| C3 | `cargo test -p musefs-core proptest_read_fidelity` green; the three WAV-variant properties pass with the new `write_wav` fixture |
+| C1 (equiv) | `walk_chunks:49` and `synthesize_layout:186` (×2) stay green under their mutation; recorded equivalent **both** in the inventory annotation **and** as a justification comment in the `wav.rs` test module (so a future reader sees why no test targets them) |
+| C2 | C2 test written **first and shown red** against unmodified `wav.rs`, then green after the filter; `wav::synthesize_layout` skips zero-byte art; the `wav_synthesize.rs` test asserts no `ArtImage` segment, valid round-trip, byte-identical audio, and the mixed empty+real case preserves the real APIC; existing non-empty-art tests still pass |
+| C3 | `cargo test -p musefs-core proptest_read_fidelity` green; **all four** WAV-variant properties pass with the new `write_wav` fixture |
 | Whole | `cargo test --workspace` + `--features fuzzing` + `clippy --all-targets -D warnings` + `fmt --check` green; next full mutants campaign shows `wav.rs` survivors dropped (excluding the documented equivalents) |
