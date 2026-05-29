@@ -204,10 +204,19 @@ cargo test -p musefs-format --features fuzzing mp3::tests::locate_audio
 ```
 - `&& -> ||` (marker guard): `..._no_id3_starts_at_zero` FAILs. Revert.
 - `+= -> -=` and `+= -> *=` (footer): `..._honors_footer_flag` FAILs. Revert each.
-- `+ -> *` (frame-sync index): `..._requires_frame_sync` FAILs (panic on the
-  1-byte case, or wrong byte on the first case). Revert.
-- `|| -> &&` (frame-sync chain): `..._requires_frame_sync` FAILs (first assert:
-  mutant returns Ok). Revert.
+- `+ -> *` — there are **two** `audio_offset + 1` sites, each killed by a different
+  assert in `..._requires_frame_sync`:
+  - the guard `audio_offset + 1 >= len`: the **1-byte** `[0xFF]` assert kills it —
+    `0*1 = 0 >= 1` is false, so the mutant falls through and panics reading `data[1]`
+    (original returns `NotMp3`).
+  - the index `data[audio_offset + 1]`: the **10-byte** `[0xFF, 0x00, …]` assert
+    kills it — `data[0*1] = data[0] = 0xFF` passes the sync bits, so the mutant
+    returns `Ok`, but the test asserts `NotMp3` (original fails on `data[1] = 0x00`).
+    A mutant returning `Ok` where the test expects `Err` **fails the assert** = kill.
+  Revert each.
+- `|| -> &&` (frame-sync chain): the 10-byte `[0xFF, 0x00, …]` assert FAILs — under
+  `&&` only `c1 && c2 && c3` rejects, so a single bad condition no longer rejects and
+  the mutant returns `Ok`. Revert.
 
 - [ ] **Step 3: Commit**
 
@@ -523,12 +532,20 @@ reject.
 
     #[test]
     fn alloc_safe_rejects_nonzero_frame_flags() {
-        // v2.3: non-zero frame flags -> reject.
-        let mut f = b"TIT2".to_vec();
-        f.extend_from_slice(&4u32.to_be_bytes()); // plain size 4
-        f.extend_from_slice(&[0x00, 0x01]); // non-zero frame flags
-        f.extend_from_slice(&[1, 2, 3, 4]);
-        assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &f)));
+        // v2.3: non-zero frame flags -> reject (the v2.3 flag check).
+        let mut f3 = b"TIT2".to_vec();
+        f3.extend_from_slice(&4u32.to_be_bytes()); // plain size 4
+        f3.extend_from_slice(&[0x00, 0x01]); // non-zero frame flags
+        f3.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &f3)));
+
+        // v2.4: non-zero frame flags -> reject. This is a SEPARATE code path (the
+        // v2.4 `else` branch) from the v2.3 check, so it needs its own fixture.
+        let mut f4 = b"TIT2".to_vec();
+        f4.extend_from_slice(&ss(4)); // valid synchsafe size 4
+        f4.extend_from_slice(&[0x00, 0x01]); // non-zero frame flags
+        f4.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(!id3v2_alloc_safe(&id3v2(0x04, 0x00, 14, &f4)));
     }
 
     #[test]
@@ -551,7 +568,9 @@ cargo test -p musefs-format --features fuzzing mp3::tests::alloc_safe_v22_24bit_
 - v2.2 `<<16 -> >>16`: FAILs (the `[0x01,0x00,0x00]` fixture). Revert.
 - v2.2 `| -> ^`: rerun → still PASS (disjoint; `^` == `|` here). Record equivalent
   (Task 8). Revert.
-- frame-flag `!= -> ==` / `|| -> &&`: `..._rejects_nonzero_frame_flags` FAILs. Revert each.
+- frame-flag `!= -> ==` / `|| -> &&` — **both the v2.3 and the v2.4 flag checks**
+  (two separate `if data[pos+8]!=0 || data[pos+9]!=0` sites):
+  `..._rejects_nonzero_frame_flags` FAILs (it now asserts both versions). Revert each.
 - `CHAP`/`CTOC` `&& -> ||` / `== -> !=` / `|| -> &&`: `..._rejects_chap_and_ctoc`
   FAILs. Revert each.
 
@@ -566,9 +585,22 @@ git commit -m "test(mp3): id3v2_alloc_safe size-decode + CHAP/CTOC + frame-flag 
 
 ## Task 7: `id3v2_alloc_safe` — frame-bounds and walk (C4d)
 
-Kills the bounds/walk survivors: `data_start > tag_end || size > tag_end -
-data_start`, `pos = data_start + size`, the loop guard `pos + header_len <=
-scan_end`, the padding `data[pos] == 0` break, and `pos >= tag_end`.
+This region has several constructs; each fixture below targets specific ones. The
+constructs (current source, locate by pattern):
+
+- **A** `let data_start = pos + header_len;` (`+ -> -`/`*`)
+- **B** `data_start > tag_end` (`> -> ==`/`>=`)
+- **C** `size > tag_end - data_start` (`> -> ==`/`>=`, and `- -> +`)
+- **D** the `||` in `data_start > tag_end || size > ...` (`|| -> &&`)
+- **E** `pos = data_start + size;` (`+ -> -`/`*`)
+- **F** `if pos >= tag_end { break; }` (`>= -> <`/`==`)
+- **G** the while guard `pos + header_len <= scan_end` (`+ -> -`/`*`)
+- **I** the padding break `if data[pos] == 0` (`== -> !=`)
+
+(Index-arithmetic `+ -> -`/`*` inside the v2.2/v2.3/v2.4 size and flag reads —
+`data[pos+3..pos+9]` — are exercised by Task 6's decode/flag fixtures: a wrong index
+changes the decoded size or flag byte, flipping accept/reject. Confirm those during
+Task 6's hand-apply.)
 
 **Files:**
 - Modify (tests only): `musefs-format/src/mp3.rs` `#[cfg(test)] mod tests`.
@@ -579,51 +611,91 @@ scan_end`, the padding `data[pos] == 0` break, and `pos >= tag_end`.
     #[test]
     fn alloc_safe_frame_size_bounds() {
         // Frame exactly filling the body -> accept (size 4, body = 10+4 = 14).
+        // data_start = 10+10 = 20, tag_end = 24, rem = 4, size 4 -> 4 > 4 is false.
+        // Kills A `+ -> *` (data_start=100 -> 100>24 -> reject) and C `> -> >=`
+        // (4 >= 4 -> reject).
         let ok = v23_frame(b"TIT2", 4, &[1, 2, 3, 4]);
         assert!(id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &ok)));
-        // size one byte past the body's remainder -> reject (size 5, body still 14:
-        // data_start=20, tag_end=24, 5 > 24-20=4 -> reject). Kills the `size > tag_end
-        // - data_start` comparison and the `-` in `tag_end - data_start`.
+        // size one byte past the remainder -> reject (size 5: 5 > 24-20=4). Kills C
+        // `> -> ==` (5==4 false -> accept), C `- -> +` (rem=44 -> 5>44 false ->
+        // accept), D `|| -> &&` (false && true -> accept), and A `+ -> -`
+        // (data_start=0 -> 5 > 24-0=24 false -> accept).
         let over = v23_frame(b"TIT2", 5, &[1, 2, 3, 4]);
         assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &over)));
     }
 
     #[test]
+    fn alloc_safe_data_start_equal_to_tag_end_is_ok() {
+        // A size-0 frame: data_start (20) == tag_end (20). Original: `20 > 20` is
+        // false -> accept. Kills B `> -> ==` (20==20 -> reject) and `> -> >=`.
+        let zero = v23_frame(b"TIT2", 0, &[]);
+        assert!(id3v2_alloc_safe(&id3v2(0x03, 0x00, 10, &zero)));
+    }
+
+    #[test]
+    fn alloc_safe_rejects_bad_second_frame_in_body() {
+        // Valid frame1 (size 2) then an out-of-bounds frame2 (size 100), both inside
+        // the declared body (body=26, tag_end=36). Original walks to frame2 and
+        // rejects. Kills E `+ -> *` (pos = 20*2 = 40 >= 36 -> break -> accept,
+        // skipping frame2) and E `+ -> -` (pos = 20-2 = 18 -> data[18]==0 padding
+        // break -> accept).
+        let mut frames = v23_frame(b"TIT2", 2, &[0xAA, 0xBB]); // 12 bytes, 10..22
+        frames.extend_from_slice(&v23_frame(b"TPE1", 100, &[1, 2, 3, 4])); // 14, 22..36
+        assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 26, &frames)));
+    }
+
+    #[test]
+    fn alloc_safe_stops_at_tag_body_end() {
+        // A size-0 frame fills the body (tag_end=20), then a bad trailing frame
+        // beyond tag_end but within the buffer. Original breaks at `pos >= tag_end`
+        // (20 >= 20) and accepts without walking the trailing garbage. Kills F
+        // `>= -> <` (20 < 20 false -> no break -> walks the bad frame -> reject).
+        let mut frames = v23_frame(b"TIT2", 0, &[]); // 10 bytes, 10..20
+        frames.extend_from_slice(&v23_frame(b"TPE1", 100, &[1, 2, 3, 4])); // 14, 20..34
+        assert!(id3v2_alloc_safe(&id3v2(0x03, 0x00, 10, &frames)));
+    }
+
+    #[test]
     fn alloc_safe_walks_two_frames_and_stops_at_padding() {
-        // Two valid frames then padding. Exercises `pos = data_start + size` (the
-        // `+` and the walk) and the `data[pos] == 0` padding break. Both frames
-        // in-bounds -> accept.
-        let mut frames = Vec::new();
-        frames.extend_from_slice(&v23_frame(b"TIT2", 2, &[0xAA, 0xBB]));
+        // Two valid frames (24 bytes, 10..34) then 10 padding zero bytes (34..44).
+        // body=25 -> tag_end=35, so after frame2 (pos=34) `34 >= 35` is false (no
+        // tag-end break); the next iteration enters (`34+10=44 <= 44`) and
+        // `data[34] == 0` triggers the PADDING break. Kills I `== -> !=` (no break ->
+        // walks zero bytes -> data_start past tag_end -> reject) and exercises the
+        // multi-frame walk (E) and the while guard (G).
+        let mut frames = v23_frame(b"TIT2", 2, &[0xAA, 0xBB]);
         frames.extend_from_slice(&v23_frame(b"TPE1", 2, &[0xCC, 0xDD]));
-        frames.push(0x00); // padding marker
-        // body = (10+2) + (10+2) = 24 (padding is outside the declared body).
-        let tag = id3v2(0x03, 0x00, 24, &frames);
-        assert!(id3v2_alloc_safe(&tag));
+        frames.extend_from_slice(&[0u8; 10]); // >= header_len of padding so the walk re-enters
+        assert!(id3v2_alloc_safe(&id3v2(0x03, 0x00, 25, &frames)));
     }
 
     #[test]
     fn alloc_safe_rejects_frame_size_exceeding_tag_end() {
-        // A single frame whose declared size walks pos past tag_end is caught by the
-        // `size > tag_end - data_start` guard before any allocation. body=14, the
-        // frame claims size 100.
+        // Single frame claiming size 100 in a 14-byte body -> reject before any
+        // allocation. Reinforces C.
         let huge = v23_frame(b"TIT2", 100, &[1, 2, 3, 4]);
         assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &huge)));
     }
 ```
 
-- [ ] **Step 2: Run + hand-apply-verify**
+- [ ] **Step 2: Run + hand-apply-verify each construct**
 
 ```bash
-cargo test -p musefs-format --features fuzzing mp3::tests::alloc_safe_frame_size_bounds mp3::tests::alloc_safe_walks_two_frames_and_stops_at_padding mp3::tests::alloc_safe_rejects_frame_size_exceeding_tag_end
+cargo test -p musefs-format --features fuzzing mp3::tests::alloc_safe_frame_size_bounds mp3::tests::alloc_safe_data_start_equal_to_tag_end_is_ok mp3::tests::alloc_safe_rejects_bad_second_frame_in_body mp3::tests::alloc_safe_stops_at_tag_body_end mp3::tests::alloc_safe_walks_two_frames_and_stops_at_padding mp3::tests::alloc_safe_rejects_frame_size_exceeding_tag_end
 ```
-Hand-apply each remaining `id3v2_alloc_safe` survivor in the bounds/walk region
-(`> -> ==`/`>=`, `- -> +`, `+ -> -`, `>= -> <`, `<= ->` variants, `|| -> &&`,
-`!= -> ==`): locate the construct by pattern, apply, confirm one of the three tests
-above goes red, revert. If a specific mutation survives all three, add a boundary
-fixture that flips accept↔reject at exactly that construct (e.g. a frame whose
-`data_start == tag_end`, or `pos + header_len == scan_end`). The walk is fully
-exercised by the two-frame + padding fixture plus the over/exceeding fixtures.
+Construct → killing test (apply the mutation, confirm the named test goes red, revert):
+
+- **A** `data_start = pos + header_len` `+ -> *`: `alloc_safe_frame_size_bounds` (ok). `+ -> -`: same test (over).
+- **B** `data_start > tag_end` `> -> ==`/`>=`: `alloc_safe_data_start_equal_to_tag_end_is_ok`.
+- **C** `size > tag_end - data_start` `> -> ==` and `- -> +`: `..._frame_size_bounds` (over); `> -> >=`: same test (ok).
+- **D** `|| -> &&`: `..._frame_size_bounds` (over).
+- **E** `pos = data_start + size` `+ -> *` and `+ -> -`: `alloc_safe_rejects_bad_second_frame_in_body`.
+- **F** `pos >= tag_end` `>= -> <`: `alloc_safe_stops_at_tag_body_end`. `>= -> ==`: `..._walks_two_frames_*` (pos advances past tag_end in a multi-frame walk).
+- **G** while `pos + header_len` `+ -> -`/`*`: any frame fixture (a corrupted guard reads `data[pos]` out of bounds → panic, or walks wrong → reject). Confirm on `..._frame_size_bounds`.
+- **I** `data[pos] == 0` `== -> !=`: `alloc_safe_walks_two_frames_and_stops_at_padding`.
+
+If any listed mutation survives all the tests above, add a boundary fixture that
+flips accept↔reject at exactly that construct and note it; do not leave it unkilled.
 
 - [ ] **Step 3: Commit**
 
@@ -699,6 +771,10 @@ equivalents).
   identity is untouched) and document it in Task 8.
 - Inventory line numbers have **drifted**; always locate the construct by its code
   pattern before hand-applying.
+- The `tag_end > data.len()` check (between the body decode and the frame walk) has
+  **no listed survivor** — existing tests already cover it. The Task 4–7 reject
+  fixtures exercise it incidentally; if the next campaign reports a new survivor
+  there, add an explicit `tag_end == data.len()` boundary fixture.
 - Only disjoint-bitfield `| → ^`/`| → +` are equivalent; disjoint `| → &` and all
   whole-byte-OR `|` mutations are **killable**. Do not over-record equivalents.
 - Never leave a hand-applied mutation in the tree — always revert before the next step.
