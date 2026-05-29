@@ -1037,4 +1037,106 @@ mod tests {
         assert_eq!(pic.mime, "image/png");
         assert_eq!(pic.picture_type, 3);
     }
+
+    #[test]
+    fn detect_codec_matches_each_magic_and_rejects_others() {
+        assert_eq!(detect_codec(b"OpusHead........").unwrap(), Codec::Opus);
+        assert_eq!(detect_codec(b"\x01vorbis...").unwrap(), Codec::Vorbis);
+        assert_eq!(detect_codec(b"\x7FFLAC...").unwrap(), Codec::OggFlac);
+        // Too-short and non-matching inputs must error (kills the :25 && -> || and
+        // the length-guard mutations).
+        assert!(detect_codec(b"OpusHea").is_err()); // 7 bytes, len guard
+        assert!(detect_codec(b"XXXXXXXX").is_err()); // right length, wrong magic
+        assert!(detect_codec(b"\x01vorbi").is_err()); // 6 bytes
+    }
+
+    #[test]
+    fn comment_body_strips_each_codec_prefix_and_guards_length() {
+        assert_eq!(comment_body(Codec::Opus, b"OpusTagsBODY").unwrap(), b"BODY");
+        assert_eq!(
+            comment_body(Codec::Vorbis, b"\x03vorbisBODY").unwrap(),
+            b"BODY"
+        );
+        assert_eq!(
+            comment_body(Codec::OggFlac, b"\x04\x00\x00\x00BODY").unwrap(),
+            b"BODY"
+        );
+        // packet shorter than the prefix errors (kills :113 < -> ==/<=).
+        assert!(comment_body(Codec::Opus, b"OpusTa").is_err());
+        assert!(comment_body(Codec::OggFlac, b"\x04\x00\x00").is_err());
+    }
+
+    #[test]
+    fn oggflac_following_packets_reads_be_count_and_guards_length() {
+        // 0x7F"FLAC" major minor count(BE) ... ; count bytes at [7],[8].
+        let pkt = b"\x7FFLAC\x01\x00\x00\x05rest";
+        assert_eq!(oggflac_following_packets(pkt).unwrap(), 5);
+        assert!(oggflac_following_packets(b"\x7FFLAC\x01\x00").is_err()); // 7 bytes (<9)
+    }
+
+    #[test]
+    fn comment_packet_index_locates_the_comment_block() {
+        // Opus/Vorbis: always packet index 1 (kills :121 -> 1 only if a non-1 case
+        // exists; assert OggFLAC search to pin the skip(1)+find logic at :130).
+        let opus = OggHeader {
+            codec: Codec::Opus,
+            serial: 1,
+            packets: vec![vec![], vec![]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        assert_eq!(comment_packet_index(&opus), 1);
+
+        // OggFLAC: packet 0 mapping, packet 1 type 1 (non-comment), packet 2 type 4.
+        let oggflac = OggHeader {
+            codec: Codec::OggFlac,
+            serial: 1,
+            packets: vec![vec![0x7F], vec![0x01], vec![0x84]], // 0x84 & 0x7F == 4
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        assert_eq!(comment_packet_index(&oggflac), 2);
+        // No type-4 block -> 0 (kills the bitmask / == mutations at :130).
+        let none = OggHeader {
+            codec: Codec::OggFlac,
+            serial: 1,
+            packets: vec![vec![0x7F], vec![0x01], vec![0x05]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        assert_eq!(comment_packet_index(&none), 0);
+    }
+
+    #[test]
+    fn locate_audio_accepts_empty_audio_region() {
+        // opus_headers() is header pages only: audio_offset == data.len(). The
+        // original `>` yields Ok (audio_length 0); the :196 `==`/`>=` mutants reject.
+        let file = opus_headers();
+        let scan = locate_audio(&file).unwrap();
+        assert_eq!(scan.codec, Codec::Opus);
+        assert_eq!(scan.audio_offset, file.len() as u64);
+        assert_eq!(scan.audio_length, 0);
+    }
+
+    #[test]
+    fn picture_prefix_declared_desc_len_pins_padding() {
+        let art = crate::input::ArtInput {
+            art_id: 1,
+            mime: "image/png".into(), // 9
+            description: "x".into(),  // 1 -> base = 42, 42 % 3 == 0 -> pad 0
+            picture_type: 3,
+            width: 1,
+            height: 1,
+            data_len: 100,
+        };
+        let prefix = picture_prefix(&art);
+        assert_eq!(prefix.len() % 3, 0);
+        // Declared description length lives at offset 8 + mime.len() (after
+        // type[4] + mimelen[4] + mime). pad = declared - desc.len() must be 0..=2.
+        let off = 8 + art.mime.len();
+        let declared = u32::from_be_bytes(prefix[off..off + 4].try_into().unwrap());
+        let pad = declared - art.description.len() as u32;
+        assert!(pad <= 2, "pad must be 0..=2, got {pad}");
+        assert_eq!(pad, 0, "base % 3 == 0 implies pad 0");
+    }
 }
