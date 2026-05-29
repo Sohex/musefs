@@ -466,4 +466,19 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn build_info_payload_word_aligns_values() {
+        // :155 `v.len() % 2 == 1`. v = value bytes + NUL.
+        // Value "a"  -> v.len()=2 (even, NO pad). Kills `% → /` (2/2==1 pads) and
+        //               `== → !=` (2%2=0 != 1 pads).
+        // Value "ab" -> v.len()=3 (odd, padded). Kills `% → +` (3+2 != 1, no pad).
+        let even = build_info_payload(&[TagInput::new("title", "a")]).unwrap();
+        // "INFO"(4) + "INAM"(4) + len(4) + "a\0"(2) = 14, no pad.
+        assert_eq!(even.len(), 14);
+
+        let odd = build_info_payload(&[TagInput::new("title", "ab")]).unwrap();
+        // "INFO"(4) + "INAM"(4) + len(4) + "ab\0"(3) + pad(1) = 16.
+        assert_eq!(odd.len(), 16);
+    }
 }
