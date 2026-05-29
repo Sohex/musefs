@@ -12,8 +12,10 @@ Audit musefs's existing test suite for **coverage**, **quality**, and **edge-cas
 handling**, and produce a single report whose closing section is a prioritized
 remediation backlog ready to execute later.
 
-This is an audit of an *already-substantial* suite: ~259 Rust tests run by
-`cargo test --workspace` — which **already includes the `fuzzing`-gated format
+This is an audit of an *already-substantial* suite — roughly 275 `#[test]` fns
+plus 6 `proptest!` blocks across the workspace at the time of writing (**a stale
+figure; Phase A re-derives the exact counts and the report uses those, never this
+number**), run by `cargo test --workspace` — which **already includes the `fuzzing`-gated format
 proptests** via workspace feature unification (`musefs-core`'s dev-dependency
 enables `musefs-format/fuzzing`, `musefs-core/Cargo.toml:26`) — plus separate
 surfaces the default run excludes: `#[ignore]`d FUSE e2e tests, the mutagen
@@ -69,6 +71,12 @@ The report lists the actual resolved version of each tool used.
   `mutagen==1.47.0` (from `tests/interop/requirements.txt`, needed by the interop
   pytest). If `pytest-cov` cannot be installed, the beets suite is still run for
   pass/fail and its coverage cell reads "not measured (pytest-cov unavailable)".
+  **Divergence from CI, intentional:** CI installs via
+  `pip install -e "contrib/beets[test]"` (resolving the `pyproject.toml`
+  `[project.optional-dependencies] test = ["pytest>=7"]` extra). The audit uses
+  `requirements.txt` + explicit extra installs instead, for finer control over the
+  exact `pytest-cov`/`mutagen` versions. The report notes that the beets env is
+  not a byte-for-byte CI reproduction.
 - **Network-unavailable fallback:** if `cargo install` / `pip install` cannot
   reach a registry, the dependent surface is marked **blocked** in the report (not
   silently skipped): Phase B emits "mutation testing blocked — cargo-mutants
@@ -105,8 +113,11 @@ Run the full test surface and record current state:
   tests/interop/test_mutagen_roundtrip.py` (in the Phase-0 venv with
   `mutagen==1.47.0`). `$D` is a fresh temp dir, not a tracked path.
 - **beets plugin suite** (`contrib/beets/`, run in the Phase-0 venv): first
-  `cargo build -p musefs-cli` so the `musefs_bin` and `e2e` suites don't auto-skip
-  on a missing binary. Then `python -m pytest` (unit + integration),
+  `cargo build -p musefs-cli` **and confirm it succeeded** before invoking pytest
+  — a failed build leaves the binary absent, silently skipping the `musefs_bin`
+  and `e2e` suites (recorded as not-run, but the dependency must be explicit so a
+  build failure is surfaced, not masked as a skip). Then `python -m pytest` (unit +
+  integration),
   `python -m pytest -m musefs_bin` (path-gate vs the real binary), and
   `python -m pytest -m e2e` (beets → mount → playback). **Skips count as not-run,
   not pass:** record `passed/failed/skipped` per invocation and, for any skip,
@@ -119,11 +130,13 @@ Run the full test surface and record current state:
   invocation's coverage separately — but never a single number from one run.
 - **Schema-parity check.** The beets suite builds its temp DB from a hand-copied
   fixture, `contrib/beets/tests/schema_v1.sql`, *not* from production
-  `musefs-db/src/schema.rs` (`MIGRATION_V1`). Diff the two (normalized for
-  whitespace/formatting); if they've drifted, every beets test validates against a
-  phantom contract — record it as a high-severity finding and treat the beets
-  results as suspect until reconciled. A drift-detection test is a likely backlog
-  item.
+  `musefs-db/src/schema.rs` (`MIGRATION_V1`). Diff the two normalized for
+  whitespace/formatting **and strip the trailing `PRAGMA user_version = 1;` from
+  the SQL fixture first** — `MIGRATION_V1` deliberately omits it (`migrate()` sets
+  `user_version` separately via `pragma_update`, `schema.rs:95`), so a naive diff
+  false-positives on that line. After that normalization, any remaining difference
+  is real drift: record it as a high-severity finding, treat the beets results as
+  suspect until reconciled, and flag a drift-detection test for the backlog.
 - **Fuzz smoke surface** (mirrors `.github/workflows/fuzz.yml` per-PR job):
   `cargo +nightly fuzz build`, then each target
   (`flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment`) run with the CI bounds
@@ -159,11 +172,21 @@ to surface ordering/timing nondeterminism. Concrete starting set to enumerate fr
     `roundtrip.rs`; the `ogg_index.rs` inline test.
   - Resolution / freshness: the `facade.rs` / `tests/facade.rs` tests for
     `poll_refresh`, `content_version`, `BackingChanged`; `tests/tree.rs` for inode
-    stability.
+    stability; **`tests/external_contract.rs`** — directly exercises the
+    backing-drift contract (mutates `audio_length` in the DB, asserts `resolve()`
+    returns `CoreError::BackingChanged`), a core Tier-1 freshness guarantee.
   - Tier-1 e2e (`--ignored`): `musefs-fuse/tests/mount.rs`,
     `ogg_read_through.rs`, `keep_cache.rs`, `playback_pcm.rs`.
 Any test not stable across all runs is recorded as **flaky** (`file:line`),
 feeding both the gate and the Phase B confidence note.
+
+The **metrics-gated tests** (`musefs-core/tests/metrics.rs`,
+`musefs-fuse/tests/concurrency.rs`) are Tier-2 but inherently timing-sensitive
+(global atomic counters serialized via a `METRICS_LOCK`). Run them 3× too —
+always with `--test-threads=1` as they require — but their instability is recorded
+as a Tier-2 flakiness finding and does **not** trip the Tier-1 halt gate. The
+report notes whether any nondeterminism there reflects a real concurrency bug
+versus test-harness contention.
 
 **Red-test gate.** If any **Tier-1** test fails or is flaky in this phase,
 **halt and report before Phase B/C.** Mutation results are meaningless against a
@@ -235,6 +258,14 @@ without any test failing — are the sharpest signal of weak or missing assertio
     strongest oracle anyway. The report **labels `musefs-format` mutation results
     as crate-local-only** so they aren't read as workspace-wide.
 - Record surviving mutants with `file:line` and the mutation applied.
+- **Out of mutation scope, by decision:** `db_pool.rs` (concurrency/connection
+  pooling — assessed directly in Phase C, since its 3 tests and WAL/pragma
+  behavior are awkward to mutate meaningfully under a wall-clock cap) and **the
+  beets plugin Python code** (`beetsplug/_core.py`, `musefs.py`). Python mutation
+  (`mutmut`/`cosmic-ray`) is **deferred**: it needs separate tooling and a venv
+  harness, and the beets suite's own value depends on the schema-parity and
+  FK-pragma checks above more than on mutation score. Recorded as a possible
+  follow-up, not run in this audit.
 - **Flakiness caveat.** A mutant "caught" by a flaky test is unreliable (it may
   have failed for an unrelated reason). If Phase A flagged any flaky test in a
   mutation-target crate, note it here and treat that crate's killed-mutant counts
@@ -271,9 +302,53 @@ Two specific spots to inspect by name:
   property. Assess whether it actually spans segment variants, offsets, and
   partial reads, or just a happy path, independent of what Phase B reports.
 
+**Audit the test infrastructure itself** (oracles and fixture builders are
+untested code that every test trusts; a bug here makes green tests meaningless):
+
+- `musefs-format/tests/common/mod.rs` — `resolve_layout()` is an **independent
+  reimplementation of the production splicer** used as the format-layer oracle. A
+  bug here means tests pass against a wrong oracle. Note specifically that it has
+  `unreachable!()` for `OggAudio`/`OggArtSlice` (`mod.rs:80-81`), so it **cannot
+  serve as an oracle for Ogg layouts** — any Ogg test routed through it panics
+  rather than failing gracefully. Assess whether Ogg correctness has an
+  equivalent independent oracle anywhere; if not, that's a Tier-1 gap.
+- `musefs-core/tests/common/mod.rs` — `write_flac()` / `minimal_m4a()` fixture
+  builders; silent corruption here poisons every downstream test.
+- `contrib/beets/tests/conftest.py` — the `db_path` fixture uses raw
+  `sqlite3.connect()` + `executescript()` **without `PRAGMA foreign_keys = ON`**,
+  while production (`musefs-db Db::configure`, `lib.rs:44`) and the `make_track`
+  fixture (`musefs_connect()`) enable FK enforcement. Tests on `db_path` can insert
+  orphaned `tags`/`track_art` rows that production would reject — a fixture/prod
+  parity gap to flag.
+- `musefs-format/src/fuzz_check.rs` — the minimal-fixture module feeding
+  `external_contract.rs` and the fuzz seeds; a quick correctness glance.
+- `musefs-core/src/db_pool.rs` (3 unit tests) — per-worker WAL connections for the
+  concurrency model. A stale connection or a worker connection missing the
+  `foreign_keys` pragma could silently corrupt reads. Not a Phase B mutation
+  target (see Phase B note); assess its tests directly here.
+
 Findings are recorded uniformly as **`file:line` — description — severity
 (P0/P1/P2)**, so Phase C output drops straight into the report's findings and
 backlog sections.
+
+## Time budget
+
+A rough wall-clock estimate so the plan can timebox and the executor knows when to
+escalate rather than silently grind:
+
+- **Phase 0** (tooling/venv install, mostly `cargo install cargo-mutants` compile)
+  — ~15–30 min, dominated by the mutants build.
+- **Phase A** (workspace + e2e + metrics + interop + beets ×3 + fuzz smoke ×8 +
+  flakiness ×3 + coverage) — **~45–90 min.**
+- **Phase B** (mutation, capped ~30 min/crate × 3 target crates) — **~60–90 min**,
+  expecting a partial `musefs-format` run.
+- **Phase C** (judgment reading) — bounded by attention, not commands; target
+  ~60–90 min and stop at diminishing returns.
+
+**Total ≈ 3–5 hours.** If any single phase runs >1.5× its estimate, the executor
+records progress so far, notes the overrun in the report, and escalates rather
+than blocking indefinitely. Tooling-blocked surfaces (Phase 0 fallback) shorten
+this materially.
 
 ## Risk-weighted surface (where depth goes)
 
@@ -303,7 +378,10 @@ backlog sections.
   `pytest-cov` over `beetsplug/` (not Rust coverage).
 
 **Tier 3 — survey only:** CLI arg parsing, template rendering, mapping. Confirm
-coverage exists and note gaps; go deep only if something looks alarming.
+coverage exists and note gaps; go deep only if something looks alarming. The
+`read_throughput` Criterion bench (`musefs-core`) is **noted but out of scope** —
+it's a performance probe, not a correctness test; the audit confirms it still
+builds/runs and flags it for a separate perf-regression effort, nothing more.
 
 ## Audit dimensions (scored per Tier-1/Tier-2 area)
 
