@@ -155,6 +155,14 @@ fn zero_byte_art_skipped_among_valid_art_keeps_block_framing_valid() {
     let mut art_map = HashMap::new();
     art_map.insert(2i64, image.clone());
     let assembled = resolve_layout(&layout, &file, &art_map);
+
+    // Re-parse the synthesized chain: locate_audio follows the last-block flag, so
+    // if the empty art were miscounted (leaving the final real block without its
+    // last-block bit) the walk would run past the metadata into the audio frames
+    // and fail. This pins the `data_len > 0` filter against `>= 0`.
+    let rescan = locate_audio(&assembled).expect("synthesized FLAC must parse");
+    assert_eq!(rescan.audio_offset, layout.header_len());
+
     let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
     let pics: Vec<_> = tag.pictures().collect();
     assert_eq!(pics.len(), 1);

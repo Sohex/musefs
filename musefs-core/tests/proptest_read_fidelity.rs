@@ -165,9 +165,12 @@ proptest! {
             &whole[art_off as usize..(art_off + art_len) as usize],
             &art[..]
         );
-        // A partial window over the art region matches the independently-read whole.
-        let offset = (a as u64) % (total + 1);
-        let len = (b as u64) % (total - offset + 1);
+        // A partial window *within the art span* matches the independently-read
+        // whole, so the assertion actually exercises art bytes (sampling the whole
+        // stream here would be redundant with read_at_partial_windows_match_whole).
+        let local_off = (a as u64) % (art_len + 1);
+        let offset = art_off + local_off;
+        let len = (b as u64) % (art_len - local_off + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
         prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
     }

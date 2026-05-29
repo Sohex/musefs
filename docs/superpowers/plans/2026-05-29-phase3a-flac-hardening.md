@@ -490,7 +490,7 @@ Kills `synthesize_layout:155` (`> → >=`).
     #[test]
     fn synthesize_layout_picture_block_size_boundary_is_inclusive() {
         // body_len = picture_body_framing(art).len() + art.data_len. The guard at
-        // flac.rs:155 rejects body_len > 0x00FF_FFFF (FLAC's 24-bit block length).
+        // flac.rs rejects body_len > 0x00FF_FFFF (FLAC's 24-bit block length).
         let scan = FlacScan { audio_offset: 0, audio_length: 0, preserved: vec![] };
         let mk = |data_len: u64| ArtInput {
             art_id: 1,
