@@ -553,4 +553,37 @@ mod tests {
         let mid = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x00_0100))]);
         assert_eq!(read_pictures(&mid), Err(FormatError::Malformed));
     }
+
+    #[test]
+    fn synthesize_layout_picture_block_size_boundary_is_inclusive() {
+        // body_len = picture_body_framing(art).len() + art.data_len. The guard at
+        // flac.rs:155 rejects body_len > 0x00FF_FFFF (FLAC's 24-bit block length).
+        let scan = FlacScan {
+            audio_offset: 0,
+            audio_length: 0,
+            preserved: vec![],
+        };
+        let mk = |data_len: u64| ArtInput {
+            art_id: 1,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len,
+        };
+        // Derive the exact framing length from production rather than hardcoding it
+        // (it is independent of the data_len *value* — that field is always 4 bytes).
+        // This keeps the boundary correct regardless of the framing's field count.
+        let framing_len = picture_body_framing(&mk(0)).len() as u64;
+        let at_limit = 0x00FF_FFFF - framing_len; // body_len == 0x00FF_FFFF exactly
+                                                  // original `>` accepts the inclusive boundary; the `>=` mutant rejects it.
+                                                  // (data_len is only a count; no large allocation occurs.)
+        assert!(synthesize_layout(&scan, &[], &[mk(at_limit)]).is_ok());
+        // one byte over must still error, pinning the high side of the boundary.
+        assert_eq!(
+            synthesize_layout(&scan, &[], &[mk(at_limit + 1)]),
+            Err(FormatError::TooLarge)
+        );
+    }
 }
