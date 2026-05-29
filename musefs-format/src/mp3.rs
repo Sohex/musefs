@@ -930,4 +930,73 @@ mod tests {
         let ctoc = v23_frame(b"CTOC", 4, &[1, 2, 3, 4]);
         assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &ctoc)));
     }
+
+    #[test]
+    fn alloc_safe_frame_size_bounds() {
+        // Frame exactly filling the body -> accept (size 4, body = 10+4 = 14).
+        // data_start = 10+10 = 20, tag_end = 24, rem = 4, size 4 -> 4 > 4 is false.
+        // Kills A `+ -> *` (data_start=100 -> 100>24 -> reject) and C `> -> >=`
+        // (4 >= 4 -> reject).
+        let ok = v23_frame(b"TIT2", 4, &[1, 2, 3, 4]);
+        assert!(id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &ok)));
+        // size one byte past the remainder -> reject (size 5: 5 > 24-20=4). Kills C
+        // `> -> ==` (5==4 false -> accept), C `- -> +` (rem=44 -> 5>44 false ->
+        // accept), D `|| -> &&` (false && true -> accept), and A `+ -> -`
+        // (data_start=0 -> 5 > 24-0=24 false -> accept).
+        let over = v23_frame(b"TIT2", 5, &[1, 2, 3, 4]);
+        assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &over)));
+    }
+
+    #[test]
+    fn alloc_safe_data_start_equal_to_tag_end_is_ok() {
+        // A size-0 frame: data_start (20) == tag_end (20). Original: `20 > 20` is
+        // false -> accept. Kills B `> -> ==` (20==20 -> reject) and `> -> >=`.
+        let zero = v23_frame(b"TIT2", 0, &[]);
+        assert!(id3v2_alloc_safe(&id3v2(0x03, 0x00, 10, &zero)));
+    }
+
+    #[test]
+    fn alloc_safe_rejects_bad_second_frame_in_body() {
+        // Valid frame1 (size 2) then an out-of-bounds frame2 (size 100), both inside
+        // the declared body (body=26, tag_end=36). Original walks to frame2 and
+        // rejects. Kills E `+ -> *` (pos = 20*2 = 40 >= 36 -> break -> accept,
+        // skipping frame2) and E `+ -> -` (pos = 20-2 = 18 -> data[18]==0 padding
+        // break -> accept).
+        let mut frames = v23_frame(b"TIT2", 2, &[0xAA, 0xBB]); // 12 bytes, 10..22
+        frames.extend_from_slice(&v23_frame(b"TPE1", 100, &[1, 2, 3, 4])); // 14, 22..36
+        assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 26, &frames)));
+    }
+
+    #[test]
+    fn alloc_safe_stops_at_tag_body_end() {
+        // A size-0 frame fills the body (tag_end=20), then a bad trailing frame
+        // beyond tag_end but within the buffer. Original breaks at `pos >= tag_end`
+        // (20 >= 20) and accepts without walking the trailing garbage. Kills F
+        // `>= -> <` (20 < 20 false -> no break -> walks the bad frame -> reject).
+        let mut frames = v23_frame(b"TIT2", 0, &[]); // 10 bytes, 10..20
+        frames.extend_from_slice(&v23_frame(b"TPE1", 100, &[1, 2, 3, 4])); // 14, 20..34
+        assert!(id3v2_alloc_safe(&id3v2(0x03, 0x00, 10, &frames)));
+    }
+
+    #[test]
+    fn alloc_safe_walks_two_frames_and_stops_at_padding() {
+        // Two valid frames (24 bytes, 10..34) then 10 padding zero bytes (34..44).
+        // body=25 -> tag_end=35, so after frame2 (pos=34) `34 >= 35` is false (no
+        // tag-end break); the next iteration enters (`34+10=44 <= 44`) and
+        // `data[34] == 0` triggers the PADDING break. Kills I `== -> !=` (no break ->
+        // walks zero bytes -> data_start past tag_end -> reject) and exercises the
+        // multi-frame walk (E) and the while guard (G).
+        let mut frames = v23_frame(b"TIT2", 2, &[0xAA, 0xBB]);
+        frames.extend_from_slice(&v23_frame(b"TPE1", 2, &[0xCC, 0xDD]));
+        frames.extend_from_slice(&[0u8; 10]); // >= header_len of padding so the walk re-enters
+        assert!(id3v2_alloc_safe(&id3v2(0x03, 0x00, 25, &frames)));
+    }
+
+    #[test]
+    fn alloc_safe_rejects_frame_size_exceeding_tag_end() {
+        // Single frame claiming size 100 in a 14-byte body -> reject before any
+        // allocation. Reinforces C.
+        let huge = v23_frame(b"TIT2", 100, &[1, 2, 3, 4]);
+        assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &huge)));
+    }
 }
