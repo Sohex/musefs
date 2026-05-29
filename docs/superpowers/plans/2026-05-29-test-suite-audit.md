@@ -194,9 +194,17 @@ cargo test -p musefs-fuse --test mount --test ogg_read_through --test keep_cache
 ```
 Expected: each prints `<name>: test` lines. The `ogg_index.rs` inline test (`build_index_renumbers_and_preserves_payload_length`) is in `musefs-core` lib tests — capture it via `cargo test -p musefs-core --lib -- --list | grep ogg_index`.
 
-- [ ] **Step 2: Write the finalized Tier-1 set into §4**
+- [ ] **Step 2: Triage the FULL format test-file list (don't silently omit)**
 
-In §4, list the exact `file::test_name` set chosen for the 3× flakiness runs, grouped as: byte-identical/read-path, resolution/freshness (incl. `external_contract.rs`), Tier-1 e2e. This is the authoritative set Task 5 reruns.
+The Step-1 commands list a *starting* subset. `musefs-format/tests/` has more files that touch the byte-identical synthesis paths and may be Tier-1, not Tier-2. List them all and classify each explicitly:
+```bash
+ls musefs-format/tests/*.rs
+```
+For each — including `flac_pictures.rs`, `mp3_pictures.rs`, `mp3_synthesize.rs`, `wav_synthesize.rs`, `synthesize_*.rs`, `read_metadata.rs`, `read_comments.rs`, `mp3_read_tags.rs`, `wav_read_tags.rs`, `locate.rs`, `mp3_locate.rs`, `wav_locate.rs`, `mp4_oracle.rs`, `roundtrip.rs`, `layout.rs` — decide **Tier-1 (byte-identical synthesis/splice) vs Tier-2 (tag/metadata read, locate helpers)** and record the rationale in §4. Synthesis/picture tests that assert served-byte identity are Tier-1 and **belong in the 3× flakiness set**; pure tag-read/locate tests are Tier-2. Do not drop a file just because Step 1 didn't name it.
+
+- [ ] **Step 3: Write the finalized Tier-1 set into §4**
+
+In §4, list the exact `file::test_name` set chosen for the 3× flakiness runs (reflecting the Step-2 triage), grouped as: byte-identical/read-path, resolution/freshness (incl. `external_contract.rs` and the `ogg_index` lib test), Tier-1 e2e. This is the authoritative set Task 5 reruns — **update the Task 5 `cargo test` invocations to match it** if the triage added Tier-1 format test files beyond the Step-1 subset.
 
 ---
 
@@ -332,14 +340,13 @@ Expected: `binary present`. **If the build fails, stop and surface it** (do not 
 
 - [ ] **Step 2: Run the three beets pytest invocations with cumulative coverage**
 
-Run:
+Run (use absolute paths in a subshell so this works regardless of the executor's cwd — pytest must run with `contrib/beets` as rootdir so `beetsplug` imports and the `pyproject.toml` markers/testpaths resolve):
 ```bash
-cd contrib/beets
+REPO=$(git rev-parse --show-toplevel)
 VENV=/tmp/musefs-audit/venv
-$VENV/bin/python -m pytest --cov=beetsplug -p no:cacheprovider 2>&1 | tee /tmp/musefs-audit/beets-default.log
-$VENV/bin/python -m pytest -m musefs_bin --cov=beetsplug --cov-append 2>&1 | tee /tmp/musefs-audit/beets-musefs_bin.log
-$VENV/bin/python -m pytest -m e2e --cov=beetsplug --cov-append 2>&1 | tee /tmp/musefs-audit/beets-e2e.log
-cd ../..
+( cd "$REPO/contrib/beets" && $VENV/bin/python -m pytest --cov=beetsplug -p no:cacheprovider ) 2>&1 | tee /tmp/musefs-audit/beets-default.log
+( cd "$REPO/contrib/beets" && $VENV/bin/python -m pytest -m musefs_bin --cov=beetsplug --cov-append ) 2>&1 | tee /tmp/musefs-audit/beets-musefs_bin.log
+( cd "$REPO/contrib/beets" && $VENV/bin/python -m pytest -m e2e --cov=beetsplug --cov-append ) 2>&1 | tee /tmp/musefs-audit/beets-e2e.log
 ```
 Expected: record `passed/failed/skipped` per invocation **and the skip reason** for any skip (missing `beet`, `fusermount`, `ffmpeg`, `/dev/fuse`, or binary). **An all-skipped marker run is "not exercised," never green.** If `pytest-cov` was blocked, drop `--cov*` and record coverage as not measured.
 
@@ -462,6 +469,8 @@ If §5 = **TRIP**, go to **Task 13** (red-test halt report). If §5 = **PASS**, 
 - Logs: `/tmp/musefs-audit/mutants-*.log`
 
 > Skip this entire task if §5 = TRIP or cargo-mutants was blocked in Task 2 (set §9 to the blocked message and continue).
+
+**Runtime risk to record up front:** `--test-workspace=true` (used for `musefs-db` and `musefs-core` below) runs the **whole workspace test suite per mutant** and rebuilds the mutated crate + its dependents under instrumentation. The one-time baseline build plus per-mutant incremental compiles can eat **10–15 min** of the 30-min cap before many mutants run, so **heavily partial runs for `musefs-db`/`musefs-core` are expected and acceptable** — record mutants-tested/total honestly. If the baseline build alone approaches the cap, note it in §9 and either narrow the `--file` set or flag a follow-up run with a higher cap rather than reporting a misleadingly low survivor count. (`cargo mutants` prints a baseline timing first; use it to gauge remaining budget.)
 
 - [ ] **Step 1: Mutate musefs-db (workspace tests, plain command)**
 
