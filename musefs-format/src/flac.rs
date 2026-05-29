@@ -469,4 +469,88 @@ mod tests {
         assert_eq!(read_vorbis_comments(&mid), Err(FormatError::Malformed));
         // (:200 `| -> ^` and :201 `| -> ^` are equivalent: disjoint shifted bytes.)
     }
+
+    /// A FLAC PICTURE block body (big-endian fields), independent of production.
+    fn picture_body(ptype: u32, mime: &str, desc: &str, w: u32, h: u32, data: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&ptype.to_be_bytes());
+        v.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        v.extend_from_slice(mime.as_bytes());
+        v.extend_from_slice(&(desc.len() as u32).to_be_bytes());
+        v.extend_from_slice(desc.as_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&0u32.to_be_bytes()); // depth
+        v.extend_from_slice(&0u32.to_be_bytes()); // colors
+        v.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        v.extend_from_slice(data);
+        v
+    }
+
+    #[test]
+    fn parse_picture_block_roundtrips_fields() {
+        let body = picture_body(3, "image/png", "desc", 4, 5, b"PIXELS");
+        let p = parse_picture_block(&body).unwrap();
+        assert_eq!(p.picture_type, 3);
+        assert_eq!(p.mime, "image/png");
+        assert_eq!(p.description, "desc");
+        assert_eq!(p.width, 4);
+        assert_eq!(p.height, 5);
+        assert_eq!(p.data, b"PIXELS");
+    }
+
+    #[test]
+    fn parse_picture_block_guards_field_bounds() {
+        // :237 `> -> ==` (mime bound): claim mime_len far past the end. Original
+        // Malformed; the `==` mutant falls through to slice body[8..8+mime_len] -> panic.
+        let mut bad_mime = 3u32.to_be_bytes().to_vec();
+        bad_mime.extend_from_slice(&16u32.to_be_bytes()); // mime_len = 16
+        bad_mime.extend_from_slice(b"ab"); // only 2 bytes present
+        assert_eq!(parse_picture_block(&bad_mime), Err(FormatError::Malformed));
+
+        // :245 `> -> ==` (desc bound): valid mime, then claim desc_len past the end.
+        let mut bad_desc = 3u32.to_be_bytes().to_vec();
+        bad_desc.extend_from_slice(&3u32.to_be_bytes()); // mime_len = 3
+        bad_desc.extend_from_slice(b"png");
+        bad_desc.extend_from_slice(&16u32.to_be_bytes()); // desc_len = 16
+        bad_desc.extend_from_slice(b"x"); // only 1 byte present
+        assert_eq!(parse_picture_block(&bad_desc), Err(FormatError::Malformed));
+
+        // :261 `> -> <` (data bound): a fully valid picture body with TRAILING bytes.
+        // Original ignores the trailing byte (data_end < len, not >) and returns Ok;
+        // the `<` mutant rejects (data_end < len -> Malformed).
+        let mut trailing = picture_body(3, "png", "", 1, 1, b"DA");
+        trailing.push(0xFF); // one extra trailing byte
+        assert!(parse_picture_block(&trailing).is_ok());
+    }
+
+    #[test]
+    fn read_pictures_extracts_and_guards_marker() {
+        // Happy path: one PICTURE block, last, no audio (body_end == len). Pins :294.
+        let pic = picture_body(3, "image/jpeg", "front", 8, 8, b"IMG");
+        let file = flac_with(&[raw_block(BLOCK_PICTURE, &pic, true, None)]);
+        let pics = read_pictures(&file).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert_eq!(pics[0].data, b"IMG");
+        // :277 `< -> ==` and `|| -> &&`: 3-byte input -> panic vs NotFlac.
+        assert_eq!(read_pictures(b"fLa"), Err(FormatError::NotFlac));
+        // :277 `< -> <=`: 4-byte fLaC -> Malformed vs NotFlac.
+        assert_eq!(read_pictures(b"fLaC"), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn read_pictures_guards_block_walk_and_length() {
+        // :283 `+ -> -`, `> -> ==`: truncated header.
+        assert_eq!(read_pictures(b"fLaC\x80"), Err(FormatError::Malformed));
+        // :283 `> -> >=`: non-PICTURE last block flush with end -> Ok(empty).
+        let none = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, None)]);
+        assert_eq!(read_pictures(&none).unwrap(), Vec::new());
+        // :289 `<<16 -> >>16` and :290 `| -> &`: high length byte over short body.
+        let hi = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0000))]);
+        assert_eq!(read_pictures(&hi), Err(FormatError::Malformed));
+        // :290 `<<8 -> >>8`: mid length byte, high byte 0.
+        let mid = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x00_0100))]);
+        assert_eq!(read_pictures(&mid), Err(FormatError::Malformed));
+    }
 }
