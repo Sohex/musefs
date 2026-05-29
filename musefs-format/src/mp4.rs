@@ -1420,4 +1420,50 @@ mod tests {
         assert_eq!(&b.kind, b"mdat");
         assert_eq!(b.total_len, buf.len() - 8); // 20
     }
+
+    #[test]
+    fn read_structure_from_rejects_box_overrunning_eof() {
+        // box_header's `remaining` arg is `file_len - pos`. Inflating the mdat box's
+        // declared size past the bytes remaining must be rejected. `- -> +` inflates
+        // `remaining` to `file_len + pos`, wrongly accepting the overrun (returns Ok).
+        let mut buf = mk_mp4(true, b"AUDIO", &[0]); // [ftyp][moov][mdat], mdat last
+        let scan = read_structure(&buf).unwrap();
+        let mdat_start = (scan.mdat_payload_offset - scan.mdat_header.len() as u64) as usize;
+        let real = u32::from_be_bytes(buf[mdat_start..mdat_start + 4].try_into().unwrap());
+        buf[mdat_start..mdat_start + 4].copy_from_slice(&(real + 100).to_be_bytes());
+        let mut cur = std::io::Cursor::new(buf.clone());
+        assert!(read_structure_from(&mut cur, buf.len() as u64).is_err());
+    }
+
+    #[test]
+    fn read_structure_from_rejects_moof() {
+        // A `moof` (fragmented MP4) top-level box must be rejected via the seeking
+        // path. Deleting the `b"moof"` match arm drops it to `_ => {}` and accepts.
+        let mut buf = mk_mp4(true, b"AUDIO", &[0]);
+        buf.extend(bx(b"moof", b"\x00\x00\x00\x00"));
+        let mut cur = std::io::Cursor::new(buf.clone());
+        assert!(read_structure_from(&mut cur, buf.len() as u64).is_err());
+    }
+
+    #[test]
+    fn read_structure_from_rejects_duplicate_top_level_boxes() {
+        // Each `dup |= X.replace(..).is_some()` accumulates a duplicate. `|= -> &=`
+        // can never set `dup` (it starts false), so a duplicate box is wrongly
+        // accepted. One duplicated box per kind isolates each of the three `|=` lines.
+        let dup = |extra: Vec<u8>| {
+            let mut buf = mk_mp4(true, b"AUDIO", &[0]);
+            buf.extend(extra);
+            let mut cur = std::io::Cursor::new(buf.clone());
+            read_structure_from(&mut cur, buf.len() as u64).is_err()
+        };
+        assert!(dup(bx(b"ftyp", b"M4A isom")), "duplicate ftyp must reject"); // ftyp |= line
+                                                                              // duplicate moov: reuse the moov from a fresh fixture so it is structurally valid.
+        let extra_moov = {
+            let other = mk_mp4(true, b"AUDIO", &[0]);
+            let s = read_structure(&other).unwrap();
+            s.moov
+        };
+        assert!(dup(extra_moov), "duplicate moov must reject"); // moov |= line
+        assert!(dup(bx(b"mdat", b"Y")), "duplicate mdat must reject"); // mdat |= line
+    }
 }
