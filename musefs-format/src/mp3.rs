@@ -794,4 +794,57 @@ mod tests {
             "one byte past boundary must be rejected"
         );
     }
+
+    /// Independent synchsafe encoder for fixtures (does NOT call `syncsafe`, so a
+    /// mutation there cannot mask a fixture).
+    fn ss(n: u32) -> [u8; 4] {
+        [
+            ((n >> 21) & 0x7F) as u8,
+            ((n >> 14) & 0x7F) as u8,
+            ((n >> 7) & 0x7F) as u8,
+            (n & 0x7F) as u8,
+        ]
+    }
+
+    /// Build an ID3v2 tag: "ID3", `major`, rev=0, `flags`, synchsafe `body` size,
+    /// then the raw `frames` bytes.
+    fn id3v2(major: u8, flags: u8, body: u32, frames: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"ID3");
+        v.push(major);
+        v.push(0x00);
+        v.push(flags);
+        v.extend_from_slice(&ss(body));
+        v.extend_from_slice(frames);
+        v
+    }
+
+    #[test]
+    fn alloc_safe_accepts_minimal_valid_header() {
+        // 10-byte v2.4 header, body=0, no frames -> safe. This is exactly the
+        // len==10 boundary, so the `< -> <=` mutant (10<=10 -> reject) flips it.
+        let tag = id3v2(0x04, 0x00, 0, &[]);
+        assert_eq!(tag.len(), 10);
+        assert!(id3v2_alloc_safe(&tag));
+    }
+
+    #[test]
+    fn alloc_safe_rejects_short_and_non_id3() {
+        // "ID3" + 2 bytes (len 5, marker correct): original returns false (len<10).
+        // `< -> ==` (5==10 false) and `|| -> &&` (true && false) both fall through
+        // and panic reading data[5]. Asserting `!safe` kills them.
+        assert!(!id3v2_alloc_safe(b"ID3xx"));
+        // Right length, wrong marker -> false.
+        assert!(!id3v2_alloc_safe(b"XXX\x04\x00\x00\x00\x00\x00\x00"));
+    }
+
+    #[test]
+    fn alloc_safe_rejects_bad_version_and_header_flags() {
+        // major outside 2..=4 -> false (kills the `matches!(major, 2..=4)` mutations).
+        assert!(!id3v2_alloc_safe(&id3v2(0x05, 0x00, 0, &[])));
+        assert!(!id3v2_alloc_safe(&id3v2(0x01, 0x00, 0, &[])));
+        // extended-header (0x40) or unsync (0x80) -> false (kills `& 0xC0` mutations).
+        assert!(!id3v2_alloc_safe(&id3v2(0x04, 0x40, 0, &[])));
+        assert!(!id3v2_alloc_safe(&id3v2(0x04, 0x80, 0, &[])));
+    }
 }
