@@ -120,8 +120,9 @@ Findings #5, #16.
   header seam, art window).
 - **3d done** — WAV survivors killed (24 kills; equivalents: `walk_chunks:49`
   guard-to-true, `synthesize_layout:186` `> → ==` and `> → >=`,
-  `synthesize_layout:227` `> → >=`); finding #16 resolved by **skipping zero-byte
-  art in WAV synthesis** (mirrors FLAC's skip); finding #5 broadened on WAV
+  `synthesize_layout:227` `> → >=`); finding #16 resolved for WAV by **delegating to
+  the shared `build_id3v2_segments`, which already skips zero-byte art** (added in
+  3b), so no WAV-local filter is needed; finding #5 broadened on WAV
   (read-fidelity proptests: preserve-backing, partial-windows, header-seam, art-window).
 - broaden `proptest_read_fidelity` (random offsets, header/audio boundary, art,
   non-FLAC) (#5)

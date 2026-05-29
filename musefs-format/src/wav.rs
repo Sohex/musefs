@@ -198,12 +198,10 @@ pub fn synthesize_layout(
     }
 
     // Embedded `id3 ` chunk: 8-byte chunk header + the ID3v2 tag segments, padded.
-    // Skip degenerate zero-byte art: an empty picture would become an
-    // `ArtImage { len: 0 }`, which `RegionLayout::validate` rejects, bricking the
-    // whole track. Filtering keeps byte-identity untouched (only whether an empty
-    // APIC is emitted changes). Mirrors `flac.rs::synthesize_layout`.
-    let nonempty_arts: Vec<ArtInput> = arts.iter().filter(|a| a.data_len > 0).cloned().collect();
-    let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, &nonempty_arts)?;
+    // `build_id3v2_segments` already skips degenerate zero-byte art (finding #16) —
+    // an empty `ArtImage { len: 0 }` would fail `RegionLayout::validate` and brick
+    // the track — so WAV inherits that handling by delegating to it.
+    let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, arts)?;
     let mut id3_head = Vec::with_capacity(8);
     id3_head.extend_from_slice(b"id3 ");
     id3_head.extend_from_slice(&(tag_len as u32).to_le_bytes());
