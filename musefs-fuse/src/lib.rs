@@ -11,8 +11,9 @@ use std::time::{Duration, SystemTime};
 use threadpool::ThreadPool;
 
 use fuser::{
-    BackgroundSession, FileAttr, FileType, Filesystem, KernelConfig, MountOption, Notifier,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
+    BackgroundSession, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
 };
 use musefs_core::Attr;
 use musefs_core::CoreError;
@@ -50,23 +51,23 @@ impl Default for FuseConfig {
 }
 
 /// `FOPEN_*` flags for an `open` reply, derived from the cache policy.
-fn open_flags(keep_cache: bool) -> u32 {
+fn open_flags(keep_cache: bool) -> FopenFlags {
     if keep_cache {
-        fuser::consts::FOPEN_KEEP_CACHE
+        FopenFlags::FOPEN_KEEP_CACHE
     } else {
-        0
+        FopenFlags::empty()
     }
 }
 
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
 /// underlying errno when present; everything structural collapses to `EIO`.
-pub fn errno(err: &CoreError) -> i32 {
+pub fn errno(err: &CoreError) -> fuser::Errno {
     match err {
-        CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => libc::ENOENT,
-        CoreError::IsDir(_) => libc::EISDIR,
-        CoreError::NotADir(_) => libc::ENOTDIR,
-        CoreError::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
-        CoreError::BackingChanged(_) | CoreError::Db(_) | CoreError::Format(_) => libc::EIO,
+        CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => fuser::Errno::ENOENT,
+        CoreError::IsDir(_) => fuser::Errno::EISDIR,
+        CoreError::NotADir(_) => fuser::Errno::ENOTDIR,
+        CoreError::Io(e) => fuser::Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)),
+        CoreError::BackingChanged(_) | CoreError::Db(_) | CoreError::Format(_) => fuser::Errno::EIO,
     }
 }
 
@@ -85,7 +86,7 @@ pub fn to_file_attr(attr: &Attr, uid: u32, gid: u32, fallback_mtime: SystemTime)
         (FileType::RegularFile, 0o444, 1)
     };
     FileAttr {
-        ino: attr.inode,
+        ino: INodeNo(attr.inode),
         size: attr.size,
         blocks: attr.size.div_ceil(512),
         atime: mtime,
@@ -153,7 +154,7 @@ impl MusefsFs {
             self.pool.execute(move || {
                 if let Err(e) = core.poll_refresh_notify(|ino| {
                     if let Some(n) = notifier.get() {
-                        if let Err(inval_err) = n.inval_inode(ino, 0, 0) {
+                        if let Err(inval_err) = n.inval_inode(INodeNo(ino), 0, 0) {
                             log::warn!("inval_inode({ino}) failed: {inval_err}");
                         }
                     }
@@ -172,7 +173,7 @@ impl MusefsFs {
 }
 
 impl Filesystem for MusefsFs {
-    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         // All tuning is best-effort and must never abort the mount. On Err these
         // setters leave the config unchanged (the nearest legal value comes back
         // as the Err payload, not written) — and for max_readahead the unchanged
@@ -183,107 +184,103 @@ impl Filesystem for MusefsFs {
         // `add_capabilities` is all-or-nothing — a single unsupported bit drops
         // the rest — so request them individually. ASYNC_READ is already on by
         // default; PARALLEL_DIROPS may be unsupported on older kernels (ignored).
-        let _ = config.add_capabilities(fuser::consts::FUSE_ASYNC_READ);
-        let _ = config.add_capabilities(fuser::consts::FUSE_PARALLEL_DIROPS);
+        let _ = config.add_capabilities(InitFlags::FUSE_ASYNC_READ);
+        let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
         Ok(())
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         self.fire_poll_refresh();
         let Some(name) = name.to_str() else {
-            return reply.error(libc::ENOENT);
+            return reply.error(fuser::Errno::ENOENT);
         };
         // Inode resolution is an in-memory tree read; the attr (which may touch
         // the DB/disk) is computed on the worker pool.
-        let Some(child) = self.core.lookup(parent, name) else {
-            return reply.error(libc::ENOENT);
+        let Some(child) = self.core.lookup(parent.0, name) else {
+            return reply.error(fuser::Errno::ENOENT);
         };
         let core = Arc::clone(&self.core);
         let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
         self.pool.execute(move || match core.getattr(child) {
-            Ok(attr) => reply.entry(&ttl, &to_file_attr(&attr, uid, gid, mt), 0),
+            Ok(attr) => reply.entry(&ttl, &to_file_attr(&attr, uid, gid, mt), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         });
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         self.fire_poll_refresh();
         let core = Arc::clone(&self.core);
         let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
-        self.pool.execute(move || match core.getattr(ino) {
+        self.pool.execute(move || match core.getattr(ino.0) {
             Ok(attr) => reply.attr(&ttl, &to_file_attr(&attr, uid, gid, mt)),
             Err(e) => reply.error(errno(&e)),
         });
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let core = Arc::clone(&self.core);
         let flags = open_flags(self.config.keep_cache);
-        self.pool.execute(move || match core.open_handle(ino) {
-            Ok(fh) => reply.opened(fh, flags),
+        self.pool.execute(move || match core.open_handle(ino.0) {
+            Ok(fh) => reply.opened(FileHandle(fh), flags),
             Err(e) => reply.error(errno(&e)),
         });
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
         // Cheap (a map remove); no need to offload to the pool.
-        self.core.release_handle(fh);
+        self.core.release_handle(fh.0);
         reply.ok();
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        if offset < 0 {
-            return reply.error(libc::EINVAL);
-        }
         let core = Arc::clone(&self.core);
-        self.pool.execute(
-            move || match core.read(ino, fh, offset as u64, size as u64) {
+        self.pool
+            .execute(move || match core.read(ino.0, fh.0, offset, size as u64) {
                 Ok(bytes) => reply.data(&bytes),
                 Err(e) => reply.error(errno(&e)),
-            },
-        );
+            });
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         self.fire_poll_refresh();
-        let entries = match self.core.readdir(ino) {
+        let entries = match self.core.readdir(ino.0) {
             Ok(e) => e,
             Err(e) => return reply.error(errno(&e)),
         };
-        let parent = self.core.parent(ino).unwrap_or(ino);
+        let parent = self.core.parent(ino.0).unwrap_or(ino.0);
 
         // `.` and `..` first, then the children. `offset` is the index already
         // consumed by a previous call; `reply.add` returns true when the buffer
         // is full, at which point we stop and reply.
         let mut listing: Vec<(u64, fuser::FileType, String)> =
             Vec::with_capacity(entries.len() + 2);
-        listing.push((ino, fuser::FileType::Directory, ".".to_string()));
+        listing.push((ino.0, fuser::FileType::Directory, ".".to_string()));
         listing.push((parent, fuser::FileType::Directory, "..".to_string()));
         for (name, child, is_dir) in entries {
             let kind = if is_dir {
@@ -296,7 +293,7 @@ impl Filesystem for MusefsFs {
 
         for (i, (child, kind, name)) in listing.into_iter().enumerate().skip(offset as usize) {
             // The offset stored is the index of the *next* entry to return.
-            if reply.add(child, (i + 1) as i64, kind, &name) {
+            if reply.add(INodeNo(child), (i + 1) as u64, kind, &name) {
                 break;
             }
         }
@@ -305,8 +302,13 @@ impl Filesystem for MusefsFs {
 }
 
 /// Read-only mount options tagged with the filesystem name.
-fn mount_options(fs_name: &str) -> Vec<MountOption> {
-    vec![MountOption::RO, MountOption::FSName(fs_name.to_string())]
+fn mount_config(fs_name: &str) -> Config {
+    let mut cfg = Config::default();
+    cfg.mount_options = vec![
+        fuser::MountOption::RO,
+        fuser::MountOption::FSName(fs_name.to_string()),
+    ];
+    cfg
 }
 
 /// Serializes the fusermount3 mount handshake (`Session::new`). That handshake
@@ -330,7 +332,7 @@ fn new_session(
     let _guard = MOUNT_SETUP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Session::new(fs, mountpoint, &mount_options(fs_name))
+    Session::new(fs, mountpoint, &mount_config(fs_name))
 }
 
 /// Mount `core` at `mountpoint` with default fuse tuning, blocking until unmounted.
@@ -347,9 +349,10 @@ pub fn mount_with(
 ) -> std::io::Result<()> {
     let fs = MusefsFs::new(core, config);
     let cell = fs.notifier_cell();
-    let mut session = new_session(fs, mountpoint, fs_name)?;
+    let session = new_session(fs, mountpoint, fs_name)?;
     let _ = cell.set(session.notifier());
-    session.run()
+    let bg = session.spawn()?;
+    bg.join()
 }
 
 /// Background-session mount with default tuning; the handle's `Drop` unmounts.
@@ -384,15 +387,18 @@ mod tests {
 
     #[test]
     fn maps_core_errors_to_errno() {
-        assert_eq!(errno(&CoreError::NoEntry(7)), libc::ENOENT);
-        assert_eq!(errno(&CoreError::TrackNotFound(7)), libc::ENOENT);
-        assert_eq!(errno(&CoreError::IsDir(7)), libc::EISDIR);
-        assert_eq!(errno(&CoreError::NotADir(7)), libc::ENOTDIR);
-        assert_eq!(errno(&CoreError::BackingChanged("x".into())), libc::EIO);
+        assert_eq!(errno(&CoreError::NoEntry(7)).code(), libc::ENOENT);
+        assert_eq!(errno(&CoreError::TrackNotFound(7)).code(), libc::ENOENT);
+        assert_eq!(errno(&CoreError::IsDir(7)).code(), libc::EISDIR);
+        assert_eq!(errno(&CoreError::NotADir(7)).code(), libc::ENOTDIR);
+        assert_eq!(
+            errno(&CoreError::BackingChanged("x".into())).code(),
+            libc::EIO
+        );
         let io = CoreError::Io(std::io::Error::from_raw_os_error(libc::ENOENT));
-        assert_eq!(errno(&io), libc::ENOENT);
+        assert_eq!(errno(&io).code(), libc::ENOENT);
         let io_other = CoreError::Io(std::io::Error::other("boom"));
-        assert_eq!(errno(&io_other), libc::EIO);
+        assert_eq!(errno(&io_other).code(), libc::EIO);
     }
 
     #[test]
@@ -406,7 +412,7 @@ mod tests {
             mtime_secs: 0,
         };
         let fa = to_file_attr(&dir, 501, 20, fallback);
-        assert_eq!(fa.ino, 1);
+        assert_eq!(fa.ino, INodeNo(1));
         assert_eq!(fa.kind, FileType::Directory);
         assert_eq!(fa.perm, 0o555);
         assert_eq!(fa.uid, 501);
@@ -442,7 +448,7 @@ mod tests {
 
     #[test]
     fn open_flags_sets_keep_cache_bit_only_when_enabled() {
-        assert_eq!(open_flags(false), 0);
-        assert_eq!(open_flags(true), fuser::consts::FOPEN_KEEP_CACHE);
+        assert_eq!(open_flags(false), FopenFlags::empty());
+        assert_eq!(open_flags(true), FopenFlags::FOPEN_KEEP_CACHE);
     }
 }
