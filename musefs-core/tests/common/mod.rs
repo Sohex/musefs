@@ -55,6 +55,21 @@ pub fn write_flac(path: &Path, comments: &[&str], audio: &[u8]) -> (i64, i64) {
     (audio_offset, audio.len() as i64)
 }
 
+/// Write a minimal MP3 (a 10-byte empty ID3v2.4 tag, then the given audio bytes)
+/// to `path`, returning (audio_offset, audio_length). The leading tag is
+/// arbitrary: MP3 synthesis regenerates the ID3v2 region entirely from the DB and
+/// never reads the backing front, so only the audio offset/length matter.
+pub fn write_mp3(path: &Path, audio: &[u8]) -> (i64, i64) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ID3");
+    bytes.extend_from_slice(&[0x04, 0x00, 0x00]); // version 2.4.0, no flags
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // synchsafe size 0
+    let audio_offset = bytes.len() as i64;
+    bytes.extend_from_slice(audio);
+    std::fs::write(path, &bytes).unwrap();
+    (audio_offset, audio.len() as i64)
+}
+
 /// Build a 32-bit-size box: [size][type][payload].
 fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
