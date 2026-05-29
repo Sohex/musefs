@@ -116,7 +116,7 @@ the table is the source of truth.
 | `push_inline_chunk:168` | `%`→`/`, `%`→`+` (in `payload.len() % 2 == 1`) | inline-chunk word-align | call directly with a len-2 payload (`%`vs`/`) and an odd-length payload (`%`vs`+`); assert the trailing pad byte present/absent in the emitted `Segment::Inline` |
 | `synthesize_layout:186` | `>`→`==`, `>`→`>=` (in `audio_length > u32::MAX`) | RF64 size guard | **suspected equivalent (both)** — whenever `audio_length > u32::MAX`, `body_len ≥ audio_length` so `riff_size = body_len + 4 > u32::MAX` and the `:227` guard returns `TooLarge` anyway; for `audio_length ≤ u32::MAX` the `:186` guard doesn't fire. Both mutations yield the identical observable result. Confirm by hand-apply; document |
 | `synthesize_layout:207` | `%`→`/`, `%`→`+` (in `tag_len % 2 == 1`) | embedded `id3 ` word-align | craft tags whose ID3v2 `tag_len` is **odd**; assert the following `data` FourCC lands at an **even** byte offset in the assembled output (orig pads → even) vs odd (mutant omits pad). `tag_len` parity is controllable via value length; compute it from `build_id3v2_segments` in the test |
-| `synthesize_layout:227` | `>`→`==`, `>`→`>=` (in `riff_size > u32::MAX`) | RIFF size overflow | **killable** — `BackingAudio` is virtual (no real 4 GB allocation), so pass an `audio_length` chosen relative to the known inline overhead: `riff_size == u32::MAX` exactly distinguishes `>=` (orig `Ok`, mutant `TooLarge`); `riff_size > u32::MAX` (with `audio_length == u32::MAX`, so `:186` passes) distinguishes `==` (orig `TooLarge`, mutant proceeds → `Ok` with a truncated size) |
+| `synthesize_layout:227` | `>`→`==` killable; `>`→`>=` **equivalent** (in `riff_size > u32::MAX`) | RIFF size overflow | `==`: `BackingAudio` is virtual (no real 4 GB allocation), so `audio_length == u32::MAX` passes `:186` but makes `riff_size > u32::MAX`; orig `TooLarge`, mutant `==` proceeds → `Ok` with a truncated size. `>=`: see equivalents — every synthesized RIFF size is even, so the only distinguishing point (`riff_size == u32::MAX`, odd) is unreachable |
 | `info_to_key:245-249` | delete arms `IPRD`→album, `ICRD`→date, `ICMT`→comment, `ITRK`→tracknumber | INFO FourCC → tag-key (inverse) | `read_tags` on a WAV carrying a `LIST/INFO` with each FourCC → assert the `(key, value)` pair returns. (`INAM`/`IART`/`IGNR` already covered) |
 | `read_tags:300` | `&&`→`\|\|` (in `slice.len() >= 4 && &slice[0..4] == b"INFO"`) | INFO body validation | a `LIST` chunk whose payload is **<4 bytes**: orig short-circuits (`len >= 4` false → filter false → empty `from_info`); mutant `\|\|` evaluates `&slice[0..4]` on the short slice → **panic** (panic-vs-empty) |
 
@@ -149,9 +149,11 @@ panic. Note this in the test so the mechanism is readable:
 
 ## Equivalent mutants (confirm by hand-apply, then document — do not chase)
 
-Three survivors are **suspected equivalent**. Each is confirmed by hand-apply (the
-targeted test stays green under the mutation) before being recorded; if a hand-apply
-unexpectedly shows the mutant *is* killable, it moves into C1 with a real test.
+**Four** mutations are **suspected equivalent** (the third and fourth in
+`synthesize_layout` were pinned during planning, not at spec time). Each is
+confirmed by hand-apply (the targeted test stays green under the mutation) before
+being recorded; if a hand-apply unexpectedly shows the mutant *is* killable, it
+moves into C1 with a real test.
 
 - **`walk_chunks:49`** — guard `next <= buf.len()` → `true`. The guard only changes
   behaviour when `checked_add` is `Some(next)` **and** `next > buf.len()`. There the
@@ -169,9 +171,17 @@ unexpectedly shows the mutant *is* killable, it moves into C1 with a real test.
   `audio_length ≤ u32::MAX`, `:186` never fires. So both mutations produce the same
   observable result as the original → equivalent. (The existing
   `rejects_audio_over_32bit` test cannot distinguish `:186` from `:227` for this
-  reason.) **Optional follow-up, not done here:** the `:186` guard is strictly
-  redundant given `:227`; removing it is a behaviour-neutral simplification deferred
-  to avoid scope creep.
+  reason — it passes `u32::MAX + 1`, which `:186` catches first.) **Optional
+  follow-up, not done here:** the `:186` guard is strictly redundant given `:227`;
+  removing it is a behaviour-neutral simplification deferred to avoid scope creep.
+- **`synthesize_layout:227`**, `> → >=` only. `synthesize_layout` word-aligns every
+  emitted chunk (RIFF header, `fmt `/`fact`, `LIST`, the `id3 ` chunk via `:207`,
+  the `data` header, and the `data` payload via `:220`), so `body_len` is always
+  even and `riff_size = body_len + 4` is always **even**. The only input that
+  distinguishes `>` from `>=` is `riff_size == u32::MAX` (odd), which is therefore
+  **unreachable** → the mutant is observably identical to the original. Its sibling
+  `> → ==` is **not** equivalent and **is** killed (`riff_size > u32::MAX` is
+  reachable — `==` then wrongly proceeds, the original rejects).
 
 ## Components
 
@@ -190,12 +200,14 @@ table:
   (`/`,`+`), `synthesize_layout:207` (id3 pad → even-`data`-offset assertion). The
   fourth `% 2` site, `synthesize_layout:220`, is **excluded** — already caught (see
   the exclusion note above).
-- **Overflow:** `synthesize_layout:227` (`>=` at exact `u32::MAX`, `==` above it,
-  via virtual `BackingAudio`).
+- **Overflow:** `synthesize_layout:227` `==` only — `audio_length == u32::MAX`
+  (virtual `BackingAudio`, no allocation) passes `:186` yet drives
+  `riff_size > u32::MAX`; orig `TooLarge`, mutant `==` proceeds → `Ok`. (The `>=`
+  sibling is equivalent — see equivalents.)
 
-Record the suspected equivalents (`walk_chunks:49`, `synthesize_layout:186` ×2)
-with their hand-apply justification (a comment in the module and the
-inventory annotation).
+Record the suspected equivalents (`walk_chunks:49`, `synthesize_layout:186` ×2,
+`synthesize_layout:227` `>=`) with their hand-apply justification (a comment in the
+module and the inventory annotation).
 
 ### C2 — finding #16: zero-byte embedded art (WAV-local skip)
 
@@ -284,8 +296,8 @@ degenerate input (the track becomes readable instead of bricked).
 
 | Component | Check |
 |-----------|-------|
-| C1 | `cargo test -p musefs-format --features fuzzing wav` green; the killable rows (`riff_wave_start:24`, `walk_chunks:47`, `locate_audio:67/:71`, `info_fourcc` 6 arms, `info_to_key` 4 arms, `read_tags:300`, `build_info_payload:155`, `push_inline_chunk:168`, `synthesize_layout:207/:227`) hand-apply red |
-| C1 (equiv) | `walk_chunks:49` and `synthesize_layout:186` (×2) stay green under their mutation; recorded equivalent **both** in the inventory annotation **and** as a justification comment in the `wav.rs` test module (so a future reader sees why no test targets them) |
+| C1 | `cargo test -p musefs-format --features fuzzing wav` green; the killable rows (`riff_wave_start:24`, `walk_chunks:47`, `locate_audio:67/:71`, `info_fourcc` 6 arms, `info_to_key` 4 arms, `read_tags:300`, `build_info_payload:155`, `push_inline_chunk:168`, `synthesize_layout:207`, `synthesize_layout:227` `==`) hand-apply red |
+| C1 (equiv) | `walk_chunks:49`, `synthesize_layout:186` (×2), and `synthesize_layout:227` `>=` stay green under their mutation; recorded equivalent **both** in the inventory annotation **and** as a justification comment in the `wav.rs` test module (so a future reader sees why no test targets them) |
 | C2 | C2 test written **first and shown red** against unmodified `wav.rs`, then green after the filter; `wav::synthesize_layout` skips zero-byte art; the `wav_synthesize.rs` test asserts no `ArtImage` segment, valid round-trip, byte-identical audio, and the mixed empty+real case preserves the real APIC; existing non-empty-art tests still pass |
 | C3 | `cargo test -p musefs-core proptest_read_fidelity` green; **all four** WAV-variant properties pass with the new `write_wav` fixture |
 | Whole | `cargo test --workspace` + `--features fuzzing` + `clippy --all-targets -D warnings` + `fmt --check` green; next full mutants campaign shows `wav.rs` survivors dropped (excluding the documented equivalents) |
