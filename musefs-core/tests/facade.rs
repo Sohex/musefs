@@ -845,3 +845,21 @@ fn poll_refresh_notify_invalidates_old_inode_for_removed_track() {
         "old inode should be invalidated after track removal"
     );
 }
+
+#[test]
+fn reads_m4b_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = b"AUDIODATA";
+    let bytes = common::minimal_m4a(audio);
+    std::fs::write(dir.path().join("book.m4b"), &bytes).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Orig Artist").unwrap();
+    let entries = fs.readdir(artist).unwrap();
+    let (name, file_inode, _) = entries.into_iter().next().unwrap();
+    assert_eq!(name, "Orig M4A.m4a");
+    let attr = fs.getattr(file_inode).unwrap();
+    assert!(!attr.is_dir);
+    assert!(attr.size > 0);
+}

@@ -323,6 +323,26 @@ mod ogg_probe_tests {
         assert_eq!(stats.scanned, 1);
         assert_eq!(stats.skipped, 0);
     }
+
+    #[test]
+    fn probe_recognizes_oga_alias() {
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&vorbis_body_empty());
+        let (mut bytes, _) = build_header_pub(0x1234, &[&head, &tags]);
+        let (audio, _) = lace_packet_pub(0x1234, 2, false, 960, &[0u8; 100]);
+        bytes.extend_from_slice(&audio);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.oga");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+
+        let probed = probe(&path, &bytes).expect("oga should probe");
+        assert_eq!(probed.format, Format::Opus);
+    }
 }
 
 #[cfg(test)]
@@ -382,5 +402,218 @@ mod wav_probe_tests {
         let stats = crate::scan_directory(&db, &path).unwrap();
         assert_eq!(stats.scanned, 1);
         assert_eq!(stats.skipped, 0);
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn max_art_bytes_is_16_mib_minus_64_kib() {
+        assert_eq!(MAX_ART_BYTES, 16_711_680);
+    }
+
+    #[test]
+    fn is_supported_audio_accepts_known_and_rejects_unknown() {
+        for ok in [
+            "a.flac", "a.mp3", "a.m4a", "a.m4b", "a.ogg", "a.oga", "a.opus", "a.wav",
+        ] {
+            assert!(
+                is_supported_audio(std::path::Path::new(ok)),
+                "{ok} should be supported"
+            );
+        }
+        for bad in ["a.txt", "a.png", "a", "a.flacx"] {
+            assert!(
+                !is_supported_audio(std::path::Path::new(bad)),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_audio_skips_unsupported_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.flac"), b"x").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), b"x").unwrap();
+        let mut out = Vec::new();
+        collect_audio(dir.path(), &mut out).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with("keep.flac"));
+    }
+
+    #[test]
+    fn probe_returns_none_for_supported_ext_with_garbage_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["bad.flac", "bad.mp3", "bad.m4a", "bad.wav", "bad.opus"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"not a real audio file").unwrap();
+            assert!(
+                probe(&path, b"not a real audio file").is_none(),
+                "{name} must skip"
+            );
+        }
+    }
+
+    fn flac_block(bt: u8, body: &[u8], last: bool) -> Vec<u8> {
+        let mut v = vec![(if last { 0x80 } else { 0 }) | (bt & 0x7F)];
+        let n = body.len();
+        v.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+        v.extend_from_slice(body);
+        v
+    }
+    fn streaminfo() -> Vec<u8> {
+        let mut si = vec![
+            0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0xC4, 0x42, 0xF0,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        si.extend_from_slice(&[0u8; 16]);
+        si
+    }
+    fn vorbis_comment(entries: &[&str]) -> Vec<u8> {
+        let mut vc = Vec::new();
+        let vendor = b"x";
+        vc.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        vc.extend_from_slice(vendor);
+        vc.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            vc.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            vc.extend_from_slice(e.as_bytes());
+        }
+        vc
+    }
+    fn picture(width: u32, height: u32, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u32.to_be_bytes());
+        let mime = "image/png";
+        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(mime.as_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&width.to_be_bytes());
+        b.extend_from_slice(&height.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+    fn write_flac(path: &std::path::Path, entries: &[&str], pic: Option<(u32, u32)>) {
+        let mut out = b"fLaC".to_vec();
+        out.extend(flac_block(0, &streaminfo(), false));
+        let last_is_vc = pic.is_none();
+        out.extend(flac_block(4, &vorbis_comment(entries), last_is_vc));
+        if let Some((w, h)) = pic {
+            out.extend(flac_block(6, &picture(w, h, &[0xAB; 64]), true));
+        }
+        out.extend_from_slice(&[0xCD; 128]);
+        std::fs::write(path, &out).unwrap();
+    }
+
+    #[test]
+    fn ingest_assigns_sequential_ordinals_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.flac");
+        write_flac(&path, &["ARTIST=A1", "ARTIST=A2"], None);
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        crate::scan_directory(&db, &path).unwrap();
+        let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+        let mut artists: Vec<(i64, String)> = db
+            .get_tags(track.id)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.key.eq_ignore_ascii_case("artist"))
+            .map(|t| (t.ordinal, t.value))
+            .collect();
+        artists.sort();
+        assert_eq!(artists, vec![(0, "A1".to_string()), (1, "A2".to_string())]);
+    }
+
+    #[test]
+    fn ingest_stores_nonzero_art_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("art.flac");
+        write_flac(&path, &["ARTIST=A", "TITLE=T"], Some((10, 20)));
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        crate::scan_directory(&db, &path).unwrap();
+        let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+        let ta = db.get_track_art(track.id).unwrap();
+        assert_eq!(ta.len(), 1);
+        let meta = db.get_art_meta(ta[0].art_id).unwrap().unwrap();
+        assert_eq!(meta.width, Some(10));
+        assert_eq!(meta.height, Some(20));
+    }
+
+    #[test]
+    fn scan_directory_counts_scanned_and_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_flac(
+            &dir.path().join("ok1.flac"),
+            &["ARTIST=A", "TITLE=T1"],
+            None,
+        );
+        write_flac(
+            &dir.path().join("ok2.flac"),
+            &["ARTIST=A", "TITLE=T2"],
+            None,
+        );
+        std::fs::write(dir.path().join("bad.flac"), b"garbage").unwrap();
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let stats = crate::scan_directory(&db, dir.path()).unwrap();
+        assert_eq!(stats.scanned, 2);
+        assert_eq!(stats.skipped, 1);
+    }
+
+    #[test]
+    fn revalidate_buckets_unchanged_and_prunes_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("keep.flac");
+        write_flac(&keep, &["ARTIST=A", "TITLE=T"], None);
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        crate::scan_directory(&db, dir.path()).unwrap();
+
+        let s1 = crate::revalidate(&db, dir.path()).unwrap();
+        assert_eq!(s1.unchanged, 1);
+        assert_eq!(s1.updated, 0);
+        assert_eq!(s1.pruned, 0);
+
+        std::fs::remove_file(&keep).unwrap();
+        let s2 = crate::revalidate(&db, dir.path()).unwrap();
+        assert_eq!(s2.pruned, 1);
+        assert!(db.list_tracks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revalidate_does_not_prune_on_non_notfound_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("real.flac");
+        write_flac(&file, &["ARTIST=A", "TITLE=T"], None);
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        crate::scan_directory(&db, dir.path()).unwrap();
+
+        use musefs_db::{Format, NewTrack};
+        let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+        db.delete_track(track.id).unwrap();
+        let canon = std::fs::canonicalize(dir.path()).unwrap();
+        let ghost = canon.join("real.flac").join("ghost.flac");
+        db.upsert_track(&NewTrack {
+            backing_path: ghost.to_string_lossy().to_string(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            backing_size: 0,
+            backing_mtime: 0,
+        })
+        .unwrap();
+
+        let stats = crate::revalidate(&db, dir.path()).unwrap();
+        assert_eq!(stats.pruned, 0, "ENOTDIR is not NotFound → must not prune");
+        assert!(
+            db.list_tracks()
+                .unwrap()
+                .iter()
+                .any(|t| t.backing_path == ghost.to_string_lossy()),
+            "ghost track must still exist"
+        );
     }
 }
