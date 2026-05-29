@@ -10,7 +10,7 @@ repository.workspace = true
 metrics = ["musefs-core/metrics"]
 
 [dependencies]
-fuser = { version = "0.16", features = ["abi-7-31"] }
+fuser = "0.17"
 libc = "0.2"
 log = "0.4"
 musefs-core = { path = "../musefs-core" }
