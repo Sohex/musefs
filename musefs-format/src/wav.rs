@@ -496,4 +496,44 @@ mod tests {
         push_inline_chunk(&mut segs2, b"test", &[0xAA, 0xBB, 0xCC]);
         assert_eq!(segs2[0].len(), 12); // 4 + 4 + 3 + pad(1)
     }
+
+    /// An `INFO` payload: `"INFO"` FourCC + NUL-terminated, word-aligned subchunks.
+    fn info_payload(pairs: &[(&[u8; 4], &str)]) -> Vec<u8> {
+        let mut p = b"INFO".to_vec();
+        for (cc, val) in pairs {
+            let mut v = val.as_bytes().to_vec();
+            v.push(0x00);
+            p.extend_from_slice(*cc);
+            p.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            p.extend_from_slice(&v);
+            if v.len() % 2 == 1 {
+                p.push(0x00);
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn info_to_key_decodes_each_mapped_fourcc() {
+        // :245-249 arm deletions: each INFO FourCC must decode to its tag key.
+        let cases: [(&[u8; 4], &str, &str); 4] = [
+            (b"IPRD", "album", "Anthology"),
+            (b"ICRD", "date", "1999"),
+            (b"ICMT", "comment", "Nice"),
+            (b"ITRK", "tracknumber", "3"),
+        ];
+        for (cc, key, val) in cases {
+            let buf = wav(&[
+                (b"fmt ", fmt_pcm()),
+                (b"LIST", info_payload(&[(cc, val)])),
+                (b"data", vec![0x00; 4]),
+            ]);
+            let tags = read_tags(&buf);
+            assert!(
+                tags.contains(&(key.to_string(), val.to_string())),
+                "FourCC {:?} must decode to {key}",
+                std::str::from_utf8(cc).unwrap()
+            );
+        }
+    }
 }
