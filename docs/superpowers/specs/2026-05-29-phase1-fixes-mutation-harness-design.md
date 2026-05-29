@@ -1,0 +1,158 @@
+# Phase 1 — Quick Fixes & Mutation-Discovery Harness
+
+**Part of:** Test-audit remediation (`docs/audits/2026-05-29-remediation-tracking.md`)
+**Source audit:** `docs/audits/2026-05-29-test-audit.md`
+**Date:** 2026-05-29
+
+## Purpose
+
+Two goals:
+
+1. Unblock the test suite by fixing the broken `metrics` test and the beets FK
+   parity gap — both correctly, since the audit's prescriptions for both are
+   wrong.
+2. Stand up a durable mutation-testing harness (script + CI, modeled on the
+   existing `fuzz.yml`) and use it to produce a **verified** survivor inventory
+   that drives remediation phases 2–4.
+
+## Guiding principle
+
+The audit was executed by a weaker model. Findings are leads, not facts. Every
+change here was verified against the live code first; the two corrected fixes
+below are the evidence and the precedent for later phases.
+
+## Component A — Corrected quick fixes
+
+### A1. `metrics.rs` compile error (Finding #13)
+
+**Audit said:** rename `backing_mtime_secs` → `backing_mtime` at
+`musefs-core/tests/metrics.rs:177`.
+
+**Reality:** `NewTrack` (`musefs-db/src/models.rs:80`) has a single
+`backing_mtime: i64` field and no `backing_mtime_secs`. The test literal at
+`metrics.rs:177-178` already contains **both** `backing_mtime_secs: 0,` and
+`backing_mtime: 0,`. Renaming would create a duplicate field — still a compile
+error.
+
+**Fix:** delete line 177 (`backing_mtime_secs: 0,`).
+
+**Verification:**
+```
+cargo test -p musefs-core --features metrics --test metrics -- --test-threads=1
+```
+All 4 metrics tests compile and pass.
+
+### A2. beets foreign-key parity (Finding #6)
+
+**Audit said:** add `PRAGMA foreign_keys = ON` to the `db_path` fixture
+(`contrib/beets/tests/conftest.py:16`).
+
+**Reality:** the `db_path` fixture opens a connection only to apply the schema,
+then closes it (`conftest.py:16-19`). `foreign_keys` is a per-connection pragma,
+so setting it on that throwaway connection has no effect on tests that later open
+their own connection. The actual gap is in `test_plugin.py`, which opens raw
+`sqlite3.connect(db_path)` at 6 sites (115, 141, 181, 197, 219, 242), bypassing
+FK enforcement. `_core.connect()` already enables FK (`_core.py:127`).
+
+**Fix:** route those 6 raw connections through `beetsplug._core.connect()` (import
+it in the test module). Add one regression assertion that a `connect()`-opened
+connection reports `PRAGMA foreign_keys` = 1.
+
+**Verification:**
+```
+cd contrib/beets && pytest
+```
+Full beets suite stays green; the new FK assertion passes.
+
+## Component B — Mutation harness
+
+Mirrors the structure of `.github/workflows/fuzz.yml`: a fast per-PR job plus a
+long-running scheduled (and manually dispatchable) campaign.
+
+### B1. `scripts/mutants.sh`
+
+Single canonical entry point for local and CI use. Responsibilities:
+
+- Set `TMPDIR` to a path off the `/tmp` tmpfs (the audit exhausted the 3.9 GB
+  tmpfs). Accept an override env var; default to a repo-local `.mutants-tmp/`
+  that callers can place on the roomiest volume.
+- `cargo clean` the working `target/` before starting (local disk: 7.3 GB free,
+  `target/` ~5.6 GB — a full mutants build tree is ~5.6 GB and will not coexist
+  with the existing one).
+- Run **one crate at a time**, `--jobs 1`, removing each crate's build dir before
+  the next, so peak disk is a single tree.
+- Per-crate invocation captures the audit's env learnings:
+  - `musefs-db` — `--test-workspace=true`, files `schema.rs`, `lib.rs` (and
+    `tracks.rs`, `art.rs`, `tags.rs` for the full sweep).
+  - `musefs-core` — `--test-workspace=false`, files `reader.rs`, `tree.rs`,
+    `scan.rs`, `facade.rs`, `ogg_index.rs`.
+  - `musefs-format` — `--test-workspace=false --features fuzzing`, all format
+    files including the 7 the audit never reached (`ogg/mod.rs`, `ogg/page.rs`,
+    `ogg/crc.rs`, `ogg/b64.rs`, `mp4.rs`, `wav.rs`, `mp3.rs`, plus `flac.rs`).
+- Emit per-crate survivor reports (cargo-mutants `--output` dir) for collection.
+- **No time cap** (the audit's 30-min cap is why only `flac.rs` was reached).
+
+### B2. `.github/workflows/mutants.yml`
+
+- **PR job** (`pull_request` on Rust paths): `cargo mutants --in-diff <diff>` so
+  only mutations on changed lines are tested — fast, gates regressions in touched
+  code without running the full matrix.
+- **Scheduled + dispatchable job** (`schedule` cron, e.g. weekly like fuzz, plus
+  `workflow_dispatch`): per-crate matrix (`musefs-db`, `musefs-core`,
+  `musefs-format`), install `cargo-mutants` and `llvm-tools-preview`, run via
+  `scripts/mutants.sh`, upload per-crate survivor reports as artifacts. GitHub
+  runners have the disk headroom local does not.
+
+`workflow_dispatch` is what we trigger to seed the initial inventory (Component C)
+without touching local disk.
+
+### B3. cargo-mutants Default limitation (record, don't fix here)
+
+`musefs-db` mutation testing is currently vacuous: every mutant replaces a body
+with `Ok(Default::default())`/`Ok(0/1/-1)`, and `Db` has no `Default`, so all
+fail to compile (19/19 unviable). Format has the same pattern in a few spots.
+Implementing `Default for Db` (or otherwise making these viable) is **deferred to
+phase 4**; phase 1 only records it in the inventory.
+
+## Component C — Verified survivor inventory
+
+`docs/audits/2026-05-29-mutation-inventory.md`, seeded from one
+`workflow_dispatch` run of `mutants.yml` (CI, not local). Contents:
+
+- Complete per-crate / per-file survivor list (caught/missed/unviable/timeout),
+  superseding the audit's partial §9 (which only reached `flac.rs`).
+- Each survivor tagged with its target remediation phase (2/3/4).
+- The Default-impl tool limitation noted with its phase-4 follow-up.
+
+This document is the authoritative input to phases 2–4. Phases consume it instead
+of the audit's §9.
+
+## Component D — Tracking doc
+
+`docs/audits/2026-05-29-remediation-tracking.md` (already written): records the
+decomposition, finding→phase map, and live status per phase.
+
+## Out of scope (this phase)
+
+- Writing any new format/core/db unit tests to *kill* survivors — that is phases
+  2–4. Phase 1 only fixes the two broken items and produces the harness + data.
+- Implementing `Default for Db` (phase 4).
+- The two document-only findings #15 (ESTALE) and the doc portion of #16.
+
+## Sequencing
+
+1. Component A (independent, lands immediately — unblocks CI).
+2. Component B (script + workflow).
+3. Component C (dispatch CI run, collect artifacts, write inventory) — the long
+   pole; depends on B.
+4. Component D maintained throughout.
+
+## Verification summary
+
+| Item | Command / check |
+|------|-----------------|
+| A1 | `cargo test -p musefs-core --features metrics --test metrics -- --test-threads=1` → 4 pass |
+| A2 | `cd contrib/beets && pytest` → green incl. new FK assertion |
+| B1 | `scripts/mutants.sh` runs a single crate locally under disk budget without exhausting `/` |
+| B2 | `mutants.yml` PR job runs `--in-diff`; `workflow_dispatch` completes the matrix |
+| C | inventory doc exists, lists survivors per crate, supersedes §9 |
