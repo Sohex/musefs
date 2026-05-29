@@ -228,6 +228,13 @@ itself is left untouched — mp3-direct synthesis gets its own skip in 3b.
 **Byte-identity is unaffected** — the filter only decides whether an empty APIC is
 emitted, never the positioned `data` reads.
 
+> **Update (post-rebase, final state):** the WAV-local filter was ultimately
+> **dropped**. Phase 3b landed the `data_len == 0` skip *inside* the shared
+> `mp3::build_id3v2_segments`, which WAV delegates to, so the local filter became
+> redundant dead code (and its `data_len > 0` guard produced an equivalent
+> `> → >=` mutant). WAV now relies on that shared skip; the `wav_synthesize.rs`
+> regression tests stay as WAV-level guards. See the tracking doc's 3d entry.
+
 **Red-green ordering (this is a production behaviour change, not a mutant kill, so
 it follows TDD, not the hand-apply method).** First add the `wav_synthesize.rs`
 test asserting the desired behaviour — a zero-byte art → no `ArtImage` segment, the

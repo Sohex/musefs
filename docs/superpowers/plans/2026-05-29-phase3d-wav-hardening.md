@@ -746,6 +746,12 @@ git commit -m "test(wav): kill synthesize_layout:227 == mutant; document 4 equiv
 
 ## Task 12: C2 — zero-byte embedded art (red-green TDD)
 
+> **Superseded (post-rebase):** the WAV-local filter this task adds was later
+> **removed**. Phase 3b put the `data_len == 0` skip inside the shared
+> `mp3::build_id3v2_segments` (which WAV delegates to), making the local filter
+> redundant. Keep the two `wav_synthesize.rs` regression tests below; skip the
+> production filter — WAV inherits the shared skip. See the tracking doc's 3d entry.
+
 **Files:**
 - Test: `musefs-format/tests/wav_synthesize.rs` (add two tests)
 - Modify: `musefs-format/src/wav.rs` (`synthesize_layout`, the `build_id3v2_segments` call)
