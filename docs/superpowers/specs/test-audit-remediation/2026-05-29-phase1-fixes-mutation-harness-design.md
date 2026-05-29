@@ -1,6 +1,6 @@
 # Phase 1 — Quick Fixes & Mutation-Discovery Harness
 
-**Part of:** Test-audit remediation (`docs/audits/2026-05-29-remediation-tracking.md`)
+**Part of:** Test-audit remediation (`docs/superpowers/specs/test-audit-remediation/2026-05-29-remediation-tracking.md`)
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Date:** 2026-05-29
 
