@@ -6,32 +6,41 @@
 # see the remediation tracking doc).
 #
 # Usage: scripts/mutants.sh [crate ...]   (default: all three in-scope crates)
-# Env:   MUTANTS_TMP  scratch PARENT dir off the /tmp tmpfs (default: ./.mutants-tmp).
-#                     cargo-mutants builds inside a unique child we create here;
-#                     a caller-provided parent is never deleted, only our children.
-#        MUTANTS_LIST set to 1 to only enumerate mutants (no build/run)
+# Env:   MUTANTS_TMP  scratch PARENT dir, MUST be OUTSIDE this repo (default: the
+#                     system temp dir). cargo-mutants copies the source tree into
+#                     a build dir under TMPDIR, so a scratch dir inside the repo
+#                     gets copied into itself recursively ("File name too long").
+#                     On a host whose /tmp is too small (e.g. a tmpfs), point this
+#                     at a roomy directory outside the repo.
+#        MUTANTS_LIST   set to 1 to only enumerate mutants (no build/run)
+#        MUTANTS_CANARY set to 1 to cargo-CHECK mutants without running tests
+#                       (--check): a fast CI canary that still exercises the real
+#                       source-copy + scratch + output pipeline.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# Scratch parent. If the caller supplied MUTANTS_TMP we treat it as a shared
-# parent and must NOT remove it on exit (could be /tmp or another shared dir);
-# we only ever remove the unique children we mktemp inside it. Our own default
-# repo-local parent we do clean up.
-if [ -n "${MUTANTS_TMP:-}" ]; then
-  SCRATCH_PARENT="$MUTANTS_TMP"; OWN_PARENT=0
-else
-  SCRATCH_PARENT="$ROOT/.mutants-tmp"; OWN_PARENT=1
-fi
+# Scratch parent. cargo-mutants copies the source tree into a build dir under
+# TMPDIR, so the scratch parent MUST live OUTSIDE this repo — a dir inside the
+# tree gets copied into itself recursively until the path overflows
+# ("File name too long"). Default to the system temp dir; honor MUTANTS_TMP only
+# if it points outside the repo. We never delete the parent (it may be shared,
+# e.g. /tmp) — only the unique per-crate children we mktemp inside it.
+SCRATCH_PARENT="${MUTANTS_TMP:-${TMPDIR:-/tmp}}"
+case "$SCRATCH_PARENT" in
+  "$ROOT" | "$ROOT"/*)
+    echo "mutants: scratch dir must be outside the repo ($ROOT); cargo-mutants" \
+         "copies the tree into it. Set MUTANTS_TMP to a roomy path outside the repo." >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$SCRATCH_PARENT"
 CREATED_TMPS=()
 cleanup() {
-  # Remove every per-crate scratch child we created, even on abnormal exit and
-  # even when the caller owns SCRATCH_PARENT (OWN_PARENT=0).
+  # Remove only the unique per-crate scratch children we created (never the
+  # possibly-shared parent), even on abnormal exit.
   [ "${#CREATED_TMPS[@]}" -gt 0 ] && rm -rf "${CREATED_TMPS[@]}"
-  # Remove the parent only if we created it.
-  [ "$OWN_PARENT" = 1 ] && rm -rf "$SCRATCH_PARENT"
 }
 trap cleanup EXIT
 
@@ -62,10 +71,19 @@ run_crate() {
   echo "== mutants: $crate (scratch: $tmp) =="
   local args=(-p "$crate" --jobs 1 --output "$out")
   [ "${MUTANTS_LIST:-0}" = "1" ] && args+=(--list)
+  [ "${MUTANTS_CANARY:-0}" = "1" ] && args+=(--check)
   args+=("$@")
   TMPDIR="$tmp" cargo mutants "${args[@]}"
   local rc=$?
   rm -rf "$tmp"
+  # Discovery run: surviving/timed-out mutants are the expected output, not a
+  # failure. If cargo-mutants produced its report dir the crate ran fine, so
+  # return success regardless of exit code; only a genuine error (no report,
+  # e.g. a baseline build failure) propagates. The PR --in-diff gate calls
+  # cargo-mutants directly and still fails on survivors.
+  if [ -d "$out/mutants.out" ]; then
+    return 0
+  fi
   return "$rc"
 }
 
