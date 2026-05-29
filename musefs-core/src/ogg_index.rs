@@ -153,4 +153,141 @@ mod tests {
         let h = parse_page(&full, 0).unwrap();
         assert_eq!(h.seq, 7);
     }
+
+    use std::os::unix::fs::FileExt;
+
+    /// A backing file: 16-byte prefix, then a 300-byte packet (seq 5) and a
+    /// 70_000-byte packet (seq 6, spans 2 pages). Returns the index built with
+    /// seq_delta=+2, an open backing handle, the audio_offset, and the total
+    /// served length of the whole audio region.
+    fn serve_fixture() -> (tempfile::TempDir, OggPageIndex, std::fs::File, u64, u64) {
+        let (mut bytes, _) = lace_packet_pub(0xABCD, 5, false, 100, &vec![1u8; 300]);
+        let (b2, _) = lace_packet_pub(0xABCD, 6, false, 200, &vec![2u8; 70_000]);
+        bytes.extend_from_slice(&b2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audio.ogg");
+        let mut file_bytes = vec![0u8; 16];
+        file_bytes.extend_from_slice(&bytes);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&file_bytes)
+            .unwrap();
+        let audio_offset = 16u64;
+        let idx = build_index(&path, audio_offset, bytes.len() as u64, 2).unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        let total: u64 = idx
+            .pages
+            .iter()
+            .map(|p| p.header.len() as u64 + p.payload_len)
+            .sum();
+        (dir, idx, backing, audio_offset, total)
+    }
+
+    /// Independent reference: the full served region is, for every page, its
+    /// patched header followed by its payload read verbatim from the backing file.
+    fn reference_region(idx: &OggPageIndex, backing: &std::fs::File, audio_offset: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        for p in &idx.pages {
+            out.extend_from_slice(&p.header);
+            let mut buf = vec![0u8; p.payload_len as usize];
+            backing
+                .read_exact_at(
+                    &mut buf,
+                    audio_offset + p.region_offset + p.header.len() as u64,
+                )
+                .unwrap();
+            out.extend_from_slice(&buf);
+        }
+        out
+    }
+
+    fn serve_range(
+        idx: &OggPageIndex,
+        backing: &std::fs::File,
+        audio_offset: u64,
+        a: u64,
+        b: u64,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        serve(idx, backing, audio_offset, a, b, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn serve_whole_region_matches_reference() {
+        let (_d, idx, backing, ao, total) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        assert_eq!(want.len() as u64, total);
+        assert_eq!(serve_range(&idx, &backing, ao, 0, total), want);
+    }
+
+    #[test]
+    fn serve_header_only_read() {
+        let (_d, idx, backing, ao, _t) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        let hlen = idx.pages[0].header.len() as u64;
+        // First 10 bytes of page 0's header.
+        assert_eq!(serve_range(&idx, &backing, ao, 0, 10), want[0..10]);
+        // The whole of page 0's header, exactly.
+        assert_eq!(
+            serve_range(&idx, &backing, ao, 0, hlen),
+            want[0..hlen as usize]
+        );
+    }
+
+    #[test]
+    fn serve_payload_only_read_starting_mid_payload() {
+        // Kills ogg_index.rs:117 (the + -> - on the backing read offset): the read
+        // starts 10 bytes INTO page 0's payload, so `within` = 10 != 0 and the sign
+        // of the offset term is observable.
+        let (_d, idx, backing, ao, _t) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        let hlen = idx.pages[0].header.len() as u64;
+        let start = hlen + 10;
+        let end = hlen + 60;
+        assert_eq!(
+            serve_range(&idx, &backing, ao, start, end),
+            want[start as usize..end as usize]
+        );
+    }
+
+    #[test]
+    fn serve_spanning_header_and_payload() {
+        let (_d, idx, backing, ao, _t) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        let hlen = idx.pages[0].header.len() as u64;
+        let r = (hlen - 5)..(hlen + 20);
+        assert_eq!(
+            serve_range(&idx, &backing, ao, r.start, r.end),
+            want[r.start as usize..r.end as usize]
+        );
+    }
+
+    #[test]
+    fn serve_crossing_page_boundary() {
+        let (_d, idx, backing, ao, _t) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        // End of page 0 region into the start of page 1.
+        let p0_end = idx.pages[0].header.len() as u64 + idx.pages[0].payload_len;
+        let r = (p0_end - 30)..(p0_end + 40);
+        assert_eq!(
+            serve_range(&idx, &backing, ao, r.start, r.end),
+            want[r.start as usize..r.end as usize]
+        );
+    }
+
+    #[test]
+    fn serve_empty_and_past_end_reads() {
+        let (_d, idx, backing, ao, total) = serve_fixture();
+        // Empty range.
+        assert!(serve_range(&idx, &backing, ao, 100, 100).is_empty());
+        // Entirely past the last page.
+        assert!(serve_range(&idx, &backing, ao, total, total + 50).is_empty());
+        // rend past the region end clamps to what exists.
+        let want = reference_region(&idx, &backing, ao);
+        assert_eq!(
+            serve_range(&idx, &backing, ao, total - 25, total + 1000),
+            want[(total - 25) as usize..]
+        );
+    }
 }
