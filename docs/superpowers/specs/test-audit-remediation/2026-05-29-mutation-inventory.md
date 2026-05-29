@@ -346,10 +346,10 @@ the rightmost column of each survivor table.
 | `ogg/mod.rs:455` | replace page_test_support::vorbis_body_empty -> Vec<u8> with vec![] | missed | 2 |
 | `ogg/mod.rs:455` | replace page_test_support::vorbis_body_empty -> Vec<u8> with vec![0] | missed | 2 |
 | `ogg/mod.rs:455` | replace page_test_support::vorbis_body_empty -> Vec<u8> with vec![1] | missed | 2 |
-| `ogg/page.rs:33` | replace > with == in parse_page | missed → **equivalent** | 2 |
-| `ogg/page.rs:33` | replace > with >= in parse_page | missed → **equivalent** | 2 |
-| `ogg/page.rs:47` | replace > with == in parse_page | missed → **equivalent** | 2 |
-| `ogg/page.rs:47` | replace > with >= in parse_page | missed → **equivalent** | 2 |
+| `ogg/page.rs:33` | replace > with == in parse_page | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:33` | replace > with >= in parse_page | missed → **survivor** (killable, uncovered: needs a 27-byte zero-segment page) | 2 |
+| `ogg/page.rs:47` | replace > with == in parse_page | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:47` | replace > with >= in parse_page | missed → **survivor** (killable, uncovered: needs a zero-payload page) | 2 |
 | `ogg/page.rs:93` | replace < with == in lace_packet | timeout → **timeout-detected** | 2 |
 | `ogg/page.rs:93` | replace < with <= in lace_packet | timeout → **timeout-detected** | 2 |
 | `ogg/page.rs:122` | replace += with *= in lace_packet | missed → **killed** (phase 2) | 2 |
@@ -363,7 +363,7 @@ the rightmost column of each survivor table.
 | `ogg/page.rs:294` | replace += with *= in lace_chunks_to_segments | timeout → **timeout-detected** | 2 |
 | `ogg/page.rs:298` | replace - with + in lace_chunks_to_segments | missed → **killed** (phase 2) | 2 |
 | `ogg/page.rs:310` | replace < with <= in copy_payload | missed → **equivalent** | 2 |
-| `ogg/page.rs:337` | replace < with <= in emit_segments | missed → **killed** (phase 2) | 2 |
+| `ogg/page.rs:337` | replace < with <= in emit_segments | missed → **equivalent** (no fixture aligns an art chunk to a page boundary, so `os == oe` never reaches the Art arm; hand-apply stays green) | 2 |
 | `wav.rs:24` | replace < with == in riff_wave_start | missed | 3 |
 | `wav.rs:24` | replace < with <= in riff_wave_start | missed | 3 |
 | `wav.rs:47` | replace + with - in walk_chunks | missed | 3 |
