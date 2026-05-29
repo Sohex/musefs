@@ -12,10 +12,18 @@ Audit musefs's existing test suite for **coverage**, **quality**, and **edge-cas
 handling**, and produce a single report whose closing section is a prioritized
 remediation backlog ready to execute later.
 
-This is an audit of an *already-substantial* suite (~281 Rust tests across five
-crates, plus proptest invariants, cargo-fuzz targets, mutagen interop, and
-`cargo-llvm-cov` coverage wired to Codecov in CI). The job is to find the gaps and
-weak spots in that suite, not to bootstrap testing from nothing.
+This is an audit of an *already-substantial* suite: ~259 Rust tests run by
+`cargo test --workspace`, plus separate surfaces that the default run excludes —
+`#[ignore]`d FUSE e2e tests, proptest invariants (some behind the `fuzzing`
+feature), the mutagen interop suite, the beets-plugin pytest suite, and the
+cargo-fuzz targets — with `cargo-llvm-cov` coverage wired to Codecov in CI. The
+job is to find the gaps and weak spots, not to bootstrap testing from nothing.
+
+**Counting methodology.** Test counts vary by surface, so Phase A reports them
+per category rather than as one number: (a) `cargo test --workspace` default
+count; (b) `#[ignore]`d tests (FUSE e2e, interop emitter) run explicitly; (c)
+proptest/`fuzzing`-feature tests; (d) beets pytest count; (e) cargo-fuzz target
+count. Any single headline figure in the report names which categories it sums.
 
 ## Scope decisions
 
@@ -37,18 +45,25 @@ that depends on it:
 
 - `cargo-llvm-cov` — already installed; verify on PATH (`~/.cargo/bin`) with
   `cargo llvm-cov --version`. No install needed.
-- `cargo-mutants` — **not installed.** Install a pinned version with
-  `cargo install cargo-mutants --version <pin> --locked` (record the exact pin in
-  the report so the run is reproducible). Verify with `cargo mutants --version`.
+- `cargo-mutants` — **not installed.** Install the confirmed-current pin with
+  `cargo install cargo-mutants --version 27.0.0 --locked`. The plan verifies and
+  records the resolved version (`cargo mutants --version`) in the report.
 - `cargo-fuzz` — **not installed.** Install with `cargo install cargo-fuzz`
   **without** `--locked` (matching `.github/workflows/fuzz.yml`, whose comment
   notes the pinned `rustix` fails to compile on current nightly). Requires the
   `nightly` toolchain (present).
-- **Network-unavailable fallback:** if `cargo install` cannot reach the registry,
-  the dependent phase is marked **blocked** in the report (not silently skipped):
-  Phase B emits "mutation testing blocked — cargo-mutants unavailable" and Phase A
-  emits the same for the fuzz smoke surface, and the affected scorecard cells read
-  "not measured (tooling unavailable)". The coverage and judgment phases still run.
+- **beets plugin venv.** `contrib/beets/requirements.txt` pins `beets` + `pytest`
+  only — **no `pytest-cov`** and no mutagen. Phase 0 builds the venv from that
+  file, then additionally installs `pytest-cov` (for `beetsplug/` coverage) and
+  `mutagen==1.47.0` (from `tests/interop/requirements.txt`, needed by the interop
+  pytest). If `pytest-cov` cannot be installed, the beets suite is still run for
+  pass/fail and its coverage cell reads "not measured (pytest-cov unavailable)".
+- **Network-unavailable fallback:** if `cargo install` / `pip install` cannot
+  reach a registry, the dependent surface is marked **blocked** in the report (not
+  silently skipped): Phase B emits "mutation testing blocked — cargo-mutants
+  unavailable", Phase A emits the same for the fuzz smoke surface and for any
+  Python dep it couldn't install, and the affected scorecard cells read "not
+  measured (tooling unavailable)". The coverage and judgment phases still run.
 
 ### Phase A — Ground truth (empirical baseline)
 
@@ -59,20 +74,32 @@ Run the full test surface and record current state:
   this environment).
 - `cargo test -p musefs-format --features fuzzing` and
   `cargo test -p musefs-core --test proptest_read_fidelity` (proptests).
-- mutagen interop suite (`MUSEFS_INTEROP_DIR=... cargo test ... -- --ignored
-  emit_interop_fixtures` then `python -m pytest tests/interop`).
-- **beets plugin suite** (`contrib/beets/`): `python -m pytest` (unit +
-  integration), `python -m pytest -m musefs_bin` (path-gate vs the real `musefs`
-  binary), and `python -m pytest -m e2e` (beets → mount → playback). Record pass
-  state and, where practical, `pytest-cov` line coverage for `beetsplug/`.
+- mutagen interop suite, two steps sharing one temp dir `$D`:
+  `MUSEFS_INTEROP_DIR=$D cargo test -p musefs-core --test interop_emit -- --ignored
+  emit_interop_fixtures`, then `MUSEFS_INTEROP_DIR=$D python -m pytest
+  tests/interop/test_mutagen_roundtrip.py` (in the Phase-0 venv with
+  `mutagen==1.47.0`). `$D` is a fresh temp dir, not a tracked path.
+- **beets plugin suite** (`contrib/beets/`, run in the Phase-0 venv):
+  `python -m pytest` (unit + integration), `python -m pytest -m musefs_bin`
+  (path-gate vs the real `musefs` binary), and `python -m pytest -m e2e`
+  (beets → mount → playback). Record pass state and, when `pytest-cov` is
+  available, `--cov=beetsplug` line coverage.
 - **Fuzz smoke surface** (mirrors `.github/workflows/fuzz.yml` per-PR job):
-  `cargo +nightly fuzz build`, then a short run of each target
-  (`flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment`) with a bounded
-  `-max_total_time`. Goal is to confirm every target still builds and reaches its
-  parser, not a full fuzzing campaign. Record any broken/unreachable target.
+  `cargo +nightly fuzz build`, then each target
+  (`flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment`) run with the CI bounds
+  `-max_len=131072 -rss_limit_mb=2048 -max_total_time=15` (15 s/target, per
+  `fuzz.yml:45`). Goal is to confirm every target still builds and reaches its
+  parser, not a full campaign. Record any broken/unreachable target.
 - `cargo-llvm-cov` (installed; ensure `~/.cargo/bin` on PATH) over the workspace
   excluding `musefs-fuse`, matching CI. Capture per-crate and per-module line +
   region coverage.
+
+**Red-test gate.** If any **Tier-1** test (byte-identical invariant or
+resolution/freshness, including the relevant `#[ignore]`d e2e tests) fails or is
+flaky in this phase, **halt and report before Phase B/C.** Mutation results are
+meaningless against a suite that isn't green — a mutant "caught" by an
+already-failing test tells us nothing. A Tier-2/Tier-3 or tooling-blocked failure
+is recorded and the audit continues, noting reduced confidence for that area.
 
 **FUSE coverage strategy.** `cargo-llvm-cov` excludes `musefs-fuse` (real mounts
 don't instrument cleanly), so FUSE-only behaviors are **not** scored by
@@ -98,8 +125,14 @@ without any test failing — are the sharpest signal of weak or missing assertio
   (`reader.rs`, `tree.rs`, `scan.rs`, `facade.rs`, and `ogg_index.rs` — central to
   Tier-1 Ogg read correctness: lazy page indexing, sequence renumbering, CRC
   patching, payload serving).
-- Bounded with a per-mutant timeout multiplier and `--file` globs to keep runtime
-  practical. Record surviving mutants with `file:line` and the mutation applied.
+- **Concrete bounds** (mutation on format parsers can otherwise run for hours):
+  scope each invocation with `--file` globs to the target list above (never the
+  whole workspace); set `--timeout-multiplier 2.0` plus a `--minimum-test-timeout`
+  floor; and cap wall-clock per crate at **~30 min** (`timeout 1800 cargo
+  mutants ...`). If a crate hits the cap, record it as a **partial** run (mutants
+  tested / total) rather than failing — partial mutation data is still useful and
+  the report says so.
+- Record surviving mutants with `file:line` and the mutation applied.
 
 ### Phase C — Judgment review (edge cases + structural quality)
 
@@ -152,13 +185,16 @@ For each area the report scores three dimensions explicitly:
   covered / partial / missing. Seed checklist (extend per area): empty /
   truncated / very large files; malformed or out-of-spec headers; multi-value and
   Unicode tags; path collisions and disambiguation; concurrent refresh during an
-  in-flight read; zero-byte and oversized embedded art; chained/multiplexed Ogg
+  in-flight read; backing file modified between `open()` and `read()` (size/mtime
+  drift → `BackingChanged`); NFS-style stale file handles (`ESTALE`) on a backing
+  read; zero-byte and oversized embedded art; chained/multiplexed Ogg
   (skipped by design — confirm the skip is tested); mode boundaries
   (synthesis vs structure-only).
 
 ## Deliverable: the report
 
-One markdown report at `docs/audits/2026-05-29-test-audit.md`, structured as:
+One markdown report at `docs/audits/2026-05-29-test-audit.md` (the plan creates
+the `docs/audits/` directory, which does not yet exist), structured as:
 
 1. **Executive summary** — overall health, headline numbers, top risks.
 2. **Per-area scorecard** — the three dimensions (§ above) for each Tier-1/2 area.
