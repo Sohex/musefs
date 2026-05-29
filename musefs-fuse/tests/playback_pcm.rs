@@ -149,6 +149,21 @@ fn mounted_path(mountpoint: &Path, case: PlaybackCase) -> PathBuf {
         .join(format!("{}.{}", case.title, case.served_ext))
 }
 
+fn walk_tree(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                out.extend(walk_tree(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 #[test]
 #[ignore = "requires /dev/fuse + libfuse + ffmpeg; run with --ignored"]
 fn all_supported_formats_decode_to_same_pcm_sha_as_source() {
@@ -177,10 +192,10 @@ fn all_supported_formats_decode_to_same_pcm_sha_as_source() {
         }
     }
 
-    if generated.is_empty() {
-        eprintln!("no playback fixtures could be generated; skipping playback PCM E2E");
-        return;
-    }
+    assert!(
+        !generated.is_empty(),
+        "no playback fixtures could be generated; ffmpeg codecs may be unavailable"
+    );
 
     let db = musefs_db::Db::open_in_memory().unwrap();
     scan_directory(&db, backing.path()).unwrap();
@@ -195,10 +210,7 @@ fn all_supported_formats_decode_to_same_pcm_sha_as_source() {
             mounted.exists(),
             "expected mounted path {} to exist; tree entries: {:?}",
             mounted.display(),
-            std::fs::read_dir(mountpoint.path())
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .collect::<Vec<_>>()
+            walk_tree(mountpoint.path()),
         );
         assert_eq!(
             pcm_sha256(&mounted),

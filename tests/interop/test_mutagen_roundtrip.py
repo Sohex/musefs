@@ -60,12 +60,8 @@ def test_ecosystem_reads_synthesized_tags():
         path = os.path.join(base, row["file"])
         title = _read_tag(path, "title")
         artist = _read_tag(path, "artist")
-        assert title == row["title"], (
-            f"{row['file']}: title {title!r} != {row['title']!r}"
-        )
-        assert artist == row["artist"], (
-            f"{row['file']}: artist {artist!r} != {row['artist']!r}"
-        )
+        assert title == row["title"], f"{row['file']}: title {title!r} != {row['title']!r}"
+        assert artist == row["artist"], f"{row['file']}: artist {artist!r} != {row['artist']!r}"
 
 
 def test_synthesized_preserves_source_audio_payload():
@@ -102,6 +98,4 @@ def test_synthesized_preserves_source_audio_payload():
         with open(src_path, "rb") as f:
             f.seek(row["source_audio_offset"])
             src_payload = f.read(row["source_audio_length"])
-        assert synth_payload == src_payload, (
-            f"{row['file']}: synthesized audio differs from source"
-        )
+        assert synth_payload == src_payload, f"{row['file']}: synthesized audio differs from source"
