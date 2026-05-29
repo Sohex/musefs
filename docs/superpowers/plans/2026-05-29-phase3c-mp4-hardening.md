@@ -372,7 +372,16 @@ cargo test -p musefs-format --features fuzzing --lib mp4::tests::read_pictures
 ```
 Expected: each PASS (the new tests plus the pre-existing `read_*` tests).
 
-- [ ] **Step 3: Hand-apply-verify each kill**
+Hand-apply-verify in three per-function sub-batches (Steps 3a–3c). 15 mutations
+total; keeping them grouped by function bounds the apply/revert cycle and the
+risk of leaving a stray edit. **After every single mutation:**
+`git checkout -- musefs-format/src/mp4.rs`, then rerun the named test to confirm it
+is green again before applying the next.
+
+> Note: the `trkn`/`disk` `&& -> ||` and `read_freeform` `|| -> &&` kills are
+> **panics** (out-of-bounds slice), which count as kills per the verification method.
+
+- [ ] **Step 3a: Hand-apply-verify the `read_freeform` group (6 mutations)**
 
 | Construct (locate by pattern) | Mutation | Test that must FAIL |
 |---|---|---|
@@ -382,20 +391,31 @@ Expected: each PASS (the new tests plus the pre-existing `read_*` tests).
 | same `<` | `<` → `<=` | `read_freeform_accepts_minimal_name_and_data` |
 | `read_freeform`: the `\|\|` on that line | `\|\|` → `&&` | `read_freeform_short_name_returns_none` (panics on `np[4..]`) |
 | `read_freeform`: `if p.len() >= 4` (mean) | `>=` → `<` | `read_freeform_mean_payload_exactly_4_uses_empty_mean` |
+
+Run between mutations: `cargo test -p musefs-format --features fuzzing --lib mp4::tests::read_freeform`
+
+- [ ] **Step 3b: Hand-apply-verify the `read_tags` group (6 mutations)**
+
+| Construct (locate by pattern) | Mutation | Test that must FAIL |
+|---|---|---|
 | `read_tags`: `if dp.len() < 8` | `<` → `==` | `read_tags_data_payload_exactly_8_is_read` |
 | same `<` | `<` → `<=` | `read_tags_data_payload_exactly_8_is_read` |
 | `read_tags`: `&atom.kind == b"trkn" && value.len() >= 4` (the `&&`) | `&&` → `\|\|` | `read_tags_trkn_short_value_is_skipped` (panics) |
 | `read_tags`: `&atom.kind == b"disk" && value.len() >= 4` (the `==`) | `==` → `!=` | `read_tags_disk_exact_4_byte_value_yields_discnumber` |
 | same line (the `&&`) | `&&` → `\|\|` | `read_tags_disk_short_value_is_skipped` (panics) |
 | same line (the `>=`) | `>=` → `<` | `read_tags_disk_exact_4_byte_value_yields_discnumber` |
+
+Run between mutations: `cargo test -p musefs-format --features fuzzing --lib mp4::tests::read_tags`
+
+- [ ] **Step 3c: Hand-apply-verify the `read_pictures` group (3 mutations)**
+
+| Construct (locate by pattern) | Mutation | Test that must FAIL |
+|---|---|---|
 | `read_pictures`: `if dp.len() < 8` | `<` → `==` | `read_pictures_data_payload_exactly_8_is_read` |
 | same `<` | `<` → `<=` | `read_pictures_data_payload_exactly_8_is_read` |
 | `read_pictures`: `14 => "image/png",` | delete arm | `read_pictures_recognizes_png` |
 
-After each: `git checkout -- musefs-format/src/mp4.rs`.
-
-> Note: the `trkn`/`disk` `&& -> ||` and `read_freeform` `|| -> &&` kills are
-> **panics** (out-of-bounds slice), which count as kills per the verification method.
+Run between mutations: `cargo test -p musefs-format --features fuzzing --lib mp4::tests::read_pictures`
 
 - [ ] **Step 4: Commit**
 
