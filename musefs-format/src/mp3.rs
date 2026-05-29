@@ -873,4 +873,61 @@ mod tests {
         let tag = id3v2(0x04, 0x00, 10, &frame);
         assert!(!id3v2_alloc_safe(&tag));
     }
+
+    /// A valid ID3v2.3 frame: 4-byte id, 4-byte plain big-endian size, 2 flag bytes,
+    /// then `payload`.
+    fn v23_frame(id: &[u8; 4], size: u32, payload: &[u8]) -> Vec<u8> {
+        let mut v = id.to_vec();
+        v.extend_from_slice(&size.to_be_bytes());
+        v.extend_from_slice(&[0x00, 0x00]);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn alloc_safe_v22_24bit_size_decode() {
+        // v2.2 frame header is 6 bytes: 3-byte id + 3-byte 24-bit big-endian size.
+        // Declare a size that the *correct* decode puts out of bounds (reject), so a
+        // wrong shift/OR that shrinks the size would wrongly accept.
+        // size bytes [0x00,0x01,0x00] = 256, body = 6 (header only, no room) -> reject.
+        let mut f_mid = b"TT2".to_vec();
+        f_mid.extend_from_slice(&[0x00, 0x01, 0x00]); // 24-bit size = 256
+        assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_mid))); // kills <<8 and |->&
+                                                                   // size bytes [0x01,0x00,0x00] = 65536 -> reject; `<<16 -> >>16` shrinks to 0.
+        let mut f_hi = b"TT2".to_vec();
+        f_hi.extend_from_slice(&[0x01, 0x00, 0x00]);
+        assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_hi)));
+        // A valid in-bounds v2.2 frame is accepted: size 4, body = 6+4 = 10.
+        let mut f_ok = b"TT2".to_vec();
+        f_ok.extend_from_slice(&[0x00, 0x00, 0x04]);
+        f_ok.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(id3v2_alloc_safe(&id3v2(0x02, 0x00, 10, &f_ok)));
+    }
+
+    #[test]
+    fn alloc_safe_rejects_nonzero_frame_flags() {
+        // v2.3: non-zero frame flags -> reject (the v2.3 flag check).
+        let mut f3 = b"TIT2".to_vec();
+        f3.extend_from_slice(&4u32.to_be_bytes()); // plain size 4
+        f3.extend_from_slice(&[0x00, 0x01]); // non-zero frame flags
+        f3.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &f3)));
+
+        // v2.4: non-zero frame flags -> reject. This is a SEPARATE code path (the
+        // v2.4 `else` branch) from the v2.3 check, so it needs its own fixture.
+        let mut f4 = b"TIT2".to_vec();
+        f4.extend_from_slice(&ss(4)); // valid synchsafe size 4
+        f4.extend_from_slice(&[0x00, 0x01]); // non-zero frame flags
+        f4.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(!id3v2_alloc_safe(&id3v2(0x04, 0x00, 14, &f4)));
+    }
+
+    #[test]
+    fn alloc_safe_rejects_chap_and_ctoc() {
+        // CHAP/CTOC carry sub-frames -> recursive OOM vector -> reject (v2.3/2.4).
+        let chap = v23_frame(b"CHAP", 4, &[1, 2, 3, 4]);
+        assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &chap)));
+        let ctoc = v23_frame(b"CTOC", 4, &[1, 2, 3, 4]);
+        assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &ctoc)));
+    }
 }
