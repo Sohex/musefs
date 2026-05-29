@@ -304,3 +304,31 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_u32_be_assembles_big_endian_and_guards_length() {
+        let data = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        assert_eq!(read_u32_be(&data, 0).unwrap(), 0x1122_3344);
+        // pins :224 (`+` -> `*`): at pos=1 the second byte is data[2]=0x33, not data[1].
+        // pins :219 (`>` -> `==`/`>=`): pos+4 == len (5) is valid, so this unwrap must
+        // succeed — a mutated bound returns Err here and the unwrap panics.
+        assert_eq!(read_u32_be(&data, 1).unwrap(), 0x2233_4455);
+        assert_eq!(read_u32_be(&data, 2), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn push_block_header_emits_24bit_length_big_endian() {
+        // pins :101 (`>>16` -> `<<16`): high byte 0x12 must land in out[1].
+        let mut out = Vec::new();
+        push_block_header(&mut out, BLOCK_PICTURE, 0x12_3456, false);
+        assert_eq!(out, vec![BLOCK_PICTURE, 0x12, 0x34, 0x56]);
+        // :99 is equivalent, but exercise the is_last/0x80 path anyway.
+        let mut last = Vec::new();
+        push_block_header(&mut last, BLOCK_VORBIS_COMMENT, 0, true);
+        assert_eq!(last, vec![0x80 | BLOCK_VORBIS_COMMENT, 0x00, 0x00, 0x00]);
+    }
+}
