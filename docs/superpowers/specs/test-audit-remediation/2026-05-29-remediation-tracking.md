@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); phases 3c/3d, 4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; phases 3d, 4 pending
 
 ## Guiding principle: verify, don't trust
 
@@ -108,6 +108,12 @@ Findings #5, #16.
   (their sub-phases) or filter empty art once at ingestion (`scan.rs`); finding #5
   broadened on FLAC (partial/seam/art windows), with the non-FLAC dimension tracked
   into 3b/3c/3d.
+- **3c done** — MP4 survivors killed (40 missed → killed, 4 timeout →
+  timeout-detected; no equivalents). Covers `box_header`, `read_box`,
+  `read_structure_from`, `read_freeform`, `read_tags`, `read_pictures`,
+  `build_udta`, `patch_chunk_offsets`, `synthesize_layout`. The `|` mutants
+  (`read_structure_from` `|= → &=` dup-accumulators) are killed, not equivalent.
+  Finding #5 non-FLAC read-fidelity dimension still tracked separately.
 - broaden `proptest_read_fidelity` (random offsets, header/audio boundary, art,
   non-FLAC) (#5)
 - zero-byte art boundary (#16)
