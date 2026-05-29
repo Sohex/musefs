@@ -71,7 +71,10 @@ long-running scheduled (and manually dispatchable) campaign.
 
 ### B1. `scripts/mutants.sh`
 
-Single canonical entry point for local and CI use. Responsibilities:
+Single canonical entry point for local and CI use. Mutation scope is the three
+logic-bearing crates only — `musefs-db`, `musefs-core`, `musefs-format`;
+`musefs-cli` and `musefs-fuse` are out of scope by decision (see the tracking
+doc's Scope section). Responsibilities:
 
 - Set `TMPDIR` to a path off the `/tmp` tmpfs (the audit exhausted the 3.9 GB
   tmpfs). Accept an override env var; default to a repo-local `.mutants-tmp/`
@@ -89,14 +92,36 @@ Single canonical entry point for local and CI use. Responsibilities:
   - `musefs-format` — `--test-workspace=false --features fuzzing`, all format
     files including the 7 the audit never reached (`ogg/mod.rs`, `ogg/page.rs`,
     `ogg/crc.rs`, `ogg/b64.rs`, `mp4.rs`, `wav.rs`, `mp3.rs`, plus `flac.rs`).
-- Emit per-crate survivor reports (cargo-mutants `--output` dir) for collection.
+- Emit per-crate survivor reports into a fixed, predictable location —
+  `--output mutants-out/<crate>/` — for collection. cargo-mutants' default output
+  dir is `mutants.out/` (and it rotates a prior run to `mutants.out.old/`); the
+  script pins `--output` so paths are deterministic.
 - **No time cap** (the audit's 30-min cap is why only `flac.rs` was reached).
+
+**Scratch/output hygiene** (`.gitignore` currently only ignores `/target`,
+`/.claude/`, `.worktrees/`, `__pycache__/`, `*.pyc`): phase 1 must add
+`.mutants-tmp/`, `mutants-out/`, `mutants.out/`, and `mutants.out.old/` to
+`.gitignore` so neither the scratch `TMPDIR` nor the reports are ever committed.
+(A stray `mutants.out.old/` is already present in the working tree from the audit
+— it must be ignored, not committed.) The script additionally removes its own
+`.mutants-tmp/` on exit.
 
 ### B2. `.github/workflows/mutants.yml`
 
-- **PR job** (`pull_request` on Rust paths): `cargo mutants --in-diff <diff>` so
-  only mutations on changed lines are tested — fast, gates regressions in touched
-  code without running the full matrix.
+- **PR job** (`pull_request` on Rust paths): runs `cargo mutants --in-diff` over
+  only the lines changed in the PR — fast, gates regressions in touched code
+  without the full matrix. `--in-diff` requires a concrete diff file, and PR
+  checkouts are shallow, so the job must explicitly materialize the diff against
+  the merge base:
+  - `actions/checkout` with `fetch-depth: 0` (or `git fetch origin
+    $GITHUB_BASE_REF` to fetch the base ref into the shallow clone).
+  - `git diff origin/$GITHUB_BASE_REF...HEAD -- '*.rs' > mutants.diff` to capture
+    the changed Rust lines on the merge-base three-dot range.
+  - `cargo mutants --in-diff mutants.diff -j1` (constrained to the three in-scope
+    crates via `-p`/`--package` filters or path globs, so CLI/FUSE changes don't
+    trigger out-of-scope mutation).
+  - If `mutants.diff` is empty (no in-scope Rust changes), the job is a no-op
+    pass rather than an error.
 - **Scheduled + dispatchable job** (`schedule` cron, e.g. weekly like fuzz, plus
   `workflow_dispatch`): per-crate matrix (`musefs-db`, `musefs-core`,
   `musefs-format`), install `cargo-mutants` and `llvm-tools-preview`, run via
@@ -116,8 +141,9 @@ phase 4**; phase 1 only records it in the inventory.
 
 ## Component C — Verified survivor inventory
 
-`docs/audits/2026-05-29-mutation-inventory.md`, seeded from one
-`workflow_dispatch` run of `mutants.yml` (CI, not local). Contents:
+`docs/superpowers/specs/test-audit-remediation/2026-05-29-mutation-inventory.md`,
+seeded from one `workflow_dispatch` run of `mutants.yml` (CI, not local).
+Contents:
 
 - Complete per-crate / per-file survivor list (caught/missed/unviable/timeout),
   superseding the audit's partial §9 (which only reached `flac.rs`).
@@ -129,8 +155,9 @@ of the audit's §9.
 
 ## Component D — Tracking doc
 
-`docs/audits/2026-05-29-remediation-tracking.md` (already written): records the
-decomposition, finding→phase map, and live status per phase.
+`docs/superpowers/specs/test-audit-remediation/2026-05-29-remediation-tracking.md`
+(already written): records the decomposition, finding→phase map, and live status
+per phase.
 
 ## Out of scope (this phase)
 

@@ -16,8 +16,21 @@ suspicion.
 
 Agreed scope: **everything actionable** — all P1 + all P2 findings (§12 of the
 audit) except the two document-only items, **plus a full mutation sweep** that
-drives mutation score up across all crates, including the 7 format files the
-audit's partial run never reached (§9).
+drives mutation score up across the three logic-bearing crates — `musefs-db`,
+`musefs-core`, `musefs-format` — including the 7 format files the audit's partial
+run never reached (§9).
+
+**Mutation scope excludes `musefs-cli` and `musefs-fuse`** (the other two
+workspace members, `Cargo.toml:3`), by decision:
+
+- `musefs-cli` is thin clap/dispatch glue (30.9% line coverage, expected for a
+  binary crate; audit §6) — little mutable logic, exercised end-to-end.
+- `musefs-fuse` is a thin `fuser` adapter validated by `#[ignore]`d e2e mounts,
+  not llvm-cov/mutant instrumentation (the project's FUSE coverage strategy;
+  audit §6/§7). Mutation testing it would require a real mount per mutant.
+
+If either crate later grows non-trivial logic, mutation coverage for it gets its
+own follow-up — it is **deferred, not silently dropped.**
 
 ## Decomposition into phased sub-projects
 
@@ -51,8 +64,9 @@ Unblock the suite and produce the data phases 2–4 consume.
     changed Rust files. Scheduled (cron) + `workflow_dispatch` job: full per-crate
     matrix, `llvm-tools-preview`, no time cap, uploads survivor reports.
 - **C. Verified survivor inventory** —
-  `docs/audits/2026-05-29-mutation-inventory.md`, seeded from a manually
-  dispatched CI run (GitHub runner has disk headroom; local does not).
+  `docs/superpowers/specs/test-audit-remediation/2026-05-29-mutation-inventory.md`,
+  seeded from a manually dispatched CI run (GitHub runner has disk headroom;
+  local does not).
   Supersedes the audit's partial §9. Records structural tool limits to revisit
   (no `Default for Db`; `Ok(Default::default())` unviables).
 - **D. This tracking doc.**
