@@ -550,4 +550,54 @@ mod tests {
         ]);
         assert!(read_tags(&buf).is_empty());
     }
+
+    /// Byte offset, in the assembled stream, of the first `Inline` segment whose
+    /// first four bytes are `fourcc`. Used to assert RIFF word-alignment.
+    fn inline_offset_of(layout: &RegionLayout, fourcc: &[u8; 4]) -> u64 {
+        let mut off = 0u64;
+        for s in &layout.segments {
+            if let Segment::Inline(b) = s {
+                if b.len() >= 4 && &b[0..4] == fourcc {
+                    return off;
+                }
+            }
+            off += s.len();
+        }
+        panic!("no inline chunk starting with {fourcc:?}");
+    }
+
+    #[test]
+    fn synthesize_word_aligns_embedded_id3_chunk() {
+        // :207 `tag_len % 2 == 1` — the pad after the `id3 ` chunk. When tag_len is
+        // odd, the original pads so the following `data` chunk starts on an even
+        // byte (RIFF word-alignment). Both mutants (`/`, `+`) drop that pad for odd
+        // tag_len, landing `data` on an odd offset.
+        //
+        // Find tags whose ID3v2 tag_len is odd (parity depends on id3 framing, so
+        // discover it rather than hard-code). "albumartist" maps to id3 only (no
+        // INFO/LIST chunk), keeping the layout simple.
+        let mut tags = Vec::new();
+        let mut tag_len = 0u64;
+        for n in 1..64 {
+            let cand = vec![TagInput::new("albumartist", &"x".repeat(n))];
+            let (_, tl) = crate::mp3::build_id3v2_segments(&cand, &[]).unwrap();
+            if tl % 2 == 1 {
+                tags = cand;
+                tag_len = tl;
+                break;
+            }
+        }
+        assert_eq!(tag_len % 2, 1, "expected to find an odd-length id3 tag");
+
+        let scan = WavScan {
+            fmt: fmt_pcm(),
+            fact: None,
+        };
+        let layout = synthesize_layout(&scan, 0, 8, &tags, &[]).unwrap();
+        assert_eq!(
+            inline_offset_of(&layout, b"data") % 2,
+            0,
+            "the data chunk must be word-aligned"
+        );
+    }
 }
