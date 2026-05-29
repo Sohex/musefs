@@ -6,6 +6,8 @@ pub const CAPTURE: &[u8; 4] = b"OggS";
 /// Header-type flag bits.
 pub const FLAG_CONTINUED: u8 = 0x01;
 pub const FLAG_BOS: u8 = 0x02;
+#[allow(dead_code)]
+pub const FLAG_EOS: u8 = 0x04;
 
 /// A parsed Ogg page header (the 27 fixed bytes + the segment table) plus the
 /// derived payload length. Multi-byte fields are little-endian on disk.
@@ -551,6 +553,16 @@ mod tests {
         let mut seq_expected = 0u32;
         while pos < flat.len() {
             let h = parse_page(&flat, pos).unwrap();
+            // Flag-bit kills: BOS only on the first page, FLAG_CONTINUED on every
+            // later page (kills :263 |=->&= on BOS, :266 on CONTINUED, :265 delete !).
+            let is_first = seq_expected == 0;
+            if is_first {
+                assert_eq!(h.header_type & FLAG_BOS, FLAG_BOS);
+                assert_eq!(h.header_type & FLAG_CONTINUED, 0);
+            } else {
+                assert_eq!(h.header_type & FLAG_BOS, 0);
+                assert_eq!(h.header_type & FLAG_CONTINUED, FLAG_CONTINUED);
+            }
             assert_eq!(h.seq, seq_expected);
             seq_expected += 1;
             // CRC self-check.
@@ -574,5 +586,81 @@ mod tests {
             })
             .sum();
         assert_eq!(art_served, art_out.len() as u64);
+        // No OggArtSlice may be zero-length (kills emit_segments:337 < -> <=).
+        assert!(segments
+            .iter()
+            .all(|s| !matches!(s, Segment::OggArtSlice { len: 0, .. })));
+    }
+
+    #[test]
+    fn eos_bit_is_preserved_through_renumber() {
+        // Build a one-page packet, set its EOS bit, repatch the CRC, then renumber
+        // via patch_page_header and confirm header_type (incl. EOS) is unchanged.
+        let (mut page, _) = lace_packet(0xEE, 3, false, 9, &[0x11u8; 120]);
+        page[5] |= FLAG_EOS; // header_type byte
+                             // Recompute the CRC over the EOS-modified page (CRC field zeroed first).
+        let mut z = page.clone();
+        z[22..26].copy_from_slice(&0u32.to_le_bytes());
+        let crc = crc32(&z);
+        page[22..26].copy_from_slice(&crc.to_le_bytes());
+
+        let patched = patch_page_header(&page, 99).unwrap();
+        let h0 = parse_page(&page, 0).unwrap();
+        let mut full = patched.clone();
+        full.extend_from_slice(&page[h0.header_len..h0.total_len()]);
+        let h1 = parse_page(&full, 0).unwrap();
+        assert_eq!(h1.seq, 99);
+        assert_eq!(h1.header_type & FLAG_EOS, FLAG_EOS, "EOS bit dropped");
+        assert_eq!(h1.header_type, h0.header_type, "header_type changed");
+    }
+
+    #[test]
+    fn parse_page_rejects_truncated_header_and_table() {
+        // Truncated 27-byte header (kills :33 `> -> ==`/`>=`).
+        let p = hand_page();
+        assert_eq!(parse_page(&p[..26], 0), Err(FormatError::Malformed));
+        assert!(parse_page(&p[..27], 0).is_err()); // header present but table missing
+                                                   // Header present, segment table truncated (kills :47).
+        assert_eq!(parse_page(&p[..28], 0), Err(FormatError::Malformed));
+        // Exactly full header+table+payload parses.
+        assert!(parse_page(&p, 0).is_ok());
+    }
+
+    #[test]
+    fn patch_page_header_rejects_truncated_page() {
+        let (page, _) = lace_packet(0xCAFE, 1, false, 0, &vec![0x42u8; 300]);
+        let h = parse_page(&page, 0).unwrap();
+        // Hand a buffer shorter than total_len: original returns Err; the `>` mutant
+        // would proceed and panic slicing page[..total_len].
+        assert_eq!(
+            patch_page_header(&page[..h.total_len() - 10], 2),
+            Err(FormatError::Malformed)
+        );
+    }
+
+    #[test]
+    fn read_packets_stops_exactly_at_want_within_a_page() {
+        // One page carrying two complete packets (two lacing values < 255).
+        // want=1 must return after the first, ignoring the second on the same page.
+        let mut page = Vec::new();
+        page.extend_from_slice(CAPTURE);
+        page.push(0);
+        page.push(FLAG_BOS);
+        page.extend_from_slice(&0u64.to_le_bytes());
+        page.extend_from_slice(&7u32.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
+        page.push(2); // 2 segments
+        page.push(3); // packet A: 3 bytes
+        page.push(4); // packet B: 4 bytes
+        page.extend_from_slice(&[1, 2, 3, 9, 9, 9, 9]);
+        let mut z = page.clone();
+        z[22..26].copy_from_slice(&0u32.to_le_bytes());
+        let crc = crc32(&z);
+        page[22..26].copy_from_slice(&crc.to_le_bytes());
+
+        let pkts = read_packets(&page, 1).unwrap();
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pkts[0].data, vec![1, 2, 3]);
     }
 }
