@@ -1,5 +1,4 @@
 import os
-import sqlite3
 
 import pytest
 
@@ -7,7 +6,7 @@ pytest.importorskip("beets")
 
 from beets.library import Item  # noqa: E402
 
-from beetsplug._core import map_fields  # noqa: E402
+from beetsplug._core import connect, map_fields  # noqa: E402
 from beetsplug.musefs import MusefsPlugin  # noqa: E402
 
 
@@ -112,7 +111,7 @@ def test_command_run_syncs(db_path, make_track, fake_item, tmp_path, monkeypatch
     cmd, opts, args = _musefs_cmd(plugin, [])
     cmd.func(FakeLib([item]), opts, args)
 
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     try:
         assert (
             conn.execute(
@@ -138,7 +137,7 @@ def test_command_autoscan_scans_matched_files(
     cmd.func(FakeLib([item]), opts, args)
 
     assert calls == [[real]]  # scanned the matched file, not the directory
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     try:
         assert conn.execute("SELECT value FROM tags WHERE key='title'").fetchone()[0] == "Song"
     finally:
@@ -178,7 +177,7 @@ def test_command_query_preserves_unrelated_missing_rows(
     cmd, opts, args = _musefs_cmd(plugin, ["title:Song"])
     cmd.func(FakeLib([item]), opts, args)
 
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
         assert "/gone/x.flac" in paths
@@ -194,7 +193,7 @@ def test_command_full_sync_prunes_missing_rows(db_path, make_track, fake_item, m
     cmd, opts, args = _musefs_cmd(plugin, [])
     cmd.func(FakeLib([fake_item(os.fsencode("/music/a.flac"))]), opts, args)
 
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
         assert "/gone/x.flac" not in paths
@@ -216,7 +215,7 @@ def test_reconcile_at_cli_exit_syncs_recorded_items(
     plugin._reconcile_pending()  # cli_exit
 
     assert calls == [[real]]
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     try:
         assert (
             conn.execute(
@@ -239,7 +238,7 @@ def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_pat
     plugin._record(item=item)
     plugin._reconcile_pending()
 
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
         assert "/old/moved-away.flac" not in paths  # stale row pruned
