@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Kill the 45 `flac.rs` mutation survivors with additive in-module tests, broaden `proptest_read_fidelity` on FLAC (finding #5), and add the zero-byte embedded-art boundary test (finding #16) — no production logic changes (one possible scoped exception from the C5 spike).
+**Goal:** Kill the 45 `flac.rs` mutation survivors with additive in-module tests, broaden `proptest_read_fidelity` on FLAC (finding #5), and make FLAC synthesis skip zero-byte embedded art so it never bricks a track (finding #16). One small scoped production change (the zero-byte-art skip, Task 7); everything else is additive tests. Byte-identity for audio is untouched.
 
 **Architecture:** All `flac.rs` kills live in one new `#[cfg(test)] mod tests` inside `musefs-format/src/flac.rs`, which can call `pub`, `pub(crate)`, and private helpers directly via `use super::*` and builds byte-precise fixtures with small independent local helpers (it cannot use `musefs-format/tests/common`). The cross-cutting findings live in their own integration files: #5 in `musefs-core/tests/proptest_read_fidelity.rs`, #16 in `musefs-format/tests/synthesize_art.rs`.
 
@@ -83,9 +83,9 @@ mod tests {
         let data = [0x11u8, 0x22, 0x33, 0x44, 0x55];
         assert_eq!(read_u32_be(&data, 0).unwrap(), 0x1122_3344);
         // pins :224 (`+` -> `*`): at pos=1 the second byte is data[2]=0x33, not data[1].
+        // pins :219 (`>` -> `==`/`>=`): pos+4 == len (5) is valid, so this unwrap must
+        // succeed — a mutated bound returns Err here and the unwrap panics.
         assert_eq!(read_u32_be(&data, 1).unwrap(), 0x2233_4455);
-        // pins :219 (`>` -> `==`/`>=`): pos+4 == len is valid (not an error).
-        assert!(read_u32_be(&data, 1).is_ok());
         assert_eq!(read_u32_be(&data, 2), Err(FormatError::Malformed));
     }
 
@@ -489,11 +489,9 @@ Kills `synthesize_layout:155` (`> → >=`).
 ```rust
     #[test]
     fn synthesize_layout_picture_block_size_boundary_is_inclusive() {
-        // body_len = picture_body_framing(art).len() + art.data_len, and the framing
-        // is 32 fixed bytes + mime.len() + desc.len(). With mime "image/png" (9) and
-        // an empty description, framing = 41. The guard rejects body_len > 0x00FF_FFFF.
+        // body_len = picture_body_framing(art).len() + art.data_len. The guard at
+        // flac.rs:155 rejects body_len > 0x00FF_FFFF (FLAC's 24-bit block length).
         let scan = FlacScan { audio_offset: 0, audio_length: 0, preserved: vec![] };
-        let framing_len = 32u64 + "image/png".len() as u64; // 41
         let mk = |data_len: u64| ArtInput {
             art_id: 1,
             mime: "image/png".to_string(),
@@ -503,12 +501,17 @@ Kills `synthesize_layout:155` (`> → >=`).
             height: 0,
             data_len,
         };
-        // body_len == 0x00FF_FFFF exactly: original `>` accepts; `>=` mutant rejects.
+        // Derive the exact framing length from production rather than hardcoding it
+        // (it is independent of the data_len *value* — that field is always 4 bytes).
+        // This keeps the boundary correct regardless of the framing's field count.
+        let framing_len = picture_body_framing(&mk(0)).len() as u64;
+        let at_limit = 0x00FF_FFFF - framing_len; // body_len == 0x00FF_FFFF exactly
+        // original `>` accepts the inclusive boundary; the `>=` mutant rejects it.
         // (data_len is only a count; no large allocation occurs.)
-        assert!(synthesize_layout(&scan, &[], &[mk(0x00FF_FFFF - framing_len)]).is_ok());
+        assert!(synthesize_layout(&scan, &[], &[mk(at_limit)]).is_ok());
         // one byte over must still error, pinning the high side of the boundary.
         assert_eq!(
-            synthesize_layout(&scan, &[], &[mk(0x00FF_FFFF - framing_len + 1)]),
+            synthesize_layout(&scan, &[], &[mk(at_limit + 1)]),
             Err(FormatError::TooLarge)
         );
     }
@@ -519,8 +522,9 @@ Kills `synthesize_layout:155` (`> → >=`).
 ```bash
 cargo test -p musefs-format --features fuzzing flac::tests::synthesize_layout_picture_block_size_boundary_is_inclusive
 ```
-Expected: pass. (If `picture_body_framing` ever changes its fixed size, recompute
-`framing_len`; the test asserts the inclusive boundary, not a magic file size.)
+Expected: pass. (`framing_len` is computed from `picture_body_framing` at runtime,
+so the test stays correct if the framing's fixed-field count ever changes; it
+asserts the inclusive boundary, not a magic file size.)
 
 - [ ] **Step 3: Hand-apply-verify**
 
@@ -648,19 +652,38 @@ fn build_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempDir, 
     ) {
         let (_dir, db, id) = build_with_art(&audio, "T", &art);
         let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
-        prop_assert!(resolved
-            .layout
-            .segments
-            .iter()
-            .any(|s| matches!(s, Segment::ArtImage { .. })));
         let total = resolved.total_len;
         let whole = read_at(&resolved, &db, 0, total).unwrap();
+
+        // Locate the ArtImage segment's exact byte offset in the assembled stream by
+        // summing the serving lengths of the segments before it. (Asserting the blob
+        // appears at this precise offset is robust; a `windows().any()` search would
+        // false-positive when a tiny blob coincidentally matches audio bytes.)
+        let mut art_off = 0u64;
+        let mut art_len = None;
+        for s in &resolved.layout.segments {
+            match s {
+                Segment::ArtImage { len, .. } => {
+                    art_len = Some(*len);
+                    break;
+                }
+                Segment::Inline(bytes) => art_off += bytes.len() as u64,
+                Segment::BackingAudio { len, .. } => art_off += *len,
+                other => panic!("unexpected FLAC segment: {other:?}"),
+            }
+        }
+        let art_len = art_len.expect("layout has an ArtImage segment");
+        prop_assert_eq!(art_len, art.len() as u64);
+        // The art blob is served verbatim at its segment offset.
+        prop_assert_eq!(
+            &whole[art_off as usize..(art_off + art_len) as usize],
+            &art[..]
+        );
+        // A partial window over the art region matches the independently-read whole.
         let offset = (a as u64) % (total + 1);
         let len = (b as u64) % (total - offset + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
         prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
-        // the art blob appears verbatim in the assembled output (it is served, not dropped).
-        prop_assert!(whole.windows(art.len()).any(|w| w == &art[..]));
     }
 ```
 
@@ -682,68 +705,134 @@ git commit -m "test(read): broaden proptest_read_fidelity — partial/seam/art w
 
 ---
 
-## Task 7: zero-byte embedded-art boundary (finding #16) — spike-first
+## Task 7: zero-byte embedded-art is skipped at synthesis (finding #16)
+
+This is the one **production change** in 3a: a degenerate picture with no image data
+must not be emitted. Today `synthesize_layout` builds `Segment::ArtImage { len: 0 }`,
+which `RegionLayout::validate` (layout.rs:102, `EmptySegment`) rejects → `synthesize_layout`
+returns `Err(FormatError::InvalidLayout)` → the whole track becomes unreadable. And
+ingestion (`scan.rs:162`) only filters art *above* `MAX_ART_BYTES`, so a source file
+with an empty PICTURE block reaches synthesis. Fix: skip zero-length art in the FLAC
+synthesizer so the track still serves. Byte-identity is unaffected (metadata framing
+only). TDD: write the failing test, then make the change.
 
 **Files:**
-- Modify (tests only): `musefs-format/tests/synthesize_art.rs`.
+- Test: `musefs-format/tests/synthesize_art.rs`.
+- Modify (production): `musefs-format/src/flac.rs` — `synthesize_layout` (the
+  `num_blocks` computation at line 129 and the `for art in arts` loop at line 149).
 
-- [ ] **Step 1: Add the zero-byte-art test (the spike)**
+- [ ] **Step 1: Write the failing tests**
 
 `cover(art_id, data_len)` and `fixture()` already exist in this file. Add:
 
 ```rust
 #[test]
-fn zero_byte_art_synthesizes_and_round_trips() {
+fn zero_byte_art_is_skipped_so_the_track_still_serves() {
     let (file, audio) = fixture();
     let scan = locate_audio(&file).unwrap();
 
+    // A picture with no image data is degenerate; synthesis must skip it rather than
+    // emit an empty PICTURE block (which would fail layout validation and brick the
+    // track).
     let art = cover(7, 0); // data_len == 0
     let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
 
-    // A zero-length PICTURE block: the ArtImage segment carries len 0.
-    assert!(layout
+    // No ArtImage segment was emitted.
+    assert!(!layout
         .segments
         .iter()
-        .any(|s| matches!(s, Segment::ArtImage { art_id: 7, len: 0 })));
+        .any(|s| matches!(s, Segment::ArtImage { .. })));
 
-    let mut art_map = HashMap::new();
-    art_map.insert(7i64, Vec::new());
+    // The track still round-trips: header + verbatim audio (no art bytes needed).
+    let art_map = HashMap::new();
     let assembled = resolve_layout(&layout, &file, &art_map);
     assert_eq!(assembled.len() as u64, layout.total_len());
     assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);
 
-    // metaflac reads back exactly one picture with empty data.
+    // metaflac sees a valid FLAC with zero pictures.
+    let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
+    assert_eq!(tag.pictures().count(), 0);
+}
+
+#[test]
+fn zero_byte_art_skipped_among_valid_art_keeps_block_framing_valid() {
+    // Guards the `is_last` flag: filtering the empty art must not leave the final
+    // real PICTURE block without its last-block bit. metaflac parsing the whole
+    // chain validates that.
+    let (file, _audio) = fixture();
+    let scan = locate_audio(&file).unwrap();
+    let image = vec![0x55u8; 64];
+    let empty = cover(1, 0);
+    let real = cover(2, image.len() as u64);
+    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[empty, real]).unwrap();
+
+    let art_segs: Vec<_> = layout
+        .segments
+        .iter()
+        .filter(|s| matches!(s, Segment::ArtImage { .. }))
+        .collect();
+    assert_eq!(art_segs.len(), 1);
+
+    let mut art_map = HashMap::new();
+    art_map.insert(2i64, image.clone());
+    let assembled = resolve_layout(&layout, &file, &art_map);
     let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
     let pics: Vec<_> = tag.pictures().collect();
     assert_eq!(pics.len(), 1);
-    assert!(pics[0].data.is_empty());
+    assert_eq!(pics[0].data, image);
 }
 ```
 
-- [ ] **Step 2: Run — this is the verification spike**
+- [ ] **Step 2: Run, expect FAIL**
 
 ```bash
-cargo test -p musefs-format --features fuzzing synthesize_art::zero_byte_art_synthesizes_and_round_trips
+cargo test -p musefs-format --features fuzzing synthesize_art::zero_byte_art
+```
+Expected: FAIL — `synthesize_layout(...).unwrap()` panics today because the empty
+`ArtImage` segment trips `RegionLayout::validate` → `Err(FormatError::InvalidLayout)`.
+
+- [ ] **Step 3: Implement the skip in `synthesize_layout`**
+
+In `musefs-format/src/flac.rs`, filter zero-length art **before** counting blocks
+(so `last_index` lands on the true final block) and `continue` past it in the loop.
+
+Change the count line (currently line 129):
+
+```rust
+    // exclude zero-byte art: an empty PICTURE block is meaningless and would fail
+    // layout validation (EmptySegment), making the track unreadable.
+    let nonempty_art = arts.iter().filter(|a| a.data_len > 0).count();
+    let num_blocks = scan.preserved.len() + 1 + nonempty_art; // preserved + VORBIS_COMMENT + pictures
 ```
 
-Two outcomes (record which in Task 8):
+And guard the loop body (currently the `for art in arts {` at line 149), as its
+first statement:
 
-- **PASS** → zero-byte art is a valid zero-length PICTURE block end to end. Done,
-  tests-only. Proceed to Step 3.
-- **FAIL** → a real defect surfaced (e.g. `metaflac` rejects empty picture data, or
-  an off-by-one in `picture_body_framing`/`synthesize_layout` at `data_len == 0`).
-  This is **not** a test artifact. Apply the **C5 contingency**: make a minimal,
-  scoped fix in `musefs-format/src/flac.rs` framing/guard logic (never the
-  positioned audio reads — byte-identity is unaffected), and adjust the assertion to
-  the corrected behavior. If the correct behavior is to *reject* zero-byte art, the
-  test asserts `synthesize_layout(...) == Err(...)` instead and ingestion is the
-  enforcement point. Use `superpowers:systematic-debugging` for the diagnosis.
+```rust
+    for art in arts {
+        if art.data_len == 0 {
+            continue; // skip degenerate empty art (see nonempty_art above)
+        }
+        let framing = picture_body_framing(art);
+        // ... unchanged ...
+    }
+```
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Run, expect PASS (and the existing art tests still pass)**
 
 ```bash
-git add musefs-format/tests/synthesize_art.rs   # plus musefs-format/src/flac.rs if the spike forced a fix
-git commit -m "test(flac): zero-byte embedded-art boundary (#16)"
+cargo test -p musefs-format --features fuzzing synthesize_art
+```
+Expected: all `synthesize_art` tests pass, including the existing
+`art_becomes_an_artimage_segment_and_lengths_are_exact`,
+`metaflac_reads_synthesized_picture`, and `synthesize_errors_on_oversized_picture`
+(non-empty art is unaffected).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add musefs-format/src/flac.rs musefs-format/tests/synthesize_art.rs
+git commit -m "fix(flac): skip zero-byte art at synthesis; boundary test (#16)"
 ```
 
 ---
@@ -772,9 +861,12 @@ In `2026-05-29-remediation-tracking.md`:
 - Top-of-file Status line: add "Phase 3a (FLAC) complete".
 - Under Phase 3, record: 3a done — FLAC survivors killed (equivalents:
   disjoint-bitfield `| → ^` at `:50/:51/:99/:200/:201/:290/:291` and inclusive-bound
-  `> → >=` at `parse_picture_block:237/:245`); finding #16 resolved (record the C5
-  spike outcome); finding #5 broadened on FLAC (partial/seam/art windows), with the
-  non-FLAC dimension tracked into 3b/3c/3d.
+  `> → >=` at `parse_picture_block:237/:245`); finding #16 resolved by **skipping
+  zero-byte art at FLAC synthesis** (small production fix in `flac.rs::synthesize_layout`),
+  with a cross-cutting follow-up noted: apply the same skip to mp3/mp4/ogg/wav
+  synthesis (their sub-phases) or filter empty art once at ingestion (`scan.rs`);
+  finding #5 broadened on FLAC (partial/seam/art windows), with the non-FLAC
+  dimension tracked into 3b/3c/3d.
 
 - [ ] **Step 3: Commit**
 
@@ -804,8 +896,9 @@ equivalents).
 
 ## Notes for the executor
 
-- The **only** possible non-test production change is the C5 contingency (Task 7);
-  every other change is additive tests. Byte-identity for audio is never touched.
+- The **only** production change is the zero-byte-art skip in `flac.rs::synthesize_layout`
+  (Task 7); every other change is additive tests. Byte-identity for audio is never
+  touched (the change only affects whether an empty PICTURE block is emitted).
 - Never leave a hand-applied mutation in the tree — always revert before the next step.
 - If a survivor turns out to be a genuine equivalent the plan did not anticipate,
   record it in Task 8 rather than forcing a contrived test. The plan already marks

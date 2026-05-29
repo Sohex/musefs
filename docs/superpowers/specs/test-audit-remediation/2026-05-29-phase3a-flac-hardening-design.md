@@ -13,12 +13,12 @@ dimensions finding #5 calls out (partial reads, header/audio boundary spanning,
 art-segment serving), and add the zero-byte embedded-art boundary test (finding
 #16).
 
-**Changes are additive: tests only, no new dependencies** — with one possible
-exception. The C5 zero-byte-art spike could surface a genuine production bug in the
-FLAC framing/guard logic; if so it gets a small, scoped fix (see C5). **Either way
-the byte-identity invariant is untouched** — no change in 3a touches the positioned
-audio reads, only metadata-block framing. (Phase 2 needed one named constant; 3a
-needs none unless the spike forces a fix.)
+**Changes are additive tests plus one small scoped production fix, no new
+dependencies.** The production change is the C5 zero-byte-art skip in
+`flac.rs::synthesize_layout` (a degenerate empty picture must not brick a track).
+**The byte-identity invariant is untouched** — no change in 3a touches the
+positioned audio reads, only whether an empty metadata-block is emitted. (Phase 2
+needed one named constant; 3a needs the zero-byte-art skip.)
 
 This is the first slice of Phase 3 (Format-layer coverage & mutants, non-Ogg),
 which is decomposed into per-format sub-phases: **3a FLAC** (this doc), 3b MP3,
@@ -212,33 +212,33 @@ matching the existing property) since each case does DB + file I/O.
 Non-FLAC formats are deferred to 3b/3c/3d (their fixtures don't exist in
 `musefs-core/tests/common` yet); 3a does not add `write_mp3/mp4/wav`.
 
-### C5 — Finding #16: zero-byte embedded art
+### C5 — Finding #16: zero-byte embedded art (skip at synthesis)
 
-Extend `musefs-format/tests/synthesize_art.rs`: synthesize a picture with
-`data_len == 0` and assert the boundary behavior. Pins the `data_len == 0` edge
-that the survivor bounds (`parse_picture_block:261`, the `data_end > body.len()`
-guard) depend on.
+**Verified behavior (not an assumption).** Today `synthesize_layout` builds
+`Segment::ArtImage { len: 0 }` for zero-byte art, which `RegionLayout::validate`
+(`layout.rs:102`, `EmptySegment`) rejects → `synthesize_layout` returns
+`Err(FormatError::InvalidLayout)`. Ingestion (`scan.rs:162`) only filters art
+*above* `MAX_ART_BYTES`, so a source file with an empty PICTURE block is ingested
+and then makes the **whole track unreadable** at serve time. That is a real
+robustness gap.
 
-**Unverified assumption + contingency (verify-don't-trust).** The spec *expects*
-zero-length art to be a valid zero-length PICTURE block: `ArtImage { len: 0 }`, the
-layout round-trips, and `metaflac` reads a picture with empty `data`. This is
-**not yet verified** — `metaflac` might reject empty picture data, or
-`picture_body_framing` / `synthesize_layout` might have an off-by-one at
-`data_len == 0`. The plan's **first C5 step is a verification spike** (write the
-test, observe actual behavior) with two branches:
+**Resolution (chosen): skip zero-byte art at FLAC synthesis.** `synthesize_layout`
+filters arts with `data_len == 0` **before** computing `num_blocks`/`last_index`
+(so the FLAC `is_last` flag lands on the true final block) and `continue`s past them
+in the emit loop. The track then serves normally without the empty picture. This is
+a small, scoped production change in `musefs-format/src/flac.rs`; **byte-identity is
+unaffected** — it only decides whether an empty PICTURE metadata block is emitted,
+never the positioned audio reads.
 
-- **Assumption holds:** assert the round-trip + `metaflac` empty-data read. Pure
-  test addition, no production change — the "tests-only" claim stands.
-- **Assumption fails (production bug surfaced):** this is a real defect, not a test
-  artifact. Fix it as a **scoped production change** to the framing/guard logic in
-  `flac.rs` (e.g. the length-field emit or the `data_end` bound) and document the
-  exception to "tests-only" in the inventory. **The byte-identity invariant is
-  unaffected either way** — the fix touches metadata-block framing, never the
-  positioned audio reads. If the correct behavior turns out to be *rejecting*
-  zero-byte art (`Err(...)`), the test asserts that error instead, and ingestion's
-  art handling is noted as the enforcement point.
+`musefs-format/tests/synthesize_art.rs` asserts: zero-byte art → no `ArtImage`
+segment, the layout is valid and round-trips, and `metaflac` reads **zero** pictures;
+plus a mixed case (empty + real art) confirming the surviving PICTURE block keeps its
+last-block flag.
 
-Either branch is acceptable; the spike decides which, and 3a records the outcome.
+**Cross-cutting follow-up (noted, not done in 3a):** the same degenerate-art skip
+applies to mp3/mp4/ogg/wav synthesis — handle it in each format's sub-phase, or
+filter empty art once at ingestion (`scan.rs`, add `&& !p.data.is_empty()`). 3a
+fixes FLAC and records the follow-up.
 
 ### C6 — inventory + tracking docs
 
@@ -273,5 +273,5 @@ Malformed, TooLarge}` mappings on crafted inputs; nothing in production changes.
 | C2 | listed `read_vorbis_comments`/`parse_picture_block`/`read_pictures` mutations hand-apply red; `| → ^` rows recorded equivalent |
 | C3 | boundary test at `0x00FF_FFFF` passes; `> → >=` hand-apply red |
 | C4 | `cargo test -p musefs-core proptest_read_fidelity` green; the three named properties (`read_at_partial_windows_match_whole`, `read_at_windows_spanning_header_seam`, `read_at_art_window_serves_blob`) pass with the art fixture |
-| C5 | spike resolved and outcome recorded: either the zero-byte-art round-trip + `metaflac` empty-data read passes (tests-only), or the scoped framing/guard fix lands with the test asserting the corrected behavior |
+| C5 | `synthesize_layout` skips zero-byte art; the synthesize_art tests assert no `ArtImage` segment, valid round-trip, `metaflac` reads 0 pictures, and the mixed empty+real case keeps the last-block flag; existing non-empty-art tests still pass |
 | Whole | `cargo test --workspace` + `--features fuzzing` + `clippy -D warnings` + `fmt --check` green; next full mutants campaign shows `flac.rs` survivors dropped (excluding documented equivalents) |
