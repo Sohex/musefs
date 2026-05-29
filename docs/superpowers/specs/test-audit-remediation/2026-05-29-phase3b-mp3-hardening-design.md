@@ -71,9 +71,9 @@ The 70 survivors cluster by function (line numbers approximate — locate by con
 | `push_frame_header` | `data_len > 0x0FFF_FFFF` TooLarge guard | boundary test at exactly `0x0FFF_FFFF` (kills `>→==`/`>=`) |
 | `is_id3_text_frame_id` | whole-fn, `key != "TXXX"`, `is_upper \|\| is_digit` | `"TPE1"`→true, `"TXXX"`→false, digit case kills the `\|\|→&&` |
 | `build_id3v2_segments` | `is_id3_text_frame_id` match guard; total-tag `> 0x0FFF_FFFF` guard | assert a `TPE1` tag emits a `TPE1` frame (not `TXXX`); total-tag boundary test |
-| `id3v2_alloc_safe` | **~45 survivors** — see its own section below | per-branch crafted ID3v2 headers |
+| `id3v2_alloc_safe` | **49 survivors** — see its own section below | per-branch crafted ID3v2 headers |
 
-### `id3v2_alloc_safe` — the dominant validator (~45 survivors)
+### `id3v2_alloc_safe` — the dominant validator (49 survivors)
 
 A `bool` guard that rejects ID3v2 tags whose declared sizes could OOM the `id3`
 crate. Survivors span every branch; each needs a crafted fixture asserting the
@@ -104,10 +104,16 @@ duplicate.
 
 **Per-site `| →` analysis — the key verify-don't-trust result for MP3:**
 
-- **Disjoint-bitfield ORs are equivalent under `| → ^` (and `| → +`).** Operands
-  occupy non-overlapping bit ranges, so the result is identical:
-  - `synchsafe_decode`'s four 7-bit groups (the three joining `|`).
-  - `id3v2_alloc_safe`'s v2.2 24-bit frame-size decode `(d3<<16)|(d4<<8)|d5`.
+- **Disjoint-bitfield ORs are equivalent under `| → ^` (and `| → +`) ONLY** — *not*
+  under `| → &`. Operands occupy non-overlapping bit ranges, so `^`/`+` give an
+  identical result, but `&` of disjoint ranges is `0`, which changes the value and
+  **is killable**. Sites:
+  - `synchsafe_decode`'s four 7-bit groups (the three joining `|`): `|→^`/`|→+`
+    equivalent, `|→&` killable.
+  - `id3v2_alloc_safe`'s v2.2 24-bit frame-size decode `(d3<<16)|(d4<<8)|d5` (the
+    `:325`/`:326` sites): `|→^` equivalent, but **`|→&` is killable** —
+    `(d3<<16) & (d4<<8) = 0` zeroes the decoded size and flips a frame-bounds
+    accept/reject. Do **not** record these `|→&` as equivalent.
 - **Whole-byte OR-chains are NOT equivalent** — `| → ^` and `| → &` are **killable**:
   - `id3v2_alloc_safe`'s synchsafe high-bit checks
     `data[6]|data[7]|data[8]|data[9] >= 0x80` and the v2.4
@@ -142,6 +148,14 @@ digit) kills the `||→&&`, a non-`T`/non-4-char key→false. `build_id3v2_segme
 assert a `TPE1` tag produces a `TPE1` frame (kills the match-guard); total-tag
 boundary at `0x0FFF_FFFF`.
 
+**Relation to `proptest_mp3.rs`:** the existing `mp3_synthesis_preserves_audio`
+proptest drives random tag keys (`[A-Z]{1,12}`, **no digits**) through
+`synthesize_layout` and asserts only the audio-coverage invariant — it neither
+exercises a digit-bearing frame id (so it cannot reach the `||→&&` case) nor
+asserts frame-id *classification* (TPE1-vs-TXXX). C3's targeted in-module kills are
+therefore complementary, not redundant; the proptest does **not** need broadening
+for 3b (it guards a different, byte-identity invariant). Leave it unchanged.
+
 ### C4 — `id3v2_alloc_safe` (the validator)
 
 A suite of crafted ID3v2 headers, one assertion per branch boundary (see its
@@ -153,15 +167,34 @@ the `data_start`/`size`/`pos`/`tag_end` bounds.
 
 ### C5 — inventory + tracking docs
 
-Annotate the `mp3.rs` rows (`killed (phase 3b)` / `equivalent`) and mark Phase 3b
-complete in the tracking doc, recording the equivalent set (disjoint-shift `|→^`/`+`
-in `synchsafe_decode` and the v2.2 decode) and any production fix that the
-contingency forced.
+Annotate the `mp3.rs` rows in
+`docs/superpowers/specs/test-audit-remediation/2026-05-29-mutation-inventory.md`
+(`missed → **killed** (phase 3b)` / `missed → **equivalent**`, matching the Phase 2
+convention), and mark Phase 3b complete in
+`docs/superpowers/specs/test-audit-remediation/2026-05-29-remediation-tracking.md`
+(Status line + Phase 3 section). Record the equivalent set (the disjoint-shift
+`|→^`/`|→+` in `synchsafe_decode` and the v2.2 24-bit decode) and any production fix
+the contingency forced.
+
+## Test budget (for chunking the plan)
+
+Rough new-test counts so the plan can split work into bite-sized tasks:
+
+- C1 synchsafe codec: ~4–6 tests.
+- C2 `locate_audio`: ~5–6 tests.
+- C3 frame helpers (`push_frame_header`, `is_id3_text_frame_id`, `build_id3v2_segments`): ~5–6 tests.
+- C4 `id3v2_alloc_safe`: ~20–30 tests (≈ one per branch boundary; several branches
+  share a base fixture mutated minimally). **The plan should split C4 into multiple
+  tasks** grouped by region — header gate, high-bit checks, per-version size decode,
+  `CHAP`/`CTOC`, bounds/walk — rather than one monolithic task.
+
+Total ≈ 35–50 new tests.
 
 ## Implementation ordering
 
-C1 → C2 → C3 → C4 (the large validator suite) → C5. C1–C4 are independent; do C4
-last because it is the biggest and reuses fixture idioms from C1–C3.
+C1 → C2 → C3 → C4 (the large validator suite, itself split into per-region tasks)
+→ C5. C1–C4 are independent; do C4 last because it is the biggest and reuses
+fixture idioms from C1–C3.
 
 ## Error handling
 
@@ -177,5 +210,5 @@ stays within `mp3.rs` framing/validation (never the audio reads).
 | C1 | `cargo test -p musefs-format --features fuzzing mp3` green; `<<`/`>>`/`|→&` hand-apply red; disjoint `|→^`/`+` stay green (equivalent) |
 | C2 | `locate_audio` `&&`/`||`/`+=`/`+` mutations hand-apply red |
 | C3 | `push_frame_header` + total-tag boundary tests red under `>→==`/`>=`; `is_id3_text_frame_id` + match-guard kills red |
-| C4 | per-branch `id3v2_alloc_safe` fixtures; whole-byte high-bit `|→^`/`|→&` hand-apply red; v2.2 disjoint `|→^` recorded equivalent; all bound mutations red |
+| C4 | per-branch `id3v2_alloc_safe` fixtures; whole-byte high-bit `|→^`/`|→&` hand-apply red; v2.2 disjoint-decode `|→^` recorded equivalent **but its `|→&` hand-apply red** (AND-of-disjoint = 0); all bound mutations red |
 | Whole | `cargo test --workspace` + `--features fuzzing` + `clippy -D warnings` + `fmt --check` green; next full mutants campaign shows `mp3.rs` survivors dropped (excluding documented equivalents) |
