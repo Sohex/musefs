@@ -81,8 +81,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
-      - name: Install libfuse3
-        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+      - name: Install FUSE and ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config ffmpeg
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
       - name: FUSE end-to-end tests

@@ -32,9 +32,62 @@ _RELEASE = REPO_ROOT / "target" / "release" / "musefs"
 MUSEFS = str(_DEBUG if _DEBUG.exists() else _RELEASE)
 BEET = os.path.join(os.path.dirname(sys.executable), "beet")
 
+PLAYBACK_FORMATS = [
+    {
+        "filename": "a.flac",
+        "freq": 330,
+        "title": "PCM FLAC",
+        "query": "title:PCM FLAC",
+        "served_ext": "flac",
+    },
+    {
+        "filename": "b.mp3",
+        "freq": 440,
+        "title": "PCM MP3",
+        "query": "title:PCM MP3",
+        "served_ext": "mp3",
+    },
+    {
+        "filename": "c.m4a",
+        "freq": 550,
+        "title": "PCM M4A",
+        "query": "title:PCM M4A",
+        "served_ext": "m4a",
+    },
+    {
+        "filename": "d.opus",
+        "freq": 660,
+        "title": "PCM Opus",
+        "query": "title:PCM Opus",
+        "served_ext": "opus",
+    },
+    {
+        "filename": "e.ogg",
+        "freq": 770,
+        "title": "PCM Vorbis",
+        "query": "title:PCM Vorbis",
+        "served_ext": "vorbis",
+    },
+    {
+        "filename": "f.oga",
+        "freq": 880,
+        "title": "PCM OggFLAC",
+        "query": "title:PCM OggFLAC",
+        "served_ext": "oggflac",
+    },
+    {
+        "filename": "g.wav",
+        "freq": 990,
+        "title": "PCM WAV",
+        "query": "title:PCM WAV",
+        "served_ext": "wav",
+    },
+]
+
 
 @pytest.fixture(autouse=True)
 def _require_tools():
+    """Skip the test when required external tools are missing."""
     if not (_DEBUG.exists() or _RELEASE.exists()):
         pytest.skip(f"musefs binary not built (looked in {_DEBUG}, {_RELEASE})")
     if not (os.path.exists("/dev/fuse") and shutil.which("fusermount")):
@@ -49,6 +102,7 @@ def _require_tools():
 
 
 def _ffmpeg_gen(path, freq, **tags):
+    """Generate an audio fixture with ffmpeg using codec-specific args."""
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -60,10 +114,21 @@ def _ffmpeg_gen(path, freq, **tags):
         "-i",
         f"sine=frequency={freq}:duration=1",
     ]
-    if str(path).endswith(".mp3"):
+    suffix = str(path).lower()
+    if suffix.endswith(".flac"):
+        cmd += ["-c:a", "flac"]
+    elif suffix.endswith(".mp3"):
         cmd += ["-c:a", "libmp3lame", "-q:a", "5"]
-    elif str(path).endswith(".m4a"):
+    elif suffix.endswith(".m4a"):
         cmd += ["-c:a", "aac", "-b:a", "64k"]
+    elif suffix.endswith(".opus"):
+        cmd += ["-c:a", "libopus"]
+    elif suffix.endswith(".ogg"):
+        cmd += ["-c:a", "libvorbis"]
+    elif suffix.endswith(".oga"):
+        cmd += ["-c:a", "flac", "-f", "ogg"]
+    elif suffix.endswith(".wav"):
+        cmd += ["-c:a", "pcm_s16le"]
     for key, value in tags.items():
         cmd += ["-metadata", f"{key}={value}"]
     cmd.append(str(path))
@@ -71,14 +136,16 @@ def _ffmpeg_gen(path, freq, **tags):
 
 
 def _env(tmp_path):
+    """Return a copy of os.environ with BEETSDIR isolated to tmp_path."""
     env = dict(os.environ)
     env["BEETSDIR"] = str(tmp_path)  # isolate from any real beets config
     return env
 
 
 def _write_config(tmp_path, library, db, fetchart=False):
+    """Write a beets config.yaml pointing at the musefs plugin."""
     plugins_block = ("plugins:\n  - musefs\n  - fetchart\n") if fetchart else "plugins: musefs\n"
-    fetchart_block = ("fetchart:\n  auto: yes\n  sources: filesystem\n") if fetchart else ""
+    fetchart_block = ("fetchart:\n  auto: yes\n  sources:\n    - filesystem\n") if fetchart else ""
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         f"directory: {library}\n"
@@ -98,6 +165,7 @@ def _write_config(tmp_path, library, db, fetchart=False):
 
 
 def _beet(cfg, env, *args):
+    """Run a beet subcommand and return stdout, raising on failure."""
     result = subprocess.run([BEET, "-c", str(cfg), *args], capture_output=True, env=env)
     if result.returncode != 0:
         raise AssertionError(
@@ -129,6 +197,34 @@ def _audio_md5(path):
         capture_output=True,
     ).stdout.decode()
     return out.strip()
+
+
+def _audio_sha256(path):
+    """SHA-256 of canonical decoded PCM used by the all-format playback E2E."""
+    out = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:a:0",
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    return hashlib.sha256(out).hexdigest()
 
 
 def _make_cover(path, color):
@@ -223,6 +319,7 @@ def _check_mount_art(cfg, env, mnt, expected_cover_sha):
 
 @contextmanager
 def _mounted(mnt, db, template):
+    """Context manager that mounts via musefs and unmounts on exit."""
     proc = subprocess.Popen(
         [MUSEFS, "mount", str(mnt), "--db", str(db), "--template", template],
         stdout=subprocess.PIPE,
@@ -299,13 +396,52 @@ def _imported_library(tmp_path, *, embed_cover=None, external_cover=None):
 
     cfg = _write_config(tmp_path, library, db, fetchart=external_cover is not None)
     _beet(cfg, env, "import", "-A", "-q", str(src))
+
+    if external_cover is not None:
+        album_dir = library / "Test AA" / "Orig Album"
+        (album_dir / "cover.jpg").write_bytes(external_cover)
+        _beet(cfg, env, "fetchart", "-f")
+
     return cfg, env, db, mnt, library
+
+
+def _imported_playback_library(tmp_path):
+    """Generate all supported playback formats and import them into beets."""
+    src = tmp_path / "src"
+    library = tmp_path / "library"
+    mnt = tmp_path / "mnt"
+    for d in (src, library, mnt):
+        d.mkdir()
+    db = tmp_path / "musefs.db"
+    env = _env(tmp_path)
+
+    for spec in PLAYBACK_FORMATS:
+        _ffmpeg_gen(
+            src / spec["filename"],
+            spec["freq"],
+            title=spec["title"],
+            artist="PCM Artist",
+            album="PCM Album",
+            album_artist="PCM Album Artist",
+        )
+
+    cfg = _write_config(tmp_path, library, db)
+    _beet(cfg, env, "import", "-A", "-q", str(src))
+
+    imported = []
+    for spec in PLAYBACK_FORMATS:
+        paths = _beet(cfg, env, "ls", "-p", spec["query"]).splitlines()
+        if len(paths) == 1:
+            imported.append(spec)
+    assert imported, "no playback formats were imported successfully"
+    return cfg, env, db, mnt, imported
 
 
 # --- tests -----------------------------------------------------------------
 
 
 def test_e2e_import_retag_mount_playback(tmp_path):
+    """Retag in beets, mount, verify tags and audio."""
     cfg, env, db, mnt, library = _imported_library(tmp_path)
 
     # Retag in the beets DB only (no file write, no move) so the divergence is
@@ -387,6 +523,7 @@ def test_e2e_import_retag_mount_playback(tmp_path):
 
 
 def test_e2e_move_reconcile(tmp_path):
+    """Rename via beets modify, verify mount reflects the move."""
     cfg, env, db, mnt, library = _imported_library(tmp_path)
     _beet(cfg, env, "musefs")  # initial sync (original tags)
 
@@ -407,7 +544,33 @@ def test_e2e_move_reconcile(tmp_path):
         assert _audio_md5(new) == _audio_md5(flac_backing)
 
 
+def test_e2e_all_formats_pcm_sha_playback(tmp_path):
+    """Verify all formats decode to same PCM SHA."""
+    cfg, env, db, mnt, imported = _imported_playback_library(tmp_path)
+    _beet(cfg, env, "musefs")
+
+    with _mounted(mnt, db, "$albumartist/$album/$title"):
+        for spec in imported:
+            mounted = (
+                mnt / "PCM Album Artist" / "PCM Album" / f"{spec['title']}.{spec['served_ext']}"
+            )
+            assert mounted.exists(), sorted(str(p.relative_to(mnt)) for p in mnt.rglob("*"))
+
+            tags = mutagen.File(str(mounted), easy=True)
+            assert tags is not None, f"mutagen could not open {mounted}"
+            assert tags["title"] == [spec["title"]]
+
+            backing_paths = _beet(cfg, env, "ls", "-p", spec["query"]).splitlines()
+            assert backing_paths, f"no beets backing path for {spec['query']}"
+            assert len(backing_paths) == 1, (
+                f"expected one beets backing path for {spec['query']}, got {backing_paths!r}"
+            )
+            backing = backing_paths[0]
+            assert _audio_sha256(mounted) == _audio_sha256(backing)
+
+
 def test_e2e_art_embedded_via_scan(tmp_path):
+    """Verify embedded art survives scan and mount."""
     cover = _make_cover(tmp_path / "embed.png", "red")
     cfg, env, db, mnt, _ = _imported_library(tmp_path, embed_cover=cover)
     _beet(cfg, env, "musefs")  # autoscan ingests the embedded pictures
@@ -416,6 +579,7 @@ def test_e2e_art_embedded_via_scan(tmp_path):
 
 
 def test_e2e_art_external_via_plugin(tmp_path):
+    """Verify external cover.jpg is synced via plugin."""
     cover = _make_cover(tmp_path / "ext.jpg", "green")
     cfg, env, db, mnt, _ = _imported_library(tmp_path, external_cover=cover)
     _beet(cfg, env, "musefs")  # plugin syncs album.artpath into track_art
@@ -424,6 +588,7 @@ def test_e2e_art_external_via_plugin(tmp_path):
 
 
 def test_e2e_art_precedence_beets_wins(tmp_path):
+    """Verify beets art wins over embedded art."""
     embedded = _make_cover(tmp_path / "embed.png", "red")
     external = _make_cover(tmp_path / "ext.jpg", "blue")
     embedded_sha = hashlib.sha256(embedded).hexdigest()

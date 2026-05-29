@@ -107,7 +107,7 @@ class MusefsPlugin(BeetsPlugin):
             if self._autoscan():
                 self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
             self._sync(db_path, items)
-            self._prune_missing(db_path, items=items)
+            self._prune_missing(db_path)
         except ui.UserError as exc:
             self._log.warning("musefs: {}", exc)
 

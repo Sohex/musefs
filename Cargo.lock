@@ -804,6 +804,7 @@ dependencies = [
  "musefs-db",
  "musefs-format",
  "ogg",
+ "sha2",
  "tempfile",
  "threadpool",
 ]
