@@ -80,4 +80,58 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn b64_window_fields_are_exact_at_group_boundaries() {
+        // out_offset and take chosen so the -1 and /4 in g1 are observable.
+        // g0 = out_offset/4, g1 = (out_offset+take-1)/4,
+        // in_start = g0*3, in_end = min((g1+1)*3, img_total), skip = out_offset - g0*4.
+        let img_total = 1024u64;
+
+        // take=1 at offset 0: g1 = 0 (with -1). The +1 mutant gives g1=0 too here,
+        // so choose offset 3 take=1: g0=0,g1=0 vs +1 mutant g1=1 -> in_len differs.
+        let w = b64_window(3, 1, img_total);
+        assert_eq!(
+            w,
+            B64Window {
+                in_start: 0,
+                in_len: 3,
+                skip: 3
+            }
+        );
+
+        // take exactly fills group 0 (offset 0, take 4): g1=0; mutant take+1 -> g1=1.
+        let w = b64_window(0, 4, img_total);
+        assert_eq!(
+            w,
+            B64Window {
+                in_start: 0,
+                in_len: 3,
+                skip: 0
+            }
+        );
+
+        // offset 4 take 4 -> g0=1,g1=1 -> in_start=3,in_len=3,skip=0; /4->*4 mutant
+        // makes g1 huge -> in_len clamps to img_total-3 (differs).
+        let w = b64_window(4, 4, img_total);
+        assert_eq!(
+            w,
+            B64Window {
+                in_start: 3,
+                in_len: 3,
+                skip: 0
+            }
+        );
+
+        // Window spanning two groups: offset 2 take 6 -> g0=0,g1=1 -> in 0..6.
+        let w = b64_window(2, 6, img_total);
+        assert_eq!(
+            w,
+            B64Window {
+                in_start: 0,
+                in_len: 6,
+                skip: 2
+            }
+        );
+    }
 }

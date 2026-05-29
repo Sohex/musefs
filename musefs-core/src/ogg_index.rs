@@ -128,15 +128,35 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn build_index_errors_when_audio_length_is_not_on_a_page_boundary() {
+        // One 300-byte packet -> one page of total_len T. Passing audio_length = T-5
+        // makes the loop read the whole page (consumed = T) then exit with
+        // consumed != audio_length.
+        let (bytes, _) = lace_packet_pub(0xABCD, 0, false, 0, &vec![7u8; 300]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.ogg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let short = bytes.len() as u64 - 5;
+        let err = build_index(&path, 0, short, 0);
+        assert!(
+            err.is_err(),
+            "expected Err on non-page-boundary audio_length"
+        );
+    }
+
+    #[test]
     fn build_index_renumbers_and_preserves_payload_length() {
-        // Two audio pages at seq 5 and 6; shift by +2 => 7 and 8.
+        use musefs_format::ogg::{parse_page, PageHeader};
+        const FLAG_CONTINUED: u8 = 0x01; // not re-exported from musefs_format::ogg
         let (mut bytes, _) = lace_packet_pub(0xABCD, 5, false, 100, &vec![1u8; 300]);
         let (b2, _) = lace_packet_pub(0xABCD, 6, false, 200, &vec![2u8; 70_000]);
         bytes.extend_from_slice(&b2);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audio.ogg");
-        // Prefix 16 bytes of "header" so audio_offset is non-zero.
         let mut file_bytes = vec![0u8; 16];
         file_bytes.extend_from_slice(&bytes);
         std::fs::File::create(&path)
@@ -146,11 +166,327 @@ mod tests {
 
         let idx = build_index(&path, 16, bytes.len() as u64, 2).unwrap();
         assert_eq!(idx.pages.len(), 3); // 1 small page + 2 from the big packet
-        assert_eq!(idx.pages[0].region_offset, 0);
-        // Reconstruct page 0 and confirm its seq shifted to 7.
-        let mut full = idx.pages[0].header.clone();
-        full.extend(std::iter::repeat_n(1u8, idx.pages[0].payload_len as usize));
-        let h = parse_page(&full, 0).unwrap();
-        assert_eq!(h.seq, 7);
+
+        // Contiguous region offsets summing to audio_length.
+        let mut expected_off = 0u64;
+        for p in &idx.pages {
+            assert_eq!(p.region_offset, expected_off);
+            expected_off += p.header.len() as u64 + p.payload_len;
+        }
+        assert_eq!(expected_off, bytes.len() as u64);
+
+        // Parse each patched header (append its payload so parse sees a full page),
+        // assert seq renumbering, payload_len match, and a self-consistent CRC.
+        let mut prev_seq: Option<u32> = None;
+        for (i, p) in idx.pages.iter().enumerate() {
+            let mut full = p.header.clone();
+            full.extend(std::iter::repeat_n(0u8, p.payload_len as usize));
+            let h: PageHeader = parse_page(&full, 0).unwrap();
+            assert_eq!(h.payload_len as u64, p.payload_len);
+            // seqs are old+2 and strictly increasing: page 0 -> 7, pages 1&2 -> 8,9.
+            if let Some(prev) = prev_seq {
+                assert_eq!(h.seq, prev + 1);
+            } else {
+                assert_eq!(h.seq, 7);
+            }
+            prev_seq = Some(h.seq);
+            // The continuation page of the big packet carries FLAG_CONTINUED.
+            if i == 2 {
+                assert_eq!(h.header_type & FLAG_CONTINUED, FLAG_CONTINUED);
+            }
+        }
+    }
+
+    use std::os::unix::fs::FileExt;
+
+    /// A backing file: 16-byte prefix, then a 300-byte packet (seq 5) and a
+    /// 70_000-byte packet (seq 6, spans 2 pages). Returns the index built with
+    /// seq_delta=+2, an open backing handle, the audio_offset, and the total
+    /// served length of the whole audio region.
+    fn serve_fixture() -> (tempfile::TempDir, OggPageIndex, std::fs::File, u64, u64) {
+        let (mut bytes, _) = lace_packet_pub(0xABCD, 5, false, 100, &vec![1u8; 300]);
+        let (b2, _) = lace_packet_pub(0xABCD, 6, false, 200, &vec![2u8; 70_000]);
+        bytes.extend_from_slice(&b2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audio.ogg");
+        let mut file_bytes = vec![0u8; 16];
+        file_bytes.extend_from_slice(&bytes);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&file_bytes)
+            .unwrap();
+        let audio_offset = 16u64;
+        let idx = build_index(&path, audio_offset, bytes.len() as u64, 2).unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        let total: u64 = idx
+            .pages
+            .iter()
+            .map(|p| p.header.len() as u64 + p.payload_len)
+            .sum();
+        (dir, idx, backing, audio_offset, total)
+    }
+
+    /// Independent reference: the full served region is, for every page, its
+    /// patched header followed by its payload read verbatim from the backing file.
+    fn reference_region(idx: &OggPageIndex, backing: &std::fs::File, audio_offset: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        for p in &idx.pages {
+            out.extend_from_slice(&p.header);
+            let mut buf = vec![0u8; p.payload_len as usize];
+            backing
+                .read_exact_at(
+                    &mut buf,
+                    audio_offset + p.region_offset + p.header.len() as u64,
+                )
+                .unwrap();
+            out.extend_from_slice(&buf);
+        }
+        out
+    }
+
+    fn serve_range(
+        idx: &OggPageIndex,
+        backing: &std::fs::File,
+        audio_offset: u64,
+        a: u64,
+        b: u64,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        serve(idx, backing, audio_offset, a, b, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn serve_whole_region_matches_reference() {
+        let (_d, idx, backing, ao, total) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        assert_eq!(want.len() as u64, total);
+        assert_eq!(serve_range(&idx, &backing, ao, 0, total), want);
+    }
+
+    #[test]
+    fn serve_header_only_read() {
+        let (_d, idx, backing, ao, _t) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        let hlen = idx.pages[0].header.len() as u64;
+        // First 10 bytes of page 0's header.
+        assert_eq!(serve_range(&idx, &backing, ao, 0, 10), want[0..10]);
+        // The whole of page 0's header, exactly.
+        assert_eq!(
+            serve_range(&idx, &backing, ao, 0, hlen),
+            want[0..hlen as usize]
+        );
+    }
+
+    #[test]
+    fn serve_payload_only_read_starting_mid_payload() {
+        // Kills ogg_index.rs:117 (the + -> - on the backing read offset): the read
+        // starts 10 bytes INTO page 0's payload, so `within` = 10 != 0 and the sign
+        // of the offset term is observable.
+        let (_d, idx, backing, ao, _t) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        let hlen = idx.pages[0].header.len() as u64;
+        let start = hlen + 10;
+        let end = hlen + 60;
+        assert_eq!(
+            serve_range(&idx, &backing, ao, start, end),
+            want[start as usize..end as usize]
+        );
+    }
+
+    #[test]
+    fn serve_spanning_header_and_payload() {
+        let (_d, idx, backing, ao, _t) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        let hlen = idx.pages[0].header.len() as u64;
+        let r = (hlen - 5)..(hlen + 20);
+        assert_eq!(
+            serve_range(&idx, &backing, ao, r.start, r.end),
+            want[r.start as usize..r.end as usize]
+        );
+    }
+
+    #[test]
+    fn serve_crossing_page_boundary() {
+        let (_d, idx, backing, ao, _t) = serve_fixture();
+        let want = reference_region(&idx, &backing, ao);
+        // End of page 0 region into the start of page 1.
+        let p0_end = idx.pages[0].header.len() as u64 + idx.pages[0].payload_len;
+        let r = (p0_end - 30)..(p0_end + 40);
+        assert_eq!(
+            serve_range(&idx, &backing, ao, r.start, r.end),
+            want[r.start as usize..r.end as usize]
+        );
+    }
+
+    #[test]
+    fn serve_empty_and_past_end_reads() {
+        let (_d, idx, backing, ao, total) = serve_fixture();
+        // Empty range.
+        assert!(serve_range(&idx, &backing, ao, 100, 100).is_empty());
+        // Entirely past the last page.
+        assert!(serve_range(&idx, &backing, ao, total, total + 50).is_empty());
+        // rend past the region end clamps to what exists.
+        let want = reference_region(&idx, &backing, ao);
+        assert_eq!(
+            serve_range(&idx, &backing, ao, total - 25, total + 1000),
+            want[(total - 25) as usize..]
+        );
+    }
+
+    /// CRC-32/Ogg: poly 0x04C11DB7, init 0, no reflection, no xorout. Independent
+    /// of musefs-format::ogg::crc (different table, from the `crc` crate).
+    const CRC_32_OGG: crc::Algorithm<u32> = crc::Algorithm {
+        width: 32,
+        poly: 0x04c1_1db7,
+        init: 0x0000_0000,
+        refin: false,
+        refout: false,
+        xorout: 0x0000_0000,
+        check: 0x0000_0000,
+        residue: 0x0000_0000,
+    };
+
+    /// Assert `stream` is a clean single Ogg bitstream: the `ogg` crate reassembles
+    /// every packet without error (it validates page CRCs), and an independent CRC
+    /// (the `crc` crate) matches every page's stored CRC while seq numbers run
+    /// 0,1,2,... contiguously.
+    fn assert_clean_bitstream(stream: &[u8]) {
+        use musefs_format::ogg::parse_page;
+        // (a) third-party structural decode (validates CRC during reassembly).
+        let mut rdr = ogg::PacketReader::new(std::io::Cursor::new(stream.to_vec()));
+        let mut packets = 0usize;
+        while rdr.read_packet().expect("ogg decode error").is_some() {
+            packets += 1;
+        }
+        assert!(packets > 0, "no packets decoded");
+        // (b) independent per-page CRC + contiguous seq.
+        let alg = crc::Crc::<u32>::new(&CRC_32_OGG);
+        let mut pos = 0usize;
+        let mut expect_seq = 0u32;
+        while pos < stream.len() {
+            let h = parse_page(stream, pos).unwrap();
+            let mut page = stream[pos..pos + h.total_len()].to_vec();
+            page[22..26].copy_from_slice(&0u32.to_le_bytes());
+            assert_eq!(alg.checksum(&page), h.crc, "page CRC mismatch at {pos}");
+            assert_eq!(h.seq, expect_seq, "seq not contiguous at {pos}");
+            expect_seq += 1;
+            pos += h.total_len();
+        }
+    }
+
+    /// Materialize the synthesized header region (Inline segments only; these
+    /// fixtures embed no art) up to the OggAudio segment, returning
+    /// (header_bytes, audio_offset, audio_length, seq_delta).
+    fn materialize_header_and_audio_params(
+        layout: &musefs_format::RegionLayout,
+    ) -> (Vec<u8>, u64, u64, i64) {
+        use musefs_format::Segment;
+        let mut header = Vec::new();
+        let mut params = None;
+        for seg in &layout.segments {
+            match seg {
+                Segment::Inline(b) => header.extend_from_slice(b),
+                Segment::OggAudio {
+                    offset,
+                    len,
+                    seq_delta,
+                } => {
+                    params = Some((*offset, *len, *seq_delta));
+                }
+                other => panic!("unexpected segment in no-art header: {other:?}"),
+            }
+        }
+        let (offset, len, delta) = params.expect("OggAudio segment present");
+        (header, offset, len, delta)
+    }
+
+    /// Build a complete synthetic Ogg file: `header_packets` laced as header pages
+    /// (BOS on the first), then `audio_packets` laced as audio pages continuing the
+    /// sequence numbers, all sharing `serial`.
+    fn build_codec_file(serial: u32, header_packets: &[&[u8]], audio_packets: &[&[u8]]) -> Vec<u8> {
+        use musefs_format::ogg::page_test_support::{build_header_pub, lace_packet_pub};
+        let (mut bytes, header_pages) = build_header_pub(serial, header_packets);
+        let mut seq = header_pages;
+        for pkt in audio_packets {
+            let (b, used) = lace_packet_pub(serial, seq, false, 1000, pkt);
+            bytes.extend_from_slice(&b);
+            seq += used;
+        }
+        bytes
+    }
+
+    /// Run the full synth+serve pipeline for one file and assert the spliced stream
+    /// is a clean bitstream.
+    fn oracle_roundtrip(file: &[u8]) {
+        use musefs_format::ogg::{locate_audio, read_header, synthesize_layout};
+        let scan = locate_audio(file).unwrap();
+        let header = read_header(file).unwrap();
+        let layout =
+            synthesize_layout(&header, scan.audio_offset, scan.audio_length, &[], &[]).unwrap();
+        let (hdr, ao, alen, delta) = materialize_header_and_audio_params(&layout);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.ogg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(file)
+            .unwrap();
+        let idx = build_index(&path, ao, alen, delta).unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        let total: u64 = idx
+            .pages
+            .iter()
+            .map(|p| p.header.len() as u64 + p.payload_len)
+            .sum();
+        let mut audio = Vec::new();
+        serve(&idx, &backing, ao, 0, total, &mut audio).unwrap();
+
+        let mut full = hdr;
+        full.extend_from_slice(&audio);
+        assert_clean_bitstream(&full);
+    }
+
+    #[test]
+    fn oracle_opus_stream_is_clean_after_synth_and_serve() {
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".as_slice();
+        let tags = b"OpusTags\x06\x00\x00\x00musefs\x00\x00\x00\x00".as_slice();
+        let audio0 = vec![0xA1u8; 4000];
+        let audio1 = vec![0xA2u8; 80_000]; // spans pages -> exercises renumber across pages
+        let file = build_codec_file(0x1234, &[head, tags], &[&audio0, &audio1]);
+        oracle_roundtrip(&file);
+    }
+
+    #[test]
+    fn oracle_vorbis_stream_is_clean_after_synth_and_serve() {
+        // Vorbis: 3 header packets (id, comment, setup).
+        let id = b"\x01vorbis\x00\x00\x00\x00\x02\x44\xac\x00\x00\x00\x00\x00\x00\x00\xee\x02\x00\x00\x00\x00\x00\x01".as_slice();
+        let comment = b"\x03vorbis\x06\x00\x00\x00musefs\x00\x00\x00\x00\x01".as_slice();
+        let setup = b"\x05vorbis-setup-stub".as_slice();
+        let audio0 = vec![0xB1u8; 5000];
+        let file = build_codec_file(0x2222, &[id, comment, setup], &[&audio0]);
+        oracle_roundtrip(&file);
+    }
+
+    #[test]
+    fn oracle_oggflac_stream_is_clean_after_synth_and_serve() {
+        // OggFLAC packet 0: 0x7F"FLAC" major minor count(BE=1) "fLaC" + STREAMINFO
+        // header (type 0, len 34) + 34 bytes. One following packet: VORBIS_COMMENT.
+        let mut p0 = Vec::new();
+        p0.extend_from_slice(b"\x7FFLAC");
+        p0.extend_from_slice(&[1, 0]); // major, minor
+        p0.extend_from_slice(&1u16.to_be_bytes()); // 1 following packet
+        p0.extend_from_slice(b"fLaC");
+        p0.push(0); // STREAMINFO block type, not last
+        p0.extend_from_slice(&[0, 0, 34]); // 24-bit length = 34
+        p0.extend_from_slice(&[0u8; 34]);
+        let mut comment = Vec::new();
+        comment.push(0x84); // block type 4 (VORBIS_COMMENT), last-block bit set
+        let vc = b"\x06\x00\x00\x00musefs\x00\x00\x00\x00";
+        comment.extend_from_slice(&[0, 0, vc.len() as u8]);
+        comment.extend_from_slice(vc);
+        let audio0 = vec![0xC1u8; 6000];
+        let file = build_codec_file(0x3333, &[&p0, &comment], &[&audio0]);
+        oracle_roundtrip(&file);
     }
 }

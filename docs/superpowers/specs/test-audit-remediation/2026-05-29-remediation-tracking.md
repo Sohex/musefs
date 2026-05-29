@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); phases 2–4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); phases 3–4 pending
 
 ## Guiding principle: verify, don't trust
 
@@ -81,20 +81,22 @@ close the beets FK correctness gap (A2), and produce the data phases 2–4 consu
   (no `Default for Db`; `Ok(Default::default())` unviables).
 - **D. This tracking doc.**
 
-### Phase 2 — Ogg hardening  ⟶ STATUS: pending phase 1
+### Phase 2 — Ogg hardening  ⟶ STATUS: complete
 
-P1 + all Ogg-related P2 + Ogg mutant kills. Findings #1, #2, #3, #4, #7, #8, #14.
+P1 + all Ogg-related P2 + Ogg mutant kills. Findings #1, #2, #3, #4, #8, #14
+(#7 dropped — see below).
 
 - `serve()` unit tests incl. boundaries (#1, #8)
 - independent Ogg oracle materializing `Segment::OggAudio`, CRC-verifying across
   Opus/Vorbis/OggFLAC (#2)
 - `build_index` consume-mismatch error path (#3)
 - `build_index` CRC/continued-page assertions (#4)
-- CRC edge cases (#7)
-- EOS flag handling (#14)
+- CRC edge cases (#7) — **dropped**: `ogg/crc.rs` had 0 mutation survivors; no CRC
+  correctness work (see phase-2 design)
+- EOS preservation, reframed from "FLAG_EOS handling" (#14)
 - kill surviving `ogg/` + `ogg_index` mutants (from phase-1 inventory)
 
-### Phase 3 — Format-layer coverage & mutants (non-Ogg)  ⟶ STATUS: pending phase 1
+### Phase 3 — Format-layer coverage & mutants (non-Ogg)  ⟶ STATUS: pending
 
 Findings #5, #16.
 
@@ -103,7 +105,7 @@ Findings #5, #16.
 - zero-byte art boundary (#16)
 - kill flac/mp3/mp4/wav boundary + bitwise survivors (from phase-1 inventory)
 
-### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: pending phase 1
+### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: pending
 
 Findings #9, #10, #11, #12, #15.
 
@@ -125,7 +127,7 @@ Findings #9, #10, #11, #12, #15.
 | #4 build_index gaps | 2 | |
 | #5 proptest offset-0 | 3 | |
 | #6 beets FK parity | 1 | audit fix wrong — see Component A |
-| #7 CRC edge cases | 2 | |
+| #7 CRC edge cases | 2 | dropped — `ogg/crc.rs` 0 survivors (phase-2 design) |
 | #8 serve() boundaries | 2 | |
 | #9 probe fallbacks | 4 | |
 | #10 tracks.rs SQL | 4 | |
