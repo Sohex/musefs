@@ -24,10 +24,13 @@ pattern, below) and are not survivors.
 
 1. Trigger the campaign: GitHub → Actions → **Mutants** → **Run workflow**
    (`workflow_dispatch`), or wait for the Monday cron.
-2. Download the `mutants-<crate>` artifacts from the run.
+2. Download the artifacts: `mutants-musefs-db`, `mutants-musefs-core`, and the
+   four format shards `mutants-musefs-format-0..3` (format is split across four
+   `--shard k/4` matrix legs; each shard tests a disjoint subset).
 3. In each artifact the per-result lists live under `<crate>/mutants.out/`
    (cargo-mutants writes `caught.txt` / `missed.txt` / `unviable.txt` /
-   `timeout.txt`). The grouped tables below were produced from those files.
+   `timeout.txt`). Concatenate the four format shards' files before grouping.
+   The tables below were produced from those files.
 
 ## Tool limitations to revisit (phase 4)
 

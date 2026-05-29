@@ -83,7 +83,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [musefs-db, musefs-core, musefs-format]
+        # db and core are quick (~5m / ~16m). musefs-format alone ran ~2h as a
+        # single serial leg (75% of the whole campaign's wall-clock), so it is
+        # split into 4 shards (~30m each) via cargo-mutants --shard. Each shard
+        # is a disjoint subset of the format mutants; their survivor reports are
+        # concatenated when (re)building the inventory.
+        include:
+          - { crate: musefs-db, label: musefs-db }
+          - { crate: musefs-core, label: musefs-core }
+          - { crate: musefs-format, label: musefs-format-0, shard: 0/4 }
+          - { crate: musefs-format, label: musefs-format-1, shard: 1/4 }
+          - { crate: musefs-format, label: musefs-format-2, shard: 2/4 }
+          - { crate: musefs-format, label: musefs-format-3, shard: 3/4 }
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -97,11 +108,16 @@ jobs:
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).
         run: cargo install cargo-mutants
       - name: Run mutation campaign
+        # Empty for the db/core legs (no `shard` key) → MUTANTS_SHARD unset →
+        # whole crate. Set to "k/4" for the format shards.
+        env:
+          MUTANTS_SHARD: ${{ matrix.shard }}
         run: scripts/mutants.sh "${{ matrix.crate }}"
       - name: Upload survivor report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: mutants-${{ matrix.crate }}
+          # Per-shard artifact names (a slash in matrix.shard is illegal here).
+          name: mutants-${{ matrix.label }}
           path: mutants-out/${{ matrix.crate }}
           if-no-files-found: warn
