@@ -627,7 +627,10 @@ pub fn synthesize_layout(
         }
     }
 
-    let art = arts.first();
+    // Skip zero-byte art (mirrors flac.rs finding #16): an empty ArtImage segment
+    // fails layout validation (EmptySegment), making the track unreadable. Pick the
+    // first art with real bytes rather than merely the first art.
+    let art = arts.iter().find(|a| a.data_len > 0);
     let (udta_prefix, art_len) = build_udta(tags, art)?;
     let udta_total = udta_prefix.len() as u64 + art_len;
 
@@ -1162,6 +1165,73 @@ mod tests {
         assert!(matches!(segs[1], Segment::ArtImage { art_id: 7, len: 50 }));
         assert!(matches!(segs[2], Segment::Inline(_))); // mdat header
         assert!(matches!(segs.last().unwrap(), Segment::BackingAudio { .. }));
+    }
+
+    #[test]
+    fn synthesize_skips_zero_length_art() {
+        // A zero-byte art must be skipped at synthesis (mirrors flac.rs finding
+        // #16): an ArtImage { len: 0 } segment fails layout validation
+        // (EmptySegment), making the track unreadable. The track must still
+        // synthesize with its tags, just without a cover-art segment or covr box.
+        let buf = mk_mp4(false, b"AUDIODATA", &[0]);
+        let scan = read_structure(&buf).unwrap();
+        let art = ArtInput {
+            art_id: 7,
+            mime: "image/jpeg".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 0,
+        };
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
+        let segs = layout.segments();
+        assert!(
+            !segs.iter().any(|s| matches!(s, Segment::ArtImage { .. })),
+            "zero-byte art must not emit an ArtImage segment"
+        );
+        let Segment::Inline(head) = &segs[0] else {
+            panic!("first segment should be the inline head");
+        };
+        assert!(
+            head.windows(4).all(|w| w != b"covr"),
+            "no covr box should be emitted for zero-byte art"
+        );
+        assert!(matches!(segs.last().unwrap(), Segment::BackingAudio { .. }));
+    }
+
+    #[test]
+    fn synthesize_picks_first_nonempty_art() {
+        // With a zero-byte art ahead of a real one, the real art must still be
+        // served (the first nonempty art wins, not merely the first art).
+        let buf = mk_mp4(false, b"AUDIODATA", &[0]);
+        let scan = read_structure(&buf).unwrap();
+        let empty = ArtInput {
+            art_id: 1,
+            mime: "image/jpeg".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 0,
+        };
+        let real = ArtInput {
+            art_id: 9,
+            mime: "image/png".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: 40,
+        };
+        let layout =
+            synthesize_layout(&scan, &[TagInput::new("title", "T")], &[empty, real]).unwrap();
+        let segs = layout.segments();
+        assert!(
+            segs.iter()
+                .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len: 40 })),
+            "the first nonempty art must be served"
+        );
     }
 
     #[test]
