@@ -382,7 +382,7 @@ impl Musefs {
     pub fn expire_poll_debounce_for_test(&self) {
         let past = std::time::Instant::now()
             .checked_sub(self.poll_interval)
-            .unwrap_or_else(std::time::Instant::now);
+            .expect("poll_interval exceeds monotonic clock base; cannot backdate last_poll");
         *self
             .last_poll
             .lock()
