@@ -20,7 +20,7 @@ around what that one did *not* deliver. Reconciliation:
 
 | Area | Prior pass | Shipped? | Open here |
 |---|---|---|---|
-| Measurement harness | Phase 0 | `metrics.rs` + one micro-bench (`read_throughput`). No corpus generator, no tiers, no latency injection, no real-mount/concurrent benches. | **SP0** completes it |
+| Measurement harness | Phase 0 | `metrics.rs` (atomic counters + in-process per-syscall latency injection via `MUSEFS_FAULT_OPEN_US`/`STAT_US`/`PREAD_US` + `snapshot`/`reset`) + one micro-bench (`read_throughput`). No corpus generator, no tiers, **no FUSE-level injection** (so SQLite/write-durability latency is unmodelled and there is no fsync counter), no real-mount/concurrent benches. | **SP0** completes it |
 | Ingestion / scan | *not in scope* (serving-side only) | scan still `fs::read`s whole files; no transaction batching; single-threaded | **SP1** — largest untouched win |
 | Refresh | Phase 4 | batched query, debounce, off-thread rebuild, stable inodes — but still a **full** rebuild on any edit | **SP2** — changed-only rebuild |
 | Read/serve | Phases 1–3 | worker pool, per-handle fd, sharded *header* cache | **SP3** residuals: `handles` + `size_cache` are single `Mutex<HashMap>`; `read_segments` double-allocates backing audio |
