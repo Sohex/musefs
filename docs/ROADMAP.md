@@ -37,6 +37,16 @@ modifying or duplicating the original audio bytes.
   whose backing file is gone), and runs both as a `beet musefs` command and via
   import/write hooks. Verified end-to-end (beets import + retag + FUSE mount)
   with byte-identical audio.
+- **picard plugin** (`contrib/picard/`) — a MusicBrainz Picard plugin whose
+  "Sync to musefs" context-menu action pushes Picard's in-memory tags and front
+  cover into the SQLite store, keyed by each file's canonical path, without ever
+  saving (rewriting) the audio file. Picard has no pre-save hook, so the action
+  is the no-rewrite analog of `beet musefs`: it autoscans each selected file via
+  the `musefs` binary to create its row, then writes tags/art the live mount
+  surfaces with no remount. Shares the DB-contract logic and the realpath
+  path-matching gate with the beets plugin; the sync core is unit/integration
+  tested without a Picard install, with the GUI path covered by a documented
+  manual smoke test.
 - **M4A / M4B (MP4):** metadata synthesized by rebuilding the `moov` atom and
   patching `stco`/`co64` chunk offsets so the `mdat` audio is served
   byte-identically. Embedded art included.
@@ -132,9 +142,8 @@ boundary stays explicit; none are half-built in the codebase.
 
 ### Distribution / integration
 
-- **picard plugin as a shipped artifact** — the SQLite *contract* is a target
-  for picard too, but only the **beets** plugin ships today (see "Delivered
-  since v0.1.0"). A picard plugin is not yet built.
+- **picard plugin** — delivered (see "Delivered since v0.1.0"). Both the beets
+  and picard plugins now write the SQLite contract.
 
 ### Operations
 
