@@ -19,6 +19,11 @@ EXPECTED_USER_VERSION = 1
 # Mirror of musefs-core scan.rs MAX_ART_BYTES: 16 MiB minus 64 KiB headroom.
 MAX_ART_BYTES = 16 * 1024 * 1024 - 64 * 1024
 
+# Upper bound on a single-file `musefs scan` autoscan. A scan probes one file,
+# so this only fires on a genuine hang (e.g. a wedged binary or stuck DB lock);
+# without it a hung scan would block the Picard worker thread forever.
+SCAN_TIMEOUT_SECONDS = 120
+
 # Picard internal tag name -> musefs (Vorbis-lowercase) key. Picard's internal
 # names already match musefs keys, so this is mostly identity.
 DIRECT_FIELDS = {
@@ -299,15 +304,21 @@ def sync_one(conn, key, pairs, art, stats, *, dry_run=False):
 def run_scan(binary, db_path, target):
     """Run ``<binary> scan <target> --db <db_path>``. Creates the DB if absent
     and fills the structural columns the plugin can't compute. Raises
-    ``MusefsError`` on a missing binary or non-zero exit."""
+    ``MusefsError`` on a missing binary, a timeout, or a non-zero exit."""
     try:
         result = subprocess.run(
             [binary, "scan", target, "--db", db_path],
             capture_output=True,
+            timeout=SCAN_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         raise MusefsError(
             f"musefs binary '{binary}' not found; set the binary path in the musefs options"
+        )
+    except subprocess.TimeoutExpired:
+        raise MusefsError(
+            f"`{binary} scan` for {target} timed out after {SCAN_TIMEOUT_SECONDS}s; "
+            f"the scan may be stuck — check the binary and DB."
         )
     if result.returncode != 0:
         raise MusefsError(
