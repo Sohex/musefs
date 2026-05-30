@@ -477,12 +477,15 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
         )
         .unwrap();
     }
+    // A generous interval keeps the DB-mutation gap below reliably within the
+    // debounce window; the window is crossed via the test hook, not a sleep, so
+    // the assertions don't race wall-clock jitter on a loaded CI runner.
     let cfg = MountConfig {
-        poll_interval: std::time::Duration::from_millis(100),
+        poll_interval: std::time::Duration::from_secs(30),
         ..config()
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    fs.expire_poll_debounce_for_test();
     assert!(!fs.poll_refresh().unwrap());
     {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
@@ -506,7 +509,7 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
         !fs.poll_refresh().unwrap(),
         "unchanged poll should have reset the debounce window"
     );
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    fs.expire_poll_debounce_for_test();
     assert!(fs.poll_refresh().unwrap());
 }
 

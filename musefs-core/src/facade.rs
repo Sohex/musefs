@@ -376,6 +376,19 @@ impl Musefs {
         self.force_rebuild_error.store(fail, Ordering::Release);
     }
 
+    /// Backdates `last_poll` so the next `poll_refresh` is past the debounce
+    /// window, letting tests cross the window deterministically without sleeping.
+    #[doc(hidden)]
+    pub fn expire_poll_debounce_for_test(&self) {
+        let past = std::time::Instant::now()
+            .checked_sub(self.poll_interval)
+            .expect("poll_interval exceeds monotonic clock base; cannot backdate last_poll");
+        *self
+            .last_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = past;
+    }
+
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
         self.tree.load().lookup(parent, name)
     }
