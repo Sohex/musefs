@@ -157,6 +157,11 @@ Append to `musefs-core/tests/common_corpus_smoke.rs`:
 ```rust
 use common::corpus::{CorpusParams, Tier};
 
+/// Serializes tests that mutate process-global `MUSEFS_BENCH_*` env vars —
+/// cargo runs all tests in one binary across threads, so concurrent
+/// set_var/remove_var would race. Every env-touching test locks this first.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn tier_presets_have_expected_shape() {
     let ci = CorpusParams::for_tier(Tier::Ci);
@@ -173,6 +178,7 @@ fn tier_presets_have_expected_shape() {
 
 #[test]
 fn env_overrides_apply_over_tier() {
+    let _g = ENV_LOCK.lock().unwrap();
     std::env::set_var("MUSEFS_BENCH_TIER", "ci");
     std::env::set_var("MUSEFS_BENCH_ALBUMS", "3");
     std::env::set_var("MUSEFS_BENCH_TRACKS_PER_ALBUM", "4");
@@ -353,7 +359,7 @@ Append to `musefs-core/tests/common_corpus_smoke.rs`:
 
 ```rust
 use common::corpus::{generate, Format};
-use musefs_db::Db as Db2; // alias to avoid clashing with the Task-1 `Db` import
+// `Db` is already imported at the top of this file (Task 1).
 
 #[test]
 fn generate_is_deterministic_and_scans_all_tracks() {
@@ -375,7 +381,7 @@ fn generate_is_deterministic_and_scans_all_tracks() {
     let first_b = std::fs::read(&files_b[0]).unwrap();
     assert_eq!(first_a, first_b, "same (params, seed) => identical bytes");
 
-    let db = Db2::open_in_memory().unwrap();
+    let db = Db::open_in_memory().unwrap();
     let stats = musefs_core::scan_directory(&db, a.path()).unwrap();
     assert_eq!(stats.scanned, 6);
 }
@@ -529,6 +535,7 @@ use common::corpus::prepare;
 
 #[test]
 fn prepare_generates_when_no_library_set() {
+    let _g = ENV_LOCK.lock().unwrap();
     std::env::remove_var("MUSEFS_BENCH_LIBRARY");
     let scratch = tempfile::tempdir().unwrap();
     std::env::set_var("MUSEFS_BENCH_DIR", scratch.path());
@@ -546,7 +553,7 @@ fn prepare_generates_when_no_library_set() {
     assert!(!t.is_real_library);
     // DB path is separate from the corpus dir.
     assert_ne!(t.db_path, t.corpus_dir);
-    let db = Db2::open(&t.db_path).unwrap();
+    let db = Db::open(&t.db_path).unwrap();
     let stats = musefs_core::scan_directory(&db, &t.corpus_dir).unwrap();
     assert_eq!(stats.scanned, 2);
 }
@@ -600,6 +607,11 @@ pub fn prepare(p: &CorpusParams) -> Target {
     let db_path = std::env::var("MUSEFS_BENCH_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|_| corpus_dir.join("musefs-bench.db"));
+    // Generated mode: start cold so a reused MUSEFS_BENCH_DIR doesn't time the
+    // scan against a DB that already holds the tracks. (WAL sidecars too.)
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
     Target {
         corpus_dir,
         db_path,
@@ -900,8 +912,12 @@ fn time_refresh(db_path: &std::path::Path, fs: &Musefs, count: usize) -> u128 {
             .unwrap();
     }
     let t0 = Instant::now();
-    fs.poll_refresh();
-    t0.elapsed().as_millis()
+    // poll_refresh returns Ok(true) when a rebuild actually happened. Asserting it
+    // guards against silently timing a no-op (e.g. data_version not observed).
+    let rebuilt = fs.poll_refresh().unwrap();
+    let ms = t0.elapsed().as_millis();
+    assert!(rebuilt, "expected a rebuild after re-tagging {count} track(s)");
+    ms
 }
 
 #[test]
@@ -916,7 +932,12 @@ fn bench_refresh_one_vs_many() {
     let fs = Musefs::open(db, config()).unwrap();
 
     let one_ms = time_refresh(&target.db_path, &fs, 1);
-    let many = (params.track_count() / 2).max(1);
+    // Cap the touch count: today's rebuild is full regardless of how many tracks
+    // changed, so a bounded sample represents "many changed" without a huge
+    // un-batched-write setup on the heavy tiers (the slow path SP1 fixes). SP2
+    // will make rebuild cost scale with the changed set, at which point this cap
+    // is revisited.
+    let many = (params.track_count() / 2).clamp(1, 1000);
     let many_ms = time_refresh(&target.db_path, &fs, many);
 
     println!("\n{}", RunReport::header());
@@ -1156,6 +1177,15 @@ MUSEFS_BENCH_LIBRARY=/srv/music \
 MUSEFS_BENCH_DB=/tmp/musefs-bench.db \
   cargo test -p musefs-core --features metrics --test bench_ingest -- --ignored --nocapture
 ```
+
+Notes:
+- A reused `MUSEFS_BENCH_DIR` is re-scanned cold: `prepare` deletes any prior
+  `musefs-bench.db` (+ `-wal`/`-shm`) so scan timings start from an empty DB.
+- **Regression gate (convention for SP1–SP4):** treat the Criterion `ci`
+  `sequential_read` median as the baseline; a change is a regression if the
+  median rises **>10%** run-over-run on the same machine (Criterion prints the
+  median + its noise estimate). SP1–SP4 record before/after medians in the
+  tracking doc's results log and must not breach this gate.
 ```
 
 - [ ] **Step 2: Commit**
