@@ -48,7 +48,7 @@ already wrote. The Picard analog of that command is a **context-menu action**.
 Therefore v1 ships an **action-only** model: the user invokes "Sync to musefs"
 instead of Save, and the file is never rewritten. This preserves musefs's
 no-rewrite invariant. A post-save hook (sync after a normal Save) is an explicit
-non-goal for v1 (§10) — it cannot preserve the invariant on its own.
+non-goal for v1 (§11) — it cannot preserve the invariant on its own.
 
 ## 3. Division of labour (the contract)
 
@@ -61,9 +61,18 @@ Identical to the beets plugin's division (see `docs/DB_CONTRACT.md`):
 
 **The plugin never writes structural `tracks` columns and never creates rows
 directly.** It creates rows only by delegating to the `musefs` binary
-(autoscan, §6). A path with no matching row after autoscan is skipped. The
-plugin's writes are exactly the "external tag edits" that `scan --revalidate`
-preserves.
+(autoscan, §6). A path with no matching row after autoscan is skipped.
+
+**Scan-then-write is a load-bearing ordering (§6.1).** Autoscan runs **plain
+`musefs scan`** (not `--revalidate`), and plain scan **unconditionally re-seeds**
+`tags` and `track_art` from the file's embedded metadata every time
+(`scan.rs::ingest` → `replace_tags`/`set_track_art`, lines 154/183). So the plugin
+must scan **first**, then write its own tags/art **after**, so Picard's view wins
+over the re-seed. This mirrors the shipped beets plugin, which scans only the
+matched files before syncing for exactly this reason (`musefs.py:67-77`). (The
+plugin's writes are still the kind of edit `scan --revalidate` is designed to
+*preserve* on a later maintenance pass — but the autoscan path itself is plain
+`scan`, so the ordering, not revalidate, is what protects them here.)
 
 The plugin depends only on the SQLite *contract* (schema + triggers) for its
 writes, and on the `musefs` binary for row creation. No musefs process needs to be
@@ -114,23 +123,45 @@ A **self-contained folder plugin** under **`contrib/picard/`**, with no shared
 runtime dependency on the beets plugin (Picard plugins are meant to be drop-in):
 
 - **`contrib/picard/musefs/__init__.py`** — plugin entry: the Picard `PLUGIN_*`
-  metadata constants (API v2), a `BaseAction` subclass registered on files,
-  clusters, albums, and tracks (resolving each selection down to its underlying
-  `File` objects), and the Qt options page.
+  metadata constants (API **v2**), the `BaseAction` subclass (imported from
+  `picard.ui.itemviews`) with `callback(self, objs)`, registered via the
+  module-level `register_track_action`, `register_album_action`,
+  `register_cluster_action`, and `register_file_action`, plus the Qt options page
+  registered with `register_options_page`. (Picard 3.x's manifest/`enable(api)`
+  form is out of scope — §11.)
 - **`contrib/picard/musefs/_core.py`** — a copy of the beets plugin's DB-contract
   logic: `check_schema_version`, content-addressed art (sha256, dedup, cap), mime
   sniff, the SQL helpers (`track_id_for_path`, `replace_tags`, `upsert_art`,
-  `replace_track_art`), and the realpath path key. Kept in sync with beets via the
-  shared `schema_v1.sql` fixture, the `user_version` guard, and tests. Duplication
-  is the deliberate cost of keeping each plugin independently installable.
+  `replace_track_art`), and the realpath path key. Duplication is the deliberate
+  cost of keeping each plugin independently installable; the
+  `contrib/beets/tests/schema_v1.sql` fixture is **copied** into the Picard
+  plugin's `tests/` (not referenced cross-folder), and schema drift surfaces in
+  both copies via the `user_version` guard and tests.
 - **`contrib/picard/README.md`**, **`pyproject.toml`** / **`requirements.txt`**,
   and **`tests/`**.
+
+**Selection → `File` resolution.** `callback(self, objs)` receives the selected
+objects, which may be `File`, `Track`, `Album`, or `Cluster`. The action resolves
+each to its underlying `File` objects: a `File` is itself; a `Track` yields
+`track.iterfiles()` (its linked on-disk files); an `Album`/`Cluster` iterates its
+tracks/files. A matched `Track` with **no** on-disk file yet yields zero files and
+contributes nothing (nothing to key on). Resolved files are **de-duplicated by
+realpath** so the same file selected twice (e.g. via both its album and itself) is
+synced once.
+
+**Per-file metadata is the source.** Each resolved `File`'s own `file.metadata`
+(not the parent `Track`'s) drives both tags and art, because the DB key is that
+file's realpath and the synthesized view should reflect what Picard would write to
+*that* file.
 
 **Testability seam.** The sync core operates on plain primitives — a
 `list[(key, value)]` of tags plus an optional `(art_bytes, mime)` — so unit and
 integration tests need no running Picard. A thin `map_fields(metadata)` adapter
 accepts any dict-like object (including Picard's `Metadata`) and produces those
 primitives. `sync_one(tags, art, conn, opts)` then performs the DB writes.
+Configuration resolution is likewise a pure function
+`resolve_config(settings, environ) -> Opts` (§8), so env-over-page precedence is
+unit-testable without Qt; the `OptionsPage` is a thin Qt shell over it.
 
 ## 5. Field mapping (tags)
 
@@ -146,9 +177,10 @@ default map is mostly identity:
 
 Rules:
 - Empty strings and zero numerics are **omitted** — no empty tags written.
-- v1 writes **one value per key** at `ordinal 0`. (Picard metadata can be
-  multi-valued; the first value is taken. Multi-value is a noted future extension,
-  mirroring beets v1.)
+- v1 writes **one value per key** at `ordinal 0`. Picard metadata is multi-valued;
+  the adapter reads `metadata.getall(key)` and takes the **first** value (not the
+  `\x00`-joined `metadata[key]` form). Multi-value is a noted future extension,
+  mirroring beets v1 (whose `_core._values` similarly collapses to one).
 - Writing replaces the track's whole tag set: `DELETE FROM tags WHERE track_id=?`
   then batched `INSERT`. Picard is authoritative for tags, overwriting scan's
   seed.
@@ -160,19 +192,49 @@ The plugin cannot compute structural columns, so it delegates row creation to th
 `musefs` binary, mirroring beets:
 
 1. A `bin` setting points at the `musefs` executable (overridable by `MUSEFS_BIN`).
-2. For each selected file, the action runs `musefs scan <file> --db <db>`
+2. For each resolved file, the action runs `musefs scan <file> --db <db>`
    (single-file scan is supported) before writing tags/art, creating the row +
    structural columns on demand. `musefs scan` creates the DB if absent.
 3. After scanning, the plugin looks up `track_id` by realpath. A path with no row
    (e.g. an unsupported format scan skipped) is counted `skipped`.
 
+**Per-file (not per-directory) scan — justified.** beets has a single library
+`directory` it can scan once; a Picard selection is an arbitrary set of objects
+with no common root, so the plugin scans **per resolved file** (already
+de-duplicated by realpath, §4). For an N-track album this is N short `musefs scan`
+subprocesses run on the background thread (§9); the cost is serial subprocess
+latency, acceptable for interactive selections. Batching by common parent
+directory is a possible future optimization, not v1.
+
+**Autoscan off + missing DB.** When the autoscan toggle (§8) is off and the DB
+does not exist, the plugin raises a clear error ("enable autoscan or run
+`musefs scan` first"), mirroring the beets `_sync` guard (`musefs.py:181-185`). It
+does not silently create or skip.
+
+### 6.1 Re-sync semantics (the scan-then-write contract)
+
+Because plain `musefs scan` re-seeds `tags`/`track_art` from the file on **every**
+run (§3), re-syncing the same file has these effects, which the plan must honour:
+
+- **Tags:** the plugin fully replaces them after the scan, so tags are an
+  idempotent overwrite — Picard's view always wins. No surprise.
+- **Art:** under §7's *conditional replacement*, when Picard has **no** front
+  cover the plugin leaves `track_art` as the scan left it — which, on a re-sync,
+  is the file's **embedded** art (just re-seeded). So a file whose Picard art was
+  cleared reverts to its embedded picture on the next sync. This matches the
+  shipped beets behavior and is the intended "Picard art wins when present;
+  embedded art otherwise" rule; it is called out here so the plan does not treat
+  it as a bug.
+
 ## 7. Art sync
 
-Source is Picard's in-memory **`metadata.images`** (Picard already holds the image
-bytes — no external file read, unlike beets' `artpath`). Per sync:
+Source is the resolved `File`'s in-memory **`file.metadata.images`** (§4 — per-file
+metadata; Picard already holds the image bytes, no external file read unlike beets'
+`artpath`). Per sync:
 
-1. Take the first **front-cover** image (type 3) from `metadata.images`; read its
-   `.data` and `.mimetype`.
+1. Take the first image for which `image.is_front_image()` is true (Picard's
+   front-cover predicate; `picture_type=3` is the value the plugin then stores).
+   Read its `.data` and `.mimetype`.
 2. Skip images larger than `MAX_ART_BYTES`; count as `skipped_art`.
 3. Hash with `sha256`; `INSERT INTO art (…) ON CONFLICT(sha256) DO NOTHING` then
    `SELECT id`. `width`/`height` stored `NULL` (no image-decode dependency).
@@ -190,21 +252,33 @@ fully replaced.)
 
 ## 8. Configuration
 
-Two layers; env vars take precedence over the options page:
+Two layers, resolved by the pure `resolve_config(settings, environ) -> Opts`
+function (§4):
 
 - **Qt options page** (primary, discoverable): registered in Picard's Options
   dialog with fields for **DB path**, **musefs binary path**, an **autoscan
   toggle**, and the optional **field map**. Persisted via Picard's config.
-- **Env overrides** (headless / test): `MUSEFS_DB`, `MUSEFS_BIN` override the
-  corresponding settings when set.
+- **Env overrides** (headless / test): only `MUSEFS_DB` and `MUSEFS_BIN` override
+  their corresponding page settings when set. The **autoscan toggle** and **field
+  map** have no env form (page-only) — intentional, as they are rarely needed in
+  headless/test contexts.
 
 ## 9. Threading & error handling
 
 - The action runs the scan subprocess + DB writes on a **background thread**
   (Picard's task runner) so the Qt UI never freezes. Results report via a
   status-bar message and the Picard log.
-- **`busy_timeout`** (~5 s) for the concurrent mount poll; transactions kept short
-  so the mount's `data_version` poll sees updates promptly.
+- **Transaction boundary — one transaction per action run** (all resolved files,
+  one commit), mirroring the beets command (`musefs.py:_sync`). A per-file
+  `skipped` (no row) or oversized-art outcome is **not** an error and does not
+  abort — it is counted and the run continues, so a single bad file never rolls
+  back the others' tag writes. A hard failure (e.g. DB write error) rolls back the
+  whole run. (Note: each `musefs scan` subprocess opens its **own** SQLite
+  connection; the plugin's own write transaction and its `busy_timeout` below
+  cover only the plugin's connection, not the scans.)
+- **`busy_timeout`** (~5 s) on the plugin's connection for the concurrent mount
+  poll; the transaction is kept short so the mount's `data_version` poll sees
+  updates promptly.
 - **Binary missing / not executable** → clear error message.
 - **`user_version` mismatch** → refuse with a version-divergence message (§3.3).
 - **Item path not a track row** (after autoscan) → counted `skipped`, sync
@@ -220,8 +294,13 @@ Two layers; env vars take precedence over the options page:
   no Picard import.
 - **Unit (mime sniff, schema guard)** — JPEG/PNG magic-byte detection + extension
   fallback; `user_version` refusal. Shared logic with the beets `_core`.
-- **Integration (pytest)** — create a temp DB from the `schema_v1.sql` fixture
-  (`PRAGMA user_version = 1` + V1 DDL/triggers), insert a fake track row, run the
+- **Unit (`resolve_config`)** — env-over-page precedence: `MUSEFS_DB`/`MUSEFS_BIN`
+  override page settings when set, fall back to the page otherwise; autoscan/field
+  map come from the page only. No Qt import (the `OptionsPage` is a thin shell over
+  this function, untested by GUI per §10.2).
+- **Integration (pytest)** — create a temp DB from the **copied** `schema_v1.sql`
+  fixture (`contrib/picard/tests/schema_v1.sql`, identical to the beets copy:
+  `PRAGMA user_version = 1` + V1 DDL/triggers), insert a fake track row, run the
   sync core over constructed primitives, then assert: `tags` rows match the
   mapping; `content_version` bumped; art deduped (same bytes on two tracks → one
   `art` row, two `track_art` rows); conditional art replacement (no art →
@@ -264,7 +343,7 @@ integration tier and the path gate. The README documents a manual smoke test
 - **Multi-valued tags** — one value per key for now.
 - **All-image sync** — front cover (type 3) only; back/booklet/etc. deferred.
 - **Picard 3.x manifest-format plugin** — target the Picard 2.x plugin API
-  (`PLUGIN_*` constants, `register_*` hooks); 3.x packaging is a follow-up (§11).
+  (`PLUGIN_*` constants, `register_*` hooks); 3.x packaging is a follow-up (§12).
 - **Creating track rows / writing structural columns directly** — owned by
   `musefs scan`; the plugin only delegates to the binary.
 - **Orphaned-art GC** — owned by `musefs scan --revalidate`.
@@ -272,7 +351,11 @@ integration tier and the path gate. The README documents a manual smoke test
 ## 12. Open risks
 
 - **Picard 2.x vs 3.x plugin API.** v1 targets the 2.x API (PLUGIN_* metadata
-  constants + `register_*` hooks). Picard 3.x introduced a manifest-based plugin
-  system; supporting it is a documented follow-up, not v1 scope.
+  constants + `register_*` hooks). `PLUGIN_API_VERSIONS` declares the supported
+  range and sets a **minimum Picard 2.x version** that provides the
+  `file.metadata.images` / `is_front_image()` surface used in §7 (pinned during
+  implementation against Picard's release notes). Picard 3.x introduced a
+  manifest-based plugin system; supporting it is a documented follow-up, not v1
+  scope.
 - **`realpath`/`canonicalize` agreement.** Retired by the §10.1 path-matching gate
   against the real `musefs scan` binary, exactly as for the beets plugin.
