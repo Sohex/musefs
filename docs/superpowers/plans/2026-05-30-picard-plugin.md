@@ -771,7 +771,7 @@ git commit -m "test(picard): add db + Picard-fake fixtures (conftest)"
 - Test: `contrib/picard/tests/test_map_fields.py`
 - (Implementation already in `_core.py` from Task 2.)
 
-- [ ] **Step 1: Write the failing test** — `contrib/picard/tests/test_map_fields.py`
+- [ ] **Step 1: Write the characterization test** (passes against the `_core` written in Task 2) — `contrib/picard/tests/test_map_fields.py`
 
 ```python
 from musefs._core import map_fields
@@ -845,7 +845,7 @@ git commit -m "test(picard): cover map_fields (identity, first-value, omissions,
 - Test: `contrib/picard/tests/test_front_cover.py`
 - (Implementation already in `_core.py`.)
 
-- [ ] **Step 1: Write the failing test** — `contrib/picard/tests/test_front_cover.py`
+- [ ] **Step 1: Write the characterization test** (passes against the `_core` written in Task 2) — `contrib/picard/tests/test_front_cover.py`
 
 ```python
 from musefs._core import front_cover
@@ -894,7 +894,7 @@ git commit -m "test(picard): cover front_cover image extraction"
 - Test: `contrib/picard/tests/test_resolve_config.py`
 - (Implementation already in `_core.py`.)
 
-- [ ] **Step 1: Write the failing test** — `contrib/picard/tests/test_resolve_config.py`
+- [ ] **Step 1: Write the characterization test** (passes against the `_core` written in Task 2) — `contrib/picard/tests/test_resolve_config.py`
 
 ```python
 from musefs._core import parse_field_map, resolve_config
@@ -967,7 +967,7 @@ git commit -m "test(picard): cover resolve_config env precedence + field-map par
 - Test: `contrib/picard/tests/test_sync.py`
 - (Implementation already in `_core.py`.)
 
-- [ ] **Step 1: Write the failing test** — `contrib/picard/tests/test_sync.py`
+- [ ] **Step 1: Write the characterization test** (integration; passes against the `_core` written in Task 2) — `contrib/picard/tests/test_sync.py`
 
 ```python
 from musefs._core import SyncStats, connect, sync_one
@@ -1003,6 +1003,31 @@ def test_tags_written_for_existing_row(db_path, make_track):
             "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
         ).fetchone()[0]
         assert title == "Song"
+        # Spec §3.5: the tags trigger bumped the track's content_version, so the
+        # mount's HeaderCache rebuilds the layout. Make that observable.
+        cv = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
+        assert cv >= 1
+    finally:
+        conn.close()
+
+
+def test_skip_mid_batch_does_not_abort_others(db_path, make_track):
+    # Spec §9: a per-file "no row" skip must not roll back the run — the real
+    # files around it still get their tags, sharing one SyncStats and one txn.
+    tid_a = make_track("/music/a.flac")
+    tid_b = make_track("/music/b.flac")
+    conn = connect(db_path)
+    try:
+        stats = SyncStats()
+        for key in ("/music/a.flac", "/music/missing.flac", "/music/b.flac"):
+            sync_one(conn, key, [("title", "T")], None, stats)
+        conn.commit()
+        assert stats.synced == 2
+        assert stats.skipped == 1
+        for tid in (tid_a, tid_b):
+            assert conn.execute(
+                "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
+            ).fetchone()[0] == "T"
     finally:
         conn.close()
 
@@ -1108,7 +1133,7 @@ def test_dry_run_writes_nothing(db_path, make_track):
 - [ ] **Step 2: Run test to verify it passes**
 
 Run: `cd contrib/picard && python -m pytest tests/test_sync.py -v`
-Expected: PASS (8 passed).
+Expected: PASS (9 passed).
 
 - [ ] **Step 3: Commit**
 
@@ -1125,7 +1150,7 @@ git commit -m "test(picard): integration cover sync_one (tags, art, dedup, dry-r
 - Test: `contrib/picard/tests/test_run_scan.py`
 - (Implementation already in `_core.py`.)
 
-- [ ] **Step 1: Write the failing test** — `contrib/picard/tests/test_run_scan.py`
+- [ ] **Step 1: Write the characterization test** (passes against the `_core` written in Task 2) — `contrib/picard/tests/test_run_scan.py`
 
 ```python
 import subprocess
@@ -1378,7 +1403,11 @@ git commit -m "test(picard): add opt-in path-matching gate vs the real musefs bi
 
 This task wires Picard to the tested `_core`. Per spec §10.2 the glue is **not** unit-tested (GUI automation is out of scope); correctness is verified by the README's manual smoke test. Keep this file a thin adapter — all logic stays in `_core`.
 
-> **Verification note for the implementer:** the exact import paths and the background-thread helper differ slightly across Picard 2.x point releases. Before finalizing, confirm against the installed Picard that `BaseAction` and `register_*_action` live in `picard.ui.itemviews`, `OptionsPage`/`register_options_page` in `picard.ui.options`, and that `picard.util.thread.run_task(task, next)` exists. Adjust the imports if the installed version differs; the delegation to `_core` does not change.
+> **Verification note for the implementer:** the exact import paths and the background-thread helper differ slightly across Picard 2.x point releases. Before finalizing, confirm against the installed Picard each of the following, and adjust if it differs — the delegation to `_core` does not change:
+> - `BaseAction` and `register_*_action` live in `picard.ui.itemviews`; `OptionsPage`/`register_options_page` in `picard.ui.options`.
+> - **`picard.util.thread.run_task`'s completion-callback contract** — the `_done` wiring below assumes the callback is invoked with `result=`/`error=` (the partial binds `n_files`, then expects those two). This is the single most fragile assumption; if the installed Picard calls it positionally as `next(result)` or `next(result, error)`, adjust `_done`'s signature accordingly.
+> - **`from PyQt5 import QtWidgets`** — some newer Picard 2.x builds ship on PyQt6. Match the installed Qt binding.
+> - **Pin `PLUGIN_API_VERSIONS`** to a real floor: identify the minimum Picard 2.x version that provides `file.metadata.images` + `image.is_front_image()` (used in §7) and set the list's lowest entry to it. The `"2.2"` below is a placeholder floor — replace it; do not ship it unverified.
 
 - [ ] **Step 1: Replace `contrib/picard/musefs/__init__.py`** with the full plugin
 
