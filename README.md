@@ -107,19 +107,31 @@ served file (always in the same format — it never converts between formats).
 - Rust (2021 edition) and Cargo.
 - Linux with FUSE (`/dev/fuse` and libfuse) to mount.
 
+## Install
+
+Install the `musefs` binary from crates.io:
+
+```bash
+cargo install musefs
+```
+
+`cargo install` compiles from source, so the same prerequisites as a local
+build apply: a Rust toolchain plus FUSE (`libfuse3` / `libfuse3-dev`) and
+`pkg-config` on Linux.
+
+Or install the latest from the repository:
+
+```bash
+cargo install --git https://github.com/Sohex/musefs musefs
+```
+
 ## Build
 
 ```bash
 cargo build --release
 ```
 
-The binary is `musefs` (the `musefs-cli` crate).
-
-Or install the `musefs` binary directly from the repository:
-
-```bash
-cargo install --git https://github.com/Sohex/musefs musefs-cli
-```
+The binary (`target/release/musefs`) is produced by the `musefs` crate.
 
 ## Usage
 
@@ -172,7 +184,8 @@ A layered Cargo workspace:
 | `musefs-format` | FLAC/MP3/MP4/Ogg/WAV byte surgery: metadata synthesis + layout |
 | `musefs-core`   | Orchestration: virtual tree, file resolution, scanning      |
 | `musefs-fuse`   | Thin FUSE adapter (fuser)                                   |
-| `musefs-cli`    | `musefs` command-line entrypoint (clap)                     |
+| `musefs-cli`    | CLI logic library: clap commands, scan/mount handlers       |
+| `musefs`        | Thin binary wrapper; published to crates.io as `musefs`     |
 
 See [`CLAUDE.md`](CLAUDE.md) for the architecture in depth.
 

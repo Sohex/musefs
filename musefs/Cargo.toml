@@ -1,0 +1,21 @@
+[package]
+name = "musefs"
+description = "Read-only FUSE filesystem presenting a re-tagged virtual view of a music library."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["fuse", "music", "metadata", "filesystem", "audio"]
+categories = ["filesystem", "multimedia::audio", "command-line-utilities"]
+
+[[bin]]
+name = "musefs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+musefs-cli = { path = "../musefs-cli", version = "0.2.0" }
+
+[lints]
+workspace = true

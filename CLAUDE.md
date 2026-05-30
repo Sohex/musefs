@@ -42,8 +42,8 @@ MUSEFS_INTEROP_DIR=/tmp/i cargo test -p musefs-core --test interop_emit -- --ign
 MUSEFS_INTEROP_DIR=/tmp/i python -m pytest tests/interop
 
 # Run the CLI (binary is `musefs`):
-cargo run -p musefs-cli -- scan <backing_dir> --db <db_path> [--revalidate]
-cargo run -p musefs-cli -- mount <mountpoint> --db <db_path> \
+cargo run -p musefs -- scan <backing_dir> --db <db_path> [--revalidate]
+cargo run -p musefs -- mount <mountpoint> --db <db_path> \
     [--template '$albumartist/$album/$title'] [--default-fallback Unknown] \
     [--mode synthesis|structure-only]
 ```
@@ -64,11 +64,12 @@ musefs-core ← (db, format)     orchestration: virtual tree, resolution, scanni
         ↑
 musefs-fuse ← (core)           thin FUSE adapter (fuser)
         ↑
-musefs-cli  ← (core, fuse, db) clap entrypoint; binary `musefs`
+musefs-cli  ← (core, fuse, db) clap commands library (scan/mount logic)
+musefs      ← (cli)            thin binary entrypoint; published as `musefs`
 ```
 
 `musefs-core` is the integration layer — most cross-cutting logic lives here.
-`musefs-fuse` and `musefs-cli` are deliberately thin.
+`musefs-fuse`, `musefs-cli`, and the `musefs` binary crate are deliberately thin.
 
 ## The central mechanism (read this before touching read/synthesis paths)
 
