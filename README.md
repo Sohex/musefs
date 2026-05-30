@@ -131,7 +131,7 @@ cargo install --git https://github.com/Sohex/musefs musefs
 cargo build --release
 ```
 
-The binary is `musefs` (the `musefs` crate).
+The binary (`target/release/musefs`) is produced by the `musefs` crate.
 
 ## Usage
 
@@ -184,7 +184,8 @@ A layered Cargo workspace:
 | `musefs-format` | FLAC/MP3/MP4/Ogg/WAV byte surgery: metadata synthesis + layout |
 | `musefs-core`   | Orchestration: virtual tree, file resolution, scanning      |
 | `musefs-fuse`   | Thin FUSE adapter (fuser)                                   |
-| `musefs-cli`    | `musefs` command-line entrypoint (clap)                     |
+| `musefs-cli`    | CLI logic library: clap commands, scan/mount handlers       |
+| `musefs`        | Thin binary wrapper; published to crates.io as `musefs`     |
 
 See [`CLAUDE.md`](CLAUDE.md) for the architecture in depth.
 

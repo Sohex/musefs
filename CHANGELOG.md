@@ -8,8 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **crates.io distribution:** the `musefs` binary is now published to crates.io
-  and installable with `cargo install musefs`. A new thin `musefs` wrapper crate
+- **crates.io distribution:** the `musefs` binary is published to crates.io as of
+  this release and installable with `cargo install musefs`. A new thin `musefs` wrapper crate
   owns the binary (`musefs-cli` is now a library crate), and a tag-triggered
   release workflow publishes all crates in dependency order.
 - **Fuzzing & property tests:** coverage-guided `cargo-fuzz` targets for every
