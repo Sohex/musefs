@@ -107,7 +107,9 @@ Findings #5, #16.
   cross-cutting follow-up noted: apply the same skip to mp3/mp4/ogg/wav synthesis
   (their sub-phases) or filter empty art once at ingestion (`scan.rs`); finding #5
   broadened on FLAC (partial/seam/art windows), with the non-FLAC dimension tracked
-  into 3b/3c/3d.
+  into 3b/3c/3d. **Cross-cutting follow-up now fully closed:** mp3/wav (3b), mp4
+  (3c), and ogg (`ogg::synthesize_layout` filters `data_len > 0` for all three
+  codecs, with `synthesize_opus_skips_zero_byte_art`) all skip zero-byte art.
 - **3c done** — MP4 survivors killed (40 missed → killed, 4 timeout →
   timeout-detected; no equivalents). Covers `box_header`, `read_box`,
   `read_structure_from`, `read_freeform`, `read_tags`, `read_pictures`,
@@ -132,7 +134,7 @@ Findings #5, #16.
   `synchsafe_decode` and v2.2 24-bit decode (note: disjoint `| → &` are killed,
   not equivalent). Production change: finding #16 zero-byte-art skip applied to
   `mp3.rs::build_id3v2_segments` (mirrors the FLAC fix; also covers the WAV `id3 `
-  chunk, which shares this builder). #16 still open for ogg (mp4 closed in 3c).
+  chunk, which shares this builder).
   Finding #5: the
   MP3 read-fidelity dimension is now done — added `write_mp3` to the core test
   harness and ported the four `proptest_read_fidelity` invariants (whole-audio,

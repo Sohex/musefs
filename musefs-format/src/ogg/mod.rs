@@ -223,7 +223,15 @@ pub fn synthesize_layout(
     tags: &[TagInput],
     arts: &[OggArt],
 ) -> Result<RegionLayout> {
-    let packet_chunks = build_packets_with_art(header, tags, arts)?;
+    // Exclude zero-byte art: an empty image yields a meaningless
+    // METADATA_BLOCK_PICTURE comment (and an empty OggArtSlice run). Mirrors the
+    // FLAC/MP3/MP4/WAV synthesis skip so every format drops degenerate art.
+    let arts: Vec<OggArt> = arts
+        .iter()
+        .filter(|a| a.meta.data_len > 0)
+        .copied()
+        .collect();
+    let packet_chunks = build_packets_with_art(header, tags, &arts)?;
     let mut segments: Vec<Segment> = Vec::new();
     let mut seq = 0u32;
     for (i, chunks) in packet_chunks.iter().enumerate() {
@@ -272,6 +280,7 @@ use crate::ogg::page::PayloadChunk;
 use base64::Engine;
 
 /// One image to embed: its metadata and raw bytes (read transiently at resolve).
+#[derive(Clone, Copy)]
 pub struct OggArt<'a> {
     pub meta: &'a crate::input::ArtInput,
     pub image: &'a [u8],
@@ -954,6 +963,45 @@ mod tests {
         assert_eq!(pics.len(), 2);
         assert_eq!(pics[0].data, img_a);
         assert_eq!(pics[1].data, img_b);
+    }
+
+    #[test]
+    fn synthesize_opus_skips_zero_byte_art() {
+        let mut data = opus_headers();
+        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 64]);
+        data.extend_from_slice(&audio);
+        let scan = locate_audio(&data).unwrap();
+        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+
+        let img: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        let empty: Vec<u8> = Vec::new();
+        let meta_empty = art_input(1, "image/jpeg", 0);
+        let meta_real = art_input(2, "image/png", img.len());
+        // Empty art listed first: it must be dropped without disturbing the real one.
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("title", "Skip")],
+            &[
+                OggArt {
+                    meta: &meta_empty,
+                    image: &empty,
+                },
+                OggArt {
+                    meta: &meta_real,
+                    image: &img,
+                },
+            ],
+        )
+        .unwrap();
+
+        let bytes = materialize_header(&layout, &[(2, &img)]);
+        let h = read_header(&bytes).unwrap();
+        assert_eq!(h.codec, Codec::Opus);
+        let pics = read_pictures(&bytes).unwrap();
+        assert_eq!(pics.len(), 1, "zero-byte art must be skipped at synthesis");
+        assert_eq!(pics[0].data, img);
     }
 
     #[test]
