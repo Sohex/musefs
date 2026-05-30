@@ -260,7 +260,7 @@ jobs:
           set -euo pipefail
           for c in musefs-db musefs-format musefs-core musefs-fuse musefs-cli musefs; do
             echo "=== publishing $c ==="
-            cargo publish -p "$c"
+            cargo publish -p "$c" --locked
           done
 ```
 

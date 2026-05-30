@@ -117,9 +117,10 @@ install, `dtolnay/rust-toolchain`, `Swatinem/rust-cache`.
      `Cargo.toml` and assert it equals the tag without its leading `v`
      (e.g. tag `v0.2.0` ⇒ workspace `0.2.0`). Fail the job on mismatch so a
      mistagged release cannot publish.
-  3. Publish each crate in dependency order with
-     `cargo publish -p <crate> --token ${{ secrets.CARGO_REGISTRY_TOKEN }}`,
-     in the order from §1. Modern `cargo publish` blocks until the just-published
+  3. Publish each crate in dependency order with `cargo publish -p <crate>
+     --locked`, in the order from §1, with `CARGO_REGISTRY_TOKEN` exported as a
+     step environment variable (`cargo publish` reads it automatically — no
+     `--token` flag). Modern `cargo publish` blocks until the just-published
      version is available in the registry index before returning, so each
      subsequent crate's version requirement resolves without manual sleeps.
 
