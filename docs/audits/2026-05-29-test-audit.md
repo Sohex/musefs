@@ -1,6 +1,6 @@
 # musefs Test Suite Audit — 2026-05-29
 
-**Status:** complete (full audit) + Phase 4a core hardening (musefs-core mutations driven toward zero)
+**Status:** complete (full audit) + Phase 4 remediation complete — 4a core-hardening (musefs-core) and 4b db-hardening (musefs-db); mutations in both crates driven toward zero (db campaign 26668141596: 53 caught / 1 missed-equivalent / 0 timeout). See `docs/superpowers/specs/test-audit-remediation/2026-05-29-remediation-tracking.md`.
 **Spec:** docs/superpowers/specs/2026-05-29-test-audit-design.md
 **Deliverable type:** _full audit_ | _red-test halt report_ (set at the Phase A gate)
 
@@ -707,11 +707,11 @@ All Tier-1 tests pass; byte-identical invariant is protected for FLAC/MP3/MP4/WA
 | P2-3 | beets FK parity (#6) | `contrib/beets/tests/conftest.py` | Add `PRAGMA foreign_keys = ON` after connection creation in the `db_path` fixture, matching production `musefs-db/src/lib.rs:44`. |
 | P2-4 | CRC edge cases (#7) | Add `musefs-format/tests/ogg_crc.rs` (or extend existing CRC test module) | Add tests for single-byte input, max-byte (0xFF) input, and patterns that exercise different polynomial tap paths. Cover the `crc_update` inner loop variants. |
 | P2-5 | `serve()` boundary conditions (#8) | Add `musefs-core/tests/ogg_index_serve.rs` (same file as P1-1) | Test header-only read, payload-only read, read spanning header+payload, empty result, and read past end of audio region. (Subsumed by P1-1; track here if P1-1 is deferred.) |
-| P2-6 | `probe()` fallback paths (#9) | Add `musefs-core/tests/scan_probe.rs` (or unit tests in `scan.rs`) | Add unit tests for truncated headers, invalid magic bytes, and other malformed inputs that exercise the `probe()` fallback and error branches. |
-| P2-7 | db tracks.rs SQL branches (#10) | Add `musefs-db/tests/tracks_cascade.rs` (or extend existing tracks tests) | Test `delete_track` cascade paths for tracks with tags, art, and multi-value tags. Test `upsert` conflict-resolution branches. |
-| P2-8 | db art.rs race paths (#11) | Add `musefs-db/tests/art_gc.rs` (or extend existing art tests) | Test `gc_orphan_art` concurrent-deletion paths. Test `linking_art` edge cases (art linked to multiple tracks, art unlinked then re-linked). |
-| P2-9 | db tags.rs GROUP BY gaps (#12) | Add `musefs-db/tests/tags_grouping.rs` (or extend existing tags tests) | Test multi-value tag grouping with empty sets, single-value, and multi-value tags. Verify `GROUP BY` assembly correctness. |
+| P2-6 | `probe()` fallback paths (#9) | Add `musefs-core/tests/scan_probe.rs` (or unit tests in `scan.rs`) | **✅ Remediated (Phase 4a, #51).** scan probe fallback + error branches covered; musefs-core mutations driven toward zero. |
+| P2-7 | db tracks.rs SQL branches (#10) | Add `musefs-db/tests/tracks_cascade.rs` (or extend existing tracks tests) | **✅ Remediated (Phase 4b, #52).** `upsert_conflict_updates_all_mutable_columns` pins the ON CONFLICT update; existing `delete_track_cascades_tags_and_track_art` covers the cascade. |
+| P2-8 | db art.rs race paths (#11) | Add `musefs-db/tests/art_gc.rs` (or extend existing art tests) | **✅ Remediated (Phase 4b, #52).** Framing corrected — no concurrent-deletion race exists (`gc_orphan_art` is a single `DELETE … WHERE id NOT IN`). Covered by `shared_art_survives_until_last_reference_gone` + `set_track_art_replaces_links`. |
+| P2-9 | db tags.rs GROUP BY gaps (#12) | Add `musefs-db/tests/tags_grouping.rs` (or extend existing tags tests) | **✅ Remediated (Phase 4b, #52).** Framing corrected — grouping is Rust-side `HashMap`, not SQL `GROUP BY`. Covered by `tags_grouped_empty_db_is_empty_map` + `tags_grouped_preserves_key_ordinal_order_for_multivalue`. |
 | P2-10 | metrics compile error (#13) | `musefs-core/tests/metrics.rs:177` | Rename `backing_mtime_secs` to `backing_mtime` in the `NewTrack` literal at line 177. Re-run all 4 metrics tests. |
 | P2-11 | EOS flag untested (#14) | Add `musefs-format/tests/ogg_eos.rs` (or extend Ogg page tests) | Add a test that constructs an Ogg page with the EOS flag set and verifies it is correctly parsed and propagated. |
-| P2-12 | NFS ESTALE not tested (#15) | Deferred — no standard test framework support | Document as a known gap. Consider adding an integration test with a mock filesystem or a conditional NFS-mounted backing directory. Low priority — FUSE mount would propagate raw `io::Error`. |
+| P2-12 | NFS ESTALE not tested (#15) | Deferred — no standard test framework support | **✅ Resolved (Phase 4a, #51) — documented as a known gap** per the original disposition; no standard framework support for ESTALE injection. FUSE mount propagates raw `io::Error`. |
 | P2-13 | Zero-byte art boundary (#16) | Add `musefs-format/tests/synthesize_art.rs` (extend existing art tests) | Add a test that synthesizes zero-byte embedded art (empty image data) and verifies the error or boundary behavior. |
