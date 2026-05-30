@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; Phase 3d (WAV) complete; Phase 4a (core hardening) complete; Phase 4b (db hardening) complete — campaign 26668141596 confirmed 53 caught / 1 missed (known equivalent) / 0 timeout / 8 unviable (tooling limits), no survivor sweep needed
+**Status:** **ALL PHASES COMPLETE.** Phase 1 (harness merged, inventory filled from CI run 26632110192); Phase 2 (Ogg hardening); Phase 3a (FLAC), 3b (MP3), 3c (MP4), 3d (WAV); Phase 4a (core hardening) and 4b (db hardening) — db campaign 26668141596 confirmed 53 caught / 1 missed (known equivalent) / 0 timeout / 8 unviable (tooling limits), no survivor sweep needed. Audit doc (`docs/audits/2026-05-29-test-audit.md`) marked Phase 4 complete in #53.
 
 ## Guiding principle: verify, don't trust
 
@@ -96,7 +96,7 @@ P1 + all Ogg-related P2 + Ogg mutant kills. Findings #1, #2, #3, #4, #8, #14
 - EOS preservation, reframed from "FLAG_EOS handling" (#14)
 - kill surviving `ogg/` + `ogg_index` mutants (from phase-1 inventory)
 
-### Phase 3 — Format-layer coverage & mutants (non-Ogg)  ⟶ STATUS: in progress
+### Phase 3 — Format-layer coverage & mutants (non-Ogg)  ⟶ STATUS: complete
 
 Findings #5, #16.
 
@@ -139,7 +139,7 @@ Findings #5, #16.
   partial windows, header seam, art window) to MP3; the WAV/MP4 dimensions land in
   their own phases.
 
-### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: in progress
+### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: complete
 
 Findings #9, #10, #11, #12, #15.
 
