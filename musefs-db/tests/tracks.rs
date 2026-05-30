@@ -110,3 +110,28 @@ fn delete_track_cascades_tags_and_track_art() {
     // The art row itself remains (GC is a separate step) until gc_orphan_art runs.
     assert!(db.get_art(art_id).unwrap().is_some());
 }
+
+#[test]
+fn upsert_conflict_updates_all_mutable_columns() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.upsert_track(&new_track("/m/a.flac")).unwrap();
+
+    // Same backing_path => ON CONFLICT update path; change every mutable column.
+    let changed = NewTrack {
+        backing_path: "/m/a.flac".to_string(),
+        format: Format::Mp3,
+        audio_offset: 222,
+        audio_length: 333,
+        backing_size: 444,
+        backing_mtime: 555,
+    };
+    let id2 = db.upsert_track(&changed).unwrap();
+    assert_eq!(id, id2, "conflict update must keep the same id");
+
+    let t = db.get_track(id).unwrap().expect("track");
+    assert_eq!(t.format, Format::Mp3);
+    assert_eq!(t.audio_offset, 222);
+    assert_eq!(t.audio_length, 333);
+    assert_eq!(t.backing_size, 444);
+    assert_eq!(t.backing_mtime, 555);
+}

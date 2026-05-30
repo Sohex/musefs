@@ -64,3 +64,35 @@ fn tags_grouped_returns_all_tags_by_track() {
     assert_eq!(grouped.get(&a), Some(&db.get_tags(a).unwrap()));
     assert_eq!(grouped.get(&b), Some(&db.get_tags(b).unwrap()));
 }
+
+#[test]
+fn tags_grouped_empty_db_is_empty_map() {
+    let db = Db::open_in_memory().unwrap();
+    assert!(db.tags_grouped().unwrap().is_empty());
+}
+
+#[test]
+fn tags_grouped_preserves_key_ordinal_order_for_multivalue() {
+    let db = Db::open_in_memory().unwrap();
+    let t = db.upsert_track(&new_track("/m/a.flac")).unwrap();
+    db.replace_tags(
+        t,
+        &[
+            Tag::new("artist", "Second", 1),
+            Tag::new("artist", "First", 0),
+            Tag::new("genre", "Rock", 0),
+        ],
+    )
+    .unwrap();
+
+    let grouped = db.tags_grouped().unwrap();
+    assert_eq!(
+        grouped.get(&t),
+        Some(&vec![
+            Tag::new("artist", "First", 0),
+            Tag::new("artist", "Second", 1),
+            Tag::new("genre", "Rock", 0),
+        ]),
+        "multi-value group must be ordered by (key, ordinal), matching get_tags"
+    );
+}

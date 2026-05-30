@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; Phase 3d (WAV) complete; phase 4 pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; Phase 3d (WAV) complete; Phase 4a (core hardening) complete; Phase 4b (db hardening) complete — campaign 26668141596 confirmed 53 caught / 1 missed (known equivalent) / 0 timeout / 8 unviable (tooling limits), no survivor sweep needed
 
 ## Guiding principle: verify, don't trust
 
@@ -139,17 +139,27 @@ Findings #5, #16.
   partial windows, header seam, art window) to MP3; the WAV/MP4 dimensions land in
   their own phases.
 
-### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: pending
+### Phase 4 — Core & DB coverage & mutants  ⟶ STATUS: in progress
 
 Findings #9, #10, #11, #12, #15.
 
+- **4b complete** — `mutants` feature gating model `Default` derives + `Default
+  for Db` (in-memory, unmigrated); `user_version` Ok(1) mutant killed; coverage
+  tests for #10 (upsert conflict columns), #11 (shared-art GC + set_track_art
+  replace), #12 (tags_grouped empty + ordering); framing corrections for #11
+  (no concurrent-deletion race) and #12 (Rust-side HashMap, not SQL GROUP BY);
+  `schema.rs` `< → <=` confirmed equivalent; campaign script + CI leg wired with
+  `--features mutants`. **Verified by campaign run 26668141596** (db leg): 53
+  caught / 1 missed (the known `schema.rs:93` equivalent) / 0 timeout / 8 unviable.
+  The feature turned the `Default`-class unviables into caught, so the planned
+  newly-viable survivor sweep had **nothing to kill** — no second PR was needed.
+  The 8 residual unviable are tooling limits (7 unqualified-`HashMap::new()` in
+  `tags.rs`, 1 unsized `&Path` in `lib.rs`), recorded in the inventory.
 - scan probe fallbacks (#9) + scan mutants
 - reader.rs header-cache survivors
 - facade glue survivors
 - tree.rs disambiguate timeouts (suspected infinite-loop path)
-- db tracks/art/tags SQL-branch coverage (#10, #11, #12)
 - document the ESTALE gap (#15)
-- decide on `Default for Db` to make db mutation testing viable
 
 ## Finding → phase map
 

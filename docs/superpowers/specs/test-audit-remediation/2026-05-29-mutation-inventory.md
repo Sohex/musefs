@@ -34,13 +34,33 @@ pattern, below) and are not survivors.
 
 ## Tool limitations to revisit (phase 4)
 
-- `musefs-db` mutation is **not** vacuous (40/62 caught), but 20 mutants are
-  unviable because they replace a body with `Ok(Default::default())` and `Db` has
-  no `Default` — concentrated in `tags.rs` (8), `tracks.rs` (5), `lib.rs` (4),
-  `art.rs` (3). Implementing `Default for Db` (phase 4) would make those viable
-  and likely surface more survivors.
+- `musefs-db` mutation is **not** vacuous (40/62 caught), but 20 mutants were
+  unviable because they replace a body with `Ok(Default::default())`. Only
+  `lib.rs`'s `Db`-returning fns need `Db: Default`; the `tags`/`tracks`/`art`
+  unviables need `Default` on the model structs (`Track`/`Art`/`ArtMeta`/`Tag`/
+  `TrackArt`) and `Format`. The `mutants` feature (Phase 4b) supplies those impls.
+
+  **Resolved — campaign run 26668141596** (db leg, `--features mutants`):
+  **53 caught / 1 missed / 0 timeout / 8 unviable.** The feature converted the
+  `Default`-class unviables straight to **caught**; there were **no newly-viable
+  survivors to sweep**, so no follow-up PR was needed. The single missed mutant is
+  `schema.rs:93 < → <=`, the documented equivalent (reached only at
+  `current=0,target=1`, where `<` and `<=` coincide). The 8 remaining unviable are
+  genuine tooling limits, not `Default` gaps:
+  - **`tags.rs:39` (7)** — cargo-mutants emits unqualified `Ok(HashMap::new())`,
+    which fails `E0433: cannot find type HashMap` because `tags.rs` names the type
+    by full path and never `use`s it. (Adding `use std::collections::HashMap;`
+    would make them viable + caught by the existing `tags_grouped` tests, but they
+    are the already-killed empty/`Default` class — left as-is.)
+  - **`lib.rs:68` `Db::path`** — `Some(Box::leak(Box::new(Default::default())))`
+    for `Option<&Path>`; `&Path` is unsized and cannot be `Default`-constructed.
 - A few `musefs-format` / `musefs-core` mutants share the same
   `Ok(Default::default())` unviable pattern.
+
+- **Framing corrections for #11 / #12:** finding #11's "concurrent-deletion race"
+  does not exist (`gc_orphan_art` is a single `DELETE … WHERE id NOT IN`);
+  finding #12's "GROUP BY assembly" is actually Rust-side `HashMap` grouping
+  (the SQL has no `GROUP BY`). Tests target the real gaps accordingly.
 
 ## Phase routing
 
@@ -63,8 +83,8 @@ the rightmost column of each survivor table.
 
 | File:line | Mutation | Kind | Phase |
 |-----------|----------|------|------:|
-| `lib.rs:55` | replace Db::user_version -> Result<i64> with Ok(1) | missed | 4 |
-| `schema.rs:93` | replace < with <= in migrate | missed | 4 |
+| `lib.rs:55` | replace Db::user_version -> Result<i64> with Ok(1) | missed → **killed** (phase 4b) | 4 |
+| `schema.rs:93` | replace < with <= in migrate | missed → **equivalent** | 4 |
 
 ## musefs-core
 

@@ -87,6 +87,24 @@ impl Db {
     }
 }
 
+#[cfg(feature = "mutants")]
+impl Default for Db {
+    /// Test-only (the `mutants` feature). An in-memory, **unmigrated** connection
+    /// (so `user_version == 0`, distinct from the always-migrated `1`). Sets the
+    /// FK/busy-timeout pragmas like a real connection, but runs no migration, so it
+    /// has **no schema**. Use only for the version-0 kill and to let
+    /// `Ok(Default::default())` mutants compile; behavioral tests use
+    /// `open_in_memory()`.
+    fn default() -> Self {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite open");
+        conn.busy_timeout(Duration::from_secs(5))
+            .expect("set busy_timeout");
+        conn.pragma_update(None, "foreign_keys", true)
+            .expect("enable foreign_keys");
+        Db { conn, path: None }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Db;

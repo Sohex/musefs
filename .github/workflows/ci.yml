@@ -33,6 +33,10 @@ jobs:
         run: cargo test --workspace
       - name: Property tests (fuzzing feature)
         run: cargo test -p musefs-format --features fuzzing
+      - name: DB mutants-feature clippy
+        run: cargo clippy -p musefs-db --features mutants --all-targets -- -D warnings
+      - name: DB mutants-feature tests
+        run: cargo test -p musefs-db --features mutants
 
   interop:
     # Property 5: an independent ecosystem reader (mutagen) reads the tags we

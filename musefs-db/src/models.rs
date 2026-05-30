@@ -1,5 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "mutants", derive(Default))]
 pub enum Format {
+    #[cfg_attr(feature = "mutants", default)]
     Flac,
     Mp3,
     M4a,
@@ -65,6 +67,7 @@ mod tests {
     }
 }
 
+#[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: i64,
@@ -96,6 +99,7 @@ pub struct NewArt {
     pub data: Vec<u8>,
 }
 
+#[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag {
     pub key: String,
@@ -113,6 +117,7 @@ impl Tag {
     }
 }
 
+#[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Art {
     pub id: i64,
@@ -124,6 +129,7 @@ pub struct Art {
     pub data: Vec<u8>,
 }
 
+#[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtMeta {
     pub mime: String,
@@ -132,6 +138,7 @@ pub struct ArtMeta {
     pub byte_len: i64,
 }
 
+#[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackArt {
     pub art_id: i64,
