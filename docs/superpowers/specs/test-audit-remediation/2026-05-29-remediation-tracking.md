@@ -2,7 +2,7 @@
 
 **Source audit:** `docs/audits/2026-05-29-test-audit.md`
 **Created:** 2026-05-29
-**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; Phase 3d (WAV) complete; Phase 4b PR 1 landed (mutants feature + user_version kill + #10/#11/#12 coverage + framing corrections); Phase 4b PR 2 pending (newly-viable survivor sweep, gated on dispatched campaign); Phase 4a pending
+**Status:** Phase 1 complete (harness merged, inventory filled from CI run 26632110192); Phase 2 complete (Ogg hardening); Phase 3a (FLAC) complete; Phase 3b complete (MP3 survivors killed); Phase 3c (MP4) complete; Phase 3d (WAV) complete; Phase 4a (core hardening) complete; Phase 4b (db hardening) complete — campaign 26668141596 confirmed 53 caught / 1 missed (known equivalent) / 0 timeout / 8 unviable (tooling limits), no survivor sweep needed
 
 ## Guiding principle: verify, don't trust
 
@@ -143,15 +143,18 @@ Findings #5, #16.
 
 Findings #9, #10, #11, #12, #15.
 
-- **4b PR 1 landed** — `mutants` feature gating model `Default` derives + `Default
+- **4b complete** — `mutants` feature gating model `Default` derives + `Default
   for Db` (in-memory, unmigrated); `user_version` Ok(1) mutant killed; coverage
   tests for #10 (upsert conflict columns), #11 (shared-art GC + set_track_art
   replace), #12 (tags_grouped empty + ordering); framing corrections for #11
   (no concurrent-deletion race) and #12 (Rust-side HashMap, not SQL GROUP BY);
   `schema.rs` `< → <=` confirmed equivalent; campaign script + CI leg wired with
-  `--features mutants`. Inventory annotations updated.
-- **4b PR 2 pending** — newly-viable survivor sweep (20 unblocked mutants),
-  gated on the dispatched campaign artifact.
+  `--features mutants`. **Verified by campaign run 26668141596** (db leg): 53
+  caught / 1 missed (the known `schema.rs:93` equivalent) / 0 timeout / 8 unviable.
+  The feature turned the `Default`-class unviables into caught, so the planned
+  newly-viable survivor sweep had **nothing to kill** — no second PR was needed.
+  The 8 residual unviable are tooling limits (7 unqualified-`HashMap::new()` in
+  `tags.rs`, 1 unsized `&Path` in `lib.rs`), recorded in the inventory.
 - scan probe fallbacks (#9) + scan mutants
 - reader.rs header-cache survivors
 - facade glue survivors

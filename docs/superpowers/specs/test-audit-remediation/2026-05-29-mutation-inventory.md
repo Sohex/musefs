@@ -34,13 +34,26 @@ pattern, below) and are not survivors.
 
 ## Tool limitations to revisit (phase 4)
 
-- `musefs-db` mutation is **not** vacuous (40/62 caught), but 20 mutants are
+- `musefs-db` mutation is **not** vacuous (40/62 caught), but 20 mutants were
   unviable because they replace a body with `Ok(Default::default())`. Only
   `lib.rs`'s `Db`-returning fns need `Db: Default`; the `tags`/`tracks`/`art`
   unviables need `Default` on the model structs (`Track`/`Art`/`ArtMeta`/`Tag`/
-  `TrackArt`) and `Format`. These are now unblocked behind the `mutants` feature
-  (PR 1), with the survivor sweep in PR 2 — concentrated in `tags.rs` (8),
-  `tracks.rs` (5), `lib.rs` (4), `art.rs` (3).
+  `TrackArt`) and `Format`. The `mutants` feature (Phase 4b) supplies those impls.
+
+  **Resolved — campaign run 26668141596** (db leg, `--features mutants`):
+  **53 caught / 1 missed / 0 timeout / 8 unviable.** The feature converted the
+  `Default`-class unviables straight to **caught**; there were **no newly-viable
+  survivors to sweep**, so no follow-up PR was needed. The single missed mutant is
+  `schema.rs:93 < → <=`, the documented equivalent (reached only at
+  `current=0,target=1`, where `<` and `<=` coincide). The 8 remaining unviable are
+  genuine tooling limits, not `Default` gaps:
+  - **`tags.rs:39` (7)** — cargo-mutants emits unqualified `Ok(HashMap::new())`,
+    which fails `E0433: cannot find type HashMap` because `tags.rs` names the type
+    by full path and never `use`s it. (Adding `use std::collections::HashMap;`
+    would make them viable + caught by the existing `tags_grouped` tests, but they
+    are the already-killed empty/`Default` class — left as-is.)
+  - **`lib.rs:68` `Db::path`** — `Some(Box::leak(Box::new(Default::default())))`
+    for `Option<&Path>`; `&Path` is unsized and cannot be `Default`-constructed.
 - A few `musefs-format` / `musefs-core` mutants share the same
   `Ok(Default::default())` unviable pattern.
 

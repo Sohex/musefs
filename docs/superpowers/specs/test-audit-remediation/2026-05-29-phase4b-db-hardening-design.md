@@ -227,6 +227,16 @@ all tags by track. Add `tags_grouped` accumulation cases:
 
 ### B6 — newly-viable survivor sweep (post-campaign)
 
+> **Resolved — campaign run 26668141596 (db leg): no follow-up PR needed.**
+> The `--features mutants` campaign returned **53 caught / 1 missed / 0 timeout /
+> 8 unviable**. The feature converted the `Default`-class unviables directly into
+> caught, so there were **zero newly-viable survivors to sweep** — the premise of
+> this component did not materialize. The lone missed mutant is the pre-documented
+> `schema.rs:93 < → <=` equivalent. The 8 residual unviable are genuine tooling
+> limits (7× cargo-mutants emitting unqualified `HashMap::new()` in `tags.rs`;
+> 1× unsized `&Path` in `Db::path`), not `Default` gaps. Recorded in the inventory;
+> the planned second PR was dispensed with.
+
 After the campaign runs with `--features mutants`, download the
 `mutants-musefs-db` artifact and enumerate the now-viable survivors among the 20
 (`mutants.out/missed.txt` minus what the B2–B5 tests already cover). Kill each via

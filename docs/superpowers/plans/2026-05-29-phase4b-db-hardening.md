@@ -540,6 +540,15 @@ The `full` job's `mutants-musefs-db` artifact (built with `--features mutants`) 
 
 ## PR 2 — newly-viable survivor sweep (post-campaign)
 
+> **RESOLVED — not executed; no PR 2.** Campaign run 26668141596 (db leg,
+> `--features mutants`) returned 53 caught / 1 missed / 0 timeout / 8 unviable.
+> The feature turned the `Default`-class unviables straight into caught, so there
+> were **no newly-viable survivors to kill**. The one missed mutant is the known
+> `schema.rs:93 < → <=` equivalent; the 8 residual unviable are tooling limits
+> (unqualified `HashMap::new()` in `tags.rs`, unsized `&Path` in `Db::path`).
+> Finding documented in the inventory + tracking docs within PR 1. The procedure
+> below is retained for reference only.
+
 ### Task 9: Kill the newly-viable db survivors and finalize the inventory (B6)
 
 > **Gated on the dispatched campaign.** This task cannot be fully specified ahead of time — the exact survivor set is unknown until the `--features mutants` campaign runs. It defines the procedure; the implementer enumerates and kills the actual survivors. Do this on a fresh branch off `main` after PR 1 merges.
