@@ -1,0 +1,3 @@
+# Picard is not pip-installed (it ships as a Qt application); the plugin runs
+# inside a Picard installation at runtime. Only the test deps are listed here.
+pytest>=7
