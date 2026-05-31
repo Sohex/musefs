@@ -112,14 +112,35 @@ impl Inodes {
         }
     }
     fn rename(&mut self, from: &Path, to: PathBuf) {
-        if let Some(i) = self.rev.remove(from) {
-            self.fwd.insert(i, to.clone());
-            // An overwrite-rename onto an already-interned path must drop the
-            // displaced inode's stale `fwd` entry, or the bidirectional map
-            // would report two inodes for one path.
-            if let Some(displaced) = self.rev.insert(to, i) {
+        let Some(i) = self.rev.remove(from) else {
+            return;
+        };
+        // Renaming a directory must re-point its already-interned descendants
+        // (`from/<suffix>` -> `to/<suffix>`); otherwise their inodes would be
+        // stranded on stale paths and later inode->path lookups would fail.
+        // `from` is already removed above, so no descendant matches it exactly.
+        let descendants: Vec<(u64, PathBuf, PathBuf)> = self
+            .rev
+            .iter()
+            .filter_map(|(path, &ino)| {
+                path.strip_prefix(from)
+                    .ok()
+                    .map(|suffix| (ino, path.clone(), to.join(suffix)))
+            })
+            .collect();
+        for (ino, old, new) in descendants {
+            self.rev.remove(&old);
+            if let Some(displaced) = self.rev.insert(new.clone(), ino) {
                 self.fwd.remove(&displaced);
             }
+            self.fwd.insert(ino, new);
+        }
+        self.fwd.insert(i, to.clone());
+        // An overwrite-rename onto an already-interned path must drop the
+        // displaced inode's stale `fwd` entry, or the bidirectional map
+        // would report two inodes for one path.
+        if let Some(displaced) = self.rev.insert(to, i) {
+            self.fwd.remove(&displaced);
         }
     }
 }
@@ -710,5 +731,157 @@ impl LatencyMount {
     /// Total `fsync`/`fsyncdir` operations observed since mount.
     pub fn fsyncs(&self) -> u64 {
         self.fsyncs.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn profile_ssd_and_unknown_are_zero() {
+        for name in ["ssd", "", "garbage"] {
+            let l = Latency::profile(name);
+            assert_eq!(l.open, Duration::ZERO);
+            assert_eq!(l.stat, Duration::ZERO);
+            assert_eq!(l.read, Duration::ZERO);
+            assert_eq!(l.write, Duration::ZERO);
+            assert_eq!(l.fsync, Duration::ZERO);
+            assert_eq!(l.other, Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn profile_hdd_values() {
+        let l = Latency::profile("hdd");
+        assert_eq!(l.open, ms(8));
+        assert_eq!(l.stat, ms(8));
+        assert_eq!(l.read, ms(8));
+        assert_eq!(l.write, ms(8));
+        assert_eq!(l.fsync, ms(10));
+        assert_eq!(l.other, ms(2));
+    }
+
+    #[test]
+    fn profile_nfs_ssd_values() {
+        let l = Latency::profile("nfs-ssd");
+        assert_eq!(l.open, us(600));
+        assert_eq!(l.stat, us(400));
+        assert_eq!(l.read, us(600));
+        assert_eq!(l.write, us(600));
+        assert_eq!(l.fsync, us(800));
+        assert_eq!(l.other, us(300));
+    }
+
+    #[test]
+    fn profile_nfs_hdd_values() {
+        let l = Latency::profile("nfs-hdd");
+        assert_eq!(l.open, us(8600));
+        assert_eq!(l.stat, us(8400));
+        assert_eq!(l.read, us(8600));
+        assert_eq!(l.write, us(8600));
+        assert_eq!(l.fsync, ms(10) + us(800));
+        assert_eq!(l.other, us(2300));
+    }
+
+    #[test]
+    fn nap_zero_is_noop_nonzero_sleeps() {
+        // Zero duration must not sleep (the guard); a tiny non-zero one returns.
+        nap(Duration::ZERO);
+        nap(us(1));
+    }
+
+    #[test]
+    fn inodes_root_is_one_and_next_starts_at_two() {
+        let m = Inodes::new(p("/root"));
+        assert_eq!(m.path(1), Some(p("/root")));
+        assert_eq!(m.next, 2);
+        assert_eq!(m.path(2), None);
+    }
+
+    #[test]
+    fn intern_is_idempotent_and_increments() {
+        let mut m = Inodes::new(p("/root"));
+        let a = m.intern(p("/root/a"));
+        let b = m.intern(p("/root/b"));
+        assert_eq!(a, 2);
+        assert_eq!(b, 3);
+        // Re-interning the same path returns the same inode, no increment.
+        assert_eq!(m.intern(p("/root/a")), a);
+        assert_eq!(m.next, 4);
+        assert_eq!(m.path(a), Some(p("/root/a")));
+    }
+
+    #[test]
+    fn forget_path_clears_both_directions() {
+        let mut m = Inodes::new(p("/root"));
+        let a = m.intern(p("/root/a"));
+        m.forget_path(&p("/root/a"));
+        assert_eq!(m.path(a), None);
+        // A fresh intern of the same path gets a new inode (never recycled).
+        let a2 = m.intern(p("/root/a"));
+        assert_ne!(a2, a);
+    }
+
+    #[test]
+    fn rename_moves_inode_and_keeps_map_consistent() {
+        let mut m = Inodes::new(p("/root"));
+        let a = m.intern(p("/root/a"));
+        m.rename(&p("/root/a"), p("/root/b"));
+        assert_eq!(m.path(a), Some(p("/root/b")));
+        assert_eq!(m.intern(p("/root/b")), a);
+        // The old path no longer resolves to the moved inode.
+        assert_ne!(m.intern(p("/root/a")), a);
+    }
+
+    #[test]
+    fn rename_onto_existing_path_drops_displaced_inode() {
+        let mut m = Inodes::new(p("/root"));
+        let a = m.intern(p("/root/a"));
+        let b = m.intern(p("/root/b"));
+        // Overwrite-rename a -> b: b's path is now owned by inode `a`, and the
+        // displaced inode `b` must have no stale forward entry.
+        m.rename(&p("/root/a"), p("/root/b"));
+        assert_eq!(m.intern(p("/root/b")), a);
+        assert_eq!(m.path(b), None);
+    }
+
+    #[test]
+    fn rename_directory_repoints_interned_descendants() {
+        let mut m = Inodes::new(p("/root"));
+        let dir = m.intern(p("/root/d"));
+        let child = m.intern(p("/root/d/c"));
+        let grandchild = m.intern(p("/root/d/sub/g"));
+        m.rename(&p("/root/d"), p("/root/e"));
+        // The directory and every interned descendant follow the new prefix,
+        // keeping their inodes (a held descriptor stays valid).
+        assert_eq!(m.path(dir), Some(p("/root/e")));
+        assert_eq!(m.path(child), Some(p("/root/e/c")));
+        assert_eq!(m.path(grandchild), Some(p("/root/e/sub/g")));
+        // The stale paths no longer resolve to the moved inodes.
+        assert_ne!(m.intern(p("/root/d/c")), child);
+    }
+
+    #[test]
+    fn attr_from_meta_maps_file_and_dir_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), b"hello").unwrap();
+        let fmeta = std::fs::symlink_metadata(dir.path().join("f")).unwrap();
+        let fa = attr_from_meta(42, &fmeta);
+        assert_eq!(fa.ino, INodeNo(42));
+        assert_eq!(fa.size, 5);
+        assert_eq!(fa.kind, FileType::RegularFile);
+        // perm carries only the 12 permission bits, never the file-type bits.
+        assert_eq!(fa.perm & !0o7777, 0);
+
+        let dmeta = std::fs::symlink_metadata(dir.path()).unwrap();
+        let da = attr_from_meta(1, &dmeta);
+        assert_eq!(da.kind, FileType::Directory);
+        assert_eq!(da.ino, INodeNo(1));
     }
 }
