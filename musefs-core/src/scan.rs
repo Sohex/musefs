@@ -355,7 +355,9 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
 /// Opus, Vorbis, FLAC-in-Ogg) under `root` (with audio bounds and validation
 /// stamps), seeding its tags from the file's existing metadata. `root` may be
 /// a single audio file (only that file is scanned) or a directory (walked
-/// recursively). Files that fail to parse are skipped.
+/// recursively). Unsupported-format files increment `ScanStats::skipped`; files
+/// with a per-file I/O or parse error increment `ScanStats::failed` and do not
+/// abort the scan.
 pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut files = Vec::new();
     if root.is_file() {
@@ -378,7 +380,12 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
         };
         match probe_file(&path, meta.len()) {
             Ok(Some(probed)) => {
-                let abs = std::fs::canonicalize(&path)?;
+                // `canonicalize` is per-file I/O (a symlink target can vanish in
+                // the window after the walk), so keep it non-fatal like `metadata`.
+                let Ok(abs) = std::fs::canonicalize(&path) else {
+                    stats.failed += 1;
+                    continue;
+                };
                 ingest(db, &abs.to_string_lossy(), &meta, probed)?;
                 stats.scanned += 1;
             }
