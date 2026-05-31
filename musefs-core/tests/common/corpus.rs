@@ -1,6 +1,8 @@
 //! Deterministic synthetic-library generator for the SP0 bench harness.
 //! Shared by `#[ignore]`d timing tests and the read Criterion bench.
 
+use std::path::{Path, PathBuf};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
     Ci,
@@ -127,11 +129,10 @@ fn env_usize(key: &str) -> Option<usize> {
     std::env::var(key).ok().and_then(|s| s.parse().ok())
 }
 
-use std::path::{Path, PathBuf};
-
 /// Deterministic filler audio: a seedable byte ramp (content is irrelevant —
 /// `BackingAudio` is served verbatim and probing reads only headers).
 fn filler(seed: u64, idx: usize, len: usize) -> Vec<u8> {
+    // Knuth multiplicative hash constant (⌊φ · 2³²⌋) to spread the seed bits.
     let base = seed.wrapping_add(idx as u64).wrapping_mul(2_654_435_761);
     (0..len)
         .map(|i| (base.wrapping_add(i as u64) & 0xFF) as u8)
@@ -206,6 +207,9 @@ pub fn generate(dir: &Path, p: &CorpusParams) -> Vec<PathBuf> {
     paths
 }
 
+/// `comments` and `art` are only consumed by [`Format::Flac`]; the other formats
+/// carry tags via the DB at scan time and have no embedded-art builder, so they
+/// ignore both here.
 fn generate_one(
     adir: &Path,
     idx: usize,
