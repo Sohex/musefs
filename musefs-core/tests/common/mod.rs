@@ -3,6 +3,7 @@
 use std::path::Path;
 
 pub mod corpus;
+pub mod report;
 
 pub fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
     let mut out = Vec::new();

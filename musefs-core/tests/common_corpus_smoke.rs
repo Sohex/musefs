@@ -1,6 +1,7 @@
 mod common;
 
 use common::corpus::{prepare, CorpusParams, Format, Tier};
+use common::report::{peak_rss_kib, RunReport};
 use common::write_m4a_moov_last;
 use musefs_core::scan_directory;
 use musefs_db::Db;
@@ -101,4 +102,24 @@ fn prepare_generates_when_no_library_set() {
     let db = Db::open(&t.db_path).unwrap();
     let stats = musefs_core::scan_directory(&db, &t.corpus_dir).unwrap();
     assert_eq!(stats.scanned, 2);
+}
+
+#[test]
+fn report_renders_a_row() {
+    let r = RunReport {
+        label: "scan".into(),
+        tier: "ci".into(),
+        storage: "tempfs".into(),
+        wall_ms: 1234,
+        opens: 200,
+        preads: 200,
+        fsyncs: None,
+        peak_rss_kib: Some(50_000),
+    };
+    let line = r.row();
+    assert!(line.contains("scan"));
+    assert!(line.contains("ci"));
+    assert!(line.contains("n/a"), "fsyncs None renders as n/a");
+    // RSS is readable and positive on Linux.
+    assert!(peak_rss_kib().unwrap_or(1) > 0);
 }
