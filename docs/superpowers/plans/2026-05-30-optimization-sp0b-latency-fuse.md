@@ -379,10 +379,15 @@ impl fuser::Filesystem for PassthroughFs {
         let Some(dir) = self.ipath(ino.0) else {
             return reply.error(fuser::Errno::ENOENT);
         };
-        let parent_ino = dir
-            .parent()
-            .map(|p| self.inodes.lock().unwrap().intern(p.to_path_buf()))
-            .unwrap_or(ino.0);
+        // Root's `..` is self-referential (conventional FUSE root), so we never
+        // intern a path outside the mounted backing tree.
+        let parent_ino = if ino.0 == 1 {
+            ino.0
+        } else {
+            dir.parent()
+                .map(|p| self.inodes.lock().unwrap().intern(p.to_path_buf()))
+                .unwrap_or(ino.0)
+        };
         let mut entries: Vec<(u64, FileType, std::ffi::OsString)> = vec![
             (ino.0, FileType::Directory, ".".into()),
             (parent_ino, FileType::Directory, "..".into()),
@@ -520,6 +525,16 @@ impl fuser::Filesystem for PassthroughFs {
     fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
 }
 
+/// Serializes the racy fusermount3 mount handshake. `Session::new` forks/execs
+/// `fusermount3` and passes the `/dev/fuse` fd back over a socket; fork and the
+/// fd table are process-global, so two mounts establishing concurrently from one
+/// process race the fd table ("file descriptor N is not a socket, can't send fuse
+/// fd"). `cargo test -- --ignored` runs a binary's tests in parallel and several
+/// test files mount more than once, so guard setup. Mirrors `musefs-fuse`'s
+/// `MOUNT_SETUP`. The lock covers only establishment, never the session lifetime,
+/// so it never serializes filesystem operations.
+static MOUNT_SETUP: Mutex<()> = Mutex::new(());
+
 /// A mounted passthrough FS. Unmounts on drop. The corpus + DB live under
 /// `path()`; point scans and `Db::open` there to measure under injected latency.
 pub struct LatencyMount {
@@ -542,7 +557,14 @@ impl LatencyMount {
         );
         let mut cfg = Config::default();
         cfg.mount_options = vec![MountOption::FSName("musefs-latencyfs".to_string())];
-        let session = Session::new(fs, mountdir.path(), &cfg)?;
+        let session = {
+            // Recover from a poisoned lock: it guards only ordering, so a prior
+            // panic during a mount leaves no inconsistent state to protect.
+            let _guard = MOUNT_SETUP
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Session::new(fs, mountdir.path(), &cfg)?
+        };
         let bg = session.spawn()?;
         Ok(LatencyMount {
             fsyncs,
@@ -628,7 +650,7 @@ fn write_fsync_rename_unlink_through_the_mount() {
 - [ ] **Step 2: Run it (fails — write ops unimplemented, default ENOSYS)**
 
 Run: `cargo test -p musefs-latencyfs --test passthrough write_fsync -- --ignored --nocapture`
-Expected: FAIL — the `OpenOptions::create` returns `ENOSYS`/`EROFS`-style error (write ops not implemented yet).
+Expected: FAIL — `OpenOptions::create` returns `ENOSYS` ("Function not implemented"): with no `create` override the trait default replies `Errno::ENOSYS`.
 
 - [ ] **Step 3: Implement the write ops**
 
@@ -1148,6 +1170,9 @@ git commit -m "docs: record SP0b latency-injection harness and how to run it"
 - **Spec coverage (the deferred SP0b items):** passthrough-FUSE latency injection (Tasks 1–3), `ssd` gating smoke test incl. WAL (Task 4), latency-effect + fsync-direction (Task 5), fsync counter/column wired into reporting (Task 6). All FUSE tests are `#[ignore]`d, matching the existing e2e convention; the default `cargo test` is unchanged.
 - **Op completeness risk:** Task 4's SQLite WAL cycle is the guard. If it fails, the error names the missing op; implement it following the Task-3 patterns (e.g. `getxattr`/`lseek` are tolerated as ENOSYS by SQLite, but if a build surfaces one, add a `reply.error(Errno::ENOSYS)` override is already the default — no action — whereas a *data* op like `copy_file_range` would need adding).
 - **Drop-order correctness:** `LatencyMount` declares `_bg` before `_mountdir` so the session unmounts before the mountpoint tempdir is removed.
+- **Mount-handshake serialization:** `LatencyMount::new` guards `Session::new` with a process-global `MOUNT_SETUP` mutex, mirroring `musefs-fuse/src/lib.rs`. Several `#[ignore]`d test files mount more than once and `cargo test -- --ignored` runs a binary's tests in parallel; the racy fusermount3 fork/fd-passing would otherwise intermittently fail. The lock covers only establishment, never op dispatch.
+- **In-process `on_fsync` hook — declined.** The spec asks for an explicit decision. The passthrough fsync counter (`LatencyMount::fsyncs`) is the single source of truth for SP1; tempfs `ci` runs report it via the same mount path, so no separate in-process `metrics::on_fsync` hook is added. (If a future tempfs-only bench needs fsync counts without a mount, revisit then — YAGNI now.)
+- **Reproducibility / regression gate is SP0a-owned.** That acceptance criterion lives on the tempfs `ci` bench (SP0a's stable-median + threshold check); SP0b deliberately does not re-implement it — its FUSE benches are `#[ignore]`d and latency-injected, not CI-gated.
 - **No production code touched:** `musefs-latencyfs` is a new `publish = false` crate; the only edit to a shipping crate is a `[dev-dependencies]` line in `musefs-core`.
 - **Type consistency:** `LatencyMount::{new, path, fsyncs}`, `Latency::profile`, `PassthroughFs` used identically across tasks; reply/trait signatures match the verified fuser 0.17 source.
 - **Known approximation:** profile latencies are representative, not calibrated to specific hardware; they model *relative* HDD/NFS behavior (the spec's stated non-goal is faithful bandwidth, which real-mount runs cover).
