@@ -2,6 +2,9 @@
 
 use std::path::Path;
 
+pub mod corpus;
+pub mod report;
+
 pub fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.push((if is_last { 0x80 } else { 0 }) | (block_type & 0x7F));
@@ -176,4 +179,96 @@ pub fn minimal_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     let entry = stco + 4 + 4 + 4; // past "stco" type + version/flags + entry count
     out[entry..entry + 4].copy_from_slice(&mdat_payload_offset.to_be_bytes());
     out
+}
+
+/// Build a minimal valid M4A with `moov` AFTER `mdat`. Same box contents as
+/// `minimal_m4a`; only top-level order differs — `moov` trails `mdat`, so a
+/// bounded-read implementation must seek backward over the payload to reach the
+/// metadata (the SP1 hard case). The MP4 reader locates boxes by scanning, so
+/// order does not affect parsing.
+pub fn minimal_m4a_moov_last(mdat_payload: &[u8]) -> Vec<u8> {
+    let ilst_atoms = [
+        bx(b"\xa9nam", &m4a_data_atom(1, b"Orig M4A")),
+        bx(b"\xa9ART", &m4a_data_atom(1, b"Orig Artist")),
+    ]
+    .concat();
+    let ilst = bx(b"ilst", &ilst_atoms);
+
+    let mut meta_hdlr = vec![0u8; 8];
+    meta_hdlr.extend_from_slice(b"mdir");
+    meta_hdlr.extend_from_slice(b"appl");
+    meta_hdlr.extend_from_slice(&[0u8; 9]);
+    let mut meta = vec![0u8; 4]; // FullBox version/flags
+    meta.extend(bx(b"hdlr", &meta_hdlr));
+    meta.extend(ilst);
+    let udta = bx(b"udta", &bx(b"meta", &meta));
+
+    let mut soun_hdlr = vec![0u8; 8];
+    soun_hdlr.extend_from_slice(b"soun");
+    soun_hdlr.extend_from_slice(&[0u8; 12]);
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&0u32.to_be_bytes());
+    let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+    let trak = bx(
+        b"trak",
+        &bx(b"mdia", &[bx(b"hdlr", &soun_hdlr), minf].concat()),
+    );
+    let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak, udta].concat());
+    let ftyp = bx(b"ftyp", b"M4A isom");
+    let mdat = bx(b"mdat", mdat_payload);
+
+    // Order: ftyp, mdat, moov. The mdat payload starts right after ftyp + mdat header.
+    // ftyp box: 8-byte header + 8-byte payload "M4A isom" = 16 bytes total.
+    // mdat header: 8 bytes. So payload offset = 16 + 8 = 24.
+    // Search for `stco` only within `moov`: the mdat payload precedes it here
+    // and could otherwise contain a false `stco` byte match.
+    let moov_start = ftyp.len() + mdat.len();
+    let mut out = [ftyp, mdat, moov].concat();
+    let mdat_payload_offset = (8 + b"M4A isom".len() + 8) as u32;
+    let stco_pos = moov_start
+        + out[moov_start..]
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco present");
+    let entry = stco_pos + 4 + 4 + 4; // past "stco" type + version/flags + entry count
+    out[entry..entry + 4].copy_from_slice(&mdat_payload_offset.to_be_bytes());
+    out
+}
+
+/// Write a moov-at-end M4A to `path`, returning (audio_offset, audio_length) of
+/// the verbatim `mdat` payload.
+pub fn write_m4a_moov_last(path: &Path, audio: &[u8]) -> (i64, i64) {
+    let bytes = minimal_m4a_moov_last(audio);
+    // ftyp: 8 header + 8 payload = 16; mdat header: 8 → payload at offset 24.
+    let audio_offset = (8 + b"M4A isom".len() + 8) as i64;
+    std::fs::write(path, &bytes).unwrap();
+    (audio_offset, audio.len() as i64)
+}
+
+/// Write a minimal valid Ogg **Opus** file (two header pages + one audio page
+/// whose packet body is `audio`) to `path`, returning (audio_offset,
+/// audio_length) where audio_length is the Ogg page span (raw audio bytes plus
+/// page-framing overhead, not `audio.len()`). Mirrors the recipe in
+/// `musefs-core/src/scan.rs`'s `ogg_probe_tests`: the `OpusTags` body must be a
+/// parseable VorbisComment (here empty) because the scanner runs `read_tags`.
+/// The synthesizer treats the audio packet body as opaque (renumbers pages,
+/// recomputes CRCs, never decodes), so arbitrary `audio` bytes are valid. The
+/// return is informational — `scan_directory` re-probes the file.
+pub fn write_ogg(path: &Path, audio: &[u8]) -> (i64, i64) {
+    use musefs_format::ogg::page_test_support::{
+        build_header_pub, lace_packet_pub, vorbis_body_empty,
+    };
+    let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&vorbis_body_empty());
+    let serial = 0x6d75_7366; // "musf"
+                              // build_header returns (bytes, header_page_count); the audio page continues
+                              // the sequence at that count.
+    let (mut bytes, header_pages) = build_header_pub(serial, &[&head, &tags]);
+    let header_len = bytes.len();
+    let (page, _) = lace_packet_pub(serial, header_pages, false, 960, audio);
+    bytes.extend_from_slice(&page);
+    std::fs::write(path, &bytes).unwrap();
+    (header_len as i64, (bytes.len() - header_len) as i64)
 }
