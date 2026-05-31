@@ -377,6 +377,14 @@ the fallback.
   triggers maintain `updated_at`, so it would miss a `format`-only change too); the
   cheap render-key scan is estimated at low-tens-of-ms at 1M rows and is measured
   by a bench row. A possible follow-up if the identity scan ever dominates.
+  *(Confirmed residual after Stage B shipped: the library-size sweep is not flat
+  because this O(N) `list_render_keys` scan — together with the full
+  `new_snapshot` `HashMap` reconstruction in `rebuild_incremental`, which clones
+  the cached path for every unchanged track each refresh — still precedes the
+  O(changed) `apply_changes`. Making `poll_refresh` strictly O(changed) means
+  mutating the snapshot in place against the retained `prev_snapshot` and a
+  changed-set query; deferred as it was never the bottleneck the full rebuild
+  was.)*
 - **"Sticky" disambiguation** (a disambiguated name surviving after its collision
   clears) — rejected: it is a behavior change that forfeits the full-rebuild
   equivalence oracle.

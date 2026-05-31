@@ -183,3 +183,16 @@ commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
   debug-assert (incremental ≡ full) green. Fallback test (forced `Err(())` →
   full-rebuild) green. FUSE byte-identical PCM e2e green. See `BENCHMARKS.md`
   "SP2 — Incremental tree refresh".
+  - **Follow-up (known residual, not addressed in SP2):** `rebuild_incremental`
+    still performs two O(library) steps before the O(changed) `apply_changes`:
+    the `Db::list_render_keys` identity scan (every track's `(id,
+    content_version, format)`) and the full `new_snapshot` reconstruction (a
+    fresh `HashMap<i64, TrackRenderState>` rebuilt each refresh, cloning the
+    cached path for every unchanged track). These are cheap relative to the
+    eliminated `build_with` (no rendering, no tree ops) but keep `poll_refresh`
+    O(N) rather than strictly O(changed), so the library-size sweep is not flat.
+    Making it truly O(changed) end-to-end means mutating the snapshot in place
+    (apply only changed/added/removed against the retained `prev_snapshot`) and
+    a changed-set DB query instead of the full identity scan — see the SP2 spec
+    "Out of scope (YAGNI)". Deferred: the residual is low-tens-of-ms at ~5k–1M
+    rows and was never the bottleneck the full rebuild was.
