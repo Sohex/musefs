@@ -1,4 +1,5 @@
 use crate::error::{FormatError, Result};
+use crate::probe::Extent;
 
 pub(crate) const FLAC_MARKER: &[u8; 4] = b"fLaC";
 
@@ -80,8 +81,6 @@ fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
 pub fn read_metadata(data: &[u8]) -> Result<FlacMeta> {
     parse_blocks(data)
 }
-
-use crate::probe::Extent;
 
 /// Bounded twin of [`read_metadata`]: walk the metadata blocks present in
 /// `prefix` (which may be a front-only window of the file). If a block's declared
