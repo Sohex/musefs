@@ -99,6 +99,19 @@ impl Db {
         Ok(())
     }
 
+    /// Test-only: force a track's format column directly (no rescan), bumping
+    /// data_version. The only way to exercise a format-only change — production
+    /// never mutates format without a rescan. content_version is NOT bumped (no
+    /// trigger fires on the tracks.format column), so this is a pure format-only edit.
+    #[doc(hidden)]
+    pub fn set_format_for_test(&self, id: i64, fmt: Format) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET format = ?1, updated_at = CAST(strftime('%s','now') AS INTEGER) WHERE id = ?2",
+            params![fmt.as_str(), id],
+        )?;
+        Ok(())
+    }
+
     /// Cheap render-key identity scan for incremental refresh: `(id, content_version,
     /// format)` for every track, ordered by id. No tags, no path columns — just the
     /// two track-level inputs that determine a rendered path. See SP2 Component 1.

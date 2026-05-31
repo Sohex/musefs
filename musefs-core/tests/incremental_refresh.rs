@@ -83,3 +83,52 @@ fn incremental_refresh_matches_full_rebuild_over_edits() {
         "incremental and full-rebuild paths must match"
     );
 }
+
+#[test]
+fn non_render_column_edit_is_noop_refresh() {
+    // Re-running scan_directory over an unchanged corpus bumps data_version but
+    // changes no rendered path, so the tree must be identical before and after.
+    let target = small_corpus(4);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+
+    // Re-scan: touches updated_at (data_version bump) but no rendered path changes.
+    let db2 = Db::open(&db_path).unwrap();
+    scan_directory(&db2, &corpus).unwrap();
+
+    let before = tree_fingerprint(&fs);
+    let rebuilt = fs.poll_refresh().unwrap();
+    let after = tree_fingerprint(&fs);
+    assert_eq!(before, after, "non-render edit must not change the tree");
+    let _ = rebuilt; // tree-equality is the gate, not the bool
+}
+
+#[test]
+fn format_only_change_notifies_old_inode() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let writer = Db::open(&db_path).unwrap();
+    let id = writer.list_tracks().unwrap()[0].id;
+    let old_ino = fs.lookup_track_inode_for_test(id).unwrap();
+
+    // Force a format change directly (no tags trigger), bumping data_version.
+    writer
+        .set_format_for_test(id, musefs_db::Format::Mp3)
+        .unwrap();
+
+    let mut notified = Vec::new();
+    fs.poll_refresh_notify(|ino| notified.push(ino)).unwrap();
+
+    assert!(
+        notified.contains(&old_ino),
+        "format-only move must invalidate the old inode (extension changed)"
+    );
+}

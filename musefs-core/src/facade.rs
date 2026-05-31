@@ -466,6 +466,11 @@ impl Musefs {
         self.force_rebuild_error.store(fail, Ordering::Release);
     }
 
+    #[doc(hidden)]
+    pub fn lookup_track_inode_for_test(&self, track_id: i64) -> Option<u64> {
+        self.tree.load().inode_of_track(track_id)
+    }
+
     /// Backdates `last_poll` so the next `poll_refresh` is past the debounce
     /// window, letting tests cross the window deterministically without sleeping.
     #[doc(hidden)]
