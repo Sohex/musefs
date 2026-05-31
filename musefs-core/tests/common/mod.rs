@@ -177,3 +177,62 @@ pub fn minimal_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     out[entry..entry + 4].copy_from_slice(&mdat_payload_offset.to_be_bytes());
     out
 }
+
+/// Build a minimal valid M4A with `moov` AFTER `mdat` (the SP1 bounded-read hard
+/// case). Same box contents as `minimal_m4a`; only top-level order differs. The
+/// MP4 reader locates boxes by scanning, so order does not affect parsing.
+pub fn minimal_m4a_moov_last(mdat_payload: &[u8]) -> Vec<u8> {
+    let ilst_atoms = [
+        bx(b"\xa9nam", &m4a_data_atom(1, b"Orig M4A")),
+        bx(b"\xa9ART", &m4a_data_atom(1, b"Orig Artist")),
+    ]
+    .concat();
+    let ilst = bx(b"ilst", &ilst_atoms);
+
+    let mut meta_hdlr = vec![0u8; 8];
+    meta_hdlr.extend_from_slice(b"mdir");
+    meta_hdlr.extend_from_slice(b"appl");
+    meta_hdlr.extend_from_slice(&[0u8; 9]);
+    let mut meta = vec![0u8; 4]; // FullBox version/flags
+    meta.extend(bx(b"hdlr", &meta_hdlr));
+    meta.extend(ilst);
+    let udta = bx(b"udta", &bx(b"meta", &meta));
+
+    let mut soun_hdlr = vec![0u8; 8];
+    soun_hdlr.extend_from_slice(b"soun");
+    soun_hdlr.extend_from_slice(&[0u8; 12]);
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&0u32.to_be_bytes());
+    let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+    let trak = bx(
+        b"trak",
+        &bx(b"mdia", &[bx(b"hdlr", &soun_hdlr), minf].concat()),
+    );
+    let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak, udta].concat());
+    let ftyp = bx(b"ftyp", b"M4A isom");
+    let mdat = bx(b"mdat", mdat_payload);
+
+    // Order: ftyp, mdat, moov. The mdat payload starts right after ftyp + mdat header.
+    // ftyp box: 8-byte header + 8-byte payload "M4A isom" = 16 bytes total.
+    // mdat header: 8 bytes. So payload offset = 16 + 8 = 24.
+    let mut out = [ftyp, mdat, moov].concat();
+    let mdat_payload_offset = (8 + b"M4A isom".len() + 8) as u32;
+    let stco_pos = out
+        .windows(4)
+        .position(|w| w == b"stco")
+        .expect("stco present");
+    let entry = stco_pos + 4 + 4 + 4; // past "stco" type + version/flags + entry count
+    out[entry..entry + 4].copy_from_slice(&mdat_payload_offset.to_be_bytes());
+    out
+}
+
+/// Write a moov-at-end M4A to `path`, returning (audio_offset, audio_length) of
+/// the verbatim `mdat` payload.
+pub fn write_m4a_moov_last(path: &std::path::Path, audio: &[u8]) -> (i64, i64) {
+    let bytes = minimal_m4a_moov_last(audio);
+    // ftyp: 8 header + 8 payload = 16; mdat header: 8 → payload at offset 24.
+    let audio_offset = (8 + b"M4A isom".len() + 8) as i64;
+    std::fs::write(path, &bytes).unwrap();
+    (audio_offset, audio.len() as i64)
+}
