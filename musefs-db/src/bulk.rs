@@ -170,4 +170,23 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
     }
+
+    #[test]
+    fn bulk_writer_dropped_without_commit_rolls_back() {
+        let db = Db::open_in_memory().unwrap();
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            bw.upsert_track(&NewTrack {
+                backing_path: "/m/ghost.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+            // Dropped here without `commit()` → Transaction rolls back.
+        }
+        assert_eq!(db.list_tracks().unwrap().len(), 0);
+    }
 }
