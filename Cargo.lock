@@ -789,6 +789,7 @@ dependencies = [
  "metaflac",
  "musefs-db",
  "musefs-format",
+ "musefs-latencyfs",
  "ogg",
  "once_cell",
  "proptest",
@@ -836,6 +837,16 @@ dependencies = [
  "sha2",
  "tempfile",
  "threadpool",
+]
+
+[[package]]
+name = "musefs-latencyfs"
+version = "0.2.0"
+dependencies = [
+ "fuser",
+ "libc",
+ "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

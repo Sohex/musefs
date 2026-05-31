@@ -82,3 +82,64 @@ fn bench_cold_scan_and_revalidate() {
         run_one(&target, &tier, format_token(fmt), storage);
     }
 }
+
+#[test]
+#[ignore = "needs /dev/fuse + MUSEFS_BENCH_LATENCY_PROFILE; run with --ignored --nocapture"]
+fn bench_scan_under_latency() {
+    use musefs_latencyfs::LatencyMount;
+
+    let Ok(profile) = std::env::var("MUSEFS_BENCH_LATENCY_PROFILE") else {
+        println!("set MUSEFS_BENCH_LATENCY_PROFILE=ssd|hdd|nfs-ssd|nfs-hdd to run");
+        return;
+    };
+    let params = CorpusParams::from_env();
+    let tier = std::env::var("MUSEFS_BENCH_TIER").unwrap_or_else(|_| "ci".into());
+
+    // Label the row with the corpus's actual format (matching the file's
+    // per-format / "mixed" convention) rather than assuming FLAC.
+    let format = if params.format_mix.len() == 1 {
+        format_token(params.format_mix[0]).to_string()
+    } else {
+        "mixed".to_string()
+    };
+
+    // Generate the corpus on a real backing dir, then mount the latency FS over
+    // it so the scan and its SQLite writes traverse the injected-latency layer.
+    let backing = tempfile::tempdir().unwrap();
+    common::corpus::generate(backing.path(), &params);
+    let mount = LatencyMount::new(backing.path(), &profile).unwrap();
+
+    let db = Db::open(mount.path().join("musefs-bench.db")).unwrap();
+    // `metrics::reset()` clears the in-process counters but NOT the mount's
+    // fsync counter, so snapshot the mount's count here to subtract Db::open's
+    // migration/WAL-setup fsyncs; the reported value then covers scan_directory
+    // only.
+    let fsyncs_before_scan = mount.fsyncs();
+    metrics::reset();
+    let t0 = Instant::now();
+    let stats = scan_directory(&db, &mount.path()).unwrap();
+    let scan_ms = t0.elapsed().as_millis();
+    let s = metrics::snapshot();
+
+    println!("\n{}", RunReport::header());
+    println!(
+        "{}",
+        RunReport {
+            label: "scan".into(),
+            format,
+            tier,
+            storage: profile.clone(),
+            wall_ms: scan_ms,
+            opens: s.opens,
+            preads: s.preads,
+            fsyncs: Some(mount.fsyncs().saturating_sub(fsyncs_before_scan)),
+            peak_rss_kib: None, // FS runs in-process here, but RSS attribution is mixed; omit.
+        }
+        .row()
+    );
+    println!("scanned={} skipped={}\n", stats.scanned, stats.skipped);
+    assert!(
+        stats.scanned > 0,
+        "scanned 0 tracks under {profile} latency"
+    );
+}
