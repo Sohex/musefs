@@ -68,11 +68,9 @@ fn bench_refresh_one_vs_many() {
     let many = (params.track_count() / 2).clamp(1, 1000);
     let many_ms = time_refresh(&target.db_path, &fs, many);
 
-    // `poll_refresh` is pure CPU + DB work, independent of the corpus storage
-    // class, so the storage column is fixed rather than derived from the target.
-    // bench_refresh stays FLAC-only: poll_refresh times a DB-driven virtual-tree
-    // rebuild, independent of the backing audio format, so per-format rows would
-    // be pure noise. The format column is fixed to "flac" for table consistency.
+    // `poll_refresh` is pure CPU + DB work — independent of both the corpus
+    // storage class and the backing audio format — so those columns are fixed
+    // rather than derived from the target. Per-format rows would be pure noise.
     println!("\n{}", RunReport::header());
     for (label, ms) in [("refresh-1", one_ms), ("refresh-N", many_ms)] {
         println!(

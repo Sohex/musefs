@@ -54,6 +54,7 @@ fn bench_cold_scan_and_revalidate() {
         "{}",
         RunReport {
             label: "scan".into(),
+            // Corpus is FLAC-only here; Task 6 replaces this with the swept format.
             format: "flac".into(),
             tier: tier.clone(),
             storage: storage.clone(),
