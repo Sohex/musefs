@@ -61,6 +61,9 @@ jobs:
           # `--output` collects the per-mutant report (missed.txt / caught.txt /
           # outcomes.json) so it can be uploaded even when the gate fails, giving
           # the authoritative survivor list without re-running the campaign.
+          # cargo-mutants' --output does a plain mkdir of the leaf (not mkdir -p),
+          # so the parent must already exist (same gotcha as scripts/mutants.sh).
+          mkdir -p mutants-out
           cargo mutants --in-diff mutants.diff -j1 --exclude 'musefs-latencyfs/**' \
             --output mutants-out/in-diff
       - name: Upload survivor report
