@@ -17,7 +17,7 @@ impl Db {
     /// Apply the bulk-write pragmas to an open connection. WAL is left untouched
     /// (retained from `open`), so concurrent mount readers keep working. Safe on
     /// in-memory DBs. Intended for a scan-scoped `Db` the caller drops at scan end.
-    pub fn apply_bulk_pragmas(conn: &rusqlite::Connection) -> Result<()> {
+    pub(crate) fn apply_bulk_pragmas(conn: &rusqlite::Connection) -> Result<()> {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "cache_size", -65536)?; // 64 MiB
         conn.pragma_update(None, "temp_store", "MEMORY")?;
