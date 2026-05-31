@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+pub mod corpus;
+
 pub fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.push((if is_last { 0x80 } else { 0 }) | (block_type & 0x7F));
