@@ -9,6 +9,7 @@ use crate::db_pool::DbPool;
 use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
 use crate::reader::{read_at, read_at_with_file, HeaderCache, ResolvedFile};
+use crate::refresh_diff::TrackRenderState;
 use crate::template::render_path;
 use crate::tree::{InodeAllocator, NodeKind, VirtualTree};
 
@@ -129,16 +130,16 @@ pub struct Musefs {
     /// Persistent path→inode allocator: carries stable inodes across tree rebuilds
     /// so open FUSE handles continue to resolve to the same node after a refresh.
     inodes: Mutex<InodeAllocator>,
-    /// Last-seen `content_version` per track, snapshotted on each rebuild, used to
-    /// report which inodes changed so the FUSE layer can drop stale kernel cache.
-    versions: Mutex<HashMap<i64, i64>>,
+    /// Last-seen render state per track, snapshotted on each rebuild. Drives the
+    /// incremental change diff and the `on_changed` cache-invalidation callbacks.
+    snapshot: Mutex<HashMap<i64, TrackRenderState>>,
     force_rebuild_error: AtomicBool,
 }
 
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let mut alloc = InodeAllocator::new();
-        let (tree, versions) = Self::build_tree(&db, &config, &mut alloc)?;
+        let (tree, snapshot) = Self::build_full(&db, &config, &mut alloc)?;
         let last_data_version = db.data_version()?;
         let poll_interval = config.poll_interval;
         Ok(Musefs {
@@ -156,34 +157,54 @@ impl Musefs {
             refresh_retry_backoff: retry_backoff_for(poll_interval),
             refreshing: AtomicBool::new(false),
             inodes: Mutex::new(alloc),
-            versions: Mutex::new(versions),
+            snapshot: Mutex::new(snapshot),
             force_rebuild_error: AtomicBool::new(false),
         })
     }
 
-    fn build_tree(
+    /// Render a single track's path from its tags + format. The one place
+    /// `render_path` is called, shared by full and incremental rebuilds.
+    fn render_one(
+        config: &MountConfig,
+        format: musefs_db::Format,
+        tags: &[musefs_db::Tag],
+    ) -> String {
+        let fields = tags_to_fields(tags);
+        render_path(
+            &config.template,
+            &fields,
+            &config.fallbacks,
+            &config.default_fallback,
+            format.as_str(),
+        )
+    }
+
+    /// Full rebuild: render every track and build the tree from scratch. Used by
+    /// `open`, forced `refresh`, and the Stage B fallback. Returns the tree and the
+    /// fresh `track_id -> TrackRenderState` snapshot.
+    fn build_full(
         db: &Db,
         config: &MountConfig,
         alloc: &mut InodeAllocator,
-    ) -> Result<(VirtualTree, HashMap<i64, i64>)> {
+    ) -> Result<(VirtualTree, HashMap<i64, TrackRenderState>)> {
         let tracks = db.list_tracks()?;
         let mut tags_by_track = db.tags_grouped()?;
         let mut entries = Vec::with_capacity(tracks.len());
-        let mut versions = HashMap::with_capacity(tracks.len());
+        let mut snapshot = HashMap::with_capacity(tracks.len());
         for t in &tracks {
-            versions.insert(t.id, t.content_version);
             let tags = tags_by_track.remove(&t.id).unwrap_or_default();
-            let fields = tags_to_fields(&tags);
-            let path = render_path(
-                &config.template,
-                &fields,
-                &config.fallbacks,
-                &config.default_fallback,
-                t.format.as_str(),
+            let path = Self::render_one(config, t.format, &tags);
+            snapshot.insert(
+                t.id,
+                TrackRenderState {
+                    content_version: t.content_version,
+                    format: t.format,
+                    path: path.clone(),
+                },
             );
             entries.push((t.id, path));
         }
-        Ok((VirtualTree::build_with(&entries, alloc), versions))
+        Ok((VirtualTree::build_with(&entries, alloc), snapshot))
     }
 
     /// Rebuild the tree from the current DB contents (used after external edits).
@@ -195,31 +216,31 @@ impl Musefs {
     /// also refreshes the `content_version` snapshot, so it must not race a
     /// `poll_refresh` whose change-diff relies on that snapshot.
     pub fn refresh(&self) -> Result<()> {
-        let versions = self.rebuild()?;
+        let snapshot = self.rebuild_full()?;
         *self
-            .versions
+            .snapshot
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = versions;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
         Ok(())
     }
 
-    /// Rebuild + publish the tree; returns the current `track_id -> content_version`
-    /// map (the caller decides whether/how to diff it).
-    fn rebuild(&self) -> Result<HashMap<i64, i64>> {
+    /// Rebuild + publish the tree via a full render; returns the fresh snapshot
+    /// (the caller decides whether/how to diff it).
+    fn rebuild_full(&self) -> Result<HashMap<i64, TrackRenderState>> {
         if self.force_rebuild_error.load(Ordering::Acquire) {
             return Err(CoreError::BackingChanged(
                 "forced refresh failure".to_string(),
             ));
         }
-        let (tree, versions) = self.pool.with(|db| {
+        let (tree, snapshot) = self.pool.with(|db| {
             let mut alloc = self
                 .inodes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Self::build_tree(db, &self.config, &mut alloc)
+            Self::build_full(db, &self.config, &mut alloc)
         })?;
         self.tree.store(Arc::new(tree));
-        Ok(versions)
+        Ok(snapshot)
     }
 
     // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) FIRST, then
@@ -296,13 +317,13 @@ impl Musefs {
         let _guard = RefreshGuard(&self.refreshing);
 
         let old_tree = self.tree.load_full();
-        let old_versions = self
-            .versions
+        let old_snapshot = self
+            .snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let new_versions = match self.rebuild() {
-            Ok(versions) => versions,
+        let new_snapshot = match self.rebuild_full() {
+            Ok(s) => s,
             Err(err) => {
                 *self
                     .last_failed_refresh
@@ -319,43 +340,57 @@ impl Musefs {
         self.cache.retain(&live);
         self.size_cache().retain(|k, _| live.contains(k));
 
-        // Invalidates inodes for content-changed tracks (path is stable, bytes changed).
-        for (tid, ver) in &new_versions {
-            if old_versions.get(tid).is_some_and(|old| old != ver) {
-                if let Some(ino) = tree.inode_of_track(*tid) {
-                    on_changed(ino);
-                }
-            }
-        }
-
-        // Invalidates old inodes for tracks whose path changed or were removed.
-        for (tid, old_ver) in &old_versions {
-            if !new_versions.contains_key(tid) {
-                // Track was removed — invalidate its old inode.
-                if let Some(ino) = old_tree.inode_of_track(*tid) {
-                    on_changed(ino);
-                }
-            } else if new_versions.get(tid) != Some(old_ver) {
-                // Content changed AND path may have changed — invalidate old inode.
-                let old_ino = old_tree.inode_of_track(*tid);
-                let new_ino = tree.inode_of_track(*tid);
-                if old_ino != new_ino {
-                    if let Some(ino) = old_ino {
-                        on_changed(ino);
-                    }
-                }
-            }
-        }
+        Self::notify_changed(
+            &old_snapshot,
+            &new_snapshot,
+            &old_tree,
+            &tree,
+            &mut on_changed,
+        );
 
         *self
-            .versions
+            .snapshot
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_versions;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_snapshot;
 
         self.last_data_version.store(version, Ordering::Release);
         self.stamp_successful_poll();
 
         Ok(true)
+    }
+
+    /// Fire `on_changed` for every inode that must drop kernel cache: a track whose
+    /// served bytes changed (content_version rose, path stable) and the OLD inode of
+    /// any track that was removed or whose path moved (incl. a format-only move that
+    /// did not bump content_version). Path-move detection is decoupled from
+    /// content_version. See SP2 Component 2.
+    fn notify_changed(
+        old: &HashMap<i64, TrackRenderState>,
+        new: &HashMap<i64, TrackRenderState>,
+        old_tree: &VirtualTree,
+        new_tree: &VirtualTree,
+        on_changed: &mut impl FnMut(u64),
+    ) {
+        for (tid, ns) in new {
+            if let Some(os) = old.get(tid) {
+                if os.content_version != ns.content_version && os.path == ns.path {
+                    if let Some(ino) = new_tree.inode_of_track(*tid) {
+                        on_changed(ino);
+                    }
+                }
+            }
+        }
+        for (tid, os) in old {
+            let moved_or_gone = match new.get(tid) {
+                None => true,
+                Some(ns) => ns.path != os.path,
+            };
+            if moved_or_gone {
+                if let Some(ino) = old_tree.inode_of_track(*tid) {
+                    on_changed(ino);
+                }
+            }
+        }
     }
 
     fn stamp_successful_poll(&self) {

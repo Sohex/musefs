@@ -801,9 +801,13 @@ fn poll_refresh_notify_reports_old_inode_for_path_changing_retag() {
         changed.contains(&old_inode),
         "old inode should be invalidated"
     );
+    // The track MOVED to a brand-new path (Moved.flac), which gets a freshly
+    // allocated inode (the persistent allocator never recycles retired inodes).
+    // The kernel has never cached it, so there is nothing stale to drop — only the
+    // OLD inode (whose cache may be live) must be invalidated. See SP2 notify_changed.
     assert!(
-        changed.contains(&new_inode),
-        "new inode should be invalidated"
+        !changed.contains(&new_inode),
+        "new (freshly allocated) inode has no cache and must not be reported"
     );
     assert_ne!(old_inode, new_inode);
 }

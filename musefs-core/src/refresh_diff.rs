@@ -6,7 +6,6 @@ use musefs_db::Format;
 /// re-render. `(content_version, format)` is the render key (the only track-level
 /// inputs to `render_path`); `path` is the last rendered path, reused verbatim for
 /// unchanged tracks. See SP2 Component 1/2.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackRenderState {
     pub content_version: i64,
