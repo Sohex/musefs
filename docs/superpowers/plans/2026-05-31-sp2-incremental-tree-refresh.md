@@ -1041,6 +1041,13 @@ Run the full gate: `cargo test` (excludes `#[ignore]` FUSE e2e) and `cargo clipp
 
 # STAGE B — in-place tree mutation (strict O(changed))
 
+> **⚠️ SUPERSEDED:** Tasks **B2–B7 below are replaced by "STAGE B (REVISED)" at the
+> end of this document** (after the Final checklist). The revision fixes plan-review
+> findings: the original `redisambiguate_dir` re-inserted *disambiguated* paths
+> (couldn't reclaim a freed base name), omitted the introducing-id cascade, and
+> contained a non-compiling first code block. **Task B1 (im migration) stands as
+> written.** Execute B1 from this section, then jump to "STAGE B (REVISED)".
+
 ## Task B1: Migrate `VirtualTree` internals to `im` persistent maps
 
 This is a pure internal swap: the public API (`build`, `build_with`, `node`, `parent`, `children`, `lookup`, `is_dir`, `track_id`, `inode_of_track`, `track_ids`, `ROOT`) is unchanged. Only field types and the insert sites change.
@@ -1782,3 +1789,652 @@ git commit -m "bench(core): Stage B refresh flat across library size; SP2 done (
 - [ ] `read_throughput` `sequential_read` median within 10% of baseline.
 - [ ] Spec README status row updated to "Implemented" with the plan link; results log + `BENCHMARKS.md` updated.
 - [ ] No `versions`/`build_tree` references remain (`grep -rn "build_tree\|\.versions\b" musefs-core/src` is empty).
+
+---
+
+# STAGE B (REVISED) — in-place mutation, precise introducing-id re-disambiguation
+
+> Replaces Tasks B2–B7 in the earlier Stage B section (B1 `im` migration stands).
+> Folds in all plan-review findings.
+
+**Why the revision.** Two facts drive the design:
+1. **Rendered paths ≠ tree paths.** A track's *rendered* path (e.g. `D/song.flac`) is the pre-disambiguation template output; the *tree* path is post-disambiguation (`D/song (2).flac`). Re-disambiguation must work from **rendered** names (so a freed base name can be reclaimed) and must be able to **navigate the tree by rendered path**. We therefore add a `rendered_name: String` to `Node` and thread it through `insert_file`/`ensure_dir`/`build_with`.
+2. **The only correctness-hard case** is a directory whose disambiguation changes *without* a direct membership change — i.e. a **dir-name-vs-file-name collision** (`ensure_dir` only disambiguates a directory against a *same-named file*, tree.rs:154-158; same-named directories merge) whose claim order flips when a child subtree's **introducing id** (its minimum descendant track id) changes. We handle this with precise introducing-id propagation.
+
+**Algorithm (per refresh).** Given `new_paths: HashMap<i64,String>` (rendered path for every current track) and the `ChangeSet`:
+1. **Compute the dirty set on the OLD tree, before mutating** (introducing-id is read from the pre-change tree):
+   - *remove/move-out* track `t` at old leaf `L`: mark `parent(L)` dirty; then while walking up, for each ancestor `A` with `introducing_id(A) == t` (t was its min), mark `parent(A)` dirty and continue (the min will rise → A's name in its parent may change).
+   - *add/move-in* track `t` with rendered path `R`: find the **deepest existing ancestor** `D` of `R` (navigate by `rendered_name`); mark `D` dirty (the new chain, if any, attaches and rebuilds under `D`); then while `t < introducing_id(A)` for ancestors `A` from `D` up, mark `parent(A)` dirty (t becomes the new min → A's name may change).
+2. **Apply structural changes:** `remove_track` every removed + moved-out leaf (pruning empty ancestors; record each pruned dir's surviving parent into the dirty set). `insert_file` every added + moved-in leaf from its rendered path (disambiguation here may be *temporarily wrong* — step 4 corrects it).
+3. **Reduce dirty to top-most survivors:** drop any dirty dir that is a descendant of another dirty dir, or that was pruned (map it to its nearest surviving ancestor, which is already dirty).
+4. **Rebuild each top-most dirty subtree from rendered paths in ascending track-id order** (`rebuild_subtree`). This reproduces `build_with` restricted to that subtree exactly (same inputs, same order, same allocator), fixing any temporary mis-disambiguation from step 2 and reclaiming freed base names.
+5. **Fallback:** any navigation/structural inconsistency returns `Err(())` → caller does a full `build_with`. A debug-only assert compares the result to `build_with(entries, allocator.clone())` (paths **and** inodes).
+
+Correctness rests on step 4 (provably equal for a whole subtree) plus a dirty set that is a **superset** of the truly-affected dirs. The property oracle (Task B6) is the gate; if it finds a divergence, the fix is always "widen the dirty set," never "change rebuild_subtree."
+
+---
+
+## Task B2: `Node.rendered_name` + navigation/introducing-id/remove primitives
+
+**Files:** Modify `musefs-core/src/tree.rs`.
+
+- [ ] **Step 1: Add `rendered_name` to `Node` and thread it through inserts**
+
+Change `Node` (tree.rs:38-43):
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    pub parent: u64,
+    pub name: String,          // disambiguated name (as today)
+    pub rendered_name: String, // pre-disambiguation base name (NEW)
+    pub kind: NodeKind,
+}
+```
+
+In `insert_file` and `ensure_dir`, set `rendered_name` to the **pre-disambiguation** component (the value passed to `disambiguate`), and `name` to the disambiguated result. The root node's `rendered_name` is `String::new()`. Update the root insert in `build_with` and the two node inserts in `insert_file`/`ensure_dir` accordingly (the disambiguated `name`/`unique` stays in `name`; the original `comp`/`name` argument goes to `rendered_name`).
+
+- [ ] **Step 2: Run existing tree tests (regression)**
+
+Run: `cargo test -p musefs-core --lib tree -- --nocapture`
+Expected: PASS (adding a field, existing behavior unchanged). Fix any `Node { .. }` literal in `facade.rs` tests that now needs `rendered_name` (the `validate_opened_backing` test builds a `ResolvedFile`, not a `Node`, so likely none — but `grep -rn "Node {" musefs-core` to be sure).
+
+- [ ] **Step 3: Add navigation + introducing-id + remove/prune helpers (with failing tests first)**
+
+Add tests:
+
+```rust
+#[test]
+fn child_by_rendered_finds_disambiguated_node() {
+    let t = VirtualTree::build(&[(10, "D/song.flac".into()), (20, "D/song.flac".into())]);
+    let d = t.lookup(VirtualTree::ROOT, "D").unwrap();
+    // Both children have rendered_name "song.flac" but disambiguated names differ.
+    let by_rendered: Vec<u64> = t.children_by_rendered(d, "song.flac");
+    assert_eq!(by_rendered.len(), 2);
+}
+
+#[test]
+fn introducing_id_is_min_descendant_track_id() {
+    let mut alloc = InodeAllocator::new();
+    let t = VirtualTree::build_with(&[(30, "A/B/x.flac".into()), (10, "A/C/y.flac".into())], &mut alloc);
+    let a = t.lookup(VirtualTree::ROOT, "A").unwrap();
+    assert_eq!(t.introducing_id(a), 10);
+}
+
+#[test]
+fn remove_track_prunes_empty_ancestors_b() {
+    let mut alloc = InodeAllocator::new();
+    let mut t = VirtualTree::build_with(&[(10, "A/B/x.flac".into()), (20, "C/y.flac".into())], &mut alloc);
+    t.remove_track(10, &mut alloc);
+    assert!(t.inode_of_track(10).is_none());
+    assert!(t.lookup(VirtualTree::ROOT, "A").is_none());
+    assert!(t.lookup(VirtualTree::ROOT, "C").is_some());
+}
+```
+
+Run: `cargo test -p musefs-core --lib "child_by_rendered|introducing_id_is_min|remove_track_prunes_empty_ancestors_b" -- --nocapture`
+Expected: FAIL (methods missing).
+
+Implement on `impl VirtualTree`:
+
+```rust
+/// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
+pub fn children_by_rendered(&self, dir: u64, rendered: &str) -> Vec<u64> {
+    match self.children.get(&dir) {
+        None => Vec::new(),
+        Some(kids) => kids.values().copied()
+            .filter(|&c| self.nodes.get(&c).is_some_and(|n| n.rendered_name == rendered))
+            .collect(),
+    }
+}
+
+/// Minimum descendant track id under `ino` (a file's own id; a dir's min over files).
+pub fn introducing_id(&self, ino: u64) -> i64 {
+    match self.nodes.get(&ino).map(|n| &n.kind) {
+        Some(NodeKind::File { track_id }) => *track_id,
+        _ => {
+            let mut min = i64::MAX;
+            let mut stack = vec![ino];
+            while let Some(n) = stack.pop() {
+                match self.nodes.get(&n).map(|x| &x.kind) {
+                    Some(NodeKind::File { track_id }) => min = min.min(*track_id),
+                    _ => if let Some(kids) = self.children.get(&n) {
+                        for &c in kids.values() { stack.push(c); }
+                    },
+                }
+            }
+            min
+        }
+    }
+}
+
+/// The full disambiguated path from root to `inode` (root → "").
+fn path_of(&self, inode: u64) -> String {
+    if inode == Self::ROOT { return String::new(); }
+    let mut parts = Vec::new();
+    let mut cur = inode;
+    while cur != Self::ROOT {
+        let n = match self.nodes.get(&cur) { Some(n) => n, None => break };
+        parts.push(n.name.clone());
+        cur = n.parent;
+    }
+    parts.reverse();
+    parts.join("/")
+}
+
+/// Remove the file node for `track_id` and prune now-empty ancestor dirs. Returns
+/// the inode of the nearest surviving ancestor directory (for dirty bookkeeping).
+pub fn remove_track(&mut self, track_id: i64, _alloc: &mut InodeAllocator) -> Option<u64> {
+    let ino = self.track_to_inode.remove(&track_id)?;
+    let parent = self.nodes.get(&ino)?.parent;
+    let name = self.nodes.get(&ino).map(|n| n.name.clone());
+    self.nodes.remove(&ino);
+    if let (Some(name), Some(kids)) = (name, self.children.get_mut(&parent)) {
+        kids.remove(&name);
+    }
+    Some(self.prune_empty_dirs_upward(parent))
+}
+
+/// Walk up from `dir`, removing empty directories; return the first non-empty
+/// (surviving) ancestor.
+fn prune_empty_dirs_upward(&mut self, mut dir: u64) -> u64 {
+    while dir != Self::ROOT
+        && self.children.get(&dir).map_or(true, |c| c.is_empty())
+    {
+        let parent = match self.nodes.get(&dir) { Some(n) => n.parent, None => break };
+        let name = self.nodes.get(&dir).map(|n| n.name.clone());
+        self.children.remove(&dir);
+        self.nodes.remove(&dir);
+        if let (Some(name), Some(kids)) = (name, self.children.get_mut(&parent)) {
+            kids.remove(&name);
+        }
+        dir = parent;
+    }
+    dir
+}
+```
+
+> `insert_file` stays private and is reused as-is (it now also sets `rendered_name`). Make it `pub(crate)`-callable from within `impl VirtualTree` methods (it already is, same impl block).
+
+Run: `cargo test -p musefs-core --lib "child_by_rendered|introducing_id_is_min|remove_track_prunes_empty_ancestors_b" -- --nocapture`
+Expected: PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+cargo fmt && cargo clippy -p musefs-core --all-targets
+git add musefs-core/src/tree.rs musefs-core/src/facade.rs
+git commit -m "feat(core): Node.rendered_name + nav/introducing-id/remove primitives (SP2 B2)"
+```
+
+---
+
+## Task B3: `rebuild_subtree` (clear + reinsert from rendered paths, id-order)
+
+The workhorse: rebuild one directory's subtree so its disambiguation equals a fresh build.
+
+**Files:** Modify `musefs-core/src/tree.rs`.
+
+- [ ] **Step 1: Write failing tests (reclamation + dir-vs-file), comparing to `build`**
+
+```rust
+fn paths_of(t: &VirtualTree) -> std::collections::BTreeMap<String, u64> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![(VirtualTree::ROOT, String::new())];
+    while let Some((ino, pfx)) = stack.pop() {
+        if let Some(kids) = t.children(ino) {
+            for (name, &child) in kids.iter() {
+                let p = if pfx.is_empty() { name.clone() } else { format!("{pfx}/{name}") };
+                if t.is_dir(child) { stack.push((child, p)); } else { out.insert(p, child); }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn rebuild_subtree_reclaims_freed_base_name() {
+    let mut alloc = InodeAllocator::new();
+    let mut t = VirtualTree::build_with(
+        &[(10, "D/song.flac".into()), (20, "D/song.flac".into())], &mut alloc);
+    let d = t.lookup(VirtualTree::ROOT, "D").unwrap();
+    t.remove_track(10, &mut alloc);
+    // new_paths after removal: only id 20 remains, rendered "D/song.flac".
+    let mut np = std::collections::HashMap::new();
+    np.insert(20, "D/song.flac".to_string());
+    t.rebuild_subtree(d, &np, &mut alloc).unwrap();
+    let reborn = t.lookup(d, "song.flac").unwrap();
+    assert_eq!(t.inode_of_track(20), Some(reborn));
+    assert!(t.lookup(d, "song (2).flac").is_none());
+}
+
+#[test]
+fn rebuild_subtree_matches_build_for_dir_vs_file() {
+    // $album="X.flac" produces dir "X.flac"; a sibling file also "X.flac".
+    let entries = vec![(1, "P/X.flac".to_string()), (2, "P/X.flac/t.flac".to_string())];
+    let reference = VirtualTree::build(&entries);
+    let mut alloc = InodeAllocator::new();
+    let mut t = VirtualTree::build_with(&entries, &mut alloc);
+    let p = t.lookup(VirtualTree::ROOT, "P").unwrap();
+    let np: std::collections::HashMap<i64,String> = entries.iter().cloned().collect();
+    t.rebuild_subtree(p, &np, &mut alloc).unwrap();
+    assert_eq!(paths_of(&t).keys().collect::<Vec<_>>(),
+               paths_of(&reference).keys().collect::<Vec<_>>());
+}
+```
+
+Run: `cargo test -p musefs-core --lib rebuild_subtree -- --nocapture`
+Expected: FAIL (`no method named rebuild_subtree`).
+
+- [ ] **Step 2: Implement `rebuild_subtree`**
+
+```rust
+/// Rebuild the subtree rooted at directory `dir` so its disambiguation matches a
+/// fresh `build_with`: collect every track currently under `dir`, remove them all
+/// (pruning), then re-insert in ascending track-id order using each track's
+/// RENDERED path from `new_paths`. `ensure_dir` reuses ancestors above `dir`, so
+/// only `dir`'s subtree is rebuilt. Errs if a collected track has no entry in
+/// `new_paths` (caller falls back to a full rebuild). See SP2 Component 3.
+#[allow(clippy::result_unit_err)]
+pub fn rebuild_subtree(
+    &mut self,
+    dir: u64,
+    new_paths: &std::collections::HashMap<i64, String>,
+    alloc: &mut InodeAllocator,
+) -> std::result::Result<(), ()> {
+    let mut ids = Vec::new();
+    let mut stack = vec![dir];
+    while let Some(n) = stack.pop() {
+        match self.nodes.get(&n).map(|x| x.kind.clone()) {
+            Some(NodeKind::File { track_id }) => ids.push(track_id),
+            _ => if let Some(kids) = self.children.get(&n) {
+                for &c in kids.values() { stack.push(c); }
+            },
+        }
+    }
+    for id in &ids { self.remove_track(*id, alloc); }
+    ids.sort_unstable();
+    for id in ids {
+        let path = new_paths.get(&id).ok_or(())?;
+        self.insert_file(id, path, alloc);
+    }
+    Ok(())
+}
+```
+
+> Note: after removing all of `dir`'s tracks, `dir` itself may be pruned. Re-inserting via full rendered paths recreates it through `ensure_dir` from root, reusing surviving ancestors — correct. The caller (Task B5) only calls `rebuild_subtree` on top-most dirty dirs, so subtrees never double-rebuild.
+
+Run: `cargo test -p musefs-core --lib rebuild_subtree -- --nocapture`
+Expected: PASS.
+
+- [ ] **Step 3: Commit**
+
+```bash
+cargo fmt && cargo clippy -p musefs-core --all-targets
+git add musefs-core/src/tree.rs
+git commit -m "feat(core): rebuild_subtree (rendered-path, id-order) reproduces build_with (SP2 B3)"
+```
+
+---
+
+## Task B4: `apply_changes` (dirty-set + propagation) and the concrete cascade test
+
+**Files:** Modify `musefs-core/src/tree.rs`.
+
+- [ ] **Step 1: Write the concrete cascade test (the case the earlier plan missed)**
+
+```rust
+#[test]
+fn apply_changes_handles_dir_vs_file_min_id_flip() {
+    // P has dir "X.flac" (from $album="X.flac", tracks 1 & 9) and file "X.flac"
+    // (track 5). Ascending id: dir introduced by 1 claims "X.flac"; file 5 -> "X (2).flac".
+    let entries = vec![
+        (1, "X.flac/a.flac".to_string()),
+        (9, "X.flac/b.flac".to_string()),
+        (5, "X.flac".to_string()),               // a FILE rendered "X.flac" in root
+    ];
+    let mut alloc = InodeAllocator::new();
+    let mut t = VirtualTree::build_with(&entries, &mut alloc);
+    // Delete track 1 (the dir's min). Dir's introducing id rises to 9; file 5 (id 5 < 9)
+    // should now claim base "X.flac" and the dir become "X.flac (2)".
+    let new_entries = vec![
+        (9, "X.flac/b.flac".to_string()),
+        (5, "X.flac".to_string()),
+    ];
+    let reference = VirtualTree::build(&new_entries);
+    let new_paths: std::collections::HashMap<i64,String> = new_entries.iter().cloned().collect();
+    t.apply_changes(&new_paths, &[], &[], &[1], &mut alloc).unwrap();
+    assert_eq!(paths_of(&t).keys().collect::<Vec<_>>(),
+               paths_of(&reference).keys().collect::<Vec<_>>(),
+               "dir-vs-file min-id flip must match a full rebuild");
+}
+```
+
+Run: `cargo test -p musefs-core --lib apply_changes_handles_dir_vs_file -- --nocapture`
+Expected: FAIL (`no method named apply_changes`).
+
+- [ ] **Step 2: Implement `apply_changes`**
+
+```rust
+/// Apply an incremental change set in place, producing a tree byte-identical to a
+/// full `build_with` over the same final track set. `new_paths` maps every CURRENT
+/// track id to its rendered path. Returns Err(()) on any inconsistency (caller
+/// falls back to full build). See SP2 Component 3.
+#[allow(clippy::result_unit_err)]
+pub fn apply_changes(
+    &mut self,
+    new_paths: &std::collections::HashMap<i64, String>,
+    changed: &[i64],
+    added: &[i64],
+    removed: &[i64],
+    alloc: &mut InodeAllocator,
+) -> std::result::Result<(), ()> {
+    use std::collections::HashSet;
+    let mut dirty: HashSet<u64> = HashSet::new();
+
+    // Partition `changed` into path-moved vs unchanged-path (using current tree).
+    let mut moved_out: Vec<i64> = Vec::new(); // remove old position
+    let mut moved_in: Vec<i64> = Vec::new();  // insert new position
+    for &id in changed {
+        let new_path = new_paths.get(&id).ok_or(())?;
+        match self.inode_of_track(id) {
+            Some(ino) if &self.path_of(ino) == new_path => { /* path stable: nothing */ }
+            Some(_) => { moved_out.push(id); moved_in.push(id); }
+            None => { moved_in.push(id); } // expected present; treat as add
+        }
+    }
+
+    // (1) Dirty set on the OLD tree, BEFORE mutating.
+    for &id in removed.iter().chain(moved_out.iter()) {
+        if let Some(leaf) = self.inode_of_track(id) {
+            if let Some(p) = self.node(leaf).map(|n| n.parent) { dirty.insert(p); }
+            // propagate up while `id` was the introducing (min) id.
+            let mut child = self.node(leaf).map(|n| n.parent).unwrap_or(Self::ROOT);
+            while child != Self::ROOT && self.introducing_id(child) == id {
+                let p = self.node(child).map(|n| n.parent).unwrap_or(Self::ROOT);
+                dirty.insert(p);
+                child = p;
+            }
+        }
+    }
+    for &id in added.iter().chain(moved_in.iter()) {
+        let rendered = new_paths.get(&id).ok_or(())?;
+        let d = self.deepest_existing_ancestor(rendered);
+        dirty.insert(d);
+        // propagate up while `id` would become the new min.
+        let mut child = d;
+        while child != Self::ROOT && id < self.introducing_id(child) {
+            let p = self.node(child).map(|n| n.parent).unwrap_or(Self::ROOT);
+            dirty.insert(p);
+            child = p;
+        }
+    }
+
+    // (2) Structural mutation. Record surviving parents of pruned dirs as dirty.
+    for &id in removed.iter().chain(moved_out.iter()) {
+        if let Some(surv) = self.remove_track(id, alloc) { dirty.insert(surv); }
+    }
+    for &id in added.iter().chain(moved_in.iter()) {
+        let rendered = new_paths.get(&id).ok_or(())?;
+        self.insert_file(id, rendered, alloc);
+    }
+
+    // (3) Keep only dirty dirs that still exist; map pruned ones to ROOT-side survivor.
+    let mut live_dirty: Vec<u64> = dirty.into_iter().filter(|d| self.node(*d).is_some()).collect();
+    // (4) Reduce to top-most and rebuild each subtree.
+    live_dirty.sort_by_key(|d| self.path_of(*d).matches('/').count()); // shallow first
+    let mut done: HashSet<u64> = HashSet::new();
+    for d in live_dirty {
+        if self.node(d).is_none() { continue; }
+        // Skip if an ancestor is already rebuilt.
+        if self.ancestor_in(d, &done) { continue; }
+        self.rebuild_subtree(d, new_paths, alloc)?;
+        done.insert(d);
+    }
+    Ok(())
+}
+
+/// The deepest directory that exists in the current tree along the RENDERED path
+/// `rendered` (navigating by `rendered_name`). Returns ROOT if none below it exist.
+fn deepest_existing_ancestor(&self, rendered: &str) -> u64 {
+    let comps: Vec<&str> = rendered.split('/').filter(|c| !c.is_empty()).collect();
+    let mut dir = Self::ROOT;
+    // walk dir components only (exclude the final filename component)
+    for comp in &comps[..comps.len().saturating_sub(1)] {
+        let next = self.children_by_rendered(dir, comp).into_iter()
+            .find(|&c| self.is_dir(c));
+        match next { Some(c) => dir = c, None => break }
+    }
+    dir
+}
+
+/// True if any inode in `set` is an ancestor of `node` (or equals it).
+fn ancestor_in(&self, node: u64, set: &std::collections::HashSet<u64>) -> bool {
+    let mut cur = node;
+    loop {
+        if set.contains(&cur) { return true; }
+        if cur == Self::ROOT { return false; }
+        cur = match self.nodes.get(&cur) { Some(n) => n.parent, None => return false };
+    }
+}
+```
+
+> The dirty set is intended a **superset** of truly-affected dirs; rebuilding a superset is still correct (just slightly more work). If the proptest (B6) finds a divergence, widen the seeds/propagation here — never touch `rebuild_subtree`.
+
+Run: `cargo test -p musefs-core --lib apply_changes_handles_dir_vs_file -- --nocapture`
+Expected: PASS.
+
+- [ ] **Step 3: Commit**
+
+```bash
+cargo fmt && cargo clippy -p musefs-core --all-targets
+git add musefs-core/src/tree.rs
+git commit -m "feat(core): apply_changes with introducing-id dirty propagation (SP2 B4)"
+```
+
+---
+
+## Task B5: Wire `apply_changes` into `rebuild_incremental` + fallback + equiv
+
+**Files:** Modify `musefs-core/src/tree.rs` (`equiv`, `#[derive(Clone)]`), `musefs-core/src/facade.rs`.
+
+- [ ] **Step 1: `#[derive(Clone)]` on `InodeAllocator` + `equiv` (incl. children)**
+
+In `tree.rs`, change `#[derive(Debug)]` on `InodeAllocator` to `#[derive(Debug, Clone)]`, and add:
+
+```rust
+/// Structural equality for the equivalence oracle: identical track→inode map,
+/// node set, AND children maps. See SP2 Testing item 1.
+pub fn equiv(&self, other: &VirtualTree) -> bool {
+    self.track_to_inode == other.track_to_inode
+        && self.nodes == other.nodes
+        && self.children == other.children
+}
+```
+
+> `im::HashMap<K,V>` and `im::OrdMap<K,V>` implement `PartialEq` when `V: PartialEq` (`Node`, `u64` do), so the `==` comparisons compile.
+
+- [ ] **Step 2: Replace the tail of `rebuild_incremental` (from Task A5) with the mutation path**
+
+Replace the entries-assembly + `build_with` tail of `rebuild_incremental` with:
+
+```rust
+    let new_paths: std::collections::HashMap<i64, String> =
+        new_snapshot.iter().map(|(&id, s)| (id, s.path.clone())).collect();
+
+    let mut alloc = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut tree = (*self.tree.load_full()).clone(); // O(1) im clone
+    let applied = if self.force_apply_fail.swap(false, Ordering::AcqRel) {
+        Err(()) // test injection (Task B7)
+    } else {
+        tree.apply_changes(&new_paths, &change.changed, &change.added, &change.removed, &mut alloc)
+    };
+    let tree = match applied {
+        Ok(()) => {
+            #[cfg(debug_assertions)]
+            {
+                let mut ref_alloc = alloc.clone();
+                let mut entries: Vec<(i64, String)> =
+                    new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
+                entries.sort_by_key(|(id, _)| *id);
+                let reference = VirtualTree::build_with(&entries, &mut ref_alloc);
+                debug_assert!(tree.equiv(&reference), "incremental tree diverged from build_with");
+            }
+            tree
+        }
+        Err(()) => {
+            eprintln!("musefs: incremental tree mutation failed; falling back to full rebuild");
+            let mut entries: Vec<(i64, String)> =
+                new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
+            entries.sort_by_key(|(id, _)| *id);
+            VirtualTree::build_with(&entries, &mut alloc)
+        }
+    };
+    self.tree.store(Arc::new(tree));
+    drop(alloc);
+    Ok((new_snapshot, change))
+```
+
+Add the `force_apply_fail: AtomicBool` field to `Musefs` (init `false` in `open`) and a `#[doc(hidden)] pub fn force_apply_failure_for_test(&self, on: bool) { self.force_apply_fail.store(on, Ordering::Release); }`.
+
+> Lock order preserved: `inodes` is the only in-memory lock held, and no `pool.with` call happens while it's held here (the DB work — `list_render_keys`/`tags_for_tracks` — finished earlier in `rebuild_incremental` inside its own `pool.with`).
+
+- [ ] **Step 3: Run the Stage A equivalence test against the now-incremental tree + full suite**
+
+Run: `cargo test -p musefs-core --test incremental_refresh -- --nocapture`
+Expected: PASS (the debug_assert is active in test builds and guards inode identity).
+
+Run: `cargo test -p musefs-core -- --nocapture`
+Expected: PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+cargo fmt && cargo clippy -p musefs-core --all-targets
+git add musefs-core/src/tree.rs musefs-core/src/facade.rs
+git commit -m "feat(core): wire apply_changes into rebuild_incremental + fallback (SP2 B5)"
+```
+
+---
+
+## Task B6: Property oracle (random edits incl. collisions + cascade)
+
+**Files:** Modify `musefs-core/tests/incremental_refresh.rs`.
+
+- [ ] **Step 1: Add the proptest** (`proptest = "1"` is already a dev-dep)
+
+```rust
+use proptest::prelude::*;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn incremental_equivalent_to_full_under_random_edits(
+        ops in proptest::collection::vec(
+            prop_oneof![
+                // Collide deliberately: few distinct album/title values.
+                (0usize..6, "[A-B]", "[x-y]"),
+            ], 0..24)
+    ) {
+        let target = small_corpus(6);
+        let db_path = target.db_path.clone();
+        let corpus = target.corpus_dir.clone();
+        let db = Db::open(&db_path).unwrap();
+        scan_directory(&db, &corpus).unwrap();
+        let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+        let writer = Db::open(&db_path).unwrap();
+        let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+        for (i, album, title) in ops {
+            if let Some(&id) = ids.get(i) {
+                let _ = writer.replace_tags(id, &[
+                    Tag::new("ARTIST", "X", 0),
+                    Tag::new("ALBUM", &album, 0),
+                    Tag::new("TITLE", &title, 0),
+                ]);
+            }
+            fs.poll_refresh().unwrap();
+            let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+            prop_assert_eq!(
+                tree_fingerprint(&fs).keys().collect::<Vec<_>>(),
+                tree_fingerprint(&reference).keys().collect::<Vec<_>>()
+            );
+        }
+    }
+}
+```
+
+> Inode-identity equivalence is enforced by the in-process `debug_assert` in B5 (it runs in these test builds, using a clone of the live allocator). Do not assert raw inode numbers across the two independent `Musefs` instances — they have separate allocator histories and legitimately differ in inode numbers (only the path↔structure must match across instances).
+
+Run: `cargo test -p musefs-core incremental_equivalent_to_full -- --nocapture`
+Expected: PASS. On failure, proptest prints the minimal failing op sequence — widen the dirty seeds in `apply_changes` (Task B4) accordingly; never change `rebuild_subtree`.
+
+- [ ] **Step 2: Commit**
+
+```bash
+cargo fmt && cargo clippy -p musefs-core --all-targets
+git add musefs-core/tests/incremental_refresh.rs
+git commit -m "test(core): property oracle — incremental == full build_with (SP2 B6)"
+```
+
+---
+
+## Task B7: Fallback test + Stage B bench + regression gate
+
+**Files:** `musefs-core/tests/incremental_refresh.rs`, `musefs-core/tests/bench_refresh.rs`, `BENCHMARKS.md`, spec README.
+
+- [ ] **Step 1: Fallback test** (uses `force_apply_failure_for_test` from B5)
+
+```rust
+#[test]
+fn apply_failure_falls_back_to_full_rebuild() {
+    let target = small_corpus(4);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let writer = Db::open(&db_path).unwrap();
+    let id = writer.list_tracks().unwrap()[0].id;
+    writer.replace_tags(id, &[Tag::new("TITLE", "moved", 0)]).unwrap();
+
+    fs.force_apply_failure_for_test(true);
+    fs.poll_refresh().unwrap();
+
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).keys().collect::<Vec<_>>(),
+    );
+}
+```
+
+Run: `cargo test -p musefs-core apply_failure_falls_back -- --nocapture`
+Expected: PASS.
+
+- [ ] **Step 2: Re-run the library-size sweep — expect flat refresh-1 across sizes**
+
+Run: `cargo test -p musefs-core --test bench_refresh bench_refresh_one_across_library_sizes -- --ignored --nocapture`
+Expected: `refresh-1@N` wall time **flat across N** (strict O(changed)) vs the Stage A baseline from A7.
+
+- [ ] **Step 3: Full regression gate**
+
+```bash
+cargo test                               # all crates, excludes #[ignore] e2e
+cargo test -p musefs-fuse -- --ignored   # byte-identical audio e2e (needs /dev/fuse)
+cargo bench -p musefs-core --bench read_throughput   # ci sequential_read median within 10%
+cargo clippy --all-targets
+```
+Expected: all green; read median within 10% of baseline.
+
+- [ ] **Step 4: Record numbers + flip status**
+
+Append Stage A-vs-B refresh numbers to `BENCHMARKS.md` and the spec README results log; update the README status row: `| SP2 | Implemented | SP2-incremental-tree-refresh.md | 2026-05-31-sp2-incremental-tree-refresh.md | ... |`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cargo fmt && cargo clippy --all-targets
+git add musefs-core/tests BENCHMARKS.md docs/superpowers/specs/2026-05-30-optimization-pass/README.md
+git commit -m "test+bench(core): Stage B fallback + flat-across-size refresh; SP2 done (SP2 B7)"
+```
