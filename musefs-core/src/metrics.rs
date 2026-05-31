@@ -8,6 +8,9 @@
 //! internal positioned reads (via the page server) and art-blob reads are
 //! tracked by call count (`on_open`/`on_art_chunk`) but are not byte-counted.
 //! `on_open` fires on the open *attempt* (a failed open is still a syscall).
+//! `on_scan_open`/`on_scan_read` count backing-file opens and positioned reads
+//! on the *scan* path (distinct from the serve path); `on_scan_read` also
+//! accumulates bytes read, analogous to `on_pread`.
 
 pub use imp::*;
 
