@@ -609,7 +609,9 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 ///
 /// Uses `opts` to configure the probe pipeline (e.g. `jobs` for parallelism).
 /// The skip-unchanged decision runs on the calling thread before workers are
-/// dispatched, so workers remain DB-free.
+/// dispatched, so workers remain DB-free. A `stat`/`canonicalize` failure on a
+/// candidate during the skip pass is counted in `failed` (and the file is left
+/// for the next revalidation) rather than re-probed or pruned.
 pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<RevalidateStats> {
     let mut files = Vec::new();
     collect_audio(root, &mut files)?;
@@ -624,12 +626,15 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         .collect();
 
     let mut unchanged = 0u64;
+    let mut skip_failed = 0u64;
     let mut changed: Vec<PathBuf> = Vec::new();
     for path in files {
         let Ok(meta) = std::fs::metadata(&path) else {
+            skip_failed += 1;
             continue;
         };
         let Ok(abs) = std::fs::canonicalize(&path) else {
+            skip_failed += 1;
             continue;
         };
         let key = abs.to_string_lossy().to_string();
@@ -664,7 +669,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         updated: scan.scanned,
         unchanged,
         pruned,
-        failed: scan.failed,
+        failed: scan.failed + skip_failed,
     })
 }
 
@@ -1093,6 +1098,18 @@ mod bounded_probe_tests {
         let s1 = revalidate_with(&db, dir.path(), &ScanOptions::default()).unwrap();
         assert_eq!(s1.unchanged, 1);
         assert_eq!(s1.updated, 0);
+
+        // Rewrite with a different size → detected as changed and re-probed.
+        std::fs::write(&p, mk(b"DIFFERENT-AUDIO")).unwrap();
+        let s2 = revalidate_with(&db, dir.path(), &ScanOptions::default()).unwrap();
+        assert_eq!(s2.updated, 1);
+        assert_eq!(s2.unchanged, 0);
+        // The track row now reflects the new (longer) audio length.
+        let track = db
+            .get_track_by_path(&std::fs::canonicalize(&p).unwrap().to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(track.audio_length as usize, b"DIFFERENT-AUDIO".len());
     }
 
     #[test]
