@@ -38,7 +38,8 @@ pub enum NodeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub parent: u64,
-    pub name: String,
+    pub name: String,          // disambiguated name
+    pub rendered_name: String, // pre-disambiguation base name
     pub kind: NodeKind,
 }
 
@@ -71,6 +72,7 @@ impl VirtualTree {
             Node {
                 parent: Self::ROOT,
                 name: String::new(),
+                rendered_name: String::new(),
                 kind: NodeKind::Dir,
             },
         );
@@ -129,7 +131,8 @@ impl VirtualTree {
             dir = child;
             dir_path = child_path;
         }
-        let name = self.disambiguate(dir, comps[comps.len() - 1]);
+        let raw_name = comps[comps.len() - 1];
+        let name = self.disambiguate(dir, raw_name);
         let full = join_path(&dir_path, &name);
         let inode = alloc.intern(&full);
         self.track_to_inode.insert(track_id, inode);
@@ -138,6 +141,7 @@ impl VirtualTree {
             Node {
                 parent: dir,
                 name: name.clone(),
+                rendered_name: raw_name.to_string(),
                 kind: NodeKind::File { track_id },
             },
         );
@@ -164,6 +168,7 @@ impl VirtualTree {
             Node {
                 parent,
                 name: unique.clone(),
+                rendered_name: name.to_string(),
                 kind: NodeKind::Dir,
             },
         );
@@ -207,6 +212,96 @@ impl VirtualTree {
                 NodeKind::Dir => None,
             })
             .collect()
+    }
+
+    /// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
+    pub fn children_by_rendered(&self, dir: u64, rendered: &str) -> Vec<u64> {
+        match self.children.get(&dir) {
+            None => Vec::new(),
+            Some(kids) => kids
+                .values()
+                .copied()
+                .filter(|&c| {
+                    self.nodes
+                        .get(&c)
+                        .is_some_and(|n| n.rendered_name == rendered)
+                })
+                .collect(),
+        }
+    }
+
+    /// Minimum descendant track id under `ino` (a file's own id; a dir's min over
+    /// files). Returns `i64::MAX` if `ino` has no file descendants (empty subtree).
+    pub fn introducing_id(&self, ino: u64) -> i64 {
+        if let Some(NodeKind::File { track_id }) = self.nodes.get(&ino).map(|n| &n.kind) {
+            return *track_id;
+        }
+        let mut min = i64::MAX;
+        let mut stack = vec![ino];
+        while let Some(n) = stack.pop() {
+            match self.nodes.get(&n).map(|x| &x.kind) {
+                Some(NodeKind::File { track_id }) => min = min.min(*track_id),
+                _ => {
+                    if let Some(kids) = self.children.get(&n) {
+                        for &c in kids.values() {
+                            stack.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        min
+    }
+
+    /// The full disambiguated path from root to `inode` (root returns "").
+    #[allow(dead_code)]
+    fn path_of(&self, inode: u64) -> String {
+        if inode == Self::ROOT {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        let mut cur = inode;
+        while cur != Self::ROOT {
+            let Some(n) = self.nodes.get(&cur) else {
+                break;
+            };
+            parts.push(n.name.clone());
+            cur = n.parent;
+        }
+        parts.reverse();
+        parts.join("/")
+    }
+
+    /// Remove the file node for `track_id` and prune now-empty ancestor dirs. Returns
+    /// the inode of the nearest surviving ancestor directory (for dirty bookkeeping).
+    pub fn remove_track(&mut self, track_id: i64, _alloc: &mut InodeAllocator) -> Option<u64> {
+        let ino = self.track_to_inode.remove(&track_id)?;
+        let parent = self.nodes.get(&ino)?.parent;
+        let name = self.nodes.get(&ino).map(|n| n.name.clone());
+        self.nodes.remove(&ino);
+        if let (Some(name), Some(kids)) = (name, self.children.get_mut(&parent)) {
+            kids.remove(&name);
+        }
+        Some(self.prune_empty_dirs_upward(parent))
+    }
+
+    /// Walk up from `dir`, removing empty directories; return the first non-empty
+    /// (surviving) ancestor.
+    fn prune_empty_dirs_upward(&mut self, mut dir: u64) -> u64 {
+        while dir != Self::ROOT && self.children.get(&dir).is_none_or(OrdMap::is_empty) {
+            let Some(node) = self.nodes.get(&dir) else {
+                break;
+            };
+            let parent = node.parent;
+            let name = self.nodes.get(&dir).map(|n| n.name.clone());
+            self.children.remove(&dir);
+            self.nodes.remove(&dir);
+            if let (Some(name), Some(kids)) = (name, self.children.get_mut(&parent)) {
+                kids.remove(&name);
+            }
+            dir = parent;
+        }
+        dir
     }
 }
 
@@ -296,5 +391,53 @@ mod tests {
         assert!(t.lookup(d, "song.flac").is_some());
         assert!(t.lookup(d, "song (2).flac").is_some());
         assert!(t.lookup(d, "song (3).flac").is_some());
+    }
+
+    #[test]
+    fn child_by_rendered_finds_disambiguated_node() {
+        let t = VirtualTree::build(&[(10, "D/song.flac".into()), (20, "D/song.flac".into())]);
+        let d = t.lookup(VirtualTree::ROOT, "D").unwrap();
+        let by_rendered: Vec<u64> = t.children_by_rendered(d, "song.flac");
+        assert_eq!(by_rendered.len(), 2);
+    }
+
+    #[test]
+    fn introducing_id_is_min_descendant_track_id() {
+        let mut alloc = InodeAllocator::new();
+        let t = VirtualTree::build_with(
+            &[(30, "A/B/x.flac".into()), (10, "A/C/y.flac".into())],
+            &mut alloc,
+        );
+        let a = t.lookup(VirtualTree::ROOT, "A").unwrap();
+        assert_eq!(t.introducing_id(a), 10);
+    }
+
+    #[test]
+    fn remove_track_prunes_empty_ancestors_b() {
+        let mut alloc = InodeAllocator::new();
+        let mut t = VirtualTree::build_with(
+            &[(10, "A/B/x.flac".into()), (20, "C/y.flac".into())],
+            &mut alloc,
+        );
+        t.remove_track(10, &mut alloc);
+        assert!(t.inode_of_track(10).is_none());
+        assert!(t.lookup(VirtualTree::ROOT, "A").is_none());
+        assert!(t.lookup(VirtualTree::ROOT, "C").is_some());
+    }
+
+    #[test]
+    fn remove_track_keeps_parent_with_surviving_sibling() {
+        let mut alloc = InodeAllocator::new();
+        let mut t = VirtualTree::build_with(
+            &[(10, "A/x.flac".into()), (20, "A/y.flac".into())],
+            &mut alloc,
+        );
+        let surviving = t.remove_track(10, &mut alloc);
+        assert!(t.inode_of_track(10).is_none());
+        // `A` must survive because `y.flac` still lives under it; remove_track
+        // returns A's inode (nearest surviving ancestor), not ROOT.
+        let a = t.lookup(VirtualTree::ROOT, "A").expect("A must survive");
+        assert_eq!(surviving, Some(a));
+        assert!(t.lookup(a, "y.flac").is_some());
     }
 }
