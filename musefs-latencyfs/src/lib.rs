@@ -756,44 +756,61 @@ mod tests {
         }
     }
 
+    // Assert against literal `Duration`s rather than ms()/us(), so a mutation
+    // of those helpers can't hide by also corrupting the expected value.
+    fn millis(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+    fn micros(n: u64) -> Duration {
+        Duration::from_micros(n)
+    }
+
     #[test]
     fn profile_hdd_values() {
         let l = Latency::profile("hdd");
-        assert_eq!(l.open, ms(8));
-        assert_eq!(l.stat, ms(8));
-        assert_eq!(l.read, ms(8));
-        assert_eq!(l.write, ms(8));
-        assert_eq!(l.fsync, ms(10));
-        assert_eq!(l.other, ms(2));
+        assert_eq!(l.open, millis(8));
+        assert_eq!(l.stat, millis(8));
+        assert_eq!(l.read, millis(8));
+        assert_eq!(l.write, millis(8));
+        assert_eq!(l.fsync, millis(10));
+        assert_eq!(l.other, millis(2));
     }
 
     #[test]
     fn profile_nfs_ssd_values() {
         let l = Latency::profile("nfs-ssd");
-        assert_eq!(l.open, us(600));
-        assert_eq!(l.stat, us(400));
-        assert_eq!(l.read, us(600));
-        assert_eq!(l.write, us(600));
-        assert_eq!(l.fsync, us(800));
-        assert_eq!(l.other, us(300));
+        assert_eq!(l.open, micros(600));
+        assert_eq!(l.stat, micros(400));
+        assert_eq!(l.read, micros(600));
+        assert_eq!(l.write, micros(600));
+        assert_eq!(l.fsync, micros(800));
+        assert_eq!(l.other, micros(300));
     }
 
     #[test]
     fn profile_nfs_hdd_values() {
         let l = Latency::profile("nfs-hdd");
-        assert_eq!(l.open, us(8600));
-        assert_eq!(l.stat, us(8400));
-        assert_eq!(l.read, us(8600));
-        assert_eq!(l.write, us(8600));
-        assert_eq!(l.fsync, ms(10) + us(800));
-        assert_eq!(l.other, us(2300));
+        assert_eq!(l.open, micros(8600));
+        assert_eq!(l.stat, micros(8400));
+        assert_eq!(l.read, micros(8600));
+        assert_eq!(l.write, micros(8600));
+        // 10ms + 800us; also pins the `+` in the profile table.
+        assert_eq!(l.fsync, micros(10_800));
+        assert_eq!(l.other, micros(2300));
     }
 
     #[test]
-    fn nap_zero_is_noop_nonzero_sleeps() {
-        // Zero duration must not sleep (the guard); a tiny non-zero one returns.
+    fn nap_sleeps_for_nonzero_and_skips_zero() {
+        use std::time::Instant;
+        // A non-zero nap sleeps at least its duration (sleep never under-sleeps),
+        // so this pins both the no-op mutation and the `!is_zero` guard direction.
+        let t = Instant::now();
+        nap(millis(30));
+        assert!(t.elapsed() >= millis(25), "nonzero nap should sleep");
+        // A zero nap returns promptly (no sleep).
+        let t = Instant::now();
         nap(Duration::ZERO);
-        nap(us(1));
+        assert!(t.elapsed() < millis(20), "zero nap should not sleep");
     }
 
     #[test]
@@ -878,6 +895,9 @@ mod tests {
         assert_eq!(fa.kind, FileType::RegularFile);
         // perm carries only the 12 permission bits, never the file-type bits.
         assert_eq!(fa.perm & !0o7777, 0);
+        // mtime is reconstructed from the raw secs/nsecs as UNIX_EPOCH + delta;
+        // it must equal what std read from the same inode (pins the epoch math).
+        assert_eq!(fa.mtime, fmeta.modified().unwrap());
 
         let dmeta = std::fs::symlink_metadata(dir.path()).unwrap();
         let da = attr_from_meta(1, &dmeta);
