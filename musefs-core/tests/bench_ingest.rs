@@ -110,8 +110,11 @@ fn bench_scan_under_latency() {
     let mount = LatencyMount::new(backing.path(), &profile).unwrap();
 
     let db = Db::open(mount.path().join("musefs-bench.db")).unwrap();
-    // Reset after Db::open so its migration/WAL-setup fsyncs are excluded; the
-    // reported fsync count then covers scan_directory's DB writes only.
+    // `metrics::reset()` clears the in-process counters but NOT the mount's
+    // fsync counter, so snapshot the mount's count here to subtract Db::open's
+    // migration/WAL-setup fsyncs; the reported value then covers scan_directory
+    // only.
+    let fsyncs_before_scan = mount.fsyncs();
     metrics::reset();
     let t0 = Instant::now();
     let stats = scan_directory(&db, &mount.path()).unwrap();
@@ -129,7 +132,7 @@ fn bench_scan_under_latency() {
             wall_ms: scan_ms,
             opens: s.opens,
             preads: s.preads,
-            fsyncs: Some(mount.fsyncs()),
+            fsyncs: Some(mount.fsyncs().saturating_sub(fsyncs_before_scan)),
             peak_rss_kib: None, // FS runs in-process here, but RSS attribution is mixed; omit.
         }
         .row()
