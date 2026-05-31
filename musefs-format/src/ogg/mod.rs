@@ -219,6 +219,10 @@ pub fn read_metadata(front: &[u8]) -> Result<OggHeader> {
 pub fn read_metadata_bounded(prefix: &[u8], file_len: u64) -> Result<Extent<OggHeader>> {
     match read_header(prefix) {
         Ok(header) => Ok(Extent::Complete(header)),
+        // `read_header` cannot distinguish a truncated front from genuine
+        // corruption, so we widen optimistically; a real error resurfaces via the
+        // `Err(e)` arm once `prefix` reaches `file_len` (and the caller's retry
+        // limit + full-read fallback bound the cost).
         Err(_) if (prefix.len() as u64) < file_len => {
             let grown = ((prefix.len() as u64).saturating_mul(2)).max(64 * 1024);
             Ok(Extent::NeedMore {
@@ -1213,7 +1217,6 @@ mod tests {
 mod bounded_tests {
     use super::*;
     use crate::ogg::page_test_support::{build_header_pub, lace_packet_pub, vorbis_body_empty};
-    use crate::probe::Extent;
 
     /// A minimal Opus stream: OpusHead + OpusTags header packets, then a trailing
     /// audio page. Returns (full, audio_offset). Mirrors the proven fixture in
