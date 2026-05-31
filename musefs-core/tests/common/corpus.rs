@@ -309,6 +309,42 @@ pub fn prepare(p: &CorpusParams) -> Target {
     }
 }
 
+/// Resolve the base directory shared by a per-format sweep: `MUSEFS_BENCH_DIR`
+/// when set (caller-managed, second element `None`), else a fresh tempdir the
+/// caller must hold for the run's duration.
+pub fn bench_base_dir() -> (PathBuf, Option<tempfile::TempDir>) {
+    if let Ok(d) = std::env::var("MUSEFS_BENCH_DIR") {
+        (PathBuf::from(d), None)
+    } else {
+        let s = tempfile::tempdir().unwrap();
+        (s.path().to_path_buf(), Some(s))
+    }
+}
+
+/// Generate a single-format corpus for `fmt` under `<base>/<token>/` with its own
+/// cold DB (`musefs-bench.db` + sidecars deleted first), returning its `Target`.
+/// Per-format generalization of `prepare`'s generated branch. `MUSEFS_BENCH_DB`
+/// is intentionally **ignored** here: each format needs its own DB, so a single
+/// shared path would clobber across formats. `p.format_mix` is overridden to the
+/// single `fmt`. The base tempdir's lifetime is the caller's responsibility, so
+/// `_scratch` is `None`.
+pub fn prepare_format(p: &CorpusParams, base: &Path, fmt: Format) -> Target {
+    let corpus_dir = base.join(format_token(fmt));
+    let mut fp = p.clone();
+    fp.format_mix = vec![fmt];
+    generate(&corpus_dir, &fp);
+    let db_path = corpus_dir.join("musefs-bench.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
+    Target {
+        corpus_dir,
+        db_path,
+        is_real_library: false,
+        _scratch: None,
+    }
+}
+
 /// `comments` and `art` are only consumed by [`Format::Flac`]; the other formats
 /// carry tags via the DB at scan time and have no embedded-art builder, so they
 /// ignore both here.

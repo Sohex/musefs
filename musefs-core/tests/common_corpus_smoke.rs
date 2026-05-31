@@ -204,3 +204,27 @@ fn all_formats_round_trip_through_tokens() {
         );
     }
 }
+
+#[test]
+fn prepare_format_generates_scannable_single_format_corpus() {
+    let base = tempfile::tempdir().unwrap();
+    let p = CorpusParams {
+        albums: 1,
+        tracks_per_album: 2,
+        bytes_per_track: 256,
+        // format_mix is overridden by prepare_format; set something different
+        // to prove the override.
+        art_bytes_per_track: 0,
+        format_mix: vec![Format::Flac],
+        seed: 5,
+    };
+    let t = common::corpus::prepare_format(&p, base.path(), Format::Ogg);
+    assert!(
+        t.corpus_dir.ends_with("ogg"),
+        "per-format subdir named by token"
+    );
+    assert_ne!(t.db_path, t.corpus_dir);
+    let db = Db::open(&t.db_path).unwrap();
+    let stats = scan_directory(&db, &t.corpus_dir).unwrap();
+    assert_eq!(stats.scanned, 2, "two Ogg tracks generated and scanned");
+}
