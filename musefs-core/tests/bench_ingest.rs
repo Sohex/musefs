@@ -16,8 +16,8 @@ use musefs_db::Db;
 /// open_handle), not the scan path, so both rows print ~0 even under
 /// `--features metrics`. The SP1-relevant signals are `wall_ms` and
 /// `peak_rss_kib`. `peak_rss_kib()` reads VmHWM — a process-lifetime high-water
-/// mark — so every row reflects the same peak; the meaningful figure is the
-/// largest corpus's scan row.
+/// mark that only rises — so later rows show the same or a higher value than
+/// earlier ones; read the first format's scan row for the pre-SP1 baseline.
 fn run_one(target: &Target, tier: &str, format: &str, storage: &str) {
     let db = Db::open(&target.db_path).unwrap();
 
@@ -71,7 +71,7 @@ fn bench_cold_scan_and_revalidate() {
 
     // Generated mode: one single-format corpus + cold DB per format under a
     // shared base dir (held for the loop's duration).
-    let (base, _scratch) = bench_base_dir();
+    let (base, _base_tempdir) = bench_base_dir();
     let storage = if std::env::var("MUSEFS_BENCH_DIR").is_ok() {
         "env-dir"
     } else {
