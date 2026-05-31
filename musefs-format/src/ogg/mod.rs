@@ -1285,9 +1285,25 @@ mod bounded_tests {
                                       // Confirm the premise: read_header genuinely errors on this buffer.
         assert!(read_header(&buf).is_err());
         let file_len = 10_000_000u64;
-        // kills ogg L227 `*`->`+` and `*`->`/`: only `*2` yields up_to == 200_000.
         match read_metadata_bounded(&buf, file_len).unwrap() {
             Extent::NeedMore { up_to } => assert_eq!(up_to, 200_000),
+            other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_metadata_bounded_floor_is_64kib_for_small_prefix() {
+        // The `*` at L227 col 74 is the `64 * 1024` FLOOR in `.max(64 * 1024)`,
+        // not the doubling. To exercise it the floor must bind: a tiny prefix whose
+        // doubled length (200) is below 64 KiB, with file_len well above 64 KiB so
+        // `.min(file_len)` doesn't clamp. Correct floor = 65_536.
+        let buf = vec![0u8; 100]; // garbage: read_header errors
+        assert!(read_header(&buf).is_err());
+        let file_len = 10_000_000u64;
+        // kills ogg L227 `64 * 1024` -> `64 + 1024` (=1088) and `64 / 1024` (=0):
+        // only `*` yields the 65_536 floor when the doubled length is smaller.
+        match read_metadata_bounded(&buf, file_len).unwrap() {
+            Extent::NeedMore { up_to } => assert_eq!(up_to, 65_536),
             other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
         }
     }

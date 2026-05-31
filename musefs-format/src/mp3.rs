@@ -1404,6 +1404,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn locate_audio_bounded_sync_exactly_at_eof_proceeds() {
+        // Boundary: audio_offset + 2 == file_len exactly (audio is just the 2-byte
+        // frame sync). `audio_offset + 2 > file_len` is false -> Complete. The
+        // `>`->`>=` mutant makes `16 >= 16` true -> wrongly Err(NotMp3). Mirrors the
+        // unbounded reject `audio_offset + 1 >= len` (accepts when +2 <= len).
+        let body = 4usize;
+        let mut full = b"ID3\x04\x00\x00".to_vec();
+        full.extend_from_slice(&syncsafe(body as u32));
+        full.extend(std::iter::repeat_n(0u8, body)); // tag end at offset 14
+        let audio_offset = full.len() as u64; // 14
+        full.push(0xFF); // frame sync pair, and nothing after
+        full.push(0xFB);
+        let file_len = full.len() as u64; // 16 == audio_offset + 2
+                                          // kills mp3 L96 `>`->`>=`: equal-fit audio must be accepted, not rejected.
+        match locate_audio_bounded(&full, file_len, None).unwrap() {
+            Extent::Complete(b) => {
+                assert_eq!(b.audio_offset, audio_offset);
+                assert_eq!(b.audio_length, 2);
+            }
+            other @ Extent::NeedMore { .. } => {
+                panic!("expected Complete (exact fit), got {other:?}")
+            }
+        }
+    }
+
     // kills mp3 L107 (`prefix[audio_offset] != 0xFF || (prefix[audio_offset+1] &
     // 0xE0) != 0xE0`): `||`->`&&` and `+`->`*`.
     // Frame-sync byte 0 is 0xFF but byte 1 lacks the 0xE0 sync bits. Correct
