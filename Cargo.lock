@@ -839,6 +839,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "musefs-latencyfs"
+version = "0.2.0"
+dependencies = [
+ "fuser",
+ "libc",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
