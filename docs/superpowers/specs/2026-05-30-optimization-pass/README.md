@@ -73,7 +73,7 @@ is built for the full capability regardless.
 
 | SP | State | Spec | Plan | Notes |
 |---|---|---|---|---|
-| SP0a | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now. See "Running the SP0a harness" below |
+| SP0a | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now. See "Running the SP0a harness" below; per-format sweep added (`SP0a-per-format-coverage.md`) |
 | SP0b | Plan drafted | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS |
 | SP1 | Not started | — | — | |
 | SP2 | Not started | — | — | |
@@ -104,6 +104,16 @@ MUSEFS_BENCH_DB=/tmp/musefs-bench.db \
 ```
 
 Notes:
+- **Per-format sweep:** `bench_ingest` and the `read_throughput` sequential bench
+  run against every supported format (FLAC, MP3, M4A moov-first, M4A moov-last,
+  Ogg, WAV) by default, one report row / Criterion line per format (see the
+  `format` column). `bench_refresh` stays FLAC-only (it times a format-independent
+  DB-driven tree rebuild).
+- `MUSEFS_BENCH_FORMAT_MIX` (comma list of `flac,mp3,m4a,m4a-last,ogg,wav`)
+  restricts the sweep to those formats; unset = all. In a `bench_ingest` sweep,
+  `MUSEFS_BENCH_DB` is ignored (each format gets its own DB under a per-format
+  subdir); a real `MUSEFS_BENCH_LIBRARY` run does a single `mixed` scan instead of
+  sweeping.
 - A reused `MUSEFS_BENCH_DIR` is re-scanned cold: `prepare` deletes any prior
   `musefs-bench.db` (+ `-wal`/`-shm`) so scan timings start from an empty DB.
 - The `bench_ingest` `opens`/`preads` columns read ≈0: the metrics counters
