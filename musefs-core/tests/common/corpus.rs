@@ -126,3 +126,119 @@ impl CorpusParams {
 fn env_usize(key: &str) -> Option<usize> {
     std::env::var(key).ok().and_then(|s| s.parse().ok())
 }
+
+use std::path::{Path, PathBuf};
+
+/// Deterministic filler audio: a seedable byte ramp (content is irrelevant —
+/// `BackingAudio` is served verbatim and probing reads only headers).
+fn filler(seed: u64, idx: usize, len: usize) -> Vec<u8> {
+    let base = seed.wrapping_add(idx as u64).wrapping_mul(2_654_435_761);
+    (0..len)
+        .map(|i| (base.wrapping_add(i as u64) & 0xFF) as u8)
+        .collect()
+}
+
+/// One shared cover per album so the content-addressed `art` table dedups.
+fn cover(seed: u64, album: usize, len: usize) -> Vec<u8> {
+    filler(
+        seed ^ 0x00C0_FFEE,
+        album.wrapping_mul(101).wrapping_add(1),
+        len,
+    )
+}
+
+/// A FLAC with STREAMINFO + comments + (optionally) a PICTURE block + audio.
+/// Mirrors `tests/common/scan.rs`'s `flac_with_picture` layout.
+fn flac_bytes(comments: &[String], art: Option<&[u8]>, audio: &[u8]) -> Vec<u8> {
+    use super::{flac_block, streaminfo_body, vorbis_comment_body};
+    let refs: Vec<&str> = comments.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    out.extend_from_slice(b"fLaC");
+    out.extend_from_slice(&flac_block(0, &streaminfo_body(), false));
+    let last_meta = art.is_none();
+    out.extend_from_slice(&flac_block(
+        4,
+        &vorbis_comment_body("musefs-bench", &refs),
+        last_meta,
+    ));
+    if let Some(img) = art {
+        let mut body = Vec::new();
+        body.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
+        body.extend_from_slice(&(b"image/png".len() as u32).to_be_bytes());
+        body.extend_from_slice(b"image/png");
+        body.extend_from_slice(&0u32.to_be_bytes()); // description len
+        body.extend_from_slice(&0u32.to_be_bytes()); // width
+        body.extend_from_slice(&0u32.to_be_bytes()); // height
+        body.extend_from_slice(&0u32.to_be_bytes()); // depth
+        body.extend_from_slice(&0u32.to_be_bytes()); // colors
+        body.extend_from_slice(&(img.len() as u32).to_be_bytes());
+        body.extend_from_slice(img);
+        out.extend_from_slice(&flac_block(6, &body, true));
+    }
+    out.extend_from_slice(audio);
+    out
+}
+
+/// Generate the corpus into `dir` (created if missing). Layout is
+/// `dir/album-{a}/track-{t}.{ext}`. Returns created file paths in stable order.
+pub fn generate(dir: &Path, p: &CorpusParams) -> Vec<PathBuf> {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut paths = Vec::with_capacity(p.track_count());
+    let mut idx = 0usize;
+    for album in 0..p.albums {
+        let adir = dir.join(format!("album-{album:05}"));
+        std::fs::create_dir_all(&adir).unwrap();
+        let art_blob =
+            (p.art_bytes_per_track > 0).then(|| cover(p.seed, album, p.art_bytes_per_track));
+        for track in 0..p.tracks_per_album {
+            let fmt = p.format_mix[idx % p.format_mix.len()];
+            let audio = filler(p.seed, idx, p.bytes_per_track);
+            let comments = vec![
+                format!("ARTIST=Artist {album:05}"),
+                format!("ALBUM=Album {album:05}"),
+                format!("TITLE=Track {track:03}"),
+            ];
+            let path = generate_one(&adir, idx, fmt, &comments, art_blob.as_deref(), &audio);
+            paths.push(path);
+            idx += 1;
+        }
+    }
+    paths
+}
+
+fn generate_one(
+    adir: &Path,
+    idx: usize,
+    fmt: Format,
+    comments: &[String],
+    art: Option<&[u8]>,
+    audio: &[u8],
+) -> PathBuf {
+    match fmt {
+        Format::Flac => {
+            let path = adir.join(format!("track-{idx:06}.flac"));
+            std::fs::write(&path, flac_bytes(comments, art, audio)).unwrap();
+            path
+        }
+        Format::Mp3 => {
+            let path = adir.join(format!("track-{idx:06}.mp3"));
+            super::write_mp3(&path, audio);
+            path
+        }
+        Format::M4aMoovFirst => {
+            let path = adir.join(format!("track-{idx:06}.m4a"));
+            super::write_m4a(&path, audio);
+            path
+        }
+        Format::M4aMoovLast => {
+            let path = adir.join(format!("track-{idx:06}.m4a"));
+            super::write_m4a_moov_last(&path, audio);
+            path
+        }
+        Format::Wav => {
+            let path = adir.join(format!("track-{idx:06}.wav"));
+            super::write_wav(&path, audio);
+            path
+        }
+    }
+}

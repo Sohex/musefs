@@ -1,6 +1,6 @@
 mod common;
 
-use common::corpus::{CorpusParams, Tier};
+use common::corpus::{CorpusParams, Format, Tier};
 use common::write_m4a_moov_last;
 use musefs_core::scan_directory;
 use musefs_db::Db;
@@ -40,6 +40,31 @@ fn env_overrides_apply_over_tier() {
     assert_eq!(p.albums, 3);
     assert_eq!(p.tracks_per_album, 4);
     assert_eq!(p.track_count(), 12);
+}
+
+#[test]
+fn generate_is_deterministic_and_scans_all_tracks() {
+    let p = CorpusParams {
+        albums: 2,
+        tracks_per_album: 3,
+        bytes_per_track: 512,
+        art_bytes_per_track: 64,
+        format_mix: vec![Format::Flac],
+        seed: 7,
+    };
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let files_a = common::corpus::generate(a.path(), &p);
+    let files_b = common::corpus::generate(b.path(), &p);
+    assert_eq!(files_a.len(), 6);
+    // Determinism: same relative names and identical bytes for the first file.
+    let first_a = std::fs::read(&files_a[0]).unwrap();
+    let first_b = std::fs::read(&files_b[0]).unwrap();
+    assert_eq!(first_a, first_b, "same (params, seed) => identical bytes");
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = musefs_core::scan_directory(&db, a.path()).unwrap();
+    assert_eq!(stats.scanned, 6);
 }
 
 #[test]
