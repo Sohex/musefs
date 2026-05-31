@@ -105,7 +105,7 @@ fn bench_refresh_one_across_library_sizes() {
         // is set) precisely so a multi-size sweep stays independent.
         let tmp = tempfile::tempdir().unwrap();
         let params = CorpusParams::single(Format::Flac, 1, n);
-        let target = prepare_format(&params, tmp.path(), Format::Flac);
+        let target = prepare_format(&params, tmp.path(), params.format_mix[0]);
 
         let db = Db::open(&target.db_path).unwrap();
         scan_directory(&db, &target.corpus_dir).unwrap();

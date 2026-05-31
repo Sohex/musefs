@@ -196,14 +196,14 @@ proptest! {
             // album+title space already drives disambiguation and path moves.
             match op {
                 Op::Retag(i, album, title) if !live.is_empty() => {
-                    let _ = writer.replace_tags(live[i % live.len()], &[
+                    writer.replace_tags(live[i % live.len()], &[
                         Tag::new("ARTIST", "X", 0),
                         Tag::new("ALBUM", &album, 0),
                         Tag::new("TITLE", &title, 0),
-                    ]);
+                    ]).unwrap();
                 }
                 Op::Delete(i) if !live.is_empty() => {
-                    let _ = writer.delete_track(live[i % live.len()]);
+                    writer.delete_track(live[i % live.len()]).unwrap();
                 }
                 Op::Add(album, title) => {
                     add_seq += 1;
