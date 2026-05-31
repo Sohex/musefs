@@ -1812,6 +1812,8 @@ git commit -m "bench(core): Stage B refresh flat across library size; SP2 done (
 
 Correctness rests on step 4 (provably equal for a whole subtree) plus a dirty set that is a **superset** of the truly-affected dirs. The property oracle (Task B6) is the gate; if it finds a divergence, the fix is always "widen the dirty set," never "change rebuild_subtree."
 
+**Perf note (the superset is bounded by the affected subtree, not the library).** The introducing-id propagation marks ancestors up to the level where the removed/added id stops being the subtree's min. For a *non-colliding* edit this over-marks (e.g. deleting an album's lowest-id track marks the album — and, if that id is also the artist's min, the artist — dirty), so `rebuild_subtree` rebuilds that artist/album subtree rather than just the one dir. That is still **O(affected subtree) ≪ O(library)** — it never reaches the SP2 anti-goal of scaling with library size unless the touched id is the *global* minimum. A later optimization could propagate only when a dir-vs-file collision actually exists at that level (the only case the cascade can change a name); that is YAGNI for now and out of scope — correctness-first superset is the chosen posture and the benches (B7) will confirm it stays sublinear in library size.
+
 ---
 
 ## Task B2: `Node.rendered_name` + navigation/introducing-id/remove primitives
@@ -2108,10 +2110,32 @@ fn apply_changes_handles_dir_vs_file_min_id_flip() {
                paths_of(&reference).keys().collect::<Vec<_>>(),
                "dir-vs-file min-id flip must match a full rebuild");
 }
+
+#[test]
+fn apply_changes_handles_add_side_min_id_flip() {
+    // Initial: file "X.flac" (id 2) claims the base name; dir "X.flac"
+    // (introduced by id 5) is disambiguated to "X.flac (2)".
+    let entries = vec![(2, "X.flac".to_string()), (5, "X.flac/a.flac".to_string())];
+    let mut alloc = InodeAllocator::new();
+    let mut t = VirtualTree::build_with(&entries, &mut alloc);
+    // ADD track 1 under the dir: its id (1) is now the dir's min (< file's 2), so a
+    // full rebuild gives the DIR the base name and the file becomes "X.flac (2)".
+    let new_entries = vec![
+        (1, "X.flac/b.flac".to_string()),
+        (2, "X.flac".to_string()),
+        (5, "X.flac/a.flac".to_string()),
+    ];
+    let reference = VirtualTree::build(&new_entries);
+    let new_paths: std::collections::HashMap<i64, String> = new_entries.iter().cloned().collect();
+    t.apply_changes(&new_paths, &[], &[1], &[], &mut alloc).unwrap();
+    assert_eq!(paths_of(&t).keys().collect::<Vec<_>>(),
+               paths_of(&reference).keys().collect::<Vec<_>>(),
+               "add-side dir-vs-file min-id flip must match a full rebuild");
+}
 ```
 
-Run: `cargo test -p musefs-core --lib apply_changes_handles_dir_vs_file -- --nocapture`
-Expected: FAIL (`no method named apply_changes`).
+Run: `cargo test -p musefs-core --lib apply_changes_handles -- --nocapture`
+Expected: FAIL (`no method named apply_changes`); both tests compile-fail until Step 2.
 
 - [ ] **Step 2: Implement `apply_changes`**
 
@@ -2326,14 +2350,22 @@ git commit -m "feat(core): wire apply_changes into rebuild_incremental + fallbac
 ```rust
 use proptest::prelude::*;
 
+#[derive(Clone, Debug)]
+enum Op {
+    Retag(usize, String, String), // retag the i-th LIVE track (forces collisions → moves)
+    Delete(usize),                // delete the i-th LIVE track (remove-cascade + prune)
+    Add(String, String),          // add a brand-new DB track row (added-side propagation)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
     fn incremental_equivalent_to_full_under_random_edits(
         ops in proptest::collection::vec(
             prop_oneof![
-                // Collide deliberately: few distinct album/title values.
-                (0usize..6, "[A-B]", "[x-y]"),
+                (0usize..8, "[A-B]", "[x-y]").prop_map(|(i, a, t)| Op::Retag(i, a, t)),
+                (0usize..8).prop_map(Op::Delete),
+                ("[A-B]", "[x-y]").prop_map(|(a, t)| Op::Add(a, t)),
             ], 0..24)
     ) {
         let target = small_corpus(6);
@@ -2343,15 +2375,40 @@ proptest! {
         scan_directory(&db, &corpus).unwrap();
         let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
         let writer = Db::open(&db_path).unwrap();
-        let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+        let mut add_seq = 0u32;
 
-        for (i, album, title) in ops {
-            if let Some(&id) = ids.get(i) {
-                let _ = writer.replace_tags(id, &[
-                    Tag::new("ARTIST", "X", 0),
-                    Tag::new("ALBUM", &album, 0),
-                    Tag::new("TITLE", &title, 0),
-                ]);
+        for op in ops {
+            // Re-query the live id set each step (deletes/adds change it).
+            let live: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+            match op {
+                Op::Retag(i, album, title) if !live.is_empty() => {
+                    let _ = writer.replace_tags(live[i % live.len()], &[
+                        Tag::new("ARTIST", "X", 0),
+                        Tag::new("ALBUM", &album, 0),
+                        Tag::new("TITLE", &title, 0),
+                    ]);
+                }
+                Op::Delete(i) if !live.is_empty() => {
+                    let _ = writer.delete_track(live[i % live.len()]);
+                }
+                Op::Add(album, title) => {
+                    add_seq += 1;
+                    // DB-only track: tree-building never reads the backing file, and
+                    // both fs and reference read the same DB, so equivalence holds.
+                    let new = musefs_db::NewTrack {
+                        backing_path: format!("/virt/added-{add_seq}.flac"),
+                        format: Format::Flac,
+                        audio_offset: 0, audio_length: 1, backing_size: 1, backing_mtime: 0,
+                    };
+                    if let Ok(id) = writer.upsert_track(&new) {
+                        let _ = writer.replace_tags(id, &[
+                            Tag::new("ARTIST", "X", 0),
+                            Tag::new("ALBUM", &album, 0),
+                            Tag::new("TITLE", &title, 0),
+                        ]);
+                    }
+                }
+                _ => {}
             }
             fs.poll_refresh().unwrap();
             let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
@@ -2364,7 +2421,7 @@ proptest! {
 }
 ```
 
-> Inode-identity equivalence is enforced by the in-process `debug_assert` in B5 (it runs in these test builds, using a clone of the live allocator). Do not assert raw inode numbers across the two independent `Musefs` instances — they have separate allocator histories and legitimately differ in inode numbers (only the path↔structure must match across instances).
+> Inode-identity equivalence is enforced by the in-process `debug_assert` in B5 (it runs in these test builds, using a clone of the live allocator). Do not assert raw inode numbers across the two independent `Musefs` instances — they have separate allocator histories and legitimately differ in inode numbers (only the path↔structure must match across instances). The `Op::Add` arm exercises the **added-side** introducing-id propagation; `Op::Delete` exercises remove-cascade pruning — both were missing from the earlier draft.
 
 Run: `cargo test -p musefs-core incremental_equivalent_to_full -- --nocapture`
 Expected: PASS. On failure, proptest prints the minimal failing op sequence — widen the dirty seeds in `apply_changes` (Task B4) accordingly; never change `rebuild_subtree`.
