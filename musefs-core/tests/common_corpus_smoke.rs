@@ -228,3 +228,15 @@ fn prepare_format_generates_scannable_single_format_corpus() {
     let stats = scan_directory(&db, &t.corpus_dir).unwrap();
     assert_eq!(stats.scanned, 2, "two Ogg tracks generated and scanned");
 }
+
+#[test]
+fn bench_base_dir_defaults_to_held_tempdir() {
+    let _g = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("MUSEFS_BENCH_DIR");
+    let (base, scratch) = common::corpus::bench_base_dir();
+    assert!(base.exists(), "base dir exists");
+    assert!(
+        scratch.is_some(),
+        "unset MUSEFS_BENCH_DIR yields a caller-held tempdir"
+    );
+}

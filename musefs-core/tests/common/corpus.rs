@@ -256,6 +256,14 @@ pub fn generate(dir: &Path, p: &CorpusParams) -> Vec<PathBuf> {
     paths
 }
 
+/// Delete a DB file and its WAL/SHM sidecars so a reused dir is scanned cold
+/// (timings start from an empty DB rather than one that already holds tracks).
+fn delete_cold_db(db_path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
+}
+
 /// Where the corpus and DB live for a run, and whether it was generated.
 pub struct Target {
     pub corpus_dir: PathBuf,
@@ -296,11 +304,7 @@ pub fn prepare(p: &CorpusParams) -> Target {
     generate(&corpus_dir, p);
     let db_path = std::env::var("MUSEFS_BENCH_DB")
         .map_or_else(|_| corpus_dir.join("musefs-bench.db"), PathBuf::from);
-    // Generated mode: start cold so a reused MUSEFS_BENCH_DIR doesn't time the
-    // scan against a DB that already holds the tracks. (WAL sidecars too.)
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
-    }
+    delete_cold_db(&db_path);
     Target {
         corpus_dir,
         db_path,
@@ -334,9 +338,7 @@ pub fn prepare_format(p: &CorpusParams, base: &Path, fmt: Format) -> Target {
     fp.format_mix = vec![fmt];
     generate(&corpus_dir, &fp);
     let db_path = corpus_dir.join("musefs-bench.db");
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
-    }
+    delete_cold_db(&db_path);
     Target {
         corpus_dir,
         db_path,
