@@ -50,6 +50,9 @@ pub fn format_token(f: Format) -> &'static str {
 
 /// Every supported format, plus the M4A moov-last layout variant (the SP1
 /// bounded-read hard case). The per-format benches sweep this set.
+///
+/// Not enforced by a compile check: if you add a `Format` variant, add it here
+/// too. The round-trip test guards token drift, not omission from this list.
 pub const ALL_FORMATS: &[Format] = &[
     Format::Flac,
     Format::Mp3,
