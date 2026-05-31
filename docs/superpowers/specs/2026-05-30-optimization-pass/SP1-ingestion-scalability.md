@@ -24,7 +24,7 @@ SP1 changes only *how metadata is extracted at scan time*. It writes the same
 `audio_offset` / `audio_length` / `tags` / `art` rows, and **never touches the
 serve/read path**. So the byte-identical-audio guarantee holds by construction —
 provided bounded probing produces results identical to full-file probing. That
-equivalence is the **headline correctness guard** (see Testing §8.1).
+equivalence is the **headline correctness guard** (see Testing & acceptance gate, item 1).
 
 ## Reuse (existing foundation)
 
@@ -54,8 +54,7 @@ splits accordingly.
 
 ### Front-anchored formats: FLAC, MP3, OGG, WAV
 
-The prober entry points (`locate_audio`, `read_vorbis_comments` / `read_tags`,
-`read_pictures`, `read_header`) change signature to accept a **probe window**:
+These probers are fed a **probe window** instead of the whole file:
 
 - `prefix: &[u8]` — the first `prefix.len()` bytes of the file
   (`prefix.len() ≤ file_len`).
@@ -67,20 +66,42 @@ Contract:
   `data.len() - audio_offset`. The audio bytes are not in `prefix`; their length
   is arithmetic, not a read.
 - If parsing needs byte index `i` with `prefix.len() ≤ i < file_len`, the prober
-  returns **`NeedMore { up_to: u64 }`** carrying the exact high-water byte it
-  needs. Block/frame/chunk *headers* are tiny and front-anchored, so a small
-  prefix lets a prober learn the exact extent of bodies (notably embedded art)
-  and request precisely that range.
+  returns **`NeedMore { up_to: u64 }`** where `up_to` is the exact end of the
+  structure it is mid-parse on. The current parsers already detect the truncation
+  point (they return `Malformed` the instant a declared body length runs past the
+  buffer); SP1 converts each such site from **"truncated → `Malformed`"** into
+  **"truncated but the declared length is known → `NeedMore { up_to }`"** vs.
+  **"truncated and length is unknowable → `Malformed`."** The field that yields
+  `up_to` per format is named in the table below.
 - The scan loop answers a `NeedMore` with **one widening read** up to `up_to`
   (capped at `file_len`) and retries the prober. Worst case for front-anchored
   formats is two bounded reads, never a full slurp — except WAV with metadata
   trailing a huge `data` chunk, whose `up_to` lands near `file_len` (≈ today's
-  cost, no worse; see §9).
+  cost, no worse; see Out of scope).
 - **MP3 ID3v1**: detected via a dedicated 128-byte **tail read**, separate from
   the prefix.
 
-`WINDOW` (initial prefix size) is a tunable constant; default **1 MiB**. Typical
-metadata + cover art fits inside it, so the widening read is rare.
+**Per-format reality (the work is not uniform).** Two formats already have a
+front-only metadata split; two do not. The plan must budget accordingly:
+
+| Format | Front-only metadata fn today | `read_tags`/`read_pictures` reach audio payload? | Field yielding `up_to` | Net work |
+|---|---|---|---|---|
+| **FLAC** | **Yes** — `read_metadata → FlacMeta { audio_offset, preserved }` (no `audio_length`); `locate_audio` is just that + `len - offset` (flac.rs:80/90) | No — metadata blocks (incl. PICTURE) are all `< audio_offset` | 24-bit METADATA_BLOCK length at the truncation point | **Small** — thread `file_len`, emit `NeedMore` from `parse_blocks` |
+| **OGG** | **Yes** — `read_metadata(front) → OggHeader` is the front-only twin of `locate_audio` (ogg/mod.rs:202/208) | No — **all** art is in the header packets before `audio_offset`: Opus/Vorbis `METADATA_BLOCK_PICTURE` in the comment packet, OggFLAC type-6 packets (ogg/mod.rs:154–184) | end of header-packet reassembly (= `audio_offset`) | **Small** — emit `NeedMore` when header packets aren't fully present in `prefix` |
+| **MP3** | **No** — `locate_audio(&[u8])` takes whole buffer (mp3.rs:26) | ID3v2 tag is front; ID3v1 is the 128-byte tail | ID3v2 synchsafe `tag_len` (fully known from the first 10 bytes, mp3.rs:36–40) | **Real** — add a front-only variant + tail read |
+| **WAV** | **No** — `locate_audio(&[u8])` takes whole buffer (wav.rs:64) | LIST/INFO + `id3 ` chunks may sit **after** `data` | next-chunk offset from the RIFF chunk header (`walk_chunks`, wav.rs:35) | **Real** — front-only chunk walk; trailing-metadata case widens toward `file_len` (Out of scope) |
+
+Note OGG art is **front-anchored by construction**, so a `WINDOW` covering the
+header region captures it with no widening read; the only OGG widening trigger is
+a header region (many/large embedded images) exceeding `WINDOW`.
+
+`WINDOW` (initial prefix size) is a tunable constant; **default 1 MiB**. Embedded
+front-cover art is routinely 0.5–3 MB, so for art-bearing FLAC/MP3 the widening
+read is the **expected** path, not a rare one — but it is still bounded to
+*metadata + the exact art extent*, never the audio payload, which is the whole
+point. (The `custom`/real-library bench tier can later inform a `WINDOW` that
+brackets a given library's p95 art size; the default is deliberately conservative
+so a giant cover never wastes a slurp.)
 
 ### M4A: seek reader
 
@@ -90,8 +111,9 @@ eliminated; `mdat` is never read.
 
 ### Per-file scan flow
 
-1. `fs::metadata` → `file_len`, `mtime`. (`revalidate`: unchanged size+mtime →
-   skip with no file read, as today.)
+1. `fs::metadata` → `file_len`, `mtime`. (`revalidate` first runs its main-thread
+   pre-dispatch skip pass — Component 2 — so unchanged files never reach a worker
+   and do no file read.)
 2. Read `prefix = min(file_len, WINDOW)` bytes.
 3. Dispatch by extension:
    - FLAC/MP3/OGG/WAV → probers with `(prefix, file_len)`; MP3 also issues the
@@ -130,44 +152,100 @@ collect_audio (main thread)
   parsing and bounded file reads — they never touch the DB.
 - **Single writer thread** owns the one write connection, so SQLite stays
   single-writer-safe with zero write contention.
-- **Bounded channel** between workers and writer provides backpressure, so
-  in-flight `Probed` values (which hold art blobs) cannot balloon memory —
-  protecting the bounded-memory goal.
-- **Order-independence**: upserts are keyed by `backing_path`, so final DB state
-  is identical regardless of `--jobs`. `--jobs 1` and `--jobs N` converge to the
-  same rows — keeping tests deterministic.
+- **Backpressure / memory budget**: the worker→writer channel is bounded so
+  in-flight `Probed` values (which hold art `Vec<u8>` blobs) cannot balloon
+  memory. The bound is **a byte budget over accumulated art**, and it is the
+  *same* budget as the batch byte-ceiling (Component 3) — a `Probed` is held
+  either in the channel or in the forming batch, so they are accounted as one
+  pool, not two. Concretely: cap total in-flight art at **B<sub>bytes</sub>**
+  (default **64 MiB**); peak scan RSS for art ≈ B<sub>bytes</sub> + the current
+  batch. (`--jobs` only sets worker count, not the memory bound.)
+- **Semantic (not literal) determinism across `--jobs`**: track rows are keyed by
+  `backing_path` (upserted) and art is deduplicated by `art.sha256 UNIQUE`, so
+  the *content* of the DB is independent of `--jobs`. But `art.id` is an
+  insertion-order rowid (schema.rs:26), so with nondeterministic worker
+  completion the same image can receive a different `art.id` (and hence
+  `track_art.art_id`) run-to-run. The DB is therefore **semantically equivalent,
+  not byte-identical at the id level**. The determinism test compares
+  **normalized** state — tracks by `backing_path`, tags by `(key, value,
+  ordinal)`, art by `sha256` + its per-track usage — **not** raw `art.id` values
+  (see Testing & acceptance gate, item 3).
+- **`revalidate` skip-unchanged must not put a DB read in the workers.** The
+  size+mtime fast-skip (scan.rs:240) is a DB lookup, and workers are DB-free. So
+  `revalidate` does a **pre-dispatch pass on the main thread**: load the existing
+  `(backing_path → backing_size, backing_mtime)` set once (one query, the way
+  prune already lists tracks), `stat` each candidate, and enqueue only the files
+  whose size/mtime changed. Workers still only probe; unchanged files never reach
+  them.
 - The **directory walk stays single-threaded** (cheap relative to probing;
   parallelizing it is out of scope).
-- `revalidate` uses the same worker/writer shape; its whole-DB tail steps (prune
-  missing tracks, `gc_orphan_art`) run after, single-threaded on the writer
-  connection.
+- `revalidate`'s whole-DB tail steps (prune missing tracks, `gc_orphan_art`) run
+  after the pipeline drains, single-threaded on the writer connection.
 
 ## Component 3 — Transaction batching
 
-- The writer accumulates **B files** and wraps all their
+- The writer accumulates files and wraps all their
   `upsert_track` + `replace_tags` + `upsert_art` + `set_track_art` calls in a
   **single transaction**, then commits — collapsing today's several
-  commits-per-file into a handful per batch.
-- **Batch sizing**: count-based default (**B = 256**) with a **byte ceiling** on
-  accumulated art so a batch can neither hold too much memory nor build an
-  oversized transaction; whichever bound trips first flushes the batch.
+  commits-per-file into a handful per batch. This is the primary **fsync**
+  reduction (one fsync per batch under `synchronous=NORMAL`, vs. several per file
+  today), measured via `musefs-latencyfs` (Component 6).
+- **Flush triggers (whichever trips first):** a **count** bound — default
+  **B = 256** files, chosen to amortize commit/fsync overhead while keeping a
+  failed-commit blast radius small — **or** the shared **art byte budget**
+  B<sub>bytes</sub> (default **64 MiB**, the same pool as the channel
+  backpressure in Component 2; measured as raw image-blob bytes, excluding
+  framing). Both are tunable constants.
+- **Trigger semantics are unaffected.** The `content_version`/`updated_at`
+  triggers (schema.rs:44–74) fire **per row** and are **scoped to the owning
+  `tracks` row** (`WHERE id = NEW.track_id`). Batching many tracks into one
+  transaction does not cross-contaminate: each track's `replace_tags`
+  (DELETE-all + INSERT-each, tags.rs:8–15) bumps only its own `content_version`,
+  exactly as today.
 - **Error semantics**: per-file read/probe failures are handled in the worker and
   **never enter a batch**, so batches need no partial-rollback logic. A DB error
-  on commit is **fatal** (stops workers, propagates).
+  on commit is **fatal** (stops workers, propagates). A batch is a unit of
+  durability only, not of correctness: a crash mid-scan loses at most the
+  un-committed batch, which a re-scan re-ingests (additive); a crash mid-`revalidate`
+  may also lose the destructive prune/GC tail, but re-running re-prunes
+  idempotently.
 
 ## Component 4 — Bulk-write pragmas
 
-A dedicated **bulk-write connection** (owned by `musefs-db`, the pragma-policy
-owner — e.g. a `Db::open_bulk` / bulk-configured connection):
+A **scan-scoped bulk-write connection**, opened by `musefs-db` at the start of a
+scan/revalidate and **closed at the end** — explicitly *distinct* from any
+long-lived mount connection, so its pragmas never leak into the serve path. New
+API surface SP1 must add (today `Db` is a single `Connection`, lib.rs:15, with no
+bulk path):
+
+- a constructor for the bulk connection (e.g. `Db::open_bulk`), and
+- a **batch-writer handle** (e.g. `BulkWriter`) that wraps the per-track
+  `upsert_track` / `replace_tags` / `upsert_art` / `set_track_art` calls in one
+  transaction and exposes `flush`/`commit`.
+
+Pragmas on that connection:
 
 - `synchronous = NORMAL` — safe under WAL (survives app crash; only a power-loss
   on the very last commit is at risk, which a re-scan fixes since scan is
-  re-runnable).
+  re-runnable; see the revalidate caveat in Component 3).
 - `cache_size` ≈ **-65536** (64 MiB).
 - `temp_store = MEMORY`.
-- **`journal_mode = WAL` retained** — a concurrent live mount keeps reading.
-- `busy_timeout` retained; optional `wal_checkpoint(TRUNCATE)` at scan end to
-  bound WAL growth.
+- **`journal_mode = WAL` retained.** WAL allows concurrent *readers* (a live
+  mount keeps reading), but only **one writer**.
+- `busy_timeout` retained (currently 5 s, lib.rs:43); `wal_checkpoint(TRUNCATE)`
+  on close to bound WAL growth.
+
+**Exclusive-write assumption (stated, not assumed silently).** `musefs scan` /
+`revalidate` assumes it is the **sole writer** for its duration. WAL's single-writer
+rule means a long-running bulk transaction holds the write lock; a *second*
+concurrent writer (e.g. a beets/picard sync to the same DB) would hit
+`SQLITE_BUSY` once the 5 s `busy_timeout` is exceeded by a slow batch. This is
+acceptable because scan is an operator-initiated maintenance pass, not a
+steady-state mount activity; the roadmap's out-of-band writers are expected to
+run a scan, not concurrently with one. A concurrent live mount only *reads* and
+is unaffected. (If concurrent external writes during scan ever become a real
+requirement, smaller batches / a shorter lock-hold would be the lever — out of
+scope here.)
 
 ## Component 5 — Resilience
 
@@ -195,14 +273,26 @@ whole scan.) `ScanStats` / `RevalidateStats` gain a **`failed`** field alongside
 
 1. **Equivalence property (headline).** For every format fixture **and**
    proptest-generated files, bounded probing — run with a deliberately tiny
-   `WINDOW` to force the `NeedMore`/widen path — yields a `Probed`
-   (`audio_offset`, `audio_length`, `tags`, `pictures`) **byte-identical** to the
-   legacy full-buffer probe. This is the core guard that the served output cannot
-   drift.
+   `WINDOW` to force the `NeedMore`/widen path — yields a `Probed` **structurally
+   equal** (all fields; tags and pictures **order-preserved**, since ordinals
+   drive template rendering and synthesis) to the legacy full-buffer probe.
+   Precisely, for each file: `bounded.audio_offset == legacy.audio_offset`;
+   `bounded.audio_length == file_len - bounded.audio_offset == legacy.audio_length`;
+   `bounded.tags == legacy.tags` as an ordered list of `(key, value)`; and
+   `bounded.pictures == legacy.pictures` as an ordered list (bytes, mime,
+   picture_type, description). ("Structurally equal," not "byte-identical" — the
+   latter is the *serve-path* guarantee; this asserts the parsed values match.)
+   This is the core guard that the served output cannot drift.
 2. **`NeedMore`/widen units.** Tiny window → correct `up_to`, exactly one
-   widening read, embedded art beyond the window still captured intact.
-3. **Parallel determinism.** `--jobs 1` vs `--jobs N` over the same corpus →
-   identical DB state (rows + tags + art).
+   widening read, embedded art beyond the window still captured intact. Includes
+   the OGG case (incomplete header-packet reassembly in `prefix` → `NeedMore`) and
+   the WAV trailing-metadata case (`up_to` near `file_len`).
+3. **Parallel determinism (normalized).** `--jobs 1` vs `--jobs N` over the same
+   corpus → **semantically equivalent** DB state, compared on **normalized** form:
+   tracks by `backing_path`; tags by `(key, value, ordinal)`; art by `sha256` plus
+   its per-track usage `(picture_type, description, ordinal)`. Raw `art.id` /
+   `track_art.art_id` values are **excluded** from the comparison (they are
+   insertion-order rowids and legitimately differ across runs).
 4. **Resilience.** A corrupt/unreadable file in the corpus → scan completes, that
    file counted `failed`, all others ingested.
 5. **Batching.** A forced DB error mid-batch is fatal and surfaces.
@@ -223,8 +313,28 @@ whole scan.) `ScanStats` / `RevalidateStats` gain a **`failed`** field alongside
 - **Seek-based RIFF chunk-walk for WAV** — WAV with metadata trailing a huge
   `data` chunk widens toward `file_len` (no worse than today). A seek-based walk
   is a possible follow-up.
+- **APEv2 tags** — not read by the current MP3 prober (only ID3v1 + ID3v2) and not
+  emitted by synthesis; SP1 does not change that. The 128-byte tail read is
+  ID3v1-only.
 - **Parallelizing the directory walk** — cheap relative to probing.
 - **Any serve/read-path change** — SP1 is ingestion-only.
 - **New formats.**
 - No storage-bound validation is deferred: SP0b's `musefs-latencyfs` and a real
   `bandwidth`-tier mount both run on the current box.
+
+## Implementation sequencing (for the plan)
+
+This is one SP, but it has a natural two-stage order the plan should follow so the
+riskiest change is verified before the concurrency machinery is layered on:
+
+1. **Stage A — bounded reads (Component 1), still single-threaded.** Land the
+   probe-window / `file_len` / `NeedMore` contract and the M4A seek route, gated
+   green by the **equivalence property (Testing item 1)** before anything else. This is the
+   only change that touches the byte-identical parsing surface.
+2. **Stage B — pipeline (Components 2–4).** Add the parallel-probe/serial-writer
+   pool, the `BulkWriter` batching, the scan-scoped bulk connection, the
+   `revalidate` pre-dispatch skip pass, and resilience counting — on top of an
+   already-verified Stage A.
+
+Stages may ship as one or two PRs at the implementer's discretion; the gating
+order (A's equivalence property green before B) is the requirement.
