@@ -285,6 +285,44 @@ impl VirtualTree {
         Some(self.prune_empty_dirs_upward(parent))
     }
 
+    /// Rebuild the subtree rooted at directory `dir` so its disambiguation matches a
+    /// fresh `build_with`: collect every track currently under `dir`, remove them all
+    /// (pruning), then re-insert in ascending track-id order using each track's
+    /// RENDERED path from `new_paths`. `ensure_dir` reuses ancestors above `dir`, so
+    /// only `dir`'s subtree is rebuilt. Errs if a collected track has no entry in
+    /// `new_paths` (caller falls back to a full rebuild). See SP2 Component 3.
+    #[allow(clippy::result_unit_err)]
+    pub fn rebuild_subtree(
+        &mut self,
+        dir: u64,
+        new_paths: &std::collections::HashMap<i64, String>,
+        alloc: &mut InodeAllocator,
+    ) -> std::result::Result<(), ()> {
+        let mut ids = Vec::new();
+        let mut stack = vec![dir];
+        while let Some(n) = stack.pop() {
+            match self.nodes.get(&n).map(|x| x.kind.clone()) {
+                Some(NodeKind::File { track_id }) => ids.push(track_id),
+                _ => {
+                    if let Some(kids) = self.children.get(&n) {
+                        for &c in kids.values() {
+                            stack.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        for id in &ids {
+            self.remove_track(*id, alloc);
+        }
+        ids.sort_unstable();
+        for id in ids {
+            let path = new_paths.get(&id).ok_or(())?;
+            self.insert_file(id, path, alloc);
+        }
+        Ok(())
+    }
+
     /// Walk up from `dir`, removing empty directories; return the first non-empty
     /// (surviving) ancestor.
     fn prune_empty_dirs_upward(&mut self, mut dir: u64) -> u64 {
@@ -439,5 +477,96 @@ mod tests {
         let a = t.lookup(VirtualTree::ROOT, "A").expect("A must survive");
         assert_eq!(surviving, Some(a));
         assert!(t.lookup(a, "y.flac").is_some());
+    }
+
+    fn paths_of(t: &VirtualTree) -> std::collections::BTreeMap<String, u64> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![(VirtualTree::ROOT, String::new())];
+        while let Some((ino, pfx)) = stack.pop() {
+            if let Some(kids) = t.children(ino) {
+                for (name, &child) in kids {
+                    let p = if pfx.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{pfx}/{name}")
+                    };
+                    if t.is_dir(child) {
+                        stack.push((child, p));
+                    } else {
+                        out.insert(p, child);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rebuild_subtree_reclaims_freed_base_name() {
+        let mut alloc = InodeAllocator::new();
+        let mut t = VirtualTree::build_with(
+            &[(10, "D/song.flac".into()), (20, "D/song.flac".into())],
+            &mut alloc,
+        );
+        let d = t.lookup(VirtualTree::ROOT, "D").unwrap();
+        t.remove_track(10, &mut alloc);
+        // new_paths after removal: only id 20 remains, rendered "D/song.flac".
+        let mut np = std::collections::HashMap::new();
+        np.insert(20, "D/song.flac".to_string());
+        t.rebuild_subtree(d, &np, &mut alloc).unwrap();
+        let reborn = t.lookup(d, "song.flac").unwrap();
+        assert_eq!(t.inode_of_track(20), Some(reborn));
+        assert!(t.lookup(d, "song (2).flac").is_none());
+    }
+
+    #[test]
+    fn rebuild_subtree_matches_build_for_dir_vs_file() {
+        // $album="X.flac" produces dir "X.flac"; a sibling file also "X.flac".
+        let entries = vec![
+            (1, "P/X.flac".to_string()),
+            (2, "P/X.flac/t.flac".to_string()),
+        ];
+        let reference = VirtualTree::build(&entries);
+        let mut alloc = InodeAllocator::new();
+        let mut t = VirtualTree::build_with(&entries, &mut alloc);
+        let p = t.lookup(VirtualTree::ROOT, "P").unwrap();
+        let np: std::collections::HashMap<i64, String> = entries.iter().cloned().collect();
+        t.rebuild_subtree(p, &np, &mut alloc).unwrap();
+        assert_eq!(
+            paths_of(&t).keys().collect::<Vec<_>>(),
+            paths_of(&reference).keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rebuild_subtree_recurses_multi_level_and_prunes_intermediate() {
+        // A two-level subtree under the rebuilt dir: the DFS must reach `t.flac`
+        // through the intermediate `Sub` dir, and re-inserting only the survivor
+        // must prune the now-empty intermediate dir.
+        let entries = vec![
+            (1, "P/Sub/t.flac".to_string()),
+            (2, "P/Sub/u.flac".to_string()),
+            (3, "P/keep.flac".to_string()),
+        ];
+        let mut alloc = InodeAllocator::new();
+        let mut t = VirtualTree::build_with(&entries, &mut alloc);
+        let p = t.lookup(VirtualTree::ROOT, "P").unwrap();
+        // Drop both tracks under Sub; rebuild P from the survivors only.
+        t.remove_track(1, &mut alloc);
+        t.remove_track(2, &mut alloc);
+        let new_entries = vec![(3, "P/keep.flac".to_string())];
+        let reference = VirtualTree::build(&new_entries);
+        let np: std::collections::HashMap<i64, String> = new_entries.into_iter().collect();
+        t.rebuild_subtree(p, &np, &mut alloc).unwrap();
+        let p2 = t.lookup(VirtualTree::ROOT, "P").unwrap();
+        assert!(
+            t.lookup(p2, "Sub").is_none(),
+            "empty intermediate dir pruned"
+        );
+        assert!(t.lookup(p2, "keep.flac").is_some());
+        assert_eq!(
+            paths_of(&t).keys().collect::<Vec<_>>(),
+            paths_of(&reference).keys().collect::<Vec<_>>()
+        );
     }
 }
