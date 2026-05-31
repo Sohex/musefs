@@ -17,7 +17,35 @@ pub enum Format {
     Mp3,
     M4aMoovFirst,
     M4aMoovLast,
+    Ogg,
     Wav,
+}
+
+/// Map a `MUSEFS_BENCH_FORMAT_MIX` token to a `Format`. Single source of truth
+/// for both `from_env` and `bench_formats`.
+pub fn format_from_token(token: &str) -> Option<Format> {
+    match token.trim() {
+        "flac" => Some(Format::Flac),
+        "mp3" => Some(Format::Mp3),
+        "m4a" => Some(Format::M4aMoovFirst),
+        "m4a-last" => Some(Format::M4aMoovLast),
+        "ogg" => Some(Format::Ogg),
+        "wav" => Some(Format::Wav),
+        _ => None,
+    }
+}
+
+/// The canonical token for a `Format` (inverse of `format_from_token`). Used for
+/// report labels, per-format corpus subdir names, and `.ext` choices.
+pub fn format_token(f: Format) -> &'static str {
+    match f {
+        Format::Flac => "flac",
+        Format::Mp3 => "mp3",
+        Format::M4aMoovFirst => "m4a",
+        Format::M4aMoovLast => "m4a-last",
+        Format::Ogg => "ogg",
+        Format::Wav => "wav",
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -104,17 +132,7 @@ impl CorpusParams {
             p.seed = v as u64;
         }
         if let Ok(mix) = std::env::var("MUSEFS_BENCH_FORMAT_MIX") {
-            let parsed: Vec<Format> = mix
-                .split(',')
-                .filter_map(|s| match s.trim() {
-                    "flac" => Some(Format::Flac),
-                    "mp3" => Some(Format::Mp3),
-                    "m4a" => Some(Format::M4aMoovFirst),
-                    "m4a-last" => Some(Format::M4aMoovLast),
-                    "wav" => Some(Format::Wav),
-                    _ => None,
-                })
-                .collect();
+            let parsed: Vec<Format> = mix.split(',').filter_map(format_from_token).collect();
             // An all-unrecognized value keeps the tier default rather than
             // erroring or yielding an empty mix.
             if !parsed.is_empty() {
@@ -279,7 +297,13 @@ fn generate_one(
         }
         Format::Mp3 => {
             let path = adir.join(format!("track-{idx:06}.mp3"));
-            super::write_mp3(&path, audio);
+            // write_mp3 emits [ID3 header][audio]; mp3::locate_audio requires a
+            // valid MPEG frame sync (0xFF 0xEx) at the start of the audio region.
+            // Prepend one so scan_directory can probe corpus MP3 files regardless
+            // of what the filler bytes happen to be.
+            let mut scannable = vec![0xFF, 0xFB]; // MPEG-1 Layer3 sync, CBR
+            scannable.extend_from_slice(audio);
+            super::write_mp3(&path, &scannable);
             path
         }
         Format::M4aMoovFirst => {
@@ -290,6 +314,11 @@ fn generate_one(
         Format::M4aMoovLast => {
             let path = adir.join(format!("track-{idx:06}.m4a"));
             super::write_m4a_moov_last(&path, audio);
+            path
+        }
+        Format::Ogg => {
+            let path = adir.join(format!("track-{idx:06}.ogg"));
+            super::write_ogg(&path, audio);
             path
         }
         Format::Wav => {

@@ -148,3 +148,20 @@ fn write_ogg_is_deterministic() {
         "same audio bytes => identical Ogg file"
     );
 }
+
+#[test]
+fn generate_with_ogg_in_mix_scans_all() {
+    let p = CorpusParams {
+        albums: 1,
+        tracks_per_album: 4,
+        bytes_per_track: 256,
+        art_bytes_per_track: 0,
+        format_mix: vec![Format::Flac, Format::Mp3, Format::Ogg, Format::Wav],
+        seed: 9,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    common::corpus::generate(dir.path(), &p);
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+    assert_eq!(stats.scanned, 4, "all four formats (incl. Ogg) ingest");
+}
