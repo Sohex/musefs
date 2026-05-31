@@ -23,14 +23,16 @@ fn config() -> MountConfig {
 
 #[test]
 fn baseline_one_open_per_read_call() {
-    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let flac = make_flac(
         &[
             (0, streaminfo_body()),
             (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
         ],
-        &[0xCD; 64 * 1024],
+        &vec![0xCD_u8; 64 * 1024],
     );
     std::fs::write(dir.path().join("a.flac"), &flac).unwrap();
 
@@ -69,14 +71,16 @@ fn baseline_one_open_per_read_call() {
 
 #[test]
 fn handle_reuses_one_open_and_no_per_read_stat() {
-    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let flac = make_flac(
         &[
             (0, streaminfo_body()),
             (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
         ],
-        &[0xCD; 64 * 1024],
+        &vec![0xCD_u8; 64 * 1024],
     );
     std::fs::write(dir.path().join("a.flac"), &flac).unwrap();
 
@@ -113,7 +117,9 @@ fn handle_reuses_one_open_and_no_per_read_stat() {
 
 #[test]
 fn getattr_size_cache_hit_skips_stat() {
-    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let flac = make_flac(
         &[
@@ -141,7 +147,9 @@ fn getattr_size_cache_hit_skips_stat() {
 #[test]
 fn layout_cache_survives_unrelated_refresh() {
     use musefs_db::{Format, NewTrack, Tag};
-    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let dir = tempfile::tempdir().unwrap();
     let bytes = make_flac(

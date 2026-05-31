@@ -789,6 +789,7 @@ dependencies = [
  "metaflac",
  "musefs-db",
  "musefs-format",
+ "musefs-latencyfs",
  "ogg",
  "once_cell",
  "proptest",
