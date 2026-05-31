@@ -554,6 +554,10 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         }
     }
     flush(&mut batch, &mut batch_bytes, &mut scanned)?;
+    // A fatal flush error above returns via `?` *before* this join, abandoning the
+    // worker threads — acceptable because a DB-write failure aborts the whole scan.
+    // On the success path every worker has already exited (the work queue drained
+    // and `drop(tx)` closed the channel), so these joins return promptly.
     for w in workers {
         let _ = w.join();
     }

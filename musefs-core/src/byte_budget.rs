@@ -23,7 +23,10 @@ impl ByteBudget {
     /// cap is admitted alone once in-flight is zero, to guarantee progress).
     pub fn acquire(&self, n: u64) {
         let mut in_flight = self.state.lock().unwrap();
-        while *in_flight != 0 && *in_flight + n > self.cap {
+        // `saturating_add` mirrors `release`'s saturating style; art weights are
+        // file-bounded so this never saturates in practice, but it keeps the
+        // guard total-order-safe regardless.
+        while *in_flight != 0 && in_flight.saturating_add(n) > self.cap {
             in_flight = self.cv.wait(in_flight).unwrap();
         }
         *in_flight += n;
