@@ -118,6 +118,7 @@ for crate in "${crates[@]}"; do
         --file musefs-core/src/reader.rs \
         --file musefs-core/src/tree.rs \
         --file musefs-core/src/scan.rs \
+        --file musefs-core/src/byte_budget.rs \
         --file musefs-core/src/facade.rs \
         --file musefs-core/src/ogg_index.rs
       ;;

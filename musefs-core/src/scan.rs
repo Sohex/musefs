@@ -718,6 +718,153 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
 }
 
 #[cfg(test)]
+mod scan_unit_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    /// Env is process-global: serialize the env-mutating tests so they never
+    /// observe each other's `MUSEFS_*` vars.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // --- scan_window() / WINDOW (lines 16, 149-154) ---
+
+    // kills scan L16 WINDOW `<<`→`>>` (default must be 1<<20, not 1>>20==0)
+    // kills scan L153 filter `>`→`>=`/`==`/`<`
+    #[test]
+    fn scan_window_default_and_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // Default (unset): WINDOW == 1<<20. `1>>20` == 0 → distinguishes the shift.
+        std::env::remove_var("MUSEFS_SCAN_WINDOW");
+        assert_eq!(scan_window(), 1 << 20);
+        assert_eq!(scan_window(), 1_048_576);
+
+        // "0" is filtered out (`0 > 0` is false) → falls back to WINDOW.
+        // Under `>=`/`==`, `0` would be kept and returned (wrong).
+        std::env::set_var("MUSEFS_SCAN_WINDOW", "0");
+        assert_eq!(
+            scan_window(),
+            1 << 20,
+            "zero must be filtered → default window"
+        );
+
+        // "5" passes the filter (`5 > 0`) → returned verbatim. Under `<`,
+        // `5 < 0` is false → 5 would be filtered → default (wrong).
+        std::env::set_var("MUSEFS_SCAN_WINDOW", "5");
+        assert_eq!(scan_window(), 5, "positive override must pass the filter");
+
+        std::env::remove_var("MUSEFS_SCAN_WINDOW");
+    }
+
+    // --- read_tail_128() (lines 170-178) ---
+
+    fn write_temp(name: &str, bytes: &[u8]) -> (tempfile::TempDir, std::fs::File) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        (dir, file)
+    }
+
+    // kills scan L171 `<`→`<=` (128-byte file must be Some)
+    // kills scan L172 Ok(None) constant, L178 Ok(Some) value
+    // kills scan L176 `file_len - 128`→`/` (offset 0 vs 1 shifts the bytes)
+    // kills scan L175 buf init [0;128]/[1;128] constants (exact bytes asserted)
+    #[test]
+    fn read_tail_128_exact_128_bytes() {
+        // Distinct, position-sensitive pattern: byte[i] = i (0..=127).
+        let pattern: Vec<u8> = (0u8..128).collect();
+        let (_dir, file) = write_temp("tail128.bin", &pattern);
+
+        let tail = read_tail_128(&file, 128).unwrap();
+        let expected: [u8; 128] = pattern.clone().try_into().unwrap();
+        // Exact equality kills:
+        //  - Ok(None) (would be None, not Some)
+        //  - [0;128]/[1;128] buf-init constants (would mismatch the pattern)
+        //  - `<`→`<=` (128<=128 true → returns None for a 128-byte file)
+        //  - `-`→`/` (offset 128/128==1 reads bytes[1..], shifting the pattern)
+        assert_eq!(tail, Some(expected));
+    }
+
+    // kills scan L171 `<`→`<=` boundary the other way (127 bytes → None)
+    #[test]
+    fn read_tail_128_short_file_is_none() {
+        let (_dir, file) = write_temp("tail127.bin", &[0xABu8; 127]);
+        assert_eq!(read_tail_128(&file, 127).unwrap(), None);
+    }
+
+    // --- effective_jobs() (lines 313-318) ---
+
+    // kills scan L314 effective_jobs body→1 (assuming parallelism > 1)
+    #[test]
+    fn effective_jobs_zero_uses_parallelism_and_nonzero_passes_through() {
+        let par = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        assert_eq!(effective_jobs(0), par);
+        assert_eq!(effective_jobs(4), 4);
+        assert_eq!(effective_jobs(1), 1);
+    }
+
+    // --- batch_bytes_cap() / BATCH_BYTES (lines 323-329) ---
+
+    // kills scan L324 batch_bytes_cap body→0/→1 (default must be BATCH_BYTES)
+    // kills scan L327 filter `>`→`>=`/`==`/`<`
+    #[test]
+    fn batch_bytes_cap_default_and_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MUSEFS_BATCH_BYTES");
+        assert_eq!(batch_bytes_cap(), BATCH_BYTES);
+        assert_eq!(batch_bytes_cap(), 64 << 20);
+        assert_eq!(batch_bytes_cap(), 67_108_864);
+
+        // "0" filtered (`0 > 0` false) → default. Kills `>=`/`==`.
+        std::env::set_var("MUSEFS_BATCH_BYTES", "0");
+        assert_eq!(batch_bytes_cap(), BATCH_BYTES);
+
+        // "5" passes (`5 > 0`) → 5. Kills `<`.
+        std::env::set_var("MUSEFS_BATCH_BYTES", "5");
+        assert_eq!(batch_bytes_cap(), 5);
+
+        std::env::remove_var("MUSEFS_BATCH_BYTES");
+    }
+
+    // --- art_weight() (lines 340-342) ---
+
+    // kills scan L341 art_weight body→0/→1 (sum of picture data lengths)
+    #[test]
+    fn art_weight_sums_picture_byte_lengths() {
+        let pic = |n: usize| EmbeddedPicture {
+            mime: "image/png".to_string(),
+            picture_type: 3,
+            description: String::new(),
+            width: 0,
+            height: 0,
+            data: vec![0u8; n],
+        };
+        let probed = Probed {
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            tags: Vec::new(),
+            pictures: vec![pic(3), pic(5)],
+        };
+        assert_eq!(art_weight(&probed), 8);
+
+        // Empty → 0, distinguishes the →1 constant (which ignores the input).
+        let empty = Probed {
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            tags: Vec::new(),
+            pictures: Vec::new(),
+        };
+        assert_eq!(art_weight(&empty), 0);
+    }
+}
+
+#[cfg(test)]
 mod ogg_probe_tests {
     use super::*;
     use musefs_format::ogg::page_test_support::{

@@ -169,6 +169,60 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM art", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+        // replace_tags actually persisted one tag per track (kills no-op replace_tags).
+        let tag_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tag_count, 3);
+        let title0: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM tags WHERE key = 'title' ORDER BY value LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title0, "t0");
+        // set_track_art actually persisted one link per track (kills no-op set_track_art).
+        let track_art_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM track_art", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(track_art_count, 3);
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_digest() {
+        // NIST sample vector: sha256("abc").
+        assert_eq!(
+            super::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn apply_bulk_pragmas_self_sets_non_default_pragmas() {
+        let db = Db::open_in_memory().unwrap();
+        db.apply_bulk_pragmas_self().unwrap();
+        // synchronous NORMAL == 1 (default for in-memory is FULL == 2).
+        let synchronous: i64 = db
+            .conn
+            .pragma_query_value(None, "synchronous", |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1);
+        // cache_size == -65536 (negative => KiB; sign matters, default is -2000).
+        let cache_size: i64 = db
+            .conn
+            .pragma_query_value(None, "cache_size", |r| r.get(0))
+            .unwrap();
+        assert_eq!(cache_size, -65536);
+        // temp_store MEMORY == 2 (default is 0).
+        let temp_store: i64 = db
+            .conn
+            .pragma_query_value(None, "temp_store", |r| r.get(0))
+            .unwrap();
+        assert_eq!(temp_store, 2);
     }
 
     #[test]

@@ -12,8 +12,18 @@
 # the #[ignore]d mounted tests (`-- -- --include-ignored`). The fast per-PR
 # `--in-diff` gate excludes it separately (it is mountless and can't kill its
 # mutants); see .github/workflows/mutants.yml.
+#
+# musefs-core/src/metrics.rs is feature-gated instrumentation: its active impl is
+# `#[cfg(feature = "metrics")]` and is only compiled (with its tests) under
+# `--features metrics`. The per-PR `--in-diff` gate runs cargo-mutants without that
+# feature, so the counter bodies aren't compiled and any mutation there is
+# unobservable — reported MISSED yet unkillable in that config. The counters are a
+# pure observability shim with no serving/correctness role and are covered
+# functionally by the feature-gated tests in that file, so exclude them from
+# mutation rather than carry permanently-surviving mutants.
 exclude_globs = [
     "musefs-fuse/**",
     "musefs-cli/**",
     "musefs/**",
+    "musefs-core/src/metrics.rs",
 ]

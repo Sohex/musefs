@@ -1257,4 +1257,53 @@ mod bounded_tests {
             other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
         }
     }
+
+    #[test]
+    fn read_metadata_bounded_errors_when_whole_file_is_unparseable() {
+        // A short garbage buffer that IS the whole file: prefix.len() == file_len and
+        // read_header errors. The guard `(prefix.len() as u64) < file_len` is FALSE,
+        // so the function must fall to the `Err(e)` arm and return Err — never grow.
+        let bad: &[u8] = b"not an ogg stream at all"; // capture pattern != "OggS"
+                                                      // Confirm the premise: read_header genuinely errors on this buffer.
+        assert!(read_header(bad).is_err());
+        let len = bad.len() as u64;
+        // kills ogg L226 guard `< file_len` -> `true`: under `true` this returns
+        // NeedMore; correct is Err.
+        // kills ogg L226 `<` -> `<=`: `len <= len` is true -> NeedMore; correct is Err.
+        match read_metadata_bounded(bad, len) {
+            Err(_) => {}
+            Ok(other) => panic!("expected Err when whole file unparseable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_metadata_bounded_doubles_window_exactly() {
+        // L = 100_000 bytes of garbage (read_header errors): L > 64*1024 so `.max`
+        // does not mask, and file_len = 10_000_000 > L*2 so `.min` does not clamp.
+        // Correct up_to = L*2 = 200_000. `+`->100_002, `/`->50_000 all differ.
+        let buf = vec![0u8; 100_000]; // all zeros: capture pattern != "OggS" -> errors
+                                      // Confirm the premise: read_header genuinely errors on this buffer.
+        assert!(read_header(&buf).is_err());
+        let file_len = 10_000_000u64;
+        // kills ogg L227 `*`->`+` and `*`->`/`: only `*2` yields up_to == 200_000.
+        match read_metadata_bounded(&buf, file_len).unwrap() {
+            Extent::NeedMore { up_to } => assert_eq!(up_to, 200_000),
+            other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_metadata_bounded_grows_when_truncated_prefix_shorter_than_file() {
+        // Pins the TRUE side of the guard: a truncated valid-prefix where
+        // prefix.len() < file_len must return NeedMore (kills `<`->`<=` from the
+        // other direction by requiring growth here while requiring Err when equal).
+        let (full, _audio_offset) = opus_stream();
+        let file_len = full.len() as u64;
+        let prefix = &full[..10]; // far short of the header region
+        assert!(read_header(prefix).is_err());
+        match read_metadata_bounded(prefix, file_len).unwrap() {
+            Extent::NeedMore { up_to } => assert!(up_to > prefix.len() as u64),
+            other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
+        }
+    }
 }
