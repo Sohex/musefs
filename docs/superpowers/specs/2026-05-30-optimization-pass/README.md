@@ -33,8 +33,9 @@ around what that one did *not* deliver. Reconciliation:
   (single + concurrent), a deterministic latency-injection layer (passthrough
   FUSE), and comparable reporting. *Spec: `SP0-measurement-foundation.md`.*
 - **SP1 — Ingestion scalability.** Bounded probing reads (stop slurping whole
-  files), transaction batching across the scan loop, optional parallel probing,
-  bulk-write pragma tuning. *Spec: TBD after SP0.*
+  files), transaction batching across the scan loop, parallel probing
+  (default-on, `--jobs` knob), bulk-write pragma tuning. *Spec:
+  `SP1-ingestion-scalability.md`.*
 - **SP2 — Incremental tree refresh.** Rebuild only changed tracks on a
   `data_version` bump instead of reloading and re-rendering the whole library.
   *Spec: TBD.*
@@ -75,7 +76,7 @@ is built for the full capability regardless.
 |---|---|---|---|---|
 | SP0a | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now. See "Running the SP0a harness" below; per-format sweep added (`SP0a-per-format-coverage.md`) |
 | SP0b | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS. See "Latency-injected runs" below. |
-| SP1 | Not started | — | — | |
+| SP1 | Spec drafted | `SP1-ingestion-scalability.md` | — | Hybrid bounded reads (window+`NeedMore` for FLAC/MP3/OGG/WAV, seek reader for M4A) · parallel-probe/serial-writer · txn batching · bulk pragmas |
 | SP2 | Not started | — | — | |
 | SP3 | Not started | — | — | |
 | SP4 | Not started | — | — | |
