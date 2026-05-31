@@ -9,7 +9,7 @@ use crate::db_pool::DbPool;
 use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
 use crate::reader::{read_at, read_at_with_file, HeaderCache, ResolvedFile};
-use crate::refresh_diff::TrackRenderState;
+use crate::refresh_diff::{partition_changes, ChangeSet, TrackRenderState};
 use crate::template::render_path;
 use crate::tree::{InodeAllocator, NodeKind, VirtualTree};
 
@@ -243,6 +243,61 @@ impl Musefs {
         Ok(snapshot)
     }
 
+    /// Incremental rebuild (Stage A): scan render keys, diff against the previous
+    /// snapshot, render only changed/added tracks (reusing cached paths otherwise),
+    /// then assemble entries and call the unchanged `build_with`. Returns the new
+    /// snapshot and the `ChangeSet`. The tree is published here. See SP2 Component 2.
+    fn rebuild_incremental(
+        &self,
+        prev_snapshot: &std::collections::HashMap<i64, TrackRenderState>,
+    ) -> Result<(std::collections::HashMap<i64, TrackRenderState>, ChangeSet)> {
+        if self.force_rebuild_error.load(Ordering::Acquire) {
+            return Err(CoreError::BackingChanged(
+                "forced refresh failure".to_string(),
+            ));
+        }
+        let (new_snapshot, change) = self.pool.with(|db| {
+            let scan = db.list_render_keys()?;
+            let change = partition_changes(prev_snapshot, &scan);
+
+            let mut to_render: Vec<i64> = change.changed.clone();
+            to_render.extend(change.added.iter().copied());
+            let render_set: std::collections::HashSet<i64> = to_render.iter().copied().collect();
+            let mut tags_by_track = db.tags_for_tracks(&to_render)?;
+
+            let mut new_snapshot = std::collections::HashMap::with_capacity(scan.len());
+            for &(id, cv, fmt) in &scan {
+                let state = if render_set.contains(&id) {
+                    let tags = tags_by_track.remove(&id).unwrap_or_default();
+                    TrackRenderState {
+                        content_version: cv,
+                        format: fmt,
+                        path: Self::render_one(&self.config, fmt, &tags),
+                    }
+                } else {
+                    prev_snapshot[&id].clone()
+                };
+                new_snapshot.insert(id, state);
+            }
+            Ok::<_, CoreError>((new_snapshot, change))
+        })?;
+
+        let mut entries: Vec<(i64, String)> = new_snapshot
+            .iter()
+            .map(|(&id, s)| (id, s.path.clone()))
+            .collect();
+        entries.sort_by_key(|(id, _)| *id);
+        {
+            let mut alloc = self
+                .inodes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let tree = VirtualTree::build_with(&entries, &mut alloc);
+            self.tree.store(Arc::new(tree));
+        }
+        Ok((new_snapshot, change))
+    }
+
     // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) FIRST, then
     // any of the in-memory locks (`inodes`, `size_cache`, the header cache's shards,
     // `handles`). `inodes` is held inside `pool.with` during `refresh` — that is the
@@ -322,8 +377,8 @@ impl Musefs {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let new_snapshot = match self.rebuild_full() {
-            Ok(s) => s,
+        let (new_snapshot, _change) = match self.rebuild_incremental(&old_snapshot) {
+            Ok(v) => v,
             Err(err) => {
                 *self
                     .last_failed_refresh
