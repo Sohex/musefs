@@ -152,20 +152,25 @@ fn write_ogg_is_deterministic() {
 }
 
 #[test]
-fn generate_with_ogg_in_mix_scans_all() {
+fn generate_with_all_formats_scans_all() {
+    // One track per supported format (round-robin over ALL_FORMATS), so every
+    // `generate_one` arm — including both M4A layouts and Ogg — is exercised
+    // through `generate()` + `scan_directory` in the default suite.
+    let mix = common::corpus::ALL_FORMATS.to_vec();
+    let n = mix.len();
     let p = CorpusParams {
         albums: 1,
-        tracks_per_album: 4,
+        tracks_per_album: n,
         bytes_per_track: 256,
         art_bytes_per_track: 0,
-        format_mix: vec![Format::Flac, Format::Mp3, Format::Ogg, Format::Wav],
+        format_mix: mix,
         seed: 9,
     };
     let dir = tempfile::tempdir().unwrap();
     common::corpus::generate(dir.path(), &p);
     let db = Db::open_in_memory().unwrap();
     let stats = scan_directory(&db, dir.path()).unwrap();
-    assert_eq!(stats.scanned, 4, "all four formats (incl. Ogg) ingest");
+    assert_eq!(stats.scanned, n as u64, "every supported format ingests");
 }
 
 #[test]
