@@ -50,6 +50,9 @@ pub enum Command {
         /// gone, and garbage-collect orphaned art.
         #[arg(long)]
         revalidate: bool,
+        /// Probe worker threads (0 = available parallelism). 1 = sequential.
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
     },
     /// Mount a read-only FUSE view of the store.
     Mount {
@@ -92,18 +95,19 @@ pub enum Command {
 /// Open (creating/migrating) the DB at `db_path` and scan `backing_dir`. With
 /// `revalidate`, run the maintenance pass (skip-unchanged, prune, GC) instead of
 /// a full ingest.
-pub fn run_scan(db_path: &Path, backing_dir: &Path, revalidate: bool) -> Result<()> {
+pub fn run_scan(db_path: &Path, backing_dir: &Path, revalidate: bool, jobs: usize) -> Result<()> {
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
+    let opts = musefs_core::ScanOptions { jobs };
     if revalidate {
-        let stats = musefs_core::revalidate(&db, backing_dir)
+        let stats = musefs_core::revalidate_with(&db, backing_dir, &opts)
             .with_context(|| format!("revalidating {}", backing_dir.display()))?;
         println!(
             "revalidated: {} updated, {} unchanged, {} pruned, {} failed",
             stats.updated, stats.unchanged, stats.pruned, stats.failed
         );
     } else {
-        let stats = musefs_core::scan_directory(&db, backing_dir)
+        let stats = musefs_core::scan_directory_with(&db, backing_dir, &opts)
             .with_context(|| format!("scanning {}", backing_dir.display()))?;
         println!(
             "scanned {} file(s), skipped {}, failed {}",
@@ -182,7 +186,8 @@ pub fn run(cli: Cli) -> Result<()> {
             backing_dir,
             db,
             revalidate,
-        } => run_scan(&db, &backing_dir, revalidate),
+            jobs,
+        } => run_scan(&db, &backing_dir, revalidate, jobs),
         Command::Mount {
             mountpoint,
             db,
@@ -206,5 +211,21 @@ pub fn run(cli: Cli) -> Result<()> {
             max_background,
             keep_cache,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_command_parses_jobs_flag() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "scan", "/m", "--db", "/tmp/x.db", "--jobs", "3"])
+            .unwrap();
+        match cli.command {
+            Command::Scan { jobs, .. } => assert_eq!(jobs, 3),
+            Command::Mount { .. } => panic!("expected Scan"),
+        }
     }
 }
