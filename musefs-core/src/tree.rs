@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use im::{HashMap as ImHashMap, OrdMap};
 
 /// Assigns stable inodes keyed by rendered path, persisted across tree rebuilds:
 /// an unchanged path keeps its inode, a new path gets a fresh one, and a retired
@@ -6,13 +6,13 @@ use std::collections::{BTreeMap, HashMap};
 /// The map grows monotonically with the universe of distinct paths ever rendered.
 #[derive(Debug)]
 pub struct InodeAllocator {
-    paths: HashMap<String, u64>,
+    paths: ImHashMap<String, u64>,
     next: u64,
 }
 
 impl InodeAllocator {
     pub fn new() -> InodeAllocator {
-        let mut paths = HashMap::new();
+        let mut paths = ImHashMap::new();
         paths.insert(String::new(), VirtualTree::ROOT); // root path "" -> inode 1
         InodeAllocator { paths, next: 2 }
     }
@@ -46,9 +46,9 @@ pub struct Node {
 /// and files mapped to track ids. Inodes are stable for the lifetime of the tree.
 #[derive(Debug, Clone)]
 pub struct VirtualTree {
-    nodes: HashMap<u64, Node>,
-    children: HashMap<u64, BTreeMap<String, u64>>,
-    track_to_inode: HashMap<i64, u64>,
+    nodes: ImHashMap<u64, Node>,
+    children: ImHashMap<u64, OrdMap<String, u64>>,
+    track_to_inode: ImHashMap<i64, u64>,
 }
 
 impl VirtualTree {
@@ -62,9 +62,9 @@ impl VirtualTree {
     /// inodes are stable across rebuilds that reuse the same allocator.
     pub fn build_with(entries: &[(i64, String)], alloc: &mut InodeAllocator) -> VirtualTree {
         let mut tree = VirtualTree {
-            nodes: HashMap::new(),
-            children: HashMap::new(),
-            track_to_inode: HashMap::new(),
+            nodes: ImHashMap::new(),
+            children: ImHashMap::new(),
+            track_to_inode: ImHashMap::new(),
         };
         tree.nodes.insert(
             Self::ROOT,
@@ -74,7 +74,7 @@ impl VirtualTree {
                 kind: NodeKind::Dir,
             },
         );
-        tree.children.insert(Self::ROOT, BTreeMap::new());
+        tree.children.insert(Self::ROOT, OrdMap::new());
         for (track_id, path) in entries {
             tree.insert_file(*track_id, path, alloc);
         }
@@ -91,7 +91,7 @@ impl VirtualTree {
         self.nodes.get(&inode).map(|n| n.parent)
     }
 
-    pub fn children(&self, inode: u64) -> Option<&BTreeMap<String, u64>> {
+    pub fn children(&self, inode: u64) -> Option<&OrdMap<String, u64>> {
         self.children.get(&inode)
     }
 
@@ -167,7 +167,7 @@ impl VirtualTree {
                 kind: NodeKind::Dir,
             },
         );
-        self.children.insert(inode, BTreeMap::new());
+        self.children.insert(inode, OrdMap::new());
         self.children
             .get_mut(&parent)
             .unwrap()
