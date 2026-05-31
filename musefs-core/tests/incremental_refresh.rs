@@ -7,6 +7,7 @@ use musefs_core::{scan_directory, Mode, MountConfig, Musefs};
 use musefs_db::{Db, Tag};
 
 use common::corpus::{prepare, CorpusParams, Format, Target};
+use proptest::prelude::*;
 
 /// A small single-album FLAC corpus with `n` tracks. The returned `Target` owns
 /// the tempdir — keep it alive for the whole test.
@@ -131,4 +132,81 @@ fn format_only_change_notifies_old_inode() {
         notified.contains(&old_ino),
         "format-only move must invalidate the old inode (extension changed)"
     );
+}
+
+#[derive(Clone, Debug)]
+enum Op {
+    Retag(usize, String, String), // retag the i-th LIVE track (forces collisions -> moves)
+    Delete(usize),                // delete the i-th LIVE track (remove-cascade + prune)
+    Add(String, String),          // add a brand-new DB track row (added-side propagation)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn incremental_equivalent_to_full_under_random_edits(
+        ops in proptest::collection::vec(
+            prop_oneof![
+                (0usize..8, "[A-B]", "[x-y]").prop_map(|(i, a, t)| Op::Retag(i, a, t)),
+                (0usize..8).prop_map(Op::Delete),
+                ("[A-B]", "[x-y]").prop_map(|(a, t)| Op::Add(a, t)),
+            ], 0..24)
+    ) {
+        let target = small_corpus(6);
+        let db_path = target.db_path.clone();
+        let corpus = target.corpus_dir.clone();
+        let db = Db::open(&db_path).unwrap();
+        scan_directory(&db, &corpus).unwrap();
+        let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+        let writer = Db::open(&db_path).unwrap();
+        let mut add_seq = 0u32;
+
+        for op in ops {
+            // Re-query the live id set each step (deletes/adds change it).
+            let live: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+            // ARTIST is fixed to "X" throughout; album/title carry the random
+            // variation. Artist-level collisions are out of scope here — the
+            // album+title space already drives disambiguation and path moves.
+            match op {
+                Op::Retag(i, album, title) if !live.is_empty() => {
+                    let _ = writer.replace_tags(live[i % live.len()], &[
+                        Tag::new("ARTIST", "X", 0),
+                        Tag::new("ALBUM", &album, 0),
+                        Tag::new("TITLE", &title, 0),
+                    ]);
+                }
+                Op::Delete(i) if !live.is_empty() => {
+                    let _ = writer.delete_track(live[i % live.len()]);
+                }
+                Op::Add(album, title) => {
+                    add_seq += 1;
+                    // DB-only track: tree-building never reads the backing file, and
+                    // both fs and reference read the same DB, so equivalence holds.
+                    let new = musefs_db::NewTrack {
+                        backing_path: format!("/virt/added-{add_seq}.flac"),
+                        format: musefs_db::Format::Flac,
+                        audio_offset: 0, audio_length: 1, backing_size: 1, backing_mtime: 0,
+                    };
+                    // Surface DB errors instead of vacuously skipping the op.
+                    let id = writer.upsert_track(&new).unwrap();
+                    writer
+                        .replace_tags(
+                            id,
+                            &[
+                                Tag::new("ARTIST", "X", 0),
+                                Tag::new("ALBUM", &album, 0),
+                                Tag::new("TITLE", &title, 0),
+                            ],
+                        )
+                        .unwrap();
+                }
+                _ => {}
+            }
+            fs.poll_refresh().unwrap();
+            let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+            let incr_keys: Vec<String> = tree_fingerprint(&fs).into_keys().collect();
+            let full_keys: Vec<String> = tree_fingerprint(&reference).into_keys().collect();
+            prop_assert_eq!(incr_keys, full_keys);
+        }
+    }
 }
