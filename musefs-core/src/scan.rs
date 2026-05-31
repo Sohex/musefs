@@ -317,6 +317,17 @@ fn effective_jobs(jobs: usize) -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }
 
+/// In-flight art-byte budget (and per-batch byte-flush threshold). Overridable via
+/// `MUSEFS_BATCH_BYTES` so tests can exercise the backpressure path without 64 MiB
+/// of fixture art; defaults to `BATCH_BYTES`.
+fn batch_bytes_cap() -> u64 {
+    std::env::var("MUSEFS_BATCH_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(BATCH_BYTES)
+}
+
 /// One probed file ready to write, plus its art-byte weight for backpressure.
 struct Unit {
     abs_path: String,
@@ -472,7 +483,8 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     use std::sync::Arc;
 
     let jobs = effective_jobs(opts.jobs);
-    let budget = Arc::new(ByteBudget::new(BATCH_BYTES));
+    let cap = batch_bytes_cap();
+    let budget = Arc::new(ByteBudget::new(cap));
     let skipped = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
 
@@ -546,11 +558,38 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         Ok(())
     };
 
-    for unit in rx {
-        batch_bytes += unit.weight;
-        batch.push(unit);
-        if batch.len() >= BATCH_FILES || batch_bytes >= BATCH_BYTES {
-            flush(&mut batch, &mut batch_bytes, &mut scanned)?;
+    // Drain the channel, batching by file count and accumulated art bytes. The
+    // budget cap equals the byte-flush threshold, so a worker calling
+    // `budget.acquire` (which it does *before* `send`) could block while the
+    // writer's pending batch sits just below the threshold — if the writer then
+    // parked on a blocking `recv`, neither side could make progress (the held
+    // budget is never released, the batch never reaches the threshold). To avoid
+    // that, whenever the channel momentarily drains we flush the pending batch —
+    // releasing the budget so blocked producers proceed — *before* blocking on the
+    // next item.
+    loop {
+        match rx.try_recv() {
+            Ok(unit) => {
+                batch_bytes += unit.weight;
+                batch.push(unit);
+                if batch.len() >= BATCH_FILES || batch_bytes >= cap {
+                    flush(&mut batch, &mut batch_bytes, &mut scanned)?;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                flush(&mut batch, &mut batch_bytes, &mut scanned)?;
+                match rx.recv() {
+                    Ok(unit) => {
+                        batch_bytes += unit.weight;
+                        batch.push(unit);
+                        if batch.len() >= BATCH_FILES || batch_bytes >= cap {
+                            flush(&mut batch, &mut batch_bytes, &mut scanned)?;
+                        }
+                    }
+                    Err(_) => break, // all workers finished; channel closed
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
         }
     }
     flush(&mut batch, &mut batch_bytes, &mut scanned)?;
