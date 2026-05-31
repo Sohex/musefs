@@ -2019,7 +2019,8 @@ git commit -m "test(bench): report scan_bytes_read + MUSEFS_BENCH_JOBS dimension
   - `cargo test -p musefs-core --features metrics --test bench_ingest -- --ignored --nocapture` on the `ci` and `large-compute` tiers (compute + `bytes_read` + `peak_rss_kib`), comparing `MUSEFS_BENCH_JOBS=1` vs unset.
   - `bandwidth` tier on a real mount (30 MiB payloads): `MUSEFS_BENCH_TIER=bandwidth MUSEFS_BENCH_DIR=<real-disk> …`.
   - fsync drop via latency FS: `MUSEFS_BENCH_LATENCY_PROFILE=hdd cargo test -p musefs-core --features metrics --test bench_ingest -- --ignored --nocapture bench_scan_under_latency` (batched vs `MUSEFS_BENCH_JOBS=1` per-file).
-  - Record tier · storage · wall · bytes_read · fsyncs · peak_rss in `docs/superpowers/specs/2026-05-30-optimization-pass/README.md` results log.
+  - **Write the captured baselines to a `BENCHMARKS.md` at the repo root** (create it): a dated SP1 section with the before/after tables (columns: tier · storage · format · jobs · wall_ms · bytes_read · fsyncs · peak_rss_kib), the machine/storage class the run was on, and the exact commands used so a run is reproducible. This is the durable, human-readable record.
+  - Also drop a one-line pointer + the headline before/after delta into the `docs/superpowers/specs/2026-05-30-optimization-pass/README.md` results log, linking to `BENCHMARKS.md` for the full tables.
 - [ ] Update the SP1 status row in that README to **Implemented**, and link this plan.
 - [ ] Finish the branch via `superpowers:finishing-a-development-branch`.
 
