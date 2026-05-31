@@ -27,6 +27,11 @@ fn bench_cold_scan_and_revalidate() {
 
     let db = Db::open(&target.db_path).unwrap();
 
+    // The `opens`/`preads` metrics instrument the *serve* path (reader.rs /
+    // open_handle), not the scan path, so both rows print ≈0 even under
+    // `--features metrics`. The SP1-relevant signals here are `wall_ms` and
+    // `peak_rss_kib` (the latter captures the whole-file `fs::read` memory spike
+    // SP1 eliminates). Per-file scan I/O counting arrives in SP1 with scan.rs.
     metrics::reset();
     let t0 = Instant::now();
     let stats = scan_directory(&db, &target.corpus_dir).unwrap();
@@ -38,7 +43,12 @@ fn bench_cold_scan_and_revalidate() {
     let t1 = Instant::now();
     let _ = revalidate(&db, &target.corpus_dir).unwrap();
     let reval_ms = t1.elapsed().as_millis();
+    let r = metrics::snapshot();
 
+    // `peak_rss_kib()` reads VmHWM: a process-lifetime high-water mark, not a
+    // per-phase sample. Both rows therefore show the same value (revalidate's
+    // working set never exceeds the scan's) — the meaningful figure is the scan
+    // row's; the revalidate row repeats it for table completeness.
     println!("\n{}", RunReport::header());
     println!(
         "{}",
@@ -61,8 +71,8 @@ fn bench_cold_scan_and_revalidate() {
             tier,
             storage,
             wall_ms: reval_ms,
-            opens: 0,
-            preads: 0,
+            opens: r.opens,
+            preads: r.preads,
             fsyncs: None,
             peak_rss_kib: peak_rss_kib(),
         }
