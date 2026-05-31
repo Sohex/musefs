@@ -134,6 +134,7 @@ pub struct Musefs {
     /// incremental change diff and the `on_changed` cache-invalidation callbacks.
     snapshot: Mutex<HashMap<i64, TrackRenderState>>,
     force_rebuild_error: AtomicBool,
+    force_apply_fail: AtomicBool,
 }
 
 impl Musefs {
@@ -159,6 +160,7 @@ impl Musefs {
             inodes: Mutex::new(alloc),
             snapshot: Mutex::new(snapshot),
             force_rebuild_error: AtomicBool::new(false),
+            force_apply_fail: AtomicBool::new(false),
         })
     }
 
@@ -282,19 +284,56 @@ impl Musefs {
             Ok::<_, CoreError>((new_snapshot, change))
         })?;
 
-        let mut entries: Vec<(i64, String)> = new_snapshot
+        let new_paths: std::collections::HashMap<i64, String> = new_snapshot
             .iter()
             .map(|(&id, s)| (id, s.path.clone()))
             .collect();
-        entries.sort_by_key(|(id, _)| *id);
-        {
-            let mut alloc = self
-                .inodes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let tree = VirtualTree::build_with(&entries, &mut alloc);
-            self.tree.store(Arc::new(tree));
-        }
+
+        let mut alloc = self
+            .inodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut tree = (*self.tree.load_full()).clone(); // O(1) im clone
+        let applied = if self.force_apply_fail.swap(false, Ordering::AcqRel) {
+            Err(()) // test injection
+        } else {
+            tree.apply_changes(
+                &new_paths,
+                &change.changed,
+                &change.added,
+                &change.removed,
+                &mut alloc,
+            )
+        };
+        // Two materially distinct arms (debug-assert vs. full-rebuild fallback), so a
+        // `match` reads clearer than the `if let .. else` clippy would prefer.
+        #[allow(clippy::single_match_else)]
+        let tree = match applied {
+            Ok(()) => {
+                #[cfg(debug_assertions)]
+                {
+                    let mut ref_alloc = alloc.clone();
+                    let mut entries: Vec<(i64, String)> =
+                        new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
+                    entries.sort_by_key(|(id, _)| *id);
+                    let reference = VirtualTree::build_with(&entries, &mut ref_alloc);
+                    debug_assert!(
+                        tree.equiv(&reference),
+                        "incremental tree diverged from build_with"
+                    );
+                }
+                tree
+            }
+            Err(()) => {
+                eprintln!("musefs: incremental tree mutation failed; falling back to full rebuild");
+                let mut entries: Vec<(i64, String)> =
+                    new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
+                entries.sort_by_key(|(id, _)| *id);
+                VirtualTree::build_with(&entries, &mut alloc)
+            }
+        };
+        self.tree.store(Arc::new(tree));
+        drop(alloc);
         Ok((new_snapshot, change))
     }
 
@@ -464,6 +503,11 @@ impl Musefs {
     #[doc(hidden)]
     pub fn force_rebuild_errors_for_test(&self, fail: bool) {
         self.force_rebuild_error.store(fail, Ordering::Release);
+    }
+
+    #[doc(hidden)]
+    pub fn force_apply_failure_for_test(&self, on: bool) {
+        self.force_apply_fail.store(on, Ordering::Release);
     }
 
     #[doc(hidden)]

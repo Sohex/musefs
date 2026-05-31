@@ -4,7 +4,7 @@ use im::{HashMap as ImHashMap, OrdMap};
 /// an unchanged path keeps its inode, a new path gets a fresh one, and a retired
 /// inode is never recycled (a stale FUSE handle can't alias a different node).
 /// The map grows monotonically with the universe of distinct paths ever rendered.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InodeAllocator {
     paths: ImHashMap<String, u64>,
     next: u64,
@@ -45,7 +45,7 @@ pub struct Node {
 
 /// An in-memory virtual filesystem tree: directories derived from path components
 /// and files mapped to track ids. Inodes are stable for the lifetime of the tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualTree {
     nodes: ImHashMap<u64, Node>,
     children: ImHashMap<u64, OrdMap<String, u64>>,
@@ -81,6 +81,13 @@ impl VirtualTree {
             tree.insert_file(*track_id, path, alloc);
         }
         tree
+    }
+
+    /// Structural equality for the equivalence oracle: identical track→inode map,
+    /// node set, AND children maps. Delegates to the derived `PartialEq` so adding a
+    /// field to `VirtualTree` can never silently weaken the oracle. See SP2 Testing item 1.
+    pub fn equiv(&self, other: &VirtualTree) -> bool {
+        self == other
     }
 
     pub fn node(&self, inode: u64) -> Option<&Node> {
