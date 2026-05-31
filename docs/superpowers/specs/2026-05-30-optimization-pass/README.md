@@ -74,7 +74,7 @@ is built for the full capability regardless.
 | SP | State | Spec | Plan | Notes |
 |---|---|---|---|---|
 | SP0a | Plan drafted | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now |
-| SP0b | Not started | `SP0-measurement-foundation.md` | — | Passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS |
+| SP0b | Plan drafted | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS |
 | SP1 | Not started | — | — | |
 | SP2 | Not started | — | — | |
 | SP3 | Not started | — | — | |
