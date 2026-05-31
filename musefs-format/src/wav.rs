@@ -1,5 +1,6 @@
 use crate::error::{FormatError, Result};
 use crate::input::EmbeddedPicture;
+use crate::probe::Extent;
 use std::collections::HashSet;
 
 /// The served audio bounds of a WAV: the `data` chunk's payload.
@@ -78,6 +79,17 @@ pub fn locate_audio(buf: &[u8]) -> Result<WavBounds> {
         }
         _ => Err(FormatError::NotWav),
     }
+}
+
+/// Bounded twin of [`locate_audio`]. WAV metadata chunks can trail the `data`
+/// payload, which the slice walk cannot skip past, so completion requires the
+/// whole file in `prefix`; otherwise request it. Equivalence is trivially
+/// preserved (the completing parse is exactly `locate_audio` on the full file).
+pub fn locate_audio_bounded(prefix: &[u8], file_len: u64) -> Result<Extent<WavBounds>> {
+    if (prefix.len() as u64) < file_len {
+        return Ok(Extent::NeedMore { up_to: file_len });
+    }
+    Ok(Extent::Complete(locate_audio(prefix)?))
 }
 
 /// Read the preserved structural chunks (`fmt `, optional `fact`) from the front
@@ -621,6 +633,43 @@ mod tests {
         };
         let res = synthesize_layout(&scan, 0, u32::MAX as u64, &[], &[]);
         assert_eq!(res, Err(FormatError::TooLarge));
+    }
+
+    /// RIFF/WAVE with a `fmt ` (16-byte) chunk and a `data` chunk of `audio`.
+    fn wav_file(audio: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fmt ");
+        body.extend_from_slice(&16u32.to_le_bytes());
+        body.extend(std::iter::repeat_n(0u8, 16));
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&(audio.len() as u32).to_le_bytes());
+        body.extend_from_slice(audio);
+        let mut v = b"RIFF".to_vec();
+        v.extend_from_slice(&((4 + body.len()) as u32).to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(&body);
+        v
+    }
+
+    #[test]
+    fn locate_audio_bounded_complete_when_prefix_is_whole_file() {
+        let full = wav_file(b"AUDIOAUDIO");
+        let file_len = full.len() as u64;
+        match locate_audio_bounded(&full, file_len).unwrap() {
+            Extent::Complete(b) => assert_eq!(b.audio_length, 10),
+            other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn locate_audio_bounded_needmore_when_prefix_short() {
+        let full = wav_file(b"AUDIOAUDIO");
+        let file_len = full.len() as u64;
+        let prefix = &full[..full.len() - 4];
+        match locate_audio_bounded(prefix, file_len).unwrap() {
+            Extent::NeedMore { up_to } => assert_eq!(up_to, file_len),
+            other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
+        }
     }
 
     // Documented EQUIVALENT mutants in this file (no test targets them; each was

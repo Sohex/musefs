@@ -122,6 +122,7 @@ fn report_renders_a_row() {
         opens: 200,
         preads: 200,
         fsyncs: None,
+        bytes_read: 0,
         peak_rss_kib: Some(50_000),
     };
     let line = r.row();

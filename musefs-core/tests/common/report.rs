@@ -5,7 +5,7 @@
 /// literal, so this is a macro rather than a `const`.)
 macro_rules! report_fmt {
     ($($arg:expr),* $(,)?) => {
-        format!("{:<10} {:<10} {:<14} {:<10} {:>10} {:>10} {:>10} {:>10} {:>12}", $($arg),*)
+        format!("{:<10} {:<10} {:<14} {:<10} {:>10} {:>10} {:>10} {:>10} {:>14} {:>12}", $($arg),*)
     };
 }
 
@@ -21,13 +21,23 @@ pub struct RunReport {
     pub opens: u64,
     pub preads: u64,
     pub fsyncs: Option<u64>,
+    pub bytes_read: u64,
     pub peak_rss_kib: Option<u64>,
 }
 
 impl RunReport {
     pub fn header() -> String {
         report_fmt!(
-            "label", "format", "tier", "storage", "wall_ms", "opens", "preads", "fsyncs", "rss_kib"
+            "label",
+            "format",
+            "tier",
+            "storage",
+            "wall_ms",
+            "opens",
+            "preads",
+            "fsyncs",
+            "bytes_read",
+            "rss_kib"
         )
     }
 
@@ -42,6 +52,7 @@ impl RunReport {
             self.opens,
             self.preads,
             opt(self.fsyncs),
+            self.bytes_read,
             opt(self.peak_rss_kib),
         )
     }

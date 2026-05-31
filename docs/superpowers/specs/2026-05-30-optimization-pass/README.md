@@ -33,8 +33,9 @@ around what that one did *not* deliver. Reconciliation:
   (single + concurrent), a deterministic latency-injection layer (passthrough
   FUSE), and comparable reporting. *Spec: `SP0-measurement-foundation.md`.*
 - **SP1 — Ingestion scalability.** Bounded probing reads (stop slurping whole
-  files), transaction batching across the scan loop, optional parallel probing,
-  bulk-write pragma tuning. *Spec: TBD after SP0.*
+  files), transaction batching across the scan loop, parallel probing
+  (default-on, `--jobs` knob), bulk-write pragma tuning. *Spec:
+  `SP1-ingestion-scalability.md`.*
 - **SP2 — Incremental tree refresh.** Rebuild only changed tracks on a
   `data_version` bump instead of reloading and re-rendering the whole library.
   *Spec: TBD.*
@@ -75,7 +76,7 @@ is built for the full capability regardless.
 |---|---|---|---|---|
 | SP0a | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now. See "Running the SP0a harness" below; per-format sweep added (`SP0a-per-format-coverage.md`) |
 | SP0b | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS. See "Latency-injected runs" below. |
-| SP1 | Not started | — | — | |
+| SP1 | Implemented | `SP1-ingestion-scalability.md` | `../../plans/2026-05-31-sp1-ingestion-scalability.md` | Hybrid bounded reads (window+`NeedMore` for FLAC/MP3/OGG/WAV, seek reader for M4A) · parallel-probe/serial-writer pipeline (`--jobs`) · byte-budget backpressure · txn batching · bulk pragmas · `failed` resilience. Bounded≡full equivalence gate + byte-identical PCM e2e green. Bench baselines in `BENCHMARKS.md` (durable-storage cold scan 20–500× faster). |
 | SP2 | Not started | — | — | |
 | SP3 | Not started | — | — | |
 | SP4 | Not started | — | — | |
@@ -149,4 +150,14 @@ so VmHWM no longer isolates the scan's footprint — use the SP0a tempfs
 ## Results log
 
 *(Per-SP before/after numbers land here as each ships. Format: tier · storage
-class · wall time · op counts · fsyncs · peak RSS.)*
+class · wall time · op counts · fsyncs · peak RSS. Full tables + reproducing
+commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
+
+- **SP1 — Ingestion scalability** (2026-05-31, AMD EPYC 6c · SSD): on durable
+  storage cold scan is **20–500× faster** — `ci`/SSD FLAC 8949 ms → 17 ms
+  (526×); `bandwidth`/SSD 30 MiB FLAC 170 263 ms → 8735 ms (19.5×) with
+  `bytes_read` 30 GiB → 1.05 GiB. Mechanism: per-file commits at
+  `synchronous=FULL` → batched at `NORMAL` = **403 → 0 fsyncs** (latency-FS, 200
+  files). Caveat: on tempfs/RAM with sub-window files (`large-compute`) the
+  pipeline overhead makes it ~1.9× slower (no fsync cost to amortize). See
+  `BENCHMARKS.md` §1–§4.

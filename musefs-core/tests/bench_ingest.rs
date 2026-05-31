@@ -6,30 +6,33 @@ use common::corpus::{
     bench_base_dir, bench_formats, format_token, prepare, prepare_format, CorpusParams, Target,
 };
 use common::report::{peak_rss_kib, RunReport};
-use musefs_core::{metrics, revalidate, scan_directory};
+use musefs_core::{metrics, revalidate_with, scan_directory_with, ScanOptions};
 use musefs_db::Db;
 
 /// Scan + revalidate one resolved target, printing a `scan` and a `revalidate`
-/// row tagged with `format`/`storage`.
-///
-/// The `opens`/`preads` metrics instrument the *serve* path (reader.rs /
-/// open_handle), not the scan path, so both rows print ~0 even under
-/// `--features metrics`. The SP1-relevant signals are `wall_ms` and
-/// `peak_rss_kib`. `peak_rss_kib()` reads VmHWM — a process-lifetime high-water
-/// mark that only rises — so later rows show the same or a higher value than
-/// earlier ones; read the first format's scan row for the pre-SP1 baseline.
+/// row tagged with `format`/`storage`. The `bytes_read` column reports
+/// `scan_bytes_read` (the SP1 bounded-read signal: front-anchored prefix, widen,
+/// and MP3 tail reads). M4A's seek-reader bytes are not counted here (they live in
+/// musefs-format); M4A's win shows in `wall_ms` and `peak_rss_kib`. `opens`/`preads`
+/// remain serve-path counters and stay ~0 on the scan path.
 fn run_one(target: &Target, tier: &str, format: &str, storage: &str) {
     let db = Db::open(&target.db_path).unwrap();
 
+    let jobs = std::env::var("MUSEFS_BENCH_JOBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let opts = ScanOptions { jobs };
+
     metrics::reset();
     let t0 = Instant::now();
-    let stats = scan_directory(&db, &target.corpus_dir).unwrap();
+    let stats = scan_directory_with(&db, &target.corpus_dir, &opts).unwrap();
     let scan_ms = t0.elapsed().as_millis();
     let s = metrics::snapshot();
 
     metrics::reset();
     let t1 = Instant::now();
-    let _ = revalidate(&db, &target.corpus_dir).unwrap();
+    let _ = revalidate_with(&db, &target.corpus_dir, &opts).unwrap();
     let reval_ms = t1.elapsed().as_millis();
     let r = metrics::snapshot();
 
@@ -45,6 +48,7 @@ fn run_one(target: &Target, tier: &str, format: &str, storage: &str) {
                 opens: snap.opens,
                 preads: snap.preads,
                 fsyncs: None,
+                bytes_read: snap.scan_bytes_read,
                 peak_rss_kib: peak_rss_kib(),
             }
             .row()
@@ -117,7 +121,17 @@ fn bench_scan_under_latency() {
     let fsyncs_before_scan = mount.fsyncs();
     metrics::reset();
     let t0 = Instant::now();
-    let stats = scan_directory(&db, &mount.path()).unwrap();
+    let stats = scan_directory_with(
+        &db,
+        &mount.path(),
+        &ScanOptions {
+            jobs: std::env::var("MUSEFS_BENCH_JOBS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        },
+    )
+    .unwrap();
     let scan_ms = t0.elapsed().as_millis();
     let s = metrics::snapshot();
 
@@ -133,6 +147,7 @@ fn bench_scan_under_latency() {
             opens: s.opens,
             preads: s.preads,
             fsyncs: Some(mount.fsyncs().saturating_sub(fsyncs_before_scan)),
+            bytes_read: s.scan_bytes_read,
             peak_rss_kib: None, // FS runs in-process here, but RSS attribution is mixed; omit.
         }
         .row()

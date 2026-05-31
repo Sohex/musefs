@@ -1,4 +1,5 @@
 use crate::error::{FormatError, Result};
+use crate::probe::Extent;
 
 pub(crate) const FLAC_MARKER: &[u8; 4] = b"fLaC";
 
@@ -79,6 +80,56 @@ fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
 /// known (e.g. stored in a database) and the full file should not be read.
 pub fn read_metadata(data: &[u8]) -> Result<FlacMeta> {
     parse_blocks(data)
+}
+
+/// Bounded twin of [`read_metadata`]: walk the metadata blocks present in
+/// `prefix` (which may be a front-only window of the file). If a block's declared
+/// body runs past the prefix, return `NeedMore { up_to }` with the exact end of
+/// that block — the caller widens the window and retries. Otherwise `Complete`.
+pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
+    if prefix.len() < 4 || &prefix[0..4] != FLAC_MARKER {
+        return Err(FormatError::NotFlac);
+    }
+    let mut pos = 4usize;
+    let mut preserved = Vec::new();
+    loop {
+        if pos + 4 > prefix.len() {
+            // Need at least the 4-byte block header.
+            return Ok(Extent::NeedMore {
+                up_to: (pos + 4) as u64,
+            });
+        }
+        let header = prefix[pos];
+        let is_last = (header & 0x80) != 0;
+        let block_type = header & 0x7F;
+        let len = ((prefix[pos + 1] as usize) << 16)
+            | ((prefix[pos + 2] as usize) << 8)
+            | (prefix[pos + 3] as usize);
+        let body_start = pos + 4;
+        let body_end = body_start + len;
+        if body_end > prefix.len() {
+            return Ok(Extent::NeedMore {
+                up_to: body_end as u64,
+            });
+        }
+        match block_type {
+            BLOCK_STREAMINFO | BLOCK_APPLICATION | BLOCK_SEEKTABLE | BLOCK_CUESHEET => {
+                preserved.push(MetadataBlock {
+                    block_type,
+                    body: prefix[body_start..body_end].to_vec(),
+                });
+            }
+            _ => {}
+        }
+        pos = body_end;
+        if is_last {
+            break;
+        }
+    }
+    Ok(Extent::Complete(FlacMeta {
+        audio_offset: pos as u64,
+        preserved,
+    }))
 }
 
 /// Parse the FLAC metadata section of a complete file, returning the audio
@@ -314,6 +365,40 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::Extent;
+
+    /// Build a minimal FLAC: marker + a single last STREAMINFO (type 0, 34-byte
+    /// body) + `audio` bytes. Returns (full_bytes, audio_offset).
+    fn flac_with_streaminfo(audio: &[u8]) -> (Vec<u8>, u64) {
+        let mut v = b"fLaC".to_vec();
+        push_block_header(&mut v, BLOCK_STREAMINFO, 34, true);
+        v.extend(std::iter::repeat_n(0u8, 34));
+        let audio_offset = v.len() as u64;
+        v.extend_from_slice(audio);
+        (v, audio_offset)
+    }
+
+    #[test]
+    fn read_metadata_bounded_complete_when_prefix_covers_blocks() {
+        let (full, audio_offset) = flac_with_streaminfo(b"AUDIOAUDIO");
+        // Prefix that includes all metadata but not all audio.
+        let prefix = &full[..audio_offset as usize + 2];
+        match read_metadata_bounded(prefix).unwrap() {
+            Extent::Complete(meta) => assert_eq!(meta.audio_offset, audio_offset),
+            other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_metadata_bounded_needmore_when_block_body_truncated() {
+        let (full, audio_offset) = flac_with_streaminfo(b"AUDIO");
+        // Cut inside the STREAMINFO body (header is 4 bytes after the marker).
+        let prefix = &full[..8];
+        match read_metadata_bounded(prefix).unwrap() {
+            Extent::NeedMore { up_to } => assert_eq!(up_to, audio_offset),
+            other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
+        }
+    }
 
     #[test]
     fn read_u32_be_assembles_big_endian_and_guards_length() {
@@ -558,6 +643,176 @@ mod tests {
         // :290 `<<8 -> >>8`: mid length byte, high byte 0.
         let mid = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x00_0100))]);
         assert_eq!(read_pictures(&mid), Err(FormatError::Malformed));
+    }
+
+    // ---- read_metadata_bounded mutant-kill tests (flac.rs:89-133) ----
+
+    #[test]
+    fn bounded_rejects_short_and_wrong_marker() {
+        // kills flac L90 `<` -> `==`/`<=` and `||` -> `&&`:
+        // a 3-byte prefix is too short. Original short-circuits NotFlac; the `==`
+        // mutant (len==4 is false for len 3) and the `&&` mutant force evaluation
+        // of &prefix[0..4] on 3 bytes -> panic. NotFlac kills both.
+        assert_eq!(read_metadata_bounded(b"fLa"), Err(FormatError::NotFlac));
+        // kills flac L90 `<` -> `<=`: a 4-byte "fLaC"-only prefix is exactly the
+        // marker. Original (len 4 < 4 is false) proceeds; since pos+4=8 > 4 it
+        // returns NeedMore{up_to:8}. The `<=` mutant (4 <= 4 true) wrongly returns
+        // NotFlac. Asserting NOT NotFlac (and the exact NeedMore) kills it.
+        match read_metadata_bounded(b"fLaC").unwrap() {
+            Extent::NeedMore { up_to } => assert_eq!(up_to, 8),
+            other @ Extent::Complete(_) => panic!("expected NeedMore{{up_to:8}}, got {other:?}"),
+        }
+        // kills flac L90 marker check: a non-FLAC 4-byte prefix -> NotFlac.
+        assert_eq!(read_metadata_bounded(b"XXXX"), Err(FormatError::NotFlac));
+    }
+
+    #[test]
+    fn bounded_needmore_up_to_is_pos_plus_4_for_truncated_header() {
+        // Marker + a non-last STREAMINFO (empty body) then truncated: after the
+        // first block, pos = 4 + 4 + 0 = 8. The prefix ends exactly there, so the
+        // loop guard `pos + 4 > prefix.len()` fires with pos == 8.
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], false, None)]);
+        // file is fLaC(4) + header(4) = 8 bytes; pos lands at 8 == prefix.len().
+        assert_eq!(file.len(), 8);
+        match read_metadata_bounded(&file).unwrap() {
+            // kills flac L96 `pos + 4 > prefix.len()` `+` -> `-`: with `pos - 4`
+            // (8-4=4) the comparison 4 > 8 is false, so it would NOT return NeedMore
+            // and instead panic reading prefix[8..]. NeedMore here kills it.
+            // kills flac L99 up_to `(pos + 4)` `+` -> `-`/`*`: pos==8 -> correct
+            // up_to == 12. `pos - 4` gives 4; `pos * 4` gives 32. Exact 12 kills both.
+            Extent::NeedMore { up_to } => assert_eq!(up_to, 12),
+            other @ Extent::Complete(_) => panic!("expected NeedMore{{up_to:12}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_is_last_flag_continues_past_nonlast_block() {
+        // Two blocks: first NON-last STREAMINFO (body 0xAA*2), then a LAST
+        // STREAMINFO (body 0xBB*3) + no audio. audio_offset must span BOTH.
+        let b1 = raw_block(BLOCK_STREAMINFO, &[0xAA, 0xAA], false, None); // 4+2=6
+        let b2 = raw_block(BLOCK_STREAMINFO, &[0xBB, 0xBB, 0xBB], true, None); // 4+3=7
+        let file = flac_with(&[b1, b2]);
+        let expected_offset = (4 + 6 + 7) as u64; // marker + block1 + block2
+        match read_metadata_bounded(&file).unwrap() {
+            Extent::Complete(meta) => {
+                // kills flac L103 `header & 0x80` `&` -> `|`: `header | 0x80` is always
+                // nonzero -> is_last always true -> it would stop after block 1 with
+                // audio_offset == 4+6 == 10. Spanning both blocks (17) kills it.
+                assert_eq!(meta.audio_offset, expected_offset);
+                // both STREAMINFO blocks preserved -> proves we walked past block 1.
+                assert_eq!(meta.preserved.len(), 2);
+            }
+            other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_block_type_mask_preserves_streaminfo() {
+        // A single last STREAMINFO (type 0) with a known body.
+        let body = vec![0x5A; 8];
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &body, true, None)]);
+        match read_metadata_bounded(&file).unwrap() {
+            Extent::Complete(meta) => {
+                // kills flac L104 `header & 0x7F` `&` -> `|`/`^`: for a last STREAMINFO
+                // the header byte is 0x80 (is_last set, type 0). Correct block_type =
+                // 0x80 & 0x7F = 0. `0x80 | 0x7F` = 0xFF, `0x80 ^ 0x7F` = 0xFF -> neither
+                // matches the STREAMINFO arm -> preserved stays empty. Asserting the
+                // block IS preserved with block_type 0 kills both.
+                assert_eq!(meta.preserved.len(), 1);
+                assert_eq!(meta.preserved[0].block_type, BLOCK_STREAMINFO);
+                assert_eq!(meta.preserved[0].body, body);
+            }
+            other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_decodes_24bit_length_exactly() {
+        // Single last block whose declared length = 0x010203 (bytes 0x01,0x02,0x03),
+        // exercising all three length positions. Body is that many bytes so the block
+        // fits and we get a Complete with an exact audio_offset.
+        let len = 0x01_0203usize;
+        let body = vec![0u8; len];
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &body, true, None)]);
+        let expected_offset = (4 + 4 + len) as u64;
+        match read_metadata_bounded(&file).unwrap() {
+            Extent::Complete(meta) => {
+                // kills flac L105 `<< 16` -> `>> 16`: (0x01 >> 16) == 0 -> len loses
+                //   its high byte -> body_end shifts -> wrong audio_offset.
+                // kills flac L106 `<< 8` -> `>> 8`: (0x02 >> 8) == 0 -> mid byte lost.
+                // kills flac L106 `|` -> `&`: (0x010000) & (0x000200) == 0 -> length
+                //   collapses (disjoint high/mid bits) -> wrong audio_offset.
+                // kills flac L107 final `|` -> assembles low byte; an exact audio_offset
+                //   pins the full 24-bit assembly.
+                assert_eq!(meta.audio_offset, expected_offset);
+            }
+            other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_length_or_vs_and_high_byte() {
+        // Dedicated `|` -> `&` kill on flac L106: declare length 0x010100 (high byte
+        // 0x01, mid byte 0x01, low 0x00). Correct len = 65792. With `(b1<<16) &
+        // (b2<<8)` the disjoint bits AND to 0, then `| low` -> very different length.
+        // Use NeedMore: body is absent, so the correct parse asks for the full body.
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0100))]);
+        match read_metadata_bounded(&file).unwrap() {
+            Extent::NeedMore { up_to } => {
+                // body_start = 4 + 4 = 8; up_to = body_end = 8 + 0x010100.
+                assert_eq!(up_to, 8 + 0x01_0100);
+            }
+            other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_body_end_equal_to_prefix_is_complete() {
+        // A single LAST STREAMINFO whose body ends EXACTLY at the prefix end (no
+        // audio). body_end == prefix.len().
+        let body = vec![0xCC; 6];
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &body, true, None)]);
+        let total = file.len() as u64; // 4 + 4 + 6 == 14
+        match read_metadata_bounded(&file).unwrap() {
+            // kills flac L110 `body_end > prefix.len()` `>` -> `>=`: with `>=`,
+            // body_end == prefix.len() is true -> wrongly returns NeedMore. Original
+            // (`>`) proceeds and, since is_last, returns Complete{audio_offset==len}.
+            Extent::Complete(meta) => assert_eq!(meta.audio_offset, total),
+            other @ Extent::NeedMore { .. } => {
+                panic!("expected Complete (exact fit), got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_preserves_all_structural_block_types() {
+        // kills flac L116 (delete the STREAMINFO|APPLICATION|SEEKTABLE|CUESHEET arm):
+        // a prefix containing each preserved type must yield all four in `preserved`.
+        // Deleting the arm makes `preserved` empty -> these assertions fail.
+        let b_si = raw_block(BLOCK_STREAMINFO, &[0x01], false, None);
+        let b_app = raw_block(BLOCK_APPLICATION, &[0x02, 0x02], false, None);
+        let b_seek = raw_block(BLOCK_SEEKTABLE, &[0x03, 0x03, 0x03], false, None);
+        let b_cue = raw_block(BLOCK_CUESHEET, &[0x04], true, None);
+        let file = flac_with(&[b_si, b_app, b_seek, b_cue]);
+        match read_metadata_bounded(&file).unwrap() {
+            Extent::Complete(meta) => {
+                let types: Vec<u8> = meta.preserved.iter().map(|b| b.block_type).collect();
+                assert_eq!(
+                    types,
+                    vec![
+                        BLOCK_STREAMINFO,
+                        BLOCK_APPLICATION,
+                        BLOCK_SEEKTABLE,
+                        BLOCK_CUESHEET,
+                    ]
+                );
+                assert_eq!(meta.preserved[0].body, vec![0x01]);
+                assert_eq!(meta.preserved[1].body, vec![0x02, 0x02]);
+                assert_eq!(meta.preserved[2].body, vec![0x03, 0x03, 0x03]);
+                assert_eq!(meta.preserved[3].body, vec![0x04]);
+            }
+            other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
+        }
     }
 
     #[test]
