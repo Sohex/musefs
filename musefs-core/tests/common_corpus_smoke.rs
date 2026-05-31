@@ -165,3 +165,40 @@ fn generate_with_ogg_in_mix_scans_all() {
     let stats = scan_directory(&db, dir.path()).unwrap();
     assert_eq!(stats.scanned, 4, "all four formats (incl. Ogg) ingest");
 }
+
+#[test]
+fn bench_formats_defaults_to_all_when_unset() {
+    let _g = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("MUSEFS_BENCH_FORMAT_MIX");
+    assert_eq!(
+        common::corpus::bench_formats(),
+        common::corpus::ALL_FORMATS.to_vec()
+    );
+}
+
+#[test]
+fn bench_formats_filters_and_never_empty() {
+    let _g = ENV_LOCK.lock().unwrap();
+    std::env::set_var("MUSEFS_BENCH_FORMAT_MIX", "ogg,wav");
+    let filtered = common::corpus::bench_formats();
+    std::env::set_var("MUSEFS_BENCH_FORMAT_MIX", "garbagetoken");
+    let fallback = common::corpus::bench_formats();
+    std::env::remove_var("MUSEFS_BENCH_FORMAT_MIX");
+    assert_eq!(filtered, vec![Format::Ogg, Format::Wav]);
+    assert_eq!(
+        fallback,
+        common::corpus::ALL_FORMATS.to_vec(),
+        "all-unrecognized must fall back to full coverage, never empty"
+    );
+}
+
+#[test]
+fn all_formats_round_trip_through_tokens() {
+    for &f in common::corpus::ALL_FORMATS {
+        assert_eq!(
+            common::corpus::format_from_token(common::corpus::format_token(f)),
+            Some(f),
+            "ALL_FORMATS member {f:?} must round-trip through its token"
+        );
+    }
+}

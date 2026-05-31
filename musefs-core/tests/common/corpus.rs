@@ -48,6 +48,34 @@ pub fn format_token(f: Format) -> &'static str {
     }
 }
 
+/// Every supported format, plus the M4A moov-last layout variant (the SP1
+/// bounded-read hard case). The per-format benches sweep this set.
+pub const ALL_FORMATS: &[Format] = &[
+    Format::Flac,
+    Format::Mp3,
+    Format::M4aMoovFirst,
+    Format::M4aMoovLast,
+    Format::Ogg,
+    Format::Wav,
+];
+
+/// The formats to sweep: `MUSEFS_BENCH_FORMAT_MIX` (comma list) acts as a filter
+/// when set; an unset or all-unrecognized value yields `ALL_FORMATS` (full
+/// coverage). Never returns an empty vec.
+pub fn bench_formats() -> Vec<Format> {
+    match std::env::var("MUSEFS_BENCH_FORMAT_MIX") {
+        Ok(mix) => {
+            let parsed: Vec<Format> = mix.split(',').filter_map(format_from_token).collect();
+            if parsed.is_empty() {
+                ALL_FORMATS.to_vec()
+            } else {
+                parsed
+            }
+        }
+        Err(_) => ALL_FORMATS.to_vec(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CorpusParams {
     pub albums: usize,
