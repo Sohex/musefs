@@ -73,12 +73,48 @@ is built for the full capability regardless.
 
 | SP | State | Spec | Plan | Notes |
 |---|---|---|---|---|
-| SP0a | Plan drafted | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now |
+| SP0a | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now. See "Running the SP0a harness" below |
 | SP0b | Plan drafted | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS |
 | SP1 | Not started | — | — | |
 | SP2 | Not started | — | — | |
 | SP3 | Not started | — | — | |
 | SP4 | Not started | — | — | |
+
+## Running the SP0a harness
+
+```bash
+# Read throughput + concurrent read/walk (Criterion):
+cargo bench -p musefs-core --bench read_throughput
+
+# Cold scan + revalidate timing (prints a table):
+cargo test -p musefs-core --features metrics --test bench_ingest -- --ignored --nocapture
+
+# Refresh timing, 1 vs N changed tracks:
+cargo test -p musefs-core --test bench_refresh -- --ignored --nocapture
+
+# Scale / storage knobs (any of the timing/bench commands above):
+MUSEFS_BENCH_TIER=large-compute \
+MUSEFS_BENCH_DIR=/mnt/ssd/musefs-bench \
+  cargo test -p musefs-core --features metrics --test bench_ingest -- --ignored --nocapture
+
+# Run against a real library (never written to; DB goes to MUSEFS_BENCH_DB or a tempfile):
+MUSEFS_BENCH_LIBRARY=/srv/music \
+MUSEFS_BENCH_DB=/tmp/musefs-bench.db \
+  cargo test -p musefs-core --features metrics --test bench_ingest -- --ignored --nocapture
+```
+
+Notes:
+- A reused `MUSEFS_BENCH_DIR` is re-scanned cold: `prepare` deletes any prior
+  `musefs-bench.db` (+ `-wal`/`-shm`) so scan timings start from an empty DB.
+- The `bench_ingest` `opens`/`preads` columns read ≈0: the metrics counters
+  instrument the serve path, not the scan path (per-file scan I/O counting
+  lands in SP1). `wall_ms` and `peak_rss_kib` are the SP1 signals here.
+- `fsyncs` shows `n/a` for every SP0a run; the SP0b passthrough FS fills it.
+- **Regression gate (convention for SP1–SP4):** treat the Criterion `ci`
+  `sequential_read` median as the baseline; a change is a regression if the
+  median rises **>10%** run-over-run on the same machine (Criterion prints the
+  median + its noise estimate). SP1–SP4 record before/after medians in the
+  results log and must not breach this gate.
 
 ## Results log
 
