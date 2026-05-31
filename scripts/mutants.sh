@@ -2,8 +2,9 @@
 # Run cargo-mutants over the three logic-bearing crates with a disk budget that
 # fits a small VPS. Known-good cargo-mutants version: 27.0.0.
 #
-# musefs-cli and musefs-fuse are intentionally out of scope (thin glue / e2e-only;
-# see the remediation tracking doc).
+# musefs-cli, musefs-fuse, and musefs-latencyfs are intentionally out of scope
+# (thin glue / e2e-only — the FUSE crates need /dev/fuse; see the remediation
+# tracking doc). The per-PR `--in-diff` gate excludes them via .cargo/mutants.toml.
 #
 # Usage: scripts/mutants.sh [crate ...]   (default: all three in-scope crates)
 # Env:   MUTANTS_TMP  scratch PARENT dir, MUST be OUTSIDE this repo (default: the

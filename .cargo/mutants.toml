@@ -1,0 +1,17 @@
+# cargo-mutants workspace config.
+#
+# Crates intentionally out of scope for mutation testing. The scheduled full
+# campaign (`scripts/mutants.sh`) only mutates the logic files in musefs-db,
+# musefs-core, and musefs-format; thin FUSE/CLI glue and bench-only tooling are
+# excluded because their behavior is exercised solely by `#[ignore]`d e2e tests
+# (the FUSE crates need /dev/fuse). A mountless `cargo mutants` run can never
+# execute those tests, so every mutant there would falsely "survive". This
+# `exclude_globs` makes the per-PR `--in-diff` gate honor the same scope the
+# campaign already uses, so changing one of these crates no longer trips the gate
+# with un-killable mutants. See docs/audits/2026-05-29-test-audit.md.
+exclude_globs = [
+    "musefs-latencyfs/**",
+    "musefs-fuse/**",
+    "musefs-cli/**",
+    "musefs/**",
+]
