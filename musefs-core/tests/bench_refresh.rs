@@ -84,6 +84,7 @@ fn bench_refresh_one_vs_many() {
                 opens: 0,
                 preads: 0,
                 fsyncs: None,
+                bytes_read: 0,
                 peak_rss_kib: None,
             }
             .row()
