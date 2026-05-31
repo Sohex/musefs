@@ -22,6 +22,9 @@ mod imp {
     static PREADS: AtomicU64 = AtomicU64::new(0);
     static PREAD_BYTES: AtomicU64 = AtomicU64::new(0);
     static ART_CHUNKS: AtomicU64 = AtomicU64::new(0);
+    static SCAN_OPENS: AtomicU64 = AtomicU64::new(0);
+    static SCAN_PREADS: AtomicU64 = AtomicU64::new(0);
+    static SCAN_BYTES_READ: AtomicU64 = AtomicU64::new(0);
 
     /// Sleep for the duration named by `var` (microseconds), parsed once.
     fn fault(var: &'static str, cell: &OnceLock<Option<Duration>>) {
@@ -60,6 +63,17 @@ mod imp {
         ART_CHUNKS.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One backing-file open on the *scan* path (distinct from serve-path `on_open`).
+    pub fn on_scan_open() {
+        SCAN_OPENS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One positioned scan-path read of `bytes` bytes (prefix, widen, or tail read).
+    pub fn on_scan_read(bytes: u64) {
+        SCAN_PREADS.fetch_add(1, Ordering::Relaxed);
+        SCAN_BYTES_READ.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct Snapshot {
         pub opens: u64,
@@ -67,6 +81,9 @@ mod imp {
         pub preads: u64,
         pub pread_bytes: u64,
         pub art_chunks: u64,
+        pub scan_opens: u64,
+        pub scan_preads: u64,
+        pub scan_bytes_read: u64,
     }
 
     pub fn snapshot() -> Snapshot {
@@ -76,6 +93,9 @@ mod imp {
             preads: PREADS.load(Ordering::Relaxed),
             pread_bytes: PREAD_BYTES.load(Ordering::Relaxed),
             art_chunks: ART_CHUNKS.load(Ordering::Relaxed),
+            scan_opens: SCAN_OPENS.load(Ordering::Relaxed),
+            scan_preads: SCAN_PREADS.load(Ordering::Relaxed),
+            scan_bytes_read: SCAN_BYTES_READ.load(Ordering::Relaxed),
         }
     }
 
@@ -85,6 +105,9 @@ mod imp {
         PREADS.store(0, Ordering::Relaxed);
         PREAD_BYTES.store(0, Ordering::Relaxed);
         ART_CHUNKS.store(0, Ordering::Relaxed);
+        SCAN_OPENS.store(0, Ordering::Relaxed);
+        SCAN_PREADS.store(0, Ordering::Relaxed);
+        SCAN_BYTES_READ.store(0, Ordering::Relaxed);
     }
 }
 
@@ -97,6 +120,9 @@ mod imp {
         pub preads: u64,
         pub pread_bytes: u64,
         pub art_chunks: u64,
+        pub scan_opens: u64,
+        pub scan_preads: u64,
+        pub scan_bytes_read: u64,
     }
 
     #[inline(always)]
@@ -107,6 +133,10 @@ mod imp {
     pub fn on_pread(_bytes: u64) {}
     #[inline(always)]
     pub fn on_art_chunk() {}
+    #[inline(always)]
+    pub fn on_scan_open() {}
+    #[inline(always)]
+    pub fn on_scan_read(_bytes: u64) {}
     #[inline(always)]
     pub fn snapshot() -> Snapshot {
         Snapshot::default()
@@ -131,6 +161,20 @@ mod tests {
         assert_eq!(s.preads, 1);
         assert_eq!(s.pread_bytes, 100);
         assert_eq!(s.art_chunks, 1);
+        reset();
+        assert_eq!(snapshot(), Snapshot::default());
+    }
+
+    #[test]
+    fn scan_counters_accumulate_and_reset() {
+        reset();
+        on_scan_open();
+        on_scan_read(4096);
+        on_scan_read(128);
+        let s = snapshot();
+        assert_eq!(s.scan_opens, 1);
+        assert_eq!(s.scan_preads, 2);
+        assert_eq!(s.scan_bytes_read, 4096 + 128);
         reset();
         assert_eq!(snapshot(), Snapshot::default());
     }
