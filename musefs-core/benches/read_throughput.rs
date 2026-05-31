@@ -7,7 +7,7 @@ use musefs_core::{scan_directory, Mode, MountConfig, Musefs, VirtualTree};
 
 #[path = "../tests/common/mod.rs"]
 mod common;
-use common::corpus::{generate, CorpusParams, Format};
+use common::corpus::{bench_formats, format_token, generate, CorpusParams, Format};
 
 fn config() -> MountConfig {
     MountConfig {
@@ -19,15 +19,29 @@ fn config() -> MountConfig {
     }
 }
 
-/// A small generated corpus with a few MB of audio per track, scanned into an
-/// in-memory DB and mounted. Returns the fs plus all file inodes.
-fn fixture(bytes_per_track: usize, tracks: usize) -> (Arc<Musefs>, Vec<u64>) {
+/// Recursively collect every non-directory inode reachable from `dir`. Used
+/// instead of a name-based lookup because non-FLAC corpus builders embed no tags,
+/// so their tracks render under the `default_fallback` ("Unknown/…") path.
+fn collect_file_inodes(fs: &Musefs, dir: u64, out: &mut Vec<u64>) {
+    for (_, ino, is_dir) in fs.readdir(dir).unwrap() {
+        if is_dir {
+            collect_file_inodes(fs, ino, out);
+        } else {
+            out.push(ino);
+        }
+    }
+}
+
+/// A small single-format generated corpus, scanned into an in-memory DB and
+/// mounted. Returns the fs plus all file inodes (discovered by a format-agnostic
+/// tree walk).
+fn fixture(format: Format, bytes_per_track: usize, tracks: usize) -> (Arc<Musefs>, Vec<u64>) {
     let p = CorpusParams {
         albums: 1,
         tracks_per_album: tracks,
         bytes_per_track,
         art_bytes_per_track: 0,
-        format_mix: vec![Format::Flac],
+        format_mix: vec![format],
         seed: 42,
     };
     let dir = tempfile::tempdir().unwrap();
@@ -36,48 +50,37 @@ fn fixture(bytes_per_track: usize, tracks: usize) -> (Arc<Musefs>, Vec<u64>) {
     scan_directory(&db, dir.path()).unwrap();
     let fs = Arc::new(Musefs::open(db, config()).unwrap());
 
-    // Walk the single album dir to collect file inodes.
-    let artist = fs.lookup(VirtualTree::ROOT, "Artist 00000").unwrap();
-    let sub = fs
-        .readdir(artist)
-        .unwrap()
-        .first()
-        .expect("fixture: expected at least one album dir under the artist")
-        .1; // Album 00000 dir
-    let inodes: Vec<u64> = fs
-        .readdir(sub)
-        .unwrap()
-        .into_iter()
-        .map(|(_, ino, _)| ino)
-        .collect();
+    let mut inodes = Vec::new();
+    collect_file_inodes(&fs, VirtualTree::ROOT, &mut inodes);
+    assert!(!inodes.is_empty(), "fixture: no file inodes for {format:?}");
     // Keep the tempdir alive for the duration of the bench by leaking it.
     std::mem::forget(dir);
     (fs, inodes)
 }
 
 fn bench_sequential_read(c: &mut Criterion) {
-    let (fs, inodes) = fixture(4 * 1024 * 1024, 1);
-    let inode = inodes[0];
-    let size = fs.getattr(inode).unwrap().size;
     let mut group = c.benchmark_group("sequential_read");
-    group.throughput(Throughput::Bytes(size));
     let chunk = 128 * 1024u64;
-    // fh=0 takes the no-handle path: each read resolves the inode via the
-    // HeaderCache rather than reusing a registered fd. This measures the
-    // warm-cache resolve+splice cost, not fd-reuse (which the concurrent bench
-    // exercises via open_handle).
-    group.bench_function("flac_128k_chunks", |b| {
-        b.iter(|| {
-            let mut off = 0u64;
-            while off < size {
-                let got = std::hint::black_box(fs.read(inode, 0, off, chunk).unwrap());
-                if got.is_empty() {
-                    break;
+    for fmt in bench_formats() {
+        let (fs, inodes) = fixture(fmt, 4 * 1024 * 1024, 1);
+        let inode = inodes[0];
+        let size = fs.getattr(inode).unwrap().size;
+        group.throughput(Throughput::Bytes(size));
+        // fh=0 takes the no-handle path: each read resolves the inode via the
+        // HeaderCache rather than reusing a registered fd.
+        group.bench_function(format_token(fmt), |b| {
+            b.iter(|| {
+                let mut off = 0u64;
+                while off < size {
+                    let got = std::hint::black_box(fs.read(inode, 0, off, chunk).unwrap());
+                    if got.is_empty() {
+                        break;
+                    }
+                    off += got.len() as u64;
                 }
-                off += got.len() as u64;
-            }
+            });
         });
-    });
+    }
     group.finish();
 }
 
@@ -88,7 +91,7 @@ fn bench_concurrent_read_and_walk(c: &mut Criterion) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(num_streams);
-    let (fs, inodes) = fixture(1024 * 1024, m.max(2));
+    let (fs, inodes) = fixture(Format::Flac, 1024 * 1024, m.max(2));
 
     // Each iteration streams `m` whole files (reader i reads inodes[i]); the
     // walker does metadata-only ops and contributes no bytes.
