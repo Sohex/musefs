@@ -6,6 +6,7 @@ pub use b64::{b64_len, b64_window, encode_b64_slice, B64Window};
 pub use page::{parse_page, patch_page_header, PageHeader};
 
 use crate::error::{FormatError, Result};
+use crate::probe::Extent;
 
 /// The codec carried inside an Ogg logical bitstream that we synthesize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +208,25 @@ pub fn locate_audio(data: &[u8]) -> Result<OggScan> {
 /// synthesis. Identical to `read_header` but named to mirror `flac::read_metadata`.
 pub fn read_metadata(front: &[u8]) -> Result<OggHeader> {
     read_header(front)
+}
+
+/// Bounded twin of [`read_metadata`]. OGG header packets (and all OGG embedded
+/// art) are front-anchored, so a prefix covering the header region is sufficient.
+/// `read_header` does not expose an exact byte need, so on a short/truncated
+/// prefix this geometrically grows the window (doubling, capped at `file_len`):
+/// header regions are tiny, so the first 1 MiB window almost always completes,
+/// and the cap guarantees the worst case equals reading the whole file.
+pub fn read_metadata_bounded(prefix: &[u8], file_len: u64) -> Result<Extent<OggHeader>> {
+    match read_header(prefix) {
+        Ok(header) => Ok(Extent::Complete(header)),
+        Err(_) if (prefix.len() as u64) < file_len => {
+            let grown = ((prefix.len() as u64).saturating_mul(2)).max(64 * 1024);
+            Ok(Extent::NeedMore {
+                up_to: grown.min(file_len),
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 use crate::input::TagInput;
@@ -1186,5 +1206,52 @@ mod tests {
         let pad = declared - art.description.len() as u32;
         assert!(pad <= 2, "pad must be 0..=2, got {pad}");
         assert_eq!(pad, 0, "base % 3 == 0 implies pad 0");
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use crate::ogg::page_test_support::{build_header_pub, lace_packet_pub, vorbis_body_empty};
+    use crate::probe::Extent;
+
+    /// A minimal Opus stream: OpusHead + OpusTags header packets, then a trailing
+    /// audio page. Returns (full, audio_offset). Mirrors the proven fixture in
+    /// `musefs-core/src/scan.rs::ogg_probe_tests::probe_detects_opus_and_seeds_tags`.
+    /// `build_header_pub(serial, &[&[u8]])` laces *all* header packets across
+    /// pages (BOS set once) and returns `(Vec<u8>, u32)`; `lace_packet_pub` takes
+    /// `(serial, seq_start, bos, granule, packet)` and returns `(Vec<u8>, u32)`.
+    fn opus_stream() -> (Vec<u8>, u64) {
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&vorbis_body_empty());
+        let serial = 0x1234;
+        let (mut v, _) = build_header_pub(serial, &[&head, &tags]);
+        let audio_offset = v.len() as u64;
+        let (audio, _) = lace_packet_pub(serial, 2, false, 960, &[0u8; 100]);
+        v.extend_from_slice(&audio);
+        (v, audio_offset)
+    }
+
+    #[test]
+    fn read_metadata_bounded_complete_when_prefix_covers_header() {
+        let (full, audio_offset) = opus_stream();
+        let file_len = full.len() as u64;
+        let prefix = &full[..audio_offset as usize]; // exactly the header region
+        match read_metadata_bounded(prefix, file_len).unwrap() {
+            Extent::Complete(h) => assert_eq!(h.audio_offset, audio_offset),
+            other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_metadata_bounded_needmore_when_header_truncated() {
+        let (full, _audio_offset) = opus_stream();
+        let file_len = full.len() as u64;
+        let prefix = &full[..20]; // mid first page
+        match read_metadata_bounded(prefix, file_len).unwrap() {
+            Extent::NeedMore { up_to } => assert!(up_to > 20 && up_to <= file_len),
+            other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
+        }
     }
 }
