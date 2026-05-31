@@ -109,6 +109,7 @@ fn prepare_generates_when_no_library_set() {
 fn report_renders_a_row() {
     let r = RunReport {
         label: "scan".into(),
+        format: "flac".into(),
         tier: "ci".into(),
         storage: "tempfs".into(),
         wall_ms: 1234,
@@ -119,6 +120,7 @@ fn report_renders_a_row() {
     };
     let line = r.row();
     assert!(line.contains("scan"));
+    assert!(line.contains("flac"), "format column is rendered");
     assert!(line.contains("ci"));
     assert!(line.contains("n/a"), "fsyncs None renders as n/a");
     // RSS is readable and positive on Linux.

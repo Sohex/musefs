@@ -70,12 +70,16 @@ fn bench_refresh_one_vs_many() {
 
     // `poll_refresh` is pure CPU + DB work, independent of the corpus storage
     // class, so the storage column is fixed rather than derived from the target.
+    // bench_refresh stays FLAC-only: poll_refresh times a DB-driven virtual-tree
+    // rebuild, independent of the backing audio format, so per-format rows would
+    // be pure noise. The format column is fixed to "flac" for table consistency.
     println!("\n{}", RunReport::header());
     for (label, ms) in [("refresh-1", one_ms), ("refresh-N", many_ms)] {
         println!(
             "{}",
             RunReport {
                 label: label.into(),
+                format: "flac".into(),
                 tier: tier.clone(),
                 storage: "tempfs".into(),
                 wall_ms: ms,

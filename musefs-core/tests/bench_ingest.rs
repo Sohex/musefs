@@ -54,6 +54,7 @@ fn bench_cold_scan_and_revalidate() {
         "{}",
         RunReport {
             label: "scan".into(),
+            format: "flac".into(),
             tier: tier.clone(),
             storage: storage.clone(),
             wall_ms: scan_ms,
@@ -68,6 +69,7 @@ fn bench_cold_scan_and_revalidate() {
         "{}",
         RunReport {
             label: "revalidate".into(),
+            format: "flac".into(),
             tier,
             storage,
             wall_ms: reval_ms,

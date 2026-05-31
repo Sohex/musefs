@@ -5,7 +5,7 @@
 /// literal, so this is a macro rather than a `const`.)
 macro_rules! report_fmt {
     ($($arg:expr),* $(,)?) => {
-        format!("{:<10} {:<14} {:<10} {:>10} {:>10} {:>10} {:>10} {:>12}", $($arg),*)
+        format!("{:<10} {:<10} {:<14} {:<10} {:>10} {:>10} {:>10} {:>10} {:>12}", $($arg),*)
     };
 }
 
@@ -14,6 +14,7 @@ macro_rules! report_fmt {
 #[derive(Debug)]
 pub struct RunReport {
     pub label: String,
+    pub format: String,
     pub tier: String,
     pub storage: String,
     pub wall_ms: u128,
@@ -25,13 +26,16 @@ pub struct RunReport {
 
 impl RunReport {
     pub fn header() -> String {
-        report_fmt!("label", "tier", "storage", "wall_ms", "opens", "preads", "fsyncs", "rss_kib")
+        report_fmt!(
+            "label", "format", "tier", "storage", "wall_ms", "opens", "preads", "fsyncs", "rss_kib"
+        )
     }
 
     pub fn row(&self) -> String {
         let opt = |v: Option<u64>| v.map_or_else(|| "n/a".into(), |x| x.to_string());
         report_fmt!(
             self.label,
+            self.format,
             self.tier,
             self.storage,
             self.wall_ms,
