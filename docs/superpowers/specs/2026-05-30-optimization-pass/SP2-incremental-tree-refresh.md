@@ -246,6 +246,25 @@ colliding groups and those groups' descendants — small, because collisions are
 localized (duplicate editions, multi-disc albums, fallback pile-ups), never
 O(library).
 
+### Concurrency / data structure (so mutation is genuinely O(changed))
+
+The tree is published via `ArcSwap<VirtualTree>` (facade.rs:110) for lock-free
+reads, and an `Arc`'d tree is immutable — so "mutate in place" cannot edit the
+published value; it must produce a new `Arc<VirtualTree>`. With plain
+`std::HashMap`/`BTreeMap` internals that means an **O(N) deep clone per publish**,
+which is the same order as today's `build_with` and would negate the O(changed)
+goal. To avoid that, `VirtualTree`'s internals switch to **`im` persistent maps**
+(`im::HashMap` for `nodes`/`track_to_inode`, `im::HashMap<u64, im::OrdMap<String,
+u64>>` for `children` — `OrdMap` preserves the sorted-by-name `readdir` order that
+`BTreeMap` gives today). Structural sharing makes `let mut t = (*current).clone()`
+**O(1)**, the mutation **O(changed)**, and the `ArcSwap` publish unchanged — so
+lock-free reads are preserved *and* a refresh is strictly O(changed). The
+`VirtualTree` public API (`lookup`/`children`/`node`/`inode_of_track`/`track_ids`/
+`build_with`) is unchanged; only the field types and the internal inserts change.
+`im`'s per-lookup cost (HAMT) is marginally above `std` but negligible on the FUSE
+metadata path. (Stage A keeps calling `build_with`, so it benefits from the cheaper
+construction but does not depend on the mutation methods.)
+
 ### Correctness posture (fallback safety valve)
 
 Stage B is intended correct-by-construction and is gated by the full-rebuild
@@ -376,10 +395,11 @@ structure. Both stages ship as part of SP2:
    diff-driven render that assembles `entries` cheaply and calls the existing
    `build_with`. Gated green by the equivalence gate (trivial here) and all
    regression gates. Record `bench_refresh` numbers.
-2. **Stage B — in-place tree mutation.** Add the mutation methods to
-   `VirtualTree` and the canonical-order re-disambiguation, replacing the
-   from-scratch `build_with`. Gated by the full-rebuild property-test oracle
-   (Testing item 1) plus items 4–5. Record `bench_refresh` numbers.
+2. **Stage B — in-place tree mutation.** Migrate `VirtualTree`'s internals to `im`
+   persistent maps (O(1) clone-on-publish), add the mutation methods +
+   canonical-order re-disambiguation, and replace the from-scratch `build_with` in
+   the incremental path. Gated by the full-rebuild property-test oracle (Testing
+   item 1) plus items 4–5. Record `bench_refresh` numbers.
 
 Stages ship as one or two PRs at the implementer's discretion; the gating order
 (Stage A's equivalence + regression gates green before Stage B is layered on) is
