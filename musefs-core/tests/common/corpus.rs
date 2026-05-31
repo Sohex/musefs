@@ -22,7 +22,7 @@ pub enum Format {
 }
 
 /// Map a `MUSEFS_BENCH_FORMAT_MIX` token to a `Format`. Single source of truth
-/// for both `from_env` and `bench_formats`.
+/// for `from_env` (and the upcoming `bench_formats`).
 pub fn format_from_token(token: &str) -> Option<Format> {
     match token.trim() {
         "flac" => Some(Format::Flac),
@@ -103,7 +103,7 @@ impl CorpusParams {
 
     /// Read `MUSEFS_BENCH_TIER` (default `ci`) then apply any `MUSEFS_BENCH_*`
     /// overrides. `MUSEFS_BENCH_FORMAT_MIX` is a comma list of
-    /// flac|mp3|m4a|m4a-last|wav.
+    /// flac|mp3|m4a|m4a-last|ogg|wav.
     pub fn from_env() -> Self {
         let tier = match std::env::var("MUSEFS_BENCH_TIER").as_deref() {
             Ok("large-compute") => Tier::LargeCompute,
@@ -301,7 +301,7 @@ fn generate_one(
             // valid MPEG frame sync (0xFF 0xEx) at the start of the audio region.
             // Prepend one so scan_directory can probe corpus MP3 files regardless
             // of what the filler bytes happen to be.
-            let mut scannable = vec![0xFF, 0xFB]; // MPEG-1 Layer3 sync, CBR
+            let mut scannable = vec![0xFF, 0xFB]; // MPEG-1 Layer3, no CRC (satisfies the 11-bit sync check)
             scannable.extend_from_slice(audio);
             super::write_mp3(&path, &scannable);
             path
