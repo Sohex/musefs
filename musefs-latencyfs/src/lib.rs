@@ -4,10 +4,6 @@
 //! mount, so backing reads and SQLite fsyncs are both delayed (and fsyncs
 //! counted). Not for production; requires /dev/fuse.
 
-// Task 3 will add write ops (create/write/fsync/fsyncdir/setattr/unlink/rename/mkdir/rmdir)
-// that consume forget_path, rename, lat.write, lat.fsync, uid, and gid.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -18,9 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    AccessFlags, BackgroundSession, Config, FileAttr, FileHandle, FileType, FopenFlags, Generation,
-    INodeNo, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyStatfs, Request, Session,
+    AccessFlags, BackgroundSession, BsdFileFlags, Config, FileAttr, FileHandle, FileType,
+    FopenFlags, Generation, INodeNo, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    Session, TimeOrNow, WriteFlags,
 };
 
 const TTL: Duration = Duration::from_secs(1);
@@ -174,7 +171,11 @@ pub struct PassthroughFs {
     next_fh: AtomicU64,
     lat: Latency,
     fsyncs: Arc<AtomicU64>,
+    // Stored for future use (e.g. chown passthrough); attrs are read from disk
+    // metadata via attr_from_meta, so these are not read by any current op.
+    #[allow(dead_code)]
     uid: u32,
+    #[allow(dead_code)]
     gid: u32,
 }
 
@@ -403,6 +404,254 @@ impl fuser::Filesystem for PassthroughFs {
     }
 
     fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        nap(self.lat.open);
+        let Some(pp) = self.ipath(parent.0) else {
+            return reply.error(fuser::Errno::ENOENT);
+        };
+        let child = pp.join(name);
+        let file = match OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&child)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return reply.error(fuser::Errno::from_i32(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                ))
+            }
+        };
+        let m = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                return reply.error(fuser::Errno::from_i32(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                ))
+            }
+        };
+        let ino = self.inodes.lock().unwrap().intern(child);
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.handles.lock().unwrap().insert(fh, file);
+        reply.created(
+            &TTL,
+            &attr_from_meta(ino, &m),
+            Generation(0),
+            FileHandle(fh),
+            FopenFlags::empty(),
+        );
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        nap(self.lat.write);
+        // The `handles` lock is held across `write_at` — safe under single-threaded
+        // dispatch (see `PassthroughFs` invariant and the `read` op comment above).
+        let guard = self.handles.lock().unwrap();
+        let Some(file) = guard.get(&fh.0) else {
+            return reply.error(fuser::Errno::EBADF);
+        };
+        match file.write_at(data, offset) {
+            Ok(n) => reply.written(n as u32),
+            Err(e) => {
+                reply.error(fuser::Errno::from_i32(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                ));
+            }
+        }
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        nap(self.lat.fsync);
+        self.fsyncs.fetch_add(1, Ordering::Relaxed);
+        let guard = self.handles.lock().unwrap();
+        let Some(file) = guard.get(&fh.0) else {
+            return reply.error(fuser::Errno::EBADF);
+        };
+        let r = if datasync {
+            file.sync_data()
+        } else {
+            file.sync_all()
+        };
+        match r {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(fuser::Errno::from_i32(
+                e.raw_os_error().unwrap_or(libc::EIO),
+            )),
+        }
+    }
+
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        nap(self.lat.fsync);
+        self.fsyncs.fetch_add(1, Ordering::Relaxed);
+        reply.ok();
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        nap(self.lat.other);
+        let Some(p) = self.ipath(ino.0) else {
+            return reply.error(fuser::Errno::ENOENT);
+        };
+        // The only attr SQLite needs: truncate/extend the WAL. Propagate any
+        // failure rather than replying ok with the stale (un-truncated) size,
+        // which would lie to the kernel and desync the WAL on disk.
+        if let Some(sz) = size {
+            if let Err(e) = OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .and_then(|f| f.set_len(sz))
+            {
+                return reply.error(fuser::Errno::from_i32(
+                    e.raw_os_error().unwrap_or(libc::EIO),
+                ));
+            }
+        }
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) => reply.attr(&TTL, &attr_from_meta(ino.0, &m)),
+            Err(e) => reply.error(fuser::Errno::from_i32(
+                e.raw_os_error().unwrap_or(libc::EIO),
+            )),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        nap(self.lat.other);
+        let Some(pp) = self.ipath(parent.0) else {
+            return reply.error(fuser::Errno::ENOENT);
+        };
+        let child = pp.join(name);
+        match std::fs::remove_file(&child) {
+            Ok(()) => {
+                self.inodes.lock().unwrap().forget_path(&child);
+                reply.ok();
+            }
+            Err(e) => reply.error(fuser::Errno::from_i32(
+                e.raw_os_error().unwrap_or(libc::EIO),
+            )),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        newparent: INodeNo,
+        newname: &std::ffi::OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        nap(self.lat.other);
+        let (Some(pp), Some(np)) = (self.ipath(parent.0), self.ipath(newparent.0)) else {
+            return reply.error(fuser::Errno::ENOENT);
+        };
+        let from = pp.join(name);
+        let to = np.join(newname);
+        match std::fs::rename(&from, &to) {
+            Ok(()) => {
+                self.inodes.lock().unwrap().rename(&from, to);
+                reply.ok();
+            }
+            Err(e) => reply.error(fuser::Errno::from_i32(
+                e.raw_os_error().unwrap_or(libc::EIO),
+            )),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        nap(self.lat.other);
+        let Some(pp) = self.ipath(parent.0) else {
+            return reply.error(fuser::Errno::ENOENT);
+        };
+        let child = pp.join(name);
+        match std::fs::create_dir(&child).and_then(|()| std::fs::symlink_metadata(&child)) {
+            Ok(m) => {
+                let ino = self.inodes.lock().unwrap().intern(child);
+                reply.entry(&TTL, &attr_from_meta(ino, &m), Generation(0));
+            }
+            Err(e) => reply.error(fuser::Errno::from_i32(
+                e.raw_os_error().unwrap_or(libc::EIO),
+            )),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        nap(self.lat.other);
+        let Some(pp) = self.ipath(parent.0) else {
+            return reply.error(fuser::Errno::ENOENT);
+        };
+        let child = pp.join(name);
+        match std::fs::remove_dir(&child) {
+            Ok(()) => {
+                self.inodes.lock().unwrap().forget_path(&child);
+                reply.ok();
+            }
+            Err(e) => reply.error(fuser::Errno::from_i32(
+                e.raw_os_error().unwrap_or(libc::EIO),
+            )),
+        }
+    }
 }
 
 /// Serializes the racy fusermount3 mount handshake. `Session::new` forks/execs
