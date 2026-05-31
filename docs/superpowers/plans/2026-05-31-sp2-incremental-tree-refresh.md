@@ -1821,3 +1821,68 @@ cargo fmt && cargo clippy --all-targets
 git add musefs-core/tests BENCHMARKS.md docs/superpowers/specs/2026-05-30-optimization-pass/README.md
 git commit -m "test+bench(core): Stage B fallback + flat-across-size refresh; SP2 done (SP2 B7)"
 ```
+
+---
+
+# RESUME NOTE — Stage A complete; pick up at B1 (added 2026-05-31)
+
+Stage A (A1–A7) is **implemented, reviewed, and committed** on branch
+`sp2-incremental-tree-refresh` (HEAD `3aa97b7` at handoff). Verified checkpoint:
+`cargo test` → 515 passed / 20 ignored; `cargo clippy --all-targets` → clean;
+working tree clean. Stage A commits (one per task):
+
+- A1 `d4de29c` `Db::list_render_keys`
+- A2 `40217a8` `Db::tags_for_tracks`
+- A3 `7af9df9` `refresh_diff.rs` (`TrackRenderState`/`ChangeSet`/`partition_changes`)
+- A4 `e59cc13` versions map → `TrackRenderState` snapshot + `notify_changed`
+- A5 `6cd6b71` `rebuild_incremental` (changed-only render) + equivalence oracle
+- A6 `efd433e` change-detection + format-only invalidation tests
+- A7 `3aa97b7` library-size refresh bench + recorded Stage A baseline
+
+**Start at Task B1.** Use superpowers:subagent-driven-development. The B1–B7 task
+text above is authoritative; the notes below are session-discovered facts that are
+NOT otherwise in the plan and will save a failed-commit or two.
+
+1. **Pre-commit hook runs `cargo clippy --all-targets -- -D warnings`.** Every
+   commit is rejected on ANY warning (unused import, `dead_code`, unused var).
+   Run `cargo fmt && cargo clippy --all-targets -- -D warnings` before each commit.
+   Gate types staged ahead of their caller with a targeted `#[allow(dead_code)]`;
+   a redundant `allow` on a now-used item is harmless.
+
+2. **`tree.rs` and `musefs-core/Cargo.toml` are pristine vs. the plan's pins** —
+   Stage A did not touch them, so B1's `VirtualTree` internals
+   (`nodes`/`children`/`track_to_inode`, `InodeAllocator`) and the `im` dep-add are
+   exactly as the plan describes.
+
+3. **Test helpers already exist** in `musefs-core/tests/incremental_refresh.rs`
+   (created A5/A6): `small_corpus(n)`, `config()`, `tree_fingerprint(fs)`. **B6
+   appends to this file — do NOT redefine them.**
+
+4. **`write_min_corpus` does not exist** (see the "Test corpus helper" section near
+   the top). Use `small_corpus(n)` / `prepare(&CorpusParams::single(Format::Flac, 1, n))`.
+
+5. **Format-type clash in test files (bit A6):** `small_corpus`/`CorpusParams::single`
+   take **`common::corpus::Format`**, while `NewTrack`/`set_format_for_test` take
+   **`musefs_db::Format`**. The test file already imports `Format` from
+   `common::corpus`, so B6's `Op::Add` (`musefs_db::NewTrack { format: … }`) must
+   write **`musefs_db::Format::Flac` fully-qualified** to avoid the clash.
+
+6. **B5 wiring:** `poll_refresh_notify` currently discards the changeset as
+   `let (new_snapshot, _change) = self.rebuild_incremental(&old_snapshot)?` — B5
+   wires `_change` into `apply_changes`. `refresh_diff.rs` still carries harmless
+   `#[allow(dead_code)]` on `ChangeSet`/`is_empty`/`partition_changes`.
+
+7. **B4 is the hard task.** `apply_changes` (introducing-id dirty propagation) is
+   where correctness lives. Honor the plan's discipline: if the B6 property oracle
+   finds a divergence, **widen the dirty set in `apply_changes` — never change
+   `rebuild_subtree`.** Use a capable model for B4/B5 and treat the B6 proptest +
+   the B5 debug-assert (`tree.equiv(&build_with(...))`, paths AND inodes) as the
+   gates.
+
+8. **A4 contract note (context, not action):** `notify_changed` fires the OLD inode
+   on a path move and the (stable) inode on an in-place content change; a moved
+   track's new path gets a freshly-allocated inode with no kernel cache, so it is
+   intentionally NOT notified. One pre-existing facade test was updated to assert
+   this. Cross-instance equivalence compares **path keys only** (two independent
+   `Musefs` allocators legitimately assign different inode numbers); inode
+   *stability within one instance* is what B5's debug-assert guards.
