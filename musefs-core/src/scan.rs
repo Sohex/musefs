@@ -22,6 +22,7 @@ const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 pub struct ScanStats {
     pub scanned: u64,
     pub skipped: u64,
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub struct RevalidateStats {
     pub updated: u64,
     pub unchanged: u64,
     pub pruned: u64,
+    pub failed: u64,
 }
 
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
@@ -367,16 +369,22 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut stats = ScanStats {
         scanned: 0,
         skipped: 0,
+        failed: 0,
     };
     for path in files {
-        let meta = std::fs::metadata(&path)?;
-        let Some(probed) = probe_file(&path, meta.len())? else {
-            stats.skipped += 1;
+        let Ok(meta) = std::fs::metadata(&path) else {
+            stats.failed += 1;
             continue;
         };
-        let abs = std::fs::canonicalize(&path)?;
-        ingest(db, &abs.to_string_lossy(), &meta, probed)?;
-        stats.scanned += 1;
+        match probe_file(&path, meta.len()) {
+            Ok(Some(probed)) => {
+                let abs = std::fs::canonicalize(&path)?;
+                ingest(db, &abs.to_string_lossy(), &meta, probed)?;
+                stats.scanned += 1;
+            }
+            Ok(None) => stats.skipped += 1,
+            Err(_) => stats.failed += 1,
+        }
     }
     Ok(stats)
 }
@@ -396,6 +404,7 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut stats = ScanStats {
         scanned: 0,
         skipped: 0,
+        failed: 0,
     };
     for path in files {
         let bytes = std::fs::read(&path)?;
@@ -425,10 +434,17 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
         updated: 0,
         unchanged: 0,
         pruned: 0,
+        failed: 0,
     };
     for path in files {
-        let meta = std::fs::metadata(&path)?;
-        let abs = std::fs::canonicalize(&path)?;
+        let Ok(meta) = std::fs::metadata(&path) else {
+            stats.failed += 1;
+            continue;
+        };
+        let Ok(abs) = std::fs::canonicalize(&path) else {
+            stats.failed += 1;
+            continue;
+        };
         let abs_str = abs.to_string_lossy().to_string();
 
         if let Some(existing) = db.get_track_by_path(&abs_str)? {
@@ -440,11 +456,16 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
             }
         }
 
-        let Some(probed) = probe_file(&path, meta.len())? else {
-            continue;
-        };
-        ingest(db, &abs_str, &meta, probed)?;
-        stats.updated += 1;
+        match probe_file(&path, meta.len()) {
+            Ok(Some(probed)) => {
+                ingest(db, &abs_str, &meta, probed)?;
+                stats.updated += 1;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                stats.failed += 1;
+            }
+        }
     }
 
     // Prune tracks under `root` whose backing file is gone. Scoped to `root` so a
@@ -826,6 +847,25 @@ mod bounded_probe_tests {
         bytes.extend(std::iter::repeat_n(0u8, 34));
         bytes.extend_from_slice(b"AUDIOPAYLOAD");
         bytes
+    }
+
+    #[test]
+    fn scan_counts_unreadable_file_as_failed_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        // One good FLAC + one zero-byte ".flac" that cannot parse.
+        let good = dir.path().join("good.flac");
+        let mut bytes = b"fLaC".to_vec();
+        bytes.push(0x80);
+        bytes.extend_from_slice(&[0, 0, 34]);
+        bytes.extend(std::iter::repeat_n(0u8, 34));
+        bytes.extend_from_slice(b"AUDIO");
+        std::fs::write(&good, &bytes).unwrap();
+        std::fs::write(dir.path().join("bad.flac"), b"").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let stats = scan_directory(&db, dir.path()).unwrap();
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.skipped + stats.failed, 1);
     }
 
     #[test]

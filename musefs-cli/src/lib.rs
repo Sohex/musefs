@@ -99,15 +99,15 @@ pub fn run_scan(db_path: &Path, backing_dir: &Path, revalidate: bool) -> Result<
         let stats = musefs_core::revalidate(&db, backing_dir)
             .with_context(|| format!("revalidating {}", backing_dir.display()))?;
         println!(
-            "revalidated: {} updated, {} unchanged, {} pruned",
-            stats.updated, stats.unchanged, stats.pruned
+            "revalidated: {} updated, {} unchanged, {} pruned, {} failed",
+            stats.updated, stats.unchanged, stats.pruned, stats.failed
         );
     } else {
         let stats = musefs_core::scan_directory(&db, backing_dir)
             .with_context(|| format!("scanning {}", backing_dir.display()))?;
         println!(
-            "scanned {} file(s), skipped {}",
-            stats.scanned, stats.skipped
+            "scanned {} file(s), skipped {}, failed {}",
+            stats.scanned, stats.skipped, stats.failed
         );
     }
     Ok(())
