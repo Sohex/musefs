@@ -161,3 +161,14 @@ commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
   files). Caveat: on tempfs/RAM with sub-window files (`large-compute`) the
   pipeline overhead makes it ~1.9× slower (no fsync cost to amortize). See
   `BENCHMARKS.md` §1–§4.
+- **SP2 Stage A — Incremental tree refresh (baseline)** (2026-05-31, box under
+  load · tempfs · FLAC): Stage A already renders incrementally (only the changed
+  track is re-rendered, O(changed)); the remaining O(N) cost is the
+  `VirtualTree::build_with` full tree reconstruction, which Stage B eliminates.
+  Hence refresh-1 still scales ~linearly with N. Library-size sweep (refresh-1
+  wall, release): **100→0 ms, 1000→4 ms, 5000→41 ms**. Caveat: single-album
+  corpus (no disambiguation), so `build_with` time is slightly optimistic vs a
+  real multi-album library. This is the Stage A baseline; Stage B (in-place tree
+  mutation) targets a flat refresh-1 vs N. Harness:
+  `bench_refresh_one_across_library_sizes`. See `BENCHMARKS.md` "SP2 —
+  Incremental tree refresh".

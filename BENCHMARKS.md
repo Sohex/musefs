@@ -101,3 +101,30 @@ MUSEFS_BENCH_TIER=large-compute MUSEFS_BENCH_FORMAT_MIX=flac [MUSEFS_BENCH_JOBS=
 
 - The bounded path issues a 128-byte ID3v1 tail read for *every* front-anchored file, but only MP3 consumes it — gating it to MP3 would drop a syscall/file for FLAC/OGG/WAV.
 - `ingest_bulk` clones each picture's bytes (the batch holds `&Probed`); draining owned `Unit`s into the writer would let the art move instead of copy.
+
+---
+
+## SP2 — Incremental tree refresh
+
+*Measured 2026-05-31 (box under load — relative scaling is the signal, not absolute ms).*
+
+### Stage A baseline — single-track refresh vs library size
+
+A single-track re-tag triggers `poll_refresh`. At Stage A the rebuild *already renders incrementally* — only the changed track is re-rendered (O(changed)) — but the subsequent `VirtualTree::build_with` reconstructs the *whole* tree from scratch (O(N)). That full tree-construction step is the remaining linear cost; Stage B eliminates it (in-place tree mutation). The sweep times one-track refresh across three library sizes to capture the Stage A baseline.
+
+`ci` tier, FLAC, on tempfs. Each library size gets its own tempdir + cold DB (no cross-size collision).
+
+| library size (N tracks) | refresh-1 wall (ms) |
+|------------------------:|--------------------:|
+| 100   | 0 |
+| 1000  | 4 |
+| 5000  | 41 |
+
+Refresh-1 wall time grows roughly linearly with N: the single-track render is O(changed), but the `VirtualTree::build_with` full reconstruction it feeds is O(N). This is the expected Stage A baseline; **Stage B targets flat** refresh-1 by mutating the tree in place instead of rebuilding it, so cost scales with the changed set, not the library.
+
+Caveat: the sweep corpus is single-album (one artist / one album, no path collisions or disambiguation), so the `build_with` time here is slightly optimistic versus a real multi-album library.
+
+```bash
+cargo test -p musefs-core --release --test bench_refresh \
+  bench_refresh_one_across_library_sizes -- --ignored --nocapture
+```
