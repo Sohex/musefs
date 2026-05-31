@@ -2,9 +2,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
-use musefs_format::{flac, mp3, mp4, ogg, wav, EmbeddedPicture};
+use musefs_format::{flac, mp3, mp4, ogg, wav, EmbeddedPicture, Extent};
 
 use crate::error::Result;
+
+/// Initial bounded-read window. Covers typical metadata + cover art; a larger
+/// metadata region triggers a `NeedMore` widen.
+const WINDOW: usize = 1 << 20; // 1 MiB
+/// Cap on widen iterations before falling back to a whole-file read.
+const MAX_WIDEN_RETRIES: usize = 8;
 
 /// Skip embedded art whose image bytes exceed this. The binding limit is FLAC's
 /// 24-bit PICTURE block length (~16 MiB for the whole block); reserve 64 KiB of
@@ -66,7 +72,7 @@ fn collect_audio(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 
 /// A backing file parsed into the fields a track row needs, plus its raw
 /// `(key, value)` tags to seed.
-struct Probed {
+pub(crate) struct Probed {
     format: Format,
     audio_offset: u64,
     audio_length: u64,
@@ -74,9 +80,9 @@ struct Probed {
     pictures: Vec<EmbeddedPicture>,
 }
 
-/// Parse one backing file into a `Probed`, or `None` if it does not parse as a
-/// supported format (and should be skipped).
-fn probe(path: &Path, bytes: &[u8]) -> Option<Probed> {
+/// Full-buffer probe (legacy path). Retained as the reference implementation the
+/// bounded path is checked against (see the equivalence property test).
+pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
     if has_ext(path, "flac") {
         let scan = flac::locate_audio(bytes).ok()?;
         Some(Probed {
@@ -129,6 +135,151 @@ fn probe(path: &Path, bytes: &[u8]) -> Option<Probed> {
         })
     } else {
         None
+    }
+}
+
+/// Read `[0, len)` of `path` into a buffer, counting the read. A short read at
+/// EOF is fine (`len` may exceed the file size).
+fn read_window(file: &std::fs::File, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; len];
+    let n = file.read_at(&mut buf, 0)?;
+    buf.truncate(n);
+    crate::metrics::on_scan_read(n as u64);
+    Ok(buf)
+}
+
+/// Read the file's last 128 bytes (for the MP3 ID3v1 trailer check), or `None`
+/// if the file is shorter than 128 bytes.
+fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<[u8; 128]>> {
+    if file_len < 128 {
+        return Ok(None);
+    }
+    use std::os::unix::fs::FileExt;
+    let mut buf = [0u8; 128];
+    file.read_exact_at(&mut buf, file_len - 128)?;
+    crate::metrics::on_scan_read(128);
+    Ok(Some(buf))
+}
+
+/// Bounded probe of one backing file: open once, read a bounded window, dispatch
+/// per format, widening on `NeedMore`. Never reads the audio payload (M4A uses
+/// the seek reader; front-anchored formats read only the metadata extent).
+/// Returns `Ok(None)` for an unsupported/unparseable file (to be skipped).
+fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
+    let file = std::fs::File::open(path)?;
+    crate::metrics::on_scan_open();
+
+    // M4A: seek reader, never touches mdat.
+    if has_ext(path, "m4a") || has_ext(path, "m4b") {
+        let mut f = &file;
+        let Ok(scan) = mp4::read_structure_from(&mut f, file_len) else {
+            return Ok(None);
+        };
+        return Ok(Some(Probed {
+            format: Format::M4a,
+            audio_offset: scan.mdat_payload_offset,
+            audio_length: scan.mdat_payload_len,
+            tags: mp4::read_tags(&scan.moov),
+            pictures: mp4::read_pictures(&scan.moov),
+        }));
+    }
+
+    // Front-anchored formats: read a window, widen on NeedMore.
+    let tail = read_tail_128(&file, file_len)?;
+    let mut want = (WINDOW as u64).min(file_len) as usize;
+    let mut prefix = read_window(&file, want)?;
+    for _ in 0..MAX_WIDEN_RETRIES {
+        match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
+            Probe::Done(p) => return Ok(Some(p)),
+            Probe::Skip => return Ok(None),
+            Probe::NeedMore(up_to) => {
+                // Already at EOF? The prefix is the whole file; widening can't help.
+                if want as u64 >= file_len {
+                    break;
+                }
+                // Grow to at least `up_to` (capped at the file), always making
+                // progress (`+1`), then retry.
+                want = (up_to.min(file_len) as usize)
+                    .max(want + 1)
+                    .min(file_len as usize);
+                prefix = read_window(&file, want)?;
+            }
+        }
+    }
+    // Fallback: read the whole file once and use the full-buffer probe.
+    if (prefix.len() as u64) < file_len {
+        prefix = read_window(&file, file_len as usize)?;
+    }
+    Ok(probe_full(path, &prefix))
+}
+
+/// Outcome of a single bounded dispatch attempt against the current `prefix`.
+enum Probe {
+    Done(Probed),
+    NeedMore(u64),
+    Skip,
+}
+
+/// Dispatch the front-anchored formats against `prefix` + `file_len`.
+fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 128]>) -> Probe {
+    if has_ext(path, "flac") {
+        match flac::read_metadata_bounded(prefix) {
+            Ok(Extent::Complete(meta)) => Probe::Done(Probed {
+                format: Format::Flac,
+                audio_offset: meta.audio_offset,
+                audio_length: file_len - meta.audio_offset,
+                tags: flac::read_vorbis_comments(prefix).unwrap_or_default(),
+                pictures: flac::read_pictures(prefix).unwrap_or_default(),
+            }),
+            Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
+            Err(_) => Probe::Skip,
+        }
+    } else if has_ext(path, "mp3") {
+        match mp3::locate_audio_bounded(prefix, file_len, tail) {
+            Ok(Extent::Complete(b)) => Probe::Done(Probed {
+                format: Format::Mp3,
+                audio_offset: b.audio_offset,
+                audio_length: b.audio_length,
+                tags: mp3::read_tags(prefix),
+                pictures: mp3::read_pictures(prefix),
+            }),
+            Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
+            Err(_) => Probe::Skip,
+        }
+    } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
+        match ogg::read_metadata_bounded(prefix, file_len) {
+            Ok(Extent::Complete(header)) => {
+                let format = match header.codec {
+                    ogg::Codec::Opus => Format::Opus,
+                    ogg::Codec::Vorbis => Format::Vorbis,
+                    ogg::Codec::OggFlac => Format::OggFlac,
+                };
+                Probe::Done(Probed {
+                    format,
+                    audio_offset: header.audio_offset,
+                    audio_length: file_len - header.audio_offset,
+                    tags: ogg::read_tags(prefix).unwrap_or_default(),
+                    pictures: ogg::read_pictures(prefix).unwrap_or_default(),
+                })
+            }
+            Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
+            Err(_) => Probe::Skip,
+        }
+    } else if has_ext(path, "wav") {
+        match wav::locate_audio_bounded(prefix, file_len) {
+            Ok(Extent::Complete(b)) => Probe::Done(Probed {
+                format: Format::Wav,
+                audio_offset: b.audio_offset,
+                audio_length: b.audio_length,
+                tags: wav::read_tags(prefix),
+                pictures: wav::read_pictures(prefix),
+            }),
+            Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
+            Err(_) => Probe::Skip,
+        }
+    } else {
+        Probe::Skip
     }
 }
 
@@ -204,12 +355,11 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
         skipped: 0,
     };
     for path in files {
-        let bytes = std::fs::read(&path)?;
-        let Some(probed) = probe(&path, &bytes) else {
+        let meta = std::fs::metadata(&path)?;
+        let Some(probed) = probe_file(&path, meta.len())? else {
             stats.skipped += 1;
             continue;
         };
-        let meta = std::fs::metadata(&path)?;
         let abs = std::fs::canonicalize(&path)?;
         ingest(db, &abs.to_string_lossy(), &meta, probed)?;
         stats.scanned += 1;
@@ -246,11 +396,11 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
             }
         }
 
-        let bytes = std::fs::read(&path)?;
-        if let Some(probed) = probe(&path, &bytes) {
-            ingest(db, &abs_str, &meta, probed)?;
-            stats.updated += 1;
-        }
+        let Some(probed) = probe_file(&path, meta.len())? else {
+            continue;
+        };
+        ingest(db, &abs_str, &meta, probed)?;
+        stats.updated += 1;
     }
 
     // Prune tracks under `root` whose backing file is gone. Scoped to `root` so a
@@ -299,7 +449,7 @@ mod ogg_probe_tests {
             .write_all(&bytes)
             .unwrap();
 
-        let probed = probe(&path, &bytes).expect("opus should probe");
+        let probed = probe_full(&path, &bytes).expect("opus should probe");
         assert_eq!(probed.format, Format::Opus);
         assert_eq!(probed.audio_offset, (bytes.len() - audio.len()) as u64);
     }
@@ -340,7 +490,7 @@ mod ogg_probe_tests {
             .write_all(&bytes)
             .unwrap();
 
-        let probed = probe(&path, &bytes).expect("oga should probe");
+        let probed = probe_full(&path, &bytes).expect("oga should probe");
         assert_eq!(probed.format, Format::Opus);
     }
 }
@@ -383,7 +533,7 @@ mod wav_probe_tests {
             .write_all(&bytes)
             .unwrap();
 
-        let probed = probe(&path, &bytes).expect("wav should probe");
+        let probed = probe_full(&path, &bytes).expect("wav should probe");
         assert_eq!(probed.format, Format::Wav);
         assert_eq!(probed.audio_length, 16);
     }
@@ -450,7 +600,7 @@ mod hardening_tests {
             let path = dir.path().join(name);
             std::fs::write(&path, b"not a real audio file").unwrap();
             assert!(
-                probe(&path, b"not a real audio file").is_none(),
+                probe_full(&path, b"not a real audio file").is_none(),
                 "{name} must skip"
             );
         }
@@ -615,5 +765,44 @@ mod hardening_tests {
                 .any(|t| t.backing_path == ghost.to_string_lossy()),
             "ghost track must still exist"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_probe_tests {
+    use super::*;
+    use musefs_db::Db;
+
+    /// Minimal FLAC: marker + a single last STREAMINFO (34-byte body) + audio.
+    /// FLAC has no frame-sync check at the audio offset, so any payload works.
+    fn flac_fixture() -> Vec<u8> {
+        let mut bytes = b"fLaC".to_vec();
+        bytes.push(0x80); // last-block flag set, type 0 (STREAMINFO)
+        bytes.extend_from_slice(&[0, 0, 34]); // 24-bit length = 34
+        bytes.extend(std::iter::repeat_n(0u8, 34));
+        bytes.extend_from_slice(b"AUDIOPAYLOAD");
+        bytes
+    }
+
+    #[test]
+    fn scan_directory_bounded_matches_full_for_flac() {
+        // A FLAC fixture written to a temp dir, scanned with the (default) bounded
+        // path, yields a track with the same audio bounds as a full-file probe.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        let bytes = flac_fixture();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let full = probe_full(&path, &bytes).expect("full probe");
+
+        let db = Db::open_in_memory().unwrap();
+        let stats = scan_directory(&db, dir.path()).unwrap();
+        assert_eq!(stats.scanned, 1);
+        let track = db
+            .get_track_by_path(&std::fs::canonicalize(&path).unwrap().to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(track.audio_offset as u64, full.audio_offset);
+        assert_eq!(track.audio_length as u64, full.audio_length);
     }
 }
