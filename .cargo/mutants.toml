@@ -27,3 +27,54 @@ exclude_globs = [
     "musefs/**",
     "musefs-core/src/metrics.rs",
 ]
+
+# Equivalent / unreachable mutants in the SP1 scan pipeline that no correctness
+# test can kill (they alter performance or batching granularity, not observable
+# results, or live in unreachable defensive branches). Documented per class.
+# Anchored on file:line:col so only the proven-equivalent sites are suppressed;
+# killable siblings (e.g. flac `|`->`&`, scan 711 `+`->`*`) stay in scope.
+exclude_re = [
+    # probe_file widen loop: `.max(want + 1)` is dominated — the bounded probers
+    # only return `NeedMore{up_to}` with `up_to > want` (we widen precisely to a
+    # block end past the prefix), so `up_to.min(file_len)` always wins the max and
+    # the `want + 1` term is never selected. `+`->`-`/`*` are equivalent.
+    'musefs-core/src/scan\.rs:225:31:',
+    # probe_file post-loop fallback guard `(prefix.len() as u64) < file_len`: when
+    # it differs, the only effect is a redundant whole-file re-read that feeds the
+    # same `probe_full` result. The >8-retry path that could diverge is unreachable
+    # given the probers' exact (FLAC/MP3/WAV) / geometric (Ogg) NeedMore.
+    'musefs-core/src/scan\.rs:232:30:',
+    # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
+    # the persisted track set is identical for any positive capacity.
+    'musefs-core/src/scan\.rs:493:46:',
+    # run_pipeline flush cadence (batch_bytes accounting + the
+    # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
+    # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on
+    # top of the flush-on-empty safety net + the final post-loop flush, so any
+    # cadence mutation persists the identical track set. The win is fewer commits
+    # (fsyncs), a performance property only observable via the `metrics`
+    # instrumentation the in-diff gate does not build.
+    'musefs-core/src/scan\.rs:573:29:',
+    'musefs-core/src/scan\.rs:575:32:',
+    'musefs-core/src/scan\.rs:575:47:',
+    'musefs-core/src/scan\.rs:575:62:',
+    'musefs-core/src/scan\.rs:583:37:',
+    'musefs-core/src/scan\.rs:585:40:',
+    'musefs-core/src/scan\.rs:585:55:',
+    'musefs-core/src/scan\.rs:585:70:',
+    # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
+    # collect_audio yields only existing regular files, so a just-collected file's
+    # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
+    # from a deterministic test. With skip_failed identically 0, the `failed =
+    # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
+    # variant IS caught, so only `-` is excluded here).
+    'musefs-core/src/scan\.rs:672:25:',
+    'musefs-core/src/scan\.rs:676:25:',
+    'musefs-core/src/scan\.rs:711:29: replace \+ with -',
+    # flac::read_metadata_bounded 24-bit block-length assembly: the three length
+    # bytes occupy disjoint bit ranges after shifting, so `|`, `^`, and `+` are
+    # bit-for-bit identical there (the `|`->`&` variant collapses to 0 and IS
+    # caught). Same equivalence the sibling parse_blocks/read_vorbis_comments tests
+    # already note.
+    'musefs-format/src/flac\.rs:\d+:\d+: replace \| with \^ in read_metadata_bounded',
+]

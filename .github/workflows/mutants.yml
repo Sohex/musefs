@@ -58,7 +58,20 @@ jobs:
           # there would falsely survive. That crate is mutation-tested in the
           # scheduled `full` job below, which installs libfuse and runs its
           # mounted #[ignore]d tests. Exclude it here so the gate stays honest.
-          cargo mutants --in-diff mutants.diff -j1 --exclude 'musefs-latencyfs/**'
+          # `--output` collects the per-mutant report (missed.txt / caught.txt /
+          # outcomes.json) so it can be uploaded even when the gate fails, giving
+          # the authoritative survivor list without re-running the campaign.
+          cargo mutants --in-diff mutants.diff -j1 --exclude 'musefs-latencyfs/**' \
+            --output mutants-out/in-diff
+      - name: Upload survivor report
+        # `always()` so the report uploads even when the gate fails on a survivor
+        # (the failing run is exactly when the survivor list is wanted).
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mutants-in-diff
+          path: mutants-out/in-diff
+          if-no-files-found: warn
 
   canary:
     # Per-PR: exercise the REAL scripts/mutants.sh pipeline (out-of-repo scratch,
