@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Run cargo-mutants over the three logic-bearing crates with a disk budget that
-# fits a small VPS. Known-good cargo-mutants version: 27.0.0.
+# Run cargo-mutants over the logic-bearing crates with a disk budget that fits a
+# small VPS. Known-good cargo-mutants version: 27.0.0.
 #
-# musefs-cli, musefs-fuse, and musefs-latencyfs are intentionally out of scope
-# (thin glue / e2e-only — the FUSE crates need /dev/fuse; see the remediation
-# tracking doc). The per-PR `--in-diff` gate excludes them via .cargo/mutants.toml.
+# musefs-cli, musefs-fuse, and the `musefs` binary are thin glue with no real
+# logic and are excluded from mutation entirely via .cargo/mutants.toml.
+# musefs-latencyfs is NOT thin (inode map, latency table, attr mapping, passthrough
+# ops): it has its own leg below, which runs the crate's #[ignore]d mounted tests
+# (`-- -- --include-ignored`) and so needs /dev/fuse + libfuse. The fast per-PR
+# `--in-diff` gate excludes it separately (that job is mountless); see mutants.yml.
 #
-# Usage: scripts/mutants.sh [crate ...]   (default: all three in-scope crates)
+# Usage: scripts/mutants.sh [crate ...]   (default: the three in-scope logic crates)
 # Env:   MUTANTS_TMP  scratch PARENT dir, MUST be OUTSIDE this repo (default: the
 #                     system temp dir). cargo-mutants copies the source tree into
 #                     a build dir under TMPDIR, so a scratch dir inside the repo

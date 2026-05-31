@@ -33,7 +33,12 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Collect coverage
-        run: cargo llvm-cov --workspace --exclude musefs-fuse --lcov --output-path lcov.info
+        # musefs-fuse and musefs-latencyfs are the FUSE crates: their behavior is
+        # exercised only by #[ignore]d /dev/fuse e2e tests, which this job does not
+        # run, so instrumenting them would report misleading near-zero coverage.
+        # They follow the FUSE coverage strategy (scored by e2e evidence, not
+        # llvm-cov); see docs/audits/2026-05-29-test-audit.md.
+        run: cargo llvm-cov --workspace --exclude musefs-fuse --exclude musefs-latencyfs --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354
         with:
