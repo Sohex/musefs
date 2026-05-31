@@ -88,6 +88,15 @@ pub fn locate_audio_bounded(
         return Ok(Extent::NeedMore { up_to: 10 });
     }
 
+    // The audio start (plus its 2-byte frame sync) must fit in the file. Mirrors
+    // the unbounded `locate_audio`'s `audio_offset + 1 >= len` reject: without
+    // this, a tag that claims audio begins at/after EOF would return `NeedMore`
+    // with `up_to > file_len`, and the caller would widen to the full file and
+    // get the same answer every retry instead of failing fast.
+    if audio_offset as u64 + 2 > file_len {
+        return Err(FormatError::NotMp3);
+    }
+
     // Need the frame-sync pair at the audio offset to be inside the prefix.
     if audio_offset + 2 > prefix.len() {
         return Ok(Extent::NeedMore {
@@ -1173,6 +1182,21 @@ mod tests {
                 assert_eq!(b.audio_length, body_end as u64 - audio_offset);
             }
             other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn locate_audio_bounded_rejects_audio_start_past_eof() {
+        // An ID3v2 tag whose declared length leaves no room for the frame sync
+        // (audio_offset == file_len). The bounded prober must fail fast with
+        // `NotMp3` rather than loop on `NeedMore { up_to > file_len }`.
+        let mut full = b"ID3\x04\x00\x00".to_vec();
+        full.extend_from_slice(&syncsafe(8));
+        full.extend(std::iter::repeat_n(0u8, 8)); // tag body; file ends here
+        let file_len = full.len() as u64; // == tag end == audio_offset
+        match locate_audio_bounded(&full, file_len, None) {
+            Err(FormatError::NotMp3) => {}
+            other => panic!("expected Err(NotMp3), got {other:?}"),
         }
     }
 }

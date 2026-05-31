@@ -27,7 +27,7 @@ Before/after measurements for the [2026-05-30 optimization pass](docs/superpower
 | ogg       | 2679 | 20 | 134× |
 | wav       | 3033 | 96 | 32× |
 
-```
+```bash
 MUSEFS_BENCH_TIER=ci MUSEFS_BENCH_DIR=/path/on/ssd \
   cargo test --release -p musefs-core --features metrics --test bench_ingest \
   -- --ignored --nocapture bench_cold_scan_and_revalidate
@@ -47,7 +47,7 @@ MUSEFS_BENCH_TIER=ci MUSEFS_BENCH_DIR=/path/on/ssd \
 ¹ `main` has no `scan_bytes_read` counter; it `fs::read`s every 30 MiB file in full, so it reads the whole ~30 GiB corpus. The "after" reads only a 1 MiB metadata window per file (1.05 GiB total).
 ² `main` holds one 30 MiB file in memory at a time (released per file); the pipeline holds its in-flight art budget + worker buffers. Neither is unbounded. The memory *win* is on M4A moov-last (the seek reader avoids slurping a hundreds-of-MB audiobook to reach a trailing `moov`) — not captured by this FLAC corpus.
 
-```
+```bash
 MUSEFS_BENCH_TIER=bandwidth MUSEFS_BENCH_FORMAT_MIX=flac MUSEFS_BENCH_DIR=/path/on/ssd \
   cargo test --release -p musefs-core --features metrics --test bench_ingest \
   -- --ignored --nocapture bench_cold_scan_and_revalidate
@@ -64,7 +64,7 @@ MUSEFS_BENCH_TIER=bandwidth MUSEFS_BENCH_FORMAT_MIX=flac MUSEFS_BENCH_DIR=/path/
 
 The 403 → 0 fsync collapse is the root cause of §1's durable-storage speedups: SP1 commits one transaction per batch (≤256 files) under `synchronous=NORMAL`, so the WAL is not fsync'd per commit.
 
-```
+```bash
 MUSEFS_BENCH_LATENCY_PROFILE=ssd MUSEFS_BENCH_TIER=ci MUSEFS_BENCH_FORMAT_MIX=flac \
   cargo test --release -p musefs-core --features metrics --test bench_ingest \
   bench_scan_under_latency -- --ignored --nocapture
@@ -84,7 +84,7 @@ On RAM with tiny files, SP1 is **~1.9× slower** than the simple slurp: the para
 
 This is the deliberate trade SP1 makes: **a little extra compute in exchange for eliminating the durable-write (fsync) storm** — a large net win on any real (non-RAM) disk, as §1–§3 show, and a small loss only on RAM-backed storage with sub-window files (not a real music-library deployment).
 
-```
+```bash
 MUSEFS_BENCH_TIER=large-compute MUSEFS_BENCH_FORMAT_MIX=flac [MUSEFS_BENCH_JOBS=1] \
   cargo test --release -p musefs-core --features metrics --test bench_ingest \
   -- --ignored --nocapture bench_cold_scan_and_revalidate
