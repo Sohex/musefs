@@ -606,68 +606,71 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 /// backing file is gone (cascading tags/art links) and garbage-collect
 /// now-unreferenced art. Pruning is scoped to `root`, so revalidating one library
 /// root never removes tracks belonging to another.
-pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
+///
+/// Uses `opts` to configure the probe pipeline (e.g. `jobs` for parallelism).
+/// The skip-unchanged decision runs on the calling thread before workers are
+/// dispatched, so workers remain DB-free.
+pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<RevalidateStats> {
     let mut files = Vec::new();
     collect_audio(root, &mut files)?;
+    db.apply_bulk_pragmas_self()?;
 
-    let mut stats = RevalidateStats {
-        updated: 0,
-        unchanged: 0,
-        pruned: 0,
-        failed: 0,
-    };
+    // Main-thread pre-dispatch skip pass: load existing (path -> size,mtime) once,
+    // stat each candidate, keep only changed files. Workers stay DB-free.
+    let existing: HashMap<String, (i64, i64)> = db
+        .list_tracks()?
+        .into_iter()
+        .map(|t| (t.backing_path, (t.backing_size, t.backing_mtime)))
+        .collect();
+
+    let mut unchanged = 0u64;
+    let mut changed: Vec<PathBuf> = Vec::new();
     for path in files {
         let Ok(meta) = std::fs::metadata(&path) else {
-            stats.failed += 1;
             continue;
         };
         let Ok(abs) = std::fs::canonicalize(&path) else {
-            stats.failed += 1;
             continue;
         };
-        let abs_str = abs.to_string_lossy().to_string();
-
-        if let Some(existing) = db.get_track_by_path(&abs_str)? {
-            if existing.backing_size == meta.len() as i64
-                && existing.backing_mtime == mtime_secs(&meta)
-            {
-                stats.unchanged += 1;
+        let key = abs.to_string_lossy().to_string();
+        if let Some(&(size, mtime)) = existing.get(&key) {
+            if size == meta.len() as i64 && mtime == mtime_secs(&meta) {
+                unchanged += 1;
                 continue;
             }
         }
-
-        match probe_file(&path, meta.len()) {
-            Ok(Some(probed)) => {
-                ingest(db, &abs_str, &meta, probed)?;
-                stats.updated += 1;
-            }
-            Ok(None) => {}
-            Err(_) => {
-                stats.failed += 1;
-            }
-        }
+        changed.push(path);
     }
 
-    // Prune tracks under `root` whose backing file is gone. Scoped to `root` so a
-    // targeted revalidate never touches tracks from a different library root, and
-    // gated on `NotFound` so a transient I/O error (an unreadable mount, a denied
-    // permission) does not delete a track whose file still exists.
+    let scan = run_pipeline(db, changed, opts)?;
+
+    // Prune + GC on the writer connection (single-threaded), unchanged from before.
     let canon_root = std::fs::canonicalize(root)?;
+    let mut pruned = 0u64;
     for track in db.list_tracks()? {
         if !Path::new(&track.backing_path).starts_with(&canon_root) {
             continue;
         }
-        match std::fs::metadata(&track.backing_path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        if let Err(e) = std::fs::metadata(&track.backing_path) {
+            if e.kind() == std::io::ErrorKind::NotFound {
                 db.delete_track(track.id)?;
-                stats.pruned += 1;
+                pruned += 1;
             }
-            _ => {}
         }
     }
     db.gc_orphan_art()?;
 
-    Ok(stats)
+    Ok(RevalidateStats {
+        updated: scan.scanned,
+        unchanged,
+        pruned,
+        failed: scan.failed,
+    })
+}
+
+/// Back-compat shim used by the CLI and existing tests.
+pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
+    revalidate_with(db, root, &ScanOptions::default())
 }
 
 #[cfg(test)]
@@ -1068,6 +1071,28 @@ mod bounded_probe_tests {
             .unwrap();
         assert_eq!(track.audio_offset as u64, full.audio_offset);
         assert_eq!(track.audio_length as u64, full.audio_length);
+    }
+
+    #[test]
+    fn revalidate_skips_unchanged_and_reprobes_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.flac");
+        let mk = |audio: &[u8]| {
+            let mut b = b"fLaC".to_vec();
+            b.push(0x80);
+            b.extend_from_slice(&[0, 0, 34]);
+            b.extend(std::iter::repeat_n(0u8, 34));
+            b.extend_from_slice(audio);
+            b
+        };
+        std::fs::write(&p, mk(b"AUDIO")).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+
+        // Unchanged → all unchanged.
+        let s1 = revalidate_with(&db, dir.path(), &ScanOptions::default()).unwrap();
+        assert_eq!(s1.unchanged, 1);
+        assert_eq!(s1.updated, 0);
     }
 
     #[test]
