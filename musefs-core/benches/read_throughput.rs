@@ -38,7 +38,12 @@ fn fixture(bytes_per_track: usize, tracks: usize) -> (Arc<Musefs>, Vec<u64>) {
 
     // Walk the single album dir to collect file inodes.
     let artist = fs.lookup(VirtualTree::ROOT, "Artist 00000").unwrap();
-    let sub = fs.readdir(artist).unwrap()[0].1; // Album 00000 dir
+    let sub = fs
+        .readdir(artist)
+        .unwrap()
+        .first()
+        .expect("fixture: expected at least one album dir under the artist")
+        .1; // Album 00000 dir
     let inodes: Vec<u64> = fs
         .readdir(sub)
         .unwrap()
@@ -57,6 +62,10 @@ fn bench_sequential_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_read");
     group.throughput(Throughput::Bytes(size));
     let chunk = 128 * 1024u64;
+    // fh=0 takes the no-handle path: each read resolves the inode via the
+    // HeaderCache rather than reusing a registered fd. This measures the
+    // warm-cache resolve+splice cost, not fd-reuse (which the concurrent bench
+    // exercises via open_handle).
     group.bench_function("flac_128k_chunks", |b| {
         b.iter(|| {
             let mut off = 0u64;
@@ -81,8 +90,19 @@ fn bench_concurrent_read_and_walk(c: &mut Criterion) {
         .unwrap_or_else(num_streams);
     let (fs, inodes) = fixture(1024 * 1024, m.max(2));
 
+    // Each iteration streams `m` whole files (reader i reads inodes[i]); the
+    // walker does metadata-only ops and contributes no bytes.
+    let total_bytes: u64 = (0..m)
+        .map(|i| fs.getattr(inodes[i % inodes.len()]).unwrap().size)
+        .sum();
+
     let mut group = c.benchmark_group("concurrent_read_walk");
+    group.throughput(Throughput::Bytes(total_bytes));
     group.bench_function(format!("m{m}_plus_walker"), |b| {
+        // Thread spawn/join overhead is included in each iteration, so this
+        // measures burst concurrency rather than steady-state throughput; the
+        // signal of interest is how that wall time scales with `m` (SP3 lock
+        // contention), not its absolute value.
         b.iter(|| {
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             // Walker thread: loop lookups/getattrs over the inodes.
@@ -119,11 +139,16 @@ fn bench_concurrent_read_and_walk(c: &mut Criterion) {
                     })
                 })
                 .collect();
-            for r in readers {
-                r.join().unwrap();
-            }
+            // Join all readers first, then stop the walker — collecting results
+            // before unwrapping so a reader panic can't leave the walker spinning
+            // (stop is always set before we re-raise the panic).
+            let reader_results: Vec<_> =
+                readers.into_iter().map(thread::JoinHandle::join).collect();
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             walker.join().unwrap();
+            for r in reader_results {
+                r.unwrap();
+            }
         });
     });
     group.finish();
