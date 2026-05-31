@@ -53,6 +53,12 @@ fn bench_refresh_one_vs_many() {
     scan_directory(&db, &target.corpus_dir).unwrap();
     let fs = Musefs::open(db, config()).unwrap();
 
+    // Both measurements run on the same `fs`. After the first poll_refresh the
+    // tree is freshly built; the second call starts from that warm state. Because
+    // today's rebuild is unconditionally full (every track, regardless of the
+    // change-set size), the two wall times should be roughly equal — that
+    // equality is the SP2 baseline. When SP2 makes rebuild cost scale with the
+    // changed set, refresh-N should diverge from refresh-1.
     let one_ms = time_refresh(&target.db_path, &fs, 1);
     // Cap the touch count: today's rebuild is full regardless of how many tracks
     // changed, so a bounded sample represents "many changed" without a huge
@@ -62,6 +68,8 @@ fn bench_refresh_one_vs_many() {
     let many = (params.track_count() / 2).clamp(1, 1000);
     let many_ms = time_refresh(&target.db_path, &fs, many);
 
+    // `poll_refresh` is pure CPU + DB work, independent of the corpus storage
+    // class, so the storage column is fixed rather than derived from the target.
     println!("\n{}", RunReport::header());
     for (label, ms) in [("refresh-1", one_ms), ("refresh-N", many_ms)] {
         println!(
