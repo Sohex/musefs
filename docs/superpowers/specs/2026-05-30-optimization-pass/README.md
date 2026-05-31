@@ -74,7 +74,7 @@ is built for the full capability regardless.
 | SP | State | Spec | Plan | Notes |
 |---|---|---|---|---|
 | SP0a | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now. See "Running the SP0a harness" below; per-format sweep added (`SP0a-per-format-coverage.md`) |
-| SP0b | Plan drafted | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS |
+| SP0b | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS. See "Latency-injected runs" below. |
 | SP1 | Not started | — | — | |
 | SP2 | Not started | — | — | |
 | SP3 | Not started | — | — | |
@@ -125,6 +125,26 @@ Notes:
   median rises **>10%** run-over-run on the same machine (Criterion prints the
   median + its noise estimate). SP1–SP4 record before/after medians in the
   results log and must not breach this gate.
+
+### Latency-injected runs (SP0b — needs /dev/fuse)
+
+```bash
+# Functional + gating tests for the passthrough FS (5 tests across 3 files):
+cargo test -p musefs-latencyfs -- --ignored --nocapture
+
+# Scan a generated corpus through an injected-latency mount (real fsync counts):
+MUSEFS_BENCH_LATENCY_PROFILE=nfs-hdd MUSEFS_BENCH_TIER=large-compute \
+  cargo test -p musefs-core --features metrics \
+  --test bench_ingest bench_scan_under_latency -- --ignored --nocapture
+```
+
+Profiles: `ssd` (≈0), `hdd`, `nfs-ssd`, `nfs-hdd`. The corpus is generated on a
+real backing dir; only the scan + DB I/O traverse the latency layer, so the row's
+`fsyncs` column is the real kernel fsync count for the scan's DB writes (the
+SP1-batching signal). `peak_rss_kib` reads `n/a` here (the FS shares this process,
+so VmHWM no longer isolates the scan's footprint — use the SP0a tempfs
+`bench_cold_scan_and_revalidate` for the RSS signal). Without
+`MUSEFS_BENCH_LATENCY_PROFILE` the test no-ops with a hint.
 
 ## Results log
 
