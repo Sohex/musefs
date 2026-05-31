@@ -81,6 +81,58 @@ pub fn read_metadata(data: &[u8]) -> Result<FlacMeta> {
     parse_blocks(data)
 }
 
+use crate::probe::Extent;
+
+/// Bounded twin of [`read_metadata`]: walk the metadata blocks present in
+/// `prefix` (which may be a front-only window of the file). If a block's declared
+/// body runs past the prefix, return `NeedMore { up_to }` with the exact end of
+/// that block — the caller widens the window and retries. Otherwise `Complete`.
+pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
+    if prefix.len() < 4 || &prefix[0..4] != FLAC_MARKER {
+        return Err(FormatError::NotFlac);
+    }
+    let mut pos = 4usize;
+    let mut preserved = Vec::new();
+    loop {
+        if pos + 4 > prefix.len() {
+            // Need at least the 4-byte block header.
+            return Ok(Extent::NeedMore {
+                up_to: (pos + 4) as u64,
+            });
+        }
+        let header = prefix[pos];
+        let is_last = (header & 0x80) != 0;
+        let block_type = header & 0x7F;
+        let len = ((prefix[pos + 1] as usize) << 16)
+            | ((prefix[pos + 2] as usize) << 8)
+            | (prefix[pos + 3] as usize);
+        let body_start = pos + 4;
+        let body_end = body_start + len;
+        if body_end > prefix.len() {
+            return Ok(Extent::NeedMore {
+                up_to: body_end as u64,
+            });
+        }
+        match block_type {
+            BLOCK_STREAMINFO | BLOCK_APPLICATION | BLOCK_SEEKTABLE | BLOCK_CUESHEET => {
+                preserved.push(MetadataBlock {
+                    block_type,
+                    body: prefix[body_start..body_end].to_vec(),
+                });
+            }
+            _ => {}
+        }
+        pos = body_end;
+        if is_last {
+            break;
+        }
+    }
+    Ok(Extent::Complete(FlacMeta {
+        audio_offset: pos as u64,
+        preserved,
+    }))
+}
+
 /// Parse the FLAC metadata section of a complete file, returning the audio
 /// boundary, audio length, and the structural blocks to carry over.
 pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
@@ -314,6 +366,40 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::Extent;
+
+    /// Build a minimal FLAC: marker + a single last STREAMINFO (type 0, 34-byte
+    /// body) + `audio` bytes. Returns (full_bytes, audio_offset).
+    fn flac_with_streaminfo(audio: &[u8]) -> (Vec<u8>, u64) {
+        let mut v = b"fLaC".to_vec();
+        push_block_header(&mut v, BLOCK_STREAMINFO, 34, true);
+        v.extend(std::iter::repeat_n(0u8, 34));
+        let audio_offset = v.len() as u64;
+        v.extend_from_slice(audio);
+        (v, audio_offset)
+    }
+
+    #[test]
+    fn read_metadata_bounded_complete_when_prefix_covers_blocks() {
+        let (full, audio_offset) = flac_with_streaminfo(b"AUDIOAUDIO");
+        // Prefix that includes all metadata but not all audio.
+        let prefix = &full[..audio_offset as usize + 2];
+        match read_metadata_bounded(prefix).unwrap() {
+            Extent::Complete(meta) => assert_eq!(meta.audio_offset, audio_offset),
+            other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_metadata_bounded_needmore_when_block_body_truncated() {
+        let (full, audio_offset) = flac_with_streaminfo(b"AUDIO");
+        // Cut inside the STREAMINFO body (header is 4 bytes after the marker).
+        let prefix = &full[..8];
+        match read_metadata_bounded(prefix).unwrap() {
+            Extent::NeedMore { up_to } => assert_eq!(up_to, audio_offset),
+            other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
+        }
+    }
 
     #[test]
     fn read_u32_be_assembles_big_endian_and_guards_length() {
