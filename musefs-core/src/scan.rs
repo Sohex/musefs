@@ -4,7 +4,12 @@ use std::path::{Path, PathBuf};
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_format::{flac, mp3, mp4, ogg, wav, EmbeddedPicture, Extent};
 
+use crate::byte_budget::ByteBudget;
 use crate::error::Result;
+use std::sync::mpsc::sync_channel;
+
+const BATCH_FILES: usize = 256;
+const BATCH_BYTES: u64 = 64 << 20; // 64 MiB
 
 /// Initial bounded-read window. Covers typical metadata + cover art; a larger
 /// metadata region triggers a `NeedMore` widen.
@@ -299,6 +304,32 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
     }
 }
 
+/// Knobs for a scan. `jobs == 0` means "use available parallelism".
+#[derive(Debug, Clone, Default)]
+pub struct ScanOptions {
+    pub jobs: usize,
+}
+
+fn effective_jobs(jobs: usize) -> usize {
+    if jobs != 0 {
+        return jobs;
+    }
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// One probed file ready to write, plus its art-byte weight for backpressure.
+struct Unit {
+    abs_path: String,
+    meta_len: u64,
+    meta_mtime: i64,
+    probed: Probed,
+    weight: u64,
+}
+
+fn art_weight(p: &Probed) -> u64 {
+    p.pictures.iter().map(|pic| pic.data.len() as u64).sum()
+}
+
 /// Upsert a track from a probed backing file: write the track row, replace its
 /// seeded tags, and ingest its embedded art (capped, deduped, clamped).
 fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
@@ -351,6 +382,62 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     Ok(())
 }
 
+/// Like `ingest`, but writes through a batch `BulkWriter`.
+fn ingest_bulk(
+    bw: &mut musefs_db::BulkWriter<'_>,
+    abs_path: &str,
+    meta_len: u64,
+    meta_mtime: i64,
+    probed: &Probed,
+) -> Result<()> {
+    let track_id = bw.upsert_track(&NewTrack {
+        backing_path: abs_path.to_string(),
+        format: probed.format,
+        audio_offset: probed.audio_offset as i64,
+        audio_length: probed.audio_length as i64,
+        backing_size: meta_len as i64,
+        backing_mtime: meta_mtime,
+    })?;
+
+    let mut tags = Vec::new();
+    let mut ordinals: HashMap<String, i64> = HashMap::new();
+    for (key, value) in &probed.tags {
+        let ord = ordinals.entry(key.clone()).or_insert(0);
+        tags.push(Tag::new(key, value, *ord));
+        *ord += 1;
+    }
+    bw.replace_tags(track_id, &tags)?;
+
+    let mut track_arts = Vec::new();
+    let accepted = probed
+        .pictures
+        .iter()
+        .filter(|p| p.data.len() <= MAX_ART_BYTES);
+    for (ordinal, pic) in accepted.enumerate() {
+        let art_id = bw.upsert_art(&NewArt {
+            mime: pic.mime.clone(),
+            width: (pic.width != 0).then_some(pic.width as i64),
+            height: (pic.height != 0).then_some(pic.height as i64),
+            data: pic.data.clone(),
+        })?;
+        let picture_type = if pic.picture_type <= 20 {
+            pic.picture_type as i64
+        } else {
+            0
+        };
+        track_arts.push(TrackArt {
+            art_id,
+            picture_type,
+            description: pic.description.clone(),
+            ordinal: ordinal as i64,
+        });
+    }
+    bw.set_track_art(track_id, &track_arts)?;
+    Ok(())
+}
+
+/// Public entry: parallel-probe / single-writer scan of `root`.
+///
 /// Insert/update a track row for each supported audio file (FLAC, MP3, M4A,
 /// Opus, Vorbis, FLAC-in-Ogg) under `root` (with audio bounds and validation
 /// stamps), seeding its tags from the file's existing metadata. `root` may be
@@ -358,7 +445,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
 /// recursively). Unsupported-format files increment `ScanStats::skipped`; files
 /// with a per-file I/O or parse error increment `ScanStats::failed` and do not
 /// abort the scan.
-pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
+pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<ScanStats> {
     let mut files = Vec::new();
     if root.is_file() {
         if is_supported_audio(root) {
@@ -367,33 +454,115 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     } else {
         collect_audio(root, &mut files)?;
     }
+    db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
+    let stats = run_pipeline(db, files, opts)?;
+    Ok(stats)
+}
 
-    let mut stats = ScanStats {
-        scanned: 0,
-        skipped: 0,
-        failed: 0,
-    };
-    for path in files {
-        let Ok(meta) = std::fs::metadata(&path) else {
-            stats.failed += 1;
-            continue;
-        };
-        match probe_file(&path, meta.len()) {
-            Ok(Some(probed)) => {
-                // `canonicalize` is per-file I/O (a symlink target can vanish in
-                // the window after the walk), so keep it non-fatal like `metadata`.
-                let Ok(abs) = std::fs::canonicalize(&path) else {
-                    stats.failed += 1;
-                    continue;
-                };
-                ingest(db, &abs.to_string_lossy(), &meta, probed)?;
-                stats.scanned += 1;
+/// Back-compat shim used by the CLI and existing tests.
+pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
+    scan_directory_with(db, root, &ScanOptions::default())
+}
+
+/// Probe `files` across `jobs` workers (no DB access) and write the results from a
+/// single writer (this thread) in batched transactions. Per-file errors are
+/// counted, not fatal.
+fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<ScanStats> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let jobs = effective_jobs(opts.jobs);
+    let budget = Arc::new(ByteBudget::new(BATCH_BYTES));
+    let skipped = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicU64::new(0));
+
+    // Work queue: a shared iterator behind a mutex (cheap; probing dominates).
+    let work = Arc::new(std::sync::Mutex::new(files.into_iter()));
+    let (tx, rx) = sync_channel::<Unit>(jobs * 2);
+
+    let mut workers = Vec::with_capacity(jobs);
+    for _ in 0..jobs {
+        let work = Arc::clone(&work);
+        let tx = tx.clone();
+        let budget = Arc::clone(&budget);
+        let skipped = Arc::clone(&skipped);
+        let failed = Arc::clone(&failed);
+        workers.push(std::thread::spawn(move || loop {
+            let next = { work.lock().unwrap().next() };
+            let Some(path) = next else { break };
+            let Ok(meta) = std::fs::metadata(&path) else {
+                failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            match probe_file(&path, meta.len()) {
+                Ok(Some(probed)) => {
+                    let Ok(abs) = std::fs::canonicalize(&path) else {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    let weight = art_weight(&probed);
+                    budget.acquire(weight); // backpressure on in-flight art bytes
+                    let unit = Unit {
+                        abs_path: abs.to_string_lossy().into_owned(),
+                        meta_len: meta.len(),
+                        meta_mtime: mtime_secs(&meta),
+                        probed,
+                        weight,
+                    };
+                    if tx.send(unit).is_err() {
+                        budget.release(weight);
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Ok(None) => stats.skipped += 1,
-            Err(_) => stats.failed += 1,
+        }));
+    }
+    drop(tx); // close the channel once all clones (workers) finish
+
+    // Writer: this thread. Batch by file count and accumulated art bytes.
+    let mut scanned = 0u64;
+    let mut batch: Vec<Unit> = Vec::new();
+    let mut batch_bytes = 0u64;
+    let flush = |batch: &mut Vec<Unit>, batch_bytes: &mut u64, scanned: &mut u64| -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut bw = db.bulk_writer()?;
+        for u in batch.iter() {
+            ingest_bulk(&mut bw, &u.abs_path, u.meta_len, u.meta_mtime, &u.probed)?;
+            *scanned += 1;
+        }
+        bw.commit()?;
+        for u in batch.drain(..) {
+            budget.release(u.weight);
+        }
+        *batch_bytes = 0;
+        Ok(())
+    };
+
+    for unit in rx {
+        batch_bytes += unit.weight;
+        batch.push(unit);
+        if batch.len() >= BATCH_FILES || batch_bytes >= BATCH_BYTES {
+            flush(&mut batch, &mut batch_bytes, &mut scanned)?;
         }
     }
-    Ok(stats)
+    flush(&mut batch, &mut batch_bytes, &mut scanned)?;
+    for w in workers {
+        let _ = w.join();
+    }
+
+    Ok(ScanStats {
+        scanned,
+        skipped: skipped.load(Ordering::Relaxed),
+        failed: failed.load(Ordering::Relaxed),
+    })
 }
 
 /// Test/oracle only: scan using the legacy whole-file probe (`probe_full`). The
@@ -895,5 +1064,33 @@ mod bounded_probe_tests {
             .unwrap();
         assert_eq!(track.audio_offset as u64, full.audio_offset);
         assert_eq!(track.audio_length as u64, full.audio_length);
+    }
+
+    #[test]
+    fn jobs1_and_jobs_n_produce_equivalent_state() {
+        let dir = tempfile::tempdir().unwrap();
+        // A handful of distinct FLACs.
+        for i in 0..12 {
+            let mut bytes = b"fLaC".to_vec();
+            bytes.push(0x80);
+            bytes.extend_from_slice(&[0, 0, 34]);
+            bytes.extend(std::iter::repeat_n(0u8, 34));
+            bytes.extend_from_slice(format!("AUDIO-{i}").as_bytes());
+            std::fs::write(dir.path().join(format!("t{i}.flac")), &bytes).unwrap();
+        }
+        let norm = |jobs: usize| {
+            let db = Db::open_in_memory().unwrap();
+            scan_directory_with(&db, dir.path(), &ScanOptions { jobs }).unwrap();
+            let mut rows: Vec<(String, i64, i64)> = db
+                .list_tracks()
+                .unwrap()
+                .into_iter()
+                .map(|t| (t.backing_path, t.audio_offset, t.audio_length))
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(norm(1), norm(4));
+        assert_eq!(norm(1).len(), 12);
     }
 }

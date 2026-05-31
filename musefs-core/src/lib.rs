@@ -1,3 +1,4 @@
+mod byte_budget;
 mod db_pool;
 mod error;
 mod facade;
@@ -14,6 +15,8 @@ pub use error::{CoreError, Result};
 pub use facade::{Attr, Mode, MountConfig, Musefs};
 pub use reader::{read_at, read_at_with_file, HeaderCache, ResolvedFile};
 pub use scan::scan_directory_full_oracle;
-pub use scan::{revalidate, scan_directory, RevalidateStats, ScanStats};
+pub use scan::{
+    revalidate, scan_directory, scan_directory_with, RevalidateStats, ScanOptions, ScanStats,
+};
 pub use template::render_path;
 pub use tree::{Node, NodeKind, VirtualTree};
