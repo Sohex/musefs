@@ -94,6 +94,23 @@ pub struct CorpusParams {
 }
 
 impl CorpusParams {
+    /// A small single-format corpus used by the equivalence property. `art_bytes`
+    /// is honored only by the FLAC generator (the MP3/M4A/Ogg/WAV corpus files
+    /// carry no embedded art or in-file tags — those ride via the DB at scan
+    /// time). The tiny `MUSEFS_SCAN_WINDOW=64` still forces the widen path on
+    /// every format, via the format's own trigger: FLAC the metadata-block walk,
+    /// MP3 the ID3v2 tag size, OGG the geometric grow, WAV the whole-file gate.
+    pub fn single(fmt: Format, albums: usize, tracks_per_album: usize) -> Self {
+        Self {
+            albums,
+            tracks_per_album,
+            bytes_per_track: 4 * 1024,
+            art_bytes_per_track: 8 * 1024,
+            format_mix: vec![fmt],
+            seed: 1,
+        }
+    }
+
     pub fn track_count(&self) -> usize {
         self.albums * self.tracks_per_album
     }

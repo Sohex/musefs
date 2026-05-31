@@ -138,6 +138,15 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
     }
 }
 
+/// Effective initial window: `MUSEFS_SCAN_WINDOW` (bytes) if set, else `WINDOW`.
+fn scan_window() -> usize {
+    std::env::var("MUSEFS_SCAN_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(WINDOW)
+}
+
 /// Read `[0, len)` of `path` into a buffer, counting the read. A short read at
 /// EOF is fine (`len` may exceed the file size).
 fn read_window(file: &std::fs::File, len: usize) -> std::io::Result<Vec<u8>> {
@@ -192,7 +201,7 @@ fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
 
     // Front-anchored formats: read a window, widen on NeedMore.
     let tail = read_tail_128(&file, file_len)?;
-    let mut want = (WINDOW as u64).min(file_len) as usize;
+    let mut want = (scan_window() as u64).min(file_len) as usize;
     let mut prefix = read_window(&file, want)?;
     for _ in 0..MAX_WIDEN_RETRIES {
         match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
@@ -365,6 +374,36 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
             stats.skipped += 1;
             continue;
         };
+        let abs = std::fs::canonicalize(&path)?;
+        ingest(db, &abs.to_string_lossy(), &meta, probed)?;
+        stats.scanned += 1;
+    }
+    Ok(stats)
+}
+
+/// Test/oracle only: scan using the legacy whole-file probe (`probe_full`). The
+/// equivalence property compares this against the bounded `scan_directory`.
+#[doc(hidden)]
+pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
+    let mut files = Vec::new();
+    if root.is_file() {
+        if is_supported_audio(root) {
+            files.push(root.to_path_buf());
+        }
+    } else {
+        collect_audio(root, &mut files)?;
+    }
+    let mut stats = ScanStats {
+        scanned: 0,
+        skipped: 0,
+    };
+    for path in files {
+        let bytes = std::fs::read(&path)?;
+        let Some(probed) = probe_full(&path, &bytes) else {
+            stats.skipped += 1;
+            continue;
+        };
+        let meta = std::fs::metadata(&path)?;
         let abs = std::fs::canonicalize(&path)?;
         ingest(db, &abs.to_string_lossy(), &meta, probed)?;
         stats.scanned += 1;
