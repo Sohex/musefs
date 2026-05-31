@@ -91,6 +91,10 @@ impl CorpusParams {
         if let Some(v) = env_usize("MUSEFS_BENCH_BYTES_PER_TRACK") {
             p.bytes_per_track = v;
         }
+        // One cover of this size is generated per album and embedded in each of
+        // its tracks (the var names the per-album cover; the field holds its
+        // byte size, embedded per track and deduped by the content-addressed
+        // `art` table).
         if let Some(v) = env_usize("MUSEFS_BENCH_ART_PER_ALBUM") {
             p.art_bytes_per_track = v;
         }
@@ -109,6 +113,8 @@ impl CorpusParams {
                     _ => None,
                 })
                 .collect();
+            // An all-unrecognized value keeps the tier default rather than
+            // erroring or yielding an empty mix.
             if !parsed.is_empty() {
                 p.format_mix = parsed;
             }
