@@ -53,24 +53,40 @@ any future format stay in sync.
 pub fn write_ogg(path: &Path, audio: &[u8]) -> (i64, i64)
 ```
 
-Builds a minimal valid **Ogg Opus** file by reusing the already-wired
-`musefs_format::ogg::page_test_support` helpers (`musefs-core`'s
-`[dev-dependencies]` already enable `musefs-format`'s `fuzzing` feature plus the
-`ogg`/`crc` crates; `tests/interop_emit.rs` already uses `fuzz_check::fixtures`):
+Builds a minimal valid **Ogg Opus** file by reusing the public
+`musefs_format::ogg::page_test_support` helpers. (`page_test_support` is an
+ordinary `pub` module — not feature-gated — and `musefs-core`'s
+`[dev-dependencies]` already pull `musefs-format` plus the `ogg`/`crc` crates;
+`tests/interop_emit.rs` already uses `musefs_format::fuzz_check::fixtures`.)
 
-- `build_header_pub(serial, &[OpusHead, OpusTags])` → the two header pages.
-- `lace_packet_pub(serial, 2, false, 960, audio)` → one audio page whose packet
-  body is the corpus's `filler` bytes. The synthesizer treats the packet body as
-  opaque (it renumbers pages / recomputes CRC, never decodes), so arbitrary
-  filler bytes are a valid payload.
+Mirror the **only** working recipe in the codebase — `scan.rs`'s
+`ogg_probe_tests` — exactly. Three helpers are needed: `build_header_pub`,
+`lace_packet_pub`, and `vorbis_body_empty`:
 
-Returns `(audio_offset, audio_length)` from the header length / page span. The
-return is informational only — `generate_one` discards it and `scan_directory`
-re-probes the file (consistent with the other `write_*` helpers).
+- The `OpusHead` packet: `b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00"`.
+- The `OpusTags` packet: `b"OpusTags"` ++ `vorbis_body_empty()`. The empty
+  VorbisComment body is **load-bearing** — `scan.rs`'s probe calls
+  `ogg::read_tags`, which requires a parseable VorbisComment body after the
+  `OpusTags` magic; a hand-rolled body risks a probe failure.
+- `let (mut bytes, _) = build_header_pub(serial, &[&head, &tags]);` → the two
+  header pages. (Both helpers return `(Vec<u8>, u32)`; the second element is a
+  page count — destructure and ignore it.)
+- `let (page, _) = lace_packet_pub(serial, 2, false, 960, audio);` then
+  `bytes.extend_from_slice(&page)` → one audio page whose packet body is the
+  corpus's `filler` bytes. The synthesizer treats the packet body as opaque (it
+  renumbers pages / recomputes CRC, never decodes), so arbitrary filler bytes are
+  a valid payload.
+
+Returns `(audio_offset, audio_length)` = (header-pages byte length, audio-page
+byte length). The return is informational only — `generate_one` discards it and
+`scan_directory` re-probes the file (consistent with the other `write_*`
+helpers), so the lacing/page-framing overhead in `audio_length` is harmless.
 
 Add `Format::Ogg` to the corpus `Format` enum, the `"ogg"` token to
 `from_env`'s `MUSEFS_BENCH_FORMAT_MIX` parser, and the `Format::Ogg => write_ogg`
-arm in `generate_one`. (`scan.rs` already probes `.ogg`.)
+arm in `generate_one`. (`scan.rs` already probes `.ogg`.) Note: the test-corpus
+`Format::Ogg` maps to the production `musefs_db::Format::Opus` at scan time via
+codec detection — there is no 1:1 `Ogg` db variant, which is expected.
 
 ### 2. `format` column in `RunReport` (`musefs-core/tests/common/report.rs`)
 
@@ -90,7 +106,10 @@ pub fn bench_formats() -> Vec<Format>
 
 `bench_formats` reads the env var directly (not via `CorpusParams.format_mix`,
 whose tier default of FLAC is indistinguishable from an explicit `flac`). Reuses
-the same token→`Format` mapping as `from_env`.
+the same token→`Format` mapping as `from_env`. An unset **or** all-unrecognized
+value (e.g. `MUSEFS_BENCH_FORMAT_MIX=garbage`) yields `ALL_FORMATS` (full
+coverage), matching `from_env`'s "never end up with an empty mix" intent — it
+must never return an empty vec (which would silently sweep nothing).
 
 ### 4. `bench_ingest` per-format sweep (`musefs-core/tests/bench_ingest.rs`)
 
@@ -105,7 +124,14 @@ format. Existing metrics/RSS/wall semantics per row.
 
 This is the per-format generalization of SP0a's `prepare`; factor the shared
 base-dir + cold-DB logic into a helper (e.g. `prepare_format(params, fmt)`)
-rather than duplicating it.
+rather than duplicating it. Reuse `prepare`'s exact sidecar-deletion loop (the
+`["", "-wal", "-shm"]` removal) per subdir DB.
+
+Each per-format subdir gets its **own** DB at `<base>/<format>/musefs-bench.db`.
+`MUSEFS_BENCH_DB` (a single explicit path) is **ignored in generated sweep mode**
+— six formats cannot share one DB file without clobbering each other — and the
+helper must document that. (`MUSEFS_BENCH_DB` still applies in real-library mode
+below, which does a single scan.)
 
 **Real-library mode** (`MUSEFS_BENCH_LIBRARY` set): a real library is already
 mixed-format and cannot be regenerated per format, so the sweep collapses to a
@@ -120,6 +146,27 @@ reports a per-format throughput line). The concurrent read+walk variant stays a
 single FLAC-only group — its purpose is mutex-contention scaling (SP3), not
 per-format cost. Throughput annotations as in SP0a.
 
+**Inode discovery must be format-agnostic.** The current SP0a fixture hardcodes
+`fs.lookup(VirtualTree::ROOT, "Artist 00000")`, which only works because the FLAC
+builder embeds `ARTIST/ALBUM/TITLE` vorbis comments. The other builders
+(`write_mp3`/`write_m4a`/`write_m4a_moov_last`/`write_wav`/`write_ogg`) embed **no
+tags**, so `probe` ingests empty artist/album/title and the `$artist/$album/$title`
+template renders every non-FLAC track under `default_fallback` ("Unknown/...").
+A hardcoded `"Artist 00000"` lookup would therefore `unwrap()` on `None` for all
+five non-FLAC formats. The fixture must instead collect file inodes by a generic
+recursive walk from `VirtualTree::ROOT` (descend dirs via `readdir`, collect the
+non-dir entries' inodes), independent of the rendered names. The fixture asserts
+it found ≥1 file inode (so a future tree-shape change fails loudly rather than
+producing a zero-byte bench).
+
+This tagless-non-FLAC reality means the per-format numbers measure container
+probing + synthesis with **minimal/empty** metadata for non-FLAC formats (only
+FLAC carries the 3 comments). That is an acceptable baseline — the dominant
+per-format cost is container parsing, page renumbering (Ogg), `moov` rebuild
+(M4A), and ID3v2 framing (MP3), not tag-string volume. Embedding equal tags
+across all formats for a fairer synthesis comparison is a possible future
+refinement, explicitly out of scope here.
+
 ### 6. `bench_refresh` stays FLAC-only (`musefs-core/tests/bench_refresh.rs`)
 
 `poll_refresh` times a DB-driven virtual-tree rebuild; the backing audio format
@@ -129,11 +176,17 @@ one-line comment stating why it does not sweep formats.
 ### 7. Tests (TDD, `musefs-core/tests/common_corpus_smoke.rs`)
 
 - `write_ogg` output scans as exactly 1 track (`scanned == 1`).
-- `generate` with `format_mix == ALL_FORMATS` scans all tracks and is
-  deterministic (byte-identical first file across two runs, per the existing
-  determinism-test pattern).
+- `write_ogg` is deterministic: two calls with the same `audio` produce
+  byte-identical files (proves the Ogg path specifically, since the existing
+  whole-corpus determinism check only inspects the first file, which is FLAC).
+- `generate` with `format_mix == ALL_FORMATS` scans all tracks (round-robin
+  coverage of every format).
 - `bench_formats()` returns `ALL_FORMATS` when `MUSEFS_BENCH_FORMAT_MIX` is unset
-  and the parsed subset when set (holds `ENV_LOCK`).
+  and the parsed subset when set; an all-unrecognized value returns `ALL_FORMATS`
+  (never empty). Holds `ENV_LOCK`.
+- `ALL_FORMATS` ↔ token-parser consistency: every `ALL_FORMATS` member round-trips
+  through the `MUSEFS_BENCH_FORMAT_MIX` token mapping (and every token maps to an
+  `ALL_FORMATS` member), so the two can't silently drift when a format is added.
 
 The benches remain `#[ignore]`d; their per-format output is verified by running
 them manually (as in SP0a), not asserted in the default suite.
@@ -149,7 +202,9 @@ them manually (as in SP0a), not asserted in the default suite.
   adding an OggFLAC variant is deferred unless a later SP needs codec-specific
   numbers.
 - No new Cargo features and no production-code changes; reuses the existing
-  `fuzzing` dev-dependency wiring.
+  `musefs-format` dev-dependency (and `ogg`/`crc`) already in `musefs-core`.
+- No tag embedding in the non-FLAC corpus builders (see Component 5) — the
+  builders are reused as-is.
 
 ## Acceptance criteria
 
@@ -160,7 +215,10 @@ them manually (as in SP0a), not asserted in the default suite.
    prints a table with a `scan`+`revalidate` row for each of the six formats,
    each with `scanned > 0`.
 3. `cargo bench -p musefs-core --bench read_throughput` reports a sequential
-   throughput line per format without panicking.
+   throughput line for **each** format in `bench_formats()` without panicking
+   (the fixture finds ≥1 inode per format, including the non-FLAC formats that
+   render under `Unknown/...`).
 4. `MUSEFS_BENCH_FORMAT_MIX=ogg,wav` restricts both sweeps to those two formats.
-5. The corpus generator produces a valid, scannable Ogg file, and generation is
-   deterministic for a fixed `(params, seed)`.
+5. The corpus generator produces a valid, scannable Ogg file, and both `write_ogg`
+   and `generate` are deterministic for fixed inputs (`(params, seed)` for the
+   corpus; identical `audio` for `write_ogg`).
