@@ -461,18 +461,21 @@ mod bounded_tests {
     use crate::ogg::page_test_support::{build_header_pub, lace_packet_pub, vorbis_body_empty};
     use crate::probe::Extent;
 
-    /// A minimal single-page Opus stream: OpusHead BOS packet + OpusTags packet,
-    /// then a trailing audio page. Returns (full, audio_offset).
+    /// A minimal Opus stream: OpusHead + OpusTags header packets, then a trailing
+    /// audio page. Returns (full, audio_offset). Mirrors the proven fixture in
+    /// `musefs-core/src/scan.rs::ogg_probe_tests::probe_detects_opus_and_seeds_tags`.
+    /// Note `build_header_pub(serial, &[&[u8]])` laces *all* header packets across
+    /// pages (BOS set once) and returns `(Vec<u8>, u32)`; `lace_packet_pub` takes
+    /// `(serial, seq_start, bos, granule, packet)` and returns `(Vec<u8>, u32)`.
     fn opus_stream() -> (Vec<u8>, u64) {
         let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
         let mut tags = b"OpusTags".to_vec();
         tags.extend_from_slice(&vorbis_body_empty());
         let serial = 0x1234;
-        let mut v = build_header_pub(serial, 0, 0x02, &[lace_packet_pub(&head)]);
-        v.extend(build_header_pub(serial, 1, 0x00, &[lace_packet_pub(&tags)]));
+        let (mut v, _) = build_header_pub(serial, &[&head, &tags]);
         let audio_offset = v.len() as u64;
-        // A trailing audio page (FLAG_NONE, granule advanced).
-        v.extend(build_header_pub(serial, 2, 0x00, &[lace_packet_pub(b"AUDIO")]));
+        let (audio, _) = lace_packet_pub(serial, 2, false, 960, &[0u8; 100]);
+        v.extend_from_slice(&audio);
         (v, audio_offset)
     }
 
@@ -720,7 +723,7 @@ const MAX_WIDEN_RETRIES: usize = 8;
 pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
 ```
 
-(Keep its body unchanged.)
+(Keep its body unchanged.) **Also update the existing in-module test call sites** that call the old `probe(&path, …)` — `cargo build -p musefs-core --tests` will name them; at the time of writing they are in `scan.rs::ogg_probe_tests` (the `probe(&path, &bytes)` calls in the opus/oga/wav probe tests and the `probe(&path, b"not a real audio file")` negative test). Rewrite each `probe(` → `probe_full(`. (The two production call sites at the old lines 208/250 are replaced wholesale in steps 4–5 below, so don't rename those — they become `probe_file`.)
 
 3. Add a positioned reader helper and the bounded probe:
 
@@ -782,11 +785,13 @@ fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
             Probe::Done(p) => return Ok(Some(p)),
             Probe::Skip => return Ok(None),
             Probe::NeedMore(up_to) => {
-                let next = (up_to.min(file_len) as usize).max(want + 1);
-                if next <= want {
+                // Already at EOF? The prefix is the whole file; widening can't help.
+                if want as u64 >= file_len {
                     break;
                 }
-                want = next;
+                // Grow to at least `up_to` (capped at the file), always making
+                // progress (`+1`), then retry.
+                want = (up_to.min(file_len) as usize).max(want + 1).min(file_len as usize);
                 prefix = read_window(&file, want)?;
             }
         }
@@ -1052,8 +1057,12 @@ In `musefs-core/tests/common/corpus.rs`, add the constructor (fields verified ag
 
 ```rust
 impl CorpusParams {
-    /// A small single-format corpus *with embedded art* (so a tiny-window scan
-    /// must exercise the widen path), used by the equivalence property.
+    /// A small single-format corpus used by the equivalence property. `art_bytes`
+    /// is honored only by the FLAC generator (the MP3/M4A/Ogg/WAV corpus files
+    /// carry no embedded art or in-file tags — those ride via the DB at scan
+    /// time). The tiny `MUSEFS_SCAN_WINDOW=64` still forces the widen path on
+    /// every format, via the format's own trigger: FLAC the metadata-block walk,
+    /// MP3 the ID3v2 tag size, OGG the geometric grow, WAV the whole-file gate.
     pub fn single(fmt: Format, albums: usize, tracks_per_album: usize) -> Self {
         Self {
             albums,
@@ -1066,6 +1075,8 @@ impl CorpusParams {
     }
 }
 ```
+
+The spec's headline property names "every format fixture **and** proptest-generated files." This task covers the six format fixtures (via the corpus generator) directly; the **generative** side is already covered by the format-layer proptests (`cargo test -p musefs-format --features fuzzing`) and `musefs-core/tests/proptest_read_fidelity` — both run in the final verification. No new proptest oracle is added here; the corpus-based oracle is the SP1-specific bounded≡full guard.
 
 Note: this task depends on Task B2 having added the `failed` field to `ScanStats` — but A7 runs in Stage A, before B2. So in Stage A, `ScanStats` still has only `scanned`/`skipped`; write `ScanStats { scanned: 0, skipped: 0 }` here and add `failed: 0` when Task B2 lands (Task B2's diff already updates every `ScanStats` constructor). If executing strictly in order, omit `failed` in this task.
 
@@ -1621,6 +1632,8 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
 }
 ```
 
+**Resilience invariant (keep workers panic-free).** The spec counts per-file errors and makes only writer/DB errors fatal. That guarantee holds **only because `probe_file` returns `io::Result` and never `unwrap()`s on per-file I/O** — a worker that panicked would silently drop its file (neither `failed`-counted nor ingested) and just reduce throughput. So: the worker body must propagate every per-file error as `Err`/`Ok(None)` (as written above), never `unwrap`/`expect` on `metadata`/`canonicalize`/read/probe. (The format parsers are already panic-hardened by the fuzz suite; this invariant keeps the orchestration layer matching it. A `catch_unwind` wrapper is deliberately *not* added — it would mask a real parser regression that the fuzzers should catch instead.)
+
 Add a `BulkWriter` flavour of `ingest` next to the existing `ingest` in `scan.rs` (the existing `ingest` stays for any single-`Db` callers; both share the tag/art mapping logic):
 
 ```rust
@@ -1948,8 +1961,15 @@ In `musefs-core/tests/common/report.rs`:
 
 In `musefs-core/tests/bench_ingest.rs`:
 
+- Update the import at the top of the file (it currently reads `use musefs_core::{metrics, revalidate, scan_directory};`) to add the `_with` variants and `ScanOptions`:
+
+```rust
+use musefs_core::{metrics, revalidate_with, scan_directory_with, ScanOptions};
+```
+
+(`scan_directory` / `revalidate` are no longer called directly once the `_with` forms below replace them; drop them from the `use` to avoid an unused-import warning.)
 - In `run_one`, set `bytes_read: snap.scan_bytes_read,` on both `RunReport`s (scan and revalidate), where `snap` is the corresponding `metrics::snapshot()`.
-- In `bench_scan_under_latency`, set `bytes_read: s.scan_bytes_read,`.
+- In `bench_scan_under_latency`, set `bytes_read: s.scan_bytes_read,` **and** convert its `scan_directory(&db, &mount.path())` call to `scan_directory_with(&db, &mount.path(), &ScanOptions { jobs: std::env::var("MUSEFS_BENCH_JOBS").ok().and_then(|s| s.parse().ok()).unwrap_or(0) })` (it has no `run_one` `opts` in scope).
 - Read `MUSEFS_BENCH_JOBS` (default 0) and thread it into a `ScanOptions`, replacing the bare `scan_directory(&db, …)` / `revalidate(&db, …)` calls with `scan_directory_with(&db, …, &opts)` / `revalidate_with(&db, …, &opts)`. Add near the top of `run_one`:
 
 ```rust
