@@ -166,6 +166,11 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
 /// per format, widening on `NeedMore`. Never reads the audio payload (M4A uses
 /// the seek reader; front-anchored formats read only the metadata extent).
 /// Returns `Ok(None)` for an unsupported/unparseable file (to be skipped).
+///
+/// Metrics note: `on_scan_read` counts the front-anchored prefix/widen/tail
+/// reads only. The M4A seek reader does its own positioned reads internally, so
+/// its bytes are not reflected in `SCAN_BYTES_READ` (only `on_scan_open` fires
+/// for M4A); its win shows up in wall time and peak RSS instead.
 fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
