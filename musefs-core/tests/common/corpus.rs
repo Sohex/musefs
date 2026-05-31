@@ -220,17 +220,22 @@ pub struct Target {
 /// - `MUSEFS_BENCH_LIBRARY` set -> scan that real directory in place (never
 ///   written to); DB goes to `MUSEFS_BENCH_DB` or a fresh tempfile.
 /// - else generate the corpus under `MUSEFS_BENCH_DIR` (or a tempdir) and put
-///   the DB alongside under a separate `musefs-bench.db` name.
+///   the DB at `MUSEFS_BENCH_DB`, or alongside the corpus as `musefs-bench.db`.
 pub fn prepare(p: &CorpusParams) -> Target {
     if let Ok(lib) = std::env::var("MUSEFS_BENCH_LIBRARY") {
-        let scratch = tempfile::tempdir().unwrap();
-        let db_path = std::env::var("MUSEFS_BENCH_DB")
-            .map_or_else(|_| scratch.path().join("musefs-bench.db"), PathBuf::from);
+        // Only allocate a scratch tempdir when no explicit DB path is given.
+        let (db_path, scratch) = if let Ok(p) = std::env::var("MUSEFS_BENCH_DB") {
+            (PathBuf::from(p), None)
+        } else {
+            let s = tempfile::tempdir().unwrap();
+            let p = s.path().join("musefs-bench.db");
+            (p, Some(s))
+        };
         return Target {
             corpus_dir: PathBuf::from(lib),
             db_path,
             is_real_library: true,
-            _scratch: Some(scratch),
+            _scratch: scratch,
         };
     }
     let (corpus_dir, scratch) = if let Ok(d) = std::env::var("MUSEFS_BENCH_DIR") {
