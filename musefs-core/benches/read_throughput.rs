@@ -53,7 +53,9 @@ fn fixture(format: Format, bytes_per_track: usize, tracks: usize) -> (Arc<Musefs
     let mut inodes = Vec::new();
     collect_file_inodes(&fs, VirtualTree::ROOT, &mut inodes);
     assert!(!inodes.is_empty(), "fixture: no file inodes for {format:?}");
-    // Keep the tempdir alive for the duration of the bench by leaking it.
+    // Keep the tempdir alive for the duration of the bench by leaking it. Each
+    // fixture call leaks one; a full run accumulates at most ALL_FORMATS.len()+1
+    // (sequential per-format + concurrent), all reclaimed when the process exits.
     std::mem::forget(dir);
     (fs, inodes)
 }
