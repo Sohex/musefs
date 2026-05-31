@@ -6,6 +6,7 @@ mod mapping;
 pub mod metrics;
 mod ogg_index;
 mod reader;
+mod refresh_diff;
 mod scan;
 mod template;
 mod tree;
