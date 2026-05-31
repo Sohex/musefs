@@ -77,7 +77,7 @@ is built for the full capability regardless.
 | SP0a | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now. See "Running the SP0a harness" below; per-format sweep added (`SP0a-per-format-coverage.md`) |
 | SP0b | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS. See "Latency-injected runs" below. |
 | SP1 | Implemented | `SP1-ingestion-scalability.md` | `../../plans/2026-05-31-sp1-ingestion-scalability.md` | Hybrid bounded reads (window+`NeedMore` for FLAC/MP3/OGG/WAV, seek reader for M4A) · parallel-probe/serial-writer pipeline (`--jobs`) · byte-budget backpressure · txn batching · bulk pragmas · `failed` resilience. Bounded≡full equivalence gate + byte-identical PCM e2e green. Bench baselines in `BENCHMARKS.md` (durable-storage cold scan 20–500× faster). |
-| SP2 | Spec drafted | `SP2-incremental-tree-refresh.md` | — | In-memory identity diff (changed/added/removed) → changed-only render (Stage A) → in-place tree mutation (Stage B). Equivalence gate: incremental tree ≡ full `build_with`. |
+| SP2 | Implemented | `SP2-incremental-tree-refresh.md` | `../../plans/2026-05-31-sp2-incremental-tree-refresh.md` | In-memory identity diff (changed/added/removed) → changed-only render (Stage A) → im-backed in-place tree mutation with introducing-id dirty propagation + full-`build_with` fallback (Stage B); equivalence gate (proptest 64 cases + debug-assert) green; refresh-1 still slopes with N at Stage B due to O(N) render-key scan (tree mutation itself is O(changed)); `VirtualTree::build_with` full reconstruction eliminated. |
 | SP3 | Not started | — | — | |
 | SP4 | Not started | — | — | |
 
@@ -172,3 +172,14 @@ commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
   mutation) targets a flat refresh-1 vs N. Harness:
   `bench_refresh_one_across_library_sizes`. See `BENCHMARKS.md` "SP2 —
   Incremental tree refresh".
+- **SP2 Stage B — In-place tree mutation** (2026-05-31, box under load · tempfs
+  · FLAC): Stage B replaces `VirtualTree::build_with` with im-backed in-place
+  `apply_changes` (O(changed) tree mutation). Library-size sweep (refresh-1 wall,
+  release, three runs averaged): **100→~1–6 ms, 1000→~10–22 ms, 5000→~38–94
+  ms**. The full `build_with` reconstruction is eliminated; the residual linear
+  slope is from the O(N) `list_render_keys` scan + `new_snapshot` HashMap rebuild
+  that still precedes `apply_changes` — a future pass could cache this. The tree
+  mutation itself is O(changed). Equivalence gate: 64-case proptest + per-refresh
+  debug-assert (incremental ≡ full) green. Fallback test (forced `Err(())` →
+  full-rebuild) green. FUSE byte-identical PCM e2e green. See `BENCHMARKS.md`
+  "SP2 — Incremental tree refresh".

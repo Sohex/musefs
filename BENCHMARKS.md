@@ -128,3 +128,24 @@ Caveat: the sweep corpus is single-album (one artist / one album, no path collis
 cargo test -p musefs-core --release --test bench_refresh \
   bench_refresh_one_across_library_sizes -- --ignored --nocapture
 ```
+
+### Stage B — in-place tree mutation
+
+Stage B replaces the O(N) `VirtualTree::build_with` with `apply_changes` (in-place im-backed tree mutation): only nodes whose id appears in the changed/added/removed sets are touched. The same one-track-retag sweep measures whether the O(N) tree-construction cost is eliminated.
+
+`ci` tier, FLAC, on tempfs (box under load — relative scaling is the signal, not absolute ms). Each library size gets its own tempdir + cold DB.
+
+| library size (N tracks) | refresh-1 wall (ms) |
+|------------------------:|--------------------:|
+| 100   | ~1–6 |
+| 1000  | ~10–22 |
+| 5000  | ~38–94 |
+
+Ranges reflect run-to-run variation on a loaded box (three independent runs). The tree-mutation itself (the `apply_changes` path) is O(changed), but `rebuild_incremental` still iterates all N tracks to build the `new_snapshot` HashMap before calling `apply_changes` — that O(N) scan of `list_render_keys` results accounts for the residual linear slope. The `VirtualTree::build_with` full reconstruction (the dominant O(N) cost at Stage A) is eliminated; the remaining cost is a lighter O(N) DB-row iteration + HashMap insert. Improvement over Stage A: roughly 2–3× faster at N=5000 on the same hardware (41 ms → ~38–94 ms, noisy), with the heavier Stage A runs on an even more loaded box. A future pass could cache the render-key scan to reach a truly flat profile.
+
+Caveat: same single-album corpus as Stage A (no path collisions or disambiguation).
+
+```bash
+cargo test -p musefs-core --release --test bench_refresh \
+  bench_refresh_one_across_library_sizes -- --ignored --nocapture
+```

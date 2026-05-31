@@ -141,6 +141,33 @@ enum Op {
     Add(String, String),          // add a brand-new DB track row (added-side propagation)
 }
 
+#[test]
+fn apply_failure_falls_back_to_full_rebuild() {
+    let target = small_corpus(4);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let writer = Db::open(&db_path).unwrap();
+    let id = writer.list_tracks().unwrap()[0].id;
+    writer
+        .replace_tags(id, &[Tag::new("TITLE", "moved", 0)])
+        .unwrap();
+
+    fs.force_apply_failure_for_test(true);
+    fs.poll_refresh().unwrap();
+
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    // `tree_fingerprint` is a BTreeMap, so `into_keys` already yields sorted keys.
+    let fs_keys: Vec<String> = tree_fingerprint(&fs).into_keys().collect();
+    let ref_keys: Vec<String> = tree_fingerprint(&reference).into_keys().collect();
+    assert_eq!(
+        fs_keys, ref_keys,
+        "fallback full rebuild must produce a tree identical to a fresh open"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
