@@ -1,16 +1,18 @@
 # cargo-mutants workspace config.
 #
-# Crates intentionally out of scope for mutation testing. The scheduled full
-# campaign (`scripts/mutants.sh`) only mutates the logic files in musefs-db,
-# musefs-core, and musefs-format; thin FUSE/CLI glue and bench-only tooling are
-# excluded because their behavior is exercised solely by `#[ignore]`d e2e tests
-# (the FUSE crates need /dev/fuse). A mountless `cargo mutants` run can never
-# execute those tests, so every mutant there would falsely "survive". This
-# `exclude_globs` makes the per-PR `--in-diff` gate honor the same scope the
-# campaign already uses, so changing one of these crates no longer trips the gate
-# with un-killable mutants. See docs/audits/2026-05-29-test-audit.md.
+# Crates permanently out of scope for mutation testing: thin glue with no real
+# logic. musefs-fuse is a thin fuser adapter, musefs-cli is thin CLI dispatch,
+# and the `musefs` binary is a one-line entrypoint — their behavior is covered by
+# e2e/integration tests, and mutating them yields only equivalent or trivially
+# untestable mutants. See docs/audits/2026-05-29-test-audit.md.
+#
+# musefs-latencyfs is NOT excluded here: it carries real logic (the inode map,
+# latency table, attr mapping, passthrough op behavior), so it gets its own
+# mutation leg in scripts/mutants.sh / mutants.yml that installs libfuse and runs
+# the #[ignore]d mounted tests (`-- -- --include-ignored`). The fast per-PR
+# `--in-diff` gate excludes it separately (it is mountless and can't kill its
+# mutants); see .github/workflows/mutants.yml.
 exclude_globs = [
-    "musefs-latencyfs/**",
     "musefs-fuse/**",
     "musefs-cli/**",
     "musefs/**",

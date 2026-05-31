@@ -53,7 +53,12 @@ jobs:
           if [ ! -s mutants.diff ]; then
             echo "No in-scope Rust changes; nothing to mutate."; exit 0
           fi
-          cargo mutants --in-diff mutants.diff -j1
+          # This fast gate runs the default `cargo test` (no libfuse, no
+          # `--ignored`), so it can't exercise musefs-latencyfs — every mutant
+          # there would falsely survive. That crate is mutation-tested in the
+          # scheduled `full` job below, which installs libfuse and runs its
+          # mounted #[ignore]d tests. Exclude it here so the gate stays honest.
+          cargo mutants --in-diff mutants.diff -j1 --exclude 'musefs-latencyfs/**'
 
   canary:
     # Per-PR: exercise the REAL scripts/mutants.sh pipeline (out-of-repo scratch,
@@ -95,6 +100,10 @@ jobs:
           - { crate: musefs-format, label: musefs-format-1, shard: 1/4 }
           - { crate: musefs-format, label: musefs-format-2, shard: 2/4 }
           - { crate: musefs-format, label: musefs-format-3, shard: 3/4 }
+          # musefs-latencyfs carries real logic (inode map, latency table, attr
+          # mapping, passthrough ops); scripts/mutants.sh runs its mounted
+          # #[ignore]d tests, so this leg needs libfuse + /dev/fuse.
+          - { crate: musefs-latencyfs, label: musefs-latencyfs }
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -103,6 +112,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Install FUSE
+        # Only the musefs-latencyfs leg mounts a passthrough FS in its tests.
+        if: matrix.crate == 'musefs-latencyfs'
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config
       - name: Install cargo-mutants
         # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).

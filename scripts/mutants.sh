@@ -129,6 +129,15 @@ for crate in "${crates[@]}"; do
         --file musefs-format/src/ogg/crc.rs \
         --file musefs-format/src/ogg/b64.rs
       ;;
+    musefs-latencyfs)
+      # Every test in this crate is #[ignore]d (it mounts a real passthrough
+      # FUSE), so the trailing `-- -- --include-ignored` forwards through
+      # cargo-mutants -> cargo test -> the test harness to run them. Needs
+      # /dev/fuse + libfuse on the runner (the CI leg installs fuse3).
+      run_crate musefs-latencyfs --test-workspace=false \
+        --file musefs-latencyfs/src/lib.rs \
+        -- -- --include-ignored
+      ;;
     *)
       echo "unknown crate: $crate" >&2; status=1; continue
       ;;
