@@ -814,4 +814,61 @@ mod tests {
             paths_of(&reference).keys().collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn equiv_distinguishes_structurally_different_trees() {
+        // `build` is deterministic (fresh allocator from the same base), so two
+        // builds of identical entries are equiv; different structure is not.
+        let a = VirtualTree::build(&[(10, "A/x.flac".into())]);
+        let same = VirtualTree::build(&[(10, "A/x.flac".into())]);
+        let different = VirtualTree::build(&[(10, "B/x.flac".into())]);
+        assert!(a.equiv(&same), "identical builds must be equiv");
+        assert!(
+            !a.equiv(&different),
+            "different structure must not be equiv (guards equiv->true)"
+        );
+    }
+
+    #[test]
+    fn path_of_returns_full_disambiguated_path() {
+        let t = VirtualTree::build(&[(10, "A/B/x.flac".into())]);
+        let a = t.lookup(VirtualTree::ROOT, "A").unwrap();
+        let b = t.lookup(a, "B").unwrap();
+        let x = t.lookup(b, "x.flac").unwrap();
+        assert_eq!(t.path_of(x), "A/B/x.flac");
+        assert_eq!(t.path_of(b), "A/B");
+        assert_eq!(t.path_of(VirtualTree::ROOT), "");
+    }
+
+    #[test]
+    fn deepest_existing_ancestor_walks_existing_rendered_dirs() {
+        let t = VirtualTree::build(&[(10, "A/B/x.flac".into())]);
+        let a = t.lookup(VirtualTree::ROOT, "A").unwrap();
+        let b = t.lookup(a, "B").unwrap();
+        // Both A and B exist: the deepest existing dir for a file under A/B is B.
+        assert_eq!(t.deepest_existing_ancestor("A/B/new.flac"), b);
+        // A exists but Q does not: the walk stops at A.
+        assert_eq!(t.deepest_existing_ancestor("A/Q/new.flac"), a);
+        // Nothing below root exists along this path.
+        assert_eq!(t.deepest_existing_ancestor("Z/new.flac"), VirtualTree::ROOT);
+    }
+
+    #[test]
+    fn ancestor_in_detects_ancestor_and_self() {
+        let t = VirtualTree::build(&[(10, "A/B/x.flac".into())]);
+        let a = t.lookup(VirtualTree::ROOT, "A").unwrap();
+        let b = t.lookup(a, "B").unwrap();
+        let mut set = std::collections::HashSet::new();
+        set.insert(a);
+        assert!(t.ancestor_in(b, &set), "A is an ancestor of B");
+        assert!(
+            t.ancestor_in(a, &set),
+            "a node is its own ancestor for this check"
+        );
+        let empty = std::collections::HashSet::new();
+        assert!(
+            !t.ancestor_in(b, &empty),
+            "no ancestor present (guards ancestor_in->false)"
+        );
+    }
 }

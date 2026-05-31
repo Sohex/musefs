@@ -105,4 +105,28 @@ mod tests {
         let scan = vec![(1, 0, Format::Flac)];
         assert!(partition_changes(&prev, &scan).is_empty());
     }
+
+    #[test]
+    fn is_empty_false_when_any_single_category_is_nonempty() {
+        // Each category alone must make `is_empty` false. A single non-empty
+        // category isolates the three `&&` conjuncts: it would read as empty
+        // under any `&&`->`||` swap, and (with the default empty case below) it
+        // also pins the function against a constant-`true` body.
+        let only_changed = ChangeSet {
+            changed: vec![1],
+            ..Default::default()
+        };
+        let only_added = ChangeSet {
+            added: vec![1],
+            ..Default::default()
+        };
+        let only_removed = ChangeSet {
+            removed: vec![1],
+            ..Default::default()
+        };
+        assert!(!only_changed.is_empty());
+        assert!(!only_added.is_empty());
+        assert!(!only_removed.is_empty());
+        assert!(ChangeSet::default().is_empty());
+    }
 }

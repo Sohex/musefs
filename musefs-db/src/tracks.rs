@@ -173,4 +173,20 @@ mod render_key_tests {
         assert_eq!(keys[0].2, Format::Flac);
         assert_eq!(keys[1].2, Format::Mp3);
     }
+
+    #[test]
+    fn set_format_for_test_persists_the_new_format() {
+        let db = open_mem();
+        let id = db
+            .upsert_track(&new_track("/a.flac", Format::Flac))
+            .unwrap();
+        db.set_format_for_test(id, Format::Mp3).unwrap();
+        let keys = db.list_render_keys().unwrap();
+        assert_eq!(keys[0].0, id);
+        assert_eq!(
+            keys[0].2,
+            Format::Mp3,
+            "set_format_for_test must actually UPDATE the format column"
+        );
+    }
 }
