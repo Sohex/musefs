@@ -3,6 +3,7 @@ mod common;
 use common::corpus::{prepare, CorpusParams, Format, Tier};
 use common::report::{peak_rss_kib, RunReport};
 use common::write_m4a_moov_last;
+use common::write_ogg;
 use musefs_core::scan_directory;
 use musefs_db::Db;
 
@@ -122,4 +123,28 @@ fn report_renders_a_row() {
     assert!(line.contains("n/a"), "fsyncs None renders as n/a");
     // RSS is readable and positive on Linux.
     assert!(peak_rss_kib().unwrap_or(1) > 0);
+}
+
+#[test]
+fn write_ogg_scans_as_one_track() {
+    let dir = tempfile::tempdir().unwrap();
+    write_ogg(&dir.path().join("a.ogg"), &[0x22u8; 256]);
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+    assert_eq!(stats.scanned, 1, "minimal Ogg Opus should probe & ingest");
+    assert_eq!(stats.skipped, 0);
+}
+
+#[test]
+fn write_ogg_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.ogg");
+    let b = dir.path().join("b.ogg");
+    write_ogg(&a, &[0x33u8; 300]);
+    write_ogg(&b, &[0x33u8; 300]);
+    assert_eq!(
+        std::fs::read(&a).unwrap(),
+        std::fs::read(&b).unwrap(),
+        "same audio bytes => identical Ogg file"
+    );
 }

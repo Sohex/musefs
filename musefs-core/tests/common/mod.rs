@@ -245,3 +245,29 @@ pub fn write_m4a_moov_last(path: &Path, audio: &[u8]) -> (i64, i64) {
     std::fs::write(path, &bytes).unwrap();
     (audio_offset, audio.len() as i64)
 }
+
+/// Write a minimal valid Ogg **Opus** file (two header pages + one audio page
+/// whose packet body is `audio`) to `path`, returning (audio_offset,
+/// audio_length) of the audio-page span. Mirrors the recipe in
+/// `musefs-core/src/scan.rs`'s `ogg_probe_tests`: the `OpusTags` body must be a
+/// parseable VorbisComment (here empty) because the scanner runs `read_tags`.
+/// The synthesizer treats the audio packet body as opaque (renumbers pages,
+/// recomputes CRCs, never decodes), so arbitrary `audio` bytes are valid. The
+/// return is informational — `scan_directory` re-probes the file.
+pub fn write_ogg(path: &Path, audio: &[u8]) -> (i64, i64) {
+    use musefs_format::ogg::page_test_support::{
+        build_header_pub, lace_packet_pub, vorbis_body_empty,
+    };
+    let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&vorbis_body_empty());
+    let serial = 0x6d75_7366; // "musf"
+                              // build_header returns (bytes, header_page_count); the audio page continues
+                              // the sequence at that count.
+    let (mut bytes, header_pages) = build_header_pub(serial, &[&head, &tags]);
+    let header_len = bytes.len();
+    let (page, _) = lace_packet_pub(serial, header_pages, false, 960, audio);
+    bytes.extend_from_slice(&page);
+    std::fs::write(path, &bytes).unwrap();
+    (header_len as i64, (bytes.len() - header_len) as i64)
+}
