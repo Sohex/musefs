@@ -248,7 +248,8 @@ pub fn write_m4a_moov_last(path: &Path, audio: &[u8]) -> (i64, i64) {
 
 /// Write a minimal valid Ogg **Opus** file (two header pages + one audio page
 /// whose packet body is `audio`) to `path`, returning (audio_offset,
-/// audio_length) of the audio-page span. Mirrors the recipe in
+/// audio_length) where audio_length is the Ogg page span (raw audio bytes plus
+/// page-framing overhead, not `audio.len()`). Mirrors the recipe in
 /// `musefs-core/src/scan.rs`'s `ogg_probe_tests`: the `OpusTags` body must be a
 /// parseable VorbisComment (here empty) because the scanner runs `read_tags`.
 /// The synthesizer treats the audio packet body as opaque (renumbers pages,
