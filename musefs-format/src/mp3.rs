@@ -83,7 +83,7 @@ pub fn locate_audio_bounded(
             return Err(FormatError::Malformed);
         }
         audio_offset = tag_len;
-    } else if prefix.len() < 10 && (file_len as usize) >= 10 {
+    } else if prefix.len() < 10 && file_len >= 10 {
         // Not enough bytes even to read the ID3v2 header.
         return Ok(Extent::NeedMore { up_to: 10 });
     }
@@ -1120,8 +1120,6 @@ mod tests {
         let huge = v23_frame(b"TIT2", 100, &[1, 2, 3, 4]);
         assert!(!id3v2_alloc_safe(&id3v2(0x03, 0x00, 14, &huge)));
     }
-
-    use crate::probe::Extent;
 
     /// ID3v2 header declaring `body` bytes of tag, then a frame-sync byte pair,
     /// then `audio`. Returns (full, audio_offset).
