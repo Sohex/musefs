@@ -1,6 +1,6 @@
 mod common;
 
-use common::corpus::{CorpusParams, Format, Tier};
+use common::corpus::{prepare, CorpusParams, Format, Tier};
 use common::write_m4a_moov_last;
 use musefs_core::scan_directory;
 use musefs_db::Db;
@@ -75,4 +75,30 @@ fn moov_last_m4a_scans_as_one_track() {
     let stats = scan_directory(&db, dir.path()).unwrap();
     assert_eq!(stats.scanned, 1, "moov-at-end M4A should probe & ingest");
     assert_eq!(stats.skipped, 0);
+}
+
+#[test]
+fn prepare_generates_when_no_library_set() {
+    let _g = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("MUSEFS_BENCH_LIBRARY");
+    std::env::remove_var("MUSEFS_BENCH_DB");
+    let scratch = tempfile::tempdir().unwrap();
+    std::env::set_var("MUSEFS_BENCH_DIR", scratch.path());
+    let p = CorpusParams {
+        albums: 1,
+        tracks_per_album: 2,
+        bytes_per_track: 128,
+        art_bytes_per_track: 0,
+        format_mix: vec![Format::Flac],
+        seed: 3,
+    };
+    let t = prepare(&p);
+    std::env::remove_var("MUSEFS_BENCH_DIR");
+    assert!(t.corpus_dir.exists());
+    assert!(!t.is_real_library);
+    // DB path is separate from the corpus dir.
+    assert_ne!(t.db_path, t.corpus_dir);
+    let db = Db::open(&t.db_path).unwrap();
+    let stats = musefs_core::scan_directory(&db, &t.corpus_dir).unwrap();
+    assert_eq!(stats.scanned, 2);
 }

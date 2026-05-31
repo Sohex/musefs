@@ -207,6 +207,54 @@ pub fn generate(dir: &Path, p: &CorpusParams) -> Vec<PathBuf> {
     paths
 }
 
+/// Where the corpus and DB live for a run, and whether it was generated.
+pub struct Target {
+    pub corpus_dir: PathBuf,
+    pub db_path: PathBuf,
+    pub is_real_library: bool,
+    /// Held to keep a tempdir alive for the run when one was created.
+    _scratch: Option<tempfile::TempDir>,
+}
+
+/// Resolve the run target:
+/// - `MUSEFS_BENCH_LIBRARY` set -> scan that real directory in place (never
+///   written to); DB goes to `MUSEFS_BENCH_DB` or a fresh tempfile.
+/// - else generate the corpus under `MUSEFS_BENCH_DIR` (or a tempdir) and put
+///   the DB alongside under a separate `musefs-bench.db` name.
+pub fn prepare(p: &CorpusParams) -> Target {
+    if let Ok(lib) = std::env::var("MUSEFS_BENCH_LIBRARY") {
+        let scratch = tempfile::tempdir().unwrap();
+        let db_path = std::env::var("MUSEFS_BENCH_DB")
+            .map_or_else(|_| scratch.path().join("musefs-bench.db"), PathBuf::from);
+        return Target {
+            corpus_dir: PathBuf::from(lib),
+            db_path,
+            is_real_library: true,
+            _scratch: Some(scratch),
+        };
+    }
+    let (corpus_dir, scratch) = if let Ok(d) = std::env::var("MUSEFS_BENCH_DIR") {
+        (PathBuf::from(d), None)
+    } else {
+        let s = tempfile::tempdir().unwrap();
+        (s.path().to_path_buf(), Some(s))
+    };
+    generate(&corpus_dir, p);
+    let db_path = std::env::var("MUSEFS_BENCH_DB")
+        .map_or_else(|_| corpus_dir.join("musefs-bench.db"), PathBuf::from);
+    // Generated mode: start cold so a reused MUSEFS_BENCH_DIR doesn't time the
+    // scan against a DB that already holds the tracks. (WAL sidecars too.)
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
+    Target {
+        corpus_dir,
+        db_path,
+        is_real_library: false,
+        _scratch: scratch,
+    }
+}
+
 /// `comments` and `art` are only consumed by [`Format::Flac`]; the other formats
 /// carry tags via the DB at scan time and have no embedded-art builder, so they
 /// ignore both here.
