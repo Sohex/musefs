@@ -9,7 +9,9 @@ use musefs_db::Db;
 
 /// Serializes tests that mutate process-global `MUSEFS_BENCH_*` env vars —
 /// cargo runs all tests in one binary across threads, so concurrent
-/// set_var/remove_var would race. Every env-touching test locks this first.
+/// set_var/remove_var would race. Every env-touching test locks this first, and
+/// recovers from poisoning (`PoisonError::into_inner`) so that a panic in one
+/// locked test doesn't cascade into spurious `.lock()` failures in the others.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
@@ -31,7 +33,9 @@ fn tier_presets_have_expected_shape() {
 
 #[test]
 fn env_overrides_apply_over_tier() {
-    let _g = ENV_LOCK.lock().unwrap();
+    let _g = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("MUSEFS_BENCH_TIER", "ci");
     std::env::set_var("MUSEFS_BENCH_ALBUMS", "3");
     std::env::set_var("MUSEFS_BENCH_TRACKS_PER_ALBUM", "4");
@@ -81,7 +85,9 @@ fn moov_last_m4a_scans_as_one_track() {
 
 #[test]
 fn prepare_generates_when_no_library_set() {
-    let _g = ENV_LOCK.lock().unwrap();
+    let _g = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::remove_var("MUSEFS_BENCH_LIBRARY");
     std::env::remove_var("MUSEFS_BENCH_DB");
     let scratch = tempfile::tempdir().unwrap();
@@ -175,7 +181,9 @@ fn generate_with_all_formats_scans_all() {
 
 #[test]
 fn bench_formats_defaults_to_all_when_unset() {
-    let _g = ENV_LOCK.lock().unwrap();
+    let _g = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::remove_var("MUSEFS_BENCH_FORMAT_MIX");
     assert_eq!(
         common::corpus::bench_formats(),
@@ -185,7 +193,9 @@ fn bench_formats_defaults_to_all_when_unset() {
 
 #[test]
 fn bench_formats_filters_and_never_empty() {
-    let _g = ENV_LOCK.lock().unwrap();
+    let _g = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("MUSEFS_BENCH_FORMAT_MIX", "ogg,wav");
     let filtered = common::corpus::bench_formats();
     std::env::set_var("MUSEFS_BENCH_FORMAT_MIX", "garbagetoken");
@@ -236,7 +246,9 @@ fn prepare_format_generates_scannable_single_format_corpus() {
 
 #[test]
 fn bench_base_dir_defaults_to_held_tempdir() {
-    let _g = ENV_LOCK.lock().unwrap();
+    let _g = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::remove_var("MUSEFS_BENCH_DIR");
     let (base, scratch) = common::corpus::bench_base_dir();
     assert!(base.exists(), "base dir exists");
