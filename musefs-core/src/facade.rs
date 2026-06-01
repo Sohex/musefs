@@ -557,6 +557,9 @@ impl Musefs {
             let track = db
                 .get_track(track_id)?
                 .ok_or(CoreError::TrackNotFound(track_id))?;
+            // `.map(|e| *e)` copies the SizeEntry (Copy) so the shard Ref drops
+            // before the miss-path insert below — same key → same shard, and
+            // holding the Ref across the re-lock would deadlock.
             if let Some(e) = self.size_cache.get(&track_id).map(|e| *e) {
                 if e.content_version == track.content_version {
                     // Hit: no backing stat, no synthesis. NOTE: a backing file
