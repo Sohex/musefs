@@ -159,6 +159,11 @@ exclude_re = [
     # so `^` and `|` are bit-identical, and the built matrix is unchanged. (The
     # linear-path `^` elsewhere in crc_shift_zeros IS caught and stays in scope.)
     'musefs-format/src/ogg/crc\.rs:\d+:\d+: replace \^ with \| in crc_shift_zeros::poly_step',
+    # matrix-power loop terminator `while exp > 0`, `>`->`>=`: `exp` is usize, so
+    # `>= 0` is always true and the loop never exits — non-terminating (TIMEOUT,
+    # never a clean kill). It is the sole `>` in crc_shift_zeros (the `p >> 24` is a
+    # shift), so anchored line-agnostically.
+    'musefs-format/src/ogg/crc\.rs:\d+:\d+: replace > with >= in crc_shift_zeros',
 
     # SP4 serve_ogg_window / find_page_start loop mutants.
     # Non-terminating (reported TIMEOUT, never a clean kill): `i -= 1` -> `i /= 1`
