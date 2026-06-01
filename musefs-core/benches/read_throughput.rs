@@ -179,7 +179,10 @@ fn cold_fixture(format: Format, bytes_per_track: usize) -> (Arc<Musefs>, u64, te
     let fs = Arc::new(Musefs::open(db, config()).unwrap());
     let mut inodes = Vec::new();
     collect_file_inodes(&fs, VirtualTree::ROOT, &mut inodes);
-    assert!(!inodes.is_empty(), "cold_fixture: no file inodes for {format:?}");
+    assert!(
+        !inodes.is_empty(),
+        "cold_fixture: no file inodes for {format:?}"
+    );
     let inode = inodes[0];
     (fs, inode, dir)
 }
