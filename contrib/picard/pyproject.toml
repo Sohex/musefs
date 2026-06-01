@@ -9,7 +9,7 @@ description = "Sync MusicBrainz Picard metadata into the musefs SQLite store"
 requires-python = ">=3.8"
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "pytest-qt>=4"]
 
 [tool.setuptools]
 packages = ["musefs"]

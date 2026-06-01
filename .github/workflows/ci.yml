@@ -79,6 +79,31 @@ jobs:
       - name: Test
         run: python -m pytest contrib/beets/tests -v
 
+  picard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install Picard (system Python + PyQt5)
+        run: sudo apt-get update && sudo apt-get install -y picard
+      - name: Verify Picard module path
+        run: test -d /usr/lib/picard/picard || { echo "::error::picard package not at /usr/lib/picard; PYTHONPATH is stale"; exit 1; }
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+      - name: Create venv on the system Python
+        run: uv venv --system-site-packages --python "$(which python3)"
+      - name: Install plugin test deps + ruff
+        run: uv pip install -e 'contrib/picard[test]' ruff
+      - name: Lint
+        run: |
+          .venv/bin/ruff check contrib/picard/
+          .venv/bin/ruff format --check contrib/picard/
+      - name: Test (real Picard, headless)
+        env:
+          PYTHONPATH: /usr/lib/picard
+          QT_QPA_PLATFORM: offscreen
+        run: .venv/bin/python -m pytest contrib/picard/tests -v
+
   e2e:
     runs-on: ubuntu-latest
     steps:

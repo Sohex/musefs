@@ -81,7 +81,24 @@ The `musefs_bin` gate shells out to the real `musefs` binary, so build it first
 from the repo root (`cargo build`). It is deselected from the default run and
 skips cleanly if the binary is absent.
 
-### Manual smoke test (the GUI path is not unit-tested)
+### Real-Picard (pytest-qt) tests
+
+The adapter (`musefs/__init__.py`) is exercised against a real Picard + PyQt5
+install, headless. Picard isn't a clean pip wheel, so use the distro package and
+bind a uv venv to the system Python it targets:
+
+```bash
+sudo apt-get install -y picard                              # Picard at /usr/lib/picard + system PyQt5
+uv venv --system-site-packages --python "$(which python3)"  # match apt Picard's C-ext interpreter
+uv pip install -e 'contrib/picard[test]'                    # test extra includes pytest-qt
+PYTHONPATH=/usr/lib/picard QT_QPA_PLATFORM=offscreen \
+  .venv/bin/python -m pytest contrib/picard/tests -v
+```
+
+These tests `importorskip("picard")`, so on a machine without Picard they skip
+cleanly and only the Qt-free `_core` tests run.
+
+### Manual smoke test (full GUI round-trip)
 
 1. `cargo build` and create a store: `musefs scan /path/to/album --db /tmp/m.db`.
 2. Copy the plugin into Picard's plugins dir; enable it; set DB path `/tmp/m.db`.
