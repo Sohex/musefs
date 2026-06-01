@@ -4,7 +4,7 @@
 
 **Goal:** Replace the eager whole-audio-region Ogg page index (`build_index` / `OggPageIndex`) with a stateless per-request backwards-scan that finds the page boundary from a ~65 KB window, patches headers algebraically (no payload I/O), and serves payload slices via exact positioned reads.
 
-**Architecture:** `crc_shift_zeros` (crc.rs) enables algebraic CRC patching; `patch_page_header_algebraic` (page.rs) patches a page header from header bytes only; `find_page_start` + `serve_ogg_window` (ogg_index.rs) replace `build_index` + `serve`. The `ResolvedFile` struct drops the `ogg_index: OnceCell` field; the `OggAudio` arm in `read_segments` becomes a direct call to `serve_ogg_window`.
+**Architecture:** `crc_shift_zeros` (crc.rs) enables algebraic CRC patching; `patch_page_header_algebraic` (page.rs) patches a page header from header bytes only; `verify_page_crc` (page.rs) backs the backward-scan entry-page CRC guard that keeps page location deterministic (byte-identical output unconditionally); `find_page_start` (CRC-validated via `page_crc_ok`) + `serve_ogg_window` (ogg_index.rs) replace `build_index` + `serve`. The `ResolvedFile` struct drops the `ogg_index: OnceCell` field; the `OggAudio` arm in `read_segments` becomes a direct call to `serve_ogg_window`.
 
 **Tech Stack:** Rust, musefs-format (ogg/crc.rs, ogg/page.rs), musefs-core (ogg_index.rs, reader.rs, facade.rs, tests/read_at.rs). No schema changes, no new dependencies.
 
@@ -15,8 +15,9 @@
 | File | Change |
 |------|--------|
 | `musefs-format/src/ogg/crc.rs` | Add `pub fn crc_shift_zeros` |
-| `musefs-format/src/ogg/page.rs` | Update import line 1; add `pub fn patch_page_header_algebraic` |
-| `musefs-core/src/ogg_index.rs` | Full replacement: remove all old code; add `find_page_start`, `serve_ogg_window`, new tests |
+| `musefs-format/src/ogg/page.rs` | Update import line 1; add `pub fn patch_page_header_algebraic` + `pub fn verify_page_crc` |
+| `musefs-format/src/ogg/mod.rs` | Re-export the two new `page` functions |
+| `musefs-core/src/ogg_index.rs` | Full replacement: remove all old code; add `find_page_start`, `page_crc_ok`, `serve_ogg_window`, new tests |
 | `musefs-core/src/reader.rs` | Remove imports (lines 9, 14); remove `ogg_index` field from `ResolvedFile`; remove constants + fn (lines 15–23); simplify `cache_bytes`; replace `OggAudio` arm; fix/delete tests |
 | `musefs-core/src/facade.rs` | Remove `ogg_index: OnceCell::new()` from line 697 |
 | `musefs-core/tests/read_at.rs` | Remove `ogg_index: once_cell::sync::OnceCell::new()` from line 120 |
@@ -137,18 +138,20 @@
   pub use page::{parse_page, patch_page_header, PageHeader};
   ```
 
-  Change it to add `patch_page_header_algebraic` (without this, Task 3's
-  `use musefs_format::ogg::patch_page_header_algebraic;` fails to resolve):
+  Change it to add `patch_page_header_algebraic` and `verify_page_crc` (without these,
+  Task 3's `use musefs_format::ogg::{patch_page_header_algebraic, verify_page_crc};`
+  fails to resolve):
 
   ```rust
-  pub use page::{parse_page, patch_page_header, patch_page_header_algebraic, PageHeader};
+  pub use page::{
+      parse_page, patch_page_header, patch_page_header_algebraic, verify_page_crc, PageHeader,
+  };
   ```
 
-  (The function does not exist yet — that's fine; this edit and the Step 2.5
-  implementation land in the same commit. The differential test in Step 2.3 lives
-  inside page.rs's own `mod tests` and would pass without this re-export, which is
-  why the re-export must be added deliberately here rather than discovered as a
-  build break in Task 3.)
+  (Neither function exists yet — that's fine; this edit and the Step 2.5
+  implementations land in the same commit. The tests in Step 2.3 live inside page.rs's
+  own `mod tests` and would pass without this re-export, which is why it must be added
+  deliberately here rather than discovered as a build break in Task 3.)
 
 - [ ] **Step 2.3 — Write the failing test**
 
@@ -179,19 +182,35 @@
           }
       }
   }
+
+  #[test]
+  fn verify_page_crc_accepts_valid_rejects_tampered() {
+      // A freshly laced page has a correct CRC.
+      let (page, _) = lace_packet(0x55, 9, false, 42, &vec![0x7Eu8; 500]);
+      assert!(verify_page_crc(&page).unwrap(), "valid page must verify true");
+      // Flip one payload byte → CRC no longer matches.
+      let mut tampered = page.clone();
+      let h = parse_page(&page, 0).unwrap();
+      tampered[h.header_len] ^= 0xFF; // first payload byte
+      assert!(!verify_page_crc(&tampered).unwrap(), "tampered payload must verify false");
+      // Corrupt the stored CRC field directly → also false.
+      let mut bad_crc = page.clone();
+      bad_crc[22] ^= 0x01;
+      assert!(!verify_page_crc(&bad_crc).unwrap(), "corrupt stored CRC must verify false");
+  }
   ```
 
-- [ ] **Step 2.4 — Run to verify it fails**
+- [ ] **Step 2.4 — Run to verify they fail**
 
   ```bash
-  cargo test -p musefs-format ogg::page::tests::patch_algebraic 2>&1 | grep -E "FAILED|error"
+  cargo test -p musefs-format ogg::page::tests 2>&1 | grep -E "FAILED|error"
   ```
 
-  Expected: compile error — `patch_page_header_algebraic` not found.
+  Expected: compile error — `patch_page_header_algebraic` and `verify_page_crc` not found.
 
-- [ ] **Step 2.5 — Implement `patch_page_header_algebraic`**
+- [ ] **Step 2.5 — Implement `patch_page_header_algebraic` and `verify_page_crc`**
 
-  Add after the closing brace of `patch_page_header` in `musefs-format/src/ogg/page.rs`:
+  Add both functions after the closing brace of `patch_page_header` in `musefs-format/src/ogg/page.rs`:
 
   ```rust
   /// Patch a page header algebraically — no payload read needed.
@@ -229,6 +248,20 @@
       out[22..26].copy_from_slice(&new_crc.to_le_bytes());
       Ok(out)
   }
+
+  /// Verify that the page at the start of `page` carries a stored CRC matching a
+  /// fresh computation. `page` must hold at least the full page (`total_len()`
+  /// bytes). Used by the backward-scan entry-page guard to reject a coincidental
+  /// `OggS` match in audio payload (a false page start fails this check).
+  pub fn verify_page_crc(page: &[u8]) -> Result<bool> {
+      let h = parse_page(page, 0)?;
+      if page.len() < h.total_len() {
+          return Err(FormatError::Malformed);
+      }
+      let mut buf = page[..h.total_len()].to_vec();
+      buf[22..26].copy_from_slice(&0u32.to_le_bytes());
+      Ok(crc32(&buf) == h.crc)
+  }
   ```
 
 - [ ] **Step 2.6 — Run tests**
@@ -237,7 +270,8 @@
   cargo test -p musefs-format ogg::page::tests 2>&1 | grep -E "test .* ok|FAILED"
   ```
 
-  Expected: all page tests pass, including `patch_algebraic_matches_full_page`.
+  Expected: all page tests pass, including `patch_algebraic_matches_full_page` and
+  `verify_page_crc_accepts_valid_rejects_tampered`.
 
 - [ ] **Step 2.7 — Run full musefs-format test suite**
 
@@ -252,12 +286,13 @@
   ```bash
   git add musefs-format/src/ogg/page.rs musefs-format/src/ogg/mod.rs
   git commit -m "$(cat <<'EOF'
-  SP4: add patch_page_header_algebraic — header-only CRC patching
+  SP4: add patch_page_header_algebraic + verify_page_crc
 
-  Uses crc_shift_zeros to compute new_crc = old_crc XOR crc32(seq_delta
-  contribution) from header bytes alone. Algebraically identical to the
-  full-page patch_page_header; differential test confirms byte-identity
-  across payload sizes 0..65025 and a range of seq values.
+  patch_page_header_algebraic: compute new_crc = old_crc XOR crc32(seq_delta
+  contribution) from header bytes alone (no payload read); algebraically
+  identical to full-page patch_page_header (differential test, payload sizes
+  0..65025). verify_page_crc: recompute a full page's CRC vs its stored CRC,
+  for the backward-scan entry-page guard. Both re-exported from ogg/mod.rs.
 
   Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
   EOF
@@ -362,6 +397,35 @@ Add the new functions **alongside** the old ones so the build stays green while 
       assert_eq!(found, ao);
   }
 
+  #[test]
+  fn find_page_start_skips_false_oggs_in_payload() {
+      // A single real page whose payload embeds a coincidental "OggS" + a plausible
+      // (version 0, header_type 0, seg_count 0) header but a garbage CRC field. The
+      // backward scan finds this fake first (it is to the right of the real start),
+      // must reject it via the CRC guard, and return the real page start.
+      let mut payload = vec![0u8; 600];
+      // A complete 27-byte fake header: OggS | ver(1)=0 | htype(1)=0 | granule(8)=0
+      // | serial(4) | seq(4) | crc(4)=garbage | seg_count(1)=0. Passes the cheap
+      // checks (version 0, header_type 0, seg_count 0) but its CRC field is garbage.
+      let fake: &[u8] =
+          b"OggS\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x9a\x9a\x9a\x9a\x11\x22\x33\x44\xde\xad\xbe\xef\x00";
+      assert_eq!(fake.len(), 27);
+      payload[100..100 + fake.len()].copy_from_slice(fake);
+      let (audio, _) = lace_packet_pub(0xABCD, 5, false, 100, &payload);
+      let dir = tempfile::tempdir().unwrap();
+      let path = dir.path().join("fake.ogg");
+      let mut file = vec![0u8; 16];
+      file.extend_from_slice(&audio);
+      std::fs::File::create(&path).unwrap().write_all(&file).unwrap();
+      let ao = 16u64;
+      let backing = std::fs::File::open(&path).unwrap();
+      // Target near the end of the real page; the fake OggS at payload+100 sits
+      // between the real start and the target, so it is the rightmost candidate.
+      let abs_target = ao + audio.len() as u64 - 1;
+      let found = find_page_start(&backing, ao, abs_target).unwrap();
+      assert_eq!(found, ao, "must reject the CRC-invalid fake OggS and return the real start");
+  }
+
   // ── serve_ogg_window tests ────────────────────────────────────────────────
 
   #[test]
@@ -386,7 +450,7 @@ Add the new functions **alongside** the old ones so the build stays green while 
   `use musefs_format::ogg::parse_page;` at line 10):
 
   ```rust
-  use musefs_format::ogg::patch_page_header_algebraic;
+  use musefs_format::ogg::{patch_page_header_algebraic, verify_page_crc};
   ```
 
   **Do NOT add a `use std::os::unix::fs::FileExt;`** — one already exists at
@@ -409,10 +473,12 @@ Add the new functions **alongside** the old ones so the build stays green while 
   /// (the first audio page always starts there, validated at scan time).
   ///
   /// General case: reads the window `[max(audio_offset, abs_target−65307), abs_target)`
-  /// in one `pread` and scans backwards for the rightmost valid OggS page start.
-  /// Validity checks: version byte 0, `header_type & 0xF8 == 0`, segment table fits
-  /// within the window. A false positive that evades these checks would produce a
-  /// malformed-CRC page (detectable by the client's Ogg decoder).
+  /// in one `pread` and scans backwards for the rightmost OggS page start. Each
+  /// candidate that passes the cheap header checks (version byte 0,
+  /// `header_type & 0xF8 == 0`, segment table fits) is then CRC-validated by
+  /// `page_crc_ok`; a coincidental `OggS` in audio payload fails the CRC check, so
+  /// the scan rejects it and continues. This makes page location deterministic —
+  /// the byte-identical guarantee holds unconditionally, not just probabilistically.
   fn find_page_start(
       backing: &std::fs::File,
       audio_offset: u64,
@@ -428,19 +494,22 @@ Add the new functions **alongside** the old ones so the build stays green while 
       let mut window = vec![0u8; window_len];
       backing.read_exact_at(&mut window, scan_start)?;
 
-      // Scan backwards for the rightmost valid OggS capture.
+      // Scan backwards for the rightmost CRC-valid OggS capture.
       let mut i = window_len.saturating_sub(4);
       loop {
           if window[i..].starts_with(b"OggS") {
-              let ok = window.get(i + 4) == Some(&0)           // version == 0
+              let cheap_ok = window.get(i + 4) == Some(&0)       // version == 0
                   && window.get(i + 5).is_some_and(|&ht| ht & 0xF8 == 0) // header_type
                   && i + 26 < window_len                         // num_segs byte fits
                   && {
                       let ns = window[i + 26] as usize;
                       i + 27 + ns <= window_len                  // seg table fits
                   };
-              if ok {
-                  return Ok(scan_start + i as u64);
+              if cheap_ok {
+                  let candidate = scan_start + i as u64;
+                  if page_crc_ok(backing, candidate)? {
+                      return Ok(candidate);
+                  }
               }
           }
           if i == 0 {
@@ -449,6 +518,32 @@ Add the new functions **alongside** the old ones so the build stays green while 
           i -= 1;
       }
       Err(musefs_format::FormatError::Malformed.into())
+  }
+
+  /// Read the full page at `page_start` and verify its stored CRC. Returns
+  /// `Ok(false)` (not an error) on a CRC mismatch, a too-short header, or EOF, so
+  /// the backward scan treats the candidate as a false positive and continues.
+  fn page_crc_ok(backing: &std::fs::File, page_start: u64) -> Result<bool> {
+      // Read up to the max header (tolerating a short read at EOF) to learn the
+      // page length without a second round trip.
+      let mut head = vec![0u8; MAX_OGG_HEADER_BYTES];
+      let n = backing.read_at(&mut head, page_start)?;
+      head.truncate(n);
+      if head.len() < 27 {
+          return Ok(false);
+      }
+      let seg_count = head[26] as usize;
+      let header_len = 27 + seg_count;
+      if head.len() < header_len {
+          return Ok(false);
+      }
+      let payload_len: usize = head[27..header_len].iter().map(|&b| b as usize).sum();
+      let total = header_len + payload_len;
+      let mut page = vec![0u8; total];
+      if backing.read_exact_at(&mut page, page_start).is_err() {
+          return Ok(false); // page runs past EOF → not a real page here
+      }
+      Ok(verify_page_crc(&page).unwrap_or(false))
   }
   ```
 
@@ -742,11 +837,13 @@ Add the new functions **alongside** the old ones so the build stays green while 
   SP4: add find_page_start + serve_ogg_window alongside old index API
 
   find_page_start: backwards-scan ~65 KB window to locate the Ogg page
-  containing the request, with OggS capture + header_type/seg_table sanity
-  checks. serve_ogg_window: stateless per-request serve — algebraic header
-  patch via patch_page_header_algebraic + exact payload pread, no index.
-  Oracle tests (Opus, Vorbis, OggFLAC) confirm clean bitstream output.
-  Old API (OggPageIndex/build_index/serve) retained temporarily.
+  containing the request, with OggS capture + header sanity checks AND a
+  deterministic entry-page CRC guard (page_crc_ok) that rejects coincidental
+  OggS-in-payload, keeping output byte-identical unconditionally.
+  serve_ogg_window: stateless per-request serve — algebraic header patch via
+  patch_page_header_algebraic + exact payload pread, no index. Oracle tests
+  (Opus, Vorbis, OggFLAC) + false-OggS rejection test green. Old API
+  (OggPageIndex/build_index/serve) retained temporarily.
 
   Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
   EOF
@@ -1038,10 +1135,11 @@ The old `OggPageIndex`, `IndexedPage`, `build_index`, and `serve` are no longer 
 
   The file's production section should now contain only:
   - `use std::os::unix::fs::FileExt;`
-  - `use musefs_format::ogg::patch_page_header_algebraic;`
+  - `use musefs_format::ogg::{patch_page_header_algebraic, verify_page_crc};`
   - `use crate::error::{CoreError, Result};`
   - `const MAX_OGG_PAGE_BYTES` and `const MAX_OGG_HEADER_BYTES`
   - `fn find_page_start`
+  - `fn page_crc_ok`
   - `pub fn serve_ogg_window`
 
 - [ ] **Step 5.2 — Remove old tests**
@@ -1148,7 +1246,19 @@ The old `OggPageIndex`, `IndexedPage`, `build_index`, and `serve` are no longer 
 
   Check: no Ogg/Opus/OggFLAC format rises >10% above the SP3 baseline. Record medians.
 
-  **If any format rises >10%:** the `crc_shift_zeros` loop is causing regression in the warm path. Implement the O(log n) GF(2) polynomial exponentiation replacement for `crc_shift_zeros`:
+  Note the SP4 per-read cost profile differs from SP3's warmed index: each non-zero-offset
+  serve now does a backward-scan window read + one entry-page CRC validation, but **no**
+  O(file-position) page-skip (SP3's `serve` linearly skipped all preceding pages every
+  read). For reads past the start of a large file SP4 should be *faster*; for tiny files
+  it is roughly even. If a regression appears, identify the contributor before reacting:
+
+  - If it tracks `crc_shift_zeros` CPU (the per-page trailing-zero loop): apply the
+    O(log n) GF(2) fallback below.
+  - If it tracks the entry-page CRC read/CPU: that is the cost of the deterministic
+    invariant guard (a deliberate, user-approved trade) — do **not** weaken it. Record
+    the measured cost; the guard stays.
+
+  **O(log n) `crc_shift_zeros` fallback (only if the loop is the culprit):**
 
   <details>
   <summary>O(log n) fallback — implement only if regression gate is breached</summary>
