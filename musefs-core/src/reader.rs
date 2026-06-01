@@ -746,7 +746,10 @@ mod resolve_ogg_tests {
             .sum();
         // SP4: no per-file index estimate; cache_bytes == inline segment bytes only.
         assert_eq!(resolved.cache_bytes, inline_sum);
-        assert!(inline_sum > 0, "Opus header should have non-empty inline segments");
+        assert!(
+            inline_sum > 0,
+            "Opus header should have non-empty inline segments"
+        );
     }
 }
 
@@ -875,7 +878,6 @@ mod cache_bound_tests {
         shard.insert(3, entry(0, 60)); // evicts the now-LRU entry
         assert!(shard.get(3).is_some());
     }
-
 
     #[test]
     fn header_cache_resolve_caches_by_content_version() {

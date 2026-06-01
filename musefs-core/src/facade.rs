@@ -665,7 +665,7 @@ impl Musefs {
 mod tests {
     use super::*;
     use musefs_format::{RegionLayout, Segment};
-    
+
     #[test]
     fn fh_from_key_offsets_by_one_and_maps_full_to_error() {
         // None (slab at capacity) -> HandleTableFull.

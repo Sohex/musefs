@@ -208,7 +208,6 @@ pub fn patch_page_header(page: &[u8], new_seq: u32) -> Result<Vec<u8>> {
     Ok(full)
 }
 
-
 /// Patch a page header algebraically — no payload read needed.
 ///
 /// `header` must be exactly `27 + seg_count` bytes (the fixed Ogg page header
@@ -715,7 +714,6 @@ mod tests {
         assert_eq!(pkts[0].data, vec![1, 2, 3]);
     }
 
-
     #[test]
     fn patch_algebraic_matches_full_page() {
         // For each combination of payload size and seq values, the algebraic
@@ -730,8 +728,7 @@ mod tests {
                     // Header-only algebraic version.
                     let h = parse_page(&page_bytes, 0).unwrap();
                     let got =
-                        patch_page_header_algebraic(&page_bytes[..h.header_len], new_seq)
-                            .unwrap();
+                        patch_page_header_algebraic(&page_bytes[..h.header_len], new_seq).unwrap();
                     assert_eq!(
                         got, want,
                         "payload_len={payload_len} old_seq={old_seq} new_seq={new_seq}"
@@ -745,16 +742,25 @@ mod tests {
     fn verify_page_crc_accepts_valid_rejects_tampered() {
         // A freshly laced page has a correct CRC.
         let (page, _) = lace_packet(0x55, 9, false, 42, &vec![0x7Eu8; 500]);
-        assert!(verify_page_crc(&page).unwrap(), "valid page must verify true");
+        assert!(
+            verify_page_crc(&page).unwrap(),
+            "valid page must verify true"
+        );
         // Flip one payload byte → CRC no longer matches.
         let mut tampered = page.clone();
         let h = parse_page(&page, 0).unwrap();
         tampered[h.header_len] ^= 0xFF; // first payload byte
-        assert!(!verify_page_crc(&tampered).unwrap(), "tampered payload must verify false");
+        assert!(
+            !verify_page_crc(&tampered).unwrap(),
+            "tampered payload must verify false"
+        );
         // Corrupt the stored CRC field directly → also false.
         let mut bad_crc = page.clone();
         bad_crc[22] ^= 0x01;
-        assert!(!verify_page_crc(&bad_crc).unwrap(), "corrupt stored CRC must verify false");
+        assert!(
+            !verify_page_crc(&bad_crc).unwrap(),
+            "corrupt stored CRC must verify false"
+        );
     }
 
     #[test]
@@ -765,7 +771,7 @@ mod tests {
         let mut hdr = vec![0u8; 27];
         hdr[..4].copy_from_slice(b"OggS");
         hdr[18..22].copy_from_slice(&7u32.to_le_bytes()); // old_seq
-        // byte 26 (seg_count) == 0 → header_len 27, payload_len 0.
+                                                          // byte 26 (seg_count) == 0 → header_len 27, payload_len 0.
         let out = patch_page_header_algebraic(&hdr, 9).unwrap();
         assert_eq!(out.len(), 27);
         assert_eq!(u32::from_le_bytes(out[18..22].try_into().unwrap()), 9);

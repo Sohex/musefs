@@ -80,7 +80,7 @@ fn find_page_start(
             // window — those must never reject the candidate (a missing byte passes).
             // `page_crc_ok` reads the full page from the file and is authoritative.
             let cheap_ok = window.get(i + 4).is_none_or(|&v| v == 0)       // version == 0
-                && window.get(i + 5).is_none_or(|&ht| ht & 0xF8 == 0);     // header_type
+                && window.get(i + 5).is_none_or(|&ht| ht & 0xF8 == 0); // header_type
             if cheap_ok {
                 let candidate = scan_start + i as u64;
                 if page_crc_ok(backing, candidate)? {
@@ -169,8 +169,7 @@ pub fn serve_ogg_window(
         if hdr_buf.len() < header_len {
             return Err(musefs_format::FormatError::Malformed.into());
         }
-        let payload_len: usize =
-            hdr_buf[27..header_len].iter().map(|&b| b as usize).sum();
+        let payload_len: usize = hdr_buf[27..header_len].iter().map(|&b| b as usize).sum();
 
         // Reuse the patched header if this is the page the last serve ended on
         // (sequential reads re-touch the page straddling each chunk boundary). The
@@ -320,7 +319,6 @@ mod tests {
         bytes
     }
 
-
     fn oracle_roundtrip_new(file: &[u8]) {
         use musefs_format::ogg::{locate_audio, read_header, synthesize_layout};
         let scan = locate_audio(file).unwrap();
@@ -331,7 +329,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.ogg");
-        std::fs::File::create(&path).unwrap().write_all(file).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(file)
+            .unwrap();
 
         let backing = std::fs::File::open(&path).unwrap();
         let mut audio = Vec::new();
@@ -395,7 +396,10 @@ mod tests {
         let path = dir.path().join("audio.ogg");
         let mut file = vec![0u8; 16];
         file.extend_from_slice(&audio);
-        std::fs::File::create(&path).unwrap().write_all(&file).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&file)
+            .unwrap();
         let audio_length = audio.len() as u64;
         (dir, path, 16, audio_length)
     }
@@ -448,7 +452,10 @@ mod tests {
         // Target 10 bytes into the payload of page 0.
         let target = ao + h.header_len as u64 + 10;
         let found = find_page_start(&backing, ao, target, None).unwrap();
-        assert_eq!(found, ao, "mid-payload target should resolve to page 0's start");
+        assert_eq!(
+            found, ao,
+            "mid-payload target should resolve to page 0's start"
+        );
     }
 
     #[test]
@@ -486,14 +493,20 @@ mod tests {
         let path = dir.path().join("fake.ogg");
         let mut file = vec![0u8; 16];
         file.extend_from_slice(&audio);
-        std::fs::File::create(&path).unwrap().write_all(&file).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&file)
+            .unwrap();
         let ao = 16u64;
         let backing = std::fs::File::open(&path).unwrap();
         // Target near the end of the real page; the fake OggS at payload+100 sits
         // between the real start and the target, so it is the rightmost candidate.
         let abs_target = ao + audio.len() as u64 - 1;
         let found = find_page_start(&backing, ao, abs_target, None).unwrap();
-        assert_eq!(found, ao, "must reject the CRC-invalid fake OggS and return the real start");
+        assert_eq!(
+            found, ao,
+            "must reject the CRC-invalid fake OggS and return the real start"
+        );
     }
 
     // ── serve_ogg_window tests ────────────────────────────────────────────────
@@ -504,7 +517,6 @@ mod tests {
         let want = new_reference_region(&path, ao, alen);
         assert_eq!(new_serve_range(&path, ao, alen, 0, alen), want);
     }
-
 
     #[test]
     fn serve_ogg_window_header_only_read() {
@@ -519,7 +531,10 @@ mod tests {
         // First 10 bytes of header.
         assert_eq!(new_serve_range(&path, ao, alen, 0, 10), want[..10]);
         // Exactly the whole header of page 0.
-        assert_eq!(new_serve_range(&path, ao, alen, 0, hlen), want[..hlen as usize]);
+        assert_eq!(
+            new_serve_range(&path, ao, alen, 0, hlen),
+            want[..hlen as usize]
+        );
     }
 
     #[test]
@@ -595,11 +610,23 @@ mod tests {
         let (bytes, _) = lace_packet_pub(0xABCD, 0, false, 0, &vec![7u8; 300]);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.ogg");
-        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
         let audio_length = bytes.len() as u64 - 5;
         let backing = std::fs::File::open(&path).unwrap();
         let mut out = Vec::new();
-        let r = serve_ogg_window(&backing, 0, audio_length, 0, 0, audio_length, &mut out, None);
+        let r = serve_ogg_window(
+            &backing,
+            0,
+            audio_length,
+            0,
+            0,
+            audio_length,
+            &mut out,
+            None,
+        );
         assert!(r.is_err(), "misaligned audio_length must error");
     }
 
@@ -672,9 +699,15 @@ mod tests {
         // Strictly inside → short-circuit (kills `<=`->`>` on `start <= abs_target`
         // and `<`->`==` on `abs_target < start+total_len`, both of which would drop
         // to the erroring scan here).
-        assert_eq!(find_page_start(&backing, ao, 500, Some(&memo)).unwrap(), 100);
+        assert_eq!(
+            find_page_start(&backing, ao, 500, Some(&memo)).unwrap(),
+            100
+        );
         // One byte below the end → still inside.
-        assert_eq!(find_page_start(&backing, ao, 1099, Some(&memo)).unwrap(), 100);
+        assert_eq!(
+            find_page_start(&backing, ao, 1099, Some(&memo)).unwrap(),
+            100
+        );
         // Exactly at the end (half-open) → NOT inside → scan → Err. Kills `<`->`<=`,
         // which would wrongly short-circuit at the boundary.
         assert!(find_page_start(&backing, ao, 1100, Some(&memo)).is_err());
@@ -700,7 +733,10 @@ mod tests {
         real.extend_from_slice(&bad);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("badht.ogg");
-        std::fs::File::create(&path).unwrap().write_all(&real).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&real)
+            .unwrap();
         let backing = std::fs::File::open(&path).unwrap();
         // Target inside the bad page → it is the rightmost cheap candidate. The scan
         // must reject it (bad header_type) and fall back to the real page at 0.
@@ -729,7 +765,10 @@ mod tests {
         data.extend_from_slice(&empty_page(0xABCD, 6));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("emptytail.ogg");
-        std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
         let backing = std::fs::File::open(&path).unwrap();
         let alen = data.len() as u64;
         let mut out = Vec::new();
@@ -748,7 +787,10 @@ mod tests {
         data.extend_from_slice(&empty_page(0xABCD, 6));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("emptyeof.ogg");
-        std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
         let backing = std::fs::File::open(&path).unwrap();
         // A few bytes past the empty page's start so its "OggS" is fully in the scan
         // window; page_crc_ok then reads the full 27-byte page from the file.
@@ -768,7 +810,10 @@ mod tests {
         data.extend_from_slice(b"OggS\x00\x00\x00\x00\x00\x00"); // 10 bytes < 27
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shorttail.ogg");
-        std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
         let backing = std::fs::File::open(&path).unwrap();
         assert_eq!(
             find_page_start(&backing, 0, data.len() as u64, None).unwrap(),

@@ -34,7 +34,6 @@ pub fn crc32(buf: &[u8]) -> u32 {
     crc
 }
 
-
 pub fn crc_shift_zeros(crc: u32, n: usize) -> u32 {
     if n == 0 || crc == 0 {
         return crc;
@@ -138,7 +137,6 @@ mod tests {
         assert_eq!(crc32(&blob), reference(&blob));
     }
 
-
     #[test]
     fn crc_shift_zeros_identity() {
         // Advancing 0 by any n stays 0 (TABLE[0] = 0 ⟹ each step: 0 ^ TABLE[0] = 0).
@@ -158,11 +156,7 @@ mod tests {
             let mut extended = data.to_vec();
             extended.resize(data.len() + n, 0u8);
             let expected = crc32(&extended);
-            assert_eq!(
-                super::crc_shift_zeros(crc_start, n),
-                expected,
-                "n = {n}"
-            );
+            assert_eq!(super::crc_shift_zeros(crc_start, n), expected, "n = {n}");
         }
     }
 }
