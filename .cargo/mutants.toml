@@ -125,4 +125,15 @@ exclude_re = [
     # at root (root.parent == root), so a node with no ancestor in the set loops
     # forever instead of returning false.
     'musefs-core/src/tree\.rs:455:20: replace == with != in VirtualTree::ancestor_in',
+
+    # SP4 storage-aware serving — equivalent mutant in serve_ogg_window's last-page
+    # memo. `total_len = header_len + payload_len` only sets the memoized page's
+    # [start, start+total_len) range, which find_page_start uses to decide whether to
+    # short-circuit. `+`->`*` only ever makes total_len LARGER (real pages) or 0
+    # (payload_len 0), never landing find_page_start on a page AFTER the true one:
+    # too-large only widens the range so the forward walk STARTS at an
+    # earlier-or-equal page (its overlap clipping then emits the identical bytes), and
+    # 0 disables the short-circuit (falls to the scan, also correct). So the served
+    # output is byte-identical either way. (`+`->`-` underflows and is caught.)
+    'musefs-core/src/ogg_index\.rs:195:41: replace \+ with \* in serve_ogg_window',
 ]

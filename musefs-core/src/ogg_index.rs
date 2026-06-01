@@ -652,4 +652,127 @@ mod tests {
             ao + h.total_len() as u64
         );
     }
+
+    #[test]
+    fn find_page_start_memo_range_boundaries_are_exact() {
+        // Backing with NO valid Ogg page → the scan path always errors, so
+        // find_page_start returns Ok ONLY when the memo short-circuit fires. That
+        // makes the range gate `start <= abs_target < start + total_len` observable
+        // at both boundaries (kills the <=/< boundary mutations on that line).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zeros.bin");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&vec![0u8; 4096])
+            .unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        let ao = 100u64;
+        // start = ao + 0 = 100; validated range [100, 1100).
+        let memo: LastPageMemo = std::sync::Mutex::new(Some((0u64, 1000u64, Vec::new())));
+        // Strictly inside → short-circuit (kills `<=`->`>` on `start <= abs_target`
+        // and `<`->`==` on `abs_target < start+total_len`, both of which would drop
+        // to the erroring scan here).
+        assert_eq!(find_page_start(&backing, ao, 500, Some(&memo)).unwrap(), 100);
+        // One byte below the end → still inside.
+        assert_eq!(find_page_start(&backing, ao, 1099, Some(&memo)).unwrap(), 100);
+        // Exactly at the end (half-open) → NOT inside → scan → Err. Kills `<`->`<=`,
+        // which would wrongly short-circuit at the boundary.
+        assert!(find_page_start(&backing, ao, 1100, Some(&memo)).is_err());
+        // Without the memo, even an inside target errors (no valid page to scan).
+        assert!(find_page_start(&backing, ao, 500, None).is_err());
+    }
+
+    #[test]
+    fn find_page_start_rejects_valid_crc_page_with_bad_header_type() {
+        // `parse_page` (hence `page_crc_ok`) does NOT check header_type, so a page
+        // with a high header_type bit set but a correctly recomputed CRC would pass
+        // the CRC guard. Only the cheap-filter's `header_type & 0xF8 == 0` test
+        // rejects it — so the `&&` joining the version and header_type checks is
+        // load-bearing. The backward scan must skip this bad page and return the
+        // real first page; an `&&`->`||` would instead accept the bad page.
+        let (mut real, _) = lace_packet_pub(0xABCD, 5, false, 100, &[3u8; 200]);
+        let (mut bad, _) = lace_packet_pub(0xABCD, 6, false, 200, &[4u8; 200]);
+        bad[5] = 0x80; // header_type high bit -> fails (ht & 0xF8 != 0), version stays 0
+        bad[22..26].copy_from_slice(&0u32.to_le_bytes());
+        let crc = crc::Crc::<u32>::new(&CRC_32_OGG).checksum(&bad);
+        bad[22..26].copy_from_slice(&crc.to_le_bytes());
+        let real_len = real.len() as u64;
+        real.extend_from_slice(&bad);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("badht.ogg");
+        std::fs::File::create(&path).unwrap().write_all(&real).unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        // Target inside the bad page → it is the rightmost cheap candidate. The scan
+        // must reject it (bad header_type) and fall back to the real page at 0.
+        let abs_target = real_len + 10;
+        assert_eq!(find_page_start(&backing, 0, abs_target, None).unwrap(), 0);
+    }
+
+    /// A valid 0-segment Ogg page: 27 bytes, no payload, correct CRC.
+    fn empty_page(serial: u32, seq: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 27];
+        p[..4].copy_from_slice(b"OggS"); // capture; version/header_type/granule = 0
+        p[14..18].copy_from_slice(&serial.to_le_bytes());
+        p[18..22].copy_from_slice(&seq.to_le_bytes()); // p[26] = seg_count 0
+        let crc = crc::Crc::<u32>::new(&CRC_32_OGG).checksum(&p);
+        p[22..26].copy_from_slice(&crc.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn serve_ogg_window_serves_valid_27_byte_trailing_page() {
+        // A real page followed by a valid 0-segment (exactly 27-byte) page. Serving
+        // the whole region makes serve_ogg_window read that trailing page with
+        // read_len == 27, exercising its `hdr_buf.len() < 27` guard at the boundary:
+        // a valid 27-byte page must NOT be rejected. `<`->`==`/`<=` would Err here.
+        let (mut data, _) = lace_packet_pub(0xABCD, 5, false, 100, &[9u8; 200]);
+        data.extend_from_slice(&empty_page(0xABCD, 6));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("emptytail.ogg");
+        std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        let alen = data.len() as u64;
+        let mut out = Vec::new();
+        // seq_delta 0 → patched headers equal the originals, so output == input.
+        serve_ogg_window(&backing, 0, alen, 0, 0, alen, &mut out, None).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn find_page_start_accepts_valid_27_byte_page_at_eof() {
+        // A valid 0-segment page whose 27 bytes are exactly all that remain at EOF.
+        // page_crc_ok reads exactly 27 bytes; `head.len() < 27` -> `<=` would reject
+        // the valid page and return the earlier one instead.
+        let (mut data, _) = lace_packet_pub(0xABCD, 5, false, 100, &[8u8; 200]);
+        let empty_start = data.len() as u64;
+        data.extend_from_slice(&empty_page(0xABCD, 6));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("emptyeof.ogg");
+        std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        // A few bytes past the empty page's start so its "OggS" is fully in the scan
+        // window; page_crc_ok then reads the full 27-byte page from the file.
+        assert_eq!(
+            find_page_start(&backing, 0, empty_start + 4, None).unwrap(),
+            empty_start
+        );
+    }
+
+    #[test]
+    fn find_page_start_skips_sub_27_byte_oggs_tail() {
+        // A bare "OggS" + a few bytes (< 27 total) at EOF. The backward scan hits it
+        // first; page_crc_ok must treat the short read as "not a page" (Ok(false))
+        // and continue to the real page. `head.len() < 27` -> `==` would index past
+        // the short buffer (panic) instead of bailing out.
+        let (mut data, _) = lace_packet_pub(0xABCD, 5, false, 100, &[7u8; 200]);
+        data.extend_from_slice(b"OggS\x00\x00\x00\x00\x00\x00"); // 10 bytes < 27
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shorttail.ogg");
+        std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            find_page_start(&backing, 0, data.len() as u64, None).unwrap(),
+            0
+        );
+    }
 }
