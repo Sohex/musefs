@@ -141,6 +141,16 @@ Stage B replaces the O(N) `VirtualTree::build_with` with `apply_changes` (in-pla
 | 1000  | ~10–22 |
 | 5000  | ~38–94 |
 
+Rerun 2026-06-01 (same box, lightly loaded), refresh-1 wall (ms):
+
+| library size (N tracks) | refresh-1 wall (ms) |
+|------------------------:|--------------------:|
+| 100   | 0 |
+| 1000  | 5 |
+| 5000  | 24 |
+
+The fresh run lands at the fast end of the prior loaded-box ranges (the box was less contended), confirming the Stage B profile: still a residual linear slope (~24 ms at 5000) from the O(N) render-key scan, not a flat O(changed) curve. Relative scaling is the signal, not absolute ms.
+
 Ranges reflect run-to-run variation on a loaded box (three independent runs). The tree-mutation itself (the `apply_changes` path) is O(changed), but `rebuild_incremental` still iterates all N tracks to build the `new_snapshot` HashMap before calling `apply_changes` — that O(N) scan of `list_render_keys` results accounts for the residual linear slope. The `VirtualTree::build_with` full reconstruction (the dominant O(N) cost at Stage A) is eliminated; the remaining cost is a lighter O(N) DB-row iteration + HashMap insert. Improvement over Stage A: comparable to slightly faster at N=5000 (41 ms vs ~38–94 ms, noisy and overlapping on a loaded box, so inconclusive in absolute ms). The structural win is removing the full tree reconstruction; the residual linear slope is the lighter render-key scan + HashMap rebuild. A future pass could cache the render-key scan to reach a truly flat profile.
 
 Caveat: same single-album corpus as Stage A (no path collisions or disambiguation).

@@ -187,6 +187,9 @@ commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
   debug-assert (incremental ≡ full) green. Fallback test (forced `Err(())` →
   full-rebuild) green. FUSE byte-identical PCM e2e green. See `BENCHMARKS.md`
   "SP2 — Incremental tree refresh".
+  - **Rerun (2026-06-01, same box, lightly loaded):** refresh-1 wall **100→0 ms,
+    1000→5 ms, 5000→24 ms** — fast end of the prior loaded-box ranges, same
+    residual linear slope (O(N) render-key scan), confirming the Stage B profile.
   - **Follow-up (known residual, not addressed in SP2):** `rebuild_incremental`
     still performs two O(library) steps before the O(changed) `apply_changes`:
     the `Db::list_render_keys` identity scan (every track's `(id,
