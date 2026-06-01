@@ -189,17 +189,21 @@ stays byte-identical by construction):
 read resolves via the header cache). The regression gate is a **>10% rise**
 run-over-run; the alloc fix should hold or improve.
 
+Δ is the ratio of the printed before→after medians; the significance note is
+Criterion's own change-estimate p-value (its bootstrap change interval, computed
+over the full samples, won't exactly equal the point-median ratio).
+
 | format    | before (µs) | after (µs) | Δ        | note |
 |-----------|------------:|-----------:|---------:|------|
-| flac      | 925         | 918        | −0.9%    | within noise (p=0.40) |
-| mp3       | 958         | 824        | −10.5%   | significant (p<0.05) |
-| m4a       | 964         | 780        | −19.2%   | significant |
-| m4a-last  | 954         | 773        | −16.4%   | significant |
-| ogg       | 965         | 948        | +0.8%    | within noise (p=0.54) |
-| wav       | 962         | 790        | −18.3%   | significant |
+| flac      | 925         | 918        | −0.8%    | within noise (p=0.40) |
+| mp3       | 958         | 824        | −14.0%   | significant (p<0.05) |
+| m4a       | 964         | 780        | −19.1%   | significant (p<0.05) |
+| m4a-last  | 954         | 773        | −19.0%   | significant (p<0.05) |
+| ogg       | 965         | 948        | −1.8%    | within noise (p=0.54) |
+| wav       | 962         | 790        | −17.9%   | significant (p<0.05) |
 
 No format breaches the >10% *rise* gate. The metadata-light formats improve
-10–19% from dropping the per-splice alloc+copy; flac/ogg hold flat within noise
+14–19% from dropping the per-splice alloc+copy; flac/ogg hold flat within noise
 (their front-of-file structural-block re-reads dominate, masking the alloc win).
 
 ### `concurrent_read_walk/m16_plus_walker` — contention signal (the SP3 target)
