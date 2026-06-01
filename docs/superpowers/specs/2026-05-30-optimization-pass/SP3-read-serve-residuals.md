@@ -58,8 +58,12 @@ Segment::BackingAudio { offset: bo, .. } => {
 ```
 
 `out` is allocated with `Vec::with_capacity(end - offset)` at the top of
-`read_segments`, so `resize` never reallocates — the zero-fill is immediately
-overwritten by the positioned read and is negligible against the `pread` itself.
+`read_segments`, and the spliced segment lengths sum to exactly `end - offset`, so
+the full output capacity is pre-reserved and `resize` never reallocates. Segments
+are appended in order, so `start == out.len()` always and `out[start..]` is
+exactly the new tail. `read_exact_at` fills all `n` bytes or returns `Err` (no
+partial-read concern — the existing `vec![0u8; n]` code already relies on this),
+fully overwriting the zero-fill, which is negligible against the `pread` itself.
 This removes one heap allocation and one memcpy of up to the FUSE read size
 (~128 KiB) per backing-audio splice.
 
@@ -90,12 +94,20 @@ The slab allocates the key, so `next_fh` is **deleted**. The FUSE file handle
 (`fh`) is the slab key offset by one:
 
 - `open_handle`: `let key = self.handles.insert(Arc::new(Handle { resolved, file
-  })).ok_or(/* at-capacity error */)?;` then return `fh = key as u64 + 1`.
-- `read` fast-path: `self.handles.get((fh - 1) as usize).map(|g| (*g).clone())`
-  — **lock-free**, no mutex on the hottest serve path.
+  })).ok_or(CoreError::HandleTableFull)?;` then return `fh = key as u64 + 1`.
+- `read` fast-path: `self.handles.get((fh - 1) as usize).map(|g| (**g).clone())`
+  — **lock-free**, no mutex on the hottest serve path. `get` returns a borrow
+  *guard*; clone the `Arc` out of it and let the guard drop **before** entering
+  `pool.with`, exactly as today's `self.handles().get(&fh).cloned()` drops its
+  `MutexGuard` before the pool call (`facade.rs:611`). This preserves the current
+  "no in-memory lock held across I/O" property.
 - `release_handle`: `self.handles.remove((fh - 1) as usize);`
 
-Two invariants this preserves:
+`Slab` keys are `usize`; the `fh` wire type is `u64`. `key as u64 + 1` is lossless
+on all targets, and `(fh - 1) as usize` always round-trips because every `fh` we
+ever hand out originated from a real `usize` key (no truncation possible).
+
+Three invariants this preserves:
 
 - **Non-zero `fh`.** This code treats `fh == 0` as "no handle" (`read()` falls
   back to inode resolve). sharded-slab keys start at `0`, so we store `fh = key +
@@ -104,10 +116,25 @@ Two invariants this preserves:
   that is later reused yields a *different* key. A stale `read` on an
   already-released `fh` returns `None` → the inode fallback path (bounded by the
   entry/attr TTL), never another file's handle. A raw slab index would not give
-  this; the generation is why the slab is correct here.
+  this; the generation is why the slab is correct here. (The generation counter is
+  finite-width and would alias only after astronomically many reuse cycles of the
+  *same* slot — unreachable within real FUSE fd lifetimes, so not defended
+  against.)
+- **At-capacity is an explicit error, never a panic.** `Slab::insert` returns
+  `None` only at the slab's configured capacity. We use sharded-slab's **default
+  `Config`**, which is effectively unbounded for FUSE fd lifetimes; an exhausted
+  slab surfaces as a new `CoreError::HandleTableFull` rather than `unwrap`.
 
-`Slab::insert` returns `None` only at the slab's configured capacity (very large
-by default); map that to a `CoreError` (handle-table-full) rather than panicking.
+**New error variant + FUSE mapping.** Add `CoreError::HandleTableFull` to
+`musefs-core/src/error.rs` (e.g. `#[error("handle table full")]`). The FUSE
+`errno()` mapper (`musefs-fuse/src/lib.rs:64-72`) is an **exhaustive** match over
+`CoreError`, so it will not compile without a new arm; add
+`CoreError::HandleTableFull => fuser::Errno::ENFILE` (POSIX "file table overflow",
+the apt code for a process-wide handle-table exhaustion and distinguishable from
+the generic `EIO` bucket). `next_fh` is removed; delete `AtomicU64` from the
+`use std::sync::atomic::{…}` import in `facade.rs` (`AtomicBool`/`AtomicI64`/
+`Ordering` remain in use) so the change lands warning-clean under the workspace's
+`clippy::pedantic`.
 
 ### 3. `size_cache` → `DashMap`
 
@@ -125,9 +152,17 @@ size_cache: dashmap::DashMap<i64, SizeEntry>,
 
 `SizeEntry` is `Copy`, so:
 
-- `getattr` hit/miss: `self.size_cache.get(&track_id).map(|e| *e)`; on a miss,
-  `self.size_cache.insert(track_id, SizeEntry { … })`.
-- `poll_refresh` prune: `self.size_cache.retain(|k, _| live.contains(k));`
+- `getattr` hit/miss: `self.size_cache.get(&track_id).map(|e| *e)` — the `*e`
+  copies the entry out and **drops the read guard immediately**; on a miss,
+  `self.size_cache.insert(track_id, SizeEntry { … })`. The drop-before-insert is
+  load-bearing: DashMap's `get` returns a `Ref` holding that key's *shard* guard,
+  and `insert` re-locks the same shard. The naive translation of today's
+  `.get(&track_id).copied()` that held the `Ref` across the `insert` would
+  deadlock on the same-shard re-entrancy; copying out first avoids it.
+- `poll_refresh` prune: `self.size_cache.retain(|k, _| live.contains(k));` —
+  `retain` locks every shard in turn, so it must not run while any `Ref`/`RefMut`
+  into the map is held (it isn't: the prune at `facade.rs:435` runs outside any
+  `get`).
 
 The map stays unbounded-but-tiny by design (one small `Copy` entry per live
 track, self-invalidating on `content_version`); DashMap's internal sharding
@@ -137,9 +172,20 @@ removes the single-mutex contention without a hand-rolled LRU.
 
 Delete the `fn handles()` and `fn size_cache()` `MutexGuard` accessor helpers
 (call sites use the slab / DashMap directly). Update the lock-order comment block
-in `facade.rs`: `handles` and `size_cache` are no longer locks, so they drop out
-of the "in-memory locks" ordering entirely. The remaining ordering (pool
-connection first, then `inodes` / header-cache shards) is unchanged.
+in `facade.rs:340-348` to tell the truth:
+
+- `handles` becomes a lock-free slab; its `get` guard is dropped before any
+  `pool.with` call (as today), so it never participates in lock ordering.
+- `size_cache` becomes a `DashMap`. Note it is **still accessed inside the
+  `pool.with` closure** in `getattr` (`facade.rs:563,574`) — that did not change.
+  This is safe because each DashMap op takes and releases its own shard guard
+  independently (the `*e` copy drops the read guard before the `insert`), so no
+  guard is held across a DB call and there is no cross-lock cycle. The two
+  same-shard hazards above (`get` guard not held across `insert`; no `Ref` held
+  across `retain`) are the only ordering rules these maps impose.
+- The pool-first rule for the *actual* remaining in-memory locks (`inodes`,
+  header-cache shards) is unchanged, with `inodes`-held-inside-`pool.with` during
+  `refresh` still the one stated exception.
 
 ### Dependencies
 
@@ -154,11 +200,21 @@ Consistent with the crate already taking `arc-swap`, `im`, and `once_cell`.
 
 - **Functional gate (hard):** full workspace `cargo test` green, plus
   `cargo test -p musefs-fuse -- --ignored` (real-mount byte-identical e2e) green.
-  The byte-identical audio round-trip is the non-negotiable gate.
-- **Concurrency correctness:** the existing facade tests exercise
-  open/read/release and refresh-prune against the new slab/DashMap; add coverage
-  if a path is newly reachable (e.g. at-capacity insert error), otherwise the
-  current suite is sufficient since behavior is unchanged.
+  The byte-identical audio round-trip is the non-negotiable gate. The
+  format-layer byte-identical proptests need the `fuzzing` feature, so pin the
+  exact commands: `cargo test -p musefs-core --test proptest_read_fidelity` and
+  `cargo test -p musefs-format --features fuzzing`.
+- **Concurrency correctness:** the existing facade tests already cover the changed
+  paths (`open_handle_read_and_release_roundtrip`,
+  `open_handle_returns_distinct_ids_and_rejects_dirs` — asserts only `!= 0` +
+  distinctness, survives the slab change, `release_handle_forces_fallback_on_next_read`,
+  `getattr_reresolves_size_after_content_version_bump`,
+  `poll_refresh_keeps_unchanged_entries_and_prunes_vanished`). Add two tests for
+  paths the slab newly makes relevant: (a) a **released-`fh` ABA fallback** test
+  (read on a removed handle returns `None` from the slab → inode fallback serves
+  correct bytes), and (b) a **`HandleTableFull`** test exercising the at-capacity
+  insert error → `ENFILE` mapping (constructible by configuring/forcing a tiny
+  slab capacity in the test, or asserting the error variant directly).
 - **Contention signal (the SP3 win):** SP0's `concurrent_read_walk` Criterion
   bench — its comments already name `handles`/`size_cache` mutex contention as
   the SP3 target. Record before/after medians.
