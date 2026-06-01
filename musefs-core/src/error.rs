@@ -18,6 +18,8 @@ pub enum CoreError {
     IsDir(u64),
     #[error("inode {0} is not a directory")]
     NotADir(u64),
+    #[error("handle table full")]
+    HandleTableFull,
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
