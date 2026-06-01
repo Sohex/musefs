@@ -422,15 +422,15 @@ fn read_segments(
                 }
                 Segment::BackingAudio { offset: bo, .. } => {
                     let f = file.expect("backing segment requires an open backing file");
-                    let mut buf = vec![0u8; n];
                     // Finding #15 (ESTALE, untested by design): on an NFS-backed mount a stale file
                     // handle surfaces here as a raw io::Error from the positioned read (or as
                     // BackingChanged from the size/mtime re-validation) and is propagated verbatim
                     // through the FUSE layer. There is no test-framework support to inject NFS ESTALE,
                     // so this path is documented rather than covered.
-                    f.read_exact_at(&mut buf, bo + within)?;
+                    let start = out.len();
+                    out.resize(start + n, 0);
+                    f.read_exact_at(&mut out[start..], bo + within)?;
                     crate::metrics::on_pread(n as u64);
-                    out.extend_from_slice(&buf);
                 }
                 Segment::ArtImage { art_id, .. } => {
                     let chunk = db.read_art_chunk(*art_id, within, n)?;
