@@ -458,7 +458,6 @@ mod tests {
 mod errno_tests {
     use super::errno;
     use musefs_core::CoreError;
-    use libc;
 
     #[test]
     fn handle_table_full_maps_to_enfile() {
