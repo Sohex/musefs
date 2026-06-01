@@ -134,42 +134,46 @@ exclude_re = [
     # too-large only widens the range so the forward walk STARTS at an
     # earlier-or-equal page (its overlap clipping then emits the identical bytes), and
     # 0 disables the short-circuit (falls to the scan, also correct). So the served
-    # output is byte-identical either way. (`+`->`-` underflows and is caught.)
-    'musefs-core/src/ogg_index\.rs:195:41: replace \+ with \* in serve_ogg_window',
+    # output is byte-identical either way. (`+`->`-` underflows and is caught.) Pinned
+    # by line:col — one of several `+` in this fn; the others ARE caught.
+    'musefs-core/src/ogg_index\.rs:194:41: replace \+ with \* in serve_ogg_window',
 
     # SP4 crc_shift_zeros — equivalent mutants inherent to the loop/matrix hybrid.
     # crc_shift_zeros has two code paths (a per-step loop and a GF(2) matrix-power)
     # that compute the IDENTICAL value; the differential test pins the result, but no
-    # test can distinguish the internal dispatch/optimization that these mutate:
+    # test can distinguish the internal dispatch/optimization that these mutate.
+    # Anchored on operator+function (line-agnostic) since each is the sole such site.
     #
     # `if n == 0 || crc == 0 { return crc }` early return, `||`->`&&`: a pure
     # short-circuit. For n==0 the loop/matrix run 0 steps and return crc unchanged;
-    # for crc==0 they propagate 0. So skipping (or not) the early return yields the
-    # same result. The `==` comparisons on that line ARE caught and stay in scope.
-    'musefs-format/src/ogg/crc\.rs:39:15:',
+    # for crc==0 they propagate 0. So skipping (or not) the early return is the same.
+    'musefs-format/src/ogg/crc\.rs:\d+:\d+: replace \|\| with && in crc_shift_zeros',
     # path-dispatch threshold `if n < MATRIX_THRESHOLD`: the loop and the matrix
     # return the same CRC for every n, so `<`->`==`/`>`/`<=` only changes which
-    # equivalent path runs, never the output.
-    'musefs-format/src/ogg/crc\.rs:51:10:',
+    # equivalent path runs, never the output. (Sole `<` in crc_shift_zeros.)
+    'musefs-format/src/ogg/crc\.rs:\d+:\d+: replace < with (==|>|<=) in crc_shift_zeros',
     # poly_step `(p << 8) ^ TABLE[p >> 24]`, `^`->`|`: poly_step is only ever applied
     # to single-bit basis vectors `1 << (31-i)`. For those, `p << 8` is 0 whenever
     # `TABLE[p >> 24]` is non-zero (i < 8) and `TABLE[p >> 24]` is 0 (== TABLE[0])
     # whenever `p << 8` is non-zero (i >= 8) — the two operands are always disjoint,
-    # so `^` and `|` are bit-identical, and the built matrix is unchanged.
-    'musefs-format/src/ogg/crc\.rs:64:18: replace \^ with \| in crc_shift_zeros::poly_step',
+    # so `^` and `|` are bit-identical, and the built matrix is unchanged. (The
+    # linear-path `^` elsewhere in crc_shift_zeros IS caught and stays in scope.)
+    'musefs-format/src/ogg/crc\.rs:\d+:\d+: replace \^ with \| in crc_shift_zeros::poly_step',
 
     # SP4 serve_ogg_window / find_page_start loop mutants.
     # Non-terminating (reported TIMEOUT, never a clean kill): `i -= 1` -> `i /= 1`
     # leaves the backward-scan index unchanged (infinite loop), and `pos += ...` ->
     # `pos *= ...` stays 0 forever once the first page is at offset 0. Like the SP2
-    # tree.rs timeouts, these can only ever flag via the timeout budget.
-    'musefs-core/src/ogg_index\.rs:94:11: replace -= with /= in find_page_start',
-    'musefs-core/src/ogg_index\.rs:222:13: replace \+= with \*= in serve_ogg_window',
+    # tree.rs timeouts, these can only ever flag via the timeout budget. Each is the
+    # sole `-=` / `+=` in its function, so anchored line-agnostically.
+    'musefs-core/src/ogg_index\.rs:\d+:\d+: replace -= with /= in find_page_start',
+    'musefs-core/src/ogg_index\.rs:\d+:\d+: replace \+= with \*= in serve_ogg_window',
     # Overlap-emit guards `if hs < he` / `if ps < pe`, `<`->`<=`: when the bound is
     # equal the extra branch emits an empty `[a..b]` slice / reads 0 payload bytes —
     # a no-op, so the served output is byte-identical (verified: the ogg tests and the
     # byte-identical proptest_read_fidelity pass with both mutations applied). They
-    # were reported TIMEOUT under the parallel gate's load, not as a real hang.
-    'musefs-core/src/ogg_index\.rs:205:15: replace < with <= in serve_ogg_window',
-    'musefs-core/src/ogg_index\.rs:214:15: replace < with <= in serve_ogg_window',
+    # were reported TIMEOUT under the parallel gate's load, not as a real hang. Pinned
+    # by line:col — several `<` in this fn (the loop/length guards) ARE caught.
+    'musefs-core/src/ogg_index\.rs:204:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:213:15: replace < with <= in serve_ogg_window',
 ]
