@@ -665,8 +665,7 @@ impl Musefs {
 mod tests {
     use super::*;
     use musefs_format::{RegionLayout, Segment};
-    use once_cell::sync::OnceCell;
-
+    
     #[test]
     fn fh_from_key_offsets_by_one_and_maps_full_to_error() {
         // None (slab at capacity) -> HandleTableFull.
@@ -694,7 +693,6 @@ mod tests {
             backing_size: expected_meta.len(),
             backing_mtime_secs: mtime_secs(&expected_meta),
             mtime_secs: mtime_secs(&expected_meta),
-            ogg_index: OnceCell::new(),
             cache_bytes: 0,
         };
 

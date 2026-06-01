@@ -117,7 +117,6 @@ fn read_at_streams_art_image_segments() {
         backing_size: 0,
         backing_mtime_secs: 0,
         mtime_secs: 0,
-        ogg_index: once_cell::sync::OnceCell::new(),
         cache_bytes: 0,
     };
 
