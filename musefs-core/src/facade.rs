@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -111,8 +111,7 @@ pub struct Musefs {
     tree: ArcSwap<VirtualTree>,
     cache: HeaderCache,
     last_data_version: AtomicI64,
-    handles: Mutex<HashMap<u64, Arc<Handle>>>,
-    next_fh: AtomicU64,
+    handles: sharded_slab::Slab<Arc<Handle>>,
     /// `SizeEntry` keyed by track id. Tiny entries, effectively unbounded; serves
     /// getattr/lookup without a backing stat or full synthesis. Self-invalidates on
     /// a content_version change.
@@ -137,6 +136,14 @@ pub struct Musefs {
     force_apply_fail: AtomicBool,
 }
 
+/// Map a `sharded_slab::Slab` insert result to a FUSE file handle. The slab key
+/// is offset by one so the wire `fh` is always non-zero (`fh == 0` means "no
+/// handle" — `read` falls back to inode resolution). `None` means the slab is at
+/// capacity, surfaced as an explicit error rather than a panic.
+fn fh_from_key(key: Option<usize>) -> Result<u64> {
+    key.map(|k| k as u64 + 1).ok_or(CoreError::HandleTableFull)
+}
+
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let mut alloc = InodeAllocator::new();
@@ -149,8 +156,7 @@ impl Musefs {
             tree: ArcSwap::from_pointee(tree),
             pool: DbPool::new(db)?,
             config,
-            handles: Mutex::new(HashMap::new()),
-            next_fh: AtomicU64::new(0),
+            handles: sharded_slab::Slab::new(),
             size_cache: Mutex::new(HashMap::new()),
             last_poll: Mutex::new(std::time::Instant::now()),
             last_failed_refresh: Mutex::new(None),
@@ -338,20 +344,13 @@ impl Musefs {
     }
 
     // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) FIRST, then
-    // any of the in-memory locks (`inodes`, `size_cache`, the header cache's shards,
-    // `handles`). `inodes` is held inside `pool.with` during `refresh` — that is the
-    // one intentional exception where a pool connection is held around an in-memory
-    // lock; all other in-memory locks must never be held while calling into the pool.
-    // Those in-memory locks are independent siblings and are each held only briefly
-    // (a map get/insert) — never across a pool/DB call (except `inodes` as above).
-    // The header cache is internally sharded; `resolve` does its stat/synthesis
-    // off-lock and locks a shard only for the get/insert.
-
-    fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Handle>>> {
-        self.handles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    // any in-memory lock (`inodes`, the header cache's shards). `inodes` is held
+    // inside `pool.with` during `refresh` — the one intentional exception where a
+    // pool connection is held around an in-memory lock. `handles` is a lock-free
+    // `sharded_slab::Slab`: its `get` guard is cloned-from and dropped before any
+    // pool call, so it never participates in lock ordering. `size_cache` is a
+    // `DashMap`; its per-shard guards are taken and released per op (never held
+    // across a DB call), so it imposes no global ordering either.
 
     fn size_cache(&self) -> std::sync::MutexGuard<'_, HashMap<i64, SizeEntry>> {
         self.size_cache
@@ -608,7 +607,7 @@ impl Musefs {
     pub fn read(&self, inode: u64, fh: u64, offset: u64, size: u64) -> Result<Vec<u8>> {
         // Fast path: serve from the per-handle fd + cached layout (no open/stat).
         if fh != 0 {
-            let handle = self.handles().get(&fh).cloned();
+            let handle = self.handles.get((fh - 1) as usize).map(|g| Arc::clone(&g));
             if let Some(h) = handle {
                 return self
                     .pool
@@ -650,15 +649,14 @@ impl Musefs {
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
         validate_opened_backing(&file, &resolved)?;
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed) + 1;
-        self.handles()
-            .insert(fh, Arc::new(Handle { resolved, file }));
-        Ok(fh)
+        fh_from_key(self.handles.insert(Arc::new(Handle { resolved, file })))
     }
 
     /// Drop an open handle (closes its backing fd when the last reference goes).
     pub fn release_handle(&self, fh: u64) {
-        self.handles().remove(&fh);
+        if fh != 0 {
+            self.handles.remove((fh - 1) as usize);
+        }
     }
 }
 
@@ -667,6 +665,15 @@ mod tests {
     use super::*;
     use musefs_format::{RegionLayout, Segment};
     use once_cell::sync::OnceCell;
+
+    #[test]
+    fn fh_from_key_offsets_by_one_and_maps_full_to_error() {
+        // None (slab at capacity) -> HandleTableFull.
+        assert!(matches!(fh_from_key(None), Err(CoreError::HandleTableFull)));
+        // Some(key) -> key + 1, so the fh is always non-zero (0 == "no handle").
+        assert_eq!(fh_from_key(Some(0)).unwrap(), 1);
+        assert_eq!(fh_from_key(Some(41)).unwrap(), 42);
+    }
 
     #[test]
     fn validate_opened_backing_rejects_mismatched_descriptor_metadata() {
