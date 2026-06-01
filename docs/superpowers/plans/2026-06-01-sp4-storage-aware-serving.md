@@ -128,7 +128,29 @@
   use super::crc::{crc32, crc_shift_zeros};
   ```
 
-- [ ] **Step 2.2 — Write the failing test**
+- [ ] **Step 2.2 — Re-export the new function from the ogg module**
+
+  `page` is a private module; consumers reach its functions only through the
+  re-export line in `musefs-format/src/ogg/mod.rs:6`, which currently reads:
+
+  ```rust
+  pub use page::{parse_page, patch_page_header, PageHeader};
+  ```
+
+  Change it to add `patch_page_header_algebraic` (without this, Task 3's
+  `use musefs_format::ogg::patch_page_header_algebraic;` fails to resolve):
+
+  ```rust
+  pub use page::{parse_page, patch_page_header, patch_page_header_algebraic, PageHeader};
+  ```
+
+  (The function does not exist yet — that's fine; this edit and the Step 2.5
+  implementation land in the same commit. The differential test in Step 2.3 lives
+  inside page.rs's own `mod tests` and would pass without this re-export, which is
+  why the re-export must be added deliberately here rather than discovered as a
+  build break in Task 3.)
+
+- [ ] **Step 2.3 — Write the failing test**
 
   Add inside the `#[cfg(test)] mod tests` block at the bottom of `page.rs`, after any existing tests:
 
@@ -159,7 +181,7 @@
   }
   ```
 
-- [ ] **Step 2.3 — Run to verify it fails**
+- [ ] **Step 2.4 — Run to verify it fails**
 
   ```bash
   cargo test -p musefs-format ogg::page::tests::patch_algebraic 2>&1 | grep -E "FAILED|error"
@@ -167,7 +189,7 @@
 
   Expected: compile error — `patch_page_header_algebraic` not found.
 
-- [ ] **Step 2.4 — Implement `patch_page_header_algebraic`**
+- [ ] **Step 2.5 — Implement `patch_page_header_algebraic`**
 
   Add after the closing brace of `patch_page_header` in `musefs-format/src/ogg/page.rs`:
 
@@ -209,7 +231,7 @@
   }
   ```
 
-- [ ] **Step 2.5 — Run tests**
+- [ ] **Step 2.6 — Run tests**
 
   ```bash
   cargo test -p musefs-format ogg::page::tests 2>&1 | grep -E "test .* ok|FAILED"
@@ -217,7 +239,7 @@
 
   Expected: all page tests pass, including `patch_algebraic_matches_full_page`.
 
-- [ ] **Step 2.6 — Run full musefs-format test suite**
+- [ ] **Step 2.7 — Run full musefs-format test suite**
 
   ```bash
   cargo test -p musefs-format 2>&1 | tail -5
@@ -225,10 +247,10 @@
 
   Expected: all tests pass.
 
-- [ ] **Step 2.7 — Commit**
+- [ ] **Step 2.8 — Commit**
 
   ```bash
-  git add musefs-format/src/ogg/page.rs
+  git add musefs-format/src/ogg/page.rs musefs-format/src/ogg/mod.rs
   git commit -m "$(cat <<'EOF'
   SP4: add patch_page_header_algebraic — header-only CRC patching
 
@@ -360,12 +382,17 @@ Add the new functions **alongside** the old ones so the build stays green while 
 
 - [ ] **Step 3.3 — Add constants and `find_page_start` to `ogg_index.rs`**
 
-  Add the following at the top of `musefs-core/src/ogg_index.rs` (before the existing `use` statements, or after them — keep as a clearly delimited new section):
+  Add one import near the top of `musefs-core/src/ogg_index.rs` (after the existing
+  `use musefs_format::ogg::parse_page;` at line 10):
 
   ```rust
-  use std::os::unix::fs::FileExt;
   use musefs_format::ogg::patch_page_header_algebraic;
   ```
+
+  **Do NOT add a `use std::os::unix::fs::FileExt;`** — one already exists at
+  `ogg_index.rs:78` (a top-level import covering the whole module). A second would
+  be a duplicate-import error (E0252). Task 5 keeps that line 78 import (it is
+  needed by `serve_ogg_window`); see Step 5.1.
 
   Then add the constants and `find_page_start` function directly before the `#[cfg(test)]` line:
 
@@ -437,8 +464,10 @@ Add the new functions **alongside** the old ones so the build stays green while 
   /// payload slices via exact positioned reads — no full-page I/O and no in-memory
   /// page index.
   ///
-  /// Integrity guard (debug builds): asserts that the page walk does not overrun
-  /// `audio_offset + audio_length`, which would indicate corrupt or misaligned data.
+  /// Integrity guard: errors (`FormatError::Malformed`) if the page walk overruns
+  /// `audio_offset + audio_length`, which indicates corrupt or misaligned data.
+  /// This preserves the `consumed == audio_length` check the removed `build_index`
+  /// enforced, as a hard error in both debug and release builds.
   pub fn serve_ogg_window(
       backing: &std::fs::File,
       audio_offset: u64,
@@ -506,14 +535,15 @@ Add the new functions **alongside** the old ones so the build stays green while 
           }
 
           pos += (header_len + payload_len) as u64;
+
+          // Integrity guard: a page whose declared length pushes past the declared
+          // audio region means the file is truncated/misaligned or the DB bounds are
+          // stale. Hard error (matches the removed build_index consumed-check).
+          if pos > audio_end {
+              return Err(musefs_format::FormatError::Malformed.into());
+          }
       }
 
-      debug_assert!(
-          pos <= audio_end,
-          "serve_ogg_window: page walk overran audio_end by {} bytes \
-           (audio_offset={audio_offset} audio_length={audio_length})",
-          pos.saturating_sub(audio_end),
-      );
       Ok(())
   }
   ```
@@ -613,10 +643,10 @@ Add the new functions **alongside** the old ones so the build stays green while 
   }
 
   #[test]
-  #[cfg(debug_assertions)]
-  #[should_panic(expected = "overran audio_end")]
-  fn serve_ogg_window_panics_on_misaligned_audio_length() {
-      // audio_length that is not on a page boundary triggers the integrity guard.
+  fn serve_ogg_window_errors_on_misaligned_audio_length() {
+      // audio_length not on a page boundary triggers the integrity guard: the
+      // single page's declared total_len pushes `pos` past audio_end → Malformed.
+      // Mirrors the removed build_index consumed != audio_length check.
       let (bytes, _) = lace_packet_pub(0xABCD, 0, false, 0, &vec![7u8; 300]);
       let dir = tempfile::tempdir().unwrap();
       let path = dir.path().join("a.ogg");
@@ -624,7 +654,8 @@ Add the new functions **alongside** the old ones so the build stays green while 
       let audio_length = bytes.len() as u64 - 5;
       let backing = std::fs::File::open(&path).unwrap();
       let mut out = Vec::new();
-      serve_ogg_window(&backing, 0, audio_length, 0, 0, audio_length, &mut out).unwrap();
+      let r = serve_ogg_window(&backing, 0, audio_length, 0, 0, audio_length, &mut out);
+      assert!(r.is_err(), "misaligned audio_length must error");
   }
   ```
 
@@ -919,15 +950,19 @@ All three files must change simultaneously because removing the `ogg_index` fiel
 
 - [ ] **Step 4.10 — Fix `ResolvedFile` literal in facade.rs**
 
-  In `musefs-core/src/facade.rs` at line ~697:
+  In `musefs-core/src/facade.rs` at line ~697 (inside the `#[cfg(test)] mod tests`
+  block):
   ```rust
   ogg_index: OnceCell::new(),
   ```
-  **Delete that line.** Also check and remove the `OnceCell` import from facade.rs if it is now unused:
+  **Delete that line.** The matching import `use once_cell::sync::OnceCell;` lives
+  at `facade.rs:668` (inside `mod tests`, not the file top) and becomes unused —
+  delete it too (under `clippy::pedantic` an unused import is a warning that can
+  fail CI). Confirm both sites:
   ```bash
   grep -n "OnceCell" musefs-core/src/facade.rs
   ```
-  Delete any unused `use once_cell::sync::OnceCell;` line found.
+  Expected after edits: no matches.
 
 - [ ] **Step 4.11 — Fix `ResolvedFile` literal in tests/read_at.rs**
 
@@ -989,15 +1024,21 @@ The old `OggPageIndex`, `IndexedPage`, `build_index`, and `serve` are no longer 
   - The module-level doc comment (lines 1–6, referencing the old eager-index approach)
   - `use std::io::{BufReader, Read, Seek, SeekFrom};`
   - `use std::path::Path;`
-  - `use musefs_format::ogg::parse_page;` (top-level; stays in test module if needed)
+  - `use musefs_format::ogg::parse_page;` (top-level; the new test helpers reference
+    it fully-qualified as `musefs_format::ogg::parse_page`, so the top-level import is
+    now unused — remove it)
   - `pub struct IndexedPage { ... }` (with doc comment)
   - `pub struct OggPageIndex { ... }` (with doc comment)
   - `pub fn build_index(...) -> Result<OggPageIndex> { ... }` (with doc comment)
-  - `use std::os::unix::fs::FileExt;` — the duplicate one before `pub fn serve`
   - `pub fn serve(...) -> Result<()> { ... }` (with doc comment)
 
+  **Keep** `use std::os::unix::fs::FileExt;` (the one at line 78, before the old
+  `pub fn serve`) — `serve_ogg_window` and the new tests need it. Move it up to sit
+  with the other top-level `use` statements if you prefer, but do not delete it.
+
   The file's production section should now contain only:
-  - Two `use` statements (`std::os::unix::fs::FileExt`, `musefs_format::ogg::patch_page_header_algebraic`)
+  - `use std::os::unix::fs::FileExt;`
+  - `use musefs_format::ogg::patch_page_header_algebraic;`
   - `use crate::error::{CoreError, Result};`
   - `const MAX_OGG_PAGE_BYTES` and `const MAX_OGG_HEADER_BYTES`
   - `fn find_page_start`
@@ -1095,7 +1136,11 @@ The old `OggPageIndex`, `IndexedPage`, `build_index`, and `serve` are no longer 
 
 - [ ] **Step 6.3 — Record SP3 baseline then run sequential_read bench**
 
-  The SP3 Ogg baseline from BENCHMARKS.md: `ogg 965→948 µs`. Capture SP4 numbers:
+  The SP3 results recorded `ogg 965→948 µs` (before→after SP3). The **SP4 baseline
+  is the SP3 *after* number, 948 µs** — the `>10%` gate is breached only if the SP4
+  median exceeds ~1043 µs. Confirm the current `ogg`/`opus`/`oggflac` baselines in
+  BENCHMARKS.md before computing the gate (re-run the bench on SP3's HEAD if the
+  recorded number is stale for this machine). Capture SP4 numbers:
 
   ```bash
   cargo bench -p musefs-core --bench read_throughput -- sequential_read 2>&1 | grep -E "ogg|opus|oggflac|Vorbis"
@@ -1170,7 +1215,11 @@ The old `OggPageIndex`, `IndexedPage`, `build_index`, and `serve` are no longer 
   }
   ```
 
-  Re-run the bench to confirm the regression is resolved.
+  **Before re-benching, re-validate correctness:** the fallback swaps a verified
+  loop for an unverified matrix impl. Re-run Steps 1.4 and 2.5 — the existing
+  `crc_shift_zeros_matches_appending_zeros` and `patch_algebraic_matches_full_page`
+  tests cover the new impl against the oracle. Both must pass before trusting the
+  bench numbers. Then re-run the bench to confirm the regression is resolved.
   </details>
 
 - [ ] **Step 6.4 — concurrent_read_walk bench**
