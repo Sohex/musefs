@@ -3,7 +3,9 @@ mod crc;
 mod page;
 
 pub use b64::{b64_len, b64_window, encode_b64_slice, B64Window};
-pub use page::{parse_page, patch_page_header, PageHeader};
+pub use page::{
+    parse_page, patch_page_header, patch_page_header_algebraic, verify_page_crc, PageHeader,
+};
 
 use crate::error::{FormatError, Result};
 use crate::probe::Extent;

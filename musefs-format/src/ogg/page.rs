@@ -1,4 +1,4 @@
-use super::crc::crc32;
+use super::crc::{crc32, crc_shift_zeros};
 use crate::error::{FormatError, Result};
 
 pub const CAPTURE: &[u8; 4] = b"OggS";
@@ -206,6 +206,57 @@ pub fn patch_page_header(page: &[u8], new_seq: u32) -> Result<Vec<u8>> {
     full[22..26].copy_from_slice(&crc.to_le_bytes());
     full.truncate(h.header_len);
     Ok(full)
+}
+
+
+/// Patch a page header algebraically — no payload read needed.
+///
+/// `header` must be exactly `27 + seg_count` bytes (the fixed Ogg page header
+/// plus segment table; seg_count is read from byte 26). Returns the patched
+/// header bytes with `new_seq` written and the CRC updated via:
+///
+///   new_crc = old_crc XOR crc32(DELTA)
+///
+/// where DELTA is the all-zero message of length page_len, except bytes 18–21
+/// hold `old_seq XOR new_seq`. The payload cancels out of the XOR because the
+/// Ogg CRC is linear (init=0, no xorout). `payload_len` is derived from the
+/// segment table (no payload I/O required).
+pub fn patch_page_header_algebraic(header: &[u8], new_seq: u32) -> Result<Vec<u8>> {
+    if header.len() < 27 {
+        return Err(FormatError::Malformed);
+    }
+    let seg_count = header[26] as usize;
+    let header_len = 27 + seg_count;
+    if header.len() < header_len {
+        return Err(FormatError::Malformed);
+    }
+    let payload_len: usize = header[27..header_len].iter().map(|&b| b as usize).sum();
+    let old_seq = u32::from_le_bytes(header[18..22].try_into().unwrap());
+    let old_crc = u32::from_le_bytes(header[22..26].try_into().unwrap());
+    // 18 leading zeros leave the CRC state at 0 (TABLE[0]=0), so we start
+    // directly from the 4-byte seq delta, then shift by the trailing zero count.
+    let delta_bytes = (old_seq ^ new_seq).to_le_bytes();
+    let trailing = 5 + seg_count + payload_len; // bytes 22..page_end are zero in DELTA
+    let delta_crc = crc_shift_zeros(crc32(&delta_bytes), trailing);
+    let new_crc = old_crc ^ delta_crc;
+    let mut out = header[..header_len].to_vec();
+    out[18..22].copy_from_slice(&new_seq.to_le_bytes());
+    out[22..26].copy_from_slice(&new_crc.to_le_bytes());
+    Ok(out)
+}
+
+/// Verify that the page at the start of `page` carries a stored CRC matching a
+/// fresh computation. `page` must hold at least the full page (`total_len()`
+/// bytes). Used by the backward-scan entry-page guard to reject a coincidental
+/// `OggS` match in audio payload (a false page start fails this check).
+pub fn verify_page_crc(page: &[u8]) -> Result<bool> {
+    let h = parse_page(page, 0)?;
+    if page.len() < h.total_len() {
+        return Err(FormatError::Malformed);
+    }
+    let mut buf = page[..h.total_len()].to_vec();
+    buf[22..26].copy_from_slice(&0u32.to_le_bytes());
+    Ok(crc32(&buf) == h.crc)
 }
 
 use crate::layout::Segment;
@@ -662,5 +713,47 @@ mod tests {
         let pkts = read_packets(&page, 1).unwrap();
         assert_eq!(pkts.len(), 1);
         assert_eq!(pkts[0].data, vec![1, 2, 3]);
+    }
+
+
+    #[test]
+    fn patch_algebraic_matches_full_page() {
+        // For each combination of payload size and seq values, the algebraic
+        // patch must produce the same header bytes as the full-page oracle.
+        for &payload_len in &[0usize, 1, 255, 3000, 65025] {
+            for &old_seq in &[0u32, 1, 42, u32::MAX - 5] {
+                for &new_seq in &[old_seq, old_seq.wrapping_add(1), old_seq.wrapping_add(10)] {
+                    let payload = vec![0xA5u8; payload_len];
+                    let (page_bytes, _) = lace_packet(0x1234, old_seq, false, 0, &payload);
+                    // Full-page oracle (existing function).
+                    let want = patch_page_header(&page_bytes, new_seq).unwrap();
+                    // Header-only algebraic version.
+                    let h = parse_page(&page_bytes, 0).unwrap();
+                    let got =
+                        patch_page_header_algebraic(&page_bytes[..h.header_len], new_seq)
+                            .unwrap();
+                    assert_eq!(
+                        got, want,
+                        "payload_len={payload_len} old_seq={old_seq} new_seq={new_seq}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verify_page_crc_accepts_valid_rejects_tampered() {
+        // A freshly laced page has a correct CRC.
+        let (page, _) = lace_packet(0x55, 9, false, 42, &vec![0x7Eu8; 500]);
+        assert!(verify_page_crc(&page).unwrap(), "valid page must verify true");
+        // Flip one payload byte → CRC no longer matches.
+        let mut tampered = page.clone();
+        let h = parse_page(&page, 0).unwrap();
+        tampered[h.header_len] ^= 0xFF; // first payload byte
+        assert!(!verify_page_crc(&tampered).unwrap(), "tampered payload must verify false");
+        // Corrupt the stored CRC field directly → also false.
+        let mut bad_crc = page.clone();
+        bad_crc[22] ^= 0x01;
+        assert!(!verify_page_crc(&bad_crc).unwrap(), "corrupt stored CRC must verify false");
     }
 }
