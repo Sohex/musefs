@@ -261,13 +261,17 @@ Remove:
 - `ogg_index: OnceCell<Arc<OggPageIndex>>` from `ResolvedFile`
 - Constants: `OGG_MIN_PAGE_BYTES`, `OGG_INDEX_BYTES_PER_PAGE`
 - Function: `estimated_ogg_index_bytes`
-- Imports: `OnceCell`, `OggPageIndex`
+- Imports (line 14): `use crate::ogg_index::{build_index, serve, OggPageIndex}` →
+  replace with `use crate::ogg_index::serve_ogg_window`
+- Import (line 9): `use once_cell::sync::OnceCell` (no longer needed)
 
 Simplify:
-- `cache_bytes` computation: drop the Ogg index estimate term. All formats now use
-  the same formula: sum of `Inline` segment byte lengths.
-- `OggAudio` arm in `read_segments`: replace `get_or_try_init` / `build_index` /
-  `serve` with a single call to `serve_ogg_window`.
+- `cache_bytes` computation: remove the entire `+ match track.format { Opus |
+  Vorbis | OggFlac => estimated_ogg_index_bytes(track.audio_length as u64), _ => 0
+  }` block that follows the `.sum::<u64>()`. All formats now use the same formula:
+  sum of `Inline` segment byte lengths.
+- `OggAudio` arm in `read_segments`: replace the `get_or_try_init` /
+  `build_index` / `serve` block with a single call to `serve_ogg_window`.
 
 ## Testing and validation
 
@@ -296,9 +300,51 @@ Simplify:
 
 ### Updated existing tests
 
-**`musefs-core/src/reader.rs`**: Remove `ogg_index: OnceCell::new()` from all
-`ResolvedFile` struct literals in `ogg_serve_tests` and `ogg_art_serve_tests`. No
-logic changes.
+**`musefs-core/src/reader.rs`** — four changes:
+1. Remove `ogg_index: OnceCell::new()` from all `ResolvedFile` struct literals in
+   `ogg_serve_tests`, `ogg_art_serve_tests`, and `cache_bound_tests`.
+2. **Delete** `ogg_index_estimate_accounts_page_dense_files` (line 894) entirely —
+   it tests `estimated_ogg_index_bytes` and the two constants, all of which are
+   removed.
+3. **Rewrite** `build_cache_bytes_includes_ogg_index_estimate` (line 731) to assert
+   `cache_bytes == inline_byte_sum` for an Ogg file — the Ogg index estimate term
+   is gone, so the correct assertion is the same as for non-Ogg formats. Rename to
+   `build_cache_bytes_counts_inline_segments_for_ogg` to reflect the new meaning.
+4. Replace the `OggAudio` arm construction (all uses of `OnceCell::new()`) with the
+   struct-literal form after `ogg_index` field removal.
+
+**`musefs-core/src/facade.rs`** (line 697): Remove `ogg_index: OnceCell::new()` from
+the `ResolvedFile` literal constructed there.
+
+**`musefs-core/tests/read_at.rs`** (line 120): Remove
+`ogg_index: once_cell::sync::OnceCell::new()` from the `ResolvedFile` literal in the
+integration test.
+
+### Integrity guard in `serve_ogg_window`
+
+`build_index` validated that `consumed == audio_length` at the end of the scan
+(`ogg_index.rs:72`), catching truncated or misaligned audio regions. This guard is
+silently dropped when `build_index` is removed. Re-introduce it in `serve_ogg_window`
+as a cheap end-of-region assertion: after the serve loop exits with
+`(P - audio_offset) >= rend`, assert (in debug builds via `debug_assert!`, hard error
+in release) that `P - audio_offset <= audio_length`. A mismatch means the page walk
+overran the declared audio region, which indicates a corrupt file or stale DB bounds.
+
+### Validation — latency-injected run (VPS)
+
+Per SP convention, storage-aware SPs are validated under injected latency as well as
+tempfs (README §Conventions). The primary win of SP4 — eliminating the first-read
+O(whole-file) scan on HDD/NFS — is not observable in the tempfs `ci` bench. On the
+VPS, run:
+
+```bash
+MUSEFS_BENCH_LATENCY_PROFILE=nfs-hdd MUSEFS_BENCH_TIER=large-compute \
+  cargo bench -p musefs-core --bench read_throughput
+```
+
+Record the `sequential_read` median for Ogg/Opus/OggFLAC before and after (first
+iteration of each Criterion sample exercises the cold path). The improvement should
+be measurable; record in BENCHMARKS.md and the tracking README.
 
 ### Unchanged gates (must stay green)
 
