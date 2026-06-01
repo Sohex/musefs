@@ -147,7 +147,7 @@ sharded-slab = "0.1"
 thiserror = "1"
 ```
 
-(`dashmap` is listed now too so Task 3 doesn't re-touch the file; it is harmless-unused until Task 3.)
+(`dashmap` is listed now too so Task 3 doesn't re-touch the file; it is harmless-unused until Task 3.) `dashmap = "6"` resolves to 6.0.1 and `sharded-slab = "0.1"` to 0.1.7; `cargo build` updates `Cargo.lock`. This step needs crates.io registry access — if the execution box is offline, fetch these first.
 
 - [ ] **Step 4: Add the `fh_from_key` helper**
 
@@ -502,8 +502,10 @@ Expected: PASS — `end_to_end_read_through_mount` and the other real-mount test
 
 - [ ] **Step 5: Regression bench — `sequential_read` (>10% gate)**
 
+**Baseline source:** capture the pre-SP3 `sequential_read` median *before* execution begins, on the current `cb8441f` commit (the last commit before any code change), and record it — that is the comparison point. (No bench baseline for SP3 is pre-recorded in `BENCHMARKS.md`; SP2's entries are tree-refresh, not read-path.)
+
 Run: `cargo bench -p musefs-core --bench read_throughput -- sequential_read`
-Expected: the `ci` median must not rise >10% vs the pre-SP3 baseline (per README convention; the alloc fix should hold or improve it). Record the median.
+Expected: the `ci` median must not rise >10% vs that captured baseline (per README convention; the alloc fix should hold or improve it). Record the median.
 
 - [ ] **Step 6: Contention signal — `concurrent_read_walk`**
 
@@ -512,7 +514,7 @@ Expected: record before/after medians (this bench names `handles`/`size_cache` c
 
 - [ ] **Step 7: Update the tracking README**
 
-In `docs/superpowers/specs/2026-05-30-optimization-pass/README.md`, set the SP3 status-row Plan column from `—` to `` `../../plans/2026-06-01-sp3-read-serve-residuals.md` `` and change State from `Plan` to `Implemented`. Add a results-log bullet under "## Results log" with the format `tier · storage class · wall time · op counts · fsyncs · peak RSS`, citing the `sequential_read` and `concurrent_read_walk` medians from Steps 5-6.
+In `docs/superpowers/specs/2026-05-30-optimization-pass/README.md`, change the SP3 status-row State from `Plan` to `Implemented` (the Plan-column link is already populated — leave it as-is). Add a results-log bullet under "## Results log" with the format `tier · storage class · wall time · op counts · fsyncs · peak RSS`, citing the `sequential_read` and `concurrent_read_walk` medians from Steps 5-6.
 
 - [ ] **Step 8: Commit**
 
@@ -525,6 +527,7 @@ git commit -m "docs(SP3): record results, mark Implemented, link plan"
 
 ## Self-Review notes (for the executor)
 
-- **Spec coverage:** Task 4 = change (1); Task 2 = change (2) + `HandleTableFull`/`ENFILE` (Task 1) + lock-order comment (handles); Task 3 = change (3) + lock-order comment (size_cache); Task 5 + Task 1 test = the two new tests the spec's Validation section asks for; Task 6 = the four validation gates + benches + README results. The deferred residuals (Options 2/3) and YAGNI items are intentionally untouched.
+- **Spec coverage:** Task 4 = change (1); Task 2 = change (2) + `HandleTableFull`/`ENFILE` (Task 1) + lock-order comment (handles); Task 3 = change (3) + lock-order comment (size_cache); Task 5 + Task 1 test = the two new tests the spec's Validation section asks for; Task 6 = the four validation gates + benches + README results.
+- **`HandleTableFull` coverage is split intentionally:** the at-capacity `insert -> None` → `HandleTableFull` branch is covered by the `fh_from_key(None)` unit test (Task 2 Step 1), and the variant→`ENFILE` mapping by `handle_table_full_maps_to_enfile` (Task 1). A test that forces *real* slab exhaustion is deliberately not written — SP3 keeps sharded-slab's default (effectively unbounded) `Config`, so exhausting it in a test is infeasible and not worth a custom tiny-`Config` seam. The two tests together cover the full construction→errno path. The deferred residuals (Options 2/3) and YAGNI items are intentionally untouched.
 - **Type consistency:** `fh_from_key(Option<usize>) -> Result<u64>` is defined in Task 2 Step 4 and used in Task 2 Step 9 and tested in Task 2 Step 1. `handles: sharded_slab::Slab<Arc<Handle>>` and `size_cache: dashmap::DashMap<i64, SizeEntry>` are consistent across struct/`open`/call sites. `Arc::clone(&g)` (not `(**g).clone()`) is used for the slab guard.
 - **Ordering rationale:** Task 1 before Task 2 (variant referenced by `open_handle`); Tasks 2/3/4 mutually independent (each leaves the crate compiling); Task 5 after Task 2 (uses the slab); Task 6 last.
