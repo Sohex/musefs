@@ -348,9 +348,12 @@ impl Musefs {
     // inside `pool.with` during `refresh` — the one intentional exception where a
     // pool connection is held around an in-memory lock. `handles` is a lock-free
     // `sharded_slab::Slab`: its `get` guard is cloned-from and dropped before any
-    // pool call, so it never participates in lock ordering. `size_cache` is a
-    // `DashMap`; its per-shard guards are taken and released per op (never held
-    // across a DB call), so it imposes no global ordering either.
+    // pool call, so it never participates in lock ordering. Slab keys are
+    // generation-encoded, so a reused slot produces a different key; a stale `fh`
+    // therefore returns `None` from `get` and falls back to inode resolution rather
+    // than aliasing a recycled handle (ABA-safe). `size_cache` is a
+    // `Mutex<HashMap<i64, SizeEntry>>`; its guard is held only briefly per op and
+    // never across a DB call, so it imposes no problematic lock ordering.
 
     fn size_cache(&self) -> std::sync::MutexGuard<'_, HashMap<i64, SizeEntry>> {
         self.size_cache
