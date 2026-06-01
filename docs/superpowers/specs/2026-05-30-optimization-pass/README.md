@@ -220,3 +220,36 @@ commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
   `end_to_end_read_through_mount` green. In-diff mutation gate (CI parity):
   **25 caught / 2 unviable / 0 missed**. See `BENCHMARKS.md` "SP3 — Read/serve
   residuals".
+- **SP4 — Storage-aware serving** (2026-06-01, same box · tempfs · Criterion `ci`
+  tier): replaced the eager whole-region Ogg page index (`OggPageIndex`/`build_index`/
+  `serve`, built once and cached on the resolved file) with a stateless per-request
+  backwards-scan — `find_page_start` (~65 KB window + CRC-validated entry-page guard)
+  + `serve_ogg_window` (algebraic header patch via `crc_shift_zeros`, no payload I/O,
+  exact payload `pread`). `ResolvedFile.ogg_index` removed; `cache_bytes` simplified
+  to inline-segment sum. **Key finding:** the apparent 19× `sequential_read/ogg`
+  regression was a benchmark artifact — that bench re-reads one *cached* file in a
+  loop, the sole workload where the old eager index's amortization helps and which no
+  real client performs. The dominant residual was the entry-page CRC guard (a full
+  ~65 KB page read + crc32 in `find_page_start`, once per chunk): an
+  `MUSEFS_DISABLE_OGG_CRC_GUARD` experiment measured it at **72–79%** of cold/warm
+  ogg cost. Amortizing it through a bounded one-entry `last_page` memo
+  `(page_rel, total_len, header)` — `find_page_start` short-circuits when the request
+  lands inside the already-located page, validating once per page not once per chunk,
+  determinism intact (memo miss → full scan + guard) — closed the gap. ogg medians
+  (release, same box): **`sequential_read` 6.40 → 0.93 ms (parity with the eager
+  index), `cold_first_read` 7.42 → 1.61 ms (~8× faster than old's 13.2 ms),
+  `seek_read` 0.83 ms (~15× faster than old's 12.7 ms)** — SP4 matches or beats the
+  eager index on every workload. Added representative `cold_first_read`/`seek_read`
+  benches (the SP4 regression gate); `sequential_read` kept as a labeled warm
+  datapoint. `crc_shift_zeros` is a hybrid (per-step loop < n=16384, GF(2)
+  matrix-power above) so realistic small-page streams never pay the matrix overhead.
+  Latency-injected read test (`bench_read_under_latency`) added (nfs-hdd: whole 29 ms,
+  seek 28 ms; Ogg serve-path preads uninstrumented — pre-existing). Byte-identical
+  gate: `proptest_read_fidelity` (16) + `musefs-format --features fuzzing` (283) +
+  FUSE e2e (9) green. In-diff mutation gate (CI parity): **0 missed** — killable
+  survivors covered by added tests (find_page_start memo-range + cheap-filter, and
+  the format-layer 0-segment/truncated header guards); proven-equivalent (crc
+  loop↔matrix dispatch, poly_step on disjoint basis vectors, empty-range overlap
+  guards) and non-terminating (`i /= 1`, `pos *= …`) mutants excluded in
+  `.cargo/mutants.toml` with per-class justification. See `BENCHMARKS.md` "SP4 —
+  Storage-aware serving".
