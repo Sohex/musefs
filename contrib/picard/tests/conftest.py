@@ -8,6 +8,9 @@ from musefs._core import connect as musefs_connect
 
 SCHEMA_SQL = (Path(__file__).parent / "schema_v1.sql").read_text()
 
+# Minimal valid JPEG header + padding; used as fake cover-art bytes in tests.
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+
 
 @pytest.fixture
 def db_path(tmp_path):
@@ -78,3 +81,34 @@ def fake_metadata():
 @pytest.fixture
 def fake_image():
     return FakeImage  # the class; call it directly in tests
+
+
+@pytest.fixture
+def picard_config(qapp, tmp_path):
+    """Initialize Picard's global config headless against a temp ini.
+
+    config.setting is None until setup_config runs; it needs a QApplication
+    (pytest-qt's qapp). Importing the plugin after this declares its options,
+    so config.setting[OPT_*] is then readable/writable.
+    """
+    from picard import config
+
+    config.setup_config(qapp, str(tmp_path / "picard.ini"))
+    return config
+
+
+class FakeFile:
+    """Stand-in for a Picard File: .filename + .metadata, and iterfiles()
+    yields itself (matching how _resolved_files walks a selection)."""
+
+    def __init__(self, filename, metadata):
+        self.filename = filename
+        self.metadata = metadata
+
+    def iterfiles(self):
+        return [self]
+
+
+@pytest.fixture
+def fake_file():
+    return FakeFile  # the class; call it directly in tests

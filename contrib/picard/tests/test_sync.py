@@ -1,6 +1,6 @@
-from musefs._core import SyncStats, connect, sync_one
+from conftest import JPEG
 
-JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+from musefs._core import SyncStats, connect, sync_one
 
 
 def _sync(conn, key, pairs, art=None, dry_run=False):
