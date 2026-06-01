@@ -693,6 +693,7 @@ mod tests {
             backing_size: expected_meta.len(),
             backing_mtime_secs: mtime_secs(&expected_meta),
             mtime_secs: mtime_secs(&expected_meta),
+            last_page: std::sync::Mutex::new(None),
             cache_bytes: 0,
         };
 

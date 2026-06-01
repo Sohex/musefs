@@ -10,6 +10,13 @@ use musefs_format::ogg::{patch_page_header_algebraic, verify_page_crc};
 
 use crate::error::{CoreError, Result};
 
+/// A one-entry memo of the most-recently-patched page: `(page offset within the
+/// audio region, patched header bytes)`. Lives on the resolved file so consecutive
+/// reads avoid re-patching the page straddling a chunk boundary. Bounded to a
+/// single ~282-byte header; invalidated implicitly when the resolved file is
+/// rebuilt (a new `content_version` yields a fresh memo).
+pub type LastPageMemo = std::sync::Mutex<Option<(u64, Vec<u8>)>>;
+
 /// Maximum Ogg page size in bytes: 27 fixed header + 255 seg-table + 255×255 payload.
 const MAX_OGG_PAGE_BYTES: u64 = 65_307;
 /// Maximum Ogg page header size: 27 fixed + 255 seg-table.
@@ -114,6 +121,7 @@ pub fn serve_ogg_window(
     rstart: u64,
     rend: u64,
     out: &mut Vec<u8>,
+    memo: Option<&LastPageMemo>,
 ) -> Result<()> {
     if rstart >= rend {
         return Ok(());
@@ -143,11 +151,30 @@ pub fn serve_ogg_window(
         let payload_len: usize =
             hdr_buf[27..header_len].iter().map(|&b| b as usize).sum();
 
-        let old_seq = u32::from_le_bytes(hdr_buf[18..22].try_into().unwrap());
-        let new_seq = (old_seq as i64 + seq_delta) as u32;
-        let patched_hdr =
-            patch_page_header_algebraic(&hdr_buf[..header_len], new_seq)
-                .map_err(CoreError::from)?;
+        // Reuse the patched header if this is the page the last serve ended on
+        // (sequential reads re-touch the page straddling each chunk boundary). The
+        // header for a given page_rel is deterministic for the life of the resolved
+        // file (immutable backing + fixed seq_delta), so a one-entry memo is always
+        // correct. The lock is released before patching so concurrent readers never
+        // serialize on the CRC work.
+        let cached = memo.and_then(|m| {
+            let g = m.lock().unwrap();
+            g.as_ref()
+                .filter(|(mp, _)| *mp == page_rel)
+                .map(|(_, h)| h.clone())
+        });
+        let patched_hdr = match cached {
+            Some(h) => h,
+            None => {
+                let old_seq = u32::from_le_bytes(hdr_buf[18..22].try_into().unwrap());
+                let new_seq = (old_seq as i64 + seq_delta) as u32;
+                patch_page_header_algebraic(&hdr_buf[..header_len], new_seq)
+                    .map_err(CoreError::from)?
+            }
+        };
+        if let Some(m) = memo {
+            *m.lock().unwrap() = Some((page_rel, patched_hdr.clone()));
+        }
 
         let hdr_end = page_rel + header_len as u64;
         let page_end = hdr_end + payload_len as u64;
@@ -288,7 +315,7 @@ mod tests {
 
         let backing = std::fs::File::open(&path).unwrap();
         let mut audio = Vec::new();
-        serve_ogg_window(&backing, ao, alen, delta, 0, alen, &mut audio).unwrap();
+        serve_ogg_window(&backing, ao, alen, delta, 0, alen, &mut audio, None).unwrap();
 
         let mut full = hdr_bytes;
         full.extend_from_slice(&audio);
@@ -376,7 +403,7 @@ mod tests {
     fn new_serve_range(path: &std::path::Path, ao: u64, alen: u64, a: u64, b: u64) -> Vec<u8> {
         let backing = std::fs::File::open(path).unwrap();
         let mut out = Vec::new();
-        serve_ogg_window(&backing, ao, alen, 2, a, b, &mut out).unwrap();
+        serve_ogg_window(&backing, ao, alen, 2, a, b, &mut out, None).unwrap();
         out
     }
 
@@ -552,7 +579,32 @@ mod tests {
         let audio_length = bytes.len() as u64 - 5;
         let backing = std::fs::File::open(&path).unwrap();
         let mut out = Vec::new();
-        let r = serve_ogg_window(&backing, 0, audio_length, 0, 0, audio_length, &mut out);
+        let r = serve_ogg_window(&backing, 0, audio_length, 0, 0, audio_length, &mut out, None);
         assert!(r.is_err(), "misaligned audio_length must error");
+    }
+
+    #[test]
+    fn serve_ogg_window_memo_reuse_is_byte_identical() {
+        // Serve the whole region in small adjacent chunks (< page size, so chunks
+        // straddle page boundaries) reusing ONE memo, the way sequential reads do.
+        // The page straddling each boundary is re-touched, hitting the memo. Output
+        // must be byte-identical to the no-memo reference, and the memo must fill.
+        let (_d, path, ao, alen) = new_serve_fixture();
+        let want = new_reference_region(&path, ao, alen);
+        let backing = std::fs::File::open(&path).unwrap();
+        let memo: LastPageMemo = std::sync::Mutex::new(None);
+        let mut out = Vec::new();
+        let mut off = 0u64;
+        let chunk = 20_000u64;
+        while off < alen {
+            let end = (off + chunk).min(alen);
+            serve_ogg_window(&backing, ao, alen, 2, off, end, &mut out, Some(&memo)).unwrap();
+            off = end;
+        }
+        assert_eq!(out, want, "memo-served bytes must match the reference");
+        assert!(
+            memo.lock().unwrap().is_some(),
+            "memo should hold the last patched page"
+        );
     }
 }

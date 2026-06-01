@@ -23,6 +23,11 @@ pub struct ResolvedFile {
     pub backing_size: u64,
     pub backing_mtime_secs: i64,
     pub mtime_secs: i64,
+    /// One-entry memo of the last patched Ogg page, so consecutive reads skip
+    /// re-patching the page straddling a chunk boundary. Empty for non-Ogg files
+    /// and reset whenever this resolved entry is rebuilt. (Concrete type spelled
+    /// out rather than `ogg_index::LastPageMemo` because that module is private.)
+    pub last_page: Mutex<Option<(u64, Vec<u8>)>>,
     /// Approximate resident bytes this entry costs the cache (sum of `Inline`
     /// segment bytes; backing/art/ogg-audio bytes are not resident).
     pub cache_bytes: u64,
@@ -341,6 +346,7 @@ impl HeaderCache {
             backing_size: track.backing_size as u64,
             backing_mtime_secs: track.backing_mtime,
             mtime_secs: mtime_secs_val,
+            last_page: Mutex::new(None),
             cache_bytes,
         }))
     }
@@ -422,7 +428,16 @@ fn read_segments(
                     len,
                 } => {
                     let f = file.expect("ogg-audio segment requires an open backing file");
-                    serve_ogg_window(f, *ao, *len, *seq_delta, within, within + n as u64, &mut out)?;
+                    serve_ogg_window(
+                        f,
+                        *ao,
+                        *len,
+                        *seq_delta,
+                        within,
+                        within + n as u64,
+                        &mut out,
+                        Some(&resolved.last_page),
+                    )?;
                 }
                 Segment::OggArtSlice {
                     art_id,
@@ -510,6 +525,7 @@ mod ogg_serve_tests {
             backing_size: 0,
             backing_mtime_secs: 0,
             mtime_secs: 0,
+            last_page: Mutex::new(None),
             cache_bytes: 8,
         };
 
@@ -778,6 +794,7 @@ mod ogg_art_serve_tests {
             backing_size: 0,
             backing_mtime_secs: 0,
             mtime_secs: 0,
+            last_page: Mutex::new(None),
             cache_bytes: 0,
         };
 
@@ -821,6 +838,7 @@ mod ogg_art_serve_tests {
             backing_size: 0,
             backing_mtime_secs: 0,
             mtime_secs: 0,
+            last_page: Mutex::new(None),
             cache_bytes: 0,
         };
         let got = read_at(&resolved, &db, 10, 50).unwrap();
@@ -842,6 +860,7 @@ mod cache_bound_tests {
             backing_size: 0,
             backing_mtime_secs: 0,
             mtime_secs: 0,
+            last_page: Mutex::new(None),
             cache_bytes: inline_len as u64,
         })
     }
