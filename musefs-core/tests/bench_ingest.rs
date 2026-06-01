@@ -6,7 +6,10 @@ use common::corpus::{
     bench_base_dir, bench_formats, format_token, prepare, prepare_format, CorpusParams, Target,
 };
 use common::report::{peak_rss_kib, RunReport};
-use musefs_core::{metrics, revalidate_with, scan_directory_with, ScanOptions};
+use musefs_core::{
+    metrics, revalidate_with, scan_directory_with, Mode, MountConfig, Musefs, ScanOptions,
+    VirtualTree,
+};
 use musefs_db::Db;
 
 /// Scan + revalidate one resolved target, printing a `scan` and a `revalidate`
@@ -157,4 +160,95 @@ fn bench_scan_under_latency() {
         stats.scanned > 0,
         "scanned 0 tracks under {profile} latency"
     );
+}
+
+/// Latency-injected READ profile (SP4 storage-aware validation). Mounts the
+/// corpus under `musefs-latencyfs`, scans through it so backing reads traverse the
+/// injected-latency layer, then times two cold operations each on a FRESH mount:
+/// a whole-file read and a single deep seek. The decisive column is `preads`/
+/// `bytes_read`: the old eager index reads the whole prefix to serve a seek, while
+/// SP4 reads only a ~65 KB backward window — so under per-pread latency the seek
+/// row separates the two strategies. Run with MUSEFS_BENCH_LATENCY_PROFILE set.
+#[test]
+#[ignore = "needs /dev/fuse + MUSEFS_BENCH_LATENCY_PROFILE; run with --ignored --nocapture"]
+fn bench_read_under_latency() {
+    use musefs_latencyfs::LatencyMount;
+
+    let Ok(profile) = std::env::var("MUSEFS_BENCH_LATENCY_PROFILE") else {
+        println!("set MUSEFS_BENCH_LATENCY_PROFILE=ssd|hdd|nfs-ssd|nfs-hdd to run");
+        return;
+    };
+    let tier = std::env::var("MUSEFS_BENCH_TIER").unwrap_or_else(|_| "ci".into());
+
+    let cfg = || MountConfig {
+        template: "$artist/$album/$title".to_string(),
+        fallbacks: std::collections::BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
+    };
+    fn first_inode(fs: &Musefs, dir: u64) -> Option<u64> {
+        for (_, ino, is_dir) in fs.readdir(dir).unwrap() {
+            if is_dir {
+                if let Some(f) = first_inode(fs, ino) {
+                    return Some(f);
+                }
+            } else {
+                return Some(ino);
+            }
+        }
+        None
+    }
+
+    let mut params = CorpusParams::from_env();
+    params.format_mix = vec![common::corpus::Format::Ogg];
+    params.tracks_per_album = params.tracks_per_album.max(1);
+
+    println!("\n{}", RunReport::header());
+    // Each row rebuilds a fresh mount + scan so the read is genuinely cold (no
+    // warmed HeaderCache / page index from a prior op).
+    for (label, whole) in [("read_whole_cold", true), ("read_seek_cold", false)] {
+        let backing = tempfile::tempdir().unwrap();
+        common::corpus::generate(backing.path(), &params);
+        let mount = LatencyMount::new(backing.path(), &profile).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        scan_directory_with(&db, &mount.path(), &ScanOptions { jobs: 0 }).unwrap();
+        let fs = Musefs::open(db, cfg()).unwrap();
+        let inode = first_inode(&fs, VirtualTree::ROOT).expect("an ogg inode");
+        let size = fs.getattr(inode).unwrap().size;
+
+        metrics::reset();
+        let t0 = Instant::now();
+        if whole {
+            let mut off = 0u64;
+            while off < size {
+                let got = fs.read(inode, 0, off, 128 * 1024).unwrap();
+                if got.is_empty() {
+                    break;
+                }
+                off += got.len() as u64;
+            }
+        } else {
+            let off = (size * 7 / 8).min(size.saturating_sub(128 * 1024));
+            let _ = fs.read(inode, 0, off, 128 * 1024).unwrap();
+        }
+        let ms = t0.elapsed().as_millis();
+        let s = metrics::snapshot();
+        println!(
+            "{}",
+            RunReport {
+                label: label.into(),
+                format: "ogg".into(),
+                tier: tier.clone(),
+                storage: profile.clone(),
+                wall_ms: ms,
+                opens: s.opens,
+                preads: s.preads,
+                fsyncs: None,
+                bytes_read: s.pread_bytes,
+                peak_rss_kib: None,
+            }
+            .row()
+        );
+    }
 }

@@ -113,6 +113,7 @@ fn page_crc_ok(backing: &std::fs::File, page_start: u64) -> Result<bool> {
 /// `audio_offset + audio_length`, which indicates corrupt or misaligned data.
 /// This preserves the `consumed == audio_length` check the removed `build_index`
 /// enforced, as a hard error in both debug and release builds.
+#[allow(clippy::too_many_arguments)] // serve geometry + memo; bundling adds no clarity
 pub fn serve_ogg_window(
     backing: &std::fs::File,
     audio_offset: u64,
@@ -163,14 +164,12 @@ pub fn serve_ogg_window(
                 .filter(|(mp, _)| *mp == page_rel)
                 .map(|(_, h)| h.clone())
         });
-        let patched_hdr = match cached {
-            Some(h) => h,
-            None => {
-                let old_seq = u32::from_le_bytes(hdr_buf[18..22].try_into().unwrap());
-                let new_seq = (old_seq as i64 + seq_delta) as u32;
-                patch_page_header_algebraic(&hdr_buf[..header_len], new_seq)
-                    .map_err(CoreError::from)?
-            }
+        let patched_hdr = if let Some(h) = cached {
+            h
+        } else {
+            let old_seq = u32::from_le_bytes(hdr_buf[18..22].try_into().unwrap());
+            let new_seq = (old_seq as i64 + seq_delta) as u32;
+            patch_page_header_algebraic(&hdr_buf[..header_len], new_seq).map_err(CoreError::from)?
         };
         if let Some(m) = memo {
             *m.lock().unwrap() = Some((page_rel, patched_hdr.clone()));

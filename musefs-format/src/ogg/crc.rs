@@ -72,10 +72,10 @@ pub fn crc_shift_zeros(crc: u32, n: usize) -> u32 {
     // Matrix–matrix multiply in GF(2): result[i][j] = OR of mat_a[i] & mat_b col j.
     fn mat_mul(a: &[u32; 32], b: &[u32; 32]) -> [u32; 32] {
         let mut r = [0u32; 32];
-        for i in 0..32usize {
-            for j in 0..32usize {
-                if (a[i] >> (31 - j)) & 1 == 1 {
-                    r[i] ^= b[j];
+        for (ri, &ai) in r.iter_mut().zip(a.iter()) {
+            for (j, &bj) in b.iter().enumerate() {
+                if (ai >> (31 - j)) & 1 == 1 {
+                    *ri ^= bj;
                 }
             }
         }
@@ -86,8 +86,8 @@ pub fn crc_shift_zeros(crc: u32, n: usize) -> u32 {
     let mut result = {
         // Identity matrix.
         let mut id = [0u32; 32];
-        for i in 0..32usize {
-            id[i] = 1u32 << (31 - i);
+        for (i, slot) in id.iter_mut().enumerate() {
+            *slot = 1u32 << (31 - i);
         }
         id
     };
@@ -101,10 +101,9 @@ pub fn crc_shift_zeros(crc: u32, n: usize) -> u32 {
     }
     // Apply result matrix to crc (matrix-vector multiply).
     let mut out = 0u32;
-    for i in 0..32usize {
-        let bit = (crc >> (31 - i)) & 1;
-        if bit == 1 {
-            out ^= result[i];
+    for (i, &row) in result.iter().enumerate() {
+        if (crc >> (31 - i)) & 1 == 1 {
+            out ^= row;
         }
     }
     out
