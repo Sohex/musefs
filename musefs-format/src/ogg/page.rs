@@ -756,4 +756,39 @@ mod tests {
         bad_crc[22] ^= 0x01;
         assert!(!verify_page_crc(&bad_crc).unwrap(), "corrupt stored CRC must verify false");
     }
+
+    #[test]
+    fn patch_algebraic_accepts_zero_segment_header() {
+        // A valid 0-segment page header is exactly 27 bytes (header_len == 27), so it
+        // exercises the `header.len() < 27` guard at the boundary: it must be
+        // accepted. `<`->`==`/`<=` would reject this valid header.
+        let mut hdr = vec![0u8; 27];
+        hdr[..4].copy_from_slice(b"OggS");
+        hdr[18..22].copy_from_slice(&7u32.to_le_bytes()); // old_seq
+        // byte 26 (seg_count) == 0 → header_len 27, payload_len 0.
+        let out = patch_page_header_algebraic(&hdr, 9).unwrap();
+        assert_eq!(out.len(), 27);
+        assert_eq!(u32::from_le_bytes(out[18..22].try_into().unwrap()), 9);
+    }
+
+    #[test]
+    fn patch_algebraic_rejects_truncated_segment_table() {
+        // A 27-byte header whose seg_count byte claims 5 segments → header_len 32 >
+        // 27 bytes provided. The `header.len() < header_len` guard must reject it;
+        // `<`->`>` would proceed and read past the slice.
+        let mut hdr = vec![0u8; 27];
+        hdr[..4].copy_from_slice(b"OggS");
+        hdr[26] = 5; // seg_count 5 → header_len 32
+        assert!(patch_page_header_algebraic(&hdr, 1).is_err());
+    }
+
+    #[test]
+    fn verify_page_crc_rejects_truncated_page() {
+        // A page buffer shorter than its declared total_len. The `page.len() <
+        // total_len` guard must reject it; `<`->`>` would slice past the buffer.
+        let (page, _) = lace_packet(0x55, 1, false, 0, &vec![0u8; 300]);
+        let h = parse_page(&page, 0).unwrap();
+        let truncated = &page[..h.total_len() - 10];
+        assert!(verify_page_crc(truncated).is_err());
+    }
 }
