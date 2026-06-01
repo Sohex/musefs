@@ -11,10 +11,12 @@ metrics = []
 
 [dependencies]
 arc-swap = "1"
+dashmap = "6"
 im = "15"
 musefs-db = { path = "../musefs-db", version = "0.2.0" }
 musefs-format = { path = "../musefs-format", version = "0.2.0" }
 once_cell = "1"
+sharded-slab = "0.1"
 thiserror = "1"
 
 [dev-dependencies]

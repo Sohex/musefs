@@ -39,8 +39,12 @@ around what that one did *not* deliver. Reconciliation:
 - **SP2 — Incremental tree refresh.** Rebuild only changed tracks on a
   `data_version` bump instead of reloading and re-rendering the whole library.
   *Spec: TBD.*
-- **SP3 — Read/serve residuals.** Remove the `read_segments` double-allocation;
-  reduce `handles` / `size_cache` global-mutex contention. *Spec: TBD.*
+- **SP3 — Read/serve residuals.** Remove the `read_segments` backing-audio
+  double-allocation (read directly into `out`'s reserved tail); replace the
+  global `handles` mutex with a lock-free `sharded-slab` (the slab key becomes the
+  FUSE `fh`, subsuming `next_fh`) and the global `size_cache` mutex with a
+  `DashMap`. Deferred (noted, not in scope): art-chunk zero-copy and zero-copy
+  into the FUSE reply buffer. *Spec: `SP3-read-serve-residuals.md`.*
 - **SP4 — Storage-aware serving residuals.** Mitigate the Ogg first-read
   whole-region index scan on HDD/NFS. *Spec: TBD.*
 
@@ -78,7 +82,7 @@ is built for the full capability regardless.
 | SP0b | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS. See "Latency-injected runs" below. |
 | SP1 | Implemented | `SP1-ingestion-scalability.md` | `../../plans/2026-05-31-sp1-ingestion-scalability.md` | Hybrid bounded reads (window+`NeedMore` for FLAC/MP3/OGG/WAV, seek reader for M4A) · parallel-probe/serial-writer pipeline (`--jobs`) · byte-budget backpressure · txn batching · bulk pragmas · `failed` resilience. Bounded≡full equivalence gate + byte-identical PCM e2e green. Bench baselines in `BENCHMARKS.md` (durable-storage cold scan 20–500× faster). |
 | SP2 | Implemented | `SP2-incremental-tree-refresh.md` | `../../plans/2026-05-31-sp2-incremental-tree-refresh.md` | In-memory identity diff (changed/added/removed) → changed-only render (Stage A) → im-backed in-place tree mutation with introducing-id dirty propagation + full-`build_with` fallback (Stage B); equivalence gate (proptest 64 cases + debug-assert) green; refresh-1 still slopes with N at Stage B due to O(N) render-key scan (tree mutation itself is O(changed)); `VirtualTree::build_with` full reconstruction eliminated. |
-| SP3 | Not started | — | — | |
+| SP3 | Implemented | `SP3-read-serve-residuals.md` | `../../plans/2026-06-01-sp3-read-serve-residuals.md` | Three residuals: `read_segments` backing-audio reads into `out`'s tail (no temp buf); `handles` → lock-free `sharded-slab` (slab key = FUSE `fh`, drops `next_fh`); `size_cache` → `DashMap`. `CoreError::HandleTableFull`→`ENFILE` for slab exhaustion. Byte-identical gate (proptests + FUSE e2e PCM-sha) green; in-diff mutation gate 25 caught / 0 missed. `sequential_read` held-or-improved (mp3/m4a/wav −14…−19%, no regression); `concurrent_read_walk` −6%. Art-chunk zero-copy + FUSE-reply-buffer zero-copy explicitly deferred. |
 | SP4 | Not started | — | — | |
 
 ## Running the SP0a harness
@@ -183,6 +187,9 @@ commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
   debug-assert (incremental ≡ full) green. Fallback test (forced `Err(())` →
   full-rebuild) green. FUSE byte-identical PCM e2e green. See `BENCHMARKS.md`
   "SP2 — Incremental tree refresh".
+  - **Rerun (2026-06-01, same box, lightly loaded):** refresh-1 wall **100→0 ms,
+    1000→5 ms, 5000→24 ms** — fast end of the prior loaded-box ranges, same
+    residual linear slope (O(N) render-key scan), confirming the Stage B profile.
   - **Follow-up (known residual, not addressed in SP2):** `rebuild_incremental`
     still performs two O(library) steps before the O(changed) `apply_changes`:
     the `Db::list_render_keys` identity scan (every track's `(id,
@@ -196,3 +203,20 @@ commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
     a changed-set DB query instead of the full identity scan — see the SP2 spec
     "Out of scope (YAGNI)". Deferred: the residual is low-tens-of-ms at ~5k–1M
     rows and was never the bottleneck the full rebuild was.
+- **SP3 — Read/serve residuals** (2026-06-01, same box · tempfs · Criterion `ci`
+  tier): three changes — `read_segments` reads backing audio into `out`'s
+  reserved tail (no per-splice temp `Vec`); `handles` mutex → lock-free
+  `sharded_slab::Slab` (FUSE `fh` = slab key + 1, `next_fh` removed); `size_cache`
+  mutex → `DashMap`. `sequential_read` median, before → after (Δ = printed-median
+  ratio): **flac 925→918 µs (−0.8%, noise), mp3 958→824 µs (−14.0%), m4a 964→780 µs
+  (−19.1%), m4a-last 954→773 µs (−19.0%), ogg 965→948 µs (−1.8%, noise), wav
+  962→790 µs (−17.9%)** — no format breaches the >10% *rise* regression gate; the
+  alloc removal improves the metadata-light formats by 14–19% (flac/ogg, dominated
+  by structural-block re-reads, hold flat within noise). `concurrent_read_walk/m16_plus_walker`
+  (the contention signal SP0 named for SP3): **8.91 → 8.35 ms (−6.3%, p=0.26)** —
+  improvement/parity from dropping the two global mutexes. Byte-identical gate:
+  `proptest_read_fidelity` + `musefs-format --features fuzzing` (212 cases) green;
+  FUSE e2e `all_supported_formats_decode_to_same_pcm_sha_as_source` +
+  `end_to_end_read_through_mount` green. In-diff mutation gate (CI parity):
+  **25 caught / 2 unviable / 0 missed**. See `BENCHMARKS.md` "SP3 — Read/serve
+  residuals".

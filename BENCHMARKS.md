@@ -141,6 +141,16 @@ Stage B replaces the O(N) `VirtualTree::build_with` with `apply_changes` (in-pla
 | 1000  | ~10–22 |
 | 5000  | ~38–94 |
 
+Rerun 2026-06-01 (same box, lightly loaded), refresh-1 wall (ms):
+
+| library size (N tracks) | refresh-1 wall (ms) |
+|------------------------:|--------------------:|
+| 100   | 0 |
+| 1000  | 5 |
+| 5000  | 24 |
+
+The fresh run lands at the fast end of the prior loaded-box ranges (the box was less contended), confirming the Stage B profile: still a residual linear slope (~24 ms at 5000) from the O(N) render-key scan, not a flat O(changed) curve. Relative scaling is the signal, not absolute ms.
+
 Ranges reflect run-to-run variation on a loaded box (three independent runs). The tree-mutation itself (the `apply_changes` path) is O(changed), but `rebuild_incremental` still iterates all N tracks to build the `new_snapshot` HashMap before calling `apply_changes` — that O(N) scan of `list_render_keys` results accounts for the residual linear slope. The `VirtualTree::build_with` full reconstruction (the dominant O(N) cost at Stage A) is eliminated; the remaining cost is a lighter O(N) DB-row iteration + HashMap insert. Improvement over Stage A: comparable to slightly faster at N=5000 (41 ms vs ~38–94 ms, noisy and overlapping on a loaded box, so inconclusive in absolute ms). The structural win is removing the full tree reconstruction; the residual linear slope is the lighter render-key scan + HashMap rebuild. A future pass could cache the render-key scan to reach a truly flat profile.
 
 Caveat: same single-album corpus as Stage A (no path collisions or disambiguation).
@@ -148,4 +158,81 @@ Caveat: same single-album corpus as Stage A (no path collisions or disambiguatio
 ```bash
 cargo test -p musefs-core --release --test bench_refresh \
   bench_refresh_one_across_library_sizes -- --ignored --nocapture
+```
+
+---
+
+## SP3 — Read/serve residuals
+
+*Measured 2026-06-01 (same box, lightly loaded · tempfs · Criterion `ci` tier).
+Relative deltas are the signal; Criterion's own before/after baseline (pre-SP3
+`main`) drives the percentages.*
+
+Three changes, none touching synthesis, layout, or what is served (served audio
+stays byte-identical by construction):
+
+1. `read_segments` reads each `BackingAudio` run directly into the output
+   `Vec`'s pre-reserved tail (`resize` + `read_exact_at(&mut out[start..])`)
+   instead of a throwaway `vec![0u8; n]` + `extend_from_slice` — removes one heap
+   alloc + one memcpy per backing-audio splice (the dominant byte volume of every
+   served file).
+2. `handles: Mutex<HashMap<u64, Arc<Handle>>>` + `next_fh: AtomicU64` →
+   `sharded_slab::Slab<Arc<Handle>>` (lock-free; FUSE `fh` = slab key + 1, so
+   `fh` stays non-zero and `next_fh` is gone). Generation-encoded keys give ABA
+   safety; at-capacity insert → `CoreError::HandleTableFull` → `ENFILE`.
+3. `size_cache: Mutex<HashMap<i64, SizeEntry>>` → `dashmap::DashMap` (per-shard
+   locking; the `*e` copy-out drops the read guard before the miss-path insert).
+
+### `sequential_read` — per-format median (the >10%-rise regression gate)
+
+`ci` tier, 4 MiB single-track files, 128 KiB reads, `fh=0` (no-handle path → each
+read resolves via the header cache). The regression gate is a **>10% rise**
+run-over-run; the alloc fix should hold or improve.
+
+Δ is the ratio of the printed before→after medians; the significance note is
+Criterion's own change-estimate p-value (its bootstrap change interval, computed
+over the full samples, won't exactly equal the point-median ratio).
+
+| format    | before (µs) | after (µs) | Δ        | note |
+|-----------|------------:|-----------:|---------:|------|
+| flac      | 925         | 918        | −0.8%    | within noise (p=0.40) |
+| mp3       | 958         | 824        | −14.0%   | significant (p<0.05) |
+| m4a       | 964         | 780        | −19.1%   | significant (p<0.05) |
+| m4a-last  | 954         | 773        | −19.0%   | significant (p<0.05) |
+| ogg       | 965         | 948        | −1.8%    | within noise (p=0.54) |
+| wav       | 962         | 790        | −17.9%   | significant (p<0.05) |
+
+No format breaches the >10% *rise* gate. The metadata-light formats improve
+14–19% from dropping the per-splice alloc+copy; flac/ogg hold flat within noise
+(their front-of-file structural-block re-reads dominate, masking the alloc win).
+
+### `concurrent_read_walk/m16_plus_walker` — contention signal (the SP3 target)
+
+16 reader threads streaming distinct files + one metadata walker, sharing one
+`Arc<Musefs>` — SP0 named this bench's `handles`/`size_cache` mutex contention as
+the SP3 target. Burst-concurrency wall time (includes thread spawn/join):
+
+| | before (ms) | after (ms) | Δ |
+|---|---:|---:|---:|
+| m16_plus_walker | 8.91 | 8.35 | −6.3% (p=0.26) |
+
+Improvement/parity from removing the two global mutexes; the high-variance burst
+metric leaves p>0.05, so the signal is "no contention regression, trending
+faster" rather than a precise speedup.
+
+### Gates
+
+- Byte-identical: `proptest_read_fidelity` + `musefs-format --features fuzzing`
+  (212 cases) green; FUSE e2e `all_supported_formats_decode_to_same_pcm_sha_as_source`
+  + `end_to_end_read_through_mount` green.
+- In-diff mutation (CI parity, `cargo mutants --in-diff` over the changed `.rs`
+  lines): **25 caught / 2 unviable / 0 missed**.
+
+```bash
+# Both benches (Criterion records its own before/after baseline):
+cargo bench -p musefs-core --bench read_throughput
+
+# In-diff mutation gate (as .github/workflows/mutants.yml runs it):
+git diff "$(git merge-base main HEAD)...HEAD" -- '*.rs' > mutants.diff
+cargo mutants --in-diff mutants.diff -j"$(nproc)" --exclude 'musefs-latencyfs/**'
 ```

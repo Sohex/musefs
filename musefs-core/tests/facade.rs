@@ -356,6 +356,34 @@ fn open_handle_read_and_release_roundtrip() {
 }
 
 #[test]
+fn stale_fh_after_release_and_reopen_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = scanned_db(dir.path());
+    let fs = Musefs::open(db, config()).unwrap();
+
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let size = fs.getattr(file_inode).unwrap().size;
+    let canonical = fs.read(file_inode, 0, 0, size).unwrap(); // inode fallback bytes
+
+    let fh_a = fs.open_handle(file_inode).unwrap();
+    fs.release_handle(fh_a);
+    let fh_b = fs.open_handle(file_inode).unwrap();
+
+    // Generation-encoded keys: the reissued handle must not collide with the stale one.
+    assert_ne!(fh_a, fh_b);
+    // A read on the stale fh_a misses the slab (None) and falls back to inode
+    // resolution — correct bytes, never fh_b's handle, never a panic.
+    let via_stale = fs.read(file_inode, fh_a, 0, size).unwrap();
+    assert_eq!(via_stale, canonical);
+    // The live handle still serves correctly.
+    let via_live = fs.read(file_inode, fh_b, 0, size).unwrap();
+    assert_eq!(via_live, canonical);
+
+    fs.release_handle(fh_b);
+}
+
+#[test]
 fn poll_refresh_keeps_unchanged_entries_and_prunes_vanished() {
     use musefs_db::{Format, NewTrack, Tag};
     let dir = tempfile::tempdir().unwrap();

@@ -66,6 +66,7 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         CoreError::NoEntry(_) | CoreError::TrackNotFound(_) => fuser::Errno::ENOENT,
         CoreError::IsDir(_) => fuser::Errno::EISDIR,
         CoreError::NotADir(_) => fuser::Errno::ENOTDIR,
+        CoreError::HandleTableFull => fuser::Errno::ENFILE,
         CoreError::Io(e) => fuser::Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)),
         CoreError::BackingChanged(_) | CoreError::Db(_) | CoreError::Format(_) => fuser::Errno::EIO,
     }
@@ -450,5 +451,16 @@ mod tests {
     fn open_flags_sets_keep_cache_bit_only_when_enabled() {
         assert_eq!(open_flags(false), FopenFlags::empty());
         assert_eq!(open_flags(true), FopenFlags::FOPEN_KEEP_CACHE);
+    }
+}
+
+#[cfg(test)]
+mod errno_tests {
+    use super::errno;
+    use musefs_core::CoreError;
+
+    #[test]
+    fn handle_table_full_maps_to_enfile() {
+        assert_eq!(errno(&CoreError::HandleTableFull).code(), libc::ENFILE);
     }
 }
