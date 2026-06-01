@@ -39,8 +39,12 @@ around what that one did *not* deliver. Reconciliation:
 - **SP2 — Incremental tree refresh.** Rebuild only changed tracks on a
   `data_version` bump instead of reloading and re-rendering the whole library.
   *Spec: TBD.*
-- **SP3 — Read/serve residuals.** Remove the `read_segments` double-allocation;
-  reduce `handles` / `size_cache` global-mutex contention. *Spec: TBD.*
+- **SP3 — Read/serve residuals.** Remove the `read_segments` backing-audio
+  double-allocation (read directly into `out`'s reserved tail); replace the
+  global `handles` mutex with a lock-free `sharded-slab` (the slab key becomes the
+  FUSE `fh`, subsuming `next_fh`) and the global `size_cache` mutex with a
+  `DashMap`. Deferred (noted, not in scope): art-chunk zero-copy and zero-copy
+  into the FUSE reply buffer. *Spec: `SP3-read-serve-residuals.md`.*
 - **SP4 — Storage-aware serving residuals.** Mitigate the Ogg first-read
   whole-region index scan on HDD/NFS. *Spec: TBD.*
 
@@ -78,7 +82,7 @@ is built for the full capability regardless.
 | SP0b | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS. See "Latency-injected runs" below. |
 | SP1 | Implemented | `SP1-ingestion-scalability.md` | `../../plans/2026-05-31-sp1-ingestion-scalability.md` | Hybrid bounded reads (window+`NeedMore` for FLAC/MP3/OGG/WAV, seek reader for M4A) · parallel-probe/serial-writer pipeline (`--jobs`) · byte-budget backpressure · txn batching · bulk pragmas · `failed` resilience. Bounded≡full equivalence gate + byte-identical PCM e2e green. Bench baselines in `BENCHMARKS.md` (durable-storage cold scan 20–500× faster). |
 | SP2 | Implemented | `SP2-incremental-tree-refresh.md` | `../../plans/2026-05-31-sp2-incremental-tree-refresh.md` | In-memory identity diff (changed/added/removed) → changed-only render (Stage A) → im-backed in-place tree mutation with introducing-id dirty propagation + full-`build_with` fallback (Stage B); equivalence gate (proptest 64 cases + debug-assert) green; refresh-1 still slopes with N at Stage B due to O(N) render-key scan (tree mutation itself is O(changed)); `VirtualTree::build_with` full reconstruction eliminated. |
-| SP3 | Not started | — | — | |
+| SP3 | Spec | `SP3-read-serve-residuals.md` | — | Three residuals: `read_segments` backing-audio reads into `out`'s tail (no temp buf); `handles` → lock-free `sharded-slab` (slab key = FUSE `fh`, drops `next_fh`); `size_cache` → `DashMap`. Validated against SP0's `concurrent_read_walk`; `ci` `sequential_read` >10% gate. Art-chunk zero-copy + FUSE-reply-buffer zero-copy explicitly deferred. |
 | SP4 | Not started | — | — | |
 
 ## Running the SP0a harness
