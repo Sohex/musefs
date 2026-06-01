@@ -236,3 +236,97 @@ cargo bench -p musefs-core --bench read_throughput
 git diff "$(git merge-base main HEAD)...HEAD" -- '*.rs' > mutants.diff
 cargo mutants --in-diff mutants.diff -j"$(nproc)" --exclude 'musefs-latencyfs/**'
 ```
+
+## SP4 — Storage-aware serving (backwards-scan + algebraic CRC)
+
+Replaced the eager whole-region Ogg page index (`build_index`/`OggPageIndex`,
+built once and cached on the resolved file) with a stateless per-request
+backwards-scan: `find_page_start` locates the containing page from a ~65 KB window
+(CRC-validated entry-page guard), and `serve_ogg_window` patches each page header
+algebraically (`crc_shift_zeros`, no payload I/O) and serves payload via exact
+`pread`. No O(whole-file) first-read scan. A one-entry `last_page` memo on the
+resolved file `(page_rel, total_len, patched_header)` short-circuits
+`find_page_start` when the next request lands inside the already-located page —
+skipping both the backward scan and the entry CRC guard, without weakening
+determinism (the page descended from a CRC-validated entry in a resolved file whose
+backing bytes are immutable for its life; a content change rebuilds it → fresh memo;
+on a memo miss the full scan + CRC guard runs).
+
+### Why the `sequential_read` "regression" was a benchmark artifact
+
+`sequential_read` re-reads **one cached file in a tight loop** — the single workload
+where the old eager index's amortization helps and which no real client performs (a
+player reads a track ~once; the kernel page cache absorbs re-reads of one offset).
+The first stateless implementation (no memo) re-ran the entry CRC guard — a full
+~65 KB page read + crc32 — on every chunk; an `MUSEFS_DISABLE_OGG_CRC_GUARD`
+experiment measured that guard at **72–79%** of cold/warm ogg cost. Amortizing it
+through the memo (validate once per page, not once per chunk) closed the gap.
+
+### `ci` tier, 4 MiB single-track ogg, apples-to-apples (release, same box)
+
+| workload                               | main (eager index) | SP4    | result        |
+|----------------------------------------|-------------------:|-------:|---------------|
+| `sequential_read` (warm repeat-read)   | 0.93 ms            | 0.93 ms| **parity**     |
+| `cold_first_read` (play a track once)  | 13.2 ms            | 1.61 ms| **SP4 ~8×**    |
+| `seek_read` (one 128 KiB read @ 3.5 MiB)| 12.7 ms           | 0.83 ms| **SP4 ~15×**   |
+
+SP4 matches or beats the eager index on every workload. The cold/seek wins come
+from never building the whole-file index up front (old code reads the entire prefix
+to serve even one chunk near EOF; SP4 scans ~65 KB backward, then the memo carries
+the validated page forward). `main` numbers are the median of 60 fresh-mount runs;
+the regression-gate evolution per implementation:
+
+| ogg bench        | SP4 linear crc | SP4 +matrix | SP4 +matrix +memo-amortized guard |
+|------------------|---------------:|------------:|----------------------------------:|
+| `sequential_read`| 17.6 ms        | 6.40 ms     | **0.93 ms**                        |
+| `cold_first_read`| ~17 ms         | 7.42 ms     | **1.61 ms**                        |
+| `seek_read`      | —              | 821 µs      | **829 µs**                         |
+
+### Other formats (unaffected by SP4)
+
+`cold_first_read`/`seek_read` (fresh mount per iteration): flac 1.43 ms / 520 µs,
+mp3 1.40 ms / 506 µs, m4a 1.43 ms / 513 µs, m4a-last 1.46 ms / 519 µs, wav ~1.4 ms.
+`sequential_read` for non-ogg stayed within noise run-over-run (no page index
+involved).
+
+### `crc_shift_zeros`: hybrid (per-step loop ↔ GF(2) matrix)
+
+`patch_page_header_algebraic` advances the CRC past a page's payload via
+`crc_shift_zeros`. The per-step loop is O(n); for the max-size 65 KB pages a
+single-giant-packet file produces it dominated (linear `sequential_read/ogg`
+17.6 ms). A GF(2) matrix-power method is O(log n) but has a fixed ~32-matmul cost,
+so it is *slower* for the small pages real Opus/Vorbis streams carry. Shipped as a
+hybrid: per-step loop below n=16384, matrix at/above. Differential test
+(`crc_shift_zeros_matches_appending_zeros`) covers both paths + the boundary.
+
+### Latency-injected reads (`bench_read_under_latency`, nfs-hdd, SP4)
+
+`read_whole_cold` 29 ms, `read_seek_cold` 28 ms. Caveat: the Ogg serve path (old
+`serve` and new `serve_ogg_window` alike) never incremented the `preads`/
+`bytes_read` serve counters, so those columns read 0 — only `wall_ms` is meaningful.
+The near-equal whole/seek wall time indicates per-file open+resolve latency
+dominates under nfs-hdd; the local cold/seek benches above are the clean signal.
+
+### Gates
+
+- Byte-identical: `proptest_read_fidelity` (16) + `musefs-format --features
+  fuzzing` (283) green; FUSE e2e (`all_supported_formats_decode_to_same_pcm_sha_as_source`,
+  `end_to_end_read_through_mount`) — 9 passed.
+- In-diff mutation (CI parity, `cargo mutants --in-diff` over changed `.rs` lines,
+  excluding `musefs-latencyfs/**`): **0 missed.** The new-code survivors were
+  resolved as (a) killing tests for the genuinely-killable ones — `find_page_start`
+  memo-range boundaries + the load-bearing cheap-filter `&&`, the `< 27` /
+  `< header_len` / `< total_len` header guards in `page_crc_ok`,
+  `patch_page_header_algebraic`, and `verify_page_crc` (a 0-segment / truncated
+  header was never exercised by the format-layer tests) — and (b) documented
+  exclusions in `.cargo/mutants.toml` for proven-equivalent mutants (the
+  `crc_shift_zeros` loop↔matrix dispatch and `poly_step` over disjoint basis
+  vectors; `serve_ogg_window`'s empty-range overlap guards, verified byte-identical)
+  and two non-terminating loop mutants (`i /= 1`, `pos *= …`).
+
+```bash
+# Representative read benches (the SP4 regression gate):
+cargo bench -p musefs-core --bench read_throughput -- cold_first_read seek_read
+# In-diff mutation gate (TMPDIR on a roomy fs; per-job tree copies are large):
+TMPDIR=/path/with/space cargo mutants --in-diff sp4.diff -j4 --exclude 'musefs-latencyfs/**'
+```

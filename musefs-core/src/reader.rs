@@ -6,22 +6,11 @@ use std::sync::Mutex;
 use musefs_db::{Db, Format};
 use musefs_format::flac::{self, FlacScan};
 use musefs_format::{mp3, mp4, wav, RegionLayout, Segment};
-use once_cell::sync::OnceCell;
 
 use crate::error::{CoreError, Result};
 use crate::facade::Mode;
 use crate::mapping::{tags_to_inputs, track_art_to_inputs};
-use crate::ogg_index::{build_index, serve, OggPageIndex};
-
-const OGG_MIN_PAGE_BYTES: u64 = 27;
-const OGG_INDEX_BYTES_PER_PAGE: u64 = 128;
-
-fn estimated_ogg_index_bytes(audio_length: u64) -> u64 {
-    let estimated_pages = audio_length
-        .saturating_div(OGG_MIN_PAGE_BYTES)
-        .saturating_add(1);
-    estimated_pages.saturating_mul(OGG_INDEX_BYTES_PER_PAGE)
-}
+use crate::ogg_index::serve_ogg_window;
 
 /// A fully resolved synthesized file: its segment layout, total size, the
 /// content version it was built from, and where the backing audio lives.
@@ -34,9 +23,11 @@ pub struct ResolvedFile {
     pub backing_size: u64,
     pub backing_mtime_secs: i64,
     pub mtime_secs: i64,
-    /// Lazily built on the first read that touches an `OggAudio` segment; guarded
-    /// so concurrent first reads build it once. Empty for non-Ogg files.
-    pub ogg_index: OnceCell<Arc<OggPageIndex>>,
+    /// One-entry memo of the last patched Ogg page, so consecutive reads skip
+    /// re-patching the page straddling a chunk boundary. Empty for non-Ogg files
+    /// and reset whenever this resolved entry is rebuilt. (Concrete type spelled
+    /// out rather than `ogg_index::LastPageMemo` because that module is private.)
+    pub last_page: Mutex<Option<(u64, u64, Vec<u8>)>>,
     /// Approximate resident bytes this entry costs the cache (sum of `Inline`
     /// segment bytes; backing/art/ogg-audio bytes are not resident).
     pub cache_bytes: u64,
@@ -346,13 +337,7 @@ impl HeaderCache {
                 Segment::Inline(b) => b.len() as u64,
                 _ => 0,
             })
-            .sum::<u64>()
-            + match track.format {
-                Format::Opus | Format::Vorbis | Format::OggFlac => {
-                    estimated_ogg_index_bytes(track.audio_length as u64)
-                }
-                _ => 0,
-            };
+            .sum::<u64>();
         Ok(Arc::new(ResolvedFile {
             layout,
             total_len,
@@ -361,7 +346,7 @@ impl HeaderCache {
             backing_size: track.backing_size as u64,
             backing_mtime_secs: track.backing_mtime,
             mtime_secs: mtime_secs_val,
-            ogg_index: OnceCell::new(),
+            last_page: Mutex::new(None),
             cache_bytes,
         }))
     }
@@ -442,14 +427,17 @@ fn read_segments(
                     seq_delta,
                     len,
                 } => {
-                    let index = resolved
-                        .ogg_index
-                        .get_or_try_init(|| {
-                            build_index(&resolved.backing_path, *ao, *len, *seq_delta).map(Arc::new)
-                        })?
-                        .clone();
                     let f = file.expect("ogg-audio segment requires an open backing file");
-                    serve(&index, f, *ao, within, within + n as u64, &mut out)?;
+                    serve_ogg_window(
+                        f,
+                        *ao,
+                        *len,
+                        *seq_delta,
+                        within,
+                        within + n as u64,
+                        &mut out,
+                        Some(&resolved.last_page),
+                    )?;
                 }
                 Segment::OggArtSlice {
                     art_id,
@@ -537,7 +525,7 @@ mod ogg_serve_tests {
             backing_size: 0,
             backing_mtime_secs: 0,
             mtime_secs: 0,
-            ogg_index: OnceCell::new(),
+            last_page: Mutex::new(None),
             cache_bytes: 8,
         };
 
@@ -728,7 +716,7 @@ mod resolve_ogg_tests {
     }
 
     #[test]
-    fn build_cache_bytes_includes_ogg_index_estimate() {
+    fn build_cache_bytes_counts_inline_segments_for_ogg() {
         use musefs_db::{Format, NewTrack};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.opus");
@@ -756,11 +744,12 @@ mod resolve_ogg_tests {
                 _ => 0,
             })
             .sum();
-        assert_eq!(
-            resolved.cache_bytes,
-            inline_sum + estimated_ogg_index_bytes(audio_length)
+        // SP4: no per-file index estimate; cache_bytes == inline segment bytes only.
+        assert_eq!(resolved.cache_bytes, inline_sum);
+        assert!(
+            inline_sum > 0,
+            "Opus header should have non-empty inline segments"
         );
-        assert!(estimated_ogg_index_bytes(audio_length) > 0);
     }
 }
 
@@ -808,7 +797,7 @@ mod ogg_art_serve_tests {
             backing_size: 0,
             backing_mtime_secs: 0,
             mtime_secs: 0,
-            ogg_index: once_cell::sync::OnceCell::new(),
+            last_page: Mutex::new(None),
             cache_bytes: 0,
         };
 
@@ -852,7 +841,7 @@ mod ogg_art_serve_tests {
             backing_size: 0,
             backing_mtime_secs: 0,
             mtime_secs: 0,
-            ogg_index: once_cell::sync::OnceCell::new(),
+            last_page: Mutex::new(None),
             cache_bytes: 0,
         };
         let got = read_at(&resolved, &db, 10, 50).unwrap();
@@ -874,7 +863,7 @@ mod cache_bound_tests {
             backing_size: 0,
             backing_mtime_secs: 0,
             mtime_secs: 0,
-            ogg_index: once_cell::sync::OnceCell::new(),
+            last_page: Mutex::new(None),
             cache_bytes: inline_len as u64,
         })
     }
@@ -888,19 +877,6 @@ mod cache_bound_tests {
         assert!(shard.get(2).is_some());
         shard.insert(3, entry(0, 60)); // evicts the now-LRU entry
         assert!(shard.get(3).is_some());
-    }
-
-    #[test]
-    fn ogg_index_estimate_accounts_page_dense_files() {
-        assert_eq!(estimated_ogg_index_bytes(0), OGG_INDEX_BYTES_PER_PAGE);
-        assert_eq!(
-            estimated_ogg_index_bytes(OGG_MIN_PAGE_BYTES),
-            OGG_INDEX_BYTES_PER_PAGE * 2
-        );
-        assert!(
-            estimated_ogg_index_bytes(8 * 1024) > OGG_INDEX_BYTES_PER_PAGE * 100,
-            "8 KiB of tiny Ogg pages must cost far more than one average page"
-        );
     }
 
     #[test]

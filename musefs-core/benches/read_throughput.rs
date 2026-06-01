@@ -159,6 +159,89 @@ fn bench_concurrent_read_and_walk(c: &mut Criterion) {
     group.finish();
 }
 
+/// A fresh fixture that does NOT leak its tempdir: the caller holds the returned
+/// `TempDir` for the lifetime of the (timed) read, so each iteration sees a cold
+/// HeaderCache. This is the realistic "open and read a file once" workload, unlike
+/// `sequential_read` which re-reads one warmed/cached file in a tight loop.
+fn cold_fixture(format: Format, bytes_per_track: usize) -> (Arc<Musefs>, u64, tempfile::TempDir) {
+    let p = CorpusParams {
+        albums: 1,
+        tracks_per_album: 1,
+        bytes_per_track,
+        art_bytes_per_track: 0,
+        format_mix: vec![format],
+        seed: 42,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    generate(dir.path(), &p);
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let fs = Arc::new(Musefs::open(db, config()).unwrap());
+    let mut inodes = Vec::new();
+    collect_file_inodes(&fs, VirtualTree::ROOT, &mut inodes);
+    assert!(
+        !inodes.is_empty(),
+        "cold_fixture: no file inodes for {format:?}"
+    );
+    let inode = inodes[0];
+    (fs, inode, dir)
+}
+
+fn read_whole(fs: &Musefs, inode: u64) {
+    let size = fs.getattr(inode).unwrap().size;
+    let chunk = 128 * 1024u64;
+    let mut off = 0u64;
+    while off < size {
+        let got = std::hint::black_box(fs.read(inode, 0, off, chunk).unwrap());
+        if got.is_empty() {
+            break;
+        }
+        off += got.len() as u64;
+    }
+}
+
+/// Cold first read: a fresh mount per iteration, so the read pays whatever
+/// per-file setup the strategy needs (the old eager index build; SP4 nothing).
+/// This is the "play a track once" workload — the eager-index amortization that
+/// `sequential_read` rewards never applies here.
+fn bench_cold_first_read(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cold_first_read");
+    let bytes = 4 * 1024 * 1024usize;
+    for fmt in bench_formats() {
+        group.throughput(Throughput::Bytes(bytes as u64));
+        group.bench_function(format_token(fmt), |b| {
+            b.iter_batched(
+                || cold_fixture(fmt, bytes),
+                |(fs, inode, _dir)| read_whole(&fs, inode),
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// Arbitrary deep seek: a fresh mount per iteration, then ONE 128 KiB read near
+/// the end of the file. The old code builds the entire page index just to serve
+/// this one chunk; SP4 scans ~65 KiB backward. The case the design targets.
+fn bench_seek_read(c: &mut Criterion) {
+    let mut group = c.benchmark_group("seek_read");
+    let bytes = 4 * 1024 * 1024usize;
+    let seek_off = 3_500_000u64;
+    for fmt in bench_formats() {
+        group.throughput(Throughput::Bytes(128 * 1024));
+        group.bench_function(format_token(fmt), |b| {
+            b.iter_batched(
+                || cold_fixture(fmt, bytes),
+                |(fs, inode, _dir)| {
+                    let _ = std::hint::black_box(fs.read(inode, 0, seek_off, 128 * 1024).unwrap());
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn num_streams() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() * 2)
 }
@@ -166,6 +249,8 @@ fn num_streams() -> usize {
 criterion_group!(
     benches,
     bench_sequential_read,
+    bench_cold_first_read,
+    bench_seek_read,
     bench_concurrent_read_and_walk
 );
 criterion_main!(benches);
