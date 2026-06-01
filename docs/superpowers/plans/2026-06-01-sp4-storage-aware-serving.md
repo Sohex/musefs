@@ -49,7 +49,7 @@
       let crc_start = crc32(data);
       for &n in &[0usize, 1, 10, 1000, 65285] {
           let mut extended = data.to_vec();
-          extended.extend(std::iter::repeat(0u8).take(n));
+          extended.resize(data.len() + n, 0u8);
           let expected = crc32(&extended);
           assert_eq!(
               super::crc_shift_zeros(crc_start, n),
@@ -433,7 +433,7 @@ Add the new functions **alongside** the old ones so the build stays green while 
       loop {
           if window[i..].starts_with(b"OggS") {
               let ok = window.get(i + 4) == Some(&0)           // version == 0
-                  && window.get(i + 5).map_or(false, |&ht| ht & 0xF8 == 0) // header_type
+                  && window.get(i + 5).is_some_and(|&ht| ht & 0xF8 == 0) // header_type
                   && i + 26 < window_len                         // num_segs byte fits
                   && {
                       let ns = window[i + 26] as usize;
@@ -1160,12 +1160,11 @@ The old `OggPageIndex`, `IndexedPage`, `build_index`, and `serve` are no longer 
       if n == 0 || crc == 0 {
           return crc;
       }
-      // Compute x^(8n) mod poly using repeated squaring, then apply as a linear
-      // map to the CRC register. Each CRC state bit i maps to a 32-bit row of
-      // the GF(2) transition matrix; we square the matrix log2(n) times.
-      //
-      // Represent polynomials in the same MSB-first convention as the CRC step:
-      // "multiply by x" = one zero-byte step of the CRC register from state `poly_val`.
+      // `mat` is the GF(2) transition matrix for ONE zero-BYTE CRC step (poly_step
+      // does `<< 8`, i.e. processes a full byte). n zero bytes therefore require
+      // mat^n — NOT mat^(8n). (The bit-level "×x^(8n)" identity is correct in the
+      // polynomial view, but the matrix here is byte-granular, so the exponent is n.)
+      // We raise mat to the n-th power by repeated squaring, then apply it to crc.
       fn poly_step(p: u32) -> u32 {
           (p << 8) ^ TABLE[(p >> 24) as usize]
       }
@@ -1187,7 +1186,7 @@ The old `OggPageIndex`, `IndexedPage`, `build_index`, and `serve` are no longer 
           }
           r
       }
-      // Raise mat to the power 8n via repeated squaring.
+      // Raise mat to the n-th power via repeated squaring.
       let mut power = mat;
       let mut result = {
           // Identity matrix.
@@ -1195,7 +1194,7 @@ The old `OggPageIndex`, `IndexedPage`, `build_index`, and `serve` are no longer 
           for i in 0..32usize { id[i] = 1u32 << (31 - i); }
           id
       };
-      let mut exp = 8 * n;
+      let mut exp = n;
       while exp > 0 {
           if exp & 1 == 1 {
               result = mat_mul(&result, &power);
@@ -1230,16 +1229,18 @@ The old `OggPageIndex`, `IndexedPage`, `build_index`, and `serve` are no longer 
 
   Record the median. Expect parity or improvement vs SP3 (`8.35 ms`).
 
-- [ ] **Step 6.5 — In-diff mutation gate**
+- [ ] **Step 6.5 — In-diff mutation gate (CI parity)**
+
+  Match the CI in-diff gate used by SP1–SP3 (mutates only the lines this branch
+  changed, parallel across cores):
 
   ```bash
-  cargo mutants -p musefs-core --file src/ogg_index.rs \
-    -p musefs-format --file src/ogg/crc.rs \
-    -p musefs-format --file src/ogg/page.rs \
-    -j$(nproc) 2>&1 | tail -20
+  git diff origin/main...HEAD > /tmp/sp4.diff
+  cargo mutants --in-diff /tmp/sp4.diff -j"$(nproc)" 2>&1 | tail -20
   ```
 
-  Record caught/missed/unviable counts.
+  Record caught / missed / unviable counts. The gate requires **0 missed**; if any
+  mutation survives, add a test that kills it before proceeding.
 
 - [ ] **Step 6.6 — FUSE e2e (requires /dev/fuse)**
 
