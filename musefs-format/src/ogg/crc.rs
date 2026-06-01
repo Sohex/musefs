@@ -34,6 +34,17 @@ pub fn crc32(buf: &[u8]) -> u32 {
     crc
 }
 
+
+/// Advance the CRC register by `n` zero-byte steps (equivalent to multiplying by
+/// x^(8n) in GF(2)[x] / poly). Since the Ogg CRC has init=0 and no final XOR it
+/// is linear: crc32(msg ++ zeros×n) == crc_shift_zeros(crc32(msg), n).
+pub fn crc_shift_zeros(mut crc: u32, n: usize) -> u32 {
+    for _ in 0..n {
+        crc = (crc << 8) ^ TABLE[(crc >> 24) as usize];
+    }
+    crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::crc32;
@@ -61,5 +72,31 @@ mod tests {
         assert_eq!(crc32(b"123456789"), reference(b"123456789"));
         let blob: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
         assert_eq!(crc32(&blob), reference(&blob));
+    }
+
+
+    #[test]
+    fn crc_shift_zeros_identity() {
+        // Advancing 0 by any n stays 0 (TABLE[0] = 0 ⟹ each step: 0 ^ TABLE[0] = 0).
+        assert_eq!(super::crc_shift_zeros(0, 0), 0);
+        assert_eq!(super::crc_shift_zeros(0, 1), 0);
+        assert_eq!(super::crc_shift_zeros(0, 65285), 0);
+    }
+
+    #[test]
+    fn crc_shift_zeros_matches_appending_zeros() {
+        // Semantic contract: crc_shift_zeros(crc32(data), n) == crc32(data ++ zeros×n).
+        let data = b"hello world";
+        let crc_start = crc32(data);
+        for &n in &[0usize, 1, 10, 1000, 65285] {
+            let mut extended = data.to_vec();
+            extended.resize(data.len() + n, 0u8);
+            let expected = crc32(&extended);
+            assert_eq!(
+                super::crc_shift_zeros(crc_start, n),
+                expected,
+                "n = {n}"
+            );
+        }
     }
 }
