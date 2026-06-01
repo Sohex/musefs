@@ -27,7 +27,7 @@ pub struct ResolvedFile {
     /// re-patching the page straddling a chunk boundary. Empty for non-Ogg files
     /// and reset whenever this resolved entry is rebuilt. (Concrete type spelled
     /// out rather than `ogg_index::LastPageMemo` because that module is private.)
-    pub last_page: Mutex<Option<(u64, Vec<u8>)>>,
+    pub last_page: Mutex<Option<(u64, u64, Vec<u8>)>>,
     /// Approximate resident bytes this entry costs the cache (sum of `Inline`
     /// segment bytes; backing/art/ogg-audio bytes are not resident).
     pub cache_bytes: u64,

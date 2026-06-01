@@ -10,12 +10,16 @@ use musefs_format::ogg::{patch_page_header_algebraic, verify_page_crc};
 
 use crate::error::{CoreError, Result};
 
-/// A one-entry memo of the most-recently-patched page: `(page offset within the
-/// audio region, patched header bytes)`. Lives on the resolved file so consecutive
-/// reads avoid re-patching the page straddling a chunk boundary. Bounded to a
-/// single ~282-byte header; invalidated implicitly when the resolved file is
-/// rebuilt (a new `content_version` yields a fresh memo).
-pub type LastPageMemo = std::sync::Mutex<Option<(u64, Vec<u8>)>>;
+/// A one-entry memo of the most-recently-served page: `(page offset within the
+/// audio region, page total length, patched header bytes)`. Lives on the resolved
+/// file so consecutive reads (a) reuse the patched header for the page straddling a
+/// chunk boundary, and (b) short-circuit `find_page_start` — skipping its backward
+/// scan AND the full-page entry CRC guard — when the next request lands inside this
+/// already-located page. Trusting it does not weaken the determinism guarantee: the
+/// page descended from a CRC-validated entry within the same resolved file, whose
+/// backing bytes are immutable for its life (a content change rebuilds the file and
+/// yields a fresh, empty memo). Bounded to a single ~282-byte header.
+pub type LastPageMemo = std::sync::Mutex<Option<(u64, u64, Vec<u8>)>>;
 
 /// Maximum Ogg page size in bytes: 27 fixed header + 255 seg-table + 255×255 payload.
 const MAX_OGG_PAGE_BYTES: u64 = 65_307;
@@ -35,13 +39,29 @@ const MAX_OGG_HEADER_BYTES: usize = 282;
 /// `page_crc_ok`; a coincidental `OggS` in audio payload fails the CRC check, so
 /// the scan rejects it and continues. This makes page location deterministic —
 /// the byte-identical guarantee holds unconditionally, not just probabilistically.
+///
+/// Fast path: if `memo` holds a page whose `[start, start+total_len)` region
+/// contains `abs_target`, return that start directly — skipping both the backward
+/// scan and the full-page CRC guard. That page was already located within this
+/// resolved file (whose backing bytes are immutable for its life), so reusing it is
+/// as sound as the forward page-length walk `serve_ogg_window` already trusts.
 fn find_page_start(
     backing: &std::fs::File,
     audio_offset: u64,
     abs_target: u64,
+    memo: Option<&LastPageMemo>,
 ) -> Result<u64> {
     if abs_target == audio_offset {
         return Ok(audio_offset);
+    }
+    if let Some(m) = memo {
+        let guard = m.lock().unwrap();
+        if let Some((rel, total_len, _)) = guard.as_ref() {
+            let start = audio_offset + *rel;
+            if start <= abs_target && abs_target < start + *total_len {
+                return Ok(start);
+            }
+        }
     }
     let scan_start = abs_target
         .saturating_sub(MAX_OGG_PAGE_BYTES)
@@ -129,7 +149,7 @@ pub fn serve_ogg_window(
     }
     let audio_end = audio_offset + audio_length;
     let abs_rstart = audio_offset + rstart;
-    let mut pos = find_page_start(backing, audio_offset, abs_rstart)?;
+    let mut pos = find_page_start(backing, audio_offset, abs_rstart, memo)?;
 
     while pos < audio_end {
         let page_rel = pos - audio_offset;
@@ -161,8 +181,8 @@ pub fn serve_ogg_window(
         let cached = memo.and_then(|m| {
             let g = m.lock().unwrap();
             g.as_ref()
-                .filter(|(mp, _)| *mp == page_rel)
-                .map(|(_, h)| h.clone())
+                .filter(|(mp, _, _)| *mp == page_rel)
+                .map(|(_, _, h)| h.clone())
         });
         let patched_hdr = if let Some(h) = cached {
             h
@@ -172,7 +192,8 @@ pub fn serve_ogg_window(
             patch_page_header_algebraic(&hdr_buf[..header_len], new_seq).map_err(CoreError::from)?
         };
         if let Some(m) = memo {
-            *m.lock().unwrap() = Some((page_rel, patched_hdr.clone()));
+            let total_len = (header_len + payload_len) as u64;
+            *m.lock().unwrap() = Some((page_rel, total_len, patched_hdr.clone()));
         }
 
         let hdr_end = page_rel + header_len as u64;
@@ -413,7 +434,7 @@ mod tests {
         let (_d, path, ao, _alen) = new_serve_fixture();
         let backing = std::fs::File::open(&path).unwrap();
         // abs_target == audio_offset → special-case, no backward read.
-        assert_eq!(find_page_start(&backing, ao, ao).unwrap(), ao);
+        assert_eq!(find_page_start(&backing, ao, ao, None).unwrap(), ao);
     }
 
     #[test]
@@ -426,7 +447,7 @@ mod tests {
         let h = musefs_format::ogg::parse_page(&hdr, 0).unwrap();
         // Target 10 bytes into the payload of page 0.
         let target = ao + h.header_len as u64 + 10;
-        let found = find_page_start(&backing, ao, target).unwrap();
+        let found = find_page_start(&backing, ao, target, None).unwrap();
         assert_eq!(found, ao, "mid-payload target should resolve to page 0's start");
     }
 
@@ -442,7 +463,7 @@ mod tests {
         // so the scan returns page 0's start. The forward pass in serve_ogg_window
         // will skip page 0 (no overlap) and serve from page 1 correctly.
         let page1_abs = ao + h.total_len() as u64;
-        let found = find_page_start(&backing, ao, page1_abs).unwrap();
+        let found = find_page_start(&backing, ao, page1_abs, None).unwrap();
         assert_eq!(found, ao);
     }
 
@@ -471,7 +492,7 @@ mod tests {
         // Target near the end of the real page; the fake OggS at payload+100 sits
         // between the real start and the target, so it is the rightmost candidate.
         let abs_target = ao + audio.len() as u64 - 1;
-        let found = find_page_start(&backing, ao, abs_target).unwrap();
+        let found = find_page_start(&backing, ao, abs_target, None).unwrap();
         assert_eq!(found, ao, "must reject the CRC-invalid fake OggS and return the real start");
     }
 
@@ -604,6 +625,31 @@ mod tests {
         assert!(
             memo.lock().unwrap().is_some(),
             "memo should hold the last patched page"
+        );
+    }
+
+    #[test]
+    fn find_page_start_short_circuits_within_memoized_page() {
+        let (_d, path, ao, _alen) = new_serve_fixture();
+        let backing = std::fs::File::open(&path).unwrap();
+        let mut hdr = vec![0u8; 282];
+        backing.read_exact_at(&mut hdr, ao).unwrap();
+        let h = musefs_format::ogg::parse_page(&hdr, 0).unwrap();
+        // Prime the memo with page 0's geometry (header bytes unused by the lookup).
+        let memo: LastPageMemo =
+            std::sync::Mutex::new(Some((0u64, h.total_len() as u64, Vec::new())));
+        // A target inside page 0 short-circuits to page 0's start (no scan/CRC).
+        let inside = ao + h.header_len as u64 + 50;
+        assert_eq!(
+            find_page_start(&backing, ao, inside, Some(&memo)).unwrap(),
+            ao
+        );
+        // A target past page 0 misses the memo and falls through to the scan,
+        // returning page 1's start — proving the short-circuit is range-gated.
+        let beyond = ao + h.total_len() as u64 + 10;
+        assert_eq!(
+            find_page_start(&backing, ao, beyond, Some(&memo)).unwrap(),
+            ao + h.total_len() as u64
         );
     }
 }
