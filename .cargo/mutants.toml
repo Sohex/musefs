@@ -77,4 +77,52 @@ exclude_re = [
     # caught). Same equivalence the sibling parse_blocks/read_vorbis_comments tests
     # already note.
     'musefs-format/src/flac\.rs:\d+:\d+: replace \| with \^ in read_metadata_bounded',
+
+    # SP2 incremental tree refresh — equivalent mutants in apply_changes & friends.
+    # The whole design contract is "the incrementally-mutated tree is byte-identical
+    # to a full VirtualTree::build_with over the same final track set" (enforced by
+    # the property oracle + a debug_assert in poll_refresh). Several mutations only
+    # change HOW MUCH work the in-place path does — never its output — so no
+    # black-box test over the tree can distinguish them, and the in-diff gate builds
+    # without the `metrics` feature, so there is no counter to observe the path
+    # taken either. Anchored on file:line:col so killable siblings stay in scope.
+    #
+    # force_apply_failure_for_test -> (): the no-op leaves force_apply_fail false, so
+    # poll_refresh runs the incremental path instead of the injected full-rebuild
+    # fallback. Both produce an identical tree (same nodes AND same inodes — the
+    # allocator interns by path and never recycles), so the only difference is an
+    # eprintln on stderr. The fallback's build_with is itself directly tested; this
+    # injection point exists only to drive that branch, with nothing observable to
+    # assert in this config.
+    'musefs-core/src/facade\.rs:510:9: replace Musefs::force_apply_failure_for_test with \(\)',
+    # apply_changes path-stable guard `&self.path_of(ino) == new_path` -> false: a
+    # `changed` id whose rendered path is unchanged would be treated as a move
+    # (remove + re-insert at the same path) instead of a no-op. Re-interning the same
+    # path yields the same inode and rebuild_subtree re-canonicalizes the parent, so
+    # the resulting tree is identical — a pure short-circuit optimization.
+    'musefs-core/src/tree\.rs:354:30: replace match guard .* with false in VirtualTree::apply_changes',
+    # add-side dirty propagation `id < self.introducing_id(child)` -> `<=`: `<=` is a
+    # strict superset of `<`, so it can only mark MORE ancestor dirs dirty. Every
+    # dirty dir is rebuilt to the same canonical layout build_with would produce, so
+    # over-marking changes only the work done, not the tree.
+    'musefs-core/src/tree\.rs:389:45: replace < with <= in VirtualTree::apply_changes',
+    #
+    # Non-terminating mutants (reported as TIMEOUT, never a clean kill): each turns a
+    # bounded upward walk into an infinite loop, because the root is its own parent
+    # (root.parent == ROOT) and these guards are exactly what stops the walk at root.
+    # cargo-mutants can only ever flag them via the 22s auto-timeout; they cannot be
+    # "caught" by an assertion, so they are excluded rather than left to flake the
+    # gate on the timeout budget.
+    #
+    # remove/move-side dirty propagation `child != ROOT && introducing_id(child) == id`
+    # -> `||`: the `||` keeps looping once child reaches ROOT whenever ROOT's global
+    # min id equals `id`, and child stays ROOT forever.
+    'musefs-core/src/tree\.rs:376:43: replace && with \|\| in VirtualTree::apply_changes',
+    # add-side dirty propagation `child != ROOT && id < introducing_id(child)` -> `||`:
+    # same non-terminating root walk as above.
+    'musefs-core/src/tree\.rs:389:39: replace && with \|\| in VirtualTree::apply_changes',
+    # ancestor_in's loop terminator `cur == Self::ROOT` -> `!=`: the walk never breaks
+    # at root (root.parent == root), so a node with no ancestor in the set loops
+    # forever instead of returning false.
+    'musefs-core/src/tree\.rs:455:20: replace == with != in VirtualTree::ancestor_in',
 ]

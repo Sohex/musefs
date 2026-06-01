@@ -77,7 +77,7 @@ is built for the full capability regardless.
 | SP0a | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0a-corpus-and-benches.md` | Corpus generator + compute benches + reporting; no /dev/fuse — runs now. See "Running the SP0a harness" below; per-format sweep added (`SP0a-per-format-coverage.md`) |
 | SP0b | Implemented | `SP0-measurement-foundation.md` | `../../plans/2026-05-30-optimization-sp0b-latency-fuse.md` | `musefs-latencyfs` passthrough latency-injection FUSE + fsync counter; needs /dev/fuse — VPS. See "Latency-injected runs" below. |
 | SP1 | Implemented | `SP1-ingestion-scalability.md` | `../../plans/2026-05-31-sp1-ingestion-scalability.md` | Hybrid bounded reads (window+`NeedMore` for FLAC/MP3/OGG/WAV, seek reader for M4A) · parallel-probe/serial-writer pipeline (`--jobs`) · byte-budget backpressure · txn batching · bulk pragmas · `failed` resilience. Bounded≡full equivalence gate + byte-identical PCM e2e green. Bench baselines in `BENCHMARKS.md` (durable-storage cold scan 20–500× faster). |
-| SP2 | Not started | — | — | |
+| SP2 | Implemented | `SP2-incremental-tree-refresh.md` | `../../plans/2026-05-31-sp2-incremental-tree-refresh.md` | In-memory identity diff (changed/added/removed) → changed-only render (Stage A) → im-backed in-place tree mutation with introducing-id dirty propagation + full-`build_with` fallback (Stage B); equivalence gate (proptest 64 cases + debug-assert) green; refresh-1 still slopes with N at Stage B due to O(N) render-key scan (tree mutation itself is O(changed)); `VirtualTree::build_with` full reconstruction eliminated. |
 | SP3 | Not started | — | — | |
 | SP4 | Not started | — | — | |
 
@@ -161,3 +161,38 @@ commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
   files). Caveat: on tempfs/RAM with sub-window files (`large-compute`) the
   pipeline overhead makes it ~1.9× slower (no fsync cost to amortize). See
   `BENCHMARKS.md` §1–§4.
+- **SP2 Stage A — Incremental tree refresh (baseline)** (2026-05-31, box under
+  load · tempfs · FLAC): Stage A already renders incrementally (only the changed
+  track is re-rendered, O(changed)); the remaining O(N) cost is the
+  `VirtualTree::build_with` full tree reconstruction, which Stage B eliminates.
+  Hence refresh-1 still scales ~linearly with N. Library-size sweep (refresh-1
+  wall, release): **100→0 ms, 1000→4 ms, 5000→41 ms**. Caveat: single-album
+  corpus (no disambiguation), so `build_with` time is slightly optimistic vs a
+  real multi-album library. This is the Stage A baseline; Stage B (in-place tree
+  mutation) targets a flat refresh-1 vs N. Harness:
+  `bench_refresh_one_across_library_sizes`. See `BENCHMARKS.md` "SP2 —
+  Incremental tree refresh".
+- **SP2 Stage B — In-place tree mutation** (2026-05-31, box under load · tempfs
+  · FLAC): Stage B replaces `VirtualTree::build_with` with im-backed in-place
+  `apply_changes` (O(changed) tree mutation). Library-size sweep (refresh-1 wall,
+  release, three runs averaged): **100→~1–6 ms, 1000→~10–22 ms, 5000→~38–94
+  ms**. The full `build_with` reconstruction is eliminated; the residual linear
+  slope is from the O(N) `list_render_keys` scan + `new_snapshot` HashMap rebuild
+  that still precedes `apply_changes` — a future pass could cache this. The tree
+  mutation itself is O(changed). Equivalence gate: 64-case proptest + per-refresh
+  debug-assert (incremental ≡ full) green. Fallback test (forced `Err(())` →
+  full-rebuild) green. FUSE byte-identical PCM e2e green. See `BENCHMARKS.md`
+  "SP2 — Incremental tree refresh".
+  - **Follow-up (known residual, not addressed in SP2):** `rebuild_incremental`
+    still performs two O(library) steps before the O(changed) `apply_changes`:
+    the `Db::list_render_keys` identity scan (every track's `(id,
+    content_version, format)`) and the full `new_snapshot` reconstruction (a
+    fresh `HashMap<i64, TrackRenderState>` rebuilt each refresh, cloning the
+    cached path for every unchanged track). These are cheap relative to the
+    eliminated `build_with` (no rendering, no tree ops) but keep `poll_refresh`
+    O(N) rather than strictly O(changed), so the library-size sweep is not flat.
+    Making it truly O(changed) end-to-end means mutating the snapshot in place
+    (apply only changed/added/removed against the retained `prev_snapshot`) and
+    a changed-set DB query instead of the full identity scan — see the SP2 spec
+    "Out of scope (YAGNI)". Deferred: the residual is low-tens-of-ms at ~5k–1M
+    rows and was never the bottleneck the full rebuild was.

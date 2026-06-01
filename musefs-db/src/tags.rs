@@ -32,6 +32,43 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Tags for a specific set of track ids, grouped by track id, ordered within each
+    /// track by `key, ordinal` (same as `tags_grouped`, so `tags_to_fields` sees the
+    /// lowest-ordinal value of each key first). The `IN (…)` list is chunked to stay
+    /// under SQLite's bound-variable limit. Used by incremental refresh to render only
+    /// changed/added tracks. See SP2 Component 2.
+    pub fn tags_for_tracks(
+        &self,
+        track_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
+        const CHUNK: usize = 900;
+        let mut out: std::collections::HashMap<i64, Vec<Tag>> = std::collections::HashMap::new();
+        for chunk in track_ids.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT track_id, key, value, ordinal FROM tags \
+                 WHERE track_id IN ({placeholders}) ORDER BY track_id, key, ordinal"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(chunk.iter());
+            let rows = stmt.query_map(params, |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    Tag {
+                        key: r.get(1)?,
+                        value: r.get(2)?,
+                        ordinal: r.get(3)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (track_id, tag) = row?;
+                out.entry(track_id).or_default().push(tag);
+            }
+        }
+        Ok(out)
+    }
+
     /// All tags for all tracks in one query, grouped by track id. Matches
     /// `get_tags`'s per-track ordering (`key, ordinal`), so callers can use it as
     /// a drop-in batch replacement for N calls to `get_tags`.
@@ -55,5 +92,70 @@ impl Db {
             out.entry(track_id).or_default().push(tag);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tags_for_tracks_tests {
+    use super::*;
+    use crate::{Format, NewTrack, Tag};
+
+    fn open_mem() -> Db {
+        Db::open_in_memory().unwrap()
+    }
+    fn new_track(path: &str) -> NewTrack {
+        NewTrack {
+            backing_path: path.into(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 1,
+            backing_size: 1,
+            backing_mtime: 0,
+        }
+    }
+
+    #[test]
+    fn tags_for_tracks_returns_only_requested_ordered_by_key_ordinal() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let b = db.upsert_track(&new_track("/b.flac")).unwrap();
+        let c = db.upsert_track(&new_track("/c.flac")).unwrap();
+        db.replace_tags(
+            a,
+            &[
+                Tag::new("ARTIST", "second", 1),
+                Tag::new("ARTIST", "first", 0),
+            ],
+        )
+        .unwrap();
+        db.replace_tags(b, &[Tag::new("ARTIST", "bee", 0)]).unwrap();
+        db.replace_tags(c, &[Tag::new("ARTIST", "cee", 0)]).unwrap();
+
+        let got = db.tags_for_tracks(&[a, b]).unwrap();
+        assert_eq!(got.len(), 2, "c was not requested");
+        assert!(!got.contains_key(&c));
+        let a_tags = &got[&a];
+        assert_eq!(a_tags[0].value, "first");
+        assert_eq!(a_tags[1].value, "second");
+    }
+
+    #[test]
+    fn tags_for_tracks_chunks_beyond_sqlite_variable_limit() {
+        let db = open_mem();
+        let mut ids = Vec::new();
+        for i in 0..1500 {
+            let id = db.upsert_track(&new_track(&format!("/t{i}.flac"))).unwrap();
+            db.replace_tags(id, &[Tag::new("TITLE", &format!("t{i}"), 0)])
+                .unwrap();
+            ids.push(id);
+        }
+        let got = db.tags_for_tracks(&ids).unwrap();
+        assert_eq!(got.len(), 1500, "all chunks fetched");
+    }
+
+    #[test]
+    fn tags_for_tracks_empty_input_is_empty_map() {
+        let db = open_mem();
+        assert!(db.tags_for_tracks(&[]).unwrap().is_empty());
     }
 }

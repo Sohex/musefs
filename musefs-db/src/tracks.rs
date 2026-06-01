@@ -98,4 +98,95 @@ impl Db {
             .execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
         Ok(())
     }
+
+    /// Test-only: force a track's format column directly (no rescan), bumping
+    /// data_version. The only way to exercise a format-only change — production
+    /// never mutates format without a rescan. content_version is NOT bumped (no
+    /// trigger fires on the tracks.format column), so this is a pure format-only edit.
+    #[doc(hidden)]
+    pub fn set_format_for_test(&self, id: i64, fmt: Format) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET format = ?1, updated_at = CAST(strftime('%s','now') AS INTEGER) WHERE id = ?2",
+            params![fmt.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Cheap render-key identity scan for incremental refresh: `(id, content_version,
+    /// format)` for every track, ordered by id. No tags, no path columns — just the
+    /// two track-level inputs that determine a rendered path. See SP2 Component 1.
+    pub fn list_render_keys(&self) -> Result<Vec<(i64, i64, Format)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content_version, format FROM tracks ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            let fmt: String = r.get(2)?;
+            let format = Format::parse(&fmt).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    usize::MAX,
+                    rusqlite::types::Type::Text,
+                    format!("unknown format {fmt}").into(),
+                )
+            })?;
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, format))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+#[cfg(test)]
+mod render_key_tests {
+    use super::*;
+    use crate::{Format, NewTrack, Tag};
+
+    fn open_mem() -> Db {
+        Db::open_in_memory().unwrap()
+    }
+
+    fn new_track(path: &str, fmt: Format) -> NewTrack {
+        NewTrack {
+            backing_path: path.to_string(),
+            format: fmt,
+            audio_offset: 0,
+            audio_length: 1,
+            backing_size: 1,
+            backing_mtime: 0,
+        }
+    }
+
+    #[test]
+    fn list_render_keys_returns_id_version_format_sorted_by_id() {
+        let db = open_mem();
+        let a = db
+            .upsert_track(&new_track("/a.flac", Format::Flac))
+            .unwrap();
+        let b = db.upsert_track(&new_track("/b.mp3", Format::Mp3)).unwrap();
+        // Bump a's content_version via a tag write (trigger).
+        db.replace_tags(a, &[Tag::new("TITLE", "x", 0)]).unwrap();
+
+        let keys = db.list_render_keys().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].0, a);
+        assert_eq!(keys[1].0, b);
+        assert!(keys[0].1 >= 1, "a content_version should have risen");
+        assert_eq!(keys[1].1, 0, "b content_version untouched");
+        assert_eq!(keys[0].2, Format::Flac);
+        assert_eq!(keys[1].2, Format::Mp3);
+    }
+
+    #[test]
+    fn set_format_for_test_persists_the_new_format() {
+        let db = open_mem();
+        let id = db
+            .upsert_track(&new_track("/a.flac", Format::Flac))
+            .unwrap();
+        db.set_format_for_test(id, Format::Mp3).unwrap();
+        let keys = db.list_render_keys().unwrap();
+        assert_eq!(keys[0].0, id);
+        assert_eq!(
+            keys[0].2,
+            Format::Mp3,
+            "set_format_for_test must actually UPDATE the format column"
+        );
+    }
 }
