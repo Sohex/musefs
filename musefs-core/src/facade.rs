@@ -115,7 +115,7 @@ pub struct Musefs {
     /// `SizeEntry` keyed by track id. Tiny entries, effectively unbounded; serves
     /// getattr/lookup without a backing stat or full synthesis. Self-invalidates on
     /// a content_version change.
-    size_cache: Mutex<HashMap<i64, SizeEntry>>,
+    size_cache: dashmap::DashMap<i64, SizeEntry>,
     /// Timestamp of the last `data_version` poll; gated by `poll_interval`.
     last_poll: Mutex<std::time::Instant>,
     /// Timestamp of the last failed refresh attempt; used to prevent tight retry loops.
@@ -157,7 +157,7 @@ impl Musefs {
             pool: DbPool::new(db)?,
             config,
             handles: sharded_slab::Slab::new(),
-            size_cache: Mutex::new(HashMap::new()),
+            size_cache: dashmap::DashMap::new(),
             last_poll: Mutex::new(std::time::Instant::now()),
             last_failed_refresh: Mutex::new(None),
             poll_interval,
@@ -351,15 +351,10 @@ impl Musefs {
     // pool call, so it never participates in lock ordering. Slab keys are
     // generation-encoded, so a reused slot produces a different key; a stale `fh`
     // therefore returns `None` from `get` and falls back to inode resolution rather
-    // than aliasing a recycled handle (ABA-safe). `size_cache` is a
-    // `Mutex<HashMap<i64, SizeEntry>>`; its guard is held only briefly per op and
-    // never across a DB call, so it imposes no problematic lock ordering.
-
-    fn size_cache(&self) -> std::sync::MutexGuard<'_, HashMap<i64, SizeEntry>> {
-        self.size_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    // than aliasing a recycled handle (ABA-safe). `size_cache` is a `DashMap`
+    // whose per-shard guards are taken and released per op (the `*e` copy drops
+    // the read guard before the `insert`; `retain` is never called while a `Ref`
+    // is held), so it imposes no problematic lock ordering / no cross-lock cycle.
 
     /// See `poll_refresh_notify`; this is the no-callback form.
     pub fn poll_refresh(&self) -> Result<bool> {
@@ -434,7 +429,7 @@ impl Musefs {
         let tree = self.tree.load();
         let live = tree.track_ids();
         self.cache.retain(&live);
-        self.size_cache().retain(|k, _| live.contains(k));
+        self.size_cache.retain(|k, _| live.contains(k));
 
         Self::notify_changed(
             &old_snapshot,
@@ -562,7 +557,7 @@ impl Musefs {
             let track = db
                 .get_track(track_id)?
                 .ok_or(CoreError::TrackNotFound(track_id))?;
-            if let Some(e) = self.size_cache().get(&track_id).copied() {
+            if let Some(e) = self.size_cache.get(&track_id).map(|e| *e) {
                 if e.content_version == track.content_version {
                     // Hit: no backing stat, no synthesis. NOTE: a backing file
                     // changed in place without a rescan would leave mtime/size
@@ -573,7 +568,7 @@ impl Musefs {
             }
             // Miss: full resolve (validates via stat, builds + caches the layout).
             let resolved = self.cache.resolve(db, track_id)?;
-            self.size_cache().insert(
+            self.size_cache.insert(
                 track_id,
                 SizeEntry {
                     content_version: track.content_version,
