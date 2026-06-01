@@ -144,13 +144,18 @@ fn find_page_start(backing: &File, audio_offset: u64, abs_target: u64) -> Result
   (validated at scan time). No backward read.
 - **General case:** read the window
   `[max(audio_offset, abs_target − 65307), abs_target)` in a single `pread`.
-  Scan backwards for the rightmost `b"OggS"` with version byte 0, validating:
+  Scan backwards for the rightmost `b"OggS"` with version byte 0, applying cheap
+  header sanity checks:
   - `header_type & 0xF8 == 0` (only bits 0–2 are defined flags)
   - `num_segs` byte fits within the window at index `i + 26`
   - The segment table (`num_segs` bytes from `i + 27`) also fits within the window
-  
-  Return `window_start + i` for the rightmost valid candidate. If none is found,
-  return `Err(CoreError::Format(FormatError::Malformed))`.
+
+  For each candidate that passes the cheap checks, **deterministically validate it
+  by reading the full candidate page from the backing file and recomputing its CRC**
+  (see "Entry-page CRC guard" below). Return `window_start + i` for the first
+  (rightmost) candidate whose CRC matches; on a CRC mismatch, continue scanning
+  backwards. If no candidate validates, return
+  `Err(CoreError::Format(FormatError::Malformed))`.
 
 If `abs_target` falls exactly on a page boundary, the backward scan finds the
 **preceding** page's start (the current page's OggS is not in the half-open window).
@@ -158,14 +163,35 @@ The forward pass below reaches the correct page in one extra parse with no
 additional I/O — the preceding page's header bytes are already in the backward-scan
 window.
 
-### False-positive handling
+### Entry-page CRC guard (preserves the cardinal invariant unconditionally)
 
-A compressed audio payload containing `b"OggS\x00"` by coincidence would pass the
-5-byte match. The `header_type` and `num_segs` sanity checks eliminate virtually all
-false positives for standard music files. A false positive that evades all checks
-produces a malformed-CRC page that the client's Ogg decoder will reject. This is
-documented as a known limitation for adversarially-crafted inputs; musefs targets a
-personal music library of standard encoder output.
+The old `build_index` scanned **forward from a known-good boundary** (`audio_offset`),
+so it could never mis-locate a page. The backward scan starts from an arbitrary
+offset and hunts for the `OggS` capture pattern, which introduces a new failure mode:
+a compressed audio payload that coincidentally contains `b"OggS\x00"` plus a plausible
+header could be mistaken for a page start, producing non-byte-identical output. The
+`header_type`/`num_segs` checks make this astronomically unlikely (~10⁻⁸ per cold
+seek), but "astronomically unlikely" is not "never," and the cardinal invariant is
+non-negotiable.
+
+So the scan does not trust the cheap checks alone: for each candidate it reads the
+full candidate page from the backing file and recomputes its CRC, accepting the
+candidate only if the recomputed CRC matches the page's stored CRC. A coincidental
+`OggS` in payload fails this check (its "CRC field" is just payload bytes), so the
+scan rejects it and continues backward to the real page boundary. This makes the
+backward scan **deterministically correct** — the byte-identical guarantee holds
+unconditionally, not merely with high probability.
+
+Cost: one extra page read (≤ 65 KB, typically a few KB for audio) per serve that does
+not start at `rstart == 0`. For sequential play that page sits in the kernel page
+cache (it is at the current read position), so the added cost is CPU-only
+(`crc32` over one page). For cold random seeks it is one additional `pread`. The
+`rstart == 0` fast path skips the scan and the guard entirely (the first audio page
+starts at `audio_offset` by construction). Worst case is O(false positives in the
+window) page reads, but for standard encoder output that count is zero.
+
+The CRC recomputation reuses `crc32` via a new `musefs_format::ogg::verify_page_crc`
+helper (CRC logic stays in the format layer where `crc32` lives).
 
 ### Forward pass (serve loop)
 
@@ -219,7 +245,8 @@ while (P < audio_end) AND ((P - audio_offset) < rend):
 
 | Path | I/O per FUSE read |
 |---|---|
-| Backward-scan window | 65 KB pread (kernel page cache hit for sequential play) |
+| Backward-scan window | 65 KB pread (kernel page cache hit for sequential play); skipped when `rstart == 0` |
+| Entry-page CRC guard | one full candidate page read (≤ 65 KB; cache hit for sequential play); skipped when `rstart == 0` |
 | Header per page in window | 282 bytes pread (cache hit for sequential play) |
 | Payload slice | Exactly the bytes served — same as warmed-index approach |
 
@@ -240,8 +267,12 @@ before any bytes are served), this is a dramatic improvement.
 ### `musefs-format/src/ogg/page.rs`
 
 - **Add** `pub fn patch_page_header_algebraic(header: &[u8], new_seq: u32) -> Result<Vec<u8>>`
+- **Add** `pub fn verify_page_crc(page: &[u8]) -> Result<bool>` — recompute a full
+  page's CRC and compare to its stored CRC (used by the entry-page guard).
 - **Keep** `patch_page_header` (used as test oracle; not on the serve hot-path after
   this SP)
+- Re-export both new functions from `musefs-format/src/ogg/mod.rs` (the `page` module
+  is private).
 
 ### `musefs-core/src/ogg_index.rs` (net reduction)
 
@@ -253,7 +284,11 @@ Remove:
 
 Add:
 - `pub fn serve_ogg_window(…) -> Result<()>` — the backwards-scan serve function
-- `fn find_page_start(…) -> Result<u64>` — the backward scan helper
+- `fn find_page_start(…) -> Result<u64>` — the backward scan helper (CRC-validates
+  each candidate page via `page_crc_ok`)
+- `fn page_crc_ok(backing, page_start) -> Result<bool>` — read the full candidate
+  page and check its CRC via `verify_page_crc`; returns `Ok(false)` (not an error) on
+  CRC mismatch or EOF so the scan continues to the next candidate.
 
 ### `musefs-core/src/reader.rs`
 
@@ -287,6 +322,8 @@ Simplify:
   payload sizes 0, 1, 255×255, and random; varied seq values), assert
   `patch_page_header_algebraic(header, new_seq) == patch_page_header(full_page,
   new_seq)`. This is the primary correctness gate for the algebraic shortcut.
+- `verify_page_crc_accepts_valid_rejects_tampered` — a laced page verifies `true`;
+  flipping one payload byte (or the stored CRC) verifies `false`.
 
 **`musefs-core/src/ogg_index.rs`**
 - `serve_ogg_window_renumbers_and_preserves_payload` — synthetic two-page file;
@@ -297,6 +334,10 @@ Simplify:
 - `find_page_start_at_boundary` — assert the preceding page's start is returned
   when target is exactly on a page boundary, and the forward pass reaches the
   correct page.
+- `find_page_start_skips_false_oggs_in_payload` — a real page whose payload embeds a
+  coincidental `OggS` + plausible header (but invalid CRC); assert the backward scan
+  rejects the fake via the CRC guard and returns the real page start. This is the
+  correctness gate for the entry-page guard.
 
 ### Updated existing tests
 
