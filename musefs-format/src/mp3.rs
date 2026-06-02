@@ -1902,6 +1902,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_id3v2_segments_first_promoted_scalar_wins() {
+        // Duplicate `rating`/`musicbrainz_trackid` rows (e.g. an over-tagged DB):
+        // the first value is rebuilt into the POPM/UFID frame, later ones dropped.
+        // Pins the `popm_rating.is_none()` / `mbid.is_none()` guards.
+        let tags = vec![
+            TagInput::new("rating", "10"),
+            TagInput::new("rating", "20"),
+            TagInput::new("musicbrainz_trackid", "mbid-first"),
+            TagInput::new("musicbrainz_trackid", "mbid-second"),
+        ];
+        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
+        let inline: Vec<u8> = segments
+            .iter()
+            .flat_map(|s| match s {
+                Segment::Inline(b) => b.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+
+        // First MusicBrainz id wins, later one dropped.
+        assert!(find_sub(&inline, b"mbid-first"), "first mbid must win");
+        assert!(
+            !find_sub(&inline, b"mbid-second"),
+            "later mbid must be dropped"
+        );
+
+        // First rating wins: re-parse the synthesized tag and read the promoted value.
+        let (_opaque, promoted) = super::read_binary_tags(&inline);
+        assert!(
+            promoted.contains(&("rating".to_string(), "10".to_string())),
+            "first rating must win: {promoted:?}"
+        );
+        assert!(
+            !promoted.iter().any(|(k, v)| k == "rating" && v == "20"),
+            "later rating must be dropped: {promoted:?}"
+        );
+    }
+
     fn find_sub(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
     }
