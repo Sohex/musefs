@@ -16,6 +16,10 @@ fn main() {
     write("flac", "seed0", &fixtures::flac(&[1, 2, 3, 4, 5, 6, 7, 8]));
     write("mp3", "seed0", &fixtures::mp3());
     write("mp4", "seed0", &fixtures::m4a(&[9u8; 32]));
+    // m4a seed with trailing entropy so arb_binary_tags/arb_arts yield non-empty inputs.
+    let mut m4a_bin = fixtures::m4a(&[9u8; 32]);
+    m4a_bin.extend_from_slice(&[0x01; 64]);
+    write("mp4", "seed_binary", &m4a_bin);
     write("ogg", "seed0", &fixtures::ogg_opus());
     write("ogg_page", "seed0", &fixtures::ogg_opus());
     write("vorbiscomment", "seed0", &fixtures::ogg_opus());

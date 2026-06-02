@@ -2,7 +2,7 @@
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 use musefs_format::{fuzz_check::assert_backing_covers_audio, mp4};
-use musefs_fuzz::{arb_arts, arb_tags, MAX_INPUT};
+use musefs_fuzz::{arb_arts, arb_binary_tags, arb_tags, MAX_INPUT};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_INPUT {
@@ -17,8 +17,9 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut u = Unstructured::new(data);
     let tags = arb_tags(&mut u).unwrap_or_default();
+    let binary = arb_binary_tags(&mut u).unwrap_or_default();
     let arts = arb_arts(&mut u).unwrap_or_default();
-    if let Ok(layout) = mp4::synthesize_layout(&scan, &tags, &[], &arts) {
+    if let Ok(layout) = mp4::synthesize_layout(&scan, &tags, &binary, &arts) {
         assert_backing_covers_audio(scan.mdat_payload_offset, scan.mdat_payload_len, &layout);
     }
 });
