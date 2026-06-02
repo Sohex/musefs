@@ -724,7 +724,11 @@ fn build_udta(
             }
         }
     }
-    if !lead.is_empty() || segments.is_empty() {
+    // `lead` is empty only when the loop's last segment was streamed (it was
+    // `take`n); otherwise it still holds the udta/meta/ilst header (when there are
+    // no streamed segments) or trailing framing. Pushing an empty `lead` would
+    // produce an EmptySegment that fails layout validation, so guard on non-empty.
+    if !lead.is_empty() {
         segments.push(Segment::Inline(lead));
     }
     Ok((segments, streamed_total))
@@ -2022,6 +2026,34 @@ mod tests {
         assert!(read_binary_tags(&moov)
             .iter()
             .all(|t| t.key != "----:com.apple.iTunes:MOOD"));
+    }
+
+    #[test]
+    fn read_binary_tags_handles_data_box_length_boundary() {
+        // A `data` box shorter than the 8-byte `[type][locale]` header is malformed:
+        // it must be skipped, never indexed into (no panic).
+        let mut short_inner = boxed(b"mean", &{
+            let mut b = 0u32.to_be_bytes().to_vec();
+            b.extend_from_slice(b"com.serato.dj");
+            b
+        });
+        short_inner.extend(boxed(b"name", &{
+            let mut b = 0u32.to_be_bytes().to_vec();
+            b.extend_from_slice(b"short");
+            b
+        }));
+        short_inner.extend(boxed(b"data", &[0u8; 5])); // 5 < 8: truncated header
+        let short = boxed(b"----", &short_inner);
+
+        // A `data` box of exactly 8 bytes (binary type 0, no value) is well-formed
+        // with an empty payload — it must be emitted, not skipped.
+        let empty = freeform_atom_typed("com.serato.dj", "empty", 0, b"");
+        let moov = moov_with_ilst(&[short, empty].concat());
+
+        let tags = read_binary_tags(&moov);
+        assert_eq!(tags.len(), 1, "short data skipped, 8-byte data emitted");
+        assert_eq!(tags[0].key, "----:com.serato.dj:empty");
+        assert!(tags[0].payload.is_empty());
     }
 
     #[test]
