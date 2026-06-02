@@ -1150,13 +1150,20 @@ mod binary_tag_serve_tests {
             .unwrap();
         db.set_binary_tags(
             id,
-            &[BinaryTag { key: "PRIV".into(), payload: vec![10, 20, 30, 40], ordinal: 0 }],
+            &[BinaryTag {
+                key: "PRIV".into(),
+                payload: vec![10, 20, 30, 40],
+                ordinal: 0,
+            }],
         )
         .unwrap();
         let rowid = db.get_binary_tags(id).unwrap()[0].rowid;
 
         let resolved = ResolvedFile {
-            layout: RegionLayout::new(vec![Segment::BinaryTag { payload_id: rowid, len: 4 }]),
+            layout: RegionLayout::new(vec![Segment::BinaryTag {
+                payload_id: rowid,
+                len: 4,
+            }]),
             total_len: 4,
             content_version: 0,
             backing_path: PathBuf::from("/x.mp3"),

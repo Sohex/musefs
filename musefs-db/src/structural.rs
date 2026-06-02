@@ -62,8 +62,16 @@ mod tests {
         db.set_structural_blocks(
             id,
             &[
-                StructuralBlock { kind: "STREAMINFO".into(), ordinal: 0, body: vec![1, 2] },
-                StructuralBlock { kind: "SEEKTABLE".into(), ordinal: 0, body: vec![3] },
+                StructuralBlock {
+                    kind: "STREAMINFO".into(),
+                    ordinal: 0,
+                    body: vec![1, 2],
+                },
+                StructuralBlock {
+                    kind: "SEEKTABLE".into(),
+                    ordinal: 0,
+                    body: vec![3],
+                },
             ],
         )
         .unwrap();

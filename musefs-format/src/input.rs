@@ -60,7 +60,11 @@ mod tests {
 
     #[test]
     fn binary_tag_input_constructs() {
-        let b = BinaryTagInput { key: "PRIV".into(), payload_id: 7, len: 3 };
+        let b = BinaryTagInput {
+            key: "PRIV".into(),
+            payload_id: 7,
+            len: 3,
+        };
         assert_eq!(b.payload_id, 7);
         assert_eq!(b.len, 3);
     }

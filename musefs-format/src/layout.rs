@@ -119,16 +119,18 @@ mod tests {
 
     #[test]
     fn binary_tag_segment_len_and_validate() {
-        let seg = Segment::BinaryTag { payload_id: 5, len: 12 };
+        let seg = Segment::BinaryTag {
+            payload_id: 5,
+            len: 12,
+        };
         assert_eq!(seg.len(), 12);
         // Non-empty binary tag passes validation.
-        RegionLayout::validated(vec![
-            seg,
-            Segment::BackingAudio { offset: 0, len: 1 },
-        ])
-        .unwrap();
+        RegionLayout::validated(vec![seg, Segment::BackingAudio { offset: 0, len: 1 }]).unwrap();
         // Empty binary tag is rejected (EmptySegment), like empty art.
-        let err = RegionLayout::validated(vec![Segment::BinaryTag { payload_id: 5, len: 0 }]);
+        let err = RegionLayout::validated(vec![Segment::BinaryTag {
+            payload_id: 5,
+            len: 0,
+        }]);
         assert!(matches!(err, Err(LayoutError::EmptySegment)));
     }
 }

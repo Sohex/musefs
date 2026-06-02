@@ -149,7 +149,9 @@ impl Db {
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>> {
-        let blob = self.conn.blob_open("main", "tags", "value_blob", payload_id, true)?;
+        let blob = self
+            .conn
+            .blob_open("main", "tags", "value_blob", payload_id, true)?;
         let mut buf = vec![0u8; len];
         blob.read_at_exact(&mut buf, offset as usize)?;
         Ok(buf)
@@ -224,7 +226,8 @@ mod tags_for_tracks_tests {
     fn text_queries_exclude_binary_rows() {
         let db = open_mem();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
-        db.replace_tags(a, &[Tag::new("artist", "Alice", 0)]).unwrap();
+        db.replace_tags(a, &[Tag::new("artist", "Alice", 0)])
+            .unwrap();
         db.conn
             .execute(
                 "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
@@ -245,18 +248,34 @@ mod tags_for_tracks_tests {
     fn binary_tags_round_trip_and_are_independent_of_text() {
         let db = open_mem();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
-        db.replace_tags(a, &[Tag::new("artist", "Alice", 0)]).unwrap();
+        db.replace_tags(a, &[Tag::new("artist", "Alice", 0)])
+            .unwrap();
         db.set_binary_tags(
             a,
             &[
-                crate::BinaryTag { key: "PRIV".into(), payload: vec![1, 2, 3], ordinal: 0 },
-                crate::BinaryTag { key: "PRIV".into(), payload: vec![9, 9], ordinal: 1 },
-                crate::BinaryTag { key: "GEOB".into(), payload: vec![7], ordinal: 0 },
+                crate::BinaryTag {
+                    key: "PRIV".into(),
+                    payload: vec![1, 2, 3],
+                    ordinal: 0,
+                },
+                crate::BinaryTag {
+                    key: "PRIV".into(),
+                    payload: vec![9, 9],
+                    ordinal: 1,
+                },
+                crate::BinaryTag {
+                    key: "GEOB".into(),
+                    payload: vec![7],
+                    ordinal: 0,
+                },
             ],
         )
         .unwrap();
 
-        assert_eq!(db.get_tags(a).unwrap(), vec![Tag::new("artist", "Alice", 0)]);
+        assert_eq!(
+            db.get_tags(a).unwrap(),
+            vec![Tag::new("artist", "Alice", 0)]
+        );
 
         let rows = db.get_binary_tags(a).unwrap();
         assert_eq!(rows.len(), 3);
@@ -273,6 +292,9 @@ mod tags_for_tracks_tests {
 
         db.set_binary_tags(a, &[]).unwrap();
         assert!(db.get_binary_tags(a).unwrap().is_empty());
-        assert_eq!(db.get_tags(a).unwrap(), vec![Tag::new("artist", "Alice", 0)]);
+        assert_eq!(
+            db.get_tags(a).unwrap(),
+            vec![Tag::new("artist", "Alice", 0)]
+        );
     }
 }
