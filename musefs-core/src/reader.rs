@@ -253,6 +253,7 @@ impl HeaderCache {
                 let tags = db.get_tags(track.id)?;
                 let inputs = tags_to_inputs(&tags);
                 let art_inputs = track_art_to_inputs(db, track.id)?;
+                let binary_tag_inputs = crate::mapping::binary_tags_to_inputs(db, track.id)?;
 
                 // FLAC re-reads the front for its preserved structural blocks; MP3 needs no
                 // front read — its ID3v2 tag is regenerated entirely from the DB and the
@@ -273,7 +274,7 @@ impl HeaderCache {
                         track.audio_offset as u64,
                         track.audio_length as u64,
                         &inputs,
-                        &[], // binary_tags — wired in Task 2.9
+                        &binary_tag_inputs,
                         &art_inputs,
                     )?,
                     Format::M4a => {
@@ -305,7 +306,7 @@ impl HeaderCache {
                             track.audio_offset as u64,
                             track.audio_length as u64,
                             &inputs,
-                            &[], // binary_tags — wired in Task 2.9
+                            &binary_tag_inputs,
                             &art_inputs,
                         )?
                     }
@@ -1146,6 +1147,67 @@ mod cache_bound_tests {
 mod binary_tag_serve_tests {
     use super::*;
     use musefs_db::{BinaryTag, NewTrack};
+
+    #[test]
+    fn resolve_mp3_emits_binary_tag_in_synthesized_region() {
+        use id3::frame::{Content, Unknown};
+        use id3::{Encoder, Frame, Tag, TagLike, Version};
+        let dir = tempfile::tempdir().unwrap();
+        let mut tag = Tag::new();
+        let needle = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x77, 0x88];
+        tag.add_frame(Frame::with_content(
+            "PRIV",
+            Content::Unknown(Unknown {
+                data: needle.to_vec(),
+                version: Version::Id3v24,
+            }),
+        ));
+        let mut bytes = Vec::new();
+        Encoder::new()
+            .version(Version::Id3v24)
+            .encode(&tag, &mut bytes)
+            .unwrap();
+        bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        let path = dir.path().join("a.mp3");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let bounds = musefs_format::mp3::locate_audio(&bytes).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let tid = db
+            .upsert_track(&musefs_db::NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: musefs_db::Format::Mp3,
+                audio_offset: bounds.audio_offset as i64,
+                audio_length: bounds.audio_length as i64,
+                backing_size: meta.len() as i64,
+                backing_mtime: meta
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+            })
+            .unwrap();
+        db.set_binary_tags(
+            tid,
+            &[musefs_db::BinaryTag {
+                key: "PRIV".into(),
+                payload: needle.to_vec(),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+
+        let cache = crate::reader::HeaderCache::new(crate::Mode::Synthesis);
+        let resolved = cache.resolve(&db, tid).unwrap();
+        let whole =
+            crate::reader::read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+        assert!(
+            whole.windows(needle.len()).any(|w| w == needle),
+            "PRIV body not in synthesized file"
+        );
+    }
 
     #[test]
     fn read_at_serves_binary_tag_segment() {

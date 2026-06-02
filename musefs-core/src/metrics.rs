@@ -25,6 +25,7 @@ mod imp {
     static PREADS: AtomicU64 = AtomicU64::new(0);
     static PREAD_BYTES: AtomicU64 = AtomicU64::new(0);
     static ART_CHUNKS: AtomicU64 = AtomicU64::new(0);
+    static BINARY_TAG_CHUNKS: AtomicU64 = AtomicU64::new(0);
     static SCAN_OPENS: AtomicU64 = AtomicU64::new(0);
     static SCAN_PREADS: AtomicU64 = AtomicU64::new(0);
     static SCAN_BYTES_READ: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +67,10 @@ mod imp {
         ART_CHUNKS.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn on_binary_tag_chunk() {
+        BINARY_TAG_CHUNKS.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One backing-file open on the *scan* path (distinct from serve-path `on_open`).
     pub fn on_scan_open() {
         SCAN_OPENS.fetch_add(1, Ordering::Relaxed);
@@ -84,6 +89,7 @@ mod imp {
         pub preads: u64,
         pub pread_bytes: u64,
         pub art_chunks: u64,
+        pub binary_tag_chunks: u64,
         pub scan_opens: u64,
         pub scan_preads: u64,
         pub scan_bytes_read: u64,
@@ -96,6 +102,7 @@ mod imp {
             preads: PREADS.load(Ordering::Relaxed),
             pread_bytes: PREAD_BYTES.load(Ordering::Relaxed),
             art_chunks: ART_CHUNKS.load(Ordering::Relaxed),
+            binary_tag_chunks: BINARY_TAG_CHUNKS.load(Ordering::Relaxed),
             scan_opens: SCAN_OPENS.load(Ordering::Relaxed),
             scan_preads: SCAN_PREADS.load(Ordering::Relaxed),
             scan_bytes_read: SCAN_BYTES_READ.load(Ordering::Relaxed),
@@ -108,6 +115,7 @@ mod imp {
         PREADS.store(0, Ordering::Relaxed);
         PREAD_BYTES.store(0, Ordering::Relaxed);
         ART_CHUNKS.store(0, Ordering::Relaxed);
+        BINARY_TAG_CHUNKS.store(0, Ordering::Relaxed);
         SCAN_OPENS.store(0, Ordering::Relaxed);
         SCAN_PREADS.store(0, Ordering::Relaxed);
         SCAN_BYTES_READ.store(0, Ordering::Relaxed);
@@ -123,6 +131,7 @@ mod imp {
         pub preads: u64,
         pub pread_bytes: u64,
         pub art_chunks: u64,
+        pub binary_tag_chunks: u64,
         pub scan_opens: u64,
         pub scan_preads: u64,
         pub scan_bytes_read: u64,
@@ -136,6 +145,8 @@ mod imp {
     pub fn on_pread(_bytes: u64) {}
     #[inline(always)]
     pub fn on_art_chunk() {}
+    #[inline(always)]
+    pub fn on_binary_tag_chunk() {}
     #[inline(always)]
     pub fn on_scan_open() {}
     #[inline(always)]
@@ -159,11 +170,13 @@ mod tests {
         on_open();
         on_pread(100);
         on_art_chunk();
+        on_binary_tag_chunk();
         let s = snapshot();
         assert_eq!(s.opens, 2);
         assert_eq!(s.preads, 1);
         assert_eq!(s.pread_bytes, 100);
         assert_eq!(s.art_chunks, 1);
+        assert_eq!(s.binary_tag_chunks, 1);
         reset();
         assert_eq!(snapshot(), Snapshot::default());
     }
