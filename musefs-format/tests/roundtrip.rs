@@ -54,7 +54,7 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
     let mut art_map = HashMap::new();
     art_map.insert(1i64, front.clone());
     art_map.insert(2i64, back.clone());
-    let assembled = resolve_layout(&layout, &file, &art_map);
+    let assembled = resolve_layout(&layout, &file, &art_map, &HashMap::new());
 
     assert_eq!(assembled.len() as u64, layout.total_len());
     assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);

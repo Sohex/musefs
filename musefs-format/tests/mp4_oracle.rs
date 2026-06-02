@@ -17,6 +17,7 @@ fn materialize(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {
             Segment::ArtImage { .. } => unreachable!("no art in this fixture"),
             Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
             Segment::OggArtSlice { .. } => unreachable!("OggArtSlice only in ogg synthesis"),
+            Segment::BinaryTag { .. } => unreachable!("no binary tags in this fixture"),
         }
     }
     out

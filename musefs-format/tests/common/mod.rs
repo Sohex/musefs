@@ -56,12 +56,14 @@ pub fn make_flac(blocks: &[(u8, Vec<u8>)], audio: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Resolve a RegionLayout into concrete bytes, given the original backing bytes and an
-/// art-id -> image-bytes map. Independent of production assembly; used to verify splicing.
+/// Resolve a RegionLayout into concrete bytes, given the original backing bytes, an
+/// art-id -> image-bytes map, and a payload-id -> bytes map for binary tag segments.
+/// Independent of production assembly; used to verify splicing.
 pub fn resolve_layout(
     layout: &RegionLayout,
     backing: &[u8],
     art: &HashMap<i64, Vec<u8>>,
+    binary_tags: &HashMap<i64, Vec<u8>>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     for seg in &layout.segments {
@@ -79,6 +81,17 @@ pub fn resolve_layout(
             }
             Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
             Segment::OggArtSlice { .. } => unreachable!("OggArtSlice only in ogg synthesis"),
+            Segment::BinaryTag { payload_id, len } => {
+                let payload = binary_tags
+                    .get(payload_id)
+                    .expect("binary tag bytes provided");
+                assert_eq!(
+                    payload.len() as u64,
+                    *len,
+                    "binary tag length mismatch in layout"
+                );
+                out.extend_from_slice(payload);
+            }
         }
     }
     out
