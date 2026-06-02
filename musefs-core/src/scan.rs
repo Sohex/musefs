@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
-use musefs_format::{flac, mp3, mp4, ogg, wav, EmbeddedPicture, Extent};
+use musefs_format::{flac, mp3, mp4, ogg, wav, EmbeddedBinaryTag, EmbeddedPicture, Extent};
 
 use crate::byte_budget::ByteBudget;
 use crate::error::Result;
@@ -22,6 +22,10 @@ const MAX_WIDEN_RETRIES: usize = 8;
 /// headroom so the block framing + mime + description can never push a near-cap
 /// image past the limit at synthesis time. Real cover art is far smaller.
 const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
+
+/// Per-frame cap for opaque binary tags, mirroring `MAX_ART_BYTES`. Oversize
+/// payloads (e.g. a GEOB embedding a multi-MB file) are logged-and-skipped.
+const MAX_BINARY_TAG_BYTES: usize = MAX_ART_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanStats {
@@ -85,6 +89,7 @@ pub(crate) struct Probed {
     audio_length: u64,
     tags: Vec<(String, String)>,
     pictures: Vec<EmbeddedPicture>,
+    binary_tags: Vec<EmbeddedBinaryTag>,
 }
 
 /// Full-buffer probe (legacy path). Retained as the reference implementation the
@@ -98,15 +103,20 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_length: scan.audio_length,
             tags: flac::read_vorbis_comments(bytes).unwrap_or_default(),
             pictures: flac::read_pictures(bytes).unwrap_or_default(),
+            binary_tags: Vec::new(),
         })
     } else if has_ext(path, "mp3") {
         let bounds = mp3::locate_audio(bytes).ok()?;
+        let (binary_tags, promoted) = mp3::read_binary_tags(bytes);
+        let mut tags = mp3::read_tags(bytes);
+        tags.extend(promoted);
         Some(Probed {
             format: Format::Mp3,
             audio_offset: bounds.audio_offset,
             audio_length: bounds.audio_length,
-            tags: mp3::read_tags(bytes),
+            tags,
             pictures: mp3::read_pictures(bytes),
+            binary_tags,
         })
     } else if has_ext(path, "m4a") || has_ext(path, "m4b") {
         let bounds = mp4::locate_audio(bytes).ok()?;
@@ -116,6 +126,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_length: bounds.audio_length,
             tags: mp4::read_tags(bytes),
             pictures: mp4::read_pictures(bytes),
+            binary_tags: Vec::new(),
         })
     } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
         let scan = ogg::locate_audio(bytes).ok()?;
@@ -130,15 +141,20 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_length: scan.audio_length,
             tags: ogg::read_tags(bytes).unwrap_or_default(),
             pictures: ogg::read_pictures(bytes).unwrap_or_default(),
+            binary_tags: Vec::new(),
         })
     } else if has_ext(path, "wav") {
         let bounds = wav::locate_audio(bytes).ok()?;
+        let (binary_tags, promoted) = wav::read_binary_tags(bytes);
+        let mut tags = wav::read_tags(bytes);
+        tags.extend(promoted);
         Some(Probed {
             format: Format::Wav,
             audio_offset: bounds.audio_offset,
             audio_length: bounds.audio_length,
-            tags: wav::read_tags(bytes),
+            tags,
             pictures: wav::read_pictures(bytes),
+            binary_tags,
         })
     } else {
         None
@@ -203,6 +219,7 @@ fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
             audio_length: scan.mdat_payload_len,
             tags: mp4::read_tags(&scan.moov),
             pictures: mp4::read_pictures(&scan.moov),
+            binary_tags: Vec::new(),
         }));
     }
 
@@ -252,19 +269,26 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
                 audio_length: file_len - meta.audio_offset,
                 tags: flac::read_vorbis_comments(prefix).unwrap_or_default(),
                 pictures: flac::read_pictures(prefix).unwrap_or_default(),
+                binary_tags: Vec::new(),
             }),
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
             Err(_) => Probe::Skip,
         }
     } else if has_ext(path, "mp3") {
         match mp3::locate_audio_bounded(prefix, file_len, tail) {
-            Ok(Extent::Complete(b)) => Probe::Done(Probed {
-                format: Format::Mp3,
-                audio_offset: b.audio_offset,
-                audio_length: b.audio_length,
-                tags: mp3::read_tags(prefix),
-                pictures: mp3::read_pictures(prefix),
-            }),
+            Ok(Extent::Complete(b)) => {
+                let (binary_tags, promoted) = mp3::read_binary_tags(prefix);
+                let mut tags = mp3::read_tags(prefix);
+                tags.extend(promoted);
+                Probe::Done(Probed {
+                    format: Format::Mp3,
+                    audio_offset: b.audio_offset,
+                    audio_length: b.audio_length,
+                    tags,
+                    pictures: mp3::read_pictures(prefix),
+                    binary_tags,
+                })
+            }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
             Err(_) => Probe::Skip,
         }
@@ -282,6 +306,7 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
                     audio_length: file_len - header.audio_offset,
                     tags: ogg::read_tags(prefix).unwrap_or_default(),
                     pictures: ogg::read_pictures(prefix).unwrap_or_default(),
+                    binary_tags: Vec::new(),
                 })
             }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
@@ -289,13 +314,19 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
         }
     } else if has_ext(path, "wav") {
         match wav::locate_audio_bounded(prefix, file_len) {
-            Ok(Extent::Complete(b)) => Probe::Done(Probed {
-                format: Format::Wav,
-                audio_offset: b.audio_offset,
-                audio_length: b.audio_length,
-                tags: wav::read_tags(prefix),
-                pictures: wav::read_pictures(prefix),
-            }),
+            Ok(Extent::Complete(b)) => {
+                let (binary_tags, promoted) = wav::read_binary_tags(prefix);
+                let mut tags = wav::read_tags(prefix);
+                tags.extend(promoted);
+                Probe::Done(Probed {
+                    format: Format::Wav,
+                    audio_offset: b.audio_offset,
+                    audio_length: b.audio_length,
+                    tags,
+                    pictures: wav::read_pictures(prefix),
+                    binary_tags,
+                })
+            }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
             Err(_) => Probe::Skip,
         }
@@ -362,6 +393,19 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     }
     db.replace_tags(track_id, &tags)?;
 
+    let binary_tags: Vec<musefs_db::BinaryTag> = probed
+        .binary_tags
+        .into_iter()
+        .filter(|b| !b.payload.is_empty() && b.payload.len() <= MAX_BINARY_TAG_BYTES)
+        .enumerate()
+        .map(|(ordinal, b)| musefs_db::BinaryTag {
+            key: b.key,
+            payload: b.payload,
+            ordinal: ordinal as i64,
+        })
+        .collect();
+    db.set_binary_tags(track_id, &binary_tags)?;
+
     let mut track_arts = Vec::new();
     // Filter before enumerating so skipped (oversized) art doesn't leave gaps
     // in the stored ordinals.
@@ -418,6 +462,19 @@ fn ingest_bulk(
         *ord += 1;
     }
     bw.replace_tags(track_id, &tags)?;
+
+    let binary_tags: Vec<musefs_db::BinaryTag> = probed
+        .binary_tags
+        .iter()
+        .filter(|b| !b.payload.is_empty() && b.payload.len() <= MAX_BINARY_TAG_BYTES)
+        .enumerate()
+        .map(|(ordinal, b)| musefs_db::BinaryTag {
+            key: b.key.clone(),
+            payload: b.payload.clone(),
+            ordinal: ordinal as i64,
+        })
+        .collect();
+    bw.set_binary_tags(track_id, &binary_tags)?;
 
     let mut track_arts = Vec::new();
     let accepted = probed
@@ -849,6 +906,7 @@ mod scan_unit_tests {
             audio_length: 0,
             tags: Vec::new(),
             pictures: vec![pic(3), pic(5)],
+            binary_tags: Vec::new(),
         };
         assert_eq!(art_weight(&probed), 8);
 
@@ -859,6 +917,7 @@ mod scan_unit_tests {
             audio_length: 0,
             tags: Vec::new(),
             pictures: Vec::new(),
+            binary_tags: Vec::new(),
         };
         assert_eq!(art_weight(&empty), 0);
     }
@@ -1203,6 +1262,60 @@ mod hardening_tests {
                 .iter()
                 .any(|t| t.backing_path == ghost.to_string_lossy()),
             "ghost track must still exist"
+        );
+    }
+
+    #[test]
+    fn scan_ingests_binary_tags_and_promotes() {
+        use id3::frame::{Content, Popularimeter, Unknown};
+        use id3::{Encoder, Frame, Tag, TagLike, Version};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Build an MP3 with a PRIV (opaque) + POPM (promoted) tag.
+        let mut tag = Tag::new();
+        tag.add_frame(Popularimeter {
+            user: "u".into(),
+            rating: 128,
+            counter: 3,
+        });
+        tag.add_frame(Frame::with_content(
+            "PRIV",
+            Content::Unknown(Unknown {
+                data: vec![1, 1, 2, 3, 5],
+                version: Version::Id3v24,
+            }),
+        ));
+        let mut bytes = Vec::new();
+        Encoder::new()
+            .version(Version::Id3v24)
+            .encode(&tag, &mut bytes)
+            .unwrap();
+        // A real MP3 frame header is enough for locate_audio_bounded to find audio.
+        bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        crate::scan::scan_directory(&db, dir.path()).unwrap();
+        let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+        let tid = track.id;
+
+        // Opaque PRIV survives as a binary row.
+        let bin = db.get_binary_tags(tid).unwrap();
+        assert!(
+            bin.iter().any(|r| r.key == "PRIV" && r.byte_len == 5),
+            "PRIV not ingested as binary row; got: {bin:?}"
+        );
+
+        // POPM promoted into editable text tags.
+        let texts = db.get_tags(tid).unwrap();
+        assert!(
+            texts.iter().any(|t| t.key == "rating" && t.value == "128"),
+            "rating not promoted; got: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.key == "playcount" && t.value == "3"),
+            "playcount not promoted; got: {texts:?}"
         );
     }
 }
