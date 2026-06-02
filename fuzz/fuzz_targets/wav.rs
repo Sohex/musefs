@@ -26,6 +26,7 @@ fuzz_target!(|data: &[u8]| {
         bounds.audio_offset,
         bounds.audio_length,
         &tags,
+        &[],
         &arts,
     ) {
         assert_backing_covers_audio(bounds.audio_offset, bounds.audio_length, &layout);

@@ -1,5 +1,5 @@
 use crate::error::{FormatError, Result};
-use crate::input::{ArtInput, EmbeddedPicture, TagInput};
+use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 use crate::probe::Extent;
 
@@ -192,18 +192,71 @@ fn apic_framing(art: &ArtInput) -> Vec<u8> {
     d
 }
 
+/// POPM body: `<owner>\0<rating:u8>[<counter: 4-byte big-endian>]`. Owner is empty
+/// by design (spec §5 — the original tagger identity is dropped). The counter is
+/// emitted as 4 bytes when `playcount > 0` and omitted when 0; values above
+/// `u32::MAX` are clamped (the typed read path caps at u64, the common case fits
+/// u32).
+fn popm_frame_data(rating: u8, playcount: u64) -> Vec<u8> {
+    let mut d = Vec::new();
+    d.push(0x00); // empty owner, NUL-terminated
+    d.push(rating);
+    if playcount > 0 {
+        let c = u32::try_from(playcount).unwrap_or(u32::MAX);
+        d.extend_from_slice(&c.to_be_bytes());
+    }
+    d
+}
+
+/// UFID body: `<owner>\0<identifier bytes>`.
+fn ufid_frame_data(owner: &str, identifier: &[u8]) -> Vec<u8> {
+    let mut d = Vec::new();
+    d.extend_from_slice(owner.as_bytes());
+    d.push(0x00);
+    d.extend_from_slice(identifier);
+    d
+}
+
+/// True for the canonical text keys that are rebuilt as POPM/UFID frames and must
+/// therefore be excluded from the generic text/TXXX emission (no double-store).
+fn is_promoted_key(key: &str) -> bool {
+    matches!(key, "rating" | "playcount" | "musicbrainz_trackid")
+}
+
 /// Build the ID3v2.4 tag region for `tags`/`arts`: an inline 10-byte header
 /// followed by text/`TXXX` frames and `APIC` frames whose image bytes are
 /// streamed as `ArtImage` segments. Returns the segments (no backing audio) and
 /// the total tag length (`10 + frames_len`). Shared by MP3 synthesis and the WAV
 /// `id3 ` chunk.
-pub(crate) fn build_id3v2_segments(
+pub fn build_id3v2_segments(
     tags: &[TagInput],
+    binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<(Vec<Segment>, u64)> {
-    // Group consecutive same-key values (the DB returns tags ordered by key).
+    // Pull the promoted scalar values out of `tags`: first `rating` /
+    // `musicbrainz_trackid` wins, `playcount` takes the last parseable value. A
+    // single POPM/UFID is the norm, so this only diverges from "first wins" for
+    // the rare multi-frame tag.
+    let mut popm_rating: Option<u8> = None;
+    let mut popm_playcount: u64 = 0;
+    let mut mbid: Option<String> = None;
+    for t in tags {
+        match t.key.as_str() {
+            "rating" if popm_rating.is_none() => popm_rating = t.value.parse().ok(),
+            "playcount" => popm_playcount = t.value.parse().unwrap_or(popm_playcount),
+            "musicbrainz_trackid" if mbid.is_none() => mbid = Some(t.value.clone()),
+            _ => {}
+        }
+    }
+
+    // Group consecutive same-key values (the DB returns tags ordered by key),
+    // skipping promoted keys so they never enter the generic text/TXXX path
+    // (no double-store).
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for t in tags {
+        if is_promoted_key(&t.key) {
+            continue;
+        }
         match groups.last_mut() {
             Some(g) if g.0 == t.key => g.1.push(t.value.clone()),
             _ => groups.push((t.key.clone(), vec![t.value.clone()])),
@@ -265,6 +318,39 @@ pub(crate) fn build_id3v2_segments(
         }
     }
 
+    // Rebuilt promoted frames (POPM from rating/playcount, UFID from MBID).
+    if let Some(rating) = popm_rating {
+        let data = popm_frame_data(rating, popm_playcount);
+        push_frame_header(&mut buf, b"POPM", data.len())?;
+        buf.extend_from_slice(&data);
+        frames_len += 10 + data.len() as u64;
+    }
+    if let Some(id) = &mbid {
+        let data = ufid_frame_data(MUSICBRAINZ_UFID_OWNER, id.as_bytes());
+        push_frame_header(&mut buf, b"UFID", data.len())?;
+        buf.extend_from_slice(&data);
+        frames_len += 10 + data.len() as u64;
+    }
+
+    // Opaque binary frames: header (inline) + streamed body (BinaryTag segment).
+    for bt in binary_tags {
+        if bt.len == 0 {
+            // An empty BinaryTag fails `RegionLayout::validate` (`EmptySegment`).
+            continue;
+        }
+        // Defensive: ID3 opaque keys are 4-byte frame ids.
+        let Ok(id): std::result::Result<[u8; 4], _> = bt.key.as_bytes().try_into() else {
+            continue;
+        };
+        push_frame_header(&mut buf, &id, bt.len as usize)?;
+        segments.push(Segment::Inline(std::mem::take(&mut buf)));
+        segments.push(Segment::BinaryTag {
+            payload_id: bt.payload_id,
+            len: bt.len,
+        });
+        frames_len += 10 + bt.len;
+    }
+
     for art in arts {
         if art.data_len == 0 {
             // Skip degenerate empty art: an `ArtImage { len: 0 }` segment fails
@@ -313,9 +399,10 @@ pub fn synthesize_layout(
     audio_offset: u64,
     audio_length: u64,
     tags: &[TagInput],
+    binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<RegionLayout> {
-    let (mut segments, _tag_len) = build_id3v2_segments(tags, arts)?;
+    let (mut segments, _tag_len) = build_id3v2_segments(tags, binary_tags, arts)?;
     segments.push(Segment::BackingAudio {
         offset: audio_offset,
         len: audio_length,
@@ -490,6 +577,107 @@ pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+pub(crate) const MUSICBRAINZ_UFID_OWNER: &str = "http://musicbrainz.org";
+
+/// Extract an ID3v2.3/2.4 tag's binary frames. Returns `(opaque, promoted)`:
+/// - `opaque`: frames preserved **byte-exact** — `(frame-id, raw post-header body)`.
+///   `PRIV`/`GEOB`/`SYLT`/`MCDI`/unknown frames and any non-MusicBrainz `UFID`.
+/// - `promoted`: `(key, value)` text pairs — `POPM` → `rating` (raw 0–255) + `playcount`
+///   (counter, omitted when 0); MusicBrainz `UFID` → `musicbrainz_trackid`. Promoted
+///   frames are NOT in `opaque`.
+///
+/// Text (`T***`), `COMM`, `USLT`, `APIC` are handled by `read_tags`/`read_pictures`
+/// and skipped. Gated by `id3v2_alloc_safe`, so the tag is well-formed, has no
+/// unsynchronisation/extended header/frame flags, and bodies are sliced verbatim.
+/// v2.2 (3-char ids) is not processed (rare; text/art still parse via the crate).
+pub fn read_binary_tags(data: &[u8]) -> (Vec<EmbeddedBinaryTag>, Vec<(String, String)>) {
+    let mut opaque = Vec::new();
+    let mut promoted = Vec::new();
+    if !id3v2_alloc_safe(data) || data[3] < 3 {
+        return (opaque, promoted);
+    }
+    let tag_end = 10 + synchsafe_decode(&data[6..10]) as usize;
+    let mut pos = 10usize;
+    while pos + 10 <= tag_end {
+        if data[pos] == 0 {
+            break;
+        }
+        let id = &data[pos..pos + 4];
+        let size = if data[3] == 3 {
+            u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                as usize
+        } else {
+            synchsafe_decode(&data[pos + 4..pos + 8]) as usize
+        };
+        let body_start = pos + 10;
+        if body_start + size > tag_end {
+            break;
+        }
+        classify_binary_frame(
+            id,
+            &data[body_start..body_start + size],
+            &mut opaque,
+            &mut promoted,
+        );
+        pos = body_start + size;
+    }
+    (opaque, promoted)
+}
+
+/// Classify one ID3v2 frame body into opaque-passthrough or promoted-text.
+fn classify_binary_frame(
+    id: &[u8],
+    body: &[u8],
+    opaque: &mut Vec<EmbeddedBinaryTag>,
+    promoted: &mut Vec<(String, String)>,
+) {
+    // Handled by read_tags/read_pictures: text frames (T***), COMM, USLT, APIC.
+    if id[0] == b'T' || id == b"COMM" || id == b"USLT" || id == b"APIC" {
+        return;
+    }
+    match id {
+        b"POPM" => {
+            // <owner>\0<rating:u8>[<counter: big-endian>]
+            if let Some(nul) = body.iter().position(|&b| b == 0) {
+                if let Some((&rating, counter)) = body[nul + 1..].split_first() {
+                    promoted.push(("rating".to_string(), rating.to_string()));
+                    let c = counter
+                        .iter()
+                        .take(8)
+                        .fold(0u64, |a, &b| (a << 8) | b as u64);
+                    if c > 0 {
+                        promoted.push(("playcount".to_string(), c.to_string()));
+                    }
+                }
+            }
+        }
+        b"UFID" => {
+            // <owner>\0<identifier>. MusicBrainz owner promotes; others opaque.
+            match body.iter().position(|&b| b == 0) {
+                Some(nul) if &body[..nul] == MUSICBRAINZ_UFID_OWNER.as_bytes() => {
+                    promoted.push((
+                        "musicbrainz_trackid".to_string(),
+                        String::from_utf8_lossy(&body[nul + 1..]).into_owned(),
+                    ));
+                }
+                _ => opaque.push(EmbeddedBinaryTag {
+                    key: "UFID".to_string(),
+                    payload: body.to_vec(),
+                }),
+            }
+        }
+        _ => {
+            // Opaque verbatim: PRIV, GEOB, SYLT, MCDI, W***, unknown, … (4-byte ids).
+            if id.iter().all(u8::is_ascii_graphic) {
+                opaque.push(EmbeddedBinaryTag {
+                    key: String::from_utf8_lossy(id).into_owned(),
+                    payload: body.to_vec(),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -679,7 +867,7 @@ mod tests {
             TagInput::new("lyrics", "la la"), // -> USLT
             TagInput::new("replaygain_track_gain", "-3.21 dB"), // -> TXXX (fixed desc)
         ];
-        let (segments, _len) = build_id3v2_segments(&tags, &[]).unwrap();
+        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
         let mut buf = Vec::new();
         for seg in &segments {
             if let Segment::Inline(bytes) = seg {
@@ -807,7 +995,7 @@ mod tests {
         // The `is_id3_text_frame_id` match-guard `-> false` mutant would route it to
         // the TXXX branch, so read_tags would surface it under a different key.
         let tags = vec![TagInput::new("TPE1", "Band")];
-        let (segments, _len) = build_id3v2_segments(&tags, &[]).unwrap();
+        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
         let mut buf = Vec::new();
         for seg in &segments {
             if let Segment::Inline(b) = seg {
@@ -842,23 +1030,23 @@ mod tests {
             data_len,
         };
         assert_eq!(
-            build_id3v2_segments(&[], &[mk(0x1000_0000)]).err(),
+            build_id3v2_segments(&[], &[], &[mk(0x1000_0000)]).err(),
             Some(FormatError::TooLarge)
         );
-        assert!(build_id3v2_segments(&[], &[mk(16)]).is_ok());
+        assert!(build_id3v2_segments(&[], &[], &[mk(16)]).is_ok());
         // Exact boundary: compute the APIC framing overhead, then place
         // frames_len exactly on 0x0FFF_FFFF (one byte under must succeed) and
         // 0x1_0000_0000 (must error). This pins the `> -> >=` mutation. The
         // baseline art uses data_len=1 (not 0) because zero-byte art is skipped.
-        let (_, total_at_one) = build_id3v2_segments(&[], &[mk(1)]).unwrap();
+        let (_, total_at_one) = build_id3v2_segments(&[], &[], &[mk(1)]).unwrap();
         let overhead = total_at_one - 10 - 1; // frames_len = overhead + data_len
         let boundary_data_len = 0x0FFF_FFFF - overhead;
         assert!(
-            build_id3v2_segments(&[], &[mk(boundary_data_len)]).is_ok(),
+            build_id3v2_segments(&[], &[], &[mk(boundary_data_len)]).is_ok(),
             "exact boundary (frames_len == 0x0FFF_FFFF) should be accepted"
         );
         assert_eq!(
-            build_id3v2_segments(&[], &[mk(boundary_data_len + 1)]).err(),
+            build_id3v2_segments(&[], &[], &[mk(boundary_data_len + 1)]).err(),
             Some(FormatError::TooLarge),
             "one byte past boundary must be rejected"
         );
@@ -879,7 +1067,7 @@ mod tests {
             height: 0,
             data_len: 0,
         };
-        let (segments, _len) = build_id3v2_segments(&[], &[empty]).unwrap();
+        let (segments, _len) = build_id3v2_segments(&[], &[], &[empty]).unwrap();
         assert!(
             !segments
                 .iter()
@@ -910,7 +1098,7 @@ mod tests {
             height: 0,
             data_len,
         };
-        let (segments, _len) = build_id3v2_segments(&[], &[mk(1, 0), mk(2, 16)]).unwrap();
+        let (segments, _len) = build_id3v2_segments(&[], &[], &[mk(1, 0), mk(2, 16)]).unwrap();
         let art_segs: Vec<_> = segments
             .iter()
             .filter_map(|s| match s {
@@ -1572,5 +1760,357 @@ mod tests {
                 panic!("expected Complete (no room, no trim), got {other:?}")
             }
         }
+    }
+
+    /// Build a minimal ID3v2.4 tag containing the given frames, with header
+    /// flags=0 (no unsync, no extended header) and per-frame flags=0 so
+    /// `id3v2_alloc_safe` accepts it. Used by `read_binary_tags` tests that
+    /// need a tag without going through the `id3` crate's encoder (which would
+    /// re-encode `Unknown` bodies and defeat the byte-exact property).
+    fn build_v24_tag(frames: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let total_body: usize = frames.iter().map(|(_, b)| 10 + b.len()).sum();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ID3");
+        out.extend_from_slice(&[0x04, 0x00, 0x00]); // v2.4.0, no flags
+        out.extend_from_slice(&ss(total_body as u32));
+        for (id, body) in frames {
+            out.extend_from_slice(*id);
+            out.extend_from_slice(&ss(body.len() as u32));
+            out.extend_from_slice(&[0x00, 0x00]); // frame flags
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    /// Like `build_v24_tag` but emits an ID3v2.3 tag: frame sizes are plain
+    /// 32-bit big-endian (not synchsafe). Exercises the `data[3] == 3` size-decode
+    /// branch of `read_binary_tags`, which no v2.4 fixture can reach.
+    fn build_v23_tag(frames: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let total_body: usize = frames.iter().map(|(_, b)| 10 + b.len()).sum();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ID3");
+        out.extend_from_slice(&[0x03, 0x00, 0x00]); // v2.3.0, no flags
+        out.extend_from_slice(&ss(total_body as u32)); // tag size is synchsafe in every version
+        for (id, body) in frames {
+            out.extend_from_slice(*id);
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes()); // v2.3: plain u32 frame size
+            out.extend_from_slice(&[0x00, 0x00]); // frame flags
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    // Documented EQUIVALENT mutant (no test can kill it):
+    //  * classify_binary_frame counter fold `(a << 8) | b` -> `(a << 8) ^ b`.
+    //    The accumulator is left-shifted by 8 before each combine, so its low
+    //    byte is always zero where `b` lands; OR and XOR are bit-for-bit identical
+    //    for every input. Confirmed by hand; left as-is.
+
+    #[test]
+    fn read_binary_tags_v23_plain_u32_frame_size() {
+        // Two v2.3 frames: a non-zero filler followed by a >=128-byte PRIV. The
+        // filler's trailing bytes sit just before the PRIV header, so every byte of
+        // the plain-u32 size field (data[pos+4..pos+8], the `data[3] == 3` branch)
+        // reads a distinct non-zero value — a wrong size-byte offset (e.g. `pos + 4`
+        // -> `pos - 4`) then decodes a bogus size and drops/corrupts the PRIV, and a
+        // synchsafe misdecode (the `== 3` branch flipped) truncates it. Both frames
+        // must survive byte-exact.
+        let filler = vec![0xAAu8; 8];
+        let body: Vec<u8> = (0..200u32).map(|i| (i % 250 + 1) as u8).collect();
+        let tag = build_v23_tag(&[(b"GEOB", &filler), (b"PRIV", &body)]);
+        let (opaque, _promoted) = super::read_binary_tags(&tag);
+        let geob = opaque
+            .iter()
+            .find(|e| e.key == "GEOB")
+            .expect("v2.3 GEOB preserved");
+        assert_eq!(
+            geob.payload, filler,
+            "v2.3 first frame must survive byte-exact"
+        );
+        let priv_frame = opaque
+            .iter()
+            .find(|e| e.key == "PRIV")
+            .expect("v2.3 PRIV preserved");
+        assert_eq!(
+            priv_frame.payload, body,
+            "v2.3 plain-u32 frame body must survive byte-exact"
+        );
+    }
+
+    #[test]
+    fn read_binary_tags_skips_unsafe_tag() {
+        // A well-formed v2.4 PRIV tag with the unsynchronisation flag forced on:
+        // id3v2_alloc_safe rejects it, so read_binary_tags must yield nothing. The
+        // major version stays >= 3, so the `!alloc_safe || major<3` guard hinges on
+        // the `||` (an `&&` mutant would parse the rejected tag).
+        let mut tag = build_v24_tag(&[(b"PRIV", &[1, 2, 3])]);
+        tag[5] = 0x80; // unsynchronisation flag
+        let (opaque, promoted) = super::read_binary_tags(&tag);
+        assert!(
+            opaque.is_empty() && promoted.is_empty(),
+            "an alloc-unsafe tag must yield no binary frames"
+        );
+    }
+
+    #[test]
+    fn read_binary_tags_skips_text_comm_uslt_apic() {
+        // T***/COMM/USLT/APIC are handled by read_tags/read_pictures and must NOT
+        // be captured as opaque binary frames; only PRIV is.
+        let tag = build_v24_tag(&[
+            (b"TIT2", &[0x00, b'x']),
+            (b"COMM", &[0x00]),
+            (b"USLT", &[0x00]),
+            (b"APIC", &[0x00]),
+            (b"PRIV", &[9, 9, 9]),
+        ]);
+        let (opaque, _promoted) = super::read_binary_tags(&tag);
+        let keys: Vec<&str> = opaque.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["PRIV"],
+            "only PRIV is opaque; T***/COMM/USLT/APIC are handled elsewhere: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn read_binary_tags_decodes_popm_counter_big_endian_and_zero() {
+        // Multi-byte counter must decode big-endian (0x0102 == 258), pinning the
+        // `<< 8` shift in the fold.
+        let tag = build_v24_tag(&[(b"POPM", &[0x00, 200, 0x01, 0x02])]);
+        let (_opaque, promoted) = super::read_binary_tags(&tag);
+        assert!(
+            promoted.contains(&("rating".to_string(), "200".to_string())),
+            "rating: {promoted:?}"
+        );
+        assert!(
+            promoted.contains(&("playcount".to_string(), "258".to_string())),
+            "counter must decode big-endian: {promoted:?}"
+        );
+
+        // A zero counter must NOT promote a playcount (pins `c > 0`).
+        let tag0 = build_v24_tag(&[(b"POPM", &[0x00, 128, 0x00])]);
+        let (_o0, promoted0) = super::read_binary_tags(&tag0);
+        assert!(
+            promoted0.contains(&("rating".to_string(), "128".to_string())),
+            "rating: {promoted0:?}"
+        );
+        assert!(
+            !promoted0.iter().any(|(k, _)| k == "playcount"),
+            "a zero POPM counter must not promote playcount: {promoted0:?}"
+        );
+    }
+
+    #[test]
+    fn popm_frame_data_emits_counter_only_when_positive() {
+        // playcount == 0: owner-nul + rating, no counter.
+        assert_eq!(
+            super::popm_frame_data(200, 0),
+            vec![0x00, 200],
+            "playcount 0 must omit the counter"
+        );
+        // playcount > 0: 4-byte big-endian counter appended.
+        assert_eq!(
+            super::popm_frame_data(200, 5),
+            vec![0x00, 200, 0x00, 0x00, 0x00, 0x05],
+            "playcount > 0 must append a 4-byte counter"
+        );
+    }
+
+    #[test]
+    fn build_id3v2_segments_accounts_playcount_and_opaque_len() {
+        use crate::{BinaryTagInput, TagInput};
+
+        // playcount text tag must rebuild into the POPM counter (pins the
+        // `"playcount"` match arm).
+        let tags = vec![
+            TagInput::new("rating", "100"),
+            TagInput::new("playcount", "42"),
+        ];
+        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
+        let inline: Vec<u8> = segments
+            .iter()
+            .flat_map(|s| match s {
+                Segment::Inline(b) => b.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let (_opaque, promoted) = super::read_binary_tags(&inline);
+        assert!(
+            promoted.contains(&("playcount".to_string(), "42".to_string())),
+            "playcount must rebuild into the POPM counter: {promoted:?}"
+        );
+
+        // Opaque-frame length accounting: total == ID3 header (10) + frame header
+        // (10) + body. Pins `frames_len += 10 + bt.len`.
+        let bin = vec![BinaryTagInput {
+            key: "PRIV".into(),
+            payload_id: 1,
+            len: 7,
+        }];
+        let (_segs, total) = build_id3v2_segments(&[], &bin, &[]).unwrap();
+        assert_eq!(total, 10 + 10 + 7, "opaque binary frame length accounting");
+    }
+
+    #[test]
+    fn read_binary_tags_promotes_popm_and_mbid_and_passes_through_priv() {
+        use id3::frame::{Content, Popularimeter, UniqueFileIdentifier, Unknown};
+        use id3::{Encoder, Frame, Tag, TagLike, Version};
+
+        let mut tag = Tag::new();
+        tag.add_frame(Popularimeter {
+            user: "a@b.c".into(),
+            rating: 200,
+            counter: 7,
+        });
+        tag.add_frame(UniqueFileIdentifier {
+            owner_identifier: "http://musicbrainz.org".into(),
+            identifier: b"mbid-123".to_vec(),
+        });
+        tag.add_frame(UniqueFileIdentifier {
+            owner_identifier: "http://other.example".into(),
+            identifier: b"other".to_vec(),
+        });
+        tag.add_frame(Frame::with_content(
+            "PRIV",
+            Content::Unknown(Unknown {
+                data: vec![9, 8, 7],
+                version: Version::Id3v24,
+            }),
+        ));
+        let mut buf = Vec::new();
+        Encoder::new()
+            .version(Version::Id3v24)
+            .encode(&tag, &mut buf)
+            .unwrap();
+
+        let (opaque, promoted) = super::read_binary_tags(&buf);
+        assert!(promoted.contains(&("rating".to_string(), "200".to_string())));
+        assert!(promoted.contains(&("playcount".to_string(), "7".to_string())));
+        assert!(promoted.contains(&("musicbrainz_trackid".to_string(), "mbid-123".to_string())));
+        let keys: Vec<&str> = opaque.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"PRIV"));
+        // Non-MusicBrainz UFID is opaque (raw body, owner + identifier); exactly one UFID.
+        assert_eq!(keys.iter().filter(|k| **k == "UFID").count(), 1);
+        assert_eq!(
+            opaque.iter().find(|e| e.key == "PRIV").unwrap().payload,
+            vec![9, 8, 7]
+        );
+    }
+
+    #[test]
+    fn read_binary_tags_preserves_geob_body_byte_exact() {
+        // A GEOB body with a Latin1 (encoding 0x00) description — the exact case
+        // the crate's to_unknown() would re-encode to UTF-8. Build a minimal v2.4
+        // tag by hand so the bytes on the wire are guaranteed to match the
+        // asserted body.
+        let geob_body: Vec<u8> = {
+            let mut b = vec![0x00]; // text encoding: ISO-8859-1
+            b.extend_from_slice(b"application/octet-stream\0"); // mime
+            b.extend_from_slice(b"Serato Overview\0"); // filename (latin1)
+            b.extend_from_slice(b"\0"); // description (empty, terminator only)
+            b.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // object data
+            b
+        };
+        let tag = build_v24_tag(&[(b"GEOB", &geob_body)]);
+
+        let (opaque, _promoted) = super::read_binary_tags(&tag);
+        let geob = opaque
+            .iter()
+            .find(|e| e.key == "GEOB")
+            .expect("GEOB preserved");
+        assert_eq!(
+            geob.payload, geob_body,
+            "GEOB body must survive byte-identical"
+        );
+    }
+
+    #[test]
+    fn build_id3v2_segments_rebuilds_popm_ufid_and_streams_opaque() {
+        use crate::BinaryTagInput;
+        let tags = vec![
+            TagInput::new("artist", "A"),
+            TagInput::new("rating", "200"),
+            TagInput::new("playcount", "7"),
+            TagInput::new("musicbrainz_trackid", "mbid-123"),
+        ];
+        let bin = vec![BinaryTagInput {
+            key: "PRIV".into(),
+            payload_id: 42,
+            len: 3,
+        }];
+        let (segments, _len) = super::build_id3v2_segments(&tags, &bin, &[]).unwrap();
+
+        assert!(
+            segments.iter().any(|s| matches!(
+                s,
+                Segment::BinaryTag {
+                    payload_id: 42,
+                    len: 3
+                }
+            )),
+            "opaque PRIV must stream as Segment::BinaryTag"
+        );
+
+        let inline: Vec<u8> = segments
+            .iter()
+            .flat_map(|s| match s {
+                Segment::Inline(b) => b.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(find_sub(&inline, b"POPM"), "POPM not rebuilt");
+        assert!(find_sub(&inline, b"UFID"), "UFID not rebuilt");
+        assert!(
+            find_sub(&inline, b"http://musicbrainz.org"),
+            "UFID owner missing"
+        );
+        assert!(!find_sub(&inline, b"rating"), "promoted key leaked as TXXX");
+        assert!(
+            !find_sub(&inline, b"musicbrainz_trackid"),
+            "promoted key leaked as TXXX"
+        );
+    }
+
+    #[test]
+    fn build_id3v2_segments_first_promoted_scalar_wins() {
+        // Duplicate `rating`/`musicbrainz_trackid` rows (e.g. an over-tagged DB):
+        // the first value is rebuilt into the POPM/UFID frame, later ones dropped.
+        // Pins the `popm_rating.is_none()` / `mbid.is_none()` guards.
+        let tags = vec![
+            TagInput::new("rating", "10"),
+            TagInput::new("rating", "20"),
+            TagInput::new("musicbrainz_trackid", "mbid-first"),
+            TagInput::new("musicbrainz_trackid", "mbid-second"),
+        ];
+        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
+        let inline: Vec<u8> = segments
+            .iter()
+            .flat_map(|s| match s {
+                Segment::Inline(b) => b.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+
+        // First MusicBrainz id wins, later one dropped.
+        assert!(find_sub(&inline, b"mbid-first"), "first mbid must win");
+        assert!(
+            !find_sub(&inline, b"mbid-second"),
+            "later mbid must be dropped"
+        );
+
+        // First rating wins: re-parse the synthesized tag and read the promoted value.
+        let (_opaque, promoted) = super::read_binary_tags(&inline);
+        assert!(
+            promoted.contains(&("rating".to_string(), "10".to_string())),
+            "first rating must win: {promoted:?}"
+        );
+        assert!(
+            !promoted.iter().any(|(k, v)| k == "rating" && v == "20"),
+            "later rating must be dropped: {promoted:?}"
+        );
+    }
+
+    fn find_sub(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
     }
 }

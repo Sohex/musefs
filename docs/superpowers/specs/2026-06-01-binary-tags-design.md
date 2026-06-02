@@ -199,11 +199,24 @@ same-length reuse would then be served silently as the snapshot's bytes
 (`read_binary_tag_chunk` only errors on a *short* read). This is the one binary-tag
 path the cache-invalidation invariant does not reach. Phase 1 is behavior-neutral
 (no synthesis path emits `BinaryTag`, so no handle can hold one) and is unaffected,
-but **Phase 2 must close this before emitting binary tags.** The preferred fix is to
-make the binary payload handle *stable and non-reused* — content-address binary
-payloads the way `art` is (so the id is never deleted out from under an open
-handle) — rather than a read-time staleness check, which would defeat the
-open-fd snapshot semantics that `Inline`/`BackingAudio` rely on.
+but **Phase 2 must close this before emitting binary tags.**
+
+**Resolution (Phase 2, chosen over content-addressing).** Rather than content-address
+binary payloads (a larger rework of the `value_blob`-in-`tags` model), Phase 2 closes
+the gap with two cooperating mechanisms in `facade.rs`: (1) a generation-gated handle
+re-resolve — a global `refresh_gen` bumped on any non-empty `poll_refresh` makes the
+next `read` re-resolve a stale handle (cheap `content_version`-keyed cache hit when
+the track is unchanged), restoring freshness and fixing a pre-existing size/content
+skew for handles held across a re-tag; and (2) for `BinaryTag`-bearing layouts only, a
+**transactional `content_version` guard** — the read runs inside one WAL read snapshot
+that first checks `live content_version == resolved.content_version` and bails to a
+bounded re-resolve-and-retry on mismatch. Within a single SQLite read snapshot the
+`content_version` row and the `value_blob` rows are mutually consistent, so a reused
+rowid can never be served — the gap is fully closed, not merely narrowed. Plain
+`Inline`/`BackingAudio` layouts skip the guard, preserving their open-fd snapshot
+semantics at no per-read cost. (The earlier "preferred: content-addressing" note is
+superseded by this resolution; content-addressing remains a viable future option if
+binary-payload dedup ever becomes worthwhile.)
 
 ### 4. Format-layer input (`musefs-format/src/input.rs`)
 

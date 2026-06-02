@@ -77,6 +77,12 @@ exclude_re = [
     # caught). Same equivalence the sibling parse_blocks/read_vorbis_comments tests
     # already note.
     'musefs-format/src/flac\.rs:\d+:\d+: replace \| with \^ in read_metadata_bounded',
+    # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
+    # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
+    # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
+    # bit-for-bit identical for every input (same equivalence as the flac assembly
+    # above). The `<<`->`>>` and `> 0` siblings in this fn ARE caught and stay in scope.
+    'musefs-format/src/mp3\.rs:\d+:\d+: replace \| with \^ in classify_binary_frame',
 
     # SP2 incremental tree refresh — equivalent mutants in apply_changes & friends.
     # The whole design contract is "the incrementally-mutated tree is byte-identical

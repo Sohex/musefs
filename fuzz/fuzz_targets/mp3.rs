@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
     let tags = arb_tags(&mut u).unwrap_or_default();
     let arts = arb_arts(&mut u).unwrap_or_default();
     if let Ok(layout) =
-        mp3::synthesize_layout(bounds.audio_offset, bounds.audio_length, &tags, &arts)
+        mp3::synthesize_layout(bounds.audio_offset, bounds.audio_length, &tags, &[], &arts)
     {
         assert_backing_covers_audio(bounds.audio_offset, bounds.audio_length, &layout);
     }

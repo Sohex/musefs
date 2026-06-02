@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -43,15 +43,21 @@ pub struct Attr {
     pub mtime_secs: i64,
 }
 
-/// An open file handle: the resolved layout and a backing fd opened (and
-/// validated) once at `open`, reused for every `read` on this handle.
+/// An open file handle: the resolved layout, the track it belongs to, the
+/// generation at which `resolved` was last validated, and a backing fd opened
+/// once at `open`.
 ///
-/// A handle intentionally outlives `poll_refresh`: it keeps serving the layout
-/// (and backing path) it was opened with, even if a rescan changes the track,
-/// until `release`. This is consistent POSIX-like open-fd snapshot behavior and
-/// is bounded by the FUSE descriptor's lifetime.
+/// A handle survives `poll_refresh`, but is **not** a frozen snapshot: when the
+/// global `refresh_gen` advances (a refresh applied changes), the next `read`
+/// re-resolves the track (a cheap `content_version`-keyed cache hit when the
+/// track is unchanged) and swaps in the fresh layout. This keeps a re-tagged
+/// file's handle consistent with the size the kernel sees via getattr, and
+/// prevents a stale `Segment::BinaryTag { payload_id }` from serving reused-rowid
+/// bytes after a re-tag.
 struct Handle {
-    resolved: Arc<ResolvedFile>,
+    track_id: i64,
+    resolved: arc_swap::ArcSwap<ResolvedFile>,
+    gen: AtomicU64,
     file: std::fs::File,
 }
 
@@ -111,6 +117,11 @@ pub struct Musefs {
     tree: ArcSwap<VirtualTree>,
     cache: HeaderCache,
     last_data_version: AtomicI64,
+    /// Bumped on every non-empty refresh (see `poll_refresh_notify`). Open handles
+    /// stamp their `gen` with the current value at `open_handle` and re-resolve
+    /// when the global value moves ahead of theirs, so a held handle cannot serve
+    /// a layout that was invalidated by a refresh the kernel did not yet see.
+    refresh_gen: AtomicU64,
     handles: sharded_slab::Slab<Arc<Handle>>,
     /// `SizeEntry` keyed by track id. Tiny entries, effectively unbounded; serves
     /// getattr/lookup without a backing stat or full synthesis. Self-invalidates on
@@ -153,6 +164,7 @@ impl Musefs {
         Ok(Musefs {
             cache: HeaderCache::new(config.mode),
             last_data_version: AtomicI64::new(last_data_version),
+            refresh_gen: AtomicU64::new(0),
             tree: ArcSwap::from_pointee(tree),
             pool: DbPool::new(db)?,
             config,
@@ -413,7 +425,7 @@ impl Musefs {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let (new_snapshot, _change) = match self.rebuild_incremental(&old_snapshot) {
+        let (new_snapshot, change) = match self.rebuild_incremental(&old_snapshot) {
             Ok(v) => v,
             Err(err) => {
                 *self
@@ -445,6 +457,12 @@ impl Musefs {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = new_snapshot;
 
         self.last_data_version.store(version, Ordering::Release);
+        if !change.is_empty() {
+            // A non-empty refresh invalidates every open handle's stamp; the
+            // next read will re-resolve (cheap content_version cache hit for
+            // unchanged tracks).
+            self.refresh_gen.fetch_add(1, Ordering::AcqRel);
+        }
         self.stamp_successful_poll();
 
         Ok(true)
@@ -610,9 +628,55 @@ impl Musefs {
         if fh != 0 {
             let handle = self.handles.get((fh - 1) as usize).map(|g| Arc::clone(&g));
             if let Some(h) = handle {
-                return self
-                    .pool
-                    .with(|db| read_at_with_file(&h.resolved, db, &h.file, offset, size));
+                // Bounded retry absorbs a refresh landing mid-read; out-of-band
+                // re-tags are human/batch-paced, so >1 attempt is already rare.
+                for _attempt in 0..4 {
+                    let cur = self.refresh_gen.load(Ordering::Acquire);
+                    if h.gen.load(Ordering::Acquire) != cur {
+                        // A refresh changed something; re-resolve (cheap content_version
+                        // cache hit when this track is unchanged) and re-stamp.
+                        let fresh = self.pool.with(|db| self.cache.resolve(db, h.track_id))?;
+                        // If a refresh raced the resolve, `fresh` may already be stale;
+                        // don't publish it under `cur` — retry against the newer gen.
+                        if self.refresh_gen.load(Ordering::Acquire) != cur {
+                            continue;
+                        }
+                        h.resolved.store(fresh);
+                        h.gen.store(cur, Ordering::Release);
+                    }
+                    let resolved = h.resolved.load();
+                    let r: &ResolvedFile = &resolved;
+                    let served = self.pool.with(|db| -> Result<Option<Vec<u8>>> {
+                        if r.has_binary_tag {
+                            // Snapshot-consistent: version check + blob reads see one
+                            // WAL snapshot, so a reused rowid can't be served.
+                            db.begin_read()?;
+                            let res = (|| {
+                                if db.track_content_version(h.track_id)? != r.content_version {
+                                    return Ok(None); // stale layout — retry after re-resolve
+                                }
+                                Ok(Some(read_at_with_file(r, db, &h.file, offset, size)?))
+                            })();
+                            let _ = db.end_read(); // always release the snapshot
+                            res
+                        } else {
+                            Ok(Some(read_at_with_file(r, db, &h.file, offset, size)?))
+                        }
+                    })?;
+                    if let Some(bytes) = served {
+                        return Ok(bytes);
+                    }
+                    // Stale layout: force a re-resolve next iteration against the live version.
+                    let fresh = self.pool.with(|db| self.cache.resolve(db, h.track_id))?;
+                    h.resolved.store(fresh);
+                    h.gen
+                        .store(self.refresh_gen.load(Ordering::Acquire), Ordering::Release);
+                }
+                // Pathological constant re-tagging raced every attempt; surface a
+                // retryable error rather than risk wrong bytes.
+                return Err(CoreError::BackingChanged(
+                    h.resolved.load().backing_path.to_string_lossy().to_string(),
+                ));
             }
         }
         // Fallback (no prior open, or unknown handle): resolve by inode and open.
@@ -646,11 +710,22 @@ impl Musefs {
                 },
             }
         };
+        // Snapshot the generation BEFORE resolving: if a refresh lands during the
+        // resolve, stamping the post-refresh gen onto this (pre-refresh) layout
+        // would make the first read skip re-resolution and serve stale bytes. With
+        // the pre-resolve gen, a racing refresh leaves gen behind refresh_gen, so
+        // the next read re-resolves.
+        let gen = self.refresh_gen.load(Ordering::Acquire);
         let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
         validate_opened_backing(&file, &resolved)?;
-        fh_from_key(self.handles.insert(Arc::new(Handle { resolved, file })))
+        fh_from_key(self.handles.insert(Arc::new(Handle {
+            track_id,
+            resolved: arc_swap::ArcSwap::from(resolved),
+            gen: AtomicU64::new(gen),
+            file,
+        })))
     }
 
     /// Drop an open handle (closes its backing fd when the last reference goes).
@@ -695,11 +770,197 @@ mod tests {
             mtime_secs: mtime_secs(&expected_meta),
             last_page: std::sync::Mutex::new(None),
             cache_bytes: 0,
+            has_binary_tag: false,
         };
 
         assert!(matches!(
             validate_opened_backing(&replacement, &resolved),
             Err(CoreError::BackingChanged(_))
         ));
+    }
+
+    #[test]
+    fn open_handle_reresolves_after_content_version_bump() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+        let fh = fs.open_handle(file_inode).unwrap();
+        let len_before = fs.read(file_inode, fh, 0, 1 << 20).unwrap().len();
+        assert!(len_before > 0, "baseline read must be non-empty");
+
+        // Out-of-band re-tag: a long comment grows the synthesized ID3v2 region.
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            let track_id = db.list_tracks().unwrap().into_iter().next().unwrap().id;
+            db.replace_tags(
+                track_id,
+                &[musefs_db::Tag::new("comment", &"x".repeat(4096), 0)],
+            )
+            .unwrap();
+        }
+        assert!(
+            fs.poll_refresh().unwrap(),
+            "poll_refresh must detect the change"
+        );
+
+        // Same handle: must re-resolve and serve the larger layout.
+        let len_after = fs.read(file_inode, fh, 0, 1 << 20).unwrap().len();
+        assert!(
+            len_after > len_before,
+            "handle did not re-resolve: {len_before} -> {len_after}"
+        );
+        fs.release_handle(fh);
+    }
+
+    /// The safety property the transactional `content_version` guard exists to
+    /// protect: a handle holding a `Segment::BinaryTag { payload_id }` must never
+    /// serve the bytes of a *different* row that later reused that rowid under the
+    /// stale layout's framing.
+    ///
+    /// We free the original PRIV row's rowid and reuse it with a different-length
+    /// payload **without** calling `poll_refresh`, so `refresh_gen` does not move
+    /// and the gen-gated re-resolve cannot mask the bug — the content_version
+    /// guard is the only thing standing between the read and torn bytes. With the
+    /// guard, a successful read is byte-identical to a fresh resolve of the new DB
+    /// state (the guard forces a re-resolve on the version mismatch); a clean
+    /// `Err` is the only other acceptable outcome. Without the guard the stale
+    /// handle would serve `len_a` bytes off the reused rowid, framed by the old
+    /// header — neither the original nor a valid new file.
+    #[test]
+    fn binary_tag_handle_never_serves_reused_rowid_bytes() {
+        use crate::scan::scan_directory;
+        use id3::frame::{Content, Unknown};
+        use id3::{Encoder, Frame, TagLike, Version};
+        use std::collections::BTreeMap;
+
+        let needle_a = [0xDEu8, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
+        let needle_b = [0x11u8, 0x22, 0x33]; // different bytes AND different length
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // PRIV-only tag: text frames are omitted because the `id3` crate's
+            // reader errors on a `Content::Unknown` frame it round-tripped, which
+            // would drop the text tags (the raw binary walker is unaffected). The
+            // track therefore renders under the `$artist/$title` fallback path.
+            let mut tag = id3::Tag::new();
+            tag.add_frame(Frame::with_content(
+                "PRIV",
+                Content::Unknown(Unknown {
+                    data: needle_a.to_vec(),
+                    version: Version::Id3v24,
+                }),
+            ));
+            let mut bytes = Vec::new();
+            Encoder::new()
+                .version(Version::Id3v24)
+                .encode(&tag, &mut bytes)
+                .unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00, 0, 0, 0, 0]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+
+        let artist = fs
+            .lookup(VirtualTree::ROOT, "Unknown")
+            .expect("fallback artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+
+        // Open the handle and read the original synthesized file (carries needle_a).
+        let fh = fs.open_handle(file_inode).unwrap();
+        let whole_a = fs.read(file_inode, fh, 0, 1 << 20).unwrap();
+        assert!(
+            whole_a.windows(needle_a.len()).any(|w| w == needle_a),
+            "baseline must carry the original PRIV body"
+        );
+
+        // Out-of-band: free the PRIV row's rowid, then reuse it with a different
+        // payload. With no other tag rows present, deleting the PRIV row empties
+        // `tags` and the next insert reclaims the freed rowid (plain INTEGER
+        // PRIMARY KEY, no AUTOINCREMENT). Both writes bump content_version. No
+        // poll_refresh, so refresh_gen stays put — only the guard can catch this.
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            let track_id = db.list_tracks().unwrap().into_iter().next().unwrap().id;
+            db.set_binary_tags(track_id, &[]).unwrap();
+            db.set_binary_tags(
+                track_id,
+                &[musefs_db::BinaryTag {
+                    key: "PRIV".into(),
+                    payload: needle_b.to_vec(),
+                    ordinal: 0,
+                }],
+            )
+            .unwrap();
+        }
+
+        // What a freshly resolved handle serves for the *current* DB state.
+        let fh2 = fs.open_handle(file_inode).unwrap();
+        let whole_b = fs.read(file_inode, fh2, 0, 1 << 20).unwrap();
+        fs.release_handle(fh2);
+        assert!(
+            whole_b.windows(needle_b.len()).any(|w| w == needle_b),
+            "fresh resolve must carry the new PRIV body"
+        );
+        assert!(
+            !whole_b.windows(needle_a.len()).any(|w| w == needle_a),
+            "fresh resolve must not carry the freed payload"
+        );
+        assert_ne!(
+            whole_a.len(),
+            whole_b.len(),
+            "test setup: payloads must differ in length to expose stale framing"
+        );
+
+        // The stale handle: either a clean error, or — via the guard's forced
+        // re-resolve — byte-identical to the fresh resolve. Never torn bytes.
+        // Err is acceptable too (the guard can surface a retryable error).
+        if let Ok(bytes) = fs.read(file_inode, fh, 0, 1 << 20) {
+            assert_eq!(
+                bytes, whole_b,
+                "stale handle served torn/reused-rowid bytes instead of re-resolving"
+            );
+        }
+        fs.release_handle(fh);
     }
 }

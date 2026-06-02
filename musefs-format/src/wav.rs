@@ -1,5 +1,5 @@
 use crate::error::{FormatError, Result};
-use crate::input::EmbeddedPicture;
+use crate::input::{BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture};
 use crate::probe::Extent;
 use std::collections::HashSet;
 
@@ -193,6 +193,7 @@ pub fn synthesize_layout(
     audio_offset: u64,
     audio_length: u64,
     tags: &[TagInput],
+    binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<RegionLayout> {
     if audio_length > u32::MAX as u64 {
@@ -213,7 +214,7 @@ pub fn synthesize_layout(
     // `build_id3v2_segments` already skips degenerate zero-byte art (finding #16) —
     // an empty `ArtImage { len: 0 }` would fail `RegionLayout::validate` and brick
     // the track — so WAV inherits that handling by delegating to it.
-    let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, arts)?;
+    let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, binary_tags, arts)?;
     let mut id3_head = Vec::with_capacity(8);
     id3_head.extend_from_slice(b"id3 ");
     id3_head.extend_from_slice(&(tag_len as u32).to_le_bytes());
@@ -324,6 +325,17 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Extract binary ID3 frames from a WAV's embedded `id3 ` chunk. Classification is
+/// identical to MP3 (`mp3::read_binary_tags`); only the chunk extraction differs.
+/// Returns `(opaque, promoted)`; empty when there is no `id3 ` chunk.
+pub fn read_binary_tags(data: &[u8]) -> (Vec<EmbeddedBinaryTag>, Vec<(String, String)>) {
+    let chunks = walk_chunks(data);
+    match find_id3_chunk(data, &chunks) {
+        Some(id3_bytes) => crate::mp3::read_binary_tags(id3_bytes),
+        None => (Vec::new(), Vec::new()),
+    }
 }
 
 /// Read embedded pictures for scan-time art ingestion. Pictures live only in the
@@ -595,7 +607,7 @@ mod tests {
         let mut tag_len = 0u64;
         for n in 1..64 {
             let cand = vec![TagInput::new("albumartist", &"x".repeat(n))];
-            let (_, tl) = crate::mp3::build_id3v2_segments(&cand, &[]).unwrap();
+            let (_, tl) = crate::mp3::build_id3v2_segments(&cand, &[], &[]).unwrap();
             if tl % 2 == 1 {
                 tags = cand;
                 tag_len = tl;
@@ -608,7 +620,7 @@ mod tests {
             fmt: fmt_pcm(),
             fact: None,
         };
-        let layout = synthesize_layout(&scan, 0, 8, &tags, &[]).unwrap();
+        let layout = synthesize_layout(&scan, 0, 8, &tags, &[], &[]).unwrap();
         assert_eq!(
             inline_offset_of(&layout, b"data") % 2,
             0,
@@ -631,7 +643,7 @@ mod tests {
             fmt: fmt_pcm(),
             fact: None,
         };
-        let res = synthesize_layout(&scan, 0, u32::MAX as u64, &[], &[]);
+        let res = synthesize_layout(&scan, 0, u32::MAX as u64, &[], &[], &[]);
         assert_eq!(res, Err(FormatError::TooLarge));
     }
 
@@ -670,6 +682,33 @@ mod tests {
             Extent::NeedMore { up_to } => assert_eq!(up_to, file_len),
             other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wav_read_binary_tags_extracts_id3_chunk_frames() {
+        use id3::frame::{Content, Unknown};
+        use id3::{Frame, Tag, TagLike, Version};
+        let mut tag = Tag::new();
+        tag.add_frame(Frame::with_content(
+            "PRIV",
+            Content::Unknown(Unknown {
+                data: vec![5, 6, 7],
+                version: Version::Id3v24,
+            }),
+        ));
+        let mut id3 = Vec::new();
+        id3::Encoder::new()
+            .version(Version::Id3v24)
+            .encode(&tag, &mut id3)
+            .unwrap();
+        let wav = wav(&[(b"id3 ", id3)]);
+
+        let (opaque, _promoted) = super::read_binary_tags(&wav);
+        let priv_tag = opaque
+            .iter()
+            .find(|e| e.key == "PRIV")
+            .expect("PRIV preserved");
+        assert_eq!(priv_tag.payload, vec![5, 6, 7]);
     }
 
     // Documented EQUIVALENT mutants in this file (no test targets them; each was

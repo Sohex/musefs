@@ -31,6 +31,10 @@ pub struct ResolvedFile {
     /// Approximate resident bytes this entry costs the cache (sum of `Inline`
     /// segment bytes; backing/art/ogg-audio bytes are not resident).
     pub cache_bytes: u64,
+    /// Precomputed from the layout: true if any segment streams an opaque binary
+    /// tag payload from the DB. Gates the transactional `content_version` guard in
+    /// the read fast path so plain Inline/BackingAudio layouts pay no per-read cost.
+    pub has_binary_tag: bool,
 }
 
 const CACHE_SHARDS: usize = 16;
@@ -249,6 +253,7 @@ impl HeaderCache {
                 let tags = db.get_tags(track.id)?;
                 let inputs = tags_to_inputs(&tags);
                 let art_inputs = track_art_to_inputs(db, track.id)?;
+                let binary_tag_inputs = crate::mapping::binary_tags_to_inputs(db, track.id)?;
 
                 // FLAC re-reads the front for its preserved structural blocks; MP3 needs no
                 // front read — its ID3v2 tag is regenerated entirely from the DB and the
@@ -269,6 +274,7 @@ impl HeaderCache {
                         track.audio_offset as u64,
                         track.audio_length as u64,
                         &inputs,
+                        &binary_tag_inputs,
                         &art_inputs,
                     )?,
                     Format::M4a => {
@@ -300,6 +306,7 @@ impl HeaderCache {
                             track.audio_offset as u64,
                             track.audio_length as u64,
                             &inputs,
+                            &binary_tag_inputs,
                             &art_inputs,
                         )?
                     }
@@ -338,6 +345,7 @@ impl HeaderCache {
                 _ => 0,
             })
             .sum::<u64>();
+        let has_binary_tag = layout.has_binary_tag();
         Ok(Arc::new(ResolvedFile {
             layout,
             total_len,
@@ -348,6 +356,7 @@ impl HeaderCache {
             mtime_secs: mtime_secs_val,
             last_page: Mutex::new(None),
             cache_bytes,
+            has_binary_tag,
         }))
     }
 }
@@ -424,6 +433,7 @@ fn read_segments(
                 }
                 Segment::BinaryTag { payload_id, .. } => {
                     let chunk = db.read_binary_tag_chunk(*payload_id, within, n)?;
+                    crate::metrics::on_binary_tag_chunk();
                     out.extend_from_slice(&chunk);
                 }
                 Segment::OggAudio {
@@ -531,6 +541,7 @@ mod ogg_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 8,
+            has_binary_tag: false,
         };
 
         // Read the whole virtual file; needs a Db only for ArtImage (unused here).
@@ -803,6 +814,7 @@ mod ogg_art_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
+            has_binary_tag: false,
         };
 
         // Full read.
@@ -847,6 +859,7 @@ mod ogg_art_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
+            has_binary_tag: false,
         };
         let got = read_at(&resolved, &db, 10, 50).unwrap();
         assert_eq!(got, image[10..60]);
@@ -869,6 +882,7 @@ mod cache_bound_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: inline_len as u64,
+            has_binary_tag: false,
         })
     }
 
@@ -1136,6 +1150,66 @@ mod binary_tag_serve_tests {
     use musefs_db::{BinaryTag, NewTrack};
 
     #[test]
+    fn resolve_mp3_emits_binary_tag_in_synthesized_region() {
+        use id3::frame::{Content, Unknown};
+        use id3::{Encoder, Frame, Tag, TagLike, Version};
+        let dir = tempfile::tempdir().unwrap();
+        let mut tag = Tag::new();
+        let needle = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x77, 0x88];
+        tag.add_frame(Frame::with_content(
+            "PRIV",
+            Content::Unknown(Unknown {
+                data: needle.to_vec(),
+                version: Version::Id3v24,
+            }),
+        ));
+        let mut bytes = Vec::new();
+        Encoder::new()
+            .version(Version::Id3v24)
+            .encode(&tag, &mut bytes)
+            .unwrap();
+        bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        let path = dir.path().join("a.mp3");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let bounds = musefs_format::mp3::locate_audio(&bytes).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let tid = db
+            .upsert_track(&musefs_db::NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: musefs_db::Format::Mp3,
+                audio_offset: bounds.audio_offset as i64,
+                audio_length: bounds.audio_length as i64,
+                backing_size: meta.len() as i64,
+                backing_mtime: meta
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+            })
+            .unwrap();
+        db.set_binary_tags(
+            tid,
+            &[musefs_db::BinaryTag {
+                key: "PRIV".into(),
+                payload: needle.to_vec(),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+
+        let cache = crate::reader::HeaderCache::new(crate::Mode::Synthesis);
+        let resolved = cache.resolve(&db, tid).unwrap();
+        let whole = crate::reader::read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+        assert!(
+            whole.windows(needle.len()).any(|w| w == needle),
+            "PRIV body not in synthesized file"
+        );
+    }
+
+    #[test]
     fn read_at_serves_binary_tag_segment() {
         let db = Db::open_in_memory().unwrap();
         let id = db
@@ -1172,6 +1246,7 @@ mod binary_tag_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
+            has_binary_tag: true,
         };
         // No BackingAudio segment, so read_at opens no file.
         let got = read_at(&resolved, &db, 1, 2).unwrap();

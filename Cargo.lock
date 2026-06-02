@@ -870,6 +870,7 @@ dependencies = [
  "id3",
  "metaflac",
  "mp4",
+ "musefs-db",
  "proptest",
  "thiserror 1.0.69",
 ]
