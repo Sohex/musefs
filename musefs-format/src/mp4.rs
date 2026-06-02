@@ -4,7 +4,7 @@
 //! supported shape (single audio track, one `mdat`, non-fragmented) is rejected.
 
 use crate::error::{FormatError, Result};
-use crate::input::{ArtInput, EmbeddedPicture, TagInput};
+use crate::input::{ArtInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -440,6 +440,65 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
             width: 0,
             height: 0,
             data: dp[8..].to_vec(),
+        });
+    }
+    out
+}
+
+/// Extract opaque (non-text) MP4 `----` freeform atoms for binary-tag passthrough.
+/// One `EmbeddedBinaryTag` per `----` atom whose first `data` sub-box is
+/// binary-typed (type code != 1): key `----:<mean>:<name>`, payload the `data`
+/// value bytes (after the 8-byte `[type][locale]` header). Text freeform atoms
+/// (type 1) are handled by `read_tags`, so the two paths never double-store.
+/// Lenient: malformed atoms are skipped. Only the first `data` sub-box is read
+/// (multi-value freeform is rare; mirrors `read_freeform`).
+pub fn read_binary_tags(buf: &[u8]) -> Vec<EmbeddedBinaryTag> {
+    let Some((start, len)) = ilst_region(buf) else {
+        return Vec::new();
+    };
+    let ilst = &buf[start..start + len];
+    let mut out = Vec::new();
+    for atom in child_boxes(ilst).unwrap_or_default() {
+        if &atom.kind != b"----" {
+            continue;
+        }
+        let inner = atom.payload(ilst);
+        let Ok(Some(data)) = find_box(inner, b"data") else {
+            continue;
+        };
+        let dp = data.payload(inner);
+        if dp.len() < 8 {
+            continue;
+        }
+        // `data` body is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text,
+        // which is the text path's job. Everything else is opaque binary.
+        let type_code = u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]);
+        if type_code == 1 {
+            continue;
+        }
+        // name/mean payloads carry a 4-byte FullBox prefix; default mean to iTunes.
+        let Some(name) = find_box(inner, b"name").ok().flatten().and_then(|n| {
+            let p = n.payload(inner);
+            (p.len() >= 4)
+                .then(|| std::str::from_utf8(&p[4..]).ok())
+                .flatten()
+        }) else {
+            continue;
+        };
+        let mean = find_box(inner, b"mean")
+            .ok()
+            .flatten()
+            .map_or("com.apple.iTunes", |m| {
+                let p = m.payload(inner);
+                if p.len() >= 4 {
+                    std::str::from_utf8(&p[4..]).unwrap_or("com.apple.iTunes")
+                } else {
+                    "com.apple.iTunes"
+                }
+            });
+        out.push(EmbeddedBinaryTag {
+            key: format!("----:{mean}:{name}"),
+            payload: dp[8..].to_vec(),
         });
     }
     out
@@ -1777,6 +1836,49 @@ mod tests {
         let stbl = bx(b"stbl", &bx(b"co64", &co64));
         let mut kept = bx(b"trak", &bx(b"mdia", &bx(b"minf", &stbl)));
         assert!(patch_chunk_offsets(&mut kept, 0).is_ok());
+    }
+
+    /// Build a `----` freeform atom with an explicit data `type_code` and raw value.
+    fn freeform_atom_typed(mean: &str, name: &str, type_code: u32, value: &[u8]) -> Vec<u8> {
+        let mut mean_body = 0u32.to_be_bytes().to_vec();
+        mean_body.extend_from_slice(mean.as_bytes());
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(name.as_bytes());
+        let mut data_body = type_code.to_be_bytes().to_vec();
+        data_body.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data_body.extend_from_slice(value);
+        let mut inner = boxed(b"mean", &mean_body);
+        inner.extend(boxed(b"name", &name_body));
+        inner.extend(boxed(b"data", &data_body));
+        boxed(b"----", &inner)
+    }
+
+    /// Wrap an `ilst` body in the moov/udta/meta/ilst boxes `ilst_region` expects.
+    fn moov_with_ilst(ilst_body: &[u8]) -> Vec<u8> {
+        let ilst = boxed(b"ilst", ilst_body);
+        let mut meta = 0u32.to_be_bytes().to_vec(); // FullBox version/flags
+        meta.extend(boxed(b"hdlr", &[0u8; 25]));
+        meta.extend_from_slice(&ilst);
+        let udta = boxed(b"udta", &boxed(b"meta", &meta));
+        boxed(b"moov", &udta)
+    }
+
+    #[test]
+    fn read_binary_tags_extracts_opaque_freeform_skips_text() {
+        let serato = vec![0x00, 0xff, 0x10, 0x42, 0x99];
+        let binary = freeform_atom_typed("com.serato.dj", "analysis", 0, &serato);
+        let text = freeform_atom_typed("com.apple.iTunes", "MOOD", 1, b"calm");
+        let moov = moov_with_ilst(&[binary, text].concat());
+
+        let tags = read_binary_tags(&moov);
+        assert_eq!(tags.len(), 1, "only the binary `----` is opaque");
+        assert_eq!(tags[0].key, "----:com.serato.dj:analysis");
+        assert_eq!(tags[0].payload, serato);
+
+        // The text `----` is the text path's job, never opaque.
+        assert!(read_binary_tags(&moov)
+            .iter()
+            .all(|t| t.key != "----:com.apple.iTunes:MOOD"));
     }
 
     #[test]
