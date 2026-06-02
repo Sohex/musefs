@@ -433,6 +433,7 @@ fn read_segments(
                 }
                 Segment::BinaryTag { payload_id, .. } => {
                     let chunk = db.read_binary_tag_chunk(*payload_id, within, n)?;
+                    crate::metrics::on_binary_tag_chunk();
                     out.extend_from_slice(&chunk);
                 }
                 Segment::OggAudio {
