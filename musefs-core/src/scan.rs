@@ -126,7 +126,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_length: bounds.audio_length,
             tags: mp4::read_tags(bytes),
             pictures: mp4::read_pictures(bytes),
-            binary_tags: Vec::new(),
+            binary_tags: mp4::read_binary_tags(bytes),
         })
     } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
         let scan = ogg::locate_audio(bytes).ok()?;
@@ -219,7 +219,7 @@ fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
             audio_length: scan.mdat_payload_len,
             tags: mp4::read_tags(&scan.moov),
             pictures: mp4::read_pictures(&scan.moov),
-            binary_tags: Vec::new(),
+            binary_tags: mp4::read_binary_tags(&scan.moov),
         }));
     }
 
@@ -920,6 +920,66 @@ mod scan_unit_tests {
             binary_tags: Vec::new(),
         };
         assert_eq!(art_weight(&empty), 0);
+    }
+
+    /// Minimal-but-valid m4a that `mp4::locate_audio` accepts (one `soun` trak),
+    /// with a `udta/meta/ilst` carrying one binary `----` atom. `value` is the raw
+    /// binary `data` payload (type code 0). Not synthesis-grade (no stco), but
+    /// `probe_full` only locates audio + reads tags, never synthesizes.
+    fn mp4_with_binary_freeform(mean: &str, name: &str, value: &[u8]) -> Vec<u8> {
+        fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut v = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(kind);
+            v.extend_from_slice(body);
+            v
+        }
+        // mdia/hdlr with handler type `soun` at payload offset 8..12 (FullBox
+        // version/flags [0..4], pre_defined [4..8], handler_type [8..12]).
+        let mut hdlr_body = vec![0u8; 8];
+        hdlr_body.extend_from_slice(b"soun");
+        hdlr_body.extend_from_slice(&[0u8; 12]); // reserved(12) + empty name
+        let trak = bx(b"trak", &bx(b"mdia", &bx(b"hdlr", &hdlr_body)));
+
+        // udta/meta/ilst with one binary `----` atom.
+        let mut mean_body = 0u32.to_be_bytes().to_vec();
+        mean_body.extend_from_slice(mean.as_bytes());
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(name.as_bytes());
+        let mut data_body = 0u32.to_be_bytes().to_vec(); // type 0 = binary
+        data_body.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data_body.extend_from_slice(value);
+        let mut free = bx(b"mean", &mean_body);
+        free.extend(bx(b"name", &name_body));
+        free.extend(bx(b"data", &data_body));
+        let ilst = bx(b"ilst", &bx(b"----", &free));
+        let mut meta = 0u32.to_be_bytes().to_vec();
+        meta.extend(bx(b"hdlr", &[0u8; 25]));
+        meta.extend(ilst);
+        let udta = bx(b"udta", &bx(b"meta", &meta));
+
+        let moov = bx(b"moov", &[trak, udta].concat());
+        [bx(b"ftyp", b"M4A "), moov, bx(b"mdat", b"AUDIODATA")].concat()
+    }
+
+    #[test]
+    fn probe_full_surfaces_mp4_binary_freeform() {
+        use musefs_format::mp4;
+        let bytes = mp4_with_binary_freeform("com.serato.dj", "analysis", &[0x00, 0xAB, 0xCD]);
+        let probed = probe_full(std::path::Path::new("/x.m4a"), &bytes).expect("probed");
+        assert_eq!(probed.format, Format::M4a);
+        let keys: Vec<&str> = probed.binary_tags.iter().map(|b| b.key.as_str()).collect();
+        assert!(
+            keys.contains(&"----:com.serato.dj:analysis"),
+            "binary freeform not surfaced: {keys:?}"
+        );
+        let bt = probed
+            .binary_tags
+            .iter()
+            .find(|b| b.key == "----:com.serato.dj:analysis")
+            .unwrap();
+        assert_eq!(bt.payload, vec![0x00, 0xAB, 0xCD]);
+        let scan = mp4::read_structure(&bytes).unwrap();
+        assert_eq!(probed.audio_offset, scan.mdat_payload_offset);
     }
 }
 

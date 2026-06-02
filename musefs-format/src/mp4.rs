@@ -4,7 +4,7 @@
 //! supported shape (single audio track, one `mdat`, non-fragmented) is rejected.
 
 use crate::error::{FormatError, Result};
-use crate::input::{ArtInput, EmbeddedPicture, TagInput};
+use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -445,6 +445,65 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
     out
 }
 
+/// Extract opaque (non-text) MP4 `----` freeform atoms for binary-tag passthrough.
+/// One `EmbeddedBinaryTag` per `----` atom whose first `data` sub-box is
+/// binary-typed (type code != 1): key `----:<mean>:<name>`, payload the `data`
+/// value bytes (after the 8-byte `[type][locale]` header). Text freeform atoms
+/// (type 1) are handled by `read_tags`, so the two paths never double-store.
+/// Lenient: malformed atoms are skipped. Only the first `data` sub-box is read
+/// (multi-value freeform is rare; mirrors `read_freeform`).
+pub fn read_binary_tags(buf: &[u8]) -> Vec<EmbeddedBinaryTag> {
+    let Some((start, len)) = ilst_region(buf) else {
+        return Vec::new();
+    };
+    let ilst = &buf[start..start + len];
+    let mut out = Vec::new();
+    for atom in child_boxes(ilst).unwrap_or_default() {
+        if &atom.kind != b"----" {
+            continue;
+        }
+        let inner = atom.payload(ilst);
+        let Ok(Some(data)) = find_box(inner, b"data") else {
+            continue;
+        };
+        let dp = data.payload(inner);
+        if dp.len() < 8 {
+            continue;
+        }
+        // `data` body is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text,
+        // which is the text path's job. Everything else is opaque binary.
+        let type_code = u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]);
+        if type_code == 1 {
+            continue;
+        }
+        // name/mean payloads carry a 4-byte FullBox prefix; default mean to iTunes.
+        let Some(name) = find_box(inner, b"name").ok().flatten().and_then(|n| {
+            let p = n.payload(inner);
+            (p.len() >= 4)
+                .then(|| std::str::from_utf8(&p[4..]).ok())
+                .flatten()
+        }) else {
+            continue;
+        };
+        let mean = find_box(inner, b"mean")
+            .ok()
+            .flatten()
+            .map_or("com.apple.iTunes", |m| {
+                let p = m.payload(inner);
+                if p.len() >= 4 {
+                    std::str::from_utf8(&p[4..]).unwrap_or("com.apple.iTunes")
+                } else {
+                    "com.apple.iTunes"
+                }
+            });
+        out.push(EmbeddedBinaryTag {
+            key: format!("----:{mean}:{name}"),
+            payload: dp[8..].to_vec(),
+        });
+    }
+    out
+}
+
 fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
     v.extend_from_slice(kind);
@@ -498,11 +557,52 @@ fn freeform_atom(mean: &str, name: &str, values: &[&str]) -> Vec<u8> {
     boxed(b"----", &inner)
 }
 
-/// Build `udta` up to (not including) the cover image bytes. Returns (prefix,
-/// art_len). No art → prefix is the complete udta, art_len 0. All enclosing box
-/// sizes include art_len so the image can stream right after the prefix.
-fn build_udta(tags: &[TagInput], art: Option<&ArtInput>) -> Result<(Vec<u8>, u64)> {
-    // Group consecutive same-key values (the DB returns tags ordered by key).
+/// Parse a `----:<mean>:<name>` opaque key back into `(mean, name)`. `name` may
+/// contain `:` (only the first separator splits). `None` if not a freeform key.
+fn parse_freeform_key(key: &str) -> Option<(&str, &str)> {
+    key.strip_prefix("----:")?.split_once(':')
+}
+
+/// Inline framing for an opaque binary `----` atom whose `data` value
+/// (`payload_len` bytes) streams next:
+/// `[---- size][----][mean box][name box][data size][data][type 0][locale 0]`.
+/// Mirrors `freeform_atom` but emits type code 0 (binary) and no value bytes — the
+/// value is served from the DB as a `Segment::BinaryTag`.
+fn freeform_binary_prefix(mean: &str, name: &str, payload_len: u64) -> Vec<u8> {
+    let mut mean_body = 0u32.to_be_bytes().to_vec(); // version/flags
+    mean_body.extend_from_slice(mean.as_bytes());
+    let mean_box = boxed(b"mean", &mean_body);
+    let mut name_body = 0u32.to_be_bytes().to_vec();
+    name_body.extend_from_slice(name.as_bytes());
+    let name_box = boxed(b"name", &name_body);
+
+    let data_size = 8 + 8 + payload_len; // data header + type + locale + payload
+    let inner_len = mean_box.len() as u64 + name_box.len() as u64 + data_size;
+
+    let mut out = ((8 + inner_len) as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(b"----");
+    out.extend_from_slice(&mean_box);
+    out.extend_from_slice(&name_box);
+    out.extend_from_slice(&(data_size as u32).to_be_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&0u32.to_be_bytes()); // type 0 = binary/implicit
+    out.extend_from_slice(&0u32.to_be_bytes()); // locale
+    out
+}
+
+/// Build the `udta` box as an ordered segment list: `Segment::Inline` for all box
+/// framing, with each opaque `----` value and the cover image streamed from the DB
+/// (`Segment::BinaryTag`/`Segment::ArtImage`) rather than materialized. Returns
+/// `(segments, streamed_total)` where `streamed_total` sums every streamed payload
+/// length (binary `----` values + art). Every enclosing box size
+/// (`----`/`ilst`/`meta`/`udta`) accounts for `streamed_total` at the right nesting
+/// depth, so the streamed bytes splice in correctly at read time.
+fn build_udta(
+    tags: &[TagInput],
+    binary_tags: &[BinaryTagInput],
+    art: Option<&ArtInput>,
+) -> Result<(Vec<Segment>, u64)> {
+    // Group consecutive same-key text values (the DB returns tags ordered by key).
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
     for t in tags {
         match groups.last_mut() {
@@ -511,21 +611,73 @@ fn build_udta(tags: &[TagInput], art: Option<&ArtInput>) -> Result<(Vec<u8>, u64
         }
     }
 
-    let mut ilst = Vec::new();
+    // ilst content: text atoms first (materialized), then opaque `----` (streamed),
+    // then cover art (streamed). `ilst_inline` accumulates framing until a streamed
+    // segment forces a flush.
+    let mut ilst_inline: Vec<u8> = Vec::new();
     for (key, values) in &groups {
         match crate::tagmap::key_to_mp4(key) {
-            Some(crate::tagmap::Mp4Slot::Text(atom)) => ilst.extend(text_atom(atom, values)),
+            Some(crate::tagmap::Mp4Slot::Text(atom)) => ilst_inline.extend(text_atom(atom, values)),
             Some(crate::tagmap::Mp4Slot::Number(atom, width)) => {
                 if let Ok(n) = values.first().copied().unwrap_or("").parse::<u16>() {
-                    ilst.extend(number_atom(atom, n, width));
+                    ilst_inline.extend(number_atom(atom, n, width));
                 }
             }
             Some(crate::tagmap::Mp4Slot::Freeform(mean, name)) => {
-                ilst.extend(freeform_atom(mean, name, values));
+                ilst_inline.extend(freeform_atom(mean, name, values));
             }
-            None => ilst.extend(freeform_atom("com.apple.iTunes", key, values)),
+            None => ilst_inline.extend(freeform_atom("com.apple.iTunes", key, values)),
         }
     }
+
+    let mut ilst_segments: Vec<Segment> = Vec::new();
+    let mut streamed_total: u64 = 0;
+
+    for bt in binary_tags {
+        if bt.len == 0 {
+            // An empty BinaryTag fails `RegionLayout::validate` (EmptySegment).
+            continue;
+        }
+        let Some((mean, name)) = parse_freeform_key(&bt.key) else {
+            // Not a `----:<mean>:<name>` key; skip defensively (no double-store path).
+            continue;
+        };
+        ilst_inline.extend_from_slice(&freeform_binary_prefix(mean, name, bt.len));
+        ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
+        ilst_segments.push(Segment::BinaryTag {
+            payload_id: bt.payload_id,
+            len: bt.len,
+        });
+        streamed_total += bt.len;
+    }
+
+    if let Some(a) = art {
+        let type_code: u32 = if a.mime == "image/png" { 14 } else { 13 };
+        let data_size = 8 + 8 + a.data_len; // data header + type + locale + image
+        let covr_size = 8 + data_size;
+        ilst_inline.extend_from_slice(&(covr_size as u32).to_be_bytes());
+        ilst_inline.extend_from_slice(b"covr");
+        ilst_inline.extend_from_slice(&(data_size as u32).to_be_bytes());
+        ilst_inline.extend_from_slice(b"data");
+        ilst_inline.extend_from_slice(&type_code.to_be_bytes());
+        ilst_inline.extend_from_slice(&0u32.to_be_bytes()); // locale; image streams next
+        ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
+        ilst_segments.push(Segment::ArtImage {
+            art_id: a.art_id,
+            len: a.data_len,
+        });
+        streamed_total += a.data_len;
+    } else if !ilst_inline.is_empty() {
+        ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
+    }
+
+    let ilst_inline_len: u64 = ilst_segments
+        .iter()
+        .map(|s| match s {
+            Segment::Inline(b) => b.len() as u64,
+            _ => 0,
+        })
+        .sum();
 
     let mut hdlr_body = vec![0u8; 8];
     hdlr_body.extend_from_slice(b"mdir");
@@ -533,44 +685,53 @@ fn build_udta(tags: &[TagInput], art: Option<&ArtInput>) -> Result<(Vec<u8>, u64
     hdlr_body.extend_from_slice(&[0u8; 9]);
     let hdlr = boxed(b"hdlr", &hdlr_body);
 
-    let art_len = art.map_or(0, |a| a.data_len);
+    // Box sizes. Each enclosing box adds its 8-byte header to the inline content of
+    // its child and carries `streamed_total` through unchanged (the streamed bytes
+    // live at the deepest level, inside ilst).
+    let ilst_size = 8 + ilst_inline_len + streamed_total;
+    let meta_inline_len = 4 + hdlr.len() as u64 + 8 + ilst_inline_len; // [vf][hdlr][ilst hdr][ilst inline]
+    let meta_size = 8 + meta_inline_len + streamed_total;
+    let udta_inline_len = 8 + meta_inline_len; // [meta hdr][meta inline]
+    let udta_size = 8 + udta_inline_len + streamed_total;
 
-    if let Some(a) = art {
-        let type_code: u32 = if a.mime == "image/png" { 14 } else { 13 };
-        let data_size = 8 + 8 + a.data_len; // data header + type + locale + image
-        let covr_size = 8 + data_size;
-        ilst.extend_from_slice(&(covr_size as u32).to_be_bytes());
-        ilst.extend_from_slice(b"covr");
-        ilst.extend_from_slice(&(data_size as u32).to_be_bytes());
-        ilst.extend_from_slice(b"data");
-        ilst.extend_from_slice(&type_code.to_be_bytes());
-        ilst.extend_from_slice(&0u32.to_be_bytes()); // locale; image streams next
-    }
-
-    let ilst_size = 8 + ilst.len() as u64 + art_len;
-    let mut meta = 0u32.to_be_bytes().to_vec(); // FullBox version/flags
-    meta.extend_from_slice(&hdlr);
-    meta.extend_from_slice(&(ilst_size as u32).to_be_bytes());
-    meta.extend_from_slice(b"ilst");
-    meta.extend_from_slice(&ilst);
-    let meta_size = 8 + meta.len() as u64 + art_len;
-
-    let mut udta = (meta_size as u32).to_be_bytes().to_vec();
-    udta.extend_from_slice(b"meta");
-    udta.extend_from_slice(&meta);
-    let udta_size = 8 + udta.len() as u64 + art_len;
-
-    // MP4 box sizes are 32-bit. udta encloses all the inner boxes, so guarding
-    // its size bounds them all; refuse oversized metadata at the format boundary
-    // rather than emit a silently-truncated (corrupt) size field.
+    // MP4 box sizes are 32-bit. udta encloses all inner boxes, so guarding it bounds
+    // them all; refuse oversized metadata at the format boundary rather than emit a
+    // silently-truncated (corrupt) size field.
     if udta_size > u32::MAX as u64 {
         return Err(FormatError::TooLarge);
     }
 
-    let mut out = (udta_size as u32).to_be_bytes().to_vec();
-    out.extend_from_slice(b"udta");
-    out.extend_from_slice(&udta);
-    Ok((out, art_len))
+    // Leading framing: everything up to the start of ilst content.
+    let mut header = (udta_size as u32).to_be_bytes().to_vec();
+    header.extend_from_slice(b"udta");
+    header.extend_from_slice(&(meta_size as u32).to_be_bytes());
+    header.extend_from_slice(b"meta");
+    header.extend_from_slice(&0u32.to_be_bytes()); // meta FullBox version/flags
+    header.extend_from_slice(&hdlr);
+    header.extend_from_slice(&(ilst_size as u32).to_be_bytes());
+    header.extend_from_slice(b"ilst");
+
+    // Merge the header into the first ilst inline segment (always Inline when present,
+    // since streamed segments are preceded by their framing).
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut lead = header;
+    for seg in ilst_segments {
+        match seg {
+            Segment::Inline(b) => lead.extend_from_slice(&b),
+            other => {
+                segments.push(Segment::Inline(std::mem::take(&mut lead)));
+                segments.push(other);
+            }
+        }
+    }
+    // `lead` is empty only when the loop's last segment was streamed (it was
+    // `take`n); otherwise it still holds the udta/meta/ilst header (when there are
+    // no streamed segments) or trailing framing. Pushing an empty `lead` would
+    // produce an EmptySegment that fails layout validation, so guard on non-empty.
+    if !lead.is_empty() {
+        segments.push(Segment::Inline(lead));
+    }
+    Ok((segments, streamed_total))
 }
 
 /// Patch every `stco` (4-byte) or `co64` (8-byte) chunk offset in `kept` (moov
@@ -611,11 +772,12 @@ fn patch_chunk_offsets(kept: &mut [u8], delta: i64) -> Result<()> {
 /// `[ftyp][regenerated moov][mdat header][mdat payload]`. The mdat payload is
 /// served verbatim, merely relocated, so every chunk offset shifts by a constant
 /// `delta`. Patching only offset VALUES (never box sizes) means `new_moov_size`
-/// is computable before `delta` — no circular dependency. With cover art the
-/// layout splits so the image streams from the DB blob at read time.
+/// is computable before `delta` — no circular dependency. Cover art and opaque `----`
+/// binary tags stream from the DB at read time, splicing into the layout.
 pub fn synthesize_layout(
     scan: &Mp4Scan,
     tags: &[TagInput],
+    binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<RegionLayout> {
     let moov_payload_start = read_box(&scan.moov, 0)?.payload_start();
@@ -627,17 +789,13 @@ pub fn synthesize_layout(
         }
     }
 
-    // Skip zero-byte art (mirrors flac.rs finding #16): an empty ArtImage segment
-    // fails layout validation (EmptySegment), making the track unreadable. Pick the
-    // first art with real bytes rather than merely the first art.
+    // Skip zero-byte art (an empty ArtImage segment fails layout validation).
     let art = arts.iter().find(|a| a.data_len > 0);
-    let (udta_prefix, art_len) = build_udta(tags, art)?;
-    let udta_total = udta_prefix.len() as u64 + art_len;
+    let (udta_segments, _streamed_total) = build_udta(tags, binary_tags, art)?;
+    let udta_total: u64 = udta_segments.iter().map(Segment::len).sum();
 
     let new_moov_size = 8 + kept.len() as u64 + udta_total;
-    // MP4 box sizes are 32-bit; mirror build_udta's guard so a moov that grows
-    // past u32 (e.g. huge art) errors at the format boundary rather than emitting
-    // a truncated, corrupt size field.
+    // MP4 box sizes are 32-bit; mirror build_udta's guard.
     if new_moov_size > u32::MAX as u64 {
         return Err(FormatError::TooLarge);
     }
@@ -652,19 +810,23 @@ pub fn synthesize_layout(
     head.extend_from_slice(&(new_moov_size as u32).to_be_bytes());
     head.extend_from_slice(b"moov");
     head.extend_from_slice(&kept);
-    head.extend_from_slice(&udta_prefix);
 
-    let mut segments = Vec::new();
-    if let Some(a) = art {
-        segments.push(Segment::Inline(head));
-        segments.push(Segment::ArtImage {
-            art_id: a.art_id,
-            len: a.data_len,
-        });
-        segments.push(Segment::Inline(scan.mdat_header.clone()));
-    } else {
-        head.extend_from_slice(&scan.mdat_header);
-        segments.push(Segment::Inline(head));
+    // Splice the udta segment list after the moov head. `build_udta` guarantees a
+    // non-empty list whose first element is the leading `Inline` framing (it opens
+    // with the udta/meta/ilst header), so fold that into `head`; the rest (streamed
+    // payloads + interleaved inline) follow. Finally append the truncated mdat header
+    // to the last inline run before backing audio.
+    let mut udta_iter = udta_segments.into_iter();
+    let Some(Segment::Inline(first)) = udta_iter.next() else {
+        // build_udta always yields a leading Inline; anything else is a producer bug.
+        return Err(FormatError::InvalidLayout);
+    };
+    head.extend_from_slice(&first);
+    let mut segments: Vec<Segment> = vec![Segment::Inline(head)];
+    segments.extend(udta_iter);
+    match segments.last_mut() {
+        Some(Segment::Inline(b)) => b.extend_from_slice(&scan.mdat_header),
+        _ => segments.push(Segment::Inline(scan.mdat_header.clone())),
     }
     segments.push(Segment::BackingAudio {
         offset: scan.mdat_payload_offset,
@@ -918,8 +1080,9 @@ mod tests {
             TagInput::new("title", "Song"),
             TagInput::new("tracknumber", "5"),
         ];
-        let (prefix, art_len) = build_udta(&tags, None).unwrap();
-        assert_eq!(art_len, 0);
+        let (segs, streamed) = build_udta(&tags, &[], None).unwrap();
+        assert_eq!(streamed, 0);
+        let prefix = materialize_udta(&segs);
         let b = read_box(&prefix, 0).unwrap();
         assert_eq!(&b.kind, b"udta");
         assert_eq!(b.total_len, prefix.len());
@@ -946,13 +1109,27 @@ mod tests {
             height: 0,
             data_len: 100,
         };
-        let (prefix, art_len) = build_udta(&[TagInput::new("title", "T")], Some(&art)).unwrap();
-        assert_eq!(art_len, 100);
-        // The udta size field accounts for the 100 streamed image bytes.
-        let declared = u32::from_be_bytes(prefix[0..4].try_into().unwrap()) as usize;
-        assert_eq!(declared, prefix.len() + 100);
-        // The prefix ends right after the covr/data header (image streams next).
-        assert!(prefix.windows(4).any(|w| w == b"covr"));
+        let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], Some(&art)).unwrap();
+        assert_eq!(streamed, 100);
+        // The image streams as the final segment; the udta size field accounts for it.
+        assert!(matches!(
+            segs.last(),
+            Some(Segment::ArtImage { len: 100, .. })
+        ));
+        let inline_total: usize = segs
+            .iter()
+            .filter_map(|s| match s {
+                Segment::Inline(b) => Some(b.len()),
+                _ => None,
+            })
+            .sum();
+        let Segment::Inline(head) = &segs[0] else {
+            panic!("first udta segment is inline framing");
+        };
+        let declared = u32::from_be_bytes(head[0..4].try_into().unwrap()) as usize;
+        assert_eq!(declared, inline_total + 100);
+        // The leading inline ends right after the covr/data header (image streams next).
+        assert!(head.windows(4).any(|w| w == b"covr"));
     }
 
     #[test]
@@ -967,7 +1144,7 @@ mod tests {
             data_len: u32::MAX as u64 + 1,
         };
         assert!(matches!(
-            build_udta(&[TagInput::new("title", "T")], Some(&art)),
+            build_udta(&[TagInput::new("title", "T")], &[], Some(&art)),
             Err(FormatError::TooLarge)
         ));
     }
@@ -981,8 +1158,9 @@ mod tests {
             TagInput::new("genre", "Rock"),
             TagInput::new("genre", "Metal"),
         ];
-        let (prefix, art_len) = build_udta(&tags, None).unwrap();
-        assert_eq!(art_len, 0);
+        let (segs, streamed) = build_udta(&tags, &[], None).unwrap();
+        assert_eq!(streamed, 0);
+        let prefix = materialize_udta(&segs);
 
         // Exactly one `©gen` atom.
         let gen_count = prefix.windows(4).filter(|w| *w == b"\xa9gen").count();
@@ -1015,8 +1193,9 @@ mod tests {
     fn build_udta_empty_tags_is_valid() {
         // A real file with no tags must still yield a structurally valid (empty)
         // udta, not a malformed box.
-        let (prefix, art_len) = build_udta(&[], None).unwrap();
-        assert_eq!(art_len, 0);
+        let (segs, streamed) = build_udta(&[], &[], None).unwrap();
+        assert_eq!(streamed, 0);
+        let prefix = materialize_udta(&segs);
         let b = read_box(&prefix, 0).unwrap();
         assert_eq!(&b.kind, b"udta");
         assert_eq!(b.total_len, prefix.len());
@@ -1035,6 +1214,23 @@ mod tests {
             Segment::Inline(b) => b.clone(),
             _ => panic!("expected Inline head"),
         }
+    }
+    /// Concatenate a udta segment list into a contiguous buffer, substituting `len`
+    /// zero bytes for each streamed (BinaryTag/ArtImage) segment. Box-size fields
+    /// already account for these, so the result parses as a complete udta box.
+    /// Do NOT use for huge reserved art lengths — read the size field off `segs[0]`.
+    fn materialize_udta(segments: &[Segment]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for seg in segments {
+            match seg {
+                Segment::Inline(b) => out.extend_from_slice(b),
+                Segment::BinaryTag { len, .. } | Segment::ArtImage { len, .. } => {
+                    out.resize(out.len() + *len as usize, 0);
+                }
+                other => panic!("unexpected segment in udta: {other:?}"),
+            }
+        }
+        out
     }
     /// Locate `moov` by reading complete boxes from the front, stopping before
     /// the trailing `mdat` header (whose declared size includes the payload that
@@ -1066,7 +1262,7 @@ mod tests {
     fn synthesize_no_art_patches_stco() {
         let buf = mk_mp4(true, b"AUDIODATA", &[42, 100]);
         let scan = read_structure(&buf).unwrap();
-        let layout = synthesize_layout(&scan, &[TagInput::new("title", "New")], &[]).unwrap();
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "New")], &[], &[]).unwrap();
 
         match layout.segments().last().unwrap() {
             Segment::BackingAudio { offset, len } => {
@@ -1127,7 +1323,7 @@ mod tests {
     fn synthesize_patches_co64() {
         let buf = mk_mp4_co64(b"AUDIODATA", &[42, 100]);
         let scan = read_structure(&buf).unwrap();
-        let layout = synthesize_layout(&scan, &[TagInput::new("title", "New")], &[]).unwrap();
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "New")], &[], &[]).unwrap();
 
         match layout.segments().last().unwrap() {
             Segment::BackingAudio { offset, len } => {
@@ -1160,7 +1356,7 @@ mod tests {
             height: 0,
             data_len: 50,
         };
-        let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[art]).unwrap();
         let segs = layout.segments();
         assert!(matches!(segs[1], Segment::ArtImage { art_id: 7, len: 50 }));
         assert!(matches!(segs[2], Segment::Inline(_))); // mdat header
@@ -1184,7 +1380,7 @@ mod tests {
             height: 0,
             data_len: 0,
         };
-        let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[art]).unwrap();
         let segs = layout.segments();
         assert!(
             !segs.iter().any(|s| matches!(s, Segment::ArtImage { .. })),
@@ -1225,7 +1421,7 @@ mod tests {
             data_len: 40,
         };
         let layout =
-            synthesize_layout(&scan, &[TagInput::new("title", "T")], &[empty, real]).unwrap();
+            synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[empty, real]).unwrap();
         let segs = layout.segments();
         assert!(
             segs.iter()
@@ -1239,7 +1435,7 @@ mod tests {
         let buf = mk_mp4(true, b"", &[0]); // empty mdat payload
         let scan = read_structure(&buf).unwrap();
         assert_eq!(scan.mdat_payload_len, 0);
-        let layout = synthesize_layout(&scan, &[TagInput::new("title", "Z")], &[]).unwrap();
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "Z")], &[], &[]).unwrap();
         match layout.segments().last().unwrap() {
             Segment::BackingAudio { offset, len } => {
                 assert_eq!(*offset, scan.mdat_payload_offset);
@@ -1400,7 +1596,8 @@ mod tests {
             TagInput::new("MyRating", "5"), // user-defined -> ----
             TagInput::new("musicbrainz_albumid", "abc-123"), // vocabulary -> ----
         ];
-        let (udta, _art_len) = build_udta(&tags, None).unwrap();
+        let (segs, _streamed) = build_udta(&tags, &[], None).unwrap();
+        let udta = materialize_udta(&segs);
         // build_udta returns a full `udta` box; read_tags expects a buffer containing
         // moov/udta/meta/ilst, so wrap udta in a minimal moov for the round trip.
         let moov = boxed(b"moov", &udta);
@@ -1658,7 +1855,8 @@ mod tests {
                 height: 0,
                 data_len: 10,
             };
-            let (prefix, _) = build_udta(&[TagInput::new("title", "T")], Some(&art)).unwrap();
+            let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], Some(&art)).unwrap();
+            let prefix = materialize_udta(&segs);
             // covr layout: [covr_size u32]["covr"][data_size u32]["data"][type u32][locale u32]
             let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
             assert_eq!(&prefix[cpos + 8..cpos + 12], b"data");
@@ -1680,7 +1878,8 @@ mod tests {
             height: 0,
             data_len: 10,
         };
-        let (prefix, _) = build_udta(&[TagInput::new("title", "T")], Some(&art)).unwrap();
+        let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], Some(&art)).unwrap();
+        let prefix = materialize_udta(&segs);
         let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
         let covr_size = u32::from_be_bytes(prefix[cpos - 4..cpos].try_into().unwrap());
         let data_size = u32::from_be_bytes(prefix[cpos + 4..cpos + 8].try_into().unwrap());
@@ -1704,21 +1903,28 @@ mod tests {
                 data_len,
             }
         }
-        // Derive the fixed overhead: with data_len 0, udta_size == overhead.
-        let (p0, _) = build_udta(&[TagInput::new("title", "T")], Some(&art(0))).unwrap();
-        let overhead = u32::from_be_bytes(p0[0..4].try_into().unwrap()) as u64;
+        // Derive the fixed overhead from the udta size field (segs[0] inline), with
+        // data_len 0, without materializing any image bytes.
+        let (segs0, _) = build_udta(&[TagInput::new("title", "T")], &[], Some(&art(0))).unwrap();
+        let Segment::Inline(h0) = &segs0[0] else {
+            panic!("inline head")
+        };
+        let overhead = u32::from_be_bytes(h0[0..4].try_into().unwrap()) as u64;
         let max_len = u32::MAX as u64 - overhead;
 
-        let (p_max, art_len) =
-            build_udta(&[TagInput::new("title", "T")], Some(&art(max_len))).unwrap();
-        assert_eq!(art_len, max_len);
+        let (segs_max, streamed) =
+            build_udta(&[TagInput::new("title", "T")], &[], Some(&art(max_len))).unwrap();
+        assert_eq!(streamed, max_len);
+        let Segment::Inline(h_max) = &segs_max[0] else {
+            panic!("inline head")
+        };
         assert_eq!(
-            u32::from_be_bytes(p_max[0..4].try_into().unwrap()),
+            u32::from_be_bytes(h_max[0..4].try_into().unwrap()),
             u32::MAX
         );
 
         assert!(matches!(
-            build_udta(&[TagInput::new("title", "T")], Some(&art(max_len + 1))),
+            build_udta(&[TagInput::new("title", "T")], &[], Some(&art(max_len + 1))),
             Err(FormatError::TooLarge)
         ));
     }
@@ -1779,6 +1985,140 @@ mod tests {
         assert!(patch_chunk_offsets(&mut kept, 0).is_ok());
     }
 
+    /// Build a `----` freeform atom with an explicit data `type_code` and raw value.
+    fn freeform_atom_typed(mean: &str, name: &str, type_code: u32, value: &[u8]) -> Vec<u8> {
+        let mut mean_body = 0u32.to_be_bytes().to_vec();
+        mean_body.extend_from_slice(mean.as_bytes());
+        let mut name_body = 0u32.to_be_bytes().to_vec();
+        name_body.extend_from_slice(name.as_bytes());
+        let mut data_body = type_code.to_be_bytes().to_vec();
+        data_body.extend_from_slice(&0u32.to_be_bytes()); // locale
+        data_body.extend_from_slice(value);
+        let mut inner = boxed(b"mean", &mean_body);
+        inner.extend(boxed(b"name", &name_body));
+        inner.extend(boxed(b"data", &data_body));
+        boxed(b"----", &inner)
+    }
+
+    /// Wrap an `ilst` body in the moov/udta/meta/ilst boxes `ilst_region` expects.
+    fn moov_with_ilst(ilst_body: &[u8]) -> Vec<u8> {
+        let ilst = boxed(b"ilst", ilst_body);
+        let mut meta = 0u32.to_be_bytes().to_vec(); // FullBox version/flags
+        meta.extend(boxed(b"hdlr", &[0u8; 25]));
+        meta.extend_from_slice(&ilst);
+        let udta = boxed(b"udta", &boxed(b"meta", &meta));
+        boxed(b"moov", &udta)
+    }
+
+    #[test]
+    fn read_binary_tags_extracts_opaque_freeform_skips_text() {
+        let serato = vec![0x00, 0xff, 0x10, 0x42, 0x99];
+        let binary = freeform_atom_typed("com.serato.dj", "analysis", 0, &serato);
+        let text = freeform_atom_typed("com.apple.iTunes", "MOOD", 1, b"calm");
+        let moov = moov_with_ilst(&[binary, text].concat());
+
+        let tags = read_binary_tags(&moov);
+        assert_eq!(tags.len(), 1, "only the binary `----` is opaque");
+        assert_eq!(tags[0].key, "----:com.serato.dj:analysis");
+        assert_eq!(tags[0].payload, serato);
+
+        // The text `----` is the text path's job, never opaque.
+        assert!(read_binary_tags(&moov)
+            .iter()
+            .all(|t| t.key != "----:com.apple.iTunes:MOOD"));
+    }
+
+    #[test]
+    fn read_binary_tags_handles_data_box_length_boundary() {
+        // A `data` box shorter than the 8-byte `[type][locale]` header is malformed:
+        // it must be skipped, never indexed into (no panic).
+        let mut short_inner = boxed(b"mean", &{
+            let mut b = 0u32.to_be_bytes().to_vec();
+            b.extend_from_slice(b"com.serato.dj");
+            b
+        });
+        short_inner.extend(boxed(b"name", &{
+            let mut b = 0u32.to_be_bytes().to_vec();
+            b.extend_from_slice(b"short");
+            b
+        }));
+        short_inner.extend(boxed(b"data", &[0u8; 5])); // 5 < 8: truncated header
+        let short = boxed(b"----", &short_inner);
+
+        // A `data` box of exactly 8 bytes (binary type 0, no value) is well-formed
+        // with an empty payload — it must be emitted, not skipped.
+        let empty = freeform_atom_typed("com.serato.dj", "empty", 0, b"");
+        let moov = moov_with_ilst(&[short, empty].concat());
+
+        let tags = read_binary_tags(&moov);
+        assert_eq!(tags.len(), 1, "short data skipped, 8-byte data emitted");
+        assert_eq!(tags[0].key, "----:com.serato.dj:empty");
+        assert!(tags[0].payload.is_empty());
+    }
+
+    #[test]
+    fn synthesize_interleaves_binary_freeform_segment() {
+        let buf = mk_mp4(true, b"AUDIODATA", &[42, 100]);
+        let scan = read_structure(&buf).unwrap();
+        let payload = vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x01];
+        let bins = vec![BinaryTagInput {
+            key: "----:com.serato.dj:analysis".into(),
+            payload_id: 7,
+            len: payload.len() as u64,
+        }];
+        let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &bins, &[]).unwrap();
+
+        // Exactly one streamed BinaryTag carrying our handle + length.
+        let bt: Vec<_> = layout
+            .segments()
+            .iter()
+            .filter_map(|s| match s {
+                Segment::BinaryTag { payload_id, len } => Some((*payload_id, *len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bt, vec![(7, payload.len() as u64)]);
+
+        // Audio is still served verbatim as the trailing BackingAudio run.
+        match layout.segments().last().unwrap() {
+            Segment::BackingAudio { offset, len } => {
+                assert_eq!(*offset, scan.mdat_payload_offset);
+                assert_eq!(*len, scan.mdat_payload_len);
+            }
+            _ => panic!("expected BackingAudio tail"),
+        }
+
+        // Box sizes are self-consistent: materialize the served file (binary payload
+        // + backing audio substituted) and re-parse. `read_structure` validates every
+        // moov/mdat box size, so a green re-parse proves the ----/ilst/meta/udta/moov
+        // sizes all account for the streamed payload — and the opaque `----` survives
+        // the round trip byte-identically.
+        //
+        // NOTE: do NOT use `inline_head`/`find_moov_in_head` here — the moov box now
+        // spans multiple segments (the streamed BinaryTag splits it), so `read_box`
+        // on `segments[0]` alone returns `Malformed`. Materialize the whole file.
+        let mut served = Vec::new();
+        for seg in layout.segments() {
+            match seg {
+                Segment::Inline(b) => served.extend_from_slice(b),
+                Segment::BinaryTag { .. } => served.extend_from_slice(&payload),
+                Segment::BackingAudio { offset, len } => {
+                    let s = *offset as usize;
+                    served.extend_from_slice(&buf[s..s + *len as usize]);
+                }
+                other => panic!("unexpected segment: {other:?}"),
+            }
+        }
+        read_structure(&served).expect("synthesized file re-parses to a valid moov/mdat");
+        // `read_binary_tags` returns a bare Vec (no promotion for MP4) and emits the
+        // raw `mean:name` key WITHOUT folding through the vocabulary — `com.serato.dj`
+        // is not in any vocabulary entry, so the key is preserved verbatim.
+        let reparsed = read_binary_tags(&served);
+        assert_eq!(reparsed.len(), 1);
+        assert_eq!(reparsed[0].key, "----:com.serato.dj:analysis");
+        assert_eq!(reparsed[0].payload, payload);
+    }
+
     #[test]
     fn synthesize_new_moov_size_exactly_u32_max_is_ok() {
         // `if new_moov_size > u32::MAX` is strict. new_moov_size == u32::MAX must be
@@ -1803,17 +2143,17 @@ mod tests {
         // box header declares new_moov_size = overhead + 1. The actual moov bytes in the
         // head are new_moov_size - 1 (the art is a separate ArtImage segment). So the
         // head length = ftyp.len() + (overhead + 1 - 1) = ftyp.len() + overhead.
-        let layout1 = synthesize_layout(&scan, &tags, &[art(1)]).unwrap();
+        let layout1 = synthesize_layout(&scan, &tags, &[], &[art(1)]).unwrap();
         let head_len = inline_head(&layout1).len();
         let overhead = (head_len as u64) - (scan.ftyp.len() as u64);
         let max_len = u32::MAX as u64 - overhead;
 
         assert!(max_len > 0, "overhead {overhead} must be < u32::MAX");
         // Boundary accepted
-        assert!(synthesize_layout(&scan, &tags, &[art(max_len)]).is_ok());
+        assert!(synthesize_layout(&scan, &tags, &[], &[art(max_len)]).is_ok());
         // Boundary+1 rejected
         assert!(matches!(
-            synthesize_layout(&scan, &tags, &[art(max_len + 1)]),
+            synthesize_layout(&scan, &tags, &[], &[art(max_len + 1)]),
             Err(FormatError::TooLarge)
         ));
     }

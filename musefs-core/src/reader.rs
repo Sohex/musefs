@@ -293,7 +293,7 @@ impl HeaderCache {
                             mp4::Mp4ScanError::Io(io) => CoreError::Io(io),
                             mp4::Mp4ScanError::Format(fe) => CoreError::Format(fe),
                         })?;
-                        mp4::synthesize_layout(&scan, &inputs, &art_inputs)?
+                        mp4::synthesize_layout(&scan, &inputs, &binary_tag_inputs, &art_inputs)?
                     }
                     Format::Wav => {
                         // Read only the front (RIFF header + fmt/fact); the data

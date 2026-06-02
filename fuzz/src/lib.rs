@@ -1,5 +1,5 @@
 use arbitrary::{Arbitrary, Unstructured};
-use musefs_format::{ArtInput, TagInput};
+use musefs_format::{ArtInput, BinaryTagInput, TagInput};
 
 /// Cap fuzz input size to avoid pathological slow paths / false-positive
 /// timeouts on chunk/frame parsers (64-128 KiB is ample for full coverage).
@@ -30,6 +30,22 @@ pub fn arb_arts(u: &mut Unstructured) -> arbitrary::Result<Vec<ArtInput>> {
             width: u.int_in_range(0..=4096u32)?,
             height: u.int_in_range(0..=4096u32)?,
             data_len: u.int_in_range(0..=8192u64)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Build a small vec of BinaryTagInputs (synthetic handles + bounded lengths; the
+/// synthesis path never reads payload bytes, only `len` for box sizing).
+pub fn arb_binary_tags(u: &mut Unstructured) -> arbitrary::Result<Vec<BinaryTagInput>> {
+    let n = u.int_in_range(0..=4u8)?;
+    let mut out = Vec::new();
+    for i in 0..n {
+        let name = String::arbitrary(u)?;
+        out.push(BinaryTagInput {
+            key: format!("----:com.apple.iTunes:{name}"),
+            payload_id: i as i64 + 1,
+            len: u.int_in_range(1..=4096u64)?,
         });
     }
     Ok(out)
