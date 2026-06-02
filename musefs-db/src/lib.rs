@@ -3,12 +3,16 @@ mod bulk;
 mod error;
 mod models;
 mod schema;
+mod structural;
 mod tags;
 mod tracks;
 
 pub use bulk::BulkWriter;
 pub use error::{DbError, Result};
-pub use models::{Art, ArtMeta, Format, NewArt, NewTrack, Tag, Track, TrackArt};
+pub use models::{
+    Art, ArtMeta, BinaryTag, BinaryTagRow, Format, NewArt, NewTrack, StructuralBlock, Tag, Track,
+    TrackArt,
+};
 
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};

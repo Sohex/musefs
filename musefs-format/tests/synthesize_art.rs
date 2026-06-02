@@ -51,7 +51,7 @@ fn art_becomes_an_artimage_segment_and_lengths_are_exact() {
 
     let mut art_map = HashMap::new();
     art_map.insert(42i64, image.clone());
-    let assembled = resolve_layout(&layout, &file, &art_map);
+    let assembled = resolve_layout(&layout, &file, &art_map, &HashMap::new());
     assert_eq!(assembled.len() as u64, layout.total_len());
     assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);
 }
@@ -67,7 +67,7 @@ fn metaflac_reads_synthesized_picture() {
 
     let mut art_map = HashMap::new();
     art_map.insert(42i64, image.clone());
-    let assembled = resolve_layout(&layout, &file, &art_map);
+    let assembled = resolve_layout(&layout, &file, &art_map, &HashMap::new());
 
     let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
     let pics: Vec<_> = tag.pictures().collect();
@@ -124,7 +124,7 @@ fn zero_byte_art_is_skipped_so_the_track_still_serves() {
 
     // The track still round-trips: header + verbatim audio (no art bytes needed).
     let art_map = HashMap::new();
-    let assembled = resolve_layout(&layout, &file, &art_map);
+    let assembled = resolve_layout(&layout, &file, &art_map, &HashMap::new());
     assert_eq!(assembled.len() as u64, layout.total_len());
     assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);
 
@@ -154,7 +154,7 @@ fn zero_byte_art_skipped_among_valid_art_keeps_block_framing_valid() {
 
     let mut art_map = HashMap::new();
     art_map.insert(2i64, image.clone());
-    let assembled = resolve_layout(&layout, &file, &art_map);
+    let assembled = resolve_layout(&layout, &file, &art_map, &HashMap::new());
 
     // Re-parse the synthesized chain: locate_audio follows the last-block flag, so
     // if the empty art were miscounted (leaving the final real block without its

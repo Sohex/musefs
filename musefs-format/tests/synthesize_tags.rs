@@ -25,7 +25,7 @@ fn measured_lengths_match_assembled_bytes() {
     ];
     let layout = synthesize_layout(&scan, &tags, &[]).unwrap();
 
-    let assembled = resolve_layout(&layout, &file, &HashMap::new());
+    let assembled = resolve_layout(&layout, &file, &HashMap::new(), &HashMap::new());
     assert_eq!(assembled.len() as u64, layout.total_len());
     assert_eq!(
         layout.header_len(),
@@ -45,7 +45,7 @@ fn metaflac_reads_synthesized_vorbis_comments_and_preserves_streaminfo() {
         TagInput::new("artist", "Second"),
     ];
     let layout = synthesize_layout(&scan, &tags, &[]).unwrap();
-    let assembled = resolve_layout(&layout, &file, &HashMap::new());
+    let assembled = resolve_layout(&layout, &file, &HashMap::new(), &HashMap::new());
 
     let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
 

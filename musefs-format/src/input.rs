@@ -41,3 +41,31 @@ pub struct EmbeddedPicture {
     pub height: u32,
     pub data: Vec<u8>,
 }
+
+/// A reference to one opaque binary tag payload to synthesize. Like `ArtInput`,
+/// the bytes are NOT held here — only `len` and `payload_id`, an opaque handle the
+/// caller (musefs-core) maps to the `tags` rowid it streams from. `key` is the
+/// format-private identifier the synthesis path decodes (ID3 frame id,
+/// `APPLICATION`/`CUESHEET`, `----:<mean>:<name>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryTagInput {
+    pub key: String,
+    pub payload_id: i64,
+    pub len: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BinaryTagInput;
+
+    #[test]
+    fn binary_tag_input_constructs() {
+        let b = BinaryTagInput {
+            key: "PRIV".into(),
+            payload_id: 7,
+            len: 3,
+        };
+        assert_eq!(b.payload_id, 7);
+        assert_eq!(b.len, 3);
+    }
+}

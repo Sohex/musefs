@@ -1,11 +1,14 @@
-use crate::models::Tag;
+use crate::models::{BinaryTag, BinaryTagRow, Tag};
 use crate::{Db, Result};
 use rusqlite::params;
 
 impl Db {
     pub fn replace_tags(&self, track_id: i64, tags: &[Tag]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM tags WHERE track_id = ?1", params![track_id])?;
+        tx.execute(
+            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NULL",
+            params![track_id],
+        )?;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
@@ -20,7 +23,8 @@ impl Db {
 
     pub fn get_tags(&self, track_id: i64) -> Result<Vec<Tag>> {
         let mut stmt = self.conn.prepare(
-            "SELECT key, value, ordinal FROM tags WHERE track_id = ?1 ORDER BY key, ordinal",
+            "SELECT key, value, ordinal FROM tags \
+             WHERE track_id = ?1 AND value_blob IS NULL ORDER BY key, ordinal",
         )?;
         let rows = stmt.query_map(params![track_id], |r| {
             Ok(Tag {
@@ -47,7 +51,8 @@ impl Db {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 "SELECT track_id, key, value, ordinal FROM tags \
-                 WHERE track_id IN ({placeholders}) ORDER BY track_id, key, ordinal"
+                 WHERE track_id IN ({placeholders}) AND value_blob IS NULL \
+                 ORDER BY track_id, key, ordinal"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let params = rusqlite::params_from_iter(chunk.iter());
@@ -74,7 +79,8 @@ impl Db {
     /// a drop-in batch replacement for N calls to `get_tags`.
     pub fn tags_grouped(&self) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT track_id, key, value, ordinal FROM tags ORDER BY track_id, key, ordinal",
+            "SELECT track_id, key, value, ordinal FROM tags \
+             WHERE value_blob IS NULL ORDER BY track_id, key, ordinal",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -92,6 +98,63 @@ impl Db {
             out.entry(track_id).or_default().push(tag);
         }
         Ok(out)
+    }
+
+    /// Replace the track's binary tag rows (value_blob IS NOT NULL); text rows
+    /// (managed by `replace_tags`) are untouched. Binary rows store '' in `value`.
+    pub fn set_binary_tags(&self, track_id: i64, tags: &[BinaryTag]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL",
+            params![track_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
+                 VALUES (?1, ?2, '', ?3, ?4)",
+            )?;
+            for t in tags {
+                stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Binary tag rows for a track: streaming handle (rowid), key, and payload
+    /// length. Ordered by (key, ordinal) to match `get_binary_tags`/synthesis order.
+    pub fn get_binary_tags(&self, track_id: i64) -> Result<Vec<BinaryTagRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, key, length(value_blob) FROM tags \
+             WHERE track_id = ?1 AND value_blob IS NOT NULL ORDER BY key, ordinal",
+        )?;
+        let rows = stmt.query_map(params![track_id], |r| {
+            Ok(BinaryTagRow {
+                rowid: r.get(0)?,
+                key: r.get(1)?,
+                byte_len: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Stream `len` bytes of a binary tag payload at `offset` via incremental blob
+    /// I/O — payloads are never fully materialized. A short read means the row
+    /// changed underneath the resolved layout; `read_at_exact` surfaces it as an
+    /// error rather than zero-filling. (`payload_id` is the `tags` rowid; see the
+    /// spec's "payload_id validity invariant".)
+    pub fn read_binary_tag_chunk(
+        &self,
+        payload_id: i64,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        let blob = self
+            .conn
+            .blob_open("main", "tags", "value_blob", payload_id, true)?;
+        let mut buf = vec![0u8; len];
+        blob.read_at_exact(&mut buf, offset as usize)?;
+        Ok(buf)
     }
 }
 
@@ -157,5 +220,81 @@ mod tags_for_tracks_tests {
     fn tags_for_tracks_empty_input_is_empty_map() {
         let db = open_mem();
         assert!(db.tags_for_tracks(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_queries_exclude_binary_rows() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.replace_tags(a, &[Tag::new("artist", "Alice", 0)])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
+                 VALUES (?1, 'PRIV', '', X'DEADBEEF', 0)",
+                rusqlite::params![a],
+            )
+            .unwrap();
+
+        let got = db.get_tags(a).unwrap();
+        assert_eq!(got, vec![Tag::new("artist", "Alice", 0)]);
+        let grouped = db.tags_grouped().unwrap();
+        assert_eq!(grouped[&a], vec![Tag::new("artist", "Alice", 0)]);
+        let for_tracks = db.tags_for_tracks(&[a]).unwrap();
+        assert_eq!(for_tracks[&a], vec![Tag::new("artist", "Alice", 0)]);
+    }
+
+    #[test]
+    fn binary_tags_round_trip_and_are_independent_of_text() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.replace_tags(a, &[Tag::new("artist", "Alice", 0)])
+            .unwrap();
+        db.set_binary_tags(
+            a,
+            &[
+                crate::BinaryTag {
+                    key: "PRIV".into(),
+                    payload: vec![1, 2, 3],
+                    ordinal: 0,
+                },
+                crate::BinaryTag {
+                    key: "PRIV".into(),
+                    payload: vec![9, 9],
+                    ordinal: 1,
+                },
+                crate::BinaryTag {
+                    key: "GEOB".into(),
+                    payload: vec![7],
+                    ordinal: 0,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.get_tags(a).unwrap(),
+            vec![Tag::new("artist", "Alice", 0)]
+        );
+
+        let rows = db.get_binary_tags(a).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].key, "GEOB");
+        assert_eq!(rows[0].byte_len, 1);
+        assert_eq!(rows[1].key, "PRIV");
+        assert_eq!(rows[1].byte_len, 3);
+        assert_eq!(rows[2].byte_len, 2);
+
+        let full = db.read_binary_tag_chunk(rows[1].rowid, 0, 3).unwrap();
+        assert_eq!(full, vec![1, 2, 3]);
+        let mid = db.read_binary_tag_chunk(rows[1].rowid, 1, 2).unwrap();
+        assert_eq!(mid, vec![2, 3]);
+
+        db.set_binary_tags(a, &[]).unwrap();
+        assert!(db.get_binary_tags(a).unwrap().is_empty());
+        assert_eq!(
+            db.get_tags(a).unwrap(),
+            vec![Tag::new("artist", "Alice", 0)]
+        );
     }
 }

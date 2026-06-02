@@ -36,6 +36,10 @@ pub enum Segment {
         base64: bool,
         art_total: u64,
     },
+    /// An opaque binary tag payload (e.g. an ID3 `PRIV` frame body or a FLAC
+    /// `APPLICATION` block body) streamed from the DB at read time; only the
+    /// length is known here. `payload_id` is the caller's `tags` rowid handle.
+    BinaryTag { payload_id: i64, len: u64 },
 }
 
 impl Segment {
@@ -45,7 +49,8 @@ impl Segment {
             Segment::ArtImage { len, .. }
             | Segment::BackingAudio { len, .. }
             | Segment::OggAudio { len, .. }
-            | Segment::OggArtSlice { len, .. } => *len,
+            | Segment::OggArtSlice { len, .. }
+            | Segment::BinaryTag { len, .. } => *len,
         }
     }
 
@@ -105,5 +110,27 @@ impl RegionLayout {
             total = total.checked_add(len).ok_or(LayoutError::TotalOverflow)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_tag_segment_len_and_validate() {
+        let seg = Segment::BinaryTag {
+            payload_id: 5,
+            len: 12,
+        };
+        assert_eq!(seg.len(), 12);
+        // Non-empty binary tag passes validation.
+        RegionLayout::validated(vec![seg, Segment::BackingAudio { offset: 0, len: 1 }]).unwrap();
+        // Empty binary tag is rejected (EmptySegment), like empty art.
+        let err = RegionLayout::validated(vec![Segment::BinaryTag {
+            payload_id: 5,
+            len: 0,
+        }]);
+        assert!(matches!(err, Err(LayoutError::EmptySegment)));
     }
 }

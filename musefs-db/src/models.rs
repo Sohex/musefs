@@ -67,6 +67,31 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod binary_tag_models_tests {
+    #[test]
+    fn binary_tag_constructs() {
+        let bt = super::BinaryTag {
+            key: "PRIV".to_string(),
+            payload: vec![1, 2, 3],
+            ordinal: 0,
+        };
+        assert_eq!(bt.payload.len(), 3);
+        let row = super::BinaryTagRow {
+            rowid: 7,
+            key: "PRIV".to_string(),
+            byte_len: 3,
+        };
+        assert_eq!(row.rowid, 7);
+        let sb = super::StructuralBlock {
+            kind: "STREAMINFO".to_string(),
+            ordinal: 0,
+            body: vec![0u8; 34],
+        };
+        assert_eq!(sb.body.len(), 34);
+    }
+}
+
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
@@ -145,4 +170,35 @@ pub struct TrackArt {
     pub picture_type: i64,
     pub description: String,
     pub ordinal: i64,
+}
+
+/// A binary tag payload to write (e.g. an opaque ID3 `PRIV` frame body). `key` is
+/// the format-private identifier (ID3 frame id, `APPLICATION`/`CUESHEET`,
+/// `----:<mean>:<name>`); `payload` is the post-header frame/block body.
+#[cfg_attr(feature = "mutants", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryTag {
+    pub key: String,
+    pub payload: Vec<u8>,
+    pub ordinal: i64,
+}
+
+/// A binary tag row read back for synthesis: the streaming handle (`rowid`), the
+/// key, and the payload length — the bytes themselves stream at read time.
+#[cfg_attr(feature = "mutants", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryTagRow {
+    pub rowid: i64,
+    pub key: String,
+    pub byte_len: i64,
+}
+
+/// A read-only structural metadata block derived from the backing file
+/// (FLAC `STREAMINFO`/`SEEKTABLE`). Stored outside the editable `tags` contract.
+#[cfg_attr(feature = "mutants", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralBlock {
+    pub kind: String,
+    pub ordinal: i64,
+    pub body: Vec<u8>,
 }
