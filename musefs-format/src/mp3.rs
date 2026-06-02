@@ -228,7 +228,7 @@ fn is_promoted_key(key: &str) -> bool {
 /// streamed as `ArtImage` segments. Returns the segments (no backing audio) and
 /// the total tag length (`10 + frames_len`). Shared by MP3 synthesis and the WAV
 /// `id3 ` chunk.
-pub(crate) fn build_id3v2_segments(
+pub fn build_id3v2_segments(
     tags: &[TagInput],
     binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],

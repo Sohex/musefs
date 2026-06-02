@@ -23,4 +23,6 @@ pub use probe::Extent;
 // indirectly by the per-format fuzz targets (which pass arbitrary tag keys through
 // synthesize_layout), so no dedicated tagmap fuzz target is needed.
 #[cfg(feature = "fuzzing")]
+pub use mp3::build_id3v2_segments;
+#[cfg(feature = "fuzzing")]
 pub use vorbiscomment::parse as parse_vorbis_comment;

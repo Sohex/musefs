@@ -1201,8 +1201,7 @@ mod binary_tag_serve_tests {
 
         let cache = crate::reader::HeaderCache::new(crate::Mode::Synthesis);
         let resolved = cache.resolve(&db, tid).unwrap();
-        let whole =
-            crate::reader::read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+        let whole = crate::reader::read_at(&resolved, &db, 0, resolved.total_len).unwrap();
         assert!(
             whole.windows(needle.len()).any(|w| w == needle),
             "PRIV body not in synthesized file"

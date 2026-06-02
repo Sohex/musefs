@@ -158,4 +158,37 @@ mod tests {
         let rowid = db.get_binary_tags(tid).unwrap()[0].rowid;
         assert_eq!(inputs[0].payload_id, rowid);
     }
+
+    #[test]
+    fn binary_rows_do_not_pollute_tags_to_fields() {
+        let db = Db::open_in_memory().unwrap();
+        let tid = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.mp3".into(),
+                format: Format::Mp3,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.replace_tags(tid, &[Tag::new("artist", "A", 0)]).unwrap();
+        db.set_binary_tags(
+            tid,
+            &[BinaryTag {
+                key: "PRIV".into(),
+                payload: vec![1, 2, 3],
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+
+        let tags = db.get_tags(tid).unwrap();
+        let fields = super::tags_to_fields(&tags);
+        assert_eq!(fields.get("artist").map(String::as_str), Some("A"));
+        assert!(
+            !fields.contains_key("priv"),
+            "binary PRIV leaked into fields: {fields:?}"
+        );
+    }
 }
