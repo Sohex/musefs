@@ -1,4 +1,4 @@
-use crate::models::{NewArt, NewTrack, Tag, TrackArt};
+use crate::models::{BinaryTag, NewArt, NewTrack, Tag, TrackArt};
 use crate::{Db, Result};
 use rusqlite::{params, Transaction};
 use sha2::{Digest, Sha256};
@@ -75,6 +75,21 @@ impl BulkWriter<'_> {
         )?;
         for t in tags {
             stmt.execute(params![track_id, t.key, t.value, t.ordinal])?;
+        }
+        Ok(())
+    }
+
+    pub fn set_binary_tags(&mut self, track_id: i64, tags: &[BinaryTag]) -> Result<()> {
+        self.tx.execute(
+            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL",
+            params![track_id],
+        )?;
+        let mut stmt = self.tx.prepare(
+            "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
+             VALUES (?1, ?2, '', ?3, ?4)",
+        )?;
+        for t in tags {
+            stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
         }
         Ok(())
     }
@@ -262,6 +277,44 @@ mod tests {
             1,
             "bulk replace_tags wiped binary rows"
         );
+        assert_eq!(
+            db.get_tags(tid).unwrap(),
+            vec![crate::Tag::new("artist", "A", 0)]
+        );
+    }
+
+    #[test]
+    fn bulk_set_binary_tags_round_trips_and_scopes_to_binary_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let tid = db
+            .upsert_track(&crate::NewTrack {
+                backing_path: "/a.mp3".into(),
+                format: crate::Format::Mp3,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            bw.replace_tags(tid, &[crate::Tag::new("artist", "A", 0)])
+                .unwrap();
+            bw.set_binary_tags(
+                tid,
+                &[crate::BinaryTag {
+                    key: "PRIV".into(),
+                    payload: vec![7, 7, 7],
+                    ordinal: 0,
+                }],
+            )
+            .unwrap();
+            bw.commit().unwrap();
+        }
+        let rows = db.get_binary_tags(tid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, "PRIV");
+        assert_eq!(rows[0].byte_len, 3);
         assert_eq!(
             db.get_tags(tid).unwrap(),
             vec![crate::Tag::new("artist", "A", 0)]
