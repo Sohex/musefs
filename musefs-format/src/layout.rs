@@ -142,4 +142,28 @@ mod tests {
         }]);
         assert!(matches!(err, Err(LayoutError::EmptySegment)));
     }
+
+    #[test]
+    fn has_binary_tag_detects_binary_segment() {
+        let with = RegionLayout::new(vec![
+            Segment::BinaryTag {
+                payload_id: 1,
+                len: 3,
+            },
+            Segment::BackingAudio { offset: 0, len: 8 },
+        ]);
+        assert!(
+            with.has_binary_tag(),
+            "layout with a BinaryTag must report true"
+        );
+
+        let without = RegionLayout::new(vec![
+            Segment::Inline(vec![1, 2, 3]),
+            Segment::BackingAudio { offset: 0, len: 8 },
+        ]);
+        assert!(
+            !without.has_binary_tag(),
+            "layout with no BinaryTag must report false"
+        );
+    }
 }

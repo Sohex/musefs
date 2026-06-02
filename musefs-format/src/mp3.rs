@@ -1782,6 +1782,162 @@ mod tests {
         out
     }
 
+    /// Like `build_v24_tag` but emits an ID3v2.3 tag: frame sizes are plain
+    /// 32-bit big-endian (not synchsafe). Exercises the `data[3] == 3` size-decode
+    /// branch of `read_binary_tags`, which no v2.4 fixture can reach.
+    fn build_v23_tag(frames: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let total_body: usize = frames.iter().map(|(_, b)| 10 + b.len()).sum();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ID3");
+        out.extend_from_slice(&[0x03, 0x00, 0x00]); // v2.3.0, no flags
+        out.extend_from_slice(&ss(total_body as u32)); // tag size is synchsafe in every version
+        for (id, body) in frames {
+            out.extend_from_slice(*id);
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes()); // v2.3: plain u32 frame size
+            out.extend_from_slice(&[0x00, 0x00]); // frame flags
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    // Documented EQUIVALENT mutant (no test can kill it):
+    //  * classify_binary_frame counter fold `(a << 8) | b` -> `(a << 8) ^ b`.
+    //    The accumulator is left-shifted by 8 before each combine, so its low
+    //    byte is always zero where `b` lands; OR and XOR are bit-for-bit identical
+    //    for every input. Confirmed by hand; left as-is.
+
+    #[test]
+    fn read_binary_tags_v23_plain_u32_frame_size() {
+        // A v2.3 PRIV frame whose body is >= 128 bytes so the plain-u32 size
+        // decode (data[3] == 3 branch) differs from a synchsafe decode of the same
+        // bytes. Non-zero, distinct bytes so a wrong size-byte offset misaligns.
+        let body: Vec<u8> = (0..200u32).map(|i| (i % 250 + 1) as u8).collect();
+        let tag = build_v23_tag(&[(b"PRIV", &body)]);
+        let (opaque, _promoted) = super::read_binary_tags(&tag);
+        let p = opaque
+            .iter()
+            .find(|e| e.key == "PRIV")
+            .expect("v2.3 PRIV preserved");
+        assert_eq!(
+            p.payload, body,
+            "v2.3 plain-u32 frame body must survive byte-exact"
+        );
+    }
+
+    #[test]
+    fn read_binary_tags_skips_unsafe_tag() {
+        // A well-formed v2.4 PRIV tag with the unsynchronisation flag forced on:
+        // id3v2_alloc_safe rejects it, so read_binary_tags must yield nothing. The
+        // major version stays >= 3, so the `!alloc_safe || major<3` guard hinges on
+        // the `||` (an `&&` mutant would parse the rejected tag).
+        let mut tag = build_v24_tag(&[(b"PRIV", &[1, 2, 3])]);
+        tag[5] = 0x80; // unsynchronisation flag
+        let (opaque, promoted) = super::read_binary_tags(&tag);
+        assert!(
+            opaque.is_empty() && promoted.is_empty(),
+            "an alloc-unsafe tag must yield no binary frames"
+        );
+    }
+
+    #[test]
+    fn read_binary_tags_skips_text_comm_uslt_apic() {
+        // T***/COMM/USLT/APIC are handled by read_tags/read_pictures and must NOT
+        // be captured as opaque binary frames; only PRIV is.
+        let tag = build_v24_tag(&[
+            (b"TIT2", &[0x00, b'x']),
+            (b"COMM", &[0x00]),
+            (b"USLT", &[0x00]),
+            (b"APIC", &[0x00]),
+            (b"PRIV", &[9, 9, 9]),
+        ]);
+        let (opaque, _promoted) = super::read_binary_tags(&tag);
+        let keys: Vec<&str> = opaque.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["PRIV"],
+            "only PRIV is opaque; T***/COMM/USLT/APIC are handled elsewhere: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn read_binary_tags_decodes_popm_counter_big_endian_and_zero() {
+        // Multi-byte counter must decode big-endian (0x0102 == 258), pinning the
+        // `<< 8` shift in the fold.
+        let tag = build_v24_tag(&[(b"POPM", &[0x00, 200, 0x01, 0x02])]);
+        let (_opaque, promoted) = super::read_binary_tags(&tag);
+        assert!(
+            promoted.contains(&("rating".to_string(), "200".to_string())),
+            "rating: {promoted:?}"
+        );
+        assert!(
+            promoted.contains(&("playcount".to_string(), "258".to_string())),
+            "counter must decode big-endian: {promoted:?}"
+        );
+
+        // A zero counter must NOT promote a playcount (pins `c > 0`).
+        let tag0 = build_v24_tag(&[(b"POPM", &[0x00, 128, 0x00])]);
+        let (_o0, promoted0) = super::read_binary_tags(&tag0);
+        assert!(
+            promoted0.contains(&("rating".to_string(), "128".to_string())),
+            "rating: {promoted0:?}"
+        );
+        assert!(
+            !promoted0.iter().any(|(k, _)| k == "playcount"),
+            "a zero POPM counter must not promote playcount: {promoted0:?}"
+        );
+    }
+
+    #[test]
+    fn popm_frame_data_emits_counter_only_when_positive() {
+        // playcount == 0: owner-nul + rating, no counter.
+        assert_eq!(
+            super::popm_frame_data(200, 0),
+            vec![0x00, 200],
+            "playcount 0 must omit the counter"
+        );
+        // playcount > 0: 4-byte big-endian counter appended.
+        assert_eq!(
+            super::popm_frame_data(200, 5),
+            vec![0x00, 200, 0x00, 0x00, 0x00, 0x05],
+            "playcount > 0 must append a 4-byte counter"
+        );
+    }
+
+    #[test]
+    fn build_id3v2_segments_accounts_playcount_and_opaque_len() {
+        use crate::{BinaryTagInput, TagInput};
+
+        // playcount text tag must rebuild into the POPM counter (pins the
+        // `"playcount"` match arm).
+        let tags = vec![
+            TagInput::new("rating", "100"),
+            TagInput::new("playcount", "42"),
+        ];
+        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
+        let inline: Vec<u8> = segments
+            .iter()
+            .flat_map(|s| match s {
+                Segment::Inline(b) => b.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let (_opaque, promoted) = super::read_binary_tags(&inline);
+        assert!(
+            promoted.contains(&("playcount".to_string(), "42".to_string())),
+            "playcount must rebuild into the POPM counter: {promoted:?}"
+        );
+
+        // Opaque-frame length accounting: total == ID3 header (10) + frame header
+        // (10) + body. Pins `frames_len += 10 + bt.len`.
+        let bin = vec![BinaryTagInput {
+            key: "PRIV".into(),
+            payload_id: 1,
+            len: 7,
+        }];
+        let (_segs, total) = build_id3v2_segments(&[], &bin, &[]).unwrap();
+        assert_eq!(total, 10 + 10 + 7, "opaque binary frame length accounting");
+    }
+
     #[test]
     fn read_binary_tags_promotes_popm_and_mbid_and_passes_through_priv() {
         use id3::frame::{Content, Popularimeter, UniqueFileIdentifier, Unknown};

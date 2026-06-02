@@ -1318,6 +1318,80 @@ mod hardening_tests {
             "playcount not promoted; got: {texts:?}"
         );
     }
+
+    /// Probed carrying a valid, an empty, and an oversize binary tag. Only the
+    /// valid one is stored: the filter drops empty (`EmptySegment` would fail
+    /// layout validation) and oversize (`> MAX_BINARY_TAG_BYTES`) payloads, with
+    /// gap-free ordinals.
+    fn probed_with_mixed_binary_tags() -> Probed {
+        Probed {
+            format: musefs_db::Format::Mp3,
+            audio_offset: 0,
+            audio_length: 0,
+            tags: Vec::new(),
+            pictures: Vec::new(),
+            binary_tags: vec![
+                EmbeddedBinaryTag {
+                    key: "PRIV".into(),
+                    payload: vec![1, 2, 3],
+                },
+                EmbeddedBinaryTag {
+                    key: "GEOB".into(),
+                    payload: Vec::new(),
+                },
+                EmbeddedBinaryTag {
+                    key: "SYLT".into(),
+                    payload: vec![0u8; MAX_BINARY_TAG_BYTES + 1],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn ingest_filters_empty_and_oversize_binary_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.mp3");
+        std::fs::write(&path, b"x").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let db = Db::open_in_memory().unwrap();
+
+        ingest(
+            &db,
+            &path.to_string_lossy(),
+            &meta,
+            probed_with_mixed_binary_tags(),
+        )
+        .unwrap();
+
+        let tid = db.list_tracks().unwrap()[0].id;
+        let rows = db.get_binary_tags(tid).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the valid binary tag survives: {rows:?}"
+        );
+        assert_eq!(rows[0].key, "PRIV");
+        assert_eq!(rows[0].byte_len, 3);
+    }
+
+    #[test]
+    fn ingest_bulk_filters_empty_and_oversize_binary_tags() {
+        let db = Db::open_in_memory().unwrap();
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            ingest_bulk(&mut bw, "/a.mp3", 1, 0, &probed_with_mixed_binary_tags()).unwrap();
+            bw.commit().unwrap();
+        }
+        let tid = db.list_tracks().unwrap()[0].id;
+        let rows = db.get_binary_tags(tid).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the valid binary tag survives: {rows:?}"
+        );
+        assert_eq!(rows[0].key, "PRIV");
+        assert_eq!(rows[0].byte_len, 3);
+    }
 }
 
 #[cfg(test)]
