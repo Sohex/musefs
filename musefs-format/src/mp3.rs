@@ -1,5 +1,5 @@
 use crate::error::{FormatError, Result};
-use crate::input::{ArtInput, EmbeddedPicture, TagInput};
+use crate::input::{ArtInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 use crate::probe::Extent;
 
@@ -490,6 +490,107 @@ pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+pub(crate) const MUSICBRAINZ_UFID_OWNER: &str = "http://musicbrainz.org";
+
+/// Extract an ID3v2.3/2.4 tag's binary frames. Returns `(opaque, promoted)`:
+/// - `opaque`: frames preserved **byte-exact** — `(frame-id, raw post-header body)`.
+///   `PRIV`/`GEOB`/`SYLT`/`MCDI`/unknown frames and any non-MusicBrainz `UFID`.
+/// - `promoted`: `(key, value)` text pairs — `POPM` → `rating` (raw 0–255) + `playcount`
+///   (counter, omitted when 0); MusicBrainz `UFID` → `musicbrainz_trackid`. Promoted
+///   frames are NOT in `opaque`.
+///
+/// Text (`T***`), `COMM`, `USLT`, `APIC` are handled by `read_tags`/`read_pictures`
+/// and skipped. Gated by `id3v2_alloc_safe`, so the tag is well-formed, has no
+/// unsynchronisation/extended header/frame flags, and bodies are sliced verbatim.
+/// v2.2 (3-char ids) is not processed (rare; text/art still parse via the crate).
+pub fn read_binary_tags(data: &[u8]) -> (Vec<EmbeddedBinaryTag>, Vec<(String, String)>) {
+    let mut opaque = Vec::new();
+    let mut promoted = Vec::new();
+    if !id3v2_alloc_safe(data) || data[3] < 3 {
+        return (opaque, promoted);
+    }
+    let tag_end = 10 + synchsafe_decode(&data[6..10]) as usize;
+    let mut pos = 10usize;
+    while pos + 10 <= tag_end {
+        if data[pos] == 0 {
+            break;
+        }
+        let id = &data[pos..pos + 4];
+        let size = if data[3] == 3 {
+            u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                as usize
+        } else {
+            synchsafe_decode(&data[pos + 4..pos + 8]) as usize
+        };
+        let body_start = pos + 10;
+        if body_start + size > tag_end {
+            break;
+        }
+        classify_binary_frame(
+            id,
+            &data[body_start..body_start + size],
+            &mut opaque,
+            &mut promoted,
+        );
+        pos = body_start + size;
+    }
+    (opaque, promoted)
+}
+
+/// Classify one ID3v2 frame body into opaque-passthrough or promoted-text.
+fn classify_binary_frame(
+    id: &[u8],
+    body: &[u8],
+    opaque: &mut Vec<EmbeddedBinaryTag>,
+    promoted: &mut Vec<(String, String)>,
+) {
+    // Handled by read_tags/read_pictures: text frames (T***), COMM, USLT, APIC.
+    if id[0] == b'T' || id == b"COMM" || id == b"USLT" || id == b"APIC" {
+        return;
+    }
+    match id {
+        b"POPM" => {
+            // <owner>\0<rating:u8>[<counter: big-endian>]
+            if let Some(nul) = body.iter().position(|&b| b == 0) {
+                if let Some((&rating, counter)) = body[nul + 1..].split_first() {
+                    promoted.push(("rating".to_string(), rating.to_string()));
+                    let c = counter
+                        .iter()
+                        .take(8)
+                        .fold(0u64, |a, &b| (a << 8) | b as u64);
+                    if c > 0 {
+                        promoted.push(("playcount".to_string(), c.to_string()));
+                    }
+                }
+            }
+        }
+        b"UFID" => {
+            // <owner>\0<identifier>. MusicBrainz owner promotes; others opaque.
+            match body.iter().position(|&b| b == 0) {
+                Some(nul) if &body[..nul] == MUSICBRAINZ_UFID_OWNER.as_bytes() => {
+                    promoted.push((
+                        "musicbrainz_trackid".to_string(),
+                        String::from_utf8_lossy(&body[nul + 1..]).into_owned(),
+                    ));
+                }
+                _ => opaque.push(EmbeddedBinaryTag {
+                    key: "UFID".to_string(),
+                    payload: body.to_vec(),
+                }),
+            }
+        }
+        _ => {
+            // Opaque verbatim: PRIV, GEOB, SYLT, MCDI, W***, unknown, … (4-byte ids).
+            if id.iter().all(u8::is_ascii_graphic) {
+                opaque.push(EmbeddedBinaryTag {
+                    key: String::from_utf8_lossy(id).into_owned(),
+                    payload: body.to_vec(),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1572,5 +1673,98 @@ mod tests {
                 panic!("expected Complete (no room, no trim), got {other:?}")
             }
         }
+    }
+
+    /// Build a minimal ID3v2.4 tag containing the given frames, with header
+    /// flags=0 (no unsync, no extended header) and per-frame flags=0 so
+    /// `id3v2_alloc_safe` accepts it. Used by `read_binary_tags` tests that
+    /// need a tag without going through the `id3` crate's encoder (which would
+    /// re-encode `Unknown` bodies and defeat the byte-exact property).
+    fn build_v24_tag(frames: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let total_body: usize = frames.iter().map(|(_, b)| 10 + b.len()).sum();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ID3");
+        out.extend_from_slice(&[0x04, 0x00, 0x00]); // v2.4.0, no flags
+        out.extend_from_slice(&ss(total_body as u32));
+        for (id, body) in frames {
+            out.extend_from_slice(*id);
+            out.extend_from_slice(&ss(body.len() as u32));
+            out.extend_from_slice(&[0x00, 0x00]); // frame flags
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    #[test]
+    fn read_binary_tags_promotes_popm_and_mbid_and_passes_through_priv() {
+        use id3::frame::{Content, Popularimeter, UniqueFileIdentifier, Unknown};
+        use id3::{Encoder, Frame, Tag, TagLike, Version};
+
+        let mut tag = Tag::new();
+        tag.add_frame(Popularimeter {
+            user: "a@b.c".into(),
+            rating: 200,
+            counter: 7,
+        });
+        tag.add_frame(UniqueFileIdentifier {
+            owner_identifier: "http://musicbrainz.org".into(),
+            identifier: b"mbid-123".to_vec(),
+        });
+        tag.add_frame(UniqueFileIdentifier {
+            owner_identifier: "http://other.example".into(),
+            identifier: b"other".to_vec(),
+        });
+        tag.add_frame(Frame::with_content(
+            "PRIV",
+            Content::Unknown(Unknown {
+                data: vec![9, 8, 7],
+                version: Version::Id3v24,
+            }),
+        ));
+        let mut buf = Vec::new();
+        Encoder::new()
+            .version(Version::Id3v24)
+            .encode(&tag, &mut buf)
+            .unwrap();
+
+        let (opaque, promoted) = super::read_binary_tags(&buf);
+        assert!(promoted.contains(&("rating".to_string(), "200".to_string())));
+        assert!(promoted.contains(&("playcount".to_string(), "7".to_string())));
+        assert!(promoted.contains(&("musicbrainz_trackid".to_string(), "mbid-123".to_string())));
+        let keys: Vec<&str> = opaque.iter().map(|e| e.key.as_str()).collect();
+        assert!(keys.contains(&"PRIV"));
+        // Non-MusicBrainz UFID is opaque (raw body, owner + identifier); exactly one UFID.
+        assert_eq!(keys.iter().filter(|k| **k == "UFID").count(), 1);
+        assert_eq!(
+            opaque.iter().find(|e| e.key == "PRIV").unwrap().payload,
+            vec![9, 8, 7]
+        );
+    }
+
+    #[test]
+    fn read_binary_tags_preserves_geob_body_byte_exact() {
+        // A GEOB body with a Latin1 (encoding 0x00) description — the exact case
+        // the crate's to_unknown() would re-encode to UTF-8. Build a minimal v2.4
+        // tag by hand so the bytes on the wire are guaranteed to match the
+        // asserted body.
+        let geob_body: Vec<u8> = {
+            let mut b = vec![0x00]; // text encoding: ISO-8859-1
+            b.extend_from_slice(b"application/octet-stream\0"); // mime
+            b.extend_from_slice(b"Serato Overview\0"); // filename (latin1)
+            b.extend_from_slice(b"\0"); // description (empty, terminator only)
+            b.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // object data
+            b
+        };
+        let tag = build_v24_tag(&[(b"GEOB", &geob_body)]);
+
+        let (opaque, _promoted) = super::read_binary_tags(&tag);
+        let geob = opaque
+            .iter()
+            .find(|e| e.key == "GEOB")
+            .expect("GEOB preserved");
+        assert_eq!(
+            geob.payload, geob_body,
+            "GEOB body must survive byte-identical"
+        );
     }
 }
