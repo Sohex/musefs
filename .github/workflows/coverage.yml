@@ -2,13 +2,7 @@ name: coverage
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
 
 concurrency:
   group: coverage-${{ github.ref }}
@@ -21,7 +15,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Cheap gate: skip the coverage run on a docs-only change (issue #75) while
+  # still reporting the always-on `coverage-ok` required check. See ci.yml's
+  # `changes` job for the rationale.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) base="$BASE_SHA" ;;
+            *)            base="$BEFORE_SHA" ;;
+          esac
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "No usable base ref; treating as a source change."
+            echo "src=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$base...HEAD")"
+          echo "Changed files:"; echo "$changed"
+          if [ -z "$changed" ]; then
+            echo "src=false" >> "$GITHUB_OUTPUT"
+          elif printf '%s\n' "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
+            echo "src=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "src=false" >> "$GITHUB_OUTPUT"
+          fi
+
   coverage:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -51,3 +85,23 @@ jobs:
           files: lcov.info
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Single required status check for branch protection; see ci.yml's `ci-ok`.
+  coverage-ok:
+    if: always()
+    needs: [changes, coverage]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate required-job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "Needed job results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::The coverage job did not pass (result: $r)."
+              exit 1
+            fi
+          done
+          echo "Coverage passed or was skipped."

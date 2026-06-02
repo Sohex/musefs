@@ -3,13 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -19,7 +13,54 @@ permissions:
   contents: read
 
 jobs:
+  # Cheap gate: decide whether anything other than docs/markdown changed. The
+  # heavy jobs below skip on a docs-only change (issue #75), but the workflow
+  # itself still runs so the always-on `ci-ok` aggregator can report the single
+  # required status check (a workflow-level `paths-ignore` would never report it
+  # and would deadlock branch protection on docs-only PRs).
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          # Full history so the three-dot merge base is present (same reason as
+          # mutants.yml); a shallow clone often lacks it and the diff then fails.
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) base="$BASE_SHA" ;;
+            *)            base="$BEFORE_SHA" ;;
+          esac
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "No usable base ref; treating as a source change."
+            echo "src=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$base...HEAD")"
+          echo "Changed files:"; echo "$changed"
+          # src unless EVERY changed path is docs/** or **/*.md (mirror of the
+          # paths-ignore globs). grep -v prints the non-doc paths; -q exits 0 if
+          # any exists.
+          if [ -z "$changed" ]; then
+            echo "src=false" >> "$GITHUB_OUTPUT"
+          elif printf '%s\n' "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
+            echo "src=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "src=false" >> "$GITHUB_OUTPUT"
+          fi
+
   check:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -48,6 +89,8 @@ jobs:
     # Property 5: an independent ecosystem reader (mutagen) reads the tags we
     # synthesize. Emits synthesized files via reader::read_at (no FUSE mount),
     # then reads them back with mutagen. Builds only musefs-core, so no libfuse.
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -66,6 +109,8 @@ jobs:
         run: MUSEFS_INTEROP_DIR="$RUNNER_TEMP/interop" python -m pytest tests/interop -v
 
   beets:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -86,6 +131,8 @@ jobs:
         run: python -m pytest contrib/beets/tests -v
 
   picard:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -111,6 +158,8 @@ jobs:
         run: .venv/bin/python -m pytest contrib/picard/tests -v
 
   e2e:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -122,3 +171,26 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - name: FUSE end-to-end tests
         run: cargo test -p musefs-fuse -- --ignored
+
+  # Single required status check for branch protection. Always runs (even when
+  # the heavy jobs were skipped on a docs-only change) so the check is always
+  # reported; green when every needed job either succeeded or was skipped, red
+  # if any failed or was cancelled.
+  ci-ok:
+    if: always()
+    needs: [changes, check, interop, beets, picard, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate required-job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "Needed job results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::A required CI job did not pass (result: $r)."
+              exit 1
+            fi
+          done
+          echo "All required CI jobs passed or were skipped."
