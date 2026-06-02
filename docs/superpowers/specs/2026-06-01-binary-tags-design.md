@@ -174,14 +174,17 @@ rowid as an opaque streaming handle.
   exactly like `ArtImage`), so the LRU budget stays correct automatically.
 
 **`payload_id` (rowid) validity invariant.** A `payload_id` is valid **only within
-the lifetime of the `ResolvedFile` that captured it.** `replace_tags` (`tags.rs:5`)
-is `DELETE` + `INSERT`, so rowids churn on every re-tag — but that same write bumps
-`content_version`, which invalidates the cached `ResolvedFile` and forces a
-re-resolve that reads fresh rowids before any stale one is used. An implementer must
+the lifetime of the `ResolvedFile` that captured it.** Binary rowids churn whenever
+`set_binary_tags` runs — it is `DELETE … WHERE value_blob IS NOT NULL` + `INSERT`
+(text edits via `replace_tags` are scoped to `value_blob IS NULL` and leave binary
+rows, hence their rowids, untouched). Crucially, **any** `tags` write — text or
+binary — fires the `content_version` trigger, which invalidates the cached
+`ResolvedFile` and forces a re-resolve that reads fresh rowids before any stale one
+is used. So even a pure text edit re-reads binary `payload_id`s. An implementer must
 **not** cache a `BinaryTagInput`/`payload_id` across a refresh; it is always obtained
 fresh during `resolve`. This is the binary-tag analogue of how `ArtImage`'s `art_id`
 stays valid (art rows are content-addressed and not deleted on re-tag; binary rows
-are, hence the explicit invariant).
+are deleted by `set_binary_tags`, hence the explicit invariant).
 
 **Open-handle gap (Phase-2 obligation).** The `content_version` argument above
 covers the *cache* path, but **not** open FUSE handles: a `Handle` keeps its own
