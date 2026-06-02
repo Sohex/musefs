@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use common::{flac_block, make_flac, resolve_layout, streaminfo_body, vorbis_comment_body};
+use musefs_format::flac::MetadataBlock;
 use musefs_format::flac::{locate_audio, synthesize_layout};
-use musefs_format::{ArtInput, TagInput};
+use musefs_format::{ArtInput, BinaryTagInput, Segment, TagInput};
 
 #[test]
 fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
@@ -49,7 +50,15 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
         },
     ];
 
-    let layout = synthesize_layout(&scan, &tags, &arts).unwrap();
+    let layout = synthesize_layout(
+        &scan.preserved,
+        scan.audio_offset,
+        scan.audio_length,
+        &tags,
+        &[],
+        &arts,
+    )
+    .unwrap();
 
     let mut art_map = HashMap::new();
     art_map.insert(1i64, front.clone());
@@ -88,4 +97,121 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
     let _ = flac_block(3, &seektable, false); // documents intent; body equality checked via scan below
     assert_eq!(scan.preserved[1].block_type, 3);
     assert_eq!(scan.preserved[1].body, seektable);
+}
+
+#[test]
+fn application_block_streams_and_metaflac_reads_it() {
+    let si = streaminfo_body();
+    let app_body = b"testAPPDATA".to_vec(); // 4-byte app id "test" + payload "APPDATA"
+    let audio = vec![0xABu8; 48];
+
+    let structural = vec![MetadataBlock {
+        block_type: 0,
+        body: si,
+    }];
+    let binary = vec![BinaryTagInput {
+        key: "APPLICATION".into(),
+        payload_id: 100,
+        len: app_body.len() as u64,
+    }];
+    let layout = synthesize_layout(
+        &structural,
+        0,
+        audio.len() as u64,
+        &[TagInput::new("title", "T")],
+        &binary,
+        &[],
+    )
+    .unwrap();
+
+    let bt = layout
+        .segments()
+        .iter()
+        .filter(|s| matches!(s, Segment::BinaryTag { .. }))
+        .count();
+    assert_eq!(bt, 1);
+
+    let mut bt_map = std::collections::HashMap::new();
+    bt_map.insert(100i64, app_body.clone());
+    let assembled = resolve_layout(&layout, &audio, &HashMap::new(), &bt_map);
+
+    let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
+    let (id, data) = tag
+        .blocks()
+        .find_map(|b| match b {
+            metaflac::Block::Application(a) => Some((a.id.clone(), a.data.clone())),
+            _ => None,
+        })
+        .expect("application block present");
+    assert_eq!(&id, b"test");
+    assert_eq!(data, b"APPDATA");
+}
+
+#[test]
+fn application_and_cuesheet_framing_is_valid_and_last_block_correct() {
+    let si = streaminfo_body();
+    let app_body = b"testAPP1".to_vec();
+    let cue_body = vec![0x11u8; 40];
+    let audio = vec![0xCDu8; 32];
+
+    let structural = vec![MetadataBlock {
+        block_type: 0,
+        body: si,
+    }];
+    let binary = vec![
+        BinaryTagInput {
+            key: "APPLICATION".into(),
+            payload_id: 1,
+            len: app_body.len() as u64,
+        },
+        BinaryTagInput {
+            key: "CUESHEET".into(),
+            payload_id: 2,
+            len: cue_body.len() as u64,
+        },
+    ];
+    let layout = synthesize_layout(
+        &structural,
+        0,
+        audio.len() as u64,
+        &[TagInput::new("title", "T")],
+        &binary,
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(
+        layout
+            .segments()
+            .iter()
+            .filter(|s| matches!(s, Segment::BinaryTag { .. }))
+            .count(),
+        2
+    );
+
+    let mut bt_map = std::collections::HashMap::new();
+    bt_map.insert(1i64, app_body);
+    bt_map.insert(2i64, cue_body);
+    let assembled = resolve_layout(&layout, &audio, &HashMap::new(), &bt_map);
+
+    let rescan = locate_audio(&assembled).expect("synthesized FLAC must parse");
+    assert_eq!(rescan.audio_offset, layout.header_len());
+}
+
+#[test]
+fn binary_tag_over_24bit_limit_errors() {
+    use musefs_format::FormatError;
+    let structural = vec![MetadataBlock {
+        block_type: 0,
+        body: streaminfo_body(),
+    }];
+    let binary = vec![BinaryTagInput {
+        key: "APPLICATION".into(),
+        payload_id: 1,
+        len: 0x0100_0000,
+    }];
+    assert_eq!(
+        synthesize_layout(&structural, 0, 0, &[], &binary, &[]),
+        Err(FormatError::TooLarge)
+    );
 }

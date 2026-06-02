@@ -23,7 +23,15 @@ fn measured_lengths_match_assembled_bytes() {
         TagInput::new("title", "New Title"),
         TagInput::new("artist", "A"),
     ];
-    let layout = synthesize_layout(&scan, &tags, &[]).unwrap();
+    let layout = synthesize_layout(
+        &scan.preserved,
+        scan.audio_offset,
+        scan.audio_length,
+        &tags,
+        &[],
+        &[],
+    )
+    .unwrap();
 
     let assembled = resolve_layout(&layout, &file, &HashMap::new(), &HashMap::new());
     assert_eq!(assembled.len() as u64, layout.total_len());
@@ -44,7 +52,15 @@ fn metaflac_reads_synthesized_vorbis_comments_and_preserves_streaminfo() {
         TagInput::new("artist", "First"),
         TagInput::new("artist", "Second"),
     ];
-    let layout = synthesize_layout(&scan, &tags, &[]).unwrap();
+    let layout = synthesize_layout(
+        &scan.preserved,
+        scan.audio_offset,
+        scan.audio_length,
+        &tags,
+        &[],
+        &[],
+    )
+    .unwrap();
     let assembled = resolve_layout(&layout, &file, &HashMap::new(), &HashMap::new());
 
     let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");
@@ -68,7 +84,15 @@ fn metaflac_reads_synthesized_vorbis_comments_and_preserves_streaminfo() {
 fn vorbis_comment_block_is_the_last_metadata_block_when_no_art() {
     let (file, _audio) = fixture();
     let scan = locate_audio(&file).unwrap();
-    let layout = synthesize_layout(&scan, &[TagInput::new("title", "X")], &[]).unwrap();
+    let layout = synthesize_layout(
+        &scan.preserved,
+        scan.audio_offset,
+        scan.audio_length,
+        &[TagInput::new("title", "X")],
+        &[],
+        &[],
+    )
+    .unwrap();
 
     assert_eq!(layout.segments.len(), 2);
     assert!(matches!(layout.segments[0], Segment::Inline(_)));
