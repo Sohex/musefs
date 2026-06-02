@@ -3,6 +3,7 @@ mod bulk;
 mod error;
 mod models;
 mod schema;
+mod structural;
 mod tags;
 mod tracks;
 
