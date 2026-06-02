@@ -82,6 +82,20 @@ impl Db {
         )?)
     }
 
+    /// Begin a deferred (read) transaction: subsequent reads on this connection see
+    /// a single consistent snapshot until `end_read`. Used to make a binary-tag
+    /// read's content_version check and its blob reads mutually consistent.
+    pub fn begin_read(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        Ok(())
+    }
+
+    /// End the read transaction opened by `begin_read` (rollback — it is read-only).
+    pub fn end_read(&self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
     fn query_optional_track(&self, sql: &str, p: impl rusqlite::Params) -> Result<Option<Track>> {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query(p)?;
@@ -188,5 +202,45 @@ mod render_key_tests {
             Format::Mp3,
             "set_format_for_test must actually UPDATE the format column"
         );
+    }
+
+    /// `begin_read`/`end_read` bracket a single WAL read snapshot on a connection,
+    /// so a write by another connection that bumps `content_version` (or reuses a
+    /// freed binary-tag rowid) is invisible until the snapshot ends. The
+    /// `read` fast path's BinaryTag guard depends on this consistency: it pins the
+    /// version + the blob reads to one snapshot so a reused rowid can't be served.
+    #[test]
+    fn begin_read_pins_a_single_wal_snapshot_against_external_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        let writer = Db::open(&path).unwrap();
+        let id = writer
+            .upsert_track(&new_track("/a.mp3", Format::Mp3))
+            .unwrap();
+        assert_eq!(writer.track_content_version(id).unwrap(), 0);
+
+        // The reader opens a second connection; the two share the WAL.
+        let reader = Db::open(&path).unwrap();
+        assert_eq!(reader.track_content_version(id).unwrap(), 0);
+
+        reader.begin_read().unwrap();
+        // Within the snapshot: the version is 0.
+        assert_eq!(reader.track_content_version(id).unwrap(), 0);
+
+        // An external write bumps the version. The reader's snapshot must NOT see it.
+        writer
+            .replace_tags(id, &[Tag::new("artist", "Alice", 0)])
+            .unwrap();
+        assert_eq!(
+            reader.track_content_version(id).unwrap(),
+            0,
+            "snapshot must pin to the pre-write content_version"
+        );
+        // Latest version (visible without the snapshot) is bumped.
+        assert_eq!(writer.track_content_version(id).unwrap(), 1);
+
+        reader.end_read().unwrap();
+        // After the snapshot ends, the reader sees the new version.
+        assert_eq!(reader.track_content_version(id).unwrap(), 1);
     }
 }

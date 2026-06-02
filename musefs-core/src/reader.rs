@@ -31,6 +31,10 @@ pub struct ResolvedFile {
     /// Approximate resident bytes this entry costs the cache (sum of `Inline`
     /// segment bytes; backing/art/ogg-audio bytes are not resident).
     pub cache_bytes: u64,
+    /// Precomputed from the layout: true if any segment streams an opaque binary
+    /// tag payload from the DB. Gates the transactional `content_version` guard in
+    /// the read fast path so plain Inline/BackingAudio layouts pay no per-read cost.
+    pub has_binary_tag: bool,
 }
 
 const CACHE_SHARDS: usize = 16;
@@ -338,6 +342,7 @@ impl HeaderCache {
                 _ => 0,
             })
             .sum::<u64>();
+        let has_binary_tag = layout.has_binary_tag();
         Ok(Arc::new(ResolvedFile {
             layout,
             total_len,
@@ -348,6 +353,7 @@ impl HeaderCache {
             mtime_secs: mtime_secs_val,
             last_page: Mutex::new(None),
             cache_bytes,
+            has_binary_tag,
         }))
     }
 }
@@ -531,6 +537,7 @@ mod ogg_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 8,
+            has_binary_tag: false,
         };
 
         // Read the whole virtual file; needs a Db only for ArtImage (unused here).
@@ -803,6 +810,7 @@ mod ogg_art_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
+            has_binary_tag: false,
         };
 
         // Full read.
@@ -847,6 +855,7 @@ mod ogg_art_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
+            has_binary_tag: false,
         };
         let got = read_at(&resolved, &db, 10, 50).unwrap();
         assert_eq!(got, image[10..60]);
@@ -869,6 +878,7 @@ mod cache_bound_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: inline_len as u64,
+            has_binary_tag: false,
         })
     }
 
@@ -1172,6 +1182,7 @@ mod binary_tag_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
+            has_binary_tag: true,
         };
         // No BackingAudio segment, so read_at opens no file.
         let got = read_at(&resolved, &db, 1, 2).unwrap();

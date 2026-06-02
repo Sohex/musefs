@@ -82,6 +82,15 @@ impl RegionLayout {
         &self.segments
     }
 
+    /// True if any segment streams an opaque binary tag payload from the DB. Used by
+    /// the reader to decide whether a read needs the transactional content_version
+    /// guard (plain Inline/BackingAudio layouts don't).
+    pub fn has_binary_tag(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| matches!(s, Segment::BinaryTag { .. }))
+    }
+
     /// Total size of the synthesized virtual file in bytes.
     pub fn total_len(&self) -> u64 {
         self.segments.iter().map(Segment::len).sum()

@@ -119,6 +119,7 @@ fn read_at_streams_art_image_segments() {
         mtime_secs: 0,
         last_page: std::sync::Mutex::new(None),
         cache_bytes: 0,
+        has_binary_tag: false,
     };
 
     // Whole read: inline framing then the streamed art bytes.
