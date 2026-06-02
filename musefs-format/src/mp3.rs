@@ -1808,18 +1808,31 @@ mod tests {
 
     #[test]
     fn read_binary_tags_v23_plain_u32_frame_size() {
-        // A v2.3 PRIV frame whose body is >= 128 bytes so the plain-u32 size
-        // decode (data[3] == 3 branch) differs from a synchsafe decode of the same
-        // bytes. Non-zero, distinct bytes so a wrong size-byte offset misaligns.
+        // Two v2.3 frames: a non-zero filler followed by a >=128-byte PRIV. The
+        // filler's trailing bytes sit just before the PRIV header, so every byte of
+        // the plain-u32 size field (data[pos+4..pos+8], the `data[3] == 3` branch)
+        // reads a distinct non-zero value — a wrong size-byte offset (e.g. `pos + 4`
+        // -> `pos - 4`) then decodes a bogus size and drops/corrupts the PRIV, and a
+        // synchsafe misdecode (the `== 3` branch flipped) truncates it. Both frames
+        // must survive byte-exact.
+        let filler = vec![0xAAu8; 8];
         let body: Vec<u8> = (0..200u32).map(|i| (i % 250 + 1) as u8).collect();
-        let tag = build_v23_tag(&[(b"PRIV", &body)]);
+        let tag = build_v23_tag(&[(b"GEOB", &filler), (b"PRIV", &body)]);
         let (opaque, _promoted) = super::read_binary_tags(&tag);
-        let p = opaque
+        let geob = opaque
+            .iter()
+            .find(|e| e.key == "GEOB")
+            .expect("v2.3 GEOB preserved");
+        assert_eq!(
+            geob.payload, filler,
+            "v2.3 first frame must survive byte-exact"
+        );
+        let priv_frame = opaque
             .iter()
             .find(|e| e.key == "PRIV")
             .expect("v2.3 PRIV preserved");
         assert_eq!(
-            p.payload, body,
+            priv_frame.payload, body,
             "v2.3 plain-u32 frame body must survive byte-exact"
         );
     }
