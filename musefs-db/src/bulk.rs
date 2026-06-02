@@ -66,8 +66,10 @@ impl BulkWriter<'_> {
     }
 
     pub fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> Result<()> {
-        self.tx
-            .execute("DELETE FROM tags WHERE track_id = ?1", params![track_id])?;
+        self.tx.execute(
+            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NULL",
+            params![track_id],
+        )?;
         let mut stmt = self.tx.prepare_cached(
             "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
         )?;
@@ -223,6 +225,47 @@ mod tests {
             .pragma_query_value(None, "temp_store", |r| r.get(0))
             .unwrap();
         assert_eq!(temp_store, 2);
+    }
+
+    #[test]
+    fn bulk_replace_tags_preserves_binary_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let tid = db
+            .upsert_track(&crate::NewTrack {
+                backing_path: "/a.mp3".into(),
+                format: crate::Format::Mp3,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.set_binary_tags(
+            tid,
+            &[crate::BinaryTag {
+                key: "PRIV".into(),
+                payload: vec![1, 2, 3],
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            bw.replace_tags(tid, &[crate::Tag::new("artist", "A", 0)])
+                .unwrap();
+            bw.commit().unwrap();
+        }
+
+        assert_eq!(
+            db.get_binary_tags(tid).unwrap().len(),
+            1,
+            "bulk replace_tags wiped binary rows"
+        );
+        assert_eq!(
+            db.get_tags(tid).unwrap(),
+            vec![crate::Tag::new("artist", "A", 0)]
+        );
     }
 
     #[test]
