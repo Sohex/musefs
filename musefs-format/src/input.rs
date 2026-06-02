@@ -54,6 +54,16 @@ pub struct BinaryTagInput {
     pub len: u64,
 }
 
+/// A binary tag frame extracted at scan time: the format-private identifier
+/// (`key` — an ID3 4-char frame id, a FLAC `APPLICATION`/`CUESHEET`, or an MP4
+/// `----:<mean>:<name>`) and the raw post-header body (`payload`). Unlike
+/// `BinaryTagInput`, this owns the bytes (scan ingests them into the DB).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedBinaryTag {
+    pub key: String,
+    pub payload: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::BinaryTagInput;
@@ -67,5 +77,12 @@ mod tests {
         };
         assert_eq!(b.payload_id, 7);
         assert_eq!(b.len, 3);
+    }
+
+    #[test]
+    fn embedded_binary_tag_constructs() {
+        let e = super::EmbeddedBinaryTag { key: "PRIV".into(), payload: vec![1, 2, 3] };
+        assert_eq!(e.key, "PRIV");
+        assert_eq!(e.payload.len(), 3);
     }
 }
