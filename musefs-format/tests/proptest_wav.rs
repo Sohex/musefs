@@ -17,7 +17,12 @@ proptest! {
         let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
         let arts: Vec<ArtInput> = Vec::new();
         if let Ok(layout) = wav::synthesize_layout(
-            &scan, bounds.audio_offset, bounds.audio_length, &taginputs, &arts,
+            &scan,
+            bounds.audio_offset,
+            bounds.audio_length,
+            &taginputs,
+            &[],
+            &arts,
         ) {
             assert_backing_covers_audio(bounds.audio_offset, bounds.audio_length, &layout);
         }

@@ -1,5 +1,5 @@
 use crate::error::{FormatError, Result};
-use crate::input::{ArtInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
+use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 use crate::probe::Extent;
 
@@ -192,6 +192,37 @@ fn apic_framing(art: &ArtInput) -> Vec<u8> {
     d
 }
 
+/// POPM body: `<owner>\0<rating:u8>[<counter: 4-byte big-endian>]`. Owner is empty
+/// by design (spec §5 — the original tagger identity is dropped). The counter is
+/// emitted as 4 bytes when `playcount > 0` and omitted when 0; values above
+/// `u32::MAX` are clamped (the typed read path caps at u64, the common case fits
+/// u32).
+fn popm_frame_data(rating: u8, playcount: u64) -> Vec<u8> {
+    let mut d = Vec::new();
+    d.push(0x00); // empty owner, NUL-terminated
+    d.push(rating);
+    if playcount > 0 {
+        let c = u32::try_from(playcount).unwrap_or(u32::MAX);
+        d.extend_from_slice(&c.to_be_bytes());
+    }
+    d
+}
+
+/// UFID body: `<owner>\0<identifier bytes>`.
+fn ufid_frame_data(owner: &str, identifier: &[u8]) -> Vec<u8> {
+    let mut d = Vec::new();
+    d.extend_from_slice(owner.as_bytes());
+    d.push(0x00);
+    d.extend_from_slice(identifier);
+    d
+}
+
+/// True for the canonical text keys that are rebuilt as POPM/UFID frames and must
+/// therefore be excluded from the generic text/TXXX emission (no double-store).
+fn is_promoted_key(key: &str) -> bool {
+    matches!(key, "rating" | "playcount" | "musicbrainz_trackid")
+}
+
 /// Build the ID3v2.4 tag region for `tags`/`arts`: an inline 10-byte header
 /// followed by text/`TXXX` frames and `APIC` frames whose image bytes are
 /// streamed as `ArtImage` segments. Returns the segments (no backing audio) and
@@ -199,11 +230,32 @@ fn apic_framing(art: &ArtInput) -> Vec<u8> {
 /// `id3 ` chunk.
 pub(crate) fn build_id3v2_segments(
     tags: &[TagInput],
+    binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<(Vec<Segment>, u64)> {
-    // Group consecutive same-key values (the DB returns tags ordered by key).
+    // Pull the promoted scalar values out of `tags` (first value wins per key,
+    // except playcount which accumulates — multiple playcount rows in the DB
+    // sum, matching the scan-time read path's behaviour).
+    let mut popm_rating: Option<u8> = None;
+    let mut popm_playcount: u64 = 0;
+    let mut mbid: Option<String> = None;
+    for t in tags {
+        match t.key.as_str() {
+            "rating" if popm_rating.is_none() => popm_rating = t.value.parse().ok(),
+            "playcount" => popm_playcount = t.value.parse().unwrap_or(popm_playcount),
+            "musicbrainz_trackid" if mbid.is_none() => mbid = Some(t.value.clone()),
+            _ => {}
+        }
+    }
+
+    // Group consecutive same-key values (the DB returns tags ordered by key),
+    // skipping promoted keys so they never enter the generic text/TXXX path
+    // (no double-store).
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for t in tags {
+        if is_promoted_key(&t.key) {
+            continue;
+        }
         match groups.last_mut() {
             Some(g) if g.0 == t.key => g.1.push(t.value.clone()),
             _ => groups.push((t.key.clone(), vec![t.value.clone()])),
@@ -265,6 +317,39 @@ pub(crate) fn build_id3v2_segments(
         }
     }
 
+    // Rebuilt promoted frames (POPM from rating/playcount, UFID from MBID).
+    if let Some(rating) = popm_rating {
+        let data = popm_frame_data(rating, popm_playcount);
+        push_frame_header(&mut buf, b"POPM", data.len())?;
+        buf.extend_from_slice(&data);
+        frames_len += 10 + data.len() as u64;
+    }
+    if let Some(id) = &mbid {
+        let data = ufid_frame_data(MUSICBRAINZ_UFID_OWNER, id.as_bytes());
+        push_frame_header(&mut buf, b"UFID", data.len())?;
+        buf.extend_from_slice(&data);
+        frames_len += 10 + data.len() as u64;
+    }
+
+    // Opaque binary frames: header (inline) + streamed body (BinaryTag segment).
+    for bt in binary_tags {
+        if bt.len == 0 {
+            // An empty BinaryTag fails `RegionLayout::validate` (`EmptySegment`).
+            continue;
+        }
+        // Defensive: ID3 opaque keys are 4-byte frame ids.
+        let Ok(id): std::result::Result<[u8; 4], _> = bt.key.as_bytes().try_into() else {
+            continue;
+        };
+        push_frame_header(&mut buf, &id, bt.len as usize)?;
+        segments.push(Segment::Inline(std::mem::take(&mut buf)));
+        segments.push(Segment::BinaryTag {
+            payload_id: bt.payload_id,
+            len: bt.len,
+        });
+        frames_len += 10 + bt.len;
+    }
+
     for art in arts {
         if art.data_len == 0 {
             // Skip degenerate empty art: an `ArtImage { len: 0 }` segment fails
@@ -313,9 +398,10 @@ pub fn synthesize_layout(
     audio_offset: u64,
     audio_length: u64,
     tags: &[TagInput],
+    binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<RegionLayout> {
-    let (mut segments, _tag_len) = build_id3v2_segments(tags, arts)?;
+    let (mut segments, _tag_len) = build_id3v2_segments(tags, binary_tags, arts)?;
     segments.push(Segment::BackingAudio {
         offset: audio_offset,
         len: audio_length,
@@ -780,7 +866,7 @@ mod tests {
             TagInput::new("lyrics", "la la"), // -> USLT
             TagInput::new("replaygain_track_gain", "-3.21 dB"), // -> TXXX (fixed desc)
         ];
-        let (segments, _len) = build_id3v2_segments(&tags, &[]).unwrap();
+        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
         let mut buf = Vec::new();
         for seg in &segments {
             if let Segment::Inline(bytes) = seg {
@@ -908,7 +994,7 @@ mod tests {
         // The `is_id3_text_frame_id` match-guard `-> false` mutant would route it to
         // the TXXX branch, so read_tags would surface it under a different key.
         let tags = vec![TagInput::new("TPE1", "Band")];
-        let (segments, _len) = build_id3v2_segments(&tags, &[]).unwrap();
+        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
         let mut buf = Vec::new();
         for seg in &segments {
             if let Segment::Inline(b) = seg {
@@ -943,23 +1029,23 @@ mod tests {
             data_len,
         };
         assert_eq!(
-            build_id3v2_segments(&[], &[mk(0x1000_0000)]).err(),
+            build_id3v2_segments(&[], &[], &[mk(0x1000_0000)]).err(),
             Some(FormatError::TooLarge)
         );
-        assert!(build_id3v2_segments(&[], &[mk(16)]).is_ok());
+        assert!(build_id3v2_segments(&[], &[], &[mk(16)]).is_ok());
         // Exact boundary: compute the APIC framing overhead, then place
         // frames_len exactly on 0x0FFF_FFFF (one byte under must succeed) and
         // 0x1_0000_0000 (must error). This pins the `> -> >=` mutation. The
         // baseline art uses data_len=1 (not 0) because zero-byte art is skipped.
-        let (_, total_at_one) = build_id3v2_segments(&[], &[mk(1)]).unwrap();
+        let (_, total_at_one) = build_id3v2_segments(&[], &[], &[mk(1)]).unwrap();
         let overhead = total_at_one - 10 - 1; // frames_len = overhead + data_len
         let boundary_data_len = 0x0FFF_FFFF - overhead;
         assert!(
-            build_id3v2_segments(&[], &[mk(boundary_data_len)]).is_ok(),
+            build_id3v2_segments(&[], &[], &[mk(boundary_data_len)]).is_ok(),
             "exact boundary (frames_len == 0x0FFF_FFFF) should be accepted"
         );
         assert_eq!(
-            build_id3v2_segments(&[], &[mk(boundary_data_len + 1)]).err(),
+            build_id3v2_segments(&[], &[], &[mk(boundary_data_len + 1)]).err(),
             Some(FormatError::TooLarge),
             "one byte past boundary must be rejected"
         );
@@ -980,7 +1066,7 @@ mod tests {
             height: 0,
             data_len: 0,
         };
-        let (segments, _len) = build_id3v2_segments(&[], &[empty]).unwrap();
+        let (segments, _len) = build_id3v2_segments(&[], &[], &[empty]).unwrap();
         assert!(
             !segments
                 .iter()
@@ -1011,7 +1097,7 @@ mod tests {
             height: 0,
             data_len,
         };
-        let (segments, _len) = build_id3v2_segments(&[], &[mk(1, 0), mk(2, 16)]).unwrap();
+        let (segments, _len) = build_id3v2_segments(&[], &[], &[mk(1, 0), mk(2, 16)]).unwrap();
         let art_segs: Vec<_> = segments
             .iter()
             .filter_map(|s| match s {
@@ -1766,5 +1852,56 @@ mod tests {
             geob.payload, geob_body,
             "GEOB body must survive byte-identical"
         );
+    }
+
+    #[test]
+    fn build_id3v2_segments_rebuilds_popm_ufid_and_streams_opaque() {
+        use crate::BinaryTagInput;
+        let tags = vec![
+            TagInput::new("artist", "A"),
+            TagInput::new("rating", "200"),
+            TagInput::new("playcount", "7"),
+            TagInput::new("musicbrainz_trackid", "mbid-123"),
+        ];
+        let bin = vec![BinaryTagInput {
+            key: "PRIV".into(),
+            payload_id: 42,
+            len: 3,
+        }];
+        let (segments, _len) = super::build_id3v2_segments(&tags, &bin, &[]).unwrap();
+
+        assert!(
+            segments.iter().any(|s| matches!(
+                s,
+                Segment::BinaryTag {
+                    payload_id: 42,
+                    len: 3
+                }
+            )),
+            "opaque PRIV must stream as Segment::BinaryTag"
+        );
+
+        let inline: Vec<u8> = segments
+            .iter()
+            .flat_map(|s| match s {
+                Segment::Inline(b) => b.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(find_sub(&inline, b"POPM"), "POPM not rebuilt");
+        assert!(find_sub(&inline, b"UFID"), "UFID not rebuilt");
+        assert!(
+            find_sub(&inline, b"http://musicbrainz.org"),
+            "UFID owner missing"
+        );
+        assert!(!find_sub(&inline, b"rating"), "promoted key leaked as TXXX");
+        assert!(
+            !find_sub(&inline, b"musicbrainz_trackid"),
+            "promoted key leaked as TXXX"
+        );
+    }
+
+    fn find_sub(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
     }
 }

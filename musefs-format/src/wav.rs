@@ -1,5 +1,5 @@
 use crate::error::{FormatError, Result};
-use crate::input::{EmbeddedBinaryTag, EmbeddedPicture};
+use crate::input::{BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture};
 use crate::probe::Extent;
 use std::collections::HashSet;
 
@@ -193,6 +193,7 @@ pub fn synthesize_layout(
     audio_offset: u64,
     audio_length: u64,
     tags: &[TagInput],
+    binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<RegionLayout> {
     if audio_length > u32::MAX as u64 {
@@ -213,7 +214,7 @@ pub fn synthesize_layout(
     // `build_id3v2_segments` already skips degenerate zero-byte art (finding #16) —
     // an empty `ArtImage { len: 0 }` would fail `RegionLayout::validate` and brick
     // the track — so WAV inherits that handling by delegating to it.
-    let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, arts)?;
+    let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, binary_tags, arts)?;
     let mut id3_head = Vec::with_capacity(8);
     id3_head.extend_from_slice(b"id3 ");
     id3_head.extend_from_slice(&(tag_len as u32).to_le_bytes());
@@ -606,7 +607,7 @@ mod tests {
         let mut tag_len = 0u64;
         for n in 1..64 {
             let cand = vec![TagInput::new("albumartist", &"x".repeat(n))];
-            let (_, tl) = crate::mp3::build_id3v2_segments(&cand, &[]).unwrap();
+            let (_, tl) = crate::mp3::build_id3v2_segments(&cand, &[], &[]).unwrap();
             if tl % 2 == 1 {
                 tags = cand;
                 tag_len = tl;
@@ -619,7 +620,7 @@ mod tests {
             fmt: fmt_pcm(),
             fact: None,
         };
-        let layout = synthesize_layout(&scan, 0, 8, &tags, &[]).unwrap();
+        let layout = synthesize_layout(&scan, 0, 8, &tags, &[], &[]).unwrap();
         assert_eq!(
             inline_offset_of(&layout, b"data") % 2,
             0,
@@ -642,7 +643,7 @@ mod tests {
             fmt: fmt_pcm(),
             fact: None,
         };
-        let res = synthesize_layout(&scan, 0, u32::MAX as u64, &[], &[]);
+        let res = synthesize_layout(&scan, 0, u32::MAX as u64, &[], &[], &[]);
         assert_eq!(res, Err(FormatError::TooLarge));
     }
 

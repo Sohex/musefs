@@ -46,7 +46,7 @@ fn synthesizes_valid_riff_and_preserves_audio() {
         TagInput::new("artist", "Alice"),
     ];
 
-    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[]).unwrap();
+    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &[]).unwrap();
     let bytes = assemble(&layout, &audio, &[]);
 
     // total_len equals the bytes actually produced (generate-and-measure).
@@ -89,7 +89,7 @@ fn embeds_full_fidelity_id3_tag_with_art() {
         data_len: art_bytes.len() as u64,
     }];
 
-    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &arts).unwrap();
+    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &arts).unwrap();
     // Art is a streamed segment, never materialized inline.
     assert!(layout
         .segments
@@ -121,7 +121,7 @@ fn emits_native_info_chunk_for_mapped_tags() {
         TagInput::new("title", "Hello"),
         TagInput::new("artist", "Bob"),
     ];
-    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[]).unwrap();
+    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &[]).unwrap();
     let bytes = assemble(&layout, &audio, &[]);
 
     let (off, len) = find_chunk(&bytes, b"LIST").expect("a LIST chunk");
@@ -141,7 +141,7 @@ fn pads_odd_data_payload_to_word_boundary() {
         fmt: fmt_pcm_16bit_mono(),
         fact: None,
     };
-    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &[], &[]).unwrap();
+    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &[], &[], &[]).unwrap();
     let bytes = assemble(&layout, &audio, &[]);
     // File length is even and total_len accounts for the pad byte.
     assert_eq!(bytes.len() % 2, 0);
@@ -163,7 +163,7 @@ fn rejects_audio_over_32bit() {
         fmt: fmt_pcm_16bit_mono(),
         fact: None,
     };
-    let res = synthesize_layout(&scan, 0, (u32::MAX as u64) + 1, &[], &[]);
+    let res = synthesize_layout(&scan, 0, (u32::MAX as u64) + 1, &[], &[], &[]);
     assert_eq!(res, Err(musefs_format::FormatError::TooLarge));
 }
 
@@ -207,7 +207,7 @@ fn skips_zero_byte_art() {
         data_len: 0,
     }];
 
-    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &arts).unwrap();
+    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &arts).unwrap();
     assert!(
         !layout
             .segments
@@ -254,7 +254,7 @@ fn keeps_real_art_when_mixed_with_empty() {
         },
     ];
 
-    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &arts).unwrap();
+    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &arts).unwrap();
     let art_segs: Vec<&Segment> = layout
         .segments
         .iter()

@@ -273,6 +273,7 @@ impl HeaderCache {
                         track.audio_offset as u64,
                         track.audio_length as u64,
                         &inputs,
+                        &[], // binary_tags — wired in Task 2.9
                         &art_inputs,
                     )?,
                     Format::M4a => {
@@ -304,6 +305,7 @@ impl HeaderCache {
                             track.audio_offset as u64,
                             track.audio_length as u64,
                             &inputs,
+                            &[], // binary_tags — wired in Task 2.9
                             &art_inputs,
                         )?
                     }
