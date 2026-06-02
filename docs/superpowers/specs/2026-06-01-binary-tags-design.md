@@ -183,6 +183,25 @@ fresh during `resolve`. This is the binary-tag analogue of how `ArtImage`'s `art
 stays valid (art rows are content-addressed and not deleted on re-tag; binary rows
 are, hence the explicit invariant).
 
+**Open-handle gap (Phase-2 obligation).** The `content_version` argument above
+covers the *cache* path, but **not** open FUSE handles: a `Handle` keeps its own
+`Arc<ResolvedFile>` (`facade.rs`) that intentionally outlives `poll_refresh`
+(POSIX-like open-fd snapshot semantics), and the `read` fast path (`fh != 0`)
+serves it via `read_at_with_file` without re-resolving or re-checking
+`content_version`. For `Inline`/`BackingAudio` this snapshot is self-contained; for
+a streamed-from-DB `Segment::BinaryTag` it is **not** — the handle still holds the
+old `payload_id`, and because `set_binary_tags` is `DELETE` + `INSERT`, SQLite can
+reuse that exact `tags` rowid for a different (possibly cross-track) payload. A
+same-length reuse would then be served silently as the snapshot's bytes
+(`read_binary_tag_chunk` only errors on a *short* read). This is the one binary-tag
+path the cache-invalidation invariant does not reach. Phase 1 is behavior-neutral
+(no synthesis path emits `BinaryTag`, so no handle can hold one) and is unaffected,
+but **Phase 2 must close this before emitting binary tags.** The preferred fix is to
+make the binary payload handle *stable and non-reused* — content-address binary
+payloads the way `art` is (so the id is never deleted out from under an open
+handle) — rather than a read-time staleness check, which would defeat the
+open-fd snapshot semantics that `Inline`/`BackingAudio` rely on.
+
 ### 4. Format-layer input (`musefs-format/src/input.rs`)
 
 ```rust
