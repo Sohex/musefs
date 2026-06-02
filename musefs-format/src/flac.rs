@@ -143,7 +143,7 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
     })
 }
 
-use crate::input::{ArtInput, EmbeddedPicture, TagInput};
+use crate::input::{ArtInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 
 pub(crate) fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usize, is_last: bool) {
@@ -152,6 +152,46 @@ pub(crate) fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usi
     out.push(((body_len >> 16) & 0xFF) as u8);
     out.push(((body_len >> 8) & 0xFF) as u8);
     out.push((body_len & 0xFF) as u8);
+}
+
+/// Map a stored structural-block `kind` string back to its FLAC block type.
+/// Only STREAMINFO/SEEKTABLE live in the structural store; everything else
+/// returns `None` (APPLICATION/CUESHEET are binary tags, not structural).
+pub fn structural_block_type(kind: &str) -> Option<u8> {
+    match kind {
+        "STREAMINFO" => Some(BLOCK_STREAMINFO),
+        "SEEKTABLE" => Some(BLOCK_SEEKTABLE),
+        _ => None,
+    }
+}
+
+/// Split a FLAC file's preserved metadata blocks into the read-only structural
+/// store (STREAMINFO/SEEKTABLE, as `(kind, body)` pairs in file order) and the
+/// editable binary tags (APPLICATION/CUESHEET, as `EmbeddedBinaryTag`s keyed by
+/// block name; `payload` is the full block body, including APPLICATION's 4-byte
+/// app id). Blocks of any other type are ignored (PICTURE/VORBIS_COMMENT are
+/// handled by their own paths and are never in `preserved`).
+pub fn split_preserved(
+    blocks: &[MetadataBlock],
+) -> (Vec<(String, Vec<u8>)>, Vec<EmbeddedBinaryTag>) {
+    let mut structural = Vec::new();
+    let mut binary = Vec::new();
+    for blk in blocks {
+        match blk.block_type {
+            BLOCK_STREAMINFO => structural.push(("STREAMINFO".to_string(), blk.body.clone())),
+            BLOCK_SEEKTABLE => structural.push(("SEEKTABLE".to_string(), blk.body.clone())),
+            BLOCK_APPLICATION => binary.push(EmbeddedBinaryTag {
+                key: "APPLICATION".to_string(),
+                payload: blk.body.clone(),
+            }),
+            BLOCK_CUESHEET => binary.push(EmbeddedBinaryTag {
+                key: "CUESHEET".to_string(),
+                payload: blk.body.clone(),
+            }),
+            _ => {}
+        }
+    }
+    (structural, binary)
 }
 
 fn picture_body_framing(art: &ArtInput) -> Vec<u8> {
@@ -813,6 +853,49 @@ mod tests {
             }
             other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn split_preserved_classifies_structural_and_binary() {
+        use super::{split_preserved, structural_block_type, MetadataBlock};
+        // STREAMINFO(0), APPLICATION(2), SEEKTABLE(3), CUESHEET(5) in arbitrary order.
+        let blocks = vec![
+            MetadataBlock {
+                block_type: 0,
+                body: vec![0xAA],
+            },
+            MetadataBlock {
+                block_type: 2,
+                body: b"testDATA".to_vec(),
+            },
+            MetadataBlock {
+                block_type: 3,
+                body: vec![0xBB],
+            },
+            MetadataBlock {
+                block_type: 5,
+                body: vec![0xCC; 4],
+            },
+        ];
+        let (structural, binary) = split_preserved(&blocks);
+
+        assert_eq!(
+            structural,
+            vec![
+                ("STREAMINFO".to_string(), vec![0xAA]),
+                ("SEEKTABLE".to_string(), vec![0xBB]),
+            ]
+        );
+        assert_eq!(binary.len(), 2);
+        assert_eq!(binary[0].key, "APPLICATION");
+        assert_eq!(binary[0].payload, b"testDATA");
+        assert_eq!(binary[1].key, "CUESHEET");
+        assert_eq!(binary[1].payload, vec![0xCC; 4]);
+
+        assert_eq!(structural_block_type("STREAMINFO"), Some(0));
+        assert_eq!(structural_block_type("SEEKTABLE"), Some(3));
+        assert_eq!(structural_block_type("APPLICATION"), None);
+        assert_eq!(structural_block_type("bogus"), None);
     }
 
     #[test]
