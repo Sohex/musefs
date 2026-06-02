@@ -74,7 +74,23 @@ CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
 END;
 ";
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1];
+const MIGRATION_V2: &str = r"
+-- Binary tag payloads live alongside text tags. A row is binary iff
+-- value_blob IS NOT NULL; binary rows store '' in value.
+ALTER TABLE tags ADD COLUMN value_blob BLOB;
+
+-- Read-only, derived-from-file structural metadata (FLAC STREAMINFO/SEEKTABLE).
+-- NOT part of the editable `tags` contract: external tools never touch it.
+CREATE TABLE structural_blocks (
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    ordinal  INTEGER NOT NULL DEFAULT 0,
+    body     BLOB NOT NULL,
+    PRIMARY KEY (track_id, kind, ordinal)
+);
+";
+
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let latest = MIGRATIONS.len() as i64;
@@ -97,4 +113,57 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_v2_tests {
+    use rusqlite::Connection;
+
+    #[test]
+    fn v2_adds_value_blob_and_structural_blocks_and_is_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::migrate(&mut conn).unwrap();
+        // user_version reflects the number of migrations applied.
+        let uv: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 2);
+
+        // value_blob exists on tags and defaults to NULL.
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/a.flac','flac',0,1,1,0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','A',0)",
+            [],
+        )
+        .unwrap();
+        let blob_is_null: bool = conn
+            .query_row(
+                "SELECT value_blob IS NULL FROM tags WHERE track_id=1 AND key='artist'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(blob_is_null);
+
+        // structural_blocks table accepts a row.
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1,'STREAMINFO',0,X'00')",
+            [],
+        )
+        .unwrap();
+
+        // Re-running migrate is a no-op (idempotent).
+        super::migrate(&mut conn).unwrap();
+        let uv2: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv2, 2);
+    }
 }
