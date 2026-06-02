@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use musefs_db::{Db, Tag};
-use musefs_format::{ArtInput, TagInput};
+use musefs_format::{ArtInput, BinaryTagInput, TagInput};
 
 use crate::error::Result;
 
@@ -49,6 +49,22 @@ pub(crate) fn track_art_to_inputs(db: &Db, track_id: i64) -> Result<Vec<ArtInput
     Ok(inputs)
 }
 
+/// Map a track's binary tag rows to `BinaryTagInput`s for synthesis. Never reads
+/// the payload bytes — only `(rowid, key, byte_len)`; the bytes stream at read
+/// time. Ordered by (key, ordinal), matching `get_binary_tags`.
+#[allow(dead_code)] // wired into the reader resolve arms in Task 2.9
+pub(crate) fn binary_tags_to_inputs(db: &Db, track_id: i64) -> Result<Vec<BinaryTagInput>> {
+    Ok(db
+        .get_binary_tags(track_id)?
+        .into_iter()
+        .map(|row| BinaryTagInput {
+            key: row.key,
+            payload_id: row.rowid,
+            len: row.byte_len as u64,
+        })
+        .collect())
+}
+
 /// Read each embedded image's raw bytes for synthesis (Ogg needs the bytes to
 /// compute page CRCs at resolve). Parallel to `track_art_to_inputs`; returns the
 /// same order. Only the Ogg synthesis path calls this — FLAC/MP3/MP4 stream art
@@ -64,6 +80,7 @@ pub(crate) fn track_art_images(db: &Db, inputs: &[ArtInput]) -> Result<Vec<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use musefs_db::{BinaryTag, Db, Format, NewTrack};
 
     fn tag(key: &str, value: &str, ordinal: i64) -> Tag {
         Tag::new(key, value, ordinal)
@@ -108,5 +125,37 @@ mod tests {
         let fields = tags_to_fields(&tags);
         assert_eq!(fields.get("myrating").map(String::as_str), Some("5"));
         assert_eq!(fields.get("albumartist").map(String::as_str), Some("VA"));
+    }
+
+    #[test]
+    fn binary_tags_to_inputs_maps_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let tid = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.mp3".into(),
+                format: Format::Mp3,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.set_binary_tags(
+            tid,
+            &[BinaryTag {
+                key: "PRIV".into(),
+                payload: vec![1, 2, 3, 4],
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+
+        let inputs = super::binary_tags_to_inputs(&db, tid).unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].key, "PRIV");
+        assert_eq!(inputs[0].len, 4);
+        // payload_id is the streaming handle (the tags rowid).
+        let rowid = db.get_binary_tags(tid).unwrap()[0].rowid;
+        assert_eq!(inputs[0].payload_id, rowid);
     }
 }
