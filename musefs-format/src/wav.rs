@@ -1,5 +1,5 @@
 use crate::error::{FormatError, Result};
-use crate::input::EmbeddedPicture;
+use crate::input::{EmbeddedBinaryTag, EmbeddedPicture};
 use crate::probe::Extent;
 use std::collections::HashSet;
 
@@ -324,6 +324,17 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Extract binary ID3 frames from a WAV's embedded `id3 ` chunk. Classification is
+/// identical to MP3 (`mp3::read_binary_tags`); only the chunk extraction differs.
+/// Returns `(opaque, promoted)`; empty when there is no `id3 ` chunk.
+pub fn read_binary_tags(data: &[u8]) -> (Vec<EmbeddedBinaryTag>, Vec<(String, String)>) {
+    let chunks = walk_chunks(data);
+    match find_id3_chunk(data, &chunks) {
+        Some(id3_bytes) => crate::mp3::read_binary_tags(id3_bytes),
+        None => (Vec::new(), Vec::new()),
+    }
 }
 
 /// Read embedded pictures for scan-time art ingestion. Pictures live only in the
@@ -670,6 +681,33 @@ mod tests {
             Extent::NeedMore { up_to } => assert_eq!(up_to, file_len),
             other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wav_read_binary_tags_extracts_id3_chunk_frames() {
+        use id3::frame::{Content, Unknown};
+        use id3::{Frame, Tag, TagLike, Version};
+        let mut tag = Tag::new();
+        tag.add_frame(Frame::with_content(
+            "PRIV",
+            Content::Unknown(Unknown {
+                data: vec![5, 6, 7],
+                version: Version::Id3v24,
+            }),
+        ));
+        let mut id3 = Vec::new();
+        id3::Encoder::new()
+            .version(Version::Id3v24)
+            .encode(&tag, &mut id3)
+            .unwrap();
+        let wav = wav(&[(b"id3 ", id3)]);
+
+        let (opaque, _promoted) = super::read_binary_tags(&wav);
+        let priv_tag = opaque
+            .iter()
+            .find(|e| e.key == "PRIV")
+            .expect("PRIV preserved");
+        assert_eq!(priv_tag.payload, vec![5, 6, 7]);
     }
 
     // Documented EQUIVALENT mutants in this file (no test targets them; each was

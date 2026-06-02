@@ -81,7 +81,10 @@ mod tests {
 
     #[test]
     fn embedded_binary_tag_constructs() {
-        let e = super::EmbeddedBinaryTag { key: "PRIV".into(), payload: vec![1, 2, 3] };
+        let e = super::EmbeddedBinaryTag {
+            key: "PRIV".into(),
+            payload: vec![1, 2, 3],
+        };
         assert_eq!(e.key, "PRIV");
         assert_eq!(e.payload.len(), 3);
     }
