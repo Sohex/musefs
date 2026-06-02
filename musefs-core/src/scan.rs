@@ -384,8 +384,19 @@ struct Unit {
     weight: u64,
 }
 
-fn art_weight(p: &Probed) -> u64 {
-    p.pictures.iter().map(|pic| pic.data.len() as u64).sum()
+/// In-memory byte weight of a `Probed`, used for batch backpressure
+/// (`MUSEFS_BATCH_BYTES`). Counts every buffered payload — pictures plus FLAC
+/// structural blocks and binary tags — so large preserved blocks can't slip the
+/// budget the way picture-only accounting did.
+fn payload_weight(p: &Probed) -> u64 {
+    let pictures: u64 = p.pictures.iter().map(|pic| pic.data.len() as u64).sum();
+    let binary: u64 = p.binary_tags.iter().map(|t| t.payload.len() as u64).sum();
+    let structural: u64 = p
+        .structural_blocks
+        .iter()
+        .map(|(_, body)| body.len() as u64)
+        .sum();
+    pictures + binary + structural
 }
 
 /// Upsert a track from a probed backing file: write the track row, replace its
@@ -619,7 +630,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                         failed.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    let weight = art_weight(&probed);
+                    let weight = payload_weight(&probed);
                     budget.acquire(weight); // backpressure on in-flight art bytes
                     let unit = Unit {
                         abs_path: abs.to_string_lossy().into_owned(),
@@ -937,11 +948,11 @@ mod scan_unit_tests {
         std::env::remove_var("MUSEFS_BATCH_BYTES");
     }
 
-    // --- art_weight() (lines 340-342) ---
+    // --- payload_weight() ---
 
-    // kills scan L341 art_weight body→0/→1 (sum of picture data lengths)
+    // Sums picture + binary-tag + structural-block byte lengths (batch backpressure).
     #[test]
-    fn art_weight_sums_picture_byte_lengths() {
+    fn payload_weight_sums_all_buffered_payloads() {
         let pic = |n: usize| EmbeddedPicture {
             mime: "image/png".to_string(),
             picture_type: 3,
@@ -956,10 +967,14 @@ mod scan_unit_tests {
             audio_length: 0,
             tags: Vec::new(),
             pictures: vec![pic(3), pic(5)],
-            binary_tags: Vec::new(),
-            structural_blocks: Vec::new(),
+            binary_tags: vec![EmbeddedBinaryTag {
+                key: "APPLICATION".into(),
+                payload: vec![0u8; 4],
+            }],
+            structural_blocks: vec![("SEEKTABLE".into(), vec![0u8; 2])],
         };
-        assert_eq!(art_weight(&probed), 8);
+        // 3 + 5 (pictures) + 4 (binary) + 2 (structural) = 14.
+        assert_eq!(payload_weight(&probed), 14);
 
         // Empty → 0, distinguishes the →1 constant (which ignores the input).
         let empty = Probed {
@@ -971,7 +986,7 @@ mod scan_unit_tests {
             binary_tags: Vec::new(),
             structural_blocks: Vec::new(),
         };
-        assert_eq!(art_weight(&empty), 0);
+        assert_eq!(payload_weight(&empty), 0);
     }
 
     /// Minimal-but-valid m4a that `mp4::locate_audio` accepts (one `soun` trak),

@@ -26,8 +26,8 @@ fn scan_splits_flac_into_structural_store_and_binary_tags() {
     let db = musefs_db::Db::open_in_memory().unwrap();
     scan_directory(&db, dir.path()).unwrap();
 
-    // Exactly one track; fetch its id via the structural query over both tracks.
-    let track_id = 1i64; // first upserted track
+    // Derive the id from DB state rather than assuming row-id ordering.
+    let track_id = db.list_tracks().unwrap()[0].id;
 
     let structural = db.get_structural_blocks(track_id).unwrap();
     let kinds: Vec<&str> = structural.iter().map(|b| b.kind.as_str()).collect();
