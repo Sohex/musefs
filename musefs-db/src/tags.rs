@@ -20,7 +20,8 @@ impl Db {
 
     pub fn get_tags(&self, track_id: i64) -> Result<Vec<Tag>> {
         let mut stmt = self.conn.prepare(
-            "SELECT key, value, ordinal FROM tags WHERE track_id = ?1 ORDER BY key, ordinal",
+            "SELECT key, value, ordinal FROM tags \
+             WHERE track_id = ?1 AND value_blob IS NULL ORDER BY key, ordinal",
         )?;
         let rows = stmt.query_map(params![track_id], |r| {
             Ok(Tag {
@@ -47,7 +48,8 @@ impl Db {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 "SELECT track_id, key, value, ordinal FROM tags \
-                 WHERE track_id IN ({placeholders}) ORDER BY track_id, key, ordinal"
+                 WHERE track_id IN ({placeholders}) AND value_blob IS NULL \
+                 ORDER BY track_id, key, ordinal"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let params = rusqlite::params_from_iter(chunk.iter());
@@ -74,7 +76,8 @@ impl Db {
     /// a drop-in batch replacement for N calls to `get_tags`.
     pub fn tags_grouped(&self) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT track_id, key, value, ordinal FROM tags ORDER BY track_id, key, ordinal",
+            "SELECT track_id, key, value, ordinal FROM tags \
+             WHERE value_blob IS NULL ORDER BY track_id, key, ordinal",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -157,5 +160,26 @@ mod tags_for_tracks_tests {
     fn tags_for_tracks_empty_input_is_empty_map() {
         let db = open_mem();
         assert!(db.tags_for_tracks(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_queries_exclude_binary_rows() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.replace_tags(a, &[Tag::new("artist", "Alice", 0)]).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
+                 VALUES (?1, 'PRIV', '', X'DEADBEEF', 0)",
+                rusqlite::params![a],
+            )
+            .unwrap();
+
+        let got = db.get_tags(a).unwrap();
+        assert_eq!(got, vec![Tag::new("artist", "Alice", 0)]);
+        let grouped = db.tags_grouped().unwrap();
+        assert_eq!(grouped[&a], vec![Tag::new("artist", "Alice", 0)]);
+        let for_tracks = db.tags_for_tracks(&[a]).unwrap();
+        assert_eq!(for_tracks[&a], vec![Tag::new("artist", "Alice", 0)]);
     }
 }
