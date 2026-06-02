@@ -15,7 +15,7 @@ proptest! {
         let scan = mp4::read_structure(&file).unwrap();
         let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
         let arts: Vec<ArtInput> = Vec::new();
-        if let Ok(layout) = mp4::synthesize_layout(&scan, &taginputs, &arts) {
+        if let Ok(layout) = mp4::synthesize_layout(&scan, &taginputs, &[], &arts) {
             assert_backing_covers_audio(scan.mdat_payload_offset, scan.mdat_payload_len, &layout);
         }
     }

@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
     let tags = arb_tags(&mut u).unwrap_or_default();
     let arts = arb_arts(&mut u).unwrap_or_default();
-    if let Ok(layout) = mp4::synthesize_layout(&scan, &tags, &arts) {
+    if let Ok(layout) = mp4::synthesize_layout(&scan, &tags, &[], &arts) {
         assert_backing_covers_audio(scan.mdat_payload_offset, scan.mdat_payload_len, &layout);
     }
 });
