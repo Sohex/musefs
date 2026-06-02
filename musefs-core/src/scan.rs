@@ -1505,6 +1505,77 @@ mod hardening_tests {
         assert_eq!(rows[0].key, "PRIV");
         assert_eq!(rows[0].byte_len, 3);
     }
+
+    /// Probed with two structural blocks of the SAME kind, to make the per-kind
+    /// ordinal increment (`*ord += 1`) observable. A real FLAC carries only one
+    /// STREAMINFO/SEEKTABLE, so a duplicate kind is the only input under which the
+    /// second block's ordinal differs from the first; without it the increment's
+    /// mutants survive.
+    fn probed_with_duplicate_structural_kind() -> Probed {
+        Probed {
+            format: musefs_db::Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            tags: Vec::new(),
+            pictures: Vec::new(),
+            binary_tags: Vec::new(),
+            structural_blocks: vec![
+                ("SEEKTABLE".to_string(), vec![0xA1]),
+                ("SEEKTABLE".to_string(), vec![0xB2]),
+            ],
+        }
+    }
+
+    #[test]
+    fn ingest_assigns_sequential_structural_ordinals_per_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        std::fs::write(&path, b"x").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let db = Db::open_in_memory().unwrap();
+
+        ingest(
+            &db,
+            &path.to_string_lossy(),
+            &meta,
+            probed_with_duplicate_structural_kind(),
+        )
+        .unwrap();
+
+        let tid = db.list_tracks().unwrap()[0].id;
+        let got = db.get_structural_blocks(tid).unwrap();
+        // Rows come back ORDER BY kind, ordinal: the two same-kind blocks must hold
+        // ordinals 0 then 1 (the `-=`/`*=` mutants collapse or invert this).
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].ordinal, 0);
+        assert_eq!(got[0].body, vec![0xA1]);
+        assert_eq!(got[1].ordinal, 1);
+        assert_eq!(got[1].body, vec![0xB2]);
+    }
+
+    #[test]
+    fn ingest_bulk_assigns_sequential_structural_ordinals_per_kind() {
+        let db = Db::open_in_memory().unwrap();
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            ingest_bulk(
+                &mut bw,
+                "/a.flac",
+                1,
+                0,
+                &probed_with_duplicate_structural_kind(),
+            )
+            .unwrap();
+            bw.commit().unwrap();
+        }
+        let tid = db.list_tracks().unwrap()[0].id;
+        let got = db.get_structural_blocks(tid).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].ordinal, 0);
+        assert_eq!(got[0].body, vec![0xA1]);
+        assert_eq!(got[1].ordinal, 1);
+        assert_eq!(got[1].body, vec![0xB2]);
+    }
 }
 
 #[cfg(test)]

@@ -950,4 +950,24 @@ mod tests {
             Err(FormatError::TooLarge)
         );
     }
+
+    #[test]
+    fn synthesize_layout_binary_tag_block_size_boundary_is_inclusive() {
+        // The binary-tag guard rejects bt.len > 0x00FF_FFFF (FLAC's 24-bit block
+        // length). `len` is only a count — no payload is allocated — so the exact
+        // boundary is cheap to pin. Mirrors the PICTURE boundary test; the `>`
+        // accepts the inclusive limit while the `>=` mutant rejects it.
+        let mk = |len: u64| BinaryTagInput {
+            key: "APPLICATION".to_string(),
+            payload_id: 1,
+            len,
+        };
+        // len == 0x00FF_FFFF exactly must succeed.
+        assert!(synthesize_layout(&[], 0, 0, &[], &[mk(0x00FF_FFFF)], &[]).is_ok());
+        // one byte over must still error, pinning the high side of the boundary.
+        assert_eq!(
+            synthesize_layout(&[], 0, 0, &[], &[mk(0x0100_0000)], &[]),
+            Err(FormatError::TooLarge)
+        );
+    }
 }
