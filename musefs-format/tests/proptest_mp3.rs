@@ -28,6 +28,8 @@ proptest! {
     #[test]
     fn binary_tags_round_trip_survives_byte_identically(
         priv_payload in proptest::collection::vec(any::<u8>(), 1..100),
+        geob_payload in proptest::collection::vec(any::<u8>(), 1..100),
+        sylt_payload in proptest::collection::vec(any::<u8>(), 1..100),
         popm_rating in proptest::option::of(0u8..=255),
         playcount in 0u64..10_000,
         has_mb_ufid in proptest::bool::ANY,
@@ -42,6 +44,21 @@ proptest! {
         tag.add_frame(Frame::with_content(
             "PRIV",
             Content::Unknown(Unknown { data: priv_payload.clone(), version: Version::Id3v24 }),
+        ));
+
+        // GEOB/SYLT opaque frames whose bodies open with a 0x00 (ISO-8859-1)
+        // text-encoding byte followed by arbitrary, likely non-UTF-8 bytes — the
+        // exact case the crate's `to_unknown()` re-encode would mangle. The raw
+        // walker must preserve them byte-identical.
+        let geob_body: Vec<u8> = std::iter::once(0x00).chain(geob_payload.iter().copied()).collect();
+        tag.add_frame(Frame::with_content(
+            "GEOB",
+            Content::Unknown(Unknown { data: geob_body.clone(), version: Version::Id3v24 }),
+        ));
+        let sylt_body: Vec<u8> = std::iter::once(0x00).chain(sylt_payload.iter().copied()).collect();
+        tag.add_frame(Frame::with_content(
+            "SYLT",
+            Content::Unknown(Unknown { data: sylt_body.clone(), version: Version::Id3v24 }),
         ));
 
         // POPM — promoted.
@@ -74,6 +91,8 @@ proptest! {
         // Step 1: Parse binary tags.
         let (opaque, promoted) = mp3::read_binary_tags(&tag_bytes);
         prop_assert!(opaque.iter().any(|e| e.key == "PRIV"), "PRIV must be opaque");
+        prop_assert!(opaque.iter().any(|e| e.key == "GEOB"), "GEOB must be opaque");
+        prop_assert!(opaque.iter().any(|e| e.key == "SYLT"), "SYLT must be opaque");
         prop_assert!(opaque.iter().any(|e| e.key == "UFID"), "non-MB UFID must be opaque");
 
         // Step 2: DB round-trip.

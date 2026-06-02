@@ -233,9 +233,10 @@ pub fn build_id3v2_segments(
     binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<(Vec<Segment>, u64)> {
-    // Pull the promoted scalar values out of `tags` (first value wins per key,
-    // except playcount which accumulates — multiple playcount rows in the DB
-    // sum, matching the scan-time read path's behaviour).
+    // Pull the promoted scalar values out of `tags`: first `rating` /
+    // `musicbrainz_trackid` wins, `playcount` takes the last parseable value. A
+    // single POPM/UFID is the norm, so this only diverges from "first wins" for
+    // the rare multi-frame tag.
     let mut popm_rating: Option<u8> = None;
     let mut popm_playcount: u64 = 0;
     let mut mbid: Option<String> = None;

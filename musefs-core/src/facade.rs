@@ -829,4 +829,128 @@ mod tests {
         );
         fs.release_handle(fh);
     }
+
+    /// The safety property the transactional `content_version` guard exists to
+    /// protect: a handle holding a `Segment::BinaryTag { payload_id }` must never
+    /// serve the bytes of a *different* row that later reused that rowid under the
+    /// stale layout's framing.
+    ///
+    /// We free the original PRIV row's rowid and reuse it with a different-length
+    /// payload **without** calling `poll_refresh`, so `refresh_gen` does not move
+    /// and the gen-gated re-resolve cannot mask the bug — the content_version
+    /// guard is the only thing standing between the read and torn bytes. With the
+    /// guard, a successful read is byte-identical to a fresh resolve of the new DB
+    /// state (the guard forces a re-resolve on the version mismatch); a clean
+    /// `Err` is the only other acceptable outcome. Without the guard the stale
+    /// handle would serve `len_a` bytes off the reused rowid, framed by the old
+    /// header — neither the original nor a valid new file.
+    #[test]
+    fn binary_tag_handle_never_serves_reused_rowid_bytes() {
+        use crate::scan::scan_directory;
+        use id3::frame::{Content, Unknown};
+        use id3::{Encoder, Frame, TagLike, Version};
+        use std::collections::BTreeMap;
+
+        let needle_a = [0xDEu8, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
+        let needle_b = [0x11u8, 0x22, 0x33]; // different bytes AND different length
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // PRIV-only tag: text frames are omitted because the `id3` crate's
+            // reader errors on a `Content::Unknown` frame it round-tripped, which
+            // would drop the text tags (the raw binary walker is unaffected). The
+            // track therefore renders under the `$artist/$title` fallback path.
+            let mut tag = id3::Tag::new();
+            tag.add_frame(Frame::with_content(
+                "PRIV",
+                Content::Unknown(Unknown {
+                    data: needle_a.to_vec(),
+                    version: Version::Id3v24,
+                }),
+            ));
+            let mut bytes = Vec::new();
+            Encoder::new()
+                .version(Version::Id3v24)
+                .encode(&tag, &mut bytes)
+                .unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00, 0, 0, 0, 0]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+
+        let artist = fs
+            .lookup(VirtualTree::ROOT, "Unknown")
+            .expect("fallback artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+
+        // Open the handle and read the original synthesized file (carries needle_a).
+        let fh = fs.open_handle(file_inode).unwrap();
+        let whole_a = fs.read(file_inode, fh, 0, 1 << 20).unwrap();
+        assert!(
+            whole_a.windows(needle_a.len()).any(|w| w == needle_a),
+            "baseline must carry the original PRIV body"
+        );
+
+        // Out-of-band: free the PRIV row's rowid, then reuse it with a different
+        // payload. With no other tag rows present, deleting the PRIV row empties
+        // `tags` and the next insert reclaims the freed rowid (plain INTEGER
+        // PRIMARY KEY, no AUTOINCREMENT). Both writes bump content_version. No
+        // poll_refresh, so refresh_gen stays put — only the guard can catch this.
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            let track_id = db.list_tracks().unwrap().into_iter().next().unwrap().id;
+            db.set_binary_tags(track_id, &[]).unwrap();
+            db.set_binary_tags(
+                track_id,
+                &[musefs_db::BinaryTag {
+                    key: "PRIV".into(),
+                    payload: needle_b.to_vec(),
+                    ordinal: 0,
+                }],
+            )
+            .unwrap();
+        }
+
+        // What a freshly resolved handle serves for the *current* DB state.
+        let fh2 = fs.open_handle(file_inode).unwrap();
+        let whole_b = fs.read(file_inode, fh2, 0, 1 << 20).unwrap();
+        fs.release_handle(fh2);
+        assert!(
+            whole_b.windows(needle_b.len()).any(|w| w == needle_b),
+            "fresh resolve must carry the new PRIV body"
+        );
+        assert!(
+            !whole_b.windows(needle_a.len()).any(|w| w == needle_a),
+            "fresh resolve must not carry the freed payload"
+        );
+        assert_ne!(
+            whole_a.len(),
+            whole_b.len(),
+            "test setup: payloads must differ in length to expose stale framing"
+        );
+
+        // The stale handle: either a clean error, or — via the guard's forced
+        // re-resolve — byte-identical to the fresh resolve. Never torn bytes.
+        match fs.read(file_inode, fh, 0, 1 << 20) {
+            Ok(bytes) => assert_eq!(
+                bytes, whole_b,
+                "stale handle served torn/reused-rowid bytes instead of re-resolving"
+            ),
+            Err(_) => {} // acceptable: guard surfaced a retryable error
+        }
+        fs.release_handle(fh);
+    }
 }
