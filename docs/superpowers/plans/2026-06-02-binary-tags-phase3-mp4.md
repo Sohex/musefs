@@ -452,7 +452,7 @@ fn build_udta(
             }
         }
     }
-    if !lead.is_empty() || segments.is_empty() {
+    if !lead.is_empty() {
         segments.push(Segment::Inline(lead));
     }
     Ok((segments, streamed_total))
