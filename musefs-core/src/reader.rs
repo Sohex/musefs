@@ -422,6 +422,10 @@ fn read_segments(
                     crate::metrics::on_art_chunk();
                     out.extend_from_slice(&chunk);
                 }
+                Segment::BinaryTag { payload_id, .. } => {
+                    let chunk = db.read_binary_tag_chunk(*payload_id, within, n)?;
+                    out.extend_from_slice(&chunk);
+                }
                 Segment::OggAudio {
                     offset: ao,
                     seq_delta,
@@ -1123,5 +1127,47 @@ mod cache_bound_tests {
         out.extend_from_slice(&audio);
         std::fs::write(path, &out).unwrap();
         (audio_offset, audio.len() as i64)
+    }
+}
+
+#[cfg(test)]
+mod binary_tag_serve_tests {
+    use super::*;
+    use musefs_db::{BinaryTag, NewTrack};
+
+    #[test]
+    fn read_at_serves_binary_tag_segment() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x.mp3".into(),
+                format: Format::Mp3,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.set_binary_tags(
+            id,
+            &[BinaryTag { key: "PRIV".into(), payload: vec![10, 20, 30, 40], ordinal: 0 }],
+        )
+        .unwrap();
+        let rowid = db.get_binary_tags(id).unwrap()[0].rowid;
+
+        let resolved = ResolvedFile {
+            layout: RegionLayout::new(vec![Segment::BinaryTag { payload_id: rowid, len: 4 }]),
+            total_len: 4,
+            content_version: 0,
+            backing_path: PathBuf::from("/x.mp3"),
+            backing_size: 0,
+            backing_mtime_secs: 0,
+            mtime_secs: 0,
+            last_page: Mutex::new(None),
+            cache_bytes: 0,
+        };
+        // No BackingAudio segment, so read_at opens no file.
+        let got = read_at(&resolved, &db, 1, 2).unwrap();
+        assert_eq!(got, vec![20, 30]);
     }
 }
