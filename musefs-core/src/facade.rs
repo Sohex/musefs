@@ -636,6 +636,11 @@ impl Musefs {
                         // A refresh changed something; re-resolve (cheap content_version
                         // cache hit when this track is unchanged) and re-stamp.
                         let fresh = self.pool.with(|db| self.cache.resolve(db, h.track_id))?;
+                        // If a refresh raced the resolve, `fresh` may already be stale;
+                        // don't publish it under `cur` — retry against the newer gen.
+                        if self.refresh_gen.load(Ordering::Acquire) != cur {
+                            continue;
+                        }
                         h.resolved.store(fresh);
                         h.gen.store(cur, Ordering::Release);
                     }
@@ -705,11 +710,16 @@ impl Musefs {
                 },
             }
         };
+        // Snapshot the generation BEFORE resolving: if a refresh lands during the
+        // resolve, stamping the post-refresh gen onto this (pre-refresh) layout
+        // would make the first read skip re-resolution and serve stale bytes. With
+        // the pre-resolve gen, a racing refresh leaves gen behind refresh_gen, so
+        // the next read re-resolves.
+        let gen = self.refresh_gen.load(Ordering::Acquire);
         let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
         validate_opened_backing(&file, &resolved)?;
-        let gen = self.refresh_gen.load(Ordering::Acquire);
         fh_from_key(self.handles.insert(Arc::new(Handle {
             track_id,
             resolved: arc_swap::ArcSwap::from(resolved),
@@ -944,12 +954,12 @@ mod tests {
 
         // The stale handle: either a clean error, or — via the guard's forced
         // re-resolve — byte-identical to the fresh resolve. Never torn bytes.
-        match fs.read(file_inode, fh, 0, 1 << 20) {
-            Ok(bytes) => assert_eq!(
+        // Err is acceptable too (the guard can surface a retryable error).
+        if let Ok(bytes) = fs.read(file_inode, fh, 0, 1 << 20) {
+            assert_eq!(
                 bytes, whole_b,
                 "stale handle served torn/reused-rowid bytes instead of re-resolving"
-            ),
-            Err(_) => {} // acceptable: guard surfaced a retryable error
+            );
         }
         fs.release_handle(fh);
     }
