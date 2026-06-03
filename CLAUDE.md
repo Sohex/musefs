@@ -63,6 +63,19 @@ freshness). Mirror these constants when the Rust schema changes:
 `MAX_ART_BYTES` (mirrors `musefs-core/src/scan.rs`) in
 `contrib/python-musefs/src/musefs_common/constants.py`.
 
+Responsibility split between the shared lib and each plugin:
+- `musefs_common/` holds the host-agnostic surface — `sync.py` (`sync_one`/
+  `sync_files` orchestration, `Record`), `scan.py` (`run_scan` shell-out),
+  `store.py`, `paths.py`, `constants.py`, `errors.py`.
+- Each plugin keeps its **own** `_core.py` for host-specific tag mapping, because
+  the source objects differ (beets `Item` vs Picard `Metadata`):
+  `contrib/beets/beetsplug/_core.py` (`DIRECT_FIELDS`, `_values`, `map_fields`,
+  `build_records`) and `contrib/picard/musefs/_core.py` (`DIRECT_FIELDS`,
+  `_first_value`, `map_fields`, `parse_field_map`, `front_cover`,
+  `resolve_config`). The beets CLI/import hooks live in
+  `contrib/beets/beetsplug/musefs.py`; the Picard entry point is
+  `contrib/picard/musefs/__init__.py`.
+
 ```bash
 # python-musefs is self-contained (its tests use pythonpath=src):
 cd contrib/python-musefs && python -m pytest && ruff check . && ruff format --check .
