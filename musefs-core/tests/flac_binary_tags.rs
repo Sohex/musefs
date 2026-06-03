@@ -156,8 +156,48 @@ fn legacy_flac_without_structural_rows_serves_via_front_read_fallback() {
         .any(|b| matches!(b, metaflac::Block::Application(_))));
 }
 
-use musefs_core::{read_at, HeaderCache, Mode};
+use musefs_core::{read_at, revalidate, HeaderCache, Mode};
 use proptest::prelude::*;
+
+#[test]
+fn revalidate_backfills_structural_and_binary_rows_for_legacy_flac() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.flac"), serve_fixture()).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+
+    // Real scan, then strip the V2 rows to simulate a V1-scanned (legacy) track.
+    scan_directory(&db, dir.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    db.set_structural_blocks(id, &[]).unwrap();
+    db.set_binary_tags(id, &[]).unwrap();
+    assert!(db.get_structural_blocks(id).unwrap().is_empty());
+    assert!(db.get_binary_tags(id).unwrap().is_empty());
+
+    // Maintenance pass must backfill both stores even though the file is unchanged.
+    revalidate(&db, dir.path()).unwrap();
+
+    let kinds: Vec<String> = db
+        .get_structural_blocks(id)
+        .unwrap()
+        .into_iter()
+        .map(|b| b.kind)
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "STREAMINFO"),
+        "STREAMINFO backfilled"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "SEEKTABLE"),
+        "SEEKTABLE backfilled"
+    );
+    assert!(
+        db.get_binary_tags(id)
+            .unwrap()
+            .iter()
+            .any(|b| b.key == "APPLICATION"),
+        "APPLICATION backfilled"
+    );
+}
 
 /// Read a binary tag's full payload from the DB via incremental blob I/O.
 fn read_binary_payload(db: &musefs_db::Db, rowid: i64, len: i64) -> Vec<u8> {

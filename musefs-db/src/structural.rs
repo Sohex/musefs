@@ -23,6 +23,16 @@ impl Db {
         Ok(())
     }
 
+    /// Track ids that have at least one structural block row. Used by `revalidate`
+    /// to detect legacy FLAC tracks (scanned under V1) that still need a backfill.
+    pub fn track_ids_with_structural_blocks(&self) -> Result<std::collections::HashSet<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT track_id FROM structural_blocks")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<i64>>>()?)
+    }
+
     /// Structural blocks for a track, ordered by (kind, ordinal). Empty when a
     /// FLAC track has not been (re)scanned under V2 — callers fall back to a
     /// front read in that case.
