@@ -9,9 +9,10 @@ metric counters covered only by direct-call tests)
 
 Two gaps in the optional `metrics` feature (`musefs-core/src/metrics.rs`):
 
-1. **Ogg is blind (#71).** `serve_ogg_window` and the lazy page-index scan
-   (`find_page_start`) in `musefs-core/src/ogg_index.rs` perform positioned
-   backing reads at four sites without calling `metrics::on_pread`, so Ogg
+1. **Ogg is blind (#71).** `serve_ogg_window`, the lazy page-index scan
+   (`find_page_start`), and its CRC probe (`page_crc_ok`) in
+   `musefs-core/src/ogg_index.rs` perform positioned backing reads at five
+   sites without calling `metrics::on_pread`, so Ogg
    reads report zero `preads`/`pread_bytes` in `metrics::snapshot()`. The
    latency read benchmark (`bench_read_under_latency` in
    `musefs-core/tests/bench_ingest.rs`) consequently reports 0 round-trips for
@@ -56,19 +57,31 @@ Add a private helper to `musefs-core/src/ogg_index.rs`:
 ```rust
 /// Positioned read that records serve-path pread metrics (count + bytes).
 /// Counts on the attempt, like `on_open` — a failed read is still a round-trip.
-fn read_counted(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+fn read_counted(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     crate::metrics::on_pread(buf.len() as u64);
     f.read_exact_at(buf, offset)
 }
 ```
 
-All four backing-read sites switch to it:
+(`ogg_index.rs` already spells `&std::fs::File` fully qualified and imports
+`std::os::unix::fs::FileExt`; the helper follows suit.)
+
+There are **five** backing-read sites; four switch to the helper:
 
 - the `find_page_start` backward-scan window read,
-- `find_page_start`'s CRC-check page read (its `is_err()` use is unchanged —
-  the attempt is counted regardless of outcome),
+- `page_crc_ok`'s full-page `read_exact_at` (its `is_err()` → `Ok(false)`
+  handling is unchanged — the attempt is counted regardless of outcome),
 - the per-page header read in `serve_ogg_window`,
 - the payload read in `serve_ogg_window`.
+
+The fifth site, `page_crc_ok`'s header probe, uses `read_at` (a tolerated
+short read at EOF that returns a byte count), so it cannot use the
+`read_exact_at`-shaped helper; it gets an inline
+`crate::metrics::on_pread(buf.len() as u64)` immediately before the call.
+Counting is uniformly **attempt-based** at all five sites: one pread and the
+attempted buffer length, recorded before the read. A short read at EOF may
+slightly overcount bytes; that is acceptable for instrumentation and keeps
+fault injection uniform across every round-trip.
 
 **Counting semantics (decided):** `preads`/`pread_bytes` mean *actual backing
 I/O performed*. For Ogg this includes index-scan and header reads whose bytes
@@ -99,16 +112,38 @@ real `Musefs` built over a scanned tempdir:
   regression class that shipped once).
 - **Ogg audio** (via `common::write_ogg`) → a read covering the audio region
   asserts `preads > 0` and `pread_bytes > 0`, locking in section 1's fix.
-- **Ogg + cover art** → a read covering the art region (`Segment::OggArtSlice`)
-  asserts `art_chunks` incremented.
+- **Opus + cover art** → a read covering the art region
+  (`Segment::OggArtSlice { base64: true }`) asserts `art_chunks` incremented
+  — the base64 `METADATA_BLOCK_PICTURE` branch.
+- **OggFLAC + cover art** → same assertion through
+  `Segment::OggArtSlice { base64: false }` — the raw PICTURE-packet branch,
+  whose `on_art_chunk` call site is distinct from the base64 branch's.
 
-Fixture gaps are filled in `musefs-core/tests/common/mod.rs` in the existing
-helper style (a PICTURE-block body builder, an APPLICATION-block fixture, an
-Ogg-with-art writer — whichever of these `common` does not already provide).
+New fixture helpers in `musefs-core/tests/common/mod.rs`, in the existing
+helper style:
+
+- a FLAC PICTURE-block body builder with **non-empty** image data (FLAC only
+  emits `ArtImage` for `data_len > 0`; the private `picture_body` test helper
+  inside `musefs-format/src/flac.rs` is unreachable from integration tests, so
+  `common` gets its own);
+- an Opus-with-art writer: `write_ogg`'s recipe with a
+  `METADATA_BLOCK_PICTURE=<base64(picture block)>` comment in the `OpusTags`
+  packet — `common::vorbis_comment_body` already emits the VorbisComment wire
+  format that packet embeds, and the page builders
+  (`page_test_support::build_header_pub`/`lace_packet_pub`) are already in use;
+- an OggFLAC writer (`0x7F "FLAC"` mapping header wrapping STREAMINFO, plus a
+  native PICTURE block packet), reusing `streaminfo_body`/`flac_block` and the
+  same page builders.
+
+The existing ffmpeg-based e2e fixtures (`musefs-fuse/tests/ogg_read_through.rs`)
+are not reused: they skip when ffmpeg is absent, and these tests must run
+deterministically in CI.
 
 These tests assert *increments* (counter strictly greater than its
 pre-read snapshot for the targeted counter), not exact totals, so they stay
-robust to unrelated reads in the serve path.
+robust to unrelated reads in the serve path. This matters specifically for
+Ogg: the backward scan's CRC probing makes exact pread counts
+fixture-dependent.
 
 ### 3. CI + benchmark refresh
 
@@ -124,14 +159,19 @@ robust to unrelated reads in the serve path.
 
 - Re-run `bench_read_under_latency` locally after the fix and update the Ogg
   rows in `BENCHMARKS.md` (and the optimization-pass tracking README if it
-  mirrors those rows), noting that pre-fix Ogg counters were blind — the old
-  zeros meant "uninstrumented", not "free".
+  mirrors those rows). The bench is `#[ignore]`d and local-only: it needs
+  `/dev/fuse`, `MUSEFS_BENCH_LATENCY_PROFILE=ssd|hdd|nfs-ssd|nfs-hdd`, and a
+  `musefs-latencyfs` `LatencyMount` — CI does not run it. The
+  "Latency-injected reads" caveat paragraph in `BENCHMARKS.md` (which today
+  explains that the pread columns read 0 because the Ogg path never counted)
+  is replaced by the refreshed numbers and a note that the old zeros meant
+  "uninstrumented", not "free".
 
 ## Error handling
 
 No new error paths. `read_counted` propagates the `io::Result` exactly as the
-bare `read_exact_at` calls do today; the one tolerated-failure site
-(`find_page_start`'s CRC-check read) keeps its tolerate-and-continue handling.
+bare `read_exact_at` calls do today; the tolerated-failure sites (both reads
+in `page_crc_ok`) keep their tolerate-and-continue handling.
 
 ## Testing / validation
 
