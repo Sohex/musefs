@@ -203,14 +203,14 @@ impl Musefs {
         )
     }
 
-    /// Full rebuild: render every track and build the tree from scratch. Used by
-    /// `open`, forced `refresh`, and the Stage B fallback. Returns the tree and the
-    /// fresh `track_id -> TrackRenderState` snapshot.
-    fn build_full(
+    /// DB read + path render with no allocator: the lock-free phase shared by
+    /// `build_full` and `rebuild_full`. Confining all `Db` access here is what
+    /// lets `rebuild_full` hold `inodes` only across the pure-CPU `build_with`.
+    #[allow(clippy::type_complexity)]
+    fn render_entries(
         db: &Db,
         config: &MountConfig,
-        alloc: &mut InodeAllocator,
-    ) -> Result<(VirtualTree, HashMap<i64, TrackRenderState>)> {
+    ) -> Result<(Vec<(i64, String)>, HashMap<i64, TrackRenderState>)> {
         let tracks = db.list_tracks()?;
         let mut tags_by_track = db.tags_grouped()?;
         let mut entries = Vec::with_capacity(tracks.len());
@@ -228,6 +228,18 @@ impl Musefs {
             );
             entries.push((t.id, path));
         }
+        Ok((entries, snapshot))
+    }
+
+    /// Full rebuild: render every track and build the tree from scratch. Used by
+    /// `open`, forced `refresh`, and the Stage B fallback. Returns the tree and the
+    /// fresh `track_id -> TrackRenderState` snapshot.
+    fn build_full(
+        db: &Db,
+        config: &MountConfig,
+        alloc: &mut InodeAllocator,
+    ) -> Result<(VirtualTree, HashMap<i64, TrackRenderState>)> {
+        let (entries, snapshot) = Self::render_entries(db, config)?;
         Ok((VirtualTree::build_with(&entries, alloc), snapshot))
     }
 
@@ -246,17 +258,25 @@ impl Musefs {
     }
 
     /// Rebuild + publish the tree via a full render; returns the fresh snapshot
-    /// (the caller decides whether/how to diff it).
+    /// (the caller decides whether/how to diff it). Mirrors `rebuild_incremental`'s
+    /// ordering: read + render under the pool connection, then lock `inodes` only
+    /// across the pure-CPU `build_with` (#90). That leaves the read→publish window
+    /// uncovered by any lock, so overlapping calls could publish a stale tree:
+    /// callers must be serialized, which they are — the production path runs inside
+    /// `poll_refresh_notify`'s `refreshing` CAS, and `refresh` documents the same
+    /// no-concurrent-rebuild contract.
     fn rebuild_full(&self) -> Result<HashMap<i64, TrackRenderState>> {
         if self.force_rebuild_error.load(Ordering::Acquire) {
             return Err(CoreError::BackingChanged(
                 "forced refresh failure".to_string(),
             ));
         }
-        let (tree, snapshot) = self.pool.with(|db| {
-            let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
-            Self::build_full(db, &self.config, &mut alloc)
-        })?;
+        let (entries, snapshot) = self
+            .pool
+            .with(|db| Self::render_entries(db, &self.config))?;
+        let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
+        let tree = VirtualTree::build_with(&entries, &mut alloc);
+        drop(alloc);
         self.tree.store(Arc::new(tree));
         Ok(snapshot)
     }
@@ -385,9 +405,10 @@ impl Musefs {
     }
 
     // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) FIRST, then
-    // any in-memory lock (`inodes`, the header cache's shards). `inodes` is held
-    // inside `pool.with` during `refresh` — the one intentional exception where a
-    // pool connection is held around an in-memory lock. `handles` is a lock-free
+    // any in-memory lock (`inodes`, the header cache's shards). Both rebuild paths
+    // (`rebuild_full`, `rebuild_incremental`) release the pool connection before
+    // locking `inodes`, so the order is uniform: a pool connection is never held
+    // around an in-memory lock. `handles` is a lock-free
     // `sharded_slab::Slab`: its `get` guard is cloned-from and dropped before any
     // pool call, so it never participates in lock ordering. Slab keys are
     // generation-encoded, so a reused slot produces a different key; a stale `fh`
@@ -396,6 +417,33 @@ impl Musefs {
     // whose per-shard guards are taken and released per op (the `*e` copy drops
     // the read guard before the `insert`; `retain` is never called while a `Ref`
     // is held), so it imposes no problematic lock ordering / no cross-lock cycle.
+
+    /// Cheap, synchronous "is a `data_version` poll worth dispatching?" predicate
+    /// for the FUSE dispatch thread to gate `fire_poll_refresh` on, so a
+    /// metadata-op storm doesn't flood the worker pool with no-op poll tasks (#89).
+    /// Mirrors the early-return gates in `poll_refresh_notify` — keep the two in
+    /// sync. Advisory only: no DB access, no `data_version` read, no rebuild. A
+    /// stale `true` costs at most one task the inner gate short-circuits, and
+    /// `needs_rebuild` is checked first so a self-heal is never debounced away.
+    pub fn poll_due(&self) -> bool {
+        if self.needs_rebuild.load(Ordering::Acquire) {
+            return true;
+        }
+        if !self.poll_interval.is_zero()
+            && crate::lock::lock_recover(&self.last_poll, "last_poll").elapsed()
+                < self.poll_interval
+        {
+            return false;
+        }
+        if let Some(last_failed) =
+            *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh")
+        {
+            if last_failed.elapsed() < self.refresh_retry_backoff {
+                return false;
+            }
+        }
+        true
+    }
 
     /// See `poll_refresh_notify`; this is the no-callback form.
     pub fn poll_refresh(&self) -> Result<bool> {
@@ -411,6 +459,8 @@ impl Musefs {
     /// Single-flighted: if a rebuild is already in progress, concurrent callers
     /// return `Ok(false)` immediately.
     pub fn poll_refresh_notify(&self, mut on_changed: impl FnMut(u64)) -> Result<bool> {
+        // These early-return gates are mirrored by the cheap `poll_due` pre-check
+        // the FUSE layer runs on the dispatch thread (#89); keep the two in sync.
         // A poisoned VFS-state lock scheduled a full rebuild: do it now,
         // bypassing the debounce / backoff / data_version gates (#96).
         if self.needs_rebuild.load(Ordering::Acquire) {
@@ -573,6 +623,24 @@ impl Musefs {
             .checked_sub(self.poll_interval)
             .expect("poll_interval exceeds monotonic clock base; cannot backdate last_poll");
         *crate::lock::lock_recover(&self.last_poll, "last_poll") = past;
+    }
+
+    /// Stamps a failed-refresh time of "now" so the backoff gate is active, for
+    /// tests exercising `poll_due`'s backoff branch without a real failure.
+    #[doc(hidden)]
+    pub fn fail_refresh_now_for_test(&self) {
+        *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") =
+            Some(std::time::Instant::now());
+    }
+
+    /// Backdates the failed-refresh stamp past the retry-backoff window so the
+    /// backoff gate no longer blocks (companion to `expire_poll_debounce_for_test`).
+    #[doc(hidden)]
+    pub fn expire_refresh_backoff_for_test(&self) {
+        let past = std::time::Instant::now()
+            .checked_sub(self.refresh_retry_backoff)
+            .expect("refresh_retry_backoff exceeds monotonic clock base");
+        *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") = Some(past);
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
@@ -997,6 +1065,40 @@ mod tests {
     }
 
     #[test]
+    fn render_entries_returns_paths_and_snapshot() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+        };
+
+        let (entries, snapshot) = Musefs::render_entries(&db, &cfg).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "Pix/Song.mp3");
+        let id = entries[0].0;
+        assert_eq!(snapshot[&id].path, "Pix/Song.mp3");
+        assert!(snapshot[&id].content_version >= 1);
+    }
+
+    #[test]
     fn needs_rebuild_flag_forces_full_rebuild_on_next_poll() {
         use crate::scan::scan_directory;
         use id3::TagLike;
@@ -1059,5 +1161,50 @@ mod tests {
             !fs.poll_refresh().unwrap(),
             "forced rebuild must stamp data_version (next poll is a no-op)"
         );
+    }
+
+    fn fs_with_poll_interval(interval: std::time::Duration) -> (tempfile::TempDir, Musefs) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: interval,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
+        (dir, fs)
+    }
+
+    #[test]
+    fn poll_due_false_within_interval_true_after_expiry() {
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::from_hours(1));
+        assert!(!fs.poll_due(), "fresh open is within the debounce window");
+        fs.expire_poll_debounce_for_test();
+        assert!(fs.poll_due(), "past the debounce window");
+    }
+
+    #[test]
+    fn poll_due_true_when_needs_rebuild_regardless_of_interval() {
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::from_hours(1));
+        assert!(!fs.poll_due());
+        fs.mark_needs_rebuild_for_test();
+        assert!(fs.poll_due(), "needs_rebuild bypasses the debounce");
+    }
+
+    #[test]
+    fn poll_due_true_when_interval_zero() {
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::ZERO);
+        assert!(fs.poll_due(), "zero interval disables the debounce");
+    }
+
+    #[test]
+    fn poll_due_respects_failure_backoff_window() {
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::from_hours(1));
+        fs.expire_poll_debounce_for_test(); // get past the debounce gate first
+        fs.fail_refresh_now_for_test();
+        assert!(!fs.poll_due(), "inside the retry backoff window");
+        fs.expire_refresh_backoff_for_test();
+        assert!(fs.poll_due(), "past the retry backoff window");
     }
 }

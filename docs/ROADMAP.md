@@ -167,9 +167,15 @@ parallel. Most of the Rust items came out of the v1 multi-model review triage.
 - ~~#94 — DbPool thread-local footguns~~ — done (PR #104): `with()` is re-entrancy-safe
   via `Rc<Db>` and open failures carry path context (`CoreError::DbOpen`).
 
-**Phase 4 — Concurrency correctness**
-- #90 — `rebuild_full` holds `inodes` across DB I/O (mirror the incremental path).
-- #89 — `fire_poll_refresh` floods the threadpool (synchronous debounce).
+**Phase 4 — Concurrency correctness** — *done*
+- ~~#90 — `rebuild_full` holds `inodes` across DB I/O~~ — done: `render_entries`
+  does the DB read + render under the pool connection; `rebuild_full` locks
+  `inodes` only across the pure-CPU `build_with` (mirrors the incremental path),
+  removing the documented lock-order exception.
+- ~~#89 — `fire_poll_refresh` floods the threadpool~~ — done: a synchronous
+  `poll_due()` gate on the dispatch thread skips submission within the debounce
+  window, and a `poll_pending` single-flight gate bounds in-flight poll tasks to
+  one (robust even with `--poll-interval-ms 0`).
 
 **Phase 5 — Metrics**
 - #71 — Ogg serve path records no pread/byte metrics (instrumentation blind today).
