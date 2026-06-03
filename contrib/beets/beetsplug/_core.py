@@ -18,11 +18,15 @@ DIRECT_FIELDS = {
     "artist": "artist",
     "albumartist": "albumartist",
     "album": "album",
-    "genre": "genre",
-    "genres": "genre",
-    "composer": "composer",
-    "composers": "composer",
 }
+
+# (list_field, scalar_field, store_key): beets carries some tags as both a list
+# (genres/composers, beets 2.x) and a joined scalar (genre/composer). Emitting
+# both duplicates rows, so prefer the list when present, else the scalar.
+TWIN_FIELDS = (
+    ("genres", "genre", "genre"),
+    ("composers", "composer", "composer"),
+)
 
 
 def _values(value):
@@ -69,6 +73,16 @@ def map_fields(item, extra_fields=None):
     for beets_field, key in fields.items():
         for text in _values(getattr(item, beets_field, None)):
             pairs.append((key, text))
+
+    for list_field, scalar_field, key in TWIN_FIELDS:
+        values = _values(getattr(item, list_field, None)) or _values(
+            getattr(item, scalar_field, None)
+        )
+        seen = set()
+        for text in values:
+            if text not in seen:
+                seen.add(text)
+                pairs.append((key, text))
 
     track = _to_int(getattr(item, "track", 0))
     if track:
