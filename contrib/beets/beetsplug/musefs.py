@@ -119,7 +119,9 @@ class MusefsPlugin(BeetsPlugin):
                 self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
             self._sync(db_path, items)
             self._prune_missing(db_path)
-        except ui.UserError as exc:
+        except Exception as exc:
+            # A passive cli_exit hook must never abort the beets operation, so any
+            # failure (ui.UserError, a sqlite3 error, etc.) degrades to a warning.
             self._log.warning("musefs: {}", exc)
 
     # --- helpers ---------------------------------------------------------
