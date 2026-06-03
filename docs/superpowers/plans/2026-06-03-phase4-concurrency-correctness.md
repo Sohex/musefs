@@ -304,7 +304,7 @@ Add the two hooks next to the existing `expire_poll_debounce_for_test` (~571):
 
 - [ ] **Step 4: Add the cross-reference comment on `poll_refresh_notify`'s gate**
 
-In `poll_refresh_notify`, immediately above the `if !self.poll_interval.is_zero()` debounce check (~429), add:
+In `poll_refresh_notify`, immediately above the **first** early-return gate — the `if self.needs_rebuild.load(...)` block (~414), so the comment scopes all the gates `poll_due` mirrors, not just the interval one — add:
 
 ```rust
         // These early-return gates are mirrored by the cheap `poll_due` pre-check
@@ -336,6 +336,8 @@ can gate poll submission on the dispatch thread."
 - Test: `musefs-fuse/src/lib.rs` (`mod tests` ~385)
 
 Gate `fire_poll_refresh` on `core.poll_due()` (submit nothing when not due), then a `poll_pending` single-flight `compare_exchange` so at most one poll task is queued/running; an RAII `PollPendingGuard` clears the flag on every exit path including panic.
+
+> **Note:** the single-flight test below deliberately supersedes the spec's barrier sketch (spec §"Piece 2", which called `queued_count`/`active_count` racy for observing task *lifecycle*). When the gate is pre-set to `true`, `fire_poll_refresh` submits *nothing*, so asserting the counts are *unchanged* is not racy — there is no task lifecycle to observe. Guard-clears-after-task is covered separately via `pool.join()`.
 
 - [ ] **Step 1: Write the failing tests**
 
