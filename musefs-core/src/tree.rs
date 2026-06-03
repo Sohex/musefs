@@ -307,10 +307,10 @@ impl VirtualTree {
     /// RENDERED path from `new_paths`. `ensure_dir` reuses ancestors above `dir`, so
     /// only `dir`'s subtree is rebuilt. Errs if a collected track has no entry in
     /// `new_paths` (caller falls back to a full rebuild). See SP2 Component 3.
-    pub fn rebuild_subtree(
+    pub(crate) fn rebuild_subtree(
         &mut self,
         dir: u64,
-        new_paths: &std::collections::HashMap<i64, String>,
+        new_paths: &std::collections::HashMap<i64, crate::refresh_diff::TrackRenderState>,
         alloc: &mut InodeAllocator,
     ) -> std::result::Result<(), RebuildError> {
         let mut ids = Vec::new();
@@ -334,6 +334,7 @@ impl VirtualTree {
         for id in ids {
             let path = new_paths
                 .get(&id)
+                .map(|s| s.path.as_str())
                 .ok_or(RebuildError::MissingRenderedPath(id))?;
             self.insert_file(id, path, alloc);
         }
@@ -344,9 +345,9 @@ impl VirtualTree {
     /// full `build_with` over the same final track set. `new_paths` maps every CURRENT
     /// track id to its rendered path. Returns `Err(RebuildError)` on any inconsistency
     /// (caller falls back to full build). See SP2 Component 3.
-    pub fn apply_changes(
+    pub(crate) fn apply_changes(
         &mut self,
-        new_paths: &std::collections::HashMap<i64, String>,
+        new_paths: &std::collections::HashMap<i64, crate::refresh_diff::TrackRenderState>,
         changed: &[i64],
         added: &[i64],
         removed: &[i64],
@@ -361,9 +362,10 @@ impl VirtualTree {
         for &id in changed {
             let new_path = new_paths
                 .get(&id)
+                .map(|s| s.path.as_str())
                 .ok_or(RebuildError::MissingRenderedPath(id))?;
             match self.inode_of_track(id) {
-                Some(ino) if &self.path_of(ino) == new_path => { /* path stable: nothing */ }
+                Some(ino) if self.path_of(ino) == new_path => { /* path stable: nothing */ }
                 Some(_) => {
                     moved_out.push(id);
                     moved_in.push(id);
@@ -395,6 +397,7 @@ impl VirtualTree {
         for &id in added.iter().chain(moved_in.iter()) {
             let rendered = new_paths
                 .get(&id)
+                .map(|s| s.path.as_str())
                 .ok_or(RebuildError::MissingRenderedPath(id))?;
             let d = self.deepest_existing_ancestor(rendered);
             dirty.insert(d);
@@ -416,6 +419,7 @@ impl VirtualTree {
         for &id in added.iter().chain(moved_in.iter()) {
             let rendered = new_paths
                 .get(&id)
+                .map(|s| s.path.as_str())
                 .ok_or(RebuildError::MissingRenderedPath(id))?;
             self.insert_file(id, rendered, alloc);
         }
@@ -510,6 +514,16 @@ fn join_path(parent: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::refresh_diff::TrackRenderState;
+    use musefs_db::Format;
+
+    fn trs(path: &str) -> TrackRenderState {
+        TrackRenderState {
+            content_version: 0,
+            format: Format::Flac,
+            path: path.into(),
+        }
+    }
 
     #[test]
     fn build_with_keeps_inodes_stable_across_rebuilds() {
@@ -662,7 +676,7 @@ mod tests {
         let mut alloc = InodeAllocator::new();
         let mut tree = VirtualTree::build_with(&[(10, "Alice/Song.flac".into())], &mut alloc);
         let dir = tree.lookup(VirtualTree::ROOT, "Alice").unwrap();
-        let new_paths: HashMap<i64, String> = HashMap::new(); // omits track 10
+        let new_paths: HashMap<i64, TrackRenderState> = HashMap::new(); // omits track 10
         let err = tree
             .rebuild_subtree(dir, &new_paths, &mut alloc)
             .unwrap_err();
@@ -680,7 +694,7 @@ mod tests {
         t.remove_track(10, &mut alloc);
         // new_paths after removal: only id 20 remains, rendered "D/song.flac".
         let mut np = std::collections::HashMap::new();
-        np.insert(20, "D/song.flac".to_string());
+        np.insert(20, trs("D/song.flac"));
         t.rebuild_subtree(d, &np, &mut alloc).unwrap();
         let reborn = t.lookup(d, "song.flac").unwrap();
         assert_eq!(t.inode_of_track(20), Some(reborn));
@@ -698,7 +712,8 @@ mod tests {
         let mut alloc = InodeAllocator::new();
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         let p = t.lookup(VirtualTree::ROOT, "P").unwrap();
-        let np: std::collections::HashMap<i64, String> = entries.iter().cloned().collect();
+        let np: std::collections::HashMap<i64, TrackRenderState> =
+            entries.iter().map(|&(id, ref p)| (id, trs(p))).collect();
         t.rebuild_subtree(p, &np, &mut alloc).unwrap();
         assert_eq!(
             paths_of(&t).keys().collect::<Vec<_>>(),
@@ -725,8 +740,10 @@ mod tests {
         let mut new_entries = vec![(9, "X.flac/b.flac".to_string()), (5, "X.flac".to_string())];
         new_entries.sort_by_key(|(id, _)| *id);
         let reference = VirtualTree::build(&new_entries);
-        let new_paths: std::collections::HashMap<i64, String> =
-            new_entries.iter().cloned().collect();
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> = new_entries
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
         t.apply_changes(&new_paths, &[], &[], &[1], &mut alloc)
             .unwrap();
         assert_eq!(
@@ -752,8 +769,10 @@ mod tests {
         ];
         new_entries.sort_by_key(|(id, _)| *id);
         let reference = VirtualTree::build(&new_entries);
-        let new_paths: std::collections::HashMap<i64, String> =
-            new_entries.iter().cloned().collect();
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> = new_entries
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
         t.apply_changes(&new_paths, &[], &[1], &[], &mut alloc)
             .unwrap();
         assert_eq!(
@@ -783,8 +802,10 @@ mod tests {
         ];
         new_entries.sort_by_key(|(id, _)| *id);
         let reference = VirtualTree::build(&new_entries);
-        let new_paths: std::collections::HashMap<i64, String> =
-            new_entries.iter().cloned().collect();
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> = new_entries
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
         t.apply_changes(&new_paths, &[2], &[], &[], &mut alloc)
             .unwrap();
         assert_eq!(
@@ -802,7 +823,8 @@ mod tests {
         let mut alloc = InodeAllocator::new();
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         let reference = VirtualTree::build(&entries);
-        let new_paths: std::collections::HashMap<i64, String> = entries.iter().cloned().collect();
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> =
+            entries.iter().map(|&(id, ref p)| (id, trs(p))).collect();
         t.apply_changes(&new_paths, &[1], &[], &[], &mut alloc)
             .unwrap();
         assert_eq!(
@@ -830,7 +852,10 @@ mod tests {
         t.remove_track(2, &mut alloc);
         let new_entries = vec![(3, "P/keep.flac".to_string())];
         let reference = VirtualTree::build(&new_entries);
-        let np: std::collections::HashMap<i64, String> = new_entries.into_iter().collect();
+        let np: std::collections::HashMap<i64, TrackRenderState> = new_entries
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
         t.rebuild_subtree(p, &np, &mut alloc).unwrap();
         let p2 = t.lookup(VirtualTree::ROOT, "P").unwrap();
         assert!(

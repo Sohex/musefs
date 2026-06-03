@@ -352,18 +352,13 @@ impl Musefs {
             Ok::<_, CoreError>((new_snapshot, change))
         })?;
 
-        let new_paths: std::collections::HashMap<i64, String> = new_snapshot
-            .iter()
-            .map(|(&id, s)| (id, s.path.clone()))
-            .collect();
-
         let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
         let mut tree = (*self.tree.load_full()).clone(); // O(1) im clone
         let applied = if self.force_apply_fail.swap(false, Ordering::AcqRel) {
             Err(crate::tree::RebuildError::TestInjected) // test injection
         } else {
             tree.apply_changes(
-                &new_paths,
+                &new_snapshot,
                 &change.changed,
                 &change.added,
                 &change.removed,
@@ -378,8 +373,10 @@ impl Musefs {
                 #[cfg(debug_assertions)]
                 {
                     let mut ref_alloc = alloc.clone();
-                    let mut entries: Vec<(i64, String)> =
-                        new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
+                    let mut entries: Vec<(i64, String)> = new_snapshot
+                        .iter()
+                        .map(|(&id, s)| (id, s.path.clone()))
+                        .collect();
                     entries.sort_by_key(|(id, _)| *id);
                     let reference = VirtualTree::build_with(&entries, &mut ref_alloc);
                     debug_assert!(
@@ -393,8 +390,10 @@ impl Musefs {
                 log::warn!(
                     "incremental tree mutation failed ({reason:?}); falling back to full rebuild"
                 );
-                let mut entries: Vec<(i64, String)> =
-                    new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
+                let mut entries: Vec<(i64, String)> = new_snapshot
+                    .iter()
+                    .map(|(&id, s)| (id, s.path.clone()))
+                    .collect();
                 entries.sort_by_key(|(id, _)| *id);
                 VirtualTree::build_with(&entries, &mut alloc)
             }
