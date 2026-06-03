@@ -35,6 +35,17 @@ pub(crate) fn track_art_to_inputs(db: &Db, track_id: i64) -> Result<Vec<ArtInput
         // `track_art.art_id` is a foreign key into `art` (enforced, no ON DELETE),
         // so the row always exists; the `if let` is defensive, not a real branch.
         if let Some(meta) = db.get_art_meta(ta.art_id)? {
+            // A negative byte_len is a malformed external write to the contract
+            // column; skip the row rather than cast it to a huge u64 segment
+            // length (which would fail layout validation and break the track).
+            if meta.byte_len < 0 {
+                log::warn!(
+                    "skipping art {} on track {track_id}: negative byte_len {} (malformed DB write)",
+                    ta.art_id,
+                    meta.byte_len
+                );
+                continue;
+            }
             inputs.push(ArtInput {
                 art_id: ta.art_id,
                 mime: meta.mime,
@@ -189,6 +200,91 @@ mod tests {
         assert!(
             !fields.contains_key("priv"),
             "binary PRIV leaked into fields: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn track_art_to_inputs_skips_negative_byte_len() {
+        use musefs_db::{NewArt, TrackArt}; // NewTrack already in scope at module level
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("art.db");
+        let db = Db::open(&path).unwrap();
+        let tid = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        let good = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![1, 2, 3, 4],
+            })
+            .unwrap();
+        let bad = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![9, 9, 9, 9, 9],
+            })
+            .unwrap();
+        // A zero-byte_len row pins the guard's strict `<`: only *negative* is
+        // skipped, so byte_len == 0 must still be kept (distinguishes `< 0` from
+        // `<= 0`).
+        let zero = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![5, 5, 5],
+            })
+            .unwrap();
+        db.set_track_art(
+            tid,
+            &[
+                TrackArt {
+                    art_id: good,
+                    picture_type: 3,
+                    description: String::new(),
+                    ordinal: 0,
+                },
+                TrackArt {
+                    art_id: bad,
+                    picture_type: 3,
+                    description: String::new(),
+                    ordinal: 1,
+                },
+                TrackArt {
+                    art_id: zero,
+                    picture_type: 3,
+                    description: String::new(),
+                    ordinal: 2,
+                },
+            ],
+        )
+        .unwrap();
+
+        // Simulate external malformed writes: byte_len is a stored column.
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute("UPDATE art SET byte_len = -1 WHERE id = ?1", [bad])
+            .unwrap();
+        raw.execute("UPDATE art SET byte_len = 0 WHERE id = ?1", [zero])
+            .unwrap();
+        drop(raw);
+
+        let inputs = super::track_art_to_inputs(&db, tid).unwrap();
+        let ids: Vec<i64> = inputs.iter().map(|a| a.art_id).collect();
+        assert_eq!(
+            ids,
+            vec![good, zero],
+            "negative byte_len is skipped; zero is kept (strict `<`)"
         );
     }
 }

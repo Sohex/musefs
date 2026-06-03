@@ -8,6 +8,8 @@ use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture,
 use crate::layout::{RegionLayout, Segment};
 use std::io::{self, Read, Seek, SeekFrom};
 
+const MAX_MP4_METADATA_BYTES: u64 = 256 * 1024 * 1024;
+
 fn be_u32(b: &[u8], pos: usize) -> Result<u32> {
     let s = b.get(pos..pos + 4).ok_or(FormatError::Malformed)?;
     Ok(u32::from_be_bytes(s.try_into().unwrap()))
@@ -91,6 +93,12 @@ pub enum Mp4ScanError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Format(#[from] FormatError),
+    #[error("MP4 {box_kind} box is {size} bytes, exceeds the {cap}-byte metadata cap")]
+    MetadataTooLarge {
+        box_kind: &'static str,
+        size: u64,
+        cap: u64,
+    },
 }
 
 fn read_box(buf: &[u8], pos: usize) -> Result<BoxRef> {
@@ -291,6 +299,16 @@ pub fn read_structure_from<R: Read + Seek>(
     let (ftyp_s, ftyp_h) = ftyp.ok_or(FormatError::NotMp4)?;
     let (moov_s, moov_h) = moov.ok_or(FormatError::NotMp4)?;
     let (mdat_s, mdat_h) = mdat.ok_or(FormatError::NotMp4)?;
+
+    for (box_kind, total_len) in [("ftyp", ftyp_h.total_len), ("moov", moov_h.total_len)] {
+        if total_len > MAX_MP4_METADATA_BYTES {
+            return Err(Mp4ScanError::MetadataTooLarge {
+                box_kind,
+                size: total_len,
+                cap: MAX_MP4_METADATA_BYTES,
+            });
+        }
+    }
 
     // `try_from` rather than `as usize`: on a 32-bit target an oversized box would
     // truncate silently; a box larger than `usize` is malformed for our purposes.
@@ -2158,5 +2176,57 @@ mod tests {
             synthesize_layout(&scan, &tags, &[], &[art(max_len + 1)]),
             Err(FormatError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn read_structure_from_rejects_oversized_moov() {
+        use std::io::Cursor;
+        let moov_size: u32 = 600 * 1024 * 1024;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(b"ftyp");
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(b"mdat");
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&moov_size.to_be_bytes());
+        buf.extend_from_slice(b"moov");
+        assert_eq!(buf.len(), 40);
+        let file_len = 32 + moov_size as u64;
+        let mut cur = Cursor::new(buf);
+        match read_structure_from(&mut cur, file_len).unwrap_err() {
+            Mp4ScanError::MetadataTooLarge {
+                box_kind,
+                size,
+                cap,
+            } => {
+                assert_eq!(box_kind, "moov");
+                assert_eq!(size, moov_size as u64);
+                assert_eq!(cap, 256 * 1024 * 1024);
+            }
+            other => panic!("expected MetadataTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_structure_from_admits_box_at_exactly_the_cap() {
+        use std::io::Cursor;
+        let cap: u32 = 256 * 1024 * 1024;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(b"ftyp");
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(b"mdat");
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&cap.to_be_bytes());
+        buf.extend_from_slice(b"moov");
+        let file_len = 32 + cap as u64;
+        let mut cur = Cursor::new(buf);
+        let err = read_structure_from(&mut cur, file_len).unwrap_err();
+        assert!(
+            matches!(err, Mp4ScanError::Io(_)),
+            "exact-cap box must pass the strict `>` guard (got {err:?})"
+        );
     }
 }

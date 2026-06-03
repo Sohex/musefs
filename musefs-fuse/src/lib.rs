@@ -68,7 +68,11 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         CoreError::NotADir(_) => fuser::Errno::ENOTDIR,
         CoreError::HandleTableFull => fuser::Errno::ENFILE,
         CoreError::Io(e) => fuser::Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)),
-        CoreError::BackingChanged(_) | CoreError::Db(_) | CoreError::Format(_) => fuser::Errno::EIO,
+        CoreError::BackingChanged(_)
+        | CoreError::Db(_)
+        | CoreError::DbOpen { .. }
+        | CoreError::Mp4MetadataTooLarge { .. }
+        | CoreError::Format(_) => fuser::Errno::EIO,
     }
 }
 

@@ -4,8 +4,20 @@ use thiserror::Error;
 pub enum CoreError {
     #[error(transparent)]
     Db(#[from] musefs_db::DbError),
+    #[error("failed to open database at {path}")]
+    DbOpen {
+        path: std::path::PathBuf,
+        #[source]
+        source: musefs_db::DbError,
+    },
     #[error(transparent)]
     Format(#[from] musefs_format::FormatError),
+    #[error("MP4 {box_kind} box is {size} bytes, exceeds the {cap}-byte metadata cap")]
+    Mp4MetadataTooLarge {
+        box_kind: &'static str,
+        size: u64,
+        cap: u64,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("backing file changed since scan: {0}")]

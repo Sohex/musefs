@@ -321,6 +321,20 @@ impl HeaderCache {
                         let scan = mp4::read_structure_from(&mut f, len).map_err(|e| match e {
                             mp4::Mp4ScanError::Io(io) => CoreError::Io(io),
                             mp4::Mp4ScanError::Format(fe) => CoreError::Format(fe),
+                            // Unreachable in practice (an ingested file already
+                            // passed the cap at scan, and backing-file drift is
+                            // caught by the size/mtime BackingChanged guard first),
+                            // but preserve the box/size/cap diagnostics rather than
+                            // erasing them into a generic Malformed.
+                            mp4::Mp4ScanError::MetadataTooLarge {
+                                box_kind,
+                                size,
+                                cap,
+                            } => CoreError::Mp4MetadataTooLarge {
+                                box_kind,
+                                size,
+                                cap,
+                            },
                         })?;
                         mp4::synthesize_layout(&scan, &inputs, &binary_tag_inputs, &art_inputs)?
                     }

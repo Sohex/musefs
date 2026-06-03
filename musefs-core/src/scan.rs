@@ -218,8 +218,14 @@ fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
     // M4A: seek reader, never touches mdat.
     if has_ext(path, "m4a") || has_ext(path, "m4b") {
         let mut f = &file;
-        let Ok(scan) = mp4::read_structure_from(&mut f, file_len) else {
-            return Ok(None);
+        let scan = match mp4::read_structure_from(&mut f, file_len) {
+            Ok(s) => s,
+            Err(e) => {
+                if matches!(e, mp4::Mp4ScanError::MetadataTooLarge { .. }) {
+                    log::warn!("skipping {}: {e}", path.display());
+                }
+                return Ok(None);
+            }
         };
         return Ok(Some(Probed {
             format: Format::M4a,

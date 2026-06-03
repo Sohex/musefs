@@ -29,7 +29,7 @@ impl ByteBudget {
         while *in_flight != 0 && in_flight.saturating_add(n) > self.cap {
             in_flight = self.cv.wait(in_flight).unwrap();
         }
-        *in_flight += n;
+        *in_flight = in_flight.saturating_add(n);
     }
 
     /// Release `n` previously reserved bytes.
