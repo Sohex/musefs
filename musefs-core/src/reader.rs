@@ -321,6 +321,9 @@ impl HeaderCache {
                         let scan = mp4::read_structure_from(&mut f, len).map_err(|e| match e {
                             mp4::Mp4ScanError::Io(io) => CoreError::Io(io),
                             mp4::Mp4ScanError::Format(fe) => CoreError::Format(fe),
+                            mp4::Mp4ScanError::MetadataTooLarge { .. } => {
+                                CoreError::Format(musefs_format::FormatError::Malformed)
+                            }
                         })?;
                         mp4::synthesize_layout(&scan, &inputs, &binary_tag_inputs, &art_inputs)?
                     }
