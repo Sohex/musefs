@@ -123,14 +123,16 @@ correctness in batches by code area → then perf/cleanup → docs last. The plu
 (Python) and core (Rust) tracks are independent codebases and can run in
 parallel. Most of the Rust items came out of the v1 multi-model review triage.
 
-**Phase 0 — Stop the bleeding**
-- #82 — plugin `replace_tags` wipes scanner-written binary tags (active data loss
-  introduced by the binary-tags work; everything else waits behind it).
+**Phase 0 — Stop the bleeding** — *done (PR #97)*
+- ~~#82 — plugin `replace_tags` wipes scanner-written binary tags~~ — done (PR #97):
+  scoped the delete to plugin-owned text rows (`value_blob IS NULL`) in both plugins.
 
-**Phase 1 — Cheap policy decisions (resolve before writing the code they shape)**
-- #96 — mutex poison-recovery policy (shapes the lock code in #89/#90/#94).
-- #95 — internal error-type convention (`Result<(),()>`, `InvalidLayout`); decide
-  it so the new error paths in #91/#92 adopt it from the start.
+**Phase 1 — Cheap policy decisions (resolve before writing the code they shape)** — *done (PR #97)*
+- ~~#96 — mutex poison-recovery policy~~ — done (PR #97): recover-by-reset helpers
+  (`lock.rs`) over the VFS serving-path mutexes; shapes the lock code in #89/#90/#94.
+- ~~#95 — internal error-type convention (`Result<(),()>`, `InvalidLayout`)~~ — done
+  (PR #97): `LayoutError`/`RebuildError` carry diagnostics; convention recorded in
+  `CLAUDE.md`, so the new error paths in #91/#92 adopt it from the start.
 
 **Phase 2 — Plugin correctness batch** *(parallel track; shared `_core.py` surface)*
 - #83 — beets reconciliation hook not fail-safe (except breadth + scan timeout).
