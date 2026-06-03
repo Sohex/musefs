@@ -339,6 +339,25 @@ mod fixtures_tests {
     }
 
     #[test]
+    fn m4a_stco_offset_points_at_mdat_payload() {
+        // The single stco chunk offset must be the absolute file position of the
+        // mdat payload, not a placeholder 0 — otherwise a retag that shrinks the
+        // moov underflows it and synthesis fails (see fixtures::m4a). Pin both the
+        // value (out.len() - payload.len()) and where it is written (stco + 12).
+        let payload = b"AUDIOAUDIO";
+        let f = fixtures::m4a(payload);
+        let expected = (f.len() - payload.len()) as u32;
+        let stco = f
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco present");
+        // [stco][version/flags(4)][entry count(4)][offset(4)]
+        let off = u32::from_be_bytes(f[stco + 12..stco + 16].try_into().unwrap());
+        assert_eq!(off, expected);
+        assert!(off > 0);
+    }
+
+    #[test]
     fn wav_fixture_parses() {
         let f = fixtures::wav(&[0i16, 1, -1, 100, -100]);
         let b = crate::wav::locate_audio(&f).unwrap();
