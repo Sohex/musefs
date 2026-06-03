@@ -185,7 +185,7 @@ Add these two tests to `musefs-format/src/mp4.rs`'s `#[cfg(test)] mod tests` blo
         // ftyp(16) + mdat(16) + moov(declares 600 MiB). The moov box "ends" exactly
         // at the (large, lied-about) file_len so the header walk terminates cleanly,
         // then the cap check fires before any payload region is allocated/read.
-        let moov_size: u32 = 600 * 1024 * 1024; // 629_145_600 > 512 MiB cap
+        let moov_size: u32 = 600 * 1024 * 1024; // 629_145_600 > 256 MiB cap
         let mut buf = Vec::new();
         buf.extend_from_slice(&16u32.to_be_bytes());
         buf.extend_from_slice(b"ftyp");
@@ -203,7 +203,7 @@ Add these two tests to `musefs-format/src/mp4.rs`'s `#[cfg(test)] mod tests` blo
             Mp4ScanError::MetadataTooLarge { box_kind, size, cap } => {
                 assert_eq!(box_kind, "moov");
                 assert_eq!(size, moov_size as u64);
-                assert_eq!(cap, 512 * 1024 * 1024);
+                assert_eq!(cap, 256 * 1024 * 1024);
             }
             other => panic!("expected MetadataTooLarge, got {other:?}"),
         }
@@ -214,7 +214,7 @@ Add these two tests to `musefs-format/src/mp4.rs`'s `#[cfg(test)] mod tests` blo
         use std::io::Cursor;
         // size == cap: the guard is strict `>`, so it does NOT trip. The read then
         // proceeds and hits EOF on the short buffer → Io, never MetadataTooLarge.
-        let cap: u32 = 512 * 1024 * 1024;
+        let cap: u32 = 256 * 1024 * 1024;
         let mut buf = Vec::new();
         buf.extend_from_slice(&16u32.to_be_bytes());
         buf.extend_from_slice(b"ftyp");
@@ -226,9 +226,9 @@ Add these two tests to `musefs-format/src/mp4.rs`'s `#[cfg(test)] mod tests` blo
         buf.extend_from_slice(b"moov");
         let file_len = 32 + cap as u64;
         let mut cur = Cursor::new(buf);
-        // region() does `vec![0u8; 512 MiB]` here, but it's alloc_zeroed (lazy zero
+        // region() does `vec![0u8; 256 MiB]` here, but it's alloc_zeroed (lazy zero
         // pages) and read_exact writes only ~8 bytes before EOF, so just one page is
-        // faulted in — no real 512 MiB RSS spike.
+        // faulted in — no real 256 MiB RSS spike.
         let err = read_structure_from(&mut cur, file_len).unwrap_err();
         assert!(
             matches!(err, Mp4ScanError::Io(_)),
@@ -249,9 +249,9 @@ In `musefs-format/src/mp4.rs`, add the module-level const (place it near the top
 ```rust
 /// Upper bound on a single MP4 metadata box (`ftyp`/`moov`) allocation. A corrupt
 /// or pathologically large box is rejected (the file is skipped at scan, logged)
-/// rather than forcing a multi-hundred-MB allocation. 512 MiB leaves generous
+/// rather than forcing a multi-hundred-MB allocation. 256 MiB leaves generous
 /// headroom for the sample tables of very long audiobooks.
-const MAX_MP4_METADATA_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_MP4_METADATA_BYTES: u64 = 256 * 1024 * 1024;
 ```
 
 Add the variant to the `Mp4ScanError` enum (after the existing `Format` variant):
@@ -328,7 +328,7 @@ with a match that loudly logs the new cap case (all other errors keep the existi
         };
 ```
 
-Note: the `MetadataTooLarge` branch at the scan site is only reachable for a genuinely >512 MiB file (scan passes the file's real length, so a small corrupt file hits `box_header`'s `Malformed` first). It is verified by inspection plus the unaffected existing MP4 scan tests, not a multi-hundred-MB fixture.
+Note: the `MetadataTooLarge` branch at the scan site is only reachable for a genuinely >256 MiB file (scan passes the file's real length, so a small corrupt file hits `box_header`'s `Malformed` first). It is verified by inspection plus the unaffected existing MP4 scan tests, not a multi-hundred-MB fixture.
 
 - [ ] **Step 7: Handle the new variant in the serve-path match (`reader.rs`)**
 
@@ -367,7 +367,7 @@ Expected: PASS — `musefs-core` compiles (the `reader.rs` arm closes E0004), ne
 
 ```bash
 git add musefs-format/src/mp4.rs musefs-core/src/scan.rs musefs-core/src/reader.rs
-git commit -m "fix(mp4): cap moov/ftyp metadata allocation at 512 MiB, log skips (#91)"
+git commit -m "fix(mp4): cap moov/ftyp metadata allocation at 256 MiB, log skips (#91)"
 ```
 
 ---
@@ -632,7 +632,7 @@ Implements Roadmap Phase 3. Five independent low-risk hardening fixes:
 
 - #93 byte_budget: saturating-add symmetry in `acquire`.
 - #92 mapping: skip art rows with negative `byte_len` from malformed external writes.
-- #91 mp4: cap `moov`/`ftyp` metadata allocation at 512 MiB; clearly logged skip at scan.
+- #91 mp4: cap `moov`/`ftyp` metadata allocation at 256 MiB; clearly logged skip at scan.
 - #94 db_pool: re-entrancy-safe `with()` via `Rc<Db>` + path-context open error; cross-thread Drop leak documented-and-accepted.
 - #88 fuzz: exercise the Ogg art-synthesis path (image bytes + `OggArt`).
 

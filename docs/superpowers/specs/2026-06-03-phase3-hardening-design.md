@@ -122,7 +122,7 @@ within a large file) there is still no upper bound comparable to
 path is shared by scan **and** serve-time resolve (`reader.rs:320`; Phase 6 made
 resolve seek the `moov`), so the cap guards both.
 
-**Fix.** Add a `const MAX_MP4_METADATA_BYTES: u64 = 512 * 1024 * 1024;` (512 MiB).
+**Fix.** Add a `const MAX_MP4_METADATA_BYTES: u64 = 256 * 1024 * 1024;` (256 MiB).
 Generous headroom for extreme audiobooks (tens of hours → tens of MB of sample
 tables) while rejecting corrupt multi-GB boxes. Before the `ftyp_bytes`/
 `moov_bytes` reads in `read_structure_from`, reject when either box's declared
@@ -157,12 +157,12 @@ check would intercept a huge box over a small file as `Malformed` *before* the n
 cap, so the test must exploit that `file_len` is a **parameter** of
 `read_structure_from` independent of the reader's real length: pass a large
 `file_len` (so `remaining` clears `box_header`) over a short in-memory cursor whose
-`moov` header declares `total_len` > 512 MiB. The cap check fires before `region`'s
+`moov` header declares `total_len` > 256 MiB. The cap check fires before `region`'s
 `read_exact`, so the result is `MetadataTooLarge` with **no** giant allocation and
 no EOF. A boundary test (box size == cap exactly) confirms the guard is strict
 `>` (it proceeds to `region`, hitting `Io`/EOF on the short buffer — *not*
 `MetadataTooLarge`). The scan-site `log::warn!` branch is reachable only with a
-genuinely >512 MiB file (scan passes the file's *real* length, so a small fixture
+genuinely >256 MiB file (scan passes the file's *real* length, so a small fixture
 hits `box_header`'s `Malformed` first) — verified by inspection plus the unaffected
 existing MP4 scan tests, not a multi-hundred-MB fixture.
 
