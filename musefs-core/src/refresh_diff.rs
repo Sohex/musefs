@@ -59,6 +59,32 @@ pub(crate) fn partition_changes(
     cs
 }
 
+/// Partition a changelog read against the previous snapshot. `prev_states` holds
+/// the prior states of just the changelog ids (the caller extracts them under a
+/// short snapshot lock); `keys` are the live render keys for those ids (absent =
+/// no longer in `tracks`). An id that is neither live nor previously known —
+/// added and deleted between polls — is pure churn and lands nowhere.
+#[allow(dead_code)] // wired into facade.rs in a later task (mirrors partition_changes)
+pub(crate) fn partition_changelog(
+    prev_states: &HashMap<i64, TrackRenderState>,
+    changelog_ids: &[i64],
+    keys: &[(i64, i64, Format)],
+) -> ChangeSet {
+    let live: HashMap<i64, (i64, Format)> = keys.iter().map(|&(id, cv, f)| (id, (cv, f))).collect();
+    let mut cs = ChangeSet::default();
+    for &id in changelog_ids {
+        match (live.get(&id), prev_states.get(&id)) {
+            (Some(&(cv, fmt)), Some(s)) if s.content_version != cv || s.format != fmt => {
+                cs.changed.push(id);
+            }
+            (Some(_), None) => cs.added.push(id),
+            (None, Some(_)) => cs.removed.push(id),
+            _ => {} // no-op (unchanged) or churn (added+removed between polls)
+        }
+    }
+    cs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +154,30 @@ mod tests {
         assert!(!only_added.is_empty());
         assert!(!only_removed.is_empty());
         assert!(ChangeSet::default().is_empty());
+    }
+
+    #[test]
+    fn changelog_partition_classifies_changed_added_removed_and_churn() {
+        use musefs_db::Format;
+        let state = |cv: i64| TrackRenderState {
+            content_version: cv,
+            format: Format::Flac,
+            path: "p".into(),
+        };
+        // prev knows 1 (cv 5), 2 (cv 1), 3 (cv 9).
+        let prev_states: HashMap<i64, TrackRenderState> =
+            [(1, state(5)), (2, state(1)), (3, state(9))].into();
+        // Changelog mentioned 1,2,3,4,5. Live keys: 1 unchanged, 2 bumped, 4 new.
+        // 3 is gone (removed); 5 was added+deleted between polls (pure churn).
+        let changelog_ids = vec![1, 2, 3, 4, 5];
+        let keys = vec![
+            (1, 5, Format::Flac),
+            (2, 2, Format::Flac),
+            (4, 0, Format::Flac),
+        ];
+        let cs = partition_changelog(&prev_states, &changelog_ids, &keys);
+        assert_eq!(cs.changed, vec![2]);
+        assert_eq!(cs.added, vec![4]);
+        assert_eq!(cs.removed, vec![3]); // churn id 5 is in neither output
     }
 }
