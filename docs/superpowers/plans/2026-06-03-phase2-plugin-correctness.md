@@ -263,6 +263,7 @@ git commit -m "run_scan accepts multiple targets in one invocation (#87)"
 
 **Files:**
 - Modify: `musefs-cli/src/lib.rs` (the `Scan` subcommand at lines 42–56, `run_scan` at 95–118, the dispatch arm at 185–190, and the test module at 217–231)
+- Modify: `musefs-cli/tests/scan.rs` (the existing `scan_ingests_flacs_into_a_fresh_db` calls `run_scan(&db_path, backing.path(), false, 0)` — the old `&Path` signature — and must move to `&[PathBuf]`; this file also holds the FLAC fixture helpers the new ingest tests reuse)
 
 - [ ] **Step 1: Write the failing test** — add to the `tests` module in `lib.rs` (after `scan_command_parses_jobs_flag`):
 
@@ -375,20 +376,94 @@ with:
         } => run_scan(&db, &targets, revalidate, jobs),
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 6: Fix the existing integration test's call to the new signature.** In `musefs-cli/tests/scan.rs`, update the call in `scan_ingests_flacs_into_a_fresh_db`:
+
+Replace:
+
+```rust
+    run_scan(&db_path, backing.path(), false, 0).unwrap();
+```
+
+with:
+
+```rust
+    run_scan(&db_path, &[backing.path().to_path_buf()], false, 0).unwrap();
+```
+
+- [ ] **Step 7: Add multi-target ingest + fail-fast integration tests.** Append to `musefs-cli/tests/scan.rs`:
+
+```rust
+#[test]
+fn scan_ingests_multiple_targets_under_one_db() {
+    let backing_a = tempfile::tempdir().unwrap();
+    std::fs::write(
+        backing_a.path().join("a.flac"),
+        make_flac(&["TITLE=A"], &[0xAB; 32]),
+    )
+    .unwrap();
+    let backing_b = tempfile::tempdir().unwrap();
+    std::fs::write(
+        backing_b.path().join("b.flac"),
+        make_flac(&["TITLE=B"], &[0xCD; 32]),
+    )
+    .unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("musefs.db");
+
+    run_scan(
+        &db_path,
+        &[
+            backing_a.path().to_path_buf(),
+            backing_b.path().to_path_buf(),
+        ],
+        false,
+        0,
+    )
+    .unwrap();
+
+    let db = musefs_db::Db::open(&db_path).unwrap();
+    assert_eq!(db.list_tracks().unwrap().len(), 2);
+}
+
+#[test]
+fn scan_fails_fast_on_a_bad_target() {
+    let backing = tempfile::tempdir().unwrap();
+    std::fs::write(
+        backing.path().join("a.flac"),
+        make_flac(&["TITLE=A"], &[0xAB; 32]),
+    )
+    .unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("musefs.db");
+
+    // Second target does not exist; collect_audio's read_dir errors, so the
+    // batch aborts with Err.
+    let missing = backing.path().join("does-not-exist");
+    let result = run_scan(
+        &db_path,
+        &[backing.path().to_path_buf(), missing],
+        false,
+        0,
+    );
+    assert!(result.is_err());
+}
+```
+
+- [ ] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo test -p musefs-cli 2>&1 | tail -20`
-Expected: PASS.
+Expected: PASS (parse tests, the updated `scan_ingests_flacs_into_a_fresh_db`, and the two new integration tests).
 
-- [ ] **Step 7: Lint and format**
+- [ ] **Step 9: Lint and format**
 
 Run: `cargo clippy -p musefs-cli --all-targets 2>&1 | tail -5 && cargo fmt --all --check`
 Expected: no warnings; fmt clean (exit 0).
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add musefs-cli/src/lib.rs
+git add musefs-cli/src/lib.rs musefs-cli/tests/scan.rs
 git commit -m "musefs scan accepts multiple target paths (#87)"
 ```
 
@@ -735,6 +810,8 @@ git commit -m "picard: expand multi-value tags via an allowlist (#84)"
 
 **Files:**
 - Modify: `contrib/picard/musefs/_core.py` (`parse_field_map` at 107–121)
+- Modify: `contrib/picard/tests/test_resolve_config.py` (existing `test_parse_field_map_variants` asserts comma semantics at lines 45 and 48 — must move to the newline model or the full Picard suite goes red)
+- Modify: `contrib/picard/musefs/__init__.py` (the field-map placeholder text at line 212)
 - Create: `contrib/picard/tests/test_parse_field_map.py`
 
 - [ ] **Step 1: Write the failing tests** — create `contrib/picard/tests/test_parse_field_map.py`:
@@ -789,25 +866,48 @@ def parse_field_map(text):
     return result
 ```
 
-- [ ] **Step 4: Update the options-page help text.** Find the field-map widget description in `contrib/picard/musefs/__init__.py` (the `MusefsOptionsPage` / `OPT_FIELDS` label or tooltip referencing "comma"). Change any "separated by commas or newlines" wording to "one `key=value` per line". If no such user-facing string mentions commas, skip this step.
+- [ ] **Step 4: Rewrite the existing comma-semantics test for the newline model.** In `contrib/picard/tests/test_resolve_config.py`, replace `test_parse_field_map_variants`:
 
-Run: `grep -rn "comma\|key=value\|separated" contrib/picard/musefs/__init__.py`
-Expected: locate any field-map help string; update it to "one `key=value` per line".
+```python
+def test_parse_field_map_variants():
+    assert parse_field_map("") == {}
+    assert parse_field_map("comment=comment") == {"comment": "comment"}
+    # Newline-separated entries (was comma-separated):
+    assert parse_field_map("a=b\nc=d") == {"a": "b", "c": "d"}
+    assert parse_field_map("a=b\n c=d ") == {"a": "b", "c": "d"}
+    # A comma inside a value is now literal, not a separator:
+    assert parse_field_map("comment=a, b, c") == {"comment": "a, b, c"}
+    # Lines without '=' or with an empty key/value are skipped:
+    assert parse_field_map("noequals\n=novalue\nkey=") == {}
+```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 5: Update the options-page placeholder text.** In `contrib/picard/musefs/__init__.py` line 212, the placeholder lists comma-separated examples:
 
-Run: `cd contrib/picard && python -m pytest tests/test_parse_field_map.py -v`
+```python
+            self._fields.setPlaceholderText("extra map, e.g. comment=comment, mood=mood")
+```
+
+Replace it with a newline-per-entry hint:
+
+```python
+            self._fields.setPlaceholderText("extra map, one per line, e.g. comment=comment")
+```
+
+- [ ] **Step 6: Run the field-map tests to verify they pass**
+
+Run: `cd contrib/picard && python -m pytest tests/test_parse_field_map.py tests/test_resolve_config.py -v`
 Expected: PASS.
 
-- [ ] **Step 6: Run the full Picard suite (catch any test that assumed comma-splitting)**
+- [ ] **Step 7: Run the full Picard suite (no regressions)**
 
 Run: `cd contrib/picard && python -m pytest tests`
-Expected: PASS (update any pre-existing field-map test that relied on comma separation to use newlines).
+Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add contrib/picard/musefs/_core.py contrib/picard/tests/test_parse_field_map.py contrib/picard/musefs/__init__.py
+git add contrib/picard/musefs/_core.py contrib/picard/tests/test_parse_field_map.py \
+        contrib/picard/tests/test_resolve_config.py contrib/picard/musefs/__init__.py
 git commit -m "picard: parse field map newline-only so commas survive in values (#85)"
 ```
 
@@ -825,7 +925,14 @@ git commit -m "picard: parse field map newline-only so commas survive in values 
 ```python
 from types import SimpleNamespace
 
-import musefs as plugin_mod  # the plugin package; its namespace is __init__.py's globals
+import pytest
+
+# _do_sync is defined inside `if _PICARD:` (the run_scan/map_fields/etc. names
+# it uses are top-level imports, but the function itself isn't bound without
+# Picard), so skip when Picard is absent — matching every sibling Picard test.
+pytest.importorskip("picard")
+
+import musefs as plugin_mod  # noqa: E402  the plugin package; its namespace is __init__.py's globals
 
 
 def test_autoscan_batches_into_one_run_scan(monkeypatch, db_path):
