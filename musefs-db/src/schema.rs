@@ -90,7 +90,39 @@ CREATE TABLE structural_blocks (
 );
 ";
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
+/// Ring capacity of the `track_changes` changelog. Must match the literal in
+/// MIGRATION_V3 (guarded by `changelog_cap_constant_matches_migration_sql`).
+#[allow(dead_code)]
+pub const CHANGELOG_CAP: i64 = 8192;
+
+const MIGRATION_V3: &str = r"
+-- Bounded changelog ring for O(changed) refresh. Every metadata edit funnels
+-- through an UPDATE on the tracks row (the V1 tags/track_art triggers), so
+-- triggers on tracks alone capture all writers. Relies on SQLite nested
+-- trigger activation (on by default; distinct from PRAGMA recursive_triggers).
+CREATE TABLE track_changes (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL
+);
+
+CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (OLD.id);
+END;
+
+-- Self-pruning ring: writers maintain it; the mount's read-only connections
+-- never need to. Deletes only from the old end, so retained seqs stay contiguous.
+CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
+    DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
+END;
+";
+
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let latest = MIGRATIONS.len() as i64;
@@ -127,7 +159,7 @@ mod migration_v2_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, 3);
 
         // value_blob exists on tags and defaults to NULL.
         conn.execute(
@@ -164,7 +196,7 @@ mod migration_v2_tests {
         let uv2: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv2, 2);
+        assert_eq!(uv2, 3);
     }
 
     #[test]
@@ -188,12 +220,12 @@ mod migration_v2_tests {
         )
         .unwrap();
 
-        // Upgrade V1 -> V2.
+        // Upgrade V1 -> V2 -> V3.
         super::migrate(&mut conn).unwrap();
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, 3);
 
         // The pre-existing row survived unchanged, with value_blob defaulted NULL.
         let (value, blob_is_null): (String, bool) = conn
@@ -216,5 +248,139 @@ mod migration_v2_tests {
             })
             .unwrap();
         assert_eq!(offset, 10);
+    }
+}
+
+#[cfg(test)]
+mod migration_v3_tests {
+    use rusqlite::Connection;
+
+    fn count_changes(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM track_changes", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn insert_track(conn: &Connection, path: &str) {
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES (?1,'flac',0,1,1,0,0)",
+            [path],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v3_changelog_records_insert_update_delete() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::migrate(&mut conn).unwrap();
+        let uv: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 3);
+
+        insert_track(&conn, "/a.flac"); // tracks AI -> 1 row
+        assert_eq!(count_changes(&conn), 1);
+
+        conn.execute(
+            "UPDATE tracks SET backing_mtime = 1 WHERE id = 1", // tracks AU -> 1 row
+            [],
+        )
+        .unwrap();
+        assert_eq!(count_changes(&conn), 2);
+
+        conn.execute("DELETE FROM tracks WHERE id = 1", []).unwrap(); // tracks AD -> 1 row
+        assert_eq!(count_changes(&conn), 3);
+
+        let ids: Vec<i64> = conn
+            .prepare("SELECT track_id FROM track_changes ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec![1, 1, 1]);
+    }
+
+    /// Load-bearing nested-trigger dependency (see spec): a bare tag write fires
+    /// tags_ai -> UPDATE tracks -> tracks changelog trigger. If this fails, nested
+    /// activation is off in this SQLite build; the fix is PRAGMA-level, not schema.
+    #[test]
+    fn v3_bare_tag_insert_produces_changelog_row_via_nested_trigger() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::migrate(&mut conn).unwrap();
+        insert_track(&conn, "/a.flac");
+        let before = count_changes(&conn);
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','A',0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            count_changes(&conn),
+            before + 1,
+            "tags_ai's UPDATE tracks must fire the changelog trigger (nested activation)"
+        );
+        let last_id: i64 = conn
+            .query_row(
+                "SELECT track_id FROM track_changes ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_id, 1);
+    }
+
+    #[test]
+    fn v3_prune_keeps_ring_bounded_and_contiguous() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::migrate(&mut conn).unwrap();
+        insert_track(&conn, "/a.flac");
+        // Drive CAP + 100 changelog inserts via track updates.
+        for i in 0..(super::CHANGELOG_CAP + 100) {
+            conn.execute("UPDATE tracks SET backing_mtime = ?1 WHERE id = 1", [i])
+                .unwrap();
+        }
+        let (min_seq, max_seq, rows): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT MIN(seq), MAX(seq), COUNT(*) FROM track_changes",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            super::CHANGELOG_CAP,
+            "ring must hold exactly CAP rows"
+        );
+        assert_eq!(min_seq, max_seq - super::CHANGELOG_CAP + 1, "contiguous");
+    }
+
+    #[test]
+    fn v2_db_upgrades_to_v3_preserving_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Apply V1+V2 only, stamp version 2, insert under the V2 schema.
+        conn.execute_batch(super::MIGRATIONS[0]).unwrap();
+        conn.execute_batch(super::MIGRATIONS[1]).unwrap();
+        conn.pragma_update(None, "user_version", 2i64).unwrap();
+        insert_track(&conn, "/legacy.flac");
+
+        super::migrate(&mut conn).unwrap();
+        let uv: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 3);
+        // Pre-migration rows produce no retroactive changelog entries...
+        assert_eq!(count_changes(&conn), 0);
+        // ...but post-migration edits do.
+        conn.execute("UPDATE tracks SET backing_mtime = 9 WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(count_changes(&conn), 1);
+    }
+
+    /// The SQL literal and the exported constant must not drift.
+    #[test]
+    fn changelog_cap_constant_matches_migration_sql() {
+        assert!(super::MIGRATIONS[2].contains(&format!("NEW.seq - {}", super::CHANGELOG_CAP)));
     }
 }
