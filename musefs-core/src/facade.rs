@@ -412,6 +412,33 @@ impl Musefs {
     // the read guard before the `insert`; `retain` is never called while a `Ref`
     // is held), so it imposes no problematic lock ordering / no cross-lock cycle.
 
+    /// Cheap, synchronous "is a `data_version` poll worth dispatching?" predicate
+    /// for the FUSE dispatch thread to gate `fire_poll_refresh` on, so a
+    /// metadata-op storm doesn't flood the worker pool with no-op poll tasks (#89).
+    /// Mirrors the early-return gates in `poll_refresh_notify` — keep the two in
+    /// sync. Advisory only: no DB access, no `data_version` read, no rebuild. A
+    /// stale `true` costs at most one task the inner gate short-circuits, and
+    /// `needs_rebuild` is checked first so a self-heal is never debounced away.
+    pub fn poll_due(&self) -> bool {
+        if self.needs_rebuild.load(Ordering::Acquire) {
+            return true;
+        }
+        if !self.poll_interval.is_zero()
+            && crate::lock::lock_recover(&self.last_poll, "last_poll").elapsed()
+                < self.poll_interval
+        {
+            return false;
+        }
+        if let Some(last_failed) =
+            *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh")
+        {
+            if last_failed.elapsed() < self.refresh_retry_backoff {
+                return false;
+            }
+        }
+        true
+    }
+
     /// See `poll_refresh_notify`; this is the no-callback form.
     pub fn poll_refresh(&self) -> Result<bool> {
         self.poll_refresh_notify(|_| {})
@@ -426,6 +453,8 @@ impl Musefs {
     /// Single-flighted: if a rebuild is already in progress, concurrent callers
     /// return `Ok(false)` immediately.
     pub fn poll_refresh_notify(&self, mut on_changed: impl FnMut(u64)) -> Result<bool> {
+        // These early-return gates are mirrored by the cheap `poll_due` pre-check
+        // the FUSE layer runs on the dispatch thread (#89); keep the two in sync.
         // A poisoned VFS-state lock scheduled a full rebuild: do it now,
         // bypassing the debounce / backoff / data_version gates (#96).
         if self.needs_rebuild.load(Ordering::Acquire) {
@@ -588,6 +617,24 @@ impl Musefs {
             .checked_sub(self.poll_interval)
             .expect("poll_interval exceeds monotonic clock base; cannot backdate last_poll");
         *crate::lock::lock_recover(&self.last_poll, "last_poll") = past;
+    }
+
+    /// Stamps a failed-refresh time of "now" so the backoff gate is active, for
+    /// tests exercising `poll_due`'s backoff branch without a real failure.
+    #[doc(hidden)]
+    pub fn fail_refresh_now_for_test(&self) {
+        *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") =
+            Some(std::time::Instant::now());
+    }
+
+    /// Backdates the failed-refresh stamp past the retry-backoff window so the
+    /// backoff gate no longer blocks (companion to `expire_poll_debounce_for_test`).
+    #[doc(hidden)]
+    pub fn expire_refresh_backoff_for_test(&self) {
+        let past = std::time::Instant::now()
+            .checked_sub(self.refresh_retry_backoff)
+            .expect("refresh_retry_backoff exceeds monotonic clock base");
+        *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") = Some(past);
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
@@ -1108,5 +1155,50 @@ mod tests {
             !fs.poll_refresh().unwrap(),
             "forced rebuild must stamp data_version (next poll is a no-op)"
         );
+    }
+
+    fn fs_with_poll_interval(interval: std::time::Duration) -> (tempfile::TempDir, Musefs) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: interval,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
+        (dir, fs)
+    }
+
+    #[test]
+    fn poll_due_false_within_interval_true_after_expiry() {
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::from_hours(1));
+        assert!(!fs.poll_due(), "fresh open is within the debounce window");
+        fs.expire_poll_debounce_for_test();
+        assert!(fs.poll_due(), "past the debounce window");
+    }
+
+    #[test]
+    fn poll_due_true_when_needs_rebuild_regardless_of_interval() {
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::from_hours(1));
+        assert!(!fs.poll_due());
+        fs.mark_needs_rebuild_for_test();
+        assert!(fs.poll_due(), "needs_rebuild bypasses the debounce");
+    }
+
+    #[test]
+    fn poll_due_true_when_interval_zero() {
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::ZERO);
+        assert!(fs.poll_due(), "zero interval disables the debounce");
+    }
+
+    #[test]
+    fn poll_due_respects_failure_backoff_window() {
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::from_hours(1));
+        fs.expire_poll_debounce_for_test(); // get past the debounce gate first
+        fs.fail_refresh_now_for_test();
+        assert!(!fs.poll_due(), "inside the retry backoff window");
+        fs.expire_refresh_backoff_for_test();
+        assert!(fs.poll_due(), "past the retry backoff window");
     }
 }
