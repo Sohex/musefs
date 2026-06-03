@@ -14,10 +14,10 @@ def run_scan(binary, db_path, target, *, timeout=None):
             capture_output=True,
             timeout=timeout,
         )
-    except FileNotFoundError:
-        raise ScanError("not_found", binary=binary, target=target)
-    except subprocess.TimeoutExpired:
-        raise ScanError("timeout", binary=binary, target=target, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise ScanError("not_found", binary=binary, target=target) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ScanError("timeout", binary=binary, target=target, timeout=timeout) from exc
     if result.returncode != 0:
         raise ScanError(
             "failed",

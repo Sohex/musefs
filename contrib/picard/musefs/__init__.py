@@ -17,6 +17,7 @@ from functools import partial
 from musefs._common import (
     Record,
     ScanError,
+    SchemaMismatch,
     check_schema_version,
     connect,
     realpath_key,
@@ -141,6 +142,10 @@ if _PICARD:
             stats = sync_files(conn, records)
             conn.commit()
             return stats
+        except SchemaMismatch as exc:
+            # Translate the library exception to the plugin's host-native error,
+            # mirroring the ScanError wrapping (and the beets adapter).
+            raise MusefsError(str(exc))
         finally:
             conn.close()
 
