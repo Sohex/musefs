@@ -108,6 +108,28 @@ jobs:
       - name: mutagen interop assertions
         run: MUSEFS_INTEROP_DIR="$RUNNER_TEMP/interop" python -m pytest tests/interop -v
 
+  python-musefs:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Lint
+        run: |
+          ruff check contrib/python-musefs/
+          ruff format --check contrib/python-musefs/
+      - name: Install library
+        run: pip install -e "contrib/python-musefs[test]"
+      - name: Test
+        run: python -m pytest contrib/python-musefs/tests -v
+
   beets:
     needs: changes
     if: needs.changes.outputs.src == 'true'
@@ -125,6 +147,8 @@ jobs:
         run: ruff check contrib/beets/ tests/interop/
       - name: Format check
         run: ruff format --check contrib/beets/ tests/interop/
+      - name: Install python-musefs (local, unpublished dependency)
+        run: pip install -e contrib/python-musefs
       - name: Install beets
         run: pip install -e "contrib/beets[test]"
       - name: Test
@@ -178,7 +202,7 @@ jobs:
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, interop, beets, picard, e2e]
+    needs: [changes, check, interop, python-musefs, beets, picard, e2e]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results
