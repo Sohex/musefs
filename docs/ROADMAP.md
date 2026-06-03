@@ -152,12 +152,20 @@ parallel. Most of the Rust items came out of the v1 multi-model review triage.
   `run_scan` + the Rust `musefs scan` CLI take many targets, so autoscan batches into
   one process under one DB open.
 
-**Phase 3 — Safety net + small Rust hardening** *(low-risk, independent)*
-- #88 — Ogg fuzz art coverage (quick win; lands coverage before later Ogg touches).
-- #93 — `byte_budget` overflow asymmetry.
-- #92 — `byte_len` non-negative guard.
-- #91 — MP4 `moov`/`ftyp` alloc cap.
-- #94 — DbPool thread-local footguns (after #96 is decided).
+**Phase 3 — Safety net + small Rust hardening** *(low-risk, independent)* — *done (PR #104)*
+- ~~#88 — Ogg fuzz art coverage~~ — done (PR #104): the Ogg fuzz target now drives the
+  art-synthesis path with arbitrary images, landing coverage before later Ogg touches.
+- ~~#93 — `byte_budget` overflow asymmetry~~ — done (PR #104): `acquire`'s increment is
+  saturating, matching its guard so the two no longer disagree on overflow.
+- ~~#92 — `byte_len` non-negative guard~~ — done (PR #104): art rows with a negative
+  `byte_len` (from a malformed external DB write) are skipped with a `warn!`; the
+  guard is art-only since binary-tag `byte_len` is `length(value_blob)`, always `>= 0`.
+- ~~#91 — MP4 `moov`/`ftyp` alloc cap~~ — done (PR #104): `moov`/`ftyp` metadata
+  allocation is capped at 256 MiB with skips logged; the serve path carries a
+  dedicated `Mp4MetadataTooLarge` diagnostic (mapped to `EIO`) rather than a generic
+  malformed error.
+- ~~#94 — DbPool thread-local footguns~~ — done (PR #104): `with()` is re-entrancy-safe
+  via `Rc<Db>` and open failures carry path context (`CoreError::DbOpen`).
 
 **Phase 4 — Concurrency correctness**
 - #90 — `rebuild_full` holds `inodes` across DB I/O (mirror the incremental path).
