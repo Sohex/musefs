@@ -74,30 +74,38 @@ reachably observable.
 
 ## #92 — `mapping.rs` casts `byte_len as u64` without a non-negative guard
 
-**Problem.** `musefs-core/src/mapping.rs` builds `data_len: meta.byte_len as u64`
-(art, line 45) and `len: row.byte_len as u64` (binary tags, line 63) from an
-`i64` DB column. The SQLite store is the documented contract external tools write
-to; a negative `byte_len` from a malformed/external row casts to a huge `u64`
-(e.g. `-1 → u64::MAX`), which would drive a bogus segment length.
+**Problem.** `musefs-core/src/mapping.rs::track_art_to_inputs` builds
+`data_len: meta.byte_len as u64` (line 45) from `art.byte_len`, an `i64` **stored
+column** (`art.byte_len INTEGER NOT NULL`, `schema.rs:31`). The SQLite store is
+the documented contract external tools write to; a negative `byte_len` from a
+malformed/external row casts to a huge `u64` (e.g. `-1 → u64::MAX`), which would
+drive a bogus segment length.
 
-**Fix.** **Skip the malformed row** rather than clamp. A negative `byte_len` is a
-contract violation for that single row; dropping it lets the track still
-synthesize without that art/tag (graceful degradation). Clamping to `0` was
-rejected: a `len: 0` `ArtImage` fails layout validation downstream, which would
-make the *whole track* unreadable instead of just losing the bad row.
+**Scope — art only, NOT binary tags.** The sibling cast `len: row.byte_len as u64`
+in `binary_tags_to_inputs` (line 63) is **safe and needs no guard**: that
+`byte_len` is computed as `length(value_blob)` in SQL (`tags.rs:127`), which is
+always ≥ 0 — a negative value is unrepresentable, so a guard there would be
+unreachable defensive code. Only the stored `art.byte_len` column is externally
+forgeable into a negative.
+
+**Fix.** **Skip the malformed art row** rather than clamp. A negative `byte_len`
+is a contract violation for that single row; dropping it lets the track still
+synthesize without that art (graceful degradation). Clamping to `0` was rejected:
+a `len: 0` `ArtImage` fails layout validation downstream, which would make the
+*whole track* unreadable instead of just losing the bad row.
 
 - `track_art_to_inputs`: inside the existing `if let Some(meta)` arm, skip the
-  push when `meta.byte_len < 0` (the row is filtered out of `inputs`).
-- `binary_tags_to_inputs`: replace the `.map(...)` with a `.filter_map(...)` (or
-  filter) that drops rows with `row.byte_len < 0`.
+  push (`continue`) when `meta.byte_len < 0`, so the row is filtered out of
+  `inputs`.
 
-**Verification.** New unit tests in `mapping.rs`: insert a row with a negative
-`byte_len` via raw SQL (bypassing the scanner, which only writes real sizes) and
-assert the resulting `inputs` omits that row while keeping well-formed siblings.
-Heads-up: `binary_tags_to_inputs` is still `#[allow(dead_code)]` (wired into the
-reader resolve arms in a later task, per its comment), so until then the new unit
-test is the *only* thing exercising its guard — no behavioral-regression risk, just
-note that coverage rests entirely on the test.
+**Verification.** New unit test in `mapping.rs`. The negative `byte_len` cannot be
+produced through the public `Db` API (`upsert_art` derives `byte_len` from
+`data.len()`), so the test simulates an external malformed write: create a
+**file-backed** `Db`, upsert a track + a valid art row + `set_track_art`, then open
+a second raw `rusqlite::Connection` to the same path and
+`UPDATE art SET byte_len = -1`. `rusqlite` is already a musefs-core dev-dependency.
+Assert `track_art_to_inputs` omits the corrupted row while keeping a well-formed
+sibling art row.
 
 ---
 
@@ -151,9 +159,12 @@ cap, so the test must exploit that `file_len` is a **parameter** of
 `file_len` (so `remaining` clears `box_header`) over a short in-memory cursor whose
 `moov` header declares `total_len` > 512 MiB. The cap check fires before `region`'s
 `read_exact`, so the result is `MetadataTooLarge` with **no** giant allocation and
-no EOF. Confirm a normal-sized fixture is unaffected. Scan-level test asserts such a
-file is skipped (counts toward `skipped`, not ingested) and that the `log::warn!`
-fires.
+no EOF. A boundary test (box size == cap exactly) confirms the guard is strict
+`>` (it proceeds to `region`, hitting `Io`/EOF on the short buffer — *not*
+`MetadataTooLarge`). The scan-site `log::warn!` branch is reachable only with a
+genuinely >512 MiB file (scan passes the file's *real* length, so a small fixture
+hits `box_header`'s `Malformed` first) — verified by inspection plus the unaffected
+existing MP4 scan tests, not a multi-hundred-MB fixture.
 
 ---
 
