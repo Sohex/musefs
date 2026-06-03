@@ -313,7 +313,7 @@ impl Musefs {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut tree = (*self.tree.load_full()).clone(); // O(1) im clone
         let applied = if self.force_apply_fail.swap(false, Ordering::AcqRel) {
-            Err(()) // test injection
+            Err(crate::tree::RebuildError::TestInjected) // test injection
         } else {
             tree.apply_changes(
                 &new_paths,
@@ -342,8 +342,10 @@ impl Musefs {
                 }
                 tree
             }
-            Err(()) => {
-                eprintln!("musefs: incremental tree mutation failed; falling back to full rebuild");
+            Err(reason) => {
+                eprintln!(
+                    "musefs: incremental tree mutation failed ({reason:?}); falling back to full rebuild"
+                );
                 let mut entries: Vec<(i64, String)> =
                     new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
                 entries.sort_by_key(|(id, _)| *id);

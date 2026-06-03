@@ -1,5 +1,15 @@
 use im::{HashMap as ImHashMap, OrdMap};
 
+/// Why an incremental tree mutation could not complete; the caller falls back to
+/// a full rebuild. Carries diagnostics instead of `()` (#95).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildError {
+    /// A track collected for rebuild had no entry in `new_paths`.
+    MissingRenderedPath(i64),
+    /// Test-only injected failure (`force_apply_fail`).
+    TestInjected,
+}
+
 /// Assigns stable inodes keyed by rendered path, persisted across tree rebuilds:
 /// an unchanged path keeps its inode, a new path gets a fresh one, and a retired
 /// inode is never recycled (a stale FUSE handle can't alias a different node).
@@ -297,13 +307,12 @@ impl VirtualTree {
     /// RENDERED path from `new_paths`. `ensure_dir` reuses ancestors above `dir`, so
     /// only `dir`'s subtree is rebuilt. Errs if a collected track has no entry in
     /// `new_paths` (caller falls back to a full rebuild). See SP2 Component 3.
-    #[allow(clippy::result_unit_err)]
     pub fn rebuild_subtree(
         &mut self,
         dir: u64,
         new_paths: &std::collections::HashMap<i64, String>,
         alloc: &mut InodeAllocator,
-    ) -> std::result::Result<(), ()> {
+    ) -> std::result::Result<(), RebuildError> {
         let mut ids = Vec::new();
         let mut stack = vec![dir];
         while let Some(n) = stack.pop() {
@@ -323,7 +332,9 @@ impl VirtualTree {
         }
         ids.sort_unstable();
         for id in ids {
-            let path = new_paths.get(&id).ok_or(())?;
+            let path = new_paths
+                .get(&id)
+                .ok_or(RebuildError::MissingRenderedPath(id))?;
             self.insert_file(id, path, alloc);
         }
         Ok(())
@@ -333,7 +344,6 @@ impl VirtualTree {
     /// full `build_with` over the same final track set. `new_paths` maps every CURRENT
     /// track id to its rendered path. Returns Err(()) on any inconsistency (caller
     /// falls back to full build). See SP2 Component 3.
-    #[allow(clippy::result_unit_err)]
     pub fn apply_changes(
         &mut self,
         new_paths: &std::collections::HashMap<i64, String>,
@@ -341,7 +351,7 @@ impl VirtualTree {
         added: &[i64],
         removed: &[i64],
         alloc: &mut InodeAllocator,
-    ) -> std::result::Result<(), ()> {
+    ) -> std::result::Result<(), RebuildError> {
         use std::collections::HashSet;
         let mut dirty: HashSet<u64> = HashSet::new();
 
@@ -349,7 +359,9 @@ impl VirtualTree {
         let mut moved_out: Vec<i64> = Vec::new(); // remove old position
         let mut moved_in: Vec<i64> = Vec::new(); // insert new position
         for &id in changed {
-            let new_path = new_paths.get(&id).ok_or(())?;
+            let new_path = new_paths
+                .get(&id)
+                .ok_or(RebuildError::MissingRenderedPath(id))?;
             match self.inode_of_track(id) {
                 Some(ino) if &self.path_of(ino) == new_path => { /* path stable: nothing */ }
                 Some(_) => {
@@ -381,7 +393,9 @@ impl VirtualTree {
             }
         }
         for &id in added.iter().chain(moved_in.iter()) {
-            let rendered = new_paths.get(&id).ok_or(())?;
+            let rendered = new_paths
+                .get(&id)
+                .ok_or(RebuildError::MissingRenderedPath(id))?;
             let d = self.deepest_existing_ancestor(rendered);
             dirty.insert(d);
             // propagate up while `id` would become the new min.
@@ -400,7 +414,9 @@ impl VirtualTree {
             }
         }
         for &id in added.iter().chain(moved_in.iter()) {
-            let rendered = new_paths.get(&id).ok_or(())?;
+            let rendered = new_paths
+                .get(&id)
+                .ok_or(RebuildError::MissingRenderedPath(id))?;
             self.insert_file(id, rendered, alloc);
         }
 
@@ -638,6 +654,19 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn rebuild_subtree_reports_missing_rendered_path() {
+        use std::collections::HashMap;
+        let mut alloc = InodeAllocator::new();
+        let mut tree = VirtualTree::build_with(&[(10, "Alice/Song.flac".into())], &mut alloc);
+        let dir = tree.lookup(VirtualTree::ROOT, "Alice").unwrap();
+        let new_paths: HashMap<i64, String> = HashMap::new(); // omits track 10
+        let err = tree
+            .rebuild_subtree(dir, &new_paths, &mut alloc)
+            .unwrap_err();
+        assert_eq!(err, RebuildError::MissingRenderedPath(10));
     }
 
     #[test]
