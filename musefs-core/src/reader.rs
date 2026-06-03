@@ -143,6 +143,12 @@ impl Shard {
     }
 }
 
+impl crate::lock::Clearable for Shard {
+    fn reset(&mut self) {
+        self.retain_keys(&HashSet::new());
+    }
+}
+
 /// A per-mount cache of resolved files, sharded for concurrency and keyed by track
 /// id; an entry self-invalidates when the track's `content_version` changes.
 pub struct HeaderCache {
@@ -182,16 +188,12 @@ impl HeaderCache {
     }
     fn shard(&self, track_id: i64) -> std::sync::MutexGuard<'_, Shard> {
         let idx = (track_id as u64 % CACHE_SHARDS as u64) as usize;
-        self.shards[idx]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::lock::lock_or_clear(&self.shards[idx], "header-cache shard")
     }
     /// Drop cached resolutions for tracks no longer present (`live` = current ids).
     pub fn retain(&self, live: &HashSet<i64>) {
         for s in &self.shards {
-            s.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain_keys(live);
+            crate::lock::lock_or_clear(s, "header-cache shard (retain)").retain_keys(live);
         }
     }
     /// Resolve a track to its layout, caching on a content-version miss. Validation
@@ -1024,6 +1026,51 @@ mod cache_bound_tests {
         s.insert(1, entry(0, 200));
         assert!(s.get(1).is_some());
         assert_eq!(s.bytes, 200);
+    }
+
+    #[test]
+    fn shard_reset_clears_all_entries() {
+        use crate::lock::Clearable;
+        let mut s = Shard::new(1000);
+        s.insert(1, entry(0, 100));
+        s.insert(2, entry(0, 100));
+        s.reset();
+        assert!(s.get(1).is_none());
+        assert!(s.get(2).is_none());
+        assert_eq!(s.bytes, 0);
+        assert_eq!(s.map.len(), 0);
+    }
+
+    #[test]
+    fn header_cache_retain_drops_absent_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mk = |name: &str| {
+            let path = dir.path().join(name);
+            let (audio_offset, audio_length) = write_flac_local(&path);
+            let meta = std::fs::metadata(&path).unwrap();
+            db.upsert_track(&NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: Format::Flac,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len() as i64,
+                backing_mtime: mtime_secs(&meta),
+            })
+            .unwrap()
+        };
+        let keep = mk("keep.flac");
+        let gone = mk("gone.flac");
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let keep_a = cache.resolve(&db, keep).unwrap();
+        let gone_a = cache.resolve(&db, gone).unwrap();
+
+        let live: HashSet<i64> = [keep].into_iter().collect();
+        cache.retain(&live);
+
+        // The kept track stays the same cached Arc; the dropped one re-resolves fresh.
+        assert!(Arc::ptr_eq(&keep_a, &cache.resolve(&db, keep).unwrap()));
+        assert!(!Arc::ptr_eq(&gone_a, &cache.resolve(&db, gone).unwrap()));
     }
 
     #[test]

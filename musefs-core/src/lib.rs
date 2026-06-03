@@ -2,6 +2,7 @@ mod byte_budget;
 mod db_pool;
 mod error;
 mod facade;
+mod lock;
 mod mapping;
 pub mod metrics;
 mod ogg_index;

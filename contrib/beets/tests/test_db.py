@@ -164,3 +164,50 @@ def test_connect_enables_foreign_keys_unlike_raw_sqlite(db_path):
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_replace_tags_preserves_binary_rows(db_path, make_track):
+    # A scanner-written binary tag row (value_blob NOT NULL, value '') must
+    # survive a plugin sync that replaces text tags. Regression test for #82.
+    tid = make_track("/music/a.flac")
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, value_blob, ordinal) "
+            "VALUES (?, 'APPLICATION', '', ?, 0)",
+            (tid, b"\x00\x01\x02binary"),
+        )
+        # Seed a committed text row too, to prove text rows are still replaced.
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, 'title', 'Old', 0)",
+            (tid,),
+        )
+        conn.commit()
+
+        replace_tags(conn, tid, [("title", "New")])
+        conn.commit()
+
+        binary = conn.execute(
+            "SELECT value, value_blob FROM tags WHERE track_id=? AND key='APPLICATION'",
+            (tid,),
+        ).fetchall()
+        assert binary == [("", b"\x00\x01\x02binary")]
+
+        titles = conn.execute(
+            "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
+        ).fetchall()
+        assert titles == [("New",)]
+    finally:
+        conn.close()
+
+
+def test_default_vocabulary_disjoint_from_binary_keys():
+    # The scoped delete is collision-free for the default vocabulary because
+    # DIRECT_FIELDS values never coincide with the scanner's binary tag keys
+    # (uppercase ID3/FLAC keys, MP4 '----:...'). Documents the #82 assumption.
+    from beetsplug._core import DIRECT_FIELDS
+
+    binary_keys = {"APPLICATION", "CUESHEET", "PRIV", "GEOB", "APIC"}
+    text_keys = set(DIRECT_FIELDS.values())
+    assert text_keys.isdisjoint(binary_keys)
+    assert not any(k.startswith("----") for k in text_keys)

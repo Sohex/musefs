@@ -145,6 +145,9 @@ pub struct Musefs {
     snapshot: Mutex<HashMap<i64, TrackRenderState>>,
     force_rebuild_error: AtomicBool,
     force_apply_fail: AtomicBool,
+    /// Set when a poisoned VFS-state lock is recovered; the next `poll_refresh`
+    /// forces a full rebuild from the DB and clears it (#96).
+    needs_rebuild: AtomicBool,
 }
 
 /// Map a `sharded_slab::Slab` insert result to a FUSE file handle. The slab key
@@ -179,6 +182,7 @@ impl Musefs {
             snapshot: Mutex::new(snapshot),
             force_rebuild_error: AtomicBool::new(false),
             force_apply_fail: AtomicBool::new(false),
+            needs_rebuild: AtomicBool::new(false),
         })
     }
 
@@ -237,10 +241,7 @@ impl Musefs {
     /// `poll_refresh` whose change-diff relies on that snapshot.
     pub fn refresh(&self) -> Result<()> {
         let snapshot = self.rebuild_full()?;
-        *self
-            .snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
+        *crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot") = snapshot;
         Ok(())
     }
 
@@ -253,14 +254,43 @@ impl Musefs {
             ));
         }
         let (tree, snapshot) = self.pool.with(|db| {
-            let mut alloc = self
-                .inodes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
             Self::build_full(db, &self.config, &mut alloc)
         })?;
         self.tree.store(Arc::new(tree));
         Ok(snapshot)
+    }
+
+    /// Full rebuild used to self-heal after a poisoned VFS-state lock: rebuild
+    /// from the DB, publish the tree, diff for cache invalidation, and clear the
+    /// flag. Bypasses the poll gates (the caller checks `needs_rebuild`).
+    fn force_full_rebuild(&self, on_changed: &mut impl FnMut(u64)) -> Result<bool> {
+        // Read data_version before rebuilding so a successful self-heal also advances
+        // the poll stamp: a write that commits mid-rebuild then leaves a newer version
+        // for the next poll (one extra rebuild, never a skipped change), rather than
+        // forcing an unconditional rebuild on every subsequent poll.
+        let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
+        let old_tree = self.tree.load_full();
+        let old_snapshot =
+            crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot").clone();
+        let new_snapshot = self.rebuild_full()?;
+        let new_tree = self.tree.load();
+        let live = new_tree.track_ids();
+        self.cache.retain(&live);
+        self.size_cache.retain(|k, _| live.contains(k));
+        Self::notify_changed(
+            &old_snapshot,
+            &new_snapshot,
+            &old_tree,
+            &new_tree,
+            on_changed,
+        );
+        *crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot") = new_snapshot;
+        self.last_data_version.store(version, Ordering::Release);
+        self.refresh_gen.fetch_add(1, Ordering::AcqRel);
+        self.needs_rebuild.store(false, Ordering::Release);
+        self.stamp_successful_poll();
+        Ok(true)
     }
 
     /// Incremental rebuild (Stage A): scan render keys, diff against the previous
@@ -307,13 +337,10 @@ impl Musefs {
             .map(|(&id, s)| (id, s.path.clone()))
             .collect();
 
-        let mut alloc = self
-            .inodes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
         let mut tree = (*self.tree.load_full()).clone(); // O(1) im clone
         let applied = if self.force_apply_fail.swap(false, Ordering::AcqRel) {
-            Err(()) // test injection
+            Err(crate::tree::RebuildError::TestInjected) // test injection
         } else {
             tree.apply_changes(
                 &new_paths,
@@ -342,8 +369,10 @@ impl Musefs {
                 }
                 tree
             }
-            Err(()) => {
-                eprintln!("musefs: incremental tree mutation failed; falling back to full rebuild");
+            Err(reason) => {
+                log::warn!(
+                    "incremental tree mutation failed ({reason:?}); falling back to full rebuild"
+                );
                 let mut entries: Vec<(i64, String)> =
                     new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
                 entries.sort_by_key(|(id, _)| *id);
@@ -382,20 +411,29 @@ impl Musefs {
     /// Single-flighted: if a rebuild is already in progress, concurrent callers
     /// return `Ok(false)` immediately.
     pub fn poll_refresh_notify(&self, mut on_changed: impl FnMut(u64)) -> Result<bool> {
+        // A poisoned VFS-state lock scheduled a full rebuild: do it now,
+        // bypassing the debounce / backoff / data_version gates (#96).
+        if self.needs_rebuild.load(Ordering::Acquire) {
+            // Single-flight with the same flag the normal path uses.
+            if self
+                .refreshing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Ok(false);
+            }
+            let _guard = RefreshGuard(&self.refreshing);
+            return self.force_full_rebuild(&mut on_changed);
+        }
+
         if !self.poll_interval.is_zero()
-            && self
-                .last_poll
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .elapsed()
+            && crate::lock::lock_recover(&self.last_poll, "last_poll").elapsed()
                 < self.poll_interval
         {
             return Ok(false);
         }
-        if let Some(last_failed) = *self
-            .last_failed_refresh
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        if let Some(last_failed) =
+            *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh")
         {
             if last_failed.elapsed() < self.refresh_retry_backoff {
                 return Ok(false);
@@ -420,18 +458,12 @@ impl Musefs {
         let _guard = RefreshGuard(&self.refreshing);
 
         let old_tree = self.tree.load_full();
-        let old_snapshot = self
-            .snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let old_snapshot =
+            crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot").clone();
         let (new_snapshot, change) = match self.rebuild_incremental(&old_snapshot) {
             Ok(v) => v,
             Err(err) => {
-                *self
-                    .last_failed_refresh
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") =
                     Some(std::time::Instant::now());
                 return Err(err);
             }
@@ -451,10 +483,7 @@ impl Musefs {
             &mut on_changed,
         );
 
-        *self
-            .snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_snapshot;
+        *crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot") = new_snapshot;
 
         self.last_data_version.store(version, Ordering::Release);
         if !change.is_empty() {
@@ -504,15 +533,9 @@ impl Musefs {
 
     fn stamp_successful_poll(&self) {
         if !self.poll_interval.is_zero() {
-            *self
-                .last_poll
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+            *crate::lock::lock_recover(&self.last_poll, "last_poll") = std::time::Instant::now();
         }
-        *self
-            .last_failed_refresh
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") = None;
     }
 
     #[doc(hidden)]
@@ -523,6 +546,18 @@ impl Musefs {
     #[doc(hidden)]
     pub fn force_apply_failure_for_test(&self, on: bool) {
         self.force_apply_fail.store(on, Ordering::Release);
+    }
+
+    #[doc(hidden)]
+    pub fn mark_needs_rebuild_for_test(&self) {
+        self.needs_rebuild
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[doc(hidden)]
+    pub fn needs_rebuild_is_set_for_test(&self) -> bool {
+        self.needs_rebuild
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[doc(hidden)]
@@ -537,10 +572,7 @@ impl Musefs {
         let past = std::time::Instant::now()
             .checked_sub(self.poll_interval)
             .expect("poll_interval exceeds monotonic clock base; cannot backdate last_poll");
-        *self
-            .last_poll
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = past;
+        *crate::lock::lock_recover(&self.last_poll, "last_poll") = past;
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
@@ -962,5 +994,70 @@ mod tests {
             );
         }
         fs.release_handle(fh);
+    }
+
+    #[test]
+    fn needs_rebuild_flag_forces_full_rebuild_on_next_poll() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+
+        // data_version is unchanged since open, so a normal poll is a no-op.
+        assert!(!fs.poll_refresh().unwrap(), "baseline poll must be a no-op");
+
+        // Advance data_version out-of-band so the forced rebuild has newer DB state
+        // to incorporate and stamp; the trailing normal poll then proves it stamped.
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            let track_id = db.list_tracks().unwrap().into_iter().next().unwrap().id;
+            db.replace_tags(track_id, &[musefs_db::Tag::new("comment", "hi", 0)])
+                .unwrap();
+        }
+
+        // Simulate recovery from a poisoned VFS-state lock.
+        fs.mark_needs_rebuild_for_test();
+        assert!(
+            fs.needs_rebuild_is_set_for_test(),
+            "flag reads set after marking"
+        );
+        assert!(
+            fs.poll_refresh().unwrap(),
+            "a set needs_rebuild flag must force a rebuild"
+        );
+        assert!(
+            !fs.needs_rebuild_is_set_for_test(),
+            "flag cleared after rebuild"
+        );
+
+        // The forced rebuild incorporated the out-of-band write and stamped its
+        // data_version, so a subsequent normal poll detects no change.
+        assert!(
+            !fs.poll_refresh().unwrap(),
+            "forced rebuild must stamp data_version (next poll is a no-op)"
+        );
     }
 }

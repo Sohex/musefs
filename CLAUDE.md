@@ -159,6 +159,9 @@ tracks whose backing file is gone, and GC orphaned art. `--revalidate` selects i
 
 - Errors: each crate has its own `error.rs` with a `thiserror` enum; `core` wraps
   lower layers in `CoreError`. The CLI is the only `anyhow` consumer.
+- Internal error paths do not discard diagnostics: no `Result<_, ()>`, and no
+  `.map_err(|_| …)` that drops a source. Each error variant carries its source
+  (`#[from]`) or a static reason describing the broken invariant.
 - Adding a format: implement probe + `synthesize_layout` in `musefs-format`
   (mirror an existing module — `flac.rs`, `mp3.rs`, `mp4.rs`, `ogg/`, `wav.rs`),
   returning a `RegionLayout`; add the variant to `musefs-db`'s `Format` enum, then

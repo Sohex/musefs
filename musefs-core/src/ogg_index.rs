@@ -55,7 +55,7 @@ fn find_page_start(
         return Ok(audio_offset);
     }
     if let Some(m) = memo {
-        let guard = m.lock().unwrap();
+        let guard = crate::lock::lock_or_clear(m, "ogg last-page memo");
         if let Some((rel, total_len, _)) = guard.as_ref() {
             let start = audio_offset + *rel;
             if start <= abs_target && abs_target < start + *total_len {
@@ -178,7 +178,7 @@ pub fn serve_ogg_window(
         // correct. The lock is released before patching so concurrent readers never
         // serialize on the CRC work.
         let cached = memo.and_then(|m| {
-            let g = m.lock().unwrap();
+            let g = crate::lock::lock_or_clear(m, "ogg last-page memo");
             g.as_ref()
                 .filter(|(mp, _, _)| *mp == page_rel)
                 .map(|(_, _, h)| h.clone())
@@ -192,7 +192,8 @@ pub fn serve_ogg_window(
         };
         if let Some(m) = memo {
             let total_len = (header_len + payload_len) as u64;
-            *m.lock().unwrap() = Some((page_rel, total_len, patched_hdr.clone()));
+            *crate::lock::lock_or_clear(m, "ogg last-page memo") =
+                Some((page_rel, total_len, patched_hdr.clone()));
         }
 
         let hdr_end = page_rel + header_len as u64;
