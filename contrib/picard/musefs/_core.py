@@ -63,6 +63,23 @@ def _first_value(metadata, field_name):
     return ""
 
 
+def _values(metadata, field_name):
+    """All non-empty, stripped string values of a Picard metadata field
+    (``getall`` when available, else a plain ``.get``)."""
+    getall = getattr(metadata, "getall", None)
+    if getall is not None:
+        values = getall(field_name)
+    else:
+        v = metadata.get(field_name) if hasattr(metadata, "get") else None
+        values = v if isinstance(v, (list, tuple)) else ([] if v is None else [v])
+    return [text for v in values if (text := str(v).strip())]
+
+
+# Keys whose Picard values may legitimately be multi-valued (one store row each).
+# Everything else (title, tracknumber, discnumber, date) stays a single scalar.
+_MULTI_VALUE_KEYS = {"artist", "albumartist", "genre", "composer"}
+
+
 def map_fields(metadata, extra_fields=None):
     """Map a Picard Metadata (dict-like) to a list of (musefs_key, value) pairs.
 
@@ -76,6 +93,10 @@ def map_fields(metadata, extra_fields=None):
 
     pairs = []
     for pic_field, key in fields.items():
+        if key in _MULTI_VALUE_KEYS:
+            for text in _values(metadata, pic_field):
+                pairs.append((key, text))
+            continue
         text = _first_value(metadata, pic_field)
         if not text:
             continue
