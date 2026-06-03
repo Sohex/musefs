@@ -115,6 +115,59 @@ modifying or duplicating the original audio bytes.
 
 ---
 
+## Open issue backlog (prioritized)
+
+Suggested order for the currently-open issues. Driving logic: stop active data
+loss first → make the cheap policy decisions that shape later code → fix
+correctness in batches by code area → then perf/cleanup → docs last. The plugin
+(Python) and core (Rust) tracks are independent codebases and can run in
+parallel. Most of the Rust items came out of the v1 multi-model review triage.
+
+**Phase 0 — Stop the bleeding**
+- #82 — plugin `replace_tags` wipes scanner-written binary tags (active data loss
+  introduced by the binary-tags work; everything else waits behind it).
+
+**Phase 1 — Cheap policy decisions (resolve before writing the code they shape)**
+- #96 — mutex poison-recovery policy (shapes the lock code in #89/#90/#94).
+- #95 — internal error-type convention (`Result<(),()>`, `InvalidLayout`); decide
+  it so the new error paths in #91/#92 adopt it from the start.
+
+**Phase 2 — Plugin correctness batch** *(parallel track; shared `_core.py` surface)*
+- #83 — beets reconciliation hook not fail-safe (except breadth + scan timeout).
+- #84 — Picard drops multi-value tags.
+- #85 — Picard comma field-map mangling.
+- #86 — beets `genre`/`genres` duplication.
+- #87 — Picard O(n) subprocess (perf rider on the same plugin pass).
+
+**Phase 3 — Safety net + small Rust hardening** *(low-risk, independent)*
+- #88 — Ogg fuzz art coverage (quick win; lands coverage before later Ogg touches).
+- #93 — `byte_budget` overflow asymmetry.
+- #92 — `byte_len` non-negative guard.
+- #91 — MP4 `moov`/`ftyp` alloc cap.
+- #94 — DbPool thread-local footguns (after #96 is decided).
+
+**Phase 4 — Concurrency correctness**
+- #90 — `rebuild_full` holds `inodes` across DB I/O (mirror the incremental path).
+- #89 — `fire_poll_refresh` floods the threadpool (synchronous debounce).
+
+**Phase 5 — Metrics**
+- #71 — Ogg serve path records no pread/byte metrics (instrumentation blind today).
+- #76 — metric counters covered only by direct-call tests (locks in #71's fix).
+
+**Phase 6 — Performance optimization SPs** *(bench-tracked: before/after in
+`BENCHMARKS.md` + the tracking README)*
+- #69 — refresh O(library)→O(changed); adjacent to #90 (same facade rebuild path),
+  do right after it. Biggest latency win.
+- #67 — bounded probe reads an ID3v1 tail per file (scan perf).
+- #68 — `ingest_bulk` copies each picture's bytes (scan perf).
+- #70 — zero-copy serve path (deferred SP3 residual; largest scope).
+
+**Phase 7 — Docs**
+- #64 — README/architecture rework. Last, so it documents settled behavior (and is
+  affected by the Phase 2 plugin changes).
+
+---
+
 ## Post-MVP (explicitly deferred)
 
 These are intentionally **out of scope for v0.1.0**. They are recorded here so the
