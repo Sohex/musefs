@@ -41,26 +41,10 @@ def _to_int(value):
         return 0
 
 
-def _first_value(metadata, field_name):
-    """First non-empty, stripped string value of a Picard metadata field.
-    Reads ``metadata.getall(field)`` when available (Picard's multi-valued
-    accessor), else falls back to a plain ``.get``."""
-    getall = getattr(metadata, "getall", None)
-    if getall is not None:
-        values = getall(field_name)
-    else:
-        v = metadata.get(field_name) if hasattr(metadata, "get") else None
-        values = v if isinstance(v, (list, tuple)) else ([] if v is None else [v])
-    for v in values:
-        text = str(v).strip()
-        if text:
-            return text
-    return ""
-
-
 def _values(metadata, field_name):
-    """All non-empty, stripped string values of a Picard metadata field
-    (``getall`` when available, else a plain ``.get``)."""
+    """All non-empty, stripped string values of a Picard metadata field. Reads
+    ``metadata.getall(field)`` when available (Picard's multi-valued accessor),
+    else falls back to a plain ``.get``."""
     getall = getattr(metadata, "getall", None)
     if getall is not None:
         values = getall(field_name)
@@ -68,6 +52,13 @@ def _values(metadata, field_name):
         v = metadata.get(field_name) if hasattr(metadata, "get") else None
         values = v if isinstance(v, (list, tuple)) else ([] if v is None else [v])
     return [text for v in values if (text := str(v).strip())]
+
+
+def _first_value(metadata, field_name):
+    """First non-empty, stripped string value of a Picard metadata field, or
+    ``""`` if none."""
+    values = _values(metadata, field_name)
+    return values[0] if values else ""
 
 
 # Keys whose Picard values may legitimately be multi-valued (one store row each).
@@ -78,9 +69,10 @@ _MULTI_VALUE_KEYS = {"artist", "albumartist", "genre", "composer"}
 def map_fields(metadata, extra_fields=None):
     """Map a Picard Metadata (dict-like) to a list of (musefs_key, value) pairs.
 
-    One value per key (the first non-empty), empty strings omitted, and a zero
-    tracknumber/discnumber omitted. ``extra_fields`` merges into (and can
-    override) the direct-copy table.
+    Keys in ``_MULTI_VALUE_KEYS`` emit one row per non-empty value (preserving
+    Picard's order); every other key emits a single row (the first non-empty).
+    Empty strings are omitted, as is a zero tracknumber/discnumber.
+    ``extra_fields`` merges into (and can override) the direct-copy table.
     """
     fields = dict(DIRECT_FIELDS)
     if extra_fields:
