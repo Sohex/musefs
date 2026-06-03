@@ -6,6 +6,18 @@
 //!   * caches  -> `lock_or_clear`  (clear; next access cold-resolves from the DB)
 //!   * VFS state -> `lock_or_flag` (schedule a full rebuild via `poll_refresh`)
 //!   * scalars -> `lock_recover`   (replace-only writes can't be half-written)
+//!
+//! Audit (every serving-path `std::sync::Mutex`):
+//!   facade.rs `inodes`            -> cat 2 (flag): InodeAllocator, rebuilt by build_full from the DB.
+//!   facade.rs `snapshot`          -> cat 2 (flag): per-track render state, rebuilt by rebuild_full from the DB.
+//!   facade.rs `last_poll`         -> cat 3 (recover): Instant, replace-only single write.
+//!   facade.rs `last_failed_refresh` -> cat 3 (recover): Option<Instant>, replace-only single write.
+//!   reader.rs HeaderCache shards  -> cat 1 (clear): pure cache, repopulated from the DB.
+//!   ResolvedFile::last_page (reader.rs:30, locked in ogg_index.rs as LastPageMemo)
+//!                                 -> cat 1 (clear): deterministic one-entry cache, re-derived.
+//! Out of scope (handled elsewhere): byte_budget.rs (#93, currently panics on
+//! poison), db_pool.rs (#94), scan.rs ENV_LOCK / work-queue (test/scan-internal,
+//! not on the FUSE serving path).
 
 #![allow(dead_code)]
 
