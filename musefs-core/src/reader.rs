@@ -142,7 +142,9 @@ impl Shard {
         }
     }
     fn remove_key(&mut self, id: i64) {
-        self.unlink(id);
+        if self.map.contains_key(&id) {
+            self.unlink(id);
+        }
         if let Some(n) = self.map.remove(&id) {
             self.bytes -= n.value.cache_bytes;
         }
@@ -1136,6 +1138,14 @@ mod cache_bound_tests {
         s.remove_key(1);
         assert!(s.get(1).is_none());
         assert!(s.get(2).is_some());
+        assert_eq!(s.bytes, 100);
+    }
+
+    #[test]
+    fn shard_remove_key_is_noop_for_absent_id() {
+        let mut s = Shard::new(1000);
+        s.insert(1, entry(0, 100));
+        s.remove_key(999); // must not panic
         assert_eq!(s.bytes, 100);
     }
 
