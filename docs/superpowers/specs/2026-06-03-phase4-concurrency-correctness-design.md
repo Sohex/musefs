@@ -26,9 +26,10 @@ untouched. The full `#[ignore]` e2e mount suite stays green.
 
 ## #90 — `rebuild_full` holds the `inodes` lock across DB I/O
 
-**Problem.** In `musefs-core/src/facade.rs`, `rebuild_full` acquires the `inodes`
-mutex *inside* the `pool.with(|db| …)` closure (`facade.rs:255-258`) and holds it
-across `build_full`'s DB reads (`list_tracks()` + `tags_grouped()`). On a slow
+**Problem.** In `musefs-core/src/facade.rs`, `rebuild_full` (`facade.rs:247-261`)
+acquires the `inodes` mutex *inside* the `pool.with(|db| …)` closure (the lock +
+`build_full` call at `facade.rs:256-257`) and holds it across `build_full`'s DB
+reads (`list_tracks()` + `tags_grouped()`). On a slow
 backing store the lock is held for the whole DB scan, blocking concurrent
 first-touch inode allocation.
 
@@ -88,10 +89,23 @@ fn rebuild_full(&self) -> Result<HashMap<i64, TrackRenderState>> {
 ```
 
 `build_full` (the other caller, `open()` at `facade.rs:163`) stays as a thin
-wrapper over `render_entries` + `build_with`, so its existing signature
-(`db, config, alloc`) is preserved. `open()` runs single-threaded at init with a
-fresh local `InodeAllocator` — no contention — so it is unaffected either way.
-`force_full_rebuild` calls `rebuild_full`, so it inherits the fix for free.
+wrapper over `render_entries` + `build_with`, preserving its existing signature
+(`db, config, alloc`) so `open()` is unchanged:
+
+```rust
+fn build_full(
+    db: &Db,
+    config: &MountConfig,
+    alloc: &mut InodeAllocator,
+) -> Result<(VirtualTree, HashMap<i64, TrackRenderState>)> {
+    let (entries, snapshot) = Self::render_entries(db, config)?;
+    Ok((VirtualTree::build_with(&entries, alloc), snapshot))
+}
+```
+
+`open()` runs single-threaded at init with a fresh local `InodeAllocator` — no
+contention — so it is unaffected either way. `force_full_rebuild` calls
+`rebuild_full`, so it inherits the fix for free.
 
 **Lock-order comment.** Update `facade.rs:387-398` to drop the "one intentional
 exception" sentence: the order is now uniform — the pool connection
@@ -176,8 +190,13 @@ measurable gain.
 
 ### Piece 2 — single-flight submission gate (musefs-fuse/src/lib.rs)
 
-Add a shared `poll_pending: Arc<AtomicBool>` to `MusefsFs` (an `Arc` because it
-must be cloned into the `'static` worker closure to be cleared on completion).
+Add a shared `poll_pending: Arc<AtomicBool>` field to `MusefsFs` (an `Arc`
+because it must be cloned into the `'static` worker closure to be cleared on
+completion). **Initialize it in `MusefsFs::new` (`musefs-fuse/src/lib.rs:128-145`,
+an explicit field-list constructor):** `poll_pending: Arc::new(AtomicBool::new(false))`
+— omitting this is a compile error, so it is part of the change, not just the
+`fire_poll_refresh` rewrite shown below.
+
 Rewrite `fire_poll_refresh`:
 
 ```rust
@@ -219,23 +238,39 @@ bound holds even with `--poll-interval-ms 0`.
 
 ## Testing
 
-- **#90:** assert the `inodes` lock is *not* held across DB I/O. Preferred seam:
-  use a slow/blocking DB injection (or the existing `force_*` test hooks) so a
-  rebuild's DB scan is in flight, and assert a concurrent first-touch inode
-  allocation is not blocked during it. If no clean blocking seam exists, fall
-  back to a structural test asserting `render_entries` performs all DB access and
-  `build_with` runs under the lock with no `Db` access in scope. Existing
+- **#90 (primary — structural invariant):** the deliverable test asserts the
+  code shape that makes the lock-held-across-I/O bug impossible: all `Db` access
+  is confined to `render_entries`, and `rebuild_full` calls `build_with` (the
+  only `inodes`-locked region) with no `Db`/`pool` in scope. There is no
+  DB-injection mock or blocking-read seam today, and the `force_*` test hooks
+  (`force_rebuild_error`, `force_apply_fail`, `needs_rebuild`) only make a rebuild
+  *fail* or *trigger* — none make a DB read *block* mid-scan — so a runtime
+  "concurrent allocation isn't blocked" assertion is **not** in scope for this PR.
+  The structural invariant is the honest, achievable guarantee. Existing
   rebuild/refresh tests (incremental + full + force-rebuild + self-heal) stay
-  green.
-- **#89, `poll_due()`:** unit-test it returns `false` inside the interval; `true`
-  past it; `true` when `needs_rebuild` is set (regardless of interval); `false`
-  inside the failure backoff window and `true` past it; and `true` when
-  `poll_interval` is zero.
-- **#89, single-flight gate:** a test that a burst of `fire_poll_refresh` calls
-  submits at most one task while one is pending — asserted via a task counter on
-  the pool, mirroring the existing direct-call metric/test style — and that the
-  gate is released after the task completes (and after a panicking task, via the
-  guard).
+  green and continue to prove behavior is unchanged.
+- **#89, `poll_due()` (core, deterministic):** unit-test it returns `false`
+  inside the interval; `true` past it; `true` when `needs_rebuild` is set
+  (regardless of interval); `false` inside the failure backoff window and `true`
+  past it; and `true` when `poll_interval` is zero. These are pure
+  state-comparison tests on the core facade, fully deterministic.
+- **#89, single-flight gate (fuse, in-crate test):** `fire_poll_refresh` is
+  **private**, so the test lives in a `#[cfg(test)] mod` inside
+  `musefs-fuse/src/lib.rs` (not `tests/`, which can't see it). It constructs a
+  `MusefsFs` over a temp-DB core via `MusefsFs::new` (no real mount needed) and
+  validates the gate **deterministically** — racy `ThreadPool::queued_count` /
+  `active_count` are unsuitable. Approach: occupy the single pool worker with a
+  barrier-blocked task that pins `poll_pending == true`, fire a burst of
+  `fire_poll_refresh` calls, and assert each is rejected by the
+  `compare_exchange` (no second task is admitted) by observing `poll_pending`
+  stays `true`; then release the barrier and assert the guard drops it back to
+  `false`. Add a separate test that a panicking task body still clears the gate
+  (the `PollPendingGuard` `Drop` runs on unwind).
+- **#89, end-to-end:** the existing `#[ignore]` mount tests that exercise
+  `fire_poll_refresh` through a live `/dev/fuse` mount —
+  `musefs-fuse/tests/keep_cache.rs` and the `metrics`-gated
+  `musefs-fuse/tests/concurrency.rs` — stay green, covering the real
+  metadata-op → poll path end to end.
 - **Suite:** `cargo test` workspace green; the full `#[ignore]` e2e mount suite
   green on `/dev/fuse`; `cargo clippy --all-targets` clean; `cargo fmt --all
   --check` clean.
