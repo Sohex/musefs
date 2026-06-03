@@ -18,8 +18,10 @@
 //! Out of scope (handled elsewhere): byte_budget.rs (#93, currently panics on
 //! poison), db_pool.rs (#94), scan.rs ENV_LOCK / work-queue (test/scan-internal,
 //! not on the FUSE serving path).
-
-#![allow(dead_code)]
+//!
+//! Recovery is one-shot: each helper calls `Mutex::clear_poison` after restoring
+//! the guarded state to a known-good value, so normal (non-clearing) operation
+//! resumes on the next acquisition rather than degrading permanently.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -39,6 +41,7 @@ impl<T> Clearable for Option<T> {
 pub(crate) fn lock_recover<'a, T>(m: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| {
         log::error!("recovered poisoned scalar lock ({what}); continuing on inner value");
+        m.clear_poison();
         e.into_inner()
     })
 }
@@ -50,6 +53,7 @@ pub(crate) fn lock_or_clear<'a, T: Clearable>(m: &'a Mutex<T>, what: &str) -> Mu
         Ok(g) => g,
         Err(e) => {
             log::error!("cleared poisoned cache lock ({what})");
+            m.clear_poison();
             let mut g = e.into_inner();
             g.reset();
             g
@@ -67,6 +71,7 @@ pub(crate) fn lock_or_flag<'a, T>(
     m.lock().unwrap_or_else(|e| {
         log::error!("poisoned VFS-state lock ({what}); scheduling full rebuild");
         needs_rebuild.store(true, Ordering::Release);
+        m.clear_poison();
         e.into_inner()
     })
 }
@@ -91,6 +96,7 @@ mod tests {
         let m = Arc::new(Mutex::new(7u32));
         poison(&m);
         assert_eq!(*lock_recover(&m, "scalar"), 7);
+        assert!(!m.is_poisoned(), "poison cleared after recovery");
     }
 
     #[test]
@@ -98,6 +104,7 @@ mod tests {
         let m = Arc::new(Mutex::new(Some(42u32)));
         poison(&m);
         assert!(lock_or_clear(&m, "cache").is_none());
+        assert!(!m.is_poisoned(), "poison cleared after clearing the cache");
     }
 
     #[test]
@@ -105,7 +112,10 @@ mod tests {
         let m = Arc::new(Mutex::new(0u32));
         let flag = AtomicBool::new(false);
         poison(&m);
-        let _g = lock_or_flag(&m, &flag, "vfs");
-        assert!(flag.load(Ordering::Acquire));
+        {
+            let _g = lock_or_flag(&m, &flag, "vfs");
+            assert!(flag.load(Ordering::Acquire));
+        }
+        assert!(!m.is_poisoned(), "poison cleared after flagging a rebuild");
     }
 }
