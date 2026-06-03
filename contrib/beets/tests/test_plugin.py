@@ -5,8 +5,9 @@ import pytest
 pytest.importorskip("beets")
 
 from beets.library import Item  # noqa: E402
+from musefs_common import connect  # noqa: E402
 
-from beetsplug._core import connect, map_fields  # noqa: E402
+from beetsplug._core import map_fields  # noqa: E402
 from beetsplug.musefs import MusefsPlugin  # noqa: E402
 
 

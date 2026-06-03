@@ -3,8 +3,7 @@ import time
 from pathlib import Path
 
 import pytest
-
-from beetsplug._core import connect as musefs_connect
+from musefs_common import connect as musefs_connect
 
 SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
 

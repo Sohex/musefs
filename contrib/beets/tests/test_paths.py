@@ -1,6 +1,6 @@
 import os
 
-from beetsplug._core import realpath_key
+from musefs_common import realpath_key
 
 
 def test_str_path_absolutised(tmp_path):

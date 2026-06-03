@@ -21,6 +21,14 @@ No install needed — point beets at the plugin's `beetsplug` directory. beets a
 `pluginpath` entries directly to the `beetsplug` package path, so it must be the
 `beetsplug` dir itself (not its parent). In your beets `config.yaml`:
 
+The plugin depends on the shared `python-musefs` library, which is unpublished
+and lives in this repo. Install it from the working tree **before** the plugin:
+
+```bash
+pip install -e contrib/python-musefs
+pip install -e "contrib/beets[test]"
+```
+
 ```yaml
 pluginpath: /path/to/musefs/contrib/beets/beetsplug
 plugins: musefs
@@ -79,6 +87,7 @@ The tests live under `tests/` and use a local virtualenv with beets + pytest.
 cd contrib/beets
 uv venv                                   # create .venv (once)
 source .venv/bin/activate
+uv pip install -e ../python-musefs        # shared library (unpublished; install first)
 uv pip install -r requirements.txt        # beets + pytest
 
 python -m pytest                          # unit + integration (no Rust binary)

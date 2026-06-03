@@ -1,10 +1,21 @@
 """beets plugin: sync canonical beets metadata into the musefs SQLite store."""
 
 import os
-import subprocess
 
 from beets import ui
 from beets.plugins import BeetsPlugin
+from musefs_common import (
+    ScanError,
+    SchemaMismatch,
+    SyncStats,
+    check_schema_version,
+    connect,
+    prune_missing,
+    realpath_key,
+    run_scan,
+    sync_files,
+    track_id_for_path,
+)
 
 from beetsplug import _core
 
@@ -108,7 +119,9 @@ class MusefsPlugin(BeetsPlugin):
                 self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
             self._sync(db_path, items)
             self._prune_missing(db_path)
-        except ui.UserError as exc:
+        except Exception as exc:
+            # A passive cli_exit hook must never abort the beets operation, so any
+            # failure (ui.UserError, a sqlite3 error, etc.) degrades to a warning.
             self._log.warning("musefs: {}", exc)
 
     # --- helpers ---------------------------------------------------------
@@ -136,28 +149,30 @@ class MusefsPlugin(BeetsPlugin):
         binary = self._bin()
         for target in targets:
             try:
-                result = subprocess.run(
-                    [binary, "scan", target, "--db", db_path],
-                    capture_output=True,
-                )
-            except FileNotFoundError:
-                raise ui.UserError(
-                    f"musefs: binary '{binary}' not found; set `musefs.bin` to "
-                    f"the musefs executable path"
-                )
-            if result.returncode != 0:
-                raise ui.UserError(
-                    f"musefs: `{binary} scan` failed for {target} "
-                    f"(exit {result.returncode}):\n"
-                    f"{result.stderr.decode(errors='replace').strip()}"
-                )
+                run_scan(binary, db_path, target, timeout=None)
+            except ScanError as exc:
+                raise self._scan_user_error(exc)
+
+    @staticmethod
+    def _scan_user_error(exc):
+        """Translate a python-musefs ScanError to beets' ui.UserError, preserving
+        the plugin's historical message text."""
+        if exc.kind == "not_found":
+            return ui.UserError(
+                f"musefs: binary '{exc.binary}' not found; set `musefs.bin` to "
+                f"the musefs executable path"
+            )
+        return ui.UserError(
+            f"musefs: `{exc.binary} scan` failed for {exc.target} "
+            f"(exit {exc.returncode}):\n{exc.stderr}"
+        )
 
     @staticmethod
     def _track_ids_for_items(conn, items):
         ids = []
         for item in items:
-            key = _core.realpath_key(item.path)
-            track_id = _core.track_id_for_path(conn, key)
+            key = realpath_key(item.path)
+            track_id = track_id_for_path(conn, key)
             if track_id is not None:
                 ids.append(track_id)
         return ids
@@ -168,10 +183,10 @@ class MusefsPlugin(BeetsPlugin):
         Returns the number pruned."""
         if not os.path.exists(db_path):
             return 0
-        conn = _core.connect(db_path)
+        conn = connect(db_path)
         try:
             track_ids = None if items is None else self._track_ids_for_items(conn, items)
-            pruned = _core.prune_missing(conn, track_ids)
+            pruned = prune_missing(conn, track_ids)
             conn.commit()
             return pruned
         finally:
@@ -183,16 +198,18 @@ class MusefsPlugin(BeetsPlugin):
                 f"musefs: DB not found at {db_path}; enable `musefs.autoscan` "
                 f"or run `musefs scan` first"
             )
-        conn = _core.connect(db_path)
+        conn = connect(db_path)
         try:
-            _core.check_schema_version(conn)
-            stats = _core.sync_items(conn, items, fields=self._fields(), dry_run=dry_run)
+            check_schema_version(conn)
+            stats = SyncStats()
+            records = _core.build_records(items, fields=self._fields(), stats=stats)
+            sync_files(conn, records, dry_run=dry_run, stats=stats)
             if dry_run:
                 conn.rollback()
             else:
                 conn.commit()
             return stats
-        except _core.SchemaMismatch as exc:
+        except SchemaMismatch as exc:
             conn.rollback()
             raise ui.UserError(f"musefs: {exc}")
         finally:

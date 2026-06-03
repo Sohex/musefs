@@ -1,20 +1,13 @@
-"""Pure logic for the musefs beets plugin: no beets imports live here.
+"""beets-specific mapping for the musefs sync plugin: no beets imports here.
 
-Everything beets-specific (the BeetsPlugin subclass, commands, event
-listeners) is in ``musefs.py``; this module is unit-testable on its own.
+The shared store/scan/sync contract lives in the ``musefs_common`` package
+(python-musefs); this module only maps beets items to musefs tag pairs and reads
+album cover art into ``Record``s. ``musefs.py`` holds the BeetsPlugin adapter.
 """
 
-import hashlib
 import os
-import sqlite3
-from dataclasses import dataclass
 
-# Schema version this plugin was written against (musefs schema.rs MIGRATIONS
-# length). The plugin refuses to run against any other version.
-EXPECTED_USER_VERSION = 2
-
-# Mirror of musefs-core scan.rs MAX_ART_BYTES: 16 MiB minus 64 KiB headroom.
-MAX_ART_BYTES = 16 * 1024 * 1024 - 64 * 1024
+from musefs_common import MAX_ART_BYTES, Record, realpath_key, sniff_mime
 
 # beets field name -> musefs (Vorbis-lowercase) tag key, for direct copies.
 # beets 2.x exposes genre/composer as the multi-valued `genres`/`composers`
@@ -90,161 +83,6 @@ def map_fields(item, extra_fields=None):
     return pairs
 
 
-def realpath_key(path):
-    """Canonical absolute path string matching musefs scan's stored
-    ``backing_path`` (``std::fs::canonicalize`` + ``to_string_lossy``).
-
-    Accepts ``str`` or ``bytes`` (beets stores ``item.path`` as bytes) and
-    always returns ``str`` via the filesystem encoding.
-    """
-    real = os.path.realpath(path)
-    if isinstance(real, bytes):
-        real = os.fsdecode(real)
-    # os.fsdecode uses surrogateescape; Rust's to_string_lossy uses U+FFFD for
-    # undecodable bytes. Normalize so a non-UTF-8 path component produces the
-    # same key string on both sides instead of silently mismatching.
-    return real.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
-
-
-class SchemaMismatch(Exception):  # noqa: N818
-    """Raised when the musefs DB schema version differs from what the plugin
-    targets (``EXPECTED_USER_VERSION``)."""
-
-    def __init__(self, found):
-        self.found = found
-        super().__init__(
-            f"musefs DB user_version is {found}, plugin targets "
-            f"{EXPECTED_USER_VERSION}; the musefs and plugin versions have "
-            f"diverged."
-        )
-
-
-def connect(db_path):
-    """Open the musefs DB with a busy timeout and foreign keys enabled."""
-    conn = sqlite3.connect(db_path)
-    # 5s busy timeout so a brief write doesn't fail while the FUSE mount reads.
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def check_schema_version(conn):
-    """Raise ``SchemaMismatch`` unless the DB's ``user_version`` matches the
-    version this plugin targets. Call on an open connection from ``connect``."""
-    found = conn.execute("PRAGMA user_version").fetchone()[0]
-    if found != EXPECTED_USER_VERSION:
-        raise SchemaMismatch(found)
-
-
-def track_id_for_path(conn, key):
-    """Return the track id whose backing_path equals ``key``, or None."""
-    row = conn.execute("SELECT id FROM tracks WHERE backing_path = ?", (key,)).fetchone()
-    return row[0] if row else None
-
-
-def prune_missing(conn, track_ids=None):
-    """Delete track rows whose backing file no longer exists on disk.
-
-    When ``track_ids`` is provided, only those tracks are checked and
-    potentially pruned. Otherwise, every track in the database is checked.
-    Returns the number pruned.
-    """
-    if track_ids is not None:
-        gone = []
-        for tid in track_ids:
-            row = conn.execute("SELECT backing_path FROM tracks WHERE id=?", (tid,)).fetchone()
-            if row is not None and not os.path.exists(row[0]):
-                gone.append((tid,))
-    else:
-        gone = [
-            (tid,)
-            for tid, path in conn.execute("SELECT id, backing_path FROM tracks")
-            if not os.path.exists(path)
-        ]
-    conn.executemany("DELETE FROM tracks WHERE id = ?", gone)
-    return len(gone)
-
-
-def replace_tags(conn, track_id, pairs):
-    """Replace all tags for a track. Duplicate keys get incrementing ordinals
-    (mirroring musefs scan ingest)."""
-    # Scope to the plugin-owned text rows: scanner-written binary tags
-    # (value_blob NOT NULL) must survive a sync (#82).
-    conn.execute("DELETE FROM tags WHERE track_id = ? AND value_blob IS NULL", (track_id,))
-    ordinals = {}
-    rows = []
-    for key, value in pairs:
-        ordinal = ordinals.get(key, 0)
-        ordinals[key] = ordinal + 1
-        rows.append((track_id, key, value, ordinal))
-    conn.executemany(
-        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, ?, ?, ?)",
-        rows,
-    )
-
-
-_EXT_MIME = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".webp": "image/webp",
-}
-
-
-def sniff_mime(data, path):
-    """Detect image mime from magic bytes, falling back to file extension."""
-    if data[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    # WebP: 'RIFF' <4-byte size> 'WEBP' (common in modern fetchart/exports).
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    ext = os.path.splitext(path)[1].lower()
-    return _EXT_MIME.get(ext, "application/octet-stream")
-
-
-def upsert_art(conn, data, mime):
-    """Content-address ``data`` by sha256 and return its art id, inserting only
-    if new (mirrors musefs Db::upsert_art). If the sha256 already exists, the
-    stored row (and its mime) is kept and the ``mime`` argument is ignored."""
-    sha = hashlib.sha256(data).hexdigest()
-    conn.execute(
-        "INSERT INTO art (sha256, mime, width, height, byte_len, data) "
-        "VALUES (?, ?, NULL, NULL, ?, ?) ON CONFLICT(sha256) DO NOTHING",
-        (sha, mime, len(data), data),
-    )
-    return conn.execute("SELECT id FROM art WHERE sha256 = ?", (sha,)).fetchone()[0]
-
-
-def replace_track_art(conn, track_id, art_id):
-    """Set the track's single front-cover art (picture_type 3, ordinal 0)."""
-    conn.execute("DELETE FROM track_art WHERE track_id = ?", (track_id,))
-    conn.execute(
-        "INSERT INTO track_art (track_id, art_id, picture_type, description, "
-        "ordinal) VALUES (?, ?, 3, '', 0)",
-        (track_id, art_id),
-    )
-
-
-# Sentinel returned by _prepare_art under dry_run: "would link, but not written".
-_WOULD_LINK = object()
-
-
-@dataclass
-class SyncStats:
-    synced: int = 0
-    skipped: int = 0  # item path had no matching track row
-    art_linked: int = 0
-    skipped_art: int = 0  # art file oversized / unreadable
-
-    def summary(self):
-        return (
-            f"synced={self.synced} skipped={self.skipped} "
-            f"art_linked={self.art_linked} skipped_art={self.skipped_art}"
-        )
-
-
 def _album_art_path(item):
     """Return the album cover path (bytes/str) for an item, or None."""
     get_album = getattr(item, "get_album", None)
@@ -255,64 +93,47 @@ def _album_art_path(item):
     return artpath or None
 
 
-def _prepare_art(conn, artpath, cache, stats, dry_run):
-    """Upsert the cover at ``artpath`` and return its art id (cached per run).
-    Returns None if unreadable/oversized, or under dry_run a non-None sentinel
-    when the art would be linked."""
-    # Cache key is the normalized realpath, but open the raw realpath: the art
-    # file only needs to be opened, not matched against the DB, so we must not
-    # apply realpath_key's lossy U+FFFD normalization to the bytes we open (it
-    # would turn a non-UTF-8 path into a different, nonexistent path).
+def _read_album_art(item, cache, stats):
+    """Return ``(data, mime)`` for the item's album cover, or None. Reads each
+    distinct cover once (cached by realpath). An unreadable or over-cap cover is
+    counted into ``stats.skipped_art`` once and cached as None (matches the
+    legacy ``_prepare_art`` counting before the python-musefs split)."""
+    artpath = _album_art_path(item)
+    if not artpath:
+        return None
     key = realpath_key(artpath)
     if key in cache:
         return cache[key]
-
     try:
+        # Open the raw realpath, not realpath_key's lossy U+FFFD form: the file
+        # is only opened, not matched against the DB.
         with open(os.path.realpath(artpath), "rb") as fh:
             data = fh.read()
     except OSError:
         stats.skipped_art += 1
         cache[key] = None
         return None
-
     if len(data) > MAX_ART_BYTES:
         stats.skipped_art += 1
         cache[key] = None
         return None
-
-    if dry_run:
-        cache[key] = _WOULD_LINK
-        return _WOULD_LINK
-
-    art_id = upsert_art(conn, data, sniff_mime(data, key))
-    cache[key] = art_id
-    return art_id
+    art = (data, sniff_mime(data, key))
+    cache[key] = art
+    return art
 
 
-def sync_items(conn, items, *, fields=None, dry_run=False):
-    """Sync beets items into the musefs DB. Caller controls the transaction
-    (commit on success, rollback for dry runs)."""
-    stats = SyncStats()
+def build_records(items, *, fields=None, stats):
+    """Build ``Record``s for beets items: map tags and resolve album art (with a
+    per-run cache; unreadable/over-cap covers counted into ``stats.skipped_art``).
+    ``stats`` is mutated and must be the same instance passed to ``sync_files``."""
+    records = []
     art_cache = {}
     for item in items:
-        key = realpath_key(item.path)
-        track_id = track_id_for_path(conn, key)
-        if track_id is None:
-            stats.skipped += 1
-            continue
-
-        pairs = map_fields(item, fields)
-        artpath = _album_art_path(item)
-        art_id = _prepare_art(conn, artpath, art_cache, stats, dry_run) if artpath else None
-
-        if not dry_run:
-            replace_tags(conn, track_id, pairs)
-            # In the live path art_id is an int or None (never _WOULD_LINK).
-            if art_id is not None:
-                replace_track_art(conn, track_id, art_id)
-
-        if art_id is not None:
-            stats.art_linked += 1
-        stats.synced += 1
-
-    return stats
+        records.append(
+            Record(
+                key=realpath_key(item.path),
+                pairs=map_fields(item, fields),
+                art=_read_album_art(item, art_cache, stats),
+            )
+        )
+    return records

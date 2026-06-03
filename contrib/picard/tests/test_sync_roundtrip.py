@@ -1,7 +1,8 @@
 import pytest
 from conftest import JPEG
 
-from musefs._core import Opts, connect
+from musefs._common import connect
+from musefs._core import Opts
 
 pytest.importorskip("picard")
 
@@ -39,5 +40,22 @@ def test_do_sync_no_db_raises():
     from musefs._core import MusefsError
 
     opts = Opts(db=None, bin="musefs", autoscan=False, fields={})
+    with pytest.raises(MusefsError):
+        musefs._do_sync(opts, {})
+
+
+def test_do_sync_schema_mismatch_raises_musefs_error(db_path):
+    import musefs
+    from musefs._core import MusefsError
+
+    conn = connect(db_path)
+    try:
+        conn.execute("PRAGMA user_version = 99")
+        conn.commit()
+    finally:
+        conn.close()
+    opts = Opts(db=db_path, bin="musefs", autoscan=False, fields={})
+    # A SchemaMismatch from the library must surface as the host-native
+    # MusefsError, like ScanError — not leak the library exception type.
     with pytest.raises(MusefsError):
         musefs._do_sync(opts, {})

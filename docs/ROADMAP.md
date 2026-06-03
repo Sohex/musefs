@@ -37,6 +37,10 @@ modifying or duplicating the original audio bytes.
   whose backing file is gone), and runs both as a `beet musefs` command and via
   import/write hooks. Verified end-to-end (beets import + retag + FUSE mount)
   with byte-identical audio.
+- **python-musefs** (`contrib/python-musefs/`) — the shared store-contract
+  library both plugins depend on for schema checks, tag/art writes, art
+  content-addressing, path normalization, and the scan shell-out. beets
+  installs it via pip; Picard vendors it into `musefs/_common/`.
 - **picard plugin** (`contrib/picard/`) — a MusicBrainz Picard plugin whose
   "Sync to musefs" context-menu action pushes Picard's in-memory tags and front
   cover into the SQLite store, keyed by each file's canonical path, without ever

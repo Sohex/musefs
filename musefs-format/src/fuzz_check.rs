@@ -141,7 +141,20 @@ pub mod fixtures {
             &bx(b"mdia", &[bx(b"hdlr", &soun_hdlr), minf].concat()),
         );
         let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), trak, udta].concat());
-        [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", mdat_payload)].concat()
+        let mut out = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", mdat_payload)].concat();
+        // Point the single `stco` chunk offset at the real `mdat` payload start. A real
+        // M4A's chunk offsets are absolute file positions; leaving it 0 means a retag
+        // that shrinks the `moov` patches the offset below zero and synthesis fails
+        // (TooLarge). With the true offset, the patched value lands at the new payload
+        // position. The first `stco` occurrence is the box type (it precedes `mdat`).
+        let mdat_payload_offset = (out.len() - mdat_payload.len()) as u32;
+        let stco = out
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco present");
+        let entry = stco + 4 + 4 + 4; // past "stco" type + version/flags + entry count
+        out[entry..entry + 4].copy_from_slice(&mdat_payload_offset.to_be_bytes());
+        out
     }
 
     /// 16-bit PCM mono WAV — hand-built RIFF/WAVE container with a `fmt ` chunk
@@ -323,6 +336,25 @@ mod fixtures_tests {
         let f = fixtures::m4a(&[9u8; 16]);
         let b = crate::mp4::locate_audio(&f).unwrap();
         assert_eq!(b.audio_length, 16);
+    }
+
+    #[test]
+    fn m4a_stco_offset_points_at_mdat_payload() {
+        // The single stco chunk offset must be the absolute file position of the
+        // mdat payload, not a placeholder 0 — otherwise a retag that shrinks the
+        // moov underflows it and synthesis fails (see fixtures::m4a). Pin both the
+        // value (out.len() - payload.len()) and where it is written (stco + 12).
+        let payload = b"AUDIOAUDIO";
+        let f = fixtures::m4a(payload);
+        let expected = (f.len() - payload.len()) as u32;
+        let stco = f
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco present");
+        // [stco][version/flags(4)][entry count(4)][offset(4)]
+        let off = u32::from_be_bytes(f[stco + 12..stco + 16].try_into().unwrap());
+        assert_eq!(off, expected);
+        assert!(off > 0);
     }
 
     #[test]
