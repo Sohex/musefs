@@ -1,7 +1,7 @@
 #![cfg(feature = "metrics")]
 
 mod common;
-use common::{make_flac, streaminfo_body, vorbis_comment_body};
+use common::{make_flac, streaminfo_body, vorbis_comment_body, write_ogg};
 use musefs_core::{metrics, scan_directory, MountConfig, Musefs, VirtualTree};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -19,6 +19,44 @@ fn config() -> MountConfig {
         mode: musefs_core::Mode::Synthesis,
         poll_interval: std::time::Duration::ZERO,
     }
+}
+
+/// Scan `dir`, mount, read the single track end-to-end in 16 KiB chunks under
+/// template `$artist/$title`, and return the metrics snapshot for those reads.
+/// Caller must hold `METRICS_LOCK`.
+fn read_all_and_snapshot(dir: &std::path::Path, artist_dir: &str) -> metrics::Snapshot {
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+    let parent = fs.lookup(VirtualTree::ROOT, artist_dir).unwrap();
+    let (_, inode, _) = fs.readdir(parent).unwrap().into_iter().next().unwrap();
+    let size = fs.getattr(inode).unwrap().size;
+    metrics::reset();
+    let mut off = 0u64;
+    while off < size {
+        let got = fs.read(inode, 0, off, 16 * 1024).unwrap();
+        if got.is_empty() {
+            break;
+        }
+        off += got.len() as u64;
+    }
+    metrics::snapshot()
+}
+
+#[test]
+fn ogg_serve_counts_backing_preads() {
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    write_ogg(&dir.path().join("a.ogg"), &vec![0xAB_u8; 8 * 1024]);
+
+    let s = read_all_and_snapshot(dir.path(), "Unknown");
+    assert!(s.preads > 0, "Ogg serve must count backing preads, got 0");
+    assert!(
+        s.pread_bytes > 0,
+        "Ogg serve must count backing bytes read, got 0"
+    );
 }
 
 #[test]

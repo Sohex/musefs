@@ -142,7 +142,7 @@ exclude_re = [
     # 0 disables the short-circuit (falls to the scan, also correct). So the served
     # output is byte-identical either way. (`+`->`-` underflows and is caught.) Pinned
     # by line:col — one of several `+` in this fn; the others ARE caught.
-    'musefs-core/src/ogg_index\.rs:194:41: replace \+ with \* in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:202:41: replace \+ with \* in serve_ogg_window',
 
     # SP4 crc_shift_zeros — equivalent mutants inherent to the loop/matrix hybrid.
     # crc_shift_zeros has two code paths (a per-step loop and a GF(2) matrix-power)
@@ -185,8 +185,8 @@ exclude_re = [
     # byte-identical proptest_read_fidelity pass with both mutations applied). They
     # were reported TIMEOUT under the parallel gate's load, not as a real hang. Pinned
     # by line:col — several `<` in this fn (the loop/length guards) ARE caught.
-    'musefs-core/src/ogg_index\.rs:204:15: replace < with <= in serve_ogg_window',
     'musefs-core/src/ogg_index\.rs:213:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:222:15: replace < with <= in serve_ogg_window',
 
     # Phase 4 poll_due (#89) — equivalent `<`->`<=` on the two wall-clock gates
     # (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <
