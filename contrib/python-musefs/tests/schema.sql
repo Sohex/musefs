@@ -1,7 +1,8 @@
 -- Copy of the migrations in musefs-db/src/schema.rs (the authoritative schema),
 -- applied in full. If the Rust schema changes: bump EXPECTED_USER_VERSION in
--- beetsplug/_core.py and update this file (append the new migration's DDL and
--- bump PRAGMA user_version). Drift otherwise surfaces as a SchemaMismatch at connect.
+-- musefs_common/constants.py (re-vendor for Picard) and update this file (append
+-- the new migration's DDL and bump PRAGMA user_version). Drift otherwise surfaces
+-- as a SchemaMismatch at connect.
 CREATE TABLE tracks (
     id              INTEGER PRIMARY KEY,
     backing_path    TEXT NOT NULL UNIQUE,

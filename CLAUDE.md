@@ -52,6 +52,31 @@ The FUSE end-to-end tests in `musefs-fuse` (e.g. `end_to_end_read_through_mount`
 are `#[ignore]`d because they perform real mounts; they only run with `--ignored`
 and require `/dev/fuse`.
 
+### contrib Python plugins (beets / Picard)
+
+The `contrib/` plugins share one library, `python-musefs` (import package
+`musefs_common`, in `contrib/python-musefs/`): beets depends on it via pip,
+Picard vendors a committed copy into `musefs/_common/` (re-vendor with
+`python contrib/python-musefs/vendor_to_picard.py`; a drift-guard test enforces
+freshness). Mirror these constants when the Rust schema changes:
+`EXPECTED_USER_VERSION` (= `MIGRATIONS` length in `musefs-db/src/schema.rs`) and
+`MAX_ART_BYTES` (mirrors `musefs-core/src/scan.rs`) in
+`contrib/python-musefs/src/musefs_common/constants.py`.
+
+```bash
+# python-musefs is self-contained (its tests use pythonpath=src):
+cd contrib/python-musefs && python -m pytest && ruff check . && ruff format --check .
+
+# beets declares python-musefs but it's UNPUBLISHED and has no [tool.uv.sources],
+# so install the local lib FIRST (a bare `uv run`/pip install of beets alone
+# fails resolving python-musefs from PyPI):
+cd contrib/beets && pip install -e ../python-musefs && pip install -e ".[test]" && python -m pytest tests
+
+# Picard needs no install (vendored + pythonpath="."); pytest-qt needs a Qt
+# binding or it errors at collection. Real-Picard tests importorskip if Picard is absent:
+cd contrib/picard && python -m pytest tests
+```
+
 ## Crate layout and dependency direction
 
 A strict layered workspace; dependencies point one way only:
