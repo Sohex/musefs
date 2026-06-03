@@ -102,8 +102,7 @@ if _PICARD:
         plugin's historical message text."""
         if exc.kind == "not_found":
             return MusefsError(
-                f"musefs binary '{exc.binary}' not found; set the binary path "
-                f"in the musefs options"
+                f"musefs binary '{exc.binary}' not found; set the binary path in the musefs options"
             )
         if exc.kind == "timeout":
             return MusefsError(
@@ -112,8 +111,7 @@ if _PICARD:
                 f"binary and DB."
             )
         return MusefsError(
-            f"`{exc.binary} scan` failed for {exc.target} "
-            f"(exit {exc.returncode}): {exc.stderr}"
+            f"`{exc.binary} scan` failed for {exc.target} (exit {exc.returncode}): {exc.stderr}"
         )
 
     def _do_sync(opts, files):

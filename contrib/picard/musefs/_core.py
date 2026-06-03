@@ -133,6 +133,3 @@ def resolve_config(settings, environ):
     if isinstance(fields, str):
         fields = parse_field_map(fields)
     return Opts(db=db, bin=binary, autoscan=autoscan, fields=fields)
-
-
-

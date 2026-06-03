@@ -1,7 +1,7 @@
+from conftest import JPEG, insert_track
+
 from musefs_common import Record, SyncStats, connect, sync_files, sync_one
 from musefs_common.constants import MAX_ART_BYTES
-
-from conftest import JPEG, insert_track
 
 
 def _seed(db_path, path="/m/a.flac"):
@@ -26,7 +26,11 @@ def test_sync_one_writes_tags_and_art(db_path):
     conn, _ = _seed(db_path)
     try:
         stats = SyncStats()
-        sync_one(conn, Record(key="/m/a.flac", pairs=[("title", "T")], art=(JPEG, "image/jpeg")), stats)
+        sync_one(
+            conn,
+            Record(key="/m/a.flac", pairs=[("title", "T")], art=(JPEG, "image/jpeg")),
+            stats,
+        )
         conn.commit()
         assert stats.synced == 1
         assert stats.art_linked == 1
@@ -103,7 +107,11 @@ def test_sync_files_reuses_caller_seeded_stats(db_path):
 def test_tags_fully_replaced(db_path):
     conn, tid = _seed(db_path)
     try:
-        sync_one(conn, Record(key="/m/a.flac", pairs=[("title", "Old"), ("genre", "Rock")]), SyncStats())
+        sync_one(
+            conn,
+            Record(key="/m/a.flac", pairs=[("title", "Old"), ("genre", "Rock")]),
+            SyncStats(),
+        )
         sync_one(conn, Record(key="/m/a.flac", pairs=[("title", "New")]), SyncStats())
         conn.commit()
         rows = dict(conn.execute("SELECT key, value FROM tags WHERE track_id=?", (tid,)))

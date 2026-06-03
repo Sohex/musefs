@@ -34,6 +34,5 @@ class ScanError(Exception):  # noqa: N818
         if self.kind == "timeout":
             return f"`{self.binary} scan` for {self.target} timed out after {self.timeout}s"
         return (
-            f"`{self.binary} scan` failed for {self.target} "
-            f"(exit {self.returncode}): {self.stderr}"
+            f"`{self.binary} scan` failed for {self.target} (exit {self.returncode}): {self.stderr}"
         )

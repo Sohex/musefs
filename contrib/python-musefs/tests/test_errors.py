@@ -1,6 +1,6 @@
 import pytest
 
-from musefs_common.errors import SchemaMismatch, ScanError
+from musefs_common.errors import ScanError, SchemaMismatch
 
 
 def test_schema_mismatch_message_and_found():

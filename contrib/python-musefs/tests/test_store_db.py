@@ -1,12 +1,9 @@
-import os
-
 import pytest
+from conftest import insert_track
 
 from musefs_common import connect, prune_missing, track_id_for_path
 from musefs_common.errors import SchemaMismatch
 from musefs_common.store import check_schema_version
-
-from conftest import insert_track
 
 
 def test_connect_sets_pragmas(db_path):
