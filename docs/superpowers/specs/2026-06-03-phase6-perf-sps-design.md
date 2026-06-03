@@ -96,7 +96,11 @@ On a `data_version` bump:
 4. **In-place snapshot mutation:** the snapshot is mutated (insert/update
    changed+added with freshly rendered state, remove removed) instead of being
    reconstructed. No clones for unchanged tracks. `apply_changes` on the tree
-   is already O(changed).
+   is already O(changed) — but its `new_paths` parameter must cover **every**
+   current track (`rebuild_subtree` disambiguates against arbitrary siblings),
+   so the O(N) `new_paths` string-clone map is replaced by passing the mutated
+   snapshot itself (`&HashMap<i64, TrackRenderState>`): lookups stay lazy and
+   O(dirty-subtree), nothing O(N) is materialized.
 5. `last_seq` advances **only after** a successful rebuild — the same
    stamp-after-success discipline `last_data_version` uses. A failed refresh
    leaves both unstamped so the next poll retries.
@@ -151,13 +155,12 @@ dispatch for every front-anchored file; only the MP3 arm of `probe_prefix`
 consumes the tail. FLAC/Ogg/WAV pay one syscall + 128 bytes per file for
 nothing.
 
-Fix: replace the eager read with a memoized lazy lookup. `probe_file` holds a
-`tail: Option<Option<[u8; 128]>>` slot (outer `Option` = not yet read, inner =
-file shorter than 128 bytes), filled on first request and persisting across
-the widen-retry loop so MP3 never reads it twice. `probe_prefix` already
-takes `file_len`; the only signature change is swapping today's
-`tail: Option<&[u8; 128]>` for the `&File` plus the memo slot, with the MP3
-arm filling the slot on first use.
+Fix: `probe_prefix` dispatches **by extension** (`has_ext`), so the tail is
+consumed iff the file is `.mp3` — no lazy machinery is needed. `probe_file`
+simply gates the eager read on the same predicate the MP3 arm uses:
+`let tail = if has_ext(path, "mp3") { read_tail_128(&file, file_len)? } else { None };`
+No signature changes; the tail is still read once before the widen-retry loop
+(MP3 behavior, including I/O-error propagation, is byte-for-byte unchanged).
 `metrics::on_scan_read(128)` fires only when the read happens. MP3 behavior is byte-for-byte unchanged; the `probe_full`
 fallback is unaffected (it reads the whole file, tail included).
 
