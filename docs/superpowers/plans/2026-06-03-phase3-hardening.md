@@ -72,7 +72,7 @@ Add this test inside `musefs-core/src/mapping.rs`'s `#[cfg(test)] mod tests` blo
 ```rust
     #[test]
     fn track_art_to_inputs_skips_negative_byte_len() {
-        use musefs_db::{NewArt, NewTrack, TrackArt};
+        use musefs_db::{NewArt, TrackArt}; // NewTrack already in scope at module level
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("art.db");
         let db = Db::open(&path).unwrap();
@@ -170,6 +170,7 @@ git commit -m "fix(mapping): skip art rows with negative byte_len from malformed
 **Files:**
 - Modify: `musefs-format/src/mp4.rs` (module const, `Mp4ScanError` enum ~line 89, `read_structure_from` ~lines 244-313, test module ~line 841)
 - Modify: `musefs-core/src/scan.rs` (`probe_file` MP4 arm, ~lines 219-222)
+- Modify: `musefs-core/src/reader.rs` (serve-path `Mp4ScanError` match, lines 321-324) — **required**: this is the only other `Mp4ScanError` consumer and its match is exhaustive/wildcard-free, so the new variant breaks compilation of `musefs-core` until this arm is added.
 
 The cap is checked on the declared box length **before** `region()` allocates. The test exploits that `read_structure_from`'s `file_len` argument is independent of the reader's real length: a large `file_len` clears `box_header`'s `total_len > remaining` check, so the new cap (not `Malformed`) is what fires.
 
@@ -225,6 +226,9 @@ Add these two tests to `musefs-format/src/mp4.rs`'s `#[cfg(test)] mod tests` blo
         buf.extend_from_slice(b"moov");
         let file_len = 32 + cap as u64;
         let mut cur = Cursor::new(buf);
+        // region() does `vec![0u8; 512 MiB]` here, but it's alloc_zeroed (lazy zero
+        // pages) and read_exact writes only ~8 bytes before EOF, so just one page is
+        // faulted in — no real 512 MiB RSS spike.
         let err = read_structure_from(&mut cur, file_len).unwrap_err();
         assert!(
             matches!(err, Mp4ScanError::Io(_)),
@@ -326,15 +330,43 @@ with a match that loudly logs the new cap case (all other errors keep the existi
 
 Note: the `MetadataTooLarge` branch at the scan site is only reachable for a genuinely >512 MiB file (scan passes the file's real length, so a small corrupt file hits `box_header`'s `Malformed` first). It is verified by inspection plus the unaffected existing MP4 scan tests, not a multi-hundred-MB fixture.
 
-- [ ] **Step 7: Verify the whole crates build and scan tests are unaffected**
+- [ ] **Step 7: Handle the new variant in the serve-path match (`reader.rs`)**
+
+`read_structure_from` is also called at serve/resolve time in `musefs-core/src/reader.rs`, where the error is mapped by an **exhaustive, wildcard-free** match. Adding `MetadataTooLarge` makes that match non-exhaustive (`error[E0004]`), so `musefs-core` will not compile until this arm is added. At `musefs-core/src/reader.rs:321-324`, change:
+
+```rust
+                        let scan = mp4::read_structure_from(&mut f, len).map_err(|e| match e {
+                            mp4::Mp4ScanError::Io(io) => CoreError::Io(io),
+                            mp4::Mp4ScanError::Format(fe) => CoreError::Format(fe),
+                        })?;
+```
+
+to add the new arm:
+
+```rust
+                        let scan = mp4::read_structure_from(&mut f, len).map_err(|e| match e {
+                            mp4::Mp4ScanError::Io(io) => CoreError::Io(io),
+                            mp4::Mp4ScanError::Format(fe) => CoreError::Format(fe),
+                            // Unreachable in practice at serve time (an ingested file
+                            // already passed the cap at scan, and backing-file drift is
+                            // caught by the size/mtime BackingChanged guard first), but
+                            // the match must stay exhaustive. Collapse to Malformed like
+                            // the Format arm — the scan path carries the detailed warn.
+                            mp4::Mp4ScanError::MetadataTooLarge { .. } => {
+                                CoreError::Format(musefs_format::FormatError::Malformed)
+                            }
+                        })?;
+```
+
+- [ ] **Step 8: Verify both crates build and scan tests are unaffected**
 
 Run: `cargo test -p musefs-format -p musefs-core mp4`
-Expected: PASS — new mp4 tests green, existing MP4 scan tests (normal files) unchanged.
+Expected: PASS — `musefs-core` compiles (the `reader.rs` arm closes E0004), new mp4 tests green, existing MP4 scan tests (normal files) unchanged.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add musefs-format/src/mp4.rs musefs-core/src/scan.rs
+git add musefs-format/src/mp4.rs musefs-core/src/scan.rs musefs-core/src/reader.rs
 git commit -m "fix(mp4): cap moov/ftyp metadata allocation at 512 MiB, log skips (#91)"
 ```
 
