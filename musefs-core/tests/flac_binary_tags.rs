@@ -155,3 +155,68 @@ fn legacy_flac_without_structural_rows_serves_via_front_read_fallback() {
         .blocks()
         .any(|b| matches!(b, metaflac::Block::Application(_))));
 }
+
+use musefs_core::{read_at, HeaderCache, Mode};
+use proptest::prelude::*;
+
+/// Read a binary tag's full payload from the DB via incremental blob I/O.
+fn read_binary_payload(db: &musefs_db::Db, rowid: i64, len: i64) -> Vec<u8> {
+    db.read_binary_tag_chunk(rowid, 0, len as usize).unwrap()
+}
+
+/// Serve a scanned track's whole file via the synthesis read path.
+fn serve_whole(db: &musefs_db::Db, id: i64) -> Vec<u8> {
+    let resolved = HeaderCache::new(Mode::Synthesis).resolve(db, id).unwrap();
+    read_at(&resolved, db, 0, resolved.total_len).unwrap()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn flac_application_cuesheet_payloads_round_trip_via_rescan(
+        app_payload in proptest::collection::vec(any::<u8>(), 1..200),
+        cue_payload in proptest::collection::vec(any::<u8>(), 1..200),
+        audio in proptest::collection::vec(any::<u8>(), 1..512),
+    ) {
+        // Block types: STREAMINFO=0, APPLICATION=2, SEEKTABLE=3, VORBIS_COMMENT=4, CUESHEET=5.
+        let blocks = vec![
+            (0u8, streaminfo_body()),
+            (2u8, app_payload.clone()),
+            (3u8, vec![0xEE; 36]),
+            (4u8, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+            (5u8, cue_payload.clone()),
+        ];
+        let bytes = make_flac(&blocks, &audio);
+
+        // Scan #1.
+        let dir1 = tempfile::tempdir().unwrap();
+        std::fs::write(dir1.path().join("a.flac"), &bytes).unwrap();
+        let db1 = musefs_db::Db::open_in_memory().unwrap();
+        scan_directory(&db1, dir1.path()).unwrap();
+        let id1 = db1.list_tracks().unwrap()[0].id;
+
+        // Synthesize the served FLAC, then scan #2 over the synthesized output.
+        let served = serve_whole(&db1, id1);
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir2.path().join("b.flac"), &served).unwrap();
+        let db2 = musefs_db::Db::open_in_memory().unwrap();
+        scan_directory(&db2, dir2.path()).unwrap();
+        let id2 = db2.list_tracks().unwrap()[0].id;
+
+        // Binary payloads survive byte-identically across the round trip.
+        let bin = db2.get_binary_tags(id2).unwrap();
+        let app = bin.iter().find(|b| b.key == "APPLICATION").expect("APPLICATION survives");
+        let app_data = read_binary_payload(&db2, app.rowid, app.byte_len);
+        prop_assert_eq!(&app_data, &app_payload, "APPLICATION payload changed");
+        let cue = bin.iter().find(|b| b.key == "CUESHEET").expect("CUESHEET survives");
+        let cue_data = read_binary_payload(&db2, cue.rowid, cue.byte_len);
+        prop_assert_eq!(&cue_data, &cue_payload, "CUESHEET payload changed");
+
+        // Structural store repopulated (canonical reorder is fine; only presence matters).
+        let structural = db2.get_structural_blocks(id2).unwrap();
+        let kinds: Vec<&str> = structural.iter().map(|b| b.kind.as_str()).collect();
+        prop_assert!(kinds.contains(&"STREAMINFO"), "STREAMINFO missing after round-trip");
+        prop_assert!(kinds.contains(&"SEEKTABLE"), "SEEKTABLE missing after round-trip");
+    }
+}
