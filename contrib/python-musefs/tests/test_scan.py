@@ -40,3 +40,66 @@ def test_run_scan_timeout(tmp_path):
         run_scan(binary, str(tmp_path / "m.db"), "/a.flac", timeout=1)
     assert ei.value.kind == "timeout"
     assert ei.value.timeout == 1
+
+
+def test_run_scan_multiple_targets_one_invocation(monkeypatch):
+    import subprocess
+
+    import musefs_common.scan as scan
+
+    calls = []
+
+    class FakeResult:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return FakeResult()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    scan.run_scan("musefs", "/db.sqlite", ["/a.flac", "/b.flac"])
+
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv == ["musefs", "scan", "/a.flac", "/b.flac", "--db", "/db.sqlite"]
+    # All targets precede the --db flag.
+    assert argv.index("/b.flac") < argv.index("--db")
+
+
+def test_run_scan_single_path_still_works(monkeypatch):
+    import subprocess
+
+    import musefs_common.scan as scan
+
+    seen = {}
+
+    class FakeResult:
+        returncode = 0
+        stderr = b""
+
+    monkeypatch.setattr(
+        subprocess, "run", lambda argv, **kw: seen.update(argv=argv) or FakeResult()
+    )
+    scan.run_scan("musefs", "/db.sqlite", "/only.flac")
+    assert seen["argv"] == ["musefs", "scan", "/only.flac", "--db", "/db.sqlite"]
+
+
+def test_run_scan_failed_batch_error_names_count(monkeypatch):
+    import subprocess
+
+    import musefs_common.scan as scan
+    from musefs_common import ScanError
+
+    class FakeResult:
+        returncode = 2
+        stderr = b"boom"
+
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: FakeResult())
+    try:
+        scan.run_scan("musefs", "/db.sqlite", ["/a.flac", "/b.flac"])
+    except ScanError as exc:
+        assert exc.kind == "failed"
+        assert "2" in str(exc.target)  # "2 target(s)"
+    else:
+        raise AssertionError("expected ScanError")

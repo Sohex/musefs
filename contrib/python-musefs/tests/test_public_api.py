@@ -10,6 +10,7 @@ def test_public_api_surface():
     expected = {
         "EXPECTED_USER_VERSION",
         "MAX_ART_BYTES",
+        "SCAN_TIMEOUT_SECONDS",
         "SchemaMismatch",
         "ScanError",
         "realpath_key",

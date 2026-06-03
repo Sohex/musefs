@@ -5,10 +5,8 @@ use musefs_cli::{Cli, Command};
 fn parses_scan_and_mount_invocations() {
     let cli = Cli::parse_from(["musefs", "scan", "/music", "--db", "/tmp/m.db"]);
     match cli.command {
-        Command::Scan {
-            backing_dir, db, ..
-        } => {
-            assert_eq!(backing_dir.to_str(), Some("/music"));
+        Command::Scan { targets, db, .. } => {
+            assert_eq!(targets, vec![std::path::PathBuf::from("/music")]);
             assert_eq!(db.to_str(), Some("/tmp/m.db"));
         }
         Command::Mount { .. } => panic!("expected scan"),

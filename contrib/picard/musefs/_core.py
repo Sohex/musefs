@@ -10,11 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Upper bound on a single-file `musefs scan` autoscan. A scan probes one file,
-# so this only fires on a genuine hang (e.g. a wedged binary or stuck DB lock);
-# without it a hung scan would block the Picard worker thread forever.
-SCAN_TIMEOUT_SECONDS = 120
-
 # Picard internal tag name -> musefs (Vorbis-lowercase) key. Picard's internal
 # names already match musefs keys, so this is mostly identity.
 DIRECT_FIELDS = {
@@ -46,29 +41,38 @@ def _to_int(value):
         return 0
 
 
-def _first_value(metadata, field_name):
-    """First non-empty, stripped string value of a Picard metadata field.
-    Reads ``metadata.getall(field)`` when available (Picard's multi-valued
-    accessor), else falls back to a plain ``.get``."""
+def _values(metadata, field_name):
+    """All non-empty, stripped string values of a Picard metadata field. Reads
+    ``metadata.getall(field)`` when available (Picard's multi-valued accessor),
+    else falls back to a plain ``.get``."""
     getall = getattr(metadata, "getall", None)
     if getall is not None:
         values = getall(field_name)
     else:
         v = metadata.get(field_name) if hasattr(metadata, "get") else None
         values = v if isinstance(v, (list, tuple)) else ([] if v is None else [v])
-    for v in values:
-        text = str(v).strip()
-        if text:
-            return text
-    return ""
+    return [text for v in values if (text := str(v).strip())]
+
+
+def _first_value(metadata, field_name):
+    """First non-empty, stripped string value of a Picard metadata field, or
+    ``""`` if none."""
+    values = _values(metadata, field_name)
+    return values[0] if values else ""
+
+
+# Keys whose Picard values may legitimately be multi-valued (one store row each).
+# Everything else (title, tracknumber, discnumber, date) stays a single scalar.
+_MULTI_VALUE_KEYS = {"artist", "albumartist", "genre", "composer"}
 
 
 def map_fields(metadata, extra_fields=None):
     """Map a Picard Metadata (dict-like) to a list of (musefs_key, value) pairs.
 
-    One value per key (the first non-empty), empty strings omitted, and a zero
-    tracknumber/discnumber omitted. ``extra_fields`` merges into (and can
-    override) the direct-copy table.
+    Keys in ``_MULTI_VALUE_KEYS`` emit one row per non-empty value (preserving
+    Picard's order); every other key emits a single row (the first non-empty).
+    Empty strings are omitted, as is a zero tracknumber/discnumber.
+    ``extra_fields`` merges into (and can override) the direct-copy table.
     """
     fields = dict(DIRECT_FIELDS)
     if extra_fields:
@@ -76,6 +80,10 @@ def map_fields(metadata, extra_fields=None):
 
     pairs = []
     for pic_field, key in fields.items():
+        if key in _MULTI_VALUE_KEYS:
+            for text in _values(metadata, pic_field):
+                pairs.append((key, text))
+            continue
         text = _first_value(metadata, pic_field)
         if not text:
             continue
@@ -107,15 +115,16 @@ class Opts:
 
 def parse_field_map(text):
     """Parse a ``key=value`` field map (from the options page) into a dict.
-    Entries are separated by commas or newlines; blank/invalid entries ignored."""
+    One entry per line; blank lines and lines without ``=`` are ignored. A
+    value may contain commas — they are kept literally."""
     result = {}
     if not text:
         return result
-    for entry in str(text).replace("\n", ",").split(","):
-        entry = entry.strip()
-        if not entry or "=" not in entry:
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
             continue
-        k, v = entry.split("=", 1)
+        k, v = line.split("=", 1)
         k, v = k.strip(), v.strip()
         if k and v:
             result[k] = v

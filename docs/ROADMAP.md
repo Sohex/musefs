@@ -138,12 +138,19 @@ parallel. Most of the Rust items came out of the v1 multi-model review triage.
   (PR #97): `LayoutError`/`RebuildError` carry diagnostics; convention recorded in
   `CLAUDE.md`, so the new error paths in #91/#92 adopt it from the start.
 
-**Phase 2 — Plugin correctness batch** *(parallel track; shared `_core.py` surface)*
-- #83 — beets reconciliation hook not fail-safe (except breadth + scan timeout).
-- #84 — Picard drops multi-value tags.
-- #85 — Picard comma field-map mangling.
-- #86 — beets `genre`/`genres` duplication.
-- #87 — Picard O(n) subprocess (perf rider on the same plugin pass).
+**Phase 2 — Plugin correctness batch** *(parallel track; shared `_core.py` surface)* — *done (PR #103)*
+- ~~#83 — beets reconciliation hook not fail-safe (except breadth + scan timeout)~~ — done
+  (PR #103): narrowed the `_reconcile_pending` catch to environmental errors so real
+  bugs propagate; `SCAN_TIMEOUT_SECONDS` moved into `musefs_common` and passed on scan.
+- ~~#84 — Picard drops multi-value tags~~ — done (PR #103): `map_fields` expands an
+  allowlist (`artist`/`albumartist`/`genre`/`composer`) to one store row per value.
+- ~~#85 — Picard comma field-map mangling~~ — done (PR #103): `parse_field_map` splits on
+  newlines only, so commas inside a value survive.
+- ~~#86 — beets `genre`/`genres` duplication~~ — done (PR #103): collapsed the list/scalar
+  twins (prefer list, dedupe, preserve order); guarded by a cross-plugin contract test.
+- ~~#87 — Picard O(n) subprocess (perf rider on the same plugin pass)~~ — done (PR #103):
+  `run_scan` + the Rust `musefs scan` CLI take many targets, so autoscan batches into
+  one process under one DB open.
 
 **Phase 3 — Safety net + small Rust hardening** *(low-risk, independent)*
 - #88 — Ogg fuzz art coverage (quick win; lands coverage before later Ogg touches).

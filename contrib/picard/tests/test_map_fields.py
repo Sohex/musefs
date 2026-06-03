@@ -8,10 +8,24 @@ def test_direct_fields_copied(fake_metadata):
     assert d["album"] == "Disc"
 
 
-def test_first_value_of_multivalued_field(fake_metadata):
-    # Picard multi-valued: getall returns a list; we take the first.
-    d = dict(map_fields(fake_metadata(artist=["First", "Second"])))
-    assert d["artist"] == "First"
+def test_multivalued_field_expands(fake_metadata):
+    # Picard multi-valued: getall returns a list; multi-value-eligible keys
+    # (artist/albumartist/genre/composer) emit one row per value.
+    pairs = map_fields(fake_metadata(artist=["First", "Second"]))
+    artists = [v for k, v in pairs if k == "artist"]
+    assert artists == ["First", "Second"]
+
+
+def test_genre_multivalue_expands(fake_metadata):
+    pairs = map_fields(fake_metadata(genre=["Rock", "Pop"]))
+    assert [v for k, v in pairs if k == "genre"] == ["Rock", "Pop"]
+
+
+def test_date_not_multivalue_expanded(fake_metadata):
+    # date is NOT in the multi-value allowlist: stays a single scalar row even
+    # if Picard happens to expose multiple values.
+    pairs = map_fields(fake_metadata(date=["2020", "2021"]))
+    assert [v for k, v in pairs if k == "date"] == ["2020"]
 
 
 def test_empty_and_whitespace_omitted(fake_metadata):

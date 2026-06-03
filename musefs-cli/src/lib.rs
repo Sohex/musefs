@@ -41,8 +41,9 @@ pub struct Cli {
 pub enum Command {
     /// Walk a backing directory, ingesting FLAC/MP3 files into the SQLite store.
     Scan {
-        /// Directory of backing audio files to scan recursively.
-        backing_dir: PathBuf,
+        /// One or more files or directories to scan (directories recurse).
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<PathBuf>,
         /// Path to the SQLite database (created if absent).
         #[arg(long)]
         db: PathBuf,
@@ -92,27 +93,38 @@ pub enum Command {
     },
 }
 
-/// Open (creating/migrating) the DB at `db_path` and scan `backing_dir`. With
-/// `revalidate`, run the maintenance pass (skip-unchanged, prune, GC) instead of
-/// a full ingest.
-pub fn run_scan(db_path: &Path, backing_dir: &Path, revalidate: bool, jobs: usize) -> Result<()> {
+/// Open (creating/migrating) the DB at `db_path` once, then scan each target in
+/// `targets` (a file or a directory; directories recurse). With `revalidate`,
+/// run the maintenance pass (skip-unchanged, prune, GC) instead of a full
+/// ingest. Fails fast: the first failing target aborts the batch; targets
+/// already scanned stay committed (ingest is an idempotent upsert).
+pub fn run_scan(db_path: &Path, targets: &[PathBuf], revalidate: bool, jobs: usize) -> Result<()> {
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let opts = musefs_core::ScanOptions { jobs };
-    if revalidate {
-        let stats = musefs_core::revalidate_with(&db, backing_dir, &opts)
-            .with_context(|| format!("revalidating {}", backing_dir.display()))?;
-        println!(
-            "revalidated: {} updated, {} unchanged, {} pruned, {} failed",
-            stats.updated, stats.unchanged, stats.pruned, stats.failed
-        );
-    } else {
-        let stats = musefs_core::scan_directory_with(&db, backing_dir, &opts)
-            .with_context(|| format!("scanning {}", backing_dir.display()))?;
-        println!(
-            "scanned {} file(s), skipped {}, failed {}",
-            stats.scanned, stats.skipped, stats.failed
-        );
+    for target in targets {
+        if revalidate {
+            let stats = musefs_core::revalidate_with(&db, target, &opts)
+                .with_context(|| format!("revalidating {}", target.display()))?;
+            println!(
+                "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed",
+                target.display(),
+                stats.updated,
+                stats.unchanged,
+                stats.pruned,
+                stats.failed
+            );
+        } else {
+            let stats = musefs_core::scan_directory_with(&db, target, &opts)
+                .with_context(|| format!("scanning {}", target.display()))?;
+            println!(
+                "scanned {}: {} file(s), skipped {}, failed {}",
+                target.display(),
+                stats.scanned,
+                stats.skipped,
+                stats.failed
+            );
+        }
     }
     Ok(())
 }
@@ -183,11 +195,11 @@ pub fn run_mount(
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Scan {
-            backing_dir,
+            targets,
             db,
             revalidate,
             jobs,
-        } => run_scan(&db, &backing_dir, revalidate, jobs),
+        } => run_scan(&db, &targets, revalidate, jobs),
         Command::Mount {
             mountpoint,
             db,
@@ -224,7 +236,30 @@ mod tests {
         let cli = Cli::try_parse_from(["musefs", "scan", "/m", "--db", "/tmp/x.db", "--jobs", "3"])
             .unwrap();
         match cli.command {
-            Command::Scan { jobs, .. } => assert_eq!(jobs, 3),
+            Command::Scan { jobs, targets, .. } => {
+                assert_eq!(jobs, 3);
+                assert_eq!(targets, vec![PathBuf::from("/m")]);
+            }
+            Command::Mount { .. } => panic!("expected Scan"),
+        }
+    }
+
+    #[test]
+    fn scan_command_parses_multiple_paths() {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["musefs", "scan", "/a", "/b", "/c", "--db", "/tmp/x.db"]).unwrap();
+        match cli.command {
+            Command::Scan { targets, .. } => {
+                assert_eq!(
+                    targets,
+                    vec![
+                        PathBuf::from("/a"),
+                        PathBuf::from("/b"),
+                        PathBuf::from("/c")
+                    ]
+                );
+            }
             Command::Mount { .. } => panic!("expected Scan"),
         }
     }

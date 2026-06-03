@@ -1,10 +1,13 @@
 """beets plugin: sync canonical beets metadata into the musefs SQLite store."""
 
 import os
+import sqlite3
+import subprocess
 
 from beets import ui
 from beets.plugins import BeetsPlugin
 from musefs_common import (
+    SCAN_TIMEOUT_SECONDS,
     ScanError,
     SchemaMismatch,
     SyncStats,
@@ -119,9 +122,11 @@ class MusefsPlugin(BeetsPlugin):
                 self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
             self._sync(db_path, items)
             self._prune_missing(db_path)
-        except Exception as exc:
-            # A passive cli_exit hook must never abort the beets operation, so any
-            # failure (ui.UserError, a sqlite3 error, etc.) degrades to a warning.
+        except (ui.UserError, sqlite3.Error, OSError, subprocess.SubprocessError) as exc:
+            # A passive cli_exit hook must never abort the beets operation for an
+            # environmental failure (locked DB, vanished file, wedged scan); those
+            # degrade to a warning. An unexpected exception still propagates so a
+            # real bug surfaces instead of hiding behind a one-line warning.
             self._log.warning("musefs: {}", exc)
 
     # --- helpers ---------------------------------------------------------
@@ -143,15 +148,14 @@ class MusefsPlugin(BeetsPlugin):
         return self.config["bin"].get(str) or "musefs"
 
     def _run_scan(self, db_path, targets):
-        """Run `musefs scan <target> --db <db>` for each target (file or dir).
+        """Run `musefs scan <target...> --db <db>` once for the whole batch.
         Creates the DB if missing and fills the structural columns the plugin
         can't compute itself. Raises ui.UserError on failure."""
         binary = self._bin()
-        for target in targets:
-            try:
-                run_scan(binary, db_path, target, timeout=None)
-            except ScanError as exc:
-                raise self._scan_user_error(exc)
+        try:
+            run_scan(binary, db_path, targets, timeout=SCAN_TIMEOUT_SECONDS)
+        except ScanError as exc:
+            raise self._scan_user_error(exc)
 
     @staticmethod
     def _scan_user_error(exc):

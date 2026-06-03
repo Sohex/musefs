@@ -42,7 +42,10 @@ def test_fields_accepts_dict_directly():
 def test_parse_field_map_variants():
     assert parse_field_map("") == {}
     assert parse_field_map("comment=comment") == {"comment": "comment"}
-    assert parse_field_map("a=b, c=d") == {"a": "b", "c": "d"}
+    # Newline-separated entries (was comma-separated):
+    assert parse_field_map("a=b\nc=d") == {"a": "b", "c": "d"}
     assert parse_field_map("a=b\n c=d ") == {"a": "b", "c": "d"}
-    # Invalid entries are dropped, not raised.
-    assert parse_field_map("noequals, =novalue, key=") == {}
+    # A comma inside a value is now literal, not a separator:
+    assert parse_field_map("comment=a, b, c") == {"comment": "a, b, c"}
+    # Lines without '=' or with an empty key/value are skipped:
+    assert parse_field_map("noequals\n=novalue\nkey=") == {}

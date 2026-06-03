@@ -76,3 +76,26 @@ def test_non_numeric_track_does_not_crash():
     # A malformed track like "1/12" must not raise; it is dropped, not emitted.
     pairs = dict(map_fields(item(track="1/12")))
     assert "tracknumber" not in pairs
+
+
+def test_genre_and_genres_deduped_prefer_list():
+    # Both the scalar and list set: prefer the list, dedupe, preserve order.
+    pairs = map_fields(item(genre="Rock", genres=["Rock", "Indie"]))
+    genres = [v for k, v in pairs if k == "genre"]
+    assert genres == ["Rock", "Indie"]  # not ["Rock", "Rock", "Indie"]
+
+
+def test_composer_and_composers_deduped_prefer_list():
+    pairs = map_fields(item(composer="Bach", composers=["Bach", "Mozart"]))
+    composers = [v for k, v in pairs if k == "composer"]
+    assert composers == ["Bach", "Mozart"]
+
+
+def test_genre_scalar_only_when_no_list():
+    pairs = map_fields(item(genre="Jazz"))
+    assert [v for k, v in pairs if k == "genre"] == ["Jazz"]
+
+
+def test_genres_list_only_when_no_scalar():
+    pairs = map_fields(item(genres=["Folk", "Pop"]))
+    assert [v for k, v in pairs if k == "genre"] == ["Folk", "Pop"]

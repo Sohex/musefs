@@ -15,6 +15,7 @@ import os
 from functools import partial
 
 from musefs._common import (
+    SCAN_TIMEOUT_SECONDS,
     Record,
     ScanError,
     SchemaMismatch,
@@ -25,7 +26,6 @@ from musefs._common import (
     sync_files,
 )
 from musefs._core import (
-    SCAN_TIMEOUT_SECONDS,
     MusefsError,
     front_cover,
     map_fields,
@@ -121,11 +121,15 @@ if _PICARD:
         if not opts.db:
             raise MusefsError("no musefs DB configured; set the DB path in Options → musefs sync")
         if opts.autoscan:
-            for f in files.values():
-                try:
-                    run_scan(opts.bin, opts.db, f.filename, timeout=SCAN_TIMEOUT_SECONDS)
-                except ScanError as exc:
-                    raise _scan_error(exc)
+            try:
+                run_scan(
+                    opts.bin,
+                    opts.db,
+                    [f.filename for f in files.values()],
+                    timeout=SCAN_TIMEOUT_SECONDS,
+                )
+            except ScanError as exc:
+                raise _scan_error(exc)
         elif not os.path.exists(opts.db):
             raise MusefsError(
                 f"musefs DB not found at {opts.db}; enable autoscan or run `musefs scan` first"
@@ -209,7 +213,7 @@ if _PICARD:
             self._bin = QtWidgets.QLineEdit(self)
             self._autoscan = QtWidgets.QCheckBox("Run `musefs scan` before syncing", self)
             self._fields = QtWidgets.QLineEdit(self)
-            self._fields.setPlaceholderText("extra map, e.g. comment=comment, mood=mood")
+            self._fields.setPlaceholderText("extra map, one per line, e.g. comment=comment")
             layout.addRow("musefs DB path", self._db)
             layout.addRow("musefs binary", self._bin)
             layout.addRow("", self._autoscan)
