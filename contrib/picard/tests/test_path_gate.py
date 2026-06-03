@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from musefs._core import connect, realpath_key, track_id_for_path
+from musefs._common import connect, realpath_key, track_id_for_path
 
 pytestmark = pytest.mark.musefs_bin
 

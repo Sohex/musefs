@@ -2,14 +2,14 @@ import sqlite3
 
 import pytest
 
-from musefs._core import (
-    DIRECT_FIELDS,
+from musefs._common import (
     SchemaMismatch,
     check_schema_version,
     realpath_key,
     replace_tags,
     sniff_mime,
 )
+from musefs._core import DIRECT_FIELDS
 
 
 def test_schema_guard_rejects_wrong_version():

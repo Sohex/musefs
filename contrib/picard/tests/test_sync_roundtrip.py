@@ -1,7 +1,8 @@
 import pytest
 from conftest import JPEG
 
-from musefs._core import Opts, connect
+from musefs._common import connect
+from musefs._core import Opts
 
 pytest.importorskip("picard")
 

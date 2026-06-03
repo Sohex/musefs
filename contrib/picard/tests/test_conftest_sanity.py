@@ -1,4 +1,4 @@
-from musefs._core import connect, track_id_for_path
+from musefs._common import connect, track_id_for_path
 
 
 def test_db_path_has_schema(db_path):

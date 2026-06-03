@@ -1,6 +1,7 @@
 from conftest import JPEG
 
-from musefs._core import SyncStats, connect, sync_one
+from musefs._common import SyncStats, connect
+from musefs._core import sync_one
 
 
 def _sync(conn, key, pairs, art=None, dry_run=False):
@@ -114,9 +115,9 @@ def test_embedded_art_preserved_when_no_front_cover(db_path, make_track):
 
 
 def test_oversized_art_skipped_but_tags_written(db_path, make_track, monkeypatch):
-    import musefs._core as core
+    from musefs._common import sync as _sync_module
 
-    monkeypatch.setattr(core, "MAX_ART_BYTES", 8)
+    monkeypatch.setattr(_sync_module, "MAX_ART_BYTES", 8)
     tid = make_track("/music/a.flac")
     conn = connect(db_path)
     try:

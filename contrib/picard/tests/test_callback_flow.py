@@ -41,7 +41,7 @@ def test_callback_runs_sync_and_logs_summary(
     musefs._action.callback([f])
 
     # _do_sync ran against the real DB.
-    from musefs._core import connect
+    from musefs._common import connect
 
     conn = connect(db_path)
     try:

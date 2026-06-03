@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from musefs._core import connect as musefs_connect
+from musefs._common import connect as musefs_connect
 
 SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
 

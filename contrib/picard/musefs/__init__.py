@@ -14,17 +14,21 @@ from __future__ import annotations
 import os
 from functools import partial
 
-from musefs._core import (
-    MusefsError,
-    SyncStats,
+from musefs._common import (
+    Record,
+    ScanError,
     check_schema_version,
     connect,
+    realpath_key,
+    run_scan,
+    sync_files,
+)
+from musefs._core import (
+    SCAN_TIMEOUT_SECONDS,
+    MusefsError,
     front_cover,
     map_fields,
-    realpath_key,
     resolve_config,
-    run_scan,
-    sync_one,
 )
 
 PLUGIN_NAME = "musefs sync"
@@ -93,6 +97,25 @@ if _PICARD:
                 seen.setdefault(realpath_key(f.filename), f)
         return seen
 
+    def _scan_error(exc):
+        """Translate a python-musefs ScanError to MusefsError, preserving the
+        plugin's historical message text."""
+        if exc.kind == "not_found":
+            return MusefsError(
+                f"musefs binary '{exc.binary}' not found; set the binary path "
+                f"in the musefs options"
+            )
+        if exc.kind == "timeout":
+            return MusefsError(
+                f"`{exc.binary} scan` for {exc.target} timed out after "
+                f"{SCAN_TIMEOUT_SECONDS}s; the scan may be stuck — check the "
+                f"binary and DB."
+            )
+        return MusefsError(
+            f"`{exc.binary} scan` failed for {exc.target} "
+            f"(exit {exc.returncode}): {exc.stderr}"
+        )
+
     def _do_sync(opts, files):
         """Background-thread worker: autoscan each file, then write tags/art.
         Returns SyncStats. Raises MusefsError / SchemaMismatch on hard failure."""
@@ -100,7 +123,10 @@ if _PICARD:
             raise MusefsError("no musefs DB configured; set the DB path in Options → musefs sync")
         if opts.autoscan:
             for f in files.values():
-                run_scan(opts.bin, opts.db, f.filename)
+                try:
+                    run_scan(opts.bin, opts.db, f.filename, timeout=SCAN_TIMEOUT_SECONDS)
+                except ScanError as exc:
+                    raise _scan_error(exc)
         elif not os.path.exists(opts.db):
             raise MusefsError(
                 f"musefs DB not found at {opts.db}; enable autoscan or run `musefs scan` first"
@@ -109,14 +135,12 @@ if _PICARD:
         conn = connect(opts.db)
         try:
             check_schema_version(conn)
-            stats = SyncStats()
+            records = []
             for key, f in files.items():
                 pairs = map_fields(f.metadata, opts.fields)
                 art = front_cover(f.metadata)
-                sync_one(conn, key, pairs, art, stats)
-            # Single commit: a mid-loop raise rolls back all tag/art writes for
-            # this batch. Autoscan's structural rows are already committed by
-            # run_scan (one txn per file), so a retry only re-syncs, not re-scans.
+                records.append(Record(key=key, pairs=pairs, art=art))
+            stats = sync_files(conn, records)
             conn.commit()
             return stats
         finally:
