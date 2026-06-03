@@ -9,7 +9,7 @@ shell-out, and the per-file sync write-loop. Consumed by the beets plugin (as a
 pip dependency) and by the Picard plugin (vendored into ``musefs/_common``).
 """
 
-from .constants import EXPECTED_USER_VERSION, MAX_ART_BYTES
+from .constants import EXPECTED_USER_VERSION, MAX_ART_BYTES, SCAN_TIMEOUT_SECONDS
 from .errors import ScanError, SchemaMismatch
 from .paths import realpath_key
 from .scan import run_scan
@@ -30,6 +30,7 @@ __version__ = "0.1.0"
 __all__ = [
     "EXPECTED_USER_VERSION",
     "MAX_ART_BYTES",
+    "SCAN_TIMEOUT_SECONDS",
     "SchemaMismatch",
     "ScanError",
     "realpath_key",
