@@ -230,6 +230,17 @@ mod tests {
                 data: vec![9, 9, 9, 9, 9],
             })
             .unwrap();
+        // A zero-byte_len row pins the guard's strict `<`: only *negative* is
+        // skipped, so byte_len == 0 must still be kept (distinguishes `< 0` from
+        // `<= 0`).
+        let zero = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![5, 5, 5],
+            })
+            .unwrap();
         db.set_track_art(
             tid,
             &[
@@ -245,22 +256,30 @@ mod tests {
                     description: String::new(),
                     ordinal: 1,
                 },
+                TrackArt {
+                    art_id: zero,
+                    picture_type: 3,
+                    description: String::new(),
+                    ordinal: 2,
+                },
             ],
         )
         .unwrap();
 
-        // Simulate an external malformed write: byte_len is a stored column.
+        // Simulate external malformed writes: byte_len is a stored column.
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute("UPDATE art SET byte_len = -1 WHERE id = ?1", [bad])
+            .unwrap();
+        raw.execute("UPDATE art SET byte_len = 0 WHERE id = ?1", [zero])
             .unwrap();
         drop(raw);
 
         let inputs = super::track_art_to_inputs(&db, tid).unwrap();
+        let ids: Vec<i64> = inputs.iter().map(|a| a.art_id).collect();
         assert_eq!(
-            inputs.len(),
-            1,
-            "the negative-byte_len art row must be skipped"
+            ids,
+            vec![good, zero],
+            "negative byte_len is skipped; zero is kept (strict `<`)"
         );
-        assert_eq!(inputs[0].art_id, good);
     }
 }
