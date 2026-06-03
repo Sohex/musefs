@@ -3,9 +3,11 @@ import sqlite3
 import pytest
 
 from musefs._core import (
+    DIRECT_FIELDS,
     SchemaMismatch,
     check_schema_version,
     realpath_key,
+    replace_tags,
     sniff_mime,
 )
 
@@ -48,3 +50,44 @@ def test_sniff_mime_magic_bytes():
 def test_sniff_mime_extension_fallback():
     assert sniff_mime(b"nope", "cover.PNG") == "image/png"
     assert sniff_mime(b"nope", "cover.bin") == "application/octet-stream"
+
+
+def test_replace_tags_preserves_binary_rows(db_path, make_track):
+    # Regression test for #82: a plugin sync must not delete scanner-written
+    # binary tags (value_blob NOT NULL).
+    tid = make_track("/music/a.flac")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, value_blob, ordinal) "
+            "VALUES (?, 'APPLICATION', '', ?, 0)",
+            (tid, b"\x00\x01\x02binary"),
+        )
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, 'title', 'Old', 0)",
+            (tid,),
+        )
+        conn.commit()
+
+        replace_tags(conn, tid, [("title", "New")])
+        conn.commit()
+
+        binary = conn.execute(
+            "SELECT value, value_blob FROM tags WHERE track_id=? AND key='APPLICATION'",
+            (tid,),
+        ).fetchall()
+        assert binary == [("", b"\x00\x01\x02binary")]
+
+        titles = conn.execute(
+            "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
+        ).fetchall()
+        assert titles == [("New",)]
+    finally:
+        conn.close()
+
+
+def test_default_vocabulary_disjoint_from_binary_keys():
+    binary_keys = {"APPLICATION", "CUESHEET", "PRIV", "GEOB", "APIC"}
+    text_keys = set(DIRECT_FIELDS.values())
+    assert text_keys.isdisjoint(binary_keys)
+    assert not any(k.startswith("----") for k in text_keys)

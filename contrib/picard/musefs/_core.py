@@ -198,7 +198,9 @@ def track_id_for_path(conn, key):
 def replace_tags(conn, track_id, pairs):
     """Replace all tags for a track. Duplicate keys get incrementing ordinals
     (mirroring musefs scan ingest)."""
-    conn.execute("DELETE FROM tags WHERE track_id = ?", (track_id,))
+    # Scope to the plugin-owned text rows: scanner-written binary tags
+    # (value_blob NOT NULL) must survive a sync (#82).
+    conn.execute("DELETE FROM tags WHERE track_id = ? AND value_blob IS NULL", (track_id,))
     ordinals = {}
     rows = []
     for key, value in pairs:
