@@ -774,13 +774,22 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     collect_audio(root, &mut files)?;
     db.apply_bulk_pragmas_self()?;
 
-    // Main-thread pre-dispatch skip pass: load existing (path -> size,mtime) once,
+    // Main-thread pre-dispatch skip pass: load existing (path -> size,mtime,id,format) once,
     // stat each candidate, keep only changed files. Workers stay DB-free.
-    let existing: HashMap<String, (i64, i64)> = db
+    let existing: HashMap<String, (i64, i64, i64, Format)> = db
         .list_tracks()?
         .into_iter()
-        .map(|t| (t.backing_path, (t.backing_size, t.backing_mtime)))
+        .map(|t| {
+            (
+                t.backing_path,
+                (t.backing_size, t.backing_mtime, t.id, t.format),
+            )
+        })
         .collect();
+    // Legacy backfill (spec §1): FLAC tracks scanned under V1 have no structural
+    // blocks. Re-scan them even when the backing file is unchanged so the V2
+    // structural store + binary tags get populated by the ingest path.
+    let have_structural = db.track_ids_with_structural_blocks()?;
 
     let mut unchanged = 0u64;
     let mut skip_failed = 0u64;
@@ -795,8 +804,9 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             continue;
         };
         let key = abs.to_string_lossy().to_string();
-        if let Some(&(size, mtime)) = existing.get(&key) {
-            if size == meta.len() as i64 && mtime == mtime_secs(&meta) {
+        if let Some(&(size, mtime, id, format)) = existing.get(&key) {
+            let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
+            if size == meta.len() as i64 && mtime == mtime_secs(&meta) && !needs_backfill {
                 unchanged += 1;
                 continue;
             }

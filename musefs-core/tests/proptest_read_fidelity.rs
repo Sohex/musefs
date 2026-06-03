@@ -4,7 +4,7 @@ use common::write_m4a;
 use common::write_mp3;
 use common::write_wav;
 use musefs_core::{read_at, HeaderCache, Mode};
-use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
+use musefs_db::{BinaryTag, Db, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_format::Segment;
 use proptest::prelude::*;
 
@@ -508,6 +508,43 @@ proptest! {
         let len = (b as u64) % (art_len - local_off + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
         prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
+    }
+
+    #[test]
+    fn read_at_preserves_backing_audio_mp3_with_binary_frames(
+        audio in proptest::collection::vec(any::<u8>(), 1..512),
+        priv_payload in proptest::collection::vec(any::<u8>(), 1..120),
+        rating in 0u8..=255,
+    ) {
+        let (_dir, db, id, original) = build_mp3(&audio, "Bin Title");
+        db.set_binary_tags(
+            id,
+            &[BinaryTag {
+                key: "PRIV".into(),
+                payload: {
+                    let mut p = b"musefs\0".to_vec();
+                    p.extend_from_slice(&priv_payload);
+                    p
+                },
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        db.replace_tags(
+            id,
+            &[Tag::new("title", "Bin Title", 0), Tag::new("rating", &rating.to_string(), 0)],
+        )
+        .unwrap();
+
+        let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
+        prop_assert!(
+            resolved.layout.segments.iter().any(|s| matches!(s, Segment::BinaryTag { .. })),
+            "resolve did not emit a BinaryTag segment"
+        );
+        let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+        prop_assert_eq!(whole.len() as u64, resolved.total_len);
+        let served_audio = &whole[resolved.layout.header_len() as usize..];
+        prop_assert_eq!(served_audio, &original[..]);
     }
 }
 

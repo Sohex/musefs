@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 # Schema version this plugin was written against (musefs schema.rs MIGRATIONS
 # length). The plugin refuses to run against any other version.
-EXPECTED_USER_VERSION = 1
+EXPECTED_USER_VERSION = 2
 
 # Mirror of musefs-core scan.rs MAX_ART_BYTES: 16 MiB minus 64 KiB headroom.
 MAX_ART_BYTES = 16 * 1024 * 1024 - 64 * 1024

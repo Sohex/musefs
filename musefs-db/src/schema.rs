@@ -166,4 +166,55 @@ mod migration_v2_tests {
             .unwrap();
         assert_eq!(uv2, 2);
     }
+
+    #[test]
+    fn v1_rows_survive_v2_migration_with_null_value_blob() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Apply ONLY V1, then stamp the version so migrate() resumes at V2.
+        conn.execute_batch(super::MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+
+        // Insert under the V1 schema (no value_blob column exists yet).
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/legacy.flac','flac',10,20,30,0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','Legacy',0)",
+            [],
+        )
+        .unwrap();
+
+        // Upgrade V1 -> V2.
+        super::migrate(&mut conn).unwrap();
+        let uv: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 2);
+
+        // The pre-existing row survived unchanged, with value_blob defaulted NULL.
+        let (value, blob_is_null): (String, bool) = conn
+            .query_row(
+                "SELECT value, value_blob IS NULL FROM tags WHERE track_id=1 AND key='artist'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(value, "Legacy");
+        assert!(
+            blob_is_null,
+            "existing tag rows must default value_blob to NULL"
+        );
+
+        // The track row survived too.
+        let offset: i64 = conn
+            .query_row("SELECT audio_offset FROM tracks WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(offset, 10);
+    }
 }

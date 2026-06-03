@@ -16,9 +16,9 @@ def test_schema_guard_rejects_wrong_version():
         check_schema_version(conn)
 
 
-def test_schema_guard_accepts_v1():
+def test_schema_guard_accepts_v2():
     conn = sqlite3.connect(":memory:")
-    conn.execute("PRAGMA user_version = 1")
+    conn.execute("PRAGMA user_version = 2")
     check_schema_version(conn)  # must not raise
 
 

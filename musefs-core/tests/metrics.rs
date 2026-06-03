@@ -243,3 +243,43 @@ fn rescanned_flac_resolve_does_no_front_read() {
         "rescanned FLAC resolve must not re-read the backing front"
     );
 }
+
+#[test]
+fn revalidated_legacy_flac_resolve_does_no_front_read() {
+    use musefs_core::revalidate;
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let dir = tempfile::tempdir().unwrap();
+    let flac = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (2, b"testAPPDATA".to_vec()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &vec![0xCD_u8; 64 * 1024],
+    );
+    std::fs::write(dir.path().join("a.flac"), &flac).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+
+    // Scan, then strip to a legacy (V1) state, then backfill via revalidate.
+    scan_directory(&db, dir.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    db.set_structural_blocks(id, &[]).unwrap();
+    db.set_binary_tags(id, &[]).unwrap();
+    revalidate(&db, dir.path()).unwrap();
+
+    let fs = Musefs::open(db, config()).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+
+    metrics::reset();
+    let fh = fs.open_handle(inode).unwrap();
+    let s = metrics::snapshot();
+    fs.release_handle(fh);
+    assert_eq!(
+        s.opens, 1,
+        "after revalidate-backfill, FLAC resolve must not re-read the backing front"
+    );
+}

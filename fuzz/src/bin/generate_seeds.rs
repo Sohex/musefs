@@ -15,6 +15,12 @@ fn write(target: &str, name: &str, bytes: &[u8]) {
 fn main() {
     write("flac", "seed0", &fixtures::flac(&[1, 2, 3, 4, 5, 6, 7, 8]));
     write("mp3", "seed0", &fixtures::mp3());
+    // A second, identically-valid MP3 seed labeled for the binary-tag synthesis
+    // path. fixtures::mp3() is the only MP3 builder (no parameterized/longer
+    // variant exists), and a corrupt seed would make locate_audio reject the
+    // file and skip synthesize_layout entirely — so reuse the valid fixture.
+    // The fuzzer reaches non-empty arb_binary_tags via mutation from here.
+    write("mp3", "seed_binary", &fixtures::mp3());
     write("mp4", "seed0", &fixtures::m4a(&[9u8; 32]));
     // m4a seed with a larger mdat payload: the extra bytes lengthen `data` so the
     // fuzz target's `Unstructured` yields non-empty arb_binary_tags/arb_arts, while

@@ -22,7 +22,7 @@ def test_connect_and_version_ok(db_path):
 
 def test_version_mismatch_raises(db_path):
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA user_version = 2")
+    conn.execute("PRAGMA user_version = 1")  # a stale V1 DB vs the V2 plugin
     conn.commit()
     conn.close()
 

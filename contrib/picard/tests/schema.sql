@@ -1,6 +1,7 @@
--- Copy of MIGRATION_V1 in musefs-db/src/schema.rs (the authoritative schema).
--- If the Rust schema changes: bump EXPECTED_USER_VERSION in beetsplug/_core.py
--- and update this file. Drift otherwise surfaces as a SchemaMismatch at connect.
+-- Copy of the migrations in musefs-db/src/schema.rs (the authoritative schema),
+-- applied in full. If the Rust schema changes: bump EXPECTED_USER_VERSION in
+-- musefs/_core.py and update this file (append the new migration's DDL and bump
+-- PRAGMA user_version). Drift otherwise surfaces as a SchemaMismatch at connect.
 CREATE TABLE tracks (
     id              INTEGER PRIMARY KEY,
     backing_path    TEXT NOT NULL UNIQUE,
@@ -72,4 +73,19 @@ CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
     WHERE id = OLD.track_id;
 END;
 
-PRAGMA user_version = 1;
+-- ── MIGRATION_V2 ──
+-- Binary tag payloads live alongside text tags. A row is binary iff
+-- value_blob IS NOT NULL; binary rows store '' in value.
+ALTER TABLE tags ADD COLUMN value_blob BLOB;
+
+-- Read-only, derived-from-file structural metadata (FLAC STREAMINFO/SEEKTABLE).
+-- NOT part of the editable `tags` contract: external tools never touch it.
+CREATE TABLE structural_blocks (
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    ordinal  INTEGER NOT NULL DEFAULT 0,
+    body     BLOB NOT NULL,
+    PRIMARY KEY (track_id, kind, ordinal)
+);
+
+PRAGMA user_version = 2;

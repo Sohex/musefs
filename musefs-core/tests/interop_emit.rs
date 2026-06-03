@@ -1,6 +1,6 @@
 mod common;
 use musefs_core::{read_at, HeaderCache, Mode};
-use musefs_db::{Db, Format, NewTrack, Tag};
+use musefs_db::{BinaryTag, Db, Format, NewTrack, Tag};
 use musefs_format::fuzz_check::fixtures;
 use musefs_format::Segment;
 use std::io::Write;
@@ -172,6 +172,38 @@ fn emit(
     synth_audio
 }
 
+/// Like `emit`, but also writes promoted text tags and opaque binary tags to the
+/// DB before synthesis — mirroring how a media manager populates the store.
+#[allow(clippy::too_many_arguments)]
+fn emit_binary(
+    src: &Path,
+    dst: &Path,
+    bytes: &[u8],
+    format: Format,
+    audio_offset: i64,
+    audio_length: i64,
+    text: &[Tag],
+    binary: &[BinaryTag],
+) {
+    std::fs::write(src, bytes).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: src.to_string_lossy().to_string(),
+            format,
+            audio_offset,
+            audio_length,
+            backing_size: std::fs::metadata(src).unwrap().len() as i64,
+            backing_mtime: real_mtime(src),
+        })
+        .unwrap();
+    db.replace_tags(id, text).unwrap();
+    db.set_binary_tags(id, binary).unwrap();
+    let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
+    let out = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+    std::fs::write(dst, &out).unwrap();
+}
+
 #[test]
 #[ignore = "interop fixture emitter; run explicitly with MUSEFS_INTEROP_DIR set"]
 fn emit_interop_fixtures() {
@@ -305,6 +337,91 @@ fn emit_interop_fixtures() {
             ogg_payload_only: false,
         });
     }
+
+    // ── Binary-frame fixtures (spec §Testing: POPM/UFID/PRIV/GEOB + MP4 ----) ──
+    // Known ASCII payloads so the Python side compares without hex.
+    let priv_owner = "musefs";
+    let priv_data = "PRIV-ANALYSIS-001";
+    let geob_data = "GEOB-OBJECT-XYZ";
+    let mb_trackid = "11111111-2222-3333-4444-555555555555";
+    let rating = "200";
+    let playcount = "42";
+    let freeform_name = "MUSEFSTEST";
+    let freeform_data = "FREEFORM-DATA-001";
+
+    // MP3: PRIV + GEOB opaque; POPM/UFID via promoted text tags.
+    {
+        let bytes = fixtures::mp3();
+        let b = musefs_format::mp3::locate_audio(&bytes).unwrap();
+        let mut priv_body = priv_owner.as_bytes().to_vec();
+        priv_body.push(0);
+        priv_body.extend_from_slice(priv_data.as_bytes());
+        let mut geob_body = vec![0x00u8]; // latin-1 text encoding
+        geob_body.extend_from_slice(b"application/octet-stream\0");
+        geob_body.push(0); // empty filename
+        geob_body.push(0); // empty description
+        geob_body.extend_from_slice(geob_data.as_bytes());
+        emit_binary(
+            &dir.join("src_bin.mp3"),
+            &dir.join("out_bin.mp3"),
+            &bytes,
+            Format::Mp3,
+            b.audio_offset as i64,
+            b.audio_length as i64,
+            &[
+                Tag::new("title", "Bin Title", 0),
+                Tag::new("artist", "Bin Artist", 0),
+                Tag::new("rating", rating, 0),
+                Tag::new("playcount", playcount, 0),
+                Tag::new("musicbrainz_trackid", mb_trackid, 0),
+            ],
+            &[
+                BinaryTag {
+                    key: "PRIV".into(),
+                    payload: priv_body,
+                    ordinal: 0,
+                },
+                BinaryTag {
+                    key: "GEOB".into(),
+                    payload: geob_body,
+                    ordinal: 0,
+                },
+            ],
+        );
+    }
+
+    // MP4: one `----` freeform atom.
+    {
+        let bytes = richer_m4a(&[7u8; 64]);
+        let scan = musefs_format::mp4::read_structure(&bytes).unwrap();
+        emit_binary(
+            &dir.join("src_bin.m4a"),
+            &dir.join("out_bin.m4a"),
+            &bytes,
+            Format::M4a,
+            scan.mdat_payload_offset as i64,
+            scan.mdat_payload_len as i64,
+            &[
+                Tag::new("title", "Bin Title", 0),
+                Tag::new("artist", "Bin Artist", 0),
+            ],
+            &[BinaryTag {
+                key: format!("----:com.apple.iTunes:{freeform_name}"),
+                payload: freeform_data.as_bytes().to_vec(),
+                ordinal: 0,
+            }],
+        );
+    }
+
+    // Emit the binary manifest the Python test consumes.
+    let binary_manifest = format!(
+        "{{\"mp3\":{{\"file\":\"out_bin.mp3\",\"priv_owner\":{priv_owner:?},\"priv_data\":{priv_data:?},\
+         \"geob_data\":{geob_data:?},\"rating\":{rating},\"playcount\":{playcount},\
+         \"mb_trackid\":{mb_trackid:?}}},\
+         \"mp4\":{{\"file\":\"out_bin.m4a\",\"freeform_key\":\"----:com.apple.iTunes:{freeform_name}\",\
+         \"freeform_data\":{freeform_data:?}}}}}",
+    );
+    std::fs::write(dir.join("binary_manifest.json"), binary_manifest).unwrap();
 
     let json: Vec<String> = manifest
         .iter()
