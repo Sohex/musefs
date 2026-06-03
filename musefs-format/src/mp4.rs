@@ -819,7 +819,9 @@ pub fn synthesize_layout(
     let mut udta_iter = udta_segments.into_iter();
     let Some(Segment::Inline(first)) = udta_iter.next() else {
         // build_udta always yields a leading Inline; anything else is a producer bug.
-        return Err(FormatError::InvalidLayout);
+        return Err(FormatError::ProducerBug(
+            "build_udta did not yield a leading Inline framing segment",
+        ));
     };
     head.extend_from_slice(&first);
     let mut segments: Vec<Segment> = vec![Segment::Inline(head)];
@@ -832,7 +834,7 @@ pub fn synthesize_layout(
         offset: scan.mdat_payload_offset,
         len: scan.mdat_payload_len,
     });
-    RegionLayout::validated(segments).map_err(|_| FormatError::InvalidLayout)
+    Ok(RegionLayout::validated(segments)?)
 }
 
 #[cfg(test)]

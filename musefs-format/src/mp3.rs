@@ -407,7 +407,7 @@ pub fn synthesize_layout(
         offset: audio_offset,
         len: audio_length,
     });
-    RegionLayout::validated(segments).map_err(|_| FormatError::InvalidLayout)
+    Ok(RegionLayout::validated(segments)?)
 }
 
 /// Returns false when `data` begins with an ID3v2 tag whose declared frame sizes

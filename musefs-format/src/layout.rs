@@ -1,9 +1,11 @@
 /// Validation errors discovered in a layout at synthesis time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LayoutError {
     /// A segment reported zero length.
+    #[error("a segment reported zero length")]
     EmptySegment,
     /// Total length overflowed u64.
+    #[error("total layout length overflowed u64")]
     TotalOverflow,
 }
 
