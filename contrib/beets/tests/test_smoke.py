@@ -1,6 +1,7 @@
 def test_core_imports_without_beets():
+    # The slimmed _core depends only on musefs_common, never on beets itself.
     import beetsplug._core as core
 
-    assert hasattr(core, "EXPECTED_USER_VERSION")
-    assert core.EXPECTED_USER_VERSION == 2
-    assert core.MAX_ART_BYTES == 16 * 1024 * 1024 - 64 * 1024
+    assert hasattr(core, "DIRECT_FIELDS")
+    assert hasattr(core, "map_fields")
+    assert hasattr(core, "build_records")

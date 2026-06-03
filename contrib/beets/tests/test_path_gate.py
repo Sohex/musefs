@@ -8,8 +8,7 @@ import warnings
 from pathlib import Path
 
 import pytest
-
-from beetsplug._core import connect, realpath_key, track_id_for_path
+from musefs_common import connect, realpath_key, track_id_for_path
 
 pytestmark = pytest.mark.musefs_bin
 
