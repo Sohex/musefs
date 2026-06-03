@@ -64,7 +64,6 @@ pub(crate) fn partition_changes(
 /// short snapshot lock); `keys` are the live render keys for those ids (absent =
 /// no longer in `tracks`). An id that is neither live nor previously known —
 /// added and deleted between polls — is pure churn and lands nowhere.
-#[allow(dead_code)] // wired into facade.rs in a later task (mirrors partition_changes)
 pub(crate) fn partition_changelog(
     prev_states: &HashMap<i64, TrackRenderState>,
     changelog_ids: &[i64],
