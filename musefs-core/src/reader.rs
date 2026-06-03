@@ -143,6 +143,12 @@ impl Shard {
     }
 }
 
+impl crate::lock::Clearable for Shard {
+    fn reset(&mut self) {
+        self.retain_keys(&HashSet::new());
+    }
+}
+
 /// A per-mount cache of resolved files, sharded for concurrency and keyed by track
 /// id; an entry self-invalidates when the track's `content_version` changes.
 pub struct HeaderCache {
@@ -182,16 +188,12 @@ impl HeaderCache {
     }
     fn shard(&self, track_id: i64) -> std::sync::MutexGuard<'_, Shard> {
         let idx = (track_id as u64 % CACHE_SHARDS as u64) as usize;
-        self.shards[idx]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::lock::lock_or_clear(&self.shards[idx], "header-cache shard")
     }
     /// Drop cached resolutions for tracks no longer present (`live` = current ids).
     pub fn retain(&self, live: &HashSet<i64>) {
         for s in &self.shards {
-            s.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain_keys(live);
+            crate::lock::lock_or_clear(s, "header-cache shard (retain)").retain_keys(live);
         }
     }
     /// Resolve a track to its layout, caching on a content-version miss. Validation
