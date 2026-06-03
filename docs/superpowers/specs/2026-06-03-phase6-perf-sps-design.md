@@ -60,6 +60,14 @@ mount's read-only WAL connections never write it. `AUTOINCREMENT` guarantees
 monotonic, never-reused seqs; rows are deleted only from the old end, so the
 retained seq range is contiguous.
 
+The design depends on SQLite **nested** trigger activation: `tags_ai` /
+`track_art_*` do `UPDATE tracks …`, which must fire the new `tracks` changelog
+trigger, whose `INSERT` in turn fires the prune trigger. Nested (non-cyclic)
+activation is on by default — it is distinct from `PRAGMA recursive_triggers`,
+which nothing in the codebase sets — but the dependency is load-bearing, so PR
+1 adds a schema test: a bare `INSERT INTO tags` must produce a `track_changes`
+row.
+
 Migrations are append-only: `MIGRATIONS` grows to length 3, `user_version`
 2→3. Contract mirror: bump `EXPECTED_USER_VERSION` in
 `contrib/python-musefs/src/musefs_common/constants.py`, re-vendor into the
@@ -93,10 +101,25 @@ On a `data_version` bump:
    stamp-after-success discipline `last_data_version` uses. A failed refresh
    leaves both unstamped so the next poll retries.
 
-Post-rebuild cache maintenance keeps its observable behavior: header/size
-caches are pruned of removed tracks (the changelog path knows the removed set
-exactly, so no live-set re-derivation is needed) and `poll_refresh_notify`
-still reports the changed inodes for `--keep-cache` invalidation.
+**Post-rebuild maintenance must also become ChangeSet-driven, or the O(N) just
+moves.** Two consumers currently scan full structures after a rebuild and are
+rescoped to the changed/removed sets, preserving observable behavior:
+
+- `notify_changed` (`facade.rs`) iterates both the old and new snapshots to
+  find inodes needing `--keep-cache` invalidation. In-place mutation removes
+  the "old snapshot" it compares against, so it is reworked to take the
+  ChangeSet plus the displaced old states — `HashMap::insert`/`remove` during
+  the in-place mutation return exactly the old `TrackRenderState`s for
+  changed/removed ids, which is all the old-side information `notify_changed`
+  uses (content-version rise with stable path → new inode; path moved or track
+  gone → old inode; added tracks notify nothing).
+- The header/size cache pruning currently retains against the full live track
+  set (`tree.track_ids()` + `retain`); on the changelog path it instead
+  removes exactly the removed ids. (The full-scan prune remains on the
+  fallback/fresh-mount path.)
+
+The `cfg(debug_assertions)` equivalence reference build stays O(N) by design —
+it is the oracle, not the product.
 
 Fresh mount: full build, then `last_seq = COALESCE(MAX(seq), 0)`. Multiple
 mounts of one DB each keep an independent in-memory watermark; reads don't
@@ -131,9 +154,10 @@ nothing.
 Fix: replace the eager read with a memoized lazy lookup. `probe_file` holds a
 `tail: Option<Option<[u8; 128]>>` slot (outer `Option` = not yet read, inner =
 file shorter than 128 bytes), filled on first request and persisting across
-the widen-retry loop so MP3 never reads it twice. `probe_prefix` takes the
-`&File`, `file_len`, and the memo slot in place of today's
-`Option<&[u8; 128]>`, and the MP3 arm fills the slot on first use.
+the widen-retry loop so MP3 never reads it twice. `probe_prefix` already
+takes `file_len`; the only signature change is swapping today's
+`tail: Option<&[u8; 128]>` for the `&File` plus the memo slot, with the MP3
+arm filling the slot on first use.
 `metrics::on_scan_read(128)` fires only when the read happens. MP3 behavior is byte-for-byte unchanged; the `probe_full`
 fallback is unaffected (it reads the whole file, tail included).
 
@@ -148,7 +172,9 @@ Fix: the pipeline batch already owns its `Probed`s — hand them to
 `ingest_bulk` by value (drain the batch) and **move** the byte buffers into
 `NewArt` / `BinaryTag` / `StructuralBlock`. No DB-layer signature changes:
 those structs already own `Vec<u8>`; the clones exist only because the caller
-holds a borrow.
+holds a borrow. One ordering constraint: the byte-budget backpressure releases
+each unit's `weight` **after** `bw.commit()`, so the weight must be captured
+before the `Probed` is moved out of the batch.
 
 ### Testing & acceptance
 
@@ -185,11 +211,15 @@ is **no userspace copy at the fuser layer**. The remaining kernel-boundary
 per-read `Vec` allocation (up to `max_readahead`, typically 128 KiB–1 MiB).
 
 Fix: add `Musefs::read_into(ino, fh, offset, size, &mut Vec<u8>)` (clear +
-fill); `read` becomes a thin wrapper for existing callers/tests. Each FUSE
-worker gets a `thread_local!` `RefCell<Vec<u8>>` scratch buffer; the read path
-fills it and replies from it. Memory stays bounded — one buffer per bounded
-pool worker, with a `shrink_to` cap (~2 MiB) so one giant read doesn't pin
-memory.
+fill) — and thread the `&mut Vec<u8>` **all the way down to `read_segments`**,
+where the allocation actually lives (`reader.rs`): `read_at` /
+`read_at_with_file` / `read_segments` gain `*_into` forms and the existing
+`Vec`-returning names become thin delegating wrappers for their current
+callers and tests. Stopping the buffer at the facade layer would add a copy
+instead of removing one. Each FUSE worker gets a `thread_local!`
+`RefCell<Vec<u8>>` scratch buffer; the read path fills it and replies from it.
+Memory stays bounded — one buffer per bounded pool worker, with a `shrink_to`
+cap (~2 MiB) so one giant read doesn't pin memory.
 
 When the PR lands, comment on #70 that the claimed reply-buffer copy does not
 exist at fuser 0.17.
