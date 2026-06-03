@@ -26,6 +26,13 @@ const MAX_OGG_PAGE_BYTES: u64 = 65_307;
 /// Maximum Ogg page header size: 27 fixed + 255 seg-table.
 const MAX_OGG_HEADER_BYTES: usize = 282;
 
+/// Positioned read that records serve-path pread metrics (count + bytes).
+/// Counts on the attempt, like `on_open` — a failed read is still a round-trip.
+fn read_counted(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    crate::metrics::on_pread(buf.len() as u64);
+    f.read_exact_at(buf, offset)
+}
+
 /// Find the absolute file offset of the Ogg page whose region contains or
 /// immediately precedes `abs_target` within `[audio_offset, audio_offset + ?)`.
 ///
@@ -68,7 +75,7 @@ fn find_page_start(
         .max(audio_offset);
     let window_len = (abs_target - scan_start) as usize;
     let mut window = vec![0u8; window_len];
-    backing.read_exact_at(&mut window, scan_start)?;
+    read_counted(backing, &mut window, scan_start)?;
 
     // Scan backwards for the rightmost CRC-valid OggS capture.
     let mut i = window_len.saturating_sub(4);
@@ -103,6 +110,7 @@ fn page_crc_ok(backing: &std::fs::File, page_start: u64) -> Result<bool> {
     // Read up to the max header (tolerating a short read at EOF) to learn the
     // page length without a second round trip.
     let mut head = vec![0u8; MAX_OGG_HEADER_BYTES];
+    crate::metrics::on_pread(head.len() as u64);
     let n = backing.read_at(&mut head, page_start)?;
     head.truncate(n);
     if head.len() < 27 {
@@ -116,7 +124,7 @@ fn page_crc_ok(backing: &std::fs::File, page_start: u64) -> Result<bool> {
     let payload_len: usize = head[27..header_len].iter().map(|&b| b as usize).sum();
     let total = header_len + payload_len;
     let mut page = vec![0u8; total];
-    if backing.read_exact_at(&mut page, page_start).is_err() {
+    if read_counted(backing, &mut page, page_start).is_err() {
         return Ok(false); // page runs past EOF → not a real page here
     }
     Ok(verify_page_crc(&page).unwrap_or(false))
@@ -160,7 +168,7 @@ pub fn serve_ogg_window(
         // Clamped to the declared audio region end.
         let read_len = MAX_OGG_HEADER_BYTES.min((audio_end - pos) as usize);
         let mut hdr_buf = vec![0u8; read_len];
-        backing.read_exact_at(&mut hdr_buf, pos)?;
+        read_counted(backing, &mut hdr_buf, pos)?;
         if hdr_buf.len() < 27 {
             return Err(musefs_format::FormatError::Malformed.into());
         }
@@ -216,7 +224,7 @@ pub fn serve_ogg_window(
             let n = (pe - ps) as usize;
             let start = out.len();
             out.resize(start + n, 0);
-            backing.read_exact_at(&mut out[start..], pos + header_len as u64 + within)?;
+            read_counted(backing, &mut out[start..], pos + header_len as u64 + within)?;
         }
 
         pos += (header_len + payload_len) as u64;

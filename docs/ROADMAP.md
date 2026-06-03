@@ -177,9 +177,15 @@ parallel. Most of the Rust items came out of the v1 multi-model review triage.
   window, and a `poll_pending` single-flight gate bounds in-flight poll tasks to
   one (robust even with `--poll-interval-ms 0`).
 
-**Phase 5 — Metrics**
-- #71 — Ogg serve path records no pread/byte metrics (instrumentation blind today).
-- #76 — metric counters covered only by direct-call tests (locks in #71's fix).
+**Phase 5 — Metrics** — *done*
+- ~~#71 — Ogg serve path records no pread/byte metrics~~ — done: every Ogg
+  backing read (index scan, CRC probe, header, payload) counts attempt-based
+  `preads`/`pread_bytes`, so latency injection and `bench_read_under_latency`
+  now cover Ogg.
+- ~~#76 — metric counters covered only by direct-call tests~~ — done: serve-site
+  tests drive real reads through every counter's segment arm (ArtImage,
+  BinaryTag, both OggArtSlice branches, Ogg preads), and CI runs
+  `cargo test -p musefs-core --features metrics` on every PR.
 
 **Phase 6 — Performance optimization SPs** *(bench-tracked: before/after in
 `BENCHMARKS.md` + the tracking README)*

@@ -3,14 +3,20 @@
 //! compiles to an empty inline fn, so call sites stay unconditional and clean.
 //!
 //! Counting scope: `on_open`/`on_stat` count every backing-file open and
-//! metadata syscall on any read path. `on_pread` counts bytes served from
-//! `BackingAudio` segments (the FLAC/MP3/M4A audio path); the Ogg audio path's
-//! internal positioned reads (via the page server) and art-blob reads are
-//! tracked by call count (`on_open`/`on_art_chunk`) but are not byte-counted.
-//! `on_open` fires on the open *attempt* (a failed open is still a syscall).
-//! `on_scan_open`/`on_scan_read` count backing-file opens and positioned reads
-//! on the *scan* path (distinct from the serve path); `on_scan_read` also
-//! accumulates bytes read, analogous to `on_pread`.
+//! metadata syscall on any read path; `on_open` fires on the open *attempt*
+//! (a failed open is still a syscall). `on_pread` counts positioned backing
+//! reads on the serve path, attempt-based: one pread plus the attempted
+//! buffer length, recorded before the read (a failed or short read is still
+//! a round-trip, and the `MUSEFS_FAULT_PREAD_US` injection applies to it).
+//! For `BackingAudio` segments, bytes attempted equal bytes served; on the
+//! Ogg path (page-index scans, CRC probes, header and payload reads) bytes
+//! attempted may exceed bytes served, because scan and header bytes are
+//! patched or discarded — the counter reports backing I/O performed, not
+//! output produced. Art-blob and binary-tag chunks are DB reads, tracked by
+//! call count (`on_art_chunk`/`on_binary_tag_chunk`), not byte-counted.
+//! `on_scan_open`/`on_scan_read` count backing-file opens and positioned
+//! reads on the *scan* path (distinct from the serve path); `on_scan_read`
+//! also accumulates bytes read, analogous to `on_pread`.
 
 pub use imp::*;
 

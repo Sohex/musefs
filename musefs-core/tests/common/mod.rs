@@ -272,3 +272,82 @@ pub fn write_ogg(path: &Path, audio: &[u8]) -> (i64, i64) {
     std::fs::write(path, &bytes).unwrap();
     (header_len as i64, (bytes.len() - header_len) as i64)
 }
+
+/// A FLAC PICTURE block body (type 3 = front cover, image/png) carrying `data`.
+/// The identical bytes serve three fixtures: a native FLAC PICTURE block, the
+/// base64 payload of an Opus/Vorbis `METADATA_BLOCK_PICTURE` comment, and an
+/// OggFLAC native PICTURE packet body. `data` must be non-empty: FLAC synthesis
+/// only emits an `ArtImage` segment for `data_len > 0`.
+pub fn picture_block_body(data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
+    v.extend_from_slice(&(b"image/png".len() as u32).to_be_bytes());
+    v.extend_from_slice(b"image/png");
+    v.extend_from_slice(&0u32.to_be_bytes()); // empty description
+    v.extend_from_slice(&1u32.to_be_bytes()); // width
+    v.extend_from_slice(&1u32.to_be_bytes()); // height
+    v.extend_from_slice(&0u32.to_be_bytes()); // depth
+    v.extend_from_slice(&0u32.to_be_bytes()); // colors
+    v.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    v.extend_from_slice(data);
+    v
+}
+
+/// Write an Opus file whose `OpusTags` packet carries `comments` plus a base64
+/// `METADATA_BLOCK_PICTURE` of `picture` (a PICTURE block body, e.g. from
+/// `picture_block_body`), returning (audio_offset, audio_length). Same page
+/// recipe as `write_ogg`.
+pub fn write_opus_with_art(
+    path: &Path,
+    comments: &[&str],
+    picture: &[u8],
+    audio: &[u8],
+) -> (i64, i64) {
+    use base64::Engine as _;
+    use musefs_format::ogg::page_test_support::{build_header_pub, lace_packet_pub};
+    let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+    let mbp = format!(
+        "METADATA_BLOCK_PICTURE={}",
+        base64::engine::general_purpose::STANDARD.encode(picture)
+    );
+    let mut all: Vec<&str> = comments.to_vec();
+    all.push(&mbp);
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&vorbis_comment_body("v", &all));
+    let serial = 0x6d75_7366; // "musf"
+    let (mut bytes, header_pages) = build_header_pub(serial, &[&head, &tags]);
+    let header_len = bytes.len();
+    let (page, _) = lace_packet_pub(serial, header_pages, false, 960, audio);
+    bytes.extend_from_slice(&page);
+    std::fs::write(path, &bytes).unwrap();
+    (header_len as i64, (bytes.len() - header_len) as i64)
+}
+
+/// Write an OggFLAC file (`0x7F "FLAC"` 1.0 mapping) whose header packets carry
+/// a VORBIS_COMMENT block with `comments` and a native PICTURE block with
+/// `picture` (a PICTURE block body), returning (audio_offset, audio_length).
+/// Packet 0 is `0x7F "FLAC" major minor count(u16 BE) "fLaC" STREAMINFO`; the
+/// count is the number of metadata-block packets that follow.
+pub fn write_oggflac_with_art(
+    path: &Path,
+    comments: &[&str],
+    picture: &[u8],
+    audio: &[u8],
+) -> (i64, i64) {
+    use musefs_format::ogg::page_test_support::{build_header_pub, lace_packet_pub};
+    let mut pkt0 = vec![0x7F];
+    pkt0.extend_from_slice(b"FLAC");
+    pkt0.extend_from_slice(&[1, 0]); // mapping version 1.0
+    pkt0.extend_from_slice(&2u16.to_be_bytes()); // two metadata packets follow
+    pkt0.extend_from_slice(b"fLaC");
+    pkt0.extend_from_slice(&flac_block(0, &streaminfo_body(), false));
+    let vc_pkt = flac_block(4, &vorbis_comment_body("v", comments), false);
+    let pic_pkt = flac_block(6, picture, true);
+    let serial = 0x6f67_666c;
+    let (mut bytes, header_pages) = build_header_pub(serial, &[&pkt0, &vc_pkt, &pic_pkt]);
+    let header_len = bytes.len();
+    let (page, _) = lace_packet_pub(serial, header_pages, false, 960, audio);
+    bytes.extend_from_slice(&page);
+    std::fs::write(path, &bytes).unwrap();
+    (header_len as i64, (bytes.len() - header_len) as i64)
+}

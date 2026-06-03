@@ -832,6 +832,7 @@ name = "musefs-core"
 version = "0.2.0"
 dependencies = [
  "arc-swap",
+ "base64",
  "crc",
  "criterion",
  "dashmap",
