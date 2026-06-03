@@ -98,7 +98,7 @@ fn bench_refresh_one_vs_many() {
 fn bench_refresh_one_across_library_sizes() {
     let tier = std::env::var("MUSEFS_BENCH_TIER").unwrap_or_else(|_| "ci".into());
     println!("\n{}", RunReport::header());
-    for n in [100usize, 1000, 5000] {
+    for n in [100usize, 1000, 5000, 20000] {
         // Each size gets its own tempdir + DB so the corpora never collide. We use
         // `prepare_format` (explicit base, ignores `MUSEFS_BENCH_DB`) rather than
         // `prepare` (env-driven, returns the same DB path when `MUSEFS_BENCH_DB`
