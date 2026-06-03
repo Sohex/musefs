@@ -12,3 +12,4 @@ from .store import (
 )
 from .errors import SchemaMismatch, ScanError
 from .scan import run_scan
+from .sync import Record, SyncStats, sync_files, sync_one
