@@ -757,12 +757,14 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
     Ok(stats)
 }
 
-/// Re-validate an already-scanned library subtree: re-probe only files whose
+/// Re-validate an already-scanned library root: re-probe only files whose
 /// size/mtime changed since the last scan (skipping unchanged ones so external
 /// tag edits in the DB are preserved), then delete tracks **under `root`** whose
 /// backing file is gone (cascading tags/art links) and garbage-collect
-/// now-unreferenced art. Pruning is scoped to `root`, so revalidating one library
-/// root never removes tracks belonging to another.
+/// now-unreferenced art. `root` may be a single audio file (only that file is
+/// revalidated) or a directory (walked recursively). Pruning is scoped to
+/// `root`, so revalidating one library root never removes tracks belonging to
+/// another.
 ///
 /// Uses `opts` to configure the probe pipeline (e.g. `jobs` for parallelism).
 /// The skip-unchanged decision runs on the calling thread before workers are
