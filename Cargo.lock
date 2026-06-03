@@ -837,6 +837,7 @@ dependencies = [
  "dashmap",
  "id3",
  "im",
+ "log",
  "metaflac",
  "musefs-db",
  "musefs-format",
