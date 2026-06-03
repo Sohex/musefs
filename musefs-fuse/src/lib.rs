@@ -5,6 +5,7 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -108,6 +109,15 @@ pub fn to_file_attr(attr: &Attr, uid: u32, gid: u32, fallback_mtime: SystemTime)
         flags: 0,
     }
 }
+/// Clears the `fire_poll_refresh` single-flight gate when the poll task ends,
+/// on every exit path including a panic in `poll_refresh_notify` (#89).
+struct PollPendingGuard<'a>(&'a AtomicBool);
+
+impl Drop for PollPendingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// A `fuser::Filesystem` that serves a `musefs_core::Musefs`. fuser dispatches
 /// on one thread; blocking ops (read/getattr/lookup-attr) are offloaded to a
@@ -123,6 +133,9 @@ pub struct MusefsFs {
     // Set once, right after the session is created (the fs is moved into the
     // session, so the notifier can only be obtained afterward via this shared cell).
     notifier: Arc<OnceLock<Notifier>>,
+    /// Single-flight gate for `fire_poll_refresh`: at most one poll task is
+    /// queued/running at a time, so a metadata-op storm can't flood the pool (#89).
+    poll_pending: Arc<AtomicBool>,
 }
 
 impl MusefsFs {
@@ -142,6 +155,7 @@ impl MusefsFs {
             mount_time: SystemTime::now(),
             config,
             notifier: Arc::new(OnceLock::new()),
+            poll_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -149,14 +163,28 @@ impl MusefsFs {
         Arc::clone(&self.notifier)
     }
 
-    /// Fire `poll_refresh` on the worker pool (off the dispatch thread). When
-    /// keep-cache is enabled, also drop the kernel page cache for every inode whose
-    /// content changed, so an external re-tag never serves stale cached bytes.
+    /// Fire `poll_refresh` on the worker pool (off the dispatch thread), but only
+    /// when due: a cheap synchronous `poll_due()` check gates submission so a
+    /// metadata-op storm doesn't flood the pool, and a `poll_pending` single-flight
+    /// gate bounds in-flight poll tasks to one (#89). When keep-cache is enabled,
+    /// also drop the kernel page cache for every inode whose content changed.
     fn fire_poll_refresh(&self) {
+        if !self.core.poll_due() {
+            return;
+        }
+        if self
+            .poll_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // a poll task is already queued/running
+        }
         let core = Arc::clone(&self.core);
+        let pending = Arc::clone(&self.poll_pending);
         if self.config.keep_cache {
             let notifier = Arc::clone(&self.notifier);
             self.pool.execute(move || {
+                let _guard = PollPendingGuard(&pending);
                 if let Err(e) = core.poll_refresh_notify(|ino| {
                     if let Some(n) = notifier.get() {
                         if let Err(inval_err) = n.inval_inode(INodeNo(ino), 0, 0) {
@@ -169,6 +197,7 @@ impl MusefsFs {
             });
         } else {
             self.pool.execute(move || {
+                let _guard = PollPendingGuard(&pending);
                 if let Err(e) = core.poll_refresh() {
                     log::warn!("poll_refresh failed: {e}");
                 }
@@ -455,6 +484,63 @@ mod tests {
     fn open_flags_sets_keep_cache_bit_only_when_enabled() {
         assert_eq!(open_flags(false), FopenFlags::empty());
         assert_eq!(open_flags(true), FopenFlags::FOPEN_KEEP_CACHE);
+    }
+
+    fn test_fs() -> (tempfile::TempDir, MusefsFs) {
+        use musefs_core::{Mode, MountConfig, Musefs};
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: std::collections::BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            // Zero interval => poll_due() is always true, isolating the gate.
+            poll_interval: std::time::Duration::ZERO,
+        };
+        let core =
+            Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
+        (dir, MusefsFs::new(core, FuseConfig::default()))
+    }
+
+    #[test]
+    fn poll_pending_guard_clears_flag_on_panic() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let f = Arc::clone(&flag);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = PollPendingGuard(&f);
+            panic!("boom");
+        }));
+        assert!(r.is_err());
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "guard must clear the flag on unwind"
+        );
+    }
+
+    #[test]
+    fn fire_poll_refresh_single_flights_when_pending() {
+        let (_d, fs) = test_fs();
+        // Simulate a poll already in flight; the gate must reject new submissions.
+        fs.poll_pending.store(true, Ordering::SeqCst);
+        let queued = fs.pool.queued_count();
+        let active = fs.pool.active_count();
+        for _ in 0..50 {
+            fs.fire_poll_refresh();
+        }
+        assert_eq!(fs.pool.queued_count(), queued, "no task should be queued");
+        assert_eq!(fs.pool.active_count(), active, "no task should be started");
+    }
+
+    #[test]
+    fn fire_poll_refresh_clears_gate_after_task() {
+        let (_d, fs) = test_fs();
+        assert!(!fs.poll_pending.load(Ordering::SeqCst));
+        fs.fire_poll_refresh(); // poll_due() true (zero interval): gate taken, task runs
+        fs.pool.join(); // block until the poll task completes
+        assert!(
+            !fs.poll_pending.load(Ordering::SeqCst),
+            "guard must clear the gate after the task finishes"
+        );
     }
 }
 
