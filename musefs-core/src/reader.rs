@@ -141,6 +141,12 @@ impl Shard {
             }
         }
     }
+    fn remove_key(&mut self, id: i64) {
+        self.unlink(id);
+        if let Some(n) = self.map.remove(&id) {
+            self.bytes -= n.value.cache_bytes;
+        }
+    }
 }
 
 impl crate::lock::Clearable for Shard {
@@ -195,6 +201,10 @@ impl HeaderCache {
         for s in &self.shards {
             crate::lock::lock_or_clear(s, "header-cache shard (retain)").retain_keys(live);
         }
+    }
+    /// Drop one track's cached resolution (changelog-refresh removal path).
+    pub fn remove(&self, id: i64) {
+        self.shard(id).remove_key(id);
     }
     /// Resolve a track to its layout, caching on a content-version miss. Validation
     /// (`stat`) and synthesis run WITHOUT holding the shard lock; the lock is taken
@@ -1085,6 +1095,48 @@ mod cache_bound_tests {
         // The kept track stays the same cached Arc; the dropped one re-resolves fresh.
         assert!(Arc::ptr_eq(&keep_a, &cache.resolve(&db, keep).unwrap()));
         assert!(!Arc::ptr_eq(&gone_a, &cache.resolve(&db, gone).unwrap()));
+    }
+
+    #[test]
+    fn header_cache_remove_drops_one_track_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mk = |name: &str| {
+            let path = dir.path().join(name);
+            let (audio_offset, audio_length) = write_flac_local(&path);
+            let meta = std::fs::metadata(&path).unwrap();
+            db.upsert_track(&NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: Format::Flac,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len() as i64,
+                backing_mtime: mtime_secs(&meta),
+            })
+            .unwrap()
+        };
+        let keep = mk("keep.flac");
+        let gone = mk("gone.flac");
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let keep_a = cache.resolve(&db, keep).unwrap();
+        let gone_a = cache.resolve(&db, gone).unwrap();
+
+        cache.remove(gone);
+
+        // The kept track stays the same cached Arc; the removed one re-resolves fresh.
+        assert!(Arc::ptr_eq(&keep_a, &cache.resolve(&db, keep).unwrap()));
+        assert!(!Arc::ptr_eq(&gone_a, &cache.resolve(&db, gone).unwrap()));
+    }
+
+    #[test]
+    fn shard_remove_key_reaccounts_bytes() {
+        let mut s = Shard::new(1000);
+        s.insert(1, entry(0, 100));
+        s.insert(2, entry(0, 100));
+        s.remove_key(1);
+        assert!(s.get(1).is_none());
+        assert!(s.get(2).is_some());
+        assert_eq!(s.bytes, 100);
     }
 
     #[test]
