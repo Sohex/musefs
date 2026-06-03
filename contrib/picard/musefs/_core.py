@@ -128,15 +128,16 @@ class Opts:
 
 def parse_field_map(text):
     """Parse a ``key=value`` field map (from the options page) into a dict.
-    Entries are separated by commas or newlines; blank/invalid entries ignored."""
+    One entry per line; blank lines and lines without ``=`` are ignored. A
+    value may contain commas — they are kept literally."""
     result = {}
     if not text:
         return result
-    for entry in str(text).replace("\n", ",").split(","):
-        entry = entry.strip()
-        if not entry or "=" not in entry:
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
             continue
-        k, v = entry.split("=", 1)
+        k, v = line.split("=", 1)
         k, v = k.strip(), v.strip()
         if k and v:
             result[k] = v

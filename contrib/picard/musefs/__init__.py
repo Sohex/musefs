@@ -209,7 +209,7 @@ if _PICARD:
             self._bin = QtWidgets.QLineEdit(self)
             self._autoscan = QtWidgets.QCheckBox("Run `musefs scan` before syncing", self)
             self._fields = QtWidgets.QLineEdit(self)
-            self._fields.setPlaceholderText("extra map, e.g. comment=comment, mood=mood")
+            self._fields.setPlaceholderText("extra map, one per line, e.g. comment=comment")
             layout.addRow("musefs DB path", self._db)
             layout.addRow("musefs binary", self._bin)
             layout.addRow("", self._autoscan)
