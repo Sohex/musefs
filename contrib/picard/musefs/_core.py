@@ -10,11 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Upper bound on a single-file `musefs scan` autoscan. A scan probes one file,
-# so this only fires on a genuine hang (e.g. a wedged binary or stuck DB lock);
-# without it a hung scan would block the Picard worker thread forever.
-SCAN_TIMEOUT_SECONDS = 120
-
 # Picard internal tag name -> musefs (Vorbis-lowercase) key. Picard's internal
 # names already match musefs keys, so this is mostly identity.
 DIRECT_FIELDS = {
