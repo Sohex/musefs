@@ -258,7 +258,9 @@ impl Musefs {
     }
 
     /// Rebuild + publish the tree via a full render; returns the fresh snapshot
-    /// (the caller decides whether/how to diff it).
+    /// (the caller decides whether/how to diff it). Mirrors `rebuild_incremental`'s
+    /// ordering: read + render under the pool connection, then lock `inodes` only
+    /// across the pure-CPU `build_with` (#90).
     fn rebuild_full(&self) -> Result<HashMap<i64, TrackRenderState>> {
         if self.force_rebuild_error.load(Ordering::Acquire) {
             return Err(CoreError::BackingChanged(
