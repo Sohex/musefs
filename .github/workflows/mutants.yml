@@ -23,6 +23,39 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    # Cheap gate: decide whether the mutation harness itself changed. The `canary`
+    # job exercises scripts/mutants.sh end to end, so it only earns its cost when
+    # that wrapper (or this workflow) can have regressed — not on every crate PR,
+    # where it's redundant with `in-diff` and just pays a second multi-minute
+    # `cargo install cargo-mutants`. The workflow-level `paths` filter can't
+    # express this (it governs all jobs and `in-diff` must run on crate changes),
+    # so we compute it here and gate `canary` below. Mirrors ci.yml's `changes`.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      harness: ${{ steps.filter.outputs.harness }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          # Full history so the three-dot merge base is present (same reason as
+          # the in-diff job); a shallow clone often lacks it and the diff fails.
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only "$BASE_SHA...HEAD")"
+          echo "Changed files:"; echo "$changed"
+          # harness=true iff scripts/mutants.sh or this workflow changed.
+          if printf '%s\n' "$changed" | grep -qxE 'scripts/mutants\.sh|\.github/workflows/mutants\.yml'; then
+            echo "harness=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "harness=false" >> "$GITHUB_OUTPUT"
+          fi
+
   in-diff:
     # Per-PR: mutate only the lines changed in this PR. Fast gate.
     if: github.event_name == 'pull_request'
@@ -81,8 +114,11 @@ jobs:
     # source-tree copy, --output dir, report) cheaply via --check on the smallest
     # crate. Catches the copy-recursion / output-dir class of bugs the --list
     # smoke test can't (list mode neither copies the tree nor creates output).
-    # cargo-check only, no test runs, so it stays fast.
-    if: github.event_name == 'pull_request'
+    # cargo-check only, no test runs, so it stays fast. Gated on the `changes`
+    # job: only runs when scripts/mutants.sh or this workflow changed, since the
+    # harness logic can't regress on an ordinary crate edit.
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.harness == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
