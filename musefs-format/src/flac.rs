@@ -143,7 +143,7 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
     })
 }
 
-use crate::input::{ArtInput, EmbeddedPicture, TagInput};
+use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 
 pub(crate) fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usize, is_last: bool) {
@@ -152,6 +152,46 @@ pub(crate) fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usi
     out.push(((body_len >> 16) & 0xFF) as u8);
     out.push(((body_len >> 8) & 0xFF) as u8);
     out.push((body_len & 0xFF) as u8);
+}
+
+/// Map a stored structural-block `kind` string back to its FLAC block type.
+/// Only STREAMINFO/SEEKTABLE live in the structural store; everything else
+/// returns `None` (APPLICATION/CUESHEET are binary tags, not structural).
+pub fn structural_block_type(kind: &str) -> Option<u8> {
+    match kind {
+        "STREAMINFO" => Some(BLOCK_STREAMINFO),
+        "SEEKTABLE" => Some(BLOCK_SEEKTABLE),
+        _ => None,
+    }
+}
+
+/// Split a FLAC file's preserved metadata blocks into the read-only structural
+/// store (STREAMINFO/SEEKTABLE, as `(kind, body)` pairs in file order) and the
+/// editable binary tags (APPLICATION/CUESHEET, as `EmbeddedBinaryTag`s keyed by
+/// block name; `payload` is the full block body, including APPLICATION's 4-byte
+/// app id). Blocks of any other type are ignored (PICTURE/VORBIS_COMMENT are
+/// handled by their own paths and are never in `preserved`).
+pub fn split_preserved(
+    blocks: &[MetadataBlock],
+) -> (Vec<(String, Vec<u8>)>, Vec<EmbeddedBinaryTag>) {
+    let mut structural = Vec::new();
+    let mut binary = Vec::new();
+    for blk in blocks {
+        match blk.block_type {
+            BLOCK_STREAMINFO => structural.push(("STREAMINFO".to_string(), blk.body.clone())),
+            BLOCK_SEEKTABLE => structural.push(("SEEKTABLE".to_string(), blk.body.clone())),
+            BLOCK_APPLICATION => binary.push(EmbeddedBinaryTag {
+                key: "APPLICATION".to_string(),
+                payload: blk.body.clone(),
+            }),
+            BLOCK_CUESHEET => binary.push(EmbeddedBinaryTag {
+                key: "CUESHEET".to_string(),
+                payload: blk.body.clone(),
+            }),
+            _ => {}
+        }
+    }
+    (structural, binary)
 }
 
 fn picture_body_framing(art: &ArtInput) -> Vec<u8> {
@@ -170,26 +210,36 @@ fn picture_body_framing(art: &ArtInput) -> Vec<u8> {
 }
 
 /// Build the ordered segment layout for a synthesized FLAC file:
-/// `fLaC` + preserved structural blocks + a regenerated VORBIS_COMMENT + PICTURE
-/// blocks (one `ArtImage` segment each) + the backing audio.
+/// `fLaC` + structural blocks (sorted by type) + a regenerated VORBIS_COMMENT +
+/// streamed APPLICATION/CUESHEET binary tags + PICTURE blocks (one `ArtImage`
+/// segment each) + the backing audio.  Structural blocks must be only
+/// STREAMINFO/SEEKTABLE; APPLICATION/CUESHEET ride through `binary_tags`.
 pub fn synthesize_layout(
-    scan: &FlacScan,
+    structural: &[MetadataBlock],
+    audio_offset: u64,
+    audio_length: u64,
     tags: &[TagInput],
+    binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<RegionLayout> {
-    // exclude zero-byte art: an empty PICTURE block is meaningless and would fail
-    // layout validation (EmptySegment), making the track unreadable.
+    let mut ordered: Vec<&MetadataBlock> = structural.iter().collect();
+    ordered.sort_by_key(|b| b.block_type);
+
+    let valid_binary: Vec<&BinaryTagInput> = binary_tags
+        .iter()
+        .filter(|bt| matches!(bt.key.as_str(), "APPLICATION" | "CUESHEET"))
+        .collect();
+
     let nonempty_art = arts.iter().filter(|a| a.data_len > 0).count();
-    let num_blocks = scan.preserved.len() + 1 + nonempty_art; // preserved + VORBIS_COMMENT + pictures
+    let num_blocks = ordered.len() + 1 + valid_binary.len() + nonempty_art;
     let last_index = num_blocks - 1;
 
     let mut segments: Vec<Segment> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(FLAC_MARKER);
-
     let mut idx = 0usize;
 
-    for blk in &scan.preserved {
+    for blk in &ordered {
         push_block_header(&mut buf, blk.block_type, blk.body.len(), idx == last_index);
         buf.extend_from_slice(&blk.body);
         idx += 1;
@@ -200,15 +250,30 @@ pub fn synthesize_layout(
     buf.extend_from_slice(&vc);
     idx += 1;
 
+    for bt in valid_binary {
+        let block_type = match bt.key.as_str() {
+            "APPLICATION" => BLOCK_APPLICATION,
+            "CUESHEET" => BLOCK_CUESHEET,
+            _ => continue,
+        };
+        if bt.len > 0x00FF_FFFF {
+            return Err(FormatError::TooLarge);
+        }
+        push_block_header(&mut buf, block_type, bt.len as usize, idx == last_index);
+        segments.push(Segment::Inline(std::mem::take(&mut buf)));
+        segments.push(Segment::BinaryTag {
+            payload_id: bt.payload_id,
+            len: bt.len,
+        });
+        idx += 1;
+    }
+
     for art in arts {
         if art.data_len == 0 {
-            continue; // skip degenerate empty art (see nonempty_art above)
+            continue;
         }
         let framing = picture_body_framing(art);
         let body_len = framing.len() as u64 + art.data_len;
-        // FLAC metadata block lengths are 24-bit (max ~16 MiB). Ingestion caps art
-        // well under this, but guard at the format boundary so an oversized block is
-        // a hard error rather than a silently-truncated (corrupt) file.
         if body_len > 0x00FF_FFFF {
             return Err(FormatError::TooLarge);
         }
@@ -231,8 +296,8 @@ pub fn synthesize_layout(
         segments.push(Segment::Inline(buf));
     }
     segments.push(Segment::BackingAudio {
-        offset: scan.audio_offset,
-        len: scan.audio_length,
+        offset: audio_offset,
+        len: audio_length,
     });
 
     RegionLayout::validated(segments).map_err(|_| FormatError::InvalidLayout)
@@ -816,14 +881,52 @@ mod tests {
     }
 
     #[test]
+    fn split_preserved_classifies_structural_and_binary() {
+        use super::{split_preserved, structural_block_type, MetadataBlock};
+        // STREAMINFO(0), APPLICATION(2), SEEKTABLE(3), CUESHEET(5) in arbitrary order.
+        let blocks = vec![
+            MetadataBlock {
+                block_type: 0,
+                body: vec![0xAA],
+            },
+            MetadataBlock {
+                block_type: 2,
+                body: b"testDATA".to_vec(),
+            },
+            MetadataBlock {
+                block_type: 3,
+                body: vec![0xBB],
+            },
+            MetadataBlock {
+                block_type: 5,
+                body: vec![0xCC; 4],
+            },
+        ];
+        let (structural, binary) = split_preserved(&blocks);
+
+        assert_eq!(
+            structural,
+            vec![
+                ("STREAMINFO".to_string(), vec![0xAA]),
+                ("SEEKTABLE".to_string(), vec![0xBB]),
+            ]
+        );
+        assert_eq!(binary.len(), 2);
+        assert_eq!(binary[0].key, "APPLICATION");
+        assert_eq!(binary[0].payload, b"testDATA");
+        assert_eq!(binary[1].key, "CUESHEET");
+        assert_eq!(binary[1].payload, vec![0xCC; 4]);
+
+        assert_eq!(structural_block_type("STREAMINFO"), Some(0));
+        assert_eq!(structural_block_type("SEEKTABLE"), Some(3));
+        assert_eq!(structural_block_type("APPLICATION"), None);
+        assert_eq!(structural_block_type("bogus"), None);
+    }
+
+    #[test]
     fn synthesize_layout_picture_block_size_boundary_is_inclusive() {
         // body_len = picture_body_framing(art).len() + art.data_len. The guard at
-        // flac.rs:155 rejects body_len > 0x00FF_FFFF (FLAC's 24-bit block length).
-        let scan = FlacScan {
-            audio_offset: 0,
-            audio_length: 0,
-            preserved: vec![],
-        };
+        // flac.rs rejects body_len > 0x00FF_FFFF (FLAC's 24-bit block length).
         let mk = |data_len: u64| ArtInput {
             art_id: 1,
             mime: "image/png".to_string(),
@@ -840,10 +943,30 @@ mod tests {
         let at_limit = 0x00FF_FFFF - framing_len; // body_len == 0x00FF_FFFF exactly
                                                   // original `>` accepts the inclusive boundary; the `>=` mutant rejects it.
                                                   // (data_len is only a count; no large allocation occurs.)
-        assert!(synthesize_layout(&scan, &[], &[mk(at_limit)]).is_ok());
+        assert!(synthesize_layout(&[], 0, 0, &[], &[], &[mk(at_limit)]).is_ok());
         // one byte over must still error, pinning the high side of the boundary.
         assert_eq!(
-            synthesize_layout(&scan, &[], &[mk(at_limit + 1)]),
+            synthesize_layout(&[], 0, 0, &[], &[], &[mk(at_limit + 1)]),
+            Err(FormatError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn synthesize_layout_binary_tag_block_size_boundary_is_inclusive() {
+        // The binary-tag guard rejects bt.len > 0x00FF_FFFF (FLAC's 24-bit block
+        // length). `len` is only a count — no payload is allocated — so the exact
+        // boundary is cheap to pin. Mirrors the PICTURE boundary test; the `>`
+        // accepts the inclusive limit while the `>=` mutant rejects it.
+        let mk = |len: u64| BinaryTagInput {
+            key: "APPLICATION".to_string(),
+            payload_id: 1,
+            len,
+        };
+        // len == 0x00FF_FFFF exactly must succeed.
+        assert!(synthesize_layout(&[], 0, 0, &[], &[mk(0x00FF_FFFF)], &[]).is_ok());
+        // one byte over must still error, pinning the high side of the boundary.
+        assert_eq!(
+            synthesize_layout(&[], 0, 0, &[], &[mk(0x0100_0000)], &[]),
             Err(FormatError::TooLarge)
         );
     }

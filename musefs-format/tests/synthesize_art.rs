@@ -33,7 +33,15 @@ fn art_becomes_an_artimage_segment_and_lengths_are_exact() {
 
     let image = vec![0x77u8; 1234];
     let art = cover(42, image.len() as u64);
-    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
+    let layout = synthesize_layout(
+        &scan.preserved,
+        scan.audio_offset,
+        scan.audio_length,
+        &[TagInput::new("title", "T")],
+        &[],
+        &[art],
+    )
+    .unwrap();
 
     let art_segs: Vec<&Segment> = layout
         .segments
@@ -63,7 +71,15 @@ fn metaflac_reads_synthesized_picture() {
 
     let image = vec![0x77u8; 1234];
     let art = cover(42, image.len() as u64);
-    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
+    let layout = synthesize_layout(
+        &scan.preserved,
+        scan.audio_offset,
+        scan.audio_length,
+        &[TagInput::new("title", "T")],
+        &[],
+        &[art],
+    )
+    .unwrap();
 
     let mut art_map = HashMap::new();
     art_map.insert(42i64, image.clone());
@@ -82,13 +98,7 @@ fn metaflac_reads_synthesized_picture() {
 
 #[test]
 fn synthesize_errors_on_oversized_picture() {
-    use musefs_format::flac::FlacScan;
     use musefs_format::FormatError;
-    let scan = FlacScan {
-        audio_offset: 0,
-        audio_length: 0,
-        preserved: vec![],
-    };
     // data_len is only a count here (bytes are streamed), so this needs no allocation.
     let art = ArtInput {
         art_id: 1,
@@ -100,7 +110,7 @@ fn synthesize_errors_on_oversized_picture() {
         data_len: 0x0100_0000, // just over the 24-bit FLAC PICTURE block limit
     };
     assert_eq!(
-        synthesize_layout(&scan, &[], &[art]),
+        synthesize_layout(&[], 0, 0, &[], &[], &[art]),
         Err(FormatError::TooLarge)
     );
 }
@@ -114,7 +124,15 @@ fn zero_byte_art_is_skipped_so_the_track_still_serves() {
     // emit an empty PICTURE block (which would fail layout validation and brick the
     // track).
     let art = cover(7, 0); // data_len == 0
-    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[art]).unwrap();
+    let layout = synthesize_layout(
+        &scan.preserved,
+        scan.audio_offset,
+        scan.audio_length,
+        &[TagInput::new("title", "T")],
+        &[],
+        &[art],
+    )
+    .unwrap();
 
     // No ArtImage segment was emitted.
     assert!(!layout
@@ -143,7 +161,15 @@ fn zero_byte_art_skipped_among_valid_art_keeps_block_framing_valid() {
     let image = vec![0x55u8; 64];
     let empty = cover(1, 0);
     let real = cover(2, image.len() as u64);
-    let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[empty, real]).unwrap();
+    let layout = synthesize_layout(
+        &scan.preserved,
+        scan.audio_offset,
+        scan.audio_length,
+        &[TagInput::new("title", "T")],
+        &[],
+        &[empty, real],
+    )
+    .unwrap();
 
     let art_segs: Vec<_> = layout
         .segments

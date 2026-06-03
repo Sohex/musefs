@@ -16,7 +16,14 @@ fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
     let tags = arb_tags(&mut u).unwrap_or_default();
     let arts = arb_arts(&mut u).unwrap_or_default();
-    if let Ok(layout) = flac::synthesize_layout(&scan, &tags, &arts) {
+    if let Ok(layout) = flac::synthesize_layout(
+        &scan.preserved,
+        scan.audio_offset,
+        scan.audio_length,
+        &tags,
+        &[],
+        &arts,
+    ) {
         assert_backing_covers_audio(scan.audio_offset, scan.audio_length, &layout);
     }
 });

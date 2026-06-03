@@ -90,6 +90,8 @@ pub(crate) struct Probed {
     tags: Vec<(String, String)>,
     pictures: Vec<EmbeddedPicture>,
     binary_tags: Vec<EmbeddedBinaryTag>,
+    /// FLAC STREAMINFO/SEEKTABLE as (kind, body) pairs; empty for other formats.
+    structural_blocks: Vec<(String, Vec<u8>)>,
 }
 
 /// Full-buffer probe (legacy path). Retained as the reference implementation the
@@ -97,13 +99,15 @@ pub(crate) struct Probed {
 pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
     if has_ext(path, "flac") {
         let scan = flac::locate_audio(bytes).ok()?;
+        let (structural_blocks, binary_tags) = flac::split_preserved(&scan.preserved);
         Some(Probed {
             format: Format::Flac,
             audio_offset: scan.audio_offset,
             audio_length: scan.audio_length,
             tags: flac::read_vorbis_comments(bytes).unwrap_or_default(),
             pictures: flac::read_pictures(bytes).unwrap_or_default(),
-            binary_tags: Vec::new(),
+            binary_tags,
+            structural_blocks,
         })
     } else if has_ext(path, "mp3") {
         let bounds = mp3::locate_audio(bytes).ok()?;
@@ -117,6 +121,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             tags,
             pictures: mp3::read_pictures(bytes),
             binary_tags,
+            structural_blocks: Vec::new(),
         })
     } else if has_ext(path, "m4a") || has_ext(path, "m4b") {
         let bounds = mp4::locate_audio(bytes).ok()?;
@@ -127,6 +132,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             tags: mp4::read_tags(bytes),
             pictures: mp4::read_pictures(bytes),
             binary_tags: mp4::read_binary_tags(bytes),
+            structural_blocks: Vec::new(),
         })
     } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
         let scan = ogg::locate_audio(bytes).ok()?;
@@ -142,6 +148,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             tags: ogg::read_tags(bytes).unwrap_or_default(),
             pictures: ogg::read_pictures(bytes).unwrap_or_default(),
             binary_tags: Vec::new(),
+            structural_blocks: Vec::new(),
         })
     } else if has_ext(path, "wav") {
         let bounds = wav::locate_audio(bytes).ok()?;
@@ -155,6 +162,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             tags,
             pictures: wav::read_pictures(bytes),
             binary_tags,
+            structural_blocks: Vec::new(),
         })
     } else {
         None
@@ -220,6 +228,7 @@ fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
             tags: mp4::read_tags(&scan.moov),
             pictures: mp4::read_pictures(&scan.moov),
             binary_tags: mp4::read_binary_tags(&scan.moov),
+            structural_blocks: Vec::new(),
         }));
     }
 
@@ -263,14 +272,18 @@ enum Probe {
 fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 128]>) -> Probe {
     if has_ext(path, "flac") {
         match flac::read_metadata_bounded(prefix) {
-            Ok(Extent::Complete(meta)) => Probe::Done(Probed {
-                format: Format::Flac,
-                audio_offset: meta.audio_offset,
-                audio_length: file_len - meta.audio_offset,
-                tags: flac::read_vorbis_comments(prefix).unwrap_or_default(),
-                pictures: flac::read_pictures(prefix).unwrap_or_default(),
-                binary_tags: Vec::new(),
-            }),
+            Ok(Extent::Complete(meta)) => {
+                let (structural_blocks, binary_tags) = flac::split_preserved(&meta.preserved);
+                Probe::Done(Probed {
+                    format: Format::Flac,
+                    audio_offset: meta.audio_offset,
+                    audio_length: file_len - meta.audio_offset,
+                    tags: flac::read_vorbis_comments(prefix).unwrap_or_default(),
+                    pictures: flac::read_pictures(prefix).unwrap_or_default(),
+                    binary_tags,
+                    structural_blocks,
+                })
+            }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
             Err(_) => Probe::Skip,
         }
@@ -287,6 +300,7 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
                     tags,
                     pictures: mp3::read_pictures(prefix),
                     binary_tags,
+                    structural_blocks: Vec::new(),
                 })
             }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
@@ -307,6 +321,7 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
                     tags: ogg::read_tags(prefix).unwrap_or_default(),
                     pictures: ogg::read_pictures(prefix).unwrap_or_default(),
                     binary_tags: Vec::new(),
+                    structural_blocks: Vec::new(),
                 })
             }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
@@ -325,6 +340,7 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
                     tags,
                     pictures: wav::read_pictures(prefix),
                     binary_tags,
+                    structural_blocks: Vec::new(),
                 })
             }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
@@ -368,8 +384,19 @@ struct Unit {
     weight: u64,
 }
 
-fn art_weight(p: &Probed) -> u64 {
-    p.pictures.iter().map(|pic| pic.data.len() as u64).sum()
+/// In-memory byte weight of a `Probed`, used for batch backpressure
+/// (`MUSEFS_BATCH_BYTES`). Counts every buffered payload — pictures plus FLAC
+/// structural blocks and binary tags — so large preserved blocks can't slip the
+/// budget the way picture-only accounting did.
+fn payload_weight(p: &Probed) -> u64 {
+    let pictures: u64 = p.pictures.iter().map(|pic| pic.data.len() as u64).sum();
+    let binary: u64 = p.binary_tags.iter().map(|t| t.payload.len() as u64).sum();
+    let structural: u64 = p
+        .structural_blocks
+        .iter()
+        .map(|(_, body)| body.len() as u64)
+        .sum();
+    pictures + binary + structural
 }
 
 /// Upsert a track from a probed backing file: write the track row, replace its
@@ -405,6 +432,23 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
         })
         .collect();
     db.set_binary_tags(track_id, &binary_tags)?;
+
+    let mut sb_ordinals: HashMap<String, i64> = HashMap::new();
+    let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
+        .structural_blocks
+        .into_iter()
+        .map(|(kind, body)| {
+            let ord = sb_ordinals.entry(kind.clone()).or_insert(0);
+            let sb = musefs_db::StructuralBlock {
+                kind,
+                ordinal: *ord,
+                body,
+            };
+            *ord += 1;
+            sb
+        })
+        .collect();
+    db.set_structural_blocks(track_id, &structural_blocks)?;
 
     let mut track_arts = Vec::new();
     // Filter before enumerating so skipped (oversized) art doesn't leave gaps
@@ -475,6 +519,23 @@ fn ingest_bulk(
         })
         .collect();
     bw.set_binary_tags(track_id, &binary_tags)?;
+
+    let mut sb_ordinals: HashMap<String, i64> = HashMap::new();
+    let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
+        .structural_blocks
+        .iter()
+        .map(|(kind, body)| {
+            let ord = sb_ordinals.entry(kind.clone()).or_insert(0);
+            let sb = musefs_db::StructuralBlock {
+                kind: kind.clone(),
+                ordinal: *ord,
+                body: body.clone(),
+            };
+            *ord += 1;
+            sb
+        })
+        .collect();
+    bw.set_structural_blocks(track_id, &structural_blocks)?;
 
     let mut track_arts = Vec::new();
     let accepted = probed
@@ -569,7 +630,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                         failed.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    let weight = art_weight(&probed);
+                    let weight = payload_weight(&probed);
                     budget.acquire(weight); // backpressure on in-flight art bytes
                     let unit = Unit {
                         abs_path: abs.to_string_lossy().into_owned(),
@@ -887,11 +948,11 @@ mod scan_unit_tests {
         std::env::remove_var("MUSEFS_BATCH_BYTES");
     }
 
-    // --- art_weight() (lines 340-342) ---
+    // --- payload_weight() ---
 
-    // kills scan L341 art_weight body→0/→1 (sum of picture data lengths)
+    // Sums picture + binary-tag + structural-block byte lengths (batch backpressure).
     #[test]
-    fn art_weight_sums_picture_byte_lengths() {
+    fn payload_weight_sums_all_buffered_payloads() {
         let pic = |n: usize| EmbeddedPicture {
             mime: "image/png".to_string(),
             picture_type: 3,
@@ -906,9 +967,14 @@ mod scan_unit_tests {
             audio_length: 0,
             tags: Vec::new(),
             pictures: vec![pic(3), pic(5)],
-            binary_tags: Vec::new(),
+            binary_tags: vec![EmbeddedBinaryTag {
+                key: "APPLICATION".into(),
+                payload: vec![0u8; 4],
+            }],
+            structural_blocks: vec![("SEEKTABLE".into(), vec![0u8; 2])],
         };
-        assert_eq!(art_weight(&probed), 8);
+        // 3 + 5 (pictures) + 4 (binary) + 2 (structural) = 14.
+        assert_eq!(payload_weight(&probed), 14);
 
         // Empty → 0, distinguishes the →1 constant (which ignores the input).
         let empty = Probed {
@@ -918,8 +984,9 @@ mod scan_unit_tests {
             tags: Vec::new(),
             pictures: Vec::new(),
             binary_tags: Vec::new(),
+            structural_blocks: Vec::new(),
         };
-        assert_eq!(art_weight(&empty), 0);
+        assert_eq!(payload_weight(&empty), 0);
     }
 
     /// Minimal-but-valid m4a that `mp4::locate_audio` accepts (one `soun` trak),
@@ -1404,6 +1471,7 @@ mod hardening_tests {
                     payload: vec![0u8; MAX_BINARY_TAG_BYTES + 1],
                 },
             ],
+            structural_blocks: Vec::new(),
         }
     }
 
@@ -1451,6 +1519,77 @@ mod hardening_tests {
         );
         assert_eq!(rows[0].key, "PRIV");
         assert_eq!(rows[0].byte_len, 3);
+    }
+
+    /// Probed with two structural blocks of the SAME kind, to make the per-kind
+    /// ordinal increment (`*ord += 1`) observable. A real FLAC carries only one
+    /// STREAMINFO/SEEKTABLE, so a duplicate kind is the only input under which the
+    /// second block's ordinal differs from the first; without it the increment's
+    /// mutants survive.
+    fn probed_with_duplicate_structural_kind() -> Probed {
+        Probed {
+            format: musefs_db::Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            tags: Vec::new(),
+            pictures: Vec::new(),
+            binary_tags: Vec::new(),
+            structural_blocks: vec![
+                ("SEEKTABLE".to_string(), vec![0xA1]),
+                ("SEEKTABLE".to_string(), vec![0xB2]),
+            ],
+        }
+    }
+
+    #[test]
+    fn ingest_assigns_sequential_structural_ordinals_per_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        std::fs::write(&path, b"x").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let db = Db::open_in_memory().unwrap();
+
+        ingest(
+            &db,
+            &path.to_string_lossy(),
+            &meta,
+            probed_with_duplicate_structural_kind(),
+        )
+        .unwrap();
+
+        let tid = db.list_tracks().unwrap()[0].id;
+        let got = db.get_structural_blocks(tid).unwrap();
+        // Rows come back ORDER BY kind, ordinal: the two same-kind blocks must hold
+        // ordinals 0 then 1 (the `-=`/`*=` mutants collapse or invert this).
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].ordinal, 0);
+        assert_eq!(got[0].body, vec![0xA1]);
+        assert_eq!(got[1].ordinal, 1);
+        assert_eq!(got[1].body, vec![0xB2]);
+    }
+
+    #[test]
+    fn ingest_bulk_assigns_sequential_structural_ordinals_per_kind() {
+        let db = Db::open_in_memory().unwrap();
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            ingest_bulk(
+                &mut bw,
+                "/a.flac",
+                1,
+                0,
+                &probed_with_duplicate_structural_kind(),
+            )
+            .unwrap();
+            bw.commit().unwrap();
+        }
+        let tid = db.list_tracks().unwrap()[0].id;
+        let got = db.get_structural_blocks(tid).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].ordinal, 0);
+        assert_eq!(got[0].body, vec![0xA1]);
+        assert_eq!(got[1].ordinal, 1);
+        assert_eq!(got[1].body, vec![0xB2]);
     }
 }
 

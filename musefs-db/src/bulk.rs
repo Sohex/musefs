@@ -1,4 +1,4 @@
-use crate::models::{BinaryTag, NewArt, NewTrack, Tag, TrackArt};
+use crate::models::{BinaryTag, NewArt, NewTrack, StructuralBlock, Tag, TrackArt};
 use crate::{Db, Result};
 use rusqlite::{params, Transaction};
 use sha2::{Digest, Sha256};
@@ -90,6 +90,25 @@ impl BulkWriter<'_> {
         )?;
         for t in tags {
             stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
+        }
+        Ok(())
+    }
+
+    pub fn set_structural_blocks(
+        &mut self,
+        track_id: i64,
+        blocks: &[StructuralBlock],
+    ) -> Result<()> {
+        self.tx.execute(
+            "DELETE FROM structural_blocks WHERE track_id = ?1",
+            params![track_id],
+        )?;
+        let mut stmt = self.tx.prepare(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for b in blocks {
+            stmt.execute(params![track_id, b.kind, b.ordinal, b.body])?;
         }
         Ok(())
     }
@@ -319,6 +338,48 @@ mod tests {
             db.get_tags(tid).unwrap(),
             vec![crate::Tag::new("artist", "A", 0)]
         );
+    }
+
+    #[test]
+    fn bulk_set_structural_blocks_round_trips() {
+        use crate::StructuralBlock;
+        let db = Db::open_in_memory().unwrap();
+        let id = {
+            let mut bw = db.bulk_writer().unwrap();
+            let id = bw
+                .upsert_track(&NewTrack {
+                    backing_path: "/a.flac".into(),
+                    format: Format::Flac,
+                    audio_offset: 0,
+                    audio_length: 1,
+                    backing_size: 1,
+                    backing_mtime: 0,
+                })
+                .unwrap();
+            bw.set_structural_blocks(
+                id,
+                &[
+                    StructuralBlock {
+                        kind: "STREAMINFO".into(),
+                        ordinal: 0,
+                        body: vec![1, 2],
+                    },
+                    StructuralBlock {
+                        kind: "SEEKTABLE".into(),
+                        ordinal: 0,
+                        body: vec![3],
+                    },
+                ],
+            )
+            .unwrap();
+            bw.commit().unwrap();
+            id
+        };
+        let got = db.get_structural_blocks(id).unwrap();
+        assert_eq!(got.len(), 2);
+        // get_structural_blocks orders by kind: SEEKTABLE before STREAMINFO.
+        assert_eq!(got[0].kind, "SEEKTABLE");
+        assert_eq!(got[1].body, vec![1, 2]);
     }
 
     #[test]

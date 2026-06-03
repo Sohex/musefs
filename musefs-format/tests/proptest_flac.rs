@@ -19,7 +19,7 @@ proptest! {
         let scan = flac::locate_audio(&file).unwrap();
         let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
         let arts: Vec<ArtInput> = Vec::new();
-        if let Ok(layout) = flac::synthesize_layout(&scan, &taginputs, &arts) {
+        if let Ok(layout) = flac::synthesize_layout(&scan.preserved, scan.audio_offset, scan.audio_length, &taginputs, &[], &arts) {
             assert_backing_covers_audio(scan.audio_offset, scan.audio_length, &layout);
         }
     }
@@ -33,7 +33,7 @@ proptest! {
         let scan = flac::locate_audio(&file).unwrap();
         let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
         let arts: Vec<ArtInput> = Vec::new();
-        let Ok(layout) = flac::synthesize_layout(&scan, &taginputs, &arts) else {
+        let Ok(layout) = flac::synthesize_layout(&scan.preserved, scan.audio_offset, scan.audio_length, &taginputs, &[], &arts) else {
             return Ok(());
         };
         let mut front = Vec::new();

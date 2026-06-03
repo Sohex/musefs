@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use musefs_db::{Db, Format};
-use musefs_format::flac::{self, FlacScan};
-use musefs_format::{mp3, mp4, wav, RegionLayout, Segment};
+use musefs_format::flac::{self, MetadataBlock};
+use musefs_format::{mp3, mp4, wav, BinaryTagInput, RegionLayout, Segment};
 
 use crate::error::{CoreError, Result};
 use crate::facade::Mode;
@@ -260,15 +260,42 @@ impl HeaderCache {
                 // Xing/LAME info frame travels with the backing audio.
                 let layout = match track.format {
                     Format::Flac => {
-                        let front =
-                            read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
-                        let fmeta = flac::read_metadata(&front)?;
-                        let scan = FlacScan {
-                            audio_offset: track.audio_offset as u64,
-                            audio_length: track.audio_length as u64,
-                            preserved: fmeta.preserved,
-                        };
-                        flac::synthesize_layout(&scan, &inputs, &art_inputs)?
+                        let rows = db.get_structural_blocks(track.id)?;
+                        // Fast path: the structural store holds STREAMINFO/SEEKTABLE and
+                        // APPLICATION/CUESHEET stream from value_blob rows. Legacy
+                        // fallback (no structural rows yet): carry every preserved block
+                        // — including APPLICATION/CUESHEET — inline from the front
+                        // re-read, and suppress the streamed binary tags so those blocks
+                        // are not emitted twice.
+                        let (structural, binary_tags): (Vec<MetadataBlock>, &[BinaryTagInput]) =
+                            if rows.is_empty() {
+                                let front = read_front(
+                                    Path::new(&track.backing_path),
+                                    track.audio_offset as u64,
+                                )?;
+                                (flac::read_metadata(&front)?.preserved, &[])
+                            } else {
+                                let structural = rows
+                                    .into_iter()
+                                    .filter_map(|b| {
+                                        flac::structural_block_type(&b.kind).map(|block_type| {
+                                            MetadataBlock {
+                                                block_type,
+                                                body: b.body,
+                                            }
+                                        })
+                                    })
+                                    .collect();
+                                (structural, &binary_tag_inputs)
+                            };
+                        flac::synthesize_layout(
+                            &structural,
+                            track.audio_offset as u64,
+                            track.audio_length as u64,
+                            &inputs,
+                            binary_tags,
+                            &art_inputs,
+                        )?
                     }
                     Format::Mp3 => mp3::synthesize_layout(
                         track.audio_offset as u64,
