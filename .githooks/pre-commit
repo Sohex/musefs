@@ -28,10 +28,10 @@ if ! cargo test --workspace --quiet; then
     exit 1
 fi
 
-# Lint the union of every path the beets + picard CI jobs lint, so a commit
+# Lint the union of every path the beets, picard, and python-musefs CI jobs lint, so a commit
 # can't pass the hook yet fail CI (beets lints contrib/beets/ + tests/interop/;
 # picard lints contrib/picard/).
-RUFF_PATHS=(contrib/beets/ contrib/picard/ tests/interop/)
+RUFF_PATHS=(contrib/beets/ contrib/picard/ contrib/python-musefs/ tests/interop/)
 
 echo "pre-commit: ruff check"
 if ! ruff check "${RUFF_PATHS[@]}"; then
