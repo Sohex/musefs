@@ -22,7 +22,10 @@ DIRECT_FIELDS = {
 
 # (list_field, scalar_field, store_key): beets carries some tags as both a list
 # (genres/composers, beets 2.x) and a joined scalar (genre/composer). Emitting
-# both duplicates rows, so prefer the list when present, else the scalar.
+# both duplicates rows, so prefer the list when present, else the scalar. The
+# per-twin dedup below is scoped to one twin: if a user maps an extra_field onto
+# the "genre"/"composer" store key, that row is emitted in the direct-fields
+# loop and won't be deduped against these — an unlikely config we don't guard.
 TWIN_FIELDS = (
     ("genres", "genre", "genre"),
     ("composers", "composer", "composer"),
