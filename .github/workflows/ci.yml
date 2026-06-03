@@ -84,6 +84,8 @@ jobs:
         run: cargo clippy -p musefs-db --features mutants --all-targets -- -D warnings
       - name: DB mutants-feature tests
         run: cargo test -p musefs-db --features mutants
+      - name: Core metrics-feature tests
+        run: cargo test -p musefs-core --features metrics
 
   interop:
     # Property 5: an independent ecosystem reader (mutagen) reads the tags we
