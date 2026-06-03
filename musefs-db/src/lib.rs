@@ -13,6 +13,7 @@ pub use models::{
     Art, ArtMeta, BinaryTag, BinaryTagRow, Format, NewArt, NewTrack, StructuralBlock, Tag, Track,
     TrackArt,
 };
+pub use tracks::ChangelogRead;
 
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
