@@ -187,4 +187,16 @@ exclude_re = [
     # by line:col — several `<` in this fn (the loop/length guards) ARE caught.
     'musefs-core/src/ogg_index\.rs:204:15: replace < with <= in serve_ogg_window',
     'musefs-core/src/ogg_index\.rs:213:15: replace < with <= in serve_ogg_window',
+
+    # Phase 4 poll_due (#89) — equivalent `<`->`<=` on the two wall-clock gates
+    # (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <
+    # refresh_retry_backoff`). The operators differ only when `Instant::elapsed()`
+    # equals the bound at the exact nanosecond it is sampled — a measure-zero
+    # boundary no deterministic test can construct: the `*_for_test` hooks backdate
+    # the stamp by exactly the bound, but time advances before the comparison runs,
+    # so elapsed() is already strictly greater under both operators. (The mirrored
+    # gates in poll_refresh_notify have the same property.) The `<`->`>`/`==`
+    # variants ARE caught and stay in scope; anchored on operator+function since
+    # both `<` in poll_due are this class.
+    'musefs-core/src/facade\.rs:\d+:\d+: replace < with <= in Musefs::poll_due',
 ]
