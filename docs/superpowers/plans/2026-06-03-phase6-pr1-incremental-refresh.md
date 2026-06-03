@@ -426,6 +426,7 @@ In `refresh_diff.rs`, after `partition_changes`:
 /// short snapshot lock); `keys` are the live render keys for those ids (absent =
 /// no longer in `tracks`). An id that is neither live nor previously known —
 /// added and deleted between polls — is pure churn and lands nowhere.
+#[allow(dead_code)] // wired into facade.rs in a later task (mirrors partition_changes)
 pub(crate) fn partition_changelog(
     prev_states: &HashMap<i64, TrackRenderState>,
     changelog_ids: &[i64],
@@ -588,11 +589,11 @@ In `impl HeaderCache` (next to `retain`):
 ```rust
 /// Drop one track's cached resolution (changelog-refresh removal path).
 pub fn remove(&self, id: i64) {
-    crate::lock::lock_or_clear(self.shard(id), "header-cache shard (remove)").remove_key(id);
+    self.shard(id).remove_key(id);
 }
 ```
 
-(Match `shard(id)`'s actual receiver/return — it exists at `reader.rs:188`.)
+(`shard(id)` at `reader.rs:189` already locks and returns a `MutexGuard<Shard>` — do NOT wrap it in another `lock_or_clear`.)
 
 - [ ] **Step 4: Run tests, then commit**
 
@@ -766,7 +767,7 @@ fn rebuild_incremental(&self) -> Result<Option<IncrementalOutcome>> {
 ```
 
 Notes for the implementer:
-- Import `partition_changelog` next to the existing `partition_changes` import; import `musefs_db::Format` if not already in scope.
+- Import `partition_changelog` next to the existing `partition_changes` import (and drop its temporary `#[allow(dead_code)]` now that it's used); import `musefs_db::Format` if not already in scope.
 - Lock order is snapshot → inodes, both held only across pure-CPU work (the #90 discipline). The mutated snapshot is published in place — there is no separate "store new snapshot" step anymore.
 - Single-flighting (the `refreshing` CAS in the caller) is what makes the unlocked phase-2→4 window safe; do not call `rebuild_incremental` outside it.
 

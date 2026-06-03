@@ -51,7 +51,7 @@ fn read_art_chunk_into_matches_vec_variant_and_errors_on_short_read() {
 }
 ```
 
-And to `musefs-db/tests/tags.rs` (its `new_track` helper + `BinaryTag` are in scope from the neighboring binary-tag tests; `get_binary_tags` returns rows carrying the `payload_id`):
+And to `musefs-db/tests/tags.rs`. That file currently imports only `{Db, Tag}` (tags.rs:3) and has no binary-tag tests — extend the import to `use musefs_db::{BinaryTag, Db, Tag};`. `get_binary_tags` returns `BinaryTagRow { rowid, key, byte_len }` (`musefs-db/src/models.rs:191`); the `rowid` is the payload id the chunk reader takes:
 
 ```rust
 #[test]
@@ -67,7 +67,7 @@ fn read_binary_tag_chunk_into_matches_vec_variant_and_errors_on_short_read() {
         }],
     )
     .unwrap();
-    let payload_id = db.get_binary_tags(track).unwrap()[0].payload_id;
+    let payload_id = db.get_binary_tags(track).unwrap()[0].rowid;
 
     let expected = db.read_binary_tag_chunk(payload_id, 3, 5).unwrap();
     let mut buf = vec![0u8; 5];
@@ -78,8 +78,6 @@ fn read_binary_tag_chunk_into_matches_vec_variant_and_errors_on_short_read() {
     assert!(db.read_binary_tag_chunk_into(payload_id, 3, &mut over).is_err());
 }
 ```
-
-(If `BinaryTagRow`'s id field has a different name than `payload_id`, use the actual field — it's whatever `musefs-core`'s resolve passes to `read_binary_tag_chunk`.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
