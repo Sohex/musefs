@@ -124,9 +124,7 @@ def test_binary_frames_survive():
 
     popm = id3.getall("POPM")
     assert popm, "POPM frame missing"
-    assert int(popm[0].rating) == int(mp3["rating"]), (
-        f"rating {popm[0].rating} != {mp3['rating']}"
-    )
+    assert int(popm[0].rating) == int(mp3["rating"]), f"rating {popm[0].rating} != {mp3['rating']}"
     assert int(popm[0].count) == int(mp3["playcount"]), (
         f"playcount {popm[0].count} != {mp3['playcount']}"
     )
