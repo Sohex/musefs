@@ -364,8 +364,8 @@ impl Musefs {
                 tree
             }
             Err(reason) => {
-                eprintln!(
-                    "musefs: incremental tree mutation failed ({reason:?}); falling back to full rebuild"
+                log::warn!(
+                    "incremental tree mutation failed ({reason:?}); falling back to full rebuild"
                 );
                 let mut entries: Vec<(i64, String)> =
                     new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
@@ -421,19 +421,13 @@ impl Musefs {
         }
 
         if !self.poll_interval.is_zero()
-            && self
-                .last_poll
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .elapsed()
+            && crate::lock::lock_recover(&self.last_poll, "last_poll").elapsed()
                 < self.poll_interval
         {
             return Ok(false);
         }
-        if let Some(last_failed) = *self
-            .last_failed_refresh
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        if let Some(last_failed) =
+            *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh")
         {
             if last_failed.elapsed() < self.refresh_retry_backoff {
                 return Ok(false);
@@ -463,10 +457,7 @@ impl Musefs {
         let (new_snapshot, change) = match self.rebuild_incremental(&old_snapshot) {
             Ok(v) => v,
             Err(err) => {
-                *self
-                    .last_failed_refresh
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") =
                     Some(std::time::Instant::now());
                 return Err(err);
             }
@@ -536,15 +527,9 @@ impl Musefs {
 
     fn stamp_successful_poll(&self) {
         if !self.poll_interval.is_zero() {
-            *self
-                .last_poll
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+            *crate::lock::lock_recover(&self.last_poll, "last_poll") = std::time::Instant::now();
         }
-        *self
-            .last_failed_refresh
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") = None;
     }
 
     #[doc(hidden)]
@@ -581,10 +566,7 @@ impl Musefs {
         let past = std::time::Instant::now()
             .checked_sub(self.poll_interval)
             .expect("poll_interval exceeds monotonic clock base; cannot backdate last_poll");
-        *self
-            .last_poll
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = past;
+        *crate::lock::lock_recover(&self.last_poll, "last_poll") = past;
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
