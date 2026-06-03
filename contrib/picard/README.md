@@ -32,6 +32,12 @@ Picard loads "folder plugins" from its plugins directory. Copy (or symlink) the
 cp -r contrib/picard/musefs ~/.config/MusicBrainz/Picard/plugins/
 ```
 
+The `musefs/_common/` subfolder is the vendored `python-musefs` library, copied
+in so the plugin folder is self-contained (Picard does not install plugin
+dependencies). It is committed; you don't need to do anything to use it. If you
+change the shared library, re-run `python contrib/python-musefs/vendor_to_picard.py`
+and commit the refreshed copy — CI's drift guard enforces it.
+
 Then enable **musefs sync** in Options → Plugins, and configure it in
 Options → musefs sync:
 
