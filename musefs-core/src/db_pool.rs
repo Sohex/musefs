@@ -12,12 +12,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use musefs_db::Db;
 
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -30,6 +31,13 @@ pub enum DbPool {
     Shared(Arc<Mutex<Db>>),
 }
 
+/// Clears only the *dropping thread's* thread-local connection for this pool.
+/// Connections this pool opened on other worker threads persist until those
+/// threads exit — accepted, because a mount's worker pool lives for the whole
+/// mount, so a connection's lifetime already matches its thread's. A future
+/// caller that creates and drops many pools over long-lived shared threads would
+/// leak; closing that would need a cross-thread registry, intentionally not built
+/// here.
 impl Drop for DbPool {
     fn drop(&mut self) {
         if let DbPool::PerThread { id, path, .. } = self {
@@ -43,7 +51,7 @@ impl Drop for DbPool {
 }
 
 thread_local! {
-    static PER_PATH: RefCell<HashMap<(PathBuf, u64), Db>> = RefCell::new(HashMap::new());
+    static PER_PATH: RefCell<HashMap<(PathBuf, u64), Rc<Db>>> = RefCell::new(HashMap::new());
 }
 
 impl DbPool {
@@ -84,13 +92,20 @@ impl DbPool {
     pub fn with<R>(&self, f: impl FnOnce(&Db) -> Result<R>) -> Result<R> {
         match self {
             DbPool::PerThread { id, path, .. } => PER_PATH.with(|cell| {
-                let mut map = cell.borrow_mut();
-                if let std::collections::hash_map::Entry::Vacant(e) = map.entry((path.clone(), *id))
-                {
-                    let db = Db::open_readonly(path)?;
-                    e.insert(db);
-                }
-                f(map.get(&(path.clone(), *id)).unwrap())
+                let db = {
+                    let mut map = cell.borrow_mut();
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        map.entry((path.clone(), *id))
+                    {
+                        let db = Db::open_readonly(path).map_err(|source| CoreError::DbOpen {
+                            path: path.clone(),
+                            source,
+                        })?;
+                        e.insert(Rc::new(db));
+                    }
+                    Rc::clone(map.get(&(path.clone(), *id)).unwrap())
+                };
+                f(&db)
             }),
             DbPool::Shared(m) => {
                 let db = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -153,5 +168,30 @@ mod tests {
                 .unwrap()
         });
         assert!(r >= 0);
+    }
+
+    #[test]
+    fn reentrant_with_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("re.db");
+        Db::open(&path).unwrap();
+        let pool = DbPool::new(Db::open(&path).unwrap()).unwrap();
+        let r: Result<i64> = pool.with(|_outer| pool.with(|db| Ok(db.data_version()?)));
+        assert!(r.is_ok(), "re-entrant with() must not panic or error");
+    }
+
+    #[test]
+    fn with_open_failure_includes_path_in_error() {
+        let bad = std::path::PathBuf::from("/nonexistent-musefs-dir/does-not-exist.db");
+        let pool = DbPool::PerThread {
+            id: u64::MAX,
+            path: bad.clone(),
+            poll: Mutex::new(Db::open_in_memory().unwrap()),
+        };
+        let msg = pool.with(|_db| Ok(())).unwrap_err().to_string();
+        assert!(
+            msg.contains("/nonexistent-musefs-dir/does-not-exist.db"),
+            "open error must name the failing path, got: {msg}"
+        );
     }
 }

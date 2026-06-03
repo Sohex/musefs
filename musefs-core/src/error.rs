@@ -4,6 +4,12 @@ use thiserror::Error;
 pub enum CoreError {
     #[error(transparent)]
     Db(#[from] musefs_db::DbError),
+    #[error("failed to open database at {path}")]
+    DbOpen {
+        path: std::path::PathBuf,
+        #[source]
+        source: musefs_db::DbError,
+    },
     #[error(transparent)]
     Format(#[from] musefs_format::FormatError),
     #[error("io error: {0}")]
