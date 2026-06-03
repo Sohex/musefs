@@ -359,7 +359,7 @@ to:
 - [ ] **Step 7: Run tests + clippy to verify pass**
 
 Run: `cargo test -p musefs-format 2>&1 | tail -20 && cargo clippy -p musefs-format --all-targets -- -D warnings 2>&1 | tail -5`
-Expected: all tests PASS; clippy clean. (If clippy flags `redundant_closure`/`needless_question_mark` anywhere, address per its suggestion.)
+Expected: all tests PASS; clippy clean. `needless_question_mark` does NOT fire on `Ok(RegionLayout::validated(segments)?)` because `?` performs the `LayoutError → FormatError` conversion (the lint only triggers when the inner and outer error types are identical). Keep the `Ok(...?)` form — do **not** "simplify" it to a bare `RegionLayout::validated(segments)`, which returns `Result<_, LayoutError>` and won't typecheck against the `Result<RegionLayout>` (= `FormatError`) return type. If some future clippy version objects, use `.map_err(FormatError::from)`.
 
 - [ ] **Step 8: Commit**
 
@@ -420,7 +420,7 @@ pub enum RebuildError {
 
 - [ ] **Step 4: Change the two signatures and the four `ok_or` sites**
 
-In `rebuild_subtree` (`tree.rs:300-306`): delete the `#[allow(clippy::result_unit_err)]` line and change the return type to `std::result::Result<(), RebuildError>`. At line 326 change:
+In `rebuild_subtree` (`tree.rs:300-306`): delete the `#[allow(clippy::result_unit_err)]` line and change the return type to `std::result::Result<(), RebuildError>`. At line 326 change (the enclosing loop is `for id in ids` over an owned `Vec<i64>`, so `id` is already `i64` — pass it by value, no `*`):
 
 ```rust
             let path = new_paths.get(&id).ok_or(())?;
@@ -429,7 +429,7 @@ In `rebuild_subtree` (`tree.rs:300-306`): delete the `#[allow(clippy::result_uni
 to:
 
 ```rust
-            let path = new_paths.get(&id).ok_or(RebuildError::MissingRenderedPath(*id))?;
+            let path = new_paths.get(&id).ok_or(RebuildError::MissingRenderedPath(id))?;
 ```
 
 In `apply_changes` (`tree.rs:336-344`): delete its `#[allow(clippy::result_unit_err)]` line and change the return type to `std::result::Result<(), RebuildError>`. Change the three sites:
@@ -462,16 +462,7 @@ Then the fallback arm (line 345-346):
                 eprintln!("musefs: incremental tree mutation failed; falling back to full rebuild");
 ```
 
-Change to bind and log the reason:
-
-```rust
-            Err(reason) => {
-                log::warn!(
-                    "musefs: incremental tree mutation failed ({reason:?}); falling back to full rebuild"
-                );
-```
-
-> This introduces the first `log::` use in `musefs-core`. Task C1 adds the `log` dependency. If Part C has not run yet, temporarily keep `eprintln!("musefs: incremental tree mutation failed ({reason:?}); falling back to full rebuild");` here and convert it to `log::warn!` in Task C4. **Recommended:** run Part C before this conversion, or use `eprintln!` now. For this task, use `eprintln!` with the `{reason:?}` interpolation so no new dependency is needed:
+Change to bind the reason and interpolate it. **Keep `eprintln!` here** — `musefs-core` does not depend on `log` until Task C1, so a `log::warn!` in this commit would fail to compile (`error[E0433]: use of undeclared crate log`). Task C4 Step 2 converts this single `eprintln!` to `log::warn!` after C1 adds the dependency.
 
 ```rust
             Err(reason) => {
@@ -957,10 +948,13 @@ to:
 - [ ] **Step 3: Run tests + clippy**
 
 Run: `cargo test -p musefs-core 2>&1 | tail -20 && cargo clippy -p musefs-core --all-targets -- -D warnings 2>&1 | tail -5`
-Expected: all PASS; clippy clean. Confirm no `unwrap_or_else(std::sync::PoisonError::into_inner)` remains in `facade.rs`/`reader.rs`:
+Expected: all PASS; clippy clean. Confirm no un-policied serving-path lock acquisition remains:
 
 Run: `grep -rn "PoisonError::into_inner" musefs-core/src/facade.rs musefs-core/src/reader.rs`
 Expected: no matches.
+
+Run: `grep -rn "\.lock()\.unwrap()" musefs-core/src/facade.rs musefs-core/src/reader.rs musefs-core/src/ogg_index.rs`
+Expected: only the test-code sites in `ogg_index.rs` (e.g. ~653/666/698) remain; no serving-path `.lock().unwrap()`.
 
 - [ ] **Step 4: Commit**
 
@@ -985,7 +979,8 @@ Append to the module doc-comment in `musefs-core/src/lock.rs` a table classifyin
 //!   facade.rs `last_poll`         -> cat 3 (recover): Instant, replace-only single write.
 //!   facade.rs `last_failed_refresh` -> cat 3 (recover): Option<Instant>, replace-only single write.
 //!   reader.rs HeaderCache shards  -> cat 1 (clear): pure cache, repopulated from the DB.
-//!   ogg_index.rs LastPageMemo     -> cat 1 (clear): deterministic one-entry cache, re-derived.
+//!   ResolvedFile::last_page (reader.rs:30, locked in ogg_index.rs as LastPageMemo)
+//!                                 -> cat 1 (clear): deterministic one-entry cache, re-derived.
 //! Out of scope (handled elsewhere): byte_budget.rs (#93, currently panics on
 //! poison), db_pool.rs (#94), scan.rs ENV_LOCK / work-queue (test/scan-internal,
 //! not on the FUSE serving path).
