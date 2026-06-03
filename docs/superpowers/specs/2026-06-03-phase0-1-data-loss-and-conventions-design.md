@@ -56,9 +56,17 @@ conn.execute(
 )
 ```
 
-The `(track_id, key, ordinal)` primary key cannot collide between a surviving
-binary row and a re-inserted text row, because binary keys (ID3 opaque/APIC,
-MP4 `----`, FLAC APPLICATION/CUESHEET) are disjoint from canonical text tag keys.
+For the **default** tag vocabulary, the `(track_id, key, ordinal)` primary key
+cannot collide between a surviving binary row and a re-inserted text row: the
+built-in keys (`DIRECT_FIELDS` in `_core.py`) are lowercase canonical names,
+disjoint from the binary key set (ID3 `PRIV`/`GEOB`/`APIC`, MP4 `----:…`, FLAC
+`APPLICATION`/`CUESHEET`). A user-configured `musefs_fields` / `extra_fields`
+mapping is unconstrained, so a key like `"PRIV"` *could* collide with a surviving
+binary row. The failure mode is **benign and safe**: SQLite raises an
+`IntegrityError` that aborts the sync transaction with no data loss (the binary
+rows are preserved, the partial text write is rolled back). We do not add key
+validation now (YAGNI); we only document this and pin the default-vocabulary
+disjointness with a test.
 
 ### Out of scope
 
@@ -74,6 +82,10 @@ For each plugin, add a test that:
    tag row.
 2. Runs a `replace_tags` / sync.
 3. Asserts the binary row survives unchanged and the text rows are replaced.
+
+Plus a static assertion that the default tag vocabulary (`DIRECT_FIELDS`) is
+disjoint from the known binary key set, documenting why the scoped delete is
+collision-free without an explicit guard.
 
 ## #95 — Internal error types carry diagnostics
 
@@ -95,8 +107,22 @@ Two internal error paths discard context:
 
 ### Fix — `musefs-format`
 
-Make `InvalidLayout` carry its source and add a distinct variant for the producer
-guard:
+First, make `LayoutError` (`layout.rs`) a real error type — it currently derives
+only `Debug, Clone, PartialEq, Eq` and implements neither `Display` nor
+`std::error::Error`, which `#[from]`/`{0}` interpolation require:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LayoutError {
+    #[error("a segment reported zero length")]
+    EmptySegment,
+    #[error("total layout length overflowed u64")]
+    TotalOverflow,
+}
+```
+
+Then make `InvalidLayout` carry its source and add a distinct variant for the
+producer guard:
 
 ```rust
 #[error("synthesized region layout violates producer invariants: {0}")]
@@ -125,8 +151,11 @@ pub enum RebuildError {
 ```
 
 - `rebuild_subtree` and `apply_changes` return `Result<(), RebuildError>`.
-- The three `new_paths.get(&id).ok_or(())` sites become
-  `.ok_or(RebuildError::MissingRenderedPath(id))`.
+- The **four** `new_paths.get(&id).ok_or(())` sites (`tree.rs:326` in
+  `rebuild_subtree`; `352`, `384`, `403` in `apply_changes`) become
+  `.ok_or(RebuildError::MissingRenderedPath(id))`. The `rebuild_subtree(...)?`
+  propagation at `tree.rs:423` works unchanged once both functions share the
+  `RebuildError` type.
 - The `force_apply_fail` test-injection arm (`facade.rs:316`) yields
   `Err(RebuildError::TestInjected)`.
 - The fallback site (`facade.rs:345-346`) logs the actual `RebuildError` instead of
@@ -157,15 +186,17 @@ Issues #91 and #92 adopt this convention from the start.
 
 The codebase recovers from poisoned mutexes throughout with
 `.unwrap_or_else(std::sync::PoisonError::into_inner)`, silently continuing on the
-inner value. Every external reviewer flagged this as a daemon-correctness risk:
-after a panic *while mutating* global VFS state, the daemon serves from
-potentially-inconsistent state.
+inner value (the one exception is `ByteBudget`, which uses `.lock().unwrap()` and
+*panics* on poison — deferred to #93, below). Every external reviewer flagged the
+recovery pattern as a daemon-correctness risk: after a panic *while mutating*
+global VFS state, the daemon serves from potentially-inconsistent state.
 
 The adopted policy is **recover-by-reset**: on a poisoned lock, reset the guarded
 state to a known-good value rather than serve suspect state, and log at every
 site. This is provably correct here because every datum under these mutexes is
-either derivable from the SQLite store (the source of truth) or a single-word
-scalar. It is preferred over:
+either derivable from the SQLite store (the source of truth — including the
+`snapshot` render state, rebuilt by the refresh path) or a single-word scalar. It
+is preferred over:
 
 - **Plain log-and-recover** — treats the symptom (visibility) without restoring
   correctness.
@@ -178,27 +209,40 @@ scalar. It is preferred over:
 
 ### Mechanism — three recovery categories
 
-Each state-mutating lock is classified into one of three categories, each with a
-defined, correct recovery action. Recovery is logged at every site.
+Only `std::sync::Mutex` fields participate. Atomics (`last_data_version:
+AtomicI64`, `refresh_gen`, `refreshing`, …) and the `DashMap` (`size_cache`)
+cannot poison and are outside this taxonomy. The poison-bearing mutexes, by
+category — each with a defined, correct recovery action, logged at every site:
 
-1. **Caches** (header-layout LRU shards, size cache) → `lock_or_clear()`.
-   On poison, take the inner guard, `.clear()` it, and return it. The next access
-   cold-resolves from the DB. A cleared cache cannot be inconsistent, so this is
-   provably safe.
+1. **Caches** → `lock_or_clear()`.
+   The header-layout LRU shards (`reader.rs` `HeaderCache`) and the per-entry Ogg
+   `ResolvedFile::last_page` cache (`reader.rs:30`). On poison, take the inner
+   guard, `.clear()` it / reset it to `None`, and return it. The next access
+   cold-resolves from the DB / re-reads the page. A cleared cache cannot be
+   inconsistent, so this is provably safe. (`size_cache` is a `DashMap`, not a
+   mutex — no treatment needed; its staleness is already handled by `retain` on
+   refresh, `facade.rs:444`.)
 
-2. **Rebuildable VFS state** (inode allocator) → `lock_or_flag()`.
-   On poison, set an `AtomicBool needs_rebuild`, log, and return the inner guard so
-   the current op completes best-effort (no rebuild while holding the poisoned
-   lock — avoids reentrancy/deadlock). `poll_refresh` already fires on every
-   metadata op (`lookup`/`readdir`); it forces `rebuild_full` when the flag is set,
-   regardless of `data_version`, and clears the flag. The state therefore
-   self-heals within one metadata-op cycle — no `EIO` to the kernel, no daemon
-   crash, no unmount. Inodes are stable across rebuilds by design, so an open
-   handle survives.
+2. **Rebuildable VFS state** → `lock_or_flag()`.
+   The inode allocator (`inodes`, `facade.rs:142`) and the render-state map
+   (`snapshot`, `facade.rs:145`) — both reconstructible from the DB. On poison,
+   set an `AtomicBool needs_rebuild`, log, and return the inner guard so the
+   current op completes best-effort (no rebuild while holding the poisoned lock —
+   avoids reentrancy/deadlock). `poll_refresh_notify` already fires on every
+   metadata op (`lookup`/`getattr`/`readdir` → `fire_poll_refresh`,
+   `musefs-fuse/src/lib.rs:194/212/272`). It must be extended so that, when
+   `needs_rebuild` is set, it **bypasses its three early-return gates** — the
+   debounce gate (`facade.rs:385`), the failed-refresh backoff (`395`), and the
+   `data_version`-equality gate (`405`) — and performs a **full** rebuild
+   (`rebuild_full`, `facade.rs:249`) instead of the usual `rebuild_incremental`
+   (`428`), then clears the flag. The state self-heals within one metadata-op
+   cycle — no `EIO` to the kernel, no daemon crash, no unmount. Inodes are stable
+   across rebuilds by design, so an open handle survives.
 
-3. **Transient scalars** (`last_poll`, `last_data_version`) → recover inner.
-   These are single-word replace-only writes that cannot be left half-written, so
-   `into_inner` recovery is already correct.
+3. **Transient scalars** → recover inner.
+   `last_poll: Mutex<Instant>` (`facade.rs:131`) and `last_failed_refresh:
+   Mutex<Option<Instant>>` (`facade.rs:133`) are replace-only single-word writes
+   that cannot be left half-written, so `into_inner` recovery is already correct.
 
 ### Audit
 
@@ -239,6 +283,10 @@ The `#[ignore]` FUSE end-to-end mount suite must remain green.
    track in parallel with the Rust track.
 2. **#95** — lands the error-diagnostics convention that #91/#92 will follow.
 3. **#96** — largest scope; depends on nothing from #95.
+
+(The ROADMAP lists Phase 1 as #96-then-#95; #95 and #96 are independent, so the
+order is a free choice. This spec does #95 first because it is the smaller,
+lower-risk change and lands the error convention sooner.)
 
 Each change ships test-driven with the project's existing review gates.
 
