@@ -265,6 +265,11 @@ impl Musefs {
     /// from the DB, publish the tree, diff for cache invalidation, and clear the
     /// flag. Bypasses the poll gates (the caller checks `needs_rebuild`).
     fn force_full_rebuild(&self, on_changed: &mut impl FnMut(u64)) -> Result<bool> {
+        // Read data_version before rebuilding so a successful self-heal also advances
+        // the poll stamp: a write that commits mid-rebuild then leaves a newer version
+        // for the next poll (one extra rebuild, never a skipped change), rather than
+        // forcing an unconditional rebuild on every subsequent poll.
+        let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
         let old_tree = self.tree.load_full();
         let old_snapshot =
             crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot").clone();
@@ -281,6 +286,7 @@ impl Musefs {
             on_changed,
         );
         *crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot") = new_snapshot;
+        self.last_data_version.store(version, Ordering::Release);
         self.refresh_gen.fetch_add(1, Ordering::AcqRel);
         self.needs_rebuild.store(false, Ordering::Release);
         self.stamp_successful_poll();
@@ -1023,6 +1029,15 @@ mod tests {
         // data_version is unchanged since open, so a normal poll is a no-op.
         assert!(!fs.poll_refresh().unwrap(), "baseline poll must be a no-op");
 
+        // Advance data_version out-of-band so the forced rebuild has newer DB state
+        // to incorporate and stamp; the trailing normal poll then proves it stamped.
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            let track_id = db.list_tracks().unwrap().into_iter().next().unwrap().id;
+            db.replace_tags(track_id, &[musefs_db::Tag::new("comment", "hi", 0)])
+                .unwrap();
+        }
+
         // Simulate recovery from a poisoned VFS-state lock.
         fs.mark_needs_rebuild_for_test();
         assert!(
@@ -1036,6 +1051,13 @@ mod tests {
         assert!(
             !fs.needs_rebuild_is_set_for_test(),
             "flag cleared after rebuild"
+        );
+
+        // The forced rebuild incorporated the out-of-band write and stamped its
+        // data_version, so a subsequent normal poll detects no change.
+        assert!(
+            !fs.poll_refresh().unwrap(),
+            "forced rebuild must stamp data_version (next poll is a no-op)"
         );
     }
 }

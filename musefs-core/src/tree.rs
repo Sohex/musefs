@@ -342,8 +342,8 @@ impl VirtualTree {
 
     /// Apply an incremental change set in place, producing a tree byte-identical to a
     /// full `build_with` over the same final track set. `new_paths` maps every CURRENT
-    /// track id to its rendered path. Returns Err(()) on any inconsistency (caller
-    /// falls back to full build). See SP2 Component 3.
+    /// track id to its rendered path. Returns `Err(RebuildError)` on any inconsistency
+    /// (caller falls back to full build). See SP2 Component 3.
     pub fn apply_changes(
         &mut self,
         new_paths: &std::collections::HashMap<i64, String>,
