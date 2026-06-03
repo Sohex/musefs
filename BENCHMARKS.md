@@ -299,13 +299,18 @@ so it is *slower* for the small pages real Opus/Vorbis streams carry. Shipped as
 hybrid: per-step loop below n=16384, matrix at/above. Differential test
 (`crc_shift_zeros_matches_appending_zeros`) covers both paths + the boundary.
 
-### Latency-injected reads (`bench_read_under_latency`, nfs-hdd, SP4)
+### Latency-injected reads (`bench_read_under_latency`, nfs-hdd, SP4 / Phase 5)
 
-`read_whole_cold` 29 ms, `read_seek_cold` 28 ms. Caveat: the Ogg serve path (old
-`serve` and new `serve_ogg_window` alike) never incremented the `preads`/
-`bytes_read` serve counters, so those columns read 0 — only `wall_ms` is meaningful.
-The near-equal whole/seek wall time indicates per-file open+resolve latency
-dominates under nfs-hdd; the local cold/seek benches above are the clean signal.
+`read_whole_cold` 30 ms (2 preads, 4378 bytes), `read_seek_cold` 29 ms
+(2 preads, 4378 bytes). Earlier recordings showed 0 in the pread columns
+because the Ogg serve path was uninstrumented (#71) — the zeros meant
+"uncounted", not "free". Since Phase 5 every Ogg backing read (index scan,
+CRC probe, header, payload) counts attempt-based preads/bytes, and
+`MUSEFS_FAULT_PREAD_US`/latency injection applies to them, so `wall_ms` and
+the round-trip columns are all meaningful for Ogg.
+The near-equal whole/seek wall time still indicates per-file open+resolve
+latency dominates under nfs-hdd; the local cold/seek benches above are the
+clean signal.
 
 ### Gates
 

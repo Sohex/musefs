@@ -243,8 +243,9 @@ commands live in the repo-root [`BENCHMARKS.md`](../../../../BENCHMARKS.md).)*
   benches (the SP4 regression gate); `sequential_read` kept as a labeled warm
   datapoint. `crc_shift_zeros` is a hybrid (per-step loop < n=16384, GF(2)
   matrix-power above) so realistic small-page streams never pay the matrix overhead.
-  Latency-injected read test (`bench_read_under_latency`) added (nfs-hdd: whole 29 ms,
-  seek 28 ms; Ogg serve-path preads uninstrumented — pre-existing). Byte-identical
+  Latency-injected read test (`bench_read_under_latency`) added (nfs-hdd: whole 30 ms,
+  seek 29 ms, 2 preads / 4378 bytes each — pread columns read 0 until Phase 5
+  instrumented the Ogg serve path, #71). Byte-identical
   gate: `proptest_read_fidelity` (16) + `musefs-format --features fuzzing` (283) +
   FUSE e2e (9) green. In-diff mutation gate (CI parity): **0 missed** — killable
   survivors covered by added tests (find_page_start memo-range + cheap-filter, and
