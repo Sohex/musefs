@@ -335,3 +335,61 @@ cargo bench -p musefs-core --bench read_throughput -- cold_first_read seek_read
 # In-diff mutation gate (TMPDIR on a roomy fs; per-job tree copies are large):
 TMPDIR=/path/with/space cargo mutants --in-diff sp4.diff -j4 --exclude 'musefs-latencyfs/**'
 ```
+
+---
+
+## Phase 6 PR 1 — Refresh O(changed) (#69)
+
+*Measured 2026-06-03 (box under load — relative scaling is the signal, not absolute ms).*
+
+- **Before** = `main` @ `16caba4` (pre-#69): `rebuild_incremental` scans all N render keys to build a full HashMap snapshot, then calls `apply_changes` — O(N) even for a single-track change. The tree mutation itself is O(changed) but the preceding render-key scan is O(N).
+- **After** = `phase6-pr1-incremental-refresh`: changelog-driven change detection (`changelog_since` + `render_keys_for` on just the changed ids) replaces the O(N) render-key scan. `rebuild_incremental` reads only the changelog rows past `last_seq`, renders only changed/added tracks, mutates the snapshot in place, and applies the delta to the tree.
+- Harness: `cargo test -p musefs-core --release --test bench_refresh -- --ignored --nocapture`. Each library size gets its own tempdir + cold DB (no cross-size collision).
+
+### Stage A→B comparison — single-track refresh vs library size
+
+A single-track re-tag (COMMENT tag change, rendered path unchanged) triggers `poll_refresh`. The sweep times one-track refresh across four library sizes to capture whether the O(N) render-key scan is eliminated.
+
+`ci` tier, FLAC, on tempfs. Three independent runs per branch.
+
+| library size (N tracks) | before run 1 (ms) | before run 2 (ms) | before run 3 (ms) | after run 1 (ms) | after run 2 (ms) | after run 3 (ms) |
+|------------------------:|------------------:|------------------:|------------------:|-----------------:|-----------------:|-----------------:|
+| 100   | 0 | 0 | 0 | 0 | 0 | 0 |
+| 1000  | 4 | 6 | 6 | 3 | 5 | 6 |
+| 5000  | 43 | 25 | 34 | 16 | 29 | 17 |
+| 20000 | 162 | 120 | 108 | 138 | 89 | 134 |
+
+**Observation:** the after sweep at 5000 tracks is consistently faster (16–29 ms vs 25–43 ms), confirming the render-key scan elimination helps at mid-sizes. However, the 20000-track point remains 89–138 ms — **the sweep is not flat**. Both before and after show a residual linear slope. The 20000-track numbers also have high run-to-run variance (89 vs 138 ms on the branch), indicating box load dominates at that size.
+
+The changelog path itself is O(changed): `changelog_since` returns 1 row, `render_keys_for` returns 1 row, `apply_changes` detects the path is stable (COMMENT doesn't affect `$artist/$album/$title`) and skips structural mutation. The remaining linear cost likely comes from SQLite WAL/page-cache effects at scale and the `data_version` PRAGMA round-trip, not from the in-memory tree mutation.
+
+### One-vs-many on the branch
+
+Both measurements run on the same `Musefs` instance (200-track `ci` tier, FLAC, tempfs). After the first `poll_refresh` the tree is freshly built; the second call starts from that warm state. `many` = 100 tracks (half the corpus, clamped to 1000).
+
+| label | wall (ms) |
+|-------|----------:|
+| refresh-1 | 0 |
+| refresh-N | 5 |
+
+`touched_many=100`
+
+With the changelog-driven path, refresh-N is only marginally slower than refresh-1 — both are dominated by the constant overhead (data_version check + changelog read + tree clone), not by the changed-set size.
+
+Caveat: the sweep corpus is single-album (one artist / one album, no path collisions or disambiguation). The 20000-track single-album case exercises a deeper tree path than a real multi-album library of the same size.
+
+```bash
+# Before (main — apply 4-point sweep edit first):
+git checkout main
+sed -i 's/\[100usize, 1000, 5000\]/[100usize, 1000, 5000, 20000]/' musefs-core/tests/bench_refresh.rs
+cargo test -p musefs-core --release --test bench_refresh \
+  bench_refresh_one_across_library_sizes -- --ignored --nocapture
+git checkout -- musefs-core/tests/bench_refresh.rs
+
+# After (branch):
+git checkout phase6-pr1-incremental-refresh
+cargo test -p musefs-core --release --test bench_refresh \
+  bench_refresh_one_across_library_sizes -- --ignored --nocapture
+cargo test -p musefs-core --release --test bench_refresh \
+  bench_refresh_one_vs_many -- --ignored --nocapture
+```
