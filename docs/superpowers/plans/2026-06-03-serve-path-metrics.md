@@ -142,11 +142,12 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 1: Write the shared read helper and the failing test**
 
-In `musefs-core/tests/metrics.rs`, extend the `common` import to
+`musefs-core/tests/metrics.rs` currently imports three helpers; replace that
+line with:
 `use common::{make_flac, streaminfo_body, vorbis_comment_body, write_ogg};`
-(import each later helper in the task that first uses it — an early unused
-import fails the feature clippy gate in Task 6), then add (after the
-`config()` fn):
+(`write_ogg` is NOT in the current import. Import each later helper in the
+task that first uses it — an early unused import fails the feature clippy
+gate in Task 6.) Then add (after the `config()` fn):
 
 ```rust
 /// Scan `dir`, mount, read the single track end-to-end in 16 KiB chunks under
@@ -257,7 +258,7 @@ Then switch the five backing-read sites (these are ALL the positioned reads in t
 
 - [ ] **Step 4: Rewrite the metrics module doc**
 
-Replace the module doc comment at the top of `musefs-core/src/metrics.rs` (the current lines 1–13, which document the Ogg blind spot as a known limitation) with:
+Replace the module doc comment at the top of `musefs-core/src/metrics.rs` (the current lines 1–13, which document the Ogg blind spot as a known limitation — replace ONLY the `//!` block; the blank line and `pub use imp::*;` after it stay) with:
 
 ```rust
 //! Optional syscall/query counters and per-syscall latency injection for
@@ -291,7 +292,10 @@ Expected: PASS.
 
 - [ ] **Step 6: Re-anchor the mutants.toml line:col exclusions**
 
-`.cargo/mutants.toml` pins three equivalent-mutant exclusions in this file by line:col, and Step 3 added lines above them:
+`.cargo/mutants.toml` contains FIVE `ogg_index.rs` exclusions; two are
+line-agnostic (`\d+:\d+` — the `-= with /=` and `+= with *=` entries) and
+need NO change. Only the three pinned by literal line:col need re-anchoring,
+because Step 3 added lines above them:
 
 ```
 'musefs-core/src/ogg_index\.rs:194:41: replace \+ with \* in serve_ogg_window',
