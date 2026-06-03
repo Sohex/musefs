@@ -101,3 +101,39 @@ def test_synthesized_preserves_source_audio_payload():
             f.seek(row["source_audio_offset"])
             src_payload = f.read(row["source_audio_length"])
         assert synth_payload == src_payload, f"{row['file']}: synthesized audio differs from source"
+
+
+def test_binary_frames_survive():
+    """Binary tag frames written to the DB survive the mount and are readable
+    by mutagen: POPM/UFID as semantic fields, PRIV/GEOB and MP4 ---- byte-for-byte."""
+    base = os.environ["MUSEFS_INTEROP_DIR"]
+    with open(os.path.join(base, "binary_manifest.json")) as fh:
+        bm = json.load(fh)
+
+    # ── MP3 (ID3) ──
+    mp3 = bm["mp3"]
+    id3 = mutagen.id3.ID3(os.path.join(base, mp3["file"]))
+
+    priv = [f for f in id3.getall("PRIV") if f.owner == mp3["priv_owner"]]
+    assert priv, "PRIV frame missing"
+    assert priv[0].data == mp3["priv_data"].encode("ascii"), "PRIV data changed"
+
+    geob = id3.getall("GEOB")
+    assert geob, "GEOB frame missing"
+    assert any(g.data == mp3["geob_data"].encode("ascii") for g in geob), "GEOB data changed"
+
+    popm = id3.getall("POPM")
+    assert popm, "POPM frame missing"
+    assert int(popm[0].rating) == int(mp3["rating"]), f"rating {popm[0].rating} != {mp3['rating']}"
+    assert int(popm[0].count) == int(mp3["playcount"]), f"playcount {popm[0].count} != {mp3['playcount']}"
+
+    ufid = [f for f in id3.getall("UFID") if f.owner == "http://musicbrainz.org"]
+    assert ufid, "MusicBrainz UFID missing"
+    assert ufid[0].data == mp3["mb_trackid"].encode("ascii"), "musicbrainz_trackid changed"
+
+    # ── MP4 (----) ──
+    mp4 = bm["mp4"]
+    f = mutagen.mp4.MP4(os.path.join(base, mp4["file"]))
+    vals = f.tags.get(mp4["freeform_key"]) if f.tags else None
+    assert vals, f"freeform atom {mp4['freeform_key']} missing"
+    assert bytes(vals[0]) == mp4["freeform_data"].encode("ascii"), "---- payload changed"
