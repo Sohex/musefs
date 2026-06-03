@@ -1029,6 +1029,51 @@ mod cache_bound_tests {
     }
 
     #[test]
+    fn shard_reset_clears_all_entries() {
+        use crate::lock::Clearable;
+        let mut s = Shard::new(1000);
+        s.insert(1, entry(0, 100));
+        s.insert(2, entry(0, 100));
+        s.reset();
+        assert!(s.get(1).is_none());
+        assert!(s.get(2).is_none());
+        assert_eq!(s.bytes, 0);
+        assert_eq!(s.map.len(), 0);
+    }
+
+    #[test]
+    fn header_cache_retain_drops_absent_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mk = |name: &str| {
+            let path = dir.path().join(name);
+            let (audio_offset, audio_length) = write_flac_local(&path);
+            let meta = std::fs::metadata(&path).unwrap();
+            db.upsert_track(&NewTrack {
+                backing_path: path.to_string_lossy().to_string(),
+                format: Format::Flac,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len() as i64,
+                backing_mtime: mtime_secs(&meta),
+            })
+            .unwrap()
+        };
+        let keep = mk("keep.flac");
+        let gone = mk("gone.flac");
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let keep_a = cache.resolve(&db, keep).unwrap();
+        let gone_a = cache.resolve(&db, gone).unwrap();
+
+        let live: HashSet<i64> = [keep].into_iter().collect();
+        cache.retain(&live);
+
+        // The kept track stays the same cached Arc; the dropped one re-resolves fresh.
+        assert!(Arc::ptr_eq(&keep_a, &cache.resolve(&db, keep).unwrap()));
+        assert!(!Arc::ptr_eq(&gone_a, &cache.resolve(&db, gone).unwrap()));
+    }
+
+    #[test]
     fn shard_retain_keys_drops_dead_and_reaccounts() {
         use std::collections::HashSet;
         let mut s = Shard::new(1000);

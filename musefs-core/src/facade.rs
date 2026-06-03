@@ -1026,6 +1026,10 @@ mod tests {
         // Simulate recovery from a poisoned VFS-state lock.
         fs.mark_needs_rebuild_for_test();
         assert!(
+            fs.needs_rebuild_is_set_for_test(),
+            "flag reads set after marking"
+        );
+        assert!(
             fs.poll_refresh().unwrap(),
             "a set needs_rebuild flag must force a rebuild"
         );
