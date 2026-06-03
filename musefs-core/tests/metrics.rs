@@ -1,7 +1,10 @@
 #![cfg(feature = "metrics")]
 
 mod common;
-use common::{make_flac, picture_block_body, streaminfo_body, vorbis_comment_body, write_ogg};
+use common::{
+    make_flac, picture_block_body, streaminfo_body, vorbis_comment_body, write_ogg,
+    write_oggflac_with_art, write_opus_with_art,
+};
 use musefs_core::{metrics, scan_directory, MountConfig, Musefs, VirtualTree};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -365,5 +368,45 @@ fn flac_binary_tag_serve_increments_binary_tag_chunks() {
     assert!(
         s.binary_tag_chunks > 0,
         "serving Segment::BinaryTag must increment binary_tag_chunks"
+    );
+}
+
+#[test]
+fn opus_base64_art_serve_increments_art_chunks() {
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    write_opus_with_art(
+        &dir.path().join("a.opus"),
+        &["ARTIST=Alice", "TITLE=Song"],
+        &picture_block_body(&[0x89_u8; 256]),
+        &vec![0xAB_u8; 8 * 1024],
+    );
+
+    let s = read_all_and_snapshot(dir.path(), "Alice");
+    assert!(
+        s.art_chunks > 0,
+        "serving OggArtSlice (base64 METADATA_BLOCK_PICTURE) must increment art_chunks"
+    );
+}
+
+#[test]
+fn oggflac_raw_art_serve_increments_art_chunks() {
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    write_oggflac_with_art(
+        &dir.path().join("a.ogg"),
+        &["ARTIST=Alice", "TITLE=Song"],
+        &picture_block_body(&[0x89_u8; 256]),
+        &vec![0xAB_u8; 8 * 1024],
+    );
+
+    let s = read_all_and_snapshot(dir.path(), "Alice");
+    assert!(
+        s.art_chunks > 0,
+        "serving OggArtSlice (raw OggFLAC PICTURE) must increment art_chunks"
     );
 }
