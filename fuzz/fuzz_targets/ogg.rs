@@ -1,7 +1,8 @@
 #![no_main]
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
-use musefs_format::{fuzz_check::assert_backing_covers_audio, ogg};
+use musefs_format::ogg::OggArt;
+use musefs_format::{fuzz_check::assert_backing_covers_audio, ogg, ArtInput};
 use musefs_fuzz::{arb_tags, MAX_INPUT};
 
 fuzz_target!(|data: &[u8]| {
@@ -20,8 +21,32 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut u = Unstructured::new(data);
     let tags = arb_tags(&mut u).unwrap_or_default();
+
+    let n = u.int_in_range(0..=2u8).unwrap_or(0);
+    let mut images: Vec<Vec<u8>> = Vec::new();
+    let mut inputs: Vec<ArtInput> = Vec::new();
+    for i in 0..n {
+        let len = u.int_in_range(0..=8192usize).unwrap_or(0);
+        let bytes = u.bytes(len).map(<[u8]>::to_vec).unwrap_or_default();
+        inputs.push(ArtInput {
+            art_id: i as i64,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: u.int_in_range(0..=20u32).unwrap_or(3),
+            width: 0,
+            height: 0,
+            data_len: bytes.len() as u64,
+        });
+        images.push(bytes);
+    }
+    let arts: Vec<OggArt> = inputs
+        .iter()
+        .zip(images.iter())
+        .map(|(meta, image)| OggArt { meta, image: image.as_slice() })
+        .collect();
+
     if let Ok(layout) =
-        ogg::synthesize_layout(&header, scan.audio_offset, scan.audio_length, &tags, &[])
+        ogg::synthesize_layout(&header, scan.audio_offset, scan.audio_length, &tags, &arts)
     {
         assert_backing_covers_audio(scan.audio_offset, scan.audio_length, &layout);
     }
