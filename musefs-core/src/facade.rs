@@ -203,14 +203,14 @@ impl Musefs {
         )
     }
 
-    /// Full rebuild: render every track and build the tree from scratch. Used by
-    /// `open`, forced `refresh`, and the Stage B fallback. Returns the tree and the
-    /// fresh `track_id -> TrackRenderState` snapshot.
-    fn build_full(
+    /// DB read + path render with no allocator: the lock-free phase shared by
+    /// `build_full` and `rebuild_full`. Confining all `Db` access here is what
+    /// lets `rebuild_full` hold `inodes` only across the pure-CPU `build_with`.
+    #[allow(clippy::type_complexity)]
+    fn render_entries(
         db: &Db,
         config: &MountConfig,
-        alloc: &mut InodeAllocator,
-    ) -> Result<(VirtualTree, HashMap<i64, TrackRenderState>)> {
+    ) -> Result<(Vec<(i64, String)>, HashMap<i64, TrackRenderState>)> {
         let tracks = db.list_tracks()?;
         let mut tags_by_track = db.tags_grouped()?;
         let mut entries = Vec::with_capacity(tracks.len());
@@ -228,6 +228,18 @@ impl Musefs {
             );
             entries.push((t.id, path));
         }
+        Ok((entries, snapshot))
+    }
+
+    /// Full rebuild: render every track and build the tree from scratch. Used by
+    /// `open`, forced `refresh`, and the Stage B fallback. Returns the tree and the
+    /// fresh `track_id -> TrackRenderState` snapshot.
+    fn build_full(
+        db: &Db,
+        config: &MountConfig,
+        alloc: &mut InodeAllocator,
+    ) -> Result<(VirtualTree, HashMap<i64, TrackRenderState>)> {
+        let (entries, snapshot) = Self::render_entries(db, config)?;
         Ok((VirtualTree::build_with(&entries, alloc), snapshot))
     }
 
@@ -253,10 +265,12 @@ impl Musefs {
                 "forced refresh failure".to_string(),
             ));
         }
-        let (tree, snapshot) = self.pool.with(|db| {
-            let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
-            Self::build_full(db, &self.config, &mut alloc)
-        })?;
+        let (entries, snapshot) = self
+            .pool
+            .with(|db| Self::render_entries(db, &self.config))?;
+        let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
+        let tree = VirtualTree::build_with(&entries, &mut alloc);
+        drop(alloc);
         self.tree.store(Arc::new(tree));
         Ok(snapshot)
     }
@@ -385,9 +399,10 @@ impl Musefs {
     }
 
     // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) FIRST, then
-    // any in-memory lock (`inodes`, the header cache's shards). `inodes` is held
-    // inside `pool.with` during `refresh` — the one intentional exception where a
-    // pool connection is held around an in-memory lock. `handles` is a lock-free
+    // any in-memory lock (`inodes`, the header cache's shards). Both rebuild paths
+    // (`rebuild_full`, `rebuild_incremental`) release the pool connection before
+    // locking `inodes`, so the order is uniform: a pool connection is never held
+    // around an in-memory lock. `handles` is a lock-free
     // `sharded_slab::Slab`: its `get` guard is cloned-from and dropped before any
     // pool call, so it never participates in lock ordering. Slab keys are
     // generation-encoded, so a reused slot produces a different key; a stale `fh`
@@ -994,6 +1009,40 @@ mod tests {
             );
         }
         fs.release_handle(fh);
+    }
+
+    #[test]
+    fn render_entries_returns_paths_and_snapshot() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+        };
+
+        let (entries, snapshot) = Musefs::render_entries(&db, &cfg).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, "Pix/Song.mp3");
+        let id = entries[0].0;
+        assert_eq!(snapshot[&id].path, "Pix/Song.mp3");
+        assert!(snapshot[&id].content_version >= 1);
     }
 
     #[test]
