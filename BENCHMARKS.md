@@ -342,26 +342,24 @@ TMPDIR=/path/with/space cargo mutants --in-diff sp4.diff -j4 --exclude 'musefs-l
 
 *Measured 2026-06-03 (box under load — relative scaling is the signal, not absolute ms).*
 
-- **Before** = `main` @ `16caba4` (pre-#69): `rebuild_incremental` scans all N render keys to build a full HashMap snapshot, then calls `apply_changes` — O(N) even for a single-track change. The tree mutation itself is O(changed) but the preceding render-key scan is O(N).
-- **After** = `phase6-pr1-incremental-refresh`: changelog-driven change detection (`changelog_since` + `render_keys_for` on just the changed ids) replaces the O(N) render-key scan. `rebuild_incremental` reads only the changelog rows past `last_seq`, renders only changed/added tracks, mutates the snapshot in place, and applies the delta to the tree.
+- **Before** = `main` @ `16caba4` (pre-#69): `rebuild_incremental` scans all N render keys to build a full HashMap snapshot, then calls `apply_changes` — O(N) even for a single-track change.
+- **After** = `phase6-pr1-incremental-refresh`: two stacked changes.
+  1. Changelog-driven change detection (`changelog_since` + `render_keys_for` on just the changed ids) replaces the O(N) render-key scan; the snapshot is mutated in place.
+  2. Collision-gated `apply_changes` dirtying. The changelog change alone did **not** flatten the sweep (intermediate column below): the bench touch (`replace_tags` with a lone COMMENT) wipes artist/album/title, so the track's rendered path moves to `Unknown/…` — and `apply_changes` dirtied the old parent chain unconditionally, rebuilding the single 20000-sibling album dir twice (a depth tie-break between `""` and depth-0 dirs rebuilt both root and the artist dir). Instrumentation: 131 ms of the 138 ms refresh was `apply_changes`; the DB phase was 0.7 ms. Gating dirty-marking on actual rendered-name collisions (O(log) probes of the deterministic ` (k)` disambiguation candidates) removed the rebuilds outright — `apply_changes` fell to 64 µs at 20k.
 - Harness: `cargo test -p musefs-core --release --test bench_refresh -- --ignored --nocapture`. Each library size gets its own tempdir + cold DB (no cross-size collision).
 
-### Stage A→B comparison — single-track refresh vs library size
+### Sweep — single-track refresh vs library size
 
-A single-track re-tag (COMMENT tag change, rendered path unchanged) triggers `poll_refresh`. The sweep times one-track refresh across four library sizes to capture whether the O(N) render-key scan is eliminated.
+A single-track re-tag (its rendered path moves out of the shared album dir, the structural worst case for a flat corpus) triggers `poll_refresh`. `ci` tier, FLAC, on tempfs. Three independent runs per stage; the intermediate stage (changelog only, ungated `apply_changes`) is kept to show where the time actually was.
 
-`ci` tier, FLAC, on tempfs. Three independent runs per branch.
+| library size (N tracks) | before (ms, 3 runs) | changelog only (ms, 3 runs) | final (ms, 3 runs) |
+|------------------------:|--------------------:|----------------------------:|-------------------:|
+| 100   | 0 / 0 / 0       | 0 / 0 / 0      | 0 / 0 / 0 |
+| 1000  | 4 / 6 / 6       | 3 / 5 / 6      | 0 / 0 / 0 |
+| 5000  | 43 / 25 / 34    | 16 / 29 / 17   | 0 / 0 / 0 |
+| 20000 | 162 / 120 / 108 | 138 / 89 / 134 | 1 / 1 / 1 |
 
-| library size (N tracks) | before run 1 (ms) | before run 2 (ms) | before run 3 (ms) | after run 1 (ms) | after run 2 (ms) | after run 3 (ms) |
-|------------------------:|------------------:|------------------:|------------------:|-----------------:|-----------------:|-----------------:|
-| 100   | 0 | 0 | 0 | 0 | 0 | 0 |
-| 1000  | 4 | 6 | 6 | 3 | 5 | 6 |
-| 5000  | 43 | 25 | 34 | 16 | 29 | 17 |
-| 20000 | 162 | 120 | 108 | 138 | 89 | 134 |
-
-**Observation:** the after sweep at 5000 tracks is consistently faster (16–29 ms vs 25–43 ms), confirming the render-key scan elimination helps at mid-sizes. However, the 20000-track point remains 89–138 ms — **the sweep is not flat**. Both before and after show a residual linear slope. The 20000-track numbers also have high run-to-run variance (89 vs 138 ms on the branch), indicating box load dominates at that size.
-
-The changelog path itself is O(changed): `changelog_since` returns 1 row, `render_keys_for` returns 1 row, `apply_changes` detects the path is stable (COMMENT doesn't affect `$artist/$album/$title`) and skips structural mutation. The remaining linear cost likely comes from SQLite WAL/page-cache effects at scale and the `data_version` PRAGMA round-trip, not from the in-memory tree mutation.
+**The final sweep is flat**: refresh-1@20000 is within 1 ms of refresh-1@100 (the #69 acceptance), against a linear ~160 ms slope on main. The corpus is deliberately pathological — one artist / one album, 20000 sibling files — so the gated path is exercised at maximum fan-out; collision-free moves and adds (including a new top-level artist dir, which previously dirtied root and forced a full-tree rebuild) no longer touch unrelated siblings. Trees with real rendered-name collisions still pay an O(subtree) rebuild of the affected dir only, by design.
 
 ### One-vs-many on the branch
 
@@ -370,13 +368,11 @@ Both measurements run on the same `Musefs` instance (200-track `ci` tier, FLAC, 
 | label | wall (ms) |
 |-------|----------:|
 | refresh-1 | 0 |
-| refresh-N | 5 |
+| refresh-N | 3 |
 
 `touched_many=100`
 
-With the changelog-driven path, refresh-N is only marginally slower than refresh-1 — both are dominated by the constant overhead (data_version check + changelog read + tree clone), not by the changed-set size.
-
-Caveat: the sweep corpus is single-album (one artist / one album, no path collisions or disambiguation). The 20000-track single-album case exercises a deeper tree path than a real multi-album library of the same size.
+refresh-N scales with the touched set (100 moved tracks), not the library: changelog read + 100 renders + 100 gated tree edits.
 
 ```bash
 # Before (main — apply 4-point sweep edit first):
