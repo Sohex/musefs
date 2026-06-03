@@ -8,7 +8,7 @@ use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture,
 use crate::layout::{RegionLayout, Segment};
 use std::io::{self, Read, Seek, SeekFrom};
 
-const MAX_MP4_METADATA_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_MP4_METADATA_BYTES: u64 = 256 * 1024 * 1024;
 
 fn be_u32(b: &[u8], pos: usize) -> Result<u32> {
     let s = b.get(pos..pos + 4).ok_or(FormatError::Malformed)?;
@@ -2202,7 +2202,7 @@ mod tests {
             } => {
                 assert_eq!(box_kind, "moov");
                 assert_eq!(size, moov_size as u64);
-                assert_eq!(cap, 512 * 1024 * 1024);
+                assert_eq!(cap, 256 * 1024 * 1024);
             }
             other => panic!("expected MetadataTooLarge, got {other:?}"),
         }
@@ -2211,7 +2211,7 @@ mod tests {
     #[test]
     fn read_structure_from_admits_box_at_exactly_the_cap() {
         use std::io::Cursor;
-        let cap: u32 = 512 * 1024 * 1024;
+        let cap: u32 = 256 * 1024 * 1024;
         let mut buf = Vec::new();
         buf.extend_from_slice(&16u32.to_be_bytes());
         buf.extend_from_slice(b"ftyp");
