@@ -1,7 +1,7 @@
 #![cfg(feature = "metrics")]
 
 mod common;
-use common::{make_flac, streaminfo_body, vorbis_comment_body, write_ogg};
+use common::{make_flac, picture_block_body, streaminfo_body, vorbis_comment_body, write_ogg};
 use musefs_core::{metrics, scan_directory, MountConfig, Musefs, VirtualTree};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -319,5 +319,51 @@ fn revalidated_legacy_flac_resolve_does_no_front_read() {
     assert_eq!(
         s.opens, 1,
         "after revalidate-backfill, FLAC resolve must not re-read the backing front"
+    );
+}
+
+#[test]
+fn flac_art_serve_increments_art_chunks() {
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let flac = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (6, picture_block_body(&[0x89_u8; 256])), // PICTURE -> Segment::ArtImage
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &vec![0xCD_u8; 16 * 1024],
+    );
+    std::fs::write(dir.path().join("a.flac"), &flac).unwrap();
+
+    let s = read_all_and_snapshot(dir.path(), "Alice");
+    assert!(
+        s.art_chunks > 0,
+        "serving Segment::ArtImage must increment art_chunks"
+    );
+}
+
+#[test]
+fn flac_binary_tag_serve_increments_binary_tag_chunks() {
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let flac = make_flac(
+        &[
+            (0, streaminfo_body()),
+            (2, b"testAPPDATA".to_vec()), // APPLICATION -> Segment::BinaryTag
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &vec![0xCD_u8; 16 * 1024],
+    );
+    std::fs::write(dir.path().join("a.flac"), &flac).unwrap();
+
+    let s = read_all_and_snapshot(dir.path(), "Alice");
+    assert!(
+        s.binary_tag_chunks > 0,
+        "serving Segment::BinaryTag must increment binary_tag_chunks"
     );
 }
