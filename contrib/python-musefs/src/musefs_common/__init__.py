@@ -10,3 +10,5 @@ from .store import (
     track_id_for_path,
     upsert_art,
 )
+from .errors import SchemaMismatch, ScanError
+from .scan import run_scan
