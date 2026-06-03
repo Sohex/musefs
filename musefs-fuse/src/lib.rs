@@ -71,6 +71,7 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         CoreError::BackingChanged(_)
         | CoreError::Db(_)
         | CoreError::DbOpen { .. }
+        | CoreError::Mp4MetadataTooLarge { .. }
         | CoreError::Format(_) => fuser::Errno::EIO,
     }
 }

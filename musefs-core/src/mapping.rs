@@ -39,6 +39,11 @@ pub(crate) fn track_art_to_inputs(db: &Db, track_id: i64) -> Result<Vec<ArtInput
             // column; skip the row rather than cast it to a huge u64 segment
             // length (which would fail layout validation and break the track).
             if meta.byte_len < 0 {
+                log::warn!(
+                    "skipping art {} on track {track_id}: negative byte_len {} (malformed DB write)",
+                    ta.art_id,
+                    meta.byte_len
+                );
                 continue;
             }
             inputs.push(ArtInput {
