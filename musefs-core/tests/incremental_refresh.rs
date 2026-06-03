@@ -168,6 +168,62 @@ fn apply_failure_falls_back_to_full_rebuild() {
     );
 }
 
+#[test]
+fn changelog_gap_falls_back_to_full_rebuild() {
+    let target = small_corpus(4);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+    writer
+        .replace_tags(ids[0], &[Tag::new("TITLE", "moved-by-gap", 0)])
+        .unwrap();
+    // Simulate the ring having pruned past the mount's watermark: drop every
+    // retained row. The next poll must detect the gap and full-rebuild.
+    let max_seq = writer.changelog_since(0).unwrap().max_seq;
+    writer.delete_changelog_through_for_test(max_seq).unwrap();
+
+    assert!(fs.poll_refresh().unwrap());
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>(),
+        "gap fallback must produce a tree identical to a fresh open"
+    );
+}
+
+#[test]
+fn removed_track_is_pruned_and_refresh_recovers_after_gap() {
+    // After a gap-driven full rebuild, subsequent incremental refreshes still
+    // work: the watermark re-anchors to the ring and deletes propagate.
+    let target = small_corpus(4);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    let max_seq = writer.changelog_since(0).unwrap().max_seq;
+    writer.delete_changelog_through_for_test(max_seq).unwrap();
+    writer.delete_track(ids[0]).unwrap();
+    assert!(fs.poll_refresh().unwrap());
+
+    writer.delete_track(ids[1]).unwrap();
+    assert!(fs.poll_refresh().unwrap());
+
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>()
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
