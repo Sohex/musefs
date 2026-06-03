@@ -771,7 +771,13 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 /// for the next revalidation) rather than re-probed or pruned.
 pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<RevalidateStats> {
     let mut files = Vec::new();
-    collect_audio(root, &mut files)?;
+    if root.is_file() {
+        if is_supported_audio(root) {
+            files.push(root.to_path_buf());
+        }
+    } else {
+        collect_audio(root, &mut files)?;
+    }
     db.apply_bulk_pragmas_self()?;
 
     // Main-thread pre-dispatch skip pass: load existing (path -> size,mtime,id,format) once,
@@ -1692,6 +1698,29 @@ mod bounded_probe_tests {
             .unwrap()
             .unwrap();
         assert_eq!(track.audio_length as usize, b"DIFFERENT-AUDIO".len());
+    }
+
+    #[test]
+    fn revalidate_accepts_a_single_file_target() {
+        // The CLI advertises file targets for every scan, including --revalidate,
+        // so revalidate_with must handle a bare file root (not just a directory).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.flac");
+        let mut bytes = b"fLaC".to_vec();
+        bytes.push(0x80);
+        bytes.extend_from_slice(&[0, 0, 34]);
+        bytes.extend(std::iter::repeat_n(0u8, 34));
+        bytes.extend_from_slice(b"AUDIO");
+        std::fs::write(&p, &bytes).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+
+        // Revalidate the file path directly: must not error on read_dir and the
+        // unchanged file is bucketed as unchanged (not pruned).
+        let stats = revalidate_with(&db, &p, &ScanOptions::default()).unwrap();
+        assert_eq!(stats.unchanged, 1);
+        assert_eq!(stats.pruned, 0);
+        assert_eq!(db.list_tracks().unwrap().len(), 1);
     }
 
     #[test]
