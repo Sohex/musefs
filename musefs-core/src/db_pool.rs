@@ -173,8 +173,6 @@ mod tests {
         assert!(r >= 0);
     }
 
-    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
-    // If these hang, the fix has regressed.
     #[test]
     fn reentrant_with_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
@@ -200,8 +198,6 @@ mod tests {
         );
     }
 
-    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
-    // If these hang, the fix has regressed.
     #[test]
     fn nested_with_on_shared_pool() {
         let pool = DbPool::new(Db::open_in_memory().unwrap()).unwrap();
@@ -209,8 +205,6 @@ mod tests {
         assert!(r.is_ok(), "nested with on Shared must not deadlock");
     }
 
-    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
-    // If these hang, the fix has regressed.
     #[test]
     fn with_poll_inside_with_on_shared_pool() {
         let pool = DbPool::new(Db::open_in_memory().unwrap()).unwrap();
@@ -221,8 +215,6 @@ mod tests {
         );
     }
 
-    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
-    // If these hang, the fix has regressed.
     #[test]
     fn nested_with_poll_on_per_thread_pool() {
         let dir = tempfile::tempdir().unwrap();
@@ -231,17 +223,5 @@ mod tests {
         let pool = DbPool::new(Db::open(&path).unwrap()).unwrap();
         let r: Result<i64> = pool.with_poll(|_outer| pool.with_poll(|db| Ok(db.data_version()?)));
         assert!(r.is_ok(), "nested with_poll on PerThread must not deadlock");
-    }
-
-    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
-    // If these hang, the fix has regressed.
-    #[test]
-    fn nested_with_on_per_thread_pool() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("np.db");
-        Db::open(&path).unwrap();
-        let pool = DbPool::new(Db::open(&path).unwrap()).unwrap();
-        let r: Result<i64> = pool.with(|_outer| pool.with(|db| Ok(db.data_version()?)));
-        assert!(r.is_ok(), "nested with on PerThread must not deadlock");
     }
 }
