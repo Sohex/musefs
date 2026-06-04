@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-04-inode-prune-dbpool-residuals-design.md`
 
-**Branching:** Both branches cut from current local `main` (which carries the spec commits — they ride with whichever PR merges first; rebase the other before merge). Repo `main` is protected; everything lands via PR.
+**Branching:** The spec and this plan live on the `126-127-spec-plan` branch. Cut both PR branches from it (the docs commits ride with whichever PR merges first; rebase the other before merge). Repo `main` is protected; everything lands via PR.
 
 ---
 
@@ -24,7 +24,7 @@
 
 ```bash
 cd /home/cfutro/git/musefs
-git checkout main && git checkout -b 126-inode-allocator-prune
+git checkout 126-127-spec-plan && git checkout -b 126-inode-allocator-prune
 ```
 
 ### Task 2: `InodeAllocator::prune_retired` (TDD)
@@ -314,10 +314,10 @@ EOF
 
 ```bash
 cd /home/cfutro/git/musefs
-git checkout main && git checkout -b 127-dbpool-reentrant
+git checkout 126-127-spec-plan && git checkout -b 127-dbpool-reentrant
 ```
 
-(If PR 1 already merged, `git fetch origin && git checkout -b 127-dbpool-reentrant origin/main` instead; otherwise the spec commits ride along and this branch is rebased after PR 1 lands.)
+(If PR 1 already merged, `git fetch origin && git checkout -b 127-dbpool-reentrant origin/main` instead; otherwise the docs commits ride along and this branch is rebased after PR 1 lands.)
 
 ### Task 6: Nested-call tests (TDD — these currently deadlock)
 
