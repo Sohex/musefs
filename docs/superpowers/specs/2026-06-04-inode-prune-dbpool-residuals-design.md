@@ -24,12 +24,13 @@ map grows without bound until remount.
 
 Add a prune step to `InodeAllocator`, driven by the just-rebuilt tree:
 
-- **Trigger:** after any rebuild, if `paths.len() > 2 × live_node_count`
+- **Trigger:** after any rebuild, if `paths.len() > 2 × tree.nodes.len()`
   (an O(1) integer compare; both counts include the root). The incremental
   `apply_changes` path therefore stays cheap in the steady state.
-- **Prune:** rebuild the `paths` map by walking the live tree (DFS over the
-  existing `children` map, joining disambiguated names) and copying each live
-  path's **existing** inode into a fresh map. `next` is never modified.
+- **Prune:** rebuild the `paths` map by iterating the tree's `nodes` and
+  rendering each live path with the existing `path_of` helper
+  (`tree.rs:301`), copying each live path's **existing** inode into a fresh
+  map. `next` is never modified.
 - **Cost:** the walk is O(live paths) but only runs after at least
   live-set-size retirements have accumulated — amortized O(1) per retirement.
   Memory is bounded at 2× the live set between prunes.
@@ -50,12 +51,12 @@ Add a prune step to `InodeAllocator`, driven by the just-rebuilt tree:
   already invalidated by the path vanishing.
 
 **Call sites.** Two, both in `facade.rs`, immediately after a rebuild while the
-`inodes` lock is held: the full-rebuild path (`rebuild_full`, near
-`facade.rs:304`) and the incremental path (after `apply_changes` /
-fallback `build_with`, near `facade.rs:466`). The debug parity check
-(`facade.rs:447`) clones the allocator before the prune point and is
-unaffected. `VirtualTree` gains a small helper for the live node count and the
-live-path walk where `path_of` doesn't already serve.
+`inodes` lock is held: the full-rebuild path (`rebuild_full`, after
+`build_with` at `facade.rs:304`) and the incremental path — on the unified
+`tree` value after the `match` over the `apply_changes` result (i.e. covering
+both the incremental success and the fallback-`build_with` arm, before
+`self.tree.store`, ~`facade.rs:468`). The debug parity check (`facade.rs:447`)
+clones the allocator before the prune point and is unaffected.
 
 **Docs.** Rewrite the struct comment (`tree.rs:13-16`): replace "the map grows
 monotonically with the universe of distinct paths ever rendered" with the new
@@ -137,7 +138,9 @@ design decision.
    entry points.
 3. `with_poll` inside `with_poll` on `PerThread` returns `Ok` — the third
    deadlock shape.
-4. Existing tests (`reentrant_with_does_not_panic`, etc.) pass unchanged.
+4. Existing tests pass; `with_open_failure_includes_path_in_error`
+   (`db_pool.rs:184`) constructs a `PerThread` directly and needs its
+   `Mutex::new` swapped for `ReentrantMutex::new` — a mechanical change only.
 
 PR 2 `Closes #127`; the PR body notes the split — (b) fixed by making nesting
 legal, (a) accepted-by-design and now documented on the type.
