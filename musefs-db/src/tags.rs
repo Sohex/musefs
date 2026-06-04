@@ -1,26 +1,8 @@
 use crate::models::{BinaryTag, BinaryTagRow, Tag};
-use crate::{Db, Result};
+use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
 
-impl Db {
-    pub fn replace_tags(&self, track_id: i64, tags: &[Tag]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NULL",
-            params![track_id],
-        )?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for t in tags {
-                stmt.execute(params![track_id, t.key, t.value, t.ordinal])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
+impl<M> Db<M> {
     pub fn get_tags(&self, track_id: i64) -> Result<Vec<Tag>> {
         let mut stmt = self.conn.prepare(
             "SELECT key, value, ordinal FROM tags \
@@ -100,27 +82,6 @@ impl Db {
         Ok(out)
     }
 
-    /// Replace the track's binary tag rows (value_blob IS NOT NULL); text rows
-    /// (managed by `replace_tags`) are untouched. Binary rows store '' in `value`.
-    pub fn set_binary_tags(&self, track_id: i64, tags: &[BinaryTag]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL",
-            params![track_id],
-        )?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
-                 VALUES (?1, ?2, '', ?3, ?4)",
-            )?;
-            for t in tags {
-                stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Binary tag rows for a track: streaming handle (rowid), key, and payload
     /// length. Ordered by (key, ordinal) to match `get_binary_tags`/synthesis order.
     pub fn get_binary_tags(&self, track_id: i64) -> Result<Vec<BinaryTagRow>> {
@@ -167,6 +128,47 @@ impl Db {
         let mut buf = vec![0u8; len];
         self.read_binary_tag_chunk_into(payload_id, offset, &mut buf)?;
         Ok(buf)
+    }
+}
+
+impl Db<ReadWrite> {
+    pub fn replace_tags(&self, track_id: i64, tags: &[Tag]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NULL",
+            params![track_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for t in tags {
+                stmt.execute(params![track_id, t.key, t.value, t.ordinal])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace the track's binary tag rows (value_blob IS NOT NULL); text rows
+    /// (managed by `replace_tags`) are untouched. Binary rows store '' in `value`.
+    pub fn set_binary_tags(&self, track_id: i64, tags: &[BinaryTag]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL",
+            params![track_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
+                 VALUES (?1, ?2, '', ?3, ?4)",
+            )?;
+            for t in tags {
+                stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 
