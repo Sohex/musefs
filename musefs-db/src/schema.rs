@@ -414,6 +414,23 @@ mod schema_py_tests {
         sql
     }
 
+    /// Full content of the generated musefs_common/schema.py. Must stay
+    /// `ruff format --check`-clean (comment header + two assignments is).
+    fn render_schema_py() -> String {
+        format!(
+            "# GENERATED from musefs-db/src/schema.rs — do not edit.\n\
+             # Regenerate: MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py\n\
+             # Re-vendor:  python contrib/python-musefs/vendor_to_picard.py\n\
+             \n\
+             SCHEMA_SQL = \"\"\"\\\n\
+             {sql}\"\"\"\n\
+             \n\
+             USER_VERSION = {version}\n",
+            sql = render_schema_sql(),
+            version = MIGRATIONS.len()
+        )
+    }
+
     fn dump_master(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
         conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
             .unwrap()
@@ -442,5 +459,29 @@ mod schema_py_tests {
         assert_eq!(dump_master(&rendered), dump_master(&migrated));
         assert_eq!(user_version(&rendered), user_version(&migrated));
         assert_eq!(user_version(&rendered), MIGRATIONS.len() as i64);
+    }
+
+    /// NOT #[ignore]d on purpose: the compare path must run under plain
+    /// `cargo test` or the CI drift gate doesn't exist. Only the write
+    /// behavior is env-gated.
+    #[test]
+    fn schema_py_fixture_is_fresh() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../contrib/python-musefs/src/musefs_common/schema.py");
+        let rendered = render_schema_py();
+        if std::env::var_os("MUSEFS_REGEN_SCHEMA_PY").is_some() {
+            std::fs::write(&path, &rendered).expect("write schema.py");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path).expect(
+            "musefs_common/schema.py missing — regenerate with \
+             MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py",
+        );
+        assert_eq!(
+            on_disk, rendered,
+            "musefs_common/schema.py is stale. Regenerate: \
+             MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py, \
+             then: python contrib/python-musefs/vendor_to_picard.py"
+        );
     }
 }
