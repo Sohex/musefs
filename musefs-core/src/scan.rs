@@ -202,15 +202,6 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
     Ok(Some(buf))
 }
 
-/// Bounded probe of one backing file: open once, read a bounded window, dispatch
-/// per format, widening on `NeedMore`. Never reads the audio payload (M4A uses
-/// the seek reader; front-anchored formats read only the metadata extent).
-/// Returns `Ok(None)` for an unsupported/unparseable file (to be skipped).
-///
-/// Metrics note: `on_scan_read` counts the front-anchored prefix/widen/tail
-/// reads only. The M4A seek reader does its own positioned reads internally, so
-/// its bytes are not reflected in `SCAN_BYTES_READ` (only `on_scan_open` fires
-/// for M4A); its win shows up in wall time and peak RSS instead.
 fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
@@ -238,8 +229,14 @@ fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
         }));
     }
 
-    // Front-anchored formats: read a window, widen on NeedMore.
-    let tail = read_tail_128(&file, file_len)?;
+    // Front-anchored formats: read a window, widen on NeedMore. Only the MP3
+    // arm of probe_prefix consumes the ID3v1 tail, and dispatch is by
+    // extension — so only .mp3 pays the tail read (#67).
+    let tail = if has_ext(path, "mp3") {
+        read_tail_128(&file, file_len)?
+    } else {
+        None
+    };
     let mut want = (scan_window() as u64).min(file_len) as usize;
     let mut prefix = read_window(&file, want)?;
     for _ in 0..MAX_WIDEN_RETRIES {
