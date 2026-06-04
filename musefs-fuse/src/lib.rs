@@ -86,6 +86,21 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
     }
 }
 
+/// Log a serve-path failure before it collapses to an errno reply, so the
+/// cause (e.g. the offending path in `BackingChanged`, or an `Io` error with
+/// no raw OS errno) is not lost. Routine tree-shape misses — a stale inode
+/// after a refresh, kernel path probing — stay at debug to avoid noise.
+fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
+    match err {
+        CoreError::NoEntry(_)
+        | CoreError::TrackNotFound(_)
+        | CoreError::IsDir(_)
+        | CoreError::NotADir(_) => log::debug!("{op}({ino}) failed: {err}"),
+        _ => log::warn!("{op}({ino}) failed: {err}"),
+    }
+    errno(err)
+}
+
 /// Translate a core `Attr` into a `fuser::FileAttr`. Read-only perms (`0o555`
 /// dirs, `0o444` files). A zero `mtime_secs` (e.g. synthetic directories) falls
 /// back to `fallback_mtime` so tools don't see a 1970 timestamp.
@@ -246,7 +261,7 @@ impl Filesystem for MusefsFs {
         let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
         self.pool.execute(move || match core.getattr(child) {
             Ok(attr) => reply.entry(&ttl, &to_file_attr(&attr, uid, gid, mt), Generation(0)),
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(reply_errno("lookup", child, &e)),
         });
     }
 
@@ -256,7 +271,7 @@ impl Filesystem for MusefsFs {
         let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
         self.pool.execute(move || match core.getattr(ino.0) {
             Ok(attr) => reply.attr(&ttl, &to_file_attr(&attr, uid, gid, mt)),
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(reply_errno("getattr", ino.0, &e)),
         });
     }
 
@@ -265,7 +280,7 @@ impl Filesystem for MusefsFs {
         let flags = open_flags(self.config.keep_cache);
         self.pool.execute(move || match core.open_handle(ino.0) {
             Ok(fh) => reply.opened(FileHandle(fh), flags),
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(reply_errno("open", ino.0, &e)),
         });
     }
 
@@ -281,6 +296,20 @@ impl Filesystem for MusefsFs {
     ) {
         // Cheap (a map remove); no need to offload to the pool.
         self.core.release_handle(fh.0);
+        reply.ok();
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        // Read-only filesystem: nothing to flush. fuser's default replies
+        // ENOSYS and logs a warn on every close(), which would drown the
+        // serve-failure log lines.
         reply.ok();
     }
 
@@ -301,7 +330,7 @@ impl Filesystem for MusefsFs {
                 let mut buf = b.borrow_mut();
                 match core.read_into(ino.0, fh.0, offset, size as u64, &mut buf) {
                     Ok(()) => reply.data(&buf),
-                    Err(e) => reply.error(errno(&e)),
+                    Err(e) => reply.error(reply_errno("read", ino.0, &e)),
                 }
                 if buf.capacity() > MAX_RETAINED_READ_BUF {
                     buf.shrink_to(MAX_RETAINED_READ_BUF);
@@ -321,7 +350,7 @@ impl Filesystem for MusefsFs {
         self.fire_poll_refresh();
         let entries = match self.core.readdir(ino.0) {
             Ok(e) => e,
-            Err(e) => return reply.error(errno(&e)),
+            Err(e) => return reply.error(reply_errno("readdir", ino.0, &e)),
         };
         let parent = self.core.parent(ino.0).unwrap_or(ino.0);
 
