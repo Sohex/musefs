@@ -138,22 +138,34 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Stream `len` bytes of a binary tag payload at `offset` via incremental blob
-    /// I/O — payloads are never fully materialized. A short read means the row
-    /// changed underneath the resolved layout; `read_at_exact` surfaces it as an
-    /// error rather than zero-filling. (`payload_id` is the `tags` rowid; see the
-    /// spec's "payload_id validity invariant".)
+    /// Stream binary-tag bytes at `offset` directly into `buf` via incremental blob
+    /// I/O — no intermediate allocation (#70). A short read means the row changed
+    /// underneath the resolved layout; `read_at_exact` surfaces it as an error rather
+    /// than zero-filling. (`payload_id` is the `tags` rowid; see the spec's
+    /// "payload_id validity invariant".)
+    pub fn read_binary_tag_chunk_into(
+        &self,
+        payload_id: i64,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        let blob = self
+            .conn
+            .blob_open("main", "tags", "value_blob", payload_id, true)?;
+        blob.read_at_exact(buf, offset as usize)?;
+        Ok(())
+    }
+
+    /// Allocating convenience form of `read_binary_tag_chunk_into` (non-hot-path
+    /// callers).
     pub fn read_binary_tag_chunk(
         &self,
         payload_id: i64,
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>> {
-        let blob = self
-            .conn
-            .blob_open("main", "tags", "value_blob", payload_id, true)?;
         let mut buf = vec![0u8; len];
-        blob.read_at_exact(&mut buf, offset as usize)?;
+        self.read_binary_tag_chunk_into(payload_id, offset, &mut buf)?;
         Ok(buf)
     }
 }

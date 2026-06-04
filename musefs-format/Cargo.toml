@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"
 id3 = "1"
 base64 = "0.22"
 
