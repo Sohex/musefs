@@ -220,6 +220,7 @@ impl Db {
     /// Test-only: delete changelog rows up to and including `seq`, simulating the
     /// ring having pruned past a sleeping mount (gap-path coverage). Follows the
     /// `set_format_for_test` precedent.
+    #[doc(hidden)]
     pub fn delete_changelog_through_for_test(&self, seq: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM track_changes WHERE seq <= ?1", [seq])?;
