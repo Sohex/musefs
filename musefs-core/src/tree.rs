@@ -13,7 +13,9 @@ pub enum RebuildError {
 /// Assigns stable inodes keyed by rendered path, persisted across tree rebuilds:
 /// an unchanged path keeps its inode, a new path gets a fresh one, and a retired
 /// inode is never recycled (a stale FUSE handle can't alias a different node).
-/// The map grows monotonically with the universe of distinct paths ever rendered.
+/// Retired paths are dropped by `prune_retired` once they outnumber live ones,
+/// bounding the map at 2x the live tree between prunes; a path that returns
+/// after a prune gets a fresh inode rather than its old one.
 #[derive(Debug, Clone)]
 pub struct InodeAllocator {
     paths: ImHashMap<String, u64>,
@@ -36,6 +38,24 @@ impl InodeAllocator {
         self.next += 1;
         self.paths.insert(path.to_string(), ino);
         ino
+    }
+
+    /// Rebuild `paths` from the live tree once retired entries outnumber live
+    /// ones (map > 2x live nodes), keeping each live path's existing inode.
+    /// `next` is untouched, so a retired inode is never reissued. A retired
+    /// path that reappears after a prune gets a fresh inode: a kernel dentry
+    /// cached for its old inode resolves ENOENT for at most one entry TTL,
+    /// the same degradation as any vanished path.
+    #[allow(dead_code)] // wired into the mount caller in the next PR
+    pub(crate) fn prune_retired(&mut self, tree: &VirtualTree) {
+        if self.paths.len() <= 2 * tree.nodes.len() {
+            return;
+        }
+        let mut live = ImHashMap::new();
+        for &ino in tree.nodes.keys() {
+            live.insert(tree.path_of(ino), ino);
+        }
+        self.paths = live;
     }
 }
 
@@ -726,6 +746,99 @@ mod tests {
         let new = t2.lookup(VirtualTree::ROOT, "New").unwrap();
         let y = t2.lookup(new, "Y.flac").unwrap();
         assert!(new != gone && new != x && y != gone && y != x);
+    }
+
+    #[test]
+    fn prune_retired_bounds_map_under_churn() {
+        let mut alloc = InodeAllocator::new();
+        for gen in 0..100 {
+            let entries = vec![(1, format!("Gen{gen}/a.flac"))];
+            let tree = VirtualTree::build_with(&entries, &mut alloc);
+            alloc.prune_retired(&tree);
+            assert!(
+                alloc.paths.len() <= 2 * tree.nodes.len(),
+                "gen {gen}: map {} exceeds 2x live {}",
+                alloc.paths.len(),
+                tree.nodes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn prune_retired_keeps_live_inodes_stable() {
+        let mut alloc = InodeAllocator::new();
+        let tree = VirtualTree::build_with(&[(1, "Keep/song.flac".into())], &mut alloc);
+        let keep_dir = tree.lookup(VirtualTree::ROOT, "Keep").unwrap();
+        let keep_file = tree.lookup(keep_dir, "song.flac").unwrap();
+        let mut last = tree;
+        for gen in 0..10 {
+            let entries = vec![
+                (1, "Keep/song.flac".to_string()),
+                (2, format!("Gen{gen}/x.flac")),
+            ];
+            last = VirtualTree::build_with(&entries, &mut alloc);
+            alloc.prune_retired(&last);
+        }
+        let d = last.lookup(VirtualTree::ROOT, "Keep").unwrap();
+        let f = last.lookup(d, "song.flac").unwrap();
+        assert_eq!((d, f), (keep_dir, keep_file), "live paths must keep inodes");
+    }
+
+    #[test]
+    fn pruned_path_reborn_gets_fresh_inode_never_recycled() {
+        let mut alloc = InodeAllocator::new();
+        let t1 = VirtualTree::build_with(&[(1, "Gone/x.flac".into())], &mut alloc);
+        let gone_dir = t1.lookup(VirtualTree::ROOT, "Gone").unwrap();
+        let gone_file = t1.lookup(gone_dir, "x.flac").unwrap();
+        // Churn well past the threshold so a prune drops the retired entries.
+        for gen in 0..10 {
+            let t = VirtualTree::build_with(&[(1, format!("Gen{gen}/x.flac"))], &mut alloc);
+            alloc.prune_retired(&t);
+        }
+        assert!(
+            !alloc.paths.contains_key("Gone"),
+            "retired path must be pruned"
+        );
+        // Rebirth: same rendered path, strictly fresh inodes (next is monotone).
+        let t2 = VirtualTree::build_with(&[(1, "Gone/x.flac".into())], &mut alloc);
+        let d2 = t2.lookup(VirtualTree::ROOT, "Gone").unwrap();
+        let f2 = t2.lookup(d2, "x.flac").unwrap();
+        assert!(
+            d2 > gone_file && f2 > gone_file,
+            "fresh inodes, never recycled"
+        );
+        assert_ne!(d2, gone_dir);
+        assert_ne!(f2, gone_file);
+    }
+
+    #[test]
+    fn prune_retired_waits_for_threshold() {
+        // Drives the map to exactly 2x live nodes: prune must NOT fire at
+        // equality (pins the `<=` boundary for the mutation gate).
+        let mut alloc = InodeAllocator::new();
+        let t1 = VirtualTree::build_with(&[(1, "A/x.flac".into())], &mut alloc);
+        let a_dir = t1.lookup(VirtualTree::ROOT, "A").unwrap();
+        // paths: "", A, A/x.flac = 3
+        let t2 = VirtualTree::build_with(&[(1, "B/x.flac".into())], &mut alloc);
+        alloc.prune_retired(&t2); // paths 5, live 3 -> 5 <= 6, no prune
+        let t3 = VirtualTree::build_with(&[(1, "B/y.flac".into())], &mut alloc);
+        alloc.prune_retired(&t3); // paths 6, live 3 -> 6 <= 6, still no prune
+        assert_eq!(
+            alloc.paths.get("A"),
+            Some(&a_dir),
+            "at exactly 2x live the retired entries must survive"
+        );
+        let t4 = VirtualTree::build_with(&[(1, "C/x.flac".into())], &mut alloc);
+        alloc.prune_retired(&t4); // paths 8 > 6: prune fires
+        assert!(
+            !alloc.paths.contains_key("A"),
+            "past 2x live the prune must fire"
+        );
+        assert_eq!(
+            alloc.paths.len(),
+            t4.nodes.len(),
+            "pruned map is exactly the live set"
+        );
     }
 
     #[test]
