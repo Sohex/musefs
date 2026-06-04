@@ -115,9 +115,29 @@ pub mod fixtures {
 
     /// Minimal moov-first M4A (ported verbatim from tests/common::minimal_m4a).
     pub fn m4a(mdat_payload: &[u8]) -> Vec<u8> {
+        m4a_with_extra_ilst(&[], mdat_payload)
+    }
+
+    /// `m4a` plus a `covr` atom holding two `data` children (jpeg + png) — the
+    /// iTunes multiple-artwork convention. Seeds the fuzzers' multi-art read
+    /// path; `m4a`'s byte output is unchanged.
+    pub fn m4a_two_covers(mdat_payload: &[u8]) -> Vec<u8> {
+        let covr = bx(
+            b"covr",
+            &[
+                m4a_data_atom(13, &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]),
+                m4a_data_atom(14, &[0x89, b'P', b'N', b'G', 4, 5]),
+            ]
+            .concat(),
+        );
+        m4a_with_extra_ilst(&covr, mdat_payload)
+    }
+
+    fn m4a_with_extra_ilst(extra_ilst_atoms: &[u8], mdat_payload: &[u8]) -> Vec<u8> {
         let ilst_atoms = [
             bx(b"\xa9nam", &m4a_data_atom(1, b"Orig M4A")),
             bx(b"\xa9ART", &m4a_data_atom(1, b"Orig Artist")),
+            extra_ilst_atoms.to_vec(),
         ]
         .concat();
         let ilst = bx(b"ilst", &ilst_atoms);
