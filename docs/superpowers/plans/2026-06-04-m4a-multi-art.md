@@ -654,6 +654,8 @@ MUSEFS_INTEROP_DIR=/tmp/i python -m pytest tests/interop
 
 Expected: emit writes fixtures + manifest; all interop tests PASS including `test_m4a_multi_cover_art` (mutagen is the independent reader confirming the wire format).
 
+This step is the plan's one runtime unknown: the existing fixture only proved `mutagen.mp4.MP4` opens the synthesized output for freeform atoms, not with an injected `covr`. The risk is low (the emitted framing is the convention mutagen itself writes), but if mutagen rejects it here, debug the covr framing in Task 2 rather than the emitter.
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -703,7 +705,7 @@ def test_replace_track_art_multiple_rows_ordered(db_path):
         conn.close()
 ```
 
-(`test_store_art.py` already imports `connect`, `replace_track_art`, `upsert_art` and defines `PNG`; `JPEG`/`insert_track` come from conftest — check its imports and extend if needed.)
+(`test_store_art.py` already imports `connect`, `replace_track_art`, `upsert_art` and defines `PNG` locally at line 11; `JPEG` and `insert_track` come from conftest via its existing imports — no new imports needed for this test.)
 
 In `tests/test_sync.py`, add `ArtImage` to the `musefs_common` import line, add a local `PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16`, and add:
 
