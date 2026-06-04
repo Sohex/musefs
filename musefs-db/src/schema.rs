@@ -384,3 +384,63 @@ mod migration_v3_tests {
         assert!(super::MIGRATIONS[2].contains(&format!("NEW.seq - {}", super::CHANGELOG_CAP)));
     }
 }
+
+#[cfg(test)]
+mod schema_py_tests {
+    use std::fmt::Write as _;
+
+    use rusqlite::Connection;
+
+    use super::MIGRATIONS;
+
+    /// Canonical SQL text: each migration verbatim, preceded by a banner and
+    /// followed by the user_version stamp `migrate()` applies after that step.
+    /// Equivalent to `migrate()` on a fresh DB only — no fast-path/partial-
+    /// upgrade logic — which is what `schema_sql_matches_migrate` proves.
+    fn render_schema_sql() -> String {
+        let mut sql = String::new();
+        for (i, migration) in MIGRATIONS.iter().enumerate() {
+            let n = i + 1;
+            if i > 0 {
+                sql.push('\n');
+            }
+            // write!/writeln! (not push_str(&format!(..))): the workspace's
+            // pedantic clippy lints deny format_push_string, and a bare
+            // write! ending in '\n' would trip write_with_newline.
+            let _ = write!(sql, "-- ── MIGRATION_V{n} ──");
+            sql.push_str(migration); // every MIGRATION_Vn starts and ends with '\n'
+            let _ = writeln!(sql, "PRAGMA user_version = {n};");
+        }
+        sql
+    }
+
+    fn dump_master(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+        conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The rendering must stay semantically identical to migrate() on a fresh
+    /// DB — guards against migrate() ever growing a non-SQL step the
+    /// concatenation cannot represent.
+    #[test]
+    fn schema_sql_matches_migrate() {
+        let rendered = Connection::open_in_memory().unwrap();
+        rendered.execute_batch(&render_schema_sql()).unwrap();
+
+        let mut migrated = Connection::open_in_memory().unwrap();
+        super::migrate(&mut migrated).unwrap();
+
+        assert_eq!(dump_master(&rendered), dump_master(&migrated));
+        assert_eq!(user_version(&rendered), user_version(&migrated));
+        assert_eq!(user_version(&rendered), MIGRATIONS.len() as i64);
+    }
+}
