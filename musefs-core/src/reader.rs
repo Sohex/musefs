@@ -211,7 +211,7 @@ impl HeaderCache {
     /// Resolve a track to its layout, caching on a content-version miss. Validation
     /// (`stat`) and synthesis run WITHOUT holding the shard lock; the lock is taken
     /// only briefly for the cache get and insert.
-    pub fn resolve(&self, db: &Db, track_id: i64) -> Result<Arc<ResolvedFile>> {
+    pub fn resolve<M>(&self, db: &Db<M>, track_id: i64) -> Result<Arc<ResolvedFile>> {
         let track = db
             .get_track(track_id)?
             .ok_or(CoreError::TrackNotFound(track_id))?;
@@ -234,9 +234,9 @@ impl HeaderCache {
         Ok(resolved)
     }
     /// Build a `ResolvedFile` for `track` (synthesis or passthrough). No lock held.
-    fn build(
+    fn build<M>(
         &self,
-        db: &Db,
+        db: &Db<M>,
         track: &musefs_db::Track,
         meta: &std::fs::Metadata,
     ) -> Result<Arc<ResolvedFile>> {
@@ -418,9 +418,9 @@ impl HeaderCache {
 
 /// Read `size` bytes at virtual `offset` into `out` (appended), opening the
 /// backing file once for this call if the layout needs it.
-pub fn read_at_into(
+pub fn read_at_into<M>(
     resolved: &ResolvedFile,
-    db: &Db,
+    db: &Db<M>,
     offset: u64,
     size: u64,
     out: &mut Vec<u8>,
@@ -443,7 +443,7 @@ pub fn read_at_into(
 }
 
 /// Allocating form of `read_at_into` (tests and non-hot-path callers).
-pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Result<Vec<u8>> {
+pub fn read_at<M>(resolved: &ResolvedFile, db: &Db<M>, offset: u64, size: u64) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     read_at_into(resolved, db, offset, size, &mut out)?;
     Ok(out)
@@ -452,9 +452,9 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
 /// The single segment-splicing loop. `file` is `Some` whenever the layout has a
 /// `BackingAudio`/`OggAudio` segment (guaranteed by `read_at`/`read_at_with_file`);
 /// the backing arms treat `None` as a contract violation.
-fn read_segments_into(
+fn read_segments_into<M>(
     resolved: &ResolvedFile,
-    db: &Db,
+    db: &Db<M>,
     file: Option<&std::fs::File>,
     offset: u64,
     size: u64,
@@ -558,9 +558,9 @@ fn read_segments_into(
 }
 
 /// Serve into `out` from an already-open backing `file` (per-handle path).
-pub fn read_at_with_file_into(
+pub fn read_at_with_file_into<M>(
     resolved: &ResolvedFile,
-    db: &Db,
+    db: &Db<M>,
     file: &std::fs::File,
     offset: u64,
     size: u64,
@@ -570,9 +570,9 @@ pub fn read_at_with_file_into(
 }
 
 /// Allocating form of `read_at_with_file_into`.
-pub fn read_at_with_file(
+pub fn read_at_with_file<M>(
     resolved: &ResolvedFile,
-    db: &Db,
+    db: &Db<M>,
     file: &std::fs::File,
     offset: u64,
     size: u64,

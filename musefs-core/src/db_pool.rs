@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use parking_lot::ReentrantMutex;
 
-use musefs_db::Db;
+use musefs_db::{Db, ReadOnly};
 
 use crate::error::{CoreError, Result};
 
@@ -39,9 +39,9 @@ pub enum DbPool {
     PerThread {
         id: u64,
         path: PathBuf,
-        poll: ReentrantMutex<Db>,
+        poll: ReentrantMutex<Db<ReadOnly>>,
     },
-    Shared(Arc<ReentrantMutex<Db>>),
+    Shared(Arc<ReentrantMutex<Db<ReadOnly>>>),
 }
 
 /// Clears only the *dropping thread's* thread-local connection for this pool —
@@ -58,8 +58,10 @@ impl Drop for DbPool {
     }
 }
 
+type PerPathMap = HashMap<(PathBuf, u64), Rc<Db<ReadOnly>>>;
+
 thread_local! {
-    static PER_PATH: RefCell<HashMap<(PathBuf, u64), Rc<Db>>> = RefCell::new(HashMap::new());
+    static PER_PATH: RefCell<PerPathMap> = RefCell::new(HashMap::new());
 }
 
 impl DbPool {
@@ -67,6 +69,7 @@ impl DbPool {
     /// become per-thread pools (the passed connection is dropped — workers open
     /// their own); in-memory DBs are wrapped in a shared mutex.
     pub fn new(db: Db) -> Result<DbPool> {
+        let db = db.into_read_only();
         match db.path() {
             Some(p) => Ok(DbPool::PerThread {
                 id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
@@ -84,7 +87,7 @@ impl DbPool {
     /// before it opened. The poll connection is the original writer Db, kept alive
     /// precisely so it can observe incremental changes from other connections.
     /// For `Shared` pools (in-memory), the single shared connection serves both roles.
-    pub fn with_poll<R>(&self, f: impl FnOnce(&Db) -> Result<R>) -> Result<R> {
+    pub fn with_poll<R>(&self, f: impl FnOnce(&Db<ReadOnly>) -> Result<R>) -> Result<R> {
         match self {
             DbPool::PerThread { poll, .. } => f(&poll.lock()),
             DbPool::Shared(m) => f(&m.lock()),
@@ -92,7 +95,7 @@ impl DbPool {
     }
 
     /// Run `f` with a read connection.
-    pub fn with<R>(&self, f: impl FnOnce(&Db) -> Result<R>) -> Result<R> {
+    pub fn with<R>(&self, f: impl FnOnce(&Db<ReadOnly>) -> Result<R>) -> Result<R> {
         match self {
             DbPool::PerThread { id, path, .. } => PER_PATH.with(|cell| {
                 let db = {
@@ -189,7 +192,7 @@ mod tests {
         let pool = DbPool::PerThread {
             id: u64::MAX,
             path: bad.clone(),
-            poll: ReentrantMutex::new(Db::open_in_memory().unwrap()),
+            poll: ReentrantMutex::new(Db::open_in_memory().unwrap().into_read_only()),
         };
         let msg = pool.with(|_db| Ok(())).unwrap_err().to_string();
         assert!(
