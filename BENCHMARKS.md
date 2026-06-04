@@ -460,14 +460,15 @@ MUSEFS_BENCH_TIER=ci \
 Four stacked serve-path optimizations, none touching synthesis or layout (served
 audio stays byte-identical by construction):
 
-1. **DB chunk readers write directly into caller buffers** (`read_exact_at`
+1. **DB chunk readers write directly into caller buffers** (`read_at_exact`
    fills the caller's `&mut [u8]` slice instead of allocating a throwaway
    `Vec<u8>` + `extend_from_slice`).
-2. **`read_segments` fills the caller's buffer** — each `BackingAudio` run
-   writes directly into the output `Vec`'s pre-reserved tail instead of a
-   temporary alloc + memcpy per splice.
+2. **`read_segments` fills the caller's buffer** — the `ArtImage`,
+   `BinaryTag`, and raw `OggArtSlice` arms write into the output `Vec`'s
+   resized tail instead of a temporary alloc + memcpy per chunk
+   (`BackingAudio`/`OggAudio`/`Inline` already wrote into `out`).
 3. **`Musefs::read_into` serves into a caller buffer** — the FUSE layer passes
-   a `&mut [u8]` destination and the core fills it in place, avoiding an
+   a `&mut Vec<u8>` destination and the core fills it in place, avoiding an
    intermediate `Vec` allocation for the entire read.
 4. **FUSE per-worker thread-local scratch buffer** — each worker reuses a
    single `Vec<u8>` across reads instead of allocating a fresh one per `read()`
