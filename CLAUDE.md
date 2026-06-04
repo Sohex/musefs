@@ -10,8 +10,7 @@ cardinal invariant: **original audio bytes are never copied or modified.** A
 served file is assembled on the fly by splicing freshly-generated metadata in
 front of positioned reads of the untouched backing file.
 
-Project state and explicit scope boundaries live in `docs/ROADMAP.md`. The
-original design spec is `docs/superpowers/specs/2026-05-24-musefs-design.md`;
+The original design spec is `docs/superpowers/specs/2026-05/2026-05-24-musefs-design.md`;
 per-milestone plans are under `docs/superpowers/plans/`.
 
 ## Commands
