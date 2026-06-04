@@ -302,6 +302,7 @@ impl Musefs {
             .with(|db| Self::render_entries(db, &self.config))?;
         let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
         let tree = VirtualTree::build_with(&entries, &mut alloc);
+        alloc.prune_retired(&tree);
         drop(alloc);
         self.tree.store(Arc::new(tree));
         Ok(snapshot)
@@ -466,6 +467,7 @@ impl Musefs {
                 VirtualTree::build_with(&entries, &mut alloc)
             }
         };
+        alloc.prune_retired(&tree);
         self.tree.store(Arc::new(tree));
         drop(alloc);
         drop(snap);

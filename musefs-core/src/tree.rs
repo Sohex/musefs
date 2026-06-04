@@ -46,7 +46,6 @@ impl InodeAllocator {
     /// path that reappears after a prune gets a fresh inode: a kernel dentry
     /// cached for its old inode resolves ENOENT for at most one entry TTL,
     /// the same degradation as any vanished path.
-    #[allow(dead_code)] // wired into the mount caller in the next PR
     pub(crate) fn prune_retired(&mut self, tree: &VirtualTree) {
         if self.paths.len() <= 2 * tree.nodes.len() {
             return;
