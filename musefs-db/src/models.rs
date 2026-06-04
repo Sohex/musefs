@@ -1,4 +1,11 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use strum::{EnumIter, EnumString, IntoStaticStr};
+
+/// The DB text representation (the `tracks.format` column) is derived:
+/// `serialize_all = "lowercase"` lowercases the whole variant ident
+/// (`OggFlac` → `"oggflac"`). The strings are an external contract —
+/// beets/Picard write them — pinned by `tests::db_strings_are_pinned`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, IntoStaticStr, EnumIter)]
+#[strum(serialize_all = "lowercase")]
 #[cfg_attr(feature = "mutants", derive(Default))]
 pub enum Format {
     #[cfg_attr(feature = "mutants", default)]
@@ -13,57 +20,39 @@ pub enum Format {
 
 impl Format {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Format::Flac => "flac",
-            Format::Mp3 => "mp3",
-            Format::M4a => "m4a",
-            Format::Opus => "opus",
-            Format::Vorbis => "vorbis",
-            Format::OggFlac => "oggflac",
-            Format::Wav => "wav",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Format> {
-        match s {
-            "flac" => Some(Format::Flac),
-            "mp3" => Some(Format::Mp3),
-            "m4a" => Some(Format::M4a),
-            "opus" => Some(Format::Opus),
-            "vorbis" => Some(Format::Vorbis),
-            "oggflac" => Some(Format::OggFlac),
-            "wav" => Some(Format::Wav),
-            _ => None,
-        }
+        self.into()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Format;
+    use strum::IntoEnumIterator;
 
     #[test]
-    fn m4a_round_trips() {
-        assert_eq!(Format::M4a.as_str(), "m4a");
-        assert_eq!(Format::parse("m4a"), Some(Format::M4a));
-    }
-
-    #[test]
-    fn ogg_codecs_round_trip() {
-        for (f, s) in [
-            (Format::Opus, "opus"),
-            (Format::Vorbis, "vorbis"),
-            (Format::OggFlac, "oggflac"),
-        ] {
-            assert_eq!(f.as_str(), s);
-            assert_eq!(Format::parse(s), Some(f));
+    fn every_format_round_trips() {
+        for f in Format::iter() {
+            assert_eq!(f.as_str().parse::<Format>(), Ok(f));
         }
     }
 
+    /// The strings are a DB contract — external writers (beets/Picard) store
+    /// them. A variant rename must not silently change the stored string.
     #[test]
-    fn wav_round_trips() {
-        assert_eq!(Format::Wav.as_str(), "wav");
-        assert_eq!(Format::parse("wav"), Some(Format::Wav));
+    fn db_strings_are_pinned() {
+        let expected = [
+            (Format::Flac, "flac"),
+            (Format::Mp3, "mp3"),
+            (Format::M4a, "m4a"),
+            (Format::Opus, "opus"),
+            (Format::Vorbis, "vorbis"),
+            (Format::OggFlac, "oggflac"),
+            (Format::Wav, "wav"),
+        ];
+        assert_eq!(expected.len(), Format::iter().count());
+        for (f, s) in expected {
+            assert_eq!(f.as_str(), s);
+        }
     }
 }
 
