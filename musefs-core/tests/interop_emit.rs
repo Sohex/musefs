@@ -1,6 +1,6 @@
 mod common;
 use musefs_core::{read_at, HeaderCache, Mode};
-use musefs_db::{BinaryTag, Db, Format, NewTrack, Tag};
+use musefs_db::{BinaryTag, Db, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_format::fuzz_check::fixtures;
 use musefs_format::Segment;
 use std::io::Write;
@@ -96,6 +96,11 @@ fn richer_m4a(mdat_payload: &[u8]) -> Vec<u8> {
 }
 // ── end local M4A helper ─────────────────────────────────────────────────────
 
+// Mirrored byte-for-byte in tests/interop/test_mutagen_roundtrip.py
+// (COVR_JPEG / COVR_PNG): mutagen must read these exact images back.
+const COVR_JPEG: &[u8] = b"\xFF\xD8\xFF\xE0interop-jpeg-cover";
+const COVR_PNG: &[u8] = b"\x89PNG\r\n\x1a\ninterop-png-cover";
+
 fn real_mtime(p: &Path) -> i64 {
     std::fs::metadata(p)
         .unwrap()
@@ -117,6 +122,7 @@ struct ManifestRow {
     synth_audio_offset: u64,
     synth_audio_length: u64,
     ogg_payload_only: bool,
+    covr_count: usize,
 }
 
 fn synthesized_audio_range(layout: &musefs_format::RegionLayout) -> (u64, u64) {
@@ -144,6 +150,7 @@ fn emit(
     format: Format,
     audio_offset: i64,
     audio_length: i64,
+    arts: &[(&[u8], &str)],
 ) -> (u64, u64) {
     std::fs::write(src, bytes).unwrap();
     let db = Db::open_in_memory().unwrap();
@@ -165,6 +172,29 @@ fn emit(
         ],
     )
     .unwrap();
+    let links: Vec<TrackArt> = arts
+        .iter()
+        .enumerate()
+        .map(|(i, (data, mime))| {
+            let art_id = db
+                .upsert_art(&NewArt {
+                    mime: (*mime).to_string(),
+                    width: None,
+                    height: None,
+                    data: data.to_vec(),
+                })
+                .unwrap();
+            TrackArt {
+                art_id,
+                picture_type: 3,
+                description: String::new(),
+                ordinal: i as i64,
+            }
+        })
+        .collect();
+    if !links.is_empty() {
+        db.set_track_art(id, &links).unwrap();
+    }
     let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
     let synth_audio = synthesized_audio_range(&resolved.layout);
     let out = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
@@ -223,6 +253,7 @@ fn emit_interop_fixtures() {
             Format::Flac,
             scan.audio_offset as i64,
             scan.audio_length as i64,
+            &[],
         );
         manifest.push(ManifestRow {
             file: "out.flac",
@@ -234,6 +265,7 @@ fn emit_interop_fixtures() {
             synth_audio_offset: ao,
             synth_audio_length: al,
             ogg_payload_only: false,
+            covr_count: 0,
         });
     }
 
@@ -248,6 +280,7 @@ fn emit_interop_fixtures() {
             Format::Mp3,
             b.audio_offset as i64,
             b.audio_length as i64,
+            &[],
         );
         manifest.push(ManifestRow {
             file: "out.mp3",
@@ -259,6 +292,7 @@ fn emit_interop_fixtures() {
             synth_audio_offset: ao,
             synth_audio_length: al,
             ogg_payload_only: false,
+            covr_count: 0,
         });
     }
 
@@ -274,6 +308,7 @@ fn emit_interop_fixtures() {
             Format::M4a,
             scan.mdat_payload_offset as i64,
             scan.mdat_payload_len as i64,
+            &[(COVR_JPEG, "image/jpeg"), (COVR_PNG, "image/png")],
         );
         manifest.push(ManifestRow {
             file: "out.m4a",
@@ -285,6 +320,7 @@ fn emit_interop_fixtures() {
             synth_audio_offset: ao,
             synth_audio_length: al,
             ogg_payload_only: false,
+            covr_count: 2,
         });
     }
 
@@ -299,6 +335,7 @@ fn emit_interop_fixtures() {
             Format::Opus,
             scan.audio_offset as i64,
             scan.audio_length as i64,
+            &[],
         );
         manifest.push(ManifestRow {
             file: "out.ogg",
@@ -310,6 +347,7 @@ fn emit_interop_fixtures() {
             synth_audio_offset: ao,
             synth_audio_length: al,
             ogg_payload_only: true,
+            covr_count: 0,
         });
     }
 
@@ -324,6 +362,7 @@ fn emit_interop_fixtures() {
             Format::Wav,
             b.audio_offset as i64,
             b.audio_length as i64,
+            &[],
         );
         manifest.push(ManifestRow {
             file: "out.wav",
@@ -335,6 +374,7 @@ fn emit_interop_fixtures() {
             synth_audio_offset: ao,
             synth_audio_length: al,
             ogg_payload_only: false,
+            covr_count: 0,
         });
     }
 
@@ -427,7 +467,7 @@ fn emit_interop_fixtures() {
         .iter()
         .map(|row| {
             format!(
-                "{{\"file\":{file:?},\"source_file\":{source_file:?},\"title\":{title:?},\"artist\":{artist:?},\"source_audio_offset\":{source_audio_offset},\"source_audio_length\":{source_audio_length},\"synth_audio_offset\":{synth_audio_offset},\"synth_audio_length\":{synth_audio_length},\"ogg_payload_only\":{ogg_payload_only}}}",
+                "{{\"file\":{file:?},\"source_file\":{source_file:?},\"title\":{title:?},\"artist\":{artist:?},\"source_audio_offset\":{source_audio_offset},\"source_audio_length\":{source_audio_length},\"synth_audio_offset\":{synth_audio_offset},\"synth_audio_length\":{synth_audio_length},\"ogg_payload_only\":{ogg_payload_only},\"covr_count\":{covr_count}}}",
                 file = row.file,
                 source_file = row.source_file,
                 title = row.title,
@@ -437,6 +477,7 @@ fn emit_interop_fixtures() {
                 synth_audio_offset = row.synth_audio_offset,
                 synth_audio_length = row.synth_audio_length,
                 ogg_payload_only = row.ogg_payload_only,
+                covr_count = row.covr_count,
             )
         })
         .collect();
