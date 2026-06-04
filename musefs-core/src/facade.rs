@@ -8,7 +8,7 @@ use musefs_db::{Db, Format};
 use crate::db_pool::DbPool;
 use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
-use crate::reader::{read_at, read_at_with_file, HeaderCache, ResolvedFile};
+use crate::reader::{read_at_into, read_at_with_file_into, HeaderCache, ResolvedFile};
 use crate::refresh_diff::{partition_changelog, ChangeSet, TrackRenderState};
 use crate::template::render_path;
 use crate::tree::{InodeAllocator, NodeKind, VirtualTree};
@@ -871,7 +871,17 @@ impl Musefs {
             .collect())
     }
 
-    pub fn read(&self, inode: u64, fh: u64, offset: u64, size: u64) -> Result<Vec<u8>> {
+    /// Serve a read into `out` (cleared first). The FUSE layer passes a reused
+    /// per-worker buffer so the hot path allocates nothing per read (#70).
+    pub fn read_into(
+        &self,
+        inode: u64,
+        fh: u64,
+        offset: u64,
+        size: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        out.clear();
         // Fast path: serve from the per-handle fd + cached layout (no open/stat).
         if fh != 0 {
             let handle = self.handles.get((fh - 1) as usize).map(|g| Arc::clone(&g));
@@ -879,6 +889,7 @@ impl Musefs {
                 // Bounded retry absorbs a refresh landing mid-read; out-of-band
                 // re-tags are human/batch-paced, so >1 attempt is already rare.
                 for _attempt in 0..4 {
+                    out.clear();
                     let cur = self.refresh_gen.load(Ordering::Acquire);
                     if h.gen.load(Ordering::Acquire) != cur {
                         // A refresh changed something; re-resolve (cheap content_version
@@ -894,7 +905,7 @@ impl Musefs {
                     }
                     let resolved = h.resolved.load();
                     let r: &ResolvedFile = &resolved;
-                    let served = self.pool.with(|db| -> Result<Option<Vec<u8>>> {
+                    let served = self.pool.with(|db| -> Result<Option<()>> {
                         if r.has_binary_tag {
                             // Snapshot-consistent: version check + blob reads see one
                             // WAL snapshot, so a reused rowid can't be served.
@@ -903,16 +914,18 @@ impl Musefs {
                                 if db.track_content_version(h.track_id)? != r.content_version {
                                     return Ok(None); // stale layout — retry after re-resolve
                                 }
-                                Ok(Some(read_at_with_file(r, db, &h.file, offset, size)?))
+                                read_at_with_file_into(r, db, &h.file, offset, size, out)?;
+                                Ok(Some(()))
                             })();
                             let _ = db.end_read(); // always release the snapshot
                             res
                         } else {
-                            Ok(Some(read_at_with_file(r, db, &h.file, offset, size)?))
+                            read_at_with_file_into(r, db, &h.file, offset, size, out)?;
+                            Ok(Some(()))
                         }
                     })?;
-                    if let Some(bytes) = served {
-                        return Ok(bytes);
+                    if served.is_some() {
+                        return Ok(());
                     }
                     // Stale layout: force a re-resolve next iteration against the live version.
                     let fresh = self.pool.with(|db| self.cache.resolve(db, h.track_id))?;
@@ -940,8 +953,15 @@ impl Musefs {
         };
         self.pool.with(|db| {
             let resolved = self.cache.resolve(db, track_id)?;
-            read_at(&resolved, db, offset, size)
+            read_at_into(&resolved, db, offset, size, out)
         })
+    }
+
+    /// Allocating form of `read_into`.
+    pub fn read(&self, inode: u64, fh: u64, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.read_into(inode, fh, offset, size, &mut out)?;
+        Ok(out)
     }
 
     /// Open a file handle: resolve + validate the layout and open the backing fd

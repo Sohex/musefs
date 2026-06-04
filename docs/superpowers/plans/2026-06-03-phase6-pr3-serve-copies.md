@@ -26,8 +26,8 @@ git checkout main && git pull && git checkout -b phase6-pr3-serve-copies
 ### Task 2: DB chunk readers — `*_into` variants
 
 **Files:**
-- Modify: `musefs-db/src/art.rs` (`read_art_chunk`, art.rs:69)
-- Modify: `musefs-db/src/tags.rs` (`read_binary_tag_chunk`, tags.rs:140)
+- Modify: `musefs-db/src/art.rs` (`read_art_chunk`, art.rs:75)
+- Modify: `musefs-db/src/tags.rs` (`read_binary_tag_chunk`, tags.rs:146)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -122,7 +122,7 @@ git commit -m "feat(db): chunk readers write into caller buffers (#70)"
 ### Task 3: Thread the output buffer through the reader
 
 **Files:**
-- Modify: `musefs-core/src/reader.rs` (`read_at` :406, `read_segments` :427, `read_at_with_file` :531)
+- Modify: `musefs-core/src/reader.rs` (`read_at` :422, `read_segments` :443, `read_at_with_file` :546)
 
 The behavior gate is the existing suite: `tests/read_at.rs`, `tests/reader.rs`, `proptest_read_fidelity`, and the `--features metrics` serve-site counter tests — all must pass unchanged (counters fire identically; only buffer destinations change).
 
@@ -266,7 +266,7 @@ git commit -m "perf(core): read_segments fills the caller's buffer; chunk arms d
 ### Task 4: `Musefs::read_into`
 
 **Files:**
-- Modify: `musefs-core/src/facade.rs` (`read`, facade.rs:725)
+- Modify: `musefs-core/src/facade.rs` (`read`, facade.rs:874)
 
 - [ ] **Step 1: Convert `read` to `read_into` + wrapper**
 
@@ -334,7 +334,7 @@ git commit -m "feat(core): Musefs::read_into serves into a caller buffer (#70)"
 ### Task 5: FUSE per-worker scratch buffer
 
 **Files:**
-- Modify: `musefs-fuse/src/lib.rs` (`impl Filesystem for MusefsFs/read`, lib.rs:277)
+- Modify: `musefs-fuse/src/lib.rs` (`impl Filesystem for MusefsFs/read`, lib.rs:278)
 
 - [ ] **Step 1: Implement the thread-local buffer**
 
@@ -454,13 +454,26 @@ Expected: all clean.
 cd /home/cfutro/git/musefs
 git diff "$(git merge-base main HEAD)...HEAD" -- '*.rs' > mutants.diff
 grep -c '^diff --git ' mutants.diff && grep -c '^@@ ' mutants.diff   # sanity: non-empty
-TMPDIR=/home/cfutro/.cache/mutants-tmp cargo mutants --in-diff mutants.diff -j4 \
+TMPDIR=/home/cfutro/.cache/mutants-tmp cargo mutants --in-diff mutants.diff -j$(nproc) \
   --exclude 'musefs-latencyfs/**' --output mutants-out/in-diff
 cat mutants-out/in-diff/mutants.out/missed.txt
 rm -rf /home/cfutro/.cache/mutants-tmp mutants-out mutants.diff
 ```
 
-Expected: 0 missed (kill survivors with targeted tests, commit, regenerate the diff, re-run).
+Expected: 0 missed AND 0 timeouts — CI's gate fails on either (kill survivors
+with targeted tests, commit, regenerate the diff, re-run; a proven-equivalent
+or hang-class survivor gets a justified mutants.toml exclusion per the
+SP3/PR 1 precedent). The gate runs the **mutated crate's own** test suite:
+musefs-db mutants (Task 2) need musefs-db tests to kill them — the Task 2
+unit tests are in `musefs-db/tests/`, which satisfies this.
+
+mutants.toml anchor note: the stale SP2 anchors (facade.rs
+force_apply_failure_for_test, tree.rs match guard / ancestor_in) were
+re-derived when this branch was opened. This PR's edits all land *below* the
+anchored facade.rs sites (≤738) and touch no other anchored file at an
+anchored line, so no further re-anchoring should be needed — but if any task
+inserts lines above an anchored site, re-derive per the PR 2 procedure
+(`cargo mutants --list -f <file>` and match by description).
 
 - [ ] **Step 3: Fuzz-target build check**
 

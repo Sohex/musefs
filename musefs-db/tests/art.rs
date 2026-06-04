@@ -213,3 +213,19 @@ fn set_track_art_replaces_links() {
     db.set_track_art(t, &[]).unwrap();
     assert!(db.get_track_art(t).unwrap().is_empty());
 }
+
+#[test]
+fn read_art_chunk_into_matches_vec_variant_and_errors_on_short_read() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.upsert_art(&jpeg((0u8..64).collect())).unwrap();
+
+    let expected = db.read_art_chunk(id, 3, 5).unwrap();
+    let mut buf = vec![0u8; 5];
+    db.read_art_chunk_into(id, 3, &mut buf).unwrap();
+    assert_eq!(buf, expected);
+    assert_eq!(buf, vec![3, 4, 5, 6, 7]);
+
+    // Reading past the blob end must error, not zero-fill (read_at_exact contract).
+    let mut over = vec![0u8; 128];
+    assert!(db.read_art_chunk_into(id, 3, &mut over).is_err());
+}
