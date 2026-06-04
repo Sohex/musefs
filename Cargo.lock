@@ -845,6 +845,7 @@ dependencies = [
  "musefs-latencyfs",
  "ogg",
  "once_cell",
+ "parking_lot",
  "proptest",
  "rusqlite",
  "sharded-slab",
