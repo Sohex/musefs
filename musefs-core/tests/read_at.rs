@@ -1,6 +1,6 @@
 mod common;
 use common::write_flac;
-use musefs_core::{read_at, HeaderCache, Mode};
+use musefs_core::{read_at, read_at_with_file, HeaderCache, Mode};
 use musefs_db::{Db, Format, NewTrack, Tag};
 
 fn setup() -> (tempfile::TempDir, Db, i64) {
@@ -128,4 +128,53 @@ fn read_at_streams_art_image_segments() {
 
     // A window that lands entirely inside the art segment (offset 4 -> art[2..5]).
     assert_eq!(read_at(&resolved, &db, 4, 3).unwrap(), vec![3, 4, 5]);
+}
+
+#[test]
+fn out_of_range_read_short_circuits_before_opening_the_backing_file() {
+    let (_dir, db, id) = setup();
+    let cache = HeaderCache::new(Mode::Synthesis);
+    let resolved = cache.resolve(&db, id).unwrap();
+    // Past-EOF and zero-size reads must return empty without ever opening the
+    // backing file; deleting it makes any open attempt an error.
+    std::fs::remove_file(&resolved.backing_path).unwrap();
+
+    assert!(read_at(&resolved, &db, resolved.total_len, 100)
+        .unwrap()
+        .is_empty());
+    assert!(read_at(&resolved, &db, 10, 0).unwrap().is_empty());
+}
+
+#[test]
+fn read_at_with_file_out_of_range_and_zero_size_return_empty() {
+    let (_dir, db, id) = setup();
+    let cache = HeaderCache::new(Mode::Synthesis);
+    let resolved = cache.resolve(&db, id).unwrap();
+    let file = std::fs::File::open(&resolved.backing_path).unwrap();
+
+    // The per-handle path has no outer guard: read_segments_into itself must
+    // bail on offset > total_len (its window arithmetic would underflow).
+    for (off, size) in [
+        (resolved.total_len + 5, 100u64),
+        (resolved.total_len, 1),
+        (10, 0),
+    ] {
+        assert!(read_at_with_file(&resolved, &db, &file, off, size)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn read_at_reserves_only_the_served_window() {
+    let (_dir, db, id) = setup();
+    let cache = HeaderCache::new(Mode::Synthesis);
+    let resolved = cache.resolve(&db, id).unwrap();
+
+    // A short tail read must reserve ~window-size capacity, not anything
+    // scaled by the offset: FUSE workers retain this buffer across reads, so
+    // an over-reserve would inflate every worker's resident memory.
+    let got = read_at(&resolved, &db, resolved.total_len - 7, 50).unwrap();
+    assert_eq!(got.len(), 7);
+    assert!(got.capacity() < resolved.total_len as usize);
 }

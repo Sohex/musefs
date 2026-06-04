@@ -121,37 +121,29 @@ exclude_re = [
     # eprintln on stderr. The fallback's build_with is itself directly tested; this
     # injection point exists only to drive that branch, with nothing observable to
     # assert in this config.
-    'musefs-core/src/facade\.rs:510:9: replace Musefs::force_apply_failure_for_test with \(\)',
+    'musefs-core/src/facade\.rs:738:9: replace Musefs::force_apply_failure_for_test with \(\)',
     # apply_changes path-stable guard `&self.path_of(ino) == new_path` -> false: a
     # `changed` id whose rendered path is unchanged would be treated as a move
     # (remove + re-insert at the same path) instead of a no-op. Re-interning the same
     # path yields the same inode and rebuild_subtree re-canonicalizes the parent, so
     # the resulting tree is identical — a pure short-circuit optimization.
-    'musefs-core/src/tree\.rs:354:30: replace match guard .* with false in VirtualTree::apply_changes',
-    # add-side dirty propagation `id < self.introducing_id(child)` -> `<=`: `<=` is a
-    # strict superset of `<`, so it can only mark MORE ancestor dirs dirty. Every
-    # dirty dir is rebuilt to the same canonical layout build_with would produce, so
-    # over-marking changes only the work done, not the tree.
-    'musefs-core/src/tree\.rs:389:45: replace < with <= in VirtualTree::apply_changes',
+    'musefs-core/src/tree\.rs:470:30: replace match guard .* with false in VirtualTree::apply_changes',
+    # (The add-side/remove-side dirty-propagation walks formerly inline in
+    # apply_changes now live in dirty_min_flip_ancestors; their equivalent and
+    # hang-class mutants are covered by the description-anchored
+    # dirty_min_flip_ancestors entries at the top of this list.)
     #
-    # Non-terminating mutants (reported as TIMEOUT, never a clean kill): each turns a
+    # Non-terminating mutant (reported as TIMEOUT, never a clean kill): turns a
     # bounded upward walk into an infinite loop, because the root is its own parent
-    # (root.parent == ROOT) and these guards are exactly what stops the walk at root.
-    # cargo-mutants can only ever flag them via the 22s auto-timeout; they cannot be
-    # "caught" by an assertion, so they are excluded rather than left to flake the
+    # (root.parent == ROOT) and this guard is exactly what stops the walk at root.
+    # cargo-mutants can only ever flag it via the 22s auto-timeout; it cannot be
+    # "caught" by an assertion, so it is excluded rather than left to flake the
     # gate on the timeout budget.
     #
-    # remove/move-side dirty propagation `child != ROOT && introducing_id(child) == id`
-    # -> `||`: the `||` keeps looping once child reaches ROOT whenever ROOT's global
-    # min id equals `id`, and child stays ROOT forever.
-    'musefs-core/src/tree\.rs:376:43: replace && with \|\| in VirtualTree::apply_changes',
-    # add-side dirty propagation `child != ROOT && id < introducing_id(child)` -> `||`:
-    # same non-terminating root walk as above.
-    'musefs-core/src/tree\.rs:389:39: replace && with \|\| in VirtualTree::apply_changes',
     # ancestor_in's loop terminator `cur == Self::ROOT` -> `!=`: the walk never breaks
     # at root (root.parent == root), so a node with no ancestor in the set loops
     # forever instead of returning false.
-    'musefs-core/src/tree\.rs:455:20: replace == with != in VirtualTree::ancestor_in',
+    'musefs-core/src/tree\.rs:596:20: replace == with != in VirtualTree::ancestor_in',
 
     # SP4 storage-aware serving — equivalent mutant in serve_ogg_window's last-page
     # memo. `total_len = header_len + payload_len` only sets the memoized page's

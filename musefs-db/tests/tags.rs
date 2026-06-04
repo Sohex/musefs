@@ -1,6 +1,6 @@
 mod common;
 use common::new_track;
-use musefs_db::{Db, Tag};
+use musefs_db::{BinaryTag, Db, Tag};
 
 #[test]
 fn replace_then_get_returns_tags_ordered() {
@@ -95,4 +95,31 @@ fn tags_grouped_preserves_key_ordinal_order_for_multivalue() {
         ]),
         "multi-value group must be ordered by (key, ordinal), matching get_tags"
     );
+}
+
+#[test]
+fn read_binary_tag_chunk_into_matches_vec_variant_and_errors_on_short_read() {
+    let db = Db::open_in_memory().unwrap();
+    let track = db.upsert_track(&new_track("/m/a.flac")).unwrap();
+    db.set_binary_tags(
+        track,
+        &[BinaryTag {
+            key: "APIC".into(),
+            payload: (0u8..64).collect(),
+            ordinal: 0,
+        }],
+    )
+    .unwrap();
+    let payload_id = db.get_binary_tags(track).unwrap()[0].rowid;
+
+    let expected = db.read_binary_tag_chunk(payload_id, 3, 5).unwrap();
+    let mut buf = vec![0u8; 5];
+    db.read_binary_tag_chunk_into(payload_id, 3, &mut buf)
+        .unwrap();
+    assert_eq!(buf, expected);
+
+    let mut over = vec![0u8; 128];
+    assert!(db
+        .read_binary_tag_chunk_into(payload_id, 3, &mut over)
+        .is_err());
 }

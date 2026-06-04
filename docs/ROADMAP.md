@@ -199,7 +199,12 @@ parallel. Most of the Rust items came out of the v1 multi-model review triage.
 - ~~#68 — `ingest_bulk` copies each picture's bytes (scan perf)~~ — done:
   the writer drains the owned `Unit` batch by value (move, not clone).
   Wall-time win on art-bearing corpora. See BENCHMARKS.md "Phase 6 PR 2".
-- #70 — zero-copy serve path (deferred SP3 residual; largest scope).
+- ~~#70 — zero-copy serve path (deferred SP3 residual; largest scope)~~ — done:
+  DB chunk readers write directly into caller buffers; `read_segments` fills
+  the caller's buffer instead of allocating; `Musefs::read_into` serves into
+  a caller buffer; FUSE per-worker thread-local scratch buffer eliminates
+  per-read `Vec` allocation. 10–14% `sequential_read` improvement across all
+  formats. See BENCHMARKS.md "Phase 6 PR 3".
 
 **Phase 7 — Docs**
 - #64 — README/architecture rework. Last, so it documents settled behavior (and is
