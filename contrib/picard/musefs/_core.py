@@ -2,13 +2,15 @@
 
 The shared store/scan/sync contract lives in the vendored ``musefs._common``
 package (python-musefs); this module only maps Picard metadata to musefs tag
-pairs, extracts the front cover, and resolves plugin options. ``__init__.py``
+pairs, extracts the cover images, and resolves plugin options. ``__init__.py``
 holds the Picard adapter (actions, options page, registration).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from ._common.sync import ArtImage
 
 # Picard internal tag name -> musefs (Vorbis-lowercase) key. Picard's internal
 # names already match musefs keys, so this is mostly identity.
@@ -93,16 +95,45 @@ def map_fields(metadata, extra_fields=None):
     return pairs
 
 
-def front_cover(metadata):
-    """Return ``(data, mime)`` for the first front-cover image in a Picard
-    Metadata, or ``None``. Duck-typed: images expose ``is_front_image()``,
-    ``data``, and ``mimetype``."""
-    images = getattr(metadata, "images", None) or []
-    for img in images:
-        is_front = getattr(img, "is_front_image", None)
-        if is_front is not None and is_front():
-            return (img.data, img.mimetype)
-    return None
+# Picard maintype → ID3 picture type (mirrors Picard's own ID3 image-type
+# map). An unrecognized maintype falls back to front-image detection (the more
+# reliable signal), then to 0 (Other).
+_ID3_PICTURE_TYPES = {
+    "front": 3,
+    "back": 4,
+    "booklet": 5,
+    "medium": 6,
+}
+
+
+def _picture_type(img):
+    maintype = getattr(img, "maintype", None)
+    if maintype in _ID3_PICTURE_TYPES:
+        return _ID3_PICTURE_TYPES[maintype]
+    is_front = getattr(img, "is_front_image", None)
+    if is_front is not None and is_front():
+        return 3
+    return 0
+
+
+def images(metadata):
+    """Return an ``ArtImage`` per syncable image in a Picard Metadata, in
+    Picard order. Duck-typed: images expose ``data`` and ``mimetype``, and
+    optionally ``maintype``, ``comment``, ``can_be_saved_to_tags``, and
+    ``is_front_image()``."""
+    out = []
+    for img in getattr(metadata, "images", None) or []:
+        if not getattr(img, "can_be_saved_to_tags", True):
+            continue
+        out.append(
+            ArtImage(
+                data=img.data,
+                mime=img.mimetype,
+                picture_type=_picture_type(img),
+                description=getattr(img, "comment", "") or "",
+            )
+        )
+    return out
 
 
 @dataclass

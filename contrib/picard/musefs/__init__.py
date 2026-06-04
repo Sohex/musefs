@@ -2,7 +2,7 @@
 
 Right-click selected files/albums/clusters → "Sync to musefs". The plugin
 runs `musefs scan` on each file (autoscan) to create/refresh its track row,
-then writes Picard's tags + front cover into the store keyed by realpath. The
+then writes Picard's tags + cover images into the store keyed by realpath. The
 audio file is never saved by Picard, preserving musefs's no-rewrite invariant.
 
 All logic lives in musefs._core (unit-tested); this module is a thin Picard
@@ -27,7 +27,7 @@ from musefs._common import (
 )
 from musefs._core import (
     MusefsError,
-    front_cover,
+    images,
     map_fields,
     resolve_config,
 )
@@ -36,7 +36,7 @@ PLUGIN_NAME = "musefs sync"
 PLUGIN_AUTHOR = "musefs contributors"
 PLUGIN_DESCRIPTION = (
     "Right-click a file/album → 'Sync to musefs' to push Picard's tags and "
-    "front cover into a musefs SQLite store, without rewriting the audio file."
+    "cover images into a musefs SQLite store, without rewriting the audio file."
 )
 PLUGIN_VERSION = "0.1.0"
 # Floor: 2.0 — all required APIs (BaseAction, register_*_action, OptionsPage,
@@ -141,7 +141,7 @@ if _PICARD:
             records = []
             for key, f in files.items():
                 pairs = map_fields(f.metadata, opts.fields)
-                art = front_cover(f.metadata)
+                art = images(f.metadata)
                 records.append(Record(key=key, pairs=pairs, art=art))
             stats = sync_files(conn, records)
             conn.commit()
