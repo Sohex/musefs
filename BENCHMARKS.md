@@ -450,3 +450,90 @@ MUSEFS_BENCH_TIER=ci \
   cargo test -p musefs-core --release --features metrics --test bench_ingest \
   -- --ignored --nocapture bench_cold_scan_and_revalidate
 ```
+
+---
+
+## Phase 6 PR 3 — Serve-path copies (#70)
+
+*Measured 2026-06-04 (same box, lightly loaded · tempfs · Criterion `ci` tier).*
+
+Four stacked serve-path optimizations, none touching synthesis or layout (served
+audio stays byte-identical by construction):
+
+1. **DB chunk readers write directly into caller buffers** (`read_at_exact`
+   fills the caller's `&mut [u8]` slice instead of allocating a throwaway
+   `Vec<u8>` + `extend_from_slice`).
+2. **`read_segments` fills the caller's buffer** — the `ArtImage`,
+   `BinaryTag`, and raw `OggArtSlice` arms write into the output `Vec`'s
+   resized tail instead of a temporary alloc + memcpy per chunk
+   (`BackingAudio`/`OggAudio`/`Inline` already wrote into `out`).
+3. **`Musefs::read_into` serves into a caller buffer** — the FUSE layer passes
+   a `&mut Vec<u8>` destination and the core fills it in place, avoiding an
+   intermediate `Vec` allocation for the entire read.
+4. **FUSE per-worker thread-local scratch buffer** — each worker reuses a
+   single `Vec<u8>` across reads instead of allocating a fresh one per `read()`
+   syscall.
+
+Note: fuser 0.17 already sends a borrowed iovec (`read` receives `&mut [u8]`);
+the win here is chunk direct-write + allocation elimination, not a fuser-layer
+copy.
+
+- **Before** = `main` @ `2d4faf3` (pre-#70): throwaway allocs per splice, fresh
+  `Vec` per FUSE read.
+- **After** = `phase6-pr3-serve-copies` @ `32be8f0`: direct-write into caller
+  buffers, thread-local scratch.
+
+### `sequential_read` — per-format median (the >10%-rise regression gate)
+
+`ci` tier, 4 MiB single-track files, 128 KiB reads, `fh=0` (no-handle path →
+each read resolves via the header cache). The regression gate is a **>10% rise**
+run-over-run.
+
+| format    | before (µs) | after (µs) | Δ        | note |
+|-----------|------------:|-----------:|---------:|------|
+| flac      | 940         | 837        | −10.9%   | improved |
+| mp3       | 919         | 808        | −12.1%   | improved |
+| m4a       | 921         | 827        | −10.2%   | improved |
+| m4a-last  | 950         | 828        | −12.8%   | improved |
+| ogg       | 1123        | 969        | −13.7%   | improved |
+| wav       | 934         | 819        | −12.3%   | improved |
+
+No format breaches the >10% *rise* gate. All formats improve 10–14% from
+eliminating per-splice alloc+copy and per-read `Vec` allocation.
+
+### `concurrent_read_walk/m16_plus_walker` — contention signal
+
+16 reader threads streaming distinct files + one metadata walker, sharing one
+`Arc<Musefs>`. Burst-concurrency wall time (includes thread spawn/join):
+
+| | before (ms) | after (ms) | Δ |
+|---|---:|---:|---:|
+| m16_plus_walker | 7.92 | 8.32 | +5.0% (p=0.17, no change detected) |
+
+Within noise; the thread-local scratch buffer is per-worker, so contention on
+the shared state is unchanged.
+
+### Ogg representative benches (SP4 regression gate)
+
+`cold_first_read` and `seek_read` (fresh mount per iteration):
+
+| workload | before | after | Δ |
+|----------|-------:|------:|--:|
+| `cold_first_read/ogg` | 1.857 ms | 1.719 ms | −7.4% |
+| `seek_read/ogg` | 783 µs | 776 µs | −0.9% |
+
+Both held or improved.
+
+### Gates
+
+- Byte-identical: `proptest_read_fidelity` (17) + `musefs-format --features
+  fuzzing` (317) green.
+
+```bash
+# Both benches (Criterion records its own before/after baseline):
+cargo bench -p musefs-core --bench read_throughput
+
+# Byte-identical gates:
+cargo test -p musefs-core --test proptest_read_fidelity
+cargo test -p musefs-format --features fuzzing
+```

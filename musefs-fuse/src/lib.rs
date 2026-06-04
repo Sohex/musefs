@@ -20,6 +20,15 @@ use musefs_core::Attr;
 use musefs_core::CoreError;
 use musefs_core::Musefs;
 
+/// Per-worker read scratch buffer: each threadpool worker reuses one Vec across
+/// reads (filled by `Musefs::read_into`, sent as fuser's borrowed iovec), so the
+/// hot path allocates nothing per read. Capacity is clamped after use so one
+/// giant read doesn't pin memory for the worker's lifetime.
+const MAX_RETAINED_READ_BUF: usize = 2 * 1024 * 1024;
+thread_local! {
+    static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Fuse-layer mount knobs: kernel tuning + page-cache policy. Distinct from
 /// `musefs_core::MountConfig`, which governs how the virtual tree is rendered.
 #[derive(Debug, Clone)]
@@ -287,11 +296,18 @@ impl Filesystem for MusefsFs {
         reply: ReplyData,
     ) {
         let core = Arc::clone(&self.core);
-        self.pool
-            .execute(move || match core.read(ino.0, fh.0, offset, size as u64) {
-                Ok(bytes) => reply.data(&bytes),
-                Err(e) => reply.error(errno(&e)),
+        self.pool.execute(move || {
+            READ_BUF.with(|b| {
+                let mut buf = b.borrow_mut();
+                match core.read_into(ino.0, fh.0, offset, size as u64, &mut buf) {
+                    Ok(()) => reply.data(&buf),
+                    Err(e) => reply.error(errno(&e)),
+                }
+                if buf.capacity() > MAX_RETAINED_READ_BUF {
+                    buf.shrink_to(MAX_RETAINED_READ_BUF);
+                }
             });
+        });
     }
 
     fn readdir(

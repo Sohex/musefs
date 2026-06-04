@@ -67,15 +67,20 @@ impl Db {
         }
     }
 
-    /// Stream `len` bytes of an art blob starting at `offset` via SQLite
-    /// incremental blob I/O, so image bytes are never fully materialized. The
-    /// caller derives `offset`/`len` from the stored `byte_len`, so a short read
-    /// means the row no longer matches the layout — `read_at_exact` surfaces that
-    /// as an error rather than silently zero-filling.
-    pub fn read_art_chunk(&self, art_id: i64, offset: u64, len: usize) -> Result<Vec<u8>> {
+    /// Stream art-blob bytes at `offset` directly into `buf` via SQLite incremental
+    /// blob I/O — no intermediate allocation (#70). A short read means the row no
+    /// longer matches the layout; `read_at_exact` surfaces that as an error rather
+    /// than silently zero-filling.
+    pub fn read_art_chunk_into(&self, art_id: i64, offset: u64, buf: &mut [u8]) -> Result<()> {
         let blob = self.conn.blob_open("main", "art", "data", art_id, true)?;
+        blob.read_at_exact(buf, offset as usize)?;
+        Ok(())
+    }
+
+    /// Allocating convenience form of `read_art_chunk_into` (non-hot-path callers).
+    pub fn read_art_chunk(&self, art_id: i64, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        blob.read_at_exact(&mut buf, offset as usize)?;
+        self.read_art_chunk_into(art_id, offset, &mut buf)?;
         Ok(buf)
     }
 
