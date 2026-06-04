@@ -359,6 +359,19 @@ mod fixtures_tests {
     }
 
     #[test]
+    fn m4a_two_covers_fixture_parses_with_both_pictures() {
+        let f = fixtures::m4a_two_covers(&[9u8; 16]);
+        let b = crate::mp4::locate_audio(&f).unwrap();
+        assert_eq!(b.audio_length, 16);
+        let pics = crate::mp4::read_pictures(&f);
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert_eq!(pics[0].data, [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]);
+        assert_eq!(pics[1].mime, "image/png");
+        assert_eq!(pics[1].data, [0x89, b'P', b'N', b'G', 4, 5]);
+    }
+
+    #[test]
     fn m4a_stco_offset_points_at_mdat_payload() {
         // The single stco chunk offset must be the absolute file position of the
         // mdat payload, not a placeholder 0 — otherwise a retag that shrinks the
