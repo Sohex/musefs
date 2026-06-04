@@ -1,7 +1,9 @@
 # GENERATED from python-musefs/src/musefs_common/constants.py — do not edit.
 # Run contrib/python-musefs/vendor_to_picard.py after changing the library.
 #
-EXPECTED_USER_VERSION = 3
+from .schema import USER_VERSION
+
+EXPECTED_USER_VERSION = USER_VERSION
 
 MAX_ART_BYTES = 16 * 1024 * 1024 - 64 * 1024
 

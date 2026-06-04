@@ -1,8 +1,12 @@
--- Copy of the migrations in musefs-db/src/schema.rs (the authoritative schema),
--- applied in full. If the Rust schema changes: bump EXPECTED_USER_VERSION in
--- musefs_common/constants.py (re-vendor for Picard) and update this file (append
--- the new migration's DDL and bump PRAGMA user_version). Drift otherwise surfaces
--- as a SchemaMismatch at connect.
+# GENERATED from python-musefs/src/musefs_common/schema.py — do not edit.
+# Run contrib/python-musefs/vendor_to_picard.py after changing the library.
+#
+# GENERATED from musefs-db/src/schema.rs — do not edit.
+# Regenerate: MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py
+# Re-vendor:  python contrib/python-musefs/vendor_to_picard.py
+
+SCHEMA_SQL = """\
+-- ── MIGRATION_V1 ──
 CREATE TABLE tracks (
     id              INTEGER PRIMARY KEY,
     backing_path    TEXT NOT NULL UNIQUE,
@@ -73,6 +77,7 @@ CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
                       updated_at = CAST(strftime('%s','now') AS INTEGER)
     WHERE id = OLD.track_id;
 END;
+PRAGMA user_version = 1;
 
 -- ── MIGRATION_V2 ──
 -- Binary tag payloads live alongside text tags. A row is binary iff
@@ -88,7 +93,6 @@ CREATE TABLE structural_blocks (
     body     BLOB NOT NULL,
     PRIMARY KEY (track_id, kind, ordinal)
 );
-
 PRAGMA user_version = 2;
 
 -- ── MIGRATION_V3 ──
@@ -116,5 +120,7 @@ END;
 CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
     DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
 END;
-
 PRAGMA user_version = 3;
+"""
+
+USER_VERSION = 3

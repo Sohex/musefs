@@ -1,16 +1,14 @@
 import sqlite3
 import time
-from pathlib import Path
 
 import pytest
 from musefs_common import connect as musefs_connect
-
-SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
+from musefs_common.schema import SCHEMA_SQL
 
 
 @pytest.fixture
 def db_path(tmp_path):
-    """A temp musefs DB with the V3 schema applied."""
+    """A temp musefs DB with the full schema applied."""
     path = tmp_path / "musefs.db"
     conn = sqlite3.connect(str(path))
     conn.executescript(SCHEMA_SQL)

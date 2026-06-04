@@ -18,7 +18,7 @@ def test_connect_sets_pragmas(db_path):
 def test_check_schema_version_passes_on_v3(db_path):
     conn = connect(db_path)
     try:
-        check_schema_version(conn)  # schema.sql applies user_version=3
+        check_schema_version(conn)  # SCHEMA_SQL stamps the latest user_version
     finally:
         conn.close()
 

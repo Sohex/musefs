@@ -26,10 +26,18 @@ library deliberately does not own it.
 
 ## Schema coupling
 
-`EXPECTED_USER_VERSION` (in `constants.py`) mirrors the Rust `schema.rs`
-MIGRATIONS length. When the Rust schema bumps, change it here once; both plugins
-inherit it (Picard after a re-vendor). This is independent of the package's own
-`__version__` (its release SemVer).
+`musefs_common/schema.py` (`SCHEMA_SQL`, `USER_VERSION`) is **generated** from
+the Rust migrations in `musefs-db/src/schema.rs` — do not edit it by hand.
+`EXPECTED_USER_VERSION` (in `constants.py`) derives from it. When the Rust
+schema bumps, regenerate and re-vendor:
+
+```bash
+MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py
+python contrib/python-musefs/vendor_to_picard.py
+```
+
+A `musefs-db` unit test fails if the generated file drifts. This is all
+independent of the package's own `__version__` (its release SemVer).
 
 ## Tests
 

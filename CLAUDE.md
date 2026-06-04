@@ -64,15 +64,20 @@ The `contrib/` plugins share one library, `python-musefs` (import package
 `musefs_common`, in `contrib/python-musefs/`): beets depends on it via pip,
 Picard vendors a committed copy into `musefs/_common/` (re-vendor with
 `python contrib/python-musefs/vendor_to_picard.py`; a drift-guard test enforces
-freshness). Mirror these constants when the Rust schema changes:
-`EXPECTED_USER_VERSION` (= `MIGRATIONS` length in `musefs-db/src/schema.rs`) and
-`MAX_ART_BYTES` (mirrors `musefs-core/src/scan.rs`) in
+freshness). `musefs_common/schema.py` (`SCHEMA_SQL`, `USER_VERSION` — from
+which `EXPECTED_USER_VERSION` derives) is GENERATED from
+`musefs-db/src/schema.rs`: after a schema change, run
+`MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py`, then re-vendor.
+Drift is enforced by a `musefs-db` unit test and the Picard vendor-sync test.
+Still hand-mirrored when the Rust side changes: `MAX_ART_BYTES` (mirrors
+`musefs-core/src/scan.rs`) in
 `contrib/python-musefs/src/musefs_common/constants.py`.
 
 Responsibility split between the shared lib and each plugin:
 - `musefs_common/` holds the host-agnostic surface — `sync.py` (`sync_one`/
   `sync_files` orchestration, `Record`), `scan.py` (`run_scan` shell-out),
-  `store.py`, `paths.py`, `constants.py`, `errors.py`.
+  `store.py`, `paths.py`, `constants.py`, `errors.py`, and the generated
+  `schema.py`.
 - Each plugin keeps its **own** `_core.py` for host-specific tag mapping, because
   the source objects differ (beets `Item` vs Picard `Metadata`):
   `contrib/beets/beetsplug/_core.py` (`DIRECT_FIELDS`, `_values`, `map_fields`,
