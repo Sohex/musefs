@@ -30,7 +30,8 @@ symmetric.
 ### Design
 
 Add `strum` (with the `derive` feature) as a dependency of `musefs-db` and
-derive the mapping:
+derive the mapping. This is a new third-party (proc-macro) dependency in the
+contract crate — call it out in the PR for supply-chain scrutiny:
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, IntoStaticStr, EnumIter)]
@@ -91,7 +92,8 @@ pub struct Db<M = ReadWrite> {
 - `impl Db<ReadWrite>`: `open()`, `open_in_memory()`, `configure()`, and a
   new `into_read_only(self) -> Db<ReadOnly>` that rewraps the same
   connection. Degrading is type-level only; runtime behavior of the
-  connection is unchanged.
+  connection is unchanged. It must be `pub` (called cross-crate), but its
+  only intended caller is `DbPool::new` — say so in its doc comment.
 - `impl Db<ReadOnly>`: `open_readonly()` (now honestly typed).
 - `impl<M> Db<M>`: `user_version()`, `data_version()`, `path()`.
 - The `mutants`-feature `Default` impl becomes `Default for Db<ReadWrite>`.
@@ -121,10 +123,20 @@ writable mount connection but immediately degrades it via
 - `Shared` becomes `Arc<ReentrantMutex<Db<ReadOnly>>>`.
 - The thread-local `PER_PATH` cache holds `Rc<Db<ReadOnly>>` (worker threads
   already open via `open_readonly`).
-- `with` hands out `&Db<ReadOnly>`. Every `&Db` parameter downstream in the
-  serve path (`reader.rs`, `facade.rs`, `mapping.rs`) becomes
-  `&Db<ReadOnly>`, after which the compiler proves the serve path contains
-  no write call.
+- `with` and `with_poll` both hand out `&Db<ReadOnly>` (the poll closures
+  call only read methods — `data_version`, `changelog_since`; the in-memory
+  `Shared` connection serves both roles).
+- Every `&Db` parameter downstream in the serve path (`reader.rs`,
+  `facade.rs`, `mapping.rs`) becomes **generic `&Db<M>`** — not concrete
+  `&Db<ReadOnly>`. Two callers require this: `Musefs::open` calls
+  `build_full(&db, ...)` on the writable connection *before* it moves into
+  the pool (`facade.rs:189`), and the integration tests pass a writable
+  in-memory `Db` directly into `resolve`/`read_at`/the `mapping.rs` fns
+  (e.g. `tests/read_at.rs:37`). Enforcement is fully preserved: write
+  methods exist only on `impl Db<ReadWrite>`, so they do not resolve for an
+  unconstrained `M` — the compiler proves the serve-path *bodies* contain
+  no write call, regardless of which connection they're handed. The live
+  mount instantiates them at `Db<ReadOnly>` via the pool.
 
 **What does not change:** `Db` defaults to `ReadWrite`, so `scan.rs`,
 `musefs-cli`, `Musefs::open(db: Db, ...)`, and every existing test spelling
@@ -139,4 +151,8 @@ The existing suites are the regression net — the split compiling against
 them is itself the verification that no read path lost a method and no
 write path gained one. One addition: a `compile_fail` doctest on
 `Db<ReadOnly>` demonstrating that a write API (e.g. `upsert_track`) does not
-resolve, pinning the guarantee against future backsliding.
+resolve, pinning the guarantee against future backsliding. Because
+`compile_fail` passes on *any* compile error, keep its body minimal and pair
+it with a sibling **passing** doctest that calls a read method (e.g.
+`data_version()`) on the same `Db<ReadOnly>` spelling — the contrast proves
+the failure is specifically the write-method non-resolution, not a typo.
