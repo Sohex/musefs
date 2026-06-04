@@ -2016,6 +2016,36 @@ mod tests {
     }
 
     #[test]
+    fn build_udta_two_arts_round_trips_through_read_pictures() {
+        // materialize_udta zero-fills streamed payloads, so assert order +
+        // mime only (mime derives from the inline type code, which survives).
+        let art = |id: i64, mime: &str, len: u64| ArtInput {
+            art_id: id,
+            mime: mime.into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: len,
+        };
+        let arts = [art(1, "image/jpeg", 5), art(2, "image/png", 9)];
+        let (segs, _) = build_udta(&[TagInput::new("title", "Song")], &[], &arts).unwrap();
+        let prefix = materialize_udta(&segs);
+        let buf = [
+            bx(b"ftyp", b"M4A "),
+            bx(b"moov", &prefix),
+            bx(b"mdat", b"A"),
+        ]
+        .concat();
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert_eq!(pics[0].data.len(), 5);
+        assert_eq!(pics[1].mime, "image/png");
+        assert_eq!(pics[1].data.len(), 9);
+    }
+
+    #[test]
     fn build_udta_udta_size_exactly_u32_max_is_ok() {
         // The guard is `udta_size > u32::MAX` (strict). udta_size == u32::MAX must be
         // accepted; `> -> >=` rejects the exact boundary. data_len is reserved as a
