@@ -416,7 +416,9 @@ fn oggflac_raw_art_serve_increments_art_chunks() {
 /// one positioned read of exactly the file's length.
 #[test]
 fn scan_reads_no_id3v1_tail_for_flac() {
-    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     // Minimal valid FLAC padded to 300 bytes: marker + last STREAMINFO + audio.
     let mut b = b"fLaC".to_vec();
@@ -442,7 +444,9 @@ fn scan_reads_no_id3v1_tail_for_flac() {
 /// #67 inverse: MP3 keeps its tail read (prefix + 128-byte ID3v1 trailer).
 #[test]
 fn scan_still_reads_id3v1_tail_for_mp3() {
-    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use common::corpus::{prepare_format, CorpusParams, Format as CFormat};
     let tmp = tempfile::tempdir().unwrap();
     let params = CorpusParams::single(CFormat::Mp3, 1, 1);
