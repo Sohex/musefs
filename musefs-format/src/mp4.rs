@@ -428,6 +428,8 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
 
 /// Lenient: returns empty / skips any malformed atom and never errors — this only
 /// seeds cover art from existing files, so a missing or garbled picture must simply be absent.
+/// Every `data` child of every `covr` atom yields one picture (the iTunes
+/// multiple-artwork convention); non-`data` children are skipped.
 pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
     let Some((start, len)) = ilst_region(buf) else {
         return Vec::new();
@@ -439,26 +441,28 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
             continue;
         }
         let inner = atom.payload(ilst);
-        let Ok(Some(data)) = find_box(inner, b"data") else {
-            continue;
-        };
-        let dp = data.payload(inner);
-        if dp.len() < 8 {
-            continue;
+        for data in child_boxes(inner).unwrap_or_default() {
+            if &data.kind != b"data" {
+                continue;
+            }
+            let dp = data.payload(inner);
+            if dp.len() < 8 {
+                continue;
+            }
+            let mime = match u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]) {
+                13 => "image/jpeg",
+                14 => "image/png",
+                _ => continue,
+            };
+            out.push(EmbeddedPicture {
+                mime: mime.to_string(),
+                picture_type: 3,
+                description: String::new(),
+                width: 0,
+                height: 0,
+                data: dp[8..].to_vec(),
+            });
         }
-        let mime = match u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]) {
-            13 => "image/jpeg",
-            14 => "image/png",
-            _ => continue,
-        };
-        out.push(EmbeddedPicture {
-            mime: mime.to_string(),
-            picture_type: 3,
-            description: String::new(),
-            width: 0,
-            height: 0,
-            data: dp[8..].to_vec(),
-        });
     }
     out
 }
@@ -1856,6 +1860,46 @@ mod tests {
         // drops it to `_ => continue` and yields no picture.
         let png = [0x89, b'P', b'N', b'G', 1, 2, 3];
         let buf = mp4_with_ilst(&bx(b"covr", &data_atom(14, &png)), false);
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/png");
+        assert_eq!(pics[0].data, png);
+    }
+
+    #[test]
+    fn read_pictures_reads_all_data_atoms_in_one_covr() {
+        // iTunes convention: multiple artworks are multiple `data` children of
+        // one `covr`. An unknown type code skips that child only, not its
+        // siblings.
+        let jpeg = [0xFF, 0xD8, 0xFF, 1];
+        let png = [0x89, b'P', b'N', b'G', 2];
+        let covr = bx(
+            b"covr",
+            &[
+                data_atom(13, &jpeg),
+                data_atom(99, b"skipped"), // unknown type code: this child only
+                data_atom(14, &png),
+            ]
+            .concat(),
+        );
+        let buf = mp4_with_ilst(&covr, true);
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert_eq!(pics[0].data, jpeg);
+        assert_eq!(pics[1].mime, "image/png");
+        assert_eq!(pics[1].data, png);
+    }
+
+    #[test]
+    fn read_pictures_skips_non_data_children_of_covr() {
+        // A non-`data` child inside covr (rare but legal) is silently skipped.
+        let png = [0x89, b'P', b'N', b'G'];
+        let covr = bx(
+            b"covr",
+            &[bx(b"free", b"pad"), data_atom(14, &png)].concat(),
+        );
+        let buf = mp4_with_ilst(&covr, false);
         let pics = read_pictures(&buf);
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].mime, "image/png");
