@@ -364,7 +364,7 @@ timeout 30 cargo test -p musefs-core --lib db_pool::tests::nested_with_on_shared
 echo "exit: $?"
 ```
 
-Expected: `exit: 124` (timeout killed the hung test — this is the bug). Do NOT run the other two the same way; they hang identically (same root cause).
+Expected: `exit: 124` (timeout killed the hung test — this is the deadlock signature). Any other non-zero exit (panic, assert) is NOT the expected failure — investigate before proceeding. Do NOT run the other two tests the same way; they hang identically (same root cause).
 
 - [ ] **Step 3: Commit the tests only if the migration follows immediately**
 
