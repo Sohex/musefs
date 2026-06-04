@@ -23,6 +23,7 @@ def test_public_api_surface():
         "upsert_art",
         "replace_track_art",
         "sniff_mime",
+        "ArtImage",
         "Record",
         "SyncStats",
         "sync_one",

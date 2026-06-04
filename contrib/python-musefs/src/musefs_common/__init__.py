@@ -20,7 +20,7 @@ from .store import (
     track_id_for_path,
     upsert_art,
 )
-from .sync import Record, SyncStats, sync_files, sync_one
+from .sync import ArtImage, Record, SyncStats, sync_files, sync_one
 
 __version__ = "0.1.0"
 
@@ -40,6 +40,7 @@ __all__ = [
     "upsert_art",
     "replace_track_art",
     "sniff_mime",
+    "ArtImage",
     "Record",
     "SyncStats",
     "sync_one",
