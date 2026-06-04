@@ -416,12 +416,17 @@ impl HeaderCache {
     }
 }
 
-/// Read `size` bytes starting at virtual `offset` from a resolved file, opening
-/// the backing file once for this call (only if the layout has a backing/ogg
-/// segment). Prefer `read_at_with_file` when a backing fd is already held.
-pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Result<Vec<u8>> {
+/// Read `size` bytes at virtual `offset` into `out` (appended), opening the
+/// backing file once for this call if the layout needs it.
+pub fn read_at_into(
+    resolved: &ResolvedFile,
+    db: &Db,
+    offset: u64,
+    size: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     if offset >= resolved.total_len || size == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let needs_file = resolved
         .layout
@@ -431,29 +436,37 @@ pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Resu
     if needs_file {
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
-        read_segments(resolved, db, Some(&file), offset, size)
+        read_segments_into(resolved, db, Some(&file), offset, size, out)
     } else {
-        read_segments(resolved, db, None, offset, size)
+        read_segments_into(resolved, db, None, offset, size, out)
     }
+}
+
+/// Allocating form of `read_at_into` (tests and non-hot-path callers).
+pub fn read_at(resolved: &ResolvedFile, db: &Db, offset: u64, size: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    read_at_into(resolved, db, offset, size, &mut out)?;
+    Ok(out)
 }
 
 /// The single segment-splicing loop. `file` is `Some` whenever the layout has a
 /// `BackingAudio`/`OggAudio` segment (guaranteed by `read_at`/`read_at_with_file`);
 /// the backing arms treat `None` as a contract violation.
-fn read_segments(
+fn read_segments_into(
     resolved: &ResolvedFile,
     db: &Db,
     file: Option<&std::fs::File>,
     offset: u64,
     size: u64,
-) -> Result<Vec<u8>> {
+    out: &mut Vec<u8>,
+) -> Result<()> {
     use std::os::unix::fs::FileExt;
 
     if offset >= resolved.total_len || size == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let end = offset.saturating_add(size).min(resolved.total_len);
-    let mut out = Vec::with_capacity((end - offset) as usize);
+    out.reserve((end - offset) as usize);
 
     let mut seg_start = 0u64;
     for seg in &resolved.layout.segments {
@@ -482,14 +495,16 @@ fn read_segments(
                     crate::metrics::on_pread(n as u64);
                 }
                 Segment::ArtImage { art_id, .. } => {
-                    let chunk = db.read_art_chunk(*art_id, within, n)?;
+                    let start = out.len();
+                    out.resize(start + n, 0);
+                    db.read_art_chunk_into(*art_id, within, &mut out[start..])?;
                     crate::metrics::on_art_chunk();
-                    out.extend_from_slice(&chunk);
                 }
                 Segment::BinaryTag { payload_id, .. } => {
-                    let chunk = db.read_binary_tag_chunk(*payload_id, within, n)?;
+                    let start = out.len();
+                    out.resize(start + n, 0);
+                    db.read_binary_tag_chunk_into(*payload_id, within, &mut out[start..])?;
                     crate::metrics::on_binary_tag_chunk();
-                    out.extend_from_slice(&chunk);
                 }
                 Segment::OggAudio {
                     offset: ao,
@@ -504,7 +519,7 @@ fn read_segments(
                         *seq_delta,
                         within,
                         within + n as u64,
-                        &mut out,
+                        &mut *out,
                         Some(&resolved.last_page),
                     )?;
                 }
@@ -526,9 +541,10 @@ fn read_segments(
                         ));
                     } else {
                         // Raw image bytes (OggFLAC PICTURE block).
-                        let chunk = db.read_art_chunk(*art_id, *offset + within, n)?;
+                        let start = out.len();
+                        out.resize(start + n, 0);
+                        db.read_art_chunk_into(*art_id, *offset + within, &mut out[start..])?;
                         crate::metrics::on_art_chunk();
-                        out.extend_from_slice(&chunk);
                     }
                 }
             }
@@ -538,11 +554,22 @@ fn read_segments(
             break;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
-/// Serve a byte range from a resolved file using an already-open backing `file`
-/// (the per-handle read path — no open syscall here).
+/// Serve into `out` from an already-open backing `file` (per-handle path).
+pub fn read_at_with_file_into(
+    resolved: &ResolvedFile,
+    db: &Db,
+    file: &std::fs::File,
+    offset: u64,
+    size: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    read_segments_into(resolved, db, Some(file), offset, size, out)
+}
+
+/// Allocating form of `read_at_with_file_into`.
 pub fn read_at_with_file(
     resolved: &ResolvedFile,
     db: &Db,
@@ -550,7 +577,9 @@ pub fn read_at_with_file(
     offset: u64,
     size: u64,
 ) -> Result<Vec<u8>> {
-    read_segments(resolved, db, Some(file), offset, size)
+    let mut out = Vec::new();
+    read_at_with_file_into(resolved, db, file, offset, size, &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1190,9 +1219,9 @@ mod cache_bound_tests {
     fn read_segments_returns_empty_past_end_of_range() {
         let db = musefs_db::Db::open_in_memory().unwrap();
         let resolved = entry(0, 10);
-        let out = read_segments(&resolved, &db, None, 11, 1).unwrap();
+        let out = read_at(&resolved, &db, 11, 1).unwrap();
         assert!(out.is_empty());
-        let out0 = read_segments(&resolved, &db, None, 0, 0).unwrap();
+        let out0 = read_at(&resolved, &db, 0, 0).unwrap();
         assert!(out0.is_empty());
     }
 
