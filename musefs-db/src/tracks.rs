@@ -8,7 +8,7 @@ const TRACK_COLS: &str = "id, backing_path, format, audio_offset, audio_length, 
 /// Parse a `format` column value, mapping an unknown name to the rusqlite
 /// conversion error every row-mapper needs (single source — three readers).
 fn parse_format_col(fmt: &str) -> rusqlite::Result<Format> {
-    Format::parse(fmt).ok_or_else(|| {
+    fmt.parse::<Format>().ok().ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
             usize::MAX,
             rusqlite::types::Type::Text,
