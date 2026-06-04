@@ -3,13 +3,13 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use musefs_db::Db;
+use musefs_db::{Db, Format};
 
 use crate::db_pool::DbPool;
 use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
 use crate::reader::{read_at, read_at_with_file, HeaderCache, ResolvedFile};
-use crate::refresh_diff::{partition_changes, ChangeSet, TrackRenderState};
+use crate::refresh_diff::{partition_changelog, ChangeSet, TrackRenderState};
 use crate::template::render_path;
 use crate::tree::{InodeAllocator, NodeKind, VirtualTree};
 
@@ -145,9 +145,15 @@ pub struct Musefs {
     snapshot: Mutex<HashMap<i64, TrackRenderState>>,
     force_rebuild_error: AtomicBool,
     force_apply_fail: AtomicBool,
+    /// Polls that took the changelog-gap full-rebuild path (observability for
+    /// tests: incremental vs gap is invisible in the resulting tree).
+    gap_fallbacks: AtomicU64,
     /// Set when a poisoned VFS-state lock is recovered; the next `poll_refresh`
     /// forces a full rebuild from the DB and clears it (#96).
     needs_rebuild: AtomicBool,
+    /// Changelog watermark: the highest `seq` consumed by a successful refresh.
+    /// Drives the O(changed) changelog path in `rebuild_incremental`.
+    last_seq: AtomicI64,
 }
 
 /// Map a `sharded_slab::Slab` insert result to a FUSE file handle. The slab key
@@ -158,11 +164,29 @@ fn fh_from_key(key: Option<usize>) -> Result<u64> {
     key.map(|k| k as u64 + 1).ok_or(CoreError::HandleTableFull)
 }
 
+/// Outcome of a successful changelog-driven incremental refresh: everything
+/// `poll_refresh_notify` needs to notify and stamp without an O(N) pass.
+struct IncrementalOutcome {
+    change: ChangeSet,
+    /// Old states displaced by the in-place mutation (changed ∪ removed ids).
+    displaced: std::collections::HashMap<i64, TrackRenderState>,
+    /// Freshly rendered states (changed ∪ added ids).
+    new_states: std::collections::HashMap<i64, TrackRenderState>,
+    new_seq: i64,
+}
+
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let mut alloc = InodeAllocator::new();
-        let (tree, snapshot) = Self::build_full(&db, &config, &mut alloc)?;
+        // Capture both freshness stamps BEFORE the build: a write landing during
+        // build_full then leaves data_version > stamp (the first poll triggers)
+        // and seq > watermark (the changelog replays it) — at worst one redundant
+        // refresh. Stamping after the build could record the writer's
+        // data_version/seq against a tree that predates it: a permanently missed
+        // update, since the next poll would see both stamps as current.
         let last_data_version = db.data_version()?;
+        let last_seq = db.changelog_since(i64::MAX)?.max_seq;
+        let (tree, snapshot) = Self::build_full(&db, &config, &mut alloc)?;
         let poll_interval = config.poll_interval;
         Ok(Musefs {
             cache: HeaderCache::new(config.mode),
@@ -182,7 +206,9 @@ impl Musefs {
             snapshot: Mutex::new(snapshot),
             force_rebuild_error: AtomicBool::new(false),
             force_apply_fail: AtomicBool::new(false),
+            gap_fallbacks: AtomicU64::new(0),
             needs_rebuild: AtomicBool::new(false),
+            last_seq: AtomicI64::new(last_seq),
         })
     }
 
@@ -290,6 +316,9 @@ impl Musefs {
         // for the next poll (one extra rebuild, never a skipped change), rather than
         // forcing an unconditional rebuild on every subsequent poll.
         let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
+        let new_seq = self
+            .pool
+            .with_poll(|db| Ok(db.changelog_since(i64::MAX)?.max_seq))?;
         let old_tree = self.tree.load_full();
         let old_snapshot =
             crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot").clone();
@@ -306,6 +335,7 @@ impl Musefs {
             on_changed,
         );
         *crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot") = new_snapshot;
+        self.last_seq.store(new_seq, Ordering::Release);
         self.last_data_version.store(version, Ordering::Release);
         self.refresh_gen.fetch_add(1, Ordering::AcqRel);
         self.needs_rebuild.store(false, Ordering::Release);
@@ -313,49 +343,88 @@ impl Musefs {
         Ok(true)
     }
 
-    /// Incremental rebuild (Stage A): scan render keys, diff against the previous
-    /// snapshot, render only changed/added tracks (reusing cached paths otherwise),
-    /// then assemble entries and call the unchanged `build_with`. Returns the new
-    /// snapshot and the `ChangeSet`. The tree is published here. See SP2 Component 2.
-    fn rebuild_incremental(
-        &self,
-        prev_snapshot: &std::collections::HashMap<i64, TrackRenderState>,
-    ) -> Result<(std::collections::HashMap<i64, TrackRenderState>, ChangeSet)> {
+    /// Changelog-driven incremental rebuild (#69): read only the changelog rows past
+    /// `last_seq`, render only changed/added tracks, mutate the snapshot in place,
+    /// and apply the delta to the tree. `Ok(None)` = the ring pruned past our
+    /// watermark (or was externally truncated); the caller falls back to the full
+    /// scan path. The tree is published here on success.
+    fn rebuild_incremental(&self) -> Result<Option<IncrementalOutcome>> {
         if self.force_rebuild_error.load(Ordering::Acquire) {
             return Err(CoreError::BackingChanged(
                 "forced refresh failure".to_string(),
             ));
         }
-        let (new_snapshot, change) = self.pool.with(|db| {
-            let scan = db.list_render_keys()?;
-            let change = partition_changes(prev_snapshot, &scan);
+        let last_seq = self.last_seq.load(Ordering::Acquire);
 
-            let mut to_render: Vec<i64> = change.changed.clone();
-            to_render.extend(change.added.iter().copied());
-            let render_set: std::collections::HashSet<i64> = to_render.iter().copied().collect();
-            let mut tags_by_track = db.tags_for_tracks(&to_render)?;
-
-            let mut new_snapshot = std::collections::HashMap::with_capacity(scan.len());
-            for &(id, cv, fmt) in &scan {
-                let state = if render_set.contains(&id) {
-                    let tags = tags_by_track.remove(&id).unwrap_or_default();
-                    TrackRenderState {
-                        content_version: cv,
-                        format: fmt,
-                        path: Self::render_one(&self.config, fmt, &tags),
-                    }
-                } else {
-                    prev_snapshot[&id].clone()
-                };
-                new_snapshot.insert(id, state);
-            }
-            Ok::<_, CoreError>((new_snapshot, change))
+        // Phase 1 (DB, no VFS locks): changelog + live render keys.
+        let (log, keys) = self.pool.with(|db| {
+            let log = db.changelog_since(last_seq)?;
+            let keys = db.render_keys_for(&log.changed_ids)?;
+            Ok::<_, CoreError>((log, keys))
         })?;
+        // Gap iff changes may have been pruned past the watermark: an emptied ring
+        // while we held a watermark (external truncation), or a retained window
+        // that no longer reaches back to it (min_seq > last_seq + 1; equality is
+        // an adjacent — contiguous — read, not a gap).
+        let gap = if log.max_seq == 0 {
+            last_seq > 0
+        } else {
+            log.min_seq > last_seq + 1
+        };
+        if gap {
+            return Ok(None);
+        }
+        let new_seq = log.max_seq.max(last_seq);
 
-        let new_paths: std::collections::HashMap<i64, String> = new_snapshot
-            .iter()
-            .map(|(&id, s)| (id, s.path.clone()))
-            .collect();
+        // Phase 2 (short snapshot lock): prior states of just the changelog ids.
+        let prev_states: std::collections::HashMap<i64, TrackRenderState> = {
+            let snap = crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot");
+            log.changed_ids
+                .iter()
+                .filter_map(|id| snap.get(id).map(|s| (*id, s.clone())))
+                .collect()
+        };
+        let change = partition_changelog(&prev_states, &log.changed_ids, &keys);
+
+        // Phase 3 (DB, no VFS locks): render changed ∪ added.
+        let mut to_render: Vec<i64> = change.changed.clone();
+        to_render.extend(change.added.iter().copied());
+        let key_of: std::collections::HashMap<i64, (i64, Format)> =
+            keys.iter().map(|&(id, cv, f)| (id, (cv, f))).collect();
+        let new_states: std::collections::HashMap<i64, TrackRenderState> = if to_render.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let mut tags_by_track = self.pool.with(|db| Ok(db.tags_for_tracks(&to_render)?))?;
+            to_render
+                .iter()
+                .map(|&id| {
+                    let (cv, fmt) = key_of[&id];
+                    let tags = tags_by_track.remove(&id).unwrap_or_default();
+                    (
+                        id,
+                        TrackRenderState {
+                            content_version: cv,
+                            format: fmt,
+                            path: Self::render_one(&self.config, fmt, &tags),
+                        },
+                    )
+                })
+                .collect()
+        };
+
+        // Phase 4 (snapshot + inodes locks, pure CPU): mutate in place, apply delta.
+        let mut snap = crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot");
+        let mut displaced = std::collections::HashMap::new();
+        for &id in &change.removed {
+            if let Some(old) = snap.remove(&id) {
+                displaced.insert(id, old);
+            }
+        }
+        for (&id, state) in &new_states {
+            if let Some(old) = snap.insert(id, state.clone()) {
+                displaced.insert(id, old);
+            }
+        }
 
         let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
         let mut tree = (*self.tree.load_full()).clone(); // O(1) im clone
@@ -363,23 +432,21 @@ impl Musefs {
             Err(crate::tree::RebuildError::TestInjected) // test injection
         } else {
             tree.apply_changes(
-                &new_paths,
+                &snap,
                 &change.changed,
                 &change.added,
                 &change.removed,
                 &mut alloc,
             )
         };
-        // Two materially distinct arms (debug-assert vs. full-rebuild fallback), so a
-        // `match` reads clearer than the `if let .. else` clippy would prefer.
         #[allow(clippy::single_match_else)]
         let tree = match applied {
-            Ok(()) => {
+            Ok(_) => {
                 #[cfg(debug_assertions)]
                 {
                     let mut ref_alloc = alloc.clone();
                     let mut entries: Vec<(i64, String)> =
-                        new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
+                        snap.iter().map(|(&id, s)| (id, s.path.clone())).collect();
                     entries.sort_by_key(|(id, _)| *id);
                     let reference = VirtualTree::build_with(&entries, &mut ref_alloc);
                     debug_assert!(
@@ -394,14 +461,20 @@ impl Musefs {
                     "incremental tree mutation failed ({reason:?}); falling back to full rebuild"
                 );
                 let mut entries: Vec<(i64, String)> =
-                    new_paths.iter().map(|(&id, p)| (id, p.clone())).collect();
+                    snap.iter().map(|(&id, s)| (id, s.path.clone())).collect();
                 entries.sort_by_key(|(id, _)| *id);
                 VirtualTree::build_with(&entries, &mut alloc)
             }
         };
         self.tree.store(Arc::new(tree));
         drop(alloc);
-        Ok((new_snapshot, change))
+        drop(snap);
+        Ok(Some(IncrementalOutcome {
+            change,
+            displaced,
+            new_states,
+            new_seq,
+        }))
     }
 
     // Lock order: acquire a DbPool connection (`pool.with`/`with_poll`) FIRST, then
@@ -508,43 +581,77 @@ impl Musefs {
         let _guard = RefreshGuard(&self.refreshing);
 
         let old_tree = self.tree.load_full();
-        let old_snapshot =
-            crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot").clone();
-        let (new_snapshot, change) = match self.rebuild_incremental(&old_snapshot) {
-            Ok(v) => v,
+        match self.rebuild_incremental() {
+            Ok(Some(out)) => {
+                // O(changed) cache maintenance: drop exactly the removed tracks.
+                for &id in &out.change.removed {
+                    self.cache.remove(id);
+                    self.size_cache.remove(&id);
+                }
+                let tree = self.tree.load();
+                Self::notify_changed_delta(
+                    &out.change,
+                    &out.displaced,
+                    &out.new_states,
+                    &old_tree,
+                    &tree,
+                    &mut on_changed,
+                );
+                self.last_seq.store(out.new_seq, Ordering::Release);
+                self.last_data_version.store(version, Ordering::Release);
+                if !out.change.is_empty() {
+                    self.refresh_gen.fetch_add(1, Ordering::AcqRel);
+                }
+                self.stamp_successful_poll();
+                Ok(true)
+            }
+            Ok(None) => {
+                // Ring gap: the mount slept past CHANGELOG_CAP changes (or the ring
+                // was truncated). Take the retained full path — correct by
+                // construction, and a bulk change wants a full rebuild anyway.
+                log::info!("changelog gap; falling back to full refresh");
+                self.gap_fallbacks.fetch_add(1, Ordering::AcqRel);
+                let new_seq = self
+                    .pool
+                    .with(|db| Ok(db.changelog_since(i64::MAX)?.max_seq))?;
+                let old_snapshot =
+                    crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot")
+                        .clone();
+                let new_snapshot = match self.rebuild_full() {
+                    Ok(v) => v,
+                    Err(err) => {
+                        *crate::lock::lock_recover(
+                            &self.last_failed_refresh,
+                            "last_failed_refresh",
+                        ) = Some(std::time::Instant::now());
+                        return Err(err);
+                    }
+                };
+                let tree = self.tree.load();
+                let live = tree.track_ids();
+                self.cache.retain(&live);
+                self.size_cache.retain(|k, _| live.contains(k));
+                Self::notify_changed(
+                    &old_snapshot,
+                    &new_snapshot,
+                    &old_tree,
+                    &tree,
+                    &mut on_changed,
+                );
+                *crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot") =
+                    new_snapshot;
+                self.last_seq.store(new_seq, Ordering::Release);
+                self.last_data_version.store(version, Ordering::Release);
+                self.refresh_gen.fetch_add(1, Ordering::AcqRel);
+                self.stamp_successful_poll();
+                Ok(true)
+            }
             Err(err) => {
                 *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") =
                     Some(std::time::Instant::now());
-                return Err(err);
+                Err(err)
             }
-        };
-        // Load the (newly rebuilt) tree. The Guard is held only across in-memory
-        // cache ops, so no blocking or I/O occurs under the pin.
-        let tree = self.tree.load();
-        let live = tree.track_ids();
-        self.cache.retain(&live);
-        self.size_cache.retain(|k, _| live.contains(k));
-
-        Self::notify_changed(
-            &old_snapshot,
-            &new_snapshot,
-            &old_tree,
-            &tree,
-            &mut on_changed,
-        );
-
-        *crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot") = new_snapshot;
-
-        self.last_data_version.store(version, Ordering::Release);
-        if !change.is_empty() {
-            // A non-empty refresh invalidates every open handle's stamp; the
-            // next read will re-resolve (cheap content_version cache hit for
-            // unchanged tracks).
-            self.refresh_gen.fetch_add(1, Ordering::AcqRel);
         }
-        self.stamp_successful_poll();
-
-        Ok(true)
     }
 
     /// Fire `on_changed` for every inode that must drop kernel cache: a track whose
@@ -581,6 +688,39 @@ impl Musefs {
         }
     }
 
+    /// ChangeSet-driven counterpart of `notify_changed` (#69): same notification
+    /// rules, evaluated only over changed/removed ids. `displaced` holds the old
+    /// states the in-place mutation returned; `new_states` the fresh renders.
+    fn notify_changed_delta(
+        change: &ChangeSet,
+        displaced: &HashMap<i64, TrackRenderState>,
+        new_states: &HashMap<i64, TrackRenderState>,
+        old_tree: &VirtualTree,
+        new_tree: &VirtualTree,
+        on_changed: &mut impl FnMut(u64),
+    ) {
+        for &id in &change.changed {
+            let (Some(os), Some(ns)) = (displaced.get(&id), new_states.get(&id)) else {
+                continue;
+            };
+            if os.content_version != ns.content_version && os.path == ns.path {
+                if let Some(ino) = new_tree.inode_of_track(id) {
+                    on_changed(ino);
+                }
+            }
+            if ns.path != os.path {
+                if let Some(ino) = old_tree.inode_of_track(id) {
+                    on_changed(ino);
+                }
+            }
+        }
+        for &id in &change.removed {
+            if let Some(ino) = displaced.get(&id).and_then(|_| old_tree.inode_of_track(id)) {
+                on_changed(ino);
+            }
+        }
+    }
+
     fn stamp_successful_poll(&self) {
         if !self.poll_interval.is_zero() {
             *crate::lock::lock_recover(&self.last_poll, "last_poll") = std::time::Instant::now();
@@ -596,6 +736,14 @@ impl Musefs {
     #[doc(hidden)]
     pub fn force_apply_failure_for_test(&self, on: bool) {
         self.force_apply_fail.store(on, Ordering::Release);
+    }
+
+    /// How many polls took the changelog-gap full-rebuild path. Test-only
+    /// observability: the gap and incremental paths produce identical trees, so
+    /// only this counter distinguishes them.
+    #[doc(hidden)]
+    pub fn gap_fallbacks_for_test(&self) -> u64 {
+        self.gap_fallbacks.load(Ordering::Acquire)
     }
 
     #[doc(hidden)]

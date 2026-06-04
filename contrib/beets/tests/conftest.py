@@ -10,7 +10,7 @@ SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
 
 @pytest.fixture
 def db_path(tmp_path):
-    """A temp musefs DB with the V2 schema applied."""
+    """A temp musefs DB with the V3 schema applied."""
     path = tmp_path / "musefs.db"
     conn = sqlite3.connect(str(path))
     conn.executescript(SCHEMA_SQL)

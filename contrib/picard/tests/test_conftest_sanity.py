@@ -5,7 +5,7 @@ def test_db_path_has_schema(db_path):
     conn = connect(db_path)
     try:
         # user_version applied from the fixture SQL.
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
     finally:
         conn.close()
 

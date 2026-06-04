@@ -203,21 +203,50 @@ impl VirtualTree {
         if !existing.contains_key(name) {
             return name.to_string();
         }
-        let (stem, ext) = match name.rfind('.') {
-            Some(i) if i > 0 => (&name[..i], Some(&name[i + 1..])),
-            _ => (name, None),
-        };
-        let mut k = 2u32;
-        loop {
-            let candidate = match ext {
-                Some(e) => format!("{stem} ({k}).{e}"),
-                None => format!("{stem} ({k})"),
-            };
+        for k in 2u32.. {
+            let candidate = suffix_candidate(name, k);
             if !existing.contains_key(&candidate) {
                 return candidate;
             }
-            k += 1;
         }
+        unreachable!("an unoccupied candidate rank always exists")
+    }
+
+    /// Cheap rename-relevance gate for the child of `dir` whose current key is
+    /// `name` and pre-disambiguation name is `rendered`: true if perturbing that
+    /// child (removal, or a dir's introducing-id change) could rename any sibling
+    /// in a fresh build. O(log)-probe based on the fresh-build invariant: a
+    /// non-empty collision group always occupies its base key, with no free
+    /// candidate rank below an occupied member. False positives only cost a
+    /// redundant subtree rebuild; false negatives would break equivalence.
+    fn collision_gate(&self, dir: u64, name: &str, rendered: &str) -> bool {
+        // A suffixed member, or a literal name shaped like one (it may be the key
+        // a pushed group member reclaims), is always rename-relevant.
+        if name != rendered || is_suffix_shaped(name) {
+            return true;
+        }
+        let Some(kids) = self.children.get(&dir) else {
+            return false;
+        };
+        // `name == rendered`: this child owns its base key. Rename-relevant iff
+        // some other child (file or dir) shares the rendered name — probe the
+        // generated candidate keys until the first free rank.
+        for k in 2u32.. {
+            let candidate = suffix_candidate(rendered, k);
+            match kids.get(&candidate) {
+                None => return false,
+                Some(c) => {
+                    if self
+                        .nodes
+                        .get(c)
+                        .is_some_and(|n| n.rendered_name == rendered)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        unreachable!("probe terminates at the first free candidate rank")
     }
 
     /// All track ids referenced by file nodes (used to prune stale cache entries).
@@ -289,8 +318,14 @@ impl VirtualTree {
     }
 
     /// Remove the file node for `track_id` and prune now-empty ancestor dirs. Returns
-    /// the inode of the nearest surviving ancestor directory (for dirty bookkeeping).
-    pub fn remove_track(&mut self, track_id: i64, _alloc: &mut InodeAllocator) -> Option<u64> {
+    /// the inode of the nearest surviving ancestor directory plus, when dirs were
+    /// pruned, the `(name, rendered_name)` of the topmost pruned dir (the direct
+    /// child the survivor lost — for collision-gated dirty bookkeeping).
+    pub fn remove_track(
+        &mut self,
+        track_id: i64,
+        _alloc: &mut InodeAllocator,
+    ) -> Option<(u64, Option<(String, String)>)> {
         let ino = self.track_to_inode.remove(&track_id)?;
         let parent = self.nodes.get(&ino)?.parent;
         let name = self.nodes.get(&ino).map(|n| n.name.clone());
@@ -307,10 +342,10 @@ impl VirtualTree {
     /// RENDERED path from `new_paths`. `ensure_dir` reuses ancestors above `dir`, so
     /// only `dir`'s subtree is rebuilt. Errs if a collected track has no entry in
     /// `new_paths` (caller falls back to a full rebuild). See SP2 Component 3.
-    pub fn rebuild_subtree(
+    pub(crate) fn rebuild_subtree(
         &mut self,
         dir: u64,
-        new_paths: &std::collections::HashMap<i64, String>,
+        new_paths: &std::collections::HashMap<i64, crate::refresh_diff::TrackRenderState>,
         alloc: &mut InodeAllocator,
     ) -> std::result::Result<(), RebuildError> {
         let mut ids = Vec::new();
@@ -334,6 +369,7 @@ impl VirtualTree {
         for id in ids {
             let path = new_paths
                 .get(&id)
+                .map(|s| s.path.as_str())
                 .ok_or(RebuildError::MissingRenderedPath(id))?;
             self.insert_file(id, path, alloc);
         }
@@ -342,16 +378,83 @@ impl VirtualTree {
 
     /// Apply an incremental change set in place, producing a tree byte-identical to a
     /// full `build_with` over the same final track set. `new_paths` maps every CURRENT
+    /// Removal-side dirty propagation: walk `leaf` -> root. At each level the
+    /// parent is dirtied only when the child link is rename-relevant
+    /// (`collision_gate`, O(log)) AND the removed `id` was the child's
+    /// introducing id (for the leaf itself `introducing_id` is an O(1) read of
+    /// its own track id; the O(subtree) walk runs only at gated dir levels). A
+    /// gated level where the min did NOT change ends the walk: `id` can't be
+    /// the min of any ancestor either.
+    fn dirty_removed_ancestors(
+        &self,
+        leaf: u64,
+        id: i64,
+        dirty: &mut std::collections::HashSet<u64>,
+    ) {
+        let mut child = leaf;
+        while child != Self::ROOT {
+            let Some((parent, name, rendered)) = self
+                .node(child)
+                .map(|n| (n.parent, n.name.clone(), n.rendered_name.clone()))
+            else {
+                break;
+            };
+            if self.collision_gate(parent, &name, &rendered) {
+                if self.introducing_id(child) == id {
+                    dirty.insert(parent);
+                } else {
+                    break;
+                }
+            }
+            child = parent;
+        }
+    }
+
+    /// Add-side dirty propagation: min-flip walk `d` -> root, collision-gated
+    /// per level. A gated level where the added `id` is not the new min ends
+    /// the walk: ancestor mins only decrease, so no higher flip is possible.
+    fn dirty_min_flip_ancestors(
+        &self,
+        d: u64,
+        id: i64,
+        dirty: &mut std::collections::HashSet<u64>,
+    ) {
+        let mut child = d;
+        while child != Self::ROOT {
+            let Some((parent, name, rendered)) = self
+                .node(child)
+                .map(|n| (n.parent, n.name.clone(), n.rendered_name.clone()))
+            else {
+                break;
+            };
+            if self.collision_gate(parent, &name, &rendered) {
+                if id < self.introducing_id(child) {
+                    dirty.insert(parent);
+                } else {
+                    break;
+                }
+            }
+            child = parent;
+        }
+    }
+
     /// track id to its rendered path. Returns `Err(RebuildError)` on any inconsistency
     /// (caller falls back to full build). See SP2 Component 3.
-    pub fn apply_changes(
+    ///
+    /// Cost is O(changed) when no rendered names collide (#69): a parent dir is
+    /// dirtied — and its subtree rebuilt — only when `collision_gate` says the
+    /// change can actually rename a sibling, and the O(subtree) `introducing_id`
+    /// walks run only at gated levels. Returns the number of `rebuild_subtree`
+    /// calls performed — the tests' observability for the O(changed) contract
+    /// (a needless rebuild produces the same tree, so only the count can pin it).
+    pub(crate) fn apply_changes(
         &mut self,
-        new_paths: &std::collections::HashMap<i64, String>,
+        new_paths: &std::collections::HashMap<i64, crate::refresh_diff::TrackRenderState>,
         changed: &[i64],
         added: &[i64],
         removed: &[i64],
         alloc: &mut InodeAllocator,
-    ) -> std::result::Result<(), RebuildError> {
+    ) -> std::result::Result<usize, RebuildError> {
         use std::collections::HashSet;
         let mut dirty: HashSet<u64> = HashSet::new();
 
@@ -361,9 +464,10 @@ impl VirtualTree {
         for &id in changed {
             let new_path = new_paths
                 .get(&id)
+                .map(|s| s.path.as_str())
                 .ok_or(RebuildError::MissingRenderedPath(id))?;
             match self.inode_of_track(id) {
-                Some(ino) if &self.path_of(ino) == new_path => { /* path stable: nothing */ }
+                Some(ino) if self.path_of(ino) == new_path => { /* path stable: nothing */ }
                 Some(_) => {
                     moved_out.push(id);
                     moved_in.push(id);
@@ -379,43 +483,49 @@ impl VirtualTree {
 
         // (1) Dirty set on the OLD tree, BEFORE mutating.
         for &id in removed.iter().chain(moved_out.iter()) {
-            if let Some(leaf) = self.inode_of_track(id) {
-                if let Some(p) = self.node(leaf).map(|n| n.parent) {
-                    dirty.insert(p);
-                }
-                // propagate up while `id` was the introducing (min) id.
-                let mut child = self.node(leaf).map_or(Self::ROOT, |n| n.parent);
-                while child != Self::ROOT && self.introducing_id(child) == id {
-                    let p = self.node(child).map_or(Self::ROOT, |n| n.parent);
-                    dirty.insert(p);
-                    child = p;
-                }
-            }
+            let Some(leaf) = self.inode_of_track(id) else {
+                continue;
+            };
+            self.dirty_removed_ancestors(leaf, id, &mut dirty);
         }
         for &id in added.iter().chain(moved_in.iter()) {
             let rendered = new_paths
                 .get(&id)
+                .map(|s| s.path.as_str())
                 .ok_or(RebuildError::MissingRenderedPath(id))?;
-            let d = self.deepest_existing_ancestor(rendered);
-            dirty.insert(d);
-            // propagate up while `id` would become the new min.
-            let mut child = d;
-            while child != Self::ROOT && id < self.introducing_id(child) {
-                let p = self.node(child).map_or(Self::ROOT, |n| n.parent);
-                dirty.insert(p);
-                child = p;
+            let comps: Vec<&str> = rendered.split('/').filter(|c| !c.is_empty()).collect();
+            let (d, consumed) = self.deepest_existing_ancestor(rendered);
+            // The first new component is the only insertion into existing
+            // structure; it can shift siblings only if its base key is occupied
+            // (fresh-build invariant: a non-empty group owns its base key).
+            if comps.get(consumed).is_some_and(|c| {
+                self.children
+                    .get(&d)
+                    .is_some_and(|kids| kids.contains_key(*c))
+            }) {
+                dirty.insert(d);
             }
+            self.dirty_min_flip_ancestors(d, id, &mut dirty);
         }
 
-        // (2) Structural mutation. Record surviving parents of pruned dirs as dirty.
+        // (2) Structural mutation. A pruned dir chain is rename-relevant for the
+        // surviving parent only on a rendered-name collision (gated like step 1).
         for &id in removed.iter().chain(moved_out.iter()) {
-            if let Some(surv) = self.remove_track(id, alloc) {
-                dirty.insert(surv);
+            if let Some((surv, Some((name, rendered)))) = self.remove_track(id, alloc) {
+                if self.collision_gate(surv, &name, &rendered) {
+                    dirty.insert(surv);
+                }
             }
         }
-        for &id in added.iter().chain(moved_in.iter()) {
+        // Insert in ascending id order: two pending ids landing on the same fresh
+        // key (no existing collision, so no rebuild repairs it) must rank by id
+        // exactly like a fresh build, not by added-before-moved processing order.
+        let mut to_insert: Vec<i64> = added.iter().chain(moved_in.iter()).copied().collect();
+        to_insert.sort_unstable();
+        for id in to_insert {
             let rendered = new_paths
                 .get(&id)
+                .map(|s| s.path.as_str())
                 .ok_or(RebuildError::MissingRenderedPath(id))?;
             self.insert_file(id, rendered, alloc);
         }
@@ -425,8 +535,16 @@ impl VirtualTree {
             .into_iter()
             .filter(|d| self.node(*d).is_some())
             .collect();
-        live_dirty.sort_by_key(|d| self.path_of(*d).matches('/').count()); // shallow first
+        // Shallow first, by component count: ROOT's path is "" (0 components),
+        // which must sort before single-component dirs ("A", also 0 slashes).
+        live_dirty.sort_by_key(|d| {
+            self.path_of(*d)
+                .split('/')
+                .filter(|c| !c.is_empty())
+                .count()
+        });
         let mut done: HashSet<u64> = HashSet::new();
+        let mut rebuilds = 0usize;
         for d in live_dirty {
             // Re-check: a shallower rebuild_subtree may have pruned this dir.
             if self.node(d).is_none() {
@@ -437,16 +555,20 @@ impl VirtualTree {
                 continue;
             }
             self.rebuild_subtree(d, new_paths, alloc)?;
+            rebuilds += 1;
             done.insert(d);
         }
-        Ok(())
+        Ok(rebuilds)
     }
 
     /// The deepest directory that exists in the current tree along the RENDERED path
-    /// `rendered` (navigating by `rendered_name`). Returns ROOT if none below it exist.
-    fn deepest_existing_ancestor(&self, rendered: &str) -> u64 {
+    /// `rendered` (navigating by `rendered_name`), plus the number of leading path
+    /// components it consumed — `components[consumed]` is the first component that
+    /// would be newly created. Returns (ROOT, 0) if nothing below root exists.
+    fn deepest_existing_ancestor(&self, rendered: &str) -> (u64, usize) {
         let comps: Vec<&str> = rendered.split('/').filter(|c| !c.is_empty()).collect();
         let mut dir = Self::ROOT;
+        let mut consumed = 0;
         // walk dir components only (exclude the final filename component)
         for comp in &comps[..comps.len().saturating_sub(1)] {
             let next = self
@@ -454,11 +576,14 @@ impl VirtualTree {
                 .into_iter()
                 .find(|&c| self.is_dir(c));
             match next {
-                Some(c) => dir = c,
+                Some(c) => {
+                    dir = c;
+                    consumed += 1;
+                }
                 None => break,
             }
         }
-        dir
+        (dir, consumed)
     }
 
     /// True if any inode in `set` is an ancestor of `node` (or equals it).
@@ -479,22 +604,28 @@ impl VirtualTree {
     }
 
     /// Walk up from `dir`, removing empty directories; return the first non-empty
-    /// (surviving) ancestor.
-    fn prune_empty_dirs_upward(&mut self, mut dir: u64) -> u64 {
+    /// (surviving) ancestor and the `(name, rendered_name)` of the last (topmost)
+    /// dir removed, if any.
+    fn prune_empty_dirs_upward(&mut self, mut dir: u64) -> (u64, Option<(String, String)>) {
+        let mut last_pruned = None;
         while dir != Self::ROOT && self.children.get(&dir).is_none_or(OrdMap::is_empty) {
             let Some(node) = self.nodes.get(&dir) else {
                 break;
             };
             let parent = node.parent;
-            let name = self.nodes.get(&dir).map(|n| n.name.clone());
+            let names = self
+                .nodes
+                .get(&dir)
+                .map(|n| (n.name.clone(), n.rendered_name.clone()));
             self.children.remove(&dir);
             self.nodes.remove(&dir);
-            if let (Some(name), Some(kids)) = (name, self.children.get_mut(&parent)) {
-                kids.remove(&name);
+            if let (Some((name, _)), Some(kids)) = (&names, self.children.get_mut(&parent)) {
+                kids.remove(name);
             }
+            last_pruned = names;
             dir = parent;
         }
-        dir
+        (dir, last_pruned)
     }
 }
 
@@ -507,9 +638,52 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+/// Split `name` the way `disambiguate` does: the extension is everything after
+/// the last `.`, unless the dot is the leading character (a dotfile stays whole).
+fn split_suffix_parts(name: &str) -> (&str, Option<&str>) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], Some(&name[i + 1..])),
+        _ => (name, None),
+    }
+}
+
+/// The rank-`k` disambiguated candidate for `name` (k >= 2): ` (k)` appended to
+/// the stem, before any extension. Single source of the suffix format —
+/// `disambiguate` generates with it and `collision_gate` probes with it.
+fn suffix_candidate(name: &str, k: u32) -> String {
+    match split_suffix_parts(name) {
+        (stem, Some(ext)) => format!("{stem} ({k}).{ext}"),
+        (stem, None) => format!("{stem} ({k})"),
+    }
+}
+
+/// True if `name` could be a `suffix_candidate` output. Such a name may be the
+/// key another rendered-name group's member would claim in a fresh build, so
+/// perturbing it must conservatively trigger a parent rebuild.
+fn is_suffix_shaped(name: &str) -> bool {
+    let (stem, _) = split_suffix_parts(name);
+    let Some(open) = stem.rfind(" (") else {
+        return false;
+    };
+    let Some(inner) = stem[open + 2..].strip_suffix(')') else {
+        return false;
+    };
+    inner.parse::<u32>().is_ok_and(|k| k >= 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::refresh_diff::TrackRenderState;
+    use musefs_db::Format;
+
+    fn trs(path: &str) -> TrackRenderState {
+        TrackRenderState {
+            content_version: 0,
+            format: Format::Flac,
+            path: path.into(),
+        }
+    }
 
     #[test]
     fn build_with_keeps_inodes_stable_across_rebuilds() {
@@ -628,9 +802,9 @@ mod tests {
         let surviving = t.remove_track(10, &mut alloc);
         assert!(t.inode_of_track(10).is_none());
         // `A` must survive because `y.flac` still lives under it; remove_track
-        // returns A's inode (nearest surviving ancestor), not ROOT.
+        // returns A's inode (nearest surviving ancestor) and no pruned dir.
         let a = t.lookup(VirtualTree::ROOT, "A").expect("A must survive");
-        assert_eq!(surviving, Some(a));
+        assert_eq!(surviving, Some((a, None)));
         assert!(t.lookup(a, "y.flac").is_some());
     }
 
@@ -662,7 +836,7 @@ mod tests {
         let mut alloc = InodeAllocator::new();
         let mut tree = VirtualTree::build_with(&[(10, "Alice/Song.flac".into())], &mut alloc);
         let dir = tree.lookup(VirtualTree::ROOT, "Alice").unwrap();
-        let new_paths: HashMap<i64, String> = HashMap::new(); // omits track 10
+        let new_paths: HashMap<i64, TrackRenderState> = HashMap::new(); // omits track 10
         let err = tree
             .rebuild_subtree(dir, &new_paths, &mut alloc)
             .unwrap_err();
@@ -680,7 +854,7 @@ mod tests {
         t.remove_track(10, &mut alloc);
         // new_paths after removal: only id 20 remains, rendered "D/song.flac".
         let mut np = std::collections::HashMap::new();
-        np.insert(20, "D/song.flac".to_string());
+        np.insert(20, trs("D/song.flac"));
         t.rebuild_subtree(d, &np, &mut alloc).unwrap();
         let reborn = t.lookup(d, "song.flac").unwrap();
         assert_eq!(t.inode_of_track(20), Some(reborn));
@@ -698,7 +872,8 @@ mod tests {
         let mut alloc = InodeAllocator::new();
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         let p = t.lookup(VirtualTree::ROOT, "P").unwrap();
-        let np: std::collections::HashMap<i64, String> = entries.iter().cloned().collect();
+        let np: std::collections::HashMap<i64, TrackRenderState> =
+            entries.iter().map(|&(id, ref p)| (id, trs(p))).collect();
         t.rebuild_subtree(p, &np, &mut alloc).unwrap();
         assert_eq!(
             paths_of(&t).keys().collect::<Vec<_>>(),
@@ -725,8 +900,10 @@ mod tests {
         let mut new_entries = vec![(9, "X.flac/b.flac".to_string()), (5, "X.flac".to_string())];
         new_entries.sort_by_key(|(id, _)| *id);
         let reference = VirtualTree::build(&new_entries);
-        let new_paths: std::collections::HashMap<i64, String> =
-            new_entries.iter().cloned().collect();
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> = new_entries
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
         t.apply_changes(&new_paths, &[], &[], &[1], &mut alloc)
             .unwrap();
         assert_eq!(
@@ -752,8 +929,10 @@ mod tests {
         ];
         new_entries.sort_by_key(|(id, _)| *id);
         let reference = VirtualTree::build(&new_entries);
-        let new_paths: std::collections::HashMap<i64, String> =
-            new_entries.iter().cloned().collect();
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> = new_entries
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
         t.apply_changes(&new_paths, &[], &[1], &[], &mut alloc)
             .unwrap();
         assert_eq!(
@@ -783,8 +962,10 @@ mod tests {
         ];
         new_entries.sort_by_key(|(id, _)| *id);
         let reference = VirtualTree::build(&new_entries);
-        let new_paths: std::collections::HashMap<i64, String> =
-            new_entries.iter().cloned().collect();
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> = new_entries
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
         t.apply_changes(&new_paths, &[2], &[], &[], &mut alloc)
             .unwrap();
         assert_eq!(
@@ -802,14 +983,186 @@ mod tests {
         let mut alloc = InodeAllocator::new();
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         let reference = VirtualTree::build(&entries);
-        let new_paths: std::collections::HashMap<i64, String> = entries.iter().cloned().collect();
-        t.apply_changes(&new_paths, &[1], &[], &[], &mut alloc)
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> =
+            entries.iter().map(|&(id, ref p)| (id, trs(p))).collect();
+        let rebuilds = t
+            .apply_changes(&new_paths, &[1], &[], &[], &mut alloc)
             .unwrap();
+        assert_eq!(rebuilds, 0, "a stable-path changed id must rebuild nothing");
         assert_eq!(
             paths_of(&t).keys().collect::<Vec<_>>(),
             paths_of(&reference).keys().collect::<Vec<_>>(),
             "unchanged-path changed id must be a no-op"
         );
+    }
+
+    /// Oracle helper for the collision pins below: apply `changed`/`added`/`removed`
+    /// against `before`, then require full `equiv` (inodes included) with a
+    /// `build_with` over `after` on a cloned allocator — the same oracle the
+    /// facade's debug-assert uses — AND that exactly `expected_rebuilds`
+    /// subtree rebuilds ran (the O(changed) contract: a needless rebuild yields
+    /// the same tree, so only the count can pin it).
+    fn assert_apply_matches_build(
+        before: &[(i64, String)],
+        after: &[(i64, String)],
+        changed: &[i64],
+        added: &[i64],
+        removed: &[i64],
+        expected_rebuilds: usize,
+    ) {
+        let mut alloc = InodeAllocator::new();
+        let mut t = VirtualTree::build_with(before, &mut alloc);
+        let mut after_sorted = after.to_vec();
+        after_sorted.sort_by_key(|(id, _)| *id);
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> = after_sorted
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
+        let rebuilds = t
+            .apply_changes(&new_paths, changed, added, removed, &mut alloc)
+            .unwrap();
+        assert_eq!(rebuilds, expected_rebuilds, "subtree rebuild count");
+        let mut ref_alloc = alloc.clone();
+        let reference = VirtualTree::build_with(&after_sorted, &mut ref_alloc);
+        assert!(
+            t.equiv(&reference),
+            "incremental tree diverged from build_with\n  applied: {:?}\n  reference: {:?}",
+            paths_of(&t).keys().collect::<Vec<_>>(),
+            paths_of(&reference).keys().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn apply_changes_remove_base_of_collision_group_renames_survivor() {
+        // ids 1,2 both render "A/t.flac": 1 -> "t.flac", 2 -> "t (2).flac".
+        // Removing 1 must give 2 the base name back.
+        let before = vec![(1, "A/t.flac".to_string()), (2, "A/t.flac".to_string())];
+        let after = vec![(2, "A/t.flac".to_string())];
+        assert_apply_matches_build(&before, &after, &[], &[], &[1], 1);
+    }
+
+    #[test]
+    fn apply_changes_remove_literal_suffix_name_frees_key_for_pushed_member() {
+        // id 2's RENDERED name is literally "t (2).flac" (its name equals its
+        // rendered name), which pushed group-"t.flac" member id 3 to "t (3).flac".
+        // Removing 2 frees the key: a fresh build puts 3 at "t (2).flac".
+        let before = vec![
+            (1, "A/t.flac".to_string()),
+            (2, "A/t (2).flac".to_string()),
+            (3, "A/t.flac".to_string()),
+        ];
+        let after = vec![(1, "A/t.flac".to_string()), (3, "A/t.flac".to_string())];
+        assert_apply_matches_build(&before, &after, &[], &[], &[2], 1);
+    }
+
+    #[test]
+    fn apply_changes_add_smaller_id_into_collision_group_shifts_member() {
+        // id 5 holds base "t.flac"; adding id 2 with the same rendered name must
+        // re-rank the group: 2 -> "t.flac", 5 -> "t (2).flac".
+        let before = vec![(5, "A/t.flac".to_string())];
+        let after = vec![(2, "A/t.flac".to_string()), (5, "A/t.flac".to_string())];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
+    }
+
+    #[test]
+    fn apply_changes_dir_reclaims_base_name_when_colliding_file_removed() {
+        // File id 1 rendered "X" owns the base; the dir for id 2's "X/a.flac" was
+        // disambiguated to "X (2)". Removing the file must rename the dir to "X".
+        let before = vec![(1, "X".to_string()), (2, "X/a.flac".to_string())];
+        let after = vec![(2, "X/a.flac".to_string())];
+        assert_apply_matches_build(&before, &after, &[], &[], &[1], 1);
+    }
+
+    #[test]
+    fn apply_changes_remove_min_id_without_collisions_matches_build() {
+        // The removed id is the introducing id of its whole ancestor chain but no
+        // rendered names collide: equivalence must hold with no sibling churn.
+        let before = vec![
+            (1, "A/B/t1.flac".to_string()),
+            (2, "A/B/t2.flac".to_string()),
+            (3, "C/u.flac".to_string()),
+        ];
+        let after = vec![(2, "A/B/t2.flac".to_string()), (3, "C/u.flac".to_string())];
+        assert_apply_matches_build(&before, &after, &[], &[], &[1], 0);
+    }
+
+    #[test]
+    fn apply_changes_add_new_top_level_dir_with_min_id_matches_build() {
+        // The added id is smaller than every existing id (a root-wide min flip)
+        // and lands under a brand-new top-level dir with no collisions.
+        let before = vec![(5, "A/t1.flac".to_string()), (6, "A/t2.flac".to_string())];
+        let after = vec![
+            (1, "B/u.flac".to_string()),
+            (5, "A/t1.flac".to_string()),
+            (6, "A/t2.flac".to_string()),
+        ];
+        assert_apply_matches_build(&before, &after, &[], &[1], &[], 0);
+    }
+
+    #[test]
+    fn apply_changes_moved_and_added_ids_colliding_on_fresh_key_rank_by_id() {
+        // id 3 (moved) and id 7 (added) both land on the brand-new key "B/t.flac".
+        // Neither collides with an EXISTING child, so no rebuild is triggered; the
+        // insertions themselves must still rank by id (3 -> base, 7 -> " (2)"),
+        // not by added-before-moved processing order.
+        let before = vec![
+            (3, "A/old.flac".to_string()),
+            (5, "A/keep.flac".to_string()),
+        ];
+        let after = vec![
+            (3, "B/t.flac".to_string()),
+            (5, "A/keep.flac".to_string()),
+            (7, "B/t.flac".to_string()),
+        ];
+        assert_apply_matches_build(&before, &after, &[3], &[7], &[], 0);
+    }
+
+    #[test]
+    fn apply_changes_same_dir_move_with_colliding_dir_rebuilds_root_once() {
+        // Dir "D" (introduced by id 1) collides with file id 2 rendered "D", and
+        // id 1 moves WITHIN D. The removal-side walk conservatively dirties ROOT
+        // (it can't know the track lands back inside D), but exactly once — the
+        // add-side equality (id == D's introducing id) must not double anything.
+        let before = vec![
+            (1, "D/x.flac".to_string()),
+            (2, "D".to_string()),
+            (3, "D/z.flac".to_string()),
+        ];
+        let after = vec![
+            (1, "D/y.flac".to_string()),
+            (2, "D".to_string()),
+            (3, "D/z.flac".to_string()),
+        ];
+        assert_apply_matches_build(&before, &after, &[1], &[], &[], 1);
+    }
+
+    #[test]
+    fn apply_changes_added_min_id_under_colliding_dir_rebuilds_parent() {
+        // File id 2 rendered "D" owns the base key; the dir for id 5's
+        // "D/x.flac" was disambiguated to "D (2)". Adding id 1 under the dir
+        // flips its introducing id below the file's — a fresh build now gives
+        // the DIR the base name. The add-side min-flip walk must catch this.
+        let before = vec![(2, "D".to_string()), (5, "D/x.flac".to_string())];
+        let after = vec![
+            (1, "D/y.flac".to_string()),
+            (2, "D".to_string()),
+            (5, "D/x.flac".to_string()),
+        ];
+        assert_apply_matches_build(&before, &after, &[], &[1], &[], 1);
+    }
+
+    #[test]
+    fn apply_changes_rebuilds_topmost_dirty_dir_only() {
+        // Two collision-gated removals dirty ROOT and "A". Shallow-first
+        // reduction must rebuild ROOT once and skip "A" as covered.
+        let before = vec![
+            (1, "t.flac".to_string()),
+            (2, "t.flac".to_string()),
+            (10, "A/u.flac".to_string()),
+            (11, "A/u.flac".to_string()),
+        ];
+        let after = vec![(2, "t.flac".to_string()), (11, "A/u.flac".to_string())];
+        assert_apply_matches_build(&before, &after, &[], &[], &[1, 10], 1);
     }
 
     #[test]
@@ -830,7 +1183,10 @@ mod tests {
         t.remove_track(2, &mut alloc);
         let new_entries = vec![(3, "P/keep.flac".to_string())];
         let reference = VirtualTree::build(&new_entries);
-        let np: std::collections::HashMap<i64, String> = new_entries.into_iter().collect();
+        let np: std::collections::HashMap<i64, TrackRenderState> = new_entries
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
         t.rebuild_subtree(p, &np, &mut alloc).unwrap();
         let p2 = t.lookup(VirtualTree::ROOT, "P").unwrap();
         assert!(
@@ -874,12 +1230,16 @@ mod tests {
         let t = VirtualTree::build(&[(10, "A/B/x.flac".into())]);
         let a = t.lookup(VirtualTree::ROOT, "A").unwrap();
         let b = t.lookup(a, "B").unwrap();
-        // Both A and B exist: the deepest existing dir for a file under A/B is B.
-        assert_eq!(t.deepest_existing_ancestor("A/B/new.flac"), b);
-        // A exists but Q does not: the walk stops at A.
-        assert_eq!(t.deepest_existing_ancestor("A/Q/new.flac"), a);
+        // Both A and B exist: the deepest existing dir for a file under A/B is B,
+        // having consumed both dir components.
+        assert_eq!(t.deepest_existing_ancestor("A/B/new.flac"), (b, 2));
+        // A exists but Q does not: the walk stops at A after one component.
+        assert_eq!(t.deepest_existing_ancestor("A/Q/new.flac"), (a, 1));
         // Nothing below root exists along this path.
-        assert_eq!(t.deepest_existing_ancestor("Z/new.flac"), VirtualTree::ROOT);
+        assert_eq!(
+            t.deepest_existing_ancestor("Z/new.flac"),
+            (VirtualTree::ROOT, 0)
+        );
     }
 
     #[test]

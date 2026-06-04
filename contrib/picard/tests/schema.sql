@@ -90,3 +90,31 @@ CREATE TABLE structural_blocks (
 );
 
 PRAGMA user_version = 2;
+
+-- ── MIGRATION_V3 ──
+-- Bounded changelog ring for O(changed) refresh. Every metadata edit funnels
+-- through an UPDATE on the tracks row (the V1 tags/track_art triggers), so
+-- triggers on tracks alone capture all writers. Relies on SQLite nested
+-- trigger activation (on by default; distinct from PRAGMA recursive_triggers).
+CREATE TABLE track_changes (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL
+);
+
+CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (OLD.id);
+END;
+
+-- Self-pruning ring: writers maintain it; the mount's read-only connections
+-- never need to. Deletes only from the old end, so retained seqs stay contiguous.
+CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
+    DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
+END;
+
+PRAGMA user_version = 3;

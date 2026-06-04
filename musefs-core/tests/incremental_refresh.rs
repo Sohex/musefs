@@ -168,6 +168,151 @@ fn apply_failure_falls_back_to_full_rebuild() {
     );
 }
 
+#[test]
+fn changelog_gap_falls_back_to_full_rebuild() {
+    let target = small_corpus(4);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+    writer
+        .replace_tags(ids[0], &[Tag::new("TITLE", "moved-by-gap", 0)])
+        .unwrap();
+    // Simulate the ring having pruned past the mount's watermark: drop every
+    // retained row. The next poll must detect the gap and full-rebuild.
+    let max_seq = writer.changelog_since(0).unwrap().max_seq;
+    writer.delete_changelog_through_for_test(max_seq).unwrap();
+
+    assert!(fs.poll_refresh().unwrap());
+    assert_eq!(
+        fs.gap_fallbacks_for_test(),
+        1,
+        "a fully truncated ring must be detected as a gap"
+    );
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>(),
+        "gap fallback must produce a tree identical to a fresh open"
+    );
+}
+
+#[test]
+fn removed_track_is_pruned_and_refresh_recovers_after_gap() {
+    // After a gap-driven full rebuild, subsequent incremental refreshes still
+    // work: the watermark re-anchors to the ring and deletes propagate.
+    let target = small_corpus(4);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    let max_seq = writer.changelog_since(0).unwrap().max_seq;
+    writer.delete_changelog_through_for_test(max_seq).unwrap();
+    writer.delete_track(ids[0]).unwrap();
+    assert!(fs.poll_refresh().unwrap());
+    // Truncation-then-edit leaves min_seq == last_seq + 1: contiguous, NOT a
+    // gap. Both polls must stay on the incremental path (and the second one
+    // starts from a retained, mutated-in-place snapshot).
+    assert_eq!(
+        fs.gap_fallbacks_for_test(),
+        0,
+        "an adjacent (min_seq == last_seq + 1) ring read is not a gap"
+    );
+
+    writer.delete_track(ids[1]).unwrap();
+    assert!(fs.poll_refresh().unwrap());
+    assert_eq!(fs.gap_fallbacks_for_test(), 0);
+
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn pruned_ring_prefix_is_a_gap_and_full_rebuild_recovers_lost_change() {
+    // A TRUE prune gap: the ring still holds rows, but its window starts past
+    // the watermark + 1. The pruned prefix held a real change; only the gap
+    // path (full rebuild) can recover it.
+    let target = small_corpus(4);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    let last_seq = writer.changelog_since(0).unwrap().max_seq; // == fs watermark
+    writer
+        .replace_tags(ids[0], &[Tag::new("TITLE", "lost-in-pruned-prefix", 0)])
+        .unwrap();
+    let x_rows = writer.changelog_since(last_seq).unwrap().max_seq;
+    writer
+        .replace_tags(ids[1], &[Tag::new("TITLE", "still-in-ring", 0)])
+        .unwrap();
+    // Prune exactly X's rows: the ring now starts at last_seq + (x_rows-last_seq) + 1
+    // > last_seq + 1, and X's change is no longer derivable from it.
+    writer.delete_changelog_through_for_test(x_rows).unwrap();
+
+    assert!(fs.poll_refresh().unwrap());
+    assert_eq!(
+        fs.gap_fallbacks_for_test(),
+        1,
+        "a pruned-prefix ring (min_seq > last_seq + 1) must be detected as a gap"
+    );
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).into_keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).into_keys().collect::<Vec<_>>(),
+        "the gap rebuild must recover the change lost from the pruned prefix"
+    );
+}
+
+#[test]
+fn empty_ring_with_zero_watermark_polls_incremental() {
+    // A data_version bump with no changelog rows and no watermark (the ring was
+    // empty at open) is NOT a gap: nothing can have been missed.
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let pre = Db::open(&db_path).unwrap();
+    let max_seq = pre.changelog_since(0).unwrap().max_seq;
+    pre.delete_changelog_through_for_test(max_seq).unwrap();
+
+    // Opened on an empty ring: watermark 0.
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config()).unwrap();
+    // An orphan art insert bumps data_version without touching `tracks`, so the
+    // ring stays empty.
+    let writer = Db::open(&db_path).unwrap();
+    writer
+        .upsert_art(&musefs_db::NewArt {
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            data: vec![0u8; 8],
+        })
+        .unwrap();
+
+    assert!(fs.poll_refresh().unwrap());
+    assert_eq!(
+        fs.gap_fallbacks_for_test(),
+        0,
+        "empty ring + zero watermark must stay on the incremental path"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]

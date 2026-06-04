@@ -189,8 +189,10 @@ parallel. Most of the Rust items came out of the v1 multi-model review triage.
 
 **Phase 6 — Performance optimization SPs** *(bench-tracked: before/after in
 `BENCHMARKS.md` + the tracking README)*
-- #69 — refresh O(library)→O(changed); adjacent to #90 (same facade rebuild path),
-  do right after it. Biggest latency win.
+- ~~#69 — refresh O(library)→O(changed)~~ — done: trigger-maintained
+  `track_changes` changelog ring (MIGRATION_V3) + in-place snapshot mutation +
+  collision-gated `apply_changes` dirtying; refresh-1 flat at 0–1 ms across
+  100..20000 tracks (was ~160 ms linear). See BENCHMARKS.md "Phase 6 PR 1".
 - #67 — bounded probe reads an ID3v1 tail per file (scan perf).
 - #68 — `ingest_bulk` copies each picture's bytes (scan perf).
 - #70 — zero-copy serve path (deferred SP3 residual; largest scope).

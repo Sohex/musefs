@@ -135,3 +135,59 @@ fn upsert_conflict_updates_all_mutable_columns() {
     assert_eq!(t.backing_size, 444);
     assert_eq!(t.backing_mtime, 555);
 }
+
+#[test]
+fn changelog_since_returns_distinct_ids_and_seq_bounds() {
+    let db = Db::open_in_memory().unwrap();
+    let id1 = db.upsert_track(&new_track("/a.flac")).unwrap();
+    let id2 = db.upsert_track(&new_track("/b.flac")).unwrap();
+    db.replace_tags(id1, &[Tag::new("ARTIST", "X", 0)]).unwrap();
+    db.replace_tags(id1, &[Tag::new("ARTIST", "Y", 0)]).unwrap();
+
+    let log = db.changelog_since(0).unwrap();
+    // Duplicates collapse: id1 appears once despite multiple changelog rows.
+    assert_eq!(log.changed_ids, vec![id1, id2]);
+    assert!(log.max_seq >= 2);
+    assert_eq!(log.min_seq, 1);
+
+    // A watermark past everything returns no ids but the same bounds.
+    let later = db.changelog_since(log.max_seq).unwrap();
+    assert!(later.changed_ids.is_empty());
+    assert_eq!(later.max_seq, log.max_seq);
+}
+
+#[test]
+fn changelog_since_empty_table_reports_zero_bounds() {
+    let db = Db::open_in_memory().unwrap();
+    let log = db.changelog_since(0).unwrap();
+    assert!(log.changed_ids.is_empty());
+    assert_eq!((log.min_seq, log.max_seq), (0, 0));
+}
+
+#[test]
+fn render_keys_for_returns_only_requested_existing_ids() {
+    let db = Db::open_in_memory().unwrap();
+    let id1 = db.upsert_track(&new_track("/a.flac")).unwrap();
+    let _id2 = db.upsert_track(&new_track("/b.flac")).unwrap();
+    let keys = db.render_keys_for(&[id1, 999_999]).unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].0, id1);
+}
+
+#[test]
+fn delete_changelog_through_for_test_prunes_the_prefix() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.upsert_track(&new_track("/a.flac")).unwrap();
+    db.replace_tags(id, &[Tag::new("ARTIST", "X", 0)]).unwrap();
+    let log = db.changelog_since(0).unwrap();
+    assert!(log.max_seq >= 2);
+
+    db.delete_changelog_through_for_test(log.max_seq - 1)
+        .unwrap();
+    let after = db.changelog_since(0).unwrap();
+    assert_eq!(
+        (after.min_seq, after.max_seq),
+        (log.max_seq, log.max_seq),
+        "rows through max_seq - 1 must actually be deleted"
+    );
+}

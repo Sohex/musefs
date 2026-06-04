@@ -5,15 +5,21 @@ use rusqlite::{params, Row};
 const TRACK_COLS: &str = "id, backing_path, format, audio_offset, audio_length, \
                           backing_size, backing_mtime, content_version, updated_at";
 
-fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
-    let fmt: String = r.get("format")?;
-    let format = Format::parse(&fmt).ok_or_else(|| {
+/// Parse a `format` column value, mapping an unknown name to the rusqlite
+/// conversion error every row-mapper needs (single source — three readers).
+fn parse_format_col(fmt: &str) -> rusqlite::Result<Format> {
+    Format::parse(fmt).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
             usize::MAX,
             rusqlite::types::Type::Text,
             format!("unknown format {fmt}").into(),
         )
-    })?;
+    })
+}
+
+fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
+    let fmt: String = r.get("format")?;
+    let format = parse_format_col(&fmt)?;
     Ok(Track {
         id: r.get("id")?,
         backing_path: r.get("backing_path")?,
@@ -25,6 +31,16 @@ fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
         content_version: r.get("content_version")?,
         updated_at: r.get("updated_at")?,
     })
+}
+
+/// One read of the changelog ring past `last_seq`: the distinct changed track
+/// ids (ascending) plus the table's retained seq bounds (0/0 when empty). The
+/// caller derives gap detection from `min_seq` (see musefs-core's refresh).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ChangelogRead {
+    pub changed_ids: Vec<i64>,
+    pub min_seq: i64,
+    pub max_seq: i64,
 }
 
 impl Db {
@@ -135,16 +151,80 @@ impl Db {
             .prepare("SELECT id, content_version, format FROM tracks ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
             let fmt: String = r.get(2)?;
-            let format = Format::parse(&fmt).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    usize::MAX,
-                    rusqlite::types::Type::Text,
-                    format!("unknown format {fmt}").into(),
-                )
-            })?;
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, format))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                parse_format_col(&fmt)?,
+            ))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// One read of the changelog ring past `last_seq`: the distinct changed track
+    /// ids (ascending) plus the table's retained seq bounds (0/0 when empty). The
+    /// caller derives gap detection from `min_seq` (see musefs-core's refresh).
+    pub fn changelog_since(&self, last_seq: i64) -> Result<ChangelogRead> {
+        // One deferred read transaction pins a single WAL snapshot for both
+        // queries: under separate implicit snapshots a concurrent write burst
+        // (with track_changes_prune trimming the old end) could pair fresh ids
+        // with stale bounds — masking a prune gap while advancing the watermark.
+        let tx = self.conn.unchecked_transaction()?;
+        let (min_seq, max_seq): (i64, i64) = tx.query_row(
+            "SELECT COALESCE(MIN(seq),0), COALESCE(MAX(seq),0) FROM track_changes",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let changed_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT track_id FROM track_changes WHERE seq > ?1 ORDER BY track_id",
+            )?;
+            let ids = stmt
+                .query_map([last_seq], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<i64>>>()?;
+            ids
+        };
+        tx.commit()?;
+        Ok(ChangelogRead {
+            changed_ids,
+            min_seq,
+            max_seq,
+        })
+    }
+
+    /// Render keys for a specific id set (the changelog ids); ids no longer in
+    /// `tracks` are simply absent from the result. Chunked like `tags_for_tracks`.
+    pub fn render_keys_for(&self, ids: &[i64]) -> Result<Vec<(i64, i64, Format)>> {
+        const CHUNK: usize = 900;
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT id, content_version, format FROM tracks \
+                 WHERE id IN ({placeholders}) ORDER BY id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(chunk.iter());
+            let rows = stmt.query_map(params, |r| {
+                let fmt: String = r.get(2)?;
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    parse_format_col(&fmt)?,
+                ))
+            })?;
+            out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        Ok(out)
+    }
+
+    /// Test-only: delete changelog rows up to and including `seq`, simulating the
+    /// ring having pruned past a sleeping mount (gap-path coverage). Follows the
+    /// `set_format_for_test` precedent.
+    #[doc(hidden)]
+    pub fn delete_changelog_through_for_test(&self, seq: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM track_changes WHERE seq <= ?1", [seq])?;
+        Ok(())
     }
 }
 
