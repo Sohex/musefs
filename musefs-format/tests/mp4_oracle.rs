@@ -107,6 +107,6 @@ fn m4a_synthesis_uses_only_first_cover_art() {
         layout_no_art, layout_single,
         "first art input must alter the layout"
     );
-    // Both layouts must be identical — the second art input is ignored.
-    assert_eq!(layout_single, layout_both);
+    // Both layouts differ — the second art is now included (one covr, two data atoms).
+    assert_ne!(layout_single, layout_both);
 }
