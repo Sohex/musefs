@@ -357,21 +357,45 @@ cargo test -p musefs-fuse -- --ignored
 
 Expected: PASS (PCM-sha byte-identical gate).
 
-- [ ] **Step 3: In-diff mutation gate (CI parity)**
+- [ ] **Step 3: Re-anchor the scan.rs mutants.toml exclusions (PR 1 learning)**
+
+`.cargo/mutants.toml` suppresses ~11 proven-equivalent scan.rs mutants by
+**file:line:col** (probe_file widen loop 225:31/232:30, run_pipeline
+sync_channel 493:46, flush cadence 573:29–585:70). The Task 2 edit inserts
+lines *above* 225 and the Task 3 rewrite changes ingest_bulk's length *above*
+573 — every shifted anchor silently stops matching and its known-equivalent
+mutant resurfaces as MISSED in the gate. After Tasks 2–3 are committed,
+re-derive each anchor's new line:col (the per-class justification comments
+identify the sites) and commit the mutants.toml update before running the
+gate. Do NOT blanket-convert these to description anchors: the file's header
+comment notes killable siblings share the same descriptions (e.g. other
+`+`->`*` sites in scan.rs); keep line:col here, description-anchoring only
+where the description is unique (see the PR 1 tree.rs/facade.rs entries for
+the pattern).
+
+- [ ] **Step 4: In-diff mutation gate (CI parity)**
 
 ```bash
 cd /home/cfutro/git/musefs
 git diff "$(git merge-base main HEAD)...HEAD" -- '*.rs' > mutants.diff
 grep -c '^diff --git ' mutants.diff && grep -c '^@@ ' mutants.diff   # sanity: non-empty
-TMPDIR=/home/cfutro/.cache/mutants-tmp cargo mutants --in-diff mutants.diff -j4 \
+TMPDIR=/home/cfutro/.cache/mutants-tmp cargo mutants --in-diff mutants.diff -j$(nproc) \
   --exclude 'musefs-latencyfs/**' --output mutants-out/in-diff
 cat mutants-out/in-diff/mutants.out/missed.txt
 rm -rf /home/cfutro/.cache/mutants-tmp mutants-out mutants.diff
 ```
 
-Expected: 0 missed. The likely survivor class is the `has_ext(path, "mp3")` gate (`== → !=` style); the two Task 2 counter tests are its killers — if one survives anyway, pin the exact byte count in the test.
+Expected: 0 missed AND 0 timeouts — CI's gate fails on either (PR 1 learning:
+a mutation that turns a bounded loop into a spin shows up as TIMEOUT, exit
+code 3; probe_file's widen-retry loop is in this diff's blast radius, so a new
+hang-class mutant gets a justified mutants.toml exclusion per the SP3/PR 1
+precedent, not a test). The likely survivor class is the `has_ext(path,
+"mp3")` gate (`== → !=` style); the two Task 2 counter tests are its killers —
+if one survives anyway, pin the exact byte count in the test. Note the gate
+runs the **mutated crate's own** test suite: scan.rs mutants need musefs-core
+tests (true here; PR 1 was bitten by this with a musefs-db mutant).
 
-- [ ] **Step 4: Push and open the PR**
+- [ ] **Step 5: Push and open the PR**
 
 ```bash
 git push -u origin phase6-pr2-scan-pair
