@@ -389,3 +389,64 @@ cargo test -p musefs-core --release --test bench_refresh \
 cargo test -p musefs-core --release --test bench_refresh \
   bench_refresh_one_vs_many -- --ignored --nocapture
 ```
+
+---
+
+## Phase 6 PR 2 — Scan pair (#67, #68)
+
+*Measured 2026-06-04 (same box, lightly loaded · tempfs · `ci` tier).*
+
+Two stacked scan-path optimizations, neither touching served bytes:
+
+1. **#67 — Lazy ID3v1 tail.** The bounded probe path issued a 128-byte
+   `read_exact` at the file tail for *every* front-anchored file, but only MP3
+   consumes the ID3v1 frame. Gating the tail read to `.mp3` files drops one
+   `read_exact` per non-MP3 file, saving exactly 128 bytes of scan I/O each.
+2. **#68 — Move-not-clone ingest.** `ingest_bulk` previously cloned each
+   picture's bytes (`Vec::clone`) because the batch held `&Probed` borrows.
+   The owned `Unit` variant now drains into the writer via `std::mem::take`,
+   moving the payload instead of copying it.
+
+- **Before** = `main` @ `e7ae912` (post-#69): reads ID3v1 tail for all formats; clones picture bytes.
+- **After** = `phase6-pr2-scan-pair` @ `9b49a63`: tail gated to `.mp3`; picture bytes moved.
+- Harness: `cargo test -p musefs-core --release --features metrics --test bench_ingest -- --ignored --nocapture bench_cold_scan_and_revalidate`. Three independent runs; `bytes_read` = `scan_bytes_read`.
+
+### Scan — `ci` tier (200 tracks × 4 KiB, no embedded art), tempfs
+
+| format    | before wall (ms, 3 runs) | after wall (ms, 3 runs) | before bytes_read | after bytes_read | Δ bytes/file |
+|-----------|-------------------------:|------------------------:|------------------:|-----------------:|-------------:|
+| flac      | 32 / 30 / 34            | 30 / 29 / 28           | 870 600           | 845 000          | **−128 B**   |
+| mp3       | 21 / 21 / 20            | 23 / 23 / 22           | 847 200           | 847 200          | 0 (tail still read) |
+| m4a       | 27 / 29 / 24            | 25 / 28 / 28           | 0                 | 0                | n/a          |
+| m4a-last  | 28 / 27 / 25            | 28 / 34 / 25           | 0                 | 0                | n/a          |
+| ogg       | 20 / 22 / 22            | 23 / 22 / 20           | 873 000           | 847 400          | **−128 B**   |
+| wav       | 24 / 23 / 20            | 23 / 22 / 23           | 853 600           | 828 000          | **−128 B**   |
+
+**#67 signal:** Non-MP3 formats (flac, ogg, wav) show exactly −128 bytes/file in
+`bytes_read` — the 128-byte ID3v1 tail read is no longer issued for those formats.
+MP3 is unchanged (it still consumes the tail). M4A is 0 in both directions (it
+uses a seek-reader, not the front-anchored probe path).
+
+**#68 signal:** Structural (move vs clone) — wall times are within run-to-run noise
+on the `ci` tier because the 4 KiB test files have no embedded art, so there is no
+picture payload to move. The win appears on art-bearing corpora (the `bandwidth`
+tier from SP1 §2 or real libraries) where the clone was O(art-size) per file.
+
+**Wall time:** held or improved across all formats; no >10% rise.
+
+`opens`/`preads` stay at 0 on the scan path (they are serve-path counters),
+matching the documented expectation.
+
+```bash
+# Before (main):
+git checkout main
+MUSEFS_BENCH_TIER=ci \
+  cargo test -p musefs-core --release --features metrics --test bench_ingest \
+  -- --ignored --nocapture bench_cold_scan_and_revalidate
+
+# After (branch):
+git checkout phase6-pr2-scan-pair
+MUSEFS_BENCH_TIER=ci \
+  cargo test -p musefs-core --release --features metrics --test bench_ingest \
+  -- --ignored --nocapture bench_cold_scan_and_revalidate
+```
