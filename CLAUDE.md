@@ -29,8 +29,8 @@ cargo fmt                                # format
 # set TMPDIR (the default is correct). Sanity-check mutants.diff is non-empty
 # first — an empty diff mutates nothing and exits 0, a silent false pass.
 git diff "$(git merge-base main HEAD)...HEAD" -- '*.rs' > mutants.diff
+grep -q '^@@ ' mutants.diff
 cargo mutants --in-diff mutants.diff -j2 --exclude 'musefs-latencyfs/**' --output /tmp/mutants-out/in-diff
-
 # Property tests (proptest): byte-identical invariant + tag round-trip. The
 # format-layer proptests need the `fuzzing` feature; `cargo test --workspace`
 # also runs them via feature unification.
