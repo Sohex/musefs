@@ -1,6 +1,7 @@
 import pytest
 
 pytest.importorskip("picard")
+pytest.importorskip("pytestqt")  # qtbot fixture
 
 
 def test_options_page_load_reflects_config(qtbot, picard_config):

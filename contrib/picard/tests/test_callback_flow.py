@@ -1,6 +1,7 @@
 import pytest
 
 pytest.importorskip("picard")
+pytest.importorskip("pytestqt")  # qapp fixture, via picard_config
 
 
 def test_callback_runs_sync_and_logs_summary(
