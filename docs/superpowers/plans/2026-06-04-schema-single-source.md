@@ -41,6 +41,8 @@ Append to the end of `musefs-db/src/schema.rs`:
 ```rust
 #[cfg(test)]
 mod schema_py_tests {
+    use std::fmt::Write as _;
+
     use rusqlite::Connection;
 
     use super::MIGRATIONS;
@@ -56,9 +58,12 @@ mod schema_py_tests {
             if i > 0 {
                 sql.push('\n');
             }
-            sql.push_str(&format!("-- ── MIGRATION_V{n} ──"));
+            // write!/writeln! (not push_str(&format!(..))): the workspace's
+            // pedantic clippy lints deny format_push_string, and a bare
+            // write! ending in '\n' would trip write_with_newline.
+            let _ = write!(sql, "-- ── MIGRATION_V{n} ──");
             sql.push_str(migration); // every MIGRATION_Vn starts and ends with '\n'
-            sql.push_str(&format!("PRAGMA user_version = {n};\n"));
+            let _ = writeln!(sql, "PRAGMA user_version = {n};");
         }
         sql
     }
