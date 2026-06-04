@@ -7,7 +7,7 @@ album cover art into ``Record``s. ``musefs.py`` holds the BeetsPlugin adapter.
 
 import os
 
-from musefs_common import MAX_ART_BYTES, Record, realpath_key, sniff_mime
+from musefs_common import MAX_ART_BYTES, ArtImage, Record, realpath_key, sniff_mime
 
 # beets field name -> musefs (Vorbis-lowercase) tag key, for direct copies.
 # beets 2.x exposes genre/composer as the multi-valued `genres`/`composers`
@@ -114,7 +114,11 @@ def _read_album_art(item, cache, stats):
     """Return ``(data, mime)`` for the item's album cover, or None. Reads each
     distinct cover once (cached by realpath). An unreadable or over-cap cover is
     counted into ``stats.skipped_art`` once and cached as None (matches the
-    legacy ``_prepare_art`` counting before the python-musefs split)."""
+    legacy ``_prepare_art`` counting before the python-musefs split).
+
+    Also size-capped here (not only in sync_one) so a shared over-cap cover is
+    counted once per distinct file — the double enforcement is intentional, not
+    dead code."""
     artpath = _album_art_path(item)
     if not artpath:
         return None
@@ -146,11 +150,12 @@ def build_records(items, *, fields=None, stats):
     records = []
     art_cache = {}
     for item in items:
+        cover = _read_album_art(item, art_cache, stats)
         records.append(
             Record(
                 key=realpath_key(item.path),
                 pairs=map_fields(item, fields),
-                art=_read_album_art(item, art_cache, stats),
+                art=[ArtImage(*cover)] if cover else None,
             )
         )
     return records
