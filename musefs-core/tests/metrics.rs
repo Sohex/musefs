@@ -410,3 +410,72 @@ fn oggflac_raw_art_serve_increments_art_chunks() {
         "serving OggArtSlice (raw OggFLAC PICTURE) must increment art_chunks"
     );
 }
+
+/// #67: only .mp3 consumes the ID3v1 tail; non-MP3 formats must not pay the
+/// 128-byte tail read. A 300-byte FLAC (< the 1 MiB window) probes in exactly
+/// one positioned read of exactly the file's length.
+#[test]
+fn scan_reads_no_id3v1_tail_for_flac() {
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    // Minimal valid FLAC padded to 300 bytes: marker + last STREAMINFO + audio.
+    let mut b = b"fLaC".to_vec();
+    b.push(0x80); // last-block flag | STREAMINFO
+    b.extend_from_slice(&[0, 0, 34]);
+    b.extend(std::iter::repeat_n(0u8, 34));
+    b.extend(std::iter::repeat_n(0x55u8, 300 - b.len())); // audio payload
+    let path = dir.path().join("t.flac");
+    std::fs::write(&path, &b).unwrap();
+    let len = std::fs::metadata(&path).unwrap().len();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    metrics::reset();
+    scan_directory(&db, dir.path()).unwrap();
+    let s = metrics::snapshot();
+    assert_eq!(
+        s.scan_preads, 1,
+        "flac: one bounded prefix read, no tail read"
+    );
+    assert_eq!(s.scan_bytes_read, len, "no +128 ID3v1 tail for non-mp3");
+}
+
+/// #67 inverse: MP3 keeps its tail read (prefix + 128-byte ID3v1 trailer).
+#[test]
+fn scan_still_reads_id3v1_tail_for_mp3() {
+    let _guard = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    use common::corpus::{prepare_format, CorpusParams, Format as CFormat};
+    let tmp = tempfile::tempdir().unwrap();
+    let params = CorpusParams::single(CFormat::Mp3, 1, 1);
+    let target = prepare_format(&params, tmp.path(), params.format_mix[0]);
+    let mp3 = std::fs::read_dir(&target.corpus_dir)
+        .unwrap()
+        .flat_map(|e| {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                std::fs::read_dir(p)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect()
+            } else {
+                vec![p]
+            }
+        })
+        .find(|p| p.extension().is_some_and(|x| x == "mp3"))
+        .expect("generated mp3");
+    let len = std::fs::metadata(&mp3).unwrap().len();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    metrics::reset();
+    scan_directory(&db, &target.corpus_dir).unwrap();
+    let s = metrics::snapshot();
+    // Corpus tracks are far below the default 1 MiB scan window (this test must
+    // not set MUSEFS_SCAN_WINDOW): one prefix read + the tail. read_tail_128
+    // always reads 128 bytes when file_len >= 128, trailer present or not, so
+    // the +128 assertion is robust.
+    assert_eq!(s.scan_preads, 2, "mp3: prefix read + ID3v1 tail read");
+    assert_eq!(s.scan_bytes_read, len + 128, "mp3 keeps the 128-byte tail");
+}

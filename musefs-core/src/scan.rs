@@ -238,8 +238,14 @@ fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
         }));
     }
 
-    // Front-anchored formats: read a window, widen on NeedMore.
-    let tail = read_tail_128(&file, file_len)?;
+    // Front-anchored formats: read a window, widen on NeedMore. Only the MP3
+    // arm of probe_prefix consumes the ID3v1 tail, and dispatch is by
+    // extension — so only .mp3 pays the tail read (#67).
+    let tail = if has_ext(path, "mp3") {
+        read_tail_128(&file, file_len)?
+    } else {
+        None
+    };
     let mut want = (scan_window() as u64).min(file_len) as usize;
     let mut prefix = read_window(&file, want)?;
     for _ in 0..MAX_WIDEN_RETRIES {
@@ -487,13 +493,14 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     Ok(())
 }
 
-/// Like `ingest`, but writes through a batch `BulkWriter`.
+/// Like `ingest`, but writes through a batch `BulkWriter`. Takes `probed` by
+/// value so picture/binary-tag/structural-block bytes are moved, not cloned (#68).
 fn ingest_bulk(
     bw: &mut musefs_db::BulkWriter<'_>,
     abs_path: &str,
     meta_len: u64,
     meta_mtime: i64,
-    probed: &Probed,
+    probed: Probed,
 ) -> Result<()> {
     let track_id = bw.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
@@ -515,12 +522,12 @@ fn ingest_bulk(
 
     let binary_tags: Vec<musefs_db::BinaryTag> = probed
         .binary_tags
-        .iter()
+        .into_iter()
         .filter(|b| !b.payload.is_empty() && b.payload.len() <= MAX_BINARY_TAG_BYTES)
         .enumerate()
         .map(|(ordinal, b)| musefs_db::BinaryTag {
-            key: b.key.clone(),
-            payload: b.payload.clone(),
+            key: b.key,
+            payload: b.payload,
             ordinal: ordinal as i64,
         })
         .collect();
@@ -529,13 +536,13 @@ fn ingest_bulk(
     let mut sb_ordinals: HashMap<String, i64> = HashMap::new();
     let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
         .structural_blocks
-        .iter()
+        .into_iter()
         .map(|(kind, body)| {
             let ord = sb_ordinals.entry(kind.clone()).or_insert(0);
             let sb = musefs_db::StructuralBlock {
-                kind: kind.clone(),
+                kind,
                 ordinal: *ord,
-                body: body.clone(),
+                body,
             };
             *ord += 1;
             sb
@@ -546,14 +553,14 @@ fn ingest_bulk(
     let mut track_arts = Vec::new();
     let accepted = probed
         .pictures
-        .iter()
+        .into_iter()
         .filter(|p| p.data.len() <= MAX_ART_BYTES);
     for (ordinal, pic) in accepted.enumerate() {
         let art_id = bw.upsert_art(&NewArt {
-            mime: pic.mime.clone(),
+            mime: pic.mime,
             width: (pic.width != 0).then_some(pic.width as i64),
             height: (pic.height != 0).then_some(pic.height as i64),
-            data: pic.data.clone(),
+            data: pic.data,
         })?;
         let picture_type = if pic.picture_type <= 20 {
             pic.picture_type as i64
@@ -563,7 +570,7 @@ fn ingest_bulk(
         track_arts.push(TrackArt {
             art_id,
             picture_type,
-            description: pic.description.clone(),
+            description: pic.description,
             ordinal: ordinal as i64,
         });
     }
@@ -670,13 +677,24 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
             return Ok(());
         }
         let mut bw = db.bulk_writer()?;
-        for u in batch.iter() {
-            ingest_bulk(&mut bw, &u.abs_path, u.meta_len, u.meta_mtime, &u.probed)?;
+        // Budget weights are released only after commit, and ingest_bulk consumes
+        // the Probed — capture each unit's weight before the move (#68).
+        let mut weights = Vec::with_capacity(batch.len());
+        for Unit {
+            abs_path,
+            meta_len,
+            meta_mtime,
+            probed,
+            weight,
+        } in batch.drain(..)
+        {
+            weights.push(weight);
+            ingest_bulk(&mut bw, &abs_path, meta_len, meta_mtime, probed)?;
             *scanned += 1;
         }
         bw.commit()?;
-        for u in batch.drain(..) {
-            budget.release(u.weight);
+        for w in weights {
+            budget.release(w);
         }
         *batch_bytes = 0;
         Ok(())
@@ -1531,7 +1549,7 @@ mod hardening_tests {
         let db = Db::open_in_memory().unwrap();
         {
             let mut bw = db.bulk_writer().unwrap();
-            ingest_bulk(&mut bw, "/a.mp3", 1, 0, &probed_with_mixed_binary_tags()).unwrap();
+            ingest_bulk(&mut bw, "/a.mp3", 1, 0, probed_with_mixed_binary_tags()).unwrap();
             bw.commit().unwrap();
         }
         let tid = db.list_tracks().unwrap()[0].id;
@@ -1602,7 +1620,7 @@ mod hardening_tests {
                 "/a.flac",
                 1,
                 0,
-                &probed_with_duplicate_structural_kind(),
+                probed_with_duplicate_structural_kind(),
             )
             .unwrap();
             bw.commit().unwrap();
