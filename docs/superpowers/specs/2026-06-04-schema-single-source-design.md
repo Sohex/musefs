@@ -41,10 +41,15 @@ by the existing vendor machinery with zero changes.
   `# GENERATED from musefs-db/src/schema.rs — do not edit.` plus the
   regeneration command
   (`MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py`).
-- `SCHEMA_SQL: str` — for each migration `n` (1-based): a
-  `-- ── MIGRATION_Vn ──` banner, the `MIGRATION_Vn` text verbatim, then
-  `PRAGMA user_version = n;`. This matches exactly what `migrate()` executes
-  (`execute_batch(sql)` followed by the `user_version` pragma update).
+- `SCHEMA_SQL: str` — for each migration `n` (1-based), uniformly including
+  `n = 1`: a `-- ── MIGRATION_Vn ──` banner, the `MIGRATION_Vn` text verbatim,
+  then `PRAGMA user_version = n;`. This intentionally differs from the old
+  fixtures (which omitted the V1 banner/pragma and disagreed with each other
+  about intermediate pragmas) — the old files are deleted, and the uniform
+  rule is the canonical format. The result is *equivalent to* `migrate()` on
+  a fresh database (`execute_batch(sql)` + `user_version` update per step);
+  it does not reproduce `migrate()`'s fast-path/partial-upgrade behavior,
+  which is why `schema_sql_matches_migrate` exists.
 - `USER_VERSION: int` — `MIGRATIONS.len()`.
 - The emitted text must pass `ruff format --check` (python-musefs CI lints the
   whole tree); a comment header, one triple-quoted string assignment, and one
@@ -53,16 +58,19 @@ by the existing vendor machinery with zero changes.
 
 ### 2. Rust side: generator + drift guards
 
-All in `musefs-db/src/schema.rs` inside `#[cfg(test)]` — no new public API,
-and invisible to cargo-mutants:
+All in `musefs-db/src/schema.rs` inside `#[cfg(test)]` — the tests must live
+in this module (the migration constants are private), there is no new public
+API, and test code is invisible to cargo-mutants:
 
 - A render helper producing the full `schema.py` text from `MIGRATIONS`.
 - **`schema_py_fixture_is_fresh`** — compares the rendered text against
   `{CARGO_MANIFEST_DIR}/../contrib/python-musefs/src/musefs_common/schema.py`
   and fails on mismatch with a message naming the regen command. When
   `MUSEFS_REGEN_SCHEMA_PY=1` is set, it writes the file instead of comparing.
-  Plain `cargo test` in CI catches drift; this mirrors the `interop_emit`
-  env-var precedent.
+  The test is **not** `#[ignore]`d — unlike `interop_emit` (which is ignored
+  and opt-in), the compare path must run under plain `cargo test` or the CI
+  gate this design depends on silently doesn't exist. Only the *write*
+  behavior is env-gated.
 - **`schema_sql_matches_migrate`** — applies the rendered SQL via
   `execute_batch` to one in-memory connection, runs `migrate()` on another,
   and asserts identical `sqlite_master` contents (name/type/sql rows) and
@@ -79,10 +87,16 @@ and invisible to cargo-mutants:
     (tests already import `musefs._common` without Picard installed, so this
     adds no new import risk)
 - `constants.py`: `EXPECTED_USER_VERSION` becomes a re-export of
-  `schema.USER_VERSION`. The import surface for `store.py` and existing tests
-  is unchanged.
+  `schema.USER_VERSION` (`constants` imports from `schema`, never the
+  reverse — `schema.py` imports nothing, so no cycle). The import surface
+  for `store.py` and existing tests is unchanged.
 - Run `vendor_to_picard.py` once to vendor the new module; Picard's
-  `test_vendor_sync.py` then covers it byte-for-byte with zero changes.
+  `test_vendor_sync.py` then covers it byte-for-byte with zero changes. The
+  vendored copy carries two generated headers (the vendor script's on top of
+  the Rust generator's) — expected and harmless.
+- Clean up comments that reference the deleted fixtures: the three conftest
+  docstrings ("temp musefs DB with the V2 schema applied") and
+  `test_store_db.py`'s "schema.sql applies user_version=3" note.
 
 ### Drift-guard chain
 
