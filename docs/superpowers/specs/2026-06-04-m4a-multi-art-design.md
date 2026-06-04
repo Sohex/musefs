@@ -39,13 +39,14 @@ first front image even though Picard metadata can hold many.
 
 ### Scan — `read_pictures`
 
-For each `covr` atom in the `ilst`, iterate **all** `data` children via
-`child_boxes` instead of `find_box`-ing the first. Per-atom rules are
-unchanged: type code 13 → `image/jpeg`, 14 → `image/png`, anything else
-skipped; `picture_type: 3`; empty description. Pictures accumulate in file
-order across all `covr` atoms (multiple `covr`s remain tolerated). The
-function stays lenient: a malformed `data` child is skipped without losing its
-siblings.
+For each `covr` atom in the `ilst`, iterate **all** children via `child_boxes`
+and keep those of kind `data` (today's `find_box(inner, b"data")` filters
+implicitly; the loop must filter `kind == b"data"` explicitly and silently
+skip children of other kinds). Per-atom rules are unchanged: type code 13 →
+`image/jpeg`, 14 → `image/png`, anything else skipped; `picture_type: 3`;
+empty description. Pictures accumulate in file order across all `covr` atoms
+(multiple `covr`s remain tolerated). The function stays lenient: a malformed
+`data` child is skipped without losing its siblings.
 
 No change in `musefs-core/src/scan.rs` — it already stores every
 `EmbeddedPicture` with its ordinal, and `upsert_art` dedupes by sha256.
@@ -80,6 +81,9 @@ variants. The existing `new_moov_size > u32::MAX` guard covers the larger
   `ArtImage(data: bytes, mime: str, picture_type: int = 3,
   description: str = "")` defined in `sync.py`. `None` and the empty list both
   mean "no art from the host" (existing scan-seeded rows left untouched).
+  Update the docstrings whose meaning shifts: `Record.art` ("an
+  `(bytes, mime)` tuple or `None`") and `SyncStats.skipped_art` (now an image
+  count, not a track count).
 - `sync_one` over-cap rule: filter images individually against
   `MAX_ART_BYTES`; each over-cap image bumps `skipped_art` (now an **image**
   count). If at least one image survives, `replace_track_art` writes the
@@ -96,20 +100,29 @@ variants. The existing `new_moov_size > u32::MAX` guard covers the larger
 `ArtImage`s (imported from the vendored `musefs._common.sync`) for all
 syncable images in Picard order. Duck-typed as today: iterate
 `metadata.images`, skip images where
-`getattr(img, "can_be_saved_to_tags", True)` is false. Map Picard's
-`maintype` string to an ID3 picture type with a module-level table mirroring
-Picard's own ID3 mapping — `front→3, back→4, booklet→5, medium→6`, everything
-else → 0 (Other) — falling back to 3 when the image has no `maintype` but
-`is_front_image()` is true. `comment`, when present, becomes `description`.
-Re-vendor with `vendor_to_picard.py`; the drift-guard test enforces
-freshness.
+`getattr(img, "can_be_saved_to_tags", True)` is false. Picture-type
+resolution, in order: if the image's `maintype` is in a module-level table
+mirroring Picard's own ID3 mapping (`front→3, back→4, booklet→5, medium→6`),
+use the table value; otherwise, if `is_front_image()` is true, use 3; else 0
+(Other) — i.e. the front-image signal wins over an unrecognized `maintype`.
+`comment`, when present, becomes `description`.
+
+The `front_cover` import and callsite in `contrib/picard/musefs/__init__.py`
+(import around line 30; `art = front_cover(f.metadata)` →
+`Record(key=…, pairs=…, art=art)` around lines 144–145) change with it —
+`Record.art` now receives the `images(...)` list. Re-vendor with
+`vendor_to_picard.py`; the drift-guard test enforces freshness.
 
 ### beets (`contrib/beets/beetsplug/_core.py`)
 
 Behavior unchanged in substance — an album has one `artpath`, so
-`_read_album_art` wraps its single cover as `[ArtImage(data, mime, 3, "")]`.
-The realpath cache and per-cover skip counting keep working; `skipped_art`'s
-shift to image-count is a no-op here.
+`_read_album_art` wraps its single cover as `[ArtImage(data, mime, 3, "")]`
+at the `Record` construction site in `build_records`. The realpath cache and
+per-cover skip counting keep working; `skipped_art`'s shift to image-count is
+a no-op here. Note `_read_album_art` already enforces `MAX_ART_BYTES` at
+ingest, so a beets over-cap cover is filtered before `sync_one`'s new
+per-image check ever sees it — the double enforcement is intentional (same
+threshold), not dead code.
 
 No schema or generated-`schema.py` change — `track_art` already supports all
 of this.
@@ -123,8 +136,12 @@ of this.
   losing the rest); `synthesize_layout` with two arts → exactly two
   `ArtImage` segments in order with correct `covr`/`ilst`/`moov` size
   accounting; zero-byte art still filtered.
-- Round-trip: synthesize with two arts, materialize the head, `read_pictures`
-  it back → two pictures, same order and mimes.
+- Round-trip: synthesize with two arts, materialize the head with the
+  existing `materialize_udta` helper wrapped in `ftyp`/`moov`/`mdat` framing
+  (mirror `build_udta_no_art_round_trips`), `read_pictures` it back → two
+  pictures, same order and mimes. `materialize_udta` zero-fills streamed
+  payloads, so the assertion is order + mime only (mime derives from the
+  inline type code), not image bytes.
 - `proptest_mp4.rs`: replace the hardcoded empty `arts` with 0–3 generated
   arts, keeping the byte-identical-audio property.
 - In-diff mutation gate (CI parity: `-j2`, output on /tmp, default TMPDIR,
@@ -135,10 +152,16 @@ of this.
 
 ### Interop (Property 5)
 
-Give `richer_m4a` in `musefs-core/tests/interop_emit.rs` a second cover (one
-jpeg + one png); assert in `tests/interop/test_mutagen_roundtrip.py` that
+Cover art in `musefs-core/tests/interop_emit.rs` comes from the DB, not the
+fixture: `emit()` hand-seeds tags via `replace_tags` and never scans, so
+adding a `covr` to `richer_m4a` would test nothing. Instead, seed two art
+rows (one jpeg + one png) plus `track_art` links into the in-memory DB for
+the M4A manifest row — either by extending the shared `emit()` with an
+optional art parameter (other formats pass none) or via an M4A-specific
+variant. Then assert in `tests/interop/test_mutagen_roundtrip.py` that
 mutagen sees `covr` as a 2-element list with the right `imageformat`s and
-bytes.
+bytes (bytes ARE checkable here — the real serve path streams them from the
+DB).
 
 ### Python
 
