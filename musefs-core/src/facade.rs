@@ -145,6 +145,9 @@ pub struct Musefs {
     snapshot: Mutex<HashMap<i64, TrackRenderState>>,
     force_rebuild_error: AtomicBool,
     force_apply_fail: AtomicBool,
+    /// Polls that took the changelog-gap full-rebuild path (observability for
+    /// tests: incremental vs gap is invisible in the resulting tree).
+    gap_fallbacks: AtomicU64,
     /// Set when a poisoned VFS-state lock is recovered; the next `poll_refresh`
     /// forces a full rebuild from the DB and clears it (#96).
     needs_rebuild: AtomicBool,
@@ -197,6 +200,7 @@ impl Musefs {
             snapshot: Mutex::new(snapshot),
             force_rebuild_error: AtomicBool::new(false),
             force_apply_fail: AtomicBool::new(false),
+            gap_fallbacks: AtomicU64::new(0),
             needs_rebuild: AtomicBool::new(false),
             last_seq: AtomicI64::new(last_seq),
         })
@@ -352,8 +356,15 @@ impl Musefs {
             let keys = db.render_keys_for(&log.changed_ids)?;
             Ok::<_, CoreError>((log, keys))
         })?;
-        let gap =
-            (log.max_seq == 0 && last_seq > 0) || (log.max_seq > 0 && log.min_seq > last_seq + 1);
+        // Gap iff changes may have been pruned past the watermark: an emptied ring
+        // while we held a watermark (external truncation), or a retained window
+        // that no longer reaches back to it (min_seq > last_seq + 1; equality is
+        // an adjacent — contiguous — read, not a gap).
+        let gap = if log.max_seq == 0 {
+            last_seq > 0
+        } else {
+            log.min_seq > last_seq + 1
+        };
         if gap {
             return Ok(None);
         }
@@ -424,7 +435,7 @@ impl Musefs {
         };
         #[allow(clippy::single_match_else)]
         let tree = match applied {
-            Ok(()) => {
+            Ok(_) => {
                 #[cfg(debug_assertions)]
                 {
                     let mut ref_alloc = alloc.clone();
@@ -593,6 +604,7 @@ impl Musefs {
                 // was truncated). Take the retained full path — correct by
                 // construction, and a bulk change wants a full rebuild anyway.
                 log::info!("changelog gap; falling back to full refresh");
+                self.gap_fallbacks.fetch_add(1, Ordering::AcqRel);
                 let new_seq = self
                     .pool
                     .with(|db| Ok(db.changelog_since(i64::MAX)?.max_seq))?;
@@ -718,6 +730,14 @@ impl Musefs {
     #[doc(hidden)]
     pub fn force_apply_failure_for_test(&self, on: bool) {
         self.force_apply_fail.store(on, Ordering::Release);
+    }
+
+    /// How many polls took the changelog-gap full-rebuild path. Test-only
+    /// observability: the gap and incremental paths produce identical trees, so
+    /// only this counter distinguishes them.
+    #[doc(hidden)]
+    pub fn gap_fallbacks_for_test(&self) -> u64 {
+        self.gap_fallbacks.load(Ordering::Acquire)
     }
 
     #[doc(hidden)]

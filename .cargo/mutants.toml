@@ -34,6 +34,15 @@ exclude_globs = [
 # Anchored on file:line:col so only the proven-equivalent sites are suppressed;
 # killable siblings (e.g. flac `|`->`&`, scan 711 `+`->`*`) stay in scope.
 exclude_re = [
+    # apply_changes add-side min-flip walk `id < introducing_id(child)`: the
+    # `<`->`<=` boundary is unreachable-different. Equality needs the walked id to
+    # BE the subtree's introducing id, which only a moved-in id can satisfy (pure
+    # adds aren't in the tree, and ids are unique) — and a mover inside that
+    # subtree always dirties the same parent on its removal-side walk first
+    # (introducing-id chains are contiguous, so the walk cannot break early). The
+    # dirty set — and hence the rebuild count — is identical. Anchored on the
+    # description (not line:col) so `cargo fmt` can't silently retire it.
+    'replace < with <= in VirtualTree::apply_changes',
     # probe_file widen loop: `.max(want + 1)` is dominated — the bounded probers
     # only return `NeedMore{up_to}` with `up_to > want` (we widen precisely to a
     # block end past the prefix), so `up_to.min(file_len)` always wins the max and
