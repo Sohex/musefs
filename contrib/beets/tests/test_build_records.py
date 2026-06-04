@@ -23,8 +23,10 @@ def test_build_records_reads_album_art(fake_item, fake_album, tmp_path):
     stats = SyncStats()
     records = _core.build_records([item], fields=None, stats=stats)
     assert records[0].art is not None
-    data, mime = records[0].art
-    assert mime == "image/jpeg"
+    (img,) = records[0].art
+    assert img.mime == "image/jpeg"
+    assert img.picture_type == 3
+    assert img.description == ""
     assert stats.skipped_art == 0
 
 

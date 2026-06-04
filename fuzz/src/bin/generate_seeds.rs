@@ -27,6 +27,9 @@ fn main() {
     // keeping the file well-formed (trailing bytes after `mdat` would make
     // read_structure reject it, skipping synthesize_layout entirely).
     write("mp4", "seed_binary", &fixtures::m4a(&[0x01; 96]));
+    // Multi-art seed: a covr atom with two `data` children reaches the
+    // read_pictures inner loop from the corpus, not only via mutation.
+    write("mp4", "seed_two_covers", &fixtures::m4a_two_covers(&[9u8; 32]));
     write("ogg", "seed0", &fixtures::ogg_opus());
     write("ogg_page", "seed0", &fixtures::ogg_opus());
     write("vorbiscomment", "seed0", &fixtures::ogg_opus());

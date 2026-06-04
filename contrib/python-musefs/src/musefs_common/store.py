@@ -104,11 +104,16 @@ def upsert_art(conn, data, mime):
     return conn.execute("SELECT id FROM art WHERE sha256 = ?", (sha,)).fetchone()[0]
 
 
-def replace_track_art(conn, track_id, art_id):
-    """Set the track's single front-cover art (picture_type 3, ordinal 0)."""
+def replace_track_art(conn, track_id, arts):
+    """Replace the track's art rows. ``arts`` is an ordered list of
+    ``(art_id, picture_type, description)``; each row's ``ordinal`` is its
+    list index."""
     conn.execute("DELETE FROM track_art WHERE track_id = ?", (track_id,))
-    conn.execute(
+    conn.executemany(
         "INSERT INTO track_art (track_id, art_id, picture_type, description, "
-        "ordinal) VALUES (?, ?, 3, '', 0)",
-        (track_id, art_id),
+        "ordinal) VALUES (?, ?, ?, ?, ?)",
+        [
+            (track_id, art_id, picture_type, description, i)
+            for i, (art_id, picture_type, description) in enumerate(arts)
+        ],
     )

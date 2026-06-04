@@ -428,6 +428,8 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
 
 /// Lenient: returns empty / skips any malformed atom and never errors — this only
 /// seeds cover art from existing files, so a missing or garbled picture must simply be absent.
+/// Every `data` child of every `covr` atom yields one picture (the iTunes
+/// multiple-artwork convention); non-`data` children are skipped.
 pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
     let Some((start, len)) = ilst_region(buf) else {
         return Vec::new();
@@ -439,26 +441,28 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
             continue;
         }
         let inner = atom.payload(ilst);
-        let Ok(Some(data)) = find_box(inner, b"data") else {
-            continue;
-        };
-        let dp = data.payload(inner);
-        if dp.len() < 8 {
-            continue;
+        for data in child_boxes(inner).unwrap_or_default() {
+            if &data.kind != b"data" {
+                continue;
+            }
+            let dp = data.payload(inner);
+            if dp.len() < 8 {
+                continue;
+            }
+            let mime = match u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]) {
+                13 => "image/jpeg",
+                14 => "image/png",
+                _ => continue,
+            };
+            out.push(EmbeddedPicture {
+                mime: mime.to_string(),
+                picture_type: 3,
+                description: String::new(),
+                width: 0,
+                height: 0,
+                data: dp[8..].to_vec(),
+            });
         }
-        let mime = match u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]) {
-            13 => "image/jpeg",
-            14 => "image/png",
-            _ => continue,
-        };
-        out.push(EmbeddedPicture {
-            mime: mime.to_string(),
-            picture_type: 3,
-            description: String::new(),
-            width: 0,
-            height: 0,
-            data: dp[8..].to_vec(),
-        });
     }
     out
 }
@@ -609,7 +613,7 @@ fn freeform_binary_prefix(mean: &str, name: &str, payload_len: u64) -> Vec<u8> {
 }
 
 /// Build the `udta` box as an ordered segment list: `Segment::Inline` for all box
-/// framing, with each opaque `----` value and the cover image streamed from the DB
+/// framing, with each opaque `----` value and each cover image streamed from the DB
 /// (`Segment::BinaryTag`/`Segment::ArtImage`) rather than materialized. Returns
 /// `(segments, streamed_total)` where `streamed_total` sums every streamed payload
 /// length (binary `----` values + art). Every enclosing box size
@@ -618,7 +622,7 @@ fn freeform_binary_prefix(mean: &str, name: &str, payload_len: u64) -> Vec<u8> {
 fn build_udta(
     tags: &[TagInput],
     binary_tags: &[BinaryTagInput],
-    art: Option<&ArtInput>,
+    arts: &[ArtInput],
 ) -> Result<(Vec<Segment>, u64)> {
     // Group consecutive same-key text values (the DB returns tags ordered by key).
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -669,22 +673,26 @@ fn build_udta(
         streamed_total += bt.len;
     }
 
-    if let Some(a) = art {
-        let type_code: u32 = if a.mime == "image/png" { 14 } else { 13 };
-        let data_size = 8 + 8 + a.data_len; // data header + type + locale + image
-        let covr_size = 8 + data_size;
+    if !arts.is_empty() {
+        // One covr atom; each art is its own `data` child (the iTunes
+        // convention for multiple artworks).
+        let covr_size: u64 = 8 + arts.iter().map(|a| 16 + a.data_len).sum::<u64>();
         ilst_inline.extend_from_slice(&(covr_size as u32).to_be_bytes());
         ilst_inline.extend_from_slice(b"covr");
-        ilst_inline.extend_from_slice(&(data_size as u32).to_be_bytes());
-        ilst_inline.extend_from_slice(b"data");
-        ilst_inline.extend_from_slice(&type_code.to_be_bytes());
-        ilst_inline.extend_from_slice(&0u32.to_be_bytes()); // locale; image streams next
-        ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
-        ilst_segments.push(Segment::ArtImage {
-            art_id: a.art_id,
-            len: a.data_len,
-        });
-        streamed_total += a.data_len;
+        for a in arts {
+            let type_code: u32 = if a.mime == "image/png" { 14 } else { 13 };
+            let data_size = 8 + 8 + a.data_len; // data header + type + locale + image
+            ilst_inline.extend_from_slice(&(data_size as u32).to_be_bytes());
+            ilst_inline.extend_from_slice(b"data");
+            ilst_inline.extend_from_slice(&type_code.to_be_bytes());
+            ilst_inline.extend_from_slice(&0u32.to_be_bytes()); // locale; image streams next
+            ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
+            ilst_segments.push(Segment::ArtImage {
+                art_id: a.art_id,
+                len: a.data_len,
+            });
+            streamed_total += a.data_len;
+        }
     } else if !ilst_inline.is_empty() {
         ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
     }
@@ -790,7 +798,7 @@ fn patch_chunk_offsets(kept: &mut [u8], delta: i64) -> Result<()> {
 /// `[ftyp][regenerated moov][mdat header][mdat payload]`. The mdat payload is
 /// served verbatim, merely relocated, so every chunk offset shifts by a constant
 /// `delta`. Patching only offset VALUES (never box sizes) means `new_moov_size`
-/// is computable before `delta` — no circular dependency. Cover art and opaque `----`
+/// is computable before `delta` — no circular dependency. Cover art (every non-empty art row, in input order) and opaque `----`
 /// binary tags stream from the DB at read time, splicing into the layout.
 pub fn synthesize_layout(
     scan: &Mp4Scan,
@@ -808,8 +816,8 @@ pub fn synthesize_layout(
     }
 
     // Skip zero-byte art (an empty ArtImage segment fails layout validation).
-    let art = arts.iter().find(|a| a.data_len > 0);
-    let (udta_segments, _streamed_total) = build_udta(tags, binary_tags, art)?;
+    let arts: Vec<ArtInput> = arts.iter().filter(|a| a.data_len > 0).cloned().collect();
+    let (udta_segments, _streamed_total) = build_udta(tags, binary_tags, &arts)?;
     let udta_total: u64 = udta_segments.iter().map(Segment::len).sum();
 
     let new_moov_size = 8 + kept.len() as u64 + udta_total;
@@ -1100,7 +1108,7 @@ mod tests {
             TagInput::new("title", "Song"),
             TagInput::new("tracknumber", "5"),
         ];
-        let (segs, streamed) = build_udta(&tags, &[], None).unwrap();
+        let (segs, streamed) = build_udta(&tags, &[], &[]).unwrap();
         assert_eq!(streamed, 0);
         let prefix = materialize_udta(&segs);
         let b = read_box(&prefix, 0).unwrap();
@@ -1129,7 +1137,7 @@ mod tests {
             height: 0,
             data_len: 100,
         };
-        let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], Some(&art)).unwrap();
+        let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], &[art]).unwrap();
         assert_eq!(streamed, 100);
         // The image streams as the final segment; the udta size field accounts for it.
         assert!(matches!(
@@ -1164,7 +1172,7 @@ mod tests {
             data_len: u32::MAX as u64 + 1,
         };
         assert!(matches!(
-            build_udta(&[TagInput::new("title", "T")], &[], Some(&art)),
+            build_udta(&[TagInput::new("title", "T")], &[], &[art]),
             Err(FormatError::TooLarge)
         ));
     }
@@ -1178,7 +1186,7 @@ mod tests {
             TagInput::new("genre", "Rock"),
             TagInput::new("genre", "Metal"),
         ];
-        let (segs, streamed) = build_udta(&tags, &[], None).unwrap();
+        let (segs, streamed) = build_udta(&tags, &[], &[]).unwrap();
         assert_eq!(streamed, 0);
         let prefix = materialize_udta(&segs);
 
@@ -1213,7 +1221,7 @@ mod tests {
     fn build_udta_empty_tags_is_valid() {
         // A real file with no tags must still yield a structurally valid (empty)
         // udta, not a malformed box.
-        let (segs, streamed) = build_udta(&[], &[], None).unwrap();
+        let (segs, streamed) = build_udta(&[], &[], &[]).unwrap();
         assert_eq!(streamed, 0);
         let prefix = materialize_udta(&segs);
         let b = read_box(&prefix, 0).unwrap();
@@ -1616,7 +1624,7 @@ mod tests {
             TagInput::new("MyRating", "5"), // user-defined -> ----
             TagInput::new("musicbrainz_albumid", "abc-123"), // vocabulary -> ----
         ];
-        let (segs, _streamed) = build_udta(&tags, &[], None).unwrap();
+        let (segs, _streamed) = build_udta(&tags, &[], &[]).unwrap();
         let udta = materialize_udta(&segs);
         // build_udta returns a full `udta` box; read_tags expects a buffer containing
         // moov/udta/meta/ilst, so wrap udta in a minimal moov for the round trip.
@@ -1863,6 +1871,46 @@ mod tests {
     }
 
     #[test]
+    fn read_pictures_reads_all_data_atoms_in_one_covr() {
+        // iTunes convention: multiple artworks are multiple `data` children of
+        // one `covr`. An unknown type code skips that child only, not its
+        // siblings.
+        let jpeg = [0xFF, 0xD8, 0xFF, 1];
+        let png = [0x89, b'P', b'N', b'G', 2];
+        let covr = bx(
+            b"covr",
+            &[
+                data_atom(13, &jpeg),
+                data_atom(99, b"skipped"), // unknown type code: this child only
+                data_atom(14, &png),
+            ]
+            .concat(),
+        );
+        let buf = mp4_with_ilst(&covr, true);
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert_eq!(pics[0].data, jpeg);
+        assert_eq!(pics[1].mime, "image/png");
+        assert_eq!(pics[1].data, png);
+    }
+
+    #[test]
+    fn read_pictures_skips_non_data_children_of_covr() {
+        // A non-`data` child inside covr (rare but legal) is silently skipped.
+        let png = [0x89, b'P', b'N', b'G'];
+        let covr = bx(
+            b"covr",
+            &[bx(b"free", b"pad"), data_atom(14, &png)].concat(),
+        );
+        let buf = mp4_with_ilst(&covr, false);
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].mime, "image/png");
+        assert_eq!(pics[0].data, png);
+    }
+
+    #[test]
     fn build_udta_png_art_uses_type_code_14() {
         // PNG art => covr/data type code 14; JPEG => 13. `== -> !=` flips them.
         for (mime, expected) in [("image/png", 14u32), ("image/jpeg", 13u32)] {
@@ -1875,7 +1923,7 @@ mod tests {
                 height: 0,
                 data_len: 10,
             };
-            let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], Some(&art)).unwrap();
+            let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art]).unwrap();
             let prefix = materialize_udta(&segs);
             // covr layout: [covr_size u32]["covr"][data_size u32]["data"][type u32][locale u32]
             let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
@@ -1898,13 +1946,103 @@ mod tests {
             height: 0,
             data_len: 10,
         };
-        let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], Some(&art)).unwrap();
+        let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art]).unwrap();
         let prefix = materialize_udta(&segs);
         let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
         let covr_size = u32::from_be_bytes(prefix[cpos - 4..cpos].try_into().unwrap());
         let data_size = u32::from_be_bytes(prefix[cpos + 4..cpos + 8].try_into().unwrap());
         assert_eq!(data_size, 8 + 8 + 10); // 26
         assert_eq!(covr_size, 8 + data_size); // 34
+    }
+
+    #[test]
+    fn build_udta_multiple_arts_one_covr_n_data_atoms() {
+        let art = |id: i64, mime: &str, len: u64| ArtInput {
+            art_id: id,
+            mime: mime.into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: len,
+        };
+        let arts = [art(1, "image/jpeg", 10), art(2, "image/png", 20)];
+        let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], &arts).unwrap();
+        assert_eq!(streamed, 30);
+
+        // Exactly one covr atom, sized for both data atoms: 8 + Σ(16 + len).
+        let prefix = materialize_udta(&segs);
+        let covr_positions: Vec<usize> = prefix
+            .windows(4)
+            .enumerate()
+            .filter_map(|(i, w)| (w == b"covr").then_some(i))
+            .collect();
+        assert_eq!(covr_positions.len(), 1);
+        let cpos = covr_positions[0];
+        let covr_size = u32::from_be_bytes(prefix[cpos - 4..cpos].try_into().unwrap());
+        assert_eq!(covr_size, 8 + (16 + 10) + (16 + 20));
+
+        // First data atom: jpeg (type 13), size 16+10; second: png (14), 16+20.
+        let d1 = cpos + 4;
+        assert_eq!(&prefix[d1 + 4..d1 + 8], b"data");
+        assert_eq!(
+            u32::from_be_bytes(prefix[d1..d1 + 4].try_into().unwrap()),
+            26
+        );
+        assert_eq!(
+            u32::from_be_bytes(prefix[d1 + 8..d1 + 12].try_into().unwrap()),
+            13
+        );
+        let d2 = d1 + 26;
+        assert_eq!(&prefix[d2 + 4..d2 + 8], b"data");
+        assert_eq!(
+            u32::from_be_bytes(prefix[d2..d2 + 4].try_into().unwrap()),
+            36
+        );
+        assert_eq!(
+            u32::from_be_bytes(prefix[d2 + 8..d2 + 12].try_into().unwrap()),
+            14
+        );
+
+        // Streamed segments: one ArtImage per art, in input order.
+        let art_segs: Vec<(i64, u64)> = segs
+            .iter()
+            .filter_map(|s| match s {
+                Segment::ArtImage { art_id, len } => Some((*art_id, *len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(art_segs, vec![(1, 10), (2, 20)]);
+    }
+
+    #[test]
+    fn build_udta_two_arts_round_trips_through_read_pictures() {
+        // materialize_udta zero-fills streamed payloads, so assert order +
+        // mime only (mime derives from the inline type code, which survives).
+        let art = |id: i64, mime: &str, len: u64| ArtInput {
+            art_id: id,
+            mime: mime.into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: len,
+        };
+        let arts = [art(1, "image/jpeg", 5), art(2, "image/png", 9)];
+        let (segs, _) = build_udta(&[TagInput::new("title", "Song")], &[], &arts).unwrap();
+        let prefix = materialize_udta(&segs);
+        let buf = [
+            bx(b"ftyp", b"M4A "),
+            bx(b"moov", &prefix),
+            bx(b"mdat", b"A"),
+        ]
+        .concat();
+        let pics = read_pictures(&buf);
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert_eq!(pics[0].data.len(), 5);
+        assert_eq!(pics[1].mime, "image/png");
+        assert_eq!(pics[1].data.len(), 9);
     }
 
     #[test]
@@ -1925,7 +2063,7 @@ mod tests {
         }
         // Derive the fixed overhead from the udta size field (segs[0] inline), with
         // data_len 0, without materializing any image bytes.
-        let (segs0, _) = build_udta(&[TagInput::new("title", "T")], &[], Some(&art(0))).unwrap();
+        let (segs0, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art(0)]).unwrap();
         let Segment::Inline(h0) = &segs0[0] else {
             panic!("inline head")
         };
@@ -1933,7 +2071,7 @@ mod tests {
         let max_len = u32::MAX as u64 - overhead;
 
         let (segs_max, streamed) =
-            build_udta(&[TagInput::new("title", "T")], &[], Some(&art(max_len))).unwrap();
+            build_udta(&[TagInput::new("title", "T")], &[], &[art(max_len)]).unwrap();
         assert_eq!(streamed, max_len);
         let Segment::Inline(h_max) = &segs_max[0] else {
             panic!("inline head")
@@ -1944,7 +2082,7 @@ mod tests {
         );
 
         assert!(matches!(
-            build_udta(&[TagInput::new("title", "T")], &[], Some(&art(max_len + 1))),
+            build_udta(&[TagInput::new("title", "T")], &[], &[art(max_len + 1)]),
             Err(FormatError::TooLarge)
         ));
     }
@@ -2176,6 +2314,38 @@ mod tests {
             synthesize_layout(&scan, &tags, &[], &[art(max_len + 1)]),
             Err(FormatError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn synthesize_layout_emits_all_nonzero_arts() {
+        // Zero-byte art is filtered; both non-empty arts stream, in input order.
+        let art = |id: i64, len: u64| ArtInput {
+            art_id: id,
+            mime: "image/jpeg".into(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len: len,
+        };
+        let buf = mk_mp4(true, b"AUDIO", &[0]);
+        let scan = read_structure(&buf).unwrap();
+        let layout = synthesize_layout(
+            &scan,
+            &[TagInput::new("title", "T")],
+            &[],
+            &[art(1, 5), art(2, 0), art(3, 7)],
+        )
+        .unwrap();
+        let art_segs: Vec<(i64, u64)> = layout
+            .segments()
+            .iter()
+            .filter_map(|s| match s {
+                Segment::ArtImage { art_id, len } => Some((*art_id, *len)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(art_segs, vec![(1, 5), (3, 7)]);
     }
 
     #[test]

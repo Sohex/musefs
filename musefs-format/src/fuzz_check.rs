@@ -115,9 +115,29 @@ pub mod fixtures {
 
     /// Minimal moov-first M4A (ported verbatim from tests/common::minimal_m4a).
     pub fn m4a(mdat_payload: &[u8]) -> Vec<u8> {
+        m4a_with_extra_ilst(&[], mdat_payload)
+    }
+
+    /// `m4a` plus a `covr` atom holding two `data` children (jpeg + png) — the
+    /// iTunes multiple-artwork convention. Seeds the fuzzers' multi-art read
+    /// path; `m4a`'s byte output is unchanged.
+    pub fn m4a_two_covers(mdat_payload: &[u8]) -> Vec<u8> {
+        let covr = bx(
+            b"covr",
+            &[
+                m4a_data_atom(13, &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]),
+                m4a_data_atom(14, &[0x89, b'P', b'N', b'G', 4, 5]),
+            ]
+            .concat(),
+        );
+        m4a_with_extra_ilst(&covr, mdat_payload)
+    }
+
+    fn m4a_with_extra_ilst(extra_ilst_atoms: &[u8], mdat_payload: &[u8]) -> Vec<u8> {
         let ilst_atoms = [
             bx(b"\xa9nam", &m4a_data_atom(1, b"Orig M4A")),
             bx(b"\xa9ART", &m4a_data_atom(1, b"Orig Artist")),
+            extra_ilst_atoms.to_vec(),
         ]
         .concat();
         let ilst = bx(b"ilst", &ilst_atoms);
@@ -336,6 +356,19 @@ mod fixtures_tests {
         let f = fixtures::m4a(&[9u8; 16]);
         let b = crate::mp4::locate_audio(&f).unwrap();
         assert_eq!(b.audio_length, 16);
+    }
+
+    #[test]
+    fn m4a_two_covers_fixture_parses_with_both_pictures() {
+        let f = fixtures::m4a_two_covers(&[9u8; 16]);
+        let b = crate::mp4::locate_audio(&f).unwrap();
+        assert_eq!(b.audio_length, 16);
+        let pics = crate::mp4::read_pictures(&f);
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].mime, "image/jpeg");
+        assert_eq!(pics[0].data, [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]);
+        assert_eq!(pics[1].mime, "image/png");
+        assert_eq!(pics[1].data, [0x89, b'P', b'N', b'G', 4, 5]);
     }
 
     #[test]

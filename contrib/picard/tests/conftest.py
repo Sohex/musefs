@@ -49,12 +49,25 @@ def make_track(db_path):
 
 
 class FakeImage:
-    """Stand-in for a Picard CoverArtImage: is_front_image() + data + mimetype."""
+    """Stand-in for a Picard CoverArtImage: is_front_image() + data + mimetype
+    (+ optional maintype / comment / can_be_saved_to_tags)."""
 
-    def __init__(self, data, mimetype, front=True):
+    def __init__(
+        self,
+        data,
+        mimetype,
+        front=True,
+        maintype=None,
+        comment="",
+        can_be_saved_to_tags=True,
+    ):
         self.data = data
         self.mimetype = mimetype
         self._front = front
+        if maintype is not None:
+            self.maintype = maintype  # absent attribute exercises the fallback
+        self.comment = comment
+        self.can_be_saved_to_tags = can_be_saved_to_tags
 
     def is_front_image(self):
         return self._front

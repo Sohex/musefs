@@ -5,6 +5,10 @@ import mutagen
 import mutagen.id3
 import mutagen.mp4
 
+# Mirrored byte-for-byte from musefs-core/tests/interop_emit.rs (COVR_JPEG/COVR_PNG).
+COVR_JPEG = b"\xff\xd8\xff\xe0interop-jpeg-cover"
+COVR_PNG = b"\x89PNG\r\n\x1a\ninterop-png-cover"
+
 
 def _read_tag(path, key):
     """Read a single tag value from an audio file using mutagen."""
@@ -139,3 +143,22 @@ def test_binary_frames_survive():
     vals = f.tags.get(mp4["freeform_key"]) if f.tags else None
     assert vals, f"freeform atom {mp4['freeform_key']} missing"
     assert bytes(vals[0]) == mp4["freeform_data"].encode("ascii"), "---- payload changed"
+
+
+def test_m4a_multi_cover_art():
+    """Every track_art row is served as a covr `data` atom (iTunes convention);
+    mutagen reads them back in ordinal order, bytes intact."""
+    base = os.environ["MUSEFS_INTEROP_DIR"]
+    with open(os.path.join(base, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    rows = [r for r in manifest if r.get("covr_count")]
+    assert rows, "no manifest row declares cover art"
+    for row in rows:
+        f = mutagen.mp4.MP4(os.path.join(base, row["file"]))
+        covr = f.tags.get("covr") if f.tags else None
+        assert covr is not None, f"{row['file']}: no covr tag"
+        assert len(covr) == row["covr_count"]
+        assert bytes(covr[0]) == COVR_JPEG
+        assert covr[0].imageformat == mutagen.mp4.MP4Cover.FORMAT_JPEG
+        assert bytes(covr[1]) == COVR_PNG
+        assert covr[1].imageformat == mutagen.mp4.MP4Cover.FORMAT_PNG

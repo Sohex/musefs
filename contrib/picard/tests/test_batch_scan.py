@@ -17,7 +17,7 @@ def test_autoscan_batches_into_one_run_scan(monkeypatch, db_path):
     monkeypatch.setattr(plugin_mod, "check_schema_version", lambda conn: None)
     monkeypatch.setattr(plugin_mod, "sync_files", lambda conn, records: SimpleNamespace())
     monkeypatch.setattr(plugin_mod, "map_fields", lambda md, fields: [])
-    monkeypatch.setattr(plugin_mod, "front_cover", lambda md: None)
+    monkeypatch.setattr(plugin_mod, "images", lambda md: [])
 
     opts = SimpleNamespace(db=db_path, bin="musefs", autoscan=True, fields={})
     files = {

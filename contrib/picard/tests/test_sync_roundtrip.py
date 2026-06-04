@@ -12,7 +12,15 @@ def test_do_sync_writes_tags_and_art(db_path, make_track, fake_file, fake_metada
 
     path = "/music/a.flac"
     tid = make_track(path)
-    meta = fake_metadata(images=[fake_image(JPEG, "image/jpeg")], title="Song", artist="Band")
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    meta = fake_metadata(
+        images=[
+            fake_image(JPEG, "image/jpeg"),
+            fake_image(png, "image/png", front=False, maintype="back"),
+        ],
+        title="Song",
+        artist="Band",
+    )
     f = fake_file(path, meta)
     files = {path: f}  # key is already a realpath for an absolute test path
     opts = Opts(db=db_path, bin="musefs", autoscan=False, fields={})
@@ -27,10 +35,11 @@ def test_do_sync_writes_tags_and_art(db_path, make_track, fake_file, fake_metada
             "SELECT value FROM tags WHERE track_id=? AND key='title'", (tid,)
         ).fetchone()[0]
         assert title == "Song"
-        assert (
-            conn.execute("SELECT COUNT(*) FROM track_art WHERE track_id=?", (tid,)).fetchone()[0]
-            == 1
-        )
+        rows = conn.execute(
+            "SELECT picture_type, ordinal FROM track_art WHERE track_id=? ORDER BY ordinal",
+            (tid,),
+        ).fetchall()
+        assert rows == [(3, 0), (4, 1)]
     finally:
         conn.close()
 

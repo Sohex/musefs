@@ -10,11 +10,26 @@ proptest! {
     fn mp4_synthesis_preserves_audio(
         payload in proptest::collection::vec(any::<u8>(), 1..256),
         tags in proptest::collection::vec(("[A-Z]{1,12}", "[ -~]{0,40}"), 0..8),
+        arts in proptest::collection::vec((1..3u8, 0..500u64), 0..3),
     ) {
         let file = fixtures::m4a(&payload);
         let scan = mp4::read_structure(&file).unwrap();
         let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
-        let arts: Vec<ArtInput> = Vec::new();
+        // (kind, len) pairs: kind 1 = jpeg, 2 = png; len 0 exercises the
+        // zero-byte filter in synthesize_layout.
+        let arts: Vec<ArtInput> = arts
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, len))| ArtInput {
+                art_id: i as i64 + 1,
+                mime: if *kind == 1 { "image/jpeg".into() } else { "image/png".into() },
+                description: String::new(),
+                picture_type: 3,
+                width: 0,
+                height: 0,
+                data_len: *len,
+            })
+            .collect();
         if let Ok(layout) = mp4::synthesize_layout(&scan, &taginputs, &[], &arts) {
             assert_backing_covers_audio(scan.mdat_payload_offset, scan.mdat_payload_len, &layout);
         }
