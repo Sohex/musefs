@@ -197,8 +197,8 @@ parallel. Most of the Rust items came out of the v1 multi-model review triage.
   gated the 128-byte tail read to `.mp3` files only; non-MP3 formats save
   −128 B/file in `scan_bytes_read`. See BENCHMARKS.md "Phase 6 PR 2".
 - ~~#68 — `ingest_bulk` copies each picture's bytes (scan perf)~~ — done:
-  owned `Unit` variants drain into the writer via `std::mem::take` (move, not
-  clone). Wall-time win on art-bearing corpora. See BENCHMARKS.md "Phase 6 PR 2".
+  the writer drains the owned `Unit` batch by value (move, not clone).
+  Wall-time win on art-bearing corpora. See BENCHMARKS.md "Phase 6 PR 2".
 - #70 — zero-copy serve path (deferred SP3 residual; largest scope).
 
 **Phase 7 — Docs**

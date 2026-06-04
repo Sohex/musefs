@@ -404,8 +404,8 @@ Two stacked scan-path optimizations, neither touching served bytes:
    `read_exact` per non-MP3 file, saving exactly 128 bytes of scan I/O each.
 2. **#68 — Move-not-clone ingest.** `ingest_bulk` previously cloned each
    picture's bytes (`Vec::clone`) because the batch held `&Probed` borrows.
-   The owned `Unit` variant now drains into the writer via `std::mem::take`,
-   moving the payload instead of copying it.
+   The writer now drains the owned `Unit` batch by value, moving the payload
+   into the DB structs instead of copying it.
 
 - **Before** = `main` @ `e7ae912` (post-#69): reads ID3v1 tail for all formats; clones picture bytes.
 - **After** = `phase6-pr2-scan-pair` @ `9b49a63`: tail gated to `.mp3`; picture bytes moved.
