@@ -1,4 +1,4 @@
-from conftest import JPEG, insert_track
+from conftest import JPEG, PNG, insert_track
 
 from musefs_common import (
     connect,
@@ -8,7 +8,6 @@ from musefs_common import (
     upsert_art,
 )
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 WEBP = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 8
 
 

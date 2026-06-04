@@ -6,8 +6,9 @@ import pytest
 from musefs_common import connect as musefs_connect
 from musefs_common.schema import SCHEMA_SQL
 
-# Minimal valid JPEG header + padding; used as fake cover-art bytes in tests.
+# Minimal valid JPEG/PNG headers + padding; used as fake cover-art bytes in tests.
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
 
 @pytest.fixture

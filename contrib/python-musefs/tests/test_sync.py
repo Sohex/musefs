@@ -1,9 +1,7 @@
-from conftest import JPEG, insert_track
+from conftest import JPEG, PNG, insert_track
 
 from musefs_common import ArtImage, Record, SyncStats, connect, sync_files, sync_one
 from musefs_common.constants import MAX_ART_BYTES
-
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
 
 def _seed(db_path, path="/m/a.flac"):
