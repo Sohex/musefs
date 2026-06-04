@@ -205,6 +205,13 @@ pattern. The **base64 arm keeps an input buffer**: it is a genuine transform
 (raw bytes in, base64 chars out) with a bounded input window. The allocating
 `read_art_chunk` remains for non-hot-path callers.
 
+Constraint carried from Phase 2: open handles intentionally outlive
+`poll_refresh`, and `set_binary_tags` can reuse `tags` rowids — so buffer
+reuse alone is NOT sufficient for `Segment::BinaryTag` correctness. A stale
+handle must never serve another payload through a recycled rowid: binary
+tags need a stable, never-reused payload id (plus a regression test pinning
+a stale-handle read across a re-tag) before or alongside this refactor.
+
 ### Half B — per-worker output-buffer reuse
 
 **Finding that rescopes the issue:** fuser 0.17's `ReplyData::data` sends a

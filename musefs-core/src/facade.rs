@@ -178,9 +178,15 @@ struct IncrementalOutcome {
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
         let mut alloc = InodeAllocator::new();
-        let (tree, snapshot) = Self::build_full(&db, &config, &mut alloc)?;
+        // Capture both freshness stamps BEFORE the build: a write landing during
+        // build_full then leaves data_version > stamp (the first poll triggers)
+        // and seq > watermark (the changelog replays it) — at worst one redundant
+        // refresh. Stamping after the build could record the writer's
+        // data_version/seq against a tree that predates it: a permanently missed
+        // update, since the next poll would see both stamps as current.
         let last_data_version = db.data_version()?;
         let last_seq = db.changelog_since(i64::MAX)?.max_seq;
+        let (tree, snapshot) = Self::build_full(&db, &config, &mut alloc)?;
         let poll_interval = config.poll_interval;
         Ok(Musefs {
             cache: HeaderCache::new(config.mode),
