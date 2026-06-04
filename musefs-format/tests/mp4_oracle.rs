@@ -74,7 +74,7 @@ fn synthesized_m4a_decodes_via_independent_parser() {
 }
 
 #[test]
-fn m4a_synthesis_uses_only_first_cover_art() {
+fn m4a_synthesis_includes_every_cover_art() {
     let original = std::fs::read("tests/fixtures/sample.m4a").unwrap();
     let scan = mp4::read_structure(&original).unwrap();
 

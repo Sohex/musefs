@@ -234,19 +234,6 @@ minus a few intentional/noisy groups — lives in the root `Cargo.toml` under
 git config core.hooksPath .githooks
 ```
 
-## Limitations
-
-### MP4/M4A Cover Art
-
-MP4/M4A synthesis embeds only the first cover-art input when multiple images
-are available. This is an intentional current limitation: the MP4 container
-format stores cover art in the `covr` metadata atom, which maps to a single
-`data` item. If multiple cover images are present in the database, only the
-first (earliest `track_art.ordinal`) is embedded.
-
-Tests lock this behavior — see `tests/mp4_oracle.rs`. Future work may
-support multiple covers via additional metadata atoms or a gallery layout.
-
 ## License
 
 Licensed under the [MIT License](LICENSE).
