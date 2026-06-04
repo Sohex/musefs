@@ -223,7 +223,7 @@ These two halves land as ONE commit: after the pool change alone, core's serve f
 - Modify: `musefs-core/src/db_pool.rs`
 - Modify: `musefs-core/src/reader.rs:214,239,423,446,457,563,575`
 - Modify: `musefs-core/src/mapping.rs:32,67,83`
-- Modify: `musefs-core/src/facade.rs:237,264`
+- Modify: `musefs-core/src/facade.rs:236,263`
 
 - [ ] **Step 1: db_pool.rs holds and hands out `Db<ReadOnly>`**
 
@@ -278,6 +278,12 @@ thread_local! {
     pub fn with<R>(&self, f: impl FnOnce(&Db<ReadOnly>) -> Result<R>) -> Result<R> {
 ```
 
+One in-file unit test constructs `PerThread` directly and needs a one-line edit: in `with_open_failure_includes_path_in_error` (`db_pool.rs:189-192`), change the `poll` initializer to
+
+```rust
+            poll: ReentrantMutex::new(Db::open_in_memory().unwrap().into_read_only()),
+```
+
 - [ ] **Step 2: Genericize the 12 serve-path fns**
 
 In each, add `<M>` to the generics and change `db: &Db` to `db: &Db<M>`. Nothing else in the signatures or bodies changes. The full list:
@@ -319,7 +325,7 @@ Do NOT touch `scan.rs` — its `&Db` params correctly stay `Db<ReadWrite>` (it w
 cargo test -p musefs-core
 ```
 
-Expected: PASS with **zero test-file edits** — that absence is itself spec verification ("every existing test spelling compiles as-is"). Tests pass writable in-memory DBs into `resolve`/`read_at` (e.g. `tests/read_at.rs:37`) — the generic accepts them; `reader.rs:1037`'s manual `Db::open_readonly` now yields an honest `Db<ReadOnly>` that the same generic accepts. If a compile error names a fn taking `&Db` receiving a `&Db<ReadOnly>`, that fn was missed in Step 2 — genericize it the same way rather than inserting any conversion.
+Expected: PASS with **no integration-test-file edits** (the only test change anywhere is the one-line `into_read_only()` in `db_pool.rs`'s own unit test, Step 1) — that absence is itself spec verification ("every existing test spelling compiles as-is"). Tests pass writable in-memory DBs into `resolve`/`read_at` (e.g. `tests/read_at.rs:37`) — the generic accepts them; `reader.rs:1037`'s manual `Db::open_readonly` now yields an honest `Db<ReadOnly>` that the same generic accepts. If a compile error names a fn taking `&Db` receiving a `&Db<ReadOnly>`, that fn was missed in Step 2 — genericize it the same way rather than inserting any conversion.
 
 - [ ] **Step 4: Build the rest of the workspace**
 
