@@ -173,3 +173,21 @@ fn render_keys_for_returns_only_requested_existing_ids() {
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].0, id1);
 }
+
+#[test]
+fn delete_changelog_through_for_test_prunes_the_prefix() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.upsert_track(&new_track("/a.flac")).unwrap();
+    db.replace_tags(id, &[Tag::new("ARTIST", "X", 0)]).unwrap();
+    let log = db.changelog_since(0).unwrap();
+    assert!(log.max_seq >= 2);
+
+    db.delete_changelog_through_for_test(log.max_seq - 1)
+        .unwrap();
+    let after = db.changelog_since(0).unwrap();
+    assert_eq!(
+        (after.min_seq, after.max_seq),
+        (log.max_seq, log.max_seq),
+        "rows through max_seq - 1 must actually be deleted"
+    );
+}

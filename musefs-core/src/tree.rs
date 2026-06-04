@@ -378,6 +378,66 @@ impl VirtualTree {
 
     /// Apply an incremental change set in place, producing a tree byte-identical to a
     /// full `build_with` over the same final track set. `new_paths` maps every CURRENT
+    /// Removal-side dirty propagation: walk `leaf` -> root. At each level the
+    /// parent is dirtied only when the child link is rename-relevant
+    /// (`collision_gate`, O(log)) AND the removed `id` was the child's
+    /// introducing id (for the leaf itself `introducing_id` is an O(1) read of
+    /// its own track id; the O(subtree) walk runs only at gated dir levels). A
+    /// gated level where the min did NOT change ends the walk: `id` can't be
+    /// the min of any ancestor either.
+    fn dirty_removed_ancestors(
+        &self,
+        leaf: u64,
+        id: i64,
+        dirty: &mut std::collections::HashSet<u64>,
+    ) {
+        let mut child = leaf;
+        while child != Self::ROOT {
+            let Some((parent, name, rendered)) = self
+                .node(child)
+                .map(|n| (n.parent, n.name.clone(), n.rendered_name.clone()))
+            else {
+                break;
+            };
+            if self.collision_gate(parent, &name, &rendered) {
+                if self.introducing_id(child) == id {
+                    dirty.insert(parent);
+                } else {
+                    break;
+                }
+            }
+            child = parent;
+        }
+    }
+
+    /// Add-side dirty propagation: min-flip walk `d` -> root, collision-gated
+    /// per level. A gated level where the added `id` is not the new min ends
+    /// the walk: ancestor mins only decrease, so no higher flip is possible.
+    fn dirty_min_flip_ancestors(
+        &self,
+        d: u64,
+        id: i64,
+        dirty: &mut std::collections::HashSet<u64>,
+    ) {
+        let mut child = d;
+        while child != Self::ROOT {
+            let Some((parent, name, rendered)) = self
+                .node(child)
+                .map(|n| (n.parent, n.name.clone(), n.rendered_name.clone()))
+            else {
+                break;
+            };
+            if self.collision_gate(parent, &name, &rendered) {
+                if id < self.introducing_id(child) {
+                    dirty.insert(parent);
+                } else {
+                    break;
+                }
+            }
+            child = parent;
+        }
+    }
+
     /// track id to its rendered path. Returns `Err(RebuildError)` on any inconsistency
     /// (caller falls back to full build). See SP2 Component 3.
     ///
@@ -426,29 +486,7 @@ impl VirtualTree {
             let Some(leaf) = self.inode_of_track(id) else {
                 continue;
             };
-            // Walk leaf -> root. At each level the parent is dirtied only when the
-            // child link is rename-relevant (collision_gate, O(log)) AND `id` was
-            // the child's introducing id (for the leaf itself introducing_id is an
-            // O(1) read of its own track id; the O(subtree) walk runs only at
-            // gated dir levels). A gated level where the min did NOT change ends
-            // the walk: `id` can't be the min of any ancestor either.
-            let mut child = leaf;
-            while child != Self::ROOT {
-                let Some((parent, name, rendered)) = self
-                    .node(child)
-                    .map(|n| (n.parent, n.name.clone(), n.rendered_name.clone()))
-                else {
-                    break;
-                };
-                if self.collision_gate(parent, &name, &rendered) {
-                    if self.introducing_id(child) == id {
-                        dirty.insert(parent);
-                    } else {
-                        break;
-                    }
-                }
-                child = parent;
-            }
+            self.dirty_removed_ancestors(leaf, id, &mut dirty);
         }
         for &id in added.iter().chain(moved_in.iter()) {
             let rendered = new_paths
@@ -467,26 +505,7 @@ impl VirtualTree {
             }) {
                 dirty.insert(d);
             }
-            // Min-flip walk d -> root, collision-gated per level. A gated level
-            // where `id` is not the new min ends the walk: ancestor mins only
-            // decrease, so no higher flip is possible either.
-            let mut child = d;
-            while child != Self::ROOT {
-                let Some((parent, name, rnd)) = self
-                    .node(child)
-                    .map(|n| (n.parent, n.name.clone(), n.rendered_name.clone()))
-                else {
-                    break;
-                };
-                if self.collision_gate(parent, &name, &rnd) {
-                    if id < self.introducing_id(child) {
-                        dirty.insert(parent);
-                    } else {
-                        break;
-                    }
-                }
-                child = parent;
-            }
+            self.dirty_min_flip_ancestors(d, id, &mut dirty);
         }
 
         // (2) Structural mutation. A pruned dir chain is rename-relevant for the
@@ -1115,6 +1134,21 @@ mod tests {
             (3, "D/z.flac".to_string()),
         ];
         assert_apply_matches_build(&before, &after, &[1], &[], &[], 1);
+    }
+
+    #[test]
+    fn apply_changes_added_min_id_under_colliding_dir_rebuilds_parent() {
+        // File id 2 rendered "D" owns the base key; the dir for id 5's
+        // "D/x.flac" was disambiguated to "D (2)". Adding id 1 under the dir
+        // flips its introducing id below the file's — a fresh build now gives
+        // the DIR the base name. The add-side min-flip walk must catch this.
+        let before = vec![(2, "D".to_string()), (5, "D/x.flac".to_string())];
+        let after = vec![
+            (1, "D/y.flac".to_string()),
+            (2, "D".to_string()),
+            (5, "D/x.flac".to_string()),
+        ];
+        assert_apply_matches_build(&before, &after, &[], &[1], &[], 1);
     }
 
     #[test]
