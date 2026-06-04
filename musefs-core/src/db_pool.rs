@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::ReentrantMutex;
 
 use musefs_db::Db;
 
@@ -22,22 +24,28 @@ use crate::error::{CoreError, Result};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
+/// `with` and `with_poll` may nest freely, on any variant: `PerThread` reads
+/// hand out thread-local `Rc` clones, and both mutexes are reentrant.
+///
+/// Lifetime contract (#127, accepted by design): `PerThread` read connections
+/// are owned by the threads that opened them and live until those threads
+/// exit. Dropping the pool clears only the dropping thread's connection, so a
+/// caller that creates and drops many pools on long-lived shared threads
+/// strands connections (one fd + SQLite cache each) until those threads exit.
+/// Fine for musefs — a mount's worker pool lives exactly as long as the mount;
+/// closing the gap would need a cross-thread registry, deliberately not built
+/// (`Rc<Db>` is `!Send`, so another thread's entry is unreachable anyway).
 pub enum DbPool {
     PerThread {
         id: u64,
         path: PathBuf,
-        poll: Mutex<Db>,
+        poll: ReentrantMutex<Db>,
     },
-    Shared(Arc<Mutex<Db>>),
+    Shared(Arc<ReentrantMutex<Db>>),
 }
 
-/// Clears only the *dropping thread's* thread-local connection for this pool.
-/// Connections this pool opened on other worker threads persist until those
-/// threads exit — accepted, because a mount's worker pool lives for the whole
-/// mount, so a connection's lifetime already matches its thread's. A future
-/// caller that creates and drops many pools over long-lived shared threads would
-/// leak; closing that would need a cross-thread registry, intentionally not built
-/// here.
+/// Clears only the *dropping thread's* thread-local connection for this pool —
+/// see the lifetime contract on [`DbPool`].
 impl Drop for DbPool {
     fn drop(&mut self) {
         if let DbPool::PerThread { id, path, .. } = self {
@@ -63,9 +71,9 @@ impl DbPool {
             Some(p) => Ok(DbPool::PerThread {
                 id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
                 path: p.to_path_buf(),
-                poll: Mutex::new(db),
+                poll: ReentrantMutex::new(db),
             }),
-            None => Ok(DbPool::Shared(Arc::new(Mutex::new(db)))),
+            None => Ok(DbPool::Shared(Arc::new(ReentrantMutex::new(db)))),
         }
     }
 
@@ -76,15 +84,10 @@ impl DbPool {
     /// before it opened. The poll connection is the original writer Db, kept alive
     /// precisely so it can observe incremental changes from other connections.
     /// For `Shared` pools (in-memory), the single shared connection serves both roles.
-    ///
-    /// Note: `std::sync::Mutex` is not reentrant — do not call `with_poll` from
-    /// inside a `with` closure on the `Shared` variant (it would deadlock).
     pub fn with_poll<R>(&self, f: impl FnOnce(&Db) -> Result<R>) -> Result<R> {
         match self {
-            DbPool::PerThread { poll, .. } => f(&poll
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)),
-            DbPool::Shared(m) => f(&m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)),
+            DbPool::PerThread { poll, .. } => f(&poll.lock()),
+            DbPool::Shared(m) => f(&m.lock()),
         }
     }
 
@@ -108,7 +111,7 @@ impl DbPool {
                 f(&db)
             }),
             DbPool::Shared(m) => {
-                let db = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let db = m.lock();
                 f(&db)
             }
         }
@@ -170,6 +173,8 @@ mod tests {
         assert!(r >= 0);
     }
 
+    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
+    // If these hang, the fix has regressed.
     #[test]
     fn reentrant_with_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
@@ -186,12 +191,57 @@ mod tests {
         let pool = DbPool::PerThread {
             id: u64::MAX,
             path: bad.clone(),
-            poll: Mutex::new(Db::open_in_memory().unwrap()),
+            poll: ReentrantMutex::new(Db::open_in_memory().unwrap()),
         };
         let msg = pool.with(|_db| Ok(())).unwrap_err().to_string();
         assert!(
             msg.contains("/nonexistent-musefs-dir/does-not-exist.db"),
             "open error must name the failing path, got: {msg}"
         );
+    }
+
+    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
+    // If these hang, the fix has regressed.
+    #[test]
+    fn nested_with_on_shared_pool() {
+        let pool = DbPool::new(Db::open_in_memory().unwrap()).unwrap();
+        let r: Result<i64> = pool.with(|_outer| pool.with(|db| Ok(db.data_version()?)));
+        assert!(r.is_ok(), "nested with on Shared must not deadlock");
+    }
+
+    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
+    // If these hang, the fix has regressed.
+    #[test]
+    fn with_poll_inside_with_on_shared_pool() {
+        let pool = DbPool::new(Db::open_in_memory().unwrap()).unwrap();
+        let r: Result<i64> = pool.with(|_outer| pool.with_poll(|db| Ok(db.data_version()?)));
+        assert!(
+            r.is_ok(),
+            "with_poll inside with on Shared must not deadlock"
+        );
+    }
+
+    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
+    // If these hang, the fix has regressed.
+    #[test]
+    fn nested_with_poll_on_per_thread_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("np.db");
+        Db::open(&path).unwrap();
+        let pool = DbPool::new(Db::open(&path).unwrap()).unwrap();
+        let r: Result<i64> = pool.with_poll(|_outer| pool.with_poll(|db| Ok(db.data_version()?)));
+        assert!(r.is_ok(), "nested with_poll on PerThread must not deadlock");
+    }
+
+    // These test the deadlock scenario; they pass after the ReentrantMutex migration (Task 7).
+    // If these hang, the fix has regressed.
+    #[test]
+    fn nested_with_on_per_thread_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("np.db");
+        Db::open(&path).unwrap();
+        let pool = DbPool::new(Db::open(&path).unwrap()).unwrap();
+        let r: Result<i64> = pool.with(|_outer| pool.with(|db| Ok(db.data_version()?)));
+        assert!(r.is_ok(), "nested with on PerThread must not deadlock");
     }
 }
