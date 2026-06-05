@@ -1,5 +1,5 @@
 use crate::models::{BinaryTag, NewArt, NewTrack, StructuralBlock, Tag, TrackArt};
-use crate::{Db, Result};
+use crate::{Db, ReadWrite, Result};
 use rusqlite::{params, Transaction};
 use sha2::{Digest, Sha256};
 
@@ -13,7 +13,7 @@ fn sha256_hex(data: &[u8]) -> String {
     s
 }
 
-impl Db {
+impl Db<ReadWrite> {
     /// Apply the bulk-write pragmas to an open connection. WAL is left untouched
     /// (retained from `open`), so concurrent mount readers keep working. Safe on
     /// in-memory DBs. Intended for a scan-scoped `Db` the caller drops at scan end.

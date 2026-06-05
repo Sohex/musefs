@@ -29,7 +29,7 @@ pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, String> {
 /// Build the synthesis art inputs for a track from `track_art` + art metadata.
 /// Reads metadata only (never the image blob) so resolve stays memory-bounded;
 /// the bytes are streamed at read time.
-pub(crate) fn track_art_to_inputs(db: &Db, track_id: i64) -> Result<Vec<ArtInput>> {
+pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<ArtInput>> {
     let mut inputs = Vec::new();
     for ta in db.get_track_art(track_id)? {
         // `track_art.art_id` is a foreign key into `art` (enforced, no ON DELETE),
@@ -64,7 +64,7 @@ pub(crate) fn track_art_to_inputs(db: &Db, track_id: i64) -> Result<Vec<ArtInput
 /// the payload bytes — only `(rowid, key, byte_len)`; the bytes stream at read
 /// time. Ordered by (key, ordinal), matching `get_binary_tags`.
 #[allow(dead_code)] // wired into the reader resolve arms in Task 2.9
-pub(crate) fn binary_tags_to_inputs(db: &Db, track_id: i64) -> Result<Vec<BinaryTagInput>> {
+pub(crate) fn binary_tags_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<BinaryTagInput>> {
     Ok(db
         .get_binary_tags(track_id)?
         .into_iter()
@@ -80,7 +80,7 @@ pub(crate) fn binary_tags_to_inputs(db: &Db, track_id: i64) -> Result<Vec<Binary
 /// compute page CRCs at resolve). Parallel to `track_art_to_inputs`; returns the
 /// same order. Only the Ogg synthesis path calls this — FLAC/MP3/MP4 stream art
 /// via `ArtImage` and never materialize it.
-pub(crate) fn track_art_images(db: &Db, inputs: &[ArtInput]) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn track_art_images<M>(db: &Db<M>, inputs: &[ArtInput]) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::with_capacity(inputs.len());
     for a in inputs {
         out.push(db.read_art_chunk(a.art_id, 0, a.data_len as usize)?);

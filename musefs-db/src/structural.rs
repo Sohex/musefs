@@ -1,28 +1,8 @@
 use crate::models::StructuralBlock;
-use crate::{Db, Result};
+use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
 
-impl Db {
-    /// Replace the track's structural blocks (FLAC STREAMINFO/SEEKTABLE).
-    pub fn set_structural_blocks(&self, track_id: i64, blocks: &[StructuralBlock]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM structural_blocks WHERE track_id = ?1",
-            params![track_id],
-        )?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for b in blocks {
-                stmt.execute(params![track_id, b.kind, b.ordinal, b.body])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
+impl<M> Db<M> {
     /// Track ids that have at least one structural block row. Used by `revalidate`
     /// to detect legacy FLAC tracks (scanned under V1) that still need a backfill.
     pub fn track_ids_with_structural_blocks(&self) -> Result<std::collections::HashSet<i64>> {
@@ -49,6 +29,28 @@ impl Db {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+impl Db<ReadWrite> {
+    /// Replace the track's structural blocks (FLAC STREAMINFO/SEEKTABLE).
+    pub fn set_structural_blocks(&self, track_id: i64, blocks: &[StructuralBlock]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM structural_blocks WHERE track_id = ?1",
+            params![track_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for b in blocks {
+                stmt.execute(params![track_id, b.kind, b.ordinal, b.body])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 

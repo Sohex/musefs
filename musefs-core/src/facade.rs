@@ -233,8 +233,8 @@ impl Musefs {
     /// `build_full` and `rebuild_full`. Confining all `Db` access here is what
     /// lets `rebuild_full` hold `inodes` only across the pure-CPU `build_with`.
     #[allow(clippy::type_complexity)]
-    fn render_entries(
-        db: &Db,
+    fn render_entries<M>(
+        db: &Db<M>,
         config: &MountConfig,
     ) -> Result<(Vec<(i64, String)>, HashMap<i64, TrackRenderState>)> {
         let tracks = db.list_tracks()?;
@@ -260,8 +260,8 @@ impl Musefs {
     /// Full rebuild: render every track and build the tree from scratch. Used by
     /// `open`, forced `refresh`, and the Stage B fallback. Returns the tree and the
     /// fresh `track_id -> TrackRenderState` snapshot.
-    fn build_full(
-        db: &Db,
+    fn build_full<M>(
+        db: &Db<M>,
         config: &MountConfig,
         alloc: &mut InodeAllocator,
     ) -> Result<(VirtualTree, HashMap<i64, TrackRenderState>)> {

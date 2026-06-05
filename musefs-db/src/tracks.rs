@@ -1,5 +1,5 @@
 use crate::models::{Format, NewTrack, Track};
-use crate::{Db, Result};
+use crate::{Db, ReadWrite, Result};
 use rusqlite::{params, Row};
 
 const TRACK_COLS: &str = "id, backing_path, format, audio_offset, audio_length, \
@@ -43,36 +43,7 @@ pub struct ChangelogRead {
     pub max_seq: i64,
 }
 
-impl Db {
-    pub fn upsert_track(&self, t: &NewTrack) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO tracks
-                (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))
-             ON CONFLICT(backing_path) DO UPDATE SET
-                format        = excluded.format,
-                audio_offset  = excluded.audio_offset,
-                audio_length  = excluded.audio_length,
-                backing_size  = excluded.backing_size,
-                backing_mtime = excluded.backing_mtime,
-                updated_at    = CAST(strftime('%s','now') AS INTEGER)",
-            params![
-                t.backing_path,
-                t.format.as_str(),
-                t.audio_offset,
-                t.audio_length,
-                t.backing_size,
-                t.backing_mtime,
-            ],
-        )?;
-        let id = self.conn.query_row(
-            "SELECT id FROM tracks WHERE backing_path = ?1",
-            params![t.backing_path],
-            |r| r.get(0),
-        )?;
-        Ok(id)
-    }
-
+impl<M> Db<M> {
     pub fn get_track(&self, id: i64) -> Result<Option<Track>> {
         let sql = format!("SELECT {TRACK_COLS} FROM tracks WHERE id = ?1");
         self.query_optional_track(&sql, params![id])
@@ -119,27 +90,6 @@ impl Db {
             Some(r) => Ok(Some(row_to_track(r)?)),
             None => Ok(None),
         }
-    }
-
-    /// Delete a track row. Foreign keys cascade to its `tags` and `track_art`
-    /// rows; the referenced `art` rows are left for `gc_orphan_art`.
-    pub fn delete_track(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    /// Test-only: force a track's format column directly (no rescan), bumping
-    /// data_version. The only way to exercise a format-only change — production
-    /// never mutates format without a rescan. content_version is NOT bumped (no
-    /// trigger fires on the tracks.format column), so this is a pure format-only edit.
-    #[doc(hidden)]
-    pub fn set_format_for_test(&self, id: i64, fmt: Format) -> Result<()> {
-        self.conn.execute(
-            "UPDATE tracks SET format = ?1, updated_at = CAST(strftime('%s','now') AS INTEGER) WHERE id = ?2",
-            params![fmt.as_str(), id],
-        )?;
-        Ok(())
     }
 
     /// Cheap render-key identity scan for incremental refresh: `(id, content_version,
@@ -215,6 +165,58 @@ impl Db {
             out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
         }
         Ok(out)
+    }
+}
+
+impl Db<ReadWrite> {
+    pub fn upsert_track(&self, t: &NewTrack) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO tracks
+                (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))
+             ON CONFLICT(backing_path) DO UPDATE SET
+                format        = excluded.format,
+                audio_offset  = excluded.audio_offset,
+                audio_length  = excluded.audio_length,
+                backing_size  = excluded.backing_size,
+                backing_mtime = excluded.backing_mtime,
+                updated_at    = CAST(strftime('%s','now') AS INTEGER)",
+            params![
+                t.backing_path,
+                t.format.as_str(),
+                t.audio_offset,
+                t.audio_length,
+                t.backing_size,
+                t.backing_mtime,
+            ],
+        )?;
+        let id = self.conn.query_row(
+            "SELECT id FROM tracks WHERE backing_path = ?1",
+            params![t.backing_path],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Delete a track row. Foreign keys cascade to its `tags` and `track_art`
+    /// rows; the referenced `art` rows are left for `gc_orphan_art`.
+    pub fn delete_track(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Test-only: force a track's format column directly (no rescan), bumping
+    /// data_version. The only way to exercise a format-only change — production
+    /// never mutates format without a rescan. content_version is NOT bumped (no
+    /// trigger fires on the tracks.format column), so this is a pure format-only edit.
+    #[doc(hidden)]
+    pub fn set_format_for_test(&self, id: i64, fmt: Format) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET format = ?1, updated_at = CAST(strftime('%s','now') AS INTEGER) WHERE id = ?2",
+            params![fmt.as_str(), id],
+        )?;
+        Ok(())
     }
 
     /// Test-only: delete changelog rows up to and including `seq`, simulating the

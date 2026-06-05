@@ -16,15 +16,36 @@ pub use models::{
 pub use tracks::ChangelogRead;
 
 use rusqlite::Connection;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub struct Db {
+/// Type-state markers for [`Db`]: the connection's write capability, at the
+/// type level. Write APIs exist only on `Db<ReadWrite>`.
+pub struct ReadOnly;
+pub struct ReadWrite;
+
+/// A SQLite connection whose mode parameter says whether write APIs resolve.
+///
+/// Read methods are available in both modes; write methods only on
+/// `Db<ReadWrite>` (the default, so `Db` spelled bare means writable):
+///
+/// ```
+/// let db = musefs_db::Db::open_in_memory().unwrap().into_read_only();
+/// db.data_version().unwrap();
+/// ```
+///
+/// ```compile_fail
+/// let db = musefs_db::Db::open_in_memory().unwrap().into_read_only();
+/// db.upsert_track(unimplemented!());
+/// ```
+pub struct Db<M = ReadWrite> {
     conn: Connection,
     path: Option<PathBuf>,
+    _mode: PhantomData<M>,
 }
 
-impl Db {
+impl Db<ReadWrite> {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Db> {
         let p = path.as_ref().to_path_buf();
         let mut conn = Connection::open(&p)?;
@@ -32,13 +53,18 @@ impl Db {
         Ok(Db {
             conn,
             path: Some(p),
+            _mode: PhantomData,
         })
     }
 
     pub fn open_in_memory() -> Result<Db> {
         let mut conn = Connection::open_in_memory()?;
         Self::configure(&mut conn, false)?;
-        Ok(Db { conn, path: None })
+        Ok(Db {
+            conn,
+            path: None,
+            _mode: PhantomData,
+        })
     }
 
     /// Apply shared connection pragmas, then migrate. `wal` enables write-ahead
@@ -58,6 +84,41 @@ impl Db {
         Ok(())
     }
 
+    /// Degrade to the read-only surface, keeping the same connection. The
+    /// change is type-level only — runtime behavior is unchanged. The only
+    /// intended caller is `musefs_core`'s `DbPool::new`, which strips write
+    /// access from the mount connection before the serve path can see it.
+    pub fn into_read_only(self) -> Db<ReadOnly> {
+        Db {
+            conn: self.conn,
+            path: self.path,
+            _mode: PhantomData,
+        }
+    }
+}
+
+impl Db<ReadOnly> {
+    /// Open an additional read-only connection to an existing file-backed DB.
+    /// WAL (set by the writer) lets these run concurrently without blocking.
+    /// No migration is run — the schema already exists and the connection is RO.
+    /// Note: even with `SQLITE_OPEN_READ_ONLY`, SQLite needs write access to the
+    /// directory (to create/use the `-shm` wal-index) when the DB is in WAL mode;
+    /// a strictly read-only DB directory will make this fail.
+    pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Db<ReadOnly>> {
+        let p = path.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // No configure()/migrate and no foreign_keys pragma: the schema already
+        // exists and no writes are possible on a read-only connection.
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Db {
+            conn,
+            path: Some(p),
+            _mode: PhantomData,
+        })
+    }
+}
+
+impl<M> Db<M> {
     pub fn user_version(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -73,24 +134,6 @@ impl Db {
     /// The backing file path, or `None` for an in-memory database.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
-    }
-
-    /// Open an additional read-only connection to an existing file-backed DB.
-    /// WAL (set by the writer) lets these run concurrently without blocking.
-    /// No migration is run — the schema already exists and the connection is RO.
-    /// Note: even with `SQLITE_OPEN_READ_ONLY`, SQLite needs write access to the
-    /// directory (to create/use the `-shm` wal-index) when the DB is in WAL mode;
-    /// a strictly read-only DB directory will make this fail.
-    pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Db> {
-        let p = path.as_ref().to_path_buf();
-        let conn = Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        // No configure()/migrate and no foreign_keys pragma: the schema already
-        // exists and no writes are possible on a read-only connection.
-        conn.busy_timeout(Duration::from_secs(5))?;
-        Ok(Db {
-            conn,
-            path: Some(p),
-        })
     }
 }
 
@@ -108,7 +151,11 @@ impl Default for Db {
             .expect("set busy_timeout");
         conn.pragma_update(None, "foreign_keys", true)
             .expect("enable foreign_keys");
-        Db { conn, path: None }
+        Db {
+            conn,
+            path: None,
+            _mode: PhantomData,
+        }
     }
 }
 
