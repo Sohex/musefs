@@ -64,9 +64,9 @@ pub struct HeaderCache {
 pub const DEFAULT_CACHE_BUDGET: u64 = 64 * 1024 * 1024;
 
 /// Item-count sizing hint for quick_cache's internal structures (not a bound):
-/// the default budget over 4 KiB, a typical inline tag region. A const so the
-/// arithmetic is outside any function body (nothing for cargo-mutants to chew
-/// on — the hint has no observable behavior to pin).
+/// the default budget over 4 KiB, a typical inline tag region. The hint has no
+/// observable public-API behavior, so its arithmetic carries an equivalent-mutant
+/// exclusion in .cargo/mutants.toml (cargo-mutants does mutate const initializers).
 const CACHE_ESTIMATED_ITEMS: usize = (DEFAULT_CACHE_BUDGET / 4096) as usize;
 
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {

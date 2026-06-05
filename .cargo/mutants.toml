@@ -218,7 +218,8 @@ exclude_re = [
     # quick_cache's internal hash map but is not a bound and has no effect on
     # eviction, correctness, or any observable public-API behavior. The `/`→`%`
     # variant yields 0 (64 MiB is 4 KiB-aligned), `/`→`*` yields ~256 GiB;
-    # quick_cache accepts any usize. The const initializer is outside any
-    # function body, so no test can observe it through the serving path.
+    # quick_cache accepts any usize. (cargo-mutants DOES mutate const
+    # initializers — the equivalence rests on unobservability, not on the
+    # const being out of reach.)
     'musefs-core/src/reader\.rs:70:60: replace / with [%*]',
 ]

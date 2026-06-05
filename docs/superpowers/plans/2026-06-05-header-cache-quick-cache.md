@@ -148,11 +148,18 @@ pub struct HeaderCache {
 pub const DEFAULT_CACHE_BUDGET: u64 = 64 * 1024 * 1024;
 
 /// Item-count sizing hint for quick_cache's internal structures (not a bound):
-/// the default budget over 4 KiB, a typical inline tag region. A const so the
-/// arithmetic is outside any function body (nothing for cargo-mutants to chew
-/// on — the hint has no observable behavior to pin).
+/// the default budget over 4 KiB, a typical inline tag region. The hint has no
+/// observable public-API behavior, so its arithmetic carries an equivalent-mutant
+/// exclusion in .cargo/mutants.toml (cargo-mutants does mutate const initializers).
 const CACHE_ESTIMATED_ITEMS: usize = (DEFAULT_CACHE_BUDGET / 4096) as usize;
 ```
+
+> **Correction (found during Task 8):** this plan originally claimed the const
+> initializer was "outside cargo-mutants' reach". That is FALSE — cargo-mutants
+> mutates const initializer expressions (`/`→`%`, `/`→`*` were generated and
+> MISSED). The hint is still unobservable through any public API, so the outcome
+> is a documented equivalent-mutant `exclude_re` in `.cargo/mutants.toml`, per
+> house convention — not a test.
 
 (`DEFAULT_CACHE_BUDGET` is unchanged — shown for placement.)
 
@@ -444,7 +451,7 @@ grep -q '^@@ ' mutants.diff && echo DIFF-OK
 cargo mutants --in-diff mutants.diff -j2 --exclude 'musefs-latencyfs/**' --output /tmp/mutants-out/in-diff
 ```
 
-Expected: `DIFF-OK`, then cargo-mutants ends with **0 missed**. The mutable surface is small: the weigher (`.max(1)`, `weight → 0/1` — killed by Task 4's two tests), the `retain` predicate (polarity/constants — killed by `header_cache_retain_drops_absent_tracks`), `remove` (killed by `header_cache_remove_drops_one_track_only`), and `resolve`'s version/metadata comparisons (killed by the surviving resolve/build tests). `CACHE_ESTIMATED_ITEMS` is a const initializer, outside cargo-mutants' reach by construction.
+Expected: `DIFF-OK`, then cargo-mutants ends with **0 missed**. The mutable surface is small: the weigher (`.max(1)`, `weight → 0/1` — killed by Task 4's two tests), the `retain` predicate (polarity/constants — killed by `header_cache_retain_drops_absent_tracks`), `remove` (killed by `header_cache_remove_drops_one_track_only`), and `resolve`'s version/metadata comparisons (killed by the surviving resolve/build tests). `CACHE_ESTIMATED_ITEMS`'s initializer IS mutated by cargo-mutants (see the Task 3 correction note) — its `/`→`%`/`*` mutants are equivalent (unobservable sizing hint) and carry a documented `exclude_re` in `.cargo/mutants.toml`.
 
 - [ ] **Step 2: If any mutant is MISSED**
 
@@ -505,6 +512,6 @@ Expected: PR URL printed. CI must show the required `ci-ok` / `coverage-ok` aggr
 
 ## Self-review notes (done at planning time)
 
-- **Spec coverage:** dependency+pin (Task 2), struct/weigher/API swap (Task 3), `.max(1)` zero-weight guard (Tasks 3+4), end-state budget test (Task 4), test split survive/rewrite/delete (Tasks 3+4), lock.rs doc (Task 5), clippy `--all-targets`/fmt/workspace tests (Task 6), BENCHMARKS.md (Tasks 1+7), mutation gate (Task 8). The spec's `estimated_items_capacity = budget / 4096` is implemented as the `CACHE_ESTIMATED_ITEMS` const derived from `DEFAULT_CACHE_BUDGET` instead of per-call arithmetic — same intent (a sizing hint), deliberately const so the unobservable arithmetic can't produce unkillable mutants (spec explicitly allows the implementer to adjust).
+- **Spec coverage:** dependency+pin (Task 2), struct/weigher/API swap (Task 3), `.max(1)` zero-weight guard (Tasks 3+4), end-state budget test (Task 4), test split survive/rewrite/delete (Tasks 3+4), lock.rs doc (Task 5), clippy `--all-targets`/fmt/workspace tests (Task 6), BENCHMARKS.md (Tasks 1+7), mutation gate (Task 8). The spec's `estimated_items_capacity = budget / 4096` is implemented as the `CACHE_ESTIMATED_ITEMS` const derived from `DEFAULT_CACHE_BUDGET` instead of per-call arithmetic — same intent (a sizing hint); the original rationale that a const initializer escapes cargo-mutants proved false during Task 8 — see the correction note in Task 3 Step 3 (spec explicitly allows the implementer to adjust).
 - **Type consistency:** `CacheBytesWeighter` (Tasks 3, 4), `cache` field name (Tasks 3, 4), `CACHE_ESTIMATED_ITEMS` (Task 3 only), `with_budget(Mode, u64)` unchanged everywhere.
 - **No placeholders:** every code step carries the actual code; the only deliberate fill-in is the BENCHMARKS.md numbers table, which cannot exist until the benches run.
