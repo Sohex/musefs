@@ -1216,12 +1216,12 @@ mod tests {
         let mut f_hi = b"TT2".to_vec();
         f_hi.extend_from_slice(&[0x01, 0x00, 0x00]);
         assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_hi)));
-        // size bytes [0x00,0x00,0x10] = 16, body = 10, tag_end = 20,
-        // data_start = 16. 16 > 20 - 16 = 4 -> reject. Pins the low byte:
+        // size bytes [0x00,0x00,0x10] = 16, body = 6, tag_end = 16,
+        // data_start = 16. 16 > 16 - 16 = 0 -> reject. Pins the low byte:
         // reading the flags byte (0x00) instead gives size 0 -> wrongly accept.
         let mut f_lo = b"TT2".to_vec();
         f_lo.extend_from_slice(&[0x00, 0x00, 0x10]); // 24-bit size = 16
-        assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 10, &f_lo)));
+        assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_lo)));
         // A valid in-bounds v2.2 frame is accepted: size 4, body = 6+4 = 10.
         let mut f_ok = b"TT2".to_vec();
         f_ok.extend_from_slice(&[0x00, 0x00, 0x04]);
