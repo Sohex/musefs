@@ -155,11 +155,10 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
 
 /// Build a `Musefs` from the DB at `args.db` and mount it (blocking) at
 /// `args.mountpoint`.
-#[allow(clippy::needless_pass_by_value)]
-pub fn run_mount(args: MountArgs) -> Result<()> {
+pub fn run_mount(args: &MountArgs) -> Result<()> {
     let db =
         Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
-    let (config, fuse_config) = parse_mount_config(&args);
+    let (config, fuse_config) = parse_mount_config(args);
     let core = Musefs::open(db, config).context("building the virtual filesystem")?;
     musefs_fuse::mount_with(core, &args.mountpoint, "musefs", fuse_config)
         .with_context(|| format!("mounting at {}", args.mountpoint.display()))?;
@@ -175,7 +174,7 @@ pub fn run(cli: Cli) -> Result<()> {
             revalidate,
             jobs,
         } => run_scan(&db, &targets, revalidate, jobs),
-        Command::Mount(args) => run_mount(args),
+        Command::Mount(args) => run_mount(&args),
     }
 }
 
