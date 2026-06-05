@@ -12,8 +12,9 @@
 //!   facade.rs `snapshot`          -> cat 2 (flag): per-track render state, rebuilt by rebuild_full from the DB.
 //!   facade.rs `last_poll`         -> cat 3 (recover): Instant, replace-only single write.
 //!   facade.rs `last_failed_refresh` -> cat 3 (recover): Option<Instant>, replace-only single write.
-//!   reader.rs HeaderCache shards  -> cat 1 (clear): pure cache, repopulated from the DB.
-//!   ResolvedFile::last_page (reader.rs:30, locked in ogg_index.rs as LastPageMemo)
+//!   reader.rs HeaderCache         -> n/a since #136: backed by quick_cache's own
+//!                                    internal locking; no std::sync::Mutex to poison.
+//!   ResolvedFile::last_page (reader.rs:32, locked in ogg_index.rs as LastPageMemo)
 //!                                 -> cat 1 (clear): deterministic one-entry cache, re-derived.
 //! Out of scope (handled elsewhere): byte_budget.rs (#93, currently panics on
 //! poison), db_pool.rs (#94), scan.rs ENV_LOCK / work-queue (test/scan-internal,

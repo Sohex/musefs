@@ -537,3 +537,37 @@ cargo bench -p musefs-core --bench read_throughput
 cargo test -p musefs-core --test proptest_read_fidelity
 cargo test -p musefs-format --features fuzzing
 ```
+
+---
+
+## 2026-06-05 — HeaderCache: hand-rolled sharded LRU → quick_cache (#136)
+
+S3-FIFO byte-weighted cache replaces the 16-shard Mutex LRU; the serve
+path's last shared std lock is gone. `read_throughput` before/after:
+
+| workload | before | after | Δ |
+|----------|-------:|------:|--:|
+| `sequential_read/flac` | 817.12 µs | 809.48 µs | −0.9% |
+| `sequential_read/mp3` | 815.81 µs | 823.02 µs | +0.9% |
+| `sequential_read/m4a` | 821.52 µs | 791.77 µs | −3.6% |
+| `sequential_read/m4a-last` | 825.11 µs | 809.40 µs | −1.9% |
+| `sequential_read/ogg` | 944.80 µs | 981.06 µs | +3.8% |
+| `sequential_read/wav` | 831.54 µs | 814.88 µs | −2.0% |
+| `cold_first_read/flac` | 1.5476 ms | 1.5769 ms | +1.9% |
+| `cold_first_read/mp3` | 1.5412 ms | 1.5501 ms | +0.6% |
+| `cold_first_read/m4a` | 1.5360 ms | 1.5296 ms | −0.4% |
+| `cold_first_read/m4a-last` | 1.5496 ms | 1.5300 ms | −1.3% |
+| `cold_first_read/ogg` | 1.7133 ms | 1.7151 ms | +0.1% |
+| `cold_first_read/wav` | 1.5937 ms | 1.5466 ms | −3.0% |
+| `seek_read/flac` | 553.30 µs | 543.93 µs | −1.7% |
+| `seek_read/mp3` | 539.68 µs | 523.98 µs | −2.9% |
+| `seek_read/m4a` | 559.38 µs | 544.93 µs | −2.6% |
+| `seek_read/m4a-last` | 561.40 µs | 528.78 µs | −5.8% |
+| `seek_read/ogg` | 798.29 µs | 754.28 µs | −5.5% |
+| `seek_read/wav` | 561.63 µs | 567.63 µs | +1.1% |
+| `concurrent_read_walk/m16_plus_walker` | 5.5074 ms | 5.4036 ms | −1.9% |
+
+No workload shows a regression outside noise. `seek_read` formats trend 2–6%
+faster (cache lookup path no longer behind a Mutex). `sequential_read/ogg`
+(+3.8%) and `cold_first_read/flac` (+1.9%) are within Criterion's noise
+threshold (p>0.05, "No change in performance detected").

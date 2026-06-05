@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -6,6 +6,8 @@ use std::sync::Mutex;
 use musefs_db::{Db, Format};
 use musefs_format::flac::{self, MetadataBlock};
 use musefs_format::{mp3, mp4, wav, BinaryTagInput, RegionLayout, Segment};
+use quick_cache::sync::Cache;
+use quick_cache::Weighter;
 
 use crate::error::{CoreError, Result};
 use crate::facade::Mode;
@@ -37,135 +39,35 @@ pub struct ResolvedFile {
     pub has_binary_tag: bool,
 }
 
-const CACHE_SHARDS: usize = 16;
+/// Weighs an entry by its resident inline bytes. The `.max(1)` is load-bearing:
+/// quick_cache ignores zero-weight entries when evicting, and every
+/// StructureOnly layout has `cache_bytes == 0`, so an unweighted entry would
+/// escape the byte budget entirely.
+#[derive(Clone)]
+struct CacheBytesWeighter;
 
-struct LruNode {
-    value: Arc<ResolvedFile>,
-    prev: Option<i64>,
-    next: Option<i64>,
-}
-
-/// One LRU shard: a hand-rolled O(1) doubly-linked list keyed by track id with a
-/// byte budget. `head` = most-recently-used, `tail` = least.
-struct Shard {
-    map: HashMap<i64, LruNode>,
-    head: Option<i64>,
-    tail: Option<i64>,
-    bytes: u64,
-    budget: u64,
-}
-
-impl Shard {
-    fn new(budget: u64) -> Shard {
-        Shard {
-            map: HashMap::new(),
-            head: None,
-            tail: None,
-            bytes: 0,
-            budget,
-        }
-    }
-    fn unlink(&mut self, key: i64) {
-        let (prev, next) = {
-            let n = &self.map[&key];
-            (n.prev, n.next)
-        };
-        match prev {
-            Some(p) => self.map.get_mut(&p).unwrap().next = next,
-            None => self.head = next,
-        }
-        match next {
-            Some(nx) => self.map.get_mut(&nx).unwrap().prev = prev,
-            None => self.tail = prev,
-        }
-        let n = self.map.get_mut(&key).unwrap();
-        n.prev = None;
-        n.next = None;
-    }
-    fn push_front(&mut self, key: i64) {
-        let old = self.head;
-        self.map.get_mut(&key).unwrap().next = old;
-        if let Some(h) = old {
-            self.map.get_mut(&h).unwrap().prev = Some(key);
-        }
-        self.head = Some(key);
-        if self.tail.is_none() {
-            self.tail = Some(key);
-        }
-    }
-    fn get(&mut self, key: i64) -> Option<Arc<ResolvedFile>> {
-        if !self.map.contains_key(&key) {
-            return None;
-        }
-        self.unlink(key);
-        self.push_front(key);
-        Some(self.map[&key].value.clone())
-    }
-    fn insert(&mut self, key: i64, value: Arc<ResolvedFile>) {
-        let add = value.cache_bytes;
-        if let Some(old_bytes) = self.map.get(&key).map(|n| n.value.cache_bytes) {
-            // Key exists: unlink from LRU list first (needs &mut self), then update.
-            self.unlink(key);
-            self.bytes -= old_bytes;
-            self.map.get_mut(&key).unwrap().value = value;
-        } else {
-            self.map.insert(
-                key,
-                LruNode {
-                    value,
-                    prev: None,
-                    next: None,
-                },
-            );
-        }
-        self.bytes += add;
-        self.push_front(key);
-        while self.bytes > self.budget && self.map.len() > 1 {
-            let lru = self.tail.unwrap();
-            self.unlink(lru);
-            let n = self.map.remove(&lru).unwrap();
-            self.bytes -= n.value.cache_bytes;
-        }
-    }
-    fn retain_keys(&mut self, live: &HashSet<i64>) {
-        let dead: Vec<i64> = self
-            .map
-            .keys()
-            .copied()
-            .filter(|k| !live.contains(k))
-            .collect();
-        for k in dead {
-            self.unlink(k);
-            if let Some(n) = self.map.remove(&k) {
-                self.bytes -= n.value.cache_bytes;
-            }
-        }
-    }
-    fn remove_key(&mut self, id: i64) {
-        if self.map.contains_key(&id) {
-            self.unlink(id);
-        }
-        if let Some(n) = self.map.remove(&id) {
-            self.bytes -= n.value.cache_bytes;
-        }
+impl Weighter<i64, Arc<ResolvedFile>> for CacheBytesWeighter {
+    fn weight(&self, _key: &i64, val: &Arc<ResolvedFile>) -> u64 {
+        val.cache_bytes.max(1)
     }
 }
 
-impl crate::lock::Clearable for Shard {
-    fn reset(&mut self) {
-        self.retain_keys(&HashSet::new());
-    }
-}
-
-/// A per-mount cache of resolved files, sharded for concurrency and keyed by track
-/// id; an entry self-invalidates when the track's `content_version` changes.
+/// A per-mount cache of resolved files keyed by track id; an entry
+/// self-invalidates when the track's `content_version` changes. Backed by
+/// quick_cache: S3-FIFO eviction, byte-weighted, internally sharded.
 pub struct HeaderCache {
-    shards: Vec<Mutex<Shard>>,
+    cache: Cache<i64, Arc<ResolvedFile>, CacheBytesWeighter>,
     mode: Mode,
 }
 
 /// Default resident-bytes budget for the header cache (64 MiB).
 pub const DEFAULT_CACHE_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// Item-count sizing hint for quick_cache's internal structures (not a bound):
+/// the default budget over 4 KiB, a typical inline tag region. The hint has no
+/// observable public-API behavior, so its arithmetic carries an equivalent-mutant
+/// exclusion in .cargo/mutants.toml (cargo-mutants does mutate const initializers).
+const CACHE_ESTIMATED_ITEMS: usize = (DEFAULT_CACHE_BUDGET / 4096) as usize;
 
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
@@ -188,29 +90,22 @@ impl HeaderCache {
         HeaderCache::with_budget(mode, DEFAULT_CACHE_BUDGET)
     }
     pub fn with_budget(mode: Mode, budget: u64) -> HeaderCache {
-        let per_shard = (budget / CACHE_SHARDS as u64).max(1);
-        let shards = (0..CACHE_SHARDS)
-            .map(|_| Mutex::new(Shard::new(per_shard)))
-            .collect();
-        HeaderCache { shards, mode }
-    }
-    fn shard(&self, track_id: i64) -> std::sync::MutexGuard<'_, Shard> {
-        let idx = (track_id as u64 % CACHE_SHARDS as u64) as usize;
-        crate::lock::lock_or_clear(&self.shards[idx], "header-cache shard")
+        HeaderCache {
+            cache: Cache::with_weighter(CACHE_ESTIMATED_ITEMS, budget, CacheBytesWeighter),
+            mode,
+        }
     }
     /// Drop cached resolutions for tracks no longer present (`live` = current ids).
     pub fn retain(&self, live: &HashSet<i64>) {
-        for s in &self.shards {
-            crate::lock::lock_or_clear(s, "header-cache shard (retain)").retain_keys(live);
-        }
+        self.cache.retain(|id, _| live.contains(id));
     }
     /// Drop one track's cached resolution (changelog-refresh removal path).
     pub fn remove(&self, id: i64) {
-        self.shard(id).remove_key(id);
+        self.cache.remove(&id);
     }
     /// Resolve a track to its layout, caching on a content-version miss. Validation
-    /// (`stat`) and synthesis run WITHOUT holding the shard lock; the lock is taken
-    /// only briefly for the cache get and insert.
+    /// (`stat`) and synthesis run outside the cache; quick_cache's internal locks
+    /// are only touched by the brief get and insert.
     pub fn resolve<M>(&self, db: &Db<M>, track_id: i64) -> Result<Arc<ResolvedFile>> {
         let track = db
             .get_track(track_id)?
@@ -224,13 +119,13 @@ impl HeaderCache {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
-        if let Some(hit) = self.shard(track_id).get(track_id) {
+        if let Some(hit) = self.cache.get(&track_id) {
             if hit.content_version == track.content_version {
                 return Ok(hit);
             }
         }
         let resolved = self.build(db, &track, &meta)?;
-        self.shard(track_id).insert(track_id, resolved.clone());
+        self.cache.insert(track_id, resolved.clone());
         Ok(resolved)
     }
     /// Build a `ResolvedFile` for `track` (synthesis or passthrough). No lock held.
@@ -971,17 +866,6 @@ mod cache_bound_tests {
     }
 
     #[test]
-    fn shard_evicts_least_recently_used_over_byte_budget() {
-        let mut shard = Shard::new(100);
-        shard.insert(1, entry(0, 60));
-        shard.insert(2, entry(0, 60)); // 120 > 100 → evict LRU key 1
-        assert!(shard.get(1).is_none());
-        assert!(shard.get(2).is_some());
-        shard.insert(3, entry(0, 60)); // evicts the now-LRU entry
-        assert!(shard.get(3).is_some());
-    }
-
-    #[test]
     fn header_cache_resolve_caches_by_content_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.flac");
@@ -1043,57 +927,6 @@ mod cache_bound_tests {
                 });
             }
         });
-    }
-
-    #[test]
-    fn shard_insert_reaccounts_bytes_on_reinsert() {
-        let mut s = Shard::new(1000);
-        s.insert(1, entry(0, 100));
-        assert_eq!(s.bytes, 100);
-        s.insert(1, entry(0, 30));
-        assert_eq!(s.bytes, 30);
-        assert_eq!(s.map.len(), 1);
-    }
-
-    #[test]
-    fn shard_evicts_and_subtracts_evicted_bytes() {
-        let mut s = Shard::new(100);
-        s.insert(1, entry(0, 60));
-        s.insert(2, entry(0, 60));
-        assert!(s.get(1).is_none());
-        assert!(s.get(2).is_some());
-        assert_eq!(s.bytes, 60);
-    }
-
-    #[test]
-    fn shard_keeps_both_entries_at_exactly_budget() {
-        let mut s = Shard::new(100);
-        s.insert(1, entry(0, 50));
-        s.insert(2, entry(0, 50));
-        assert!(s.get(1).is_some());
-        assert!(s.get(2).is_some());
-        assert_eq!(s.bytes, 100);
-    }
-
-    #[test]
-    fn shard_never_evicts_the_sole_entry_even_over_budget() {
-        let mut s = Shard::new(100);
-        s.insert(1, entry(0, 200));
-        assert!(s.get(1).is_some());
-        assert_eq!(s.bytes, 200);
-    }
-
-    #[test]
-    fn shard_reset_clears_all_entries() {
-        use crate::lock::Clearable;
-        let mut s = Shard::new(1000);
-        s.insert(1, entry(0, 100));
-        s.insert(2, entry(0, 100));
-        s.reset();
-        assert!(s.get(1).is_none());
-        assert!(s.get(2).is_none());
-        assert_eq!(s.bytes, 0);
-        assert_eq!(s.map.len(), 0);
     }
 
     #[test]
@@ -1160,59 +993,8 @@ mod cache_bound_tests {
     }
 
     #[test]
-    fn shard_remove_key_reaccounts_bytes() {
-        let mut s = Shard::new(1000);
-        s.insert(1, entry(0, 100));
-        s.insert(2, entry(0, 100));
-        s.remove_key(1);
-        assert!(s.get(1).is_none());
-        assert!(s.get(2).is_some());
-        assert_eq!(s.bytes, 100);
-    }
-
-    #[test]
-    fn shard_remove_key_is_noop_for_absent_id() {
-        let mut s = Shard::new(1000);
-        s.insert(1, entry(0, 100));
-        s.remove_key(999); // must not panic
-        assert_eq!(s.bytes, 100);
-    }
-
-    #[test]
-    fn shard_retain_keys_drops_dead_and_reaccounts() {
-        use std::collections::HashSet;
-        let mut s = Shard::new(1000);
-        s.insert(1, entry(0, 100));
-        s.insert(2, entry(0, 100));
-        s.insert(3, entry(0, 100));
-        let live: HashSet<i64> = [2, 3].into_iter().collect();
-        s.retain_keys(&live);
-        assert!(s.get(1).is_none());
-        assert!(s.get(2).is_some());
-        assert!(s.get(3).is_some());
-        assert_eq!(s.bytes, 200);
-    }
-
-    #[test]
     fn default_cache_budget_is_64_mib() {
         assert_eq!(DEFAULT_CACHE_BUDGET, 67_108_864);
-    }
-
-    #[test]
-    fn with_budget_divides_evenly_across_shards() {
-        let cache = HeaderCache::with_budget(Mode::Synthesis, 16_384);
-        assert_eq!(cache.shard(0).budget, 1024);
-    }
-
-    #[test]
-    fn shard_routes_by_modulo_not_division() {
-        let cache = HeaderCache::with_budget(Mode::Synthesis, 16 * 1024 * 1024);
-        cache.shard(1).insert(1, entry(0, 50));
-        assert!(
-            cache.shard(17).bytes > 0,
-            "17 and 1 must map to the same shard"
-        );
-        assert_eq!(cache.shard(2).bytes, 0, "2 maps to a different shard");
     }
 
     #[test]
@@ -1320,6 +1102,39 @@ mod cache_bound_tests {
         out.extend_from_slice(&audio);
         std::fs::write(path, &out).unwrap();
         (audio_offset, audio.len() as i64)
+    }
+
+    #[test]
+    fn cache_weight_stays_within_budget_after_flood() {
+        let cache = HeaderCache::with_budget(Mode::Synthesis, 4096);
+        for id in 0..64i64 {
+            cache.cache.insert(id, entry(0, 256)); // 64 × 256 B = 16 KiB ≫ 4 KiB
+        }
+        // End-state assertion only: quick_cache does not document per-insert
+        // synchronous eviction, so the per-insert bound is not guaranteed.
+        assert!(
+            cache.cache.weight() <= 4096,
+            "total weight {} exceeds the 4096-byte budget",
+            cache.cache.weight()
+        );
+        // len() is assumed to count resident entries. If this assertion ever
+        // trips, the diagnosis is the same as the weight() note above: re-read
+        // the spec's eviction-timing section and escalate — don't loosen.
+        assert!(
+            cache.cache.len() < 64,
+            "no eviction happened: all 64 over-budget entries are resident"
+        );
+    }
+
+    #[test]
+    fn zero_cache_bytes_entry_still_weighs_one() {
+        // StructureOnly layouts have cache_bytes == 0; the weigher's .max(1) keeps
+        // them inside the weighted bound instead of escaping it (quick_cache
+        // ignores zero-weight entries when evicting).
+        let cache = HeaderCache::with_budget(Mode::StructureOnly, 1024);
+        cache.cache.insert(1, entry(0, 0));
+        assert_eq!(cache.cache.weight(), 1);
+        assert!(cache.cache.get(&1).is_some());
     }
 }
 
