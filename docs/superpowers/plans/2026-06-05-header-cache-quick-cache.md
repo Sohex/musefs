@@ -62,7 +62,7 @@ quick_cache = "0.6.23"
 
 The patch-level minimum matters: `retain()` does not exist in early 0.6.x (verified absent in 0.6.0/0.6.2/0.6.9). Do NOT set `default-features = false` — the default `parking_lot` feature is wanted (musefs-core already depends on parking_lot 0.12 directly).
 
-- [ ] **Step 2: Verify it builds and the API assumptions hold**
+- [ ] **Step 2: Verify it builds**
 
 ```bash
 cargo build -p musefs-core
@@ -70,13 +70,7 @@ cargo build -p musefs-core
 
 Expected: clean build, `Compiling quick_cache v0.6.x` (x ≥ 23) in the output.
 
-Then confirm the four API signatures this plan leans on exist in the resolved version (one command, no network):
-
-```bash
-cargo doc -p quick_cache --no-deps -q && grep -o 'fn with_weighter\|fn retain\|fn weight\|fn remove' target/doc/quick_cache/sync/struct.Cache.html | sort -u
-```
-
-Expected output contains all of: `fn remove`, `fn retain`, `fn weight`, `fn with_weighter`. If any is missing, STOP and check docs.rs/quick_cache for the resolved version — do not improvise a replacement primitive.
+The real verification of the API surface this plan leans on (`with_weighter(usize, u64, W)`, `retain`, `remove`, `weight() -> u64`, `len()`, the `Weighter` trait signature) is Task 3's build and Task 4's tests — a missing or renamed method fails loudly there. If that happens, STOP and check docs.rs/quick_cache for the resolved version — do not improvise a replacement primitive.
 
 - [ ] **Step 3: Commit**
 
@@ -287,6 +281,9 @@ fn cache_weight_stays_within_budget_after_flood() {
         "total weight {} exceeds the 4096-byte budget",
         cache.cache.weight()
     );
+    // len() is assumed to count resident entries. If this assertion ever
+    // trips, the diagnosis is the same as the weight() note above: re-read
+    // the spec's eviction-timing section and escalate — don't loosen.
     assert!(
         cache.cache.len() < 64,
         "no eviction happened: all 64 over-budget entries are resident"
