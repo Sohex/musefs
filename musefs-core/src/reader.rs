@@ -159,8 +159,7 @@ impl HeaderCache {
                     return Err(CoreError::BackingChanged(track.backing_path.clone()));
                 }
 
-                let tags = db.get_tags(track.id)?;
-                let inputs = tags_to_inputs(&tags);
+                let inputs = tags_to_inputs(db.get_tags(track.id)?);
                 let art_inputs = track_art_to_inputs(db, track.id)?;
                 let binary_tag_inputs = crate::mapping::binary_tags_to_inputs(db, track.id)?;
 

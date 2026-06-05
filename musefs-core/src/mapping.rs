@@ -5,11 +5,15 @@ use musefs_format::{ArtInput, BinaryTagInput, TagInput};
 
 use crate::error::Result;
 
-/// Convert DB tag rows into the ordered list of synthesis inputs (one per value).
+/// Convert DB tag rows into the ordered list of synthesis inputs (one per value),
+/// moving the strings out of the rows rather than copying them.
 /// `Db::get_tags` already returns rows ordered by `(key, ordinal)`, so order is preserved.
-pub(crate) fn tags_to_inputs(tags: &[Tag]) -> Vec<TagInput> {
-    tags.iter()
-        .map(|t| TagInput::new(&t.key, &t.value))
+pub(crate) fn tags_to_inputs(tags: Vec<Tag>) -> Vec<TagInput> {
+    tags.into_iter()
+        .map(|t| TagInput {
+            key: t.key,
+            value: t.value,
+        })
         .collect()
 }
 
@@ -105,7 +109,7 @@ mod tests {
             tag("artist", "Bob", 1),
             tag("title", "Song", 0),
         ];
-        let inputs = tags_to_inputs(&tags);
+        let inputs = tags_to_inputs(tags);
         assert_eq!(
             inputs,
             vec![
