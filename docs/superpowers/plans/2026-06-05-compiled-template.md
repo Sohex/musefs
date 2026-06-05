@@ -35,7 +35,7 @@ Expected: `Switched to a new branch 'compiled-template'`
 **Files:**
 - Test: `musefs-core/tests/template.rs` (full rewrite)
 - Modify: `musefs-core/src/template.rs` (add `Template`; keep `render_path`/`resolve`/`sanitize` for now — `facade.rs` still uses them)
-- Modify: `musefs-core/src/lib.rs:23`
+- Modify: `musefs-core/src/lib.rs:24`
 
 - [ ] **Step 1: Rewrite the integration tests against `Template`**
 
@@ -271,7 +271,7 @@ EOF
 - Modify: `musefs-core/src/mapping.rs` (`tags_to_fields` ~line 20; tests at ~126-127, ~136-138, ~198-199)
 - Modify: `musefs-core/src/facade.rs` (import ~13, `Musefs` struct ~117, `open` ~209, `render_one` ~248, `render_entries` ~267, `build_full` ~294, `rebuild_full` ~333, incremental ~440, test `render_entries_returns_paths_and_snapshot` ~1297)
 - Modify: `musefs-core/src/template.rs` (delete `render_path`, `resolve`, `sanitize`)
-- Modify: `musefs-core/src/lib.rs:23`, `musefs-core/src/refresh_diff.rs:7`
+- Modify: `musefs-core/src/lib.rs:24`, `musefs-core/src/refresh_diff.rs:7`
 
 - [ ] **Step 1: Update the mapping unit tests to the borrowed-value map**
 
@@ -447,7 +447,7 @@ with:
 
 (a) In `musefs-core/src/template.rs`, delete the three now-dead items: `fn sanitize`, `fn resolve`, and `pub fn render_path` (keep `is_field_char` and everything added in Task 2).
 
-(b) In `musefs-core/src/lib.rs:23`, replace:
+(b) In `musefs-core/src/lib.rs:24`, replace:
 
 ```rust
 pub use template::{render_path, Template};

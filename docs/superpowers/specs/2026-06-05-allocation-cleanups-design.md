@@ -38,8 +38,8 @@ pub(crate) fn tags_to_inputs(tags: Vec<Tag>) -> Vec<TagInput> {
 ```
 
 The caller becomes `let inputs = tags_to_inputs(db.get_tags(track.id)?);`.
-The `Tag` rows' `id`/`track_id`/`ordinal` are dropped; key/value strings
-are moved, never copied. The only remaining allocation is the unavoidable
+The `Tag` rows' `ordinal` is dropped; key/value strings are moved, never
+copied. The only remaining allocation is the unavoidable
 SQLite-row materialization.
 
 Deliberately NOT done: borrowed `TagInput<'a>`/`Cow` fields (what the issue
