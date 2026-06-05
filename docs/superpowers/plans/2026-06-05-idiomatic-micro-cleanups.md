@@ -138,17 +138,32 @@ At ~line 105:
         // data.len() -> Malformed; a decode that drops the high byte gets len 0 -> Ok.
 ```
 
-(b) `read_vorbis_comments_decodes_24bit_length` (~615):
+(b) `read_vorbis_comments_decodes_24bit_length` (~615) — the test has three stale comment chunks; replace the whole body's comments, keeping both assertions:
 
 ```rust
 // OLD:
         // :199 `<<16 -> >>16` AND :200 `| -> &`: high length byte set over a short
         // body. Original len = 0x10000 -> Malformed. `>>16` -> len 0 -> Ok; `&` ->
         // (0x10000 & 0) -> len 0 -> Ok. Either mutant returns Ok instead of Malformed.
+        let hi = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0000))]);
+        assert_eq!(read_vorbis_comments(&hi), Err(FormatError::Malformed));
+        // :200 `<<8 -> >>8`: mid length byte set, high byte 0. Original len = 0x100
+        // -> Malformed; `>>8` -> len 0 -> Ok.
+        let mid = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x00_0100))]);
+        assert_eq!(read_vorbis_comments(&mid), Err(FormatError::Malformed));
+        // (:200 `| -> ^` and :201 `| -> ^` are equivalent: disjoint shifted bytes.)
 // NEW:
         // High length byte set over a short body: len = 0x10000 -> Malformed. Pins
         // the high byte of the 24-bit length decode (dropping it gets len 0 -> Ok).
+        let hi = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0000))]);
+        assert_eq!(read_vorbis_comments(&hi), Err(FormatError::Malformed));
+        // Mid length byte set, high byte 0: len = 0x100 -> Malformed. Pins the mid
+        // byte (dropping it gets len 0 -> Ok).
+        let mid = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x00_0100))]);
+        assert_eq!(read_vorbis_comments(&mid), Err(FormatError::Malformed));
 ```
+
+(The final parenthetical line about the equivalent `| -> ^` mutants is deleted outright — there is no `|` left to mutate.)
 
 (c) `read_pictures` test (~705 and ~708), two single-line rewording edits:
 
