@@ -1,5 +1,5 @@
 use clap::Parser;
-use musefs_cli::{Cli, Command};
+use musefs_cli::{Cli, Command, MountArgs};
 
 #[test]
 fn parses_scan_and_mount_invocations() {
@@ -9,7 +9,7 @@ fn parses_scan_and_mount_invocations() {
             assert_eq!(targets, vec![std::path::PathBuf::from("/music")]);
             assert_eq!(db.to_str(), Some("/tmp/m.db"));
         }
-        Command::Mount { .. } => panic!("expected scan"),
+        Command::Mount(..) => panic!("expected scan"),
     }
 
     let cli = Cli::parse_from([
@@ -22,17 +22,11 @@ fn parses_scan_and_mount_invocations() {
         "$album/$title",
     ]);
     match cli.command {
-        Command::Mount {
-            mountpoint,
-            db,
-            template,
-            default_fallback,
-            ..
-        } => {
-            assert_eq!(mountpoint.to_str(), Some("/mnt/x"));
-            assert_eq!(db.to_str(), Some("/tmp/m.db"));
-            assert_eq!(template, "$album/$title");
-            assert_eq!(default_fallback, "Unknown"); // default applied
+        Command::Mount(args) => {
+            assert_eq!(args.mountpoint.to_str(), Some("/mnt/x"));
+            assert_eq!(args.db.to_str(), Some("/tmp/m.db"));
+            assert_eq!(args.template, "$album/$title");
+            assert_eq!(args.default_fallback, "Unknown"); // default applied
         }
         Command::Scan { .. } => panic!("expected mount"),
     }
@@ -52,28 +46,20 @@ fn parses_mode_and_revalidate_flags() {
         "structure-only",
     ]);
     match cli.command {
-        Command::Mount { mode, .. } => assert_eq!(mode, CliMode::StructureOnly),
+        Command::Mount(args) => assert_eq!(args.mode, CliMode::StructureOnly),
         Command::Scan { .. } => panic!("expected mount"),
     }
 
     // Mode defaults to synthesis; tuning knobs have conservative defaults.
     let cli = Cli::parse_from(["musefs", "mount", "/mnt/x", "--db", "/tmp/m.db"]);
     match cli.command {
-        Command::Mount {
-            mode,
-            poll_interval_ms,
-            attr_ttl_ms,
-            max_readahead_kib,
-            max_background,
-            keep_cache,
-            ..
-        } => {
-            assert_eq!(mode, CliMode::Synthesis);
-            assert_eq!(poll_interval_ms, 1000); // default
-            assert_eq!(attr_ttl_ms, 1000); // default
-            assert_eq!(max_readahead_kib, 512); // default
-            assert_eq!(max_background, 64); // default
-            assert!(!keep_cache); // default off
+        Command::Mount(args) => {
+            assert_eq!(args.mode, CliMode::Synthesis);
+            assert_eq!(args.poll_interval_ms, 1000); // default
+            assert_eq!(args.attr_ttl_ms, 1000); // default
+            assert_eq!(args.max_readahead_kib, 512); // default
+            assert_eq!(args.max_background, 64); // default
+            assert!(!args.keep_cache); // default off
         }
         Command::Scan { .. } => panic!("expected mount"),
     }
@@ -96,19 +82,12 @@ fn parses_mode_and_revalidate_flags() {
         "--keep-cache",
     ]);
     match cli.command {
-        Command::Mount {
-            poll_interval_ms,
-            attr_ttl_ms,
-            max_readahead_kib,
-            max_background,
-            keep_cache,
-            ..
-        } => {
-            assert_eq!(poll_interval_ms, 500);
-            assert_eq!(attr_ttl_ms, 2000);
-            assert_eq!(max_readahead_kib, 1024);
-            assert_eq!(max_background, 128);
-            assert!(keep_cache);
+        Command::Mount(args) => {
+            assert_eq!(args.poll_interval_ms, 500);
+            assert_eq!(args.attr_ttl_ms, 2000);
+            assert_eq!(args.max_readahead_kib, 1024);
+            assert_eq!(args.max_background, 128);
+            assert!(args.keep_cache);
         }
         Command::Scan { .. } => panic!("expected mount"),
     }
@@ -124,12 +103,12 @@ fn parses_mode_and_revalidate_flags() {
     ]);
     match cli.command {
         Command::Scan { revalidate, .. } => assert!(revalidate),
-        Command::Mount { .. } => panic!("expected scan"),
+        Command::Mount(..) => panic!("expected scan"),
     }
     let cli = Cli::parse_from(["musefs", "scan", "/music", "--db", "/tmp/m.db"]);
     match cli.command {
         Command::Scan { revalidate, .. } => assert!(!revalidate),
-        Command::Mount { .. } => panic!("expected scan"),
+        Command::Mount(..) => panic!("expected scan"),
     }
 }
 
@@ -139,16 +118,19 @@ use std::time::Duration;
 
 #[test]
 fn parse_mount_config_defaults_are_sensible() {
-    let (config, fuse_config) = parse_mount_config(
-        "$artist/$title".to_string(),
-        "Unknown".to_string(),
-        Mode::Synthesis,
-        1000,
-        1000,
-        512,
-        64,
-        false,
-    );
+    let args = MountArgs {
+        mountpoint: "/mnt/x".into(),
+        db: "/tmp/x.db".into(),
+        template: "$artist/$title".to_string(),
+        default_fallback: "Unknown".to_string(),
+        mode: musefs_cli::CliMode::Synthesis,
+        poll_interval_ms: 1000,
+        attr_ttl_ms: 1000,
+        max_readahead_kib: 512,
+        max_background: 64,
+        keep_cache: false,
+    };
+    let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.template, "$artist/$title");
     assert_eq!(config.default_fallback, "Unknown");
     assert_eq!(config.mode, Mode::Synthesis);
@@ -162,16 +144,19 @@ fn parse_mount_config_defaults_are_sensible() {
 
 #[test]
 fn parse_mount_config_keep_cache_sets_flag() {
-    let (config, fuse_config) = parse_mount_config(
-        "$title".to_string(),
-        "Unknown".to_string(),
-        Mode::StructureOnly,
-        250,
-        5000,
-        256,
-        32,
-        true,
-    );
+    let args = MountArgs {
+        mountpoint: "/mnt/x".into(),
+        db: "/tmp/x.db".into(),
+        template: "$title".to_string(),
+        default_fallback: "Unknown".to_string(),
+        mode: musefs_cli::CliMode::StructureOnly,
+        poll_interval_ms: 250,
+        attr_ttl_ms: 5000,
+        max_readahead_kib: 256,
+        max_background: 32,
+        keep_cache: true,
+    };
+    let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.mode, Mode::StructureOnly);
     assert_eq!(config.poll_interval, Duration::from_millis(250));
     assert!(fuse_config.keep_cache);
@@ -181,15 +166,18 @@ fn parse_mount_config_keep_cache_sets_flag() {
 
 #[test]
 fn parse_mount_config_saturating_readahead() {
-    let (_, fuse_config) = parse_mount_config(
-        "$title".to_string(),
-        "Unknown".to_string(),
-        Mode::Synthesis,
-        1000,
-        1000,
-        u32::MAX,
-        64,
-        false,
-    );
+    let args = MountArgs {
+        mountpoint: "/mnt/x".into(),
+        db: "/tmp/x.db".into(),
+        template: "$title".to_string(),
+        default_fallback: "Unknown".to_string(),
+        mode: musefs_cli::CliMode::Synthesis,
+        poll_interval_ms: 1000,
+        attr_ttl_ms: 1000,
+        max_readahead_kib: u32::MAX,
+        max_background: 64,
+        keep_cache: false,
+    };
+    let (_, fuse_config) = parse_mount_config(&args);
     assert_eq!(fuse_config.max_readahead, u32::MAX);
 }

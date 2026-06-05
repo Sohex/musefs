@@ -37,6 +37,45 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Flags for `musefs mount`, grouped so the mount plumbing passes one value
+/// instead of ten ordering-fragile positional parameters.
+#[derive(clap::Args, Debug)]
+pub struct MountArgs {
+    /// Empty directory to mount at.
+    pub mountpoint: PathBuf,
+    /// Path to the SQLite database.
+    #[arg(long)]
+    pub db: PathBuf,
+    /// Path template, e.g. "$albumartist/$album/$title".
+    #[arg(long, default_value = "$artist/$title")]
+    pub template: String,
+    /// Fallback value substituted for any missing template field.
+    #[arg(long, default_value = "Unknown")]
+    pub default_fallback: String,
+    /// How file contents are served.
+    #[arg(long, value_enum, default_value_t = CliMode::Synthesis)]
+    pub mode: CliMode,
+    /// Debounce window (ms) for picking up external DB edits.
+    #[arg(long, default_value_t = 1000)]
+    pub poll_interval_ms: u64,
+    /// Entry/attr cache TTL (ms) the kernel may trust before re-validating.
+    /// Higher cuts lookup/getattr traffic but slows visibility of DB edits.
+    #[arg(long, default_value_t = 1000)]
+    pub attr_ttl_ms: u64,
+    /// Kernel read-ahead window (KiB). Larger hides HDD/NFS latency while
+    /// streaming; clamped to the kernel maximum at mount.
+    #[arg(long, default_value_t = 512)]
+    pub max_readahead_kib: u32,
+    /// Max outstanding background (readahead/async) requests the kernel queues.
+    #[arg(long, default_value_t = 64)]
+    pub max_background: u16,
+    /// Keep the kernel page cache across opens. External re-tags auto-invalidate
+    /// the affected inodes on refresh, so cached bytes are dropped when content
+    /// changes.
+    #[arg(long)]
+    pub keep_cache: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Walk a backing directory, ingesting FLAC/MP3 files into the SQLite store.
@@ -56,41 +95,7 @@ pub enum Command {
         jobs: usize,
     },
     /// Mount a read-only FUSE view of the store.
-    Mount {
-        /// Empty directory to mount at.
-        mountpoint: PathBuf,
-        /// Path to the SQLite database.
-        #[arg(long)]
-        db: PathBuf,
-        /// Path template, e.g. "$albumartist/$album/$title".
-        #[arg(long, default_value = "$artist/$title")]
-        template: String,
-        /// Fallback value substituted for any missing template field.
-        #[arg(long, default_value = "Unknown")]
-        default_fallback: String,
-        /// How file contents are served.
-        #[arg(long, value_enum, default_value_t = CliMode::Synthesis)]
-        mode: CliMode,
-        /// Debounce window (ms) for picking up external DB edits.
-        #[arg(long, default_value_t = 1000)]
-        poll_interval_ms: u64,
-        /// Entry/attr cache TTL (ms) the kernel may trust before re-validating.
-        /// Higher cuts lookup/getattr traffic but slows visibility of DB edits.
-        #[arg(long, default_value_t = 1000)]
-        attr_ttl_ms: u64,
-        /// Kernel read-ahead window (KiB). Larger hides HDD/NFS latency while
-        /// streaming; clamped to the kernel maximum at mount.
-        #[arg(long, default_value_t = 512)]
-        max_readahead_kib: u32,
-        /// Max outstanding background (readahead/async) requests the kernel queues.
-        #[arg(long, default_value_t = 64)]
-        max_background: u16,
-        /// Keep the kernel page cache across opens. External re-tags auto-invalidate
-        /// the affected inodes on refresh, so cached bytes are dropped when content
-        /// changes.
-        #[arg(long)]
-        keep_cache: bool,
-    },
+    Mount(MountArgs),
 }
 
 /// Open (creating/migrating) the DB at `db_path` once, then scan each target in
@@ -131,63 +136,32 @@ pub fn run_scan(db_path: &Path, targets: &[PathBuf], revalidate: bool, jobs: usi
 
 /// Parse mount CLI flags into `MountConfig` and `FuseConfig`. Pure function —
 /// no DB access, no mounting. Exported for unit testing.
-#[allow(clippy::too_many_arguments)]
-pub fn parse_mount_config(
-    template: String,
-    default_fallback: String,
-    mode: musefs_core::Mode,
-    poll_interval_ms: u64,
-    attr_ttl_ms: u64,
-    max_readahead_kib: u32,
-    max_background: u16,
-    keep_cache: bool,
-) -> (MountConfig, musefs_fuse::FuseConfig) {
+pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseConfig) {
     let config = MountConfig {
-        template,
+        template: args.template.clone(),
         fallbacks: BTreeMap::new(),
-        default_fallback,
-        mode,
-        poll_interval: std::time::Duration::from_millis(poll_interval_ms),
+        default_fallback: args.default_fallback.clone(),
+        mode: args.mode.into(),
+        poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),
     };
     let fuse_config = musefs_fuse::FuseConfig {
-        ttl: std::time::Duration::from_millis(attr_ttl_ms),
-        max_readahead: max_readahead_kib.saturating_mul(1024),
-        max_background,
-        keep_cache,
+        ttl: std::time::Duration::from_millis(args.attr_ttl_ms),
+        max_readahead: args.max_readahead_kib.saturating_mul(1024),
+        max_background: args.max_background,
+        keep_cache: args.keep_cache,
     };
     (config, fuse_config)
 }
 
-/// Build a `Musefs` from the DB at `db_path` and mount it (blocking) at
-/// `mountpoint`.
-#[allow(clippy::too_many_arguments)]
-pub fn run_mount(
-    db_path: &Path,
-    mountpoint: &Path,
-    template: String,
-    default_fallback: String,
-    mode: musefs_core::Mode,
-    poll_interval_ms: u64,
-    attr_ttl_ms: u64,
-    max_readahead_kib: u32,
-    max_background: u16,
-    keep_cache: bool,
-) -> Result<()> {
+/// Build a `Musefs` from the DB at `args.db` and mount it (blocking) at
+/// `args.mountpoint`.
+pub fn run_mount(args: &MountArgs) -> Result<()> {
     let db =
-        Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
-    let (config, fuse_config) = parse_mount_config(
-        template,
-        default_fallback,
-        mode,
-        poll_interval_ms,
-        attr_ttl_ms,
-        max_readahead_kib,
-        max_background,
-        keep_cache,
-    );
+        Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
+    let (config, fuse_config) = parse_mount_config(args);
     let core = Musefs::open(db, config).context("building the virtual filesystem")?;
-    musefs_fuse::mount_with(core, mountpoint, "musefs", fuse_config)
-        .with_context(|| format!("mounting at {}", mountpoint.display()))?;
+    musefs_fuse::mount_with(core, &args.mountpoint, "musefs", fuse_config)
+        .with_context(|| format!("mounting at {}", args.mountpoint.display()))?;
     Ok(())
 }
 
@@ -200,29 +174,7 @@ pub fn run(cli: Cli) -> Result<()> {
             revalidate,
             jobs,
         } => run_scan(&db, &targets, revalidate, jobs),
-        Command::Mount {
-            mountpoint,
-            db,
-            template,
-            default_fallback,
-            mode,
-            poll_interval_ms,
-            attr_ttl_ms,
-            max_readahead_kib,
-            max_background,
-            keep_cache,
-        } => run_mount(
-            &db,
-            &mountpoint,
-            template,
-            default_fallback,
-            mode.into(),
-            poll_interval_ms,
-            attr_ttl_ms,
-            max_readahead_kib,
-            max_background,
-            keep_cache,
-        ),
+        Command::Mount(args) => run_mount(&args),
     }
 }
 
@@ -240,7 +192,7 @@ mod tests {
                 assert_eq!(jobs, 3);
                 assert_eq!(targets, vec![PathBuf::from("/m")]);
             }
-            Command::Mount { .. } => panic!("expected Scan"),
+            Command::Mount(..) => panic!("expected Scan"),
         }
     }
 
@@ -260,7 +212,43 @@ mod tests {
                     ]
                 );
             }
-            Command::Mount { .. } => panic!("expected Scan"),
+            Command::Mount(..) => panic!("expected Scan"),
         }
+    }
+
+    #[test]
+    fn mount_args_parse_into_configs() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "musefs",
+            "mount",
+            "/mnt/muse",
+            "--db",
+            "/tmp/x.db",
+            "--poll-interval-ms",
+            "250",
+            "--attr-ttl-ms",
+            "750",
+            "--max-readahead-kib",
+            "64",
+            "--max-background",
+            "32",
+        ])
+        .unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected Mount");
+        };
+        let (config, fuse_config) = parse_mount_config(&args);
+        // Defaults survive the move into the struct.
+        assert_eq!(config.template, "$artist/$title");
+        assert_eq!(config.default_fallback, "Unknown");
+        assert_eq!(config.mode, musefs_core::Mode::Synthesis);
+        assert!(!fuse_config.keep_cache);
+        // ms → Duration.
+        assert_eq!(config.poll_interval, std::time::Duration::from_millis(250));
+        assert_eq!(fuse_config.ttl, std::time::Duration::from_millis(750));
+        // KiB → bytes.
+        assert_eq!(fuse_config.max_readahead, 64 * 1024);
+        assert_eq!(fuse_config.max_background, 32);
     }
 }
