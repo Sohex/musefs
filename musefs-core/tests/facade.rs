@@ -51,7 +51,7 @@ fn lookup_getattr_readdir_and_read_through_the_facade() {
     assert!(fattr.size > 0);
 
     // Reading the whole file yields a valid FLAC whose TITLE is the synthesized value.
-    let bytes = fs.read(file_inode, 0, 0, fattr.size).unwrap();
+    let bytes = fs.read(file_inode, None, 0, fattr.size).unwrap();
     assert_eq!(bytes.len() as u64, fattr.size);
     let tag = metaflac::Tag::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
     assert_eq!(
@@ -137,7 +137,7 @@ fn reads_a_synthesized_mp3_through_the_facade() {
     assert_eq!(name, "Old.mp3");
 
     let attr = fs.getattr(file_inode).unwrap();
-    let whole = fs.read(file_inode, 0, 0, attr.size).unwrap();
+    let whole = fs.read(file_inode, None, 0, attr.size).unwrap();
     assert_eq!(whole.len() as u64, attr.size);
 
     // The synthesized file is a valid ID3v2.4 stream carrying the DB tags, and the
@@ -170,7 +170,7 @@ fn reads_a_synthesized_m4a_through_the_facade() {
     assert_eq!(name, "Orig M4A.m4a");
 
     let attr = fs.getattr(file_inode).unwrap();
-    let whole = fs.read(file_inode, 0, 0, attr.size).unwrap();
+    let whole = fs.read(file_inode, None, 0, attr.size).unwrap();
     assert_eq!(whole.len() as u64, attr.size);
 
     // The original audio frames are spliced in verbatim at the tail of the
@@ -225,7 +225,7 @@ fn serves_flac_with_embedded_art_through_the_facade() {
     let artist = fs.lookup(VirtualTree::ROOT, "Art").unwrap();
     let (_name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
     let attr = fs.getattr(file_inode).unwrap();
-    let whole = fs.read(file_inode, 0, 0, attr.size).unwrap();
+    let whole = fs.read(file_inode, None, 0, attr.size).unwrap();
     assert_eq!(whole.len() as u64, attr.size);
 
     // The synthesized FLAC carries the embedded picture with the original bytes.
@@ -263,7 +263,7 @@ fn serves_mp3_with_embedded_art_through_the_facade() {
     let artist = fs.lookup(VirtualTree::ROOT, "Pix").unwrap();
     let (_name, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
     let attr = fs.getattr(file_inode).unwrap();
-    let whole = fs.read(file_inode, 0, 0, attr.size).unwrap();
+    let whole = fs.read(file_inode, None, 0, attr.size).unwrap();
     assert_eq!(whole.len() as u64, attr.size);
 
     // The synthesized MP3 carries the embedded APIC picture with the original bytes.
@@ -344,14 +344,13 @@ fn open_handle_read_and_release_roundtrip() {
     let size = fs.getattr(file_inode).unwrap().size;
 
     let fh = fs.open_handle(file_inode).unwrap();
-    assert!(fh != 0);
-    let via_handle = fs.read(file_inode, fh, 0, size).unwrap();
-    let via_fallback = fs.read(file_inode, 0, 0, size).unwrap();
+    let via_handle = fs.read(file_inode, Some(fh), 0, size).unwrap();
+    let via_fallback = fs.read(file_inode, None, 0, size).unwrap();
     assert_eq!(via_handle, via_fallback);
     assert_eq!(via_handle.len() as u64, size);
 
     fs.release_handle(fh);
-    let after = fs.read(file_inode, fh, 0, size).unwrap(); // unknown fh → fallback
+    let after = fs.read(file_inode, Some(fh), 0, size).unwrap(); // unknown fh → fallback
     assert_eq!(after, via_fallback);
 }
 
@@ -364,7 +363,7 @@ fn stale_fh_after_release_and_reopen_falls_back() {
     let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
     let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
     let size = fs.getattr(file_inode).unwrap().size;
-    let canonical = fs.read(file_inode, 0, 0, size).unwrap(); // inode fallback bytes
+    let canonical = fs.read(file_inode, None, 0, size).unwrap(); // inode fallback bytes
 
     let fh_a = fs.open_handle(file_inode).unwrap();
     fs.release_handle(fh_a);
@@ -374,10 +373,10 @@ fn stale_fh_after_release_and_reopen_falls_back() {
     assert_ne!(fh_a, fh_b);
     // A read on the stale fh_a misses the slab (None) and falls back to inode
     // resolution — correct bytes, never fh_b's handle, never a panic.
-    let via_stale = fs.read(file_inode, fh_a, 0, size).unwrap();
+    let via_stale = fs.read(file_inode, Some(fh_a), 0, size).unwrap();
     assert_eq!(via_stale, canonical);
     // The live handle still serves correctly.
-    let via_live = fs.read(file_inode, fh_b, 0, size).unwrap();
+    let via_live = fs.read(file_inode, Some(fh_b), 0, size).unwrap();
     assert_eq!(via_live, canonical);
 
     fs.release_handle(fh_b);
@@ -962,7 +961,6 @@ fn open_handle_returns_distinct_ids_and_rejects_dirs() {
     let fh1 = fs.open_handle(file_inode).unwrap();
     let fh2 = fs.open_handle(file_inode).unwrap();
     assert_ne!(fh1, fh2, "each open must yield a fresh handle id");
-    assert!(fh1 != 0 && fh2 != 0);
 
     assert!(matches!(fs.open_handle(artist), Err(CoreError::IsDir(_))));
 }
@@ -985,7 +983,7 @@ fn read_uses_cached_handle_after_backing_grows() {
             .unwrap();
         f.write_all(&[0u8; 64]).unwrap();
     }
-    let via_handle = fs.read(file_inode, fh, 0, size).unwrap();
+    let via_handle = fs.read(file_inode, Some(fh), 0, size).unwrap();
     assert_eq!(via_handle.len() as u64, size);
 }
 
@@ -1009,7 +1007,7 @@ fn release_handle_forces_fallback_on_next_read() {
         f.write_all(&[0u8; 64]).unwrap();
     }
     assert!(matches!(
-        fs.read(file_inode, fh, 0, size),
+        fs.read(file_inode, Some(fh), 0, size),
         Err(CoreError::BackingChanged(_))
     ));
 }

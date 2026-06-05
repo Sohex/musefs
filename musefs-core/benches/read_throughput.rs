@@ -74,7 +74,7 @@ fn bench_sequential_read(c: &mut Criterion) {
             b.iter(|| {
                 let mut off = 0u64;
                 while off < size {
-                    let got = std::hint::black_box(fs.read(inode, 0, off, chunk).unwrap());
+                    let got = std::hint::black_box(fs.read(inode, None, off, chunk).unwrap());
                     if got.is_empty() {
                         break;
                     }
@@ -134,7 +134,7 @@ fn bench_concurrent_read_and_walk(c: &mut Criterion) {
                         let size = fs.getattr(ino).unwrap().size;
                         let mut off = 0u64;
                         while off < size {
-                            let got = fs.read(ino, fh, off, 128 * 1024).unwrap();
+                            let got = fs.read(ino, Some(fh), off, 128 * 1024).unwrap();
                             if got.is_empty() {
                                 break;
                             }
@@ -192,7 +192,7 @@ fn read_whole(fs: &Musefs, inode: u64) {
     let chunk = 128 * 1024u64;
     let mut off = 0u64;
     while off < size {
-        let got = std::hint::black_box(fs.read(inode, 0, off, chunk).unwrap());
+        let got = std::hint::black_box(fs.read(inode, None, off, chunk).unwrap());
         if got.is_empty() {
             break;
         }
@@ -233,7 +233,8 @@ fn bench_seek_read(c: &mut Criterion) {
             b.iter_batched(
                 || cold_fixture(fmt, bytes),
                 |(fs, inode, _dir)| {
-                    let _ = std::hint::black_box(fs.read(inode, 0, seek_off, 128 * 1024).unwrap());
+                    let _ =
+                        std::hint::black_box(fs.read(inode, None, seek_off, 128 * 1024).unwrap());
                 },
                 criterion::BatchSize::PerIteration,
             );

@@ -37,7 +37,7 @@ fn read_all_and_snapshot(dir: &std::path::Path, artist_dir: &str) -> metrics::Sn
     metrics::reset();
     let mut off = 0u64;
     while off < size {
-        let got = fs.read(inode, 0, off, 16 * 1024).unwrap();
+        let got = fs.read(inode, None, off, 16 * 1024).unwrap();
         if got.is_empty() {
             break;
         }
@@ -92,7 +92,7 @@ fn baseline_one_open_per_read_call() {
     let mut off = 0u64;
     let mut reads = 0u64;
     while off < size {
-        let got = fs.read(file_inode, 0, off, chunk).unwrap();
+        let got = fs.read(file_inode, None, off, chunk).unwrap();
         if got.is_empty() {
             break;
         }
@@ -139,7 +139,7 @@ fn handle_reuses_one_open_and_no_per_read_stat() {
     let mut off = 0u64;
     let mut reads = 0u64;
     while off < size {
-        let got = fs.read(file_inode, fh, off, chunk).unwrap();
+        let got = fs.read(file_inode, Some(fh), off, chunk).unwrap();
         if got.is_empty() {
             break;
         }

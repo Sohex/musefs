@@ -58,7 +58,7 @@ fn read_whole(fs: &Musefs, inode: u64) -> Vec<u8> {
     let mut out = Vec::new();
     let mut off = 0u64;
     while off < size {
-        let got = fs.read(inode, fh, off, 64 * 1024).unwrap();
+        let got = fs.read(inode, Some(fh), off, 64 * 1024).unwrap();
         if got.is_empty() {
             break;
         }

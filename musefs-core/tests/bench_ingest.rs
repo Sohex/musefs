@@ -222,7 +222,7 @@ fn bench_read_under_latency() {
         if whole {
             let mut off = 0u64;
             while off < size {
-                let got = fs.read(inode, 0, off, 128 * 1024).unwrap();
+                let got = fs.read(inode, None, off, 128 * 1024).unwrap();
                 if got.is_empty() {
                     break;
                 }
@@ -230,7 +230,7 @@ fn bench_read_under_latency() {
             }
         } else {
             let off = (size * 7 / 8).min(size.saturating_sub(128 * 1024));
-            let _ = fs.read(inode, 0, off, 128 * 1024).unwrap();
+            let _ = fs.read(inode, None, off, 128 * 1024).unwrap();
         }
         let ms = t0.elapsed().as_millis();
         let s = metrics::snapshot();
