@@ -26,8 +26,10 @@ Manual 24-bit big-endian shift assembly, both directions:
     private `fn u24_be(b0: u8, b1: u8, b2: u8) -> usize` implemented as
     `u32::from_be_bytes([0, b0, b1, b2]) as usize` and use it at all four
     sites.
-  - `musefs-format/src/mp3.rs` — 1 site (~479): inline `from_be_bytes` (a
-    shared helper across crates is not warranted for one extra site).
+  - `musefs-format/src/mp3.rs` — 1 site (~479, the ID3v2.2 three-byte frame
+    size): inline `u32::from_be_bytes` with a leading `0` pad byte, same shape
+    as `u24_be` (a shared helper across crates is not warranted for one extra
+    site).
 - **Write side** — per-byte `push((n >> 16) as u8)` shifts:
   - `flac.rs::push_block_header` (~152) and the `raw_block` test helper
     (~498): replace the three pushes with
@@ -35,13 +37,16 @@ Manual 24-bit big-endian shift assembly, both directions:
 
 **Mutation-gate residue to clean up in the same commit:**
 
-- `mutants.toml` carries a description-anchored exclude
+- `.cargo/mutants.toml` carries an exclude
   `'musefs-format/src/flac\.rs:\d+:\d+: replace \| with \^ in read_metadata_bounded'`
   for the `|`-assembly equivalence. With `from_be_bytes` there is no `|` to
-  mutate; delete the entry.
-- The test comment at `flac.rs:805` names the L105 `<< 16` → `>> 16` mutant it
-  kills. Reword to describe the invariant (truncated-length handling), not the
-  retired mutant.
+  mutate; delete the entry. Note the exclude covers `read_metadata_bounded`
+  only — the other three read sites never had one, so removing the `|`
+  everywhere only *removes* mutants and cannot fail the gate.
+- The four read sites sit in four different functions, each with mutant-kill
+  test comments that name the retired shift/`|` mutants: `flac.rs:547-548`,
+  `:617`, `:705`, `:805-811`, `:821`. Reword all of them to describe the
+  invariant (e.g. truncated-length handling), not the retired mutants.
 
 ### 2. Deduplicate `sha256_hex`, drop the hand-rolled hex loop
 
@@ -54,10 +59,11 @@ loop. Keep a single `pub(crate)` copy in `art.rs` with body
 
 ### 3. `to_string_lossy().to_string()` → `.into_owned()`
 
-Mechanical swap at all sites (~10 in src: `musefs-core/src/scan.rs`,
-`facade.rs`, `reader.rs`; ~10 in tests: `proptest_read_fidelity.rs`,
-`interop_emit.rs`). `.into_owned()` avoids the unconditional reallocation when
-the lossy conversion borrows.
+Mechanical swap at all 28 sites — src: `musefs-core/src/scan.rs`,
+`facade.rs`, `reader.rs`; tests: `proptest_read_fidelity.rs`,
+`interop_emit.rs`, `external_contract.rs`, `read_at.rs`, `tests/reader.rs`.
+`.into_owned()` avoids the unconditional reallocation when the lossy
+conversion borrows.
 
 ### 4. `wav.rs` chunk assembly helpers
 
