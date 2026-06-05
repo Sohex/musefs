@@ -212,4 +212,13 @@ exclude_re = [
     # variants ARE caught and stay in scope; anchored on operator+function since
     # both `<` in poll_due are this class.
     'musefs-core/src/facade\.rs:\d+:\d+: replace < with <= in Musefs::poll_due',
+
+    # CACHE_ESTIMATED_ITEMS const arithmetic — equivalent mutant. This is the
+    # `estimated_items_capacity` hint passed to Cache::with_weighter; it sizes
+    # quick_cache's internal hash map but is not a bound and has no effect on
+    # eviction, correctness, or any observable public-API behavior. The `/`→`%`
+    # variant yields 0 (64 MiB is 4 KiB-aligned), `/`→`*` yields ~256 GiB;
+    # quick_cache accepts any usize. The const initializer is outside any
+    # function body, so no test can observe it through the serving path.
+    'musefs-core/src/reader\.rs:70:60: replace / with [%*]',
 ]
