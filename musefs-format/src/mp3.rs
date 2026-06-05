@@ -132,10 +132,13 @@ fn syncsafe(n: u32) -> [u8; 4] {
     ]
 }
 
+/// Inclusive maximum of a 28-bit ID3v2.4 syncsafe size field.
+const SYNCHSAFE_MAX: usize = 0x0FFF_FFFF;
+
 fn push_frame_header(out: &mut Vec<u8>, id: &[u8; 4], data_len: usize) -> Result<()> {
     // ID3v2.4 frame sizes are a 28-bit syncsafe field; guard so an oversized frame
     // is a hard error rather than a silently-truncated (corrupt) tag.
-    if data_len > 0x0FFF_FFFF {
+    if data_len > SYNCHSAFE_MAX {
         return Err(FormatError::TooLarge);
     }
     out.extend_from_slice(id);
@@ -383,7 +386,7 @@ pub fn build_id3v2_segments(
     // The total tag size is a 28-bit syncsafe field. Ingestion caps each art well
     // under this, but guard at the format boundary so an oversized tag (e.g. many
     // large pictures summing past the limit) is a hard error, not a truncated file.
-    if frames_len > 0x0FFF_FFFF {
+    if frames_len > SYNCHSAFE_MAX as u64 {
         return Err(FormatError::TooLarge);
     }
     header.extend_from_slice(&syncsafe(frames_len as u32));
