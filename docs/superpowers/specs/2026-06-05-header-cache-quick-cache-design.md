@@ -48,9 +48,12 @@ All changes in `musefs-core` (`Cargo.toml`, `src/reader.rs`, `src/lock.rs`).
 
 ### Dependency
 
-Add `quick_cache = "0.6"` to `musefs-core/Cargo.toml`, with its
-`parking_lot` feature enabled — `parking_lot` is already a direct dependency
-of musefs-core, so both share one lock implementation.
+Add `quick_cache = "0.6.23"` to `musefs-core/Cargo.toml`. The patch-level
+pin matters: `retain()` — the load-bearing primitive that won quick_cache
+the comparison — does not exist in early 0.6.x (verified absent in 0.6.0,
+0.6.2, 0.6.9); 0.6.23 provably has it. quick_cache's `parking_lot` feature
+is on by default and matches musefs-core's existing direct `parking_lot`
+dependency — do not set `default-features = false`.
 
 ### HeaderCache shape — public API unchanged
 
@@ -103,10 +106,14 @@ weighted bound entirely. Weighting them 1 bounds StructureOnly mounts too —
 the current code never evicts them either, so this is strictly an
 improvement.
 
-`with_budget` passes the budget as the cache's weight capacity. The exact
-constructor surface (`Cache::with_weighter` vs `OptionsBuilder`, and whether
-to pin a shard count) is verified against the real 0.6 API at implementation
-time. quick_cache's per-shard weight capacity is a non-issue here: entries
+`with_budget` passes the budget as the cache's weight capacity, via
+`Cache::with_weighter(estimated_items_capacity, weight_capacity, weighter)`.
+For `estimated_items_capacity` use `budget / 4096` (4 KiB as a typical
+inline tag region) — it is a sizing hint for the admission ghost structures,
+not a bound; the implementer may adjust if profiling says otherwise.
+Whether to pin a shard count is decided against the real 0.6.23 API at
+implementation time. quick_cache's per-shard weight capacity is a non-issue
+here: entries
 are KB-scale inline tag framing (`cache_bytes` counts only
 `Segment::Inline` bytes; art is streamed via `ArtImage`/`OggArtSlice` and
 never counted) against a 64 MiB default budget.
@@ -143,17 +150,31 @@ never counted) against a 64 MiB default budget.
 `header_cache_remove_drops_one_track_only`,
 `default_cache_budget_is_64_mib`, and the `build_*` audio-bounds and
 `cache_bytes`-accounting tests (those test `build`, not the cache).
+One contingency to watch:
+`header_cache_resolve_caches_by_content_version` asserts `Arc::ptr_eq`
+across two back-to-back resolves, which now depends on quick_cache
+*admitting* the lone entry rather than on a guaranteed insert. A single
+small entry in an otherwise empty cache is admitted in practice, but if it
+proves otherwise the test — not the design — is what flexes.
 
 **Rewritten property-style** (intent kept, mechanism-free):
 
 - *Budget bound:* insert entries totaling far over budget through the public
-  path; assert the cache's total weight stays ≤ budget after each insert
-  (eager eviction makes this deterministic — no pending-task drain).
-- *Hot-entry survival:* a repeatedly-`get` entry survives a flood of cold
-  inserts. No exact-victim assertions — S3-FIFO is not LRU.
+  path; assert the cache's total `weight() <= budget` **as an end-state
+  check after the flood**, not after each individual insert. quick_cache
+  does not document whether eviction inside `insert` is strictly synchronous
+  or amortized; the end-state assertion is robust either way. If the
+  implementer confirms per-insert eagerness against 0.6.23, the assertion
+  may be tightened — but the spec'd form must not assume it.
 - *Zero-weight bound:* a `StructureOnly` entry (`cache_bytes == 0`) still
   counts ≥ 1 against the bound, pinning the `.max(1)` weigher behavior
   against mutants.
+
+No hot-entry-survival test: S3-FIFO admission is probabilistic, so "the hot
+entry survives a cold flood" is an exact-victim assertion in disguise and a
+flaky-CI trap. The agreed bar is "bounded by byte budget, sensible eviction"
+— retention guarantees are explicitly out; budget-bound plus zero-weight
+cover the intent, and such a test kills no weigher/retain mutants anyway.
 
 **Deleted with the implementation** (they test the removed linked
 list/sharding): `shard_evicts_least_recently_used_over_byte_budget`,
