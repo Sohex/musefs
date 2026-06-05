@@ -4,7 +4,7 @@ use musefs_db::Format;
 
 /// Per-track state persisted between refreshes so unchanged tracks need no
 /// re-render. `(content_version, format)` is the render key (the only track-level
-/// inputs to `render_path`); `path` is the last rendered path, reused verbatim for
+/// inputs to `Template::render`); `path` is the last rendered path, reused verbatim for
 /// unchanged tracks. See SP2 Component 1/2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackRenderState {
