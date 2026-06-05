@@ -1103,6 +1103,39 @@ mod cache_bound_tests {
         std::fs::write(path, &out).unwrap();
         (audio_offset, audio.len() as i64)
     }
+
+    #[test]
+    fn cache_weight_stays_within_budget_after_flood() {
+        let cache = HeaderCache::with_budget(Mode::Synthesis, 4096);
+        for id in 0..64i64 {
+            cache.cache.insert(id, entry(0, 256)); // 64 × 256 B = 16 KiB ≫ 4 KiB
+        }
+        // End-state assertion only: quick_cache does not document per-insert
+        // synchronous eviction, so the per-insert bound is not guaranteed.
+        assert!(
+            cache.cache.weight() <= 4096,
+            "total weight {} exceeds the 4096-byte budget",
+            cache.cache.weight()
+        );
+        // len() is assumed to count resident entries. If this assertion ever
+        // trips, the diagnosis is the same as the weight() note above: re-read
+        // the spec's eviction-timing section and escalate — don't loosen.
+        assert!(
+            cache.cache.len() < 64,
+            "no eviction happened: all 64 over-budget entries are resident"
+        );
+    }
+
+    #[test]
+    fn zero_cache_bytes_entry_still_weighs_one() {
+        // StructureOnly layouts have cache_bytes == 0; the weigher's .max(1) keeps
+        // them inside the weighted bound instead of escaping it (quick_cache
+        // ignores zero-weight entries when evicting).
+        let cache = HeaderCache::with_budget(Mode::StructureOnly, 1024);
+        cache.cache.insert(1, entry(0, 0));
+        assert_eq!(cache.cache.weight(), 1);
+        assert!(cache.cache.get(&1).is_some());
+    }
 }
 
 #[cfg(test)]
