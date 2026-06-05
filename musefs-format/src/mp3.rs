@@ -476,9 +476,7 @@ fn id3v2_alloc_safe(data: &[u8]) -> bool {
             return false;
         }
         let size = if major == 2 {
-            ((data[pos + 3] as usize) << 16)
-                | ((data[pos + 4] as usize) << 8)
-                | (data[pos + 5] as usize)
+            u32::from_be_bytes([0, data[pos + 3], data[pos + 4], data[pos + 5]]) as usize
         } else if major == 3 {
             // ID3v2.3: plain 32-bit big-endian frame size.
             // Frame flags at pos+8..pos+10: reject any non-zero flags.  The id3
@@ -1206,12 +1204,12 @@ mod tests {
     fn alloc_safe_v22_24bit_size_decode() {
         // v2.2 frame header is 6 bytes: 3-byte id + 3-byte 24-bit big-endian size.
         // Declare a size that the *correct* decode puts out of bounds (reject), so a
-        // wrong shift/OR that shrinks the size would wrongly accept.
+        // decode that drops a size byte would wrongly accept.
         // size bytes [0x00,0x01,0x00] = 256, body = 6 (header only, no room) -> reject.
         let mut f_mid = b"TT2".to_vec();
         f_mid.extend_from_slice(&[0x00, 0x01, 0x00]); // 24-bit size = 256
-        assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_mid))); // kills <<8 and |->&
-                                                                   // size bytes [0x01,0x00,0x00] = 65536 -> reject; `<<16 -> >>16` shrinks to 0.
+        assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_mid))); // pins the mid byte
+                                                                   // size bytes [0x01,0x00,0x00] = 65536 -> reject; pins the high byte.
         let mut f_hi = b"TT2".to_vec();
         f_hi.extend_from_slice(&[0x01, 0x00, 0x00]);
         assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_hi)));
