@@ -835,7 +835,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             skip_failed += 1;
             continue;
         };
-        let key = abs.to_string_lossy().to_string();
+        let key = abs.to_string_lossy().into_owned();
         if let Some(&(size, mtime, id, format)) = existing.get(&key) {
             let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
             if size == meta.len() as i64 && mtime == mtime_secs(&meta) && !needs_backfill {
@@ -1414,7 +1414,7 @@ mod hardening_tests {
         let canon = std::fs::canonicalize(dir.path()).unwrap();
         let ghost = canon.join("real.flac").join("ghost.flac");
         db.upsert_track(&NewTrack {
-            backing_path: ghost.to_string_lossy().to_string(),
+            backing_path: ghost.to_string_lossy().into_owned(),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 0,

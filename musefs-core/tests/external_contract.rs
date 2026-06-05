@@ -24,7 +24,7 @@ fn scanner_owned_bounds_mutation_returns_controlled_error() {
     let db = Db::open(&db_path).unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: audio_path.to_string_lossy().to_string(),
+            backing_path: audio_path.to_string_lossy().into_owned(),
             format: Format::Mp3,
             audio_offset: bounds.audio_offset as i64,
             audio_length: bounds.audio_length as i64,

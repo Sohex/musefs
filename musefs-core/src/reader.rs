@@ -583,7 +583,7 @@ mod resolve_ogg_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let track_id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().to_string(),
+                backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Opus,
                 audio_offset: audio_offset as i64,
                 audio_length: audio_length as i64,
@@ -622,7 +622,7 @@ mod resolve_ogg_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let track_id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().to_string(),
+                backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Opus,
                 audio_offset: audio_offset as i64,
                 audio_length: audio_length as i64,
@@ -679,7 +679,7 @@ mod resolve_ogg_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let track_id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().to_string(),
+                backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Wav,
                 audio_offset: audio_offset as i64,
                 audio_length: audio_length as i64,
@@ -718,7 +718,7 @@ mod resolve_ogg_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().to_string(),
+                backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Opus,
                 audio_offset: audio_offset as i64,
                 audio_length: audio_length as i64,
@@ -873,7 +873,7 @@ mod cache_bound_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().to_string(),
+                backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
@@ -901,7 +901,7 @@ mod cache_bound_tests {
             let db = Db::open(&db_path).unwrap();
             let meta = std::fs::metadata(&flac_path).unwrap();
             db.upsert_track(&NewTrack {
-                backing_path: flac_path.to_string_lossy().to_string(),
+                backing_path: flac_path.to_string_lossy().into_owned(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
@@ -937,7 +937,7 @@ mod cache_bound_tests {
             let (audio_offset, audio_length) = write_flac_local(&path);
             let meta = std::fs::metadata(&path).unwrap();
             db.upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().to_string(),
+                backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
@@ -969,7 +969,7 @@ mod cache_bound_tests {
             let (audio_offset, audio_length) = write_flac_local(&path);
             let meta = std::fs::metadata(&path).unwrap();
             db.upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().to_string(),
+                backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
@@ -1016,7 +1016,7 @@ mod cache_bound_tests {
         let meta = std::fs::metadata(path).unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: path.to_string_lossy().to_string(),
+                backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
@@ -1170,7 +1170,7 @@ mod binary_tag_serve_tests {
         let meta = std::fs::metadata(&path).unwrap();
         let tid = db
             .upsert_track(&musefs_db::NewTrack {
-                backing_path: path.to_string_lossy().to_string(),
+                backing_path: path.to_string_lossy().into_owned(),
                 format: musefs_db::Format::Mp3,
                 audio_offset: bounds.audio_offset as i64,
                 audio_length: bounds.audio_length as i64,

@@ -91,7 +91,7 @@ fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Res
     let meta = file.metadata()?;
     if meta.len() != resolved.backing_size || mtime_secs(&meta) != resolved.backing_mtime_secs {
         return Err(CoreError::BackingChanged(
-            resolved.backing_path.to_string_lossy().to_string(),
+            resolved.backing_path.to_string_lossy().into_owned(),
         ));
     }
     Ok(())
@@ -975,7 +975,11 @@ impl Musefs {
                 // Pathological constant re-tagging raced every attempt; surface a
                 // retryable error rather than risk wrong bytes.
                 return Err(CoreError::BackingChanged(
-                    h.resolved.load().backing_path.to_string_lossy().to_string(),
+                    h.resolved
+                        .load()
+                        .backing_path
+                        .to_string_lossy()
+                        .into_owned(),
                 ));
             }
         }
