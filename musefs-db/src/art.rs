@@ -3,14 +3,14 @@ use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 
-fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    let mut s = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 impl<M> Db<M> {

@@ -1,17 +1,7 @@
+use crate::art::sha256_hex;
 use crate::models::{BinaryTag, NewArt, NewTrack, StructuralBlock, Tag, TrackArt};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::{params, Transaction};
-use sha2::{Digest, Sha256};
-
-fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    let mut s = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
 
 impl Db<ReadWrite> {
     /// Apply the bulk-write pragmas to an open connection. WAL is left untouched
