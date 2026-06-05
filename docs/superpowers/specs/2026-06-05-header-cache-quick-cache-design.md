@@ -7,7 +7,7 @@
 ## Problem
 
 `HeaderCache` (`musefs-core/src/reader.rs`) implements a byte-budgeted LRU
-from scratch: `CACHE_SHARDS` (8) `Mutex<Shard>`s, each a `HashMap<i64,
+from scratch: `CACHE_SHARDS` (16) `Mutex<Shard>`s, each a `HashMap<i64,
 LruNode>` plus a doubly-linked list expressed as `Option<i64>` prev/next
 indices maintained by manual `unlink`/`push_front` pointer surgery, with
 hand-kept byte accounting against a per-shard budget. This is exactly the
