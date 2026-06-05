@@ -161,25 +161,32 @@ fn build_info_payload(tags: &[TagInput]) -> Option<Vec<u8>> {
     for (cc, value) in entries {
         let mut v = value.as_bytes().to_vec();
         v.push(0x00); // INFO values are NUL-terminated
-        payload.extend_from_slice(cc);
-        payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&v);
-        if v.len() % 2 == 1 {
-            payload.push(0x00); // word-align
-        }
+        append_chunk(&mut payload, cc, &v);
     }
     Some(payload)
+}
+
+/// 8-byte RIFF chunk header: fourcc + LE u32 size.
+fn chunk_header(id: &[u8; 4], len: u32) -> [u8; 8] {
+    let mut h = [0u8; 8];
+    h[..4].copy_from_slice(id);
+    h[4..].copy_from_slice(&len.to_le_bytes());
+    h
+}
+
+/// Append a chunk (`fourcc + LE size + payload + word-align pad`) to `out`.
+fn append_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(&chunk_header(id, payload.len() as u32));
+    out.extend_from_slice(payload);
+    if payload.len() % 2 == 1 {
+        out.push(0x00);
+    }
 }
 
 /// Push a fully-inline chunk (`fourcc + LE size + payload + word-align pad`).
 fn push_inline_chunk(segments: &mut Vec<Segment>, id: &[u8; 4], payload: &[u8]) {
     let mut chunk = Vec::with_capacity(8 + payload.len() + 1);
-    chunk.extend_from_slice(id);
-    chunk.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    chunk.extend_from_slice(payload);
-    if payload.len() % 2 == 1 {
-        chunk.push(0x00);
-    }
+    append_chunk(&mut chunk, id, payload);
     segments.push(Segment::Inline(chunk));
 }
 
@@ -215,20 +222,18 @@ pub fn synthesize_layout(
     // an empty `ArtImage { len: 0 }` would fail `RegionLayout::validate` and brick
     // the track — so WAV inherits that handling by delegating to it.
     let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, binary_tags, arts)?;
-    let mut id3_head = Vec::with_capacity(8);
-    id3_head.extend_from_slice(b"id3 ");
-    id3_head.extend_from_slice(&(tag_len as u32).to_le_bytes());
-    segments.push(Segment::Inline(id3_head));
+    segments.push(Segment::Inline(
+        chunk_header(b"id3 ", tag_len as u32).to_vec(),
+    ));
     segments.extend(tag_segments);
     if tag_len % 2 == 1 {
         segments.push(Segment::Inline(vec![0x00]));
     }
 
     // `data` chunk: header + the original payload (BackingAudio) + word-align pad.
-    let mut data_head = Vec::with_capacity(8);
-    data_head.extend_from_slice(b"data");
-    data_head.extend_from_slice(&(audio_length as u32).to_le_bytes());
-    segments.push(Segment::Inline(data_head));
+    segments.push(Segment::Inline(
+        chunk_header(b"data", audio_length as u32).to_vec(),
+    ));
     segments.push(Segment::BackingAudio {
         offset: audio_offset,
         len: audio_length,
