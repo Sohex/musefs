@@ -21,5 +21,5 @@ pub use scan::{
     revalidate, revalidate_with, scan_directory, scan_directory_with, RevalidateStats, ScanOptions,
     ScanStats,
 };
-pub use template::render_path;
+pub use template::{render_path, Template};
 pub use tree::{Node, NodeKind, VirtualTree};
