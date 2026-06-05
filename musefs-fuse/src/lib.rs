@@ -18,7 +18,9 @@ use fuser::{
 };
 use musefs_core::Attr;
 use musefs_core::CoreError;
+use musefs_core::Fh;
 use musefs_core::Musefs;
+use std::num::NonZeroU64;
 
 /// Per-worker read scratch buffer: each threadpool worker reuses one Vec across
 /// reads (filled by `Musefs::read_into`, sent as fuser's borrowed iovec), so the
@@ -279,7 +281,7 @@ impl Filesystem for MusefsFs {
         let core = Arc::clone(&self.core);
         let flags = open_flags(self.config.keep_cache);
         self.pool.execute(move || match core.open_handle(ino.0) {
-            Ok(fh) => reply.opened(FileHandle(fh), flags),
+            Ok(fh) => reply.opened(FileHandle(fh.get()), flags),
             Err(e) => reply.error(reply_errno("open", ino.0, &e)),
         });
     }
@@ -295,7 +297,9 @@ impl Filesystem for MusefsFs {
         reply: ReplyEmpty,
     ) {
         // Cheap (a map remove); no need to offload to the pool.
-        self.core.release_handle(fh.0);
+        if let Some(fh) = NonZeroU64::new(fh.0) {
+            self.core.release_handle(Fh::from(fh));
+        }
         reply.ok();
     }
 
@@ -328,7 +332,13 @@ impl Filesystem for MusefsFs {
         self.pool.execute(move || {
             READ_BUF.with(|b| {
                 let mut buf = b.borrow_mut();
-                match core.read_into(ino.0, fh.0, offset, size as u64, &mut buf) {
+                match core.read_into(
+                    ino.0,
+                    NonZeroU64::new(fh.0).map(Fh::from),
+                    offset,
+                    size as u64,
+                    &mut buf,
+                ) {
                     Ok(()) => reply.data(&buf),
                     Err(e) => reply.error(reply_errno("read", ino.0, &e)),
                 }

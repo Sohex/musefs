@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -156,12 +157,42 @@ pub struct Musefs {
     last_seq: AtomicI64,
 }
 
-/// Map a `sharded_slab::Slab` insert result to a FUSE file handle. The slab key
-/// is offset by one so the wire `fh` is always non-zero (`fh == 0` means "no
-/// handle" — `read` falls back to inode resolution). `None` means the slab is at
-/// capacity, surfaced as an explicit error rather than a panic.
-fn fh_from_key(key: Option<usize>) -> Result<u64> {
-    key.map(|k| k as u64 + 1).ok_or(CoreError::HandleTableFull)
+/// A FUSE file handle: the sharded-slab key offset by one, so the wire value
+/// is never 0 (`0` on the wire means "no handle" — `read` falls back to inode
+/// resolution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fh(NonZeroU64);
+
+impl Fh {
+    /// Sole site of the `+1`: slab key → wire-safe non-zero handle.
+    /// `NonZeroU64::MIN.saturating_add` is panic-free, overflow-proof, and
+    /// non-zero by construction.
+    fn from_slab_key(key: usize) -> Fh {
+        Fh(NonZeroU64::MIN.saturating_add(key as u64))
+    }
+
+    /// Sole site of the `-1`: handle → slab key.
+    fn slab_key(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
+
+    /// The raw wire value handed to the kernel.
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Wire → type, for the FUSE layer's boundary conversion.
+impl From<NonZeroU64> for Fh {
+    fn from(raw: NonZeroU64) -> Fh {
+        Fh(raw)
+    }
+}
+
+/// Map a `sharded_slab::Slab` insert result to a file handle. `None` means the
+/// slab is at capacity, surfaced as an explicit error rather than a panic.
+fn fh_from_key(key: Option<usize>) -> Result<Fh> {
+    key.map(Fh::from_slab_key).ok_or(CoreError::HandleTableFull)
 }
 
 /// Outcome of a successful changelog-driven incremental refresh: everything
@@ -878,15 +909,15 @@ impl Musefs {
     pub fn read_into(
         &self,
         inode: u64,
-        fh: u64,
+        fh: Option<Fh>,
         offset: u64,
         size: u64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
         out.clear();
         // Fast path: serve from the per-handle fd + cached layout (no open/stat).
-        if fh != 0 {
-            let handle = self.handles.get((fh - 1) as usize).map(|g| Arc::clone(&g));
+        if let Some(fh) = fh {
+            let handle = self.handles.get(fh.slab_key()).map(|g| Arc::clone(&g));
             if let Some(h) = handle {
                 // Bounded retry absorbs a refresh landing mid-read; out-of-band
                 // re-tags are human/batch-paced, so >1 attempt is already rare.
@@ -960,16 +991,16 @@ impl Musefs {
     }
 
     /// Allocating form of `read_into`.
-    pub fn read(&self, inode: u64, fh: u64, offset: u64, size: u64) -> Result<Vec<u8>> {
+    pub fn read(&self, inode: u64, fh: Option<Fh>, offset: u64, size: u64) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         self.read_into(inode, fh, offset, size, &mut out)?;
         Ok(out)
     }
 
     /// Open a file handle: resolve + validate the layout and open the backing fd
-    /// once, store it, and return a non-zero handle id. Subsequent `read`s with
-    /// this handle reuse the fd (no per-read open/stat).
-    pub fn open_handle(&self, inode: u64) -> Result<u64> {
+    /// once, store it, and return a handle. Subsequent `read`s with this handle
+    /// reuse the fd (no per-read open/stat).
+    pub fn open_handle(&self, inode: u64) -> Result<Fh> {
         let track_id = {
             let tree = self.tree.load();
             match tree.node(inode) {
@@ -999,10 +1030,8 @@ impl Musefs {
     }
 
     /// Drop an open handle (closes its backing fd when the last reference goes).
-    pub fn release_handle(&self, fh: u64) {
-        if fh != 0 {
-            self.handles.remove((fh - 1) as usize);
-        }
+    pub fn release_handle(&self, fh: Fh) {
+        self.handles.remove(fh.slab_key());
     }
 }
 
@@ -1012,12 +1041,17 @@ mod tests {
     use musefs_format::{RegionLayout, Segment};
 
     #[test]
-    fn fh_from_key_offsets_by_one_and_maps_full_to_error() {
+    fn fh_round_trips_slab_key_and_maps_full_to_error() {
         // None (slab at capacity) -> HandleTableFull.
         assert!(matches!(fh_from_key(None), Err(CoreError::HandleTableFull)));
-        // Some(key) -> key + 1, so the fh is always non-zero (0 == "no handle").
-        assert_eq!(fh_from_key(Some(0)).unwrap(), 1);
-        assert_eq!(fh_from_key(Some(41)).unwrap(), 42);
+        // Wire value is the slab key + 1, so the kernel never sees 0 ("no
+        // handle"). Non-zero needs no runtime assertion — NonZeroU64 makes a
+        // zero handle unrepresentable.
+        assert_eq!(fh_from_key(Some(0)).unwrap().get(), 1);
+        assert_eq!(fh_from_key(Some(41)).unwrap().get(), 42);
+        // The two private conversion methods invert each other.
+        assert_eq!(Fh::from_slab_key(0).slab_key(), 0);
+        assert_eq!(Fh::from_slab_key(41).slab_key(), 41);
     }
 
     #[test]
@@ -1083,7 +1117,7 @@ mod tests {
         let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
         let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
         let fh = fs.open_handle(file_inode).unwrap();
-        let len_before = fs.read(file_inode, fh, 0, 1 << 20).unwrap().len();
+        let len_before = fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap().len();
         assert!(len_before > 0, "baseline read must be non-empty");
 
         // Out-of-band re-tag: a long comment grows the synthesized ID3v2 region.
@@ -1102,7 +1136,7 @@ mod tests {
         );
 
         // Same handle: must re-resolve and serve the larger layout.
-        let len_after = fs.read(file_inode, fh, 0, 1 << 20).unwrap().len();
+        let len_after = fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap().len();
         assert!(
             len_after > len_before,
             "handle did not re-resolve: {len_before} -> {len_after}"
@@ -1178,7 +1212,7 @@ mod tests {
 
         // Open the handle and read the original synthesized file (carries needle_a).
         let fh = fs.open_handle(file_inode).unwrap();
-        let whole_a = fs.read(file_inode, fh, 0, 1 << 20).unwrap();
+        let whole_a = fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap();
         assert!(
             whole_a.windows(needle_a.len()).any(|w| w == needle_a),
             "baseline must carry the original PRIV body"
@@ -1206,7 +1240,7 @@ mod tests {
 
         // What a freshly resolved handle serves for the *current* DB state.
         let fh2 = fs.open_handle(file_inode).unwrap();
-        let whole_b = fs.read(file_inode, fh2, 0, 1 << 20).unwrap();
+        let whole_b = fs.read(file_inode, Some(fh2), 0, 1 << 20).unwrap();
         fs.release_handle(fh2);
         assert!(
             whole_b.windows(needle_b.len()).any(|w| w == needle_b),
@@ -1225,7 +1259,7 @@ mod tests {
         // The stale handle: either a clean error, or — via the guard's forced
         // re-resolve — byte-identical to the fresh resolve. Never torn bytes.
         // Err is acceptable too (the guard can surface a retryable error).
-        if let Ok(bytes) = fs.read(file_inode, fh, 0, 1 << 20) {
+        if let Ok(bytes) = fs.read(file_inode, Some(fh), 0, 1 << 20) {
             assert_eq!(
                 bytes, whole_b,
                 "stale handle served torn/reused-rowid bytes instead of re-resolving"
