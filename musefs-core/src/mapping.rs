@@ -14,14 +14,15 @@ pub(crate) fn tags_to_inputs(tags: &[Tag]) -> Vec<TagInput> {
 }
 
 /// Build the field map used for path-template rendering: the first value (lowest
-/// ordinal) of each key. Relies on `Db::get_tags` ordering by `(key, ordinal)`.
-/// Keys are ASCII-lowercased so a `$field` placeholder resolves regardless of the
-/// stored key's case (unlike `tags_to_inputs`, which passes keys verbatim to synthesis).
-pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, String> {
+/// ordinal) of each key, borrowed from the rows. Relies on `Db::get_tags` ordering
+/// by `(key, ordinal)`. Keys are ASCII-lowercased so a `$field` placeholder
+/// resolves regardless of the stored key's case (unlike `tags_to_inputs`, which
+/// passes keys verbatim to synthesis).
+pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, &str> {
     let mut map = BTreeMap::new();
     for t in tags {
         map.entry(t.key.to_ascii_lowercase())
-            .or_insert_with(|| t.value.clone());
+            .or_insert_with(|| t.value.as_str());
     }
     map
 }
@@ -123,8 +124,8 @@ mod tests {
             tag("album", "X", 0),
         ];
         let fields = tags_to_fields(&tags);
-        assert_eq!(fields.get("artist").map(String::as_str), Some("Alice"));
-        assert_eq!(fields.get("album").map(String::as_str), Some("X"));
+        assert_eq!(fields.get("artist").copied(), Some("Alice"));
+        assert_eq!(fields.get("album").copied(), Some("X"));
     }
 
     #[test]
@@ -134,8 +135,8 @@ mod tests {
             Tag::new("albumartist", "VA", 0),
         ];
         let fields = tags_to_fields(&tags);
-        assert_eq!(fields.get("myrating").map(String::as_str), Some("5"));
-        assert_eq!(fields.get("albumartist").map(String::as_str), Some("VA"));
+        assert_eq!(fields.get("myrating").copied(), Some("5"));
+        assert_eq!(fields.get("albumartist").copied(), Some("VA"));
     }
 
     #[test]
@@ -196,7 +197,7 @@ mod tests {
 
         let tags = db.get_tags(tid).unwrap();
         let fields = super::tags_to_fields(&tags);
-        assert_eq!(fields.get("artist").map(String::as_str), Some("A"));
+        assert_eq!(fields.get("artist").copied(), Some("A"));
         assert!(
             !fields.contains_key("priv"),
             "binary PRIV leaked into fields: {fields:?}"

@@ -11,7 +11,7 @@ use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
 use crate::reader::{read_at_into, read_at_with_file_into, HeaderCache, ResolvedFile};
 use crate::refresh_diff::{partition_changelog, ChangeSet, TrackRenderState};
-use crate::template::render_path;
+use crate::template::Template;
 use crate::tree::{InodeAllocator, NodeKind, VirtualTree};
 
 /// How the mount serves file *contents*. The virtual tree is identical either way.
@@ -115,6 +115,8 @@ fn retry_backoff_for(poll_interval: std::time::Duration) -> std::time::Duration 
 pub struct Musefs {
     pool: DbPool,
     config: MountConfig,
+    /// Compiled once from `config.template`; rendering never re-parses.
+    template: Template,
     tree: ArcSwap<VirtualTree>,
     cache: HeaderCache,
     last_data_version: AtomicI64,
@@ -217,7 +219,8 @@ impl Musefs {
         // update, since the next poll would see both stamps as current.
         let last_data_version = db.data_version()?;
         let last_seq = db.changelog_since(i64::MAX)?.max_seq;
-        let (tree, snapshot) = Self::build_full(&db, &config, &mut alloc)?;
+        let template = Template::parse(&config.template);
+        let (tree, snapshot) = Self::build_full(&db, &template, &config, &mut alloc)?;
         let poll_interval = config.poll_interval;
         Ok(Musefs {
             cache: HeaderCache::new(config.mode),
@@ -226,6 +229,7 @@ impl Musefs {
             tree: ArcSwap::from_pointee(tree),
             pool: DbPool::new(db)?,
             config,
+            template,
             handles: sharded_slab::Slab::new(),
             size_cache: dashmap::DashMap::new(),
             last_poll: Mutex::new(std::time::Instant::now()),
@@ -244,15 +248,15 @@ impl Musefs {
     }
 
     /// Render a single track's path from its tags + format. The one place
-    /// `render_path` is called, shared by full and incremental rebuilds.
+    /// `Template::render` is called, shared by full and incremental rebuilds.
     fn render_one(
+        template: &Template,
         config: &MountConfig,
         format: musefs_db::Format,
         tags: &[musefs_db::Tag],
     ) -> String {
         let fields = tags_to_fields(tags);
-        render_path(
-            &config.template,
+        template.render(
             &fields,
             &config.fallbacks,
             &config.default_fallback,
@@ -266,6 +270,7 @@ impl Musefs {
     #[allow(clippy::type_complexity)]
     fn render_entries<M>(
         db: &Db<M>,
+        template: &Template,
         config: &MountConfig,
     ) -> Result<(Vec<(i64, String)>, HashMap<i64, TrackRenderState>)> {
         let tracks = db.list_tracks()?;
@@ -274,7 +279,7 @@ impl Musefs {
         let mut snapshot = HashMap::with_capacity(tracks.len());
         for t in &tracks {
             let tags = tags_by_track.remove(&t.id).unwrap_or_default();
-            let path = Self::render_one(config, t.format, &tags);
+            let path = Self::render_one(template, config, t.format, &tags);
             snapshot.insert(
                 t.id,
                 TrackRenderState {
@@ -293,10 +298,11 @@ impl Musefs {
     /// fresh `track_id -> TrackRenderState` snapshot.
     fn build_full<M>(
         db: &Db<M>,
+        template: &Template,
         config: &MountConfig,
         alloc: &mut InodeAllocator,
     ) -> Result<(VirtualTree, HashMap<i64, TrackRenderState>)> {
-        let (entries, snapshot) = Self::render_entries(db, config)?;
+        let (entries, snapshot) = Self::render_entries(db, template, config)?;
         Ok((VirtualTree::build_with(&entries, alloc), snapshot))
     }
 
@@ -330,7 +336,7 @@ impl Musefs {
         }
         let (entries, snapshot) = self
             .pool
-            .with(|db| Self::render_entries(db, &self.config))?;
+            .with(|db| Self::render_entries(db, &self.template, &self.config))?;
         let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
         let tree = VirtualTree::build_with(&entries, &mut alloc);
         alloc.prune_retired(&tree);
@@ -437,7 +443,7 @@ impl Musefs {
                         TrackRenderState {
                             content_version: cv,
                             format: fmt,
-                            path: Self::render_one(&self.config, fmt, &tags),
+                            path: Self::render_one(&self.template, &self.config, fmt, &tags),
                         },
                     )
                 })
@@ -1294,7 +1300,8 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
         };
 
-        let (entries, snapshot) = Musefs::render_entries(&db, &cfg).unwrap();
+        let (entries, snapshot) =
+            Musefs::render_entries(&db, &Template::parse(&cfg.template), &cfg).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, "Pix/Song.mp3");
         let id = entries[0].0;
