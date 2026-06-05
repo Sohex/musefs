@@ -127,16 +127,18 @@ re-parse, per-field name and sanitize `String`s, per-value clones.
 ### Scope
 
 `musefs-core` only: `template.rs` (rewrite around `Template`),
-`mapping.rs` (`tags_to_fields` signature + unit tests), `facade.rs`
+`mapping.rs` (`tags_to_fields` signature + unit tests, whose
+`.map(String::as_str)` assertions change with the value type), `facade.rs`
 (`Musefs` field, `render_one` and rebuild-helper signatures), `lib.rs`
 (re-export), `tests/template.rs` (rewritten against
-`Template::parse(...).render(...)`).
+`Template::parse(...).render(...)`), and the `TrackRenderState` doc comment
+in `refresh_diff.rs` that names `render_path`.
 
 ## Testing
 
 - `tests/template.rs`: same behavioral assertions (substitution, fallback
-  chain, sanitization) rewritten against `Template`, plus explicit
-  literal-`$` and unterminated-`${` cases if not already covered — the
+  chain, sanitization) rewritten against `Template`, plus new explicit
+  literal-`$` and unterminated-`${` cases (currently uncovered) — the
   parse/render split adds branches the mutation gate will probe.
 - `mapping.rs` unit tests updated for the new signatures; existing
   facade/reader tests guard the wiring end to end. FUSE e2e unaffected.
