@@ -40,7 +40,7 @@ In `musefs-core/src/tree.rs`, inside the existing `#[cfg(test)] mod tests`, repl
     }
 
     #[test]
-    fn deepest_existing_ancestor_preserves_dir_vs_file_order() {
+    fn deepest_existing_ancestor_preserves_rendered_dir_vs_file_order() {
         let t = VirtualTree::build(&[(1, "X".into()), (2, "X/a.flac".into())]);
         let file = t.lookup(VirtualTree::ROOT, "X").unwrap();
         let dir = t.lookup(VirtualTree::ROOT, "X (2)").unwrap();
@@ -90,7 +90,7 @@ In `musefs-core/src/tree.rs`, inside the existing `#[cfg(test)] mod tests`, repl
     }
 
     #[test]
-    fn deepest_existing_ancestor_miss_does_not_scan_root_fanout() {
+    fn deepest_existing_ancestor_rendered_miss_does_not_scan_root_fanout() {
         let entries: Vec<(i64, String)> = (0..1024)
             .map(|i| {
                 (
@@ -314,6 +314,14 @@ Replace the existing `children_by_rendered` method with these methods:
         self.children_by_rendered_with_examined(dir, rendered).1
     }
 ```
+
+`children_by_rendered_with_examined` must treat `examined` as the number of
+direct child entries inspected by the lookup, not merely the number of returned
+matches. With the rendered index, an absent rendered-name bucket inspects `0`
+child entries and a present bucket inspects `same_rendered.len()` child entries.
+If this helper were ever implemented by scanning `children[dir]`, it would need
+to count every sibling visited, so the root fan-out miss test would report the
+full fan-out and fail.
 
 This keeps `deepest_existing_ancestor` unchanged; it should continue to call `children_by_rendered`.
 
