@@ -24,12 +24,20 @@ cargo test -p musefs-fuse -- --ignored   # FUSE end-to-end; needs /dev/fuse + li
 cargo clippy --all-targets               # lint
 cargo fmt                                # format
 
-# In-diff mutation gate (CI parity). Always -j2, output on /tmp, and do NOT
-# set TMPDIR (the default is correct). Sanity-check mutants.diff is non-empty
-# first — an empty diff mutates nothing and exits 0, a silent false pass.
+# In-diff mutation gate (CI parity). Always -j2, output on /tmp. Run it inside
+# a memory-capped cgroup with TMPDIR on real disk: /tmp is a RAM-backed tmpfs
+# here, and some mutants are allocation bombs (a constant-return on a parser
+# position helper spins a collect-loop) that OOM the whole host faster than the
+# test timeout — this killed two tmux sessions and two CI runners before the
+# bomb class got a documented exclude in .cargo/mutants.toml. Sanity-check
+# mutants.diff is non-empty first — an empty diff mutates nothing and exits 0,
+# a silent false pass. Don't pipe the run through tail/grep (masks exit code).
 git diff "$(git merge-base main HEAD)...HEAD" -- '*.rs' > mutants.diff
 grep -q '^@@ ' mutants.diff
-cargo mutants --in-diff mutants.diff -j2 --exclude 'musefs-latencyfs/**' --output /tmp/mutants-out/in-diff
+mkdir -p ~/.cache/musefs-mutants-tmp
+TMPDIR="$HOME/.cache/musefs-mutants-tmp" systemd-run --user --scope --collect \
+    -p MemoryMax=10G -p MemorySwapMax=0 \
+    cargo mutants --in-diff mutants.diff -j2 --exclude 'musefs-latencyfs/**' --output /tmp/mutants-out/in-diff
 # Property tests (proptest): byte-identical invariant + tag round-trip. The
 # format-layer proptests are gated on the `fuzzing` feature, which
 # musefs-format's self-dev-dependency enables for all of its test builds.

@@ -34,6 +34,19 @@ exclude_globs = [
 # Anchored on file:line:col so only the proven-equivalent sites are suppressed;
 # killable siblings (e.g. flac `|`->`&`, scan 871 `+`->`*`) stay in scope.
 exclude_re = [
+    # musefs-format's sanctioned u64->usize helper: replacing its body with a
+    # constant (`-> 0` / `-> 1`) is a MACHINE-KILLER, not an equivalent mutant.
+    # The format parsers assign absolute walk positions through it
+    # (`pos = usize_from(next)` in wav::walk_chunks, mp4's box walk, the ogg
+    # page scan); a constant return pins the position forever while the loop
+    # pushes a record per iteration — an allocation bomb that OOMs the HOST
+    # (observed: 26.7G RSS + 11.5G swap killing a tmux session twice; two CI
+    # runners died with "runner received a shutdown signal") faster than
+    # cargo-mutants' test timeout can fire. The helper's correctness is pinned
+    # instead by its unit test plus every slice/alloc consumer. musefs-db's
+    # sibling helper stays IN scope: core uses it only for slice bounds, so its
+    # constant-return mutants die by prompt panic (verified caught).
+    'musefs-format/src/convert\.rs:\d+:\d+: replace usize_from -> usize',
     # dirty_min_flip_ancestors (add-side walk) `id < introducing_id(child)`: the
     # `<`->`<=` boundary is unreachable-different. Equality needs the walked id to
     # BE the subtree's introducing id, which only a moved-in id can satisfy (pure
