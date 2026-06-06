@@ -610,11 +610,11 @@ threshold (p>0.05, "No change in performance detected").
 
 - **Before** = `main` @ `0881b31`: every read round-trips kernel → daemon → positioned read → copy back.
 - **After** = `issue-112-passthrough`: backing fd registered at open (FUSE passthrough, kernel 6.9+); the kernel serves reads directly from the backing inode, bypassing the daemon entirely.
-- Harness: 512 MiB single-track FLAC StructureOnly mount, `dd bs=1M` sequential read, 3 runs each, fresh mount per run, RAM-cached backing file (isolates FUSE-path overhead). Both binaries mounted via `sudo` (passthrough requires `CAP_SYS_ADMIN` for `FUSE_DEV_IOC_BACKING_OPEN`).
+- Harness: 512 MiB single-track FLAC StructureOnly mount, `dd bs=1M` sequential read, fresh mount per binary with 3 runs inside it, RAM-cached backing file (isolates FUSE-path overhead). Both binaries mounted via `sudo` (passthrough requires `CAP_SYS_ADMIN` for `FUSE_DEV_IOC_BACKING_OPEN`).
 
 | | run 1 | run 2 | run 3 | median |
 |---|---|---|---|---|
 | Before (daemon reads) | 2.7 GB/s | 2.8 GB/s | 2.8 GB/s | 2.8 GB/s |
 | After (passthrough) | 9.3 GB/s | 9.3 GB/s | 9.4 GB/s | 9.3 GB/s |
 
-Passthrough is **~3.3× faster** on this RAM-cached sequential-read workload; the before path copies 512 MiB twice (daemon read buffer → kernel reply), while the after path copies it zero times.
+Passthrough is **~3.3× faster** on this RAM-cached sequential-read workload: the before path round-trips every ~128 KiB chunk through the daemon (wakeup + positioned read into the reply buffer + copy back through `/dev/fuse`), while the after path reads straight from the backing inode's page cache like a native file.
