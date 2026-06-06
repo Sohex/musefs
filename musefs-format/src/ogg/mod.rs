@@ -345,12 +345,12 @@ fn build_packets_with_art(
             if header.codec == Codec::Opus {
                 Ok(vec![
                     vec![PayloadChunk::Bytes(header.packets[0].clone())],
-                    comment_packet_chunks(b"OpusTags", tags, arts, false),
+                    comment_packet_chunks(b"OpusTags", tags, arts, false)?,
                 ])
             } else {
                 Ok(vec![
                     vec![PayloadChunk::Bytes(header.packets[0].clone())],
-                    comment_packet_chunks(b"\x03vorbis", tags, arts, true),
+                    comment_packet_chunks(b"\x03vorbis", tags, arts, true)?,
                     vec![PayloadChunk::Bytes(header.packets[2].clone())],
                 ])
             }
@@ -369,13 +369,13 @@ fn comment_packet_chunks(
     tags: &[TagInput],
     arts: &[OggArt],
     framing_bit: bool,
-) -> Vec<PayloadChunk> {
-    let text_body = crate::vorbiscomment::build(tags); // vendor + count(text) + text comments
+) -> Result<Vec<PayloadChunk>> {
+    let text_body = crate::vorbiscomment::build(tags)?; // vendor + count(text) + text comments
     let vendor_len = u32::from_le_bytes(text_body[0..4].try_into().unwrap()) as usize;
     let count_pos = 4 + vendor_len;
     let text_count = u32::from_le_bytes(text_body[count_pos..count_pos + 4].try_into().unwrap());
     let mut leading = text_body.clone();
-    let new_count = text_count + arts.len() as u32;
+    let new_count = text_count + u32::try_from(arts.len()).map_err(|_| FormatError::TooLarge)?;
     leading[count_pos..count_pos + 4].copy_from_slice(&new_count.to_le_bytes());
 
     let mut chunks: Vec<PayloadChunk> = Vec::new();
@@ -387,8 +387,12 @@ fn comment_packet_chunks(
         let b64_prefix = b64_encode(&prefix);
         let value_len = METADATA_BLOCK_PICTURE_KEY.len()
             + b64_prefix.len()
-            + b64_len(art.meta.data_len) as usize;
-        head.extend_from_slice(&(value_len as u32).to_le_bytes());
+            + crate::convert::usize_from(b64_len(art.meta.data_len));
+        head.extend_from_slice(
+            &u32::try_from(value_len)
+                .map_err(|_| FormatError::TooLarge)?
+                .to_le_bytes(),
+        );
         head.extend_from_slice(METADATA_BLOCK_PICTURE_KEY);
         head.extend_from_slice(&b64_prefix);
         chunks.push(PayloadChunk::Bytes(std::mem::take(&mut head)));
@@ -405,7 +409,7 @@ fn comment_packet_chunks(
     if !head.is_empty() {
         chunks.push(PayloadChunk::Bytes(head));
     }
-    chunks
+    Ok(chunks)
 }
 
 /// OggFLAC header packets with art: the text comment packet (no art) plus one
@@ -426,12 +430,12 @@ fn oggflac_packets_with_art(
         }
     }
 
-    let vc = crate::vorbiscomment::build(tags);
+    let vc = crate::vorbiscomment::build(tags)?;
     if vc.len() as u64 > crate::flac::MAX_BLOCK_BODY {
         return Err(FormatError::TooLarge);
     }
     let mut comment = Vec::new();
-    crate::flac::push_block_header(&mut comment, 4, vc.len(), false);
+    crate::flac::push_block_header(&mut comment, 4, vc.len(), false)?;
     comment.extend_from_slice(&vc);
 
     let following_count = structural.len() + 1 + arts.len();
@@ -449,7 +453,7 @@ fn oggflac_packets_with_art(
             return Err(FormatError::TooLarge);
         }
         let mut blk = Vec::new();
-        crate::flac::push_block_header(&mut blk, 6, body_len as usize, false);
+        crate::flac::push_block_header(&mut blk, 6, crate::convert::usize_from(body_len), false)?;
         blk.extend_from_slice(&prefix);
         block_packets.push(vec![
             PayloadChunk::Bytes(blk),
@@ -490,7 +494,7 @@ pub mod page_test_support {
 
     /// An empty VorbisComment body (vendor + zero comments), for fixtures.
     pub fn vorbis_body_empty() -> Vec<u8> {
-        crate::vorbiscomment::build(&[])
+        crate::vorbiscomment::build(&[]).unwrap()
     }
 }
 
@@ -538,7 +542,8 @@ mod tests {
     #[test]
     fn read_tags_opus() {
         // Build an OpusTags packet with one real comment via the shared builder.
-        let body = crate::vorbiscomment::build(&[crate::input::TagInput::new("title", "Sun")]);
+        let body =
+            crate::vorbiscomment::build(&[crate::input::TagInput::new("title", "Sun")]).unwrap();
         let mut tags_pkt = b"OpusTags".to_vec();
         tags_pkt.extend_from_slice(&body);
         let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
@@ -605,7 +610,7 @@ mod tests {
         id.push(0xB8); // blocksizes
         id.push(0x01); // framing bit
         let mut comment = b"\x03vorbis".to_vec();
-        comment.extend_from_slice(&crate::vorbiscomment::build(&[]));
+        comment.extend_from_slice(&crate::vorbiscomment::build(&[]).unwrap());
         comment.push(0x01);
         let (bytes, _) = crate::ogg::page::build_header(55, &[&id, &comment, setup]);
         bytes
@@ -694,7 +699,7 @@ mod tests {
         // STREAMINFO block (type 0): 4-byte header + 34-byte body (zeros are fine
         // for our framing test).
         let mut streaminfo = Vec::new();
-        crate::flac::push_block_header(&mut streaminfo, 0, 34, false);
+        crate::flac::push_block_header(&mut streaminfo, 0, 34, false).unwrap();
         streaminfo.extend(std::iter::repeat_n(0u8, 34));
 
         // Mapping header packet: 0x7F "FLAC" v1.0 count "fLaC" STREAMINFO.
@@ -708,13 +713,13 @@ mod tests {
 
         // A SEEKTABLE block (type 3, structural — must be preserved).
         let mut seektable = Vec::new();
-        crate::flac::push_block_header(&mut seektable, 3, 18, false);
+        crate::flac::push_block_header(&mut seektable, 3, 18, false).unwrap();
         seektable.extend(std::iter::repeat_n(0xEEu8, 18));
 
         // An existing VORBIS_COMMENT (type 4, last) to be replaced.
         let mut old_vc = Vec::new();
-        let body = crate::vorbiscomment::build(&[crate::input::TagInput::new("x", "old")]);
-        crate::flac::push_block_header(&mut old_vc, 4, body.len(), true);
+        let body = crate::vorbiscomment::build(&[crate::input::TagInput::new("x", "old")]).unwrap();
+        crate::flac::push_block_header(&mut old_vc, 4, body.len(), true).unwrap();
         old_vc.extend_from_slice(&body);
 
         let (bytes, _) = crate::ogg::page::build_header(77, &[&mapping, &seektable, &old_vc]);
@@ -1164,8 +1169,9 @@ mod tests {
             header_pages: 1,
             audio_offset: 0,
         };
-        let overhead =
-            crate::vorbiscomment::build(&[crate::input::TagInput::new("title", "")]).len() as u64;
+        let overhead = crate::vorbiscomment::build(&[crate::input::TagInput::new("title", "")])
+            .unwrap()
+            .len() as u64;
         let at_limit = "x".repeat((crate::flac::MAX_BLOCK_BODY - overhead) as usize);
         let tags = [crate::input::TagInput::new("title", at_limit.as_str())];
         assert!(oggflac_packets_with_art(&header, &tags, &[]).is_ok());
