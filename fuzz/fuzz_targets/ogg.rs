@@ -42,7 +42,10 @@ fuzz_target!(|data: &[u8]| {
     let arts: Vec<OggArt> = inputs
         .iter()
         .zip(images.iter())
-        .map(|(meta, image)| OggArt { meta, image: image.as_slice() })
+        .map(|(meta, image)| OggArt {
+            meta,
+            image: image.as_slice(),
+        })
         .collect();
 
     if let Ok(layout) =

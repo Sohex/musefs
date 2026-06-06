@@ -35,7 +35,11 @@ fn collect_file_inodes(fs: &Musefs, dir: u64, out: &mut Vec<u64>) {
 /// A small single-format generated corpus, scanned into an in-memory DB and
 /// mounted. Returns the fs plus all file inodes (discovered by a format-agnostic
 /// tree walk).
-fn fixture(format: Format, bytes_per_track: usize, tracks: usize) -> (Arc<Musefs>, Vec<u64>) {
+fn fixture(
+    format: Format,
+    bytes_per_track: usize,
+    tracks: usize,
+) -> (Arc<Musefs>, Vec<u64>, tempfile::TempDir) {
     let p = CorpusParams {
         albums: 1,
         tracks_per_album: tracks,
@@ -53,18 +57,14 @@ fn fixture(format: Format, bytes_per_track: usize, tracks: usize) -> (Arc<Musefs
     let mut inodes = Vec::new();
     collect_file_inodes(&fs, VirtualTree::ROOT, &mut inodes);
     assert!(!inodes.is_empty(), "fixture: no file inodes for {format:?}");
-    // Keep the tempdir alive for the duration of the bench by leaking it. Each
-    // fixture call leaks one; a full run accumulates at most ALL_FORMATS.len()+1
-    // (sequential per-format + concurrent), all reclaimed when the process exits.
-    std::mem::forget(dir);
-    (fs, inodes)
+    (fs, inodes, dir)
 }
 
 fn bench_sequential_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_read");
     let chunk = 128 * 1024u64;
     for fmt in bench_formats() {
-        let (fs, inodes) = fixture(fmt, 4 * 1024 * 1024, 1);
+        let (fs, inodes, _dir) = fixture(fmt, 4 * 1024 * 1024, 1);
         let inode = inodes[0];
         let size = fs.getattr(inode).unwrap().size;
         group.throughput(Throughput::Bytes(size));
@@ -93,7 +93,7 @@ fn bench_concurrent_read_and_walk(c: &mut Criterion) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(num_streams);
-    let (fs, inodes) = fixture(Format::Flac, 1024 * 1024, m.max(2));
+    let (fs, inodes, _dir) = fixture(Format::Flac, 1024 * 1024, m.max(2));
 
     // Each iteration streams `m` whole files (reader i reads inodes[i]); the
     // walker does metadata-only ops and contributes no bytes.

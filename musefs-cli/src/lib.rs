@@ -106,7 +106,10 @@ pub enum Command {
 pub fn run_scan(db_path: &Path, targets: &[PathBuf], revalidate: bool, jobs: usize) -> Result<()> {
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
-    let opts = musefs_core::ScanOptions { jobs };
+    let opts = musefs_core::ScanOptions {
+        jobs,
+        ..Default::default()
+    };
     for target in targets {
         if revalidate {
             let stats = musefs_core::revalidate_with(&db, target, &opts)

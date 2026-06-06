@@ -169,15 +169,6 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
     }
 }
 
-/// Effective initial window: `MUSEFS_SCAN_WINDOW` (bytes) if set, else `WINDOW`.
-fn scan_window() -> usize {
-    std::env::var("MUSEFS_SCAN_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(WINDOW)
-}
-
 /// Read `[0, len)` of `path` into a buffer, counting the read. A short read at
 /// EOF is fine (`len` may exceed the file size).
 fn read_window(file: &std::fs::File, len: usize) -> std::io::Result<Vec<u8>> {
@@ -211,7 +202,7 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
 /// reads only. The M4A seek reader does its own positioned reads internally, so
 /// its bytes are not reflected in `SCAN_BYTES_READ` (only `on_scan_open` fires
 /// for M4A); its win shows up in wall time and peak RSS instead.
-fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
+fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Option<Probed>> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
 
@@ -246,7 +237,7 @@ fn probe_file(path: &Path, file_len: u64) -> std::io::Result<Option<Probed>> {
     } else {
         None
     };
-    let mut want = (scan_window() as u64).min(file_len) as usize;
+    let mut want = (window as u64).min(file_len) as usize;
     let mut prefix = read_window(&file, want)?;
     for _ in 0..MAX_WIDEN_RETRIES {
         match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
@@ -364,9 +355,23 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
 }
 
 /// Knobs for a scan. `jobs == 0` means "use available parallelism".
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub jobs: usize,
+    /// Initial probe read window in bytes; widened on `NeedMore`.
+    pub window: usize,
+    /// In-flight art-byte budget and per-batch byte-flush threshold.
+    pub batch_bytes: u64,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            jobs: 0,
+            window: WINDOW,
+            batch_bytes: BATCH_BYTES,
+        }
+    }
 }
 
 fn effective_jobs(jobs: usize) -> usize {
@@ -374,17 +379,6 @@ fn effective_jobs(jobs: usize) -> usize {
         return jobs;
     }
     std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
-}
-
-/// In-flight art-byte budget (and per-batch byte-flush threshold). Overridable via
-/// `MUSEFS_BATCH_BYTES` so tests can exercise the backpressure path without 64 MiB
-/// of fixture art; defaults to `BATCH_BYTES`.
-fn batch_bytes_cap() -> u64 {
-    std::env::var("MUSEFS_BATCH_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(BATCH_BYTES)
 }
 
 /// One probed file ready to write, plus its art-byte weight for backpressure.
@@ -397,7 +391,7 @@ struct Unit {
 }
 
 /// In-memory byte weight of a `Probed`, used for batch backpressure
-/// (`MUSEFS_BATCH_BYTES`). Counts every buffered payload — pictures plus FLAC
+/// (`ScanOptions::batch_bytes`). Counts every buffered payload — pictures plus FLAC
 /// structural blocks and binary tags — so large preserved blocks can't slip the
 /// budget the way picture-only accounting did.
 fn payload_weight(p: &Probed) -> u64 {
@@ -614,7 +608,8 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     use std::sync::Arc;
 
     let jobs = effective_jobs(opts.jobs);
-    let cap = batch_bytes_cap();
+    let window = opts.window;
+    let cap = opts.batch_bytes;
     let budget = Arc::new(ByteBudget::new(cap));
     let skipped = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
@@ -637,7 +632,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                 failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            match probe_file(&path, meta.len()) {
+            match probe_file(&path, meta.len(), window) {
                 Ok(Some(probed)) => {
                     let Ok(abs) = std::fs::canonicalize(&path) else {
                         failed.fetch_add(1, Ordering::Relaxed);
@@ -881,39 +876,18 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
 mod scan_unit_tests {
     use super::*;
     use std::io::Write;
-    use std::sync::Mutex;
 
-    /// Env is process-global: serialize the env-mutating tests so they never
-    /// observe each other's `MUSEFS_*` vars.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // --- ScanOptions defaults (WINDOW L16, BATCH_BYTES L12) ---
 
-    // --- scan_window() / WINDOW (lines 16, 149-154) ---
-
-    // kills scan L16 WINDOW `<<`→`>>` (default must be 1<<20, not 1>>20==0)
-    // kills scan L153 filter `>`→`>=`/`==`/`<`
+    // kills the WINDOW `<<`→`>>` and BATCH_BYTES initializer mutants: the
+    // right-hand sides are decimal literals, so a mutated const/Default
+    // initializer cannot flow to both sides of the assertion.
     #[test]
-    fn scan_window_default_and_env() {
-        let _g = ENV_LOCK.lock().unwrap();
-        // Default (unset): WINDOW == 1<<20. `1>>20` == 0 → distinguishes the shift.
-        std::env::remove_var("MUSEFS_SCAN_WINDOW");
-        assert_eq!(scan_window(), 1 << 20);
-        assert_eq!(scan_window(), 1_048_576);
-
-        // "0" is filtered out (`0 > 0` is false) → falls back to WINDOW.
-        // Under `>=`/`==`, `0` would be kept and returned (wrong).
-        std::env::set_var("MUSEFS_SCAN_WINDOW", "0");
-        assert_eq!(
-            scan_window(),
-            1 << 20,
-            "zero must be filtered → default window"
-        );
-
-        // "5" passes the filter (`5 > 0`) → returned verbatim. Under `<`,
-        // `5 < 0` is false → 5 would be filtered → default (wrong).
-        std::env::set_var("MUSEFS_SCAN_WINDOW", "5");
-        assert_eq!(scan_window(), 5, "positive override must pass the filter");
-
-        std::env::remove_var("MUSEFS_SCAN_WINDOW");
+    fn scan_options_defaults() {
+        let d = ScanOptions::default();
+        assert_eq!(d.jobs, 0, "jobs default = use available parallelism");
+        assert_eq!(d.window, 1_048_576, "window default = 1 MiB");
+        assert_eq!(d.batch_bytes, 67_108_864, "batch_bytes default = 64 MiB");
     }
 
     // --- read_tail_128() (lines 170-178) ---
@@ -965,29 +939,6 @@ mod scan_unit_tests {
         assert_eq!(effective_jobs(0), par);
         assert_eq!(effective_jobs(4), 4);
         assert_eq!(effective_jobs(1), 1);
-    }
-
-    // --- batch_bytes_cap() / BATCH_BYTES (lines 323-329) ---
-
-    // kills scan L324 batch_bytes_cap body→0/→1 (default must be BATCH_BYTES)
-    // kills scan L327 filter `>`→`>=`/`==`/`<`
-    #[test]
-    fn batch_bytes_cap_default_and_env() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("MUSEFS_BATCH_BYTES");
-        assert_eq!(batch_bytes_cap(), BATCH_BYTES);
-        assert_eq!(batch_bytes_cap(), 64 << 20);
-        assert_eq!(batch_bytes_cap(), 67_108_864);
-
-        // "0" filtered (`0 > 0` false) → default. Kills `>=`/`==`.
-        std::env::set_var("MUSEFS_BATCH_BYTES", "0");
-        assert_eq!(batch_bytes_cap(), BATCH_BYTES);
-
-        // "5" passes (`5 > 0`) → 5. Kills `<`.
-        std::env::set_var("MUSEFS_BATCH_BYTES", "5");
-        assert_eq!(batch_bytes_cap(), 5);
-
-        std::env::remove_var("MUSEFS_BATCH_BYTES");
     }
 
     // --- payload_weight() ---
@@ -1763,7 +1714,15 @@ mod bounded_probe_tests {
         }
         let norm = |jobs: usize| {
             let db = Db::open_in_memory().unwrap();
-            scan_directory_with(&db, dir.path(), &ScanOptions { jobs }).unwrap();
+            scan_directory_with(
+                &db,
+                dir.path(),
+                &ScanOptions {
+                    jobs,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             let mut rows: Vec<(String, i64, i64)> = db
                 .list_tracks()
                 .unwrap()

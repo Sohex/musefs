@@ -25,7 +25,10 @@ fn run_one(target: &Target, tier: &str, format: &str, storage: &str) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let opts = ScanOptions { jobs };
+    let opts = ScanOptions {
+        jobs,
+        ..Default::default()
+    };
 
     metrics::reset();
     let t0 = Instant::now();
@@ -132,6 +135,7 @@ fn bench_scan_under_latency() {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+            ..Default::default()
         },
     )
     .unwrap();
@@ -212,7 +216,7 @@ fn bench_read_under_latency() {
         common::corpus::generate(backing.path(), &params);
         let mount = LatencyMount::new(backing.path(), &profile).unwrap();
         let db = Db::open_in_memory().unwrap();
-        scan_directory_with(&db, &mount.path(), &ScanOptions { jobs: 0 }).unwrap();
+        scan_directory_with(&db, &mount.path(), &ScanOptions::default()).unwrap();
         let fs = Musefs::open(db, cfg()).unwrap();
         let inode = first_inode(&fs, VirtualTree::ROOT).expect("an ogg inode");
         let size = fs.getattr(inode).unwrap().size;

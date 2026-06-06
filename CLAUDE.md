@@ -31,9 +31,9 @@ git diff "$(git merge-base main HEAD)...HEAD" -- '*.rs' > mutants.diff
 grep -q '^@@ ' mutants.diff
 cargo mutants --in-diff mutants.diff -j2 --exclude 'musefs-latencyfs/**' --output /tmp/mutants-out/in-diff
 # Property tests (proptest): byte-identical invariant + tag round-trip. The
-# format-layer proptests need the `fuzzing` feature; `cargo test --workspace`
-# also runs them via feature unification.
-cargo test -p musefs-format --features fuzzing
+# format-layer proptests are gated on the `fuzzing` feature, which
+# musefs-format's self-dev-dependency enables for all of its test builds.
+cargo test -p musefs-format
 cargo test -p musefs-core --test proptest_read_fidelity
 
 # Coverage-guided fuzzing (needs nightly + cargo-fuzz; the fuzz/ crate is

@@ -937,6 +937,7 @@ dependencies = [
  "metaflac",
  "mp4",
  "musefs-db",
+ "musefs-format",
  "proptest",
  "thiserror 2.0.18",
 ]

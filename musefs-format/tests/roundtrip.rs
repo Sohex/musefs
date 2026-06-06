@@ -2,9 +2,10 @@ mod common;
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use common::{flac_block, make_flac, resolve_layout, streaminfo_body, vorbis_comment_body};
+use common::{make_flac, resolve_layout, streaminfo_body, vorbis_comment_body};
 use musefs_format::flac::MetadataBlock;
 use musefs_format::flac::{locate_audio, synthesize_layout};
+use musefs_format::fuzz_check::fixtures::flac_block;
 use musefs_format::{ArtInput, BinaryTagInput, Segment, TagInput};
 
 #[test]

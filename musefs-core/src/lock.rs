@@ -17,8 +17,8 @@
 //!   ResolvedFile::last_page (reader.rs:32, locked in ogg_index.rs as LastPageMemo)
 //!                                 -> cat 1 (clear): deterministic one-entry cache, re-derived.
 //! Out of scope (handled elsewhere): byte_budget.rs (#93, currently panics on
-//! poison), db_pool.rs (#94), scan.rs ENV_LOCK / work-queue (test/scan-internal,
-//! not on the FUSE serving path).
+//! poison), db_pool.rs (#94), scan.rs work-queue (scan-internal, not on the
+//! FUSE serving path).
 //!
 //! Recovery is one-shot: each helper calls `Mutex::clear_poison` after restoring
 //! the guarded state to a known-good value, so normal (non-clearing) operation
