@@ -328,6 +328,79 @@ git commit -m "fuse: register StructureOnly backing fds for kernel passthrough (
 
 ---
 
+### Task 3b: Mount-time CAP_SYS_ADMIN probe (added after discovery)
+
+**Why (discovered in Task 4):** the kernel gates `FUSE_DEV_IOC_BACKING_OPEN`
+behind `CAP_SYS_ADMIN`; unprivileged daemons get EPERM on every registration.
+Decision: pre-set the sticky disable at mount time for a StructureOnly mount
+that definitively lacks the capability, logging one info line so the operator
+learns at mount, not first open.
+
+**Files:**
+- Modify: `musefs-core/src/facade.rs` (tiny `Musefs::mode()` accessor)
+- Modify: `musefs-fuse/src/lib.rs` (probe helper + `MusefsFs::new` wiring; parser unit test)
+
+- [ ] **Step 1: Core accessor** — in `impl Musefs` next to `passthrough_fd`:
+
+```rust
+/// The mount's serving mode (how file contents are produced).
+pub fn mode(&self) -> Mode {
+    self.config.mode
+}
+```
+
+- [ ] **Step 2: Probe helper in musefs-fuse** — a pure parser plus a thin reader, near `open_flags`:
+
+```rust
+/// True only when /proc/self/status definitively shows CAP_SYS_ADMIN (bit 21)
+/// absent from CapEff. Unreadable/unparseable -> false (stay neutral; the
+/// first open's ioctl attempt decides instead).
+fn definitely_lacks_cap_sys_admin() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| cap_eff_has_sys_admin(&s))
+        .is_some_and(|has| !has)
+}
+
+/// Parse the `CapEff:` line; None when absent or malformed.
+fn cap_eff_has_sys_admin(status: &str) -> Option<bool> {
+    const CAP_SYS_ADMIN_BIT: u32 = 21;
+    let hex = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))?
+        .trim();
+    let mask = u64::from_str_radix(hex, 16).ok()?;
+    Some(mask & (1 << CAP_SYS_ADMIN_BIT) != 0)
+}
+```
+
+Unit tests (in the existing tests module of lib.rs): root mask (`0000003fffffffff` → Some(true)), unprivileged (`0000000000000000` → Some(false)), missing line → None, garbage hex → None.
+
+- [ ] **Step 3: Wire into `MusefsFs::new`** — initialize the sticky flag from the probe:
+
+```rust
+        let passthrough_disabled =
+            core.mode() == musefs_core::Mode::StructureOnly && definitely_lacks_cap_sys_admin();
+        if passthrough_disabled {
+            log::info!(
+                "StructureOnly mount without CAP_SYS_ADMIN: kernel passthrough unavailable; reads will be served by the daemon"
+            );
+        }
+```
+
+and `passthrough_disabled: Arc::new(AtomicBool::new(passthrough_disabled)),` in the struct literal. (`core` is the `Musefs` parameter, before it moves into the `Arc`.)
+
+- [ ] **Step 4: Verify** — `cargo test -p musefs-fuse` (parser tests pass), `cargo clippy --all-targets`, `cargo fmt --all --check`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add musefs-core/src/facade.rs musefs-fuse/src/lib.rs
+git commit -m "fuse: pre-disable passthrough at mount when CAP_SYS_ADMIN is absent (#112)"
+```
+
+---
+
 ### Task 4: End-to-end passthrough test
 
 **Files:**
@@ -445,11 +518,26 @@ fn mount_one_track(
     (flac, virt, session, backing, mnt)
 }
 
+/// The backing-open ioctl is CAP_SYS_ADMIN-gated; without it passthrough
+/// falls back to daemon reads and the zero-pread assert cannot hold.
+fn have_cap_sys_admin() -> bool {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .is_some_and(|mask| mask & (1 << 21) != 0)
+}
+
 #[test]
-#[ignore = "real mount; needs /dev/fuse + kernel >= 6.9 — run with: cargo test -p musefs-fuse --features metrics --test passthrough -- --ignored --nocapture --test-threads=1"]
+#[ignore = "real mount; needs /dev/fuse + kernel >= 6.9 + CAP_SYS_ADMIN — build as user, run test binary via sudo"]
 fn structure_only_reads_are_kernel_passthrough() {
     if !kernel_supports_passthrough() {
         eprintln!("kernel < 6.9: no FUSE passthrough; skipping");
+        return;
+    }
+    if !have_cap_sys_admin() {
+        eprintln!("no CAP_SYS_ADMIN: backing-open ioctl would EPERM; skipping (run via sudo)");
         return;
     }
     let (backing_bytes, virt, session, _backing, _mnt) = mount_one_track(Mode::StructureOnly);
@@ -504,8 +592,16 @@ fn synthesis_reads_still_go_through_the_daemon() {
 
 - [ ] **Step 2: Run the new tests (they must FAIL only if Tasks 1–3 are broken)**
 
-Run: `cargo test -p musefs-fuse --features metrics --test passthrough -- --ignored --nocapture --test-threads=1`
-Expected: both PASS (kernel here is 7.0). If `structure_only_reads_are_kernel_passthrough` fails on the pread assert, passthrough did not engage — debug Tasks 2/3 (most likely the init handshake) before proceeding; do not weaken the assert.
+Unprivileged run (structure_only must SKIP with the capability message, synthesis must PASS):
+`cargo test -p musefs-fuse --features metrics --test passthrough -- --ignored --nocapture --test-threads=1`
+
+Privileged run (both must PASS — build as user, run the binary via sudo):
+```bash
+BIN=$(cargo test -p musefs-fuse --features metrics --test passthrough --no-run 2>&1 \
+      | grep -o 'target/debug/deps/passthrough-[a-f0-9]*' | head -1)
+sudo -n "$BIN" --ignored --nocapture --test-threads=1
+```
+If `structure_only_reads_are_kernel_passthrough` fails on the pread assert under sudo, passthrough did not engage — debug Tasks 2/3 (most likely the init handshake) before proceeding; do not weaken the assert.
 
 - [ ] **Step 3: Run the full ignored e2e suite (no regressions)**
 
@@ -534,10 +630,12 @@ Replace the `StructureOnly` variant doc in `musefs-core/src/facade.rs`:
 
 ```rust
     /// Pure passthrough: serve the original backing file bytes unchanged.
-    /// Where the kernel supports FUSE passthrough (6.9+), reads are served
-    /// directly from the backing fd registered at open — open-time validation
-    /// only: a handle held across a backing-file replacement keeps serving
-    /// the inode it opened (plain POSIX fd semantics); new opens re-resolve.
+    /// Where the kernel supports FUSE passthrough (6.9+) and the daemon holds
+    /// CAP_SYS_ADMIN (the kernel gates backing-fd registration), reads are
+    /// served directly from the backing fd registered at open — open-time
+    /// validation only: a handle held across a backing-file replacement keeps
+    /// serving the inode it opened (plain POSIX fd semantics); new opens
+    /// re-resolve. Without the capability, reads fall back to the daemon.
     StructureOnly,
 ```
 
@@ -559,9 +657,11 @@ In CLAUDE.md's "Two mount **modes**" section, extend the `StructureOnly` bullet:
 - `StructureOnly` — a single whole-file `BackingAudio` segment; the original bytes
   are served verbatim under the templated tree. Stored audio bounds are not
   validated in this mode because the whole file is served. On kernels with FUSE
-  passthrough (6.9+) reads are served by the kernel directly from the backing fd
-  registered at open (silent fallback to daemon reads elsewhere); freshness is
-  open-time-only for such handles — plain POSIX fd semantics.
+  passthrough (6.9+) **and a daemon holding CAP_SYS_ADMIN** (kernel-gated; run as
+  root or `setcap cap_sys_admin=ep` the binary) reads are served by the kernel
+  directly from the backing fd registered at open (silent fallback to daemon
+  reads elsewhere, pre-announced at mount time when the capability is absent);
+  freshness is open-time-only for such handles — plain POSIX fd semantics.
 ```
 
 - [ ] **Step 4: Verify build (doc comments compile)**
@@ -623,7 +723,9 @@ For each binary `BIN` in `target/release/musefs` (after) and `/tmp/pt-bench/main
 
 ```bash
 "$BIN" scan /tmp/pt-bench/backing --db /tmp/pt-bench/m.db
-"$BIN" mount /tmp/pt-bench/mnt --db /tmp/pt-bench/m.db --mode structure-only &
+# sudo: the backing-open ioctl is CAP_SYS_ADMIN-gated; without it the "after"
+# measurement would silently benchmark the fallback path.
+sudo -n "$BIN" mount /tmp/pt-bench/mnt --db /tmp/pt-bench/m.db --mode structure-only &
 MOUNT_PID=$!; sleep 1
 for i in 1 2 3; do
   dd if=/tmp/pt-bench/mnt/Alpha/Big.flac of=/dev/null bs=1M 2>&1 | tail -1

@@ -18,7 +18,12 @@ API: `KernelConfig::set_max_stack_depth`, `ReplyOpen::open_backing` →
 ## Goals
 
 - StructureOnly reads served by the kernel at near-native throughput, with no
-  userspace round-trip after open.
+  userspace round-trip after open. **Scope discovered during implementation:**
+  the kernel gates backing-fd registration (`FUSE_DEV_IOC_BACKING_OPEN`)
+  behind `CAP_SYS_ADMIN` — a security restriction kept since the 6.9 merge —
+  so passthrough engages only for a privileged daemon (root, or
+  `setcap cap_sys_admin=ep` on the binary). Unprivileged mounts take the
+  silent fallback below; the optimization is opt-in-by-privilege.
 - Lookup, readdir, getattr, and poll-refresh behavior unchanged.
 - Strict best-effort: every passthrough failure degrades to the existing
   daemon-served read path, never to a user-visible error.
@@ -102,6 +107,13 @@ from the registered backing fd.
   the handle works exactly as today. The first failure flips an `AtomicBool`
   on `MusefsFs` and subsequent opens skip the attempt, so a long-running mount
   on an old kernel does not pay a doomed ioctl per open.
+- Missing `CAP_SYS_ADMIN` (the common unprivileged-mount case): a mount-time
+  probe parses `CapEff` from `/proc/self/status` (bit 21); when a
+  StructureOnly mount definitively lacks the capability, the sticky disable
+  is pre-set and one info-level line is logged at mount time — the operator
+  learns immediately instead of at first open, and no doomed ioctl is ever
+  issued. If `/proc` is unreadable or the line unparseable, the probe stays
+  neutral and the first open's attempt decides, as above.
 - `open_handle` failure: unchanged — the error is replied before passthrough
   is considered.
 - `BackingId` drop safety: fuser's `Drop` impl holds only a `Weak` to the
@@ -153,7 +165,9 @@ wrong is reverting to today's behavior.
   `metrics::reset()`, then read, then assert the preads delta against that
   clean baseline. Exercise open → read → close → unmount to cover the
   `BackingId` release path. The test skips (not fails) when the kernel
-  predates passthrough, mirroring the silent-fallback contract.
+  predates passthrough OR the process lacks `CAP_SYS_ADMIN`, mirroring the
+  silent-fallback contract; locally it runs under `sudo` (build as the user,
+  run the test binary privileged).
 - **Regression:** existing Synthesis e2e tests guard that passthrough stays
   inert outside StructureOnly; no changes to them.
 - **Mutation gate:** standard in-diff `cargo mutants` run per CI parity.
