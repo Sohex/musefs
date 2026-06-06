@@ -281,4 +281,64 @@ mod tests {
             "negative byte_len must error at row-read, not be skipped"
         );
     }
+
+    #[test]
+    fn track_art_images_reads_stored_blob_bytes() {
+        use musefs_db::{NewArt, TrackArt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("art.db");
+        let db = Db::open(&path).unwrap();
+        let tid = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        let first = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![1, 2, 3, 4],
+            })
+            .unwrap();
+        let second = db
+            .upsert_art(&NewArt {
+                mime: "image/jpeg".into(),
+                width: None,
+                height: None,
+                data: vec![7, 8, 9],
+            })
+            .unwrap();
+        db.set_track_art(
+            tid,
+            &[
+                TrackArt {
+                    art_id: first,
+                    picture_type: 3,
+                    description: String::new(),
+                    ordinal: 0,
+                },
+                TrackArt {
+                    art_id: second,
+                    picture_type: 4,
+                    description: String::new(),
+                    ordinal: 1,
+                },
+            ],
+        )
+        .unwrap();
+
+        let inputs = super::track_art_to_inputs(&db, tid).unwrap();
+        let images = super::track_art_images(&db, &inputs).unwrap();
+        assert_eq!(
+            images,
+            vec![vec![1, 2, 3, 4], vec![7, 8, 9]],
+            "must return each stored blob's exact bytes, in input order"
+        );
+    }
 }

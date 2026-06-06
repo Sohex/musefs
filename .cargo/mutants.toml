@@ -59,15 +59,15 @@ exclude_re = [
     # only return `NeedMore{up_to}` with `up_to > want` (we widen precisely to a
     # block end past the prefix), so `up_to.min(file_len)` always wins the max and
     # the `want + 1` term is never selected. `+`->`-`/`*` are equivalent.
-    'musefs-core/src/scan\.rs:254:31:',
+    'musefs-core/src/scan\.rs:255:31:',
     # probe_file post-loop fallback guard `(prefix.len() as u64) < file_len`: when
     # it differs, the only effect is a redundant whole-file re-read that feeds the
     # same `probe_full` result. The >8-retry path that could diverge is unreachable
     # given the probers' exact (FLAC/MP3/WAV) / geometric (Ogg) NeedMore.
-    'musefs-core/src/scan\.rs:261:30:',
+    'musefs-core/src/scan\.rs:262:30:',
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
-    'musefs-core/src/scan\.rs:619:46:',
+    'musefs-core/src/scan\.rs:620:46:',
     # run_pipeline flush cadence (batch_bytes accounting + the
     # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
     # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on
@@ -75,29 +75,35 @@ exclude_re = [
     # cadence mutation persists the identical track set. The win is fewer commits
     # (fsyncs), a performance property only observable via the `metrics`
     # instrumentation the in-diff gate does not build.
-    'musefs-core/src/scan\.rs:710:29:',
-    'musefs-core/src/scan\.rs:712:32:',
-    'musefs-core/src/scan\.rs:712:47:',
-    'musefs-core/src/scan\.rs:712:62:',
-    'musefs-core/src/scan\.rs:720:37:',
-    'musefs-core/src/scan\.rs:722:40:',
-    'musefs-core/src/scan\.rs:722:55:',
-    'musefs-core/src/scan\.rs:722:70:',
+    'musefs-core/src/scan\.rs:711:29:',
+    'musefs-core/src/scan\.rs:713:32:',
+    'musefs-core/src/scan\.rs:713:47:',
+    'musefs-core/src/scan\.rs:713:62:',
+    'musefs-core/src/scan\.rs:721:37:',
+    'musefs-core/src/scan\.rs:723:40:',
+    'musefs-core/src/scan\.rs:723:55:',
+    'musefs-core/src/scan\.rs:723:70:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
     # from a deterministic test. With skip_failed identically 0, the `failed =
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
-    'musefs-core/src/scan\.rs:826:25:',
-    'musefs-core/src/scan\.rs:830:25:',
-    'musefs-core/src/scan\.rs:866:29: replace \+ with -',
+    'musefs-core/src/scan\.rs:827:25:',
+    'musefs-core/src/scan\.rs:831:25:',
+    'musefs-core/src/scan\.rs:867:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
     # bit-for-bit identical for every input (same equivalence as the flac assembly
     # above). The `<<`->`>>` and `> 0` siblings in this fn ARE caught and stay in scope.
     'musefs-format/src/mp3\.rs:\d+:\d+: replace \| with \^ in classify_binary_frame',
+    # synchsafe_decode's four ORed operands `u32::from(b[n] & 0x7F)` are each
+    # shifted by 21/14/7/0 into NON-OVERLAPPING 7-bit windows of the 28-bit result,
+    # so the operands are bit-disjoint and `|`/`^` agree for every input (same
+    # equivalence class as classify_binary_frame above). Description-anchored so
+    # `cargo fmt` line drift can't silently retire it.
+    'replace \| with \^ in synchsafe_decode',
     # fuzz_check fixtures::flac_block header byte
     # `(if is_last { 0x80 } else { 0 }) | (block_type & 0x7F)` -> `^`: the right
     # operand is masked to bits 0-6 and the left is bit 7 or zero, so the operands
@@ -122,13 +128,13 @@ exclude_re = [
     # eprintln on stderr. The fallback's build_with is itself directly tested; this
     # injection point exists only to drive that branch, with nothing observable to
     # assert in this config.
-    'musefs-core/src/facade\.rs:738:9: replace Musefs::force_apply_failure_for_test with \(\)',
+    'musefs-core/src/facade\.rs:777:9: replace Musefs::force_apply_failure_for_test with \(\)',
     # apply_changes path-stable guard `&self.path_of(ino) == new_path` -> false: a
     # `changed` id whose rendered path is unchanged would be treated as a move
     # (remove + re-insert at the same path) instead of a no-op. Re-interning the same
     # path yields the same inode and rebuild_subtree re-canonicalizes the parent, so
     # the resulting tree is identical — a pure short-circuit optimization.
-    'musefs-core/src/tree\.rs:470:30: replace match guard .* with false in VirtualTree::apply_changes',
+    'musefs-core/src/tree\.rs:489:30: replace match guard .* with false in VirtualTree::apply_changes',
     # (The add-side/remove-side dirty-propagation walks formerly inline in
     # apply_changes now live in dirty_min_flip_ancestors; their equivalent and
     # hang-class mutants are covered by the description-anchored
@@ -144,7 +150,7 @@ exclude_re = [
     # ancestor_in's loop terminator `cur == Self::ROOT` -> `!=`: the walk never breaks
     # at root (root.parent == root), so a node with no ancestor in the set loops
     # forever instead of returning false.
-    'musefs-core/src/tree\.rs:596:20: replace == with != in VirtualTree::ancestor_in',
+    'musefs-core/src/tree\.rs:615:20: replace == with != in VirtualTree::ancestor_in',
 
     # SP4 storage-aware serving — equivalent mutant in serve_ogg_window's last-page
     # memo. `total_len = header_len + payload_len` only sets the memoized page's
@@ -156,7 +162,7 @@ exclude_re = [
     # 0 disables the short-circuit (falls to the scan, also correct). So the served
     # output is byte-identical either way. (`+`->`-` underflows and is caught.) Pinned
     # by line:col — one of several `+` in this fn; the others ARE caught.
-    'musefs-core/src/ogg_index\.rs:202:41: replace \+ with \* in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:205:41: replace \+ with \* in serve_ogg_window',
 
     # SP4 crc_shift_zeros — equivalent mutants inherent to the loop/matrix hybrid.
     # crc_shift_zeros has two code paths (a per-step loop and a GF(2) matrix-power)
@@ -199,8 +205,8 @@ exclude_re = [
     # byte-identical proptest_read_fidelity pass with both mutations applied). They
     # were reported TIMEOUT under the parallel gate's load, not as a real hang. Pinned
     # by line:col — several `<` in this fn (the loop/length guards) ARE caught.
-    'musefs-core/src/ogg_index\.rs:213:15: replace < with <= in serve_ogg_window',
-    'musefs-core/src/ogg_index\.rs:222:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:216:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:225:15: replace < with <= in serve_ogg_window',
 
     # Phase 4 poll_due (#89) — equivalent `<`->`<=` on the two wall-clock gates
     # (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <
@@ -222,5 +228,25 @@ exclude_re = [
     # quick_cache accepts any usize. (cargo-mutants DOES mutate const
     # initializers — the equivalence rests on unobservability, not on the
     # const being out of reach.)
-    'musefs-core/src/reader\.rs:70:60: replace / with [%*]',
+    'musefs-core/src/reader\.rs:71:60: replace / with [%*]',
+
+    # wav walk_chunks advance guard `next <= buf.len() as u64` -> `true`: forcing
+    # the guard true sets `pos = next` even when `next > buf.len()`, but the loop's
+    # `while pos + 8 <= buf.len()` test is then immediately false (next can't wrap —
+    # checked_add guards overflow and usize_from doesn't truncate on 64-bit), so the
+    # walk ends on the next iteration with the IDENTICAL output Vec the original's
+    # `break` produced (the chunk header was pushed before the advance). Equivalent;
+    # the in-file note in wav.rs's test module documents the hand-apply confirmation.
+    # The sole match guard in walk_chunks, so description-anchored.
+    'replace match guard next <= buf.len\(\) as u64 with true in walk_chunks',
+
+    # fuzz_check fixtures::wav RIFF-size sum `4 + fmt_chunk.len() + data_chunk.len()`
+    # `+`->`*`: the computed `riff_size` is written into the RIFF header's size field,
+    # but NO in-workspace WAV parser reads it — `riff_wave_start` only checks the
+    # "RIFF"/"WAVE" magic (bytes 0-3 / 8-11, never the 4-7 size word) and `walk_chunks`
+    # ignores it entirely, walking chunk-to-chunk by each chunk's own declared length.
+    # So any value the mutated sum produces is unobservable through the format API the
+    # in-diff gate builds. The two `+` in fixtures::wav are this one expression; both
+    # `+` elsewhere are absent (`samples.len() * 2` is `*`), so description-anchored.
+    'replace \+ with \* in fixtures::wav',
 ]

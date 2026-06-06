@@ -610,6 +610,50 @@ mod tests {
         assert_eq!(len, scan.audio_length);
     }
 
+    #[test]
+    fn synthesize_emits_nonzero_seq_delta_when_header_page_count_changes() {
+        // seq_delta = synthesized_page_count - original_header_pages. When the
+        // original header spanned a different number of pages than the regenerated
+        // one, the delta is non-zero — pins the subtraction at the OggAudio segment.
+        let mut data = opus_headers();
+        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 80]);
+        data.extend_from_slice(&audio);
+        let scan = locate_audio(&data).unwrap();
+        let mut header =
+            read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
+
+        // Synthesis re-lays the Opus header into a known page count; record it.
+        let baseline =
+            synthesize_layout(&header, scan.audio_offset, scan.audio_length, &[], &[]).unwrap();
+        let synth_pages = baseline
+            .segments()
+            .iter()
+            .filter(|s| matches!(s, Segment::Inline(_)))
+            .count();
+        assert!(synth_pages >= 1);
+
+        // Pretend the ORIGINAL header spanned three extra pages, so the served audio
+        // pages must be renumbered downward by exactly three.
+        let original_pages = u32::try_from(synth_pages).unwrap() + 3;
+        header.header_pages = original_pages;
+        let layout =
+            synthesize_layout(&header, scan.audio_offset, scan.audio_length, &[], &[]).unwrap();
+        let delta = layout
+            .segments()
+            .iter()
+            .find_map(|s| match s {
+                Segment::OggAudio { seq_delta, .. } => Some(*seq_delta),
+                _ => None,
+            })
+            .expect("expected an OggAudio segment");
+        assert_eq!(
+            delta,
+            i64::try_from(synth_pages).unwrap() - i64::from(original_pages),
+            "seq_delta must be synthesized pages minus original header pages"
+        );
+        assert_eq!(delta, -3);
+    }
+
     fn vorbis_headers_with(setup: &[u8]) -> Vec<u8> {
         // Minimal-but-shaped Vorbis ID header (30 bytes from 0x01"vorbis").
         let mut id = b"\x01vorbis".to_vec();
@@ -1121,6 +1165,41 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err when key + b64(prefix) + b64(data) overflows u32"
+        );
+    }
+
+    #[test]
+    fn art_value_at_u32_max_boundary_is_accepted_by_build_packets() {
+        // Pin the exact `value_len > u32::MAX` boundary: with mime "image/png" and
+        // an empty description, key(23) + b64(prefix=42)=56 + b64(data_len) lands on
+        // u32::MAX EXACTLY when data_len == 3_221_225_412. A correct `>` admits it
+        // (the downstream u32 length field still fits); `>=`/`==` or a `*`-mutated
+        // sum would wrongly reject it. The declared 3 GiB image is never
+        // materialized (image bytes are empty), so the build is cheap.
+        let meta = crate::input::ArtInput {
+            art_id: 0,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            data_len: 3_221_225_412,
+            picture_type: 3,
+            width: 0,
+            height: 0,
+        };
+        let art = OggArt {
+            meta: &meta,
+            image: &[],
+        };
+        let header = OggHeader {
+            codec: Codec::Vorbis,
+            serial: 0,
+            packets: vec![vec![], vec![], vec![]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let accepted = build_packets_with_art(&header, &[], &[art]).is_ok();
+        assert!(
+            accepted,
+            "value_len exactly u32::MAX must be accepted by build_packets_with_art"
         );
     }
 

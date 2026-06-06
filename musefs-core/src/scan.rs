@@ -1321,6 +1321,23 @@ mod hardening_tests {
     }
 
     #[test]
+    fn ingest_oracle_path_stores_nonzero_art_dimensions() {
+        // Drives the single-file `ingest` (not `ingest_bulk`) so the
+        // `(pic.width != 0).then_some(..)` dimension guards there are pinned.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("art.flac");
+        write_flac(&path, &["ARTIST=A", "TITLE=T"], Some((10, 20)));
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        crate::scan_directory_full_oracle(&db, &path).unwrap();
+        let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+        let ta = db.get_track_art(track.id).unwrap();
+        assert_eq!(ta.len(), 1);
+        let meta = db.get_art_meta(ta[0].art_id).unwrap().unwrap();
+        assert_eq!(meta.width, Some(10));
+        assert_eq!(meta.height, Some(20));
+    }
+
+    #[test]
     fn scan_directory_counts_scanned_and_skipped() {
         let dir = tempfile::tempdir().unwrap();
         write_flac(

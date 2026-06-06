@@ -374,6 +374,24 @@ mod fixtures_tests {
     }
 
     #[test]
+    fn flac_block_encodes_24bit_length_big_endian() {
+        // Pin all three length bytes of the 24-bit block-length field. The body is
+        // sized so each byte is distinct and non-zero (0x030201 = 197_121), which
+        // distinguishes `>> 16`/`>> 8` from `<< 16`/`<< 8` (a left shift would zero
+        // the high/mid bytes). The header is 4 bytes: type|last, then 3 length bytes.
+        let len = 0x03_02_01usize;
+        let body = vec![0xABu8; len];
+        let block = fixtures::flac_block(4, &body, false);
+        assert_eq!(block[0], 4, "block type, last-flag clear");
+        assert_eq!(
+            &block[1..4],
+            &[0x03, 0x02, 0x01],
+            "24-bit big-endian length"
+        );
+        assert_eq!(block.len(), 4 + len);
+    }
+
+    #[test]
     fn m4a_fixture_parses() {
         let f = fixtures::m4a(&[9u8; 16]);
         let b = crate::mp4::locate_audio(&f).unwrap();
