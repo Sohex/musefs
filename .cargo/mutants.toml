@@ -98,6 +98,13 @@ exclude_re = [
     # bit-for-bit identical for every input (same equivalence as the flac assembly
     # above). The `<<`->`>>` and `> 0` siblings in this fn ARE caught and stay in scope.
     'musefs-format/src/mp3\.rs:\d+:\d+: replace \| with \^ in classify_binary_frame',
+    # fuzz_check fixtures::flac_block header byte
+    # `(if is_last { 0x80 } else { 0 }) | (block_type & 0x7F)` -> `^`: the right
+    # operand is masked to bits 0-6 and the left is bit 7 or zero, so the operands
+    # are bit-disjoint and `|`/`^` agree for every input (mutation-eligible since
+    # the #139 consolidation moved the fixture from tests/ into src/fuzz_check.rs).
+    # The `|`->`&` sibling IS caught and stays in scope.
+    'musefs-format/src/fuzz_check\.rs:\d+:\d+: replace \| with \^ in fixtures::flac_block',
 
     # SP2 incremental tree refresh — equivalent mutants in apply_changes & friends.
     # The whole design contract is "the incrementally-mutated tree is byte-identical
