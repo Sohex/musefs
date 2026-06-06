@@ -406,7 +406,8 @@ impl fuser::Filesystem for PassthroughFs {
                 if unsafe { libc::statvfs(cstr.as_ptr(), s.as_mut_ptr()) } == 0 {
                     // SAFETY: statvfs returned 0, so it fully initialized `s`.
                     let s = unsafe { s.assume_init() };
-                    #[allow(clippy::unnecessary_cast)] // field types vary by platform
+                    #[allow(clippy::unnecessary_cast)]
+                    // field types vary by platform (rust-lang/rust-clippy#17166)
                     return reply.statfs(
                         s.f_blocks as u64,
                         s.f_bfree as u64,
