@@ -42,22 +42,10 @@ PLUGIN_VERSION = "0.1.0"
 # Floor: 2.0 — all required APIs (BaseAction, register_*_action, OptionsPage,
 # register_options_page, config.TextOption/BoolOption, thread.run_task,
 # iterfiles, metadata.images, is_front_image) are present since Picard 2.0.0.
-PLUGIN_API_VERSIONS = [
-    "2.0",
-    "2.1",
-    "2.2",
-    "2.3",
-    "2.4",
-    "2.5",
-    "2.6",
-    "2.7",
-    "2.8",
-    "2.9",
-    "2.10",
-    "2.11",
-    "2.12",
-    "2.13",
-]
+# The loader intersects this list with picard.api_versions, which every 2.x
+# release keeps back-filled to "2.0", so declaring the floor alone loads on
+# all Picard 2.x without per-release edits.
+PLUGIN_API_VERSIONS = ["2.0"]
 PLUGIN_LICENSE = "MIT"
 PLUGIN_LICENSE_URL = "https://opensource.org/licenses/MIT"
 
@@ -87,15 +75,23 @@ if _PICARD:
 
     def _resolved_files(objs):
         """Resolve a selection (File/Track/Album/Cluster) to a dict of
-        realpath-key -> File, de-duplicated. Picard items all implement
-        iterfiles(); a File yields itself; a matched Track with no on-disk
-        file yields nothing."""
+        realpath-key -> File, de-duplicated (first wins, drops logged at
+        debug level). Picard items all implement iterfiles(); a File yields
+        itself; a matched Track with no on-disk file yields nothing."""
         seen = {}
         for obj in objs:
             for f in obj.iterfiles():
                 if not f.filename:  # unsaved/virtual file: no path to key on
                     continue
-                seen.setdefault(realpath_key(f.filename), f)
+                key = realpath_key(f.filename)
+                kept = seen.setdefault(key, f)
+                if kept is not f:
+                    log.debug(
+                        "musefs: duplicate file for %s: %r dropped in favor of %r",
+                        key,
+                        f.filename,
+                        kept.filename,
+                    )
         return seen
 
     def _scan_error(exc):

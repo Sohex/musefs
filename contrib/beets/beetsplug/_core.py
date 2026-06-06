@@ -125,10 +125,11 @@ def _read_album_art(item, cache, stats):
     key = realpath_key(artpath)
     if key in cache:
         return cache[key]
+    # Use the raw realpath, not realpath_key's lossy U+FFFD form: the file is
+    # only opened and extension-sniffed, not matched against the DB.
+    real = os.path.realpath(artpath)
     try:
-        # Open the raw realpath, not realpath_key's lossy U+FFFD form: the file
-        # is only opened, not matched against the DB.
-        with open(os.path.realpath(artpath), "rb") as fh:
+        with open(real, "rb") as fh:
             data = fh.read()
     except OSError:
         stats.skipped_art += 1
@@ -138,7 +139,7 @@ def _read_album_art(item, cache, stats):
         stats.skipped_art += 1
         cache[key] = None
         return None
-    art = (data, sniff_mime(data, key))
+    art = (data, sniff_mime(data, os.fsdecode(real)))
     cache[key] = art
     return art
 
