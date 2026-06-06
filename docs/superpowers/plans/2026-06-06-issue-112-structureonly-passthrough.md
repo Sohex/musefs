@@ -301,7 +301,7 @@ Replace the body of `fn open` (`musefs-fuse/src/lib.rs:283-290`) with:
 In `fn release` (`musefs-fuse/src/lib.rs:292-307`), replace the `if let` body:
 
 ```rust
-        // Cheap (two map removes); no need to offload to the pool.
+        // Cheap (a backing-map remove + a slab remove); no need to offload to the pool.
         if let Some(fh) = NonZeroU64::new(fh.0) {
             // Dropping the BackingId fires the backing-close ioctl. Absent for
             // plain (non-passthrough) handles — remove is then a no-op.
@@ -432,7 +432,7 @@ fn mount_one_track(
     let flac = make_flac(&["ARTIST=Alpha", "TITLE=Track"], &audio);
     std::fs::write(backing.path().join("a.flac"), &flac).unwrap();
 
-    // On-disk DB so musefs_db uses the PerThread pool (mirrors tests/mount.rs).
+    // On-disk DB so musefs_db uses the PerThread pool (mirrors tests/concurrency.rs).
     let db_path = backing.path().join("m.db");
     let db = musefs_db::Db::open(&db_path).unwrap();
     scan_directory(&db, backing.path()).unwrap();
