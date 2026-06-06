@@ -12,7 +12,7 @@ impl<M> Db<M> {
             Ok(Tag {
                 key: r.get(0)?,
                 value: r.get(1)?,
-                ordinal: r.get(2)?,
+                ordinal: r.get::<_, i64>(2)? as u64,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -44,7 +44,7 @@ impl<M> Db<M> {
                     Tag {
                         key: r.get(1)?,
                         value: r.get(2)?,
-                        ordinal: r.get(3)?,
+                        ordinal: r.get::<_, i64>(3)? as u64,
                     },
                 ))
             })?;
@@ -70,7 +70,7 @@ impl<M> Db<M> {
                 Tag {
                     key: r.get(1)?,
                     value: r.get(2)?,
-                    ordinal: r.get(3)?,
+                    ordinal: r.get::<_, i64>(3)? as u64,
                 },
             ))
         })?;
@@ -141,7 +141,7 @@ impl Db<ReadWrite> {
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for t in tags {
-                stmt.execute(params![track_id, t.key, t.value, t.ordinal])?;
+                stmt.execute(params![track_id, t.key, t.value, t.ordinal as i64])?;
             }
         }
         tx.commit()?;
@@ -162,7 +162,7 @@ impl Db<ReadWrite> {
                  VALUES (?1, ?2, '', ?3, ?4)",
             )?;
             for t in tags {
-                stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
+                stmt.execute(params![track_id, t.key, t.payload, t.ordinal as i64])?;
             }
         }
         tx.commit()?;

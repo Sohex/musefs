@@ -189,6 +189,10 @@ fn apic_framing(art: &ArtInput) -> Vec<u8> {
     let mut d = vec![ENC_UTF8];
     d.extend_from_slice(art.mime.as_bytes());
     d.push(0x00);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "ID3 APIC type is one byte; valid picture types are 0..=20"
+    )]
     d.push(art.picture_type as u8);
     d.extend_from_slice(art.description.as_bytes());
     d.push(0x00);

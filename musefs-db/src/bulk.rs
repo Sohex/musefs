@@ -64,7 +64,7 @@ impl BulkWriter<'_> {
             "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
         )?;
         for t in tags {
-            stmt.execute(params![track_id, t.key, t.value, t.ordinal])?;
+            stmt.execute(params![track_id, t.key, t.value, t.ordinal as i64])?;
         }
         Ok(())
     }
@@ -79,7 +79,7 @@ impl BulkWriter<'_> {
              VALUES (?1, ?2, '', ?3, ?4)",
         )?;
         for t in tags {
-            stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
+            stmt.execute(params![track_id, t.key, t.payload, t.ordinal as i64])?;
         }
         Ok(())
     }
@@ -98,7 +98,7 @@ impl BulkWriter<'_> {
              VALUES (?1, ?2, ?3, ?4)",
         )?;
         for b in blocks {
-            stmt.execute(params![track_id, b.kind, b.ordinal, b.body])?;
+            stmt.execute(params![track_id, b.kind, b.ordinal as i64, b.body])?;
         }
         Ok(())
     }
@@ -130,9 +130,9 @@ impl BulkWriter<'_> {
             stmt.execute(params![
                 track_id,
                 it.art_id,
-                it.picture_type,
+                it.picture_type as i32,
                 it.description,
-                it.ordinal
+                it.ordinal as i64
             ])?;
         }
         Ok(())

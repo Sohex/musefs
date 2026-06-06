@@ -44,7 +44,7 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
                 art_id: ta.art_id,
                 mime: meta.mime,
                 description: ta.description,
-                picture_type: ta.picture_type as u32,
+                picture_type: ta.picture_type,
                 width: meta.width.unwrap_or(0),
                 height: meta.height.unwrap_or(0),
                 data_len: meta.byte_len,
@@ -87,7 +87,7 @@ mod tests {
     use super::*;
     use musefs_db::{BinaryTag, Db, Format, NewTrack};
 
-    fn tag(key: &str, value: &str, ordinal: i64) -> Tag {
+    fn tag(key: &str, value: &str, ordinal: u64) -> Tag {
         Tag::new(key, value, ordinal)
     }
 

@@ -418,7 +418,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     })?;
 
     let mut tags = Vec::new();
-    let mut ordinals: HashMap<String, i64> = HashMap::new();
+    let mut ordinals: HashMap<String, u64> = HashMap::new();
     for (key, value) in probed.tags {
         let ord = ordinals.entry(key.clone()).or_insert(0);
         tags.push(Tag::new(&key, &value, *ord));
@@ -434,12 +434,12 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
         .map(|(ordinal, b)| musefs_db::BinaryTag {
             key: b.key,
             payload: b.payload,
-            ordinal: ordinal as i64,
+            ordinal: ordinal as u64,
         })
         .collect();
     db.set_binary_tags(track_id, &binary_tags)?;
 
-    let mut sb_ordinals: HashMap<String, i64> = HashMap::new();
+    let mut sb_ordinals: HashMap<String, u64> = HashMap::new();
     let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
         .structural_blocks
         .into_iter()
@@ -472,7 +472,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
         })?;
         // Valid ID3/FLAC picture types are 0..=20; clamp anything out of range.
         let picture_type = if pic.picture_type <= 20 {
-            pic.picture_type as i64
+            pic.picture_type
         } else {
             0
         };
@@ -480,7 +480,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
             art_id,
             picture_type,
             description: pic.description,
-            ordinal: ordinal as i64,
+            ordinal: ordinal as u64,
         });
     }
     db.set_track_art(track_id, &track_arts)?;
@@ -506,7 +506,7 @@ fn ingest_bulk(
     })?;
 
     let mut tags = Vec::new();
-    let mut ordinals: HashMap<String, i64> = HashMap::new();
+    let mut ordinals: HashMap<String, u64> = HashMap::new();
     for (key, value) in &probed.tags {
         let ord = ordinals.entry(key.clone()).or_insert(0);
         tags.push(Tag::new(key, value, *ord));
@@ -522,12 +522,12 @@ fn ingest_bulk(
         .map(|(ordinal, b)| musefs_db::BinaryTag {
             key: b.key,
             payload: b.payload,
-            ordinal: ordinal as i64,
+            ordinal: ordinal as u64,
         })
         .collect();
     bw.set_binary_tags(track_id, &binary_tags)?;
 
-    let mut sb_ordinals: HashMap<String, i64> = HashMap::new();
+    let mut sb_ordinals: HashMap<String, u64> = HashMap::new();
     let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
         .structural_blocks
         .into_iter()
@@ -557,7 +557,7 @@ fn ingest_bulk(
             data: pic.data,
         })?;
         let picture_type = if pic.picture_type <= 20 {
-            pic.picture_type as i64
+            pic.picture_type
         } else {
             0
         };
@@ -565,7 +565,7 @@ fn ingest_bulk(
             art_id,
             picture_type,
             description: pic.description,
-            ordinal: ordinal as i64,
+            ordinal: ordinal as u64,
         });
     }
     bw.set_track_art(track_id, &track_arts)?;
@@ -1286,7 +1286,7 @@ mod hardening_tests {
         let db = musefs_db::Db::open_in_memory().unwrap();
         crate::scan_directory(&db, &path).unwrap();
         let track = db.list_tracks().unwrap().into_iter().next().unwrap();
-        let mut artists: Vec<(i64, String)> = db
+        let mut artists: Vec<(u64, String)> = db
             .get_tags(track.id)
             .unwrap()
             .into_iter()

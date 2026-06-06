@@ -96,9 +96,9 @@ impl<M> Db<M> {
         let rows = stmt.query_map(params![track_id], |r| {
             Ok(TrackArt {
                 art_id: r.get(0)?,
-                picture_type: r.get(1)?,
+                picture_type: r.get::<_, i32>(1)? as u32,
                 description: r.get(2)?,
-                ordinal: r.get(3)?,
+                ordinal: r.get::<_, i64>(3)? as u64,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -137,9 +137,9 @@ impl Db<ReadWrite> {
                 stmt.execute(params![
                     track_id,
                     it.art_id,
-                    it.picture_type,
+                    it.picture_type as i32,
                     it.description,
-                    it.ordinal
+                    it.ordinal as i64
                 ])?;
             }
         }

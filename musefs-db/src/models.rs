@@ -118,11 +118,11 @@ pub struct NewArt {
 pub struct Tag {
     pub key: String,
     pub value: String,
-    pub ordinal: i64,
+    pub ordinal: u64,
 }
 
 impl Tag {
-    pub fn new(key: &str, value: &str, ordinal: i64) -> Tag {
+    pub fn new(key: &str, value: &str, ordinal: u64) -> Tag {
         Tag {
             key: key.to_string(),
             value: value.to_string(),
@@ -156,9 +156,9 @@ pub struct ArtMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackArt {
     pub art_id: i64,
-    pub picture_type: i64,
+    pub picture_type: u32,
     pub description: String,
-    pub ordinal: i64,
+    pub ordinal: u64,
 }
 
 /// A binary tag payload to write (e.g. an opaque ID3 `PRIV` frame body). `key` is
@@ -169,7 +169,7 @@ pub struct TrackArt {
 pub struct BinaryTag {
     pub key: String,
     pub payload: Vec<u8>,
-    pub ordinal: i64,
+    pub ordinal: u64,
 }
 
 /// A binary tag row read back for synthesis: the streaming handle (`rowid`), the
@@ -188,6 +188,6 @@ pub struct BinaryTagRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuralBlock {
     pub kind: String,
-    pub ordinal: i64,
+    pub ordinal: u64,
     pub body: Vec<u8>,
 }

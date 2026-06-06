@@ -106,7 +106,7 @@ proptest! {
             backing_mtime: 0,
         }).unwrap();
         let db_tags: Vec<musefs_db::BinaryTag> = opaque.iter().enumerate().map(|(i, e)| {
-            musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: i as i64 }
+            musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: i as u64 }
         }).collect();
         db.set_binary_tags(tid, &db_tags).unwrap();
         let rows = db.get_binary_tags(tid).unwrap();

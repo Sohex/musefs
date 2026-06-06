@@ -13,8 +13,8 @@ type NormalizedTrack = (
     String,
     u64,
     u64,
-    Vec<(String, String, i64)>,
-    Vec<(String, i64, String, i64)>,
+    Vec<(String, String, u64)>,
+    Vec<(String, u32, String, u64)>,
 );
 
 /// Normalize a DB to comparable rows: tracks by path, tags by (key,value,ordinal),

@@ -188,7 +188,7 @@ fn emit(
                 art_id,
                 picture_type: 3,
                 description: String::new(),
-                ordinal: i as i64,
+                ordinal: i as u64,
             }
         })
         .collect();
