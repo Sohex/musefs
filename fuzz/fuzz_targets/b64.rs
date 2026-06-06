@@ -18,15 +18,20 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let total = b64_len(img.len() as u64);
-    if total == 0 {
-        return;
-    }
     let full = encode_b64_slice(&img, 0, total as usize);
-    let out_off = match u.int_in_range(0..=total - 1) {
+    // img is non-empty so total >= 4; checked_sub keeps each bound
+    // underflow-safe on its own, independent of statement order.
+    let Some(max_off) = total.checked_sub(1) else {
+        return;
+    };
+    let out_off = match u.int_in_range(0..=max_off) {
         Ok(v) => v,
         Err(_) => return,
     };
-    let take = match u.int_in_range(1..=total - out_off) {
+    let Some(max_take) = total.checked_sub(out_off) else {
+        return;
+    };
+    let take = match u.int_in_range(1..=max_take) {
         Ok(v) => v,
         Err(_) => return,
     };
