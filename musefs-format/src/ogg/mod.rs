@@ -1179,6 +1179,48 @@ mod tests {
     }
 
     #[test]
+    fn oggflac_picture_block_size_boundary_is_inclusive() {
+        // body_len = picture_prefix(meta).len() + data_len; the guard shares
+        // FLAC's 24-bit block limit. data_len is only a count (image bytes are
+        // streamed), so the exact boundary is cheap to pin. The `>` accepts the
+        // inclusive limit — which also pins the `+` assembly, since a product
+        // of the two terms overshoots it — while the `>=` mutant rejects it.
+        let header = OggHeader {
+            codec: Codec::OggFlac,
+            serial: 1,
+            packets: vec![vec![0x7F; 9]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let mk = |data_len: u64| crate::input::ArtInput {
+            art_id: 1,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len,
+        };
+        let framing_len = picture_prefix(&mk(0)).len() as u64;
+        let at_limit = mk(crate::flac::MAX_BLOCK_BODY - framing_len);
+        let arts = [OggArt {
+            meta: &at_limit,
+            image: &[],
+        }];
+        assert!(oggflac_packets_with_art(&header, &[], &arts).is_ok());
+        // one byte over must still error, pinning the high side of the boundary.
+        let over = mk(crate::flac::MAX_BLOCK_BODY - framing_len + 1);
+        let arts = [OggArt {
+            meta: &over,
+            image: &[],
+        }];
+        assert!(matches!(
+            oggflac_packets_with_art(&header, &[], &arts),
+            Err(FormatError::TooLarge)
+        ));
+    }
+
+    #[test]
     fn comment_packet_index_locates_the_comment_block() {
         // Opus/Vorbis: always packet index 1 (kills :121 -> 1 only if a non-1 case
         // exists; assert OggFLAC search to pin the skip(1)+find logic at :130).
