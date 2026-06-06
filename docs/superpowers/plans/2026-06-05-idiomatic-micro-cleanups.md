@@ -275,7 +275,14 @@ EOF
 
 ---
 
-### Task 2: Deduplicate `sha256_hex`, use `LowerHex` (musefs-db)
+### Task 2: Deduplicate `sha256_hex` (musefs-db)
+
+> **Deviation (found during execution):** the planned `format!("{:x}", …)`
+> body does not compile on sha2 0.11 — its digest output
+> (`hybrid_array::Array`) has no `LowerHex` impl
+> (RustCrypto/hybrid-array#201) — so the per-byte loop stays, documented in
+> a comment; revisit tracked in #153. Commit `b8231c4` was made with the
+> stale "format via LowerHex" subject below; `9125655` corrects the record.
 
 **Files:**
 - Modify: `musefs-db/src/art.rs:6-14` (single shared impl)
@@ -302,9 +309,15 @@ fn sha256_hex(data: &[u8]) -> String {
     }
     s
 }
-// NEW:
+// NEW (see the deviation note above — LowerHex is unavailable on sha2 0.11,
+// so the body keeps the per-byte loop and only gains `pub(crate)` + a comment):
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    let mut s = String::with_capacity(64);
+    for b in Sha256::digest(data) {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 ```
 
@@ -333,7 +346,7 @@ use rusqlite::{params, Transaction};
 cargo test -p musefs-db
 ```
 
-Expected: PASS (including `sha256_hex_matches_known_digest` — `LowerHex` output is identical to the old per-byte loop).
+Expected: PASS (including `sha256_hex_matches_known_digest`, which keeps pinning the per-byte loop's output).
 
 - [ ] **Step 2.5: Commit**
 

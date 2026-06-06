@@ -52,10 +52,14 @@ Manual 24-bit big-endian shift assembly, both directions:
 
 `sha256_hex` is duplicated identically in `musefs-db/src/art.rs:6` and
 `musefs-db/src/bulk.rs:6`, each hand-encoding hex with a per-byte `write!`
-loop. Keep a single `pub(crate)` copy in `art.rs` with body
-`format!("{:x}", Sha256::digest(data))` (sha2's digest output implements
-`LowerHex`); `bulk.rs` imports it. The known-digest test in `bulk.rs`
-(`sha256_hex_matches_known_digest`) stays and keeps pinning the output.
+loop. Keep a single `pub(crate)` copy in `art.rs`; `bulk.rs` imports it.
+The intended `format!("{:x}", Sha256::digest(data))` body does not compile
+on sha2 0.11 — its digest output (`hybrid_array::Array`) has no `LowerHex`
+impl, unlike sha2 0.10's `GenericArray` (RustCrypto/hybrid-array#201) — so
+the per-byte loop stays, with a comment citing the upstream issue;
+revisiting on the next sha2 bump is tracked in #153. The known-digest test
+in `bulk.rs` (`sha256_hex_matches_known_digest`) stays and keeps pinning
+the output.
 
 ### 3. `to_string_lossy().to_string()` → `.into_owned()`
 
