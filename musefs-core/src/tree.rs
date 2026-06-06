@@ -78,6 +78,7 @@ pub struct Node {
 pub struct VirtualTree {
     nodes: ImHashMap<u64, Node>,
     children: ImHashMap<u64, OrdMap<String, u64>>,
+    rendered_children: ImHashMap<u64, OrdMap<String, OrdMap<String, u64>>>,
     track_to_inode: ImHashMap<i64, u64>,
 }
 
@@ -94,6 +95,7 @@ impl VirtualTree {
         let mut tree = VirtualTree {
             nodes: ImHashMap::new(),
             children: ImHashMap::new(),
+            rendered_children: ImHashMap::new(),
             track_to_inode: ImHashMap::new(),
         };
         tree.nodes.insert(
@@ -106,6 +108,7 @@ impl VirtualTree {
             },
         );
         tree.children.insert(Self::ROOT, OrdMap::new());
+        tree.rendered_children.insert(Self::ROOT, OrdMap::new());
         for (track_id, path) in entries {
             tree.insert_file(*track_id, path, alloc);
         }
@@ -181,7 +184,11 @@ impl VirtualTree {
                 kind: NodeKind::File { track_id },
             },
         );
-        self.children.get_mut(&dir).unwrap().insert(name, inode);
+        self.children
+            .get_mut(&dir)
+            .unwrap()
+            .insert(name.clone(), inode);
+        self.insert_rendered_child(dir, raw_name, &name, inode);
     }
 
     fn ensure_dir(
@@ -209,10 +216,12 @@ impl VirtualTree {
             },
         );
         self.children.insert(inode, OrdMap::new());
+        self.rendered_children.insert(inode, OrdMap::new());
         self.children
             .get_mut(&parent)
             .unwrap()
-            .insert(unique, inode);
+            .insert(unique.clone(), inode);
+        self.insert_rendered_child(parent, name, &unique, inode);
         (inode, full)
     }
 
@@ -280,18 +289,53 @@ impl VirtualTree {
     }
 
     /// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
+    fn children_by_rendered_with_examined(&self, dir: u64, rendered: &str) -> (Vec<u64>, usize) {
+        match self
+            .rendered_children
+            .get(&dir)
+            .and_then(|kids| kids.get(rendered))
+        {
+            None => (Vec::new(), 0),
+            Some(same_rendered) => {
+                let children: Vec<u64> = same_rendered.values().copied().collect();
+                let examined = same_rendered.len();
+                (children, examined)
+            }
+        }
+    }
+
+    /// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
     pub fn children_by_rendered(&self, dir: u64, rendered: &str) -> Vec<u64> {
-        match self.children.get(&dir) {
-            None => Vec::new(),
-            Some(kids) => kids
-                .values()
-                .copied()
-                .filter(|&c| {
-                    self.nodes
-                        .get(&c)
-                        .is_some_and(|n| n.rendered_name == rendered)
-                })
-                .collect(),
+        self.children_by_rendered_with_examined(dir, rendered).0
+    }
+
+    #[cfg(test)]
+    fn children_by_rendered_examined_for_test(&self, dir: u64, rendered: &str) -> usize {
+        self.children_by_rendered_with_examined(dir, rendered).1
+    }
+
+    fn insert_rendered_child(&mut self, parent: u64, rendered: &str, name: &str, inode: u64) {
+        self.rendered_children
+            .entry(parent)
+            .or_default()
+            .entry(rendered.to_string())
+            .or_default()
+            .insert(name.to_string(), inode);
+    }
+
+    fn remove_rendered_child(&mut self, parent: u64, rendered: &str, name: &str) {
+        let Some(by_rendered) = self.rendered_children.get_mut(&parent) else {
+            return;
+        };
+        let remove_bucket = match by_rendered.get_mut(rendered) {
+            Some(same_rendered) => {
+                same_rendered.remove(name);
+                same_rendered.is_empty()
+            }
+            None => false,
+        };
+        if remove_bucket {
+            by_rendered.remove(rendered);
         }
     }
 
@@ -347,10 +391,16 @@ impl VirtualTree {
     ) -> Option<(u64, Option<(String, String)>)> {
         let ino = self.track_to_inode.remove(&track_id)?;
         let parent = self.nodes.get(&ino)?.parent;
-        let name = self.nodes.get(&ino).map(|n| n.name.clone());
+        let names = self
+            .nodes
+            .get(&ino)
+            .map(|n| (n.name.clone(), n.rendered_name.clone()));
         self.nodes.remove(&ino);
-        if let (Some(name), Some(kids)) = (name, self.children.get_mut(&parent)) {
-            kids.remove(&name);
+        if let Some((name, rendered)) = names {
+            if let Some(kids) = self.children.get_mut(&parent) {
+                kids.remove(&name);
+            }
+            self.remove_rendered_child(parent, &rendered, &name);
         }
         Some(self.prune_empty_dirs_upward(parent))
     }
@@ -637,9 +687,13 @@ impl VirtualTree {
                 .get(&dir)
                 .map(|n| (n.name.clone(), n.rendered_name.clone()));
             self.children.remove(&dir);
+            self.rendered_children.remove(&dir);
             self.nodes.remove(&dir);
-            if let (Some((name, _)), Some(kids)) = (&names, self.children.get_mut(&parent)) {
-                kids.remove(name);
+            if let Some((name, rendered)) = &names {
+                if let Some(kids) = self.children.get_mut(&parent) {
+                    kids.remove(name);
+                }
+                self.remove_rendered_child(parent, rendered, name);
             }
             last_pruned = names;
             dir = parent;
@@ -876,8 +930,84 @@ mod tests {
     fn child_by_rendered_finds_disambiguated_node() {
         let t = VirtualTree::build(&[(10, "D/song.flac".into()), (20, "D/song.flac".into())]);
         let d = t.lookup(VirtualTree::ROOT, "D").unwrap();
-        let by_rendered: Vec<u64> = t.children_by_rendered(d, "song.flac");
-        assert_eq!(by_rendered.len(), 2);
+        let base = t.lookup(d, "song.flac").unwrap();
+        let suffixed = t.lookup(d, "song (2).flac").unwrap();
+
+        assert_eq!(t.children_by_rendered(d, "song.flac"), vec![suffixed, base]);
+        assert_eq!(t.children_by_rendered_examined_for_test(d, "song.flac"), 2);
+    }
+
+    #[test]
+    fn deepest_existing_ancestor_preserves_rendered_dir_vs_file_order() {
+        let t = VirtualTree::build(&[(1, "X".into()), (2, "X/a.flac".into())]);
+        let file = t.lookup(VirtualTree::ROOT, "X").unwrap();
+        let dir = t.lookup(VirtualTree::ROOT, "X (2)").unwrap();
+
+        assert_eq!(
+            t.children_by_rendered(VirtualTree::ROOT, "X"),
+            vec![file, dir]
+        );
+        assert_eq!(
+            t.deepest_existing_ancestor("X/new.flac"),
+            (dir, 1),
+            "same-rendered file must not hide the matching directory"
+        );
+    }
+
+    #[test]
+    fn children_by_rendered_updates_when_collision_member_removed() {
+        let mut alloc = InodeAllocator::new();
+        let mut t = VirtualTree::build_with(
+            &[(10, "D/song.flac".into()), (20, "D/song.flac".into())],
+            &mut alloc,
+        );
+        let d = t.lookup(VirtualTree::ROOT, "D").unwrap();
+        let survivor = t.lookup(d, "song (2).flac").unwrap();
+
+        t.remove_track(10, &mut alloc);
+
+        assert_eq!(t.children_by_rendered(d, "song.flac"), vec![survivor]);
+        assert_eq!(t.children_by_rendered_examined_for_test(d, "song.flac"), 1);
+    }
+
+    #[test]
+    fn children_by_rendered_updates_when_empty_dir_pruned() {
+        let mut alloc = InodeAllocator::new();
+        let mut t = VirtualTree::build_with(
+            &[(10, "A/B/x.flac".into()), (20, "A/C/y.flac".into())],
+            &mut alloc,
+        );
+        let a = t.lookup(VirtualTree::ROOT, "A").unwrap();
+        assert_eq!(t.children_by_rendered_examined_for_test(a, "B"), 1);
+
+        t.remove_track(10, &mut alloc);
+
+        assert!(t.children_by_rendered(a, "B").is_empty());
+        assert_eq!(t.children_by_rendered_examined_for_test(a, "B"), 0);
+        assert_eq!(t.children_by_rendered_examined_for_test(a, "C"), 1);
+    }
+
+    #[test]
+    fn deepest_existing_ancestor_rendered_miss_does_not_scan_root_fanout() {
+        let entries: Vec<(i64, String)> = (0..1024)
+            .map(|i| {
+                (
+                    i64::from(i),
+                    format!("Artist {i:04}/Album {i:04}/Track.flac"),
+                )
+            })
+            .collect();
+        let t = VirtualTree::build(&entries);
+
+        assert_eq!(
+            t.deepest_existing_ancestor("Unknown/Unknown/new.flac"),
+            (VirtualTree::ROOT, 0)
+        );
+        assert_eq!(
+            t.children_by_rendered_examined_for_test(VirtualTree::ROOT, "Unknown"),
+            0,
+            "rendered-name miss should examine no same-rendered candidates"
+        );
     }
 
     #[test]

@@ -136,3 +136,41 @@ fn bench_refresh_one_across_library_sizes() {
     }
     println!();
 }
+
+#[test]
+#[ignore = "issue #114 timing harness; run with --ignored --nocapture"]
+fn bench_refresh_root_fanout_one_across_library_sizes() {
+    let tier = std::env::var("MUSEFS_BENCH_TIER").unwrap_or_else(|_| "ci".into());
+    println!("\n{}", RunReport::header());
+    for n in [100usize, 1000, 5000, 20000] {
+        // Many albums with one track each produce many top-level artists under
+        // `$artist/$album/$title`, exercising `deepest_existing_ancestor` at
+        // root fan-out when the changed track moves to fallback `Unknown`.
+        let tmp = tempfile::tempdir().unwrap();
+        let params = CorpusParams::single(Format::Flac, n, 1);
+        let target = prepare_format(&params, tmp.path(), params.format_mix[0]);
+
+        let db = Db::open(&target.db_path).unwrap();
+        scan_directory(&db, &target.corpus_dir).unwrap();
+        let fs = Musefs::open(db, config()).unwrap();
+
+        let one_ms = time_refresh(&target.db_path, &fs, 1);
+        println!(
+            "{}",
+            RunReport {
+                label: format!("refresh-root-fanout-1@{n}"),
+                format: "flac".into(),
+                tier: tier.clone(),
+                storage: "tempfs".into(),
+                wall_ms: one_ms,
+                opens: 0,
+                preads: 0,
+                fsyncs: None,
+                bytes_read: 0,
+                peak_rss_kib: None,
+            }
+            .row()
+        );
+    }
+    println!();
+}
