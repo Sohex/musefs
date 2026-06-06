@@ -134,14 +134,14 @@ fn syncsafe(n: u32) -> [u8; 4] {
 }
 
 /// Inclusive maximum of a 28-bit ID3v2.4 syncsafe size field.
-const SYNCHSAFE_MAX: usize = 0x0FFF_FFFF;
+const SYNCHSAFE_MAX: u32 = 0x0FFF_FFFF;
 
 fn push_frame_header(out: &mut Vec<u8>, id: &[u8; 4], data_len: usize) -> Result<()> {
     // ID3v2.4 frame sizes are a 28-bit syncsafe field; guard so an oversized frame
     // is a hard error rather than a silently-truncated (corrupt) tag.
     let data_len_u32 = u32::try_from(data_len)
         .ok()
-        .filter(|&v| v as usize <= SYNCHSAFE_MAX)
+        .filter(|&v| v <= SYNCHSAFE_MAX)
         .ok_or(FormatError::TooLarge)?;
     out.extend_from_slice(id);
     out.extend_from_slice(&syncsafe(data_len_u32));
@@ -394,7 +394,7 @@ pub fn build_id3v2_segments(
     // large pictures summing past the limit) is a hard error, not a truncated file.
     let frames_len_ss = u32::try_from(frames_len)
         .ok()
-        .filter(|&v| v as usize <= SYNCHSAFE_MAX)
+        .filter(|&v| v <= SYNCHSAFE_MAX)
         .ok_or(FormatError::TooLarge)?;
     header.extend_from_slice(&syncsafe(frames_len_ss));
     segments.insert(0, Segment::Inline(header));
