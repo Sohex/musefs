@@ -327,27 +327,36 @@ skip-with-warn behavior. Rewrite it (keep the existing setup code that
 creates the db, track, and two art rows; replace name, the `UPDATE`, and the
 assertions):
 
+The existing test already corrupts rows through a **second raw
+`rusqlite::Connection`** on the same db file (`mapping.rs:280` — `Db.conn` is
+private to musefs-db and unreachable from this crate; keep that pattern and
+the file-backed `Db::open(&path)` it requires). Keep the whole setup
+(tempdir, track `tid`, art rows `good`/`bad`/`zero`, `set_track_art`) and
+replace the final corrupt-and-assert portion:
+
 ```rust
-    #[test]
-    fn track_art_to_inputs_errors_on_negative_byte_len() {
-        // ... existing setup: tempdir, Db::open, upsert_track -> tid,
-        //     upsert_art -> good, upsert_art -> bad, set_track_art ...
-        // (byte_len is derived from data, so corrupt it directly — a
-        // malformed external write to the contract column.)
-        db.conn
-            .execute("UPDATE art SET byte_len = -1 WHERE id = ?1", [bad])
+        // byte_len == 0 is valid and must still be served (was the old
+        // strict-`<` pin; now pins that zero passes the u64 row-read).
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute("UPDATE art SET byte_len = 0 WHERE id = ?1", [zero])
             .unwrap();
-        let err = track_art_to_inputs(&db, tid);
+        let inputs = super::track_art_to_inputs(&db, tid).unwrap();
+        let ids: Vec<i64> = inputs.iter().map(|a| a.art_id).collect();
+        assert_eq!(ids, vec![good, bad, zero]);
+
+        // A negative byte_len is a malformed external write to the contract
+        // column: it now errors at row-read instead of being skipped.
+        raw.execute("UPDATE art SET byte_len = -1 WHERE id = ?1", [bad])
+            .unwrap();
+        drop(raw);
         assert!(
-            err.is_err(),
-            "negative byte_len must error at row-read, not be skipped: {err:?}"
+            super::track_art_to_inputs(&db, tid).is_err(),
+            "negative byte_len must error at row-read, not be skipped"
         );
-    }
 ```
 
-Keep whatever zero-byte_len assertion the old test made for the `good` row in
-a separate, passing form if it still applies (byte_len == 0 remains valid and
-must still produce an input).
+(Match the `[good, bad, zero]` order to the ordinal order the existing setup
+establishes; rename the test to `track_art_to_inputs_errors_on_negative_byte_len`.)
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -506,15 +515,21 @@ git commit -m "Make ordinals u64 and picture_type u32 across db rows (#133)"
 
 - [ ] **Step 1: Restructure the migration loop (no cast at all)**
 
-`schema.rs:128/140` cast loop indices (`(i + 1) as i64`) for `user_version`
-targets. Restructure with a typed counter — pattern (adapt to the actual loop
-shape at those lines):
+`schema.rs:128` is the fast-path binding (a separate site from the loop):
+
+```rust
+let latest = i64::try_from(MIGRATIONS.len()).expect("migration count fits i64");
+```
+
+`schema.rs:140` casts the loop index (`(i + 1) as i64`) for `user_version`
+targets. Restructure with a typed counter, **preserving the
+`if current < target { … }` body** the real loop carries (lines ~139-145):
 
 ```rust
 for (target, migration) in (1i64..).zip(MIGRATIONS) {
 ```
 
-so `target` is born i64 and both casts disappear. `schema.rs:461` is a test:
+so `target` is born i64 and the cast disappears. `schema.rs:461` is a test:
 `MIGRATIONS.len() as i64` → `i64::try_from(MIGRATIONS.len()).unwrap()`.
 
 - [ ] **Step 2: Route blob offsets through the helper**
@@ -744,17 +759,20 @@ git commit -m "Apply cast convention to MP3/ID3 synthesis (#133)"
 `604,608` (`---- ` atom), `680,685` (`covr`/`data` sizes), `731,733,737`
 (`udta`/`meta`/`ilst` — these three sit right after an existing
 `return Err(FormatError::TooLarge)` guard), `836` (`new_moov_size`):
-all become `u32::try_from(x).map_err(|_| FormatError::TooLarge)?`. Where a
-fn is currently infallible (`build_dash_atom`-style returning `Vec<u8>`),
-make it return `Result<Vec<u8>, FormatError>` and `?` at callers — every
-transitive caller already returns `Result<_, FormatError>`. Where the
-explicit guard makes the `try_from` infallible, you may delete the guard if
-and only if the `try_from` error carries the same semantics (it does:
-`TooLarge`); otherwise keep both.
+all become `u32::try_from(x).map_err(|_| FormatError::TooLarge)?`. This
+makes the currently-infallible atom builders fallible; the exact set whose
+signatures flip from `Vec<u8>` to `Result<Vec<u8>, FormatError>` is:
+`boxed` (:529), `text_atom` (:536), `number_atom` (:547), `freeform_atom`
+(:565), `freeform_binary_prefix` (:593). Verified: their only transitive
+consumers are `build_udta` (:622) and `synthesize_layout` (:803), both
+already `Result<_, FormatError>` — the `?` cascade stops there. Where an
+explicit `> u32::MAX` guard makes the `try_from` infallible (:731-737, :836),
+you may delete the guard if and only if the `try_from` error carries the
+same semantics (it does: `TooLarge`); otherwise keep both.
 `530,872,916` (`usize → u32`): same `TooLarge` pattern.
-`785` (`i64 → u32`): inspect the site — it converts a parsed value; use
-`u32::try_from(x).map_err(|_| FormatError::Malformed)?` since it's file
-input, not synthesized size.
+`785` (`i64 → u32`, in `patch_chunk_offsets`): a patched stco chunk offset
+that leaves u32 range means the synthesized header grew past what stco can
+express — `u32::try_from(x).map_err(|_| FormatError::TooLarge)?`.
 
 - [ ] **Step 4: Test-module sites** (`1306-1321,2070-2071,2307,2365-2394`):
 `.unwrap()` / `From` per the test rule.
@@ -802,6 +820,21 @@ index into the alphabet, bounded by `% 64`-style masking):
 `u8::try_from(...).expect("…mask bound…")` matching what the expression
 guarantees. `65,72,73,76` (test-mod slicing): `usize_from` or
 `.try_from(...).unwrap()`.
+
+crc.rs has a **second site the original sweep under-counted**: `crc32()` at
+`crc.rs:31`:
+
+```rust
+        crc = (crc << 8) ^ TABLE[(((crc >> 24) as u8) ^ b) as usize];
+```
+
+→ restructure (high byte of the accumulator; `to_be_bytes()[0]` is exactly
+`(crc >> 24) as u8`, and `usize::from` covers the u8→usize widening that
+`cast_lossless` would otherwise flag):
+
+```rust
+        crc = (crc << 8) ^ TABLE[usize::from(crc.to_be_bytes()[0] ^ b)];
+```
 
 crc.rs:`11` (`(i as u32) << 24` in a `const fn` — `try_from` is not const):
 restructure the loop variable:
@@ -1018,7 +1051,8 @@ failed gate after fixing):
 
 Run: `cargo fmt --all --check`
 Expected: exit 0 (check the exit status directly, not just output).
-If it fails: `cargo fmt --all`, re-check, and amend the fix into a new commit.
+If it fails: `cargo fmt --all`, re-check, and put the fix in a new commit
+(never `--amend`).
 
 - [ ] **Step 2: Workspace tests + proptests**
 
