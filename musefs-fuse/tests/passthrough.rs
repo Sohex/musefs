@@ -77,7 +77,8 @@ fn kernel_supports_passthrough() -> bool {
 }
 
 /// Scan one ~2 MiB FLAC into a fresh on-disk DB and mount it. Returns the
-/// backing bytes, the virtual path, the session, and the two TempDir guards.
+/// backing bytes, the virtual path, the session, the backing TempDir guard,
+/// and the (deliberately leaked, mirrors concurrency.rs) mountpoint path.
 fn mount_one_track(
     mode: Mode,
 ) -> (
@@ -107,6 +108,8 @@ fn mount_one_track(
 
 /// The backing-open ioctl is CAP_SYS_ADMIN-gated; without it passthrough
 /// falls back to daemon reads and the zero-pread assert cannot hold.
+/// Mirrors the daemon's private `cap_eff_has_sys_admin` (src/lib.rs) — keep
+/// the two predicates in sync.
 fn have_cap_sys_admin() -> bool {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     status
@@ -149,7 +152,8 @@ fn structure_only_reads_are_kernel_passthrough() {
     );
 
     // Close + unmount exercise the BackingId release path (release drops the
-    // map entry; session drop tears down the channel) — must not hang or error.
+    // map entry; session drop tears down the channel) — a regression there
+    // manifests as a hang here.
     drop(f);
     drop(session);
 }
