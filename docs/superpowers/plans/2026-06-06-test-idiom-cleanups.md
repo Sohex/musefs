@@ -165,9 +165,11 @@ b. Delete the `ENV_LOCK` static and its doc comment:
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 ```
 
-c. Delete the whole `scan_window_default_and_env` test (with its `// --- scan_window() ... ---` section header and kills-comments) and the whole `batch_bytes_cap_default_and_env` test (with its section header and kills-comments).
+c. Delete two **non-adjacent** blocks (the `read_tail_128` tests, `write_temp`, and `effective_jobs` test sit between them — leave those untouched):
+   - the `// --- scan_window() / WINDOW ... ---` section header, its kills-comments, and the whole `scan_window_default_and_env` test;
+   - the `// --- batch_bytes_cap() / BATCH_BYTES ... ---` section header, its kills-comments, and the whole `batch_bytes_cap_default_and_env` test.
 
-d. In their place (where the `scan_window` section header was), add:
+d. Where the `scan_window` section header was (before the `read_tail_128` section), add:
 
 ```rust
     // --- ScanOptions defaults (WINDOW L16, BATCH_BYTES L12) ---
@@ -479,25 +481,38 @@ c. `musefs-core/tests/metrics.rs` (~line 476):
     // keep the default ScanOptions::window): one prefix read + the tail. read_tail_128
 ```
 
-- [ ] **Step 13: Re-anchor the three `mutants.toml` line:col excludes**
+- [ ] **Step 13: Re-anchor ALL TWELVE `mutants.toml` `scan.rs` line:col excludes**
 
-`.cargo/mutants.toml` pins three equivalent-mutant excludes by `scan.rs` line:col; the deletions above shift them. After `cargo fmt --all`, recompute:
+`.cargo/mutants.toml` pins **twelve** equivalent-mutant excludes by `scan.rs` line:col, and every one sits below the first deletion (~line 172), so all twelve shift. Re-anchoring only some leaves the rest silently stale: the in-diff gate stays green (those lines aren't in the diff) but the later full mutation leg reports them MISSED.
 
-Run: `grep -n 'max(want + 1)' musefs-core/src/scan.rs` → new line of the widen-progress site (col stays `31` if indentation is unchanged — verify against the old entry's column by checking the character offset of the `+`-operator's mutated expression start; if unsure, run the gate in Step 15 and read the reported line:col from any MISSED mutant at that site).
-Run: `grep -n '(prefix.len() as u64) < file_len' musefs-core/src/scan.rs` → new line for the fallback-guard exclude (old `270:30`).
-Run: `grep -n 'sync_channel::<Unit>(jobs \* 2)' musefs-core/src/scan.rs` → new line for the channel-capacity exclude (old `624:46`).
+After `cargo fmt --all`, recompute each anchor's new line by grepping its source content. Columns are unchanged (only whole lines above were added/removed; indentation is untouched):
 
-Update the three entries:
+| Old anchor | Content to grep for | Notes |
+|---|---|---|
+| `263:31` | `.max(want + 1)` | unique; widen progress in `probe_file` |
+| `270:30` | `(prefix.len() as u64) < file_len` | unique; post-loop fallback guard |
+| `624:46` | `sync_channel::<Unit>(jobs * 2)` | unique; channel capacity in `run_pipeline` |
+| `715:29` | `batch_bytes += unit.weight;` | **first** of 2 matches (try_recv branch) |
+| `717:32`, `717:47`, `717:62` | `if batch.len() >= BATCH_FILES \|\| batch_bytes >= cap {` | **first** of 2 matches; three cols on one line |
+| `725:37` | `batch_bytes += unit.weight;` | **second** of 2 matches (recv branch, deeper indent) |
+| `727:40`, `727:55`, `727:70` | `if batch.len() >= BATCH_FILES \|\| batch_bytes >= cap {` | **second** of 2 matches; three cols on one line |
+| `831:25` | `skip_failed += 1;` | **first** of 2 matches (`revalidate_with` stat failure) |
+| `835:25` | `skip_failed += 1;` | **second** of 2 matches (canonicalize failure) |
+| `871:29` | `failed: scan.failed + skip_failed,` | unique; entry reads `:871:29: replace \+ with -` — keep that suffix |
 
-```toml
-    'musefs-core/src/scan\.rs:263:31:',
-    ...
-    'musefs-core/src/scan\.rs:270:30:',
-    ...
-    'musefs-core/src/scan\.rs:624:46:',
+```bash
+grep -nF '.max(want + 1)' musefs-core/src/scan.rs
+grep -nF '(prefix.len() as u64) < file_len' musefs-core/src/scan.rs
+grep -nF 'sync_channel::<Unit>(jobs * 2)' musefs-core/src/scan.rs
+grep -nF 'batch_bytes += unit.weight;' musefs-core/src/scan.rs            # 2 matches: first→715-group, second→725-group
+grep -nF 'batch.len() >= BATCH_FILES || batch_bytes >= cap' musefs-core/src/scan.rs  # 2 matches: first→717-group, second→727-group
+grep -nF 'skip_failed += 1;' musefs-core/src/scan.rs                      # 2 matches: first→831, second→835
+grep -nF 'failed: scan.failed + skip_failed,' musefs-core/src/scan.rs
 ```
 
-replacing `263`, `270`, and `624` with the new line numbers (columns are unchanged when only lines above were removed).
+Edit each of the twelve `'musefs-core/src/scan\.rs:<line>:<col>:'` entries in `.cargo/mutants.toml`, substituting the new line numbers and keeping every column (and the `871` entry's ` replace \+ with -` suffix) exactly as is.
+
+Cross-check: if Step 15's gate (or the full mutation leg) reports a MISSED mutant at one of these sites, copy the exact `file:line:col:` from the report into the corresponding entry and re-run.
 
 - [ ] **Step 14: Run the workspace tests**
 
@@ -688,7 +703,10 @@ The fuzz crate consumes `fuzz_check::fixtures` and is not compiled by workspace 
 Run: `cargo +nightly fuzz build`
 Expected: all targets build (the `fixtures::flac()` signature is unchanged; this catches any accidental breakage).
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Format, then commit**
+
+Run: `cargo fmt --all && cargo fmt --all --check`
+Expected: exit 0 (the fmt gate is CI-enforced; never commit unformatted code).
 
 ```bash
 git add musefs-format/Cargo.toml musefs-format/src/fuzz_check.rs \
@@ -781,6 +799,9 @@ In `bench_concurrent_read_and_walk`:
 Run: `cargo clippy -p musefs-core --benches`
 Expected: clean (this compiles `read_throughput.rs`; plain `cargo test` does not build `harness = false` benches).
 
+Run: `cargo fmt --all && cargo fmt --all --check`
+Expected: exit 0.
+
 - [ ] **Step 4: Commit**
 
 ```bash
@@ -857,6 +878,9 @@ Expected: builds clean.
 
 Run: `cargo +nightly fuzz run b64 -- -max_total_time=30`
 Expected: no crashes in 30 seconds (the windowed-encode property still holds).
+
+Run: `cd fuzz && cargo fmt --check; cd ..`
+Expected: exit 0 (the fuzz crate is outside the workspace, so `cargo fmt --all` from the root does not cover it; format it in place with `cd fuzz && cargo fmt` if the check fails).
 
 - [ ] **Step 4: Commit**
 
