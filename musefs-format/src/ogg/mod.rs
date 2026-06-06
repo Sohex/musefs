@@ -266,7 +266,7 @@ pub fn synthesize_layout(
         segments.extend(segs);
         seq += used;
     }
-    let seq_delta = seq as i64 - header.header_pages as i64;
+    let seq_delta = i64::from(seq) - i64::from(header.header_pages);
     segments.push(Segment::OggAudio {
         offset: audio_offset,
         len: audio_length,
@@ -281,7 +281,7 @@ pub fn synthesize_layout(
 /// This makes `base64(prefix ++ image) == base64(prefix) ++ base64(image)`, so the
 /// image's base64 is an independent substring that can be served incrementally.
 /// The declared data-length field is the true image length (`art.data_len`).
-fn picture_prefix(art: &crate::input::ArtInput) -> Vec<u8> {
+fn picture_prefix(art: &crate::input::ArtInput) -> Result<Vec<u8>> {
     // Unpadded prefix length = 4(type)+4(mimelen)+mime +4(desclen)+desc
     //   +4(w)+4(h)+4(depth)+4(colors)+4(datalen) = 32 + mime + desc.
     let base = 32 + art.mime.len() + art.description.len();
@@ -290,16 +290,28 @@ fn picture_prefix(art: &crate::input::ArtInput) -> Vec<u8> {
 
     let mut out = Vec::new();
     out.extend_from_slice(&art.picture_type.to_be_bytes());
-    out.extend_from_slice(&(art.mime.len() as u32).to_be_bytes());
+    out.extend_from_slice(
+        &u32::try_from(art.mime.len())
+            .map_err(|_| FormatError::TooLarge)?
+            .to_be_bytes(),
+    );
     out.extend_from_slice(art.mime.as_bytes());
-    out.extend_from_slice(&(description.len() as u32).to_be_bytes());
+    out.extend_from_slice(
+        &u32::try_from(description.len())
+            .map_err(|_| FormatError::TooLarge)?
+            .to_be_bytes(),
+    );
     out.extend_from_slice(description.as_bytes());
     out.extend_from_slice(&art.width.to_be_bytes());
     out.extend_from_slice(&art.height.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes()); // depth
     out.extend_from_slice(&0u32.to_be_bytes()); // colors
-    out.extend_from_slice(&(art.data_len as u32).to_be_bytes()); // image data length
-    out
+    out.extend_from_slice(
+        &u32::try_from(art.data_len)
+            .map_err(|_| FormatError::TooLarge)?
+            .to_be_bytes(),
+    ); // image data length
+    Ok(out)
 }
 
 use crate::ogg::page::PayloadChunk;
@@ -333,12 +345,12 @@ fn build_packets_with_art(
             // value includes the key, base64 of the picture prefix, and base64 of
             // the image; any one of these alone may fit in u32 but the sum may not.
             for a in arts {
-                let prefix = picture_prefix(a.meta);
+                let prefix = picture_prefix(a.meta)?;
                 let b64_prefix_len = b64_len(prefix.len() as u64);
                 let value_len = METADATA_BLOCK_PICTURE_KEY.len() as u64
                     + b64_prefix_len
                     + b64_len(a.meta.data_len);
-                if value_len > u32::MAX as u64 {
+                if value_len > u64::from(u32::MAX) {
                     return Err(FormatError::TooLarge);
                 }
             }
@@ -383,7 +395,7 @@ fn comment_packet_chunks(
     head.extend_from_slice(&leading);
 
     for art in arts {
-        let prefix = picture_prefix(art.meta);
+        let prefix = picture_prefix(art.meta)?;
         let b64_prefix = b64_encode(&prefix);
         let value_len = METADATA_BLOCK_PICTURE_KEY.len()
             + b64_prefix.len()
@@ -447,7 +459,7 @@ fn oggflac_packets_with_art(
     }
     block_packets.push(vec![PayloadChunk::Bytes(comment)]);
     for art in arts {
-        let prefix = picture_prefix(art.meta);
+        let prefix = picture_prefix(art.meta)?;
         let body_len = prefix.len() as u64 + art.meta.data_len;
         if body_len > crate::flac::MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
@@ -564,7 +576,7 @@ mod tests {
             &data
         })
         .unwrap();
-        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
 
         let layout = synthesize_layout(
             &header,
@@ -625,7 +637,7 @@ mod tests {
 
         let scan = locate_audio(&data).unwrap();
         assert_eq!(scan.codec, Codec::Vorbis);
-        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
         // The original setup packet (3rd header packet) must be carried through.
         assert_eq!(header.packets[2], setup);
 
@@ -662,7 +674,7 @@ mod tests {
         let mut pic = Vec::new();
         pic.extend_from_slice(&3u32.to_be_bytes());
         let mime = b"image/png";
-        pic.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        pic.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
         pic.extend_from_slice(mime);
         pic.extend_from_slice(&0u32.to_be_bytes()); // desc len
         pic.extend_from_slice(&1u32.to_be_bytes()); // width
@@ -670,16 +682,20 @@ mod tests {
         pic.extend_from_slice(&0u32.to_be_bytes()); // depth
         pic.extend_from_slice(&0u32.to_be_bytes()); // colors
         let img = b"PNG";
-        pic.extend_from_slice(&(img.len() as u32).to_be_bytes());
+        pic.extend_from_slice(&u32::try_from(img.len()).unwrap().to_be_bytes());
         pic.extend_from_slice(img);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&pic);
 
         let mut body = Vec::new();
-        body.extend_from_slice(&(crate::vorbiscomment::VENDOR.len() as u32).to_le_bytes());
+        body.extend_from_slice(
+            &u32::try_from(crate::vorbiscomment::VENDOR.len())
+                .unwrap()
+                .to_le_bytes(),
+        );
         body.extend_from_slice(crate::vorbiscomment::VENDOR.as_bytes());
         body.extend_from_slice(&1u32.to_le_bytes()); // one comment
         let comment = format!("METADATA_BLOCK_PICTURE={b64}");
-        body.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        body.extend_from_slice(&u32::try_from(comment.len()).unwrap().to_le_bytes());
         body.extend_from_slice(comment.as_bytes());
 
         let mut tags_pkt = b"OpusTags".to_vec();
@@ -755,7 +771,7 @@ mod tests {
 
         let scan = locate_audio(&data).unwrap();
         assert_eq!(scan.codec, Codec::OggFlac);
-        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
 
         let layout = synthesize_layout(
             &header,
@@ -801,7 +817,7 @@ mod tests {
         let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 80]);
         data.extend_from_slice(&audio);
         let scan = locate_audio(&data).unwrap();
-        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
 
         let image: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         let meta = crate::input::ArtInput {
@@ -840,8 +856,13 @@ mod tests {
                 } => {
                     assert!(*base64);
                     let w = b64_window(*offset, *len, *art_total);
-                    let raw = &image[w.in_start as usize..(w.in_start + w.in_len) as usize];
-                    bytes.extend_from_slice(&encode_b64_slice(raw, w.skip, *len as usize));
+                    let raw = &image[crate::convert::usize_from(w.in_start)
+                        ..crate::convert::usize_from(w.in_start + w.in_len)];
+                    bytes.extend_from_slice(&encode_b64_slice(
+                        raw,
+                        w.skip,
+                        crate::convert::usize_from(*len),
+                    ));
                 }
                 Segment::OggAudio { .. } => break, // header region ends here
                 other => panic!("unexpected {other:?}"),
@@ -873,10 +894,18 @@ mod tests {
                     let img = images.iter().find(|(id, _)| id == art_id).expect("image").1;
                     if *base64 {
                         let w = b64_window(*offset, *len, *art_total);
-                        let raw = &img[w.in_start as usize..(w.in_start + w.in_len) as usize];
-                        bytes.extend_from_slice(&encode_b64_slice(raw, w.skip, *len as usize));
+                        let raw = &img[crate::convert::usize_from(w.in_start)
+                            ..crate::convert::usize_from(w.in_start + w.in_len)];
+                        bytes.extend_from_slice(&encode_b64_slice(
+                            raw,
+                            w.skip,
+                            crate::convert::usize_from(*len),
+                        ));
                     } else {
-                        bytes.extend_from_slice(&img[*offset as usize..(*offset + *len) as usize]);
+                        bytes.extend_from_slice(
+                            &img[crate::convert::usize_from(*offset)
+                                ..crate::convert::usize_from(*offset + *len)],
+                        );
                     }
                 }
                 Segment::OggAudio { .. } => break,
@@ -905,7 +934,7 @@ mod tests {
         let (audio, _) = crate::ogg::page::lace_packet(55, 99, false, 1024, &[0u8; 64]);
         data.extend_from_slice(&audio);
         let scan = locate_audio(&data).unwrap();
-        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
 
         let image: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         let meta = art_input(11, "image/png", image.len());
@@ -936,7 +965,7 @@ mod tests {
         let (audio, _) = crate::ogg::page::lace_packet(77, 3, false, 4096, &[0u8; 64]);
         data.extend_from_slice(&audio);
         let scan = locate_audio(&data).unwrap();
-        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
 
         let image: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         let meta = art_input(22, "image/png", image.len());
@@ -966,7 +995,7 @@ mod tests {
         let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 64]);
         data.extend_from_slice(&audio);
         let scan = locate_audio(&data).unwrap();
-        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
 
         let img_a: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
         let img_b: Vec<u8> = (0..1500u32).map(|i| ((i * 3) % 251) as u8).collect();
@@ -1005,7 +1034,7 @@ mod tests {
         let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 64]);
         data.extend_from_slice(&audio);
         let scan = locate_audio(&data).unwrap();
-        let header = read_metadata(&data[..scan.audio_offset as usize]).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
 
         let img: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
         let empty: Vec<u8> = Vec::new();
@@ -1044,7 +1073,7 @@ mod tests {
             art_id: 0,
             mime: "image/jpeg".to_string(),
             description: String::new(),
-            data_len: u32::MAX as u64,
+            data_len: u64::from(u32::MAX),
             picture_type: 3,
             width: 0,
             height: 0,
@@ -1106,7 +1135,7 @@ mod tests {
             height: 1,
             data_len: 12345,
         };
-        let p = picture_prefix(&art);
+        let p = picture_prefix(&art).unwrap();
         assert_eq!(p.len() % 3, 0);
         // datalen is the last 4 bytes (big-endian) and equals the true image length.
         let dl = u32::from_be_bytes(p[p.len() - 4..].try_into().unwrap());
@@ -1172,7 +1201,9 @@ mod tests {
         let overhead = crate::vorbiscomment::build(&[crate::input::TagInput::new("title", "")])
             .unwrap()
             .len() as u64;
-        let at_limit = "x".repeat((crate::flac::MAX_BLOCK_BODY - overhead) as usize);
+        let at_limit = "x".repeat(crate::convert::usize_from(
+            crate::flac::MAX_BLOCK_BODY - overhead,
+        ));
         let tags = [crate::input::TagInput::new("title", at_limit.as_str())];
         assert!(oggflac_packets_with_art(&header, &tags, &[]).is_ok());
         // one byte over must still error, pinning the high side of the boundary.
@@ -1207,7 +1238,7 @@ mod tests {
             height: 0,
             data_len,
         };
-        let framing_len = picture_prefix(&mk(0)).len() as u64;
+        let framing_len = picture_prefix(&mk(0)).unwrap().len() as u64;
         let at_limit = mk(crate::flac::MAX_BLOCK_BODY - framing_len);
         let arts = [OggArt {
             meta: &at_limit,
@@ -1281,13 +1312,13 @@ mod tests {
             height: 1,
             data_len: 100,
         };
-        let prefix = picture_prefix(&art);
+        let prefix = picture_prefix(&art).unwrap();
         assert_eq!(prefix.len() % 3, 0);
         // Declared description length lives at offset 8 + mime.len() (after
         // type[4] + mimelen[4] + mime). pad = declared - desc.len() must be 0..=2.
         let off = 8 + art.mime.len();
         let declared = u32::from_be_bytes(prefix[off..off + 4].try_into().unwrap());
-        let pad = declared - art.description.len() as u32;
+        let pad = declared - u32::try_from(art.description.len()).unwrap();
         assert!(pad <= 2, "pad must be 0..=2, got {pad}");
         assert_eq!(pad, 0, "base % 3 == 0 implies pad 0");
     }
@@ -1320,7 +1351,7 @@ mod bounded_tests {
     fn read_metadata_bounded_complete_when_prefix_covers_header() {
         let (full, audio_offset) = opus_stream();
         let file_len = full.len() as u64;
-        let prefix = &full[..audio_offset as usize]; // exactly the header region
+        let prefix = &full[..crate::convert::usize_from(audio_offset)]; // exactly the header region
         match read_metadata_bounded(prefix, file_len).unwrap() {
             Extent::Complete(h) => assert_eq!(h.audio_offset, audio_offset),
             other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),

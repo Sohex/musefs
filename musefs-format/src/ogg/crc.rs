@@ -6,9 +6,9 @@ const POLY: u32 = 0x04c1_1db7;
 
 const fn build_table() -> [u32; 256] {
     let mut t = [0u32; 256];
-    let mut i = 0usize;
+    let mut i = 0u32;
     while i < 256 {
-        let mut crc = (i as u32) << 24;
+        let mut crc = i << 24;
         let mut j = 0;
         while j < 8 {
             crc = if crc & 0x8000_0000 != 0 {
@@ -18,7 +18,7 @@ const fn build_table() -> [u32; 256] {
             };
             j += 1;
         }
-        t[i] = crc;
+        t[i as usize] = crc;
         i += 1;
     }
     t
