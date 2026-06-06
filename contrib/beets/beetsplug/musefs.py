@@ -68,7 +68,7 @@ class MusefsPlugin(BeetsPlugin):
         """Drop an optional leading `sync` verb so `beet musefs sync QUERY`
         and `beet musefs QUERY` both work."""
         if args and args[0] == "sync":
-            return args[1:]
+            return list(args[1:])
         return list(args)
 
     def _command(self, lib, opts, args):

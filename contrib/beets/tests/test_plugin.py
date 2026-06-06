@@ -100,6 +100,10 @@ def test_command_strips_leading_sync_verb():
     assert plugin._query_from_args(["sync", "artist:Band"]) == ["artist:Band"]
     assert plugin._query_from_args(["artist:Band"]) == ["artist:Band"]
     assert plugin._query_from_args([]) == []
+    # A tuple must not leak through the sync branch as a tuple slice.
+    result = plugin._query_from_args(("sync", "artist:Band"))
+    assert result == ["artist:Band"]
+    assert type(result) is list
 
 
 def test_command_run_syncs(db_path, make_track, fake_item, tmp_path, monkeypatch):
