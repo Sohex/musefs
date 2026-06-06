@@ -75,15 +75,23 @@ if _PICARD:
 
     def _resolved_files(objs):
         """Resolve a selection (File/Track/Album/Cluster) to a dict of
-        realpath-key -> File, de-duplicated. Picard items all implement
-        iterfiles(); a File yields itself; a matched Track with no on-disk
-        file yields nothing."""
+        realpath-key -> File, de-duplicated (first wins, drops logged at
+        debug level). Picard items all implement iterfiles(); a File yields
+        itself; a matched Track with no on-disk file yields nothing."""
         seen = {}
         for obj in objs:
             for f in obj.iterfiles():
                 if not f.filename:  # unsaved/virtual file: no path to key on
                     continue
-                seen.setdefault(realpath_key(f.filename), f)
+                key = realpath_key(f.filename)
+                kept = seen.setdefault(key, f)
+                if kept is not f:
+                    log.debug(
+                        "musefs: duplicate file for %s: %r dropped in favor of %r",
+                        key,
+                        f.filename,
+                        kept.filename,
+                    )
         return seen
 
     def _scan_error(exc):
