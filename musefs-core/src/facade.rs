@@ -21,6 +21,12 @@ pub enum Mode {
     /// Splice a freshly synthesized metadata region in front of the backing audio.
     Synthesis,
     /// Pure passthrough: serve the original backing file bytes unchanged.
+    /// Where the kernel supports FUSE passthrough (6.9+) and the daemon holds
+    /// CAP_SYS_ADMIN (the kernel gates backing-fd registration), reads are
+    /// served directly from the backing fd registered at open — open-time
+    /// validation only: a handle held across a backing-file replacement keeps
+    /// serving the inode it opened (plain POSIX fd semantics); new opens
+    /// re-resolve. Without the capability, reads fall back to the daemon.
     StructureOnly,
 }
 

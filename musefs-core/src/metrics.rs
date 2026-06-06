@@ -17,6 +17,9 @@
 //! `on_scan_open`/`on_scan_read` count backing-file opens and positioned
 //! reads on the *scan* path (distinct from the serve path); `on_scan_read`
 //! also accumulates bytes read, analogous to `on_pread`.
+//! Counters measure *daemon* work, not user traffic: StructureOnly reads
+//! served via kernel passthrough never reach userspace and are invisible to
+//! `on_pread` — by design (the passthrough e2e test asserts exactly this).
 
 pub use imp::*;
 
