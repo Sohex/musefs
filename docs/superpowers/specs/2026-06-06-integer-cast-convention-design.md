@@ -87,7 +87,11 @@ version goes into CLAUDE.md's Conventions section.
   - `Art`/`ArtMeta`/`BinaryTagRow`: `byte_len` → `u64`; `width`/`height` →
     `u32` (Option-ness unchanged).
   - `Tag`/`TrackArt`/`BinaryTag`/`StructuralBlock`: `ordinal` → `u64`;
-    `picture_type` → `u8` (APIC type byte). `Tag::new`'s `ordinal: i64`
+    `picture_type` → `u32` (FLAC's `METADATA_BLOCK_PICTURE` type field is
+    natively u32 and `ArtInput.picture_type` is already u32, so u32 keeps
+    scan-side ingestion lossless; the only narrower consumer is mp3's APIC
+    framing, which keeps its pre-existing deliberate one-byte truncation
+    under an `#[expect]`). `Tag::new`'s `ordinal: i64`
     parameter (`models.rs:125`) flips with it. Write-side mechanics: the
     `.enumerate()` sites become clippy-clean `usize as u64`, but the four
     manual ordinal accumulators in `scan.rs` (`HashMap<String, i64>` at
@@ -115,10 +119,9 @@ version goes into CLAUDE.md's Conventions section.
   is dead (`unused_comparisons`, a warn-by-default rustc lint that fires
   under CI's `-D warnings` immediately — the guard must be removed in the
   same step as the field flip). See Behavioral changes.
-- Read-side fallout in `mapping.rs:58-61`: `ta.picture_type as u32` becomes
-  `u32::from(...)` (a new `cast_lossless` site once `picture_type` is `u8`);
-  the `width`/`height` `as u32` and `byte_len as u64` casts (also
-  `mapping.rs:79`) vanish outright.
+- Read-side fallout in `mapping.rs:58-61`: the `ta.picture_type as u32`,
+  `width`/`height` `as u32`, and `byte_len as u64` casts (also
+  `mapping.rs:79`) all vanish outright.
 
 ### `musefs-format`
 
@@ -130,11 +133,11 @@ version goes into CLAUDE.md's Conventions section.
 
 - A handful of sites; use the re-exported helper / `try_from` per the
   convention.
-- One special case: `attr.mtime_secs as u64` (`musefs-fuse/src/lib.rs:111`)
-  is a real sign-loss on a legitimately-negative value (pre-1970 mtime wraps
-  to a far-future date today). Fixing that display behavior is out of scope —
-  the site keeps `as` with an `#[expect(clippy::cast_sign_loss, reason)]`
-  documenting the pre-existing limitation.
+- Note: `attr.mtime_secs as u64` (`musefs-fuse/src/lib.rs:112`) is guarded by
+  `if attr.mtime_secs > 0` and clippy's `cast_sign_loss` does not flag it, so
+  it needs no change (an `#[expect]` there would error as unfulfilled).
+  fuse's actual sites are `lib.rs:339` (lossless `u32 as u64`) and
+  `lib.rs:383` (`u64 → usize`).
 
 ### `musefs-latencyfs`
 
