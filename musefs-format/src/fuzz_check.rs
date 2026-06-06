@@ -55,9 +55,11 @@ pub fn assert_backing_covers_audio(audio_offset: u64, audio_length: u64, layout:
 /// (RIFF/WAVE with a `fmt ` + `data` chunk); MP3 is a bare MPEG frame sync;
 /// Ogg is lifted from `musefs-format/src/ogg/mod.rs`'s `opus_headers` helper.
 pub mod fixtures {
-    fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
+    /// Build a FLAC metadata block (4-byte header + body) independently of production code.
+    pub fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push((if is_last { 0x80 } else { 0 }) | (block_type & 0x7F));
+        let first = (if is_last { 0x80 } else { 0 }) | (block_type & 0x7F);
+        out.push(first);
         let len = body.len();
         out.push(((len >> 16) & 0xFF) as u8);
         out.push(((len >> 8) & 0xFF) as u8);
@@ -66,16 +68,23 @@ pub mod fixtures {
         out
     }
 
-    fn streaminfo_body() -> Vec<u8> {
+    /// A structurally valid STREAMINFO body: 44100 Hz, 2 channels, 16-bit, unknown frame/sample counts.
+    pub fn streaminfo_body() -> Vec<u8> {
         let mut b = vec![
-            0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0xC4, 0x42, 0xF0,
-            0x00, 0x00, 0x00, 0x00,
+            0x10, 0x00, // min block size = 4096
+            0x10, 0x00, // max block size = 4096
+            0x00, 0x00, 0x00, // min frame size = 0 (unknown)
+            0x00, 0x00, 0x00, // max frame size = 0 (unknown)
+            0x0A, 0xC4, 0x42,
+            0xF0, // sample_rate=44100, channels=2, bps=16, top of total samples
+            0x00, 0x00, 0x00, 0x00, // remaining total-samples bits = 0
         ];
-        b.extend_from_slice(&[0u8; 16]);
+        b.extend_from_slice(&[0u8; 16]); // MD5 signature = 0
         b
     }
 
-    fn vorbis_comment_body(vendor: &str, comments: &[&str]) -> Vec<u8> {
+    /// Minimal VORBIS_COMMENT body with the given already-formatted `KEY=value` comments.
+    pub fn vorbis_comment_body(vendor: &str, comments: &[&str]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
         out.extend_from_slice(vendor.as_bytes());
@@ -87,17 +96,27 @@ pub mod fixtures {
         out
     }
 
-    /// FLAC = `fLaC` + STREAMINFO + VORBIS_COMMENT + `audio`.
-    pub fn flac(audio: &[u8]) -> Vec<u8> {
-        let mut out = b"fLaC".to_vec();
-        out.extend(flac_block(0, &streaminfo_body(), false));
-        out.extend(flac_block(
-            4,
-            &vorbis_comment_body("orig", &["TITLE=Orig"]),
-            true,
-        ));
+    /// Assemble a full FLAC byte stream: marker + blocks (last-flag auto-set on the final block) + audio.
+    pub fn make_flac(blocks: &[(u8, Vec<u8>)], audio: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"fLaC");
+        for (i, (bt, body)) in blocks.iter().enumerate() {
+            let is_last = i == blocks.len() - 1;
+            out.extend_from_slice(&flac_block(*bt, body, is_last));
+        }
         out.extend_from_slice(audio);
         out
+    }
+
+    /// FLAC = `fLaC` + STREAMINFO + VORBIS_COMMENT + `audio`.
+    pub fn flac(audio: &[u8]) -> Vec<u8> {
+        make_flac(
+            &[
+                (0, streaminfo_body()),
+                (4, vorbis_comment_body("orig", &["TITLE=Orig"])),
+            ],
+            audio,
+        )
     }
 
     fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
