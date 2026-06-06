@@ -3,6 +3,7 @@
 //! offloaded onto a bounded worker pool and answered via the `Send` reply
 //! objects, so a slow backing read cannot stall metadata operations.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,9 +13,9 @@ use std::time::{Duration, SystemTime};
 use threadpool::ThreadPool;
 
 use fuser::{
-    BackgroundSession, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
+    BackgroundSession, BackingId, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
 };
 use musefs_core::convert::usize_from;
 use musefs_core::Attr;
@@ -166,6 +167,15 @@ pub struct MusefsFs {
     /// Single-flight gate for `fire_poll_refresh`: at most one poll task is
     /// queued/running at a time, so a metadata-op storm can't flood the pool (#89).
     poll_pending: Arc<AtomicBool>,
+    /// Kernel-registered backing fds for live passthrough handles, keyed by
+    /// the wire fh. The entry is inserted BEFORE the open reply is sent — the
+    /// kernel cannot release an fh it has not yet seen — so every live
+    /// passthrough handle has an entry. `release` removes it; dropping the
+    /// `BackingId` fires the backing-close ioctl.
+    backing: Arc<Mutex<HashMap<u64, BackingId>>>,
+    /// Sticky disable: flipped on the first `open_backing` failure (kernel
+    /// without passthrough support), so later opens skip the doomed ioctl.
+    passthrough_disabled: Arc<AtomicBool>,
 }
 
 impl MusefsFs {
@@ -186,6 +196,8 @@ impl MusefsFs {
             config,
             notifier: Arc::new(OnceLock::new()),
             poll_pending: Arc::new(AtomicBool::new(false)),
+            backing: Arc::new(Mutex::new(HashMap::new())),
+            passthrough_disabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -292,9 +304,44 @@ impl Filesystem for MusefsFs {
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let core = Arc::clone(&self.core);
         let flags = open_flags(self.config.keep_cache);
-        self.pool.execute(move || match core.open_handle(ino.0) {
-            Ok(fh) => reply.opened(FileHandle(fh.get()), flags),
-            Err(e) => reply.error(reply_errno("open", ino.0, &e)),
+        let backing = Arc::clone(&self.backing);
+        let passthrough_disabled = Arc::clone(&self.passthrough_disabled);
+        self.pool.execute(move || {
+            let fh = match core.open_handle(ino.0) {
+                Ok(fh) => fh,
+                Err(e) => return reply.error(reply_errno("open", ino.0, &e)),
+            };
+            if !passthrough_disabled.load(Ordering::Relaxed) {
+                if let Some(pfd) = core.passthrough_fd(fh) {
+                    match reply.open_backing(&pfd) {
+                        Ok(id) => {
+                            // Insert before the reply (see the `backing` field
+                            // doc). FOPEN_KEEP_CACHE is dropped: page-cache
+                            // ownership belongs to the backing inode here.
+                            // Poisoning recovery: the lock guards single map
+                            // ops; a panic mid-insert leaves nothing torn.
+                            let mut map = backing
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let id = map.entry(fh.get()).or_insert(id);
+                            return reply.opened_passthrough(
+                                FileHandle(fh.get()),
+                                FopenFlags::empty(),
+                                id,
+                            );
+                        }
+                        Err(e) => {
+                            // Sticky: the failure modes (kernel < 6.9, ioctl
+                            // unsupported) are static per mount.
+                            passthrough_disabled.store(true, Ordering::Relaxed);
+                            log::info!(
+                                "FUSE passthrough unavailable; serving reads through the daemon: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            reply.opened(FileHandle(fh.get()), flags);
         });
     }
 
@@ -308,8 +355,14 @@ impl Filesystem for MusefsFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        // Cheap (a map remove); no need to offload to the pool.
+        // Cheap (a backing-map remove + a slab remove); no need to offload to the pool.
         if let Some(fh) = NonZeroU64::new(fh.0) {
+            // Dropping the BackingId fires the backing-close ioctl. Absent for
+            // plain (non-passthrough) handles — remove is then a no-op.
+            self.backing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&fh.get());
             self.core.release_handle(Fh::from(fh));
         }
         reply.ok();
