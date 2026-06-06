@@ -24,7 +24,7 @@ impl<M> Db<M> {
         let rows = stmt.query_map(params![track_id], |r| {
             Ok(StructuralBlock {
                 kind: r.get(0)?,
-                ordinal: r.get::<_, i64>(1)? as u64,
+                ordinal: r.get(1)?,
                 body: r.get(2)?,
             })
         })?;
@@ -46,7 +46,7 @@ impl Db<ReadWrite> {
                  VALUES (?1, ?2, ?3, ?4)",
             )?;
             for b in blocks {
-                stmt.execute(params![track_id, b.kind, b.ordinal as i64, b.body])?;
+                stmt.execute(params![track_id, b.kind, b.ordinal, b.body])?;
             }
         }
         tx.commit()?;

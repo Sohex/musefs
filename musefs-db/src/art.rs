@@ -22,24 +22,15 @@ impl<M> Db<M> {
         )?;
         let mut rows = stmt.query(params![id])?;
         match rows.next()? {
-            Some(r) => {
-                let byte_len: i64 = r.get(5)?;
-                if byte_len < 0 {
-                    return Err(rusqlite::Error::InvalidParameterName(format!(
-                        "negative byte_len {byte_len} for art id {id}"
-                    ))
-                    .into());
-                }
-                Ok(Some(Art {
-                    id: r.get(0)?,
-                    sha256: r.get(1)?,
-                    mime: r.get(2)?,
-                    width: r.get::<_, Option<i64>>(3)?.map(|v| v as u32),
-                    height: r.get::<_, Option<i64>>(4)?.map(|v| v as u32),
-                    byte_len: byte_len as u64,
-                    data: r.get(6)?,
-                }))
-            }
+            Some(r) => Ok(Some(Art {
+                id: r.get(0)?,
+                sha256: r.get(1)?,
+                mime: r.get(2)?,
+                width: r.get(3)?,
+                height: r.get(4)?,
+                byte_len: r.get(5)?,
+                data: r.get(6)?,
+            })),
             None => Ok(None),
         }
     }
@@ -52,21 +43,12 @@ impl<M> Db<M> {
             .prepare("SELECT mime, width, height, byte_len FROM art WHERE id = ?1")?;
         let mut rows = stmt.query(params![id])?;
         match rows.next()? {
-            Some(r) => {
-                let byte_len: i64 = r.get(3)?;
-                if byte_len < 0 {
-                    return Err(rusqlite::Error::InvalidParameterName(format!(
-                        "negative byte_len {byte_len} for art id {id}"
-                    ))
-                    .into());
-                }
-                Ok(Some(ArtMeta {
-                    mime: r.get(0)?,
-                    width: r.get::<_, Option<i64>>(1)?.map(|v| v as u32),
-                    height: r.get::<_, Option<i64>>(2)?.map(|v| v as u32),
-                    byte_len: byte_len as u64,
-                }))
-            }
+            Some(r) => Ok(Some(ArtMeta {
+                mime: r.get(0)?,
+                width: r.get(1)?,
+                height: r.get(2)?,
+                byte_len: r.get(3)?,
+            })),
             None => Ok(None),
         }
     }
@@ -96,9 +78,9 @@ impl<M> Db<M> {
         let rows = stmt.query_map(params![track_id], |r| {
             Ok(TrackArt {
                 art_id: r.get(0)?,
-                picture_type: r.get::<_, i32>(1)? as u32,
+                picture_type: r.get(1)?,
                 description: r.get(2)?,
-                ordinal: r.get::<_, i64>(3)? as u64,
+                ordinal: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -112,7 +94,7 @@ impl Db<ReadWrite> {
             "INSERT INTO art (sha256, mime, width, height, byte_len, data)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(sha256) DO NOTHING",
-            params![sha, a.mime, a.width, a.height, a.data.len() as i64, a.data],
+            params![sha, a.mime, a.width, a.height, a.data.len() as u64, a.data],
         )?;
         let id =
             self.conn
@@ -137,9 +119,9 @@ impl Db<ReadWrite> {
                 stmt.execute(params![
                     track_id,
                     it.art_id,
-                    it.picture_type as i32,
+                    it.picture_type,
                     it.description,
-                    it.ordinal as i64
+                    it.ordinal
                 ])?;
             }
         }

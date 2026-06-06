@@ -46,7 +46,7 @@ impl BulkWriter<'_> {
                 audio_length=excluded.audio_length, backing_size=excluded.backing_size,
                 backing_mtime=excluded.backing_mtime,
                 updated_at=CAST(strftime('%s','now') AS INTEGER)",
-            params![t.backing_path, t.format.as_str(), t.audio_offset as i64, t.audio_length as i64, t.backing_size as i64, t.backing_mtime],
+            params![t.backing_path, t.format.as_str(), t.audio_offset, t.audio_length, t.backing_size, t.backing_mtime],
         )?;
         Ok(self.tx.query_row(
             "SELECT id FROM tracks WHERE backing_path = ?1",
@@ -64,7 +64,7 @@ impl BulkWriter<'_> {
             "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
         )?;
         for t in tags {
-            stmt.execute(params![track_id, t.key, t.value, t.ordinal as i64])?;
+            stmt.execute(params![track_id, t.key, t.value, t.ordinal])?;
         }
         Ok(())
     }
@@ -79,7 +79,7 @@ impl BulkWriter<'_> {
              VALUES (?1, ?2, '', ?3, ?4)",
         )?;
         for t in tags {
-            stmt.execute(params![track_id, t.key, t.payload, t.ordinal as i64])?;
+            stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
         }
         Ok(())
     }
@@ -98,7 +98,7 @@ impl BulkWriter<'_> {
              VALUES (?1, ?2, ?3, ?4)",
         )?;
         for b in blocks {
-            stmt.execute(params![track_id, b.kind, b.ordinal as i64, b.body])?;
+            stmt.execute(params![track_id, b.kind, b.ordinal, b.body])?;
         }
         Ok(())
     }
@@ -108,7 +108,7 @@ impl BulkWriter<'_> {
         self.tx.execute(
             "INSERT INTO art (sha256, mime, width, height, byte_len, data)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(sha256) DO NOTHING",
-            params![sha, a.mime, a.width, a.height, a.data.len() as i64, a.data],
+            params![sha, a.mime, a.width, a.height, a.data.len() as u64, a.data],
         )?;
         Ok(self
             .tx
@@ -130,9 +130,9 @@ impl BulkWriter<'_> {
             stmt.execute(params![
                 track_id,
                 it.art_id,
-                it.picture_type as i32,
+                it.picture_type,
                 it.description,
-                it.ordinal as i64
+                it.ordinal
             ])?;
         }
         Ok(())
