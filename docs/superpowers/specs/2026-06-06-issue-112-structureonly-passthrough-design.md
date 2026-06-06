@@ -46,25 +46,45 @@ re-opened fd would not be the one `open_handle` validated.)
 ### Core (`musefs-core/src/facade.rs`)
 
 One new method on `Musefs`: `passthrough_fd(fh)`, returning `Some` only when
-the mount mode is `StructureOnly`. It hands back a borrowable view of the
-backing `File` that `open_handle` already opened and validated — likely a
-small public wrapper around the `Arc<Handle>` implementing `AsFd`, so no
-lifetime entanglement with the handle map (exact shape settled at plan time).
+the mount mode is `StructureOnly` (gate on the existing `self.config.mode`).
+It hands back an owned wrapper around the `Arc<Handle>` implementing `AsFd`,
+exposing the backing `File` that `open_handle` already opened and validated —
+no lifetime entanglement with the handle slab.
 
 No other core changes. `open_handle`, `read_into`, and `release_handle` are
 untouched; in `Synthesis` mode the feature is completely inert.
 
 ### FUSE (`musefs-fuse/src/lib.rs`)
 
-- `init`: request `set_max_stack_depth(1)` best-effort, alongside the existing
-  capability requests. This advertises `FUSE_PASSTHROUGH` to the kernel.
+- `init`: request `add_capabilities(InitFlags::FUSE_PASSTHROUGH)` **and**
+  `set_max_stack_depth(2)`, both best-effort, alongside the existing
+  per-bit capability requests. Both calls are required: fuser only copies
+  `max_stack_depth` into the init reply when the `FUSE_PASSTHROUGH`
+  capability bit was negotiated (fuser `ll/request.rs`), and the stack depth
+  must be ≥ 1 or passthrough is disabled. Depth 2 (matching fuser's own
+  passthrough example) lets backing files live on a stacked fs themselves
+  (e.g. a music library on overlayfs); the cost is nil and the failure mode
+  at depth 1 would be a silent fallback the user never sees.
 - `open`: after `core.open_handle(ino)` succeeds, ask
   `core.passthrough_fd(fh)`. If `Some`, try `reply.open_backing(fd)`; on
-  success reply `opened_passthrough(fh, flags, &backing_id)` and stash the
-  `BackingId` in a new `fh → BackingId` map on `MusefsFs`. Otherwise reply
-  plain `opened` as today.
+  success, insert the `BackingId` into the `fh → BackingId` map **before**
+  sending `opened_passthrough(fh, flags, &backing_id)` — the kernel cannot
+  send `release` for an fh before it receives the open reply, so
+  insert-before-reply makes the map entry's existence an invariant for every
+  live passthrough handle (no orphan-leak window). Otherwise reply plain
+  `opened` as today. The open handler runs inside `pool.execute`, which
+  captures only what it is given — the map and the sticky-disable flag are
+  therefore `Arc`-shared state cloned into the closure (the map as
+  `Arc<Mutex<HashMap<u64, BackingId>>>`), exactly like `core` and
+  `poll_pending` already are.
+- Open flags for passthrough replies: strip `FOPEN_KEEP_CACHE`. Page-cache
+  ownership for a passthrough handle belongs to the backing inode, so the
+  flag is meaningless there; plain (fallback and Synthesis) opens keep
+  today's flags unchanged.
 - `release`: remove the map entry — dropping the `BackingId` fires the
-  backing-close ioctl — then `core.release_handle` as today.
+  backing-close ioctl — then `core.release_handle` as today. (`release` runs
+  synchronously on the dispatch thread; a map remove is cheap enough, same
+  rationale as the existing `release_handle` comment.)
 - `read`: unchanged. The kernel never sends reads for passthrough handles;
   non-passthrough handles (Synthesis mounts, fallback opens) keep the existing
   path.
@@ -74,8 +94,9 @@ from the registered backing fd.
 
 ## Error Handling and Fallback
 
-- `set_max_stack_depth` result is discarded like the existing capability
-  requests; an old kernel just means the flag is not advertised.
+- The `add_capabilities(FUSE_PASSTHROUGH)` and `set_max_stack_depth` results
+  are discarded like the existing capability requests; an old kernel just
+  means the flag is not advertised.
 - `open_backing` failure (kernel < 6.9 did not ack `FUSE_PASSTHROUGH`, ioctl
   error, fd problem): log once at info level and reply with plain `opened` —
   the handle works exactly as today. The first failure flips an `AtomicBool`
@@ -102,7 +123,8 @@ wrong is reverting to today's behavior.
   a stale handle serves the file it opened — never corrupted splice output.
   Documented on `Mode::StructureOnly` and in CLAUDE.md's mode description.
 - **`--keep-cache` / `inval_inode`:** for passthrough handles, page-cache
-  ownership moves to the backing inode, so the `poll_refresh_notify` →
+  ownership moves to the backing inode (and `FOPEN_KEEP_CACHE` is stripped
+  from their open replies, per above), so the `poll_refresh_notify` →
   `inval_inode` flow is irrelevant but harmless for them (it targets the FUSE
   inode's cache, which passthrough reads do not populate). No changes; a
   comment notes why.
@@ -123,11 +145,15 @@ wrong is reverting to today's behavior.
   `end_to_end_read_through_mount`): mount StructureOnly on a kernel ≥ 6.9,
   read a file through the mount, assert (a) bytes identical to the backing
   file, and (b) — gated on the `metrics` feature, which musefs-fuse already
-  forwards to core — the serve-path pread counter delta is zero, proving the
-  kernel served the reads without calling the daemon. Exercise
-  open → read → close → unmount to cover the `BackingId` release path. The
-  test skips (not fails) when the kernel predates passthrough, mirroring the
-  silent-fallback contract.
+  forwards to core (the existing metrics-gated `concurrency.rs` test is the
+  template) — the serve-path pread counter (`PREADS`) delta is zero, proving
+  the kernel served the reads without calling the daemon. Counter sequencing
+  matters because `on_open`/`on_stat` fire during open and other counters
+  during mount warmup: open the file through the mount first, then
+  `metrics::reset()`, then read, then assert the preads delta against that
+  clean baseline. Exercise open → read → close → unmount to cover the
+  `BackingId` release path. The test skips (not fails) when the kernel
+  predates passthrough, mirroring the silent-fallback contract.
 - **Regression:** existing Synthesis e2e tests guard that passthrough stays
   inert outside StructureOnly; no changes to them.
 - **Mutation gate:** standard in-diff `cargo mutants` run per CI parity.
