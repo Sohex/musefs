@@ -63,6 +63,17 @@ struct Handle {
     file: std::fs::File,
 }
 
+/// An owned view of an open handle's backing fd, for FUSE passthrough
+/// registration. Holds its own `Arc<Handle>`, so the fd outlives a concurrent
+/// slab removal while the registration ioctl is in flight.
+pub struct PassthroughFd(Arc<Handle>);
+
+impl std::os::fd::AsFd for PassthroughFd {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.file.as_fd()
+    }
+}
+
 /// A cached file size/attr entry: validated at `content_version`.
 #[derive(Clone, Copy)]
 struct SizeEntry {
@@ -1044,6 +1055,18 @@ impl Musefs {
     pub fn release_handle(&self, fh: Fh) {
         self.handles.remove(fh.slab_key());
     }
+
+    /// The backing fd behind `fh`, for kernel passthrough registration. `Some`
+    /// only in StructureOnly mode, where the served bytes ARE the backing file;
+    /// in Synthesis mode the bytes are spliced, so no single fd represents
+    /// them. `None` also for a stale or released handle.
+    pub fn passthrough_fd(&self, fh: Fh) -> Option<PassthroughFd> {
+        if self.config.mode != Mode::StructureOnly {
+            return None;
+        }
+        let handle = self.handles.get(fh.slab_key())?;
+        Some(PassthroughFd(Arc::clone(&*handle)))
+    }
 }
 
 #[cfg(test)]
@@ -1422,5 +1445,71 @@ mod tests {
         assert!(!fs.poll_due(), "inside the retry backoff window");
         fs.expire_refresh_backoff_for_test();
         assert!(fs.poll_due(), "past the retry backoff window");
+    }
+
+    #[test]
+    fn passthrough_fd_exposes_backing_only_in_structure_only() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = |mode| MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode,
+            poll_interval: std::time::Duration::ZERO,
+        };
+
+        // StructureOnly: exposed, and the fd refers to the backing inode.
+        let fs = Musefs::open(
+            musefs_db::Db::open(&db_path).unwrap(),
+            cfg(Mode::StructureOnly),
+        )
+        .unwrap();
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+        let fh = fs.open_handle(file_inode).unwrap();
+        let pfd = fs
+            .passthrough_fd(fh)
+            .expect("StructureOnly exposes the backing fd");
+        let fd_meta = std::fs::File::from(pfd.as_fd().try_clone_to_owned().unwrap())
+            .metadata()
+            .unwrap();
+        let backing_meta = std::fs::metadata(dir.path().join("a.mp3")).unwrap();
+        assert_eq!(
+            (fd_meta.dev(), fd_meta.ino()),
+            (backing_meta.dev(), backing_meta.ino()),
+            "passthrough fd must be the backing file"
+        );
+
+        // A released handle no longer resolves.
+        fs.release_handle(fh);
+        assert!(fs.passthrough_fd(fh).is_none());
+
+        // Synthesis: never exposed, even for a live handle.
+        let fs =
+            Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg(Mode::Synthesis)).unwrap();
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+        let fh = fs.open_handle(file_inode).unwrap();
+        assert!(fs.passthrough_fd(fh).is_none());
     }
 }
