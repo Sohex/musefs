@@ -250,6 +250,14 @@ impl Filesystem for MusefsFs {
         // default; PARALLEL_DIROPS may be unsupported on older kernels (ignored).
         let _ = config.add_capabilities(InitFlags::FUSE_ASYNC_READ);
         let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+        // Passthrough needs BOTH calls: fuser only copies max_stack_depth into
+        // the init reply when the FUSE_PASSTHROUGH bit was negotiated, and a
+        // depth of 0 disables passthrough outright. Depth 2 (fuser's own
+        // example value) additionally lets backing files live on a stacked fs
+        // (e.g. a music library on overlayfs). On kernels without support the
+        // bit is simply not acked and open_backing later fails -> fallback.
+        let _ = config.add_capabilities(InitFlags::FUSE_PASSTHROUGH);
+        let _ = config.set_max_stack_depth(2);
         Ok(())
     }
 
