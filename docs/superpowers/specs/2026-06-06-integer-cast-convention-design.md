@@ -7,7 +7,8 @@ integer conversions: ~300 bare `as` casts
 ## Problem
 
 `musefs-core` and `musefs-format` (and the rest of the workspace) contain
-hundreds of bare `as` integer casts and almost no `try_from`. `as` silently
+hundreds of bare `as` integer casts (the issue estimates ~300; the measured
+lint baseline below is 451) and almost no `try_from`. `as` silently
 truncates/wraps, which matters at every i64↔u64 boundary and on 32-bit
 targets. The workspace `Cargo.toml` currently blanket-allows the four clippy
 cast lints with a "casts are deliberate" comment — a stance, but not a
@@ -85,13 +86,22 @@ version goes into CLAUDE.md's Conventions section.
     (bookkeeping counter).
   - `Art`/`ArtMeta`/`BinaryTagRow`: `byte_len` → `u64`; `width`/`height` →
     `u32` (Option-ness unchanged).
-  - `Tag`/`TrackArt`/`BinaryTag`: `ordinal` → `u64` (write side becomes a
-    clippy-clean `usize as u64`); `picture_type` → `u8` (APIC type byte).
+  - `Tag`/`TrackArt`/`BinaryTag`/`StructuralBlock`: `ordinal` → `u64`;
+    `picture_type` → `u8` (APIC type byte). `Tag::new`'s `ordinal: i64`
+    parameter (`models.rs:125`) flips with it. Write-side mechanics: the
+    `.enumerate()` sites become clippy-clean `usize as u64`, but the four
+    manual ordinal accumulators in `scan.rs` (`HashMap<String, i64>` at
+    scan.rs:421, 442, 509, 530) flip their value type to `u64` along with
+    their `*ord += 1` increments.
 - **New `convert.rs`**: `pub fn usize_from(v: u64) -> usize` containing the
   workspace's only pointer-width `#[expect(clippy::cast_possible_truncation)]`
   (latencyfs, standalone, carries its own), adjacent to the 64-bit const
   guard. db hosts it because it is the workspace's base
   crate and needs it itself (`art.rs:62`, `tags.rs:116`).
+- One write site is not dissolved by any field flip: `art.rs:97` computes
+  `byte_len` from data (`a.data.len() as i64`; `NewArt` has no `byte_len`
+  field). It becomes `a.data.len() as u64` (clippy-clean) through the
+  fallible `ToSql for u64`. Same pattern at `bulk.rs:111`.
 
 ### `musefs-core`
 
@@ -100,6 +110,15 @@ version goes into CLAUDE.md's Conventions section.
 - The manual negative-bounds check at `reader.rs:154-156` dissolves into the
   type system; `track.audio_offset as u64` reads and `as i64` writes in
   `reader.rs`/`scan.rs`/`mapping.rs` disappear.
+- A **second** guard dissolves: the negative-`byte_len` skip-with-warn at
+  `mapping.rs:46-53`. Once `ArtMeta.byte_len` is `u64`, the `< 0` comparison
+  is dead (`unused_comparisons`, a warn-by-default rustc lint that fires
+  under CI's `-D warnings` immediately — the guard must be removed in the
+  same step as the field flip). See Behavioral changes.
+- Read-side fallout in `mapping.rs:58-61`: `ta.picture_type as u32` becomes
+  `u32::from(...)` (a new `cast_lossless` site once `picture_type` is `u8`);
+  the `width`/`height` `as u32` and `byte_len as u64` casts (also
+  `mapping.rs:79`) vanish outright.
 
 ### `musefs-format`
 
@@ -122,7 +141,8 @@ version goes into CLAUDE.md's Conventions section.
 - Standalone by design (no musefs deps) — stays that way. Its ~10 sites are
   handled locally: fuser attr-struct `u64 as u32` fields fed from test
   fixtures get `try_from(...).expect(...)` or a local `#[expect]` with
-  reason, plus its own one-line guard for its single `u64 → usize`.
+  reason, plus its own one-line guard for its two `u64 → usize` sites
+  (lib.rs:296, lib.rs:358).
 
 ### Workspace `Cargo.toml`
 
@@ -134,7 +154,11 @@ version goes into CLAUDE.md's Conventions section.
 
 Dependency order so the tree compiles at each step:
 
-1. db model type flips + `convert.rs`.
+1. db model type flips + `convert.rs`. Dissolving guards
+   (`reader.rs:154-156`, `mapping.rs:46-53`) are removed in the same step as
+   their field flips: dead `< 0` comparisons trip rustc's warn-by-default
+   `unused_comparisons` under `-D warnings`, independent of the cast-lint
+   flip in step 5.
 2. Consumers: core, fuse, cli — including tests/ and benches/ (the hidden
    `--all-targets` consumers).
 3. format parser-internal narrowings.
@@ -146,10 +170,19 @@ The ~190 test/bench fixture sites are mechanical
 
 ## Behavioral changes
 
-Exactly one intended: a corrupt row (negative offset/length/byte_len written
-by an external tool) now errors at row-read (`FromSqlError::OutOfRange`)
-instead of relying on the single hand-rolled check in `reader.rs`. Everything
-else — including the byte-identical serve-path invariant — must be unchanged.
+Exactly two intended, both the same class — a corrupt row (negative value in
+a contract column written by an external tool) now errors at row-read
+(`FromSqlError::OutOfRange`) instead of being handled ad hoc:
+
+1. Negative `audio_offset`/`audio_length`/`backing_size`: previously caught
+   by the hand-rolled check at `reader.rs:154-156`.
+2. Negative art `byte_len`: previously **skipped with a warning**
+   (`mapping.rs:46-53`, art row dropped, track still served); now the track
+   resolve errors. Stricter, and consistent with decision 3's
+   validate-at-the-boundary rationale.
+
+Everything else — including the byte-identical serve-path invariant — must
+be unchanged.
 
 ## Validation
 
