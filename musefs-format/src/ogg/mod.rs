@@ -1404,6 +1404,20 @@ mod tests {
 }
 
 #[cfg(test)]
+mod page_test_support_tests {
+    /// Pins the fixture's contract: a parseable VorbisComment with zero
+    /// comments. Consumers (musefs-core's ogg tests) splice it into OpusTags
+    /// packets, but only format-local tests can kill mutations of it — the
+    /// mutation gate runs each crate's own suite.
+    #[test]
+    fn vorbis_body_empty_is_a_parseable_empty_comment() {
+        let body = super::page_test_support::vorbis_body_empty();
+        let parsed = crate::vorbiscomment::parse(&body).unwrap();
+        assert!(parsed.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod bounded_tests {
     use super::*;
     use crate::ogg::page_test_support::{build_header_pub, lace_packet_pub, vorbis_body_empty};
