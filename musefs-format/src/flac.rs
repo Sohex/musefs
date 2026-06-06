@@ -142,6 +142,9 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
 use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 
+/// Inclusive maximum body length of a FLAC metadata block (24-bit length field).
+pub(crate) const MAX_BLOCK_BODY: u64 = 0x00FF_FFFF;
+
 pub(crate) fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usize, is_last: bool) {
     let first = (if is_last { 0x80 } else { 0 }) | (block_type & 0x7F);
     out.push(first);
@@ -240,6 +243,9 @@ pub fn synthesize_layout(
     }
 
     let vc = crate::vorbiscomment::build(tags);
+    if vc.len() as u64 > MAX_BLOCK_BODY {
+        return Err(FormatError::TooLarge);
+    }
     push_block_header(&mut buf, BLOCK_VORBIS_COMMENT, vc.len(), idx == last_index);
     buf.extend_from_slice(&vc);
     idx += 1;
@@ -250,7 +256,7 @@ pub fn synthesize_layout(
             "CUESHEET" => BLOCK_CUESHEET,
             _ => continue,
         };
-        if bt.len > 0x00FF_FFFF {
+        if bt.len > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
         push_block_header(&mut buf, block_type, bt.len as usize, idx == last_index);
@@ -268,7 +274,7 @@ pub fn synthesize_layout(
         }
         let framing = picture_body_framing(art);
         let body_len = framing.len() as u64 + art.data_len;
-        if body_len > 0x00FF_FFFF {
+        if body_len > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
         push_block_header(
@@ -933,6 +939,26 @@ mod tests {
         // one byte over must still error, pinning the high side of the boundary.
         assert_eq!(
             synthesize_layout(&[], 0, 0, &[], &[], &[mk(at_limit + 1)]),
+            Err(FormatError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn synthesize_layout_vorbis_comment_block_size_boundary_is_inclusive() {
+        // The regenerated VORBIS_COMMENT body must also fit FLAC's 24-bit block
+        // length. Derive the non-value overhead from production, then size the
+        // value so the body lands exactly on the limit; one more byte errors.
+        // Mirrors the PICTURE/binary-tag boundary tests: the `>` accepts the
+        // inclusive limit while the `>=` mutant rejects it.
+        let overhead = crate::vorbiscomment::build(&[TagInput::new("title", "")]).len() as u64;
+        let at_limit = "x".repeat((MAX_BLOCK_BODY - overhead) as usize);
+        let tags = [TagInput::new("title", at_limit.as_str())];
+        assert!(synthesize_layout(&[], 0, 0, &tags, &[], &[]).is_ok());
+        // one byte over must still error, pinning the high side of the boundary.
+        let over = format!("{at_limit}x");
+        let tags = [TagInput::new("title", over.as_str())];
+        assert_eq!(
+            synthesize_layout(&[], 0, 0, &tags, &[], &[]),
             Err(FormatError::TooLarge)
         );
     }
