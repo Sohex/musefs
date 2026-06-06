@@ -838,10 +838,9 @@ pub fn synthesize_layout(
     let udta_total: u64 = udta_segments.iter().map(Segment::len).sum();
 
     let new_moov_size = 8 + kept.len() as u64 + udta_total;
-    // MP4 box sizes are 32-bit; mirror build_udta's guard.
-    if new_moov_size > u64::from(u32::MAX) {
-        return Err(FormatError::TooLarge);
-    }
+    // MP4 box sizes are 32-bit; mirror build_udta's bound. The try_from below
+    // (writing the size field) is the enforcing check.
+    let new_moov_size_u32 = u32::try_from(new_moov_size).map_err(|_| FormatError::TooLarge)?;
     let new_mdat_payload_pos =
         scan.ftyp.len() as u64 + new_moov_size + scan.mdat_header.len() as u64;
     let delta = new_mdat_payload_pos.cast_signed() - scan.mdat_payload_offset.cast_signed();
@@ -850,11 +849,7 @@ pub fn synthesize_layout(
 
     let mut head = Vec::new();
     head.extend_from_slice(&scan.ftyp);
-    head.extend_from_slice(
-        &u32::try_from(new_moov_size)
-            .map_err(|_| FormatError::TooLarge)?
-            .to_be_bytes(),
-    );
+    head.extend_from_slice(&new_moov_size_u32.to_be_bytes());
     head.extend_from_slice(b"moov");
     head.extend_from_slice(&kept);
 
