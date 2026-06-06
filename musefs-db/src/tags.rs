@@ -111,7 +111,7 @@ impl<M> Db<M> {
         let blob = self
             .conn
             .blob_open("main", "tags", "value_blob", payload_id, true)?;
-        blob.read_at_exact(buf, offset as usize)?;
+        blob.read_at_exact(buf, crate::convert::usize_from(offset))?;
         Ok(())
     }
 

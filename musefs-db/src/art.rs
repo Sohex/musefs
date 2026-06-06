@@ -77,7 +77,7 @@ impl<M> Db<M> {
     /// than silently zero-filling.
     pub fn read_art_chunk_into(&self, art_id: i64, offset: u64, buf: &mut [u8]) -> Result<()> {
         let blob = self.conn.blob_open("main", "art", "data", art_id, true)?;
-        blob.read_at_exact(buf, offset as usize)?;
+        blob.read_at_exact(buf, crate::convert::usize_from(offset))?;
         Ok(())
     }
 
