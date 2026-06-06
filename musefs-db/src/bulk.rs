@@ -46,7 +46,7 @@ impl BulkWriter<'_> {
                 audio_length=excluded.audio_length, backing_size=excluded.backing_size,
                 backing_mtime=excluded.backing_mtime,
                 updated_at=CAST(strftime('%s','now') AS INTEGER)",
-            params![t.backing_path, t.format.as_str(), t.audio_offset, t.audio_length, t.backing_size, t.backing_mtime],
+            params![t.backing_path, t.format.as_str(), t.audio_offset as i64, t.audio_length as i64, t.backing_size as i64, t.backing_mtime],
         )?;
         Ok(self.tx.query_row(
             "SELECT id FROM tracks WHERE backing_path = ?1",

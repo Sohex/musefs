@@ -111,8 +111,8 @@ fn scans_mp3_files_seeding_tracks_and_tags() {
     assert_eq!(tracks.len(), 1);
     let t = &tracks[0];
     assert_eq!(t.format, Format::Mp3);
-    assert_eq!(t.audio_offset as u64, audio_offset);
-    assert_eq!(t.audio_length, audio_len as i64);
+    assert_eq!(t.audio_offset, audio_offset);
+    assert_eq!(t.audio_length, audio_len);
 
     let tags = db.get_tags(t.id).unwrap();
     assert!(tags

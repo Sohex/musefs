@@ -11,8 +11,8 @@ use musefs_db::Db;
 /// `(sha256, picture_type, description, ordinal)`.
 type NormalizedTrack = (
     String,
-    i64,
-    i64,
+    u64,
+    u64,
     Vec<(String, String, i64)>,
     Vec<(String, i64, String, i64)>,
 );

@@ -26,9 +26,9 @@ fn scanner_owned_bounds_mutation_returns_controlled_error() {
         .upsert_track(&NewTrack {
             backing_path: audio_path.to_string_lossy().into_owned(),
             format: Format::Mp3,
-            audio_offset: bounds.audio_offset as i64,
-            audio_length: bounds.audio_length as i64,
-            backing_size: bytes.len() as i64,
+            audio_offset: bounds.audio_offset,
+            audio_length: bounds.audio_length,
+            backing_size: bytes.len() as u64,
             backing_mtime: real_mtime(&audio_path),
         })
         .unwrap();

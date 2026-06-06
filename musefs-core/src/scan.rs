@@ -411,9 +411,9 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     let track_id = db.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
         format: probed.format,
-        audio_offset: probed.audio_offset as i64,
-        audio_length: probed.audio_length as i64,
-        backing_size: meta.len() as i64,
+        audio_offset: probed.audio_offset,
+        audio_length: probed.audio_length,
+        backing_size: meta.len(),
         backing_mtime: mtime_secs(meta),
     })?;
 
@@ -499,9 +499,9 @@ fn ingest_bulk(
     let track_id = bw.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
         format: probed.format,
-        audio_offset: probed.audio_offset as i64,
-        audio_length: probed.audio_length as i64,
-        backing_size: meta_len as i64,
+        audio_offset: probed.audio_offset,
+        audio_length: probed.audio_length,
+        backing_size: meta_len,
         backing_mtime: meta_mtime,
     })?;
 
@@ -803,7 +803,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
 
     // Main-thread pre-dispatch skip pass: load existing (path -> size,mtime,id,format) once,
     // stat each candidate, keep only changed files. Workers stay DB-free.
-    let existing: HashMap<String, (i64, i64, i64, Format)> = db
+    let existing: HashMap<String, (u64, i64, i64, Format)> = db
         .list_tracks()?
         .into_iter()
         .map(|t| {
@@ -833,7 +833,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         let key = abs.to_string_lossy().into_owned();
         if let Some(&(size, mtime, id, format)) = existing.get(&key) {
             let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
-            if size == meta.len() as i64 && mtime == mtime_secs(&meta) && !needs_backfill {
+            if size == meta.len() && mtime == mtime_secs(&meta) && !needs_backfill {
                 unchanged += 1;
                 continue;
             }
@@ -1639,8 +1639,8 @@ mod bounded_probe_tests {
             .get_track_by_path(&std::fs::canonicalize(&path).unwrap().to_string_lossy())
             .unwrap()
             .unwrap();
-        assert_eq!(track.audio_offset as u64, full.audio_offset);
-        assert_eq!(track.audio_length as u64, full.audio_length);
+        assert_eq!(track.audio_offset, full.audio_offset);
+        assert_eq!(track.audio_length, full.audio_length);
     }
 
     #[test]
@@ -1723,7 +1723,7 @@ mod bounded_probe_tests {
                 },
             )
             .unwrap();
-            let mut rows: Vec<(String, i64, i64)> = db
+            let mut rows: Vec<(String, u64, u64)> = db
                 .list_tracks()
                 .unwrap()
                 .into_iter()

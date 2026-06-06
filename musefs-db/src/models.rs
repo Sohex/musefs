@@ -87,9 +87,9 @@ pub struct Track {
     pub id: i64,
     pub backing_path: String,
     pub format: Format,
-    pub audio_offset: i64,
-    pub audio_length: i64,
-    pub backing_size: i64,
+    pub audio_offset: u64,
+    pub audio_length: u64,
+    pub backing_size: u64,
     pub backing_mtime: i64,
     pub content_version: i64,
     pub updated_at: i64,
@@ -99,9 +99,9 @@ pub struct Track {
 pub struct NewTrack {
     pub backing_path: String,
     pub format: Format,
-    pub audio_offset: i64,
-    pub audio_length: i64,
-    pub backing_size: i64,
+    pub audio_offset: u64,
+    pub audio_length: u64,
+    pub backing_size: u64,
     pub backing_mtime: i64,
 }
 

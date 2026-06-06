@@ -17,7 +17,7 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
             format: Format::Flac,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()
@@ -76,8 +76,8 @@ fn resolve_errors_when_audio_bounds_overrun_the_file() {
             backing_path: flac.to_string_lossy().into_owned(),
             format: Format::Flac,
             audio_offset: 0,
-            audio_length: meta.len() as i64 + 1,
-            backing_size: meta.len() as i64,
+            audio_length: meta.len() + 1,
+            backing_size: meta.len(),
             backing_mtime: mtime,
         })
         .unwrap();

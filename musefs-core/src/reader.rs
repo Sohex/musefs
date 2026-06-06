@@ -115,7 +115,7 @@ impl HeaderCache {
         // on a cache hit, because the audio region may have shifted.
         crate::metrics::on_stat();
         let meta = std::fs::metadata(&track.backing_path)?;
-        if meta.len() != track.backing_size as u64 || mtime_secs(&meta) != track.backing_mtime {
+        if meta.len() != track.backing_size || mtime_secs(&meta) != track.backing_mtime {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
@@ -151,11 +151,7 @@ impl HeaderCache {
                 // bound, or an audio region that runs past the end of the backing file,
                 // means the row no longer matches the file. Only synthesis splices at
                 // these bounds, so the check is scoped to this mode.
-                if track.audio_offset < 0
-                    || track.audio_length < 0
-                    || (track.audio_offset as u64).saturating_add(track.audio_length as u64)
-                        > meta.len()
-                {
+                if track.audio_offset.saturating_add(track.audio_length) > meta.len() {
                     return Err(CoreError::BackingChanged(track.backing_path.clone()));
                 }
 
@@ -177,10 +173,8 @@ impl HeaderCache {
                         // are not emitted twice.
                         let (structural, binary_tags): (Vec<MetadataBlock>, &[BinaryTagInput]) =
                             if rows.is_empty() {
-                                let front = read_front(
-                                    Path::new(&track.backing_path),
-                                    track.audio_offset as u64,
-                                )?;
+                                let front =
+                                    read_front(Path::new(&track.backing_path), track.audio_offset)?;
                                 (flac::read_metadata(&front)?.preserved, &[])
                             } else {
                                 let structural = rows
@@ -198,16 +192,16 @@ impl HeaderCache {
                             };
                         flac::synthesize_layout(
                             &structural,
-                            track.audio_offset as u64,
-                            track.audio_length as u64,
+                            track.audio_offset,
+                            track.audio_length,
                             &inputs,
                             binary_tags,
                             &art_inputs,
                         )?
                     }
                     Format::Mp3 => mp3::synthesize_layout(
-                        track.audio_offset as u64,
-                        track.audio_length as u64,
+                        track.audio_offset,
+                        track.audio_length,
                         &inputs,
                         &binary_tag_inputs,
                         &art_inputs,
@@ -247,21 +241,19 @@ impl HeaderCache {
                     Format::Wav => {
                         // Read only the front (RIFF header + fmt/fact); the data
                         // payload is served from the backing file at read time.
-                        let front =
-                            read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
+                        let front = read_front(Path::new(&track.backing_path), track.audio_offset)?;
                         let scan = wav::read_structure(&front)?;
                         wav::synthesize_layout(
                             &scan,
-                            track.audio_offset as u64,
-                            track.audio_length as u64,
+                            track.audio_offset,
+                            track.audio_length,
                             &inputs,
                             &binary_tag_inputs,
                             &art_inputs,
                         )?
                     }
                     Format::Opus | Format::Vorbis | Format::OggFlac => {
-                        let front =
-                            read_front(Path::new(&track.backing_path), track.audio_offset as u64)?;
+                        let front = read_front(Path::new(&track.backing_path), track.audio_offset)?;
                         let header = musefs_format::ogg::read_metadata(&front)?;
                         let art_images = crate::mapping::track_art_images(db, &art_inputs)?;
                         let arts: Vec<musefs_format::ogg::OggArt> = art_inputs
@@ -274,8 +266,8 @@ impl HeaderCache {
                             .collect();
                         musefs_format::ogg::synthesize_layout(
                             &header,
-                            track.audio_offset as u64,
-                            track.audio_length as u64,
+                            track.audio_offset,
+                            track.audio_length,
                             &inputs,
                             &arts,
                         )?
@@ -300,7 +292,7 @@ impl HeaderCache {
             total_len,
             content_version: track.content_version,
             backing_path: PathBuf::from(&track.backing_path),
-            backing_size: track.backing_size as u64,
+            backing_size: track.backing_size,
             backing_mtime_secs: track.backing_mtime,
             mtime_secs: mtime_secs_val,
             last_page: Mutex::new(None),
@@ -585,9 +577,9 @@ mod resolve_ogg_tests {
             .upsert_track(&NewTrack {
                 backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Opus,
-                audio_offset: audio_offset as i64,
-                audio_length: audio_length as i64,
-                backing_size: meta.len() as i64,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len(),
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap();
@@ -624,9 +616,9 @@ mod resolve_ogg_tests {
             .upsert_track(&NewTrack {
                 backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Opus,
-                audio_offset: audio_offset as i64,
-                audio_length: audio_length as i64,
-                backing_size: meta.len() as i64,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len(),
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap();
@@ -681,9 +673,9 @@ mod resolve_ogg_tests {
             .upsert_track(&NewTrack {
                 backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Wav,
-                audio_offset: audio_offset as i64,
-                audio_length: audio_length as i64,
-                backing_size: meta.len() as i64,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len(),
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap();
@@ -720,9 +712,9 @@ mod resolve_ogg_tests {
             .upsert_track(&NewTrack {
                 backing_path: path.to_string_lossy().into_owned(),
                 format: Format::Opus,
-                audio_offset: audio_offset as i64,
-                audio_length: audio_length as i64,
-                backing_size: meta.len() as i64,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len(),
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap();
@@ -877,7 +869,7 @@ mod cache_bound_tests {
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
-                backing_size: meta.len() as i64,
+                backing_size: meta.len(),
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap();
@@ -905,7 +897,7 @@ mod cache_bound_tests {
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
-                backing_size: meta.len() as i64,
+                backing_size: meta.len(),
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap()
@@ -941,7 +933,7 @@ mod cache_bound_tests {
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
-                backing_size: meta.len() as i64,
+                backing_size: meta.len(),
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap()
@@ -973,7 +965,7 @@ mod cache_bound_tests {
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
-                backing_size: meta.len() as i64,
+                backing_size: meta.len(),
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap()
@@ -1008,8 +1000,8 @@ mod cache_bound_tests {
 
     fn track_with_bounds(
         path: &std::path::Path,
-        audio_offset: i64,
-        audio_length: i64,
+        audio_offset: u64,
+        audio_length: u64,
     ) -> (musefs_db::Db, i64) {
         use musefs_db::{Format, NewTrack};
         let db = musefs_db::Db::open_in_memory().unwrap();
@@ -1020,7 +1012,7 @@ mod cache_bound_tests {
                 format: Format::Flac,
                 audio_offset,
                 audio_length,
-                backing_size: meta.len() as i64,
+                backing_size: meta.len(),
                 backing_mtime: mtime_secs(&meta),
             })
             .unwrap();
@@ -1032,7 +1024,7 @@ mod cache_bound_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.flac");
         let _ = write_flac_local(&path);
-        let len = std::fs::metadata(&path).unwrap().len() as i64;
+        let len = std::fs::metadata(&path).unwrap().len();
         let (db, id) = track_with_bounds(&path, len, 5);
         let cache = HeaderCache::new(Mode::Synthesis);
         assert!(matches!(
@@ -1075,7 +1067,7 @@ mod cache_bound_tests {
         assert_eq!(resolved.cache_bytes, inline_sum);
     }
 
-    fn write_flac_local(path: &std::path::Path) -> (i64, i64) {
+    fn write_flac_local(path: &std::path::Path) -> (u64, u64) {
         fn block(bt: u8, body: &[u8], last: bool) -> Vec<u8> {
             let mut v = vec![(if last { 0x80 } else { 0 }) | (bt & 0x7F)];
             let n = body.len();
@@ -1097,10 +1089,10 @@ mod cache_bound_tests {
         out.extend(block(0, &si, false));
         out.extend(block(4, &vc, true));
         let audio = [0xABu8; 256];
-        let audio_offset = out.len() as i64;
+        let audio_offset = out.len() as u64;
         out.extend_from_slice(&audio);
         std::fs::write(path, &out).unwrap();
-        (audio_offset, audio.len() as i64)
+        (audio_offset, audio.len() as u64)
     }
 
     #[test]
@@ -1172,9 +1164,9 @@ mod binary_tag_serve_tests {
             .upsert_track(&musefs_db::NewTrack {
                 backing_path: path.to_string_lossy().into_owned(),
                 format: musefs_db::Format::Mp3,
-                audio_offset: bounds.audio_offset as i64,
-                audio_length: bounds.audio_length as i64,
-                backing_size: meta.len() as i64,
+                audio_offset: bounds.audio_offset,
+                audio_length: bounds.audio_length,
+                backing_size: meta.len(),
                 backing_mtime: meta
                     .modified()
                     .unwrap()

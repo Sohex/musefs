@@ -126,9 +126,9 @@ fn legacy_flac_without_structural_rows_serves_via_front_read_fallback() {
         .upsert_track(&NewTrack {
             backing_path: path.to_string_lossy().into_owned(),
             format: Format::Flac,
-            audio_offset: scan.audio_offset as i64,
-            audio_length: scan.audio_length as i64,
-            backing_size: meta.len() as i64,
+            audio_offset: scan.audio_offset,
+            audio_length: scan.audio_length,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()

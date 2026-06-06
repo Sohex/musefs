@@ -16,7 +16,7 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
             format: Format::Flac,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()

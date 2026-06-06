@@ -20,7 +20,7 @@ fn build(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>) {
             format: Format::Flac,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()
@@ -48,7 +48,7 @@ fn build_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempDir, 
             format: Format::Flac,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()
@@ -92,7 +92,7 @@ fn build_wav(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             format: Format::Wav,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()
@@ -119,7 +119,7 @@ fn build_wav_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             format: Format::Wav,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()
@@ -357,7 +357,7 @@ fn build_mp3(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             format: Format::Mp3,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()
@@ -382,7 +382,7 @@ fn build_mp3_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             format: Format::Mp3,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()
@@ -560,7 +560,7 @@ fn build_m4a(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             format: Format::M4a,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()
@@ -585,7 +585,7 @@ fn build_m4a_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             format: Format::M4a,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
+            backing_size: meta.len(),
             backing_mtime: meta
                 .modified()
                 .unwrap()

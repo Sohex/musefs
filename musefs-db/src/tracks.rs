@@ -20,13 +20,23 @@ fn parse_format_col(fmt: &str) -> rusqlite::Result<Format> {
 fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
     let fmt: String = r.get("format")?;
     let format = parse_format_col(&fmt)?;
+    let audio_offset_i: i64 = r.get("audio_offset")?;
+    let audio_length_i: i64 = r.get("audio_length")?;
+    let backing_size_i: i64 = r.get("backing_size")?;
+    if audio_offset_i < 0 || audio_length_i < 0 || backing_size_i < 0 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            "negative audio bounds or backing size".into(),
+        ));
+    }
     Ok(Track {
         id: r.get("id")?,
         backing_path: r.get("backing_path")?,
         format,
-        audio_offset: r.get("audio_offset")?,
-        audio_length: r.get("audio_length")?,
-        backing_size: r.get("backing_size")?,
+        audio_offset: audio_offset_i as u64,
+        audio_length: audio_length_i as u64,
+        backing_size: backing_size_i as u64,
         backing_mtime: r.get("backing_mtime")?,
         content_version: r.get("content_version")?,
         updated_at: r.get("updated_at")?,
@@ -184,9 +194,9 @@ impl Db<ReadWrite> {
             params![
                 t.backing_path,
                 t.format.as_str(),
-                t.audio_offset,
-                t.audio_length,
-                t.backing_size,
+                t.audio_offset as i64,
+                t.audio_length as i64,
+                t.backing_size as i64,
                 t.backing_mtime,
             ],
         )?;
@@ -227,6 +237,34 @@ impl Db<ReadWrite> {
         self.conn
             .execute("DELETE FROM track_changes WHERE seq <= ?1", [seq])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod negative_audio_bounds_tests {
+    use crate::{Db, Format, NewTrack};
+
+    #[test]
+    fn negative_audio_bounds_error_at_row_read() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        // Simulate a malformed external write to a contract column.
+        db.conn
+            .execute("UPDATE tracks SET audio_offset = -1 WHERE id = ?1", [id])
+            .unwrap();
+        assert!(
+            db.get_track(id).is_err(),
+            "negative audio_offset must fail row-read, not wrap"
+        );
     }
 }
 
