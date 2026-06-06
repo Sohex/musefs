@@ -28,10 +28,14 @@ regardless of this list, so enumerating newer versions buys nothing.
 
 Changes:
 - `PLUGIN_API_VERSIONS = ["2.0"]`.
-- Keep the API-inventory comment; add one line explaining the intersection
-  semantics (why the floor alone suffices).
-- Add an assertion in `contrib/picard/tests/test_plugin_loads.py` that
-  `PLUGIN_API_VERSIONS == ["2.0"]`, so a future hand-extension gets flagged.
+- Keep the API-inventory comment (it already states the 2.0 floor); the added
+  line explains only the intersection semantics — why declaring the floor
+  alone suffices — without restating the floor.
+- Add a test asserting `PLUGIN_API_VERSIONS == ["2.0"]` so a future
+  hand-extension gets flagged. The constant sits *outside* the `if _PICARD:`
+  block, so the assert must NOT be `importorskip("picard")`-gated — placed
+  where it runs under the default pytest invocation too, catching drift on
+  hosts without Picard.
 
 ## 2. `dry_run` unused from Picard — no code change
 
@@ -49,18 +53,20 @@ The `sync`-verb branch returns `args[1:]` (a tuple slice when the caller hands
 a tuple); the fallthrough returns `list(args)`. Change the first branch to
 `return list(args[1:])`.
 
-Tests: `contrib/beets/tests/test_plugin.py` already covers both paths; extend
-it to feed a tuple (or assert `type(...) is list`) so the inconsistency cannot
-regress.
+Tests: `contrib/beets/tests/test_plugin.py` already covers both paths but only
+with list inputs. Extend it to feed a tuple through the `sync`-verb branch —
+`_query_from_args(("sync", "artist:Band"))` — asserting the result equals the
+expected list and `type(result) is list`, exercising the actual bug path.
 
 ## 4. Picard `_resolved_files` logs dropped duplicates
 
 **File:** `contrib/picard/musefs/__init__.py` (`_resolved_files`)
 
 Replace the bare `seen.setdefault(realpath_key(...), f)` with an explicit
-membership check. When the key is already present **and maps to a different
-`File` object** (the same object re-yielded by overlapping selections is not
-interesting), emit:
+membership check. Log only when the key is already present **and** the stored
+value is a different object — i.e. the suppression rule is identity-based,
+`seen[key] is not f` (the same `File` re-yielded by overlapping selections is
+not interesting):
 
 ```python
 log.debug("musefs: duplicate file for %s: %r dropped in favor of %r", ...)
@@ -69,9 +75,18 @@ log.debug("musefs: duplicate file for %s: %r dropped in favor of %r", ...)
 `log` is already imported and used in this scope. Behavior is otherwise
 unchanged: first file wins.
 
-Tests: extend the existing `_resolved_files` coverage (`tests/test_path_gate.py`)
-with a case asserting the duplicate is still dropped and a debug record is
-emitted (caplog or a log stub, matching how the suite handles Picard's `log`).
+Tests: **net-new** — no existing test exercises `_resolved_files` (the only
+mention in the suite is a `conftest.py` docstring). Add a dedicated test file
+mirroring `test_callback_flow.py`'s structure: `importorskip("picard")`-gated,
+since `_resolved_files` lives inside the `if _PICARD:` block and is only
+importable with real Picard (so it runs only under the real-Picard harness).
+Picard's `log` is not stdlib `logging`, so pytest's `caplog` captures nothing;
+use the suite's established pattern instead —
+`monkeypatch.setattr(musefs.log, "debug", recorder)` as in
+`test_callback_flow.py:37`. Two cases:
+- two distinct `File`s sharing one realpath key → duplicate dropped (first
+  wins) **and** one debug record emitted;
+- the same `File` object yielded twice → dropped, **no** debug record.
 
 ## 5. beets `sniff_mime` receives the real path, not the lossy key
 
