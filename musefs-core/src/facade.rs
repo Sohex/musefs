@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
+use musefs_db::convert::usize_from;
 use musefs_db::{Db, Format};
 
 use crate::db_pool::DbPool;
@@ -84,7 +85,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64)
+        .map_or(0, |d| d.as_secs().cast_signed())
 }
 
 fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Result<()> {
@@ -175,7 +176,7 @@ impl Fh {
 
     /// Sole site of the `-1`: handle → slab key.
     fn slab_key(self) -> usize {
-        (self.0.get() - 1) as usize
+        usize_from(self.0.get() - 1)
     }
 
     /// The raw wire value handed to the kernel.

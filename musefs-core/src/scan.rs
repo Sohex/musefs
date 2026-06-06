@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use musefs_db::convert::usize_from;
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_format::{flac, mp3, mp4, ogg, wav, EmbeddedBinaryTag, EmbeddedPicture, Extent};
 
@@ -46,7 +47,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64)
+        .map_or(0, |d| d.as_secs().cast_signed())
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
@@ -237,7 +238,7 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
     } else {
         None
     };
-    let mut want = (window as u64).min(file_len) as usize;
+    let mut want = usize_from((window as u64).min(file_len));
     let mut prefix = read_window(&file, want)?;
     for _ in 0..MAX_WIDEN_RETRIES {
         match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
@@ -250,16 +251,16 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
                 }
                 // Grow to at least `up_to` (capped at the file), always making
                 // progress (`+1`), then retry.
-                want = (up_to.min(file_len) as usize)
+                want = usize_from(up_to.min(file_len))
                     .max(want + 1)
-                    .min(file_len as usize);
+                    .min(usize_from(file_len));
                 prefix = read_window(&file, want)?;
             }
         }
     }
     // Fallback: read the whole file once and use the full-buffer probe.
     if (prefix.len() as u64) < file_len {
-        prefix = read_window(&file, file_len as usize)?;
+        prefix = read_window(&file, usize_from(file_len))?;
     }
     Ok(probe_full(path, &prefix))
 }
@@ -988,7 +989,10 @@ mod scan_unit_tests {
     /// `probe_full` only locates audio + reads tags, never synthesizes.
     fn mp4_with_binary_freeform(mean: &str, name: &str, value: &[u8]) -> Vec<u8> {
         fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-            let mut v = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+            let mut v = u32::try_from(8 + body.len())
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
             v.extend_from_slice(kind);
             v.extend_from_slice(body);
             v
@@ -1131,11 +1135,11 @@ mod wav_probe_tests {
         let mut body = Vec::new();
         for (id, payload) in [(b"fmt ", &fmt), (b"data", &data)] {
             body.extend_from_slice(id);
-            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
             body.extend_from_slice(payload);
         }
         let mut out = b"RIFF".to_vec();
-        out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
         out.extend_from_slice(b"WAVE");
         out.extend_from_slice(&body);
         out
@@ -1226,8 +1230,12 @@ mod hardening_tests {
 
     fn flac_block(bt: u8, body: &[u8], last: bool) -> Vec<u8> {
         let mut v = vec![(if last { 0x80 } else { 0 }) | (bt & 0x7F)];
-        let n = body.len();
-        v.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+        let n: u32 = u32::try_from(body.len()).unwrap();
+        v.extend_from_slice(&[
+            u8::try_from(n >> 16).unwrap(),
+            u8::try_from(n >> 8).unwrap(),
+            u8::try_from(n).unwrap(),
+        ]);
         v.extend_from_slice(body);
         v
     }
@@ -1242,11 +1250,11 @@ mod hardening_tests {
     fn vorbis_comment(entries: &[&str]) -> Vec<u8> {
         let mut vc = Vec::new();
         let vendor = b"x";
-        vc.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        vc.extend_from_slice(&u32::try_from(vendor.len()).unwrap().to_le_bytes());
         vc.extend_from_slice(vendor);
-        vc.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        vc.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_le_bytes());
         for e in entries {
-            vc.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            vc.extend_from_slice(&u32::try_from(e.len()).unwrap().to_le_bytes());
             vc.extend_from_slice(e.as_bytes());
         }
         vc
@@ -1255,14 +1263,14 @@ mod hardening_tests {
         let mut b = Vec::new();
         b.extend_from_slice(&3u32.to_be_bytes());
         let mime = "image/png";
-        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
         b.extend_from_slice(mime.as_bytes());
         b.extend_from_slice(&0u32.to_be_bytes());
         b.extend_from_slice(&width.to_be_bytes());
         b.extend_from_slice(&height.to_be_bytes());
         b.extend_from_slice(&0u32.to_be_bytes());
         b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
         b.extend_from_slice(data);
         b
     }
@@ -1674,7 +1682,7 @@ mod bounded_probe_tests {
             .get_track_by_path(&std::fs::canonicalize(&p).unwrap().to_string_lossy())
             .unwrap()
             .unwrap();
-        assert_eq!(track.audio_length as usize, b"DIFFERENT-AUDIO".len());
+        assert_eq!(usize_from(track.audio_length), b"DIFFERENT-AUDIO".len());
     }
 
     #[test]
