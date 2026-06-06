@@ -108,8 +108,8 @@ pub struct NewTrack {
 #[derive(Debug, Clone)]
 pub struct NewArt {
     pub mime: String,
-    pub width: Option<i64>,
-    pub height: Option<i64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     pub data: Vec<u8>,
 }
 
@@ -137,9 +137,9 @@ pub struct Art {
     pub id: i64,
     pub sha256: String,
     pub mime: String,
-    pub width: Option<i64>,
-    pub height: Option<i64>,
-    pub byte_len: i64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub byte_len: u64,
     pub data: Vec<u8>,
 }
 
@@ -147,9 +147,9 @@ pub struct Art {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtMeta {
     pub mime: String,
-    pub width: Option<i64>,
-    pub height: Option<i64>,
-    pub byte_len: i64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub byte_len: u64,
 }
 
 #[cfg_attr(feature = "mutants", derive(Default))]
@@ -179,7 +179,7 @@ pub struct BinaryTag {
 pub struct BinaryTagRow {
     pub rowid: i64,
     pub key: String,
-    pub byte_len: i64,
+    pub byte_len: u64,
 }
 
 /// A read-only structural metadata block derived from the backing file

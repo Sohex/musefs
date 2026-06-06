@@ -466,8 +466,8 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     for (ordinal, pic) in accepted.enumerate() {
         let art_id = db.upsert_art(&NewArt {
             mime: pic.mime,
-            width: (pic.width != 0).then_some(pic.width as i64),
-            height: (pic.height != 0).then_some(pic.height as i64),
+            width: (pic.width != 0).then_some(pic.width),
+            height: (pic.height != 0).then_some(pic.height),
             data: pic.data,
         })?;
         // Valid ID3/FLAC picture types are 0..=20; clamp anything out of range.
@@ -552,8 +552,8 @@ fn ingest_bulk(
     for (ordinal, pic) in accepted.enumerate() {
         let art_id = bw.upsert_art(&NewArt {
             mime: pic.mime,
-            width: (pic.width != 0).then_some(pic.width as i64),
-            height: (pic.height != 0).then_some(pic.height as i64),
+            width: (pic.width != 0).then_some(pic.width),
+            height: (pic.height != 0).then_some(pic.height),
             data: pic.data,
         })?;
         let picture_type = if pic.picture_type <= 20 {

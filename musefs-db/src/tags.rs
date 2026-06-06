@@ -82,8 +82,6 @@ impl<M> Db<M> {
         Ok(out)
     }
 
-    /// Binary tag rows for a track: streaming handle (rowid), key, and payload
-    /// length. Ordered by (key, ordinal) to match `get_binary_tags`/synthesis order.
     pub fn get_binary_tags(&self, track_id: i64) -> Result<Vec<BinaryTagRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT rowid, key, length(value_blob) FROM tags \
@@ -93,7 +91,7 @@ impl<M> Db<M> {
             Ok(BinaryTagRow {
                 rowid: r.get(0)?,
                 key: r.get(1)?,
-                byte_len: r.get(2)?,
+                byte_len: r.get::<_, i64>(2)? as u64,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

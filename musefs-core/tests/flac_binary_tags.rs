@@ -200,7 +200,7 @@ fn revalidate_backfills_structural_and_binary_rows_for_legacy_flac() {
 }
 
 /// Read a binary tag's full payload from the DB via incremental blob I/O.
-fn read_binary_payload(db: &musefs_db::Db, rowid: i64, len: i64) -> Vec<u8> {
+fn read_binary_payload(db: &musefs_db::Db, rowid: i64, len: u64) -> Vec<u8> {
     db.read_binary_tag_chunk(rowid, 0, len as usize).unwrap()
 }
 

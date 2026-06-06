@@ -22,15 +22,24 @@ impl<M> Db<M> {
         )?;
         let mut rows = stmt.query(params![id])?;
         match rows.next()? {
-            Some(r) => Ok(Some(Art {
-                id: r.get(0)?,
-                sha256: r.get(1)?,
-                mime: r.get(2)?,
-                width: r.get(3)?,
-                height: r.get(4)?,
-                byte_len: r.get(5)?,
-                data: r.get(6)?,
-            })),
+            Some(r) => {
+                let byte_len: i64 = r.get(5)?;
+                if byte_len < 0 {
+                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                        "negative byte_len {byte_len} for art id {id}"
+                    ))
+                    .into());
+                }
+                Ok(Some(Art {
+                    id: r.get(0)?,
+                    sha256: r.get(1)?,
+                    mime: r.get(2)?,
+                    width: r.get::<_, Option<i64>>(3)?.map(|v| v as u32),
+                    height: r.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+                    byte_len: byte_len as u64,
+                    data: r.get(6)?,
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -43,12 +52,21 @@ impl<M> Db<M> {
             .prepare("SELECT mime, width, height, byte_len FROM art WHERE id = ?1")?;
         let mut rows = stmt.query(params![id])?;
         match rows.next()? {
-            Some(r) => Ok(Some(ArtMeta {
-                mime: r.get(0)?,
-                width: r.get(1)?,
-                height: r.get(2)?,
-                byte_len: r.get(3)?,
-            })),
+            Some(r) => {
+                let byte_len: i64 = r.get(3)?;
+                if byte_len < 0 {
+                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                        "negative byte_len {byte_len} for art id {id}"
+                    ))
+                    .into());
+                }
+                Ok(Some(ArtMeta {
+                    mime: r.get(0)?,
+                    width: r.get::<_, Option<i64>>(1)?.map(|v| v as u32),
+                    height: r.get::<_, Option<i64>>(2)?.map(|v| v as u32),
+                    byte_len: byte_len as u64,
+                }))
+            }
             None => Ok(None),
         }
     }

@@ -163,7 +163,7 @@ proptest! {
         db.set_binary_tags(tid, &rows).unwrap();
         let stored = db.get_binary_tags(tid).unwrap();
         let inputs: Vec<BinaryTagInput> = stored.iter().map(|r| {
-            BinaryTagInput { key: r.key.clone(), payload_id: r.rowid, len: r.byte_len as u64 }
+            BinaryTagInput { key: r.key.clone(), payload_id: r.rowid, len: r.byte_len }
         }).collect();
         let mut map: HashMap<i64, Vec<u8>> = HashMap::new();
         for r in &stored {
