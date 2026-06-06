@@ -36,37 +36,64 @@ Four test-suite idiom problems, all flagged in issue #139:
   `Default` impl supplies `WINDOW` (1<<20), `BATCH_BYTES` (64<<20), and the
   current `jobs` default.
 - Delete `scan_window()` and `batch_bytes_cap()` (env read + zero-filter
-  parsing). The probe path takes `window` as a parameter, threaded from
-  `scan_directory_with` / `revalidate_with` (which already carry
-  `&ScanOptions`); the batch pipeline reads `opts.batch_bytes` directly.
+  parsing). Threading chain: `scan_directory_with` / `revalidate_with` →
+  `run_pipeline` (already takes `&ScanOptions`; reads `opts.batch_bytes`
+  where it called `batch_bytes_cap()`) → `probe_file`, whose signature gains
+  the `window` parameter (it is the sole `scan_window()` consumer).
 - The `MUSEFS_SCAN_WINDOW` and `MUSEFS_BATCH_BYTES` env vars are removed
   entirely (decision: no fallback layer — they had no non-test consumers).
 - No validation on the new fields: they are test-only injection points and
   the `Default` values are the only production path.
 
+Call-site blast radius — adding required fields breaks **every**
+`ScanOptions` struct literal workspace-wide, not just the env-mutating tests:
+
+- **Production:** `musefs-cli/src/lib.rs` (`run_scan`) constructs a literal;
+  it gains `..Default::default()` (behavior unchanged — defaults are what
+  the env-free production path always got).
+- Tests with literals: `pipeline_backpressure.rs`,
+  `scan_counters.rs` (several), `bench_ingest.rs` (several), and the
+  in-file `scan.rs` test `jobs1_and_jobs_n_produce_equivalent_state`. Both
+  spellings occur: `ScanOptions { jobs: 4 }` → add `..Default::default()`,
+  and field-shorthand `ScanOptions { jobs }` →
+  `ScanOptions { jobs, ..Default::default() }`. `bench_ingest.rs` is in
+  scope only for these mechanical edits (it must compile under
+  `cargo test --workspace`).
+- Tests that today combine the **no-options** API with env mutation switch
+  APIs instead: `probe_equivalence.rs` and two `scan_counters.rs` tests call
+  `scan_directory(&db, dir)` under `MUSEFS_SCAN_WINDOW`; they become
+  `scan_directory_with(&db, dir, &ScanOptions { window: 64, ..Default::default() })`
+  (likewise for `MUSEFS_BATCH_BYTES` → `batch_bytes`).
+
 Test updates:
 
 - `scan.rs` unit tests drop their `ENV_LOCK`. `scan_window_default_and_env`
   and `batch_bytes_cap_default_and_env` are replaced by one test asserting
-  `ScanOptions::default()` field values — this keeps the constant/initializer
-  mutants killed (the in-diff mutation gate mutates `Default` impl
-  initializers).
-- `scan_counters.rs`, `probe_equivalence.rs`, and `pipeline_backpressure.rs`
-  pass options instead of mutating env; their `ENV_LOCK`s and
-  `set_var`/`remove_var` calls go away. Existing `ScanOptions { jobs: 4 }`
-  struct literals become `ScanOptions { jobs: 4, ..Default::default() }`.
-- The lock-registry comment in `musefs-core/src/lock.rs` that names
-  "scan.rs ENV_LOCK" is updated.
+  `ScanOptions::default()` field values **against decimal literals**
+  (`1_048_576`, `67_108_864`), not against `WINDOW`/`BATCH_BYTES` — the
+  in-diff mutation gate mutates const and `Default` initializers, and a
+  `== WINDOW` assertion lets a `<<`→`>>` const mutant flow to both sides and
+  survive.
+- Env-lock reality check: only `scan_counters.rs` has a test-file `ENV_LOCK`
+  (deleted); `probe_equivalence.rs` and `pipeline_backpressure.rs` call
+  `set_var`/`remove_var` **unguarded** today — a latent cross-test race this
+  change fixes as a side benefit.
+- Stale references scrubbed: the lock-registry comment in
+  `musefs-core/src/lock.rs` naming "scan.rs ENV_LOCK", plus comments
+  mentioning the deleted env vars in `tests/common/corpus.rs`,
+  `tests/metrics.rs`, and `tests/scan_counters.rs`.
 - Out of scope: `common_corpus_smoke.rs` keeps its `ENV_LOCK` — those tests
   deliberately exercise `MUSEFS_BENCH_*` env *parsing*, which is a real
   user-facing bench-config surface, not test plumbing.
 
 ### 2. Consolidate FLAC fixtures into `fuzz_check::fixtures`
 
-- Move the four helpers into `musefs_format::fuzz_check::fixtures` as
-  `pub fn`s, keeping the better-commented bodies (the musefs-format copy).
-- Rewrite the existing `fixtures::flac()` on top of them and delete
-  `fuzz_check`'s private `flac_block` — three copies become one.
+- Consolidate into `musefs_format::fuzz_check::fixtures`: its existing
+  private `flac_block` / `streaminfo_body` / `vorbis_comment_body` are
+  overwritten with the better-commented bodies (the musefs-format
+  `tests/common` copy) and made `pub`; `make_flac` is **added** (it has no
+  `fuzz_check` counterpart today — `fixtures::flac()` inlines its assembly).
+- Rewrite `fixtures::flac()` on top of `make_flac` — three copies become one.
 - Add a self-dev-dependency to musefs-format
   (`musefs-format = { path = ".", features = ["fuzzing"] }`) so the
   feature-gated `fuzz_check` module is visible to musefs-format's own
@@ -74,7 +101,9 @@ Test updates:
 - Both `tests/common/mod.rs` files replace their local copies with
   `pub use musefs_format::fuzz_check::fixtures::{flac_block, streaminfo_body,
   vorbis_comment_body, make_flac};` — call sites in dependent test files do
-  not change.
+  not change, and the `pub use` keeps in-module callers (`write_flac`,
+  `write_oggflac_with_art` in musefs-core's `common/mod.rs`) resolving
+  unchanged.
 - Side effect (documented in CLAUDE.md): feature unification from the
   self-dev-dependency means plain `cargo test -p musefs-format` now runs the
   format-layer proptests; the explicit `--features fuzzing` flag is no longer
@@ -88,9 +117,10 @@ Rejected alternatives: a cross-crate `#[path]` include (brittle, leaves the
 ### 3. Bench fixture returns its `TempDir`
 
 `fixture()` in `musefs-core/benches/read_throughput.rs` returns
-`(Arc<Musefs>, Vec<u64>, TempDir)`; each caller binds the dir (`_dir`) so it
-lives for the bench's scope. `std::mem::forget(dir)` and its justifying
-comment are removed.
+`(Arc<Musefs>, Vec<u64>, TempDir)`; its two callers (`bench_sequential_read`,
+the concurrent bench) bind the dir (`_dir`) so it lives for the bench's
+scope. `std::mem::forget(dir)` and its justifying comment are removed. The
+sibling `cold_fixture()` already returns its `TempDir` and is the model.
 
 ### 4. Locally-evident bounds in the `b64` fuzz target
 
@@ -103,8 +133,10 @@ let Some(max_take) = total.checked_sub(out_off) else { return };
 let take = match u.int_in_range(1..=max_take) { ... };
 ```
 
-The standalone `total == 0` guard becomes redundant (subsumed by the first
-`checked_sub`) and is dropped. Behavior is identical; underflow-safety no
+The standalone `total == 0` guard is dead code — `img` is guaranteed
+non-empty, so `total = b64_len(img.len()) >= 4` always — and is dropped; the
+first `checked_sub` covers the case anyway. `let full = encode_b64_slice(…)`
+stays before the bounds block. Behavior is identical; underflow-safety no
 longer depends on statement order.
 
 ## Verification
