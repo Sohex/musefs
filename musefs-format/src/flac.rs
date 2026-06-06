@@ -47,9 +47,7 @@ fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
         let header = data[pos];
         let is_last = (header & 0x80) != 0;
         let block_type = header & 0x7F;
-        let len = ((data[pos + 1] as usize) << 16)
-            | ((data[pos + 2] as usize) << 8)
-            | (data[pos + 3] as usize);
+        let len = u24_be(data[pos + 1], data[pos + 2], data[pos + 3]);
         let body_start = pos + 4;
         let body_end = body_start + len;
         if body_end > data.len() {
@@ -102,9 +100,7 @@ pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
         let header = prefix[pos];
         let is_last = (header & 0x80) != 0;
         let block_type = header & 0x7F;
-        let len = ((prefix[pos + 1] as usize) << 16)
-            | ((prefix[pos + 2] as usize) << 8)
-            | (prefix[pos + 3] as usize);
+        let len = u24_be(prefix[pos + 1], prefix[pos + 2], prefix[pos + 3]);
         let body_start = pos + 4;
         let body_end = body_start + len;
         if body_end > prefix.len() {
@@ -146,12 +142,13 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
 use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
 
+/// Inclusive maximum body length of a FLAC metadata block (24-bit length field).
+pub(crate) const MAX_BLOCK_BODY: u64 = 0x00FF_FFFF;
+
 pub(crate) fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usize, is_last: bool) {
     let first = (if is_last { 0x80 } else { 0 }) | (block_type & 0x7F);
     out.push(first);
-    out.push(((body_len >> 16) & 0xFF) as u8);
-    out.push(((body_len >> 8) & 0xFF) as u8);
-    out.push((body_len & 0xFF) as u8);
+    out.extend_from_slice(&(body_len as u32).to_be_bytes()[1..]);
 }
 
 /// Map a stored structural-block `kind` string back to its FLAC block type.
@@ -246,6 +243,9 @@ pub fn synthesize_layout(
     }
 
     let vc = crate::vorbiscomment::build(tags);
+    if vc.len() as u64 > MAX_BLOCK_BODY {
+        return Err(FormatError::TooLarge);
+    }
     push_block_header(&mut buf, BLOCK_VORBIS_COMMENT, vc.len(), idx == last_index);
     buf.extend_from_slice(&vc);
     idx += 1;
@@ -256,7 +256,7 @@ pub fn synthesize_layout(
             "CUESHEET" => BLOCK_CUESHEET,
             _ => continue,
         };
-        if bt.len > 0x00FF_FFFF {
+        if bt.len > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
         push_block_header(&mut buf, block_type, bt.len as usize, idx == last_index);
@@ -274,7 +274,7 @@ pub fn synthesize_layout(
         }
         let framing = picture_body_framing(art);
         let body_len = framing.len() as u64 + art.data_len;
-        if body_len > 0x00FF_FFFF {
+        if body_len > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
         push_block_header(
@@ -318,9 +318,7 @@ pub fn read_vorbis_comments(data: &[u8]) -> Result<Vec<(String, String)>> {
         let header = data[pos];
         let is_last = (header & 0x80) != 0;
         let block_type = header & 0x7F;
-        let len = ((data[pos + 1] as usize) << 16)
-            | ((data[pos + 2] as usize) << 8)
-            | (data[pos + 3] as usize);
+        let len = u24_be(data[pos + 1], data[pos + 2], data[pos + 3]);
         let body_start = pos + 4;
         let body_end = body_start + len;
         if body_end > data.len() {
@@ -335,6 +333,11 @@ pub fn read_vorbis_comments(data: &[u8]) -> Result<Vec<(String, String)>> {
         }
     }
     Ok(Vec::new())
+}
+
+/// Assemble a 24-bit big-endian block length from its three raw bytes.
+fn u24_be(b0: u8, b1: u8, b2: u8) -> usize {
+    u32::from_be_bytes([0, b0, b1, b2]) as usize
 }
 
 pub(crate) fn read_u32_be(data: &[u8], pos: usize) -> Result<u32> {
@@ -408,9 +411,7 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
         let header = data[pos];
         let is_last = (header & 0x80) != 0;
         let block_type = header & 0x7F;
-        let len = ((data[pos + 1] as usize) << 16)
-            | ((data[pos + 2] as usize) << 8)
-            | (data[pos + 3] as usize);
+        let len = u24_be(data[pos + 1], data[pos + 2], data[pos + 3]);
         let body_start = pos + 4;
         let body_end = body_start + len;
         if body_end > data.len() {
@@ -495,9 +496,7 @@ mod tests {
     fn raw_block(block_type: u8, body: &[u8], last: bool, len_override: Option<usize>) -> Vec<u8> {
         let n = len_override.unwrap_or(body.len());
         let mut v = vec![(if last { 0x80 } else { 0 }) | (block_type & 0x7F)];
-        v.push((n >> 16) as u8);
-        v.push((n >> 8) as u8);
-        v.push(n as u8);
+        v.extend_from_slice(&(n as u32).to_be_bytes()[1..]);
         v.extend_from_slice(body);
         v
     }
@@ -543,9 +542,8 @@ mod tests {
     #[test]
     fn parse_blocks_decodes_24bit_length_high_byte() {
         // STREAMINFO header claims length 0x010000 (high byte set) over an empty body.
-        // Original: len = 65536 -> body_end > data.len() -> Malformed.
-        // :49 `<<16 -> >>16`: (0x01 >> 16) = 0 -> len = 0 -> body fits -> Ok.
-        // (:50/:51 `| -> ^` are equivalent here: the shifted bytes are disjoint.)
+        // Pins the high byte of the 24-bit length decode: len = 65536 -> body_end >
+        // data.len() -> Malformed; a decode that drops the high byte gets len 0 -> Ok.
         let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0000))]);
         assert_eq!(parse_blocks(&file), Err(FormatError::Malformed));
     }
@@ -614,16 +612,14 @@ mod tests {
 
     #[test]
     fn read_vorbis_comments_decodes_24bit_length() {
-        // :199 `<<16 -> >>16` AND :200 `| -> &`: high length byte set over a short
-        // body. Original len = 0x10000 -> Malformed. `>>16` -> len 0 -> Ok; `&` ->
-        // (0x10000 & 0) -> len 0 -> Ok. Either mutant returns Ok instead of Malformed.
+        // High length byte set over a short body: len = 0x10000 -> Malformed. Pins
+        // the high byte of the 24-bit length decode (dropping it gets len 0 -> Ok).
         let hi = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0000))]);
         assert_eq!(read_vorbis_comments(&hi), Err(FormatError::Malformed));
-        // :200 `<<8 -> >>8`: mid length byte set, high byte 0. Original len = 0x100
-        // -> Malformed; `>>8` -> len 0 -> Ok.
+        // Mid length byte set, high byte 0: len = 0x100 -> Malformed. Pins the mid
+        // byte (dropping it gets len 0 -> Ok).
         let mid = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x00_0100))]);
         assert_eq!(read_vorbis_comments(&mid), Err(FormatError::Malformed));
-        // (:200 `| -> ^` and :201 `| -> ^` are equivalent: disjoint shifted bytes.)
     }
 
     /// A FLAC PICTURE block body (big-endian fields), independent of production.
@@ -702,10 +698,10 @@ mod tests {
         // :283 `> -> >=`: non-PICTURE last block flush with end -> Ok(empty).
         let none = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, None)]);
         assert_eq!(read_pictures(&none).unwrap(), Vec::new());
-        // :289 `<<16 -> >>16` and :290 `| -> &`: high length byte over short body.
+        // High length byte over short body: pins the 24-bit decode's high byte.
         let hi = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0000))]);
         assert_eq!(read_pictures(&hi), Err(FormatError::Malformed));
-        // :290 `<<8 -> >>8`: mid length byte, high byte 0.
+        // Mid length byte (high byte 0): pins the 24-bit decode's mid byte.
         let mid = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x00_0100))]);
         assert_eq!(read_pictures(&mid), Err(FormatError::Malformed));
     }
@@ -802,13 +798,9 @@ mod tests {
         let expected_offset = (4 + 4 + len) as u64;
         match read_metadata_bounded(&file).unwrap() {
             Extent::Complete(meta) => {
-                // kills flac L105 `<< 16` -> `>> 16`: (0x01 >> 16) == 0 -> len loses
-                //   its high byte -> body_end shifts -> wrong audio_offset.
-                // kills flac L106 `<< 8` -> `>> 8`: (0x02 >> 8) == 0 -> mid byte lost.
-                // kills flac L106 `|` -> `&`: (0x010000) & (0x000200) == 0 -> length
-                //   collapses (disjoint high/mid bits) -> wrong audio_offset.
-                // kills flac L107 final `|` -> assembles low byte; an exact audio_offset
-                //   pins the full 24-bit assembly.
+                // The exact audio_offset pins all three bytes of the 24-bit length
+                // decode: losing the high, mid, or low byte shifts body_end and
+                // yields a wrong audio_offset.
                 assert_eq!(meta.audio_offset, expected_offset);
             }
             other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
@@ -816,10 +808,10 @@ mod tests {
     }
 
     #[test]
-    fn bounded_length_or_vs_and_high_byte() {
-        // Dedicated `|` -> `&` kill on flac L106: declare length 0x010100 (high byte
-        // 0x01, mid byte 0x01, low 0x00). Correct len = 65792. With `(b1<<16) &
-        // (b2<<8)` the disjoint bits AND to 0, then `| low` -> very different length.
+    fn bounded_length_decodes_high_and_mid_bytes() {
+        // Declare length 0x010100 (high byte 0x01, mid byte 0x01, low 0x00); correct
+        // len = 65792. A decode that collapses the high or mid byte asks for a very
+        // different body.
         // Use NeedMore: body is absent, so the correct parse asks for the full body.
         let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0100))]);
         match read_metadata_bounded(&file).unwrap() {
@@ -947,6 +939,26 @@ mod tests {
         // one byte over must still error, pinning the high side of the boundary.
         assert_eq!(
             synthesize_layout(&[], 0, 0, &[], &[], &[mk(at_limit + 1)]),
+            Err(FormatError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn synthesize_layout_vorbis_comment_block_size_boundary_is_inclusive() {
+        // The regenerated VORBIS_COMMENT body must also fit FLAC's 24-bit block
+        // length. Derive the non-value overhead from production, then size the
+        // value so the body lands exactly on the limit; one more byte errors.
+        // Mirrors the PICTURE/binary-tag boundary tests: the `>` accepts the
+        // inclusive limit while the `>=` mutant rejects it.
+        let overhead = crate::vorbiscomment::build(&[TagInput::new("title", "")]).len() as u64;
+        let at_limit = "x".repeat((MAX_BLOCK_BODY - overhead) as usize);
+        let tags = [TagInput::new("title", at_limit.as_str())];
+        assert!(synthesize_layout(&[], 0, 0, &tags, &[], &[]).is_ok());
+        // one byte over must still error, pinning the high side of the boundary.
+        let over = format!("{at_limit}x");
+        let tags = [TagInput::new("title", over.as_str())];
+        assert_eq!(
+            synthesize_layout(&[], 0, 0, &tags, &[], &[]),
             Err(FormatError::TooLarge)
         );
     }

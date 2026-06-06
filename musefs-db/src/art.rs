@@ -3,10 +3,12 @@ use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 
-fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
+// Hand-encoded: sha2 0.11's digest output (hybrid_array::Array) has no
+// LowerHex impl, so `format!("{:x}", ..)` does not compile. Revisit on the
+// next sha2 bump (RustCrypto/hybrid-array#201).
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let mut s = String::with_capacity(64);
-    for b in digest {
+    for b in Sha256::digest(data) {
         use std::fmt::Write;
         let _ = write!(s, "{b:02x}");
     }

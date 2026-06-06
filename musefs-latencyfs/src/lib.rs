@@ -401,9 +401,13 @@ impl fuser::Filesystem for PassthroughFs {
             if let Ok(cstr) =
                 std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(p.as_os_str()))
             {
-                let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+                let mut s = std::mem::MaybeUninit::<libc::statvfs>::uninit();
                 // SAFETY: cstr is a valid NUL-terminated path; s is a valid out-param.
-                if unsafe { libc::statvfs(cstr.as_ptr(), &raw mut s) } == 0 {
+                if unsafe { libc::statvfs(cstr.as_ptr(), s.as_mut_ptr()) } == 0 {
+                    // SAFETY: statvfs returned 0, so it fully initialized `s`.
+                    let s = unsafe { s.assume_init() };
+                    #[allow(clippy::unnecessary_cast)]
+                    // field types vary by platform (rust-lang/rust-clippy#17166)
                     return reply.statfs(
                         s.f_blocks as u64,
                         s.f_bfree as u64,

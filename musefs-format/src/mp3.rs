@@ -132,10 +132,13 @@ fn syncsafe(n: u32) -> [u8; 4] {
     ]
 }
 
+/// Inclusive maximum of a 28-bit ID3v2.4 syncsafe size field.
+const SYNCHSAFE_MAX: usize = 0x0FFF_FFFF;
+
 fn push_frame_header(out: &mut Vec<u8>, id: &[u8; 4], data_len: usize) -> Result<()> {
     // ID3v2.4 frame sizes are a 28-bit syncsafe field; guard so an oversized frame
     // is a hard error rather than a silently-truncated (corrupt) tag.
-    if data_len > 0x0FFF_FFFF {
+    if data_len > SYNCHSAFE_MAX {
         return Err(FormatError::TooLarge);
     }
     out.extend_from_slice(id);
@@ -383,7 +386,7 @@ pub fn build_id3v2_segments(
     // The total tag size is a 28-bit syncsafe field. Ingestion caps each art well
     // under this, but guard at the format boundary so an oversized tag (e.g. many
     // large pictures summing past the limit) is a hard error, not a truncated file.
-    if frames_len > 0x0FFF_FFFF {
+    if frames_len > SYNCHSAFE_MAX as u64 {
         return Err(FormatError::TooLarge);
     }
     header.extend_from_slice(&syncsafe(frames_len as u32));
@@ -476,9 +479,7 @@ fn id3v2_alloc_safe(data: &[u8]) -> bool {
             return false;
         }
         let size = if major == 2 {
-            ((data[pos + 3] as usize) << 16)
-                | ((data[pos + 4] as usize) << 8)
-                | (data[pos + 5] as usize)
+            u32::from_be_bytes([0, data[pos + 3], data[pos + 4], data[pos + 5]]) as usize
         } else if major == 3 {
             // ID3v2.3: plain 32-bit big-endian frame size.
             // Frame flags at pos+8..pos+10: reject any non-zero flags.  The id3
@@ -1206,15 +1207,21 @@ mod tests {
     fn alloc_safe_v22_24bit_size_decode() {
         // v2.2 frame header is 6 bytes: 3-byte id + 3-byte 24-bit big-endian size.
         // Declare a size that the *correct* decode puts out of bounds (reject), so a
-        // wrong shift/OR that shrinks the size would wrongly accept.
+        // decode that drops a size byte would wrongly accept.
         // size bytes [0x00,0x01,0x00] = 256, body = 6 (header only, no room) -> reject.
         let mut f_mid = b"TT2".to_vec();
         f_mid.extend_from_slice(&[0x00, 0x01, 0x00]); // 24-bit size = 256
-        assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_mid))); // kills <<8 and |->&
-                                                                   // size bytes [0x01,0x00,0x00] = 65536 -> reject; `<<16 -> >>16` shrinks to 0.
+        assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_mid))); // pins the mid byte
+                                                                   // size bytes [0x01,0x00,0x00] = 65536 -> reject; pins the high byte.
         let mut f_hi = b"TT2".to_vec();
         f_hi.extend_from_slice(&[0x01, 0x00, 0x00]);
         assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_hi)));
+        // size bytes [0x00,0x00,0x10] = 16, body = 6, tag_end = 16,
+        // data_start = 16. 16 > 16 - 16 = 0 -> reject. Pins the low byte:
+        // reading the flags byte (0x00) instead gives size 0 -> wrongly accept.
+        let mut f_lo = b"TT2".to_vec();
+        f_lo.extend_from_slice(&[0x00, 0x00, 0x10]); // 24-bit size = 16
+        assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_lo)));
         // A valid in-bounds v2.2 frame is accepted: size 4, body = 6+4 = 10.
         let mut f_ok = b"TT2".to_vec();
         f_ok.extend_from_slice(&[0x00, 0x00, 0x04]);

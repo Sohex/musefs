@@ -156,7 +156,7 @@ fn emit(
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: src.to_string_lossy().to_string(),
+            backing_path: src.to_string_lossy().into_owned(),
             format,
             audio_offset,
             audio_length,
@@ -219,7 +219,7 @@ fn emit_binary(
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: src.to_string_lossy().to_string(),
+            backing_path: src.to_string_lossy().into_owned(),
             format,
             audio_offset,
             audio_length,

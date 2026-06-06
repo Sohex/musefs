@@ -455,7 +455,7 @@ mod tests {
         let (_d, path, ao, _alen) = new_serve_fixture();
         let backing = std::fs::File::open(&path).unwrap();
         // Parse the first page header to know its length.
-        let mut hdr = vec![0u8; 282];
+        let mut hdr = vec![0u8; MAX_OGG_HEADER_BYTES];
         backing.read_exact_at(&mut hdr, ao).unwrap();
         let h = musefs_format::ogg::parse_page(&hdr, 0).unwrap();
         // Target 10 bytes into the payload of page 0.
@@ -471,7 +471,7 @@ mod tests {
     fn find_page_start_at_page_boundary_returns_preceding_page() {
         let (_d, path, ao, _alen) = new_serve_fixture();
         let backing = std::fs::File::open(&path).unwrap();
-        let mut hdr = vec![0u8; 282];
+        let mut hdr = vec![0u8; MAX_OGG_HEADER_BYTES];
         backing.read_exact_at(&mut hdr, ao).unwrap();
         let h = musefs_format::ogg::parse_page(&hdr, 0).unwrap();
         // Target exactly at the boundary between page 0 and page 1.
@@ -533,7 +533,7 @@ mod tests {
         let want = new_reference_region(&path, ao, alen);
         // Parse the first page to get header_len.
         let backing = std::fs::File::open(&path).unwrap();
-        let mut hdr = vec![0u8; 282];
+        let mut hdr = vec![0u8; MAX_OGG_HEADER_BYTES];
         backing.read_exact_at(&mut hdr, ao).unwrap();
         let h = musefs_format::ogg::parse_page(&hdr, 0).unwrap();
         let hlen = h.header_len as u64;
@@ -552,7 +552,7 @@ mod tests {
         let (_d, path, ao, alen) = new_serve_fixture();
         let want = new_reference_region(&path, ao, alen);
         let backing = std::fs::File::open(&path).unwrap();
-        let mut hdr = vec![0u8; 282];
+        let mut hdr = vec![0u8; MAX_OGG_HEADER_BYTES];
         backing.read_exact_at(&mut hdr, ao).unwrap();
         let h = musefs_format::ogg::parse_page(&hdr, 0).unwrap();
         let hlen = h.header_len as u64;
@@ -569,7 +569,7 @@ mod tests {
         let (_d, path, ao, alen) = new_serve_fixture();
         let want = new_reference_region(&path, ao, alen);
         let backing = std::fs::File::open(&path).unwrap();
-        let mut hdr = vec![0u8; 282];
+        let mut hdr = vec![0u8; MAX_OGG_HEADER_BYTES];
         backing.read_exact_at(&mut hdr, ao).unwrap();
         let h = musefs_format::ogg::parse_page(&hdr, 0).unwrap();
         let hlen = h.header_len as u64;
@@ -585,7 +585,7 @@ mod tests {
         let (_d, path, ao, alen) = new_serve_fixture();
         let want = new_reference_region(&path, ao, alen);
         let backing = std::fs::File::open(&path).unwrap();
-        let mut hdr = vec![0u8; 282];
+        let mut hdr = vec![0u8; MAX_OGG_HEADER_BYTES];
         backing.read_exact_at(&mut hdr, ao).unwrap();
         let h = musefs_format::ogg::parse_page(&hdr, 0).unwrap();
         let p0_end = h.total_len() as u64;
@@ -668,7 +668,7 @@ mod tests {
     fn find_page_start_short_circuits_within_memoized_page() {
         let (_d, path, ao, _alen) = new_serve_fixture();
         let backing = std::fs::File::open(&path).unwrap();
-        let mut hdr = vec![0u8; 282];
+        let mut hdr = vec![0u8; MAX_OGG_HEADER_BYTES];
         backing.read_exact_at(&mut hdr, ao).unwrap();
         let h = musefs_format::ogg::parse_page(&hdr, 0).unwrap();
         // Prime the memo with page 0's geometry (header bytes unused by the lookup).

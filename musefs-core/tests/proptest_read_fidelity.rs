@@ -16,7 +16,7 @@ fn build(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>) {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().to_string(),
+            backing_path: path.to_string_lossy().into_owned(),
             format: Format::Flac,
             audio_offset,
             audio_length,
@@ -44,7 +44,7 @@ fn build_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempDir, 
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().to_string(),
+            backing_path: path.to_string_lossy().into_owned(),
             format: Format::Flac,
             audio_offset,
             audio_length,
@@ -88,7 +88,7 @@ fn build_wav(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().to_string(),
+            backing_path: path.to_string_lossy().into_owned(),
             format: Format::Wav,
             audio_offset,
             audio_length,
@@ -115,7 +115,7 @@ fn build_wav_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().to_string(),
+            backing_path: path.to_string_lossy().into_owned(),
             format: Format::Wav,
             audio_offset,
             audio_length,
@@ -353,7 +353,7 @@ fn build_mp3(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().to_string(),
+            backing_path: path.to_string_lossy().into_owned(),
             format: Format::Mp3,
             audio_offset,
             audio_length,
@@ -378,7 +378,7 @@ fn build_mp3_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().to_string(),
+            backing_path: path.to_string_lossy().into_owned(),
             format: Format::Mp3,
             audio_offset,
             audio_length,
@@ -556,7 +556,7 @@ fn build_m4a(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().to_string(),
+            backing_path: path.to_string_lossy().into_owned(),
             format: Format::M4a,
             audio_offset,
             audio_length,
@@ -581,7 +581,7 @@ fn build_m4a_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().to_string(),
+            backing_path: path.to_string_lossy().into_owned(),
             format: Format::M4a,
             audio_offset,
             audio_length,

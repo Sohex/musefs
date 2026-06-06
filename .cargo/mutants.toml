@@ -92,12 +92,6 @@ exclude_re = [
     'musefs-core/src/scan\.rs:831:25:',
     'musefs-core/src/scan\.rs:835:25:',
     'musefs-core/src/scan\.rs:871:29: replace \+ with -',
-    # flac::read_metadata_bounded 24-bit block-length assembly: the three length
-    # bytes occupy disjoint bit ranges after shifting, so `|`, `^`, and `+` are
-    # bit-for-bit identical there (the `|`->`&` variant collapses to 0 and IS
-    # caught). Same equivalence the sibling parse_blocks/read_vorbis_comments tests
-    # already note.
-    'musefs-format/src/flac\.rs:\d+:\d+: replace \| with \^ in read_metadata_bounded',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are

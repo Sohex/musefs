@@ -427,6 +427,9 @@ fn oggflac_packets_with_art(
     }
 
     let vc = crate::vorbiscomment::build(tags);
+    if vc.len() as u64 > crate::flac::MAX_BLOCK_BODY {
+        return Err(FormatError::TooLarge);
+    }
     let mut comment = Vec::new();
     crate::flac::push_block_header(&mut comment, 4, vc.len(), false);
     comment.extend_from_slice(&vc);
@@ -442,7 +445,7 @@ fn oggflac_packets_with_art(
     for art in arts {
         let prefix = picture_prefix(art.meta);
         let body_len = prefix.len() as u64 + art.meta.data_len;
-        if body_len > 0x00FF_FFFF {
+        if body_len > crate::flac::MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
         let mut blk = Vec::new();
@@ -1146,6 +1149,75 @@ mod tests {
         let pkt = b"\x7FFLAC\x01\x00\x00\x05rest";
         assert_eq!(oggflac_following_packets(pkt).unwrap(), 5);
         assert!(oggflac_following_packets(b"\x7FFLAC\x01\x00").is_err()); // 7 bytes (<9)
+    }
+
+    #[test]
+    fn oggflac_comment_block_size_boundary_is_inclusive() {
+        // The regenerated OggFLAC VORBIS_COMMENT block shares FLAC's 24-bit
+        // block length. Derive the non-value overhead from production, then
+        // size the value so the body lands exactly on the limit; one more byte
+        // errors. The `>` accepts the inclusive limit; the `>=` mutant rejects.
+        let header = OggHeader {
+            codec: Codec::OggFlac,
+            serial: 1,
+            packets: vec![vec![0x7F; 9]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let overhead =
+            crate::vorbiscomment::build(&[crate::input::TagInput::new("title", "")]).len() as u64;
+        let at_limit = "x".repeat((crate::flac::MAX_BLOCK_BODY - overhead) as usize);
+        let tags = [crate::input::TagInput::new("title", at_limit.as_str())];
+        assert!(oggflac_packets_with_art(&header, &tags, &[]).is_ok());
+        // one byte over must still error, pinning the high side of the boundary.
+        let over = format!("{at_limit}x");
+        let tags = [crate::input::TagInput::new("title", over.as_str())];
+        assert!(matches!(
+            oggflac_packets_with_art(&header, &tags, &[]),
+            Err(FormatError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn oggflac_picture_block_size_boundary_is_inclusive() {
+        // body_len = picture_prefix(meta).len() + data_len; the guard shares
+        // FLAC's 24-bit block limit. data_len is only a count (image bytes are
+        // streamed), so the exact boundary is cheap to pin. The `>` accepts the
+        // inclusive limit — which also pins the `+` assembly, since a product
+        // of the two terms overshoots it — while the `>=` mutant rejects it.
+        let header = OggHeader {
+            codec: Codec::OggFlac,
+            serial: 1,
+            packets: vec![vec![0x7F; 9]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let mk = |data_len: u64| crate::input::ArtInput {
+            art_id: 1,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: 3,
+            width: 0,
+            height: 0,
+            data_len,
+        };
+        let framing_len = picture_prefix(&mk(0)).len() as u64;
+        let at_limit = mk(crate::flac::MAX_BLOCK_BODY - framing_len);
+        let arts = [OggArt {
+            meta: &at_limit,
+            image: &[],
+        }];
+        assert!(oggflac_packets_with_art(&header, &[], &arts).is_ok());
+        // one byte over must still error, pinning the high side of the boundary.
+        let over = mk(crate::flac::MAX_BLOCK_BODY - framing_len + 1);
+        let arts = [OggArt {
+            meta: &over,
+            image: &[],
+        }];
+        assert!(matches!(
+            oggflac_packets_with_art(&header, &[], &arts),
+            Err(FormatError::TooLarge)
+        ));
     }
 
     #[test]

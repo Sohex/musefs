@@ -13,7 +13,7 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: flac.to_string_lossy().to_string(),
+            backing_path: flac.to_string_lossy().into_owned(),
             format: Format::Flac,
             audio_offset,
             audio_length,
@@ -73,7 +73,7 @@ fn resolve_errors_when_audio_bounds_overrun_the_file() {
     // is valid, but offset + length exceeds the file size).
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: flac.to_string_lossy().to_string(),
+            backing_path: flac.to_string_lossy().into_owned(),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: meta.len() as i64 + 1,
