@@ -31,26 +31,30 @@ fn flac_with_big_art(data_len: usize, audio: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&3u32.to_be_bytes()); // picture type (front cover)
     let mime = b"image/png";
-    body.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+    body.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
     body.extend_from_slice(mime);
     body.extend_from_slice(&0u32.to_be_bytes()); // description length
     body.extend_from_slice(&0u32.to_be_bytes()); // width
     body.extend_from_slice(&0u32.to_be_bytes()); // height
     body.extend_from_slice(&0u32.to_be_bytes()); // depth
     body.extend_from_slice(&0u32.to_be_bytes()); // colors
-    body.extend_from_slice(&(data_len as u32).to_be_bytes());
+    body.extend_from_slice(&u32::try_from(data_len).unwrap().to_be_bytes());
     // Distinct, position-sensitive bytes so a misparse is observable.
-    body.extend((0..data_len).map(|i| (i % 251) as u8));
+    body.extend((0u8..=200).cycle().take(data_len));
     v.push(0x86); // last-block flag (0x80) | PICTURE (0x06)
     let blen = body.len();
-    v.extend_from_slice(&[(blen >> 16) as u8, (blen >> 8) as u8, blen as u8]);
+    v.extend_from_slice(&[
+        u8::try_from((blen >> 16) & 0xFF).unwrap(),
+        u8::try_from((blen >> 8) & 0xFF).unwrap(),
+        u8::try_from(blen & 0xFF).unwrap(),
+    ]);
     v.extend_from_slice(&body);
     v.extend_from_slice(audio);
     v
 }
 
 /// Normalize a DB to comparable `(path, audio_offset, audio_length)` rows.
-fn rows(db: &Db) -> Vec<(String, i64, i64)> {
+fn rows(db: &Db) -> Vec<(String, u64, u64)> {
     let mut r: Vec<_> = db
         .list_tracks()
         .unwrap()

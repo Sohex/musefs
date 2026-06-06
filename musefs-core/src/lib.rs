@@ -15,6 +15,7 @@ mod tree;
 pub use db_pool::DbPool;
 pub use error::{CoreError, Result};
 pub use facade::{Attr, Fh, Mode, MountConfig, Musefs};
+pub use musefs_db::convert;
 pub use reader::{read_at, read_at_with_file, HeaderCache, ResolvedFile};
 pub use scan::scan_directory_full_oracle;
 pub use scan::{

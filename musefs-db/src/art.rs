@@ -59,7 +59,7 @@ impl<M> Db<M> {
     /// than silently zero-filling.
     pub fn read_art_chunk_into(&self, art_id: i64, offset: u64, buf: &mut [u8]) -> Result<()> {
         let blob = self.conn.blob_open("main", "art", "data", art_id, true)?;
-        blob.read_at_exact(buf, offset as usize)?;
+        blob.read_at_exact(buf, crate::convert::usize_from(offset))?;
         Ok(())
     }
 
@@ -94,7 +94,7 @@ impl Db<ReadWrite> {
             "INSERT INTO art (sha256, mime, width, height, byte_len, data)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(sha256) DO NOTHING",
-            params![sha, a.mime, a.width, a.height, a.data.len() as i64, a.data],
+            params![sha, a.mime, a.width, a.height, a.data.len() as u64, a.data],
         )?;
         let id =
             self.conn

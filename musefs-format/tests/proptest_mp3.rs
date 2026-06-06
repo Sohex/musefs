@@ -106,12 +106,12 @@ proptest! {
             backing_mtime: 0,
         }).unwrap();
         let db_tags: Vec<musefs_db::BinaryTag> = opaque.iter().enumerate().map(|(i, e)| {
-            musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: i as i64 }
+            musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: u64::try_from(i).unwrap() }
         }).collect();
         db.set_binary_tags(tid, &db_tags).unwrap();
         let rows = db.get_binary_tags(tid).unwrap();
         let binary_tag_inputs: Vec<BinaryTagInput> = rows.iter().map(|r| {
-            BinaryTagInput { key: r.key.clone(), payload_id: r.rowid, len: r.byte_len as u64 }
+            BinaryTagInput { key: r.key.clone(), payload_id: r.rowid, len: r.byte_len }
         }).collect();
 
         // Step 3: Build promoted text tags.
@@ -126,7 +126,7 @@ proptest! {
         // Step 5: Materialize — inline bytes + substituted BinaryTag payloads.
         let mut materialized = Vec::new();
         let payload_map: std::collections::HashMap<i64, Vec<u8>> = rows.iter().map(|r| {
-            let blob = db.read_binary_tag_chunk(r.rowid, 0, r.byte_len as usize).unwrap();
+            let blob = db.read_binary_tag_chunk(r.rowid, 0, usize::try_from(r.byte_len).unwrap()).unwrap();
             (r.rowid, blob)
         }).collect();
         for seg in &segments {

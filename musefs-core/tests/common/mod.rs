@@ -11,45 +11,45 @@ pub use musefs_format::fuzz_check::fixtures::{
 
 /// Write a simple FLAC (STREAMINFO + comment + audio) to `path`,
 /// returning (audio_offset, audio_length).
-pub fn write_flac(path: &Path, comments: &[&str], audio: &[u8]) -> (i64, i64) {
+pub fn write_flac(path: &Path, comments: &[&str], audio: &[u8]) -> (u64, u64) {
     let si = streaminfo_body();
     let vc = vorbis_comment_body("orig", comments);
     let bytes = make_flac(&[(0, si), (4, vc)], audio);
-    let audio_offset = (bytes.len() - audio.len()) as i64;
+    let audio_offset = (bytes.len() - audio.len()) as u64;
     std::fs::write(path, &bytes).unwrap();
-    (audio_offset, audio.len() as i64)
+    (audio_offset, audio.len() as u64)
 }
 
 /// Write a minimal MP3 (a 10-byte empty ID3v2.4 tag, then the given audio bytes)
 /// to `path`, returning (audio_offset, audio_length). The leading tag is
 /// arbitrary: MP3 synthesis regenerates the ID3v2 region entirely from the DB and
 /// never reads the backing front, so only the audio offset/length matter.
-pub fn write_mp3(path: &Path, audio: &[u8]) -> (i64, i64) {
+pub fn write_mp3(path: &Path, audio: &[u8]) -> (u64, u64) {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"ID3");
     bytes.extend_from_slice(&[0x04, 0x00, 0x00]); // version 2.4.0, no flags
     bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // synchsafe size 0
-    let audio_offset = bytes.len() as i64;
+    let audio_offset = bytes.len() as u64;
     bytes.extend_from_slice(audio);
     std::fs::write(path, &bytes).unwrap();
-    (audio_offset, audio.len() as i64)
+    (audio_offset, audio.len() as u64)
 }
 
 /// Write a minimal moov-first M4A (see `minimal_m4a`) to `path`, returning
 /// (audio_offset, audio_length) for the verbatim trailing `mdat` payload. M4A
 /// synthesis re-scans the file's structural boxes and serves the mdat payload
 /// verbatim, so the stored bounds need only satisfy the reader's size guard.
-pub fn write_m4a(path: &Path, audio: &[u8]) -> (i64, i64) {
+pub fn write_m4a(path: &Path, audio: &[u8]) -> (u64, u64) {
     let bytes = minimal_m4a(audio);
-    let audio_offset = (bytes.len() - audio.len()) as i64;
+    let audio_offset = (bytes.len() - audio.len()) as u64;
     std::fs::write(path, &bytes).unwrap();
-    (audio_offset, audio.len() as i64)
+    (audio_offset, audio.len() as u64)
 }
 
 /// Write a minimal valid PCM WAV (`fmt ` + `data`) to `path`, returning
 /// (audio_offset, audio_length) of the `data` payload. Tags are applied via the DB
 /// by the caller (mirrors how `write_flac` is paired with `replace_tags`).
-pub fn write_wav(path: &Path, audio: &[u8]) -> (i64, i64) {
+pub fn write_wav(path: &Path, audio: &[u8]) -> (u64, u64) {
     let mut fmt = Vec::new();
     fmt.extend_from_slice(&1u16.to_le_bytes()); // PCM
     fmt.extend_from_slice(&1u16.to_le_bytes()); // mono
@@ -61,22 +61,25 @@ pub fn write_wav(path: &Path, audio: &[u8]) -> (i64, i64) {
     let mut body = Vec::new();
     for (id, payload) in [(&b"fmt "[..], &fmt[..]), (&b"data"[..], audio)] {
         body.extend_from_slice(id);
-        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
         body.extend_from_slice(payload);
     }
     let mut bytes = b"RIFF".to_vec();
-    bytes.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
     bytes.extend_from_slice(b"WAVE");
     bytes.extend_from_slice(&body);
 
-    let audio_offset = (bytes.len() - audio.len()) as i64;
+    let audio_offset = (bytes.len() - audio.len()) as u64;
     std::fs::write(path, &bytes).unwrap();
-    (audio_offset, audio.len() as i64)
+    (audio_offset, audio.len() as u64)
 }
 
 /// Build a 32-bit-size box: [size][type][payload].
 fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-    let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+    let mut v = u32::try_from(8 + payload.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
     v.extend_from_slice(kind);
     v.extend_from_slice(payload);
     v
@@ -133,7 +136,7 @@ pub fn minimal_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     // that shrinks the `moov` patches the offset below zero and synthesis fails
     // (TooLarge). With the true offset, the patched value lands at the new payload
     // position. The first `stco` occurrence is the box type (it precedes `mdat`).
-    let mdat_payload_offset = (out.len() - mdat_payload.len()) as u32;
+    let mdat_payload_offset = u32::try_from(out.len() - mdat_payload.len()).unwrap();
     let stco = out
         .windows(4)
         .position(|w| w == b"stco")
@@ -187,7 +190,7 @@ pub fn minimal_m4a_moov_last(mdat_payload: &[u8]) -> Vec<u8> {
     // and could otherwise contain a false `stco` byte match.
     let moov_start = ftyp.len() + mdat.len();
     let mut out = [ftyp, mdat, moov].concat();
-    let mdat_payload_offset = (8 + b"M4A isom".len() + 8) as u32;
+    let mdat_payload_offset = u32::try_from(8 + b"M4A isom".len() + 8).unwrap();
     let stco_pos = moov_start
         + out[moov_start..]
             .windows(4)
@@ -200,12 +203,12 @@ pub fn minimal_m4a_moov_last(mdat_payload: &[u8]) -> Vec<u8> {
 
 /// Write a moov-at-end M4A to `path`, returning (audio_offset, audio_length) of
 /// the verbatim `mdat` payload.
-pub fn write_m4a_moov_last(path: &Path, audio: &[u8]) -> (i64, i64) {
+pub fn write_m4a_moov_last(path: &Path, audio: &[u8]) -> (u64, u64) {
     let bytes = minimal_m4a_moov_last(audio);
     // ftyp: 8 header + 8 payload = 16; mdat header: 8 → payload at offset 24.
-    let audio_offset = (8 + b"M4A isom".len() + 8) as i64;
+    let audio_offset = (8 + b"M4A isom".len() + 8) as u64;
     std::fs::write(path, &bytes).unwrap();
-    (audio_offset, audio.len() as i64)
+    (audio_offset, audio.len() as u64)
 }
 
 /// Write a minimal valid Ogg **Opus** file (two header pages + one audio page
@@ -217,7 +220,7 @@ pub fn write_m4a_moov_last(path: &Path, audio: &[u8]) -> (i64, i64) {
 /// The synthesizer treats the audio packet body as opaque (renumbers pages,
 /// recomputes CRCs, never decodes), so arbitrary `audio` bytes are valid. The
 /// return is informational — `scan_directory` re-probes the file.
-pub fn write_ogg(path: &Path, audio: &[u8]) -> (i64, i64) {
+pub fn write_ogg(path: &Path, audio: &[u8]) -> (u64, u64) {
     use musefs_format::ogg::page_test_support::{
         build_header_pub, lace_packet_pub, vorbis_body_empty,
     };
@@ -232,7 +235,7 @@ pub fn write_ogg(path: &Path, audio: &[u8]) -> (i64, i64) {
     let (page, _) = lace_packet_pub(serial, header_pages, false, 960, audio);
     bytes.extend_from_slice(&page);
     std::fs::write(path, &bytes).unwrap();
-    (header_len as i64, (bytes.len() - header_len) as i64)
+    (header_len as u64, (bytes.len() - header_len) as u64)
 }
 
 /// A FLAC PICTURE block body (type 3 = front cover, image/png) carrying `data`.
@@ -243,14 +246,14 @@ pub fn write_ogg(path: &Path, audio: &[u8]) -> (i64, i64) {
 pub fn picture_block_body(data: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
-    v.extend_from_slice(&(b"image/png".len() as u32).to_be_bytes());
+    v.extend_from_slice(&u32::try_from(b"image/png".len()).unwrap().to_be_bytes());
     v.extend_from_slice(b"image/png");
     v.extend_from_slice(&0u32.to_be_bytes()); // empty description
     v.extend_from_slice(&1u32.to_be_bytes()); // width
     v.extend_from_slice(&1u32.to_be_bytes()); // height
     v.extend_from_slice(&0u32.to_be_bytes()); // depth
     v.extend_from_slice(&0u32.to_be_bytes()); // colors
-    v.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    v.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
     v.extend_from_slice(data);
     v
 }
@@ -264,7 +267,7 @@ pub fn write_opus_with_art(
     comments: &[&str],
     picture: &[u8],
     audio: &[u8],
-) -> (i64, i64) {
+) -> (u64, u64) {
     use base64::Engine as _;
     use musefs_format::ogg::page_test_support::{build_header_pub, lace_packet_pub};
     let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
@@ -282,7 +285,7 @@ pub fn write_opus_with_art(
     let (page, _) = lace_packet_pub(serial, header_pages, false, 960, audio);
     bytes.extend_from_slice(&page);
     std::fs::write(path, &bytes).unwrap();
-    (header_len as i64, (bytes.len() - header_len) as i64)
+    (header_len as u64, (bytes.len() - header_len) as u64)
 }
 
 /// Write an OggFLAC file (`0x7F "FLAC"` 1.0 mapping) whose header packets carry
@@ -295,7 +298,7 @@ pub fn write_oggflac_with_art(
     comments: &[&str],
     picture: &[u8],
     audio: &[u8],
-) -> (i64, i64) {
+) -> (u64, u64) {
     use musefs_format::ogg::page_test_support::{build_header_pub, lace_packet_pub};
     let mut pkt0 = vec![0x7F];
     pkt0.extend_from_slice(b"FLAC");
@@ -311,5 +314,5 @@ pub fn write_oggflac_with_art(
     let (page, _) = lace_packet_pub(serial, header_pages, false, 960, audio);
     bytes.extend_from_slice(&page);
     std::fs::write(path, &bytes).unwrap();
-    (header_len as i64, (bytes.len() - header_len) as i64)
+    (header_len as u64, (bytes.len() - header_len) as u64)
 }

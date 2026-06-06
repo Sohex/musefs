@@ -108,7 +108,7 @@ impl BulkWriter<'_> {
         self.tx.execute(
             "INSERT INTO art (sha256, mime, width, height, byte_len, data)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(sha256) DO NOTHING",
-            params![sha, a.mime, a.width, a.height, a.data.len() as i64, a.data],
+            params![sha, a.mime, a.width, a.height, a.data.len() as u64, a.data],
         )?;
         Ok(self
             .tx

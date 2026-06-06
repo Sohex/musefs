@@ -10,19 +10,31 @@ pub(crate) const VENDOR: &str = "musefs";
 /// Build a VorbisComment body: vendor string then count then `KEY=value` comments.
 /// Lengths are 32-bit little-endian. Known canonical keys are mapped to their
 /// Vorbis field name via the vocabulary; unknown keys are upper-cased.
-pub(crate) fn build(tags: &[TagInput]) -> Vec<u8> {
+pub(crate) fn build(tags: &[TagInput]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(VENDOR.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(VENDOR.len())
+            .map_err(|_| FormatError::TooLarge)?
+            .to_le_bytes(),
+    );
     out.extend_from_slice(VENDOR.as_bytes());
-    out.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(tags.len())
+            .map_err(|_| FormatError::TooLarge)?
+            .to_le_bytes(),
+    );
     for t in tags {
         let field = crate::tagmap::key_to_vorbis(&t.key)
             .map_or_else(|| t.key.to_ascii_uppercase(), str::to_string);
         let comment = format!("{field}={}", t.value);
-        out.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(comment.len())
+                .map_err(|_| FormatError::TooLarge)?
+                .to_le_bytes(),
+        );
         out.extend_from_slice(comment.as_bytes());
     }
-    out
+    Ok(out)
 }
 
 fn read_u32_le(data: &[u8], pos: usize) -> Result<u32> {
@@ -76,7 +88,7 @@ mod tests {
             TagInput::new("artist", "Boards of Canada"),
             TagInput::new("title", "Roygbiv"),
         ];
-        let body = build(&tags);
+        let body = build(&tags).unwrap();
         let parsed = parse(&body).unwrap();
         assert_eq!(
             parsed,
@@ -102,7 +114,7 @@ mod tests {
             TagInput::new("albumartist", "VA"),
             TagInput::new("custom_thing", "x"),
         ];
-        let body = build(&tags);
+        let body = build(&tags).unwrap();
         let parsed = parse(&body).unwrap();
         // build upper-cases unknown keys; parse folds known fields to canonical,
         // keeps unknown verbatim.

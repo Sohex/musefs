@@ -231,6 +231,34 @@ impl Db<ReadWrite> {
 }
 
 #[cfg(test)]
+mod negative_audio_bounds_tests {
+    use crate::{Db, Format, NewTrack};
+
+    #[test]
+    fn negative_audio_bounds_error_at_row_read() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        // Simulate a malformed external write to a contract column.
+        db.conn
+            .execute("UPDATE tracks SET audio_offset = -1 WHERE id = ?1", [id])
+            .unwrap();
+        assert!(
+            db.get_track(id).is_err(),
+            "negative audio_offset must fail row-read, not wrap"
+        );
+    }
+}
+
+#[cfg(test)]
 mod render_key_tests {
     use super::*;
     use crate::{Format, NewTrack, Tag};

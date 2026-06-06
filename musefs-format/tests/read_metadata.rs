@@ -10,7 +10,7 @@ fn read_metadata_on_front_bytes_recovers_preserved_and_offset() {
     let file = make_flac(&[(0, si.clone()), (4, vc)], &audio);
 
     let scan = locate_audio(&file).unwrap();
-    let front = &file[..scan.audio_offset as usize];
+    let front = &file[..usize::try_from(scan.audio_offset).unwrap()];
 
     let meta = read_metadata(front).unwrap();
     assert_eq!(meta.audio_offset, scan.audio_offset);

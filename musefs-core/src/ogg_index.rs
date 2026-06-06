@@ -8,7 +8,9 @@ use std::os::unix::fs::FileExt;
 
 use musefs_format::ogg::{patch_page_header_algebraic, verify_page_crc};
 
-use crate::error::{CoreError, Result};
+use musefs_db::convert::usize_from;
+
+use crate::error::Result;
 
 /// A one-entry memo of the most-recently-served page: `(page offset within the
 /// audio region, page total length, patched header bytes)`. Lives on the resolved
@@ -73,7 +75,7 @@ fn find_page_start(
     let scan_start = abs_target
         .saturating_sub(MAX_OGG_PAGE_BYTES)
         .max(audio_offset);
-    let window_len = (abs_target - scan_start) as usize;
+    let window_len = usize_from(abs_target - scan_start);
     let mut window = vec![0u8; window_len];
     read_counted(backing, &mut window, scan_start)?;
 
@@ -166,7 +168,7 @@ pub fn serve_ogg_window(
         }
         // One pread for the full header (27 + up to 255 seg-table bytes).
         // Clamped to the declared audio region end.
-        let read_len = MAX_OGG_HEADER_BYTES.min((audio_end - pos) as usize);
+        let read_len = MAX_OGG_HEADER_BYTES.min(usize_from(audio_end - pos));
         let mut hdr_buf = vec![0u8; read_len];
         read_counted(backing, &mut hdr_buf, pos)?;
         if hdr_buf.len() < 27 {
@@ -195,8 +197,9 @@ pub fn serve_ogg_window(
             h
         } else {
             let old_seq = u32::from_le_bytes(hdr_buf[18..22].try_into().unwrap());
-            let new_seq = (old_seq as i64 + seq_delta) as u32;
-            patch_page_header_algebraic(&hdr_buf[..header_len], new_seq).map_err(CoreError::from)?
+            let new_seq = u32::try_from(i64::from(old_seq) + seq_delta)
+                .map_err(|_| musefs_format::FormatError::Malformed)?;
+            patch_page_header_algebraic(&hdr_buf[..header_len], new_seq)?
         };
         if let Some(m) = memo {
             let total_len = (header_len + payload_len) as u64;
@@ -211,8 +214,8 @@ pub fn serve_ogg_window(
         let hs = rstart.max(page_rel);
         let he = rend.min(hdr_end);
         if hs < he {
-            let a = (hs - page_rel) as usize;
-            let b = (he - page_rel) as usize;
+            let a = usize_from(hs - page_rel);
+            let b = usize_from(he - page_rel);
             out.extend_from_slice(&patched_hdr[a..b]);
         }
 
@@ -221,7 +224,7 @@ pub fn serve_ogg_window(
         let pe = rend.min(page_end);
         if ps < pe {
             let within = ps - hdr_end;
-            let n = (pe - ps) as usize;
+            let n = usize_from(pe - ps);
             let start = out.len();
             out.resize(start + n, 0);
             read_counted(backing, &mut out[start..], pos + header_len as u64 + within)?;
@@ -385,7 +388,7 @@ mod tests {
         let mut comment = Vec::new();
         comment.push(0x84);
         let vc = b"\x06\x00\x00\x00musefs\x00\x00\x00\x00";
-        comment.extend_from_slice(&[0, 0, vc.len() as u8]);
+        comment.extend_from_slice(&[0, 0, u8::try_from(vc.len()).unwrap()]);
         comment.extend_from_slice(vc);
         let audio0 = vec![0xC1u8; 6000];
         let file = build_codec_file(0x3333, &[&p0, &comment], &[&audio0]);
@@ -418,7 +421,7 @@ mod tests {
     fn new_reference_region(path: &std::path::Path, ao: u64, alen: u64) -> Vec<u8> {
         use musefs_format::ogg::{parse_page, patch_page_header};
         let backing = std::fs::File::open(path).unwrap();
-        let mut full = vec![0u8; alen as usize];
+        let mut full = vec![0u8; usize_from(alen)];
         backing.read_exact_at(&mut full, ao).unwrap();
         let mut out = Vec::new();
         let mut pos = 0usize;
@@ -542,7 +545,7 @@ mod tests {
         // Exactly the whole header of page 0.
         assert_eq!(
             new_serve_range(&path, ao, alen, 0, hlen),
-            want[..hlen as usize]
+            want[..usize_from(hlen)]
         );
     }
 
@@ -560,7 +563,7 @@ mod tests {
         let end = hlen + 60;
         assert_eq!(
             new_serve_range(&path, ao, alen, start, end),
-            want[start as usize..end as usize]
+            want[usize_from(start)..usize_from(end)]
         );
     }
 
@@ -576,7 +579,7 @@ mod tests {
         let r = (hlen - 5)..(hlen + 20);
         assert_eq!(
             new_serve_range(&path, ao, alen, r.start, r.end),
-            want[r.start as usize..r.end as usize]
+            want[usize_from(r.start)..usize_from(r.end)]
         );
     }
 
@@ -592,7 +595,7 @@ mod tests {
         let r = (p0_end - 30)..(p0_end + 40);
         assert_eq!(
             new_serve_range(&path, ao, alen, r.start, r.end),
-            want[r.start as usize..r.end as usize]
+            want[usize_from(r.start)..usize_from(r.end)]
         );
     }
 
@@ -607,7 +610,7 @@ mod tests {
         // rend clamped to region end.
         assert_eq!(
             new_serve_range(&path, ao, alen, alen - 25, alen + 1000),
-            want[(alen - 25) as usize..]
+            want[usize_from(alen - 25)..]
         );
     }
 

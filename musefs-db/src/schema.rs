@@ -125,7 +125,7 @@ END;
 const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    let latest = MIGRATIONS.len() as i64;
+    let latest = i64::try_from(MIGRATIONS.len()).expect("MIGRATIONS count must fit i64");
     // Fast path: already at the latest version, no transaction needed.
     if conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))? >= latest {
         return Ok(());
@@ -136,8 +136,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     // sees the updated version and skips re-applying the migration.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    for (i, sql) in MIGRATIONS.iter().enumerate() {
-        let target = (i + 1) as i64;
+    for (target, sql) in (1i64..).zip(MIGRATIONS) {
         if current < target {
             tx.execute_batch(sql)?;
             tx.pragma_update(None, "user_version", target)?;
@@ -458,7 +457,10 @@ mod schema_py_tests {
 
         assert_eq!(dump_master(&rendered), dump_master(&migrated));
         assert_eq!(user_version(&rendered), user_version(&migrated));
-        assert_eq!(user_version(&rendered), MIGRATIONS.len() as i64);
+        assert_eq!(
+            user_version(&rendered),
+            i64::try_from(MIGRATIONS.len()).unwrap()
+        );
     }
 
     /// NOT #[ignore]d on purpose: the compare path must run under plain

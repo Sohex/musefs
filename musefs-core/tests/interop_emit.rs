@@ -20,7 +20,10 @@ use std::path::Path;
 // requires `ftyp`, `mvhd`, exactly one `soun` trak whose `stbl` has `stco`,
 // and `udta/meta/ilst`.
 fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-    let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+    let mut v = u32::try_from(8 + payload.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
     v.extend_from_slice(kind);
     v.extend_from_slice(payload);
     v
@@ -102,13 +105,16 @@ const COVR_JPEG: &[u8] = b"\xFF\xD8\xFF\xE0interop-jpeg-cover";
 const COVR_PNG: &[u8] = b"\x89PNG\r\n\x1a\ninterop-png-cover";
 
 fn real_mtime(p: &Path) -> i64 {
-    std::fs::metadata(p)
-        .unwrap()
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    i64::try_from(
+        std::fs::metadata(p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
 }
 
 #[derive(Debug)]
@@ -148,8 +154,8 @@ fn emit(
     dst: &Path,
     bytes: &[u8],
     format: Format,
-    audio_offset: i64,
-    audio_length: i64,
+    audio_offset: u64,
+    audio_length: u64,
     arts: &[(&[u8], &str)],
 ) -> (u64, u64) {
     std::fs::write(src, bytes).unwrap();
@@ -160,7 +166,7 @@ fn emit(
             format,
             audio_offset,
             audio_length,
-            backing_size: std::fs::metadata(src).unwrap().len() as i64,
+            backing_size: std::fs::metadata(src).unwrap().len(),
             backing_mtime: real_mtime(src),
         })
         .unwrap();
@@ -188,7 +194,7 @@ fn emit(
                 art_id,
                 picture_type: 3,
                 description: String::new(),
-                ordinal: i as i64,
+                ordinal: i as u64,
             }
         })
         .collect();
@@ -210,8 +216,8 @@ fn emit_binary(
     dst: &Path,
     bytes: &[u8],
     format: Format,
-    audio_offset: i64,
-    audio_length: i64,
+    audio_offset: u64,
+    audio_length: u64,
     text: &[Tag],
     binary: &[BinaryTag],
 ) {
@@ -223,7 +229,7 @@ fn emit_binary(
             format,
             audio_offset,
             audio_length,
-            backing_size: std::fs::metadata(src).unwrap().len() as i64,
+            backing_size: std::fs::metadata(src).unwrap().len(),
             backing_mtime: real_mtime(src),
         })
         .unwrap();
@@ -251,8 +257,8 @@ fn emit_interop_fixtures() {
             &dir.join("out.flac"),
             &bytes,
             Format::Flac,
-            scan.audio_offset as i64,
-            scan.audio_length as i64,
+            scan.audio_offset,
+            scan.audio_length,
             &[],
         );
         manifest.push(ManifestRow {
@@ -278,8 +284,8 @@ fn emit_interop_fixtures() {
             &dir.join("out.mp3"),
             &bytes,
             Format::Mp3,
-            b.audio_offset as i64,
-            b.audio_length as i64,
+            b.audio_offset,
+            b.audio_length,
             &[],
         );
         manifest.push(ManifestRow {
@@ -306,8 +312,8 @@ fn emit_interop_fixtures() {
             &dir.join("out.m4a"),
             &bytes,
             Format::M4a,
-            scan.mdat_payload_offset as i64,
-            scan.mdat_payload_len as i64,
+            scan.mdat_payload_offset,
+            scan.mdat_payload_len,
             &[(COVR_JPEG, "image/jpeg"), (COVR_PNG, "image/png")],
         );
         manifest.push(ManifestRow {
@@ -333,8 +339,8 @@ fn emit_interop_fixtures() {
             &dir.join("out.ogg"),
             &bytes,
             Format::Opus,
-            scan.audio_offset as i64,
-            scan.audio_length as i64,
+            scan.audio_offset,
+            scan.audio_length,
             &[],
         );
         manifest.push(ManifestRow {
@@ -360,8 +366,8 @@ fn emit_interop_fixtures() {
             &dir.join("out.wav"),
             &bytes,
             Format::Wav,
-            b.audio_offset as i64,
-            b.audio_length as i64,
+            b.audio_offset,
+            b.audio_length,
             &[],
         );
         manifest.push(ManifestRow {
@@ -406,8 +412,8 @@ fn emit_interop_fixtures() {
             &dir.join("out_bin.mp3"),
             &bytes,
             Format::Mp3,
-            b.audio_offset as i64,
-            b.audio_length as i64,
+            b.audio_offset,
+            b.audio_length,
             &[
                 Tag::new("title", "Bin Title", 0),
                 Tag::new("artist", "Bin Artist", 0),
@@ -439,8 +445,8 @@ fn emit_interop_fixtures() {
             &dir.join("out_bin.m4a"),
             &bytes,
             Format::M4a,
-            scan.mdat_payload_offset as i64,
-            scan.mdat_payload_len as i64,
+            scan.mdat_payload_offset,
+            scan.mdat_payload_len,
             &[
                 Tag::new("title", "Bin Title", 0),
                 Tag::new("artist", "Bin Artist", 0),

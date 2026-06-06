@@ -29,7 +29,7 @@ pub fn b64_window(out_offset: u64, take: u64, img_total: u64) -> B64Window {
     B64Window {
         in_start,
         in_len: in_end.saturating_sub(in_start),
-        skip: (out_offset - g0 * 4) as usize,
+        skip: crate::convert::usize_from(out_offset - g0 * 4),
     }
 }
 
@@ -60,20 +60,23 @@ mod tests {
     fn any_window_matches_substring_of_full_encode() {
         // Cover image lengths that hit every length-mod-3 case and various windows.
         for &img_total in &[0u64, 1, 2, 3, 4, 5, 6, 7, 100, 257, 1024] {
-            let img: Vec<u8> = (0..img_total).map(|i| (i * 7 + 3) as u8).collect();
+            let img: Vec<u8> = (0..img_total)
+                .map(|i| u8::try_from((i * 7 + 3) % 256).unwrap())
+                .collect();
             let full = full_b64(&img);
-            assert_eq!(b64_len(img_total) as usize, full.len());
+            assert_eq!(crate::convert::usize_from(b64_len(img_total)), full.len());
             if full.is_empty() {
                 continue;
             }
             for o in 0..full.len() as u64 {
                 for take in 1..=(full.len() as u64 - o) {
                     let w = b64_window(o, take, img_total);
-                    let raw = &img[w.in_start as usize..(w.in_start + w.in_len) as usize];
-                    let got = encode_b64_slice(raw, w.skip, take as usize);
+                    let raw = &img[crate::convert::usize_from(w.in_start)
+                        ..crate::convert::usize_from(w.in_start + w.in_len)];
+                    let got = encode_b64_slice(raw, w.skip, crate::convert::usize_from(take));
                     assert_eq!(
                         got,
-                        &full[o as usize..(o + take) as usize],
+                        &full[crate::convert::usize_from(o)..crate::convert::usize_from(o + take)],
                         "img_total={img_total} o={o} take={take}"
                     );
                 }

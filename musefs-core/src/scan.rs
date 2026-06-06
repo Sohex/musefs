@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use musefs_db::convert::usize_from;
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_format::{flac, mp3, mp4, ogg, wav, EmbeddedBinaryTag, EmbeddedPicture, Extent};
 
@@ -46,7 +47,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64)
+        .map_or(0, |d| d.as_secs().cast_signed())
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
@@ -237,7 +238,7 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
     } else {
         None
     };
-    let mut want = (window as u64).min(file_len) as usize;
+    let mut want = usize_from((window as u64).min(file_len));
     let mut prefix = read_window(&file, want)?;
     for _ in 0..MAX_WIDEN_RETRIES {
         match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
@@ -250,16 +251,16 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
                 }
                 // Grow to at least `up_to` (capped at the file), always making
                 // progress (`+1`), then retry.
-                want = (up_to.min(file_len) as usize)
+                want = usize_from(up_to.min(file_len))
                     .max(want + 1)
-                    .min(file_len as usize);
+                    .min(usize_from(file_len));
                 prefix = read_window(&file, want)?;
             }
         }
     }
     // Fallback: read the whole file once and use the full-buffer probe.
     if (prefix.len() as u64) < file_len {
-        prefix = read_window(&file, file_len as usize)?;
+        prefix = read_window(&file, usize_from(file_len))?;
     }
     Ok(probe_full(path, &prefix))
 }
@@ -411,14 +412,14 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     let track_id = db.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
         format: probed.format,
-        audio_offset: probed.audio_offset as i64,
-        audio_length: probed.audio_length as i64,
-        backing_size: meta.len() as i64,
+        audio_offset: probed.audio_offset,
+        audio_length: probed.audio_length,
+        backing_size: meta.len(),
         backing_mtime: mtime_secs(meta),
     })?;
 
     let mut tags = Vec::new();
-    let mut ordinals: HashMap<String, i64> = HashMap::new();
+    let mut ordinals: HashMap<String, u64> = HashMap::new();
     for (key, value) in probed.tags {
         let ord = ordinals.entry(key.clone()).or_insert(0);
         tags.push(Tag::new(&key, &value, *ord));
@@ -434,12 +435,12 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
         .map(|(ordinal, b)| musefs_db::BinaryTag {
             key: b.key,
             payload: b.payload,
-            ordinal: ordinal as i64,
+            ordinal: ordinal as u64,
         })
         .collect();
     db.set_binary_tags(track_id, &binary_tags)?;
 
-    let mut sb_ordinals: HashMap<String, i64> = HashMap::new();
+    let mut sb_ordinals: HashMap<String, u64> = HashMap::new();
     let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
         .structural_blocks
         .into_iter()
@@ -466,13 +467,13 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     for (ordinal, pic) in accepted.enumerate() {
         let art_id = db.upsert_art(&NewArt {
             mime: pic.mime,
-            width: (pic.width != 0).then_some(pic.width as i64),
-            height: (pic.height != 0).then_some(pic.height as i64),
+            width: (pic.width != 0).then_some(pic.width),
+            height: (pic.height != 0).then_some(pic.height),
             data: pic.data,
         })?;
         // Valid ID3/FLAC picture types are 0..=20; clamp anything out of range.
         let picture_type = if pic.picture_type <= 20 {
-            pic.picture_type as i64
+            pic.picture_type
         } else {
             0
         };
@@ -480,7 +481,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
             art_id,
             picture_type,
             description: pic.description,
-            ordinal: ordinal as i64,
+            ordinal: ordinal as u64,
         });
     }
     db.set_track_art(track_id, &track_arts)?;
@@ -499,14 +500,14 @@ fn ingest_bulk(
     let track_id = bw.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
         format: probed.format,
-        audio_offset: probed.audio_offset as i64,
-        audio_length: probed.audio_length as i64,
-        backing_size: meta_len as i64,
+        audio_offset: probed.audio_offset,
+        audio_length: probed.audio_length,
+        backing_size: meta_len,
         backing_mtime: meta_mtime,
     })?;
 
     let mut tags = Vec::new();
-    let mut ordinals: HashMap<String, i64> = HashMap::new();
+    let mut ordinals: HashMap<String, u64> = HashMap::new();
     for (key, value) in &probed.tags {
         let ord = ordinals.entry(key.clone()).or_insert(0);
         tags.push(Tag::new(key, value, *ord));
@@ -522,12 +523,12 @@ fn ingest_bulk(
         .map(|(ordinal, b)| musefs_db::BinaryTag {
             key: b.key,
             payload: b.payload,
-            ordinal: ordinal as i64,
+            ordinal: ordinal as u64,
         })
         .collect();
     bw.set_binary_tags(track_id, &binary_tags)?;
 
-    let mut sb_ordinals: HashMap<String, i64> = HashMap::new();
+    let mut sb_ordinals: HashMap<String, u64> = HashMap::new();
     let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
         .structural_blocks
         .into_iter()
@@ -552,12 +553,12 @@ fn ingest_bulk(
     for (ordinal, pic) in accepted.enumerate() {
         let art_id = bw.upsert_art(&NewArt {
             mime: pic.mime,
-            width: (pic.width != 0).then_some(pic.width as i64),
-            height: (pic.height != 0).then_some(pic.height as i64),
+            width: (pic.width != 0).then_some(pic.width),
+            height: (pic.height != 0).then_some(pic.height),
             data: pic.data,
         })?;
         let picture_type = if pic.picture_type <= 20 {
-            pic.picture_type as i64
+            pic.picture_type
         } else {
             0
         };
@@ -565,7 +566,7 @@ fn ingest_bulk(
             art_id,
             picture_type,
             description: pic.description,
-            ordinal: ordinal as i64,
+            ordinal: ordinal as u64,
         });
     }
     bw.set_track_art(track_id, &track_arts)?;
@@ -803,7 +804,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
 
     // Main-thread pre-dispatch skip pass: load existing (path -> size,mtime,id,format) once,
     // stat each candidate, keep only changed files. Workers stay DB-free.
-    let existing: HashMap<String, (i64, i64, i64, Format)> = db
+    let existing: HashMap<String, (u64, i64, i64, Format)> = db
         .list_tracks()?
         .into_iter()
         .map(|t| {
@@ -833,7 +834,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         let key = abs.to_string_lossy().into_owned();
         if let Some(&(size, mtime, id, format)) = existing.get(&key) {
             let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
-            if size == meta.len() as i64 && mtime == mtime_secs(&meta) && !needs_backfill {
+            if size == meta.len() && mtime == mtime_secs(&meta) && !needs_backfill {
                 unchanged += 1;
                 continue;
             }
@@ -988,7 +989,10 @@ mod scan_unit_tests {
     /// `probe_full` only locates audio + reads tags, never synthesizes.
     fn mp4_with_binary_freeform(mean: &str, name: &str, value: &[u8]) -> Vec<u8> {
         fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-            let mut v = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+            let mut v = u32::try_from(8 + body.len())
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
             v.extend_from_slice(kind);
             v.extend_from_slice(body);
             v
@@ -1131,11 +1135,11 @@ mod wav_probe_tests {
         let mut body = Vec::new();
         for (id, payload) in [(b"fmt ", &fmt), (b"data", &data)] {
             body.extend_from_slice(id);
-            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
             body.extend_from_slice(payload);
         }
         let mut out = b"RIFF".to_vec();
-        out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
         out.extend_from_slice(b"WAVE");
         out.extend_from_slice(&body);
         out
@@ -1226,8 +1230,12 @@ mod hardening_tests {
 
     fn flac_block(bt: u8, body: &[u8], last: bool) -> Vec<u8> {
         let mut v = vec![(if last { 0x80 } else { 0 }) | (bt & 0x7F)];
-        let n = body.len();
-        v.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+        let n: u32 = u32::try_from(body.len()).unwrap();
+        v.extend_from_slice(&[
+            u8::try_from(n >> 16).unwrap(),
+            u8::try_from(n >> 8).unwrap(),
+            u8::try_from(n).unwrap(),
+        ]);
         v.extend_from_slice(body);
         v
     }
@@ -1242,11 +1250,11 @@ mod hardening_tests {
     fn vorbis_comment(entries: &[&str]) -> Vec<u8> {
         let mut vc = Vec::new();
         let vendor = b"x";
-        vc.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        vc.extend_from_slice(&u32::try_from(vendor.len()).unwrap().to_le_bytes());
         vc.extend_from_slice(vendor);
-        vc.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        vc.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_le_bytes());
         for e in entries {
-            vc.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            vc.extend_from_slice(&u32::try_from(e.len()).unwrap().to_le_bytes());
             vc.extend_from_slice(e.as_bytes());
         }
         vc
@@ -1255,14 +1263,14 @@ mod hardening_tests {
         let mut b = Vec::new();
         b.extend_from_slice(&3u32.to_be_bytes());
         let mime = "image/png";
-        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
         b.extend_from_slice(mime.as_bytes());
         b.extend_from_slice(&0u32.to_be_bytes());
         b.extend_from_slice(&width.to_be_bytes());
         b.extend_from_slice(&height.to_be_bytes());
         b.extend_from_slice(&0u32.to_be_bytes());
         b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
         b.extend_from_slice(data);
         b
     }
@@ -1286,7 +1294,7 @@ mod hardening_tests {
         let db = musefs_db::Db::open_in_memory().unwrap();
         crate::scan_directory(&db, &path).unwrap();
         let track = db.list_tracks().unwrap().into_iter().next().unwrap();
-        let mut artists: Vec<(i64, String)> = db
+        let mut artists: Vec<(u64, String)> = db
             .get_tags(track.id)
             .unwrap()
             .into_iter()
@@ -1304,6 +1312,23 @@ mod hardening_tests {
         write_flac(&path, &["ARTIST=A", "TITLE=T"], Some((10, 20)));
         let db = musefs_db::Db::open_in_memory().unwrap();
         crate::scan_directory(&db, &path).unwrap();
+        let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+        let ta = db.get_track_art(track.id).unwrap();
+        assert_eq!(ta.len(), 1);
+        let meta = db.get_art_meta(ta[0].art_id).unwrap().unwrap();
+        assert_eq!(meta.width, Some(10));
+        assert_eq!(meta.height, Some(20));
+    }
+
+    #[test]
+    fn ingest_oracle_path_stores_nonzero_art_dimensions() {
+        // Drives the single-file `ingest` (not `ingest_bulk`) so the
+        // `(pic.width != 0).then_some(..)` dimension guards there are pinned.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("art.flac");
+        write_flac(&path, &["ARTIST=A", "TITLE=T"], Some((10, 20)));
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        crate::scan_directory_full_oracle(&db, &path).unwrap();
         let track = db.list_tracks().unwrap().into_iter().next().unwrap();
         let ta = db.get_track_art(track.id).unwrap();
         assert_eq!(ta.len(), 1);
@@ -1639,8 +1664,8 @@ mod bounded_probe_tests {
             .get_track_by_path(&std::fs::canonicalize(&path).unwrap().to_string_lossy())
             .unwrap()
             .unwrap();
-        assert_eq!(track.audio_offset as u64, full.audio_offset);
-        assert_eq!(track.audio_length as u64, full.audio_length);
+        assert_eq!(track.audio_offset, full.audio_offset);
+        assert_eq!(track.audio_length, full.audio_length);
     }
 
     #[test]
@@ -1674,7 +1699,7 @@ mod bounded_probe_tests {
             .get_track_by_path(&std::fs::canonicalize(&p).unwrap().to_string_lossy())
             .unwrap()
             .unwrap();
-        assert_eq!(track.audio_length as usize, b"DIFFERENT-AUDIO".len());
+        assert_eq!(usize_from(track.audio_length), b"DIFFERENT-AUDIO".len());
     }
 
     #[test]
@@ -1723,7 +1748,7 @@ mod bounded_probe_tests {
                 },
             )
             .unwrap();
-            let mut rows: Vec<(String, i64, i64)> = db
+            let mut rows: Vec<(String, u64, u64)> = db
                 .list_tracks()
                 .unwrap()
                 .into_iter()

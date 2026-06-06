@@ -16,6 +16,7 @@ use fuser::{
     INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
 };
+use musefs_core::convert::usize_from;
 use musefs_core::Attr;
 use musefs_core::CoreError;
 use musefs_core::Fh;
@@ -108,7 +109,10 @@ fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
 /// back to `fallback_mtime` so tools don't see a 1970 timestamp.
 pub fn to_file_attr(attr: &Attr, uid: u32, gid: u32, fallback_mtime: SystemTime) -> FileAttr {
     let mtime = if attr.mtime_secs > 0 {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(attr.mtime_secs as u64)
+        SystemTime::UNIX_EPOCH
+            + Duration::from_secs(
+                u64::try_from(attr.mtime_secs).expect("guarded by mtime_secs > 0"),
+            )
     } else {
         fallback_mtime
     };
@@ -336,7 +340,7 @@ impl Filesystem for MusefsFs {
                     ino.0,
                     NonZeroU64::new(fh.0).map(Fh::from),
                     offset,
-                    size as u64,
+                    u64::from(size),
                     &mut buf,
                 ) {
                     Ok(()) => reply.data(&buf),
@@ -380,7 +384,7 @@ impl Filesystem for MusefsFs {
             listing.push((child, kind, name));
         }
 
-        for (i, (child, kind, name)) in listing.into_iter().enumerate().skip(offset as usize) {
+        for (i, (child, kind, name)) in listing.into_iter().enumerate().skip(usize_from(offset)) {
             // The offset stored is the index of the *next* entry to return.
             if reply.add(INodeNo(child), (i + 1) as u64, kind, &name) {
                 break;

@@ -163,7 +163,7 @@ fn rejects_audio_over_32bit() {
         fmt: fmt_pcm_16bit_mono(),
         fact: None,
     };
-    let res = synthesize_layout(&scan, 0, (u32::MAX as u64) + 1, &[], &[], &[]);
+    let res = synthesize_layout(&scan, 0, u64::from(u32::MAX) + 1, &[], &[], &[]);
     assert_eq!(res, Err(musefs_format::FormatError::TooLarge));
 }
 
@@ -219,7 +219,8 @@ fn skips_zero_byte_art() {
     let bytes = assemble(&layout, &audio, &[]);
     let bounds = musefs_format::wav::locate_audio(&bytes).unwrap();
     assert_eq!(
-        &bytes[bounds.audio_offset as usize..(bounds.audio_offset + bounds.audio_length) as usize],
+        &bytes[usize::try_from(bounds.audio_offset).unwrap()
+            ..usize::try_from(bounds.audio_offset + bounds.audio_length).unwrap()],
         &audio[..]
     );
 }

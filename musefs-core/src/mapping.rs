@@ -40,25 +40,14 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
         // `track_art.art_id` is a foreign key into `art` (enforced, no ON DELETE),
         // so the row always exists; the `if let` is defensive, not a real branch.
         if let Some(meta) = db.get_art_meta(ta.art_id)? {
-            // A negative byte_len is a malformed external write to the contract
-            // column; skip the row rather than cast it to a huge u64 segment
-            // length (which would fail layout validation and break the track).
-            if meta.byte_len < 0 {
-                log::warn!(
-                    "skipping art {} on track {track_id}: negative byte_len {} (malformed DB write)",
-                    ta.art_id,
-                    meta.byte_len
-                );
-                continue;
-            }
             inputs.push(ArtInput {
                 art_id: ta.art_id,
                 mime: meta.mime,
                 description: ta.description,
-                picture_type: ta.picture_type as u32,
-                width: meta.width.unwrap_or(0) as u32,
-                height: meta.height.unwrap_or(0) as u32,
-                data_len: meta.byte_len as u64,
+                picture_type: ta.picture_type,
+                width: meta.width.unwrap_or(0),
+                height: meta.height.unwrap_or(0),
+                data_len: meta.byte_len,
             });
         }
     }
@@ -76,7 +65,7 @@ pub(crate) fn binary_tags_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<
         .map(|row| BinaryTagInput {
             key: row.key,
             payload_id: row.rowid,
-            len: row.byte_len as u64,
+            len: row.byte_len,
         })
         .collect())
 }
@@ -88,7 +77,7 @@ pub(crate) fn binary_tags_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<
 pub(crate) fn track_art_images<M>(db: &Db<M>, inputs: &[ArtInput]) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::with_capacity(inputs.len());
     for a in inputs {
-        out.push(db.read_art_chunk(a.art_id, 0, a.data_len as usize)?);
+        out.push(db.read_art_chunk(a.art_id, 0, musefs_db::convert::usize_from(a.data_len))?);
     }
     Ok(out)
 }
@@ -98,7 +87,7 @@ mod tests {
     use super::*;
     use musefs_db::{BinaryTag, Db, Format, NewTrack};
 
-    fn tag(key: &str, value: &str, ordinal: i64) -> Tag {
+    fn tag(key: &str, value: &str, ordinal: u64) -> Tag {
         Tag::new(key, value, ordinal)
     }
 
@@ -209,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn track_art_to_inputs_skips_negative_byte_len() {
+    fn track_art_to_inputs_errors_on_negative_byte_len() {
         use musefs_db::{NewArt, TrackArt}; // NewTrack already in scope at module level
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("art.db");
@@ -240,9 +229,6 @@ mod tests {
                 data: vec![9, 9, 9, 9, 9],
             })
             .unwrap();
-        // A zero-byte_len row pins the guard's strict `<`: only *negative* is
-        // skipped, so byte_len == 0 must still be kept (distinguishes `< 0` from
-        // `<= 0`).
         let zero = db
             .upsert_art(&NewArt {
                 mime: "image/png".into(),
@@ -276,20 +262,83 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate external malformed writes: byte_len is a stored column.
+        // byte_len == 0 is valid and must still be served (was the old
+        // strict-`<` pin; now pins that zero passes the u64 row-read).
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute("UPDATE art SET byte_len = -1 WHERE id = ?1", [bad])
-            .unwrap();
         raw.execute("UPDATE art SET byte_len = 0 WHERE id = ?1", [zero])
             .unwrap();
-        drop(raw);
-
         let inputs = super::track_art_to_inputs(&db, tid).unwrap();
         let ids: Vec<i64> = inputs.iter().map(|a| a.art_id).collect();
+        assert_eq!(ids, vec![good, bad, zero]);
+
+        // A negative byte_len is a malformed external write to the contract
+        // column: it now errors at row-read instead of being skipped.
+        raw.execute("UPDATE art SET byte_len = -1 WHERE id = ?1", [bad])
+            .unwrap();
+        drop(raw);
+        assert!(
+            super::track_art_to_inputs(&db, tid).is_err(),
+            "negative byte_len must error at row-read, not be skipped"
+        );
+    }
+
+    #[test]
+    fn track_art_images_reads_stored_blob_bytes() {
+        use musefs_db::{NewArt, TrackArt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("art.db");
+        let db = Db::open(&path).unwrap();
+        let tid = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        let first = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![1, 2, 3, 4],
+            })
+            .unwrap();
+        let second = db
+            .upsert_art(&NewArt {
+                mime: "image/jpeg".into(),
+                width: None,
+                height: None,
+                data: vec![7, 8, 9],
+            })
+            .unwrap();
+        db.set_track_art(
+            tid,
+            &[
+                TrackArt {
+                    art_id: first,
+                    picture_type: 3,
+                    description: String::new(),
+                    ordinal: 0,
+                },
+                TrackArt {
+                    art_id: second,
+                    picture_type: 4,
+                    description: String::new(),
+                    ordinal: 1,
+                },
+            ],
+        )
+        .unwrap();
+
+        let inputs = super::track_art_to_inputs(&db, tid).unwrap();
+        let images = super::track_art_images(&db, &inputs).unwrap();
         assert_eq!(
-            ids,
-            vec![good, zero],
-            "negative byte_len is skipped; zero is kept (strict `<`)"
+            images,
+            vec![vec![1, 2, 3, 4], vec![7, 8, 9]],
+            "must return each stored blob's exact bytes, in input order"
         );
     }
 }

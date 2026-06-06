@@ -26,10 +26,10 @@ fn assemble(layout: &RegionLayout, audio: &[u8], arts: &[(i64, &[u8])]) -> Vec<u
 
 /// Decode the 28-bit syncsafe ID3v2 tag-size field from the 10-byte header.
 fn header_size_field(bytes: &[u8]) -> u64 {
-    ((bytes[6] as u64) << 21)
-        | ((bytes[7] as u64) << 14)
-        | ((bytes[8] as u64) << 7)
-        | (bytes[9] as u64)
+    (u64::from(bytes[6]) << 21)
+        | (u64::from(bytes[7]) << 14)
+        | (u64::from(bytes[8]) << 7)
+        | u64::from(bytes[9])
 }
 
 #[test]
@@ -264,7 +264,7 @@ fn synthesize_errors_when_frames_sum_past_the_tag_limit() {
         art_id: id,
         mime: "image/jpeg".to_string(),
         description: String::new(),
-        picture_type: id as u32,
+        picture_type: u32::try_from(id).unwrap(),
         width: 0,
         height: 0,
         data_len: 0x0800_0000, // 128 MiB each; two sum past the 256 MiB tag limit

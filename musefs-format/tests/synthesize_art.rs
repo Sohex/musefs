@@ -61,7 +61,10 @@ fn art_becomes_an_artimage_segment_and_lengths_are_exact() {
     art_map.insert(42i64, image.clone());
     let assembled = resolve_layout(&layout, &file, &art_map, &HashMap::new());
     assert_eq!(assembled.len() as u64, layout.total_len());
-    assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);
+    assert_eq!(
+        &assembled[usize::try_from(layout.header_len()).unwrap()..],
+        &audio[..]
+    );
 }
 
 #[test]
@@ -144,7 +147,10 @@ fn zero_byte_art_is_skipped_so_the_track_still_serves() {
     let art_map = HashMap::new();
     let assembled = resolve_layout(&layout, &file, &art_map, &HashMap::new());
     assert_eq!(assembled.len() as u64, layout.total_len());
-    assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);
+    assert_eq!(
+        &assembled[usize::try_from(layout.header_len()).unwrap()..],
+        &audio[..]
+    );
 
     // metaflac sees a valid FLAC with zero pictures.
     let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC metadata");

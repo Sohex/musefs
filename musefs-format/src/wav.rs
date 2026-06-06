@@ -41,13 +41,17 @@ fn walk_chunks(buf: &[u8]) -> Vec<([u8; 4], usize, u64)> {
     while pos + 8 <= buf.len() {
         let mut id = [0u8; 4];
         id.copy_from_slice(&buf[pos..pos + 4]);
-        let size =
-            u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]) as u64;
+        let size = u64::from(u32::from_le_bytes([
+            buf[pos + 4],
+            buf[pos + 5],
+            buf[pos + 6],
+            buf[pos + 7],
+        ]));
         let payload_offset = pos + 8;
         out.push((id, payload_offset, size));
         let advance = 8u64 + size + (size & 1); // word-align: pad odd payloads
         match (pos as u64).checked_add(advance) {
-            Some(next) if next <= buf.len() as u64 => pos = next as usize,
+            Some(next) if next <= buf.len() as u64 => pos = crate::convert::usize_from(next),
             _ => break,
         }
     }
@@ -56,7 +60,7 @@ fn walk_chunks(buf: &[u8]) -> Vec<([u8; 4], usize, u64)> {
 
 /// Borrow a chunk's payload bytes if they fit fully in `buf`.
 fn chunk_slice(buf: &[u8], offset: usize, len: u64) -> Option<&[u8]> {
-    let end = offset.checked_add(len as usize)?;
+    let end = offset.checked_add(crate::convert::usize_from(len))?;
     buf.get(offset..end)
 }
 
@@ -141,7 +145,7 @@ fn info_fourcc(key: &str) -> Option<&'static [u8; 4]> {
 /// Build the `LIST`/`INFO` chunk payload (`"INFO"` + subchunks) from the first
 /// value of each mappable tag key, in first-seen order. Returns `None` when no
 /// tag maps to an INFO field (so the chunk is omitted entirely).
-fn build_info_payload(tags: &[TagInput]) -> Option<Vec<u8>> {
+fn build_info_payload(tags: &[TagInput]) -> Result<Option<Vec<u8>>> {
     let mut entries: Vec<(&'static [u8; 4], &str)> = Vec::new();
     let mut used: Vec<&str> = Vec::new();
     for t in tags {
@@ -154,16 +158,16 @@ fn build_info_payload(tags: &[TagInput]) -> Option<Vec<u8>> {
         }
     }
     if entries.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut payload = Vec::new();
     payload.extend_from_slice(b"INFO");
     for (cc, value) in entries {
         let mut v = value.as_bytes().to_vec();
         v.push(0x00); // INFO values are NUL-terminated
-        append_chunk(&mut payload, cc, &v);
+        append_chunk(&mut payload, cc, &v)?;
     }
-    Some(payload)
+    Ok(Some(payload))
 }
 
 /// 8-byte RIFF chunk header: fourcc + LE u32 size.
@@ -175,19 +179,22 @@ fn chunk_header(id: &[u8; 4], len: u32) -> [u8; 8] {
 }
 
 /// Append a chunk (`fourcc + LE size + payload + word-align pad`) to `out`.
-fn append_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) {
-    out.extend_from_slice(&chunk_header(id, payload.len() as u32));
+fn append_chunk(out: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) -> Result<()> {
+    let len = u32::try_from(payload.len()).map_err(|_| FormatError::TooLarge)?;
+    out.extend_from_slice(&chunk_header(id, len));
     out.extend_from_slice(payload);
     if payload.len() % 2 == 1 {
         out.push(0x00);
     }
+    Ok(())
 }
 
 /// Push a fully-inline chunk (`fourcc + LE size + payload + word-align pad`).
-fn push_inline_chunk(segments: &mut Vec<Segment>, id: &[u8; 4], payload: &[u8]) {
+fn push_inline_chunk(segments: &mut Vec<Segment>, id: &[u8; 4], payload: &[u8]) -> Result<()> {
     let mut chunk = Vec::with_capacity(8 + payload.len() + 1);
-    append_chunk(&mut chunk, id, payload);
+    append_chunk(&mut chunk, id, payload)?;
     segments.push(Segment::Inline(chunk));
+    Ok(())
 }
 
 /// Build the synthesized WAV region: a fresh `RIFF`/`WAVE` front carrying the
@@ -203,18 +210,16 @@ pub fn synthesize_layout(
     binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<RegionLayout> {
-    if audio_length > u32::MAX as u64 {
-        return Err(FormatError::TooLarge); // RF64 territory; out of scope
-    }
+    let audio_length_u32 = u32::try_from(audio_length).map_err(|_| FormatError::TooLarge)?; // RF64 territory; out of scope
 
     let mut segments: Vec<Segment> = Vec::new();
 
-    push_inline_chunk(&mut segments, b"fmt ", &scan.fmt);
+    push_inline_chunk(&mut segments, b"fmt ", &scan.fmt)?;
     if let Some(fact) = &scan.fact {
-        push_inline_chunk(&mut segments, b"fact", fact);
+        push_inline_chunk(&mut segments, b"fact", fact)?;
     }
-    if let Some(info) = build_info_payload(tags) {
-        push_inline_chunk(&mut segments, b"LIST", &info);
+    if let Some(info) = build_info_payload(tags)? {
+        push_inline_chunk(&mut segments, b"LIST", &info)?;
     }
 
     // Embedded `id3 ` chunk: 8-byte chunk header + the ID3v2 tag segments, padded.
@@ -222,9 +227,8 @@ pub fn synthesize_layout(
     // an empty `ArtImage { len: 0 }` would fail `RegionLayout::validate` and brick
     // the track — so WAV inherits that handling by delegating to it.
     let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, binary_tags, arts)?;
-    segments.push(Segment::Inline(
-        chunk_header(b"id3 ", tag_len as u32).to_vec(),
-    ));
+    let tag_len_u32 = u32::try_from(tag_len).map_err(|_| FormatError::TooLarge)?;
+    segments.push(Segment::Inline(chunk_header(b"id3 ", tag_len_u32).to_vec()));
     segments.extend(tag_segments);
     if tag_len % 2 == 1 {
         segments.push(Segment::Inline(vec![0x00]));
@@ -232,7 +236,7 @@ pub fn synthesize_layout(
 
     // `data` chunk: header + the original payload (BackingAudio) + word-align pad.
     segments.push(Segment::Inline(
-        chunk_header(b"data", audio_length as u32).to_vec(),
+        chunk_header(b"data", audio_length_u32).to_vec(),
     ));
     segments.push(Segment::BackingAudio {
         offset: audio_offset,
@@ -244,13 +248,10 @@ pub fn synthesize_layout(
 
     // RIFF size = (everything after the 8-byte "RIFF"+size prefix) = body + "WAVE".
     let body_len: u64 = segments.iter().map(Segment::len).sum();
-    let riff_size = body_len + 4;
-    if riff_size > u32::MAX as u64 {
-        return Err(FormatError::TooLarge);
-    }
+    let riff_size = u32::try_from(body_len + 4).map_err(|_| FormatError::TooLarge)?;
     let mut header = Vec::with_capacity(12);
     header.extend_from_slice(b"RIFF");
-    header.extend_from_slice(&(riff_size as u32).to_le_bytes());
+    header.extend_from_slice(&riff_size.to_le_bytes());
     header.extend_from_slice(b"WAVE");
     segments.insert(0, Segment::Inline(header));
 
@@ -418,14 +419,14 @@ mod tests {
         let mut body = Vec::new();
         for (id, payload) in chunks {
             body.extend_from_slice(*id);
-            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
             body.extend_from_slice(payload);
             if payload.len() % 2 == 1 {
                 body.push(0x00);
             }
         }
         let mut out = b"RIFF".to_vec();
-        out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
         out.extend_from_slice(b"WAVE");
         out.extend_from_slice(&body);
         out
@@ -490,6 +491,7 @@ mod tests {
         ];
         for (key, cc) in cases {
             let payload = build_info_payload(&[TagInput::new(key, "X")])
+                .unwrap()
                 .unwrap_or_else(|| panic!("INFO payload for {key}"));
             assert!(
                 payload.windows(4).any(|w| w == &cc[..]),
@@ -505,11 +507,15 @@ mod tests {
         // Value "a"  -> v.len()=2 (even, NO pad). Kills `% → /` (2/2==1 pads) and
         //               `== → !=` (2%2=0 != 1 pads).
         // Value "ab" -> v.len()=3 (odd, padded). Kills `% → +` (3+2 != 1, no pad).
-        let even = build_info_payload(&[TagInput::new("title", "a")]).unwrap();
+        let even = build_info_payload(&[TagInput::new("title", "a")])
+            .unwrap()
+            .unwrap();
         // "INFO"(4) + "INAM"(4) + len(4) + "a\0"(2) = 14, no pad.
         assert_eq!(even.len(), 14);
 
-        let odd = build_info_payload(&[TagInput::new("title", "ab")]).unwrap();
+        let odd = build_info_payload(&[TagInput::new("title", "ab")])
+            .unwrap()
+            .unwrap();
         // "INFO"(4) + "INAM"(4) + len(4) + "ab\0"(3) + pad(1) = 16.
         assert_eq!(odd.len(), 16);
     }
@@ -519,13 +525,13 @@ mod tests {
         // :168 `payload.len() % 2 == 1`.
         // Even payload (len 2): NO pad. Kills `% → /` (2/2==1 pads).
         let mut segs = Vec::new();
-        push_inline_chunk(&mut segs, b"test", &[0xAA, 0xBB]);
+        push_inline_chunk(&mut segs, b"test", &[0xAA, 0xBB]).unwrap();
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].len(), 10); // "test"(4) + len(4) + payload(2)
 
         // Odd payload (len 3): padded. Kills `% → +` (3+2 != 1, no pad).
         let mut segs2 = Vec::new();
-        push_inline_chunk(&mut segs2, b"test", &[0xAA, 0xBB, 0xCC]);
+        push_inline_chunk(&mut segs2, b"test", &[0xAA, 0xBB, 0xCC]).unwrap();
         assert_eq!(segs2[0].len(), 12); // 4 + 4 + 3 + pad(1)
     }
 
@@ -536,7 +542,7 @@ mod tests {
             let mut v = val.as_bytes().to_vec();
             v.push(0x00);
             p.extend_from_slice(*cc);
-            p.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            p.extend_from_slice(&u32::try_from(v.len()).unwrap().to_le_bytes());
             p.extend_from_slice(&v);
             if v.len() % 2 == 1 {
                 p.push(0x00);
@@ -635,20 +641,18 @@ mod tests {
 
     #[test]
     fn synthesize_rejects_riff_size_overflow() {
-        // :227 `> → ==`. `BackingAudio` is virtual (no real allocation), so we can
-        // pass `audio_length == u32::MAX`: it PASSES the :186 guard (`> u32::MAX` is
-        // false) but makes `riff_size > u32::MAX`. Original `>` → TooLarge; the `==`
-        // mutant (`riff_size == u32::MAX`) is false (riff_size is strictly greater),
-        // so it wrongly proceeds and returns Ok with a truncated size.
+        // `BackingAudio` is virtual (no real allocation), so we can pass
+        // `audio_length == u32::MAX`: it passes the audio_length u32 check but makes
+        // `riff_size > u32::MAX` once the other chunks are added.
         //
-        // NOTE — this must use exactly u32::MAX, not the existing
-        // `rejects_audio_over_32bit` test's `u32::MAX + 1`: that larger value is
-        // caught by the :186 guard first and never reaches :227.
+        // NOTE — this must use exactly u32::MAX, not `u32::MAX + 1`: the larger
+        // value is caught by the audio_length conversion first and never reaches
+        // the riff_size check.
         let scan = WavScan {
             fmt: fmt_pcm(),
             fact: None,
         };
-        let res = synthesize_layout(&scan, 0, u32::MAX as u64, &[], &[], &[]);
+        let res = synthesize_layout(&scan, 0, u64::from(u32::MAX), &[], &[], &[]);
         assert_eq!(res, Err(FormatError::TooLarge));
     }
 
@@ -659,10 +663,10 @@ mod tests {
         body.extend_from_slice(&16u32.to_le_bytes());
         body.extend(std::iter::repeat_n(0u8, 16));
         body.extend_from_slice(b"data");
-        body.extend_from_slice(&(audio.len() as u32).to_le_bytes());
+        body.extend_from_slice(&u32::try_from(audio.len()).unwrap().to_le_bytes());
         body.extend_from_slice(audio);
         let mut v = b"RIFF".to_vec();
-        v.extend_from_slice(&((4 + body.len()) as u32).to_le_bytes());
+        v.extend_from_slice(&u32::try_from(4 + body.len()).unwrap().to_le_bytes());
         v.extend_from_slice(b"WAVE");
         v.extend_from_slice(&body);
         v

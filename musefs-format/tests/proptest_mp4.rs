@@ -21,7 +21,7 @@ proptest! {
             .iter()
             .enumerate()
             .map(|(i, (kind, len))| ArtInput {
-                art_id: i as i64 + 1,
+                art_id: i64::try_from(i).unwrap() + 1,
                 mime: if *kind == 1 { "image/jpeg".into() } else { "image/png".into() },
                 description: String::new(),
                 picture_type: 3,
@@ -53,7 +53,7 @@ proptest! {
         let mut inputs: Vec<BinaryTagInput> = Vec::new();
         let mut map: HashMap<i64, Vec<u8>> = HashMap::new();
         for (i, (name, bytes)) in bins.iter().enumerate() {
-            let id = i as i64 + 1;
+            let id = i64::try_from(i).unwrap() + 1;
             inputs.push(BinaryTagInput {
                 key: format!("----:com.apple.iTunes:{name}"),
                 payload_id: id,
@@ -79,8 +79,8 @@ proptest! {
                         out.extend_from_slice(map.get(payload_id).unwrap());
                     }
                     Segment::BackingAudio { offset, len } => {
-                        let s = *offset as usize;
-                        out.extend_from_slice(&original[s..s + *len as usize]);
+                        let s = usize::try_from(*offset).unwrap();
+                        out.extend_from_slice(&original[s..s + usize::try_from(*len).unwrap()]);
                     }
                     other => panic!("unexpected segment: {other:?}"),
                 }

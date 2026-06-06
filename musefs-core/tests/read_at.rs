@@ -16,13 +16,15 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
             format: Format::Flac,
             audio_offset,
             audio_length,
-            backing_size: meta.len() as i64,
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_size: meta.len(),
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", "Real", 0)])
@@ -39,7 +41,7 @@ fn reading_whole_file_matches_total_len_and_splices_audio() {
     let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
     assert_eq!(whole.len() as u64, resolved.total_len);
 
-    let audio_part = &whole[resolved.layout.header_len() as usize..];
+    let audio_part = &whole[usize::try_from(resolved.layout.header_len()).unwrap()..];
     let expected: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
     assert_eq!(audio_part, &expected[..]);
 
@@ -67,8 +69,12 @@ fn random_offset_and_size_match_the_whole_read() {
         (50, 0),
     ] {
         let got = read_at(&resolved, &db, off, size).unwrap();
-        let end = (off + size).min(resolved.total_len) as usize;
-        assert_eq!(got, &whole[off as usize..end], "off={off} size={size}");
+        let end = usize::try_from((off + size).min(resolved.total_len)).unwrap();
+        assert_eq!(
+            got,
+            &whole[usize::try_from(off).unwrap()..end],
+            "off={off} size={size}"
+        );
     }
 }
 
@@ -176,5 +182,5 @@ fn read_at_reserves_only_the_served_window() {
     // an over-reserve would inflate every worker's resident memory.
     let got = read_at(&resolved, &db, resolved.total_len - 7, 50).unwrap();
     assert_eq!(got.len(), 7);
-    assert!(got.capacity() < resolved.total_len as usize);
+    assert!(got.capacity() < usize::try_from(resolved.total_len).unwrap());
 }

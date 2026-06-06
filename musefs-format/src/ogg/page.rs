@@ -70,7 +70,7 @@ pub fn parse_page(buf: &[u8], pos: usize) -> Result<PageHeader> {
 /// 0, which is required to signal the packet's end.
 pub(crate) fn lacing_values(payload_len: usize) -> Vec<u8> {
     let mut v = vec![255u8; payload_len / 255];
-    v.push((payload_len % 255) as u8);
+    v.push(u8::try_from(payload_len % 255).expect("x % 255 < 256"));
     v
 }
 
@@ -113,7 +113,7 @@ pub fn lace_packet(
         out.extend_from_slice(&serial.to_le_bytes());
         out.extend_from_slice(&seq.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
-        out.push(chunk as u8);
+        out.push(u8::try_from(chunk).expect("chunk is .min(255) so fits in u8"));
         out.extend_from_slice(table);
         out.extend_from_slice(&packet[payload_pos..payload_pos + page_payload]);
 
@@ -327,7 +327,7 @@ pub(crate) fn lace_chunks_to_segments(
         page.extend_from_slice(&serial.to_le_bytes());
         page.extend_from_slice(&seq.to_le_bytes());
         page.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
-        page.push(seg_count as u8);
+        page.push(u8::try_from(seg_count).expect("seg_count is .min(255) so fits in u8"));
         page.extend_from_slice(table);
         copy_payload(&mut page, chunks, payload_pos, page_payload);
         let crc = crc32(&page);
@@ -567,7 +567,10 @@ mod tests {
                     ..
                 } => {
                     assert!(*base64);
-                    v.extend_from_slice(&art_out[*offset as usize..(*offset + *len) as usize]);
+                    v.extend_from_slice(
+                        &art_out[usize::try_from(*offset).unwrap()
+                            ..usize::try_from(*offset + *len).unwrap()],
+                    );
                 }
                 other => panic!("unexpected segment {other:?}"),
             }

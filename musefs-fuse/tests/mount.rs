@@ -8,9 +8,9 @@ fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.push((if is_last { 0x80 } else { 0 }) | (block_type & 0x7F));
     let len = body.len();
-    out.push(((len >> 16) & 0xFF) as u8);
-    out.push(((len >> 8) & 0xFF) as u8);
-    out.push((len & 0xFF) as u8);
+    out.push(u8::try_from((len >> 16) & 0xFF).unwrap());
+    out.push(u8::try_from((len >> 8) & 0xFF).unwrap());
+    out.push(u8::try_from(len & 0xFF).unwrap());
     out.extend_from_slice(body);
     out
 }
@@ -26,11 +26,11 @@ fn streaminfo_body() -> Vec<u8> {
 
 fn vorbis_comment_body(vendor: &str, comments: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(vendor.len()).unwrap().to_le_bytes());
     out.extend_from_slice(vendor.as_bytes());
-    out.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(comments.len()).unwrap().to_le_bytes());
     for c in comments {
-        out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(c.len()).unwrap().to_le_bytes());
         out.extend_from_slice(c.as_bytes());
     }
     out
@@ -110,7 +110,7 @@ fn make_wav(artist: &str, title: &str, audio: &[u8]) -> Vec<u8> {
         let mut v = val.as_bytes().to_vec();
         v.push(0x00);
         info.extend_from_slice(cc);
-        info.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        info.extend_from_slice(&u32::try_from(v.len()).unwrap().to_le_bytes());
         info.extend_from_slice(&v);
         if v.len() % 2 == 1 {
             info.push(0x00);
@@ -124,14 +124,14 @@ fn make_wav(artist: &str, title: &str, audio: &[u8]) -> Vec<u8> {
         (&b"data"[..], audio),
     ] {
         body.extend_from_slice(id);
-        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
         body.extend_from_slice(payload);
         if payload.len() % 2 == 1 {
             body.push(0x00);
         }
     }
     let mut out = b"RIFF".to_vec();
-    out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
     out.extend_from_slice(b"WAVE");
     out.extend_from_slice(&body);
     out
@@ -162,7 +162,8 @@ fn end_to_end_read_through_mount_wav() {
     assert_eq!(&bytes[8..12], b"WAVE");
     let bounds = musefs_format::wav::locate_audio(&bytes).unwrap();
     assert_eq!(
-        &bytes[bounds.audio_offset as usize..(bounds.audio_offset + bounds.audio_length) as usize],
+        &bytes[usize::try_from(bounds.audio_offset).unwrap()
+            ..usize::try_from(bounds.audio_offset + bounds.audio_length).unwrap()],
         audio.as_slice()
     );
 

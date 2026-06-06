@@ -87,9 +87,9 @@ pub struct Track {
     pub id: i64,
     pub backing_path: String,
     pub format: Format,
-    pub audio_offset: i64,
-    pub audio_length: i64,
-    pub backing_size: i64,
+    pub audio_offset: u64,
+    pub audio_length: u64,
+    pub backing_size: u64,
     pub backing_mtime: i64,
     pub content_version: i64,
     pub updated_at: i64,
@@ -99,17 +99,17 @@ pub struct Track {
 pub struct NewTrack {
     pub backing_path: String,
     pub format: Format,
-    pub audio_offset: i64,
-    pub audio_length: i64,
-    pub backing_size: i64,
+    pub audio_offset: u64,
+    pub audio_length: u64,
+    pub backing_size: u64,
     pub backing_mtime: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct NewArt {
     pub mime: String,
-    pub width: Option<i64>,
-    pub height: Option<i64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     pub data: Vec<u8>,
 }
 
@@ -118,11 +118,11 @@ pub struct NewArt {
 pub struct Tag {
     pub key: String,
     pub value: String,
-    pub ordinal: i64,
+    pub ordinal: u64,
 }
 
 impl Tag {
-    pub fn new(key: &str, value: &str, ordinal: i64) -> Tag {
+    pub fn new(key: &str, value: &str, ordinal: u64) -> Tag {
         Tag {
             key: key.to_string(),
             value: value.to_string(),
@@ -137,9 +137,9 @@ pub struct Art {
     pub id: i64,
     pub sha256: String,
     pub mime: String,
-    pub width: Option<i64>,
-    pub height: Option<i64>,
-    pub byte_len: i64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub byte_len: u64,
     pub data: Vec<u8>,
 }
 
@@ -147,18 +147,18 @@ pub struct Art {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtMeta {
     pub mime: String,
-    pub width: Option<i64>,
-    pub height: Option<i64>,
-    pub byte_len: i64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub byte_len: u64,
 }
 
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackArt {
     pub art_id: i64,
-    pub picture_type: i64,
+    pub picture_type: u32,
     pub description: String,
-    pub ordinal: i64,
+    pub ordinal: u64,
 }
 
 /// A binary tag payload to write (e.g. an opaque ID3 `PRIV` frame body). `key` is
@@ -169,7 +169,7 @@ pub struct TrackArt {
 pub struct BinaryTag {
     pub key: String,
     pub payload: Vec<u8>,
-    pub ordinal: i64,
+    pub ordinal: u64,
 }
 
 /// A binary tag row read back for synthesis: the streaming handle (`rowid`), the
@@ -179,7 +179,7 @@ pub struct BinaryTag {
 pub struct BinaryTagRow {
     pub rowid: i64,
     pub key: String,
-    pub byte_len: i64,
+    pub byte_len: u64,
 }
 
 /// A read-only structural metadata block derived from the backing file
@@ -188,6 +188,6 @@ pub struct BinaryTagRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuralBlock {
     pub kind: String,
-    pub ordinal: i64,
+    pub ordinal: u64,
     pub body: Vec<u8>,
 }

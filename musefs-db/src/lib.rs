@@ -1,5 +1,6 @@
 mod art;
 mod bulk;
+pub mod convert;
 mod error;
 mod models;
 mod schema;

@@ -39,7 +39,10 @@ fn measured_lengths_match_assembled_bytes() {
         layout.header_len(),
         assembled.len() as u64 - audio.len() as u64
     );
-    assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);
+    assert_eq!(
+        &assembled[usize::try_from(layout.header_len()).unwrap()..],
+        &audio[..]
+    );
 }
 
 #[test]

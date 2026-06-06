@@ -145,10 +145,22 @@ use crate::layout::{RegionLayout, Segment};
 /// Inclusive maximum body length of a FLAC metadata block (24-bit length field).
 pub(crate) const MAX_BLOCK_BODY: u64 = 0x00FF_FFFF;
 
-pub(crate) fn push_block_header(out: &mut Vec<u8>, block_type: u8, body_len: usize, is_last: bool) {
+pub(crate) fn push_block_header(
+    out: &mut Vec<u8>,
+    block_type: u8,
+    body_len: usize,
+    is_last: bool,
+) -> Result<()> {
+    // A FLAC block length is a 24-bit field; refuse anything larger rather
+    // than emit a truncated length.
+    let len = u32::try_from(body_len)
+        .ok()
+        .filter(|&v| u64::from(v) <= MAX_BLOCK_BODY)
+        .ok_or(FormatError::TooLarge)?;
     let first = (if is_last { 0x80 } else { 0 }) | (block_type & 0x7F);
     out.push(first);
-    out.extend_from_slice(&(body_len as u32).to_be_bytes()[1..]);
+    out.extend_from_slice(&len.to_be_bytes()[1..]);
+    Ok(())
 }
 
 /// Map a stored structural-block `kind` string back to its FLAC block type.
@@ -191,19 +203,31 @@ pub fn split_preserved(
     (structural, binary)
 }
 
-fn picture_body_framing(art: &ArtInput) -> Vec<u8> {
+fn picture_body_framing(art: &ArtInput) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&art.picture_type.to_be_bytes());
-    out.extend_from_slice(&(art.mime.len() as u32).to_be_bytes());
+    out.extend_from_slice(
+        &u32::try_from(art.mime.len())
+            .map_err(|_| FormatError::TooLarge)?
+            .to_be_bytes(),
+    );
     out.extend_from_slice(art.mime.as_bytes());
-    out.extend_from_slice(&(art.description.len() as u32).to_be_bytes());
+    out.extend_from_slice(
+        &u32::try_from(art.description.len())
+            .map_err(|_| FormatError::TooLarge)?
+            .to_be_bytes(),
+    );
     out.extend_from_slice(art.description.as_bytes());
     out.extend_from_slice(&art.width.to_be_bytes());
     out.extend_from_slice(&art.height.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes()); // color depth (unknown)
     out.extend_from_slice(&0u32.to_be_bytes()); // number of colors (non-indexed)
-    out.extend_from_slice(&(art.data_len as u32).to_be_bytes()); // picture data length
-    out
+    out.extend_from_slice(
+        &u32::try_from(art.data_len)
+            .map_err(|_| FormatError::TooLarge)?
+            .to_be_bytes(),
+    ); // picture data length
+    Ok(out)
 }
 
 /// Build the ordered segment layout for a synthesized FLAC file:
@@ -237,16 +261,16 @@ pub fn synthesize_layout(
     let mut idx = 0usize;
 
     for blk in &ordered {
-        push_block_header(&mut buf, blk.block_type, blk.body.len(), idx == last_index);
+        push_block_header(&mut buf, blk.block_type, blk.body.len(), idx == last_index)?;
         buf.extend_from_slice(&blk.body);
         idx += 1;
     }
 
-    let vc = crate::vorbiscomment::build(tags);
+    let vc = crate::vorbiscomment::build(tags)?;
     if vc.len() as u64 > MAX_BLOCK_BODY {
         return Err(FormatError::TooLarge);
     }
-    push_block_header(&mut buf, BLOCK_VORBIS_COMMENT, vc.len(), idx == last_index);
+    push_block_header(&mut buf, BLOCK_VORBIS_COMMENT, vc.len(), idx == last_index)?;
     buf.extend_from_slice(&vc);
     idx += 1;
 
@@ -259,7 +283,12 @@ pub fn synthesize_layout(
         if bt.len > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
-        push_block_header(&mut buf, block_type, bt.len as usize, idx == last_index);
+        push_block_header(
+            &mut buf,
+            block_type,
+            crate::convert::usize_from(bt.len),
+            idx == last_index,
+        )?;
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::BinaryTag {
             payload_id: bt.payload_id,
@@ -272,7 +301,7 @@ pub fn synthesize_layout(
         if art.data_len == 0 {
             continue;
         }
-        let framing = picture_body_framing(art);
+        let framing = picture_body_framing(art)?;
         let body_len = framing.len() as u64 + art.data_len;
         if body_len > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
@@ -280,9 +309,9 @@ pub fn synthesize_layout(
         push_block_header(
             &mut buf,
             BLOCK_PICTURE,
-            body_len as usize,
+            crate::convert::usize_from(body_len),
             idx == last_index,
-        );
+        )?;
         buf.extend_from_slice(&framing);
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::ArtImage {
@@ -437,7 +466,7 @@ mod tests {
     /// body) + `audio` bytes. Returns (full_bytes, audio_offset).
     fn flac_with_streaminfo(audio: &[u8]) -> (Vec<u8>, u64) {
         let mut v = b"fLaC".to_vec();
-        push_block_header(&mut v, BLOCK_STREAMINFO, 34, true);
+        push_block_header(&mut v, BLOCK_STREAMINFO, 34, true).unwrap();
         v.extend(std::iter::repeat_n(0u8, 34));
         let audio_offset = v.len() as u64;
         v.extend_from_slice(audio);
@@ -448,7 +477,7 @@ mod tests {
     fn read_metadata_bounded_complete_when_prefix_covers_blocks() {
         let (full, audio_offset) = flac_with_streaminfo(b"AUDIOAUDIO");
         // Prefix that includes all metadata but not all audio.
-        let prefix = &full[..audio_offset as usize + 2];
+        let prefix = &full[..crate::convert::usize_from(audio_offset) + 2];
         match read_metadata_bounded(prefix).unwrap() {
             Extent::Complete(meta) => assert_eq!(meta.audio_offset, audio_offset),
             other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
@@ -481,11 +510,11 @@ mod tests {
     fn push_block_header_emits_24bit_length_big_endian() {
         // pins :101 (`>>16` -> `<<16`): high byte 0x12 must land in out[1].
         let mut out = Vec::new();
-        push_block_header(&mut out, BLOCK_PICTURE, 0x12_3456, false);
+        push_block_header(&mut out, BLOCK_PICTURE, 0x12_3456, false).unwrap();
         assert_eq!(out, vec![BLOCK_PICTURE, 0x12, 0x34, 0x56]);
         // :99 is equivalent, but exercise the is_last/0x80 path anyway.
         let mut last = Vec::new();
-        push_block_header(&mut last, BLOCK_VORBIS_COMMENT, 0, true);
+        push_block_header(&mut last, BLOCK_VORBIS_COMMENT, 0, true).unwrap();
         assert_eq!(last, vec![0x80 | BLOCK_VORBIS_COMMENT, 0x00, 0x00, 0x00]);
     }
 
@@ -496,7 +525,7 @@ mod tests {
     fn raw_block(block_type: u8, body: &[u8], last: bool, len_override: Option<usize>) -> Vec<u8> {
         let n = len_override.unwrap_or(body.len());
         let mut v = vec![(if last { 0x80 } else { 0 }) | (block_type & 0x7F)];
-        v.extend_from_slice(&(n as u32).to_be_bytes()[1..]);
+        v.extend_from_slice(&u32::try_from(n).unwrap().to_be_bytes()[1..]);
         v.extend_from_slice(body);
         v
     }
@@ -564,11 +593,11 @@ mod tests {
     /// comment as u32-LE length + bytes.
     fn vc_body(vendor: &str, comments: &[&str]) -> Vec<u8> {
         let mut v = Vec::new();
-        v.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        v.extend_from_slice(&u32::try_from(vendor.len()).unwrap().to_le_bytes());
         v.extend_from_slice(vendor.as_bytes());
-        v.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        v.extend_from_slice(&u32::try_from(comments.len()).unwrap().to_le_bytes());
         for c in comments {
-            v.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            v.extend_from_slice(&u32::try_from(c.len()).unwrap().to_le_bytes());
             v.extend_from_slice(c.as_bytes());
         }
         v
@@ -626,15 +655,15 @@ mod tests {
     fn picture_body(ptype: u32, mime: &str, desc: &str, w: u32, h: u32, data: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&ptype.to_be_bytes());
-        v.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        v.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
         v.extend_from_slice(mime.as_bytes());
-        v.extend_from_slice(&(desc.len() as u32).to_be_bytes());
+        v.extend_from_slice(&u32::try_from(desc.len()).unwrap().to_be_bytes());
         v.extend_from_slice(desc.as_bytes());
         v.extend_from_slice(&w.to_be_bytes());
         v.extend_from_slice(&h.to_be_bytes());
         v.extend_from_slice(&0u32.to_be_bytes()); // depth
         v.extend_from_slice(&0u32.to_be_bytes()); // colors
-        v.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        v.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
         v.extend_from_slice(data);
         v
     }
@@ -931,7 +960,7 @@ mod tests {
         // Derive the exact framing length from production rather than hardcoding it
         // (it is independent of the data_len *value* — that field is always 4 bytes).
         // This keeps the boundary correct regardless of the framing's field count.
-        let framing_len = picture_body_framing(&mk(0)).len() as u64;
+        let framing_len = picture_body_framing(&mk(0)).unwrap().len() as u64;
         let at_limit = 0x00FF_FFFF - framing_len; // body_len == 0x00FF_FFFF exactly
                                                   // original `>` accepts the inclusive boundary; the `>=` mutant rejects it.
                                                   // (data_len is only a count; no large allocation occurs.)
@@ -950,8 +979,10 @@ mod tests {
         // value so the body lands exactly on the limit; one more byte errors.
         // Mirrors the PICTURE/binary-tag boundary tests: the `>` accepts the
         // inclusive limit while the `>=` mutant rejects it.
-        let overhead = crate::vorbiscomment::build(&[TagInput::new("title", "")]).len() as u64;
-        let at_limit = "x".repeat((MAX_BLOCK_BODY - overhead) as usize);
+        let overhead = crate::vorbiscomment::build(&[TagInput::new("title", "")])
+            .unwrap()
+            .len() as u64;
+        let at_limit = "x".repeat(crate::convert::usize_from(MAX_BLOCK_BODY - overhead));
         let tags = [TagInput::new("title", at_limit.as_str())];
         assert!(synthesize_layout(&[], 0, 0, &tags, &[], &[]).is_ok());
         // one byte over must still error, pinning the high side of the boundary.

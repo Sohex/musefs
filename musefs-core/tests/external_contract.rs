@@ -3,13 +3,16 @@ use musefs_db::{Db, Format, NewTrack};
 use musefs_format::fuzz_check::fixtures;
 
 fn real_mtime(path: &std::path::Path) -> i64 {
-    std::fs::metadata(path)
-        .unwrap()
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    i64::try_from(
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -26,9 +29,9 @@ fn scanner_owned_bounds_mutation_returns_controlled_error() {
         .upsert_track(&NewTrack {
             backing_path: audio_path.to_string_lossy().into_owned(),
             format: Format::Mp3,
-            audio_offset: bounds.audio_offset as i64,
-            audio_length: bounds.audio_length as i64,
-            backing_size: bytes.len() as i64,
+            audio_offset: bounds.audio_offset,
+            audio_length: bounds.audio_length,
+            backing_size: bytes.len() as u64,
             backing_mtime: real_mtime(&audio_path),
         })
         .unwrap();
@@ -37,7 +40,7 @@ fn scanner_owned_bounds_mutation_returns_controlled_error() {
     external
         .execute(
             "UPDATE tracks SET audio_length = audio_length + ?1 WHERE id = ?2",
-            rusqlite::params![bytes.len() as i64, id],
+            rusqlite::params![i64::try_from(bytes.len()).unwrap(), id],
         )
         .unwrap();
 

@@ -18,7 +18,7 @@ pub fn build_wav(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
     let mut body = Vec::new();
     for (id, payload) in chunks {
         body.extend_from_slice(*id);
-        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
         body.extend_from_slice(payload);
         if payload.len() % 2 == 1 {
             body.push(0x00);
@@ -26,7 +26,7 @@ pub fn build_wav(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
     }
     let mut out = Vec::new();
     out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
     out.extend_from_slice(b"WAVE");
     out.extend_from_slice(&body);
     out
@@ -39,7 +39,8 @@ fn locate_finds_data_bounds() {
     let bounds = locate_audio(&wav).unwrap();
     assert_eq!(bounds.audio_length, 10);
     assert_eq!(
-        &wav[bounds.audio_offset as usize..(bounds.audio_offset + bounds.audio_length) as usize],
+        &wav[usize::try_from(bounds.audio_offset).unwrap()
+            ..usize::try_from(bounds.audio_offset + bounds.audio_length).unwrap()],
         data.as_slice()
     );
 }
@@ -80,7 +81,7 @@ fn read_structure_works_on_front_only_buffer() {
     // walk must still surface `fmt ` even though `data`'s payload is absent.
     let wav = build_wav(&[(b"fmt ", fmt_pcm_16bit_mono()), (b"data", vec![0u8; 100])]);
     let bounds = locate_audio(&wav).unwrap();
-    let front = &wav[..bounds.audio_offset as usize];
+    let front = &wav[..usize::try_from(bounds.audio_offset).unwrap()];
     let scan = read_structure(front).unwrap();
     assert_eq!(scan.fmt, fmt_pcm_16bit_mono());
     assert_eq!(scan.fact, None);

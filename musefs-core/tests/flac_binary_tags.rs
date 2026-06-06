@@ -126,15 +126,17 @@ fn legacy_flac_without_structural_rows_serves_via_front_read_fallback() {
         .upsert_track(&NewTrack {
             backing_path: path.to_string_lossy().into_owned(),
             format: Format::Flac,
-            audio_offset: scan.audio_offset as i64,
-            audio_length: scan.audio_length as i64,
-            backing_size: meta.len() as i64,
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            audio_offset: scan.audio_offset,
+            audio_length: scan.audio_length,
+            backing_size: meta.len(),
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(
@@ -200,8 +202,9 @@ fn revalidate_backfills_structural_and_binary_rows_for_legacy_flac() {
 }
 
 /// Read a binary tag's full payload from the DB via incremental blob I/O.
-fn read_binary_payload(db: &musefs_db::Db, rowid: i64, len: i64) -> Vec<u8> {
-    db.read_binary_tag_chunk(rowid, 0, len as usize).unwrap()
+fn read_binary_payload(db: &musefs_db::Db, rowid: i64, len: u64) -> Vec<u8> {
+    db.read_binary_tag_chunk(rowid, 0, usize::try_from(len).unwrap())
+        .unwrap()
 }
 
 /// Serve a scanned track's whole file via the synthesis read path.

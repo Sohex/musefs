@@ -1,3 +1,4 @@
+use crate::convert::usize_from;
 use crate::error::{FormatError, Result};
 use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
 use crate::layout::{RegionLayout, Segment};
@@ -14,10 +15,10 @@ pub struct Mp3Bounds {
 }
 
 fn synchsafe_decode(b: &[u8]) -> u32 {
-    ((b[0] & 0x7F) as u32) << 21
-        | ((b[1] & 0x7F) as u32) << 14
-        | ((b[2] & 0x7F) as u32) << 7
-        | (b[3] & 0x7F) as u32
+    u32::from(b[0] & 0x7F) << 21
+        | u32::from(b[1] & 0x7F) << 14
+        | u32::from(b[2] & 0x7F) << 7
+        | u32::from(b[3] & 0x7F)
 }
 
 /// Locate the audio region: skip a leading ID3v2 tag (if present) and a trailing
@@ -133,16 +134,17 @@ fn syncsafe(n: u32) -> [u8; 4] {
 }
 
 /// Inclusive maximum of a 28-bit ID3v2.4 syncsafe size field.
-const SYNCHSAFE_MAX: usize = 0x0FFF_FFFF;
+const SYNCHSAFE_MAX: u32 = 0x0FFF_FFFF;
 
 fn push_frame_header(out: &mut Vec<u8>, id: &[u8; 4], data_len: usize) -> Result<()> {
     // ID3v2.4 frame sizes are a 28-bit syncsafe field; guard so an oversized frame
     // is a hard error rather than a silently-truncated (corrupt) tag.
-    if data_len > SYNCHSAFE_MAX {
-        return Err(FormatError::TooLarge);
-    }
+    let data_len_u32 = u32::try_from(data_len)
+        .ok()
+        .filter(|&v| v <= SYNCHSAFE_MAX)
+        .ok_or(FormatError::TooLarge)?;
     out.extend_from_slice(id);
-    out.extend_from_slice(&syncsafe(data_len as u32));
+    out.extend_from_slice(&syncsafe(data_len_u32));
     out.extend_from_slice(&[0x00, 0x00]); // frame flags
     Ok(())
 }
@@ -189,6 +191,10 @@ fn apic_framing(art: &ArtInput) -> Vec<u8> {
     let mut d = vec![ENC_UTF8];
     d.extend_from_slice(art.mime.as_bytes());
     d.push(0x00);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "ID3 APIC type is one byte; valid picture types are 0..=20"
+    )]
     d.push(art.picture_type as u8);
     d.extend_from_slice(art.description.as_bytes());
     d.push(0x00);
@@ -345,7 +351,7 @@ pub fn build_id3v2_segments(
         let Ok(id): std::result::Result<[u8; 4], _> = bt.key.as_bytes().try_into() else {
             continue;
         };
-        push_frame_header(&mut buf, &id, bt.len as usize)?;
+        push_frame_header(&mut buf, &id, usize_from(bt.len))?;
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::BinaryTag {
             payload_id: bt.payload_id,
@@ -363,7 +369,7 @@ pub fn build_id3v2_segments(
         }
         let framing = apic_framing(art);
         let data_len = framing.len() as u64 + art.data_len;
-        push_frame_header(&mut buf, b"APIC", data_len as usize)?;
+        push_frame_header(&mut buf, b"APIC", usize_from(data_len))?;
         buf.extend_from_slice(&framing);
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::ArtImage {
@@ -386,10 +392,11 @@ pub fn build_id3v2_segments(
     // The total tag size is a 28-bit syncsafe field. Ingestion caps each art well
     // under this, but guard at the format boundary so an oversized tag (e.g. many
     // large pictures summing past the limit) is a hard error, not a truncated file.
-    if frames_len > SYNCHSAFE_MAX as u64 {
-        return Err(FormatError::TooLarge);
-    }
-    header.extend_from_slice(&syncsafe(frames_len as u32));
+    let frames_len_ss = u32::try_from(frames_len)
+        .ok()
+        .filter(|&v| v <= SYNCHSAFE_MAX)
+        .ok_or(FormatError::TooLarge)?;
+    header.extend_from_slice(&syncsafe(frames_len_ss));
     segments.insert(0, Segment::Inline(header));
 
     Ok((segments, 10 + frames_len))
@@ -534,7 +541,7 @@ pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
     tag.pictures()
         .map(|p| EmbeddedPicture {
             mime: p.mime_type.clone(),
-            picture_type: u8::from(p.picture_type) as u32,
+            picture_type: u8::from(p.picture_type).into(),
             description: p.description.clone(),
             width: 0,
             height: 0,
@@ -647,7 +654,7 @@ fn classify_binary_frame(
                     let c = counter
                         .iter()
                         .take(8)
-                        .fold(0u64, |a, &b| (a << 8) | b as u64);
+                        .fold(0u64, |a, &b| (a << 8) | u64::from(b));
                     if c > 0 {
                         promoted.push(("playcount".to_string(), c.to_string()));
                     }
@@ -1329,7 +1336,7 @@ mod tests {
     /// then `audio`. Returns (full, audio_offset).
     fn mp3_with_id3v2(body_len: usize, audio: &[u8]) -> (Vec<u8>, u64) {
         let mut v = b"ID3\x04\x00\x00".to_vec(); // version 2.4, no flags
-        v.extend_from_slice(&syncsafe(body_len as u32));
+        v.extend_from_slice(&syncsafe(u32::try_from(body_len).unwrap()));
         v.extend(std::iter::repeat_n(0u8, body_len)); // tag body
         let audio_offset = v.len() as u64;
         v.extend_from_slice(&[0xFF, 0xFB]); // MPEG frame sync
@@ -1340,7 +1347,7 @@ mod tests {
     #[test]
     fn locate_audio_bounded_complete_with_no_id3v1() {
         let (full, audio_offset) = mp3_with_id3v2(8, b"frames");
-        let prefix = &full[..audio_offset as usize + 2]; // covers tag + sync
+        let prefix = &full[..usize_from(audio_offset) + 2]; // covers tag + sync
         let file_len = full.len() as u64;
         match locate_audio_bounded(prefix, file_len, None).unwrap() {
             Extent::Complete(b) => {
@@ -1370,7 +1377,7 @@ mod tests {
         full.extend(std::iter::repeat_n(0u8, 125)); // 128-byte tag total
         let file_len = full.len() as u64;
         let tail: [u8; 128] = full[full.len() - 128..].try_into().unwrap();
-        let prefix = &full[..audio_offset as usize + 2];
+        let prefix = &full[..usize_from(audio_offset) + 2];
         match locate_audio_bounded(prefix, file_len, Some(&tail)).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
@@ -1449,7 +1456,7 @@ mod tests {
         let body = 6usize;
         let mut full = b"ID3\x04\x00".to_vec();
         full.push(0x10); // flags: footer present
-        full.extend_from_slice(&syncsafe(body as u32));
+        full.extend_from_slice(&syncsafe(u32::try_from(body).unwrap()));
         full.extend(std::iter::repeat_n(0u8, body)); // tag body
         full.extend(std::iter::repeat_n(0u8, 10)); // footer region
         let expected_offset = full.len() as u64; // 10 + 6 + 10 = 26
@@ -1478,7 +1485,7 @@ mod tests {
     fn locate_audio_bounded_tag_len_equals_file_len_is_notmp3_not_malformed() {
         let body = 8usize;
         let mut full = b"ID3\x04\x00\x00".to_vec();
-        full.extend_from_slice(&syncsafe(body as u32));
+        full.extend_from_slice(&syncsafe(u32::try_from(body).unwrap()));
         full.extend(std::iter::repeat_n(0u8, body)); // file ends exactly at tag end
         let file_len = full.len() as u64; // == tag_len == audio_offset (18)
         match locate_audio_bounded(&full, file_len, None) {
@@ -1574,7 +1581,7 @@ mod tests {
     fn locate_audio_bounded_sync_one_byte_past_eof_is_notmp3() {
         let body = 4usize;
         let mut full = b"ID3\x04\x00\x00".to_vec();
-        full.extend_from_slice(&syncsafe(body as u32));
+        full.extend_from_slice(&syncsafe(u32::try_from(body).unwrap()));
         full.extend(std::iter::repeat_n(0u8, body)); // tag end at offset 14
         let audio_offset = full.len() as u64; // 14
         full.push(0xFF); // a single sync byte present (so prefix has audio_offset+1)
@@ -1607,7 +1614,7 @@ mod tests {
         // unbounded reject `audio_offset + 1 >= len` (accepts when +2 <= len).
         let body = 4usize;
         let mut full = b"ID3\x04\x00\x00".to_vec();
-        full.extend_from_slice(&syncsafe(body as u32));
+        full.extend_from_slice(&syncsafe(u32::try_from(body).unwrap()));
         full.extend(std::iter::repeat_n(0u8, body)); // tag end at offset 14
         let audio_offset = full.len() as u64; // 14
         full.push(0xFF); // frame sync pair, and nothing after
@@ -1657,7 +1664,7 @@ mod tests {
     fn locate_audio_bounded_rejects_bad_second_sync_byte_after_id3() {
         let body = 4usize;
         let mut full = b"ID3\x04\x00\x00".to_vec();
-        full.extend_from_slice(&syncsafe(body as u32));
+        full.extend_from_slice(&syncsafe(u32::try_from(body).unwrap()));
         full.extend(std::iter::repeat_n(0u8, body)); // audio_offset = 14
         full.extend_from_slice(&[0xFF, 0x00]); // byte14=0xFF good, byte15=0x00 bad
         full.extend_from_slice(b"tail");
@@ -1678,7 +1685,7 @@ mod tests {
     fn locate_audio_bounded_needmore_for_sync_past_prefix() {
         let body = 4usize;
         let mut full = b"ID3\x04\x00\x00".to_vec();
-        full.extend_from_slice(&syncsafe(body as u32));
+        full.extend_from_slice(&syncsafe(u32::try_from(body).unwrap()));
         full.extend(std::iter::repeat_n(0u8, body)); // audio_offset = 14
         full.extend_from_slice(&[0xFF, 0xFB]); // sync at 14..16
         full.extend_from_slice(b"more audio bytes here");
@@ -1704,7 +1711,7 @@ mod tests {
         let file_len = full.len() as u64;
         assert!(file_len >= audio_offset + 128); // both conditions true
         let tail: [u8; 128] = full[full.len() - 128..].try_into().unwrap();
-        let prefix = &full[..audio_offset as usize + 2];
+        let prefix = &full[..usize_from(audio_offset) + 2];
         match locate_audio_bounded(prefix, file_len, Some(&tail)).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
@@ -1730,7 +1737,7 @@ mod tests {
         assert!(file_len >= audio_offset + 128); // first operand TRUE
         let tail: [u8; 128] = full[full.len() - 128..].try_into().unwrap();
         assert_ne!(&tail[0..3], b"TAG"); // second operand FALSE
-        let prefix = &full[..audio_offset as usize + 2];
+        let prefix = &full[..usize_from(audio_offset) + 2];
         match locate_audio_bounded(prefix, file_len, Some(&tail)).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
@@ -1757,7 +1764,7 @@ mod tests {
                                                 // looks at tail[0..3]); file_len is the real gate here.
         let mut tail = [0u8; 128];
         tail[0..3].copy_from_slice(b"TAG");
-        let prefix = &full[..audio_offset as usize + 2];
+        let prefix = &full[..usize_from(audio_offset) + 2];
         match locate_audio_bounded(prefix, file_len, Some(&tail)).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
@@ -1779,10 +1786,10 @@ mod tests {
         let mut out = Vec::new();
         out.extend_from_slice(b"ID3");
         out.extend_from_slice(&[0x04, 0x00, 0x00]); // v2.4.0, no flags
-        out.extend_from_slice(&ss(total_body as u32));
+        out.extend_from_slice(&ss(u32::try_from(total_body).unwrap()));
         for (id, body) in frames {
             out.extend_from_slice(*id);
-            out.extend_from_slice(&ss(body.len() as u32));
+            out.extend_from_slice(&ss(u32::try_from(body.len()).unwrap()));
             out.extend_from_slice(&[0x00, 0x00]); // frame flags
             out.extend_from_slice(body);
         }
@@ -1797,10 +1804,10 @@ mod tests {
         let mut out = Vec::new();
         out.extend_from_slice(b"ID3");
         out.extend_from_slice(&[0x03, 0x00, 0x00]); // v2.3.0, no flags
-        out.extend_from_slice(&ss(total_body as u32)); // tag size is synchsafe in every version
+        out.extend_from_slice(&ss(u32::try_from(total_body).unwrap())); // tag size is synchsafe in every version
         for (id, body) in frames {
             out.extend_from_slice(*id);
-            out.extend_from_slice(&(body.len() as u32).to_be_bytes()); // v2.3: plain u32 frame size
+            out.extend_from_slice(&(u32::try_from(body.len()).unwrap()).to_be_bytes()); // v2.3: plain u32 frame size
             out.extend_from_slice(&[0x00, 0x00]); // frame flags
             out.extend_from_slice(body);
         }
@@ -1823,7 +1830,9 @@ mod tests {
         // synchsafe misdecode (the `== 3` branch flipped) truncates it. Both frames
         // must survive byte-exact.
         let filler = vec![0xAAu8; 8];
-        let body: Vec<u8> = (0..200u32).map(|i| (i % 250 + 1) as u8).collect();
+        let body: Vec<u8> = (0..200u32)
+            .map(|i| u8::try_from(i % 250 + 1).unwrap())
+            .collect();
         let tag = build_v23_tag(&[(b"GEOB", &filler), (b"PRIV", &body)]);
         let (opaque, _promoted) = super::read_binary_tags(&tag);
         let geob = opaque

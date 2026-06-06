@@ -20,6 +20,23 @@ use fuser::{
     Session, TimeOrNow, WriteFlags,
 };
 
+// latencyfs is 64-bit-only, like the rest of the workspace (musefs-db's
+// convert module declares the same bound for the dependent crates).
+const _: () = assert!(
+    std::mem::size_of::<usize>() == 8,
+    "musefs-latencyfs supports 64-bit targets only"
+);
+
+/// The crate's only sanctioned `u64 -> usize` cast (see the guard above).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "u64 -> usize is lossless on 64-bit targets; guarded by the const assert above"
+)]
+#[inline]
+fn usize_from(v: u64) -> usize {
+    v as usize
+}
+
 const TTL: Duration = Duration::from_secs(1);
 
 fn ms(n: u64) -> Duration {
@@ -156,7 +173,11 @@ fn attr_from_meta(ino: u64, m: &std::fs::Metadata) -> FileAttr {
     };
     let t = |secs: i64, nsec: i64| {
         if secs >= 0 {
-            SystemTime::UNIX_EPOCH + Duration::new(secs as u64, nsec as u32)
+            SystemTime::UNIX_EPOCH
+                + Duration::new(
+                    u64::try_from(secs).unwrap_or(0),
+                    u32::try_from(nsec).unwrap_or(0),
+                )
         } else {
             SystemTime::UNIX_EPOCH
         }
@@ -171,11 +192,11 @@ fn attr_from_meta(ino: u64, m: &std::fs::Metadata) -> FileAttr {
         crtime: SystemTime::UNIX_EPOCH,
         kind,
         perm: (m.mode() & 0o7777) as u16,
-        nlink: m.nlink() as u32,
+        nlink: u32::try_from(m.nlink()).unwrap_or(u32::MAX),
         uid: m.uid(),
         gid: m.gid(),
-        rdev: m.rdev() as u32,
-        blksize: m.blksize() as u32,
+        rdev: u32::try_from(m.rdev()).unwrap_or(u32::MAX),
+        blksize: u32::try_from(m.blksize()).unwrap_or(u32::MAX),
         flags: 0,
     }
 }
@@ -293,7 +314,7 @@ impl fuser::Filesystem for PassthroughFs {
             let cino = self.inodes.lock().unwrap().intern(p);
             entries.push((cino, kind, ent.file_name()));
         }
-        for (i, (cino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
+        for (i, (cino, kind, name)) in entries.into_iter().enumerate().skip(usize_from(offset)) {
             if reply.add(INodeNo(cino), (i + 1) as u64, kind, &name) {
                 break;
             }
@@ -355,7 +376,7 @@ impl fuser::Filesystem for PassthroughFs {
         let Some(file) = guard.get(&fh.0) else {
             return reply.error(fuser::Errno::EBADF);
         };
-        let mut buf = vec![0u8; size as usize];
+        let mut buf = vec![0u8; usize_from(u64::from(size))];
         match file.read_at(&mut buf, offset) {
             Ok(n) => reply.data(&buf[..n]),
             Err(e) => {
@@ -414,9 +435,9 @@ impl fuser::Filesystem for PassthroughFs {
                         s.f_bavail as u64,
                         s.f_files as u64,
                         s.f_ffree as u64,
-                        s.f_bsize as u32,
-                        s.f_namemax as u32,
-                        s.f_frsize as u32,
+                        u32::try_from(s.f_bsize as u64).unwrap_or(u32::MAX),
+                        u32::try_from(s.f_namemax as u64).unwrap_or(u32::MAX),
+                        u32::try_from(s.f_frsize as u64).unwrap_or(u32::MAX),
                     );
                 }
             }
@@ -499,7 +520,7 @@ impl fuser::Filesystem for PassthroughFs {
             return reply.error(fuser::Errno::EBADF);
         };
         match file.write_at(data, offset) {
-            Ok(n) => reply.written(n as u32),
+            Ok(n) => reply.written(u32::try_from(n).unwrap_or(u32::MAX)),
             Err(e) => {
                 reply.error(fuser::Errno::from_i32(
                     e.raw_os_error().unwrap_or(libc::EIO),

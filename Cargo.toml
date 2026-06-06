@@ -14,12 +14,17 @@ repository = "https://github.com/Sohex/musefs"
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
-# Explicit `as` casts are deliberate throughout the byte/offset arithmetic
-# (audio bounds, chunk sizes, FUSE inode/size fields); flagging every one is noise.
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
-cast_possible_wrap = "allow"
-cast_lossless = "allow"
+# Integer-conversion convention (docs/superpowers/specs/2026-06-06-integer-cast-convention-design.md):
+# widenings use `From`; u64->usize goes through a sanctioned usize_from helper
+# (64-bit-only, compile-time guarded; `musefs_db::convert` for db/core/fuse/cli,
+# a crate-local sibling in musefs-format, a local copy in standalone latencyfs);
+# genuine narrowings use `try_from` (`?` on input-dependent values,
+# `.expect`/`.unwrap` on structurally bounded ones and in tests); deliberate
+# bit-truncation carries a per-site `#[expect]`.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+cast_lossless = "warn"
 
 # Doc conventions this project does not adopt.
 missing_errors_doc = "allow"

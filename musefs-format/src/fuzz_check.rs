@@ -61,9 +61,9 @@ pub mod fixtures {
         let first = (if is_last { 0x80 } else { 0 }) | (block_type & 0x7F);
         out.push(first);
         let len = body.len();
-        out.push(((len >> 16) & 0xFF) as u8);
-        out.push(((len >> 8) & 0xFF) as u8);
-        out.push((len & 0xFF) as u8);
+        out.push(u8::try_from((len >> 16) & 0xFF).expect("masked to 0xFF"));
+        out.push(u8::try_from((len >> 8) & 0xFF).expect("masked to 0xFF"));
+        out.push(u8::try_from(len & 0xFF).expect("masked to 0xFF"));
         out.extend_from_slice(body);
         out
     }
@@ -86,11 +86,11 @@ pub mod fixtures {
     /// Minimal VORBIS_COMMENT body with the given already-formatted `KEY=value` comments.
     pub fn vorbis_comment_body(vendor: &str, comments: &[&str]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(vendor.len()).unwrap().to_le_bytes());
         out.extend_from_slice(vendor.as_bytes());
-        out.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(comments.len()).unwrap().to_le_bytes());
         for c in comments {
-            out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            out.extend_from_slice(&u32::try_from(c.len()).unwrap().to_le_bytes());
             out.extend_from_slice(c.as_bytes());
         }
         out
@@ -120,7 +120,10 @@ pub mod fixtures {
     }
 
     fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-        let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+        let mut v = u32::try_from(8 + payload.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
         v.extend_from_slice(kind);
         v.extend_from_slice(payload);
         v
@@ -186,7 +189,7 @@ pub mod fixtures {
         // that shrinks the `moov` patches the offset below zero and synthesis fails
         // (TooLarge). With the true offset, the patched value lands at the new payload
         // position. The first `stco` occurrence is the box type (it precedes `mdat`).
-        let mdat_payload_offset = (out.len() - mdat_payload.len()) as u32;
+        let mdat_payload_offset = u32::try_from(out.len() - mdat_payload.len()).unwrap();
         let stco = out
             .windows(4)
             .position(|w| w == b"stco")
@@ -217,15 +220,15 @@ pub mod fixtures {
 
         // Chunk helpers: 4-byte id + LE 32-bit size + payload.
         let mut fmt_chunk = b"fmt ".to_vec();
-        fmt_chunk.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        fmt_chunk.extend_from_slice(&u32::try_from(fmt.len()).unwrap().to_le_bytes());
         fmt_chunk.extend_from_slice(&fmt);
 
         let mut data_chunk = b"data".to_vec();
-        data_chunk.extend_from_slice(&(data_payload.len() as u32).to_le_bytes());
+        data_chunk.extend_from_slice(&u32::try_from(data_payload.len()).unwrap().to_le_bytes());
         data_chunk.extend_from_slice(&data_payload);
 
         // RIFF size = 4 ("WAVE") + fmt_chunk.len() + data_chunk.len()
-        let riff_size = (4 + fmt_chunk.len() + data_chunk.len()) as u32;
+        let riff_size = u32::try_from(4 + fmt_chunk.len() + data_chunk.len()).unwrap();
         let mut out = Vec::with_capacity(12 + fmt_chunk.len() + data_chunk.len());
         out.extend_from_slice(b"RIFF");
         out.extend_from_slice(&riff_size.to_le_bytes());
@@ -371,6 +374,24 @@ mod fixtures_tests {
     }
 
     #[test]
+    fn flac_block_encodes_24bit_length_big_endian() {
+        // Pin all three length bytes of the 24-bit block-length field. The body is
+        // sized so each byte is distinct and non-zero (0x030201 = 197_121), which
+        // distinguishes `>> 16`/`>> 8` from `<< 16`/`<< 8` (a left shift would zero
+        // the high/mid bytes). The header is 4 bytes: type|last, then 3 length bytes.
+        let len = 0x03_02_01usize;
+        let body = vec![0xABu8; len];
+        let block = fixtures::flac_block(4, &body, false);
+        assert_eq!(block[0], 4, "block type, last-flag clear");
+        assert_eq!(
+            &block[1..4],
+            &[0x03, 0x02, 0x01],
+            "24-bit big-endian length"
+        );
+        assert_eq!(block.len(), 4 + len);
+    }
+
+    #[test]
     fn m4a_fixture_parses() {
         let f = fixtures::m4a(&[9u8; 16]);
         let b = crate::mp4::locate_audio(&f).unwrap();
@@ -398,7 +419,7 @@ mod fixtures_tests {
         // value (out.len() - payload.len()) and where it is written (stco + 12).
         let payload = b"AUDIOAUDIO";
         let f = fixtures::m4a(payload);
-        let expected = (f.len() - payload.len()) as u32;
+        let expected = u32::try_from(f.len() - payload.len()).unwrap();
         let stco = f
             .windows(4)
             .position(|w| w == b"stco")
