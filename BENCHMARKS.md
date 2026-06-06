@@ -392,6 +392,36 @@ cargo test -p musefs-core --release --test bench_refresh \
 
 ---
 
+## Issue #114 — Rendered Child Lookup Root Fan-Out
+
+*Measured 2026-06-06 (same machine as implementation run; release build; ignored harness).*
+
+Harness:
+
+```bash
+cargo test -p musefs-core --release --test bench_refresh \
+  bench_refresh_root_fanout_one_across_library_sizes -- --ignored --nocapture
+```
+
+The corpus uses `CorpusParams::single(Format::Flac, n, 1)`, so `$artist/$album/$title`
+creates `n` top-level artist directories. The timed update retags one track with
+only `COMMENT`, moving it to fallback `Unknown/Unknown/...`; this exercises an
+absent rendered-name lookup at root in `deepest_existing_ancestor`.
+
+| library size (top-level artists) | refresh-root-fanout-1 wall (ms) |
+|---------------------------------:|--------------------------------:|
+| 100 | 0 |
+| 1000 | 0 |
+| 5000 | 1 |
+| 20000 | 1 |
+
+The rendered-name child index turns the root lookup into an indexed miss, so the
+tree-side lookup no longer scans unrelated artists. Overall wall time may still
+include SQLite changelog reads, changed-track rendering, and test harness setup,
+but the root sibling scan from issue #114 is removed.
+
+---
+
 ## Phase 6 PR 2 — Scan pair (#67, #68)
 
 *Measured 2026-06-04 (same box, lightly loaded · tempfs · `ci` tier).*
