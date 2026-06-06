@@ -323,7 +323,7 @@ impl Filesystem for MusefsFs {
                             let mut map = backing
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let id = map.entry(fh.get()).or_insert(id);
+                            let id = map.entry(fh.get()).insert_entry(id).into_mut();
                             return reply.opened_passthrough(
                                 FileHandle(fh.get()),
                                 FopenFlags::empty(),
