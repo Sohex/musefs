@@ -1067,6 +1067,11 @@ impl Musefs {
         let handle = self.handles.get(fh.slab_key())?;
         Some(PassthroughFd(Arc::clone(&*handle)))
     }
+
+    /// The mount's serving mode (how file contents are produced).
+    pub fn mode(&self) -> Mode {
+        self.config.mode
+    }
 }
 
 #[cfg(test)]

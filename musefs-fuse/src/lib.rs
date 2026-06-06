@@ -73,6 +73,27 @@ fn open_flags(keep_cache: bool) -> FopenFlags {
     }
 }
 
+/// True only when /proc/self/status definitively shows CAP_SYS_ADMIN (bit 21)
+/// absent from CapEff. Unreadable/unparseable -> false (stay neutral; the
+/// first open's ioctl attempt decides instead).
+fn definitely_lacks_cap_sys_admin() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| cap_eff_has_sys_admin(&s))
+        .is_some_and(|has| !has)
+}
+
+/// Parse the `CapEff:` line; None when absent or malformed.
+fn cap_eff_has_sys_admin(status: &str) -> Option<bool> {
+    const CAP_SYS_ADMIN_BIT: u32 = 21;
+    let hex = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))?
+        .trim();
+    let mask = u64::from_str_radix(hex, 16).ok()?;
+    Some(mask & (1 << CAP_SYS_ADMIN_BIT) != 0)
+}
+
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
 /// underlying errno when present; everything structural collapses to `EIO`.
 pub fn errno(err: &CoreError) -> fuser::Errno {
@@ -182,6 +203,13 @@ impl MusefsFs {
     pub fn new(core: Musefs, config: FuseConfig) -> MusefsFs {
         // Work is I/O-bound (especially on NFS), so oversize the pool vs CPUs.
         let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2;
+        let passthrough_disabled =
+            core.mode() == musefs_core::Mode::StructureOnly && definitely_lacks_cap_sys_admin();
+        if passthrough_disabled {
+            log::info!(
+                "StructureOnly mount without CAP_SYS_ADMIN: kernel passthrough unavailable; reads will be served by the daemon"
+            );
+        }
         MusefsFs {
             core: Arc::new(core),
             // `ThreadPool`'s queue is unbounded. `max_background` (set in `init`)
@@ -197,7 +225,7 @@ impl MusefsFs {
             notifier: Arc::new(OnceLock::new()),
             poll_pending: Arc::new(AtomicBool::new(false)),
             backing: Arc::new(Mutex::new(HashMap::new())),
-            passthrough_disabled: Arc::new(AtomicBool::new(false)),
+            passthrough_disabled: Arc::new(AtomicBool::new(passthrough_disabled)),
         }
     }
 
@@ -649,6 +677,33 @@ mod tests {
         }
         assert_eq!(fs.pool.queued_count(), queued, "no task should be queued");
         assert_eq!(fs.pool.active_count(), active, "no task should be started");
+    }
+
+    #[test]
+    fn cap_eff_parser_root_mask_has_sys_admin() {
+        // Bit 21 is set in the root effective capability mask.
+        assert_eq!(
+            cap_eff_has_sys_admin("CapPrm:\t0000003fffffffff\nCapEff:\t0000003fffffffff\n"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cap_eff_parser_zero_mask_lacks_sys_admin() {
+        assert_eq!(
+            cap_eff_has_sys_admin("CapEff:\t0000000000000000\n"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cap_eff_parser_missing_line_returns_none() {
+        assert_eq!(cap_eff_has_sys_admin("Name:\tfoo\nUid:\t1000\n"), None);
+    }
+
+    #[test]
+    fn cap_eff_parser_garbage_hex_returns_none() {
+        assert_eq!(cap_eff_has_sys_admin("CapEff:\tnothex\n"), None);
     }
 
     #[test]
