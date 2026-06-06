@@ -218,3 +218,12 @@ tracks whose backing file is gone, and GC orphaned art. `--revalidate` selects i
   `fuzz_check::fixtures::<fmt>()` minimal file, a `fuzz/fuzz_targets/<fmt>.rs`
   target with a seed in `generate_seeds`, a `musefs-format/tests/proptest_<fmt>.rs`,
   and a manifest row in `musefs-core/tests/interop_emit.rs`.
+- Integer conversions: the four clippy cast lints are deny-via-CI. Widenings
+  use `From`; `u64 -> usize` only via the sanctioned `usize_from` helpers
+  (`musefs_db::convert`, re-exported by core; musefs-format and latencyfs carry
+  crate-local siblings — the workspace is declared 64-bit-only); genuine
+  narrowings use `try_from` (`?` for input-dependent values, `.expect` for
+  structurally bounded ones, `.unwrap` in tests); deliberate bit-truncation
+  keeps `as` under a reasoned `#[expect]`. Non-negative db row fields are
+  unsigned; rusqlite's checked conversions (feature `fallible_uint`) validate
+  at the row boundary.

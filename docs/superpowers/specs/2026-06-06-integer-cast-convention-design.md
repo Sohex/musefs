@@ -99,8 +99,9 @@ version goes into CLAUDE.md's Conventions section.
     their `*ord += 1` increments.
 - **New `convert.rs`**: `pub fn usize_from(v: u64) -> usize` containing the
   workspace's only pointer-width `#[expect(clippy::cast_possible_truncation)]`
-  (latencyfs, standalone, carries its own), adjacent to the 64-bit const
-  guard. db hosts it because it is the workspace's base
+  for the db/core/fuse/cli stack (musefs-format carries its own crate-local
+  sibling — see below — and latencyfs, standalone, carries its own), adjacent
+  to the 64-bit const guard. db hosts it because it is the workspace's base
   crate and needs it itself (`art.rs:62`, `tags.rs:116`).
 - One write site is not dissolved by any field flip: `art.rs:97` computes
   `byte_len` from data (`a.data.len() as i64`; `NewArt` has no `byte_len`
@@ -128,15 +129,21 @@ version goes into CLAUDE.md's Conventions section.
 - Parser-internal narrowings get individual judgment: already-bounds-checked
   values keep a justified path (restructure or helper); input-dependent ones
   get `try_from` + `?` into the existing per-format error.
+- musefs-db is a DEV-dependency of musefs-format only (to avoid linking SQLite
+  into production format builds and the out-of-workspace fuzz targets), so
+  musefs-format carries its own crate-local `convert` sibling — a single
+  `usize_from` function with its own `#[expect(clippy::cast_possible_truncation)]`
+  and 64-bit guard — rather than re-exporting `musefs_db::convert`.
 
 ### `musefs-fuse`, `musefs-cli`
 
 - A handful of sites; use the re-exported helper / `try_from` per the
   convention.
 - Note: `attr.mtime_secs as u64` (`musefs-fuse/src/lib.rs:112`) is guarded by
-  `if attr.mtime_secs > 0` and clippy's `cast_sign_loss` does not flag it, so
-  it needs no change (an `#[expect]` there would error as unfulfilled).
-  fuse's actual sites are `lib.rs:339` (lossless `u32 as u64`) and
+  `if attr.mtime_secs > 0`, but clippy's `cast_sign_loss` flags it regardless
+  of the runtime guard. It was fixed with
+  `u64::try_from(...).expect("guarded by mtime_secs > 0")`.
+  fuse's other sites are `lib.rs:339` (lossless `u32 as u64`) and
   `lib.rs:383` (`u64 → usize`).
 
 ### `musefs-latencyfs`
