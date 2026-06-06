@@ -18,12 +18,14 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", "Real Title", 0)])
@@ -63,12 +65,14 @@ fn resolve_errors_when_audio_bounds_overrun_the_file() {
     let (dir, db, _id) = setup();
     let flac = dir.path().join("song.flac");
     let meta = std::fs::metadata(&flac).unwrap();
-    let mtime = meta
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let mtime = i64::try_from(
+        meta.modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
     // Re-upsert the same path with an audio_length that runs past EOF (the offset
     // is valid, but offset + length exceeds the file size).
     let id = db

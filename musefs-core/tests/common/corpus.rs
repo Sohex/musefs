@@ -231,14 +231,14 @@ fn flac_bytes(comments: &[String], art: Option<&[u8]>, audio: &[u8]) -> Vec<u8> 
     if let Some(img) = art {
         let mut body = Vec::new();
         body.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
-        body.extend_from_slice(&(b"image/png".len() as u32).to_be_bytes());
+        body.extend_from_slice(&u32::try_from(b"image/png".len()).unwrap().to_be_bytes());
         body.extend_from_slice(b"image/png");
         body.extend_from_slice(&0u32.to_be_bytes()); // description len
         body.extend_from_slice(&0u32.to_be_bytes()); // width
         body.extend_from_slice(&0u32.to_be_bytes()); // height
         body.extend_from_slice(&0u32.to_be_bytes()); // depth
         body.extend_from_slice(&0u32.to_be_bytes()); // colors
-        body.extend_from_slice(&(img.len() as u32).to_be_bytes());
+        body.extend_from_slice(&u32::try_from(img.len()).unwrap().to_be_bytes());
         body.extend_from_slice(img);
         out.extend_from_slice(&flac_block(6, &body, true));
     }

@@ -46,7 +46,7 @@ fn fmt_pcm_16bit_mono() -> Vec<u8> {
 fn wav_with_id3(id3: &[u8], audio: &[u8]) -> Vec<u8> {
     fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
         let mut c = id.to_vec();
-        c.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        c.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
         c.extend_from_slice(body);
         if body.len() % 2 == 1 {
             c.push(0); // RIFF word-alignment pad
@@ -60,7 +60,7 @@ fn wav_with_id3(id3: &[u8], audio: &[u8]) -> Vec<u8> {
     body.extend(chunk(b"data", audio));
     let mut out = Vec::new();
     out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&body);
     out
 }
@@ -79,8 +79,8 @@ fn materialize_wav(
                 out.extend_from_slice(map.get(payload_id).unwrap());
             }
             Segment::BackingAudio { offset, len } => {
-                let s = *offset as usize;
-                out.extend_from_slice(&audio[s..s + *len as usize]);
+                let s = usize::try_from(*offset).unwrap();
+                out.extend_from_slice(&audio[s..s + usize::try_from(*len).unwrap()]);
             }
             Segment::ArtImage { .. } => panic!("no art in this fixture"),
             other => panic!("unexpected segment in WAV layout: {other:?}"),
@@ -158,7 +158,7 @@ proptest! {
             audio_offset: 0, audio_length: 0, backing_size: 0, backing_mtime: 0,
         }).unwrap();
         let rows: Vec<musefs_db::BinaryTag> = opaque.iter().enumerate().map(|(i, e)| {
-            musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: i as u64 }
+            musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: u64::try_from(i).unwrap() }
         }).collect();
         db.set_binary_tags(tid, &rows).unwrap();
         let stored = db.get_binary_tags(tid).unwrap();
@@ -167,7 +167,7 @@ proptest! {
         }).collect();
         let mut map: HashMap<i64, Vec<u8>> = HashMap::new();
         for r in &stored {
-            map.insert(r.rowid, db.read_binary_tag_chunk(r.rowid, 0, r.byte_len as usize).unwrap());
+            map.insert(r.rowid, db.read_binary_tag_chunk(r.rowid, 0, usize::try_from(r.byte_len).unwrap()).unwrap());
         }
 
         // Promoted text tags drive POPM/UFID regeneration.

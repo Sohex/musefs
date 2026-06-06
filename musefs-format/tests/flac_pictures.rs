@@ -4,15 +4,15 @@ use musefs_format::fuzz_check::fixtures::{flac_block, streaminfo_body};
 fn picture_body(pic_type: u32, mime: &str, desc: &str, w: u32, h: u32, data: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&pic_type.to_be_bytes());
-    b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+    b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
     b.extend_from_slice(mime.as_bytes());
-    b.extend_from_slice(&(desc.len() as u32).to_be_bytes());
+    b.extend_from_slice(&u32::try_from(desc.len()).unwrap().to_be_bytes());
     b.extend_from_slice(desc.as_bytes());
     b.extend_from_slice(&w.to_be_bytes());
     b.extend_from_slice(&h.to_be_bytes());
     b.extend_from_slice(&0u32.to_be_bytes()); // color depth
     b.extend_from_slice(&0u32.to_be_bytes()); // colors used
-    b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
     b.extend_from_slice(data);
     b
 }

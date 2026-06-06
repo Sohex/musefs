@@ -191,14 +191,14 @@ fn serves_flac_with_embedded_art_through_the_facade() {
     fn picture_body(mime: &str, data: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&3u32.to_be_bytes()); // front cover
-        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
         b.extend_from_slice(mime.as_bytes());
         b.extend_from_slice(&0u32.to_be_bytes()); // description length
         b.extend_from_slice(&0u32.to_be_bytes()); // width
         b.extend_from_slice(&0u32.to_be_bytes()); // height
         b.extend_from_slice(&0u32.to_be_bytes()); // color depth
         b.extend_from_slice(&0u32.to_be_bytes()); // colors used
-        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
         b.extend_from_slice(data);
         b
     }

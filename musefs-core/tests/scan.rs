@@ -255,14 +255,14 @@ fn flac_with_picture(comments: &[&str], img: &[u8]) -> Vec<u8> {
     fn picture_body(pic_type: u32, mime: &str, data: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&pic_type.to_be_bytes());
-        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
         b.extend_from_slice(mime.as_bytes());
         b.extend_from_slice(&0u32.to_be_bytes()); // empty description
         b.extend_from_slice(&0u32.to_be_bytes()); // width
         b.extend_from_slice(&0u32.to_be_bytes()); // height
         b.extend_from_slice(&0u32.to_be_bytes()); // depth
         b.extend_from_slice(&0u32.to_be_bytes()); // colors
-        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
         b.extend_from_slice(data);
         b
     }
@@ -316,14 +316,14 @@ fn flac_with_pictures(comments: &[&str], pics: &[(u32, &[u8])]) -> Vec<u8> {
     fn picture_body(pic_type: u32, mime: &str, data: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&pic_type.to_be_bytes());
-        b.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
         b.extend_from_slice(mime.as_bytes());
         b.extend_from_slice(&0u32.to_be_bytes()); // description
         b.extend_from_slice(&0u32.to_be_bytes()); // width
         b.extend_from_slice(&0u32.to_be_bytes()); // height
         b.extend_from_slice(&0u32.to_be_bytes()); // depth
         b.extend_from_slice(&0u32.to_be_bytes()); // colors
-        b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        b.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
         b.extend_from_slice(data);
         b
     }

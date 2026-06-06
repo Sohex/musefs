@@ -12,7 +12,9 @@ fn materialize(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {
         match seg {
             Segment::Inline(b) => out.extend_from_slice(b),
             Segment::BackingAudio { offset, len } => {
-                out.extend_from_slice(&backing[*offset as usize..(*offset + *len) as usize]);
+                let s = usize::try_from(*offset).unwrap();
+                let e = usize::try_from(*offset + *len).unwrap();
+                out.extend_from_slice(&backing[s..e]);
             }
             Segment::ArtImage { .. } => unreachable!("no art in this fixture"),
             Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
@@ -25,7 +27,9 @@ fn materialize(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {
 
 fn samples(bytes: &[u8]) -> Vec<Vec<u8>> {
     // `::mp4` is the external oracle crate; `mp4` (no leading `::`) is our own module.
-    let mut r = ::mp4::Mp4Reader::read_header(Cursor::new(bytes), bytes.len() as u64).unwrap();
+    let mut r =
+        ::mp4::Mp4Reader::read_header(Cursor::new(bytes), u64::try_from(bytes.len()).unwrap())
+            .unwrap();
     let track_id = *r.tracks().keys().next().unwrap();
     let count = r.sample_count(track_id).unwrap();
     (1..=count)

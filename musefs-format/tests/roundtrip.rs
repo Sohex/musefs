@@ -67,7 +67,10 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
     let assembled = resolve_layout(&layout, &file, &art_map, &HashMap::new());
 
     assert_eq!(assembled.len() as u64, layout.total_len());
-    assert_eq!(&assembled[layout.header_len() as usize..], &audio[..]);
+    assert_eq!(
+        &assembled[usize::try_from(layout.header_len()).unwrap()..],
+        &audio[..]
+    );
 
     let tag = metaflac::Tag::read_from(&mut Cursor::new(&assembled)).expect("valid FLAC");
 

@@ -61,11 +61,11 @@ pub fn write_wav(path: &Path, audio: &[u8]) -> (u64, u64) {
     let mut body = Vec::new();
     for (id, payload) in [(&b"fmt "[..], &fmt[..]), (&b"data"[..], audio)] {
         body.extend_from_slice(id);
-        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
         body.extend_from_slice(payload);
     }
     let mut bytes = b"RIFF".to_vec();
-    bytes.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
     bytes.extend_from_slice(b"WAVE");
     bytes.extend_from_slice(&body);
 
@@ -76,7 +76,10 @@ pub fn write_wav(path: &Path, audio: &[u8]) -> (u64, u64) {
 
 /// Build a 32-bit-size box: [size][type][payload].
 fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-    let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+    let mut v = u32::try_from(8 + payload.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
     v.extend_from_slice(kind);
     v.extend_from_slice(payload);
     v
@@ -133,7 +136,7 @@ pub fn minimal_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     // that shrinks the `moov` patches the offset below zero and synthesis fails
     // (TooLarge). With the true offset, the patched value lands at the new payload
     // position. The first `stco` occurrence is the box type (it precedes `mdat`).
-    let mdat_payload_offset = (out.len() - mdat_payload.len()) as u32;
+    let mdat_payload_offset = u32::try_from(out.len() - mdat_payload.len()).unwrap();
     let stco = out
         .windows(4)
         .position(|w| w == b"stco")
@@ -187,7 +190,7 @@ pub fn minimal_m4a_moov_last(mdat_payload: &[u8]) -> Vec<u8> {
     // and could otherwise contain a false `stco` byte match.
     let moov_start = ftyp.len() + mdat.len();
     let mut out = [ftyp, mdat, moov].concat();
-    let mdat_payload_offset = (8 + b"M4A isom".len() + 8) as u32;
+    let mdat_payload_offset = u32::try_from(8 + b"M4A isom".len() + 8).unwrap();
     let stco_pos = moov_start
         + out[moov_start..]
             .windows(4)
@@ -243,14 +246,14 @@ pub fn write_ogg(path: &Path, audio: &[u8]) -> (u64, u64) {
 pub fn picture_block_body(data: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
-    v.extend_from_slice(&(b"image/png".len() as u32).to_be_bytes());
+    v.extend_from_slice(&u32::try_from(b"image/png".len()).unwrap().to_be_bytes());
     v.extend_from_slice(b"image/png");
     v.extend_from_slice(&0u32.to_be_bytes()); // empty description
     v.extend_from_slice(&1u32.to_be_bytes()); // width
     v.extend_from_slice(&1u32.to_be_bytes()); // height
     v.extend_from_slice(&0u32.to_be_bytes()); // depth
     v.extend_from_slice(&0u32.to_be_bytes()); // colors
-    v.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    v.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
     v.extend_from_slice(data);
     v
 }

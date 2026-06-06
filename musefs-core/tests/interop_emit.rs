@@ -20,7 +20,10 @@ use std::path::Path;
 // requires `ftyp`, `mvhd`, exactly one `soun` trak whose `stbl` has `stco`,
 // and `udta/meta/ilst`.
 fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-    let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+    let mut v = u32::try_from(8 + payload.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
     v.extend_from_slice(kind);
     v.extend_from_slice(payload);
     v
@@ -102,13 +105,16 @@ const COVR_JPEG: &[u8] = b"\xFF\xD8\xFF\xE0interop-jpeg-cover";
 const COVR_PNG: &[u8] = b"\x89PNG\r\n\x1a\ninterop-png-cover";
 
 fn real_mtime(p: &Path) -> i64 {
-    std::fs::metadata(p)
-        .unwrap()
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    i64::try_from(
+        std::fs::metadata(p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
 }
 
 #[derive(Debug)]

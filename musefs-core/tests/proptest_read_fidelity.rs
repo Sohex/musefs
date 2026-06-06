@@ -21,12 +21,14 @@ fn build(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>) {
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -49,12 +51,14 @@ fn build_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempDir, 
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -93,12 +97,14 @@ fn build_wav(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -120,12 +126,14 @@ fn build_wav_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -162,7 +170,7 @@ proptest! {
         let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
         let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
         prop_assert_eq!(whole.len() as u64, resolved.total_len);
-        let served_audio = &whole[resolved.layout.header_len() as usize..];
+        let served_audio = &whole[usize::try_from(resolved.layout.header_len()).unwrap()..];
         prop_assert_eq!(served_audio, &original[..]);
     }
 
@@ -181,7 +189,7 @@ proptest! {
         let len = (b as u64) % (total - offset + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
         prop_assert_eq!(got.len() as u64, len);
-        prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
     }
 
     #[test]
@@ -200,7 +208,7 @@ proptest! {
         let end = hlen + 1 + (after as u64 % (total - hlen)); // in (hlen, total]
         let whole = read_at(&resolved, &db, 0, total).unwrap();
         let got = read_at(&resolved, &db, start, end - start).unwrap();
-        prop_assert_eq!(&got[..], &whole[start as usize..end as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(start).unwrap()..usize::try_from(end).unwrap()]);
     }
 
     #[test]
@@ -236,7 +244,7 @@ proptest! {
         prop_assert_eq!(art_len, art.len() as u64);
         // The art blob is served verbatim at its segment offset.
         prop_assert_eq!(
-            &whole[art_off as usize..(art_off + art_len) as usize],
+            &whole[usize::try_from(art_off).unwrap()..usize::try_from(art_off + art_len).unwrap()],
             &art[..]
         );
         // A partial window *within the art span* matches the independently-read
@@ -246,7 +254,7 @@ proptest! {
         let offset = art_off + local_off;
         let len = (b as u64) % (art_len - local_off + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
-        prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
     }
 
     #[test]
@@ -262,7 +270,7 @@ proptest! {
         // not the trailing bytes (a word-align pad may follow), so locate it.
         let bounds = musefs_format::wav::locate_audio(&whole).unwrap();
         prop_assert_eq!(
-            &whole[bounds.audio_offset as usize..(bounds.audio_offset + bounds.audio_length) as usize],
+            &whole[usize::try_from(bounds.audio_offset).unwrap()..usize::try_from(bounds.audio_offset + bounds.audio_length).unwrap()],
             &original[..]
         );
     }
@@ -282,7 +290,7 @@ proptest! {
         let len = (b as u64) % (total - offset + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
         prop_assert_eq!(got.len() as u64, len);
-        prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
     }
 
     #[test]
@@ -301,7 +309,7 @@ proptest! {
         let end = hlen + 1 + (after as u64 % (total - hlen));
         let whole = read_at(&resolved, &db, 0, total).unwrap();
         let got = read_at(&resolved, &db, start, end - start).unwrap();
-        prop_assert_eq!(&got[..], &whole[start as usize..end as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(start).unwrap()..usize::try_from(end).unwrap()]);
     }
 
     #[test]
@@ -334,14 +342,14 @@ proptest! {
         let art_len = art_len.expect("layout has an ArtImage segment");
         prop_assert_eq!(art_len, art.len() as u64);
         prop_assert_eq!(
-            &whole[art_off as usize..(art_off + art_len) as usize],
+            &whole[usize::try_from(art_off).unwrap()..usize::try_from(art_off + art_len).unwrap()],
             &art[..]
         );
         let local_off = (a as u64) % (art_len + 1);
         let offset = art_off + local_off;
         let len = (b as u64) % (art_len - local_off + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
-        prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
     }
 }
 
@@ -358,12 +366,14 @@ fn build_mp3(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -383,12 +393,14 @@ fn build_mp3_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -428,7 +440,7 @@ proptest! {
         let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
         let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
         prop_assert_eq!(whole.len() as u64, resolved.total_len);
-        let served_audio = &whole[resolved.layout.header_len() as usize..];
+        let served_audio = &whole[usize::try_from(resolved.layout.header_len()).unwrap()..];
         prop_assert_eq!(served_audio, &original[..]);
     }
 
@@ -447,7 +459,7 @@ proptest! {
         let len = (b as u64) % (total - offset + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
         prop_assert_eq!(got.len() as u64, len);
-        prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
     }
 
     #[test]
@@ -466,7 +478,7 @@ proptest! {
         let end = hlen + 1 + (after as u64 % (total - hlen)); // in (hlen, total]
         let whole = read_at(&resolved, &db, 0, total).unwrap();
         let got = read_at(&resolved, &db, start, end - start).unwrap();
-        prop_assert_eq!(&got[..], &whole[start as usize..end as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(start).unwrap()..usize::try_from(end).unwrap()]);
     }
 
     #[test]
@@ -500,14 +512,14 @@ proptest! {
         let art_len = art_len.expect("layout has an ArtImage segment");
         prop_assert_eq!(art_len, art.len() as u64);
         prop_assert_eq!(
-            &whole[art_off as usize..(art_off + art_len) as usize],
+            &whole[usize::try_from(art_off).unwrap()..usize::try_from(art_off + art_len).unwrap()],
             &art[..]
         );
         let local_off = (a as u64) % (art_len + 1);
         let offset = art_off + local_off;
         let len = (b as u64) % (art_len - local_off + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
-        prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
     }
 
     #[test]
@@ -543,7 +555,7 @@ proptest! {
         );
         let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
         prop_assert_eq!(whole.len() as u64, resolved.total_len);
-        let served_audio = &whole[resolved.layout.header_len() as usize..];
+        let served_audio = &whole[usize::try_from(resolved.layout.header_len()).unwrap()..];
         prop_assert_eq!(served_audio, &original[..]);
     }
 }
@@ -561,12 +573,14 @@ fn build_m4a(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -586,12 +600,14 @@ fn build_m4a_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: meta
-                .modified()
-                .unwrap()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -632,7 +648,7 @@ proptest! {
         let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
         let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
         prop_assert_eq!(whole.len() as u64, resolved.total_len);
-        let served_audio = &whole[resolved.layout.header_len() as usize..];
+        let served_audio = &whole[usize::try_from(resolved.layout.header_len()).unwrap()..];
         prop_assert_eq!(served_audio, &original[..]);
     }
 
@@ -651,7 +667,7 @@ proptest! {
         let len = (b as u64) % (total - offset + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
         prop_assert_eq!(got.len() as u64, len);
-        prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
     }
 
     #[test]
@@ -670,7 +686,7 @@ proptest! {
         let end = hlen + 1 + (after as u64 % (total - hlen)); // in (hlen, total]
         let whole = read_at(&resolved, &db, 0, total).unwrap();
         let got = read_at(&resolved, &db, start, end - start).unwrap();
-        prop_assert_eq!(&got[..], &whole[start as usize..end as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(start).unwrap()..usize::try_from(end).unwrap()]);
     }
 
     #[test]
@@ -704,13 +720,13 @@ proptest! {
         let art_len = art_len.expect("layout has an ArtImage segment");
         prop_assert_eq!(art_len, art.len() as u64);
         prop_assert_eq!(
-            &whole[art_off as usize..(art_off + art_len) as usize],
+            &whole[usize::try_from(art_off).unwrap()..usize::try_from(art_off + art_len).unwrap()],
             &art[..]
         );
         let local_off = (a as u64) % (art_len + 1);
         let offset = art_off + local_off;
         let len = (b as u64) % (art_len - local_off + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
-        prop_assert_eq!(&got[..], &whole[offset as usize..(offset + len) as usize]);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
     }
 }

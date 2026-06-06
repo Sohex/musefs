@@ -17,7 +17,7 @@ fn build_wav(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
     let mut body = Vec::new();
     for (id, payload) in chunks {
         body.extend_from_slice(*id);
-        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
         body.extend_from_slice(payload);
         if payload.len() % 2 == 1 {
             body.push(0x00);
@@ -25,7 +25,7 @@ fn build_wav(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
     }
     let mut out = Vec::new();
     out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
     out.extend_from_slice(b"WAVE");
     out.extend_from_slice(&body);
     out
@@ -38,7 +38,7 @@ fn info_payload(pairs: &[(&[u8; 4], &str)]) -> Vec<u8> {
         let mut v = val.as_bytes().to_vec();
         v.push(0x00);
         p.extend_from_slice(*cc);
-        p.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        p.extend_from_slice(&u32::try_from(v.len()).unwrap().to_le_bytes());
         p.extend_from_slice(&v);
         if v.len() % 2 == 1 {
             p.push(0x00);

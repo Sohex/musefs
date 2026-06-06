@@ -3,13 +3,16 @@ use musefs_db::{Db, Format, NewTrack};
 use musefs_format::fuzz_check::fixtures;
 
 fn real_mtime(path: &std::path::Path) -> i64 {
-    std::fs::metadata(path)
-        .unwrap()
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    i64::try_from(
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -37,7 +40,7 @@ fn scanner_owned_bounds_mutation_returns_controlled_error() {
     external
         .execute(
             "UPDATE tracks SET audio_length = audio_length + ?1 WHERE id = ?2",
-            rusqlite::params![bytes.len() as i64, id],
+            rusqlite::params![i64::try_from(bytes.len()).unwrap(), id],
         )
         .unwrap();
 

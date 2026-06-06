@@ -25,8 +25,8 @@ pub fn resolve_layout(
                 out.extend_from_slice(img);
             }
             Segment::BackingAudio { offset, len } => {
-                let o = *offset as usize;
-                let l = *len as usize;
+                let o = usize::try_from(*offset).unwrap();
+                let l = usize::try_from(*len).unwrap();
                 out.extend_from_slice(&backing[o..o + l]);
             }
             Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
