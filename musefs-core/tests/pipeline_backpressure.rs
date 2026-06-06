@@ -48,12 +48,19 @@ fn pipeline_completes_under_art_backpressure() {
     // Cap the in-flight budget below two files' cumulative art (6 bytes each), so a
     // second concurrent `acquire` blocks while the writer's batch sits below the
     // flush threshold — the exact pre-fix deadlock window.
-    std::env::set_var("MUSEFS_BATCH_BYTES", "8");
-
     let root = dir.path().to_path_buf();
     let handle = std::thread::spawn(move || {
         let db = Db::open_in_memory().unwrap();
-        scan_directory_with(&db, &root, &ScanOptions { jobs: 4 }).unwrap();
+        scan_directory_with(
+            &db,
+            &root,
+            &ScanOptions {
+                jobs: 4,
+                batch_bytes: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         db.list_tracks().unwrap().len()
     });
 
@@ -67,6 +74,5 @@ fn pipeline_completes_under_art_backpressure() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let scanned = handle.join().unwrap();
-    std::env::remove_var("MUSEFS_BATCH_BYTES");
     assert_eq!(scanned, 8, "all art-bearing files should ingest");
 }

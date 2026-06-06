@@ -58,10 +58,16 @@ fn bounded_probe_equivalent_to_full_for_every_format() {
         let oracle = normalized(&oracle_db);
 
         // Bounded scan with a 64-byte window → widen path fires on every file.
-        std::env::set_var("MUSEFS_SCAN_WINDOW", "64");
         let bounded_db = Db::open_in_memory().unwrap();
-        musefs_core::scan_directory(&bounded_db, dir.path()).unwrap();
-        std::env::remove_var("MUSEFS_SCAN_WINDOW");
+        musefs_core::scan_directory_with(
+            &bounded_db,
+            dir.path(),
+            &musefs_core::ScanOptions {
+                window: 64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let bounded = normalized(&bounded_db);
 
         assert_eq!(

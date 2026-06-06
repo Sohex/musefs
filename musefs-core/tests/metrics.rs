@@ -473,7 +473,7 @@ fn scan_still_reads_id3v1_tail_for_mp3() {
     scan_directory(&db, &target.corpus_dir).unwrap();
     let s = metrics::snapshot();
     // Corpus tracks are far below the default 1 MiB scan window (this test must
-    // not set MUSEFS_SCAN_WINDOW): one prefix read + the tail. read_tail_128
+    // keep the default ScanOptions::window): one prefix read + the tail. read_tail_128
     // always reads 128 bytes when file_len >= 128, trailer present or not, so
     // the +128 assertion is robust.
     assert_eq!(s.scan_preads, 2, "mp3: prefix read + ID3v1 tail read");

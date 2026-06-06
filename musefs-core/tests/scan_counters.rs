@@ -10,9 +10,6 @@ use musefs_core::{
 };
 use musefs_db::Db;
 
-/// Serialize env-mutating tests: `MUSEFS_*` vars are process-global.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Minimal valid FLAC: marker + last STREAMINFO (34-byte body) + audio payload.
 fn flac_minimal(audio: &[u8]) -> Vec<u8> {
     let mut b = b"fLaC".to_vec();
@@ -74,7 +71,6 @@ fn rows(db: &Db) -> Vec<(String, i64, i64)> {
 // kills scan L232 `(prefix.len() as u64) < file_len`→`<=`/`==`/`>` (oracle match)
 #[test]
 fn widen_then_fallback_matches_oracle_under_tiny_window() {
-    let _g = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     // Big-art FLAC: bounded probe must widen well past a 64-byte window.
     std::fs::write(
@@ -94,10 +90,16 @@ fn widen_then_fallback_matches_oracle_under_tiny_window() {
     scan_directory_full_oracle(&oracle_db, dir.path()).unwrap();
     let oracle = rows(&oracle_db);
 
-    std::env::set_var("MUSEFS_SCAN_WINDOW", "64");
     let bounded_db = Db::open_in_memory().unwrap();
-    let stats = scan_directory(&bounded_db, dir.path()).unwrap();
-    std::env::remove_var("MUSEFS_SCAN_WINDOW");
+    let stats = scan_directory_with(
+        &bounded_db,
+        dir.path(),
+        &ScanOptions {
+            window: 64,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     assert_eq!(stats.scanned, 2);
     assert_eq!(rows(&bounded_db), oracle, "bounded widen/fallback diverged");
@@ -112,7 +114,6 @@ fn widen_then_fallback_matches_oracle_under_tiny_window() {
 // kills scan L225 `want + 1` (widen must make progress to reach the art body)
 #[test]
 fn widen_preserves_art_bytes_vs_oracle() {
-    let _g = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("art.flac"),
@@ -127,10 +128,16 @@ fn widen_preserves_art_bytes_vs_oracle() {
     let o_sha = oracle_db.get_art(o_art[0].art_id).unwrap().unwrap().sha256;
 
     // Tiny window forces a multi-step widen to reach the 4 KiB picture body.
-    std::env::set_var("MUSEFS_SCAN_WINDOW", "16");
     let db = Db::open_in_memory().unwrap();
-    scan_directory(&db, dir.path()).unwrap();
-    std::env::remove_var("MUSEFS_SCAN_WINDOW");
+    scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            window: 16,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let track = db.list_tracks().unwrap().into_iter().next().unwrap();
     assert_eq!(track.audio_offset, o_track.audio_offset);
@@ -164,7 +171,15 @@ fn scans_more_than_batch_files_persists_all_once() {
         .unwrap();
     }
     let db = Db::open_in_memory().unwrap();
-    let stats = scan_directory_with(&db, dir.path(), &ScanOptions { jobs: 4 }).unwrap();
+    let stats = scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(stats.scanned, n as u64, "every file must be scanned once");
     assert_eq!(
         db.list_tracks().unwrap().len(),
@@ -174,19 +189,26 @@ fn scans_more_than_batch_files_persists_all_once() {
 
     // Idempotent re-scan: still exactly n rows (catches duplicate writes from a
     // wrong flush cadence).
-    let stats2 = scan_directory_with(&db, dir.path(), &ScanOptions { jobs: 4 }).unwrap();
+    let stats2 = scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(stats2.scanned, n as u64);
     assert_eq!(db.list_tracks().unwrap().len(), n);
 }
 
-/// Byte-threshold flushing: with a tiny `MUSEFS_BATCH_BYTES` and art-bearing
+/// Byte-threshold flushing: with a tiny `batch_bytes` and art-bearing
 /// files, the byte branch (`batch_bytes >= cap`, L575/585) drives flushes. All
 /// tracks and their art must persist. Guards the `batch_bytes +=` accumulation
 /// (L573/583, `+=`→`*=`) and the `||` flush disjunction.
 // kills scan L573/583 `batch_bytes += unit.weight` `+=`→`*=`; L575/585 byte branch
 #[test]
 fn byte_threshold_flush_persists_all_art() {
-    let _g = ENV_LOCK.lock().unwrap();
     let n = 20usize;
     let dir = tempfile::tempdir().unwrap();
     for i in 0..n {
@@ -197,10 +219,17 @@ fn byte_threshold_flush_persists_all_art() {
         .unwrap();
     }
     // Cap below a couple files' cumulative art so the byte branch flushes often.
-    std::env::set_var("MUSEFS_BATCH_BYTES", "100");
     let db = Db::open_in_memory().unwrap();
-    let stats = scan_directory_with(&db, dir.path(), &ScanOptions { jobs: 4 }).unwrap();
-    std::env::remove_var("MUSEFS_BATCH_BYTES");
+    let stats = scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 4,
+            batch_bytes: 100,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     assert_eq!(stats.scanned, n as u64);
     let tracks = db.list_tracks().unwrap();

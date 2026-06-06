@@ -59,15 +59,15 @@ exclude_re = [
     # only return `NeedMore{up_to}` with `up_to > want` (we widen precisely to a
     # block end past the prefix), so `up_to.min(file_len)` always wins the max and
     # the `want + 1` term is never selected. `+`->`-`/`*` are equivalent.
-    'musefs-core/src/scan\.rs:263:31:',
+    'musefs-core/src/scan\.rs:254:31:',
     # probe_file post-loop fallback guard `(prefix.len() as u64) < file_len`: when
     # it differs, the only effect is a redundant whole-file re-read that feeds the
     # same `probe_full` result. The >8-retry path that could diverge is unreachable
     # given the probers' exact (FLAC/MP3/WAV) / geometric (Ogg) NeedMore.
-    'musefs-core/src/scan\.rs:270:30:',
+    'musefs-core/src/scan\.rs:261:30:',
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
-    'musefs-core/src/scan\.rs:624:46:',
+    'musefs-core/src/scan\.rs:619:46:',
     # run_pipeline flush cadence (batch_bytes accounting + the
     # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
     # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on
@@ -75,23 +75,23 @@ exclude_re = [
     # cadence mutation persists the identical track set. The win is fewer commits
     # (fsyncs), a performance property only observable via the `metrics`
     # instrumentation the in-diff gate does not build.
-    'musefs-core/src/scan\.rs:715:29:',
-    'musefs-core/src/scan\.rs:717:32:',
-    'musefs-core/src/scan\.rs:717:47:',
-    'musefs-core/src/scan\.rs:717:62:',
-    'musefs-core/src/scan\.rs:725:37:',
-    'musefs-core/src/scan\.rs:727:40:',
-    'musefs-core/src/scan\.rs:727:55:',
-    'musefs-core/src/scan\.rs:727:70:',
+    'musefs-core/src/scan\.rs:710:29:',
+    'musefs-core/src/scan\.rs:712:32:',
+    'musefs-core/src/scan\.rs:712:47:',
+    'musefs-core/src/scan\.rs:712:62:',
+    'musefs-core/src/scan\.rs:720:37:',
+    'musefs-core/src/scan\.rs:722:40:',
+    'musefs-core/src/scan\.rs:722:55:',
+    'musefs-core/src/scan\.rs:722:70:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
     # from a deterministic test. With skip_failed identically 0, the `failed =
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
-    'musefs-core/src/scan\.rs:831:25:',
-    'musefs-core/src/scan\.rs:835:25:',
-    'musefs-core/src/scan\.rs:871:29: replace \+ with -',
+    'musefs-core/src/scan\.rs:826:25:',
+    'musefs-core/src/scan\.rs:830:25:',
+    'musefs-core/src/scan\.rs:866:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
