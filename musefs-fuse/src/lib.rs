@@ -109,7 +109,10 @@ fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
 /// back to `fallback_mtime` so tools don't see a 1970 timestamp.
 pub fn to_file_attr(attr: &Attr, uid: u32, gid: u32, fallback_mtime: SystemTime) -> FileAttr {
     let mtime = if attr.mtime_secs > 0 {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(attr.mtime_secs).unwrap_or(0))
+        SystemTime::UNIX_EPOCH
+            + Duration::from_secs(
+                u64::try_from(attr.mtime_secs).expect("guarded by mtime_secs > 0"),
+            )
     } else {
         fallback_mtime
     };
