@@ -29,8 +29,9 @@ scales with directory fan-out even when rendered names do not collide.
 
 - Do not change template rendering, collision disambiguation, inode allocation,
   or FUSE behavior.
-- Do not address the separate residual O(N) work in `rebuild_incremental`
-  (`list_render_keys` and full snapshot reconstruction).
+- Do not address refresh costs outside rendered-name child lookup. The current
+  changelog path already renders only changed/added tracks and mutates the
+  render-state snapshot in place.
 - Do not introduce a new runtime fallback path for index inconsistency; the
   index is maintained as an internal tree invariant and covered by tests.
 
@@ -40,7 +41,7 @@ Add a secondary rendered-name child index to `VirtualTree`:
 
 ```rust
 children: parent -> disambiguated_name -> inode
-rendered_children: parent -> rendered_name -> ordered child inodes
+rendered_children: parent -> rendered_name -> disambiguated_name -> inode
 ```
 
 The existing `children` map remains the public directory map for mounted paths,
@@ -59,17 +60,22 @@ has to resolve.
 Use an immutable map shape consistent with the current tree representation:
 
 ```rust
-rendered_children: ImHashMap<u64, OrdMap<String, OrdSet<u64>>>
+rendered_children: ImHashMap<u64, OrdMap<String, OrdMap<String, u64>>>
 ```
 
-`OrdSet<u64>` gives deterministic iteration for tests and preserves derived
-`PartialEq`/`Eq` as a strong equivalence oracle. The field should be part of the
-`VirtualTree` struct, so existing `self == other` equivalence also validates the
-secondary index.
+The inner `OrdMap<String, u64>` is keyed by the child's disambiguated name. This
+preserves the current `children_by_rendered` iteration order, because today's
+implementation scans `children[parent]` in disambiguated-name order and filters
+by `Node.rendered_name`. Preserving that order matters because
+`deepest_existing_ancestor` picks the first same-rendered child that is a
+directory.
+
+The field should be part of the `VirtualTree` struct, so existing `self == other`
+equivalence also validates the secondary index.
 
 The name `rendered_children` avoids colliding with the existing
 `children_by_rendered` method name. The method can keep its public test-facing
-API and return a `Vec<u64>` collected from the indexed set.
+API and return a `Vec<u64>` collected from the inner map's values.
 
 ## Maintenance Rules
 
@@ -83,14 +89,18 @@ On root initialization:
 On inserting a file:
 - Insert the node into `nodes`.
 - Insert the disambiguated name into `children[parent]`.
-- Insert the inode into `rendered_children[parent][raw_file_name]`.
+- Insert the inode into
+  `rendered_children[parent][raw_file_name][disambiguated_file_name]`.
 
 On ensuring a new directory:
-- If an existing child with the raw rendered name is already a directory, return
-  it as today. No index update is needed.
+- Preserve current semantics: first check `children[parent].get(raw_dir_name)`.
+  If the base public key is occupied by a directory, return it. Do not search the
+  rendered-name bucket for some other same-rendered directory, because that would
+  change collision/disambiguation behavior.
 - Otherwise insert the new directory node and empty child maps.
 - Insert its disambiguated name into `children[parent]`.
-- Insert its inode into `rendered_children[parent][raw_dir_name]`.
+- Insert its inode into
+  `rendered_children[parent][raw_dir_name][disambiguated_dir_name]`.
 
 On removing a file:
 - Read the node's parent, disambiguated name, and rendered name before deleting
@@ -98,8 +108,9 @@ On removing a file:
 - Remove the track from `track_to_inode`.
 - Remove the node from `nodes`.
 - Remove the disambiguated name from `children[parent]`.
-- Remove the inode from `rendered_children[parent][rendered_name]`; remove the
-  bucket if it becomes empty.
+- Remove the disambiguated name from
+  `rendered_children[parent][rendered_name]`; remove the rendered-name bucket if
+  it becomes empty.
 
 On pruning an empty directory:
 - Read the directory node's parent, disambiguated name, and rendered name before
@@ -107,8 +118,9 @@ On pruning an empty directory:
 - Remove the directory's own empty `children` and `rendered_children` entries.
 - Remove the directory node from `nodes`.
 - Remove the disambiguated child link from `children[parent]`.
-- Remove the inode from `rendered_children[parent][rendered_name]`; remove the
-  bucket if it becomes empty.
+- Remove the disambiguated child link from
+  `rendered_children[parent][rendered_name]`; remove the rendered-name bucket if
+  it becomes empty.
 
 `rebuild_subtree` already removes and reinserts tracks through these primitives,
 so it should maintain the index without special-case code.
@@ -122,7 +134,7 @@ fn children_by_rendered(&self, dir: u64, rendered: &str) -> Vec<u64> {
     self.rendered_children
         .get(&dir)
         .and_then(|kids| kids.get(rendered))
-        .map(|set| set.iter().copied().collect())
+        .map(|same_rendered| same_rendered.values().copied().collect())
         .unwrap_or_default()
 }
 ```
@@ -168,9 +180,14 @@ Focused tree tests in `musefs-core/src/tree.rs`:
 - Add a prune test proving that removing the only file under a directory deletes
   that directory from its parent's rendered-name bucket.
 - Add a root fan-out regression test that builds many top-level rendered
-  directories and resolves a path under a late entry. The functional assertion
-  confirms the correct ancestor; test-only observability can assert that lookup
-  visits only the matching rendered-name bucket rather than every root sibling.
+  directories and resolves a path under an absent rendered root such as
+  `Unknown/Unknown/new.flac`.
+- Make test-only lookup observability mandatory. Implement `children_by_rendered`
+  through a small helper that returns both the matching children and the number
+  of same-rendered candidates examined. In non-test builds the count is ignored;
+  in tests, the root fan-out miss asserts the count is `0`, proving the lookup
+  did not scan unrelated root siblings. Collision tests can assert the count is
+  the rendered bucket size.
 
 Existing equivalence tests and the incremental-refresh property oracle should
 remain green. Because `VirtualTree::equiv` delegates to derived equality, adding
@@ -207,7 +224,7 @@ Implementation should run at least:
 ```bash
 cargo test -p musefs-core --lib tree
 cargo test -p musefs-core --test incremental_refresh
-cargo test -p musefs-core --test bench_refresh bench_refresh_root_fanout_one_across_library_sizes -- --ignored --nocapture
+cargo test -p musefs-core --release --test bench_refresh bench_refresh_root_fanout_one_across_library_sizes -- --ignored --nocapture
 ```
 
 Then run the broader core/workspace checks selected by the implementation plan,
