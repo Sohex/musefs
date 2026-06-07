@@ -198,13 +198,44 @@ jobs:
       - name: FUSE end-to-end tests
         run: cargo test -p musefs-fuse -- --ignored
 
+  macos:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  freebsd:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: vmactions/freebsd-vm@a6de9343ef5747433d9c25784c90e84998b9d69a
+        with:
+          usesh: true
+          prepare: sh scripts/freebsd-vm/provision.sh
+          run: sh scripts/freebsd-vm/run-e2e.sh
+
   # Single required status check for branch protection. Always runs (even when
   # the heavy jobs were skipped on a docs-only change) so the check is always
   # reported; green when every needed job either succeeded or was skipped, red
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, interop, python-musefs, beets, picard, e2e]
+    needs: [changes, check, interop, python-musefs, beets, picard, e2e, macos, freebsd]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results
