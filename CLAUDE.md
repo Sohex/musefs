@@ -160,7 +160,12 @@ Two mount **modes** (`musefs_core::Mode`):
   payload.
 - `StructureOnly` — a single whole-file `BackingAudio` segment; the original bytes
   are served verbatim under the templated tree. Stored audio bounds are not
-  validated in this mode because the whole file is served.
+  validated in this mode because the whole file is served. On kernels with FUSE
+  passthrough (6.9+) **and a daemon holding CAP_SYS_ADMIN** (kernel-gated; run as
+  root or `setcap cap_sys_admin=ep` the binary) reads are served by the kernel
+  directly from the backing fd registered at open (silent fallback to daemon
+  reads elsewhere, pre-announced at mount time when the capability is absent);
+  freshness is open-time-only for such handles — plain POSIX fd semantics.
 
 ## SQLite store is the contract
 

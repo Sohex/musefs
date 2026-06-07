@@ -601,3 +601,20 @@ No workload shows a regression outside noise. `seek_read` formats trend 2–6%
 faster (cache lookup path no longer behind a Mutex). `sequential_read/ogg`
 (+3.8%) and `cold_first_read/flac` (+1.9%) are within Criterion's noise
 threshold (p>0.05, "No change in performance detected").
+
+---
+
+## Issue #112 — StructureOnly kernel passthrough
+
+*Measured 2026-06-06.*
+
+- **Before** = `main` @ `0881b31`: every read round-trips kernel → daemon → positioned read → copy back.
+- **After** = `issue-112-passthrough`: backing fd registered at open (FUSE passthrough, kernel 6.9+); the kernel serves reads directly from the backing inode, bypassing the daemon entirely.
+- Harness: 512 MiB single-track FLAC StructureOnly mount, `dd bs=1M` sequential read, fresh mount per binary with 3 runs inside it, RAM-cached backing file (isolates FUSE-path overhead). Both binaries mounted via `sudo` (passthrough requires `CAP_SYS_ADMIN` for `FUSE_DEV_IOC_BACKING_OPEN`).
+
+| | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| Before (daemon reads) | 2.7 GB/s | 2.8 GB/s | 2.8 GB/s | 2.8 GB/s |
+| After (passthrough) | 9.3 GB/s | 9.3 GB/s | 9.4 GB/s | 9.3 GB/s |
+
+Passthrough is **~3.3× faster** on this RAM-cached sequential-read workload: the before path round-trips every ~128 KiB chunk through the daemon (wakeup + positioned read into the reply buffer + copy back through `/dev/fuse`), while the after path reads straight from the backing inode's page cache like a native file.

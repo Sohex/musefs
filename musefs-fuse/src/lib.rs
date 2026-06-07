@@ -3,6 +3,7 @@
 //! offloaded onto a bounded worker pool and answered via the `Send` reply
 //! objects, so a slow backing read cannot stall metadata operations.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,9 +13,9 @@ use std::time::{Duration, SystemTime};
 use threadpool::ThreadPool;
 
 use fuser::{
-    BackgroundSession, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
+    BackgroundSession, BackingId, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
 };
 use musefs_core::convert::usize_from;
 use musefs_core::Attr;
@@ -70,6 +71,27 @@ fn open_flags(keep_cache: bool) -> FopenFlags {
     } else {
         FopenFlags::empty()
     }
+}
+
+/// True only when /proc/self/status definitively shows CAP_SYS_ADMIN (bit 21)
+/// absent from CapEff. Unreadable/unparseable -> false (stay neutral; the
+/// first open's ioctl attempt decides instead).
+fn definitely_lacks_cap_sys_admin() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| cap_eff_has_sys_admin(&s))
+        .is_some_and(|has| !has)
+}
+
+/// Parse the `CapEff:` line; None when absent or malformed.
+fn cap_eff_has_sys_admin(status: &str) -> Option<bool> {
+    const CAP_SYS_ADMIN_BIT: u32 = 21;
+    let hex = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))?
+        .trim();
+    let mask = u64::from_str_radix(hex, 16).ok()?;
+    Some(mask & (1 << CAP_SYS_ADMIN_BIT) != 0)
 }
 
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
@@ -166,12 +188,28 @@ pub struct MusefsFs {
     /// Single-flight gate for `fire_poll_refresh`: at most one poll task is
     /// queued/running at a time, so a metadata-op storm can't flood the pool (#89).
     poll_pending: Arc<AtomicBool>,
+    /// Kernel-registered backing fds for live passthrough handles, keyed by
+    /// the wire fh. The entry is inserted BEFORE the open reply is sent — the
+    /// kernel cannot release an fh it has not yet seen — so every live
+    /// passthrough handle has an entry. `release` removes it; dropping the
+    /// `BackingId` fires the backing-close ioctl.
+    backing: Arc<Mutex<HashMap<u64, BackingId>>>,
+    /// Sticky disable: flipped on the first `open_backing` failure (kernel
+    /// without passthrough support), so later opens skip the doomed ioctl.
+    passthrough_disabled: Arc<AtomicBool>,
 }
 
 impl MusefsFs {
     pub fn new(core: Musefs, config: FuseConfig) -> MusefsFs {
         // Work is I/O-bound (especially on NFS), so oversize the pool vs CPUs.
         let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2;
+        let passthrough_disabled =
+            core.mode() == musefs_core::Mode::StructureOnly && definitely_lacks_cap_sys_admin();
+        if passthrough_disabled {
+            log::info!(
+                "StructureOnly mount without CAP_SYS_ADMIN: kernel passthrough unavailable; reads will be served by the daemon"
+            );
+        }
         MusefsFs {
             core: Arc::new(core),
             // `ThreadPool`'s queue is unbounded. `max_background` (set in `init`)
@@ -186,6 +224,8 @@ impl MusefsFs {
             config,
             notifier: Arc::new(OnceLock::new()),
             poll_pending: Arc::new(AtomicBool::new(false)),
+            backing: Arc::new(Mutex::new(HashMap::new())),
+            passthrough_disabled: Arc::new(AtomicBool::new(passthrough_disabled)),
         }
     }
 
@@ -250,6 +290,14 @@ impl Filesystem for MusefsFs {
         // default; PARALLEL_DIROPS may be unsupported on older kernels (ignored).
         let _ = config.add_capabilities(InitFlags::FUSE_ASYNC_READ);
         let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+        // Passthrough needs BOTH calls: fuser only copies max_stack_depth into
+        // the init reply when the FUSE_PASSTHROUGH bit was negotiated, and a
+        // depth of 0 disables passthrough outright. Depth 2 (the kernel's
+        // hard maximum) additionally lets backing files live on a stacked fs
+        // (e.g. a music library on overlayfs). On kernels without support the
+        // bit is simply not acked and open_backing later fails -> fallback.
+        let _ = config.add_capabilities(InitFlags::FUSE_PASSTHROUGH);
+        let _ = config.set_max_stack_depth(2);
         Ok(())
     }
 
@@ -284,9 +332,44 @@ impl Filesystem for MusefsFs {
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let core = Arc::clone(&self.core);
         let flags = open_flags(self.config.keep_cache);
-        self.pool.execute(move || match core.open_handle(ino.0) {
-            Ok(fh) => reply.opened(FileHandle(fh.get()), flags),
-            Err(e) => reply.error(reply_errno("open", ino.0, &e)),
+        let backing = Arc::clone(&self.backing);
+        let passthrough_disabled = Arc::clone(&self.passthrough_disabled);
+        self.pool.execute(move || {
+            let fh = match core.open_handle(ino.0) {
+                Ok(fh) => fh,
+                Err(e) => return reply.error(reply_errno("open", ino.0, &e)),
+            };
+            if !passthrough_disabled.load(Ordering::Relaxed) {
+                if let Some(pfd) = core.passthrough_fd(fh) {
+                    match reply.open_backing(&pfd) {
+                        Ok(id) => {
+                            // Insert before the reply (see the `backing` field
+                            // doc). FOPEN_KEEP_CACHE is dropped: page-cache
+                            // ownership belongs to the backing inode here.
+                            // Poisoning recovery: the lock guards single map
+                            // ops; a panic mid-insert leaves nothing torn.
+                            let mut map = backing
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let id = map.entry(fh.get()).insert_entry(id).into_mut();
+                            return reply.opened_passthrough(
+                                FileHandle(fh.get()),
+                                FopenFlags::empty(),
+                                id,
+                            );
+                        }
+                        Err(e) => {
+                            // Sticky: the failure modes (kernel < 6.9, ioctl
+                            // unsupported) are static per mount.
+                            passthrough_disabled.store(true, Ordering::Relaxed);
+                            log::info!(
+                                "FUSE passthrough unavailable; serving reads through the daemon: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            reply.opened(FileHandle(fh.get()), flags);
         });
     }
 
@@ -300,8 +383,14 @@ impl Filesystem for MusefsFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        // Cheap (a map remove); no need to offload to the pool.
+        // Cheap (a backing-map remove + a slab remove); no need to offload to the pool.
         if let Some(fh) = NonZeroU64::new(fh.0) {
+            // Dropping the BackingId fires the backing-close ioctl. Absent for
+            // plain (non-passthrough) handles — remove is then a no-op.
+            self.backing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&fh.get());
             self.core.release_handle(Fh::from(fh));
         }
         reply.ok();
@@ -588,6 +677,33 @@ mod tests {
         }
         assert_eq!(fs.pool.queued_count(), queued, "no task should be queued");
         assert_eq!(fs.pool.active_count(), active, "no task should be started");
+    }
+
+    #[test]
+    fn cap_eff_parser_root_mask_has_sys_admin() {
+        // Bit 21 is set in the root effective capability mask.
+        assert_eq!(
+            cap_eff_has_sys_admin("CapPrm:\t0000003fffffffff\nCapEff:\t0000003fffffffff\n"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cap_eff_parser_zero_mask_lacks_sys_admin() {
+        assert_eq!(
+            cap_eff_has_sys_admin("CapEff:\t0000000000000000\n"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cap_eff_parser_missing_line_returns_none() {
+        assert_eq!(cap_eff_has_sys_admin("Name:\tfoo\nUid:\t1000\n"), None);
+    }
+
+    #[test]
+    fn cap_eff_parser_garbage_hex_returns_none() {
+        assert_eq!(cap_eff_has_sys_admin("CapEff:\tnothex\n"), None);
     }
 
     #[test]
