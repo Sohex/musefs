@@ -269,7 +269,7 @@ filesystem write in the default import path is creating a symlink placeholder.
 Because unsafe Lidarr settings can break musefs's no-mutation invariant, sync
 must provide a preflight check:
 
-- `musefs-lidarr-sync doctor` queries Lidarr's API and verifies `WriteAudioTags`
+- `musefs-lidarr-sync --doctor` queries Lidarr's API and verifies `WriteAudioTags`
   is `No`, `FileDate` is `None`, and Linux permission management is disabled.
 - Normal sync runs the same preflight before writing unless the user passes an
   explicit escape hatch such as `--skip-lidarr-preflight`.

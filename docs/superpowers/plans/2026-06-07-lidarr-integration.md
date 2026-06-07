@@ -989,7 +989,7 @@ import pytest
 from musefs_common import realpath_key
 
 from musefs_lidarr.errors import MappingError
-from musefs_lidarr.mapping import build_pairs, match_track_file, records_for_paths
+from musefs_lidarr.mapping import SkippedPath, build_pairs, match_track_file, records_for_paths
 
 
 def test_build_pairs_maps_core_tags(sample_artist, sample_album, sample_track):
@@ -1077,6 +1077,49 @@ def test_records_for_paths_uses_each_track_files_own_album(
         realpath_key(sample_track_file["path"])
     ].pairs
     assert ("album", "Geogaddi") in by_key[realpath_key(second_path)].pairs
+
+
+def test_records_for_paths_emits_multitrack_pairs_in_lidarr_order(
+    sample_artist, sample_album, sample_track, sample_track_file
+):
+    second_track = dict(
+        sample_track,
+        id=41,
+        title="Second linked track",
+        trackNumber="2",
+    )
+
+    records, skipped = records_for_paths(
+        paths=[sample_track_file["path"]],
+        track_files=[sample_track_file],
+        tracks=[sample_track, second_track],
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
+    )
+
+    assert skipped == []
+    titles = [value for key, value in records[0].pairs if key == "title"]
+    assert titles == ["Wildlife Analysis", "Second linked track"]
+
+
+def test_records_for_paths_returns_reason_for_missing_linked_tracks(
+    sample_artist, sample_album, sample_track_file
+):
+    records, skipped = records_for_paths(
+        paths=[sample_track_file["path"]],
+        track_files=[sample_track_file],
+        tracks=[],
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
+    )
+
+    assert records == []
+    assert skipped == [
+        SkippedPath(
+            path=sample_track_file["path"],
+            reason="multi-track metadata unavailable",
+        )
+    ]
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -1093,10 +1136,17 @@ Create `contrib/lidarr/src/musefs_lidarr/mapping.py`:
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 
 from musefs_common import Record, realpath_key
 
 from .errors import MappingError
+
+
+@dataclass(frozen=True)
+class SkippedPath:
+    path: str
+    reason: str
 
 
 def _text(value) -> str | None:
@@ -1165,7 +1215,7 @@ def records_for_paths(
     tracks: list[dict],
     albums_by_id: dict[int, dict],
     artists_by_id: dict[int, dict],
-) -> tuple[list[Record], list[str]]:
+) -> tuple[list[Record], list[SkippedPath]]:
     tracks_by_file = _tracks_by_file(tracks)
     records = []
     skipped = []
@@ -1173,16 +1223,16 @@ def records_for_paths(
         key = realpath_key(path)
         track_file = match_track_file(key, track_files)
         if track_file is None:
-            skipped.append(path)
+            skipped.append(SkippedPath(path=path, reason="no matching Lidarr track file"))
             continue
         linked = tracks_by_file.get(int(track_file["id"]), [])
         if not linked:
-            skipped.append(path)
+            skipped.append(SkippedPath(path=path, reason="multi-track metadata unavailable"))
             continue
         album = albums_by_id.get(int(track_file["albumId"]))
         artist = artists_by_id.get(int(track_file["artistId"]))
         if album is None or artist is None:
-            skipped.append(path)
+            skipped.append(SkippedPath(path=path, reason="album or artist metadata unavailable"))
             continue
         pairs = []
         for track in linked:
@@ -1257,7 +1307,9 @@ def test_sync_records_writes_tags(db_path, make_track, sample_track_file, sample
     assert ("genre", "Electronic") in rows
 
 
-def test_sync_records_counts_missing_row_as_skipped(db_path, sample_track_file, sample_track, sample_album, sample_artist):
+def test_sync_records_counts_and_logs_missing_row_as_skipped(
+    db_path, sample_track_file, sample_track, sample_album, sample_artist, capsys
+):
     event = LidarrEvent(
         event_type=EventType.ALBUM_DOWNLOAD,
         raw_type="AlbumDownload",
@@ -1278,6 +1330,9 @@ def test_sync_records_counts_missing_row_as_skipped(db_path, sample_track_file, 
 
     assert stats.synced == 0
     assert stats.skipped == 1
+    captured = capsys.readouterr()
+    assert realpath_key(sample_track_file["path"]) in captured.err
+    assert "no matching musefs track row after scan" in captured.err
 
 
 def test_symlink_rename_does_not_prune_previous_placeholder(db_path, make_track, sample_track_file, tmp_path):
@@ -1314,6 +1369,7 @@ Create `contrib/lidarr/src/musefs_lidarr/sync.py`:
 ```python
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 
 from musefs_common import (
@@ -1323,6 +1379,7 @@ from musefs_common import (
     prune_missing,
     realpath_key,
     sync_files,
+    track_id_for_path,
 )
 
 from .events import LidarrEvent
@@ -1346,6 +1403,7 @@ def sync_records(
     tracks: list[dict],
     albums_by_id: dict[int, dict],
     artists_by_id: dict[int, dict],
+    warning_printer=print,
 ) -> SyncStats:
     records, skipped_paths = records_for_paths(
         paths=event.paths,
@@ -1354,11 +1412,27 @@ def sync_records(
         albums_by_id=albums_by_id,
         artists_by_id=artists_by_id,
     )
+    for skipped in skipped_paths:
+        warning_printer(
+            f"musefs-lidarr-sync: skipped {skipped.path}: {skipped.reason}",
+            file=sys.stderr,
+        )
     stats = SyncStats(skipped=len(skipped_paths))
     conn = connect(config.db_path)
     try:
         check_schema_version(conn)
-        sync_files(conn, records, stats=stats)
+        present_records = []
+        for record in records:
+            if track_id_for_path(conn, record.key) is None:
+                stats.skipped += 1
+                warning_printer(
+                    "musefs-lidarr-sync: skipped "
+                    f"{record.key}: no matching musefs track row after scan",
+                    file=sys.stderr,
+                )
+            else:
+                present_records.append(record)
+        sync_files(conn, present_records, stats=stats)
         conn.commit()
         return stats
     except Exception:
@@ -2148,6 +2222,51 @@ def test_sync_cli_skip_preflight_allows_sync(tmp_path, capsys, sample_track_file
     assert "secret" not in captured.err
 
 
+def test_sync_cli_logs_skipped_path(
+    db_path, capsys, sample_track_file, sample_track, sample_album, sample_artist
+):
+    from musefs_common import realpath_key
+
+    class FakeClient:
+        def track_files(self, **kwargs):
+            return [sample_track_file]
+
+        def tracks(self, **kwargs):
+            return [sample_track]
+
+        def album(self, album_id):
+            return sample_album
+
+        def artist(self, artist_id):
+            return sample_artist
+
+        def metadata_provider_config(self):
+            return {"writeAudioTags": "no"}
+
+        def media_management_config(self):
+            return {"fileDate": "none", "setPermissionsLinux": False}
+
+    rc = run_sync(
+        [],
+        {
+            "Lidarr_EventType": "AlbumDownload",
+            "Lidarr_Artist_Id": "10",
+            "Lidarr_Album_Id": "20",
+            "Lidarr_AddedTrackPaths": sample_track_file["path"],
+            "MUSEFS_DB": db_path,
+            "MUSEFS_LIDARR_AUTOSCAN": "0",
+            "MUSEFS_LIDARR_URL": "http://lidarr.local",
+            "MUSEFS_LIDARR_API_KEY": "secret",
+        },
+        client_factory=lambda config: FakeClient(),
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert realpath_key(sample_track_file["path"]) in captured.err
+    assert "no matching musefs track row after scan" in captured.err
+
+
 def test_sync_cli_all_runs_manual_backfill(tmp_path, sample_track_file, sample_track, sample_album, sample_artist):
     calls = []
 
@@ -2590,7 +2709,7 @@ Add a top entry:
   imports plus musefs metadata sync.
 ```
 
-- [ ] **Step 7: Run docs grep checks**
+- [ ] **Step 7: Create smoke checklist**
 
 Create `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`:
 
@@ -2766,9 +2885,17 @@ musefs mount metadata verified: yes
 
 If a real Lidarr instance is not available, do not mark the feature
 release-ready. Leave `Status: Pending` in
-`docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md` and note that the
-manual smoke gate was not run. The implementation can still merge behind normal
-automated tests if the project owner accepts the deferred release gate.
+`docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md` and add a dated
+note under `Notes:` saying the manual smoke gate was not run because no real
+Lidarr instance was available:
+
+```markdown
+- Notes: 2026-06-07: Manual smoke gate not run; no real Lidarr instance was
+  available in the implementation environment.
+```
+
+The implementation can still merge behind normal automated tests if the project
+owner accepts the deferred release gate.
 
 - [ ] **Step 4: Commit smoke checklist state**
 
