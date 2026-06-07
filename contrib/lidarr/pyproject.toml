@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lidarr-musefs"
+version = "0.1.0"
+description = "Sync Lidarr metadata into the musefs SQLite store"
+requires-python = ">=3.9"
+dependencies = ["python-musefs>=0.1.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+musefs-lidarr-import = "musefs_lidarr.cli_import:main"
+musefs-lidarr-sync = "musefs_lidarr.cli_sync:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "musefs_bin: tests that shell out to the real `musefs` Rust binary (opt-in)",
+]
+addopts = "-m 'not musefs_bin'"
