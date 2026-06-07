@@ -20,9 +20,13 @@
 - Create: `musefs-fuse/src/platform/spotlight.rs` — macOS `.metadata_never_index` marker; `None`/`false` stubs elsewhere.
 - Modify: `musefs-fuse/src/lib.rs` — declare `mod platform`; refactor `init`/`open`/`release`/`read`/`lookup`/`getattr`/`readdir`/`mount_config`/`MusefsFs`/`MusefsFs::new`; trim imports; relocate the cap-parser tests.
 - Modify: `musefs-fuse/Cargo.toml` — enable `fuser`'s `macos-no-mount` feature on macOS targets.
-- Modify: `.github/workflows/ci.yml` — add `macos` and `freebsd` jobs; add both to `ci-ok`'s `needs:`.
+- Create: `scripts/freebsd-vm/provision.sh` — in-guest provisioning (rust, git, load `fusefs`); used by BOTH CI and local runs.
+- Create: `scripts/freebsd-vm/run-e2e.sh` — build + run the workspace and the FUSE `--ignored` e2e suite inside FreeBSD.
+- Create: `scripts/freebsd-vm/README.md` — in-tree reproduction steps for the local FreeBSD VM harness (image lives in gitignored `.scratch/`).
+- Modify: `.github/workflows/ci.yml` — add `macos` and `freebsd` jobs (the FreeBSD job invokes the in-tree scripts so CI and local share identical steps); add both to `ci-ok`'s `needs:`.
 - Modify: `.gitignore` — ignore `/.scratch/`.
-- Modify: `CONTRIBUTING.md` — document the local FreeBSD VM workflow.
+- Modify: `CONTRIBUTING.md` — document the FreeBSD e2e tier and point at `scripts/freebsd-vm/README.md`; note macOS best-effort.
+- Modify: `README.md` — add a "Platform support" section (Linux / FreeBSD / macOS-FUSE-T) covering what works per platform.
 
 ---
 
@@ -849,13 +853,20 @@ git commit -m "ci: best-effort macOS build (fuser macos-no-mount) + macOS job"
 
 ---
 
-## Task 5: FreeBSD CI job + `ci-ok` wiring + `.gitignore`
+## Task 5: In-tree FreeBSD VM test harness + `.gitignore`
+
+The reproducible setup/run steps live **in the repo** as scripts (the VM *image*
+stays in gitignored `/.scratch/`). CI invokes these same scripts (Task 6), so
+local and CI runs are identical — no drift between "what CI does" and "what a
+contributor does locally."
 
 **Files:**
-- Modify: `.github/workflows/ci.yml`
+- Create: `scripts/freebsd-vm/provision.sh`
+- Create: `scripts/freebsd-vm/run-e2e.sh`
+- Create: `scripts/freebsd-vm/README.md`
 - Modify: `.gitignore`
 
-- [ ] **Step 1: Ignore the local FreeBSD VM scratch dir**
+- [ ] **Step 1: Ignore the local VM scratch dir**
 
 In `.gitignore`, add under the existing entries (e.g. after the `/.claude/` line):
 
@@ -864,17 +875,136 @@ In `.gitignore`, add under the existing entries (e.g. after the `/.claude/` line
 /.scratch/
 ```
 
-- [ ] **Step 2: Add the FreeBSD CI job**
+- [ ] **Step 2: Create the in-guest provisioning script**
 
-In `.github/workflows/ci.yml`, after the `macos` job (added in Task 4) and before
-`ci-ok`, add:
+Create `scripts/freebsd-vm/provision.sh`:
+
+```sh
+#!/bin/sh
+# Provision a FreeBSD host/VM to build and run musefs FUSE e2e tests.
+# Run as root, from the repo root. Used by BOTH the CI `freebsd` job
+# (vmactions/freebsd-vm) and local runs against a VM image in /.scratch/
+# (see this directory's README.md). Keep CI and local identical by editing
+# only this file.
+set -eu
+
+# Toolchain + VCS. FreeBSD packages a recent stable Rust as `rust`.
+pkg install -y rust git
+
+# FUSE support: load the in-kernel fusefs module. fuser uses its pure-rust
+# /dev/fuse backend on FreeBSD, so NO libfuse package is required — only the
+# kernel module and the base-system mount_fusefs(8). `|| true`: already-loaded
+# is fine.
+kldload fusefs || true
+
+# Allow unprivileged mounts, so the e2e suite can mount as a non-root user if the
+# CI/VM runs tests unprivileged. Harmless when already running as root.
+sysctl vfs.usermount=1 || true
+```
+
+- [ ] **Step 3: Create the build+test script**
+
+Create `scripts/freebsd-vm/run-e2e.sh`:
+
+```sh
+#!/bin/sh
+# Build the workspace and run the FUSE end-to-end suite on FreeBSD.
+# Run from the repo root after provision.sh. Requires the fusefs kernel module
+# (loaded by provision.sh) and /dev/fuse.
+set -eu
+
+# Full workspace (unit + integration, excludes the #[ignore]d FUSE e2e).
+cargo test --workspace
+
+# The FUSE end-to-end tests (mount/read-through). Passthrough-specific e2e
+# (the `metrics`-gated tests) are Linux-only and intentionally NOT run here:
+# FreeBSD has no kernel passthrough, so StructureOnly falls back to daemon
+# serving (verified by the standard suite).
+cargo test -p musefs-fuse -- --ignored
+```
+
+- [ ] **Step 4: Mark the scripts executable**
+
+Run: `chmod +x scripts/freebsd-vm/provision.sh scripts/freebsd-vm/run-e2e.sh`
+Expected: no output. (`git` records the executable bit so CI/local both see it.)
+
+- [ ] **Step 5: Create the harness README (the in-tree reproduction steps)**
+
+Create `scripts/freebsd-vm/README.md`:
+
+````markdown
+# FreeBSD VM e2e harness
+
+Runs the musefs FUSE end-to-end suite on FreeBSD. CI does this in a VM (the
+`freebsd` job in `.github/workflows/ci.yml`) by invoking the two scripts here;
+this document is the matching **local** procedure. The scripts are the single
+source of truth — CI and local both run them, so they cannot drift.
+
+## What's where
+
+- `provision.sh` — installs the toolchain and loads the `fusefs` kernel module.
+- `run-e2e.sh` — `cargo test --workspace` then the `--ignored` FUSE e2e suite.
+- The VM **image** is not committed; keep it under the gitignored `/.scratch/`.
+
+## Local run (qemu example)
+
+1. Put a FreeBSD disk image under `/.scratch/`, e.g.
+   `/.scratch/freebsd-14.qcow2` (download an official VM image or build one).
+2. Boot it with the repo shared in (9p/virtfs or just `scp`/`git clone` inside):
+
+   ```sh
+   qemu-system-x86_64 -m 4096 -smp 4 \
+     -drive file=.scratch/freebsd-14.qcow2,if=virtio \
+     -nic user,hostfwd=tcp::2222-:22
+   ```
+
+3. Get the repo into the VM (clone your branch, or `rsync` the worktree), then
+   from the repo root inside the VM, as root:
+
+   ```sh
+   sh scripts/freebsd-vm/provision.sh
+   sh scripts/freebsd-vm/run-e2e.sh
+   ```
+
+`provision.sh` needs root (it runs `pkg install` and `kldload`). If you run the
+tests as an unprivileged user, `vfs.usermount=1` (set by `provision.sh`) lets the
+mount succeed; otherwise run `run-e2e.sh` as root too.
+
+## Notes
+
+- FreeBSD uses fuser's pure-rust `/dev/fuse` backend — **no libfuse package**;
+  only the `fusefs` kernel module and base-system `mount_fusefs(8)` are needed.
+- Kernel FUSE passthrough (StructureOnly) is **Linux-only**; on FreeBSD it falls
+  back to daemon serving. macOS is best-effort (compile + unit only; no mount
+  harness yet).
+````
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add scripts/freebsd-vm/provision.sh scripts/freebsd-vm/run-e2e.sh \
+        scripts/freebsd-vm/README.md .gitignore
+git commit -m "test: in-tree FreeBSD VM e2e harness (provision + run scripts)"
+```
+
+---
+
+## Task 6: FreeBSD CI job (invokes the in-tree scripts) + `ci-ok` wiring
+
+**Files:**
+- Modify: `.github/workflows/ci.yml`
+
+- [ ] **Step 1: Add the FreeBSD CI job**
+
+In `.github/workflows/ci.yml`, after the `macos` job (Task 4) and before `ci-ok`,
+add a job that runs the committed scripts (vmactions mounts the checked-out repo
+into the VM, so the scripts are present at the repo root):
 
 ```yaml
   freebsd:
-    # Real FreeBSD e2e in a VM. FreeBSD uses fuser's pure-rust mount backend
-    # (talks to /dev/fuse directly; no libfuse link), so we only need the
-    # fusefs kernel module loaded. Confirm package/module names against the
-    # local .scratch VM before relying on this.
+    # Real FreeBSD e2e in a VM, running the same scripts a contributor runs
+    # locally (scripts/freebsd-vm/). FreeBSD uses fuser's pure-rust /dev/fuse
+    # backend (no libfuse); provision.sh loads the fusefs kernel module.
     needs: changes
     if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
@@ -887,21 +1017,18 @@ In `.github/workflows/ci.yml`, after the `macos` job (added in Task 4) and befor
         with:
           usesh: true
           prepare: |
-            pkg install -y rust git
-            kldload fusefs || true
+            sh scripts/freebsd-vm/provision.sh
           run: |
-            cargo test --workspace
-            cargo test -p musefs-fuse -- --ignored
+            sh scripts/freebsd-vm/run-e2e.sh
 ```
 
-NOTE: pin `vmactions/freebsd-vm` to the SHA of the version you intend to use
-(the SHA above is a placeholder — replace it with the current release's commit
-SHA, matching the project's convention of pinning every action to a full SHA).
-If `cargo test -- --ignored` fails to mount, verify `fusefs` is loaded
-(`kldstat | grep fusefs`) and that `mount_fusefs` (FreeBSD base system) is
-present; adjust `prepare` accordingly.
+NOTE: replace the `vmactions/freebsd-vm` SHA above with the current release's
+full commit SHA (the value shown is a placeholder; the project pins every action
+to a full SHA). If the e2e suite fails to mount, confirm `fusefs` is loaded
+(`kldstat | grep fusefs`) and `mount_fusefs` exists, and adjust `provision.sh`
+(not the workflow) so local and CI stay in lockstep.
 
-- [ ] **Step 3: Wire both new jobs into the required-status aggregator**
+- [ ] **Step 2: Wire both new jobs into the required-status aggregator**
 
 In `.github/workflows/ci.yml`, update the `ci-ok` job's `needs:` (currently line
 207) to include `macos` and `freebsd`:
@@ -910,61 +1037,89 @@ In `.github/workflows/ci.yml`, update the `ci-ok` job's `needs:` (currently line
     needs: [changes, check, interop, python-musefs, beets, picard, e2e, macos, freebsd]
 ```
 
-- [ ] **Step 4: Verify the workflow is valid YAML**
+- [ ] **Step 3: Verify the workflow is valid YAML**
 
 Run: `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/ci.yml')); print('ok')"`
 Expected: `ok`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add .github/workflows/ci.yml .gitignore
-git commit -m "ci: FreeBSD VM e2e job; wire macos+freebsd into ci-ok"
+git add .github/workflows/ci.yml
+git commit -m "ci: FreeBSD VM e2e job (runs in-tree scripts); wire macos+freebsd into ci-ok"
 ```
 
 ---
 
-## Task 6: Document the local FreeBSD VM workflow
+## Task 7: Documentation
+
+Per CLAUDE.md's doc map: usage/CLI → `README.md`; dev workflow/test tiers →
+`CONTRIBUTING.md`. Update both to reflect the new platform support.
 
 **Files:**
 - Modify: `CONTRIBUTING.md`
+- Modify: `README.md`
 
-- [ ] **Step 1: Find the test-tiers section**
+- [ ] **Step 1: Find the CONTRIBUTING test-tiers section**
 
 Run: `grep -n -i "tier\|e2e\|/dev/fuse\|FUSE end-to-end\|## .*[Tt]est" CONTRIBUTING.md | head -30`
-Expected: locate the section that documents the FUSE e2e tier (the `--ignored` tests).
+Expected: locate the section documenting the FUSE e2e tier (the `--ignored` tests).
 
-- [ ] **Step 2: Add a short FreeBSD subsection**
+- [ ] **Step 2: Document the FreeBSD tier + macOS best-effort in CONTRIBUTING**
 
-Append a subsection to that area of `CONTRIBUTING.md` (adjust the heading level to
-match the surrounding document):
+Append to that section (match the surrounding heading level):
 
 ```markdown
-### FreeBSD e2e (local)
+### FreeBSD e2e
 
-The FUSE e2e suite also runs on FreeBSD (CI uses a VM; see the `freebsd` job in
-`.github/workflows/ci.yml`). For local runs, keep a small FreeBSD VM image under
-the gitignored `/.scratch/` directory. Inside the VM, with the `fusefs` kernel
-module loaded (`kldload fusefs`), run:
-
-    cargo test --workspace
-    cargo test -p musefs-fuse -- --ignored
+The FUSE e2e suite also runs on FreeBSD — CI uses a VM (the `freebsd` job in
+`.github/workflows/ci.yml`), and the identical local procedure plus the
+`provision.sh` / `run-e2e.sh` scripts it runs live in
+[`scripts/freebsd-vm/`](../scripts/freebsd-vm/README.md). Keep a FreeBSD VM
+image under the gitignored `/.scratch/`; the scripts handle provisioning
+(`fusefs` kernel module; no libfuse needed — FreeBSD uses fuser's pure-rust
+backend) and running the suite.
 
 macOS support is best-effort: it compiles (CI builds with fuser's
 `macos-no-mount` feature) and its platform-specific logic is unit-tested, but
 mounted e2e on macOS/FUSE-T is not yet validated.
 ```
 
-- [ ] **Step 3: Verify markdown lints (ruff is for Python only; just sanity-check)**
+(Adjust the relative link path to wherever `CONTRIBUTING.md` sits relative to
+`scripts/`; from the repo root it is `scripts/freebsd-vm/README.md`.)
 
-Run: `git diff --stat CONTRIBUTING.md`
-Expected: shows the addition. (No markdown linter is enforced by the pre-commit hook.)
+- [ ] **Step 3: Find the README platform/overview area**
 
-- [ ] **Step 4: Commit**
+Run: `grep -n -i "platform\|linux\|fuse\|## .*[Uu]sage\|requirement" README.md | head -30`
+Expected: locate where to add a short platform-support note (near requirements/usage).
+
+- [ ] **Step 4: Add a "Platform support" section to README**
+
+Add (place near the install/usage/requirements area, matching the README's tone):
+
+```markdown
+## Platform support
+
+| Platform | FUSE | Kernel passthrough (StructureOnly) | Notes |
+| --- | --- | --- | --- |
+| Linux | ✅ | ✅ (6.9+; falls back to daemon serving otherwise) | Full support. |
+| FreeBSD | ✅ (pure-rust `/dev/fuse` backend; `fusefs` kernel module) | ❌ — falls back to daemon serving | Full FUSE support. |
+| macOS (FUSE-T) | Best-effort | ❌ — falls back to daemon serving | Defaults to case-insensitive (`--case-insensitive`); presents `.metadata_never_index` so Spotlight skips the mount. Compiles + unit-tested; mounted e2e not yet validated. |
+
+On platforms without kernel passthrough, `--mode structure-only` still serves
+the original bytes — just through the daemon instead of the kernel.
+```
+
+NOTE (cross-plan): the `--case-insensitive` mention is introduced by Plan B. If
+Plan A lands first, drop the parenthetical "(`--case-insensitive`)" from the
+macOS row and add it back when Plan B's CLI flag exists (Plan B Task 4 documents
+the flag itself). If Plan B has already landed, leave it as written.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add CONTRIBUTING.md
-git commit -m "docs: document local FreeBSD VM e2e workflow"
+git add CONTRIBUTING.md README.md
+git commit -m "docs: platform-support table (README) + FreeBSD/macOS test tiers (CONTRIBUTING)"
 ```
 
 ---
