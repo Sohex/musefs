@@ -78,7 +78,8 @@ pub struct MountArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Walk a backing directory, ingesting FLAC/MP3 files into the SQLite store.
+    /// Walk backing files or directories, ingesting supported audio
+    /// (FLAC, MP3, M4A, Ogg, WAV) into the SQLite store.
     Scan {
         /// One or more files or directories to scan (directories recurse).
         #[arg(required = true, num_args = 1..)]

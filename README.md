@@ -2,146 +2,58 @@
 
 [![CI](https://github.com/Sohex/musefs/actions/workflows/ci.yml/badge.svg)](https://github.com/Sohex/musefs/actions/workflows/ci.yml)
 
-A read-only passthrough FUSE filesystem that presents a virtually reorganized,
-re-tagged view of a music library — without modifying or duplicating a single
-byte of the original audio.
+A read-only FUSE filesystem that presents a re-tagged, reorganized view of
+your music library — without modifying or duplicating a single byte of the
+original audio. Fix tags, art, and folder structure in a SQLite store; the
+mount shows a clean library while your files stay exactly as they are.
 
-Point musefs at a directory of FLAC, MP3, M4A, Ogg (Opus / Vorbis /
-FLAC-in-Ogg), or WAV files, edit tags and organization in a SQLite store (directly, or
-out-of-band via tools like beets/picard), and mount a clean
-`$albumartist/$album/$title` tree whose files carry the corrected metadata. The
-audio frames are served straight from your original files; only the
-metadata/header region is synthesized on the fly.
-
-> **Status:** MVP complete and extended. FLAC, MP3, M4A, Ogg
-> (Opus / Vorbis / FLAC-in-Ogg), and WAV are supported, with embedded cover art, and the
-> filesystem has been through a performance/concurrency pass hardening it for
-> real-world player/media-manager access and large libraries on HDD/SSD/NFS. See
-> [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's in scope and what's explicitly
-> deferred (writable mounts, a shipped picard plugin).
-
-## How it works
-
-The original files are never copied or rewritten. Each served file is assembled
-on demand from an ordered list of segments:
-
-- **Inline** — generated framing/text bytes (a fresh ID3v2 tag, FLAC metadata
-  blocks) materialized from the database.
-- **Art** — embedded cover art streamed from the store's content-addressed,
-  deduplicated blob table (never buffered whole in memory); for Ogg the base64
-  `METADATA_BLOCK_PICTURE` is encoded incrementally at read time.
-- **Backing audio** — positioned reads of the untouched audio frames in your
-  original file.
-- **Renumbered audio (Ogg)** — original Ogg pages served verbatim with only their
-  page sequence numbers and CRCs patched in place, so a resized header never
-  requires rewriting the audio.
-
-A SQLite database is the source of truth for tags, art, and the audio byte ranges
-within each file. Editing happens there; the mounted view reflects it.
-
-## Features
-
-- **FLAC, MP3, M4A, Ogg (Opus / Vorbis / FLAC-in-Ogg), and WAV** — metadata
-  synthesized from the DB and spliced in front of byte-identical backing audio. M4A
-  rebuilds the `moov` atom (patching chunk offsets); Ogg renumbers audio pages and
-  recomputes their CRCs so the audio frames stay untouched; WAV regenerates the
-  RIFF front (a native `LIST`/`INFO` chunk plus an embedded `id3 ` chunk for full
-  ID3v2 + art) ahead of the verbatim `data` payload. Multiplexed/chained Ogg is
-  detected and skipped.
-- **Embedded art** — re-embedded into the served file and streamed from the
-  content-addressed, deduplicated blob store (never buffered whole in memory),
-  including Ogg cover art served as incremental base64.
-- **Virtual tree** — beets-style `$field` / `${field}` path templates with
-  fallbacks and deterministic collision disambiguation.
-- **Two mount modes** — `synthesis` (default, re-tagged view) and
-  `structure-only` (pure passthrough: original bytes served verbatim under the
-  templated tree).
-- **Auto-refresh** — external DB edits (a `scan`, a beets/picard retag on another
-  connection) are picked up automatically; no remount required.
-- **Maintenance** — `scan --revalidate` skips unchanged files (preserving
-  external tag edits), prunes tracks whose backing file is gone, and garbage-
-  collects orphaned art.
-- **Concurrent & cache-friendly** — blocking reads run on a worker pool, so a slow
-  backing read (NFS, spun-down HDD) never stalls metadata operations; synthesized
-  layouts, file sizes, and headers are cached and invalidated lazily on external
-  edits, and inodes stay stable across refreshes. Kernel read-ahead, background
-  depth, the entry/attr cache TTL, the refresh poll interval, and page-cache
-  retention are all tunable per backing store (see [Tuning](#tuning)). With
-  `--keep-cache`, an external re-tag automatically drops the affected kernel page
-  cache, so cached bytes never go stale.
-
-## Tag handling
-
-musefs preserves the tags it reads from a backing file when it synthesizes the
-served file (always in the same format — it never converts between formats).
-
-**Round-trips losslessly:**
-
-- All text tags. Common fields use a shared canonical vocabulary (so
-  `$albumartist`, `$date`, etc. work the same regardless of source format);
-  everything else round-trips through the format's extension slot — ID3 `TXXX`,
-  MP4 `----` freeform, or a raw Vorbis field — keyed by its own name. Unmapped
-  standard ID3 text frames round-trip by their frame id.
-- Comments and lyrics (text content).
-- User-defined keys keep their original casing (e.g. `MusicBrainz Album Id`).
-
-**Known limitations (lossy edges):**
-
-- All ID3v2.x tags are normalized to **ID3v2.4** on synthesis. Legacy date
-  frames (`TYER`, `TDAT`) fold to `date` and are re-emitted as `TDRC`.
-- ID3 `COMM`/`USLT` language code and short description are not preserved; they
-  are written back with language `XXX` and an empty description. Multiple
-  comments/lyrics distinguished only by those collapse to one.
-- MP4 `----` `mean` is normalized to `com.apple.iTunes` on write.
-- Binary / extended frames are **not** round-tripped and are dropped on scan:
-  ID3 `POPM` (ratings), `UFID`, and other non-text frames; MP4 binary atoms
-  beyond `trkn`/`disk` (e.g. `tmpo`, `cpil`). Embedded cover art is handled by a
-  separate dedicated path, not the tag path.
-- Multi-value MP4 `----` freeform tags round-trip only their first value.
-- If several source tags map to one canonical key (e.g. a `TXXX` whose
-  description is `comment` alongside a real `COMM` frame), they merge into a
-  single multi-value tag and are re-emitted via that key's native slot.
-
-## Requirements
-
-- Rust (2021 edition) and Cargo.
-- Linux with FUSE (`/dev/fuse` and libfuse) to mount.
-
-## Install
-
-Install the `musefs` binary from crates.io:
+## Quick start
 
 ```bash
-cargo install musefs
+cargo install musefs    # compiles from source: needs a Rust toolchain,
+                        # libfuse3-dev and pkg-config — see Requirements
+
+musefs scan ~/Music --db library.db        # ingest your library
+mkdir -p ~/mnt/music
+musefs mount ~/mnt/music --db library.db \
+    --template '$albumartist/$album/$title'
+# mount blocks until unmounted: fusermount -u ~/mnt/music (or Ctrl-C)
 ```
 
-`cargo install` compiles from source, so the same prerequisites as a local
-build apply: a Rust toolchain plus FUSE (`libfuse3` / `libfuse3-dev`) and
-`pkg-config` on Linux.
+`~/mnt/music` now serves your library as
+`Album Artist/Album/Title.flac` — with each file's metadata generated fresh
+from the database, spliced in front of your original, untouched audio.
 
-Or install the latest from the repository:
+## What it's for
 
-```bash
-cargo install --git https://github.com/Sohex/musefs musefs
-```
-
-## Build
-
-```bash
-cargo build --release
-```
-
-The binary (`target/release/musefs`) is produced by the `musefs` crate.
+- **A clean view of a messy library.** Your files keep their on-disk chaos;
+  the mount presents one consistent, template-driven tree for players and
+  media managers.
+- **Tag editing without touching files.** Edit the SQLite store (directly,
+  or via the [beets plugin](contrib/beets/README.md) or
+  [Picard plugin](contrib/picard/README.md)) and the mounted view updates
+  live — no remount, no rewrite, no re-rip anxiety.
+- **Lossless-by-construction experimentation.** Try a retag, a different
+  organization scheme, new cover art — the originals are physically
+  read-only to the mount.
 
 ## Usage
 
-Ingest a backing directory into a SQLite store:
+### Scan
 
 ```bash
-musefs scan /path/to/music --db library.db
+musefs scan /path/to/music --db library.db            # ingest (dirs recurse)
+musefs scan /path/to/music --db library.db --revalidate
 ```
 
-Mount a read-only view:
+`scan` probes each audio file (FLAC, MP3, M4A/M4B, Ogg, WAV), recording its
+audio byte range, tags, and embedded art in the store. It takes one or more
+files or directories, and `--jobs N` controls probe parallelism.
+`--revalidate` is the maintenance pass: it skips unchanged files —
+**preserving any tag edits you made in the store** — prunes tracks whose
+backing file is gone, and garbage-collects orphaned art.
+
+### Mount
 
 ```bash
 musefs mount /path/to/mountpoint --db library.db \
@@ -150,89 +62,117 @@ musefs mount /path/to/mountpoint --db library.db \
     --mode synthesis        # or: structure-only
 ```
 
-`mount` blocks until the filesystem is unmounted. Edit tags/art in `library.db`
-(or run another `scan`) while mounted and the view refreshes automatically.
+`mount` blocks until the filesystem is unmounted (`fusermount -u`, or
+Ctrl-C). Paths come from a beets-style template: `$field` or `${field}`
+substitutes a tag field (e.g. `$artist`, `$album`, `$title`, `$tracknumber`,
+`$date`, `$genre` — any tag key in the store works, matched
+case-insensitively); anything else is literal. A missing field renders as
+the `--default-fallback` value (default `Unknown`). Name collisions get a
+deterministic `(2)`, `(3)`, … suffix. The default template is
+`$artist/$title`.
 
-Re-scan to pick up changes on disk while preserving external tag edits:
+Two modes:
 
-```bash
-musefs scan /path/to/music --db library.db --revalidate
-```
+- **`synthesis`** (default) — files carry metadata freshly generated from
+  the store, spliced ahead of the original audio bytes.
+- **`structure-only`** — files are served byte-for-byte as they are on disk;
+  only the directory tree is virtual.
+
+Edit tags or art in the database while mounted (another `scan`, a
+beets/Picard sync, raw SQL) and the view refreshes automatically.
 
 Run `musefs <command> --help` for the full flag list.
 
 ### Tuning
 
-`mount` accepts optional performance flags, all with sensible defaults — tune them
-to your backing store:
+All tuning flags have sensible defaults; adjust them to your backing store:
 
 | Flag | Default | What it does |
 | ---- | ------- | ------------ |
 | `--poll-interval-ms` | `1000` | Debounce window for detecting external DB edits. |
-| `--attr-ttl-ms` | `1000` | How long the kernel may trust cached entry/attr lookups before re-validating. Higher cuts `lookup`/`getattr` traffic; bounds how fast external edits become visible. |
-| `--max-readahead-kib` | `512` | Kernel read-ahead window. Larger hides HDD/NFS latency during sequential playback. |
+| `--attr-ttl-ms` | `1000` | How long the kernel may trust cached entry/attr lookups. Higher cuts `lookup`/`getattr` traffic; bounds how fast external edits become visible. |
+| `--max-readahead-kib` | `512` | Kernel read-ahead window. Larger hides HDD/NFS latency during sequential playback (clamped to the kernel maximum). |
 | `--max-background` | `64` | Max outstanding background (read-ahead/async) requests the kernel keeps in flight. |
-| `--keep-cache` | off | Keep the kernel page cache across opens. External re-tags auto-invalidate the affected inodes on refresh, so cached bytes are dropped when content changes. |
+| `--keep-cache` | disabled | Keep the kernel page cache across opens. External re-tags auto-invalidate the affected files, so cached bytes never go stale. |
 
-## Project layout
+## Supported formats
 
-A layered Cargo workspace:
+| Format | Extensions | What synthesis does | Details |
+| ------ | ---------- | ------------------- | ------- |
+| FLAC | `.flac` | Regenerates the metadata blocks; preserves `STREAMINFO`/`SEEKTABLE` bit-exact | [docs/FLAC.md](docs/FLAC.md) |
+| MP3 | `.mp3` | Regenerates the ID3v2.4 tag; the audio frames (incl. Xing/LAME) are untouched | [docs/MP3.md](docs/MP3.md) |
+| M4A | `.m4a`, `.m4b` | Rebuilds the `moov` atom, patching chunk offsets; `mdat` served verbatim | [docs/M4A.md](docs/M4A.md) |
+| Ogg | `.ogg`, `.oga`, `.opus` | Regenerates header pages (Opus/Vorbis/FLAC-in-Ogg); audio pages served verbatim, only page seq numbers/CRCs patched in place | [docs/OGG.md](docs/OGG.md) |
+| WAV | `.wav` | Regenerates the RIFF front (`LIST`/`INFO` + embedded ID3v2); `data` payload verbatim | [docs/WAV.md](docs/WAV.md) |
 
-| Crate           | Responsibility                                              |
-| --------------- | ----------------------------------------------------------- |
-| `musefs-db`     | SQLite store: schema, migrations, tracks/tags/art access    |
-| `musefs-format` | FLAC/MP3/MP4/Ogg/WAV byte surgery: metadata synthesis + layout |
-| `musefs-core`   | Orchestration: virtual tree, file resolution, scanning      |
-| `musefs-fuse`   | Thin FUSE adapter (fuser)                                   |
-| `musefs-cli`    | CLI logic library: clap commands, scan/mount handlers       |
-| `musefs`        | Thin binary wrapper; published to crates.io as `musefs`     |
+Text tags round-trip losslessly through a shared canonical vocabulary (so
+`$albumartist`, `$date`, etc. work the same regardless of source format),
+and binary metadata (ratings, embedded blocks, opaque frames) is preserved
+where the format allows. Each format has a handful of well-defined lossy
+edges — see its doc for the exact list.
 
-See [`CLAUDE.md`](CLAUDE.md) for the architecture in depth.
+## FAQ
 
-## Development
+**Does musefs ever write to my audio files?**
+No. The mount is read-only and the scanner only reads. The served files are
+assembled on the fly: generated metadata plus positioned reads of your
+originals. Nothing is ever copied or rewritten.
+
+**Where do my edited tags live?**
+In the SQLite store (`--db`). Edit it with the
+[beets](contrib/beets/README.md) or [Picard](contrib/picard/README.md)
+plugins, or with plain SQL — the schema is a documented, stable contract
+(see [ARCHITECTURE.md](ARCHITECTURE.md#the-sqlite-store)).
+
+**Do edits show up without remounting?**
+Yes. The mount polls the database (debounced) and picks up external commits
+automatically, with stable inodes across refreshes — even files held open
+keep working.
+
+**Can I write through the mount?**
+No — and it's not planned. Out-of-band editing against the store *is* the
+design: it's what guarantees your originals can never be corrupted.
+
+**What platforms?**
+Linux with FUSE (`/dev/fuse` + libfuse). That's currently the only supported
+platform.
+
+**Is it fast enough for a big library on a NAS?**
+That's the design target: synthesized headers are cached, blocking reads run
+on a worker pool so a slow disk never stalls the filesystem, and read-ahead,
+cache TTLs, and poll intervals are all [tunable](#tuning). In
+`structure-only` mode on kernel 6.9+, reads can bypass the daemon entirely
+via FUSE passthrough (needs `CAP_SYS_ADMIN`).
+
+**A file in the mount won't open / reads error — why?**
+The most common cause is a backing file that changed since its last scan
+(musefs refuses to serve a file whose size or mtime drifted, rather than
+splice at stale offsets). Run `musefs scan --revalidate` to re-probe it.
+
+## Requirements
+
+- Rust (2021 edition) and Cargo to build/install.
+- Linux with FUSE (`/dev/fuse` and libfuse) to mount.
+
+`cargo install` compiles from source, so the same prerequisites as a local
+build apply: a Rust toolchain plus FUSE headers (`libfuse3-dev`) and
+`pkg-config`. To install the latest development version:
 
 ```bash
-cargo test                               # all crates
-cargo test -p musefs-core read_at        # tests matching a substring
-cargo test -p musefs-fuse -- --ignored   # FUSE end-to-end (needs /dev/fuse)
-cargo clippy --all-targets
-cargo fmt
+cargo install --git https://github.com/Sohex/musefs musefs
 ```
 
-### Fuzzing & property tests
+## Status
 
-Property-based tests (`proptest`) assert the byte-identical audio invariant and
-tag round-trips, and run as part of `cargo test`. Coverage-guided fuzzing
-(`cargo-fuzz`, requires a nightly toolchain) hammers every format parser and the
-byte-level primitives for panics, hangs, and OOM:
+All five formats ship with embedded cover art and binary-tag preservation.
+The serve path has been through a performance/concurrency hardening pass for
+real-world player and media-manager access against large libraries on
+HDD/SSD/NFS, and the parsers are continuously fuzzed. beets and Picard
+plugins ship in [`contrib/`](contrib/). See the
+[CHANGELOG](CHANGELOG.md) for history.
 
-```bash
-cargo test -p musefs-format --features fuzzing   # format-layer property tests
-cargo install cargo-fuzz                         # one-time
-cargo +nightly fuzz run flac                     # or mp3|mp4|ogg|wav|ogg_page|b64|vorbiscomment
-cargo +nightly fuzz coverage flac                # confirm coverage reaches the parser
-```
-
-An independent-reader interop test confirms the wider ecosystem (`mutagen`) reads
-the tags musefs synthesizes, across all five formats:
-
-```bash
-pip install -r tests/interop/requirements.txt
-MUSEFS_INTEROP_DIR=/tmp/i cargo test -p musefs-core --test interop_emit -- --ignored emit_interop_fixtures
-MUSEFS_INTEROP_DIR=/tmp/i python -m pytest tests/interop
-```
-
-The FUSE end-to-end tests perform real mounts and are `#[ignore]`d by default; run
-them with `--ignored` on a host that has `/dev/fuse`.
-
-A pre-commit hook (`.githooks/pre-commit`) runs `cargo fmt --check` and
-`cargo clippy --all-targets -- -D warnings`. The lint policy — `clippy::pedantic`
-minus a few intentional/noisy groups — lives in the root `Cargo.toml` under
-`[workspace.lints]`. Enable the hook in a fresh clone with:
-
-```bash
-git config core.hooksPath .githooks
-```
+Deeper reading: [ARCHITECTURE.md](ARCHITECTURE.md) for how it works,
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
 
 ## License
 
