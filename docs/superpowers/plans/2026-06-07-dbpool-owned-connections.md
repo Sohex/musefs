@@ -110,14 +110,12 @@ Run: `cargo test -p musefs-core db_pool`
 
 Expected: the two new tests FAIL on their `assert_eq!` (fd count above baseline — the current TLS design leaks the workers'/main's connections), every pre-existing `db_pool` test still PASSES. If a new test passes here, STOP — the test is not observing the leak (most likely the readlink prefix doesn't match; check `db_fd_count` against a hand-opened `Db`).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Do NOT commit yet**
 
-```bash
-git add musefs-core/src/db_pool.rs
-git commit -m "test: pin DbPool drop-closes-connections contract (#127)"
-```
-
-(The pre-commit hook runs fmt/clippy on the diff; failing-but-compiling tests are expected to commit cleanly. If the hook rejects committing red tests for some reason, fold this commit into Task 2's instead — do not skip hooks.)
+The pre-commit hook (`.githooks/pre-commit`) runs `cargo test --workspace`, so
+a commit with deliberately-red tests is guaranteed to be rejected. Never
+bypass it with `--no-verify`. The red state was verified in Step 2; these
+tests are committed together with the implementation in Task 2 Step 5.
 
 ---
 
@@ -272,7 +270,10 @@ Run: `cargo test`
 
 Expected: PASS across all crates (the FUSE e2e tests stay `#[ignore]`d). The only consumer (`facade.rs`) uses `with`/`with_poll` only, so nothing else should need edits — a failure elsewhere means the rewrite changed observable behavior; stop and investigate rather than patching the caller.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit (tests from Task 1 + implementation together)**
+
+This is the first commit of the branch — it carries Task 1's tests too, since
+the pre-commit hook's workspace test run forbids committing them red.
 
 ```bash
 git add musefs-core/src/db_pool.rs
