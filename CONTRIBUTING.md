@@ -55,6 +55,20 @@ cargo test -p musefs-fuse --no-run
 sudo target/debug/deps/<e2e_test_binary> --ignored <passthrough_test_name>
 ```
 
+### FreeBSD e2e
+
+The FUSE e2e suite also runs on FreeBSD. CI uses the `freebsd` job in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml), which invokes the
+committed scripts in [`scripts/freebsd-vm/`](scripts/freebsd-vm/README.md).
+Those scripts provision the VM (`rust`, `git`, `ffmpeg`, and the `fusefs`
+kernel module) and then run the same workspace + `--ignored` FUSE test
+commands locally and in CI. Keep a FreeBSD VM image under the gitignored
+`/.scratch/`.
+
+macOS support is best-effort: CI builds there with `fuser`'s
+`macos-no-mount` feature, and the platform-specific logic is unit-tested.
+Mounted e2e on macOS/FUSE-T is not yet validated.
+
 ## Test tiers beyond `cargo test`
 
 ### Property tests
