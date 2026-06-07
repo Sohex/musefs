@@ -888,8 +888,13 @@ Create `scripts/freebsd-vm/provision.sh`:
 # only this file.
 set -eu
 
-# Toolchain + VCS. FreeBSD packages a recent stable Rust as `rust`.
-pkg install -y rust git
+# Toolchain + VCS + ffmpeg. FreeBSD packages a recent stable Rust as `rust`.
+# ffmpeg is REQUIRED for the full e2e suite: playback_pcm.rs decodes served
+# files to PCM and compares SHAs, and ogg_read_through.rs encodes opus/vorbis/
+# flac-in-ogg fixtures — both shell out to `ffmpeg` and SILENTLY SKIP if it is
+# absent (a vacuous pass). The default FreeBSD `ffmpeg` package ships the
+# needed decoders/encoders (flac, opus, vorbis, aac, mp3, pcm/wav).
+pkg install -y rust git ffmpeg
 
 # FUSE support: load the in-kernel fusefs module. fuser uses its pure-rust
 # /dev/fuse backend on FreeBSD, so NO libfuse package is required — only the
@@ -910,16 +915,25 @@ Create `scripts/freebsd-vm/run-e2e.sh`:
 #!/bin/sh
 # Build the workspace and run the FUSE end-to-end suite on FreeBSD.
 # Run from the repo root after provision.sh. Requires the fusefs kernel module
-# (loaded by provision.sh) and /dev/fuse.
+# (loaded by provision.sh), /dev/fuse, and ffmpeg.
 set -eu
+
+# Fail loudly if ffmpeg is missing: the playback/ogg e2e tests skip silently
+# without it, which would otherwise turn a missing dependency into a vacuous
+# green run. (provision.sh installs it.)
+command -v ffmpeg >/dev/null 2>&1 || {
+    echo "error: ffmpeg not found — playback_pcm/ogg_read_through e2e would" >&2
+    echo "       silently skip. Run scripts/freebsd-vm/provision.sh first." >&2
+    exit 1
+}
 
 # Full workspace (unit + integration, excludes the #[ignore]d FUSE e2e).
 cargo test --workspace
 
-# The FUSE end-to-end tests (mount/read-through). Passthrough-specific e2e
-# (the `metrics`-gated tests) are Linux-only and intentionally NOT run here:
-# FreeBSD has no kernel passthrough, so StructureOnly falls back to daemon
-# serving (verified by the standard suite).
+# The FUSE end-to-end tests (mount/read-through + ffmpeg decode/encode
+# fidelity). Passthrough-specific e2e (the `metrics`-gated tests) are Linux-only
+# and intentionally NOT run here: FreeBSD has no kernel passthrough, so
+# StructureOnly falls back to daemon serving (verified by the standard suite).
 cargo test -p musefs-fuse -- --ignored
 ```
 
@@ -942,8 +956,10 @@ source of truth — CI and local both run them, so they cannot drift.
 
 ## What's where
 
-- `provision.sh` — installs the toolchain and loads the `fusefs` kernel module.
-- `run-e2e.sh` — `cargo test --workspace` then the `--ignored` FUSE e2e suite.
+- `provision.sh` — installs the toolchain + `ffmpeg` and loads the `fusefs`
+  kernel module.
+- `run-e2e.sh` — `cargo test --workspace` then the `--ignored` FUSE e2e suite
+  (guards that `ffmpeg` is present so the decode/encode tests don't skip).
 - The VM **image** is not committed; keep it under the gitignored `/.scratch/`.
 
 ## Local run (qemu example)
@@ -974,6 +990,10 @@ mount succeed; otherwise run `run-e2e.sh` as root too.
 
 - FreeBSD uses fuser's pure-rust `/dev/fuse` backend — **no libfuse package**;
   only the `fusefs` kernel module and base-system `mount_fusefs(8)` are needed.
+- **`ffmpeg` is required** for the full suite: `playback_pcm.rs` (decode-to-PCM
+  SHA equality) and `ogg_read_through.rs` (opus/vorbis/flac-in-ogg fixtures)
+  shell out to it and skip silently if it is missing — `run-e2e.sh` guards
+  against that. The default FreeBSD `ffmpeg` package has the needed codecs.
 - Kernel FUSE passthrough (StructureOnly) is **Linux-only**; on FreeBSD it falls
   back to daemon serving. macOS is best-effort (compile + unit only; no mount
   harness yet).
@@ -1077,8 +1097,9 @@ The FUSE e2e suite also runs on FreeBSD — CI uses a VM (the `freebsd` job in
 `provision.sh` / `run-e2e.sh` scripts it runs live in
 [`scripts/freebsd-vm/`](../scripts/freebsd-vm/README.md). Keep a FreeBSD VM
 image under the gitignored `/.scratch/`; the scripts handle provisioning
-(`fusefs` kernel module; no libfuse needed — FreeBSD uses fuser's pure-rust
-backend) and running the suite.
+(`fusefs` kernel module + `ffmpeg`; no libfuse needed — FreeBSD uses fuser's
+pure-rust backend) and running the suite. `ffmpeg` is required so the
+decode/playback fidelity e2e tests run rather than silently skip.
 
 macOS support is best-effort: it compiles (CI builds with fuser's
 `macos-no-mount` feature) and its platform-specific logic is unit-tested, but
