@@ -17,7 +17,7 @@
 ## Design decisions (read before starting)
 
 - **Fold function:** `str::to_lowercase()` (Unicode-aware lowercasing). ASCII case-insensitivity is the floor; full Apple HFS+/APFS normalization (NFD + Apple's folding table) is out of scope for this best-effort pass. Apply the fold *identically* to every comparison (collision, disambiguation, lookup) — never compare a folded value against an unfolded one.
-- **Directories merge, leaf files disambiguate.** `ensure_dir` reuses an existing *directory* child matching the folded name (merge); `disambiguate` treats a folded collision as a collision and appends ` (k)` (leaf disambiguation). Mirrors a native case-insensitive filesystem; minimal generalization of the existing exact-name behavior.
+- **Directories merge, leaf files disambiguate.** `ensure_dir` reuses an existing *directory* child matching the folded name (merge); `disambiguate` treats a folded collision as a collision and appends ` (k)` (leaf disambiguation). Mirrors a native case-insensitive filesystem; minimal generalization of the existing exact-name behavior. The merged dir keeps the **first-seen** casing for display and the allocator's rendered-path key — "first-seen" is the first row `db.list_tracks()` returns (build order), not the lowest track id. Two fresh folded builds use the same query order, so this is deterministic and the equivalence/acceptance tests hold.
 - **Incremental refresh bypassed when folding.** `apply_changes` and its helpers (`deepest_existing_ancestor`, `children_by_rendered`, `collision_gate`) navigate by *exact* rendered name and would mis-handle a merged folded tree, silently breaking the fresh-vs-incremental equivalence invariant. Rather than fold that hard-to-verify path, `rebuild_incremental` returns `Ok(None)` when `case_insensitive` is set; the existing caller (`poll_refresh_notify`, facade.rs:665) already treats `Ok(None)` as "do a full rebuild" via `rebuild_full`. So `collision_gate`, `deepest_existing_ancestor`, `children_by_rendered`, `apply_changes`, `remove_track`, and `prune_empty_dirs_upward` are **left untouched** — under folding they are never invoked.
 - **Folded index is build-only.** Because folding always full-rebuilds, a published folded tree is never mutated in place — `build_with` only ever *inserts*. So only the two insert sites maintain `folded_children`; there is no remove-side maintenance to get wrong. The case-sensitive path never populates the index (the maintenance helper early-returns), so Linux/FreeBSD pay nothing. The index is part of `VirtualTree`'s derived `PartialEq`; since it is built deterministically from the same inserts, a fresh folded build and a re-rendered folded build compare equal.
 - **No mount-option change.** Case-insensitivity is enforced entirely by the daemon's folded lookup. macFUSE/FUSE-T do not honor a daemon-set case-sensitivity mount flag, so `platform::mount::options` (Plan A) is unchanged — matching the spec's "where the backend honors it" hedge.
@@ -298,34 +298,33 @@ falling back to full refresh" and bumps `gap_fallbacks`. That wording/counter is
 cosmetically off for the case-insensitive case but functionally correct (it does
 a full rebuild). Leaving it is acceptable for this best-effort path.
 
-- [ ] **Step 11: Move the 5 production `build_with` calls to `build_with_ci`**
+- [ ] **Step 11: Move the production `build_with` calls to `build_with_ci`**
 
-In `musefs-core/src/facade.rs`, change each production call to pass the flag:
+There are exactly **four** `build_with` call sites (grep confirms). `Musefs::open`
+does NOT call `build_with` directly — it calls `Self::build_full(&db, &template,
+&config, &mut alloc)` (`facade.rs:241`), so folding reaches `open`'s tree
+transitively once `build_full` honors the flag. Change each of the four:
 
-- `Musefs::open` (~line 231) — `config` is the param in scope:
+- `build_full` (`facade.rs:324`) — an **associated fn** `fn build_full<M>(db,
+  template, config: &MountConfig, alloc)` with **no `&self`**; use the `config`
+  **parameter**:
   ```rust
-  let tree = VirtualTree::build_with_ci(&entries, &mut alloc, config.case_insensitive);
+  Ok((VirtualTree::build_with_ci(&entries, alloc, config.case_insensitive), snapshot))
   ```
-- `build_full` (~line 324) — `self.config` in scope:
-  ```rust
-  Ok((VirtualTree::build_with_ci(&entries, alloc, self.config.case_insensitive), snapshot))
-  ```
-- `rebuild_full` (~line 359):
+- `rebuild_full` (`facade.rs:359`) — `&self` method:
   ```rust
   let tree = VirtualTree::build_with_ci(&entries, &mut alloc, self.config.case_insensitive);
   ```
-- the incremental reference equiv check (~line 507) — bypassed when folding, but
-  keep it building like-for-like:
+- the incremental reference equiv check (`facade.rs:507`) — inside `&self`
+  `rebuild_incremental`; this code is dead under folding (Step 10 returns early)
+  but keep it like-for-like:
   ```rust
   let reference = VirtualTree::build_with_ci(&entries, &mut ref_alloc, self.config.case_insensitive);
   ```
-- the incremental fallback (~line 522):
+- the incremental fallback (`facade.rs:522`) — same method:
   ```rust
   VirtualTree::build_with_ci(&entries, &mut alloc, self.config.case_insensitive)
   ```
-
-NOTE: if `build_full` does not have `&self` in scope (verify), thread the flag in
-from its caller instead of `self.config`. The other four are `&self` methods.
 
 - [ ] **Step 12: Add `case_insensitive: false` to every `MountConfig` literal**
 
