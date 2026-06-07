@@ -122,7 +122,8 @@ On Lidarr rename:
 Manual backfill:
 
 - Provide a manual mode such as `musefs-lidarr-sync --all`.
-- It queries Lidarr for known track files and syncs every known file into the
+- It requires Lidarr API configuration, queries every known artist, then queries
+  each artist's track files and tracks so every known file can be synced into the
   musefs store.
 - This is useful for an existing Lidarr library or for recovering from missed
   Custom Script events.
@@ -136,8 +137,9 @@ Unsupported events:
 - Events that do not include useful paths are ignored with a concise log message
   and exit `0`.
 - `TrackRetag` is not the primary workflow because it fires after Lidarr rewrites
-  tags. It can be treated as best-effort sync if present, but the docs must make
-  clear that enabling Lidarr retagging violates the intended setup.
+  tags. v1 must skip `TrackRetag` with a warning and exit `0`; enabling Lidarr
+  retagging violates the intended setup and must not be treated as a supported
+  sync source.
 
 ## Configuration
 
@@ -167,9 +169,8 @@ Sync script:
 
 - `MUSEFS_DB`: required.
 - `MUSEFS_BIN`: optional, default `musefs`.
-- `MUSEFS_LIDARR_URL`: required for API-enriched metadata and config preflight.
-- `MUSEFS_LIDARR_API_KEY`: required for API-enriched metadata and config
-  preflight.
+- `MUSEFS_LIDARR_URL`: required for sync metadata and config preflight.
+- `MUSEFS_LIDARR_API_KEY`: required for sync metadata and config preflight.
 - `MUSEFS_LIDARR_AUTOSCAN`: optional, default enabled.
 
 The sync command should support CLI flags mirroring the environment where that
@@ -190,15 +191,14 @@ First version mapping should be intentionally pragmatic:
 
 Data sources, in order:
 
-1. Custom Script environment variables for event, affected paths, and coarse
-   artist/album fields.
-2. Lidarr API, when URL and API key are configured, for per-track and per-album
-   metadata.
-3. A minimal env-only fallback for simple tags when API configuration is absent.
+1. Custom Script environment variables for event type, affected paths, and
+   coarse artist/album IDs.
+2. Lidarr API for per-track, per-album, and per-artist metadata.
 
-The env-only fallback should be honest: it can sync basic album-level fields but
-cannot produce a complete per-track tag set in every case. Rich metadata requires
-the Lidarr API.
+For v1, all non-test, non-unsupported sync modes require `MUSEFS_LIDARR_URL` and
+`MUSEFS_LIDARR_API_KEY`. There is no env-only metadata sync fallback because
+Custom Script environment variables cannot reliably produce a complete
+per-track tag set.
 
 Tags are fully replaced for each synced track, preserving scanner-written binary
 tags according to the existing `python-musefs` behavior.
@@ -218,6 +218,9 @@ records before building `Record`s:
 5. Require exactly one candidate for each affected path.
 6. Fetch or use the linked track, album, and artist data for the matched
    track-file.
+7. For artist-scoped rename or manual backfill payloads, group candidate
+   track-files by each file's own `albumId` and `artistId`; never apply one
+   album payload to every file in a multi-album event.
 
 Zero matches are counted as skipped and logged with the path. Multiple matches
 are an error for that path because syncing ambiguous metadata is worse than
@@ -249,6 +252,10 @@ Sync behavior:
   beets and Picard.
 - Lidarr API failures should be explicit and should distinguish configuration
   errors from transient HTTP errors.
+- Missing Lidarr API configuration is a user-facing error for `AlbumDownload`,
+  `Rename`, and `--all`; it is not an env-only fallback path.
+- `TrackRetag` logs that it is skipped because it fires after Lidarr writes tags
+  and exits `0` without scanning or writing the DB.
 - Sync should write one batch transaction and commit only on success.
 - API keys and authorization values must never be printed in logs, errors, test
   snapshots, or command output. Redact them as `<redacted>` whenever reporting
@@ -264,14 +271,12 @@ must provide a preflight check:
 
 - `musefs-lidarr-sync doctor` queries Lidarr's API and verifies `WriteAudioTags`
   is `No`, `FileDate` is `None`, and Linux permission management is disabled.
-- When API configuration is present, normal sync runs the same preflight before
-  writing unless the user passes an explicit escape hatch such as
-  `--skip-lidarr-preflight`.
+- Normal sync runs the same preflight before writing unless the user passes an
+  explicit escape hatch such as `--skip-lidarr-preflight`.
 - Unsafe settings are a hard failure by default. The failure message names the
   specific setting and the required value.
-- When API configuration is absent, sync may run in env-only mode, but it must
-  print a concise warning that settings could not be verified and that the user
-  must manually keep the documented safe settings.
+- When API configuration is absent, `doctor` and non-test sync fail with a
+  concise configuration error.
 
 ## Documentation updates required
 
@@ -280,6 +285,12 @@ Implementation must update all relevant docs, not only add code:
 - New `contrib/lidarr/README.md` covering installation, Lidarr UI settings,
   environment variables, symlink vs hardlink mode, Custom Script setup, manual
   backfill, troubleshooting, and a smoke test.
+- New durable real-Lidarr smoke checklist artifact under
+  `docs/superpowers/specs/` or another release-note path chosen during
+  implementation. It must record whether the real-instance smoke gate is pending
+  or completed, the Lidarr version, link mode, destination entry type, source
+  checksum before/after, source mtime before/after, and whether mount metadata
+  was verified.
 - Root `README.md` integration list and workflow text, adding Lidarr beside
   beets and Picard.
 - `ARCHITECTURE.md` contrib ecosystem section, adding Lidarr as a third
@@ -294,7 +305,7 @@ Implementation must update all relevant docs, not only add code:
   servers should point at the musefs FUSE mount, not at Lidarr's placeholder
   destination tree.
 - A `doctor` section documenting the exact settings checked through the Lidarr
-  API and the manual checklist for env-only operation.
+  API and the failure behavior when API configuration is absent.
 
 The docs must explicitly warn against these unsupported or dangerous setups:
 
@@ -316,18 +327,26 @@ Unit tests:
   source failure.
 - Hardlink creation, same-inode idempotency, and no copy fallback.
 - Event selection: `Test`, `AlbumDownload`, `Rename`, unsupported events.
+- `TrackRetag` skip behavior: warning, exit `0`, no scan, no DB writes.
 - Metadata mapping from representative Lidarr API payloads.
 - API path-to-track matching for exact match, zero match, multiple matches, and
   multi-track file behavior.
+- Artist-scoped rename payloads spanning multiple albums, proving each file uses
+  metadata from its own `albumId`.
 - API client URL construction, auth header/API key behavior, and error
   classification, including API key redaction in logs and exceptions.
 - Lidarr settings preflight: safe settings pass; unsafe `WriteAudioTags`,
-  `FileDate`, and permission settings fail; missing API config warns.
+  `FileDate`, and permission settings fail; missing API config fails for doctor
+  and non-test sync.
+- CLI preflight behavior: unsafe settings return `1`, `--skip-lidarr-preflight`
+  allows sync to proceed, and stdout/stderr never include the API key.
 
 Integration tests:
 
 - Temporary musefs DB with `python-musefs` sync helpers.
 - `musefs-lidarr-sync` writes expected tags and repeated genre rows.
+- `musefs-lidarr-sync --all` queries Lidarr API data for all artists and syncs
+  every matched known track file.
 - Rename sync behavior differs by link mode: symlink mode rescans without stale
   placeholder pruning; hardlink mode prunes missing previous paths.
 - Missing row after scan is counted as skipped.

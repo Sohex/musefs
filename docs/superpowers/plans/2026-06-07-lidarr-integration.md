@@ -35,6 +35,8 @@ Create these files:
 - `contrib/lidarr/tests/test_cli.py` — CLI behavior and exit code tests.
 - `contrib/lidarr/tests/test_path_gate.py` — opt-in real `musefs` path matching gate.
 - `contrib/lidarr/README.md` — Lidarr setup and safety docs.
+- `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md` — durable
+  real-Lidarr release-gate checklist and observations.
 
 Modify these files:
 
@@ -829,6 +831,9 @@ class LidarrClient:
     def album(self, album_id: int):
         return self.get_json(f"/api/v1/album/{album_id}")
 
+    def artists(self):
+        return self.get_json("/api/v1/artist")
+
     def artist(self, artist_id: int):
         return self.get_json(f"/api/v1/artist/{artist_id}")
 
@@ -1030,14 +1035,48 @@ def test_records_for_paths_builds_record(sample_artist, sample_album, sample_tra
         paths=[sample_track_file["path"]],
         track_files=[sample_track_file],
         tracks=[sample_track],
-        album=sample_album,
-        artist=sample_artist,
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
     )
 
     assert skipped == []
     assert len(records) == 1
     assert records[0].key == realpath_key(sample_track_file["path"])
     assert ("title", "Wildlife Analysis") in records[0].pairs
+
+
+def test_records_for_paths_uses_each_track_files_own_album(
+    sample_artist, sample_album, sample_track_file, tmp_path
+):
+    second_path = tmp_path / "library" / "02 - Second.flac"
+    second_path.write_bytes(b"audio")
+    second_album = dict(sample_album, id=21, title="Geogaddi")
+    first_track = {
+        "id": 40,
+        "artistId": 10,
+        "albumId": 20,
+        "trackFileId": sample_track_file["id"],
+        "trackNumber": "1",
+        "mediumNumber": 1,
+        "title": "Wildlife Analysis",
+    }
+    second_track_file = dict(sample_track_file, id=31, albumId=21, path=str(second_path))
+    second_track = dict(first_track, id=41, albumId=21, trackFileId=31, title="Ready Lets Go")
+
+    records, skipped = records_for_paths(
+        paths=[sample_track_file["path"], str(second_path)],
+        track_files=[sample_track_file, second_track_file],
+        tracks=[first_track, second_track],
+        albums_by_id={20: sample_album, 21: second_album},
+        artists_by_id={10: sample_artist},
+    )
+
+    assert skipped == []
+    by_key = {record.key: record for record in records}
+    assert ("album", "Music Has the Right to Children") in by_key[
+        realpath_key(sample_track_file["path"])
+    ].pairs
+    assert ("album", "Geogaddi") in by_key[realpath_key(second_path)].pairs
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -1124,8 +1163,8 @@ def records_for_paths(
     paths: list[str],
     track_files: list[dict],
     tracks: list[dict],
-    album: dict,
-    artist: dict,
+    albums_by_id: dict[int, dict],
+    artists_by_id: dict[int, dict],
 ) -> tuple[list[Record], list[str]]:
     tracks_by_file = _tracks_by_file(tracks)
     records = []
@@ -1138,6 +1177,11 @@ def records_for_paths(
             continue
         linked = tracks_by_file.get(int(track_file["id"]), [])
         if not linked:
+            skipped.append(path)
+            continue
+        album = albums_by_id.get(int(track_file["albumId"]))
+        artist = artists_by_id.get(int(track_file["artistId"]))
+        if album is None or artist is None:
             skipped.append(path)
             continue
         pairs = []
@@ -1197,8 +1241,8 @@ def test_sync_records_writes_tags(db_path, make_track, sample_track_file, sample
         event=event,
         track_files=[sample_track_file],
         tracks=[sample_track],
-        album=sample_album,
-        artist=sample_artist,
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
     )
 
     assert stats.synced == 1
@@ -1228,8 +1272,8 @@ def test_sync_records_counts_missing_row_as_skipped(db_path, sample_track_file, 
         event=event,
         track_files=[sample_track_file],
         tracks=[sample_track],
-        album=sample_album,
-        artist=sample_artist,
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
     )
 
     assert stats.synced == 0
@@ -1300,15 +1344,15 @@ def sync_records(
     event: LidarrEvent,
     track_files: list[dict],
     tracks: list[dict],
-    album: dict,
-    artist: dict,
+    albums_by_id: dict[int, dict],
+    artists_by_id: dict[int, dict],
 ) -> SyncStats:
     records, skipped_paths = records_for_paths(
         paths=event.paths,
         track_files=track_files,
         tracks=tracks,
-        album=album,
-        artist=artist,
+        albums_by_id=albums_by_id,
+        artists_by_id=artists_by_id,
     )
     stats = SyncStats(skipped=len(skipped_paths))
     conn = connect(config.db_path)
@@ -1542,7 +1586,7 @@ def run(argv: list[str] | None = None, environ: dict[str, str] | None = None) ->
         if event.event_type is EventType.UNSUPPORTED:
             print(f"musefs-lidarr-sync: unsupported event {event.raw_type!r}; skipping")
             return 0
-        raise ConfigError("MUSEFS_DB is required for AlbumDownload, Rename, and TrackRetag events")
+        raise ConfigError("MUSEFS_DB is required for AlbumDownload and Rename events")
     except (MusefsLidarrError, LidarrApiError) as exc:
         print(f"musefs-lidarr-sync: {exc}", file=sys.stderr)
         return 1
@@ -1680,8 +1724,8 @@ def test_sync_event_with_payloads_scans_then_syncs(db_path, make_track, sample_t
         event=event,
         track_files=[sample_track_file],
         tracks=[sample_track],
-        album=sample_album,
-        artist=sample_artist,
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
         scanner=lambda binary, db_path, targets: scan_calls.append((binary, db_path, targets)),
     )
 
@@ -1700,8 +1744,8 @@ def sync_event_with_payloads(
     event: LidarrEvent,
     track_files: list[dict],
     tracks: list[dict],
-    album: dict,
-    artist: dict,
+    albums_by_id: dict[int, dict],
+    artists_by_id: dict[int, dict],
     scanner=run_scan,
 ) -> SyncStats:
     scan_if_enabled(config=config, paths=event.paths, runner=scanner)
@@ -1710,8 +1754,8 @@ def sync_event_with_payloads(
         event=event,
         track_files=track_files,
         tracks=tracks,
-        album=album,
-        artist=artist,
+        albums_by_id=albums_by_id,
+        artists_by_id=artists_by_id,
     )
     sync_rename_prune(config=config, previous_paths=event.previous_paths)
     return stats
@@ -1735,17 +1779,17 @@ rtk git commit -m "feat(lidarr): wire sync workflow"
 Append to `contrib/lidarr/tests/test_sync.py`:
 
 ```python
-from musefs_lidarr.sync import collect_event_payloads
+from musefs_lidarr.sync import collect_all_payloads, collect_event_payloads
 
 
 class FakeLidarrClient:
-    def __init__(self, *, track_files, tracks, album, artist):
+    def __init__(self, *, track_files, tracks, albums, artists):
         self.track_file_calls = []
         self.track_calls = []
         self._track_files = track_files
         self._tracks = tracks
-        self._album = album
-        self._artist = artist
+        self._albums = {album["id"]: album for album in albums}
+        self._artists = {artist["id"]: artist for artist in artists}
 
     def track_files(self, **kwargs):
         self.track_file_calls.append(kwargs)
@@ -1756,12 +1800,10 @@ class FakeLidarrClient:
         return self._tracks
 
     def album(self, album_id):
-        assert album_id == self._album["id"]
-        return self._album
+        return self._albums[album_id]
 
     def artist(self, artist_id):
-        assert artist_id == self._artist["id"]
-        return self._artist
+        return self._artists[artist_id]
 
 
 def test_collect_event_payloads_queries_by_album_when_available(
@@ -1770,8 +1812,8 @@ def test_collect_event_payloads_queries_by_album_when_available(
     client = FakeLidarrClient(
         track_files=[sample_track_file],
         tracks=[sample_track],
-        album=sample_album,
-        artist=sample_artist,
+        albums=[sample_album],
+        artists=[sample_artist],
     )
     event = LidarrEvent(
         event_type=EventType.ALBUM_DOWNLOAD,
@@ -1787,8 +1829,63 @@ def test_collect_event_payloads_queries_by_album_when_available(
     assert client.track_calls == [{"album_id": 20}]
     assert payloads.track_files == [sample_track_file]
     assert payloads.tracks == [sample_track]
-    assert payloads.album == sample_album
-    assert payloads.artist == sample_artist
+    assert payloads.albums_by_id == {20: sample_album}
+    assert payloads.artists_by_id == {10: sample_artist}
+
+
+def test_collect_event_payloads_fetches_all_albums_for_artist_rename(
+    sample_track_file, sample_track, sample_album, sample_artist, tmp_path
+):
+    second_album = dict(sample_album, id=21, title="Geogaddi")
+    second_track_file = dict(
+        sample_track_file,
+        id=31,
+        albumId=21,
+        path=str(tmp_path / "library" / "02 - Second.flac"),
+    )
+    second_track = dict(sample_track, id=41, albumId=21, trackFileId=31, title="Ready Lets Go")
+    client = FakeLidarrClient(
+        track_files=[sample_track_file, second_track_file],
+        tracks=[sample_track, second_track],
+        albums=[sample_album, second_album],
+        artists=[sample_artist],
+    )
+    event = LidarrEvent(
+        event_type=EventType.RENAME,
+        raw_type="Rename",
+        paths=[sample_track_file["path"], second_track_file["path"]],
+        artist_id=10,
+    )
+
+    payloads = collect_event_payloads(client=client, event=event)
+
+    assert client.track_file_calls == [{"artist_id": 10}]
+    assert client.track_calls == [{"artist_id": 10}]
+    assert payloads.albums_by_id == {20: sample_album, 21: second_album}
+    assert payloads.artists_by_id == {10: sample_artist}
+
+
+def test_collect_all_payloads_queries_each_artist(
+    sample_track_file, sample_track, sample_album, sample_artist
+):
+    class AllClient(FakeLidarrClient):
+        def artists(self):
+            return [sample_artist]
+
+    client = AllClient(
+        track_files=[sample_track_file],
+        tracks=[sample_track],
+        albums=[sample_album],
+        artists=[sample_artist],
+    )
+
+    payloads = collect_all_payloads(client=client)
+
+    assert client.track_file_calls == [{"artist_id": 10}]
+    assert client.track_calls == [{"artist_id": 10}]
+    assert payloads.track_files == [sample_track_file]
+    assert payloads.tracks == [sample_track]
+    assert payloads.paths == [sample_track_file["path"]]
 ```
 
 - [ ] **Step 9: Implement payload collection**
@@ -1798,10 +1895,22 @@ Append to `sync.py`:
 ```python
 @dataclass(frozen=True)
 class EventPayloads:
+    paths: list[str]
     track_files: list[dict]
     tracks: list[dict]
-    album: dict
-    artist: dict
+    albums_by_id: dict[int, dict]
+    artists_by_id: dict[int, dict]
+
+
+def _album_ids(track_files: list[dict]) -> set[int]:
+    return {int(track_file["albumId"]) for track_file in track_files}
+
+
+def _artist_ids(track_files: list[dict], *, fallback: int | None = None) -> set[int]:
+    ids = {int(track_file["artistId"]) for track_file in track_files if track_file.get("artistId")}
+    if fallback is not None:
+        ids.add(fallback)
+    return ids
 
 
 def collect_event_payloads(*, client, event: LidarrEvent) -> EventPayloads:
@@ -1812,24 +1921,52 @@ def collect_event_payloads(*, client, event: LidarrEvent) -> EventPayloads:
         artist_id = event.artist_id or album["artistId"]
         artist = client.artist(artist_id)
         return EventPayloads(
+            paths=event.paths,
             track_files=track_files,
             tracks=tracks,
-            album=album,
-            artist=artist,
+            albums_by_id={int(album["id"]): album},
+            artists_by_id={int(artist["id"]): artist},
         )
     if event.artist_id is not None:
         track_files = client.track_files(artist_id=event.artist_id)
         tracks = client.tracks(artist_id=event.artist_id)
-        artist = client.artist(event.artist_id)
-        album_id = track_files[0]["albumId"] if track_files else 0
-        album = client.album(album_id) if album_id else {}
+        albums_by_id = {album_id: client.album(album_id) for album_id in _album_ids(track_files)}
+        artists_by_id = {
+            artist_id: client.artist(artist_id)
+            for artist_id in _artist_ids(track_files, fallback=event.artist_id)
+        }
         return EventPayloads(
+            paths=event.paths,
             track_files=track_files,
             tracks=tracks,
-            album=album,
-            artist=artist,
+            albums_by_id=albums_by_id,
+            artists_by_id=artists_by_id,
         )
     raise ConfigError("Lidarr event must include Lidarr_Album_Id or Lidarr_Artist_Id")
+
+
+def collect_all_payloads(*, client) -> EventPayloads:
+    artists = client.artists()
+    all_track_files = []
+    all_tracks = []
+    albums_by_id = {}
+    artists_by_id = {}
+    for artist in artists:
+        artist_id = int(artist["id"])
+        artists_by_id[artist_id] = artist
+        track_files = client.track_files(artist_id=artist_id)
+        tracks = client.tracks(artist_id=artist_id)
+        all_track_files.extend(track_files)
+        all_tracks.extend(tracks)
+        for album_id in _album_ids(track_files):
+            albums_by_id.setdefault(album_id, client.album(album_id))
+    return EventPayloads(
+        paths=[track_file["path"] for track_file in all_track_files],
+        track_files=all_track_files,
+        tracks=all_tracks,
+        albums_by_id=albums_by_id,
+        artists_by_id=artists_by_id,
+    )
 ```
 
 - [ ] **Step 10: Run tests**
@@ -1843,14 +1980,14 @@ Expected: PASS.
 Append to `contrib/lidarr/tests/test_cli.py`:
 
 ```python
-def test_sync_cli_requires_db_for_album_download(capsys):
+def test_sync_cli_requires_api_for_album_download(capsys):
     rc = run_sync([], {
         "Lidarr_EventType": "AlbumDownload",
         "Lidarr_AddedTrackPaths": "/music/a.flac",
     })
 
     assert rc == 1
-    assert "MUSEFS_DB is required" in capsys.readouterr().err
+    assert "MUSEFS_LIDARR_URL" in capsys.readouterr().err
 ```
 
 - [ ] **Step 12: Run CLI tests**
@@ -1918,7 +2055,142 @@ def test_sync_cli_runs_api_backed_event(tmp_path, capsys, sample_track_file, sam
     assert rc == 0
     assert calls[0]["track_files"] == [sample_track_file]
     assert calls[0]["tracks"] == [sample_track]
+    assert calls[0]["albums_by_id"] == {20: sample_album}
+    assert calls[0]["artists_by_id"] == {10: sample_artist}
     assert "synced=1" in capsys.readouterr().out
+
+
+def test_sync_cli_track_retag_skips_without_db_or_api(capsys):
+    rc = run_sync([], {"Lidarr_EventType": "TrackRetag"})
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "TrackRetag" in captured.err
+
+
+def test_sync_cli_unsafe_preflight_returns_one(tmp_path, capsys, sample_track_file):
+    class UnsafeClient:
+        def metadata_provider_config(self):
+            return {"writeAudioTags": "allFiles"}
+
+        def media_management_config(self):
+            return {"fileDate": "albumReleaseDate", "setPermissionsLinux": True}
+
+    rc = run_sync(
+        [],
+        {
+            "Lidarr_EventType": "AlbumDownload",
+            "Lidarr_Artist_Id": "10",
+            "Lidarr_Album_Id": "20",
+            "Lidarr_AddedTrackPaths": sample_track_file["path"],
+            "MUSEFS_DB": str(tmp_path / "musefs.db"),
+            "MUSEFS_LIDARR_URL": "http://lidarr.local",
+            "MUSEFS_LIDARR_API_KEY": "secret",
+        },
+        client_factory=lambda config: UnsafeClient(),
+    )
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "unsafe Lidarr setting" in captured.err
+    assert "secret" not in captured.out
+    assert "secret" not in captured.err
+
+
+def test_sync_cli_skip_preflight_allows_sync(tmp_path, capsys, sample_track_file, sample_track, sample_album, sample_artist):
+    calls = []
+
+    class UnsafeClient:
+        def track_files(self, **kwargs):
+            return [sample_track_file]
+
+        def tracks(self, **kwargs):
+            return [sample_track]
+
+        def album(self, album_id):
+            return sample_album
+
+        def artist(self, artist_id):
+            return sample_artist
+
+        def metadata_provider_config(self):
+            return {"writeAudioTags": "allFiles"}
+
+        def media_management_config(self):
+            return {"fileDate": "albumReleaseDate", "setPermissionsLinux": True}
+
+    def fake_sync(**kwargs):
+        calls.append(kwargs)
+        class Stats:
+            def summary(self):
+                return "synced=1 skipped=0 art_linked=0 skipped_art=0"
+        return Stats()
+
+    rc = run_sync(
+        ["--skip-lidarr-preflight"],
+        {
+            "Lidarr_EventType": "AlbumDownload",
+            "Lidarr_Artist_Id": "10",
+            "Lidarr_Album_Id": "20",
+            "Lidarr_AddedTrackPaths": sample_track_file["path"],
+            "MUSEFS_DB": str(tmp_path / "musefs.db"),
+            "MUSEFS_LIDARR_URL": "http://lidarr.local",
+            "MUSEFS_LIDARR_API_KEY": "secret",
+        },
+        client_factory=lambda config: UnsafeClient(),
+        sync_runner=fake_sync,
+    )
+
+    assert rc == 0
+    assert calls
+    captured = capsys.readouterr()
+    assert "secret" not in captured.out
+    assert "secret" not in captured.err
+
+
+def test_sync_cli_all_runs_manual_backfill(tmp_path, sample_track_file, sample_track, sample_album, sample_artist):
+    calls = []
+
+    class FakeClient:
+        def artists(self):
+            return [sample_artist]
+
+        def track_files(self, **kwargs):
+            return [sample_track_file]
+
+        def tracks(self, **kwargs):
+            return [sample_track]
+
+        def album(self, album_id):
+            return sample_album
+
+        def metadata_provider_config(self):
+            return {"writeAudioTags": "no"}
+
+        def media_management_config(self):
+            return {"fileDate": "none", "setPermissionsLinux": False}
+
+    def fake_sync(**kwargs):
+        calls.append(kwargs)
+        class Stats:
+            def summary(self):
+                return "synced=1 skipped=0 art_linked=0 skipped_art=0"
+        return Stats()
+
+    rc = run_sync(
+        ["--all"],
+        {
+            "MUSEFS_DB": str(tmp_path / "musefs.db"),
+            "MUSEFS_LIDARR_URL": "http://lidarr.local",
+            "MUSEFS_LIDARR_API_KEY": "secret",
+        },
+        client_factory=lambda config: FakeClient(),
+        sync_runner=fake_sync,
+    )
+
+    assert rc == 0
+    assert calls[0]["event"].raw_type == "ManualAll"
+    assert calls[0]["event"].paths == [sample_track_file["path"]]
 ```
 
 - [ ] **Step 15: Update sync CLI to run real events**
@@ -1934,13 +2206,14 @@ import sys
 
 from .api import LidarrClient, LidarrConfig, run_preflight
 from .errors import ConfigError, LidarrApiError, MusefsLidarrError
-from .events import EventType, parse_event
-from .sync import collect_event_payloads, config_from_env, sync_event_with_payloads
+from .events import EventType, LidarrEvent, parse_event
+from .sync import collect_all_payloads, collect_event_payloads, config_from_env, sync_event_with_payloads
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="musefs-lidarr-sync")
     parser.add_argument("--doctor", action="store_true", help="check Lidarr settings and exit")
+    parser.add_argument("--all", action="store_true", help="sync every known Lidarr track file")
     parser.add_argument("--skip-lidarr-preflight", action="store_true")
     return parser
 
@@ -1971,6 +2244,30 @@ def run(
             if client is None:
                 raise ConfigError("MUSEFS_LIDARR_URL and MUSEFS_LIDARR_API_KEY are required for doctor")
             return _doctor(client)
+        if args.all:
+            if client is None:
+                raise ConfigError("MUSEFS_LIDARR_URL and MUSEFS_LIDARR_API_KEY are required for --all")
+            sync_config = config_from_env(env)
+            if not args.skip_lidarr_preflight:
+                doctor_rc = _doctor(client)
+                if doctor_rc != 0:
+                    return doctor_rc
+            payloads = collect_all_payloads(client=client)
+            event = LidarrEvent(
+                event_type=EventType.ALBUM_DOWNLOAD,
+                raw_type="ManualAll",
+                paths=payloads.paths,
+            )
+            stats = sync_runner(
+                config=sync_config,
+                event=event,
+                track_files=payloads.track_files,
+                tracks=payloads.tracks,
+                albums_by_id=payloads.albums_by_id,
+                artists_by_id=payloads.artists_by_id,
+            )
+            print(f"musefs-lidarr-sync: {stats.summary()}")
+            return 0
 
         event = parse_event(env)
         if event.event_type is EventType.TEST:
@@ -1979,10 +2276,16 @@ def run(
         if event.event_type is EventType.UNSUPPORTED:
             print(f"musefs-lidarr-sync: unsupported event {event.raw_type!r}; skipping")
             return 0
+        if event.event_type is EventType.TRACK_RETAG:
+            print(
+                "musefs-lidarr-sync: TrackRetag fires after Lidarr writes tags; skipping",
+                file=sys.stderr,
+            )
+            return 0
         if client is None:
             print(
-                "musefs-lidarr-sync: warning: Lidarr API settings are absent; "
-                "only env-only sync is available and unsafe Lidarr settings cannot be verified",
+                "musefs-lidarr-sync: Lidarr API settings are required for event sync "
+                "and settings preflight",
                 file=sys.stderr,
             )
             raise ConfigError("MUSEFS_LIDARR_URL and MUSEFS_LIDARR_API_KEY are required for v1 event sync")
@@ -1999,8 +2302,8 @@ def run(
             event=event,
             track_files=payloads.track_files,
             tracks=payloads.tracks,
-            album=payloads.album,
-            artist=payloads.artist,
+            albums_by_id=payloads.albums_by_id,
+            artists_by_id=payloads.artists_by_id,
         )
         print(f"musefs-lidarr-sync: {stats.summary()}")
         return 0
@@ -2041,6 +2344,7 @@ Create `contrib/lidarr/tests/test_path_gate.py`:
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 from musefs_common import connect, realpath_key
@@ -2049,9 +2353,12 @@ pytestmark = pytest.mark.musefs_bin
 
 
 def test_symlink_scan_matches_real_backing_path(tmp_path):
-    musefs_bin = shutil.which("musefs")
-    if musefs_bin is None:
-        pytest.skip("musefs binary not on PATH")
+    repo_root = Path(__file__).resolve().parents[3]
+    musefs_bin = Path(os.environ.get("MUSEFS_BIN") or repo_root / "target" / "debug" / "musefs")
+    if not musefs_bin.exists():
+        pytest.skip("musefs binary not found; run `cargo build` or set MUSEFS_BIN")
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
 
     source = tmp_path / "download.flac"
     destination = tmp_path / "library" / "Artist" / "download.flac"
@@ -2074,7 +2381,7 @@ def test_symlink_scan_matches_real_backing_path(tmp_path):
     )
     destination.symlink_to(source)
 
-    subprocess.run([musefs_bin, "scan", str(destination), "--db", str(db_path)], check=True)
+    subprocess.run([str(musefs_bin), "scan", str(destination), "--db", str(db_path)], check=True)
 
     conn = connect(str(db_path))
     try:
@@ -2095,7 +2402,8 @@ Expected: `1 deselected` because `musefs_bin` tests are opt-in.
 
 Run: `rtk cargo build` from repo root, then `cd contrib/lidarr && rtk python -m pytest -m musefs_bin tests/test_path_gate.py -v`.
 
-Expected: PASS when `musefs` is on `PATH` and `ffmpeg` exists; SKIP if the binary is not on `PATH`.
+Expected: PASS when the built `target/debug/musefs` or `MUSEFS_BIN` exists and
+`ffmpeg` exists; SKIP if either prerequisite is missing.
 
 - [ ] **Step 4: Commit**
 
@@ -2110,6 +2418,7 @@ rtk git commit -m "test(lidarr): add symlink path gate"
 
 **Files:**
 - Create: `contrib/lidarr/README.md`
+- Create: `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`
 - Modify: `README.md`
 - Modify: `ARCHITECTURE.md`
 - Modify: `CONTRIBUTING.md`
@@ -2173,6 +2482,19 @@ Configure a Custom Script notification:
 - Path: `musefs-lidarr-sync`.
 
 Test events exit successfully without touching files or the database.
+`TrackRetag` events are skipped with a warning because they fire after Lidarr
+writes tags.
+
+## Manual backfill
+
+Run:
+
+```bash
+musefs-lidarr-sync --all
+```
+
+Manual backfill requires `MUSEFS_LIDARR_URL` and `MUSEFS_LIDARR_API_KEY`. It
+queries all Lidarr artists and syncs their known track files into the musefs DB.
 
 ## Doctor
 
@@ -2188,8 +2510,9 @@ The doctor checks Lidarr's API for:
 - `fileDate = none`
 - `setPermissionsLinux = false`
 
-If `MUSEFS_LIDARR_URL` and `MUSEFS_LIDARR_API_KEY` are not configured, manually
-verify the settings above before syncing.
+If `MUSEFS_LIDARR_URL` and `MUSEFS_LIDARR_API_KEY` are not configured, `doctor`
+and sync fail because the integration cannot verify safe settings or build
+complete per-track metadata.
 
 ## Smoke test
 
@@ -2269,14 +2592,42 @@ Add a top entry:
 
 - [ ] **Step 7: Run docs grep checks**
 
-Run: `rtk rg -n "Lidarr|lidarr" README.md ARCHITECTURE.md CONTRIBUTING.md contrib/python-musefs/README.md contrib/lidarr/README.md CHANGELOG.md`
+Create `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`:
 
-Expected: output includes all six documentation locations.
+```markdown
+# Lidarr Integration Real-Instance Smoke Checklist
 
-- [ ] **Step 8: Commit**
+**Date:** 2026-06-07
+**Status:** Pending
+
+This checklist is the durable release gate for issue #141. The automated suite
+can pass without a real Lidarr instance, but the Lidarr integration is not
+release-ready until this file records a completed smoke run.
+
+## Required Observations
+
+- Lidarr version:
+- Import link mode:
+- Destination entry type:
+- Source byte checksum before:
+- Source byte checksum after:
+- Source mtime before:
+- Source mtime after:
+- musefs mount metadata verified:
+- Notes:
+```
+
+- [ ] **Step 8: Run docs grep checks**
+
+Run: `rtk rg -n "Lidarr|lidarr" README.md ARCHITECTURE.md CONTRIBUTING.md contrib/python-musefs/README.md contrib/lidarr/README.md CHANGELOG.md docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`
+
+Expected: output includes all six documentation locations and the smoke
+checklist file.
+
+- [ ] **Step 9: Commit**
 
 ```bash
-rtk git add contrib/lidarr/README.md README.md ARCHITECTURE.md CONTRIBUTING.md contrib/python-musefs/README.md CHANGELOG.md
+rtk git add contrib/lidarr/README.md docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md README.md ARCHITECTURE.md CONTRIBUTING.md contrib/python-musefs/README.md CHANGELOG.md
 rtk git commit -m "docs: add Lidarr integration guide"
 ```
 
@@ -2376,6 +2727,7 @@ rtk git commit -m "ci: test Lidarr integration"
 
 **Files:**
 - Modify: `contrib/lidarr/README.md`
+- Modify: `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`
 - Modify: `docs/superpowers/plans/2026-06-07-lidarr-integration.md` only if the implementation discovers a required command correction while executing this task.
 
 - [ ] **Step 1: Verify README has release gate checklist**
@@ -2386,7 +2738,9 @@ Expected: output includes the smoke test section and checks for symlink, musefs 
 
 - [ ] **Step 2: If a real Lidarr instance is available, run the smoke test**
 
-Run the manual flow from `contrib/lidarr/README.md`. Record these observations in the PR description or release notes:
+Run the manual flow from `contrib/lidarr/README.md`. Record these observations
+in `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md` and set
+`Status: Completed`:
 
 ```text
 Lidarr version:
@@ -2410,9 +2764,20 @@ musefs mount metadata verified: yes
 
 - [ ] **Step 3: Do not block local development if Lidarr is unavailable**
 
-If a real Lidarr instance is not available, do not mark the feature release-ready. Leave the release-gate observation for the PR/release checklist. The implementation can still merge behind normal automated tests if the project owner accepts the deferred release gate.
+If a real Lidarr instance is not available, do not mark the feature
+release-ready. Leave `Status: Pending` in
+`docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md` and note that the
+manual smoke gate was not run. The implementation can still merge behind normal
+automated tests if the project owner accepts the deferred release gate.
 
-- [ ] **Step 4: Final verification**
+- [ ] **Step 4: Commit smoke checklist state**
+
+```bash
+rtk git add contrib/lidarr/README.md docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md
+rtk git commit -m "docs(lidarr): record smoke checklist state"
+```
+
+- [ ] **Step 5: Final verification**
 
 Run:
 
@@ -2433,11 +2798,11 @@ Expected: tests/lint pass; `git status --short` is clean or contains only intent
 - API client, API key redaction, preflight: Task 4.
 - Path-to-track matching and metadata mapping: Task 5.
 - DB sync, scan wrapper, symlink/hardlink rename semantics: Tasks 6 and 8.
-- CLI entry points: Task 7.
+- CLI entry points, `TrackRetag` skip, and manual `--all` backfill: Tasks 7 and 8.
 - Path gate against real `musefs`: Task 9.
 - Documentation updates: Task 10.
 - CI updates: Task 11.
-- Real-Lidarr release gate: Task 12.
+- Durable real-Lidarr release gate checklist and observations: Tasks 10 and 12.
 
 ## Notes for Implementers
 
