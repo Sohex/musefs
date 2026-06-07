@@ -1,6 +1,6 @@
 # Benchmarks
 
-Before/after measurements for the [2026-05-30 optimization pass](docs/superpowers/specs/2026-05-30-optimization-pass/README.md). Each section is reproducible from the SP0 harness (`bench_ingest`); commands are given inline.
+Before/after measurements for the [optimization pass](docs/superpowers/specs/2026-05/2026-05-26-optimization-pass-design.md). Each section is reproducible from the SP0 harness (`bench_ingest`); commands are given inline.
 
 **Machine:** AMD EPYC (6 cores) · 17 GiB RAM · `/dev/sda3` SSD (non-rotational) · Linux 7.0 · rustc 1.96 · release builds.
 
