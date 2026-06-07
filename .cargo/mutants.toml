@@ -4,7 +4,7 @@
 # logic. musefs-fuse is a thin fuser adapter, musefs-cli is thin CLI dispatch,
 # and the `musefs` binary is a one-line entrypoint — their behavior is covered by
 # e2e/integration tests, and mutating them yields only equivalent or trivially
-# untestable mutants. See docs/audits/2026-05-29-test-audit.md.
+# untestable mutants. See docs/superpowers/specs/2026-05/2026-05-29-test-audit-design.md.
 #
 # musefs-latencyfs is NOT excluded here: it carries real logic (the inode map,
 # latency table, attr mapping, passthrough op behavior), so it gets its own
