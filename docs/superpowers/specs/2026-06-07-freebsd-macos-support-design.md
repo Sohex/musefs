@@ -32,9 +32,9 @@ independent features that should become **two implementation plans**:
   gating, per-OS mount options, the macOS Spotlight marker, and FreeBSD e2e/CI.
   Low-risk, mechanical, verifiable on the FreeBSD VM.
 - **Plan B (runtime case-insensitivity axis):** the `case_insensitive` flag and
-  the tree case-folding work. Higher-risk; it touches the disambiguation and
-  incremental-rebuild equivalence machinery and deserves its own TDD-driven plan
-  with the `assert_apply_matches_build` invariant front and center.
+  the tree case-folding work (merge dirs / disambiguate files / folded lookup),
+  with the incremental refresh path bypassed (full rebuild) when folding to keep
+  it correct without folding the incremental machinery. Its own TDD-driven plan.
 
 Plan A can land first and independently; Plan B has no dependency on Plan A
 beyond sharing the CLI/config plumbing.
@@ -121,11 +121,10 @@ path, or it breaks the fresh-build equivalence invariant.
   `MountConfig → build_full / rebuild_full / rebuild_incremental → VirtualTree`.
 
 - **Stored on the tree.** Because folding must be consulted by `lookup`,
-  `disambiguate`, `collision_gate`, `ensure_dir`, and the subtree reconstruction
-  in `apply_changes`, the flag is **stored as a field on `VirtualTree`** (and on
-  the `InodeAllocator` where it keys by rendered path), not passed ad hoc. All
-  four tree entry points must construct with the same value: `build`,
-  `build_full`, `rebuild_full`, and `rebuild_incremental`.
+  `disambiguate`, and `ensure_dir` during build, the flag is **stored as a field
+  on `VirtualTree`**, not passed ad hoc. Every build path must construct with the
+  same value: `build`, `build_full`, and `rebuild_full` (all routed through
+  `build_with`).
 
 - **Directory collisions → merge.** `ensure_dir` currently reuses an existing
   directory via exact `get(name)`. Under folding it reuses on the **folded** key,
@@ -140,12 +139,20 @@ path, or it breaks the fresh-build equivalence invariant.
   folding are disambiguated by the same suffixing machinery that already handles
   exact collisions. Displayed names retain their original case.
 
-- **Rendered index + inode allocation must fold consistently.** The
-  rendered-child index, `InodeAllocator` (keyed by rendered path), and the
-  disambiguation collision key must all use the folded key in lockstep. If the
-  collision key folds but the rendered/allocator key does not, the
-  `assert_apply_matches_build` equivalence test (incremental rebuild ==
-  fresh build) breaks. This invariant is the acceptance gate for Plan B.
+- **Incremental refresh is bypassed when folding.** The incremental path
+  (`apply_changes` → `deepest_existing_ancestor` / `children_by_rendered` /
+  `collision_gate`) navigates by *exact* rendered name; on a folded tree it could
+  fail to find a merged directory and miss a dirtying, silently breaking the
+  fresh-vs-incremental equivalence invariant. Rather than fold that hard-to-verify
+  path, `rebuild_incremental` returns its existing `Ok(None)` "can't do
+  incremental" signal whenever `case_insensitive` is set, so the caller performs a
+  full folded `build_with`. The O(changed) refresh optimization therefore stays
+  case-sensitive-only (a refresh-latency cost on macOS, which is best-effort).
+  This keeps the disambiguation collision key, the rendered-child index, and
+  `InodeAllocator` (keyed by the already-unique disambiguated path) untouched on
+  the incremental path. The acceptance gate for Plan B is folded full-build
+  correctness (merge/disambiguate/lookup unit tests) plus a facade test that a
+  case-insensitive mount still reflects external edits after a refresh.
 
 - **Lookup index.** When the flag is on, the tree maintains a parallel
   **folded-name index** (`parent → folded_name → inode`) consulted by folding
