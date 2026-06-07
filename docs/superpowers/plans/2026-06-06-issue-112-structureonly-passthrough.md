@@ -727,10 +727,12 @@ For each binary `BIN` in `target/release/musefs` (after) and `/tmp/pt-bench/main
 # measurement would silently benchmark the fallback path.
 sudo -n "$BIN" mount /tmp/pt-bench/mnt --db /tmp/pt-bench/m.db --mode structure-only &
 MOUNT_PID=$!; sleep 1
+# sudo dd too: a root-mounted FUSE fs without allow_other is readable only by
+# root. Run BOTH binaries this way so before/after measure the same setup.
 for i in 1 2 3; do
-  dd if=/tmp/pt-bench/mnt/Alpha/Big.flac of=/dev/null bs=1M 2>&1 | tail -1
+  sudo -n dd if=/tmp/pt-bench/mnt/Alpha/Big.flac of=/dev/null bs=1M 2>&1 | tail -1
 done
-fusermount3 -u /tmp/pt-bench/mnt; wait $MOUNT_PID
+sudo -n umount /tmp/pt-bench/mnt; wait $MOUNT_PID
 ```
 
 Record the dd-reported MB/s for each run. (First run includes page-cache warmup of the backing file; report all three, call out the median.)
