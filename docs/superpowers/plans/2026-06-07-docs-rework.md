@@ -54,7 +54,7 @@
 
 Read these (symbol-level reads are fine; you need the shapes, not every line):
 - `Cargo.toml` — workspace members (note `musefs-latencyfs`; check its `Cargo.toml` for `publish = false`).
-- `musefs-format/src/layout.rs` — `RegionLayout`, all five `Segment` variants.
+- `musefs-format/src/layout.rs` — `RegionLayout`, all six `Segment` variants.
 - `musefs-core/src/reader.rs` — `read_at` walk, `HeaderCache::resolve`, `content_version` keying, `BackingChanged` size+mtime validation.
 - `musefs-core/src/facade.rs` — `Mode`, `poll_refresh` / `poll_refresh_notify`, `data_version` stamping.
 - `musefs-core/src/tree.rs` — `VirtualTree::build`, `disambiguate`, the persistent path→inode allocator.
@@ -69,7 +69,7 @@ Read these (symbol-level reads are fine; you need the shapes, not every line):
 Follow the spec's ARCHITECTURE outline exactly (§ "ARCHITECTURE.md — technical reference", 9 sections):
 1. Design overview — cardinal invariant + one-paragraph serving model.
 2. Crate layout — layered diagram (ASCII, like the old CLAUDE.md's), dependency direction, placement rules. Include `musefs-latencyfs` marked dev/bench-only (`publish = false`, BENCHMARKS.md harness).
-3. Segment model — `RegionLayout`, the five variants, `read_at` splice walk. One paragraph per format + link `docs/<FMT>.md` (links will dangle until Tasks 2–6; final check is Task 12).
+3. Segment model — `RegionLayout`, the six variants, `read_at` splice walk. One paragraph per format + link `docs/<FMT>.md` (links will dangle until Tasks 2–6; final check is Task 12).
 4. Mount modes — `Synthesis` vs `StructureOnly`, FUSE passthrough gating + fallback semantics.
 5. SQLite store — schema shape, append-only migrations, **external-writer contract** (scanner-owned `tracks` columns vs writable `tags`/`art`/`track_art`; violated-contract behavior = controlled backing/layout error).
 6. Freshness — `content_version` vs `data_version`, HeaderCache keying, debounced single-flighted refresh, `--keep-cache` invalidation.

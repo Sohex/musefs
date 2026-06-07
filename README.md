@@ -68,7 +68,7 @@ substitutes a tag field (e.g. `$artist`, `$album`, `$title`, `$tracknumber`,
 `$date`, `$genre` — any tag key in the store works, matched
 case-insensitively); anything else is literal. A missing field renders as
 the `--default-fallback` value (default `Unknown`). Name collisions get a
-deterministic ` (2)`, ` (3)`, … suffix. The default template is
+deterministic `(2)`, `(3)`, … suffix. The default template is
 `$artist/$title`.
 
 Two modes:
