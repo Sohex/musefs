@@ -15,7 +15,8 @@ predate binary-tag support) shows the text has drifted from the code.
 Every document in the repo **except** `docs/superpowers/**` is in scope.
 `CHANGELOG.md` and `BENCHMARKS.md` are kept as-is (link fixes only). The three
 `contrib/` READMEs get a light touch only: cross-link fixes and any claims
-invalidated by the rework.
+invalidated by the rework, explicitly including references to absorbed/deleted
+docs (DB_CONTRACT, OGG_INVARIANT, COVERAGE, ROADMAP).
 
 ## End state
 
@@ -40,8 +41,10 @@ Deleted (after their back-validation pass, see Method):
 - `docs/DB_CONTRACT.md` → absorbed by ARCHITECTURE.md
 - `docs/OGG_INVARIANT.md` → absorbed by `docs/OGG.md`
 - `docs/COVERAGE.md` → absorbed by CONTRIBUTING.md
-- `docs/ROADMAP.md` is already gone; nothing reintroduces a roadmap. The
-  README status text states deferred items inline.
+- `docs/ROADMAP.md` is already gone; nothing reintroduces a roadmap, and the
+  README carries **no deferral list** — the old one is wrong on both counts
+  (write mounts are a permanent non-goal; the Picard plugin ships in
+  `contrib/`).
 
 ## Method: greenfield + back-validation
 
@@ -83,15 +86,19 @@ All work happens on a feature branch in a dedicated git worktree.
    (Linux + FUSE); can I write through the mount (**no — and not planned**;
    out-of-band editing against the store is the design, a permanent
    non-goal, not a deferral); performance on NFS/HDD (tuning flags).
-7. Requirements / Status / License. Status states deferred items inline;
-   links out to ARCHITECTURE.md and CONTRIBUTING.md.
+7. Requirements / Status / License. Status describes what works today and
+   carries no deferral list (write mounts are a FAQ-handled non-goal, not a
+   deferral); links out to ARCHITECTURE.md and CONTRIBUTING.md.
 
 ### ARCHITECTURE.md — technical reference
 
 1. Design overview: the cardinal invariant and one-paragraph serving model
    (synthesized metadata spliced ahead of positioned backing reads).
 2. Crate layout: the layered workspace, dependency direction, layer placement
-   rules (core integrates; fuse/cli/binary thin).
+   rules (core integrates; fuse/cli/binary thin). Includes `musefs-latencyfs`
+   marked as a dev/bench-only crate (`publish = false`, used by the
+   BENCHMARKS.md harness); the README's user-facing table shows only the six
+   shipping crates.
 3. The segment model: `RegionLayout`, the five `Segment` variants, how
    `read_at` walks them. One paragraph per format + link to its doc.
 4. Mount modes: `Synthesis` vs `StructureOnly`, FUSE passthrough (kernel
@@ -111,15 +118,19 @@ All work happens on a feature branch in a dedicated git worktree.
 ### CONTRIBUTING.md — working-developer manual
 
 1. Getting set up: toolchain, FUSE prerequisites,
-   `git config core.hooksPath .githooks`; the pre-commit hook runs the full
-   workspace test suite (red-test commits always rejected).
+   `git config core.hooksPath .githooks`; the pre-commit hook runs fmt,
+   clippy, the full workspace test suite (red-test commits always rejected)
+   **and** `ruff check` + `ruff format --check` over `contrib/` and
+   `tests/interop/` — Python-only changes hit the hook too.
 2. Build & test: full command reference — workspace/per-crate/substring,
    clippy/fmt, FUSE e2e (`--ignored`, `/dev/fuse`; passthrough e2e needs
    CAP_SYS_ADMIN via sudo on the prebuilt test binary).
 3. Test tiers beyond `cargo test`: property tests (`fuzzing` feature);
    coverage-guided fuzzing (nightly, out-of-workspace caveat — fuzz targets
    break only in CI's smoke job, `cargo +nightly fuzz build` locally); the
-   mutagen interop suite; the in-diff mutation gate. Mutation-gate TMPDIR
+   mutagen interop suite; the in-diff mutation gate (referencing
+   `scripts/mutants.sh` as the wrapper that encapsulates the recipe).
+   Mutation-gate TMPDIR
    nuance: tmpfs is fine (and preferable, faster) for small in-diff mutant
    sets; the cgroup + on-disk-TMPDIR recipe is for larger sets where
    allocation-bomb mutants can OOM the host; sharding support exists but
@@ -136,7 +147,9 @@ All work happens on a feature branch in a dedicated git worktree.
    reader/scan wiring, the full test surface (fixture, fuzz target + seed,
    proptest, interop manifest row), and "write `docs/<FMT>.md`".
 7. Python plugins: how to run the three contrib test suites, including the
-   venv (beets) and system-package (Picard/Qt) gotchas.
+   venv (beets) and system-package (Picard/Qt) gotchas; the hand-mirrored
+   constants (`MAX_ART_BYTES` mirrors `musefs-core/src/scan.rs`) and the
+   generated `schema.py` regeneration step.
 8. PRs & commits: conventional-style subjects, scoped commits, the required
    CI aggregator checks, benchmarks recorded in BENCHMARKS.md.
 
@@ -154,7 +167,9 @@ One shared shape:
    code checks.
 4. How synthesis works (developer-facing): the layout this format produces,
    segment by segment. `docs/OGG.md` absorbs OGG_INVARIANT.md (invariant
-   statement + its "verified by" list).
+   statement + its "verified by" list) and covers the art split: base64
+   `METADATA_BLOCK_PICTURE` for Opus/Vorbis vs native FLAC PICTURE blocks
+   for FLAC-in-Ogg.
 5. Quirks & invariants: remaining hard-won format-specific facts.
 
 ### SECURITY.md
@@ -191,14 +206,17 @@ Anything currently in CLAUDE.md not covered by 1–5 moves out or dies
 ### AGENTS.md
 
 Deleted as a file; recreated as a symlink to CLAUDE.md so cross-tool agents
-get the same instructions with zero drift.
+get the same instructions with zero drift. Known caveat, accepted: on
+github.com the symlink renders as a pointer to CLAUDE.md, not inlined
+content — fine, since the consumers are agents that resolve symlinks.
 
 ## Verification
 
 - Repo-wide markdown link check passes (no dead intra-repo links).
 - Every absorbed doc's content is accounted for: absorbed claims verified
   against code, or consciously dropped.
-- CLAUDE.md under 100 lines; AGENTS.md resolves through the symlink.
+- CLAUDE.md under 100 lines; `readlink AGENTS.md` prints `CLAUDE.md` and
+  `test -e AGENTS.md` succeeds (the symlink resolves).
 - `rg ROADMAP` over tracked files returns nothing outside `docs/superpowers/`
   (historical references in superpowers specs/plans are fine).
 
