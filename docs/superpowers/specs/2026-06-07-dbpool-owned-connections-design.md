@@ -75,6 +75,14 @@ field, and therefore `DbPool`, `Send + Sync`. It is reentrant (not a plain
 `Mutex`) so nested `with` on the same thread keeps working. This earns a
 comment in the code.
 
+The `poll`/`conns` asymmetry is deliberate and also earns a comment: `poll`
+stays a bare `ReentrantMutex` field because the pool owns it directly and
+`with_poll` takes no other lock, while `conns` values are `Arc`-wrapped
+precisely so `with` can clone a handle and **release the map guard before
+running `f`**. "Tidying" the asymmetry away — holding the map guard across
+`f` instead — would reintroduce the nested-`with` deadlock PR #144 fixed
+(the map `Mutex` is not reentrant).
+
 ### `with` flow
 
 1. Lock `conns`; `entry(thread::current().id())` — on vacancy,
@@ -85,9 +93,14 @@ comment in the code.
 
 The map lock is never held while `f` runs, so nesting cannot deadlock on it;
 lock order is strictly map→conn, and conn locks are single-thread by
-construction, so no cross-order deadlock exists. The one-time open happens
-under the map lock — that briefly blocks other threads' first access, once
-per thread per pool; not worth a double-checked dance.
+construction, so no cross-order deadlock exists. The `poll` lock participates
+safely too (`with_poll` inside `with` and vice versa): `poll` is never
+acquired while the map lock is held, the map lock is never held while
+acquiring any other lock, and conn locks are only ever taken by their owning
+thread — so any wait chain through `poll` terminates; no cycle is possible.
+The one-time open happens under the map lock — that briefly blocks other
+threads' first access, once per thread per pool; not worth a double-checked
+dance.
 
 `with_poll`, the `Shared` variant, and `data_version` semantics are
 untouched. Warm per-thread page caches and contention-free WAL reads (#94)
@@ -109,12 +122,16 @@ everything. One sentence in the module doc.
   `with_open_failure_includes_path_in_error` loses `id`, gains an empty
   `conns`.
 - **New: drop closes other threads' connections.** Worker threads each run
-  `with`, then park on a barrier — still alive — when the pool is dropped;
-  assert the process's open-fd count for the DB path (readlink over
-  `/proc/self/fd`, Linux-only like the rest of the suite) returns to
-  baseline. (Note: `std::thread::scope` can't express this — scoped closures
-  borrow the pool for the whole scope — so plain threads with a done-signal
-  before the drop, joined at the end.)
+  `with`, then park on a barrier — still alive — when the pool is dropped.
+  Fd accounting: readlink every entry of `/proc/self/fd` and **prefix-match**
+  against the DB path, since a WAL reader holds up to three fds (`db`,
+  `db-wal`, `db-shm`); baseline is the count taken **before the pool is
+  created**, and the assertion (count back to baseline) runs **while the
+  workers are still parked** — only then is the barrier released and the
+  threads joined, so thread exit can't be what closed the fds. (Note:
+  `std::thread::scope` can't express this — scoped closures borrow the pool
+  for the whole scope — so plain threads with a done-signal before the drop,
+  joined at the end.)
 - **New: cross-thread drop.** Create and use the pool on one thread, move it
   into another thread and drop it there; assert all DB fds are closed. This
   pins the `Send` hole as a regression test.
