@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Lidarr integration:** a new `contrib/lidarr/` package that drives
+  symlink-based placeholder imports and syncs Lidarr metadata into the musefs
+  SQLite store.
 - **crates.io distribution:** the `musefs` binary is published to crates.io as of
   this release and installable with `cargo install musefs`. A new thin `musefs` wrapper crate
   owns the binary (`musefs-cli` is now a library crate), and a tag-triggered

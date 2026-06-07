@@ -22,8 +22,9 @@ git config core.hooksPath .githooks
 The hook (`.githooks/pre-commit`) runs, in order: `cargo fmt --all --check`,
 `cargo clippy --all-targets -- -D warnings`, **the full workspace test
 suite** (`cargo test --workspace`), and `ruff check` + `ruff format --check`
-over `contrib/beets/`, `contrib/picard/`, `contrib/python-musefs/`, and
-`tests/interop/`. Two consequences worth internalizing:
+over `contrib/beets/`, `contrib/picard/`, `contrib/lidarr/`,
+`contrib/python-musefs/`, and `tests/interop/`. Two consequences worth
+internalizing:
 
 - A commit with red tests is always rejected — there is no
   "commit-now-fix-later" workflow here.
@@ -268,7 +269,7 @@ this on every push/PR and uploads to Codecov (`CODECOV_TOKEN` repo secret).
 
 ## Python plugins (contrib)
 
-The three packages share one drift-guarded contract; see
+The four packages share one drift-guarded contract; see
 [ARCHITECTURE.md](ARCHITECTURE.md#the-contrib-ecosystem) for the layout and
 each README for plugin-specific setup.
 
@@ -282,6 +283,10 @@ cd contrib/beets && pip install -e ../python-musefs && pip install -e ".[test]" 
 
 # picard: no install needed (vendored + pythonpath=".")
 cd contrib/picard && python -m pytest tests
+
+# lidarr: python-musefs is UNPUBLISHED — install the local lib first or
+# dependency resolution fails (see contrib/lidarr/README.md for the env flow)
+cd contrib/lidarr && pip install -e ../python-musefs && pip install -e ".[test]" && python -m pytest tests
 ```
 
 Gotchas that have bitten before:
@@ -291,6 +296,9 @@ Gotchas that have bitten before:
 - The real-Picard tests `importorskip` Picard and Qt: without an importable
   Picard (e.g. the system package on `PYTHONPATH`), they **silently skip**.
   When touching the Picard plugin, make sure they actually ran.
+- The Lidarr real-instance smoke test is a release gate, not a default CI job.
+  It verifies Lidarr accepts script-created symlink destinations and emits the
+  expected Custom Script event.
 - `musefs_common/schema.py` is **generated** from `musefs-db/src/schema.rs`.
   After a schema change:
   `MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py`, then
