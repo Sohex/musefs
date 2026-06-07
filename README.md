@@ -10,12 +10,14 @@ mount shows a clean library while your files stay exactly as they are.
 ## Quick start
 
 ```bash
-cargo install musefs
+cargo install musefs    # compiles from source: needs a Rust toolchain,
+                        # libfuse3-dev and pkg-config — see Requirements
 
 musefs scan ~/Music --db library.db        # ingest your library
 mkdir -p ~/mnt/music
 musefs mount ~/mnt/music --db library.db \
     --template '$albumartist/$album/$title'
+# mount blocks until unmounted: fusermount -u ~/mnt/music (or Ctrl-C)
 ```
 
 `~/mnt/music` now serves your library as
@@ -91,7 +93,7 @@ All tuning flags have sensible defaults; adjust them to your backing store:
 | `--attr-ttl-ms` | `1000` | How long the kernel may trust cached entry/attr lookups. Higher cuts `lookup`/`getattr` traffic; bounds how fast external edits become visible. |
 | `--max-readahead-kib` | `512` | Kernel read-ahead window. Larger hides HDD/NFS latency during sequential playback (clamped to the kernel maximum). |
 | `--max-background` | `64` | Max outstanding background (read-ahead/async) requests the kernel keeps in flight. |
-| `--keep-cache` | off | Keep the kernel page cache across opens. External re-tags auto-invalidate the affected files, so cached bytes never go stale. |
+| `--keep-cache` | disabled | Keep the kernel page cache across opens. External re-tags auto-invalidate the affected files, so cached bytes never go stale. |
 
 ## Supported formats
 
@@ -100,7 +102,7 @@ All tuning flags have sensible defaults; adjust them to your backing store:
 | FLAC | `.flac` | Regenerates the metadata blocks; preserves `STREAMINFO`/`SEEKTABLE` bit-exact | [docs/FLAC.md](docs/FLAC.md) |
 | MP3 | `.mp3` | Regenerates the ID3v2.4 tag; the audio frames (incl. Xing/LAME) are untouched | [docs/MP3.md](docs/MP3.md) |
 | M4A | `.m4a`, `.m4b` | Rebuilds the `moov` atom, patching chunk offsets; `mdat` served verbatim | [docs/M4A.md](docs/M4A.md) |
-| Ogg | `.ogg`, `.oga`, `.opus` | Regenerates header pages (Opus/Vorbis/FLAC-in-Ogg); audio pages renumbered in place, never recopied | [docs/OGG.md](docs/OGG.md) |
+| Ogg | `.ogg`, `.oga`, `.opus` | Regenerates header pages (Opus/Vorbis/FLAC-in-Ogg); audio pages served verbatim, only page seq numbers/CRCs patched in place | [docs/OGG.md](docs/OGG.md) |
 | WAV | `.wav` | Regenerates the RIFF front (`LIST`/`INFO` + embedded ID3v2); `data` payload verbatim | [docs/WAV.md](docs/WAV.md) |
 
 Text tags round-trip losslessly through a shared canonical vocabulary (so
@@ -162,9 +164,8 @@ cargo install --git https://github.com/Sohex/musefs musefs
 
 ## Status
 
-FLAC, MP3, M4A/M4B, Ogg (Opus / Vorbis / FLAC-in-Ogg), and WAV are fully
-supported, with embedded cover art and binary-tag preservation. The serve
-path has been through a performance/concurrency hardening pass for
+All five formats ship with embedded cover art and binary-tag preservation.
+The serve path has been through a performance/concurrency hardening pass for
 real-world player and media-manager access against large libraries on
 HDD/SSD/NFS, and the parsers are continuously fuzzed. beets and Picard
 plugins ship in [`contrib/`](contrib/). See the

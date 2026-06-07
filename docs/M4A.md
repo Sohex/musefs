@@ -49,6 +49,23 @@ layouts plug into, see [ARCHITECTURE.md](../ARCHITECTURE.md#the-segment-model).
 `mp4::synthesize_layout` (`musefs-format/src/mp4.rs`) regenerates the `moov`
 box and serves `[ftyp][regenerated moov][mdat header][mdat payload]`:
 
+```text
+ offset 0
+ ┌──────────────────────────────────────────────┐ ┐
+ │ █ ftyp, copied verbatim              (Inline) │ │
+ │ █ moov: kept structural children,    (Inline) │ │ regenerated
+ │ █   stco/co64 offset values += Δ              │ │ front
+ │ █ fresh udta/meta/ilst framing       (Inline) │ │
+ │ █ ---- framing + ▒ freeform body  (BinaryTag) │ │
+ │ █ covr framing + ▒ image bytes     (ArtImage) │ │
+ │ █ mdat header                        (Inline) │ │
+ ├──────────────────────────────────────────────┤ ┘
+ │ ░ mdat payload, verbatim       (BackingAudio) │
+ └──────────────────────────────────────────────┘
+ EOF     █ inline-generated   ▒ DB-streamed   ░ untouched backing
+         Δ = new mdat payload offset − old
+```
+
 1. The scan keeps `moov`'s structural children and drops its old `udta`. A
    fresh `udta`/`meta`/`ilst` is built from the DB: inline box framing, with
    each opaque `----` value and each cover image spliced in as streamed

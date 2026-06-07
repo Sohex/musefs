@@ -39,12 +39,28 @@ precedence** and INFO filling gaps; only chunk headers are walked — the
   the `id3 ` chunk.
 - All of MP3's ID3 lossy edges apply to the `id3 ` chunk: ID3v2.4-only
   output, `COMM`/`USLT` language/description reset, `POPM` owner dropped,
-  ID3v1 ignored, the OOM-guard skips.
+  ID3v1 ignored, the OOM-guard skips (the authoritative list lives in
+  [MP3.md](MP3.md#lossy-edges)).
 
 ## How synthesis works
 
 `wav::synthesize_layout` (`musefs-format/src/wav.rs`) regenerates the entire
 RIFF front, then serves the untouched payload:
+
+```text
+ offset 0
+ ┌──────────────────────────────────────────────┐ ┐
+ │ █ RIFF/WAVE framing                  (Inline) │ │
+ │ █ fmt  (+ fact), preserved           (Inline) │ │ regenerated
+ │ █ LIST/INFO chunk (7-field subset)   (Inline) │ │ RIFF front
+ │ █ id3  chunk: ID3v2.4 text frames    (Inline) │ │ (metadata
+ │ █   frame header + ▒ opaque body  (BinaryTag) │ │  written
+ │ █   APIC framing + ▒ image bytes   (ArtImage) │ │  twice)
+ ├──────────────────────────────────────────────┤ ┘
+ │ ░ data chunk payload, verbatim (BackingAudio) │
+ └──────────────────────────────────────────────┘
+ EOF     █ inline-generated   ▒ DB-streamed   ░ untouched backing
+```
 
 1. `Inline` — `RIFF`/`WAVE` framing, the preserved `fmt ` (and `fact`)
    chunks, the rebuilt `LIST`/`INFO` chunk, and the embedded `id3 ` chunk's

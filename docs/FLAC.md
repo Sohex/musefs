@@ -36,7 +36,22 @@ model these layouts plug into, see
 ## How synthesis works
 
 `flac::synthesize_layout` (`musefs-format/src/flac.rs`) builds the layout in
-this order:
+this order — an inline metadata region, DB-streamed payloads, then the
+untouched audio:
+
+```text
+ offset 0
+ ┌──────────────────────────────────────────────┐ ┐
+ │ █ "fLaC" marker                      (Inline) │ │
+ │ █ STREAMINFO / SEEKTABLE, bit-exact  (Inline) │ │ generated
+ │ █ VORBIS_COMMENT rebuilt from DB     (Inline) │ │ metadata
+ │ ▒ APPLICATION / CUESHEET bodies   (BinaryTag) │ │ region
+ │ █ PICTURE framing + ▒ image bytes  (ArtImage) │ │
+ ├──────────────────────────────────────────────┤ ┘
+ │ ░ audio frames, verbatim       (BackingAudio) │
+ └──────────────────────────────────────────────┘
+ EOF     █ inline-generated   ▒ DB-streamed   ░ untouched backing
+```
 
 1. `Inline` — the `fLaC` marker plus the preserved structural blocks
    (`STREAMINFO`, `SEEKTABLE`, sorted by block type) and a `VORBIS_COMMENT`

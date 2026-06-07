@@ -62,6 +62,21 @@ described here is shared with WAV's embedded `id3 ` chunk — see
 `mp3::synthesize_layout` (`musefs-format/src/mp3.rs`) emits a fresh ID3v2.4
 tag followed by the untouched audio:
 
+```text
+ offset 0
+ ┌──────────────────────────────────────────────┐ ┐
+ │ █ ID3v2.4 header (10 bytes)          (Inline) │ │
+ │ █ text / TXXX / COMM / USLT frames   (Inline) │ │ generated
+ │ █ rebuilt POPM / UFID frames         (Inline) │ │ ID3v2.4
+ │ █ frame header + ▒ opaque body    (BinaryTag) │ │ tag
+ │ █ APIC framing + ▒ image bytes     (ArtImage) │ │
+ ├──────────────────────────────────────────────┤ ┘
+ │ ░ MPEG audio incl. Xing/LAME,  (BackingAudio) │
+ │ ░ verbatim                                    │
+ └──────────────────────────────────────────────┘
+ EOF     █ inline-generated   ▒ DB-streamed   ░ untouched backing
+```
+
 1. `Inline` — the 10-byte tag header, all text/`TXXX`/`COMM`/`USLT` frames,
    and the rebuilt `POPM`/`UFID` frames. Frame sizes are synchsafe-bounded;
    oversized frames fail synthesis rather than emit a corrupt tag.

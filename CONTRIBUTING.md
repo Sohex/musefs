@@ -110,7 +110,7 @@ grep -q '^@@ ' mutants.diff   # IMPORTANT: an empty diff mutates nothing and exi
 cargo mutants --in-diff mutants.diff -j2 --exclude 'musefs-latencyfs/**' --output /tmp/mutants-out/in-diff
 ```
 
-Two sharp edges:
+Sharp edges:
 
 - **Check the exit status directly.** Don't pipe the run through
   `tail`/`grep` — that masks the exit code.

@@ -49,6 +49,22 @@ Verified by `musefs-format/tests/proptest_ogg.rs` (crate feature `fuzzing`),
 
 `ogg::synthesize_layout` (`musefs-format/src/ogg/mod.rs`) produces:
 
+```text
+ offset 0
+ ┌──────────────────────────────────────────────┐ ┐
+ │ █ identification page, preserved     (Inline) │ │ regenerated
+ │ █ comment page(s) rebuilt from DB    (Inline) │ │ header
+ │ ▒   art windows, base64/raw    (OggArtSlice)  │ │ pages
+ │ █ trailing header pages, preserved   (Inline) │ │ (repaginated)
+ ├──────────────────────────────────────────────┤ ┘
+ │ ░ audio pages: payload verbatim,   (OggAudio) │
+ │ ░ page seq += Δ, CRC repatched in place       │
+ └──────────────────────────────────────────────┘
+ EOF     █ inline-generated   ▒ DB-streamed
+         ░ backing pages (headers patched in place, payload untouched)
+         Δ = synthesized header page count − original
+```
+
 1. `Inline` — the regenerated header pages: the preserved identification
    packet, a comment packet rebuilt from the DB, and the preserved trailing
    header packets, repaginated with correct CRCs.
