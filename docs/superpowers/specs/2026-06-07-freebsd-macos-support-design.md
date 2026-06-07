@@ -23,6 +23,22 @@ Two platform realities drive the design:
 The cardinal musefs invariant is untouched: original audio bytes are never
 copied or modified on any platform.
 
+## Scope split: one spec, two plans
+
+This design is a single coherent document, but it covers two largely
+independent features that should become **two implementation plans**:
+
+- **Plan A (compile-time platform axis):** the `platform` module, passthrough
+  gating, per-OS mount options, the macOS Spotlight marker, and FreeBSD e2e/CI.
+  Low-risk, mechanical, verifiable on the FreeBSD VM.
+- **Plan B (runtime case-insensitivity axis):** the `case_insensitive` flag and
+  the tree case-folding work. Higher-risk; it touches the disambiguation and
+  incremental-rebuild equivalence machinery and deserves its own TDD-driven plan
+  with the `assert_apply_matches_build` invariant front and center.
+
+Plan A can land first and independently; Plan B has no dependency on Plan A
+beyond sharing the CLI/config plumbing.
+
 ## Architecture: centralized platform module (Approach B)
 
 A new `musefs-fuse/src/platform/` module is the single home for all per-OS
@@ -41,8 +57,8 @@ musefs-fuse/src/platform/
 The split between compile-time and runtime axes:
 
 - **Compile-time per-OS** (handled by `#[cfg(target_os = ...)]` *inside* the
-  platform module): passthrough availability, the Spotlight marker, the
-  per-OS mount-option set.
+  platform module): passthrough behavior, the Spotlight marker, the per-OS
+  mount-option set.
 - **Runtime, volume-dependent**: case-insensitivity, carried as a single config
   flag (APFS can be either case-sensitive or case-insensitive, so a compile-time
   assumption would be wrong even on macOS).
@@ -55,54 +71,99 @@ The stubs are written so that off-target handlers compile to nothing: e.g.
 
 ### 1. Passthrough gating (`platform::passthrough`)
 
-Today `init`/`open` (`musefs-fuse/src/lib.rs`) directly reference Linux-only
-fuser symbols and Linux capability probes:
+**Important correction to a naive assumption:** the fuser 0.17 passthrough
+symbols (`InitFlags::FUSE_PASSTHROUGH`, `KernelConfig::set_max_stack_depth`,
+`reply.open_backing`, `reply.opened_passthrough`) **already compile on every
+OS** — they are not cfg-gated out by fuser. `BackingId::new` simply returns a
+runtime error on non-Linux. So the motivation for the platform module here is
+**design clarity and correct runtime behavior**, not compilation necessity.
 
-- `InitFlags::FUSE_PASSTHROUGH`, `KernelConfig::set_max_stack_depth`
-- `reply.open_backing(...)`, `reply.opened_passthrough(...)`
-- `cap_eff_has_sys_admin`, `definitely_lacks_cap_sys_admin` (which use
-  `capget`/`prctl`)
+Two concrete refactors:
 
-All of these move into `platform::passthrough`:
+- Today `init` (`musefs-fuse/src/lib.rs`) requests `FUSE_PASSTHROUGH` and sets
+  `max_stack_depth` **unconditionally**. The Linux capability probes
+  `cap_eff_has_sys_admin` / `definitely_lacks_cap_sys_admin` (`capget`/`prctl`)
+  are also Linux-specific. These move behind `platform::passthrough`.
+- `open` attempts `open_backing` and, on failure, sets the sticky
+  `passthrough_disabled` flag and falls through to `reply.opened(...)`. This
+  becomes a call to `platform::passthrough::try_open_backing(...)`.
 
-- **Linux:** behavior verbatim — request the passthrough capability and stack
-  depth in `init`; attempt `open_backing` in `open`; on failure set the sticky
-  `passthrough_disabled` flag and log, then serve via the daemon.
-- **Non-Linux:** the `init` tuning omits the passthrough bits; `try_open_backing`
-  is a no-op signalling "not attempted," so `open` always takes the userspace
-  serving path.
+Behavior per OS:
+
+- **Linux:** verbatim current behavior — request the passthrough capability and
+  stack depth in `init`; attempt `open_backing` in `open`; on failure set the
+  sticky flag, log, and serve via the daemon.
+- **Non-Linux:** the `init` tuning omits the passthrough request;
+  `try_open_backing` is a no-op signalling "not attempted," so `open` always
+  takes the userspace serving path.
 
 `StructureOnly` mode remains selectable on every platform. On non-Linux it logs
 once (reusing the existing message style, "FUSE passthrough unavailable; serving
 reads through the daemon") and serves identical bytes via synthesis. This is the
-**warn + fallback** behavior — and it is the *same* fallback that older Linux
-kernels (no passthrough support) already exercise, so there is no new serving
-path to reason about.
+**warn + fallback** behavior — and it lands on exactly the path that
+`open` (`lib.rs:331`) already takes today when `open_backing` fails on an older
+Linux kernel, so there is no new serving path to reason about.
 
 `musefs-core`'s `passthrough_fd` / `PassthroughFd` are plain file descriptors and
 remain cross-platform; only the fuser-side registration is gated.
 
 ### 2. Case-insensitivity (`case_insensitive` config flag)
 
-- **Config & CLI:** add `case_insensitive: bool` to the core config, plumbed from
-  a new `--case-insensitive` CLI flag (`musefs-cli`). Its default is OS-derived:
-  `true` on macOS, `false` on Linux/FreeBSD. The user can override it on any OS
-  (e.g. a case-sensitive APFS volume → `--case-insensitive=false`).
-- **Tree build (`musefs-core/src/tree.rs`):** the existing sibling-collision
-  disambiguation generalizes to compare on a **case-folded** key when the flag is
-  set. Two siblings that differ only by case (e.g. an album tagged `Foo` and
-  another `foo`) are disambiguated by the same machinery that already handles
-  exact-name collisions. Displayed names retain their original case.
-- **Lookup (`musefs-core/src/facade.rs::lookup`):** when the flag is on, the tree
-  maintains a parallel **folded-name index** (`parent → folded_name → inode`)
-  consulted by folding the query name — O(1). This index is built **only** when
-  the flag is on, so Linux/FreeBSD pay zero extra memory or CPU. When off,
-  matching is byte-for-byte identical to today.
+This is the larger, riskier feature (Plan B). It must fold case consistently
+across *every* place the tree compares names, including the incremental-rebuild
+path, or it breaks the fresh-build equivalence invariant.
 
-**Consequence (intended):** with the flag on, a library containing
-case-colliding siblings presents slightly different (disambiguated) names than on
-Linux. This is inherent to a case-insensitive namespace and is the correct
-trade-off.
+- **Config & CLI:** add `case_insensitive: bool` to `MountConfig`
+  (`musefs-core/src/facade.rs:35`, alongside `mode`), plumbed from a new
+  `--case-insensitive` CLI flag (`musefs-cli`). Its default is OS-derived:
+  `true` on macOS, `false` on Linux/FreeBSD; user-overridable on any OS (e.g. a
+  case-sensitive APFS volume → `--case-insensitive=false`). The flag threads
+  `MountConfig → build_full / rebuild_full / rebuild_incremental → VirtualTree`.
+
+- **Stored on the tree.** Because folding must be consulted by `lookup`,
+  `disambiguate`, `collision_gate`, `ensure_dir`, and the subtree reconstruction
+  in `apply_changes`, the flag is **stored as a field on `VirtualTree`** (and on
+  the `InodeAllocator` where it keys by rendered path), not passed ad hoc. All
+  four tree entry points must construct with the same value: `build`,
+  `build_full`, `rebuild_full`, and `rebuild_incremental`.
+
+- **Directory collisions → merge.** `ensure_dir` currently reuses an existing
+  directory via exact `get(name)`. Under folding it reuses on the **folded** key,
+  so two intermediate path components differing only by case
+  (e.g. `Foo/` and `foo/`) collapse into **one** directory; the first-seen
+  casing wins for display and the tracks live together. This mirrors a native
+  case-insensitive filesystem and is the minimal generalization of the existing
+  exact-name reuse.
+
+- **Leaf collisions → disambiguate.** `disambiguate` / `collision_gate` /
+  `insert_file` compare on the folded key, so two *files* that collide under
+  folding are disambiguated by the same suffixing machinery that already handles
+  exact collisions. Displayed names retain their original case.
+
+- **Rendered index + inode allocation must fold consistently.** The
+  rendered-child index, `InodeAllocator` (keyed by rendered path), and the
+  disambiguation collision key must all use the folded key in lockstep. If the
+  collision key folds but the rendered/allocator key does not, the
+  `assert_apply_matches_build` equivalence test (incremental rebuild ==
+  fresh build) breaks. This invariant is the acceptance gate for Plan B.
+
+- **Lookup index.** When the flag is on, the tree maintains a parallel
+  **folded-name index** (`parent → folded_name → inode`) consulted by folding
+  the query name in `facade.rs::lookup` (`facade.rs:850`) — O(1). It is built
+  **only** when the flag is on, so Linux/FreeBSD pay zero extra memory or CPU.
+  When off, matching is byte-for-byte identical to today. (The index uses the
+  same `im` persistent-map types as the existing children maps so structural
+  sharing across rebuilds is preserved.)
+
+- **Folding definition.** Use Unicode-aware case folding consistent with the
+  host's expectations; ASCII case-insensitive is the floor. The exact folding
+  function is an implementation detail of Plan B but must be applied uniformly
+  to collision key, rendered key, allocator key, and lookup key.
+
+**Consequence (intended):** with the flag on, a library with case-colliding
+names presents a different tree than on Linux — case-variant directories merge,
+case-variant files get disambiguated. This is inherent to a case-insensitive
+namespace and is the correct trade-off.
 
 ### 3. `.metadata_never_index` marker (`platform::spotlight`, macOS only)
 
@@ -110,30 +171,41 @@ Compile-time macOS-only; no CLI flag. The mount is read-only, so the marker is
 always desirable on macOS and never conflicts with a writer — an escape hatch is
 unnecessary.
 
-- A reserved high inode constant (chosen above the allocator's range so it never
-  collides with a real node).
-- The marker is a **zero-byte regular file at the mount root**.
-- FUSE handlers consult `platform::spotlight` helpers that return `None` on
-  non-macOS:
-  - `readdir(root)` appends the entry.
-  - `lookup(root, ".metadata_never_index")` and `getattr(marker_ino)` return its
-    attributes.
-  - `open` / `read` serve an empty file (read → 0 bytes / EOF); `release`
-    no-ops.
+- **Reserved inode:** a sentinel constant `u64::MAX`. `InodeAllocator` starts at
+  2 and only ever increments with no upper bound (`tree.rs:22`), so `u64::MAX`
+  is unreachable in practice and cannot collide with a real node. (A fixed
+  "high" constant like 1_000_000 would *not* be safe — there is no allocator
+  ceiling to sit above.)
+- **Shape:** a zero-byte regular file at the mount root.
+- **Six interception points in `lib.rs`**, each delegating to a
+  `platform::spotlight` helper that returns `None`/no-op on non-macOS so the
+  handlers stay `#[cfg]`-free:
+  1. `lookup(root, ".metadata_never_index")` → marker attr.
+  2. `readdir(root)` → append the entry.
+  3. `getattr(SENTINEL)` → marker attr.
+  4. `open(SENTINEL)` → a handle that serves empty.
+  5. `read(SENTINEL, ...)` → 0 bytes (EOF).
+  6. `release(SENTINEL)` → no-op (no core handle to release).
+- **Marker attributes** (`to_file_attr` inputs): `FileType::RegularFile`, mode
+  `0o444` (read-only), `nlink = 1`, `size = 0`, `blocks = 0`, owner = the
+  mount's `uid`/`gid`, all timestamps = the mount time (matching how other
+  synthetic nodes are stamped).
 
 On Linux and FreeBSD every helper is a stub returning `None`, so the marker does
 not exist and the handlers are unaffected.
 
 ### 4. Mount options (`platform::mount`)
 
-`mount_config` (`musefs-fuse/src/lib.rs`) delegates to
+`mount_config` (`musefs-fuse/src/lib.rs:485`) delegates to
 `platform::mount::options(fs_name, case_insensitive)`:
 
 - **Common:** `MountOption::RO`, `MountOption::FSName`.
-- **macOS (best-effort, tunable):** add `VolName`; suppress AppleDouble noise
-  (`noappledouble`-style options via `MountOption::CUSTOM`); pass a
-  case-sensitivity hint where the backend honors it. Marked tunable because
-  FUSE-T's option set differs from macFUSE and is the least-verified surface.
+- **macOS (best-effort, tunable):** fuser 0.17 has **no** `VolName` variant, so
+  macOS-specific options go through `MountOption::CUSTOM(...)`: e.g.
+  `CUSTOM("volname=<name>")`, AppleDouble suppression
+  (`CUSTOM("noappledouble")`), and a case-sensitivity hint where the backend
+  honors it. Marked tunable because FUSE-T's option set differs from macFUSE and
+  is the least-verified surface.
 - **FreeBSD:** the common set only (verified against the local VM).
 
 ## Data flow (unchanged core)
@@ -146,9 +218,9 @@ macOS.
 
 ## Error handling
 
-- Mount failures surface as today (the racy fusermount handshake serialization in
-  `new_session` is Linux/FreeBSD relevant; macOS/FUSE-T uses its own mechanism
-  but the same `Session::new` entry point).
+- Mount failures surface as today. On macOS built with fuser's `macos-no-mount`
+  feature (see Testing), `Mount::new` is a compiled-out stub that returns a
+  runtime error — acceptable for the best-effort, no-mount CI configuration.
 - Requesting `StructureOnly` on a platform/kernel without passthrough is **not**
   an error: it warns once and falls back to userspace serving.
 - Case-insensitive lookups that miss return `ENOENT` exactly as exact-match
@@ -158,20 +230,34 @@ macOS.
 
 - **FreeBSD (real e2e):** a gitignored `.scratch/` directory holds a small
   FreeBSD VM image for local testing. CI uses a FreeBSD VM GitHub action that
-  installs `fusefs-libfuse`, enables `fusefs`, and runs the `--ignored` FUSE e2e
-  suite. The job slots into the existing `ci-ok` aggregator required by the
-  branch-protection ruleset.
+  loads the **`fusefs` kernel module** and runs the `--ignored` FUSE e2e suite.
+  (FreeBSD resolves to fuser's `pure-rust` mount backend, which talks to
+  `/dev/fuse` directly and does **not** link libfuse — so installing
+  `fusefs-libfuse` is unnecessary; confirm the exact module/package against the
+  VM before finalizing the workflow.) The new job **must be added to the
+  `ci-ok` aggregator's `needs:` array** (`.github/workflows/ci.yml:207`,
+  currently `[changes, check, interop, python-musefs, beets, picard, e2e]`) —
+  otherwise it runs but cannot block merges.
 - **macOS (best-effort):** the CI runner does `cargo build` / `cargo clippy` /
-  `cargo test` (unit + non-mount integration) only. No mount step — macFUSE needs
-  a kext approval and FUSE-T a signed pkg, neither CI-friendly. The
-  case-folding/disambiguation logic and the marker helpers are covered by unit
-  tests that toggle the runtime flag, so they are exercised on every OS even
-  where we cannot mount.
+  `cargo test` (unit + non-mount integration) only. A stock macOS build
+  **fails in fuser's `build.rs`**, which `pkg-config`-probes for macFUSE unless
+  fuser's **`macos-no-mount`** feature is enabled. The macOS build therefore
+  enables `fuser/macos-no-mount`; under it `Mount::new` is a test-only stub and
+  no mount is attempted. The case-folding/disambiguation logic and the marker
+  helpers are covered by unit tests that toggle the runtime flag, so they are
+  exercised on every OS even where we cannot mount.
 - **fuzz crate:** unaffected. Changes live in `musefs-core`/`musefs-cli`/
   `musefs-fuse`, not the `musefs-format` API surface that the out-of-workspace
   fuzz targets bind to.
 - All new platform code follows the workspace integer-cast convention
   (`usize_from` and friends).
+
+## Open questions (resolve during implementation)
+
+- **FUSE-T vs macFUSE for a *real* macOS build.** Does FUSE-T satisfy fuser's
+  `pkg-config "fuse"` probe, or does a FUSE-T-backed (non-`macos-no-mount`)
+  build need a different link/probe path? Out of scope for the best-effort CI
+  build, but determines whether musefs can actually mount on macOS later.
 
 ## Out of scope
 
