@@ -53,7 +53,7 @@ one. The global TLS map is deleted.
 pub enum DbPool {
     PerThread {
         path: PathBuf,
-        poll: ReentrantMutex<Db<ReadOnly>>,
+        poll: Box<ReentrantMutex<Db<ReadOnly>>>,
         conns: Mutex<HashMap<ThreadId, Arc<ReentrantMutex<Db<ReadOnly>>>>>,
     },
     Shared(Arc<ReentrantMutex<Db<ReadOnly>>>),
@@ -76,10 +76,11 @@ field, and therefore `DbPool`, `Send + Sync`. It is reentrant (not a plain
 comment in the code.
 
 The `poll`/`conns` asymmetry is deliberate and also earns a comment: `poll`
-stays a bare `ReentrantMutex` field because the pool owns it directly and
-`with_poll` takes no other lock, while `conns` values are `Arc`-wrapped
-precisely so `with` can clone a handle and **release the map guard before
-running `f`**. "Tidying" the asymmetry away — holding the map guard across
+stays a uniquely owned `Box<ReentrantMutex>` field (boxed only to keep the
+variant small for `clippy::large_enum_variant`) because the pool owns it
+directly and `with_poll` takes no other lock, while `conns` values are
+`Arc`-wrapped precisely so `with` can clone a handle and **release the map
+guard before running `f`**. "Tidying" the asymmetry away — holding the map guard across
 `f` instead — would reintroduce the nested-`with` deadlock PR #144 fixed
 (the map `Mutex` is not reentrant).
 

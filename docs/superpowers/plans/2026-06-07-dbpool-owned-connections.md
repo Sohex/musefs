@@ -158,9 +158,9 @@ use crate::error::{CoreError, Result};
 /// hand out `Arc` clones of this thread's own connection, and every mutex a
 /// caller's closure can re-enter is reentrant.
 ///
-/// The `poll`/`conns` asymmetry is deliberate. `poll` is a bare
-/// `ReentrantMutex` because the pool owns it directly and `with_poll` takes
-/// no other lock. `conns` values are `Arc`-wrapped so `with` can clone a
+/// The `poll`/`conns` asymmetry is deliberate. `poll` is uniquely owned (the
+/// `Box` only keeps the variant small) because `with_poll` locks it in place
+/// and takes no other lock. `conns` values are `Arc`-wrapped so `with` can clone a
 /// handle and release the map guard *before* running the caller's closure —
 /// holding the (non-reentrant) map guard across it would deadlock nested
 /// `with`. The inner `ReentrantMutex` is never contended (only its owning
@@ -170,7 +170,7 @@ use crate::error::{CoreError, Result};
 pub enum DbPool {
     PerThread {
         path: PathBuf,
-        poll: ReentrantMutex<Db<ReadOnly>>,
+        poll: Box<ReentrantMutex<Db<ReadOnly>>>,
         conns: Mutex<HashMap<ThreadId, Arc<ReentrantMutex<Db<ReadOnly>>>>>,
     },
     Shared(Arc<ReentrantMutex<Db<ReadOnly>>>),
@@ -186,7 +186,7 @@ impl DbPool {
         match db.path() {
             Some(p) => Ok(DbPool::PerThread {
                 path: p.to_path_buf(),
-                poll: ReentrantMutex::new(db),
+                poll: Box::new(ReentrantMutex::new(db)),
                 conns: Mutex::new(HashMap::new()),
             }),
             None => Ok(DbPool::Shared(Arc::new(ReentrantMutex::new(db)))),
@@ -253,7 +253,9 @@ with:
 ```rust
         let pool = DbPool::PerThread {
             path: bad.clone(),
-            poll: ReentrantMutex::new(Db::open_in_memory().unwrap().into_read_only()),
+            poll: Box::new(ReentrantMutex::new(
+                Db::open_in_memory().unwrap().into_read_only(),
+            )),
             conns: Mutex::new(HashMap::new()),
         };
 ```

@@ -47,8 +47,9 @@ pub enum DbPool {
 
 impl DbPool {
     /// Build a pool from the DB used to construct the mount. File-backed DBs
-    /// become per-thread pools (the passed connection is dropped — workers open
-    /// their own); in-memory DBs are wrapped in a shared mutex.
+    /// become per-thread pools (the passed connection becomes the poll
+    /// connection — workers open their own); in-memory DBs are wrapped in a
+    /// shared mutex.
     pub fn new(db: Db) -> Result<DbPool> {
         let db = db.into_read_only();
         match db.path() {
