@@ -88,23 +88,27 @@ exclude_re = [
     # cadence mutation persists the identical track set. The win is fewer commits
     # (fsyncs), a performance property only observable via the `metrics`
     # instrumentation the in-diff gate does not build.
-    'musefs-core/src/scan\.rs:711:29:',
-    'musefs-core/src/scan\.rs:713:32:',
-    'musefs-core/src/scan\.rs:713:47:',
-    'musefs-core/src/scan\.rs:713:62:',
-    'musefs-core/src/scan\.rs:721:37:',
-    'musefs-core/src/scan\.rs:723:40:',
-    'musefs-core/src/scan\.rs:723:55:',
-    'musefs-core/src/scan\.rs:723:70:',
+    # NB: line:col here (and for revalidate below) — `replace += with` and
+    # `>=`/`||` repeat in run_pipeline (e.g. the killable `*scanned += 1` at
+    # 691), so these cannot be safely description-anchored. Re-verify these
+    # coordinates after any change that reformats scan.rs.
+    'musefs-core/src/scan\.rs:713:29:',
+    'musefs-core/src/scan\.rs:715:32:',
+    'musefs-core/src/scan\.rs:715:47:',
+    'musefs-core/src/scan\.rs:715:62:',
+    'musefs-core/src/scan\.rs:723:37:',
+    'musefs-core/src/scan\.rs:725:40:',
+    'musefs-core/src/scan\.rs:725:55:',
+    'musefs-core/src/scan\.rs:725:70:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
     # from a deterministic test. With skip_failed identically 0, the `failed =
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
-    'musefs-core/src/scan\.rs:827:25:',
-    'musefs-core/src/scan\.rs:831:25:',
-    'musefs-core/src/scan\.rs:867:29: replace \+ with -',
+    'musefs-core/src/scan\.rs:829:25:',
+    'musefs-core/src/scan\.rs:833:25:',
+    'musefs-core/src/scan\.rs:869:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
@@ -141,13 +145,13 @@ exclude_re = [
     # eprintln on stderr. The fallback's build_with is itself directly tested; this
     # injection point exists only to drive that branch, with nothing observable to
     # assert in this config.
-    'musefs-core/src/facade\.rs:777:9: replace Musefs::force_apply_failure_for_test with \(\)',
+    'replace Musefs::force_apply_failure_for_test with \(\)',
     # apply_changes path-stable guard `&self.path_of(ino) == new_path` -> false: a
     # `changed` id whose rendered path is unchanged would be treated as a move
     # (remove + re-insert at the same path) instead of a no-op. Re-interning the same
     # path yields the same inode and rebuild_subtree re-canonicalizes the parent, so
     # the resulting tree is identical — a pure short-circuit optimization.
-    'musefs-core/src/tree\.rs:489:30: replace match guard .* with false in VirtualTree::apply_changes',
+    'replace match guard .* with false in VirtualTree::apply_changes',
     # (The add-side/remove-side dirty-propagation walks formerly inline in
     # apply_changes now live in dirty_min_flip_ancestors; their equivalent and
     # hang-class mutants are covered by the description-anchored
@@ -163,7 +167,7 @@ exclude_re = [
     # ancestor_in's loop terminator `cur == Self::ROOT` -> `!=`: the walk never breaks
     # at root (root.parent == root), so a node with no ancestor in the set loops
     # forever instead of returning false.
-    'musefs-core/src/tree\.rs:615:20: replace == with != in VirtualTree::ancestor_in',
+    'replace == with != in VirtualTree::ancestor_in',
 
     # SP4 storage-aware serving — equivalent mutant in serve_ogg_window's last-page
     # memo. `total_len = header_len + payload_len` only sets the memoized page's
