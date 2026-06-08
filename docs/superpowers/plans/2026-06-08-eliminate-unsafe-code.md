@@ -21,7 +21,7 @@
 | `musefs-latencyfs/Cargo.toml` | Modify | Add `rustix` dep (`process` + `fs` features) |
 | `musefs-latencyfs/src/lib.rs:232-234` | Modify | getuid/getgid → rustix |
 | `musefs-latencyfs/src/lib.rs:416-449` | Modify | `statfs` MaybeUninit/`libc::statvfs` → `rustix::fs::statvfs` |
-| `musefs-latencyfs/tests/passthrough.rs:107-117` | Modify | test `libc::statvfs` → `rustix::fs::statvfs` |
+| `musefs-latencyfs/tests/passthrough.rs:106-112` | Modify | test `libc::statvfs` → `rustix::fs::statvfs` |
 | `musefs-core/src/metrics.rs:26-78` | Modify | Lift per-pread fault cell to module scope; add `set_fault_pread` |
 | `musefs-core/tests/fault_injection.rs` | Create | TDD test for `set_fault_pread` (its own metrics-gated binary) |
 | `musefs-fuse/tests/concurrency.rs:118-127` | Modify | `set_var` → `set_fault_pread` |
@@ -107,7 +107,7 @@ git commit -m "musefs-fuse: getuid/getgid via rustix (drop unsafe)"
 - Modify: `musefs-latencyfs/Cargo.toml`
 - Modify: `musefs-latencyfs/src/lib.rs:232-234` (getuid/getgid)
 - Modify: `musefs-latencyfs/src/lib.rs:416-449` (`statfs`)
-- Modify: `musefs-latencyfs/tests/passthrough.rs:107-117` (test statvfs)
+- Modify: `musefs-latencyfs/tests/passthrough.rs:106-112` (test statvfs)
 
 Behavior-preserving FFI swaps. The `statfs` path is exercised by the ignored
 `mkdir_rmdir_and_statfs_through_the_mount` e2e test (real mount; needs `/dev/fuse`).
@@ -220,7 +220,7 @@ and the `CString`/`MaybeUninit` machinery are gone.
 - [ ] **Step 4: Replace the statvfs unsafe in the passthrough test**
 
 In `musefs-latencyfs/tests/passthrough.rs`, the tail of
-`mkdir_rmdir_and_statfs_through_the_mount` (lines 107-117) reads:
+`mkdir_rmdir_and_statfs_through_the_mount` (lines 106-112) reads:
 
 ```rust
     // statfs returns real, non-empty filesystem stats for the mount (not the
@@ -425,11 +425,12 @@ fn slow_read_does_not_block_stat() {
     // on_pread. This is its own integration-test binary with a single test, so
     // no earlier on_pread can have seeded it — setting it here, before any read,
     // is guaranteed to be observed.
-    musefs_core::metrics::set_fault_pread(Some(std::time::Duration::from_micros(50_000)));
+    musefs_core::metrics::set_fault_pread(Some(Duration::from_micros(50_000)));
 ```
 
 (`musefs_core` is already imported in this file via
-`use musefs_core::{scan_directory, Mode, MountConfig, Musefs};`; the fully-qualified
+`use musefs_core::{scan_directory, Mode, MountConfig, Musefs};`, and `Duration`
+via `use std::time::{Duration, Instant};` — the
 `musefs_core::metrics::set_fault_pread` call needs no new `use`.)
 
 - [ ] **Step 2: Verify the test binary compiles under the metrics feature**
