@@ -11,16 +11,23 @@ from .errors import ConfigError, LidarrApiError
 
 
 def redacted(value: str | None) -> str:
+    """Return ``"<redacted>"`` for a non-empty value, else ``"<missing>"``."""
     return "<redacted>" if value else "<missing>"
 
 
 @dataclass(frozen=True)
 class LidarrConfig:
+    """Lidarr API connection settings (URL and API key)."""
+
     url: str | None = None
     api_key: str | None = None
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "LidarrConfig":
+        """Read URL/key from ``MUSEFS_LIDARR_URL``/``MUSEFS_LIDARR_API_KEY``.
+
+        Raises ``ConfigError`` if only one of the two is set.
+        """
         env = os.environ if environ is None else environ
         url = env.get("MUSEFS_LIDARR_URL") or None
         api_key = env.get("MUSEFS_LIDARR_API_KEY") or None
@@ -30,16 +37,21 @@ class LidarrConfig:
 
     @property
     def enabled(self) -> bool:
+        """True when both URL and API key are present."""
         return bool(self.url and self.api_key)
 
 
 @dataclass(frozen=True)
 class PreflightResult:
+    """Outcome of the Lidarr settings preflight: ``ok`` plus any error strings."""
+
     ok: bool
     errors: list[str]
 
 
 class LidarrClient:
+    """Minimal read-only client for the Lidarr v1 REST API."""
+
     def __init__(self, config: LidarrConfig, *, opener=urlopen, timeout: int = 15):
         if not config.url or not config.api_key:
             raise ConfigError("Lidarr API configuration is required")
@@ -49,6 +61,10 @@ class LidarrClient:
         self._timeout = timeout
 
     def get_json(self, path: str, params: dict[str, object] | None = None):
+        """GET ``path`` with optional query params; return parsed JSON.
+
+        Raises ``LidarrApiError`` on HTTP, network, or JSON-decode failure.
+        """
         query = ""
         if params:
             clean = {k: v for k, v in params.items() if v is not None}
@@ -69,22 +85,26 @@ class LidarrClient:
             raise LidarrApiError("Lidarr API returned invalid JSON") from exc
 
     def media_management_config(self):
+        """Return Lidarr's media-management config."""
         return self.get_json("/api/v1/config/mediamanagement")
 
     def metadata_provider_config(self):
+        """Return Lidarr's metadata-provider config."""
         return self.get_json("/api/v1/config/metadataprovider")
 
     def track_files(self, *, artist_id=None, album_id=None, track_file_ids=None):
+        """Return track files filtered by artist, album, or track-file ids."""
         params = {}
         if artist_id is not None:
             params["artistId"] = artist_id
         if album_id is not None:
-            params["albumId"] = [album_id]
+            params["albumId"] = album_id
         if track_file_ids:
             params["trackFileIds"] = list(track_file_ids)
         return self.get_json("/api/v1/trackfile", params)
 
     def tracks(self, *, artist_id=None, album_id=None, track_ids=None):
+        """Return tracks filtered by artist, album, or track ids."""
         params = {}
         if artist_id is not None:
             params["artistId"] = artist_id
@@ -95,12 +115,15 @@ class LidarrClient:
         return self.get_json("/api/v1/track", params)
 
     def album(self, album_id: int):
+        """Return a single album by id."""
         return self.get_json(f"/api/v1/album/{album_id}")
 
     def artists(self):
+        """Return all artists in the Lidarr library."""
         return self.get_json("/api/v1/artist")
 
     def artist(self, artist_id: int):
+        """Return a single artist by id."""
         return self.get_json(f"/api/v1/artist/{artist_id}")
 
 
@@ -109,6 +132,11 @@ def _lower(value) -> str:
 
 
 def check_safe_settings(metadata: dict, media_management: dict) -> PreflightResult:
+    """Verify Lidarr won't mutate backing files.
+
+    Requires ``writeAudioTags=no``, ``fileDate=none``, and
+    ``setPermissionsLinux`` falsy; collects a message per violation.
+    """
     errors = []
     if _lower(metadata.get("writeAudioTags")) != "no":
         errors.append(f"writeAudioTags must be no, got {metadata.get('writeAudioTags')}")
@@ -120,6 +148,7 @@ def check_safe_settings(metadata: dict, media_management: dict) -> PreflightResu
 
 
 def run_preflight(client: LidarrClient) -> PreflightResult:
+    """Fetch Lidarr's configs and run :func:`check_safe_settings`."""
     return check_safe_settings(
         metadata=client.metadata_provider_config(),
         media_management=client.media_management_config(),

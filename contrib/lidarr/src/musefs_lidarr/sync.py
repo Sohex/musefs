@@ -23,6 +23,8 @@ from .mapping import records_for_paths
 
 @dataclass(frozen=True)
 class SyncConfig:
+    """musefs-side sync settings: DB path, link mode, autoscan, scanner binary."""
+
     db_path: str
     link_mode: LinkMode
     autoscan: bool = True
@@ -31,6 +33,8 @@ class SyncConfig:
 
 @dataclass(frozen=True)
 class EventPayloads:
+    """Lidarr API data for an event: paths plus track/album/artist lookups."""
+
     paths: list[str]
     track_files: list[dict]
     tracks: list[dict]
@@ -45,6 +49,10 @@ def _env_bool(value: str | None, *, default: bool) -> bool:
 
 
 def config_from_env(environ: dict[str, str] | None = None) -> SyncConfig:
+    """Build a :class:`SyncConfig` from ``MUSEFS_*`` env vars.
+
+    Raises ``ConfigError`` if ``MUSEFS_DB`` is unset.
+    """
     env = os.environ if environ is None else environ
     db_path = env.get("MUSEFS_DB")
     if not db_path:
@@ -58,6 +66,7 @@ def config_from_env(environ: dict[str, str] | None = None) -> SyncConfig:
 
 
 def scan_if_enabled(*, config: SyncConfig, paths: list[str], runner=run_scan) -> None:
+    """Run ``musefs scan`` over ``paths`` when autoscan is on and paths exist."""
     if not config.autoscan or not paths:
         return
     runner(config.musefs_bin, config.db_path, paths)
@@ -81,6 +90,11 @@ def sync_records(
     artists_by_id: dict[int, dict],
     warning_printer=print,
 ) -> SyncStats:
+    """Map the event's paths to records and write their tags into the store.
+
+    Paths with no matching track row (e.g. unscanned) are skipped and counted;
+    the write runs in a single transaction that rolls back on error.
+    """
     records, skipped_paths = records_for_paths(
         paths=event.paths,
         track_files=track_files,
@@ -119,6 +133,10 @@ def sync_records(
 
 
 def sync_rename_prune(*, config: SyncConfig, previous_paths: list[str]) -> int:
+    """Prune store rows for a rename's old paths; return the count pruned.
+
+    No-op in symlink mode (the backing path is the unchanged real file).
+    """
     if config.link_mode is LinkMode.SYMLINK or not previous_paths:
         return 0
 
@@ -180,6 +198,11 @@ def _album_artist_id(album: dict) -> int | None:
 
 
 def collect_event_payloads(*, client, event: LidarrEvent) -> EventPayloads:
+    """Fetch the track/album/artist data an event needs from the Lidarr API.
+
+    Scopes the queries by album id when present, else by artist id; raises
+    ``ConfigError`` if the event carries neither.
+    """
     if event.album_id is not None:
         track_files = client.track_files(album_id=event.album_id)
         tracks = client.tracks(album_id=event.album_id)
@@ -218,6 +241,7 @@ def collect_event_payloads(*, client, event: LidarrEvent) -> EventPayloads:
 
 
 def collect_all_payloads(*, client) -> EventPayloads:
+    """Fetch every artist's track/album data for a full ``--all`` backfill."""
     artists = client.artists()
     track_files = []
     tracks = []
@@ -255,6 +279,7 @@ def sync_event_with_payloads(
     artists_by_id: dict[int, dict],
     scanner=run_scan,
 ) -> SyncStats:
+    """Scan, write tags, then prune renames for one event; return its stats."""
     scan_if_enabled(config=config, paths=event.paths, runner=scanner)
     stats = sync_records(
         config=config,

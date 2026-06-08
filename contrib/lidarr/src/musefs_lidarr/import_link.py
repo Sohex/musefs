@@ -64,6 +64,12 @@ def _same_inode(source: Path, destination: Path) -> bool:
 
 
 def ensure_link(source: Path, destination: Path, mode: LinkMode) -> None:
+    """Create a symlink/hardlink at ``destination`` pointing to ``source``.
+
+    Idempotent when the destination already links to the same source; raises
+    ``ImportLinkError`` if the source is missing or the destination exists but
+    does not match. Never copies bytes.
+    """
     if not source.exists():
         raise ImportLinkError(f"source does not exist: {source}")
 

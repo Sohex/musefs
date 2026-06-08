@@ -9,6 +9,11 @@ from .import_link import ensure_link, parse_import_env
 
 
 def run(environ: dict[str, str] | None = None) -> int:
+    """Create the import link for one Lidarr script-import call; return exit code.
+
+    Lidarr's Test event is a no-op success. Other events read the source and
+    destination from the environment and create the link.
+    """
     env = os.environ if environ is None else environ
     if lidarr_get(env, "Lidarr_EventType") == "Test":
         print("musefs-lidarr-import: test ok")

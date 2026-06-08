@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-def lidarr_get(environ, key, default=None):
+def lidarr_get(environ: dict[str, str], key: str, default: str | None = None) -> str | None:
     """Look up a Lidarr custom-script environment variable case-insensitively.
 
     Lidarr documents these variables in PascalCase (e.g. ``Lidarr_EventType``),

@@ -139,7 +139,8 @@ originals. Nothing is ever copied or rewritten.
 **Where do my edited tags live?**
 In the SQLite store (`--db`). Edit it with the
 [beets](contrib/beets/README.md) or [Picard](contrib/picard/README.md)
-plugins, or with plain SQL — the schema is a documented, stable contract
+plugins, the [Lidarr](contrib/lidarr/README.md) integration, or with plain
+SQL — the schema is a documented, stable contract
 (see [ARCHITECTURE.md](ARCHITECTURE.md#the-sqlite-store)).
 
 **Do edits show up without remounting?**

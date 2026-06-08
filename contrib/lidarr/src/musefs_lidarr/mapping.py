@@ -10,11 +10,14 @@ from .errors import MappingError
 
 @dataclass(frozen=True)
 class SkippedPath:
+    """A path that could not be mapped, with the reason it was skipped."""
+
     path: str
     reason: str
 
 
 def _text(value) -> str | None:
+    """Stringify and strip ``value``; return None if empty."""
     if value is None:
         return None
     out = str(value).strip()
@@ -22,6 +25,7 @@ def _text(value) -> str | None:
 
 
 def _date(value) -> str | None:
+    """Return an ``YYYY-MM-DD`` date (the leading 10 chars), or None."""
     text = _text(value)
     if not text:
         return None
@@ -35,6 +39,7 @@ def _append(pairs: list[tuple[str, str]], key: str, value) -> None:
 
 
 def build_pairs(*, track: dict, album: dict, artist: dict) -> list[tuple[str, str]]:
+    """Map Lidarr track/album/artist fields to musefs ``(key, value)`` tag pairs."""
     pairs: list[tuple[str, str]] = []
     artist_name = artist.get("artistName") or artist.get("name")
     _append(pairs, "title", track.get("title"))
@@ -59,6 +64,10 @@ def build_pairs(*, track: dict, album: dict, artist: dict) -> list[tuple[str, st
 
 
 def match_track_file(path_key: str, track_files: list[dict]) -> dict | None:
+    """Return the track file whose real path equals ``path_key``, or None.
+
+    Raises ``MappingError`` if more than one track file matches.
+    """
     matches = [tf for tf in track_files if realpath_key(tf["path"]) == path_key]
     if len(matches) > 1:
         ids = ", ".join(str(tf.get("id")) for tf in matches)
@@ -81,6 +90,11 @@ def records_for_paths(
     albums_by_id: dict[int, dict],
     artists_by_id: dict[int, dict],
 ) -> tuple[list[Record], list[SkippedPath]]:
+    """Build a store ``Record`` per path; return (records, skipped).
+
+    A path is skipped when no track file matches it or its track/album/artist
+    metadata is unavailable.
+    """
     tracks_by_file = _tracks_by_file(tracks)
     records = []
     skipped = []

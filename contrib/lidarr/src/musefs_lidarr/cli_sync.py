@@ -40,6 +40,12 @@ def run(
     client_factory=LidarrClient,
     sync_runner=sync_event_with_payloads,
 ) -> int:
+    """Run the sync CLI; return a process exit code.
+
+    Dispatches on flags (``--doctor``, ``--all``) and otherwise on the Lidarr
+    event type, syncing API metadata into the store. Test/unsupported/TrackRetag
+    events are no-op successes.
+    """
     env = os.environ if environ is None else environ
     args = _parser().parse_args([] if argv is None else argv)
     try:
