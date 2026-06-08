@@ -68,7 +68,7 @@ pub struct Attr {
 struct Handle {
     track_id: i64,
     resolved: arc_swap::ArcSwap<ResolvedFile>,
-    gen: AtomicU64,
+    generation: AtomicU64,
     file: std::fs::File,
 }
 
@@ -968,7 +968,7 @@ impl Musefs {
                 for _attempt in 0..4 {
                     out.clear();
                     let cur = self.refresh_gen.load(Ordering::Acquire);
-                    if h.gen.load(Ordering::Acquire) != cur {
+                    if h.generation.load(Ordering::Acquire) != cur {
                         // A refresh changed something; re-resolve (cheap content_version
                         // cache hit when this track is unchanged) and re-stamp.
                         let fresh = self.pool.with(|db| self.cache.resolve(db, h.track_id))?;
@@ -978,7 +978,7 @@ impl Musefs {
                             continue;
                         }
                         h.resolved.store(fresh);
-                        h.gen.store(cur, Ordering::Release);
+                        h.generation.store(cur, Ordering::Release);
                     }
                     let resolved = h.resolved.load();
                     let r: &ResolvedFile = &resolved;
@@ -1007,7 +1007,7 @@ impl Musefs {
                     // Stale layout: force a re-resolve next iteration against the live version.
                     let fresh = self.pool.with(|db| self.cache.resolve(db, h.track_id))?;
                     h.resolved.store(fresh);
-                    h.gen
+                    h.generation
                         .store(self.refresh_gen.load(Ordering::Acquire), Ordering::Release);
                 }
                 // Pathological constant re-tagging raced every attempt; surface a
@@ -1064,7 +1064,7 @@ impl Musefs {
         // would make the first read skip re-resolution and serve stale bytes. With
         // the pre-resolve gen, a racing refresh leaves gen behind refresh_gen, so
         // the next read re-resolves.
-        let gen = self.refresh_gen.load(Ordering::Acquire);
+        let generation = self.refresh_gen.load(Ordering::Acquire);
         let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
@@ -1072,7 +1072,7 @@ impl Musefs {
         fh_from_key(self.handles.insert(Arc::new(Handle {
             track_id,
             resolved: arc_swap::ArcSwap::from(resolved),
-            gen: AtomicU64::new(gen),
+            generation: AtomicU64::new(generation),
             file,
         })))
     }
