@@ -37,14 +37,16 @@ harness changes.** The benchmark harnesses (`bench_ingest`, `bench_refresh`,
 ## This box (new machine header)
 
 - 8-core, **32 GB RAM**, `rustc 1.96`, release builds.
-- **Durable storage → `/data`**: single rotational disk `/dev/sda3`, btrfs
-  (`compress=zstd:1`, `noatime`), 3.0 TB free. Deliberately **not** the `md` RAID
-  that backs `/home` (avoids RAID write amplification). No SSD on this box —
+- **Durable storage → `/data`**: a 2-device btrfs spanning the rotational disks
+  `/dev/sda3` + `/dev/sdb3` (`compress=zstd:1`, `noatime`), 3.0 TB free, profile
+  `Data: single` / `Metadata,System: RAID1` (so metadata fsyncs mirror to both
+  spindles). Distinct from the `md` RAID that backs `/home`. No SSD on this box —
   durable benches are rotational, so SP1's fsync-bound "before" absolutes will be
-  *larger* than the header SSD's; expected, and still a valid before/after on
-  identical hardware. `zstd:1` is irrelevant to the fsync-count tests and the
-  bandwidth-tier FLAC corpus is largely incompressible, so it does not materially
-  distort the I/O numbers; noted in the header for honesty.
+  *larger* than the header SSD's (and the RAID1 metadata mirroring adds to that);
+  expected, and still a valid before/after on identical hardware. `zstd:1` is
+  irrelevant to the fsync-count tests and the bandwidth-tier FLAC corpus is largely
+  incompressible, so it does not materially distort the I/O numbers; noted in the
+  header for honesty.
 - **RAM-backed → `/dev/shm`** (16 GiB tmpfs) for the compute-isolated / tempfs
   sections.
 - One-time setup (requires sudo): `sudo mkdir -p /data/musefs-bench && sudo chown
