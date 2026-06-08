@@ -416,14 +416,6 @@ impl Musefs {
                 "forced refresh failure".to_string(),
             ));
         }
-        // Case-insensitive trees use full rebuilds: the incremental path
-        // navigates by exact rendered name, which a folded (merged) tree can
-        // mismatch. `Ok(None)` routes the caller to `rebuild_full`, which builds a
-        // correct folded tree via `build_with_ci`. (The O(changed) optimization
-        // stays case-sensitive-only.)
-        if self.config.case_insensitive {
-            return Ok(None);
-        }
         let last_seq = self.last_seq.load(Ordering::Acquire);
 
         // Phase 1 (DB, no VFS locks): changelog + live render keys.
@@ -654,6 +646,16 @@ impl Musefs {
         }
         // The guard clears `refreshing` on every exit path (incl. panic).
         let _guard = RefreshGuard(&self.refreshing);
+
+        // A folded tree can't use the incremental path (it navigates by exact
+        // rendered name, which a merged/folded tree mismatches), so always
+        // full-rebuild. This is intentional — NOT a changelog gap — so route
+        // through force_full_rebuild to keep the gap counter and the "changelog
+        // gap" diagnostics meaningful (the O(changed) fast path stays
+        // case-sensitive-only).
+        if self.config.case_insensitive {
+            return self.force_full_rebuild(&mut on_changed);
+        }
 
         let old_tree = self.tree.load_full();
         match self.rebuild_incremental() {

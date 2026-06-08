@@ -87,10 +87,12 @@ pub struct VirtualTree {
     children: ImHashMap<u64, OrdMap<String, u64>>,
     rendered_children: ImHashMap<u64, OrdMap<String, OrdMap<String, u64>>>,
     /// `parent -> fold(name) -> inode`, populated ONLY when `case_insensitive`.
-    /// Build-only (folding always full-rebuilds, so a published tree is never
-    /// mutated). Gives O(1) folded lookup and collision checks. Part of structural
-    /// equality; built deterministically, so fresh and re-rendered folded trees
-    /// compare equal.
+    /// Kept in sync with `children` on every insert AND removal, so a folded
+    /// `lookup` never resolves a stale inode even if the tree is mutated in place
+    /// (production folded mounts only ever full-rebuild, but the public
+    /// `build_with_ci` + mutators must stay consistent). Gives O(1) folded lookup
+    /// and collision checks. Part of structural equality; built deterministically,
+    /// so fresh and re-rendered folded trees compare equal.
     folded_children: ImHashMap<u64, ImHashMap<String, u64>>,
     track_to_inode: ImHashMap<i64, u64>,
     /// When true, names are compared case-insensitively (dirs merge, files
@@ -291,6 +293,20 @@ impl VirtualTree {
             .insert(fold(name), inode);
     }
 
+    /// Mirror a child removal out of the folded index, dropping an emptied parent
+    /// bucket so lookups never resolve a stale inode (no-op unless folding).
+    fn remove_folded_child(&mut self, parent: u64, name: &str) {
+        if !self.case_insensitive {
+            return;
+        }
+        if let Some(bucket) = self.folded_children.get_mut(&parent) {
+            bucket.remove(&fold(name));
+            if bucket.is_empty() {
+                self.folded_children.remove(&parent);
+            }
+        }
+    }
+
     /// True if `name` is already taken in `dir` (folded when case-insensitive).
     fn taken(&self, dir: u64, name: &str) -> bool {
         if self.case_insensitive {
@@ -478,6 +494,7 @@ impl VirtualTree {
                 kids.remove(&name);
             }
             self.remove_rendered_child(parent, &rendered, &name);
+            self.remove_folded_child(parent, &name);
         }
         Some(self.prune_empty_dirs_upward(parent))
     }
@@ -765,12 +782,14 @@ impl VirtualTree {
                 .map(|n| (n.name.clone(), n.rendered_name.clone()));
             self.children.remove(&dir);
             self.rendered_children.remove(&dir);
+            self.folded_children.remove(&dir);
             self.nodes.remove(&dir);
             if let Some((name, rendered)) = &names {
                 if let Some(kids) = self.children.get_mut(&parent) {
                     kids.remove(name);
                 }
                 self.remove_rendered_child(parent, rendered, name);
+                self.remove_folded_child(parent, name);
             }
             last_pruned = names;
             dir = parent;
@@ -1049,6 +1068,26 @@ mod tests {
             tree.lookup(VirtualTree::ROOT, "foo")
         );
         assert_eq!(tree.lookup(VirtualTree::ROOT, "FOO"), None);
+    }
+
+    #[test]
+    fn case_insensitive_removal_keeps_folded_lookup_consistent() {
+        // A folded tree mutated in place must not resolve a removed name via the
+        // folded index (the index is maintained on removal, not just insert).
+        let entries = vec![
+            (1i64, "Dir/Song".to_string()),
+            (2i64, "Dir/Other".to_string()),
+        ];
+        let mut tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(), true);
+        let dir = tree.lookup(VirtualTree::ROOT, "dir").expect("dir");
+        assert!(tree.lookup(dir, "song").is_some());
+
+        tree.remove_track(1, &mut InodeAllocator::new());
+
+        // The removed file no longer resolves (any casing); the sibling still does.
+        assert_eq!(tree.lookup(dir, "song"), None);
+        assert_eq!(tree.lookup(dir, "Song"), None);
+        assert!(tree.lookup(dir, "other").is_some());
     }
 
     #[test]
