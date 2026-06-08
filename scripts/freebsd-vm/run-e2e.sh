@@ -7,6 +7,10 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
+# rustup installs cargo/rustc here (provision.sh); a fresh non-login shell
+# doesn't have it on PATH yet.
+export PATH="$HOME/.cargo/bin:$PATH"
+
 # Fail loudly if ffmpeg is missing: the playback/ogg e2e tests skip silently
 # without it, which would otherwise turn a missing dependency into a vacuous
 # green run. (provision.sh installs it.)
