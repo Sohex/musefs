@@ -82,6 +82,45 @@ impl<M> Db<M> {
         Ok(out)
     }
 
+    /// Text tags whose key matches one of `keys` case-insensitively, grouped by
+    /// track id and ordered `track_id, key, ordinal` (same as `tags_grouped`). The
+    /// `IN (…)` list is chunked under SQLite's bound-variable limit. Empty `keys`
+    /// yields an empty map (no query). Used by the virtual-tree build to load only
+    /// the fields a path template references (#177).
+    pub fn tags_grouped_for_keys(
+        &self,
+        keys: &[&str],
+    ) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
+        const CHUNK: usize = 900;
+        let mut out: std::collections::HashMap<i64, Vec<Tag>> = std::collections::HashMap::new();
+        for chunk in keys.chunks(CHUNK) {
+            let lowered: Vec<String> = chunk.iter().map(|k| k.to_ascii_lowercase()).collect();
+            let placeholders = vec!["?"; lowered.len()].join(",");
+            let sql = format!(
+                "SELECT track_id, key, value, ordinal FROM tags \
+                 WHERE value_blob IS NULL AND lower(key) IN ({placeholders}) \
+                 ORDER BY track_id, key, ordinal"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(lowered.iter());
+            let rows = stmt.query_map(params, |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    Tag {
+                        key: r.get(1)?,
+                        value: r.get(2)?,
+                        ordinal: r.get(3)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (track_id, tag) = row?;
+                out.entry(track_id).or_default().push(tag);
+            }
+        }
+        Ok(out)
+    }
+
     /// Binary tag rows for a track: streaming handle (rowid), key, and payload
     /// length. Ordered by (key, ordinal) to match `get_binary_tags`/synthesis order.
     pub fn get_binary_tags(&self, track_id: i64) -> Result<Vec<BinaryTagRow>> {
@@ -310,5 +349,34 @@ mod tags_for_tracks_tests {
             db.get_tags(a).unwrap(),
             vec![Tag::new("artist", "Alice", 0)]
         );
+    }
+
+    #[test]
+    fn tags_grouped_for_keys_filters_case_insensitively() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.replace_tags(
+            a,
+            &[
+                Tag::new("ARTIST", "Pix", 0),
+                Tag::new("Title", "Song", 0),
+                Tag::new("LYRICS", "la la", 0),
+            ],
+        )
+        .unwrap();
+        let got = db.tags_grouped_for_keys(&["artist", "title"]).unwrap();
+        let tags = &got[&a];
+        assert!(tags.iter().any(|t| t.value == "Pix"), "ARTIST matched");
+        assert!(tags.iter().any(|t| t.value == "Song"), "Title matched");
+        assert!(!tags.iter().any(|t| t.value == "la la"), "LYRICS excluded");
+    }
+
+    #[test]
+    fn tags_grouped_for_keys_empty_keys_is_empty_map() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.replace_tags(a, &[Tag::new("ARTIST", "Pix", 0)]).unwrap();
+        let got = db.tags_grouped_for_keys(&[]).unwrap();
+        assert!(got.is_empty());
     }
 }

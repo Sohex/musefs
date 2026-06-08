@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::iter::Peekable;
 use std::str::Chars;
 
@@ -41,6 +42,17 @@ impl Template {
         let mut chars = template.chars().peekable();
         let parts = parse_parts(&mut chars, false);
         Template { parts }
+    }
+
+    /// The set of field names this template references, across plain fields, `$!{}`
+    /// path fields, `|` fallback chains, and `[...]` sections. Names are already
+    /// ASCII-lowercased at parse time, matching `tags_to_fields`'s key folding, so a
+    /// key-filtered tag load (`Db::tags_grouped_for_keys`) fetches exactly what
+    /// rendering consumes.
+    pub fn referenced_fields(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        collect_field_names(&self.parts, &mut out);
+        out
     }
 
     /// Render one track's path. Outside a section a missing field resolves
@@ -156,6 +168,20 @@ fn parse_unbraced_name(chars: &mut Peekable<Chars>) -> String {
         }
     }
     name.to_ascii_lowercase()
+}
+
+fn collect_field_names(parts: &[Part], out: &mut BTreeSet<String>) {
+    for part in parts {
+        match part {
+            Part::Literal(_) => {}
+            Part::Field { names, .. } => {
+                for name in names {
+                    out.insert(name.clone());
+                }
+            }
+            Part::Section(inner) => collect_field_names(inner, out),
+        }
+    }
 }
 
 /// Render `parts`, returning the text and whether at least one referenced field
@@ -278,4 +304,22 @@ fn sanitize_path(value: &str) -> String {
 
 fn is_field_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn referenced_fields_collects_plain_path_section_and_fallback_names() {
+        let t = Template::parse("$artist/$!{beets_path}/[$disc - ]${title|name}");
+        let f = t.referenced_fields();
+        assert!(f.contains("artist"));
+        assert!(f.contains("beets_path"));
+        assert!(f.contains("disc"));
+        assert!(f.contains("title"));
+        assert!(f.contains("name"));
+        // No spurious entries from literals.
+        assert_eq!(f.len(), 5);
+    }
 }
