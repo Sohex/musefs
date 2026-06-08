@@ -594,10 +594,11 @@ mod tests {
     fn inline_offset_of(layout: &RegionLayout, fourcc: &[u8; 4]) -> u64 {
         let mut off = 0u64;
         for s in &layout.segments {
-            if let Segment::Inline(b) = s {
-                if b.len() >= 4 && &b[0..4] == fourcc {
-                    return off;
-                }
+            if let Segment::Inline(b) = s
+                && b.len() >= 4
+                && &b[0..4] == fourcc
+            {
+                return off;
             }
             off += s.len();
         }

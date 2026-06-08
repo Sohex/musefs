@@ -1,7 +1,7 @@
 mod common;
 use common::make_flac;
 use common::{streaminfo_body, vorbis_comment_body};
-use musefs_core::{scan_directory, CoreError, MountConfig, Musefs, VirtualTree};
+use musefs_core::{CoreError, MountConfig, Musefs, VirtualTree, scan_directory};
 use std::collections::BTreeMap;
 
 fn config() -> MountConfig {
@@ -777,6 +777,79 @@ fn poll_refresh_notify_reports_changed_track_inode() {
         fs.lookup(fs.lookup(VirtualTree::ROOT, "Alice").unwrap(), "Song.flac")
             .unwrap(),
         alice_song
+    );
+}
+
+#[test]
+fn poll_refresh_notify_reports_changed_inode_on_full_rebuild_fallback() {
+    use musefs_db::Tag;
+    let dir = tempfile::tempdir().unwrap();
+    // Two backing files -> two tracks: Alice/Song and Bob/Tune.
+    for (name, artist, title) in [("a.flac", "Alice", "Song"), ("b.flac", "Bob", "Tune")] {
+        let bytes = make_flac(
+            &[
+                (0, streaminfo_body()),
+                (
+                    4,
+                    vorbis_comment_body(
+                        "v",
+                        &[&format!("ARTIST={artist}"), &format!("TITLE={title}")],
+                    ),
+                ),
+            ],
+            &[0xAB; 64],
+        );
+        std::fs::write(dir.path().join(name), &bytes).unwrap();
+    }
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let alice = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let alice_song = fs.lookup(alice, "Song.flac").unwrap();
+
+    let alice_id = musefs_db::Db::open(&db_path)
+        .unwrap()
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.backing_path.ends_with("a.flac"))
+        .unwrap()
+        .id;
+
+    // Path-stable retag: content_version bumps, inode/path stay put.
+    {
+        let db2 = musefs_db::Db::open(&db_path).unwrap();
+        db2.replace_tags(
+            alice_id,
+            &[
+                Tag::new("artist", "Alice", 0),
+                Tag::new("title", "Song", 0),
+                Tag::new("album", "New", 0),
+            ],
+        )
+        .unwrap();
+    }
+
+    // Force the changelog-gap full-rebuild path so the notifier is
+    // `notify_changed` (the full-rebuild routine) rather than the incremental
+    // `notify_changed_delta` the sibling test exercises — covering the
+    // full-rebuild change-detection (content_version-rose + path-stable). The
+    // rebuild reuses the same inode for a path-stable track.
+    {
+        let writer = musefs_db::Db::open(&db_path).unwrap();
+        let max_seq = writer.changelog_since(0).unwrap().max_seq;
+        writer.delete_changelog_through_for_test(max_seq).unwrap();
+    }
+    let mut changed = Vec::new();
+    assert!(fs.poll_refresh_notify(|ino| changed.push(ino)).unwrap());
+    assert_eq!(
+        changed,
+        vec![alice_song],
+        "full-rebuild path must invalidate exactly the changed track's stable inode"
     );
 }
 

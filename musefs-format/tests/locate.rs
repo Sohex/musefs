@@ -1,7 +1,7 @@
 mod common;
 use common::{make_flac, streaminfo_body, vorbis_comment_body};
-use musefs_format::flac::locate_audio;
 use musefs_format::FormatError;
+use musefs_format::flac::locate_audio;
 
 #[test]
 fn locates_audio_after_metadata_and_preserves_streaminfo() {

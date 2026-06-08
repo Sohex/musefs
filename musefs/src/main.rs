@@ -1,5 +1,5 @@
 use clap::Parser;
-use musefs_cli::{run, Cli};
+use musefs_cli::{Cli, run};
 
 fn main() {
     // The library crates report serve-path failures through the `log` facade;

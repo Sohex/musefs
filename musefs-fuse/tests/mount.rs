@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use musefs_core::{scan_directory, MountConfig, Musefs};
+use musefs_core::{MountConfig, Musefs, scan_directory};
 
 // --- minimal proven FLAC fixture (mirrors musefs-core/tests/common) ---
 

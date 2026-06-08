@@ -261,7 +261,7 @@ pub mod fixtures {
         out.push(0x04); // major version 4
         out.push(0x00); // revision 0
         out.push(0x00); // flags
-                        // Syncsafe size = 0 (no frames).
+        // Syncsafe size = 0 (no frames).
         out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         // MPEG frame sync: 0xFF + 0xFB (MPEG1, Layer III, 128kbps, 44100Hz, stereo).
         // Followed by 2 bytes to satisfy the `audio_offset + 1 < len` check.

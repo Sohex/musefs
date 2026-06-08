@@ -1,5 +1,5 @@
-use musefs_format::wav::{locate_audio, read_structure};
 use musefs_format::FormatError;
+use musefs_format::wav::{locate_audio, read_structure};
 
 /// A 16-byte PCM `fmt ` payload: mono, 44.1 kHz, 16-bit.
 pub fn fmt_pcm_16bit_mono() -> Vec<u8> {

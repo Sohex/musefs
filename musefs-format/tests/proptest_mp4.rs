@@ -1,6 +1,6 @@
 #![cfg(feature = "fuzzing")]
 use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
-use musefs_format::{mp4, ArtInput, BinaryTagInput, RegionLayout, Segment, TagInput};
+use musefs_format::{ArtInput, BinaryTagInput, RegionLayout, Segment, TagInput, mp4};
 use proptest::prelude::*;
 
 proptest! {

@@ -1,7 +1,7 @@
 use crate::art::sha256_hex;
 use crate::models::{BinaryTag, NewArt, NewTrack, StructuralBlock, Tag, TrackArt};
 use crate::{Db, ReadWrite, Result};
-use rusqlite::{params, Transaction};
+use rusqlite::{Transaction, params};
 
 impl Db<ReadWrite> {
     /// Apply the bulk-write pragmas to an open connection. WAL is left untouched
@@ -146,8 +146,8 @@ impl BulkWriter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::models::{Format, NewArt, NewTrack, Tag, TrackArt};
     use crate::Db;
+    use crate::models::{Format, NewArt, NewTrack, Tag, TrackArt};
 
     #[test]
     fn bulk_writer_persists_a_batch_in_one_commit() {

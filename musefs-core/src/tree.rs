@@ -674,10 +674,10 @@ impl VirtualTree {
         // (2) Structural mutation. A pruned dir chain is rename-relevant for the
         // surviving parent only on a rendered-name collision (gated like step 1).
         for &id in removed.iter().chain(moved_out.iter()) {
-            if let Some((surv, Some((name, rendered)))) = self.remove_track(id, alloc) {
-                if self.collision_gate(surv, &name, &rendered) {
-                    dirty.insert(surv);
-                }
+            if let Some((surv, Some((name, rendered)))) = self.remove_track(id, alloc)
+                && self.collision_gate(surv, &name, &rendered)
+            {
+                dirty.insert(surv);
             }
         }
         // Insert in ascending id order: two pending ids landing on the same fresh
@@ -900,13 +900,13 @@ mod tests {
     #[test]
     fn prune_retired_bounds_map_under_churn() {
         let mut alloc = InodeAllocator::new();
-        for gen in 0..100 {
-            let entries = vec![(1, format!("Gen{gen}/a.flac"))];
+        for generation in 0..100 {
+            let entries = vec![(1, format!("Gen{generation}/a.flac"))];
             let tree = VirtualTree::build_with(&entries, &mut alloc);
             alloc.prune_retired(&tree);
             assert!(
                 alloc.paths.len() <= 2 * tree.nodes.len(),
-                "gen {gen}: map {} exceeds 2x live {}",
+                "gen {generation}: map {} exceeds 2x live {}",
                 alloc.paths.len(),
                 tree.nodes.len()
             );
@@ -920,10 +920,10 @@ mod tests {
         let keep_dir = tree.lookup(VirtualTree::ROOT, "Keep").unwrap();
         let keep_file = tree.lookup(keep_dir, "song.flac").unwrap();
         let mut last = tree;
-        for gen in 0..10 {
+        for generation in 0..10 {
             let entries = vec![
                 (1, "Keep/song.flac".to_string()),
-                (2, format!("Gen{gen}/x.flac")),
+                (2, format!("Gen{generation}/x.flac")),
             ];
             last = VirtualTree::build_with(&entries, &mut alloc);
             alloc.prune_retired(&last);
@@ -940,8 +940,8 @@ mod tests {
         let gone_dir = t1.lookup(VirtualTree::ROOT, "Gone").unwrap();
         let gone_file = t1.lookup(gone_dir, "x.flac").unwrap();
         // Churn well past the threshold so a prune drops the retired entries.
-        for gen in 0..10 {
-            let t = VirtualTree::build_with(&[(1, format!("Gen{gen}/x.flac"))], &mut alloc);
+        for generation in 0..10 {
+            let t = VirtualTree::build_with(&[(1, format!("Gen{generation}/x.flac"))], &mut alloc);
             alloc.prune_retired(&t);
         }
         assert!(

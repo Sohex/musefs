@@ -1,6 +1,6 @@
 use crate::models::{Format, NewTrack, Track};
 use crate::{Db, ReadWrite, Result};
-use rusqlite::{params, Row};
+use rusqlite::{Row, params};
 
 const TRACK_COLS: &str = "id, backing_path, format, audio_offset, audio_length, \
                           backing_size, backing_mtime, content_version, updated_at";
@@ -128,10 +128,8 @@ impl<M> Db<M> {
             let mut stmt = tx.prepare(
                 "SELECT DISTINCT track_id FROM track_changes WHERE seq > ?1 ORDER BY track_id",
             )?;
-            let ids = stmt
-                .query_map([last_seq], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<i64>>>()?;
-            ids
+            stmt.query_map([last_seq], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<i64>>>()?
         };
         tx.commit()?;
         Ok(ChangelogRead {

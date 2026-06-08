@@ -3,10 +3,10 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use musefs_core::{scan_directory, Mode, MountConfig, Musefs};
+use musefs_core::{Mode, MountConfig, Musefs, scan_directory};
 use musefs_db::{Db, Tag};
 
-use common::corpus::{prepare, CorpusParams, Format, Target};
+use common::corpus::{CorpusParams, Format, Target, prepare};
 use proptest::prelude::*;
 
 /// A small single-album FLAC corpus with `n` tracks. The returned `Target` owns

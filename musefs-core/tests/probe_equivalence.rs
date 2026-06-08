@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::corpus::{bench_formats, format_token, generate, CorpusParams};
+use common::corpus::{CorpusParams, bench_formats, format_token, generate};
 use musefs_db::Db;
 
 /// One comparable track row: `(backing_path, audio_offset, audio_length, tags,

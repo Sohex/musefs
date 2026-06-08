@@ -3,12 +3,12 @@ mod common;
 use std::time::Instant;
 
 use common::corpus::{
-    bench_base_dir, bench_formats, format_token, prepare, prepare_format, CorpusParams, Target,
+    CorpusParams, Target, bench_base_dir, bench_formats, format_token, prepare, prepare_format,
 };
-use common::report::{peak_rss_kib, RunReport};
+use common::report::{RunReport, peak_rss_kib};
 use musefs_core::{
-    metrics, revalidate_with, scan_directory_with, Mode, MountConfig, Musefs, ScanOptions,
-    VirtualTree,
+    Mode, MountConfig, Musefs, ScanOptions, VirtualTree, metrics, revalidate_with,
+    scan_directory_with,
 };
 use musefs_db::Db;
 

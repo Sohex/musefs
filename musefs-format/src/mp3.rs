@@ -110,10 +110,11 @@ pub fn locate_audio_bounded(
     }
 
     let mut audio_end = file_len;
-    if let Some(tail) = tail {
-        if file_len >= audio_offset as u64 + 128 && &tail[0..3] == b"TAG" {
-            audio_end -= 128;
-        }
+    if let Some(tail) = tail
+        && file_len >= audio_offset as u64 + 128
+        && &tail[0..3] == b"TAG"
+    {
+        audio_end -= 128;
     }
 
     Ok(Extent::Complete(Mp3Bounds {
@@ -648,16 +649,16 @@ fn classify_binary_frame(
     match id {
         b"POPM" => {
             // <owner>\0<rating:u8>[<counter: big-endian>]
-            if let Some(nul) = body.iter().position(|&b| b == 0) {
-                if let Some((&rating, counter)) = body[nul + 1..].split_first() {
-                    promoted.push(("rating".to_string(), rating.to_string()));
-                    let c = counter
-                        .iter()
-                        .take(8)
-                        .fold(0u64, |a, &b| (a << 8) | u64::from(b));
-                    if c > 0 {
-                        promoted.push(("playcount".to_string(), c.to_string()));
-                    }
+            if let Some(nul) = body.iter().position(|&b| b == 0)
+                && let Some((&rating, counter)) = body[nul + 1..].split_first()
+            {
+                promoted.push(("rating".to_string(), rating.to_string()));
+                let c = counter
+                    .iter()
+                    .take(8)
+                    .fold(0u64, |a, &b| (a << 8) | u64::from(b));
+                if c > 0 {
+                    promoted.push(("playcount".to_string(), c.to_string()));
                 }
             }
         }
@@ -705,7 +706,7 @@ mod tests {
         bytes.push(0x03); // major version 2.3
         bytes.push(0x00); // revision
         bytes.push(0x00); // flags: no extended header, no unsync
-                          // synchsafe body = 10 (covers exactly one 10-byte frame header)
+        // synchsafe body = 10 (covers exactly one 10-byte frame header)
         bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x0A]);
         // Frame header: id "TIT2", size 0xFFFF_FFFF (big-endian, plain 32-bit)
         bytes.extend_from_slice(b"TIT2");
@@ -1219,7 +1220,7 @@ mod tests {
         let mut f_mid = b"TT2".to_vec();
         f_mid.extend_from_slice(&[0x00, 0x01, 0x00]); // 24-bit size = 256
         assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_mid))); // pins the mid byte
-                                                                   // size bytes [0x01,0x00,0x00] = 65536 -> reject; pins the high byte.
+        // size bytes [0x01,0x00,0x00] = 65536 -> reject; pins the high byte.
         let mut f_hi = b"TT2".to_vec();
         f_hi.extend_from_slice(&[0x01, 0x00, 0x00]);
         assert!(!id3v2_alloc_safe(&id3v2(0x02, 0x00, 6, &f_hi)));
@@ -1557,8 +1558,8 @@ mod tests {
     #[test]
     fn locate_audio_bounded_short_prefix_small_file_proceeds() {
         let data = [0xFF, 0xFB, 0x90, 0x00, 0x00]; // len 5, file_len 8 -> but prefix==file here
-                                                   // Make file_len 8 with the same 5-byte prefix window; the sync pair (2 bytes)
-                                                   // is inside the prefix, so it resolves without needing more.
+        // Make file_len 8 with the same 5-byte prefix window; the sync pair (2 bytes)
+        // is inside the prefix, so it resolves without needing more.
         let file_len = 8u64;
         match locate_audio_bounded(&data, file_len, None).unwrap() {
             Extent::Complete(b) => {
@@ -1585,7 +1586,7 @@ mod tests {
         full.extend(std::iter::repeat_n(0u8, body)); // tag end at offset 14
         let audio_offset = full.len() as u64; // 14
         full.push(0xFF); // a single sync byte present (so prefix has audio_offset+1)
-                         // file_len = audio_offset + 1, so audio_offset + 2 == file_len + 1 (just past).
+        // file_len = audio_offset + 1, so audio_offset + 2 == file_len + 1 (just past).
         let file_len = audio_offset + 1; // 15
         match locate_audio_bounded(&full, file_len, None) {
             Err(FormatError::NotMp3) => {}
@@ -1620,7 +1621,7 @@ mod tests {
         full.push(0xFF); // frame sync pair, and nothing after
         full.push(0xFB);
         let file_len = full.len() as u64; // 16 == audio_offset + 2
-                                          // kills mp3 L96 `>`->`>=`: equal-fit audio must be accepted, not rejected.
+        // kills mp3 L96 `>`->`>=`: equal-fit audio must be accepted, not rejected.
         match locate_audio_bounded(&full, file_len, None).unwrap() {
             Extent::Complete(b) => {
                 assert_eq!(b.audio_offset, audio_offset);
@@ -1760,8 +1761,8 @@ mod tests {
         full.extend_from_slice(b"TAGxx"); // tail-ish marker, but file stays short
         let file_len = full.len() as u64;
         assert!(file_len < audio_offset + 128); // first operand FALSE
-                                                // Build a 128-byte tail buffer that starts with "TAG" (the function only
-                                                // looks at tail[0..3]); file_len is the real gate here.
+        // Build a 128-byte tail buffer that starts with "TAG" (the function only
+        // looks at tail[0..3]); file_len is the real gate here.
         let mut tail = [0u8; 128];
         tail[0..3].copy_from_slice(b"TAG");
         let prefix = &full[..usize_from(audio_offset) + 2];

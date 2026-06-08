@@ -3,9 +3,9 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use common::corpus::{prepare, prepare_format, CorpusParams, Format};
+use common::corpus::{CorpusParams, Format, prepare, prepare_format};
 use common::report::RunReport;
-use musefs_core::{scan_directory, Mode, MountConfig, Musefs};
+use musefs_core::{Mode, MountConfig, Musefs, scan_directory};
 use musefs_db::Db;
 
 fn config() -> MountConfig {

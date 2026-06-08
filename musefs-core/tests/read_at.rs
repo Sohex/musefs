@@ -1,6 +1,6 @@
 mod common;
 use common::write_flac;
-use musefs_core::{read_at, read_at_with_file, HeaderCache, Mode};
+use musefs_core::{HeaderCache, Mode, read_at, read_at_with_file};
 use musefs_db::{Db, Format, NewTrack, Tag};
 
 fn setup() -> (tempfile::TempDir, Db, i64) {
@@ -83,17 +83,21 @@ fn reading_past_eof_returns_empty() {
     let (_dir, db, id) = setup();
     let cache = HeaderCache::new(Mode::Synthesis);
     let resolved = cache.resolve(&db, id).unwrap();
-    assert!(read_at(&resolved, &db, resolved.total_len, 100)
-        .unwrap()
-        .is_empty());
-    assert!(read_at(&resolved, &db, resolved.total_len + 5, 100)
-        .unwrap()
-        .is_empty());
+    assert!(
+        read_at(&resolved, &db, resolved.total_len, 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        read_at(&resolved, &db, resolved.total_len + 5, 100)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn read_at_streams_art_image_segments() {
-    use musefs_core::{read_at, ResolvedFile};
+    use musefs_core::{ResolvedFile, read_at};
     use musefs_format::{RegionLayout, Segment};
 
     let db = Db::open_in_memory().unwrap();
@@ -145,9 +149,11 @@ fn out_of_range_read_short_circuits_before_opening_the_backing_file() {
     // backing file; deleting it makes any open attempt an error.
     std::fs::remove_file(&resolved.backing_path).unwrap();
 
-    assert!(read_at(&resolved, &db, resolved.total_len, 100)
-        .unwrap()
-        .is_empty());
+    assert!(
+        read_at(&resolved, &db, resolved.total_len, 100)
+            .unwrap()
+            .is_empty()
+    );
     assert!(read_at(&resolved, &db, 10, 0).unwrap().is_empty());
 }
 
@@ -165,9 +171,11 @@ fn read_at_with_file_out_of_range_and_zero_size_return_empty() {
         (resolved.total_len, 1),
         (10, 0),
     ] {
-        assert!(read_at_with_file(&resolved, &db, &file, off, size)
-            .unwrap()
-            .is_empty());
+        assert!(
+            read_at_with_file(&resolved, &db, &file, off, size)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 

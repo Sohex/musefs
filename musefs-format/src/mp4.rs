@@ -1774,7 +1774,7 @@ mod tests {
             read_structure_from(&mut cur, buf.len() as u64).is_err()
         };
         assert!(dup(bx(b"ftyp", b"M4A isom")), "duplicate ftyp must reject"); // ftyp |= line
-                                                                              // duplicate moov: reuse the moov from a fresh fixture so it is structurally valid.
+        // duplicate moov: reuse the moov from a fresh fixture so it is structurally valid.
         let extra_moov = {
             let other = mk_mp4(true, b"AUDIO", &[0]);
             let s = read_structure(&other).unwrap();
@@ -2203,9 +2203,11 @@ mod tests {
         assert_eq!(tags[0].payload, serato);
 
         // The text `----` is the text path's job, never opaque.
-        assert!(read_binary_tags(&moov)
-            .iter()
-            .all(|t| t.key != "----:com.apple.iTunes:MOOD"));
+        assert!(
+            read_binary_tags(&moov)
+                .iter()
+                .all(|t| t.key != "----:com.apple.iTunes:MOOD")
+        );
     }
 
     #[test]

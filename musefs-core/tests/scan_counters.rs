@@ -5,8 +5,8 @@
 //! fallback, and the revalidate skip-pass counters.
 
 use musefs_core::{
-    revalidate, revalidate_with, scan_directory, scan_directory_full_oracle, scan_directory_with,
-    ScanOptions,
+    ScanOptions, revalidate, revalidate_with, scan_directory, scan_directory_full_oracle,
+    scan_directory_with,
 };
 use musefs_db::Db;
 
@@ -306,7 +306,9 @@ fn revalidate_failed_carries_scan_failure() {
     // still opens despite mode 000, permissions aren't enforced for us, so this
     // test can't exercise the probe_file failure path. Skip rather than fail.
     if std::fs::File::open(&denied).is_ok() {
-        eprintln!("skipping revalidate_failed_carries_scan_failure: file permissions not enforced (running as root?)");
+        eprintln!(
+            "skipping revalidate_failed_carries_scan_failure: file permissions not enforced (running as root?)"
+        );
         std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o644)).unwrap();
         return;
     }

@@ -55,27 +55,23 @@ mod imp {
         reply: ReplyOpen,
         plain_flags: FopenFlags,
     ) {
-        if !pt.disabled.load(Ordering::Relaxed) {
-            if let Some(pfd) = core.passthrough_fd(fh) {
-                match reply.open_backing(&pfd) {
-                    Ok(id) => {
-                        // Insert before the reply: the kernel cannot release an
-                        // fh it has not yet seen. FOPEN_KEEP_CACHE is dropped -
-                        // page-cache ownership belongs to the backing inode here.
-                        let mut map = pt.backing.lock().unwrap_or_else(PoisonError::into_inner);
-                        let id = map.entry(fh.get()).insert_entry(id).into_mut();
-                        return reply.opened_passthrough(
-                            FileHandle(fh.get()),
-                            FopenFlags::empty(),
-                            id,
-                        );
-                    }
-                    Err(e) => {
-                        pt.disabled.store(true, Ordering::Relaxed);
-                        log::info!(
-                            "FUSE passthrough unavailable; serving reads through the daemon: {e}"
-                        );
-                    }
+        if !pt.disabled.load(Ordering::Relaxed)
+            && let Some(pfd) = core.passthrough_fd(fh)
+        {
+            match reply.open_backing(&pfd) {
+                Ok(id) => {
+                    // Insert before the reply: the kernel cannot release an
+                    // fh it has not yet seen. FOPEN_KEEP_CACHE is dropped -
+                    // page-cache ownership belongs to the backing inode here.
+                    let mut map = pt.backing.lock().unwrap_or_else(PoisonError::into_inner);
+                    let id = map.entry(fh.get()).insert_entry(id).into_mut();
+                    return reply.opened_passthrough(FileHandle(fh.get()), FopenFlags::empty(), id);
+                }
+                Err(e) => {
+                    pt.disabled.store(true, Ordering::Relaxed);
+                    log::info!(
+                        "FUSE passthrough unavailable; serving reads through the daemon: {e}"
+                    );
                 }
             }
         }
@@ -182,4 +178,4 @@ mod imp {
     pub fn request_capabilities(_config: &mut KernelConfig) {}
 }
 
-pub use imp::{reply_open, request_capabilities, PassthroughState};
+pub use imp::{PassthroughState, reply_open, request_capabilities};

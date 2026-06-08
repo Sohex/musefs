@@ -115,12 +115,14 @@ fn scans_mp3_files_seeding_tracks_and_tags() {
     assert_eq!(t.audio_length, audio_len);
 
     let tags = db.get_tags(t.id).unwrap();
-    assert!(tags
-        .iter()
-        .any(|tag| tag.key == "artist" && tag.value == "Bob"));
-    assert!(tags
-        .iter()
-        .any(|tag| tag.key == "title" && tag.value == "Track"));
+    assert!(
+        tags.iter()
+            .any(|tag| tag.key == "artist" && tag.value == "Bob")
+    );
+    assert!(
+        tags.iter()
+            .any(|tag| tag.key == "title" && tag.value == "Track")
+    );
 }
 
 #[test]
@@ -139,9 +141,10 @@ fn scans_m4a_files_seeding_tracks() {
     assert_eq!(tracks[0].format, Format::M4a);
 
     let tags = db.get_tags(tracks[0].id).unwrap();
-    assert!(tags
-        .iter()
-        .any(|t| t.key == "title" && t.value == "Orig M4A"));
+    assert!(
+        tags.iter()
+            .any(|t| t.key == "title" && t.value == "Orig M4A")
+    );
 }
 
 #[test]

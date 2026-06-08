@@ -4,7 +4,7 @@
 /// place so the two can never drift out of alignment. (`format!` needs a string
 /// literal, so this is a macro rather than a `const`.)
 macro_rules! report_fmt {
-    ($($arg:expr),* $(,)?) => {
+    ($($arg:expr_2021),* $(,)?) => {
         format!("{:<10} {:<10} {:<14} {:<10} {:>10} {:>10} {:>10} {:>10} {:>14} {:>12}", $($arg),*)
     };
 }

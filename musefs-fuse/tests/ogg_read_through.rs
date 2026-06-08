@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use musefs_core::{scan_directory, MountConfig, Musefs};
+use musefs_core::{MountConfig, Musefs, scan_directory};
 
 /// Encode a tiny tagged fixture with ffmpeg. `args` are the codec-specific ffmpeg
 /// args (codec + container). Returns false (skip) if ffmpeg/codec is unavailable.
@@ -158,11 +158,7 @@ fn make_fixture_with_cover(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let ok = cmd.status().is_ok_and(|s| s.success()) && out.exists();
-    if ok {
-        Some((out, png.to_vec()))
-    } else {
-        None
-    }
+    if ok { Some((out, png.to_vec())) } else { None }
 }
 
 #[test]

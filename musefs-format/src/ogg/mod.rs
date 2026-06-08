@@ -2,9 +2,9 @@ mod b64;
 mod crc;
 mod page;
 
-pub use b64::{b64_len, b64_window, encode_b64_slice, B64Window};
+pub use b64::{B64Window, b64_len, b64_window, encode_b64_slice};
 pub use page::{
-    parse_page, patch_page_header, patch_page_header_algebraic, verify_page_crc, PageHeader,
+    PageHeader, parse_page, patch_page_header, patch_page_header_algebraic, verify_page_crc,
 };
 
 use crate::error::{FormatError, Result};
@@ -1468,7 +1468,7 @@ mod bounded_tests {
         // read_header errors. The guard `(prefix.len() as u64) < file_len` is FALSE,
         // so the function must fall to the `Err(e)` arm and return Err — never grow.
         let bad: &[u8] = b"not an ogg stream at all"; // capture pattern != "OggS"
-                                                      // Confirm the premise: read_header genuinely errors on this buffer.
+        // Confirm the premise: read_header genuinely errors on this buffer.
         assert!(read_header(bad).is_err());
         let len = bad.len() as u64;
         // kills ogg L226 guard `< file_len` -> `true`: under `true` this returns
@@ -1486,7 +1486,7 @@ mod bounded_tests {
         // does not mask, and file_len = 10_000_000 > L*2 so `.min` does not clamp.
         // Correct up_to = L*2 = 200_000. `+`->100_002, `/`->50_000 all differ.
         let buf = vec![0u8; 100_000]; // all zeros: capture pattern != "OggS" -> errors
-                                      // Confirm the premise: read_header genuinely errors on this buffer.
+        // Confirm the premise: read_header genuinely errors on this buffer.
         assert!(read_header(&buf).is_err());
         let file_len = 10_000_000u64;
         match read_metadata_bounded(&buf, file_len).unwrap() {

@@ -1,6 +1,6 @@
 #![cfg(feature = "fuzzing")]
 use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
-use musefs_format::{flac, ArtInput, Segment, TagInput};
+use musefs_format::{ArtInput, Segment, TagInput, flac};
 use proptest::prelude::*;
 
 fn tags_strategy() -> impl Strategy<Value = Vec<(String, String)>> {

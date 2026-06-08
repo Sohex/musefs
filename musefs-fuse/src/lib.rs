@@ -16,11 +16,11 @@ use fuser::{
     INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
 };
-use musefs_core::convert::usize_from;
 use musefs_core::Attr;
 use musefs_core::CoreError;
 use musefs_core::Fh;
 use musefs_core::Musefs;
+use musefs_core::convert::usize_from;
 use std::num::NonZeroU64;
 
 mod platform;
@@ -222,10 +222,10 @@ impl MusefsFs {
             self.pool.execute(move || {
                 let _guard = PollPendingGuard(&pending);
                 if let Err(e) = core.poll_refresh_notify(|ino| {
-                    if let Some(n) = notifier.get() {
-                        if let Err(inval_err) = n.inval_inode(INodeNo(ino), 0, 0) {
-                            log::warn!("inval_inode({ino}) failed: {inval_err}");
-                        }
+                    if let Some(n) = notifier.get()
+                        && let Err(inval_err) = n.inval_inode(INodeNo(ino), 0, 0)
+                    {
+                        log::warn!("inval_inode({ino}) failed: {inval_err}");
                     }
                 }) {
                     log::warn!("poll_refresh_notify failed: {e}");

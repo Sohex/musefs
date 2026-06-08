@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use musefs_core::{scan_directory, MountConfig, Musefs};
+use musefs_core::{MountConfig, Musefs, scan_directory};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy)]

@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 
-use musefs_core::{metrics, scan_directory, Mode, MountConfig, Musefs};
+use musefs_core::{Mode, MountConfig, Musefs, metrics, scan_directory};
 
 // ---------------------------------------------------------------------------
 // Minimal proven FLAC fixture (mirrors tests/mount.rs exactly)

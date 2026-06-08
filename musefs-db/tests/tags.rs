@@ -119,7 +119,8 @@ fn read_binary_tag_chunk_into_matches_vec_variant_and_errors_on_short_read() {
     assert_eq!(buf, expected);
 
     let mut over = vec![0u8; 128];
-    assert!(db
-        .read_binary_tag_chunk_into(payload_id, 3, &mut over)
-        .is_err());
+    assert!(
+        db.read_binary_tag_chunk_into(payload_id, 3, &mut over)
+            .is_err()
+    );
 }
