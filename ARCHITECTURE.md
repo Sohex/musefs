@@ -204,7 +204,9 @@ mapping from rendered paths. Paths come from beets-style templates
 chains) over the track's tag fields, each resolving through per-field fallbacks
 and then a global `default_fallback`; `[...]` conditional sections suppress
 their literals when every field they reference is empty. Plain values are
-sanitized to a single path component ('/' and control characters become '_'),
+sanitized to a single path component ('/' and control characters become '_',
+components equal to `.` or `..` are dropped, and any component is truncated to
+255 bytes on a UTF-8 boundary so it stays within NAME_MAX),
 while a `$!{field}` path field keeps '/' as directory separators (sanitizing
 each segment and dropping empty/`.`/`..` segments) so a precomputed multi-level
 path expands into real directories. Path collisions are resolved

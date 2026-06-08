@@ -82,7 +82,10 @@ any tag key in the store works):
   `--template '$!{beets_path}'`.
 
 Anything else is literal. Name collisions get a deterministic `(2)`, `(3)`, …
-suffix. The default template is `$artist/$title`.
+suffix. Every rendered component is capped at 255 bytes (NAME_MAX, truncated on
+a UTF-8 boundary, extension preserved), and a plain field whose value is
+exactly `.` or `..` is dropped rather than creating an unusable directory. The
+default template is `$artist/$title`.
 
 Two modes:
 
