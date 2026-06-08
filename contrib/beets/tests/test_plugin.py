@@ -73,7 +73,7 @@ def _autoscan_plugin(db_path, monkeypatch):
     monkeypatch.setattr(
         plugin,
         "config",
-        FakeConfigView({"db": db_path, "fields": {}, "autoscan": True}),
+        FakeConfigView({"db": db_path, "fields": {}, "autoscan": True, "write_path": True}),
         raising=False,
     )
     calls = []
