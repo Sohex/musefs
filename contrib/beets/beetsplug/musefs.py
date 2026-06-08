@@ -31,6 +31,7 @@ class MusefsPlugin(BeetsPlugin):
             "fields": {},
             "bin": "musefs",  # musefs executable (PATH name or full path)
             "autoscan": True,  # run `musefs scan` automatically before syncing
+            "write_path": True,  # emit a beets_path tag for $!{beets_path} mounts
         })
         # beets has no file-move event, and `after_write` fires *before* a move
         # (at the old path). So imports/writes are recorded and reconciled once
@@ -144,6 +145,9 @@ class MusefsPlugin(BeetsPlugin):
     def _autoscan(self):
         return bool(self.config["autoscan"].get(bool))
 
+    def _write_path(self):
+        return bool(self.config["write_path"].get(bool))
+
     def _bin(self):
         return self.config["bin"].get(str) or "musefs"
 
@@ -206,7 +210,13 @@ class MusefsPlugin(BeetsPlugin):
         try:
             check_schema_version(conn)
             stats = SyncStats()
-            records = _core.build_records(items, fields=self._fields(), stats=stats)
+            records = _core.build_records(
+                items,
+                fields=self._fields(),
+                stats=stats,
+                write_path=self._write_path(),
+                log=self._log,
+            )
             sync_files(conn, records, dry_run=dry_run, stats=stats)
             if dry_run:
                 conn.rollback()

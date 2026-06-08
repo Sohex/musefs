@@ -54,6 +54,9 @@ beet musefs -n                   # dry run: report counts, write nothing
 # Mount the re-tagged view.
 musefs mount ~/mnt --db ~/musefs.db \
     --template '$albumartist/$album/$tracknumber - $title'
+
+# ...or mirror your beets library layout exactly, via the computed beets_path tag.
+musefs mount ~/mnt --db ~/musefs.db --template '$!{beets_path}'
 ```
 
 Imports and tag write-backs auto-sync via event hooks: `beet import` and
@@ -69,6 +72,14 @@ first; the hooks then skip gracefully if the DB is missing.
 - **Cover art:** taken from the album's `artpath` (beets' external cover file).
   beets art wins when present; otherwise any art `musefs scan` ingested from
   embedded pictures is preserved.
+- **Computed path (`beets_path`):** each sync also writes a `beets_path` text tag
+  holding the track's beets library-relative path (from your `paths:` config, via
+  `item.destination`), with the file extension removed — musefs re-appends it. Mount
+  with `--template '$!{beets_path}'` (the `$!{}` path field keeps `/` as directory
+  separators) to mirror your beets layout, including layouts musefs's own template
+  engine can't express. Set `write_path: no` in the `musefs:` config to skip it.
+  Do not add an extension in a template that consumes `beets_path`. See the
+  computed-tag workflow in [ARCHITECTURE.md](../../ARCHITECTURE.md).
 - **Moves & deletes:** every sync (the command and the end-of-command reconcile)
   prunes track rows whose backing file is no longer present, so renames/moves
   don't leave stale entries. Caveat: a file that's merely offline at sync time

@@ -73,7 +73,7 @@ def _autoscan_plugin(db_path, monkeypatch):
     monkeypatch.setattr(
         plugin,
         "config",
-        FakeConfigView({"db": db_path, "fields": {}, "autoscan": True}),
+        FakeConfigView({"db": db_path, "fields": {}, "autoscan": True, "write_path": True}),
         raising=False,
     )
     calls = []
@@ -284,3 +284,61 @@ def test_reconcile_best_effort_on_scan_failure(db_path, fake_item, monkeypatch):
     plugin._record(item=fake_item(os.fsencode("/music/a.flac")))
     # A passive hook must swallow the error (warn), never abort the beets op.
     plugin._reconcile_pending()
+
+
+def test_sync_writes_beets_path_when_enabled(db_path, make_track, fake_item, tmp_path, monkeypatch):
+    real, tid, item = _real_track(
+        tmp_path,
+        make_track,
+        fake_item,
+        title="Song",
+        destination=b"Artist/Album/01 Song.flac",
+    )
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin,
+        "config",
+        FakeConfigView({"db": db_path, "fields": {}, "write_path": True}),
+        raising=False,
+    )
+    plugin._sync(db_path, [item])
+
+    conn = connect(db_path)
+    try:
+        assert (
+            conn.execute(
+                "SELECT value FROM tags WHERE track_id=? AND key='beets_path'", (tid,)
+            ).fetchone()[0]
+            == "Artist/Album/01 Song"
+        )
+    finally:
+        conn.close()
+
+
+def test_sync_omits_beets_path_when_disabled(db_path, make_track, fake_item, tmp_path, monkeypatch):
+    real, tid, item = _real_track(
+        tmp_path,
+        make_track,
+        fake_item,
+        title="Song",
+        destination=b"Artist/Album/01 Song.flac",
+    )
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin,
+        "config",
+        FakeConfigView({"db": db_path, "fields": {}, "write_path": False}),
+        raising=False,
+    )
+    plugin._sync(db_path, [item])
+
+    conn = connect(db_path)
+    try:
+        assert (
+            conn.execute(
+                "SELECT value FROM tags WHERE track_id=? AND key='beets_path'", (tid,)
+            ).fetchone()
+            is None
+        )
+    finally:
+        conn.close()
