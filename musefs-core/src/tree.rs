@@ -196,7 +196,10 @@ impl VirtualTree {
     }
 
     fn insert_file(&mut self, track_id: i64, path: &str, alloc: &mut InodeAllocator) {
-        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let comps: Vec<&str> = path
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+            .collect();
         if comps.is_empty() {
             return;
         }
@@ -1665,5 +1668,17 @@ mod tests {
             !t.ancestor_in(b, &empty),
             "no ancestor present (guards ancestor_in->false)"
         );
+    }
+
+    #[test]
+    fn dot_and_dotdot_plain_components_are_dropped() {
+        // A plain field rendering to exactly "." or ".." (e.g. an artist tagged ".")
+        // must not create a directory that collides with readdir's hardcoded "."/"..".
+        let t = VirtualTree::build(&[(10, "./Song.flac".into()), (20, "../Tune.flac".into())]);
+        assert!(t.lookup(VirtualTree::ROOT, ".").is_none());
+        assert!(t.lookup(VirtualTree::ROOT, "..").is_none());
+        // The dropped level collapses; the leaf lands directly under root.
+        assert!(t.lookup(VirtualTree::ROOT, "Song.flac").is_some());
+        assert!(t.lookup(VirtualTree::ROOT, "Tune.flac").is_some());
     }
 }
