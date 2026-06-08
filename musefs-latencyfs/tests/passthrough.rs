@@ -105,9 +105,6 @@ fn mkdir_rmdir_and_statfs_through_the_mount() {
 
     // statfs returns real, non-empty filesystem stats for the mount (not the
     // benign all-zero fallback), exercising the passthrough statvfs path.
-    let cpath = std::ffi::CString::new(mp.to_str().unwrap()).unwrap();
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: cpath is a valid NUL-terminated path; s is a valid out-param.
-    assert_eq!(unsafe { libc::statvfs(cpath.as_ptr(), &raw mut s) }, 0);
+    let s = rustix::fs::statvfs(mp).unwrap();
     assert!(s.f_blocks > 0, "statfs should report real block counts");
 }

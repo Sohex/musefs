@@ -185,9 +185,8 @@ impl MusefsFs {
             // class of work; foreground reads are bounded only by client
             // concurrency, so a wide parallel read storm can still queue jobs.
             pool: ThreadPool::new(workers),
-            // SAFETY: getuid/getgid are always-successful libc calls.
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: rustix::process::getuid().as_raw(),
+            gid: rustix::process::getgid().as_raw(),
             mount_time: SystemTime::now(),
             config,
             notifier: Arc::new(OnceLock::new()),

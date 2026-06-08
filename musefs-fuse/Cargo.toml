@@ -13,6 +13,7 @@ metrics = ["musefs-core/metrics"]
 fuser = "0.17"
 libc = "0.2"
 log = "0.4"
+rustix = { version = "1", features = ["process"] }
 musefs-core = { path = "../musefs-core", version = "0.2.0" }
 threadpool = "1"
 

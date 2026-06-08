@@ -954,6 +954,7 @@ dependencies = [
  "musefs-db",
  "musefs-format",
  "ogg",
+ "rustix",
  "sha2",
  "tempfile",
  "threadpool",
@@ -966,6 +967,7 @@ dependencies = [
  "fuser",
  "libc",
  "rusqlite",
+ "rustix",
  "tempfile",
 ]
 

@@ -19,9 +19,9 @@ fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.push((if is_last { 0x80 } else { 0 }) | (block_type & 0x7F));
     let len = body.len();
-    out.push(((len >> 16) & 0xFF) as u8);
-    out.push(((len >> 8) & 0xFF) as u8);
-    out.push((len & 0xFF) as u8);
+    out.push(u8::try_from((len >> 16) & 0xFF).expect("FLAC block length high byte fits in u8"));
+    out.push(u8::try_from((len >> 8) & 0xFF).expect("FLAC block length middle byte fits in u8"));
+    out.push(u8::try_from(len & 0xFF).expect("FLAC block length low byte fits in u8"));
     out.extend_from_slice(body);
     out
 }
@@ -37,11 +37,23 @@ fn streaminfo_body() -> Vec<u8> {
 
 fn vorbis_comment_body(vendor: &str, comments: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(vendor.len())
+            .expect("vendor length fits in u32")
+            .to_le_bytes(),
+    );
     out.extend_from_slice(vendor.as_bytes());
-    out.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(comments.len())
+            .expect("comment count fits in u32")
+            .to_le_bytes(),
+    );
     for c in comments {
-        out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(c.len())
+                .expect("comment length fits in u32")
+                .to_le_bytes(),
+        );
         out.extend_from_slice(c.as_bytes());
     }
     out
@@ -120,11 +132,11 @@ fn setup_two_track_mount() -> (
 fn slow_read_does_not_block_stat() {
     // 50 ms per backing pread call. The big file is >2 MiB; the kernel sends
     // ~128 KiB chunks, so there are ~16 FUSE read calls → ~800ms total.
-    // The fault duration is parsed once into a process-global OnceLock on the
-    // first on_pread. This is its own integration-test binary with a single test,
-    // so no earlier on_pread can have initialized it — setting the env var here,
-    // before any read, is guaranteed to be observed.
-    unsafe { std::env::set_var("MUSEFS_FAULT_PREAD_US", "50000") };
+    // The fault duration seeds a process-global OnceLock read on the first
+    // on_pread. This is its own integration-test binary with a single test, so
+    // no earlier on_pread can have seeded it — setting it here, before any read,
+    // is guaranteed to be observed.
+    musefs_core::metrics::set_fault_pread(Some(Duration::from_millis(50)));
 
     let (_mnt, big, other, _session, _backing) = setup_two_track_mount();
 

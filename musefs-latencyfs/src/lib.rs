@@ -229,9 +229,8 @@ impl PassthroughFs {
             next_fh: AtomicU64::new(1),
             lat,
             fsyncs,
-            // SAFETY: getuid/getgid never fail.
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: rustix::process::getuid().as_raw(),
+            gid: rustix::process::getgid().as_raw(),
         }
     }
     fn ipath(&self, ino: u64) -> Option<PathBuf> {
@@ -417,32 +416,17 @@ impl fuser::Filesystem for PassthroughFs {
         nap(self.lat.stat);
         // Pass through real statvfs of the inode's path; fall back to benign values.
         if let Some(p) = self.ipath(ino.0) {
-            // Use the raw OS path bytes (not `to_string_lossy`, which would
-            // mangle non-UTF-8 names into U+FFFD and statvfs a different path).
-            if let Ok(cstr) =
-                std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(p.as_os_str()))
-            {
-                let mut s = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-                // SAFETY: cstr is a valid NUL-terminated path; s is a valid out-param.
-                if unsafe { libc::statvfs(cstr.as_ptr(), s.as_mut_ptr()) } == 0 {
-                    // SAFETY: statvfs returned 0, so it fully initialized `s`.
-                    let s = unsafe { s.assume_init() };
-                    // statvfs field types vary by platform: the count fields are
-                    // u64 on Linux/FreeBSD (so `as u64` is unnecessary) but u32 on
-                    // macOS (so it's a lossless widening). Allow both lints rather
-                    // than branch per-OS (rust-lang/rust-clippy#17166).
-                    #[allow(clippy::unnecessary_cast, clippy::cast_lossless)]
-                    return reply.statfs(
-                        s.f_blocks as u64,
-                        s.f_bfree as u64,
-                        s.f_bavail as u64,
-                        s.f_files as u64,
-                        s.f_ffree as u64,
-                        u32::try_from(s.f_bsize as u64).unwrap_or(u32::MAX),
-                        u32::try_from(s.f_namemax as u64).unwrap_or(u32::MAX),
-                        u32::try_from(s.f_frsize as u64).unwrap_or(u32::MAX),
-                    );
-                }
+            if let Ok(s) = rustix::fs::statvfs(&p) {
+                return reply.statfs(
+                    s.f_blocks,
+                    s.f_bfree,
+                    s.f_bavail,
+                    s.f_files,
+                    s.f_ffree,
+                    u32::try_from(s.f_bsize).unwrap_or(u32::MAX),
+                    u32::try_from(s.f_namemax).unwrap_or(u32::MAX),
+                    u32::try_from(s.f_frsize).unwrap_or(u32::MAX),
+                );
             }
         }
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
