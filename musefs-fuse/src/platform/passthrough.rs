@@ -162,6 +162,8 @@ mod imp {
             PassthroughState
         }
 
+        // Mirrors the Linux signature (which uses `self`); the stub doesn't.
+        #[allow(clippy::unused_self)]
         pub fn remove(&self, _fh: u64) {}
     }
 
