@@ -113,7 +113,10 @@ mod tests {
 
     /// Count this process's open fds whose target path starts with `db_path`.
     /// Prefix match deliberately: a WAL reader holds up to three fds
-    /// (`db`, `db-wal`, `db-shm`).
+    /// (`db`, `db-wal`, `db-shm`). Linux-only: it reads `/proc/self/fd`, which
+    /// FreeBSD has no equivalent for by default — so the two fd-leak tests that
+    /// use it are gated to Linux as well.
+    #[cfg(target_os = "linux")]
     fn db_fd_count(db_path: &std::path::Path) -> usize {
         let prefix = db_path.to_str().unwrap();
         std::fs::read_dir("/proc/self/fd")
@@ -123,6 +126,8 @@ mod tests {
             .count()
     }
 
+    // Linux-only: asserts fd closure via `db_fd_count` (/proc/self/fd).
+    #[cfg(target_os = "linux")]
     #[test]
     fn drop_closes_connections_opened_by_live_threads() {
         let dir = tempfile::tempdir().unwrap();
@@ -168,6 +173,8 @@ mod tests {
         }
     }
 
+    // Linux-only: asserts fd closure via `db_fd_count` (/proc/self/fd).
+    #[cfg(target_os = "linux")]
     #[test]
     fn drop_on_foreign_thread_closes_all_connections() {
         let dir = tempfile::tempdir().unwrap();

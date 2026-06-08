@@ -301,6 +301,16 @@ fn revalidate_failed_carries_scan_failure() {
     std::fs::write(&denied, flac_minimal(b"AUDIO-DENIED")).unwrap();
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
 
+    // chmod-000 denial is meaningless when running as root (root bypasses file
+    // permissions) — e.g. the FreeBSD CI/VM runs as root. Probe it: if the file
+    // still opens despite mode 000, permissions aren't enforced for us, so this
+    // test can't exercise the probe_file failure path. Skip rather than fail.
+    if std::fs::File::open(&denied).is_ok() {
+        eprintln!("skipping revalidate_failed_carries_scan_failure: file permissions not enforced (running as root?)");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+
     let stats = revalidate(&db, dir.path()).unwrap();
 
     // Restore perms so the TempDir can be cleaned up.
