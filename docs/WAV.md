@@ -41,6 +41,11 @@ precedence** and INFO filling gaps; only chunk headers are walked — the
   output, `COMM`/`USLT` language/description reset, `POPM` owner dropped,
   ID3v1 ignored, the OOM-guard skips (the authoritative list lives in
   [MP3.md](MP3.md#lossy-edges)).
+- **Tags trailing a very large `data` payload are not seen.** When the `data`
+  payload pushes any `LIST`/`INFO` or `id3 ` chunk beyond the scan probe
+  ceiling (64 MiB), the file is still ingested — the `data` chunk header gives
+  the audio bounds without reading the payload — but those trailing tag chunks
+  are not read at scan time. Front-positioned metadata is unaffected.
 
 ## How synthesis works
 
