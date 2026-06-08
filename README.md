@@ -134,8 +134,7 @@ No — and it's not planned. Out-of-band editing against the store *is* the
 design: it's what guarantees your originals can never be corrupted.
 
 **What platforms?**
-Linux with FUSE (`/dev/fuse` + libfuse). That's currently the only supported
-platform.
+See [Platform support](#platform-support).
 
 **Is it fast enough for a big library on a NAS?**
 That's the design target: synthesized headers are cached, blocking reads run
@@ -152,7 +151,20 @@ splice at stale offsets). Run `musefs scan --revalidate` to re-probe it.
 ## Requirements
 
 - Rust (2021 edition) and Cargo to build/install.
-- Linux with FUSE (`/dev/fuse` and libfuse) to mount.
+- A supported OS with FUSE to mount — Linux (`/dev/fuse` + libfuse) or FreeBSD
+  (`/dev/fuse` + the `fusefs` kernel module; no libfuse). macOS (FUSE-T) is
+  best-effort. See [Platform support](#platform-support) for details.
+
+## Platform support
+
+| Platform | FUSE | Kernel passthrough (StructureOnly) | Notes |
+| --- | --- | --- | --- |
+| Linux | Yes | Yes (6.9+, falls back to daemon serving otherwise) | Full support. |
+| FreeBSD | Yes (pure-rust `/dev/fuse` backend; `fusefs` kernel module) | No | Full FUSE support. |
+| macOS (FUSE-T) | Best-effort | No | Compiles and runs unit tests with `macos-no-mount`; mounted e2e is not yet validated. |
+
+On platforms without kernel passthrough, `--mode structure-only` still serves
+the original bytes, just through the daemon instead of the kernel.
 
 `cargo install` compiles from source, so the same prerequisites as a local
 build apply: a Rust toolchain plus FUSE headers (`libfuse3-dev`) and

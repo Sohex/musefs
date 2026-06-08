@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']   # release tags run the full matrix, incl. the FreeBSD VM e2e
   pull_request:
 
 concurrency:
@@ -22,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       src: ${{ steps.filter.outputs.src }}
+      fuse: ${{ steps.filter.outputs.fuse }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
@@ -43,6 +45,7 @@ jobs:
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
             echo "No usable base ref; treating as a source change."
             echo "src=true" >> "$GITHUB_OUTPUT"
+            echo "fuse=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed="$(git diff --name-only "$base...HEAD")"
@@ -56,6 +59,14 @@ jobs:
             echo "src=true" >> "$GITHUB_OUTPUT"
           else
             echo "src=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The FreeBSD VM e2e is far too slow for every PR: run it only when the
+          # FUSE/mount surface or its harness changes. Release tags run it
+          # unconditionally (gated in the job's `if`, not here).
+          if printf '%s\n' "$changed" | grep -qE '^(musefs-fuse/|scripts/freebsd-vm/|\.github/workflows/ci\.yml$)'; then
+            echo "fuse=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fuse=false" >> "$GITHUB_OUTPUT"
           fi
 
   check:
@@ -198,13 +209,52 @@ jobs:
       - name: FUSE end-to-end tests
         run: cargo test -p musefs-fuse -- --ignored
 
+  macos:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  freebsd:
+    # Expensive (a full in-VM build), so NOT on every PR: only when the
+    # FUSE/mount surface or its harness changed, or on a release tag (`v*`).
+    needs: changes
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      needs.changes.outputs.fuse == 'true'
+    runs-on: ubuntu-latest
+    # Bound a stuck VM/provision step rather than holding a runner for the
+    # workflow default. A clean run is ~6 min (image download + in-VM build).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: vmactions/freebsd-vm@a6de9343ef5747433d9c25784c90e84998b9d69a
+        with:
+          usesh: true
+          prepare: sh scripts/freebsd-vm/provision.sh
+          run: sh scripts/freebsd-vm/run-e2e.sh
+
   # Single required status check for branch protection. Always runs (even when
   # the heavy jobs were skipped on a docs-only change) so the check is always
   # reported; green when every needed job either succeeded or was skipped, red
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, interop, python-musefs, beets, picard, e2e]
+    needs: [changes, check, interop, python-musefs, beets, picard, e2e, macos, freebsd]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results
