@@ -150,6 +150,16 @@ for plugin authors, including a generated copy of the schema
 (`musefs_common/schema.py`, regenerated from `schema.rs` by a drift-guarded
 test — see [CONTRIBUTING](CONTRIBUTING.md)).
 
+External tools can also offload path layout entirely: a plugin evaluates its own
+(arbitrarily complex) path logic, writes the resulting relative path into a
+custom text tag — e.g. `INSERT INTO tags (track_id, key, value, ordinal) VALUES
+(?, 'beets_path', 'Pink Floyd/Animals/01 Pigs', 0)` — and the user mounts with
+`--template '$!{beets_path}'`. Because the field map is just the (lowercased) tag
+keys, any number of such tags (`beets_path`, `lidarr_path`, …) can back
+different concurrent mounts. The path field keeps embedded `/` as directory
+separators but sanitizes each segment and drops empty/`.`/`..` segments, so a
+misbehaving writer cannot inject traversal or empty components into the tree.
+
 Connections are mode-typed (`Db<ReadWrite>` / `Db<ReadOnly>`), opened in WAL
 mode with a busy timeout. The serve path uses a `DbPool` whose per-thread
 variant hands each reader thread its own connection — WAL reads never contend.
@@ -190,10 +200,14 @@ bytes.
 
 `VirtualTree::build` (`musefs-core/src/tree.rs`) materializes an inode → node
 mapping from rendered paths. Paths come from beets-style templates
-(`template.rs`): `$field` / `${field}` substitutions over the track's tag
-fields, each resolving through per-field fallbacks and then a global
-`default_fallback`; rendered values are sanitized to a single path component
-('/' and control characters become '_'). Path collisions are resolved
+(`template.rs`): `$field` / `${field}` substitutions (with `${a|b}` fallback
+chains) over the track's tag fields, each resolving through per-field fallbacks
+and then a global `default_fallback`; `[...]` conditional sections suppress
+their literals when every field they reference is empty. Plain values are
+sanitized to a single path component ('/' and control characters become '_'),
+while a `$!{field}` path field keeps '/' as directory separators (sanitizing
+each segment and dropping empty/`.`/`..` segments) so a precomputed multi-level
+path expands into real directories. Path collisions are resolved
 deterministically by appending ` (k)` before the extension
 (`disambiguate`). `mapping.rs` bridges DB tag rows to the format layer's
 inputs and to template fields — ordering and multi-value semantics live
