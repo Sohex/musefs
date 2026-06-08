@@ -54,7 +54,7 @@ fn scan_ingests_flacs_into_a_fresh_db() {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("musefs.db");
 
-    run_scan(&db_path, &[backing.path().to_path_buf()], false, 0).unwrap();
+    run_scan(&db_path, &[backing.path().to_path_buf()], false, 0, false).unwrap();
 
     // The DB file was created and persists the track.
     let db = musefs_db::Db::open(&db_path).unwrap();
@@ -89,6 +89,7 @@ fn scan_ingests_multiple_targets_under_one_db() {
         ],
         false,
         0,
+        false,
     )
     .unwrap();
 
@@ -110,6 +111,12 @@ fn scan_fails_fast_on_a_bad_target() {
     // Second target does not exist; collect_audio's read_dir errors, so the
     // batch aborts with Err.
     let missing = backing.path().join("does-not-exist");
-    let result = run_scan(&db_path, &[backing.path().to_path_buf(), missing], false, 0);
+    let result = run_scan(
+        &db_path,
+        &[backing.path().to_path_buf(), missing],
+        false,
+        0,
+        false,
+    );
     assert!(result.is_err());
 }

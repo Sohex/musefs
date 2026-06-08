@@ -102,6 +102,10 @@ pub enum Command {
         /// Probe worker threads (0 = available parallelism). 1 = sequential.
         #[arg(long, default_value_t = 0)]
         jobs: usize,
+        /// Suppress the per-target summary on stdout (failures still surface via
+        /// the `log` facade on stderr; raise detail with `RUST_LOG=info`).
+        #[arg(long, short)]
+        quiet: bool,
     },
     /// Mount a read-only FUSE view of the store.
     Mount(MountArgs),
@@ -110,9 +114,16 @@ pub enum Command {
 /// Open (creating/migrating) the DB at `db_path` once, then scan each target in
 /// `targets` (a file or a directory; directories recurse). With `revalidate`,
 /// run the maintenance pass (skip-unchanged, prune, GC) instead of a full
-/// ingest. Fails fast: the first failing target aborts the batch; targets
-/// already scanned stay committed (ingest is an idempotent upsert).
-pub fn run_scan(db_path: &Path, targets: &[PathBuf], revalidate: bool, jobs: usize) -> Result<()> {
+/// ingest. With `quiet`, suppress the per-target summary on stdout. Fails fast:
+/// the first failing target aborts the batch; targets already scanned stay
+/// committed (ingest is an idempotent upsert).
+pub fn run_scan(
+    db_path: &Path,
+    targets: &[PathBuf],
+    revalidate: bool,
+    jobs: usize,
+    quiet: bool,
+) -> Result<()> {
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let opts = musefs_core::ScanOptions {
@@ -123,24 +134,28 @@ pub fn run_scan(db_path: &Path, targets: &[PathBuf], revalidate: bool, jobs: usi
         if revalidate {
             let stats = musefs_core::revalidate_with(&db, target, &opts)
                 .with_context(|| format!("revalidating {}", target.display()))?;
-            println!(
-                "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed",
-                target.display(),
-                stats.updated,
-                stats.unchanged,
-                stats.pruned,
-                stats.failed
-            );
+            if !quiet {
+                println!(
+                    "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed",
+                    target.display(),
+                    stats.updated,
+                    stats.unchanged,
+                    stats.pruned,
+                    stats.failed
+                );
+            }
         } else {
             let stats = musefs_core::scan_directory_with(&db, target, &opts)
                 .with_context(|| format!("scanning {}", target.display()))?;
-            println!(
-                "scanned {}: {} file(s), skipped {}, failed {}",
-                target.display(),
-                stats.scanned,
-                stats.skipped,
-                stats.failed
-            );
+            if !quiet {
+                println!(
+                    "scanned {}: {} file(s), skipped {}, failed {}",
+                    target.display(),
+                    stats.scanned,
+                    stats.skipped,
+                    stats.failed
+                );
+            }
         }
     }
     Ok(())
@@ -186,7 +201,8 @@ pub fn run(cli: Cli) -> Result<()> {
             db,
             revalidate,
             jobs,
-        } => run_scan(&db, &targets, revalidate, jobs),
+            quiet,
+        } => run_scan(&db, &targets, revalidate, jobs, quiet),
         Command::Mount(args) => run_mount(&args),
     }
 }
@@ -206,6 +222,24 @@ mod tests {
                 assert_eq!(targets, vec![PathBuf::from("/m")]);
             }
             Command::Mount(..) => panic!("expected Scan"),
+        }
+    }
+
+    #[test]
+    fn scan_command_quiet_flag_defaults_off_and_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "scan", "/m", "--db", "/tmp/x.db"]).unwrap();
+        match cli.command {
+            Command::Scan { quiet, .. } => assert!(!quiet),
+            Command::Mount(..) => panic!("expected Scan"),
+        }
+        for arg in ["--quiet", "-q"] {
+            let cli =
+                Cli::try_parse_from(["musefs", "scan", "/m", "--db", "/tmp/x.db", arg]).unwrap();
+            match cli.command {
+                Command::Scan { quiet, .. } => assert!(quiet),
+                Command::Mount(..) => panic!("expected Scan"),
+            }
         }
     }
 
