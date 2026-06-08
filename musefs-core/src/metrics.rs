@@ -38,6 +38,7 @@ mod imp {
     static SCAN_OPENS: AtomicU64 = AtomicU64::new(0);
     static SCAN_PREADS: AtomicU64 = AtomicU64::new(0);
     static SCAN_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+    static PREAD_FAULT: OnceLock<Option<Duration>> = OnceLock::new();
 
     /// Sleep for the duration named by `var` (microseconds), parsed once.
     fn fault(var: &'static str, cell: &OnceLock<Option<Duration>>) {
@@ -68,8 +69,15 @@ mod imp {
     pub fn on_pread(bytes: u64) {
         PREADS.fetch_add(1, Ordering::Relaxed);
         PREAD_BYTES.fetch_add(bytes, Ordering::Relaxed);
-        static C: OnceLock<Option<Duration>> = OnceLock::new();
-        fault("MUSEFS_FAULT_PREAD_US", &C);
+        fault("MUSEFS_FAULT_PREAD_US", &PREAD_FAULT);
+    }
+
+    pub fn set_fault_pread(d: Option<Duration>) {
+        let first_set = PREAD_FAULT.set(d).is_ok();
+        debug_assert!(
+            first_set,
+            "set_fault_pread must run before the first on_pread"
+        );
     }
 
     pub fn on_art_chunk() {
@@ -152,6 +160,8 @@ mod imp {
     pub fn on_stat() {}
     #[inline(always)]
     pub fn on_pread(_bytes: u64) {}
+    #[inline(always)]
+    pub fn set_fault_pread(_d: Option<std::time::Duration>) {}
     #[inline(always)]
     pub fn on_art_chunk() {}
     #[inline(always)]

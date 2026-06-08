@@ -9,6 +9,12 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/Sohex/musefs"
 
+[workspace.lints.rust]
+# unsafe is denied by default everywhere; a genuinely-necessary unsafe must be
+# opted in per-site with `#[expect(unsafe_code, reason = "...")]` so it stays
+# greppable and review-visible. Never relax this workspace lint for a one-off.
+unsafe_code = "deny"
+
 # Curated clippy policy: pedantic on, minus the groups that are intentional or
 # stylistic in this codebase. Inherited by each crate via `[lints] workspace = true`.
 [workspace.lints.clippy]

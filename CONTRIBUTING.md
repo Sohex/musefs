@@ -237,6 +237,13 @@ this on every push/PR and uploads to Codecov (`CODECOV_TOKEN` repo secret).
 - **Lint policy.** `clippy::pedantic` minus a few intentional/noisy groups,
   defined in the root `Cargo.toml` under `[workspace.lints]`. The hook and
   CI deny all warnings.
+- **Unsafe code.** `unsafe_code = "deny"` is set for the workspace members in
+  the root `Cargo.toml` (`[workspace.lints.rust]`); the standalone `fuzz/`
+  crate is outside the workspace and is not covered. A genuinely-necessary
+  `unsafe` is opted in per-site with `#[expect(unsafe_code, reason = "...")]`
+  — never a bare `unsafe` block and never by relaxing the workspace lint, so
+  every `unsafe` is greppable and review-visible. Prefer a safe crate (e.g.
+  `rustix` for syscalls) over hand-rolled FFI.
 - **Layering.** Keep `musefs-fuse`, `musefs-cli`, and the `musefs` binary
   thin; cross-cutting logic belongs in `musefs-core`
   (see [ARCHITECTURE.md](ARCHITECTURE.md#crate-layout)).

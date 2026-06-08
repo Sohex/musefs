@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 fuser = "0.17"
 libc = "0.2"
+rustix = { version = "1", features = ["process", "fs"] }
 tempfile = "3"
 
 [dev-dependencies]
