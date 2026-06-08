@@ -61,6 +61,10 @@ Alternatives considered and rejected:
 - `musefs-fuse/Cargo.toml`: add `rustix = { version = "1", features = ["process"] }`
 - `musefs-latencyfs/Cargo.toml`: add `rustix = { version = "1", features = ["process", "fs"] }`
 
+`default-features` is left **on** — rustix's default `std` (and the libc-auxv
+backend it selects on non-Linux) is what provides the safe API and the
+FreeBSD/macOS backends. Do not pass `default-features = false`.
+
 **Site 1 & 2 — getuid/getgid**
 
 Replace the `unsafe` block with:
@@ -142,6 +146,13 @@ In `musefs-core/src/metrics.rs` (inside the existing `#[cfg(feature =
 The `fault()` helper still falls back to `std::env::var` via `get_or_init` when
 the cell was not pre-seeded, so the benchmark env-var path is unchanged.
 
+Note the cells are now module-scope statics (process-global): a value seeded or
+read once persists for the life of the process. This is fine here because the
+concurrency test is its own single-test `#![cfg(feature = "metrics")]` binary,
+so `set_fault_pread` always runs before any `on_pread` and no other test in the
+same binary contends for the cell. The plan should add a short comment at the
+setter documenting this single-binary / set-before-first-read constraint.
+
 The concurrency test replaces line 127 with:
 
 ```rust
@@ -195,7 +206,9 @@ one-off until the whole-workspace lint were relaxed.
 
 ## Documentation
 
-No user-facing docs change (the env-var benchmark interface is unchanged). If a
-contributor-facing note on the `unsafe_code = "deny"` policy and the
-`#[expect(unsafe_code, reason = "...")]` opt-in convention fits CONTRIBUTING.md's
-conventions section, add it there.
+No user-facing docs change (the env-var benchmark interface is unchanged). Add a
+short note to CONTRIBUTING.md's conventions section recording the policy: the
+workspace denies `unsafe_code`; a genuinely-necessary `unsafe` is opted in
+per-site with `#[expect(unsafe_code, reason = "...")]` (never a bare `unsafe`
+block and never relaxing the workspace lint), so every `unsafe` is greppable and
+review-visible.
