@@ -3,7 +3,7 @@
 //! blocking in `budget.acquire` (called before `send`) must never strand the
 //! writer parked on `recv`. Pre-fix this deadlocked on art-bearing libraries.
 
-use musefs_core::{scan_directory_with, ScanOptions};
+use musefs_core::{ScanOptions, scan_directory_with};
 use musefs_db::Db;
 
 /// A minimal FLAC carrying a PICTURE block of `data_len` image bytes (so the

@@ -1,5 +1,5 @@
-use musefs_format::mp3::locate_audio;
 use musefs_format::FormatError;
+use musefs_format::mp3::locate_audio;
 
 /// A 10-byte ID3v2.4 header declaring `body_len` bytes of tag body (no footer).
 fn id3v2_header(body_len: u32) -> Vec<u8> {

@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use id3::TagLike;
-use musefs_format::wav::{synthesize_layout, WavScan};
+use musefs_format::wav::{WavScan, synthesize_layout};
 use musefs_format::{ArtInput, RegionLayout, Segment, TagInput};
 
 fn fmt_pcm_16bit_mono() -> Vec<u8> {
@@ -91,10 +91,12 @@ fn embeds_full_fidelity_id3_tag_with_art() {
 
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &arts).unwrap();
     // Art is a streamed segment, never materialized inline.
-    assert!(layout
-        .segments
-        .iter()
-        .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len } if *len == 120)));
+    assert!(
+        layout
+            .segments
+            .iter()
+            .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len } if *len == 120))
+    );
 
     let bytes = assemble(&layout, &audio, &[(9, &art_bytes)]);
 

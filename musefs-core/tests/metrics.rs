@@ -5,7 +5,7 @@ use common::{
     make_flac, picture_block_body, streaminfo_body, vorbis_comment_body, write_ogg,
     write_oggflac_with_art, write_opus_with_art,
 };
-use musefs_core::{metrics, scan_directory, MountConfig, Musefs, VirtualTree};
+use musefs_core::{MountConfig, Musefs, VirtualTree, metrics, scan_directory};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -448,7 +448,7 @@ fn scan_still_reads_id3v1_tail_for_mp3() {
     let _guard = METRICS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    use common::corpus::{prepare_format, CorpusParams, Format as CFormat};
+    use common::corpus::{CorpusParams, Format as CFormat, prepare_format};
     let tmp = tempfile::tempdir().unwrap();
     let params = CorpusParams::single(CFormat::Mp3, 1, 1);
     let target = prepare_format(&params, tmp.path(), params.format_mix[0]);

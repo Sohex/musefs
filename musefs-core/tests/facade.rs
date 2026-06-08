@@ -1,7 +1,7 @@
 mod common;
 use common::make_flac;
 use common::{streaminfo_body, vorbis_comment_body};
-use musefs_core::{scan_directory, CoreError, MountConfig, Musefs, VirtualTree};
+use musefs_core::{CoreError, MountConfig, Musefs, VirtualTree, scan_directory};
 use std::collections::BTreeMap;
 
 fn config() -> MountConfig {

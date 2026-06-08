@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use musefs_core::{scan_directory, Mode, MountConfig, Musefs, VirtualTree};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use musefs_core::{Mode, MountConfig, Musefs, VirtualTree, scan_directory};
 
 #[path = "../tests/common/mod.rs"]
 mod common;
-use common::corpus::{bench_formats, format_token, generate, CorpusParams, Format};
+use common::corpus::{CorpusParams, Format, bench_formats, format_token, generate};
 
 fn config() -> MountConfig {
     MountConfig {

@@ -1,6 +1,6 @@
 #![cfg(feature = "fuzzing")]
 use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
-use musefs_format::{ogg, TagInput};
+use musefs_format::{TagInput, ogg};
 use proptest::prelude::*;
 
 proptest! {

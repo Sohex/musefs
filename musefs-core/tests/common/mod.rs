@@ -228,8 +228,8 @@ pub fn write_ogg(path: &Path, audio: &[u8]) -> (u64, u64) {
     let mut tags = b"OpusTags".to_vec();
     tags.extend_from_slice(&vorbis_body_empty());
     let serial = 0x6d75_7366; // "musf"
-                              // build_header returns (bytes, header_page_count); the audio page continues
-                              // the sequence at that count.
+    // build_header returns (bytes, header_page_count); the audio page continues
+    // the sequence at that count.
     let (mut bytes, header_pages) = build_header_pub(serial, &[&head, &tags]);
     let header_len = bytes.len();
     let (page, _) = lace_packet_pub(serial, header_pages, false, 960, audio);

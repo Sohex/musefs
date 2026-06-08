@@ -6,7 +6,7 @@ behavior, the docs under [`docs/`](docs/).
 
 ## Getting set up
 
-You need stable Rust (edition 2021) with `rustfmt` and `clippy`. To mount or run
+You need stable Rust (edition 2024) with `rustfmt` and `clippy`. To mount or run
 the FUSE end-to-end tests you need a FUSE-capable OS: Linux with `/dev/fuse` and
 libfuse (`libfuse3-dev` / `libfuse3` plus `pkg-config`), or FreeBSD with
 `/dev/fuse` and the `fusefs` kernel module (no libfuse — see [FreeBSD

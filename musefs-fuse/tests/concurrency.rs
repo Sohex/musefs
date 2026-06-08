@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use fuser::BackgroundSession;
-use musefs_core::{scan_directory, Mode, MountConfig, Musefs};
+use musefs_core::{Mode, MountConfig, Musefs, scan_directory};
 
 // ---------------------------------------------------------------------------
 // Minimal proven FLAC fixture (mirrors tests/mount.rs exactly)

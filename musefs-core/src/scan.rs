@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use musefs_db::convert::usize_from;
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
-use musefs_format::{flac, mp3, mp4, ogg, wav, EmbeddedBinaryTag, EmbeddedPicture, Extent};
+use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, ogg, wav};
 
 use crate::byte_budget::ByteBudget;
 use crate::error::Result;
@@ -605,8 +605,8 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
 /// single writer (this thread) in batched transactions. Per-file errors are
 /// counted, not fatal.
 fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<ScanStats> {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     let jobs = effective_jobs(opts.jobs);
     let window = opts.window;
@@ -626,38 +626,40 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         let budget = Arc::clone(&budget);
         let skipped = Arc::clone(&skipped);
         let failed = Arc::clone(&failed);
-        workers.push(std::thread::spawn(move || loop {
-            let next = { work.lock().unwrap().next() };
-            let Some(path) = next else { break };
-            let Ok(meta) = std::fs::metadata(&path) else {
-                failed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            match probe_file(&path, meta.len(), window) {
-                Ok(Some(probed)) => {
-                    let Ok(abs) = std::fs::canonicalize(&path) else {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    };
-                    let weight = payload_weight(&probed);
-                    budget.acquire(weight); // backpressure on in-flight art bytes
-                    let unit = Unit {
-                        abs_path: abs.to_string_lossy().into_owned(),
-                        meta_len: meta.len(),
-                        meta_mtime: mtime_secs(&meta),
-                        probed,
-                        weight,
-                    };
-                    if tx.send(unit).is_err() {
-                        budget.release(weight);
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(_) => {
+        workers.push(std::thread::spawn(move || {
+            loop {
+                let next = { work.lock().unwrap().next() };
+                let Some(path) = next else { break };
+                let Ok(meta) = std::fs::metadata(&path) else {
                     failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                match probe_file(&path, meta.len(), window) {
+                    Ok(Some(probed)) => {
+                        let Ok(abs) = std::fs::canonicalize(&path) else {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
+                        let weight = payload_weight(&probed);
+                        budget.acquire(weight); // backpressure on in-flight art bytes
+                        let unit = Unit {
+                            abs_path: abs.to_string_lossy().into_owned(),
+                            meta_len: meta.len(),
+                            meta_mtime: mtime_secs(&meta),
+                            probed,
+                            weight,
+                        };
+                        if tx.send(unit).is_err() {
+                            budget.release(weight);
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }));
@@ -851,11 +853,11 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         if !Path::new(&track.backing_path).starts_with(&canon_root) {
             continue;
         }
-        if let Err(e) = std::fs::metadata(&track.backing_path) {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                db.delete_track(track.id)?;
-                pruned += 1;
-            }
+        if let Err(e) = std::fs::metadata(&track.backing_path)
+            && e.kind() == std::io::ErrorKind::NotFound
+        {
+            db.delete_track(track.id)?;
+            pruned += 1;
         }
     }
     db.gc_orphan_art()?;

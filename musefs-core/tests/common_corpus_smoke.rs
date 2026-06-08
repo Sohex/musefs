@@ -1,7 +1,7 @@
 mod common;
 
-use common::corpus::{prepare, CorpusParams, Format, Tier};
-use common::report::{peak_rss_kib, RunReport};
+use common::corpus::{CorpusParams, Format, Tier, prepare};
+use common::report::{RunReport, peak_rss_kib};
 use common::write_m4a_moov_last;
 use common::write_ogg;
 use musefs_core::scan_directory;
@@ -13,6 +13,33 @@ use musefs_db::Db;
 /// recovers from poisoning (`PoisonError::into_inner`) so that a panic in one
 /// locked test doesn't cascade into spurious `.lock()` failures in the others.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Set a process-global env var. `std::env::set_var` became `unsafe` in
+/// edition 2024 (mutating the environment is unsound with concurrent readers).
+/// This concentrates that single `unsafe` in one audited place; soundness rests
+/// on the existing `ENV_LOCK` discipline — every env-touching test holds the
+/// lock for the full read-modify span, so no other test thread touches the
+/// environment concurrently.
+fn set_env(key: &str, val: impl AsRef<std::ffi::OsStr>) {
+    #[expect(
+        unsafe_code,
+        reason = "test-only env mutation, serialized by ENV_LOCK; std marked env mutation unsafe in edition 2024"
+    )]
+    unsafe {
+        std::env::set_var(key, val);
+    }
+}
+
+/// Remove a process-global env var. See [`set_env`] for the safety argument.
+fn remove_env(key: &str) {
+    #[expect(
+        unsafe_code,
+        reason = "test-only env mutation, serialized by ENV_LOCK; std marked env mutation unsafe in edition 2024"
+    )]
+    unsafe {
+        std::env::remove_var(key);
+    }
+}
 
 #[test]
 fn tier_presets_have_expected_shape() {
@@ -36,13 +63,13 @@ fn env_overrides_apply_over_tier() {
     let _g = ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::env::set_var("MUSEFS_BENCH_TIER", "ci");
-    std::env::set_var("MUSEFS_BENCH_ALBUMS", "3");
-    std::env::set_var("MUSEFS_BENCH_TRACKS_PER_ALBUM", "4");
+    set_env("MUSEFS_BENCH_TIER", "ci");
+    set_env("MUSEFS_BENCH_ALBUMS", "3");
+    set_env("MUSEFS_BENCH_TRACKS_PER_ALBUM", "4");
     let p = CorpusParams::from_env();
-    std::env::remove_var("MUSEFS_BENCH_ALBUMS");
-    std::env::remove_var("MUSEFS_BENCH_TRACKS_PER_ALBUM");
-    std::env::remove_var("MUSEFS_BENCH_TIER");
+    remove_env("MUSEFS_BENCH_ALBUMS");
+    remove_env("MUSEFS_BENCH_TRACKS_PER_ALBUM");
+    remove_env("MUSEFS_BENCH_TIER");
     assert_eq!(p.albums, 3);
     assert_eq!(p.tracks_per_album, 4);
     assert_eq!(p.track_count(), 12);
@@ -88,10 +115,10 @@ fn prepare_generates_when_no_library_set() {
     let _g = ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::env::remove_var("MUSEFS_BENCH_LIBRARY");
-    std::env::remove_var("MUSEFS_BENCH_DB");
+    remove_env("MUSEFS_BENCH_LIBRARY");
+    remove_env("MUSEFS_BENCH_DB");
     let scratch = tempfile::tempdir().unwrap();
-    std::env::set_var("MUSEFS_BENCH_DIR", scratch.path());
+    set_env("MUSEFS_BENCH_DIR", scratch.path());
     let p = CorpusParams {
         albums: 1,
         tracks_per_album: 2,
@@ -101,7 +128,7 @@ fn prepare_generates_when_no_library_set() {
         seed: 3,
     };
     let t = prepare(&p);
-    std::env::remove_var("MUSEFS_BENCH_DIR");
+    remove_env("MUSEFS_BENCH_DIR");
     assert!(t.corpus_dir.exists());
     assert!(!t.is_real_library);
     // DB path is separate from the corpus dir.
@@ -185,7 +212,7 @@ fn bench_formats_defaults_to_all_when_unset() {
     let _g = ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::env::remove_var("MUSEFS_BENCH_FORMAT_MIX");
+    remove_env("MUSEFS_BENCH_FORMAT_MIX");
     assert_eq!(
         common::corpus::bench_formats(),
         common::corpus::ALL_FORMATS.to_vec()
@@ -197,11 +224,11 @@ fn bench_formats_filters_and_never_empty() {
     let _g = ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::env::set_var("MUSEFS_BENCH_FORMAT_MIX", "ogg,wav");
+    set_env("MUSEFS_BENCH_FORMAT_MIX", "ogg,wav");
     let filtered = common::corpus::bench_formats();
-    std::env::set_var("MUSEFS_BENCH_FORMAT_MIX", "garbagetoken");
+    set_env("MUSEFS_BENCH_FORMAT_MIX", "garbagetoken");
     let fallback = common::corpus::bench_formats();
-    std::env::remove_var("MUSEFS_BENCH_FORMAT_MIX");
+    remove_env("MUSEFS_BENCH_FORMAT_MIX");
     assert_eq!(filtered, vec![Format::Ogg, Format::Wav]);
     assert_eq!(
         fallback,
@@ -250,7 +277,7 @@ fn bench_base_dir_defaults_to_held_tempdir() {
     let _g = ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::env::remove_var("MUSEFS_BENCH_DIR");
+    remove_env("MUSEFS_BENCH_DIR");
     let (base, scratch) = common::corpus::bench_base_dir();
     assert!(base.exists(), "base dir exists");
     assert!(

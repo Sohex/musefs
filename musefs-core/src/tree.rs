@@ -674,10 +674,10 @@ impl VirtualTree {
         // (2) Structural mutation. A pruned dir chain is rename-relevant for the
         // surviving parent only on a rendered-name collision (gated like step 1).
         for &id in removed.iter().chain(moved_out.iter()) {
-            if let Some((surv, Some((name, rendered)))) = self.remove_track(id, alloc) {
-                if self.collision_gate(surv, &name, &rendered) {
-                    dirty.insert(surv);
-                }
+            if let Some((surv, Some((name, rendered)))) = self.remove_track(id, alloc)
+                && self.collision_gate(surv, &name, &rendered)
+            {
+                dirty.insert(surv);
             }
         }
         // Insert in ascending id order: two pending ids landing on the same fresh

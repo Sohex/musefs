@@ -6,9 +6,9 @@ use std::sync::Mutex;
 use musefs_db::convert::usize_from;
 use musefs_db::{Db, Format};
 use musefs_format::flac::{self, MetadataBlock};
-use musefs_format::{mp3, mp4, wav, BinaryTagInput, RegionLayout, Segment};
-use quick_cache::sync::Cache;
+use musefs_format::{BinaryTagInput, RegionLayout, Segment, mp3, mp4, wav};
 use quick_cache::Weighter;
+use quick_cache::sync::Cache;
 
 use crate::error::{CoreError, Result};
 use crate::facade::Mode;
@@ -120,10 +120,10 @@ impl HeaderCache {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
-        if let Some(hit) = self.cache.get(&track_id) {
-            if hit.content_version == track.content_version {
-                return Ok(hit);
-            }
+        if let Some(hit) = self.cache.get(&track_id)
+            && hit.content_version == track.content_version
+        {
+            return Ok(hit);
         }
         let resolved = self.build(db, &track, &meta)?;
         self.cache.insert(track_id, resolved.clone());
@@ -472,8 +472,8 @@ pub fn read_at_with_file<M>(
 #[cfg(test)]
 mod ogg_serve_tests {
     use super::*;
-    use musefs_format::ogg::page_test_support::lace_packet_pub;
     use musefs_format::Segment;
+    use musefs_format::ogg::page_test_support::lace_packet_pub;
     use std::io::Write;
 
     #[test]
@@ -530,9 +530,11 @@ mod ogg_serve_tests {
         let h1 = musefs_format::ogg::parse_page(served_audio, p1_off).unwrap();
         assert_eq!(h1.seq, 5);
         // Payload bytes unchanged.
-        assert!(served_audio[h0.header_len..h0.total_len()]
-            .iter()
-            .all(|&b| b == 0xA1));
+        assert!(
+            served_audio[h0.header_len..h0.total_len()]
+                .iter()
+                .all(|&b| b == 0xA1)
+        );
         assert!(
             served_audio[p1_off + h1.header_len..p1_off + h1.total_len()]
                 .iter()
@@ -601,9 +603,10 @@ mod resolve_ogg_tests {
         // Tags were rewritten. `ogg::read_tags` now returns canonical lowercase
         // keys for known Vorbis fields (Tasks 1–6 changed the format layer).
         let tags = musefs_format::ogg::read_tags(&out).unwrap();
-        assert!(tags
-            .iter()
-            .any(|(k, v)| k == "title" && v == "Telephasic Workshop"));
+        assert!(
+            tags.iter()
+                .any(|(k, v)| k == "title" && v == "Telephasic Workshop")
+        );
     }
 
     #[test]

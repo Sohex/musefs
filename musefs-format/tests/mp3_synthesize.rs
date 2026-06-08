@@ -73,10 +73,12 @@ fn synthesizes_apic_with_streamed_image_bytes() {
     let layout = synthesize_layout(0, audio.len() as u64, &tags, &[], &arts).unwrap();
 
     // The image is a streamed segment, not materialized inline.
-    assert!(layout
-        .segments
-        .iter()
-        .any(|s| matches!(s, Segment::ArtImage { art_id: 7, len } if *len == 200)));
+    assert!(
+        layout
+            .segments
+            .iter()
+            .any(|s| matches!(s, Segment::ArtImage { art_id: 7, len } if *len == 200))
+    );
 
     let bytes = assemble(&layout, &audio, &[(7, &art_bytes)]);
     assert_eq!(bytes.len() as u64, layout.total_len());

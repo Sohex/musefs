@@ -300,7 +300,7 @@ impl fuser::Filesystem for PassthroughFs {
             Err(e) => {
                 return reply.error(fuser::Errno::from_i32(
                     e.raw_os_error().unwrap_or(libc::EIO),
-                ))
+                ));
             }
         };
         for ent in rd.flatten() {
@@ -345,7 +345,7 @@ impl fuser::Filesystem for PassthroughFs {
                 Err(e) => {
                     return reply.error(fuser::Errno::from_i32(
                         e.raw_os_error().unwrap_or(libc::EIO),
-                    ))
+                    ));
                 }
             },
         };
@@ -415,19 +415,19 @@ impl fuser::Filesystem for PassthroughFs {
     fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
         nap(self.lat.stat);
         // Pass through real statvfs of the inode's path; fall back to benign values.
-        if let Some(p) = self.ipath(ino.0) {
-            if let Ok(s) = rustix::fs::statvfs(&p) {
-                return reply.statfs(
-                    s.f_blocks,
-                    s.f_bfree,
-                    s.f_bavail,
-                    s.f_files,
-                    s.f_ffree,
-                    u32::try_from(s.f_bsize).unwrap_or(u32::MAX),
-                    u32::try_from(s.f_namemax).unwrap_or(u32::MAX),
-                    u32::try_from(s.f_frsize).unwrap_or(u32::MAX),
-                );
-            }
+        if let Some(p) = self.ipath(ino.0)
+            && let Ok(s) = rustix::fs::statvfs(&p)
+        {
+            return reply.statfs(
+                s.f_blocks,
+                s.f_bfree,
+                s.f_bavail,
+                s.f_files,
+                s.f_ffree,
+                u32::try_from(s.f_bsize).unwrap_or(u32::MAX),
+                u32::try_from(s.f_namemax).unwrap_or(u32::MAX),
+                u32::try_from(s.f_frsize).unwrap_or(u32::MAX),
+            );
         }
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
@@ -464,7 +464,7 @@ impl fuser::Filesystem for PassthroughFs {
             Err(e) => {
                 return reply.error(fuser::Errno::from_i32(
                     e.raw_os_error().unwrap_or(libc::EIO),
-                ))
+                ));
             }
         };
         let m = match file.metadata() {
@@ -472,7 +472,7 @@ impl fuser::Filesystem for PassthroughFs {
             Err(e) => {
                 return reply.error(fuser::Errno::from_i32(
                     e.raw_os_error().unwrap_or(libc::EIO),
-                ))
+                ));
             }
         };
         let ino = self.inodes.lock().unwrap().intern(child);
@@ -581,16 +581,15 @@ impl fuser::Filesystem for PassthroughFs {
         // The only attr SQLite needs: truncate/extend the WAL. Propagate any
         // failure rather than replying ok with the stale (un-truncated) size,
         // which would lie to the kernel and desync the WAL on disk.
-        if let Some(sz) = size {
-            if let Err(e) = OpenOptions::new()
+        if let Some(sz) = size
+            && let Err(e) = OpenOptions::new()
                 .write(true)
                 .open(&p)
                 .and_then(|f| f.set_len(sz))
-            {
-                return reply.error(fuser::Errno::from_i32(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                ));
-            }
+        {
+            return reply.error(fuser::Errno::from_i32(
+                e.raw_os_error().unwrap_or(libc::EIO),
+            ));
         }
         match std::fs::symlink_metadata(&p) {
             Ok(m) => reply.attr(&TTL, &attr_from_meta(ino.0, &m)),

@@ -1,4 +1,4 @@
-use super::crc::{crc32, crc_shift_zeros};
+use super::crc::{crc_shift_zeros, crc32};
 use crate::error::{FormatError, Result};
 
 pub const CAPTURE: &[u8; 4] = b"OggS";
@@ -640,9 +640,11 @@ mod tests {
             .sum();
         assert_eq!(art_served, art_out.len() as u64);
         // No OggArtSlice may be zero-length (kills emit_segments:337 < -> <=).
-        assert!(segments
-            .iter()
-            .all(|s| !matches!(s, Segment::OggArtSlice { len: 0, .. })));
+        assert!(
+            segments
+                .iter()
+                .all(|s| !matches!(s, Segment::OggArtSlice { len: 0, .. }))
+        );
     }
 
     #[test]
@@ -651,7 +653,7 @@ mod tests {
         // via patch_page_header and confirm header_type (incl. EOS) is unchanged.
         let (mut page, _) = lace_packet(0xEE, 3, false, 9, &[0x11u8; 120]);
         page[5] |= FLAG_EOS; // header_type byte
-                             // Recompute the CRC over the EOS-modified page (CRC field zeroed first).
+        // Recompute the CRC over the EOS-modified page (CRC field zeroed first).
         let mut z = page.clone();
         z[22..26].copy_from_slice(&0u32.to_le_bytes());
         let crc = crc32(&z);
@@ -673,7 +675,7 @@ mod tests {
         let p = hand_page();
         assert_eq!(parse_page(&p[..26], 0), Err(FormatError::Malformed));
         assert!(parse_page(&p[..27], 0).is_err()); // header present but table missing
-                                                   // Header present, segment table truncated (kills :47).
+        // Header present, segment table truncated (kills :47).
         assert_eq!(parse_page(&p[..28], 0), Err(FormatError::Malformed));
         // Exactly full header+table+payload parses.
         assert!(parse_page(&p, 0).is_ok());
@@ -774,7 +776,7 @@ mod tests {
         let mut hdr = vec![0u8; 27];
         hdr[..4].copy_from_slice(b"OggS");
         hdr[18..22].copy_from_slice(&7u32.to_le_bytes()); // old_seq
-                                                          // byte 26 (seg_count) == 0 → header_len 27, payload_len 0.
+        // byte 26 (seg_count) == 0 → header_len 27, payload_len 0.
         let out = patch_page_header_algebraic(&hdr, 9).unwrap();
         assert_eq!(out.len(), 27);
         assert_eq!(u32::from_le_bytes(out[18..22].try_into().unwrap()), 9);

@@ -138,10 +138,12 @@ fn zero_byte_art_is_skipped_so_the_track_still_serves() {
     .unwrap();
 
     // No ArtImage segment was emitted.
-    assert!(!layout
-        .segments
-        .iter()
-        .any(|s| matches!(s, Segment::ArtImage { .. })));
+    assert!(
+        !layout
+            .segments
+            .iter()
+            .any(|s| matches!(s, Segment::ArtImage { .. }))
+    );
 
     // The track still round-trips: header + verbatim audio (no art bytes needed).
     let art_map = HashMap::new();

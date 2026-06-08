@@ -12,7 +12,7 @@
 //! lifetime, not the thread's. Each pool has its own map, so multiple mounts
 //! (or test DBs) on the same thread don't collide.
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{HashMap, hash_map::Entry};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::ThreadId;

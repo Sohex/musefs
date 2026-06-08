@@ -10,8 +10,8 @@ use musefs_db::{Db, Format};
 use crate::db_pool::DbPool;
 use crate::error::{CoreError, Result};
 use crate::mapping::tags_to_fields;
-use crate::reader::{read_at_into, read_at_with_file_into, HeaderCache, ResolvedFile};
-use crate::refresh_diff::{partition_changelog, ChangeSet, TrackRenderState};
+use crate::reader::{HeaderCache, ResolvedFile, read_at_into, read_at_with_file_into};
+use crate::refresh_diff::{ChangeSet, TrackRenderState, partition_changelog};
 use crate::template::Template;
 use crate::tree::{InodeAllocator, NodeKind, VirtualTree};
 
@@ -577,10 +577,9 @@ impl Musefs {
         }
         if let Some(last_failed) =
             *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh")
+            && last_failed.elapsed() < self.refresh_retry_backoff
         {
-            if last_failed.elapsed() < self.refresh_retry_backoff {
-                return false;
-            }
+            return false;
         }
         true
     }
@@ -624,10 +623,9 @@ impl Musefs {
         }
         if let Some(last_failed) =
             *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh")
+            && last_failed.elapsed() < self.refresh_retry_backoff
         {
-            if last_failed.elapsed() < self.refresh_retry_backoff {
-                return Ok(false);
-            }
+            return Ok(false);
         }
         let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
         if version == self.last_data_version.load(Ordering::Acquire) {
@@ -744,12 +742,12 @@ impl Musefs {
         on_changed: &mut impl FnMut(u64),
     ) {
         for (tid, ns) in new {
-            if let Some(os) = old.get(tid) {
-                if os.content_version != ns.content_version && os.path == ns.path {
-                    if let Some(ino) = new_tree.inode_of_track(*tid) {
-                        on_changed(ino);
-                    }
-                }
+            if let Some(os) = old.get(tid)
+                && os.content_version != ns.content_version
+                && os.path == ns.path
+                && let Some(ino) = new_tree.inode_of_track(*tid)
+            {
+                on_changed(ino);
             }
         }
         for (tid, os) in old {
@@ -757,10 +755,8 @@ impl Musefs {
                 None => true,
                 Some(ns) => ns.path != os.path,
             };
-            if moved_or_gone {
-                if let Some(ino) = old_tree.inode_of_track(*tid) {
-                    on_changed(ino);
-                }
+            if moved_or_gone && let Some(ino) = old_tree.inode_of_track(*tid) {
+                on_changed(ino);
             }
         }
     }
@@ -780,15 +776,16 @@ impl Musefs {
             let (Some(os), Some(ns)) = (displaced.get(&id), new_states.get(&id)) else {
                 continue;
             };
-            if os.content_version != ns.content_version && os.path == ns.path {
-                if let Some(ino) = new_tree.inode_of_track(id) {
-                    on_changed(ino);
-                }
+            if os.content_version != ns.content_version
+                && os.path == ns.path
+                && let Some(ino) = new_tree.inode_of_track(id)
+            {
+                on_changed(ino);
             }
-            if ns.path != os.path {
-                if let Some(ino) = old_tree.inode_of_track(id) {
-                    on_changed(ino);
-                }
+            if ns.path != os.path
+                && let Some(ino) = old_tree.inode_of_track(id)
+            {
+                on_changed(ino);
             }
         }
         for &id in &change.removed {
@@ -889,7 +886,7 @@ impl Musefs {
                             is_dir: true,
                             size: 0,
                             mtime_secs: 0,
-                        })
+                        });
                     }
                     NodeKind::File { track_id } => *track_id,
                 },
@@ -903,14 +900,14 @@ impl Musefs {
             // `.map(|e| *e)` copies the SizeEntry (Copy) so the shard Ref drops
             // before the miss-path insert below — same key → same shard, and
             // holding the Ref across the re-lock would deadlock.
-            if let Some(e) = self.size_cache.get(&track_id).map(|e| *e) {
-                if e.content_version == track.content_version {
-                    // Hit: no backing stat, no synthesis. NOTE: a backing file
-                    // changed in place without a rescan would leave mtime/size
-                    // stale until the next scan bumps content_version — acceptable
-                    // for a read-only mount (reads still validate at open()).
-                    return Ok((e.total_len, e.mtime_secs));
-                }
+            if let Some(e) = self.size_cache.get(&track_id).map(|e| *e)
+                && e.content_version == track.content_version
+            {
+                // Hit: no backing stat, no synthesis. NOTE: a backing file
+                // changed in place without a rescan would leave mtime/size
+                // stale until the next scan bumps content_version — acceptable
+                // for a read-only mount (reads still validate at open()).
+                return Ok((e.total_len, e.mtime_secs));
             }
             // Miss: full resolve (validates via stat, builds + caches the layout).
             let resolved = self.cache.resolve(db, track_id)?;

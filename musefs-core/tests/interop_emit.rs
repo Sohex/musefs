@@ -1,8 +1,8 @@
 mod common;
-use musefs_core::{read_at, HeaderCache, Mode};
+use musefs_core::{HeaderCache, Mode, read_at};
 use musefs_db::{BinaryTag, Db, Format, NewArt, NewTrack, Tag, TrackArt};
-use musefs_format::fuzz_check::fixtures;
 use musefs_format::Segment;
+use musefs_format::fuzz_check::fixtures;
 use std::io::Write;
 use std::path::Path;
 

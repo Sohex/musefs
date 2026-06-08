@@ -1,6 +1,6 @@
 mod common;
 use common::{make_flac, streaminfo_body, vorbis_comment_body};
-use musefs_core::{scan_directory, MountConfig, Musefs, VirtualTree};
+use musefs_core::{MountConfig, Musefs, VirtualTree, scan_directory};
 use std::collections::BTreeMap;
 
 // Block types: STREAMINFO=0, APPLICATION=2, SEEKTABLE=3, VORBIS_COMMENT=4, CUESHEET=5.
@@ -154,12 +154,13 @@ fn legacy_flac_without_structural_rows_serves_via_front_read_fallback() {
 
     // The legacy path carries every preserved block inline, including APPLICATION.
     let tag = metaflac::Tag::read_from(&mut std::io::Cursor::new(&served)).expect("valid FLAC");
-    assert!(tag
-        .blocks()
-        .any(|b| matches!(b, metaflac::Block::Application(_))));
+    assert!(
+        tag.blocks()
+            .any(|b| matches!(b, metaflac::Block::Application(_)))
+    );
 }
 
-use musefs_core::{read_at, revalidate, HeaderCache, Mode};
+use musefs_core::{HeaderCache, Mode, read_at, revalidate};
 use proptest::prelude::*;
 
 #[test]

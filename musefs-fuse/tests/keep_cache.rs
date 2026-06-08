@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use musefs_core::{scan_directory, MountConfig, Musefs};
+use musefs_core::{MountConfig, Musefs, scan_directory};
 
 // --- minimal proven FLAC fixture (mirrors musefs-fuse/tests/mount.rs) ---
 
@@ -129,11 +129,11 @@ fn keep_cache_mount_reflects_retag_after_refresh() {
             let _ = std::fs::metadata(&song);
             std::thread::sleep(Duration::from_millis(50));
             // re-read and check whether the size changed
-            if let Ok(b) = std::fs::read(&song) {
-                if b.len() != original_size {
-                    result = Some(b);
-                    break;
-                }
+            if let Ok(b) = std::fs::read(&song)
+                && b.len() != original_size
+            {
+                result = Some(b);
+                break;
             }
         }
         // Final read regardless — we'll assert on the content below

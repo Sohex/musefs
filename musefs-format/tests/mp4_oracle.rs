@@ -3,7 +3,7 @@
 //! samples read through OUR patched chunk offsets are byte-identical to the
 //! originals — proving the offset surgery.
 
-use musefs_format::{mp4, ArtInput, RegionLayout, Segment, TagInput};
+use musefs_format::{ArtInput, RegionLayout, Segment, TagInput, mp4};
 use std::io::Cursor;
 
 fn materialize(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {

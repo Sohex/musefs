@@ -3,7 +3,7 @@ use common::write_flac;
 use common::write_m4a;
 use common::write_mp3;
 use common::write_wav;
-use musefs_core::{read_at, HeaderCache, Mode};
+use musefs_core::{HeaderCache, Mode, read_at};
 use musefs_db::{BinaryTag, Db, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_format::Segment;
 use proptest::prelude::*;

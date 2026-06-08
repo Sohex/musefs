@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn split_preserved_classifies_structural_and_binary() {
-        use super::{split_preserved, structural_block_type, MetadataBlock};
+        use super::{MetadataBlock, split_preserved, structural_block_type};
         // STREAMINFO(0), APPLICATION(2), SEEKTABLE(3), CUESHEET(5) in arbitrary order.
         let blocks = vec![
             MetadataBlock {
@@ -962,8 +962,8 @@ mod tests {
         // This keeps the boundary correct regardless of the framing's field count.
         let framing_len = picture_body_framing(&mk(0)).unwrap().len() as u64;
         let at_limit = 0x00FF_FFFF - framing_len; // body_len == 0x00FF_FFFF exactly
-                                                  // original `>` accepts the inclusive boundary; the `>=` mutant rejects it.
-                                                  // (data_len is only a count; no large allocation occurs.)
+        // original `>` accepts the inclusive boundary; the `>=` mutant rejects it.
+        // (data_len is only a count; no large allocation occurs.)
         assert!(synthesize_layout(&[], 0, 0, &[], &[], &[mk(at_limit)]).is_ok());
         // one byte over must still error, pinning the high side of the boundary.
         assert_eq!(

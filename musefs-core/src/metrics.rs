@@ -25,8 +25,8 @@ pub use imp::*;
 
 #[cfg(feature = "metrics")]
 mod imp {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     static OPENS: AtomicU64 = AtomicU64::new(0);
