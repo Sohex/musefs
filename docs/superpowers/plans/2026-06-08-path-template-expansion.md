@@ -31,7 +31,7 @@ fn owned(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 ```
 
-- [ ] **Step 1: Add fallback-chain tests**
+- [x] **Step 1: Add fallback-chain tests**
 
 Append to `musefs-core/tests/template.rs`:
 
@@ -68,7 +68,7 @@ fn field_names_are_case_insensitive() {
 }
 ```
 
-- [ ] **Step 2: Add conditional-section tests**
+- [x] **Step 2: Add conditional-section tests**
 
 Append:
 
@@ -137,7 +137,7 @@ fn empty_section_emits_nothing() {
 }
 ```
 
-- [ ] **Step 3: Add path-field tests**
+- [x] **Step 3: Add path-field tests**
 
 Append:
 
@@ -179,7 +179,7 @@ fn path_field_sanitizes_control_chars_within_segments() {
 }
 ```
 
-- [ ] **Step 4: Add escaping and parser-edge-case tests**
+- [x] **Step 4: Add escaping and parser-edge-case tests**
 
 Append:
 
@@ -220,12 +220,12 @@ fn empty_braced_field_is_absent() {
 }
 ```
 
-- [ ] **Step 5: Run the new tests to verify they fail**
+- [x] **Step 5: Run the new tests to verify they fail**
 
 Run: `cargo test -p musefs-core --test template`
 Expected: compile error / FAIL — the new syntax (`${a|b}`, `[...]`, `$!{}`, `$[`) isn't implemented yet (e.g. `${albumartist|artist}` resolves the literal name `"albumartist|artist"` to `Unknown`, sections render their brackets literally, `$!{p}` flattens slashes).
 
-- [ ] **Step 6: Replace the `Part` enum and `Template` struct doc**
+- [x] **Step 6: Replace the `Part` enum and `Template` struct doc**
 
 In `musefs-core/src/template.rs`, replace the struct/enum block (the current `pub struct Template { parts: Vec<Part> }` and `enum Part { Literal(String), Field(String) }`, lines ~3–15) with:
 
@@ -251,7 +251,7 @@ enum Part {
 }
 ```
 
-- [ ] **Step 7: Replace the imports and `impl Template` block**
+- [x] **Step 7: Replace the imports and `impl Template` block**
 
 Replace the top-of-file `use std::collections::BTreeMap;` with:
 
@@ -300,7 +300,7 @@ impl Template {
 }
 ```
 
-- [ ] **Step 8: Replace the free functions (parse + render helpers + sanitizers)**
+- [x] **Step 8: Replace the free functions (parse + render helpers + sanitizers)**
 
 Replace the existing free functions at the bottom of the file (`sanitize_into` and `is_field_char`) with the full set below:
 
@@ -526,17 +526,17 @@ fn is_field_char(c: char) -> bool {
 }
 ```
 
-- [ ] **Step 9: Run the full template test file to verify all pass**
+- [x] **Step 9: Run the full template test file to verify all pass**
 
 Run: `cargo test -p musefs-core --test template`
 Expected: PASS — all new cases plus the original 5 (`substitutes_dollar_and_braced_fields_and_appends_ext`, `missing_field_uses_per_field_fallback_then_default`, `sanitizes_path_illegal_characters_in_values`, `lone_dollar_stays_literal`, `unterminated_brace_consumes_rest_as_field_name`).
 
-- [ ] **Step 10: Lint and format**
+- [x] **Step 10: Lint and format**
 
 Run: `cargo fmt && cargo clippy -p musefs-core --all-targets -- -D warnings`
 Expected: no warnings, no diff from fmt.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add musefs-core/src/template.rs musefs-core/tests/template.rs
@@ -560,7 +560,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 `proptest` is already a `musefs-core` dev-dependency (`musefs-core/Cargo.toml`). There is no template fuzz target (the `fuzz/` crate only covers the format layer); this proptest is the invariant gate.
 
-- [ ] **Step 1: Add the proptest import**
+- [x] **Step 1: Add the proptest import**
 
 At the top of `musefs-core/tests/template.rs`, below the existing `use` lines, add:
 
@@ -568,7 +568,7 @@ At the top of `musefs-core/tests/template.rs`, below the existing `use` lines, a
 use proptest::prelude::*;
 ```
 
-- [ ] **Step 2: Add the invariant property test**
+- [x] **Step 2: Add the invariant property test**
 
 Append to `musefs-core/tests/template.rs`:
 
@@ -609,12 +609,12 @@ fn path_field_neutralizes_traversal_values() {
 }
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 Run: `cargo test -p musefs-core --test template`
 Expected: PASS (proptest runs its default 256 cases; the explicit traversal test passes). Note `....//` sanitizes to the component `....` (not `.` or `..`), which is a legal filename — the assertion only forbids empty/`.`/`..`.
 
-- [ ] **Step 4: Lint, format, commit**
+- [x] **Step 4: Lint, format, commit**
 
 ```bash
 cargo fmt && cargo clippy -p musefs-core --all-targets -- -D warnings
@@ -633,7 +633,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `ARCHITECTURE.md` (Virtual tree paragraph ~lines 192–200; external-writer contract ~after line 151)
 - Modify: `musefs-cli/src/lib.rs` (doc-comment on the `template` arg, line 49)
 
-- [ ] **Step 1: Update the README template description**
+- [x] **Step 1: Update the README template description**
 
 In `README.md`, replace the paragraph that currently reads:
 
@@ -672,7 +672,7 @@ Anything else is literal. Name collisions get a deterministic `(2)`, `(3)`, …
 suffix. The default template is `$artist/$title`.
 ```
 
-- [ ] **Step 2: Update the ARCHITECTURE Virtual tree paragraph**
+- [x] **Step 2: Update the ARCHITECTURE Virtual tree paragraph**
 
 In `ARCHITECTURE.md`, replace the sentence in the **Virtual tree** section that currently reads:
 
@@ -698,7 +698,7 @@ each segment and dropping empty/`.`/`..` segments) so a precomputed multi-level
 path expands into real directories.
 ```
 
-- [ ] **Step 3: Document the computed-path tag workflow**
+- [x] **Step 3: Document the computed-path tag workflow**
 
 In `ARCHITECTURE.md`, in **The external-writer contract** section, insert this paragraph immediately before the line that begins `Connections are mode-typed`:
 
@@ -715,7 +715,7 @@ misbehaving writer cannot inject traversal or empty components into the tree.
 
 ```
 
-- [ ] **Step 4: Update the CLI doc-comment**
+- [x] **Step 4: Update the CLI doc-comment**
 
 In `musefs-cli/src/lib.rs`, replace the doc-comment line:
 
@@ -731,12 +731,12 @@ with:
     /// brackets), and $!{field} path fields that keep '/' as separators.
 ```
 
-- [ ] **Step 5: Verify docs build cleanly and CLI still parses**
+- [x] **Step 5: Verify docs build cleanly and CLI still parses**
 
 Run: `cargo build -p musefs-cli && cargo test -p musefs-cli`
 Expected: PASS (the doc-comment change is a comment; the `default-fallback`/`template` default-value tests at `musefs-cli/src/lib.rs:254-255` are unaffected).
 
-- [ ] **Step 6: Format and commit**
+- [x] **Step 6: Format and commit**
 
 ```bash
 cargo fmt
@@ -750,7 +750,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ## Final verification
 
-- [ ] **Run the full workspace suite (mirrors the pre-commit gate):**
+- [x] **Run the full workspace suite (mirrors the pre-commit gate):**
 
 Run: `cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test`
 Expected: all green.
