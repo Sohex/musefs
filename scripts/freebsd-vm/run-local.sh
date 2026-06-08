@@ -49,7 +49,13 @@ cleanup() {
     for pf in "$PIDFILE" "$HTTP_PIDFILE"; do
         if [ -f "$pf" ]; then
             pid="$(cat "$pf" 2>/dev/null || true)"
-            [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
+            # Only kill if the PID is still one of *our* processes — a stale
+            # pidfile (e.g. after a SIGKILL bypassed this trap) could otherwise
+            # name a reused, unrelated host PID.
+            if [ -n "${pid:-}" ] \
+                && ps -p "$pid" -o command= 2>/dev/null | grep -qE 'qemu-system|http\.server'; then
+                kill "$pid" 2>/dev/null || true
+            fi
             rm -f "$pf"
         fi
     done
