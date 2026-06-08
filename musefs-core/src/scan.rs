@@ -15,8 +15,14 @@ const BATCH_BYTES: u64 = 64 << 20; // 64 MiB
 /// Initial bounded-read window. Covers typical metadata + cover art; a larger
 /// metadata region triggers a `NeedMore` widen.
 const WINDOW: usize = 1 << 20; // 1 MiB
-/// Cap on widen iterations before falling back to a whole-file read.
+/// Cap on widen iterations before falling back to a full-buffer read.
 const MAX_WIDEN_RETRIES: usize = 8;
+/// Hard ceiling on bytes read to probe one file. Real audio metadata fits far
+/// below this, so a file still unparsed past the cap is treated as malformed
+/// rather than read whole into RAM. Guards against a multi-GB file misnamed with
+/// an audio extension, and against a corrupt header whose length field demands a
+/// giant `NeedMore` widen.
+const MAX_PROBE_BYTES: u64 = 64 << 20; // 64 MiB
 
 /// Skip embedded art whose image bytes exceed this. The binding limit is FLAC's
 /// 24-bit PICTURE block length (~16 MiB for the whole block); reserve 64 KiB of
@@ -238,31 +244,41 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
     } else {
         None
     };
-    let mut want = usize_from((window as u64).min(file_len));
+    // Never read past the probe ceiling, however large the file or whatever a
+    // (possibly corrupt) header asks for via `NeedMore`.
+    let probe_cap = file_len.min(MAX_PROBE_BYTES);
+    let mut want = usize_from((window as u64).min(probe_cap));
     let mut prefix = read_window(&file, want)?;
     for _ in 0..MAX_WIDEN_RETRIES {
         match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
             Probe::Done(p) => return Ok(Some(p)),
             Probe::Skip => return Ok(None),
             Probe::NeedMore(up_to) => {
-                // Already at EOF? The prefix is the whole file; widening can't help.
-                if want as u64 >= file_len {
+                // Read everything we're willing to probe? Widening can't help.
+                if want as u64 >= probe_cap {
                     break;
                 }
-                // Grow to at least `up_to` (capped at the file), always making
+                // Grow to at least `up_to` (capped at `probe_cap`), always making
                 // progress (`+1`), then retry.
-                want = usize_from(up_to.min(file_len))
+                want = usize_from(up_to.min(probe_cap))
                     .max(want + 1)
-                    .min(usize_from(file_len));
+                    .min(usize_from(probe_cap));
                 prefix = read_window(&file, want)?;
             }
         }
     }
-    // Fallback: read the whole file once and use the full-buffer probe.
-    if (prefix.len() as u64) < file_len {
-        prefix = read_window(&file, usize_from(file_len))?;
+    // Fallback: full-buffer probe over the bytes we were willing to read.
+    if (prefix.len() as u64) < probe_cap {
+        prefix = read_window(&file, usize_from(probe_cap))?;
     }
-    Ok(probe_full(path, &prefix))
+    let probed = probe_full(path, &prefix);
+    if probed.is_none() && file_len > MAX_PROBE_BYTES {
+        log::warn!(
+            "skipping {}: no parseable metadata within first {MAX_PROBE_BYTES} bytes",
+            path.display()
+        );
+    }
+    Ok(probed)
 }
 
 /// Outcome of a single bounded dispatch attempt against the current `prefix`.
@@ -1761,5 +1777,25 @@ mod bounded_probe_tests {
         };
         assert_eq!(norm(1), norm(4));
         assert_eq!(norm(1).len(), 12);
+    }
+
+    #[test]
+    fn oversize_unparseable_file_is_skipped_not_read_whole() {
+        // A file far larger than the probe ceiling, with a valid FLAC marker but
+        // a metadata block that never terminates, must be skipped rather than
+        // allocated whole into RAM (the misnamed-multi-GB-file OOM guard).
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.flac");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Marker + a non-last VORBIS_COMMENT block claiming the max 24-bit
+        // length, so the bounded reader keeps asking for more.
+        f.write_all(b"fLaC").unwrap();
+        f.write_all(&[0x04, 0xFF, 0xFF, 0xFF]).unwrap();
+        let len = MAX_PROBE_BYTES + 4096;
+        f.set_len(len).unwrap();
+        drop(f);
+
+        assert!(probe_file(&path, len, WINDOW).unwrap().is_none());
     }
 }
