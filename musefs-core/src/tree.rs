@@ -1771,8 +1771,38 @@ mod tests {
         let kids = t.children(VirtualTree::ROOT).unwrap();
         assert_eq!(kids.len(), 12, "all collisions disambiguated distinctly");
         for name in kids.keys() {
-            assert!(name.len() <= 255, "{} bytes", name.len());
+            // Each name packs to the full NAME_MAX: the base leaf trims its stem to
+            // leave room for `.flac`, and every ` (k)`-disambiguated sibling trims
+            // per-rank to land on exactly 255 bytes. Pinning the exact length (not
+            // just `<= 255`) guards suffix_candidate's budget arithmetic.
+            assert_eq!(name.len(), 255, "{name:?}");
         }
+    }
+
+    #[test]
+    fn over_long_leaf_with_oversize_extension_truncates_whole_name() {
+        // When the extension alone is NAME_MAX-1 bytes there is zero byte budget for
+        // any stem, so the leaf falls back to a plain whole-name truncation rather
+        // than emitting an empty-stem `.ext`. Guards truncate_component's
+        // `budget > 0` filter.
+        let path = format!("{}.{}", "s".repeat(300), "e".repeat(254));
+        let t = VirtualTree::build(&[(10, path)]);
+        let name = t
+            .children(VirtualTree::ROOT)
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(name.len() <= 255, "{} bytes", name.len());
+        assert!(
+            !name.starts_with('.'),
+            "no empty-stem leading dot: {name:?}"
+        );
+        assert!(
+            name.starts_with('s'),
+            "whole-name truncation keeps the stem prefix"
+        );
     }
 
     #[test]
