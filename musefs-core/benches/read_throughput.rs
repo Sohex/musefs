@@ -16,6 +16,7 @@ fn config() -> MountConfig {
         default_fallback: "Unknown".to_string(),
         mode: Mode::Synthesis,
         poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
     }
 }
 

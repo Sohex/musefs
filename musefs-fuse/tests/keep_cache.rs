@@ -55,6 +55,7 @@ fn mount_config() -> MountConfig {
         default_fallback: "Unknown".to_string(),
         mode: musefs_core::Mode::Synthesis,
         poll_interval: Duration::ZERO,
+        case_insensitive: false,
     }
 }
 

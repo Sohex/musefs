@@ -64,6 +64,7 @@ fn config(mode: Mode) -> MountConfig {
         default_fallback: "Unknown".to_string(),
         mode,
         poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
     }
 }
 

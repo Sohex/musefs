@@ -1,5 +1,12 @@
 use im::{HashMap as ImHashMap, OrdMap};
 
+/// Case-fold a name for case-insensitive comparison. Unicode-aware lowercasing;
+/// ASCII is the floor. Applied identically to every comparison (collision,
+/// disambiguation, lookup) - never compare a folded value against an unfolded one.
+fn fold(name: &str) -> String {
+    name.to_lowercase()
+}
+
 /// Why an incremental tree mutation could not complete; the caller falls back to
 /// a full rebuild. Carries diagnostics instead of `()` (#95).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +86,16 @@ pub struct VirtualTree {
     nodes: ImHashMap<u64, Node>,
     children: ImHashMap<u64, OrdMap<String, u64>>,
     rendered_children: ImHashMap<u64, OrdMap<String, OrdMap<String, u64>>>,
+    /// `parent -> fold(name) -> inode`, populated ONLY when `case_insensitive`.
+    /// Build-only (folding always full-rebuilds, so a published tree is never
+    /// mutated). Gives O(1) folded lookup and collision checks. Part of structural
+    /// equality; built deterministically, so fresh and re-rendered folded trees
+    /// compare equal.
+    folded_children: ImHashMap<u64, ImHashMap<String, u64>>,
     track_to_inode: ImHashMap<i64, u64>,
+    /// When true, names are compared case-insensitively (dirs merge, files
+    /// disambiguate). Defaults to false (exact matching, identical to Linux).
+    case_insensitive: bool,
 }
 
 impl VirtualTree {
@@ -89,14 +105,27 @@ impl VirtualTree {
         VirtualTree::build_with(entries, &mut InodeAllocator::new())
     }
 
-    /// Build the tree assigning inodes via `alloc` (keyed by rendered path), so
-    /// inodes are stable across rebuilds that reuse the same allocator.
+    /// Case-sensitive build (the default everywhere except a folded mount).
+    /// Inodes are assigned via `alloc` (keyed by rendered path), stable across
+    /// rebuilds that reuse the same allocator.
     pub fn build_with(entries: &[(i64, String)], alloc: &mut InodeAllocator) -> VirtualTree {
+        VirtualTree::build_with_ci(entries, alloc, false)
+    }
+
+    /// Build with explicit case-folding. With `case_insensitive`, names fold:
+    /// case-variant directories merge, case-variant files disambiguate.
+    pub fn build_with_ci(
+        entries: &[(i64, String)],
+        alloc: &mut InodeAllocator,
+        case_insensitive: bool,
+    ) -> VirtualTree {
         let mut tree = VirtualTree {
             nodes: ImHashMap::new(),
             children: ImHashMap::new(),
             rendered_children: ImHashMap::new(),
+            folded_children: ImHashMap::new(),
             track_to_inode: ImHashMap::new(),
+            case_insensitive,
         };
         tree.nodes.insert(
             Self::ROOT,
@@ -137,9 +166,15 @@ impl VirtualTree {
     }
 
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
-        self.children
-            .get(&parent)
-            .and_then(|c| c.get(name).copied())
+        if self.case_insensitive {
+            self.folded_children
+                .get(&parent)
+                .and_then(|b| b.get(&fold(name)).copied())
+        } else {
+            self.children
+                .get(&parent)
+                .and_then(|c| c.get(name).copied())
+        }
     }
 
     pub fn is_dir(&self, inode: u64) -> bool {
@@ -189,6 +224,7 @@ impl VirtualTree {
             .unwrap()
             .insert(name.clone(), inode);
         self.insert_rendered_child(dir, raw_name, &name, inode);
+        self.insert_folded_child(dir, &name, inode);
     }
 
     fn ensure_dir(
@@ -198,10 +234,13 @@ impl VirtualTree {
         name: &str,
         alloc: &mut InodeAllocator,
     ) -> (u64, String) {
-        if let Some(&existing) = self.children[&parent].get(name) {
-            if self.is_dir(existing) {
-                return (existing, join_path(parent_path, name));
-            }
+        if let Some(existing) = self.dir_child_named(parent, name) {
+            let stored = self
+                .node(existing)
+                .expect("dir_child_named node")
+                .name
+                .clone();
+            return (existing, join_path(parent_path, &stored));
         }
         let unique = self.disambiguate(parent, name);
         let full = join_path(parent_path, &unique);
@@ -222,22 +261,60 @@ impl VirtualTree {
             .unwrap()
             .insert(unique.clone(), inode);
         self.insert_rendered_child(parent, name, &unique, inode);
+        self.insert_folded_child(parent, &unique, inode);
         (inode, full)
     }
 
     /// Return `name` if free in `dir`, else append ` (k)` before the extension.
+    /// Freeness is case-folded when the tree is case-insensitive.
     fn disambiguate(&self, dir: u64, name: &str) -> String {
-        let existing = &self.children[&dir];
-        if !existing.contains_key(name) {
+        if !self.taken(dir, name) {
             return name.to_string();
         }
         for k in 2u32.. {
             let candidate = suffix_candidate(name, k);
-            if !existing.contains_key(&candidate) {
+            if !self.taken(dir, &candidate) {
                 return candidate;
             }
         }
         unreachable!("an unoccupied candidate rank always exists")
+    }
+
+    /// Mirror a child insertion into the folded index (no-op unless folding).
+    fn insert_folded_child(&mut self, parent: u64, name: &str, inode: u64) {
+        if !self.case_insensitive {
+            return;
+        }
+        self.folded_children
+            .entry(parent)
+            .or_default()
+            .insert(fold(name), inode);
+    }
+
+    /// True if `name` is already taken in `dir` (folded when case-insensitive).
+    fn taken(&self, dir: u64, name: &str) -> bool {
+        if self.case_insensitive {
+            self.folded_children
+                .get(&dir)
+                .is_some_and(|b| b.contains_key(&fold(name)))
+        } else {
+            self.children
+                .get(&dir)
+                .is_some_and(|c| c.contains_key(name))
+        }
+    }
+
+    /// An existing *directory* child of `dir` matching `name` (folded when
+    /// case-insensitive), for merge reuse. `None` if absent or a non-dir.
+    fn dir_child_named(&self, dir: u64, name: &str) -> Option<u64> {
+        let ino = if self.case_insensitive {
+            self.folded_children
+                .get(&dir)
+                .and_then(|b| b.get(&fold(name)).copied())
+        } else {
+            self.children.get(&dir).and_then(|c| c.get(name).copied())
+        }?;
+        self.is_dir(ino).then_some(ino)
     }
 
     /// Cheap rename-relevance gate for the child of `dir` whose current key is
@@ -924,6 +1001,54 @@ mod tests {
         assert!(t.lookup(d, "song.flac").is_some());
         assert!(t.lookup(d, "song (2).flac").is_some());
         assert!(t.lookup(d, "song (3).flac").is_some());
+    }
+
+    #[test]
+    fn case_insensitive_merges_directories() {
+        // Two artist dirs differing only by case collapse into one; both titles
+        // live under the first-seen casing.
+        let entries = vec![(1i64, "Foo/A".to_string()), (2i64, "foo/B".to_string())];
+        let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(), true);
+        let foo = tree.lookup(VirtualTree::ROOT, "Foo").expect("Foo dir");
+        // Case-insensitive lookup resolves any casing to the same inode.
+        assert_eq!(tree.lookup(VirtualTree::ROOT, "foo"), Some(foo));
+        assert_eq!(tree.lookup(VirtualTree::ROOT, "FOO"), Some(foo));
+        // Exactly one child of root (the merged dir), with both files under it.
+        assert_eq!(tree.children(VirtualTree::ROOT).unwrap().len(), 1);
+        assert!(tree.lookup(foo, "A").is_some());
+        assert!(tree.lookup(foo, "B").is_some());
+        assert_eq!(tree.children(foo).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn case_insensitive_disambiguates_leaf_files() {
+        // Two files in the same dir whose names differ only by case must NOT
+        // collide: the second is disambiguated.
+        let entries = vec![
+            (1i64, "Dir/Song".to_string()),
+            (2i64, "Dir/song".to_string()),
+        ];
+        let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(), true);
+        let dir = tree.lookup(VirtualTree::ROOT, "Dir").expect("Dir");
+        let names: Vec<String> = tree.children(dir).unwrap().keys().cloned().collect();
+        // First-seen "Song" keeps its name; "song" becomes "song (2)".
+        assert!(names.contains(&"Song".to_string()));
+        assert!(names.contains(&"song (2)".to_string()));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn case_sensitive_keeps_both_dirs_separate() {
+        // Control: with folding OFF, "Foo" and "foo" are distinct dirs and a
+        // differently-cased query misses.
+        let entries = vec![(1i64, "Foo/A".to_string()), (2i64, "foo/B".to_string())];
+        let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(), false);
+        assert_eq!(tree.children(VirtualTree::ROOT).unwrap().len(), 2);
+        assert_ne!(
+            tree.lookup(VirtualTree::ROOT, "Foo"),
+            tree.lookup(VirtualTree::ROOT, "foo")
+        );
+        assert_eq!(tree.lookup(VirtualTree::ROOT, "FOO"), None);
     }
 
     #[test]

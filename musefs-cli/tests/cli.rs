@@ -129,6 +129,7 @@ fn parse_mount_config_defaults_are_sensible() {
         max_readahead_kib: 512,
         max_background: 64,
         keep_cache: false,
+        case_insensitive: false,
     };
     let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.template, "$artist/$title");
@@ -155,6 +156,7 @@ fn parse_mount_config_keep_cache_sets_flag() {
         max_readahead_kib: 256,
         max_background: 32,
         keep_cache: true,
+        case_insensitive: false,
     };
     let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.mode, Mode::StructureOnly);
@@ -177,6 +179,7 @@ fn parse_mount_config_saturating_readahead() {
         max_readahead_kib: u32::MAX,
         max_background: 64,
         keep_cache: false,
+        case_insensitive: false,
     };
     let (_, fuse_config) = parse_mount_config(&args);
     assert_eq!(fuse_config.max_readahead, u32::MAX);
