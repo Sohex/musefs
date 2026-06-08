@@ -2,8 +2,20 @@ use crate::models::{Format, NewTrack, Track};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::{Row, params};
 
-const TRACK_COLS: &str = "id, backing_path, format, audio_offset, audio_length, \
-                          backing_size, backing_mtime, content_version, updated_at";
+/// Build a `SELECT <track columns> FROM tracks <tail>` as a compile-time string
+/// literal, so every track read shares one column list (kept in lockstep with
+/// `row_to_track`) and can be served via `prepare_cached` — no per-call `format!`
+/// allocation and no SQL recompilation on the `getattr`/`read` hot path.
+macro_rules! track_select {
+    ($tail:literal) => {
+        concat!(
+            "SELECT id, backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, content_version, updated_at \
+             FROM tracks ",
+            $tail
+        )
+    };
+}
 
 /// Parse a `format` column value, mapping an unknown name to the rusqlite
 /// conversion error every row-mapper needs (single source — three readers).
@@ -45,18 +57,15 @@ pub struct ChangelogRead {
 
 impl<M> Db<M> {
     pub fn get_track(&self, id: i64) -> Result<Option<Track>> {
-        let sql = format!("SELECT {TRACK_COLS} FROM tracks WHERE id = ?1");
-        self.query_optional_track(&sql, params![id])
+        self.query_optional_track(track_select!("WHERE id = ?1"), params![id])
     }
 
     pub fn get_track_by_path(&self, path: &str) -> Result<Option<Track>> {
-        let sql = format!("SELECT {TRACK_COLS} FROM tracks WHERE backing_path = ?1");
-        self.query_optional_track(&sql, params![path])
+        self.query_optional_track(track_select!("WHERE backing_path = ?1"), params![path])
     }
 
     pub fn list_tracks(&self) -> Result<Vec<Track>> {
-        let sql = format!("SELECT {TRACK_COLS} FROM tracks ORDER BY id");
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(track_select!("ORDER BY id"))?;
         let rows = stmt.query_map([], row_to_track)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -84,7 +93,7 @@ impl<M> Db<M> {
     }
 
     fn query_optional_track(&self, sql: &str, p: impl rusqlite::Params) -> Result<Option<Track>> {
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let mut rows = stmt.query(p)?;
         match rows.next()? {
             Some(r) => Ok(Some(row_to_track(r)?)),
