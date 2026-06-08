@@ -58,8 +58,17 @@ class FakeItem:
         self.year = fields.pop("year", 0)
         self.month = fields.pop("month", 0)
         self.day = fields.pop("day", 0)
+        # beets' Item.destination(relative_to_libdir=True) returns a bytes path;
+        # default to the item's own path so existing tests keep working.
+        self._destination = fields.pop("destination", path)
+        self._destination_raises = fields.pop("destination_raises", False)
         for k, v in fields.items():
             setattr(self, k, v)
+
+    def destination(self, relative_to_libdir=False):
+        if self._destination_raises:
+            raise RuntimeError("destination boom")
+        return self._destination
 
     def get_album(self):
         return self._album

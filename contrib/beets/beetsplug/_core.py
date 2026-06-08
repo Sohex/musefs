@@ -144,18 +144,54 @@ def _read_album_art(item, cache, stats):
     return art
 
 
-def build_records(items, *, fields=None, stats):
+def _computed_path(item):
+    """Beets' library-relative path for ``item``, decoded to a SQLite-safe str
+    with the file extension removed (musefs re-appends it at render time).
+
+    Mirrors ``realpath_key``'s lossy normalization (U+FFFD for undecodable
+    bytes) so the value is always valid UTF-8, but without realpath's on-disk
+    resolution. Returns "" when beets yields no usable path.
+    """
+    raw = item.destination(relative_to_libdir=True)
+    decoded = os.fsdecode(raw)
+    safe = decoded.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return os.path.splitext(safe)[0].lstrip("/")
+
+
+def _computed_path_or_skip(item, log):
+    """``_computed_path`` guarded so a bad destination never aborts a sync.
+
+    Returns "" (skip the tag) on any failure, warning through ``log`` if given.
+    """
+    try:
+        return _computed_path(item)
+    except Exception as exc:
+        if log is not None:
+            # beets' plugin logger is a StrFormatLogger ({}-style, not %-style).
+            log.warning("musefs: skipping beets_path for {!r}: {}", item.path, exc)
+        return ""
+
+
+def build_records(items, *, fields=None, stats, write_path=True, log=None):
     """Build ``Record``s for beets items: map tags and resolve album art (with a
     per-run cache; unreadable/over-cap covers counted into ``stats.skipped_art``).
-    ``stats`` is mutated and must be the same instance passed to ``sync_files``."""
+    When ``write_path`` is set, also emit a ``beets_path`` tag with the track's
+    beets library-relative path (extension stripped); a failed computation is
+    skipped and warned through ``log``. ``stats`` is mutated and must be the same
+    instance passed to ``sync_files``."""
     records = []
     art_cache = {}
     for item in items:
         cover = _read_album_art(item, art_cache, stats)
+        pairs = map_fields(item, fields)
+        if write_path:
+            path = _computed_path_or_skip(item, log)
+            if path:
+                pairs.append(("beets_path", path))
         records.append(
             Record(
                 key=realpath_key(item.path),
-                pairs=map_fields(item, fields),
+                pairs=pairs,
                 art=[ArtImage(*cover)] if cover else None,
             )
         )
