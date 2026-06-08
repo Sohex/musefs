@@ -70,14 +70,22 @@ exclude_re = [
     'replace suffix_candidate -> String with',
     # probe_file widen loop: `.max(want + 1)` is dominated — the bounded probers
     # only return `NeedMore{up_to}` with `up_to > want` (we widen precisely to a
-    # block end past the prefix), so `up_to.min(file_len)` always wins the max and
+    # block end past the prefix), so `up_to.min(probe_cap)` always wins the max and
     # the `want + 1` term is never selected. `+`->`-`/`*` are equivalent.
-    'musefs-core/src/scan\.rs:255:31:',
-    # probe_file post-loop fallback guard `(prefix.len() as u64) < file_len`: when
-    # it differs, the only effect is a redundant whole-file re-read that feeds the
-    # same `probe_full` result. The >8-retry path that could diverge is unreachable
-    # given the probers' exact (FLAC/MP3/WAV) / geometric (Ogg) NeedMore.
-    'musefs-core/src/scan\.rs:262:30:',
+    'musefs-core/src/scan\.rs:264:31:',
+    # probe_file post-loop fallback guard `(prefix.len() as u64) < probe_cap`: when
+    # it differs, the only effect is a redundant re-read up to the probe cap that
+    # feeds the same `probe_full` result. The >8-retry path that could diverge is
+    # unreachable given the probers' exact (FLAC/MP3/WAV) / geometric (Ogg) NeedMore.
+    'musefs-core/src/scan\.rs:271:30:',
+    # probe_file oversize-skip diagnostic `probed.is_none() && file_len >
+    # MAX_PROBE_BYTES`: gates only a `log::warn!` (mirroring the M4A
+    # `MetadataTooLarge` warn). It has no effect on the returned `Probed`/skip
+    # decision or any persisted state, so every mutation of the condition is
+    # unobservable — a pure observability shim, like the metrics counters above.
+    # Both operands (`&&` at :25, the `>` compare at :37) excluded.
+    'musefs-core/src/scan\.rs:275:25:',
+    'musefs-core/src/scan\.rs:275:37:',
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     'musefs-core/src/scan\.rs:620:46:',
