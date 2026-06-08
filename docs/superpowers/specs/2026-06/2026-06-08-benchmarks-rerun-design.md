@@ -162,9 +162,10 @@ CI, and the per-PR history; this file is about performance only.
 3. **Per-pass detail sections** — same passes as today, each trimmed to: a
    one-line "what changed", the before/after table with this-box numbers, and the
    reproduce command. No gate notes; repeated methodology boilerplate removed.
-   (Open: whether SP2's Stage-A/B narrative and SP4's crc linear↔matrix↔memo
-   evolution table are kept as "why" context or trimmed — see Out of scope /
-   user-decision below.)
+   **SP2's Stage-A/B narrative and SP4's crc linear↔matrix↔memo evolution table
+   are kept** as "why" context (they explain the implementation journey, not just
+   the numbers) — trimming applies only to the repeated methodology boilerplate,
+   not to genuine design rationale.
 
 ## #112 passthrough harness
 
@@ -174,14 +175,13 @@ capture it as a committed script (e.g. `benches/passthrough_dd.sh`) that takes t
 mount path, does the fresh-mount-per-binary 3-runs-inside loop, and prints the
 GB/s. The reproduce command in the rewritten §112 section points at the script.
 
-## Open user decisions
+## Resolved presentation decisions
 
-- **SP2/SP4 detail depth:** keep the richer multi-table "why" context (SP2 Stage
-  A/B narrative; SP4's crc linear↔matrix↔memo evolution table) or trim to a single
-  before/after table per the layered-structure goal. Default: trim, keeping a
-  one-line "why" note; confirm before planning.
-- **Cumulative row form:** per-subsystem before→after **deltas** (assumed) vs.
-  absolute current-`main` numbers only.
+- **SP2/SP4 detail depth:** *keep* the richer "why" context — SP2's Stage A/B
+  narrative and SP4's crc linear↔matrix↔memo evolution table stay. They explain
+  the implementation journey; only repeated methodology boilerplate is trimmed.
+- **Cumulative row form:** per-subsystem before→after **deltas** (`16caba4` →
+  current `main`), one line each for ingest / refresh / serve.
 
 ## Out of scope
 
