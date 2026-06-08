@@ -1,4 +1,5 @@
 use musefs_core::Template;
+use proptest::prelude::*;
 use std::collections::BTreeMap;
 
 fn fields<'a>(pairs: &[(&str, &'a str)]) -> BTreeMap<String, &'a str> {
@@ -251,4 +252,47 @@ fn empty_braced_field_is_absent() {
     let f = fields(&[("title", "Song")]);
     let path = Template::parse("${}/$title").render(&f, &BTreeMap::new(), "Unknown", "flac");
     assert_eq!(path, "Unknown/Song.flac");
+}
+
+proptest! {
+    // render must never panic, and a path field must never emit an empty,
+    // '.', or '..' component (no traversal / no absolute path into the tree).
+    #[test]
+    fn render_never_panics_and_path_fields_stay_safe(tmpl in ".{0,64}", value in ".{0,64}") {
+        let f = fields(&[("p", value.as_str())]);
+
+        // arbitrary templates must not panic
+        let _ = Template::parse(&tmpl).render(&f, &BTreeMap::new(), "Unknown", "flac");
+
+        // a path field over an adversarial value yields only safe components
+        let rendered = Template::parse("$!{p}").render(&f, &BTreeMap::new(), "Unknown", "flac");
+        let body = rendered.strip_suffix(".flac").expect("ext appended");
+        for component in body.split('/') {
+            prop_assert!(!component.is_empty());
+            prop_assert_ne!(component, ".");
+            prop_assert_ne!(component, "..");
+        }
+    }
+}
+
+#[test]
+fn path_field_neutralizes_traversal_values() {
+    for value in [
+        "../../etc/passwd",
+        "/abs/path",
+        "a/../../b",
+        "....//",
+        "/",
+        "..",
+        ".",
+    ] {
+        let f = fields(&[("p", value)]);
+        let rendered = Template::parse("$!{p}").render(&f, &BTreeMap::new(), "Unknown", "flac");
+        let body = rendered.strip_suffix(".flac").unwrap();
+        for component in body.split('/') {
+            assert!(!component.is_empty(), "empty component from {value:?}");
+            assert_ne!(component, ".", "'.' component from {value:?}");
+            assert_ne!(component, "..", "'..' component from {value:?}");
+        }
+    }
 }
