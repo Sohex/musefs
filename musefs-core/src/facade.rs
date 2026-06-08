@@ -295,7 +295,9 @@ impl Musefs {
         config: &MountConfig,
     ) -> Result<(Vec<(i64, String)>, HashMap<i64, TrackRenderState>)> {
         let tracks = db.list_tracks()?;
-        let mut tags_by_track = db.tags_grouped()?;
+        let field_names = template.referenced_fields();
+        let keys: Vec<&str> = field_names.iter().map(String::as_str).collect();
+        let mut tags_by_track = db.tags_grouped_for_keys(&keys)?;
         let mut entries = Vec::with_capacity(tracks.len());
         let mut snapshot = HashMap::with_capacity(tracks.len());
         for t in &tracks {

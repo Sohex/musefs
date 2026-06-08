@@ -282,4 +282,27 @@ exclude_re = [
     # in-diff gate builds. The two `+` in fixtures::wav are this one expression; both
     # `+` elsewhere are absent (`samples.len() * 2` is `*`), so description-anchored.
     'replace \+ with \* in fixtures::wav',
+
+    # truncate_bytes char-boundary back-off loop `while end > 0 && ...`, `>`->`>=`:
+    # equivalent. `end` is usize so `end >= 0` is always true, but byte 0 is always a
+    # char boundary, so `!s.is_char_boundary(0)` is false and the `&&` short-circuits
+    # the loop to the same exit — identical `&s[..end]`. The sole `>` in truncate_bytes,
+    # so operator+function-anchored.
+    'replace > with >= in truncate_bytes',
+    # truncate_bytes back-off step `end -= 1` -> `end /= 1`: `/= 1` leaves `end`
+    # unchanged, so once the loop is entered on a non-boundary index it never advances
+    # — non-terminating (TIMEOUT-only, never a clean kill), the SP3 hang-class
+    # precedent. The decrement's correctness is pinned by the UTF-8-boundary truncation
+    # tests; only the un-steppable `/=` replacement is excluded. Sole `-=` in the fn.
+    'replace -= with /= in truncate_bytes',
+    # truncate_component empty-string const returns (`Cow::Borrowed("")` /
+    # `Cow::Owned("".to_owned())`): hang-class. An empty component is unreachable in
+    # production — callers pass non-empty `/`-split path components and the fn never
+    # shrinks a non-empty name to "" — and forcing every component empty makes a
+    # rebuild test spin past the timeout (reported TIMEOUT, never a clean kill). The
+    # NON-empty const returns (`"xyzzy"`) stay in scope and ARE caught, so the fn's real
+    # behavior is still pinned; only the unreachable empty returns are excluded. (`.`
+    # stands in for the `'` in `Cow<'_, str>`, which a TOML literal string can't hold.)
+    'replace truncate_component -> Cow<._, str> with Cow::Borrowed\(""\)',
+    'replace truncate_component -> Cow<._, str> with Cow::Owned\(""\.to_owned\(\)\)',
 ]

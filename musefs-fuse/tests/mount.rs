@@ -220,3 +220,32 @@ fn concurrent_spawns_do_not_race() {
         h.join().expect("a concurrent mount thread panicked (race)");
     }
 }
+
+#[test]
+#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse -- --ignored"]
+fn large_directory_lists_fully_across_paginated_readdir() {
+    let backing = tempfile::tempdir().unwrap();
+    const N: usize = 5000;
+    for i in 0..N {
+        let flac = make_flac(&["ARTIST=Alice", &format!("TITLE=Song{i:05}")], &[0xAB; 8]);
+        std::fs::write(backing.path().join(format!("t{i:05}.flac")), &flac).unwrap();
+    }
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, backing.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+
+    let mountpoint = tempfile::tempdir().unwrap();
+    let session = musefs_fuse::spawn(fs, mountpoint.path(), "musefs-test").unwrap();
+
+    let names: std::collections::HashSet<String> =
+        std::fs::read_dir(mountpoint.path().join("Alice"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+    assert_eq!(names.len(), N, "every entry listed exactly once");
+    assert!(names.contains("Song00000.flac"));
+    assert!(names.contains("Song04999.flac"));
+
+    drop(session);
+    drop(backing);
+}

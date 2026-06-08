@@ -1,4 +1,5 @@
 use im::{HashMap as ImHashMap, OrdMap};
+use std::borrow::Cow;
 
 /// Case-fold a name for case-insensitive comparison. Unicode-aware lowercasing;
 /// ASCII is the floor. Applied identically to every comparison (collision,
@@ -196,7 +197,10 @@ impl VirtualTree {
     }
 
     fn insert_file(&mut self, track_id: i64, path: &str, alloc: &mut InodeAllocator) {
-        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let comps: Vec<&str> = path
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+            .collect();
         if comps.is_empty() {
             return;
         }
@@ -208,6 +212,8 @@ impl VirtualTree {
             dir_path = child_path;
         }
         let raw_name = comps[comps.len() - 1];
+        let truncated = truncate_component(raw_name, true);
+        let raw_name = truncated.as_ref();
         let name = self.disambiguate(dir, raw_name);
         let full = join_path(&dir_path, &name);
         let inode = alloc.intern(&full);
@@ -236,6 +242,8 @@ impl VirtualTree {
         name: &str,
         alloc: &mut InodeAllocator,
     ) -> (u64, String) {
+        let truncated = truncate_component(name, false);
+        let name = truncated.as_ref();
         if let Some(existing) = self.dir_child_named(parent, name) {
             let stored = self
                 .node(existing)
@@ -816,14 +824,53 @@ fn split_suffix_parts(name: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Linux NAME_MAX: a single path component may be at most this many *bytes*.
+/// A longer component makes lookup/readdir/stat fail with ENAMETOOLONG.
+const NAME_MAX: usize = 255;
+
+/// Largest char-boundary prefix of `s` that is at most `max` bytes.
+fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Truncate a rendered component to NAME_MAX bytes. For a leaf (`preserve_ext`),
+/// the stem is trimmed so `stem.ext` fits while the extension survives; if the
+/// extension alone is too long, the whole name is truncated. Borrows when the
+/// component already fits, so the common short-name path allocates nothing.
+fn truncate_component(name: &str, preserve_ext: bool) -> Cow<'_, str> {
+    if name.len() <= NAME_MAX {
+        return Cow::Borrowed(name);
+    }
+    if preserve_ext && let (stem, Some(ext)) = split_suffix_parts(name) {
+        // +1 for the '.' separator.
+        if let Some(budget) = NAME_MAX.checked_sub(ext.len() + 1).filter(|b| *b > 0) {
+            let stem_t = truncate_bytes(stem, budget);
+            return Cow::Owned(format!("{stem_t}.{ext}"));
+        }
+    }
+    Cow::Owned(truncate_bytes(name, NAME_MAX).to_string())
+}
+
 /// The rank-`k` disambiguated candidate for `name` (k >= 2): ` (k)` appended to
 /// the stem, before any extension. Single source of the suffix format —
 /// `disambiguate` generates with it and `collision_gate` probes with it.
 fn suffix_candidate(name: &str, k: u32) -> String {
-    match split_suffix_parts(name) {
-        (stem, Some(ext)) => format!("{stem} ({k}).{ext}"),
-        (stem, None) => format!("{stem} ({k})"),
-    }
+    let (stem, ext) = split_suffix_parts(name);
+    let suffix = format!(" ({k})");
+    let ext_part = match ext {
+        Some(e) => format!(".{e}"),
+        None => String::new(),
+    };
+    let budget = NAME_MAX.saturating_sub(suffix.len() + ext_part.len());
+    let stem_t = truncate_bytes(stem, budget);
+    format!("{stem_t}{suffix}{ext_part}")
 }
 
 /// True if `name` could be a `suffix_candidate` output. Such a name may be the
@@ -1665,5 +1712,129 @@ mod tests {
             !t.ancestor_in(b, &empty),
             "no ancestor present (guards ancestor_in->false)"
         );
+    }
+
+    #[test]
+    fn over_long_leaf_truncates_to_255_keeping_extension() {
+        let path = format!("{}.flac", "t".repeat(300));
+        let t = VirtualTree::build(&[(10, path)]);
+        let kids = t.children(VirtualTree::ROOT).unwrap();
+        assert_eq!(kids.len(), 1);
+        let name = kids.keys().next().unwrap();
+        assert!(name.len() <= 255, "leaf is {} bytes", name.len());
+        assert!(
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("flac")),
+            "extension preserved"
+        );
+    }
+
+    #[test]
+    fn over_long_directory_component_truncates_to_255() {
+        let path = format!("{}/Song.flac", "d".repeat(300));
+        let t = VirtualTree::build(&[(10, path)]);
+        let dir = t
+            .children(VirtualTree::ROOT)
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(dir.len() <= 255, "dir is {} bytes", dir.len());
+    }
+
+    #[test]
+    fn over_long_component_truncates_on_utf8_boundary() {
+        let path = format!("{}.flac", "€".repeat(100));
+        let t = VirtualTree::build(&[(10, path)]);
+        let name = t
+            .children(VirtualTree::ROOT)
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(name.len() <= 255);
+        assert!(
+            std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"))
+        );
+    }
+
+    #[test]
+    fn colliding_over_long_leaves_stay_distinct_and_within_255() {
+        let path = format!("{}.flac", "x".repeat(300));
+        let entries: Vec<(i64, String)> = (0..12).map(|i| (i, path.clone())).collect();
+        let t = VirtualTree::build(&entries);
+        let kids = t.children(VirtualTree::ROOT).unwrap();
+        assert_eq!(kids.len(), 12, "all collisions disambiguated distinctly");
+        for name in kids.keys() {
+            // Each name packs to the full NAME_MAX: the base leaf trims its stem to
+            // leave room for `.flac`, and every ` (k)`-disambiguated sibling trims
+            // per-rank to land on exactly 255 bytes. Pinning the exact length (not
+            // just `<= 255`) guards suffix_candidate's budget arithmetic.
+            assert_eq!(name.len(), 255, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn over_long_leaf_with_oversize_extension_truncates_whole_name() {
+        // When the extension alone is NAME_MAX-1 bytes there is zero byte budget for
+        // any stem, so the leaf falls back to a plain whole-name truncation rather
+        // than emitting an empty-stem `.ext`. Guards truncate_component's
+        // `budget > 0` filter.
+        let path = format!("{}.{}", "s".repeat(300), "e".repeat(254));
+        let t = VirtualTree::build(&[(10, path)]);
+        let name = t
+            .children(VirtualTree::ROOT)
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(name.len() <= 255, "{} bytes", name.len());
+        assert!(
+            !name.starts_with('.'),
+            "no empty-stem leading dot: {name:?}"
+        );
+        assert!(
+            name.starts_with('s'),
+            "whole-name truncation keeps the stem prefix"
+        );
+    }
+
+    #[test]
+    fn over_long_collisions_render_deterministically() {
+        let path = format!("{}.flac", "y".repeat(300));
+        let entries: Vec<(i64, String)> = (0..5).map(|i| (i, path.clone())).collect();
+        let a = VirtualTree::build(&entries);
+        let b = VirtualTree::build(&entries);
+        let ak: Vec<_> = a
+            .children(VirtualTree::ROOT)
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let bk: Vec<_> = b
+            .children(VirtualTree::ROOT)
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(ak, bk);
+    }
+
+    #[test]
+    fn dot_and_dotdot_plain_components_are_dropped() {
+        // A plain field rendering to exactly "." or ".." (e.g. an artist tagged ".")
+        // must not create a directory that collides with readdir's hardcoded "."/"..".
+        let t = VirtualTree::build(&[(10, "./Song.flac".into()), (20, "../Tune.flac".into())]);
+        assert!(t.lookup(VirtualTree::ROOT, ".").is_none());
+        assert!(t.lookup(VirtualTree::ROOT, "..").is_none());
+        // The dropped level collapses; the leaf lands directly under root.
+        assert!(t.lookup(VirtualTree::ROOT, "Song.flac").is_some());
+        assert!(t.lookup(VirtualTree::ROOT, "Tune.flac").is_some());
     }
 }

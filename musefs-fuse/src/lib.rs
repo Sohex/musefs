@@ -5,7 +5,7 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -141,6 +141,40 @@ pub fn to_file_attr(attr: &Attr, uid: u32, gid: u32, fallback_mtime: SystemTime)
         flags: 0,
     }
 }
+/// Assemble a directory's readdir listing: `.`, `..`, the children, then the
+/// optional Spotlight marker. Pure (no DB/tree access) so it is unit-testable.
+fn assemble_dir_listing(
+    ino: u64,
+    parent: u64,
+    entries: Vec<(String, u64, bool)>,
+    marker: Option<(u64, FileType, String)>,
+) -> Vec<(u64, FileType, String)> {
+    let mut listing: Vec<(u64, FileType, String)> = Vec::with_capacity(entries.len() + 2);
+    listing.push((ino, FileType::Directory, ".".to_string()));
+    listing.push((parent, FileType::Directory, "..".to_string()));
+    for (name, child, is_dir) in entries {
+        let kind = if is_dir {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        };
+        listing.push((child, kind, name));
+    }
+    if let Some(entry) = marker {
+        listing.push(entry);
+    }
+    listing
+}
+
+/// Build a directory's full readdir listing once. Shared by `opendir`
+/// (snapshotted per fh) and the `readdir` fallback for an unknown fh.
+fn build_dir_listing(core: &Musefs, ino: u64) -> Result<Vec<(u64, FileType, String)>, CoreError> {
+    let entries = core.readdir(ino)?;
+    let parent = core.parent(ino).unwrap_or(ino);
+    let marker = platform::spotlight::marker_dir_entry(ino);
+    Ok(assemble_dir_listing(ino, parent, entries, marker))
+}
+
 /// Clears the `fire_poll_refresh` single-flight gate when the poll task ends,
 /// on every exit path including a panic in `poll_refresh_notify` (#89).
 struct PollPendingGuard<'a>(&'a AtomicBool);
@@ -171,6 +205,14 @@ pub struct MusefsFs {
     /// Per-OS kernel-passthrough state (live backing registrations + sticky
     /// disable on Linux; a no-op marker elsewhere).
     passthrough: platform::passthrough::PassthroughState,
+    /// Per-open directory listing snapshots, keyed by the fh handed out by
+    /// `opendir`. A paginated `readdir` clones the `Arc` under the lock and
+    /// serves it lock-free, so building the listing is O(N) per `ls`, not per
+    /// `readdir` call (#176).
+    #[allow(clippy::type_complexity)]
+    dir_handles: Arc<Mutex<std::collections::HashMap<u64, Arc<Vec<(u64, FileType, String)>>>>>,
+    /// Monotonic dir-handle id (starts at 1; 0 stays the stateless sentinel).
+    dir_fh: Arc<AtomicU64>,
 }
 
 impl MusefsFs {
@@ -192,6 +234,8 @@ impl MusefsFs {
             notifier: Arc::new(OnceLock::new()),
             poll_pending: Arc::new(AtomicBool::new(false)),
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
+            dir_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            dir_fh: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -316,6 +360,25 @@ impl Filesystem for MusefsFs {
         });
     }
 
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        self.fire_poll_refresh();
+        let core = Arc::clone(&self.core);
+        let handles = Arc::clone(&self.dir_handles);
+        let counter = Arc::clone(&self.dir_fh);
+        self.pool.execute(move || {
+            let listing = match build_dir_listing(&core, ino.0) {
+                Ok(l) => l,
+                Err(e) => return reply.error(reply_errno("opendir", ino.0, &e)),
+            };
+            let fh = counter.fetch_add(1, Ordering::Relaxed);
+            handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(fh, Arc::new(listing));
+            reply.opened(FileHandle(fh), FopenFlags::empty());
+        });
+    }
+
     fn release(
         &self,
         _req: &Request,
@@ -333,6 +396,21 @@ impl Filesystem for MusefsFs {
             self.passthrough.remove(fh.get());
             self.core.release_handle(Fh::from(fh));
         }
+        reply.ok();
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.dir_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&fh.0);
         reply.ok();
     }
 
@@ -389,39 +467,29 @@ impl Filesystem for MusefsFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
         self.fire_poll_refresh();
-        let entries = match self.core.readdir(ino.0) {
-            Ok(e) => e,
-            Err(e) => return reply.error(reply_errno("readdir", ino.0, &e)),
+        let snapshot = self
+            .dir_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&fh.0)
+            .map(Arc::clone);
+        // Lock released; the reply loop below runs without holding it.
+        let listing = match snapshot {
+            Some(l) => l,
+            // Unknown fh (e.g. fh 0): build once inline so we never regress.
+            None => match build_dir_listing(&self.core, ino.0) {
+                Ok(l) => Arc::new(l),
+                Err(e) => return reply.error(reply_errno("readdir", ino.0, &e)),
+            },
         };
-        let parent = self.core.parent(ino.0).unwrap_or(ino.0);
-
-        // `.` and `..` first, then the children. `offset` is the index already
-        // consumed by a previous call; `reply.add` returns true when the buffer
-        // is full, at which point we stop and reply.
-        let mut listing: Vec<(u64, fuser::FileType, String)> =
-            Vec::with_capacity(entries.len() + 2);
-        listing.push((ino.0, fuser::FileType::Directory, ".".to_string()));
-        listing.push((parent, fuser::FileType::Directory, "..".to_string()));
-        for (name, child, is_dir) in entries {
-            let kind = if is_dir {
-                fuser::FileType::Directory
-            } else {
-                fuser::FileType::RegularFile
-            };
-            listing.push((child, kind, name));
-        }
-        if let Some(entry) = platform::spotlight::marker_dir_entry(ino.0) {
-            listing.push(entry);
-        }
-
-        for (i, (child, kind, name)) in listing.into_iter().enumerate().skip(usize_from(offset)) {
-            // The offset stored is the index of the *next* entry to return.
-            if reply.add(INodeNo(child), (i + 1) as u64, kind, &name) {
+        for (i, (child, kind, name)) in listing.iter().enumerate().skip(usize_from(offset)) {
+            // The stored offset is the index of the *next* entry to return.
+            if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
                 break;
             }
         }
@@ -633,6 +701,23 @@ mod tests {
             !fs.poll_pending.load(Ordering::SeqCst),
             "guard must clear the gate after the task finishes"
         );
+    }
+
+    #[test]
+    fn assemble_dir_listing_puts_dot_and_dotdot_first() {
+        let entries = vec![
+            ("Song.flac".to_string(), 42, false),
+            ("Sub".to_string(), 43, true),
+        ];
+        let listing = assemble_dir_listing(7, 3, entries, None);
+        assert_eq!(listing.len(), 4);
+        assert_eq!(listing[0], (7, FileType::Directory, ".".to_string()));
+        assert_eq!(listing[1], (3, FileType::Directory, "..".to_string()));
+        assert_eq!(
+            listing[2],
+            (42, FileType::RegularFile, "Song.flac".to_string())
+        );
+        assert_eq!(listing[3], (43, FileType::Directory, "Sub".to_string()));
     }
 }
 
