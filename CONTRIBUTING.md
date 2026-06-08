@@ -57,17 +57,69 @@ sudo target/debug/deps/<e2e_test_binary> --ignored <passthrough_test_name>
 
 ### FreeBSD e2e
 
-The FUSE e2e suite also runs on FreeBSD. CI uses the `freebsd` job in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml), which invokes the
-committed scripts in [`scripts/freebsd-vm/`](scripts/freebsd-vm/README.md).
-Those scripts provision the VM (`rust`, `git`, `ffmpeg`, and the `fusefs`
-kernel module) and then run the same workspace + `--ignored` FUSE test
-commands locally and in CI. Keep a FreeBSD VM image under the gitignored
-`/.scratch/`.
+The FUSE e2e suite also runs on FreeBSD, via the scripts in
+[`scripts/freebsd-vm/`](scripts/freebsd-vm/). They are the single source of
+truth — CI and local runs invoke the same scripts, so they can't drift:
 
-macOS support is best-effort: CI builds there with `fuser`'s
-`macos-no-mount` feature, and the platform-specific logic is unit-tested.
-Mounted e2e on macOS/FUSE-T is not yet validated.
+- `run-local.sh` — host-side orchestrator: creates and boots a FreeBSD VM under
+  qemu/KVM and runs the suite in it. All artifacts go under the gitignored
+  `.scratch/freebsd/`.
+- `provision.sh` — in-guest: installs `git`, `ffmpeg`, and the current stable
+  Rust toolchain via `rustup` (FreeBSD's packaged `rust` lags and is too old for
+  some deps), and loads the `fusefs` kernel module. Run by `run-local.sh` and CI.
+- `run-e2e.sh` — in-guest: `cargo test --workspace` then the `--ignored` FUSE
+  e2e suite (guards that `ffmpeg` is present so the decode/encode tests don't
+  silently skip).
+- `serial-run.py` — drives the VM over its serial console (the console driver
+  used by `run-local.sh`).
+
+**CI.** The `freebsd` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+runs these in a `vmactions/freebsd-vm` VM. It is expensive (a full in-VM build),
+so it does **not** run on every PR — only when the FUSE/mount surface or its
+harness changed (`musefs-fuse/`, `scripts/freebsd-vm/`, `ci.yml`) or on a release
+tag (`v*`).
+
+**Local run (one command):**
+
+```sh
+sh scripts/freebsd-vm/run-local.sh
+```
+
+Host prerequisites (Debian/Ubuntu packages in parens): `qemu-system-x86_64` +
+`qemu-img` (`qemu-system-x86`, `qemu-utils`), `xorriso` (`xorriso`), `curl` +
+`xz` (`curl`, `xz-utils`), `python3`. `/dev/kvm` for acceleration (it runs
+without it, just far slower); ~6 GB free under `.scratch/`.
+
+What it does, end to end:
+
+1. Downloads the official `FreeBSD-<rel>-amd64-BASIC-CLOUDINIT-ufs.qcow2` image
+   into `.scratch/freebsd/` (cached; downloaded once). That image directs its
+   console to the serial line, which is what lets the harness drive it.
+2. Creates a fresh overlay disk from the cached base each run (cheap reset).
+3. Boots the VM headless and logs in as `root` over the serial console (the
+   image has an empty root password — no SSH, no keys, no cloud-init).
+4. Serves this repo over a throwaway HTTP server on qemu's user-net gateway
+   (`10.0.2.2`); the guest `fetch`es and unpacks it.
+5. Runs `provision.sh` + `run-e2e.sh` over the console and propagates the exit
+   code, then powers the VM off.
+
+Tunable via env: `FREEBSD_REL` (default `14.3-RELEASE`), `VM_MEM`, `VM_SMP`,
+`VM_DISK`, `HTTP_PORT`, `RUN_TIMEOUT`.
+
+To drive your own VM instead, boot any FreeBSD image and, from the repo root
+inside it as root, run `sh scripts/freebsd-vm/provision.sh` then
+`sh scripts/freebsd-vm/run-e2e.sh`.
+
+Notes:
+
+- FreeBSD uses fuser's pure-rust `/dev/fuse` backend — **no libfuse package**;
+  only the `fusefs` kernel module and base-system `mount_fusefs(8)` are needed.
+- Kernel FUSE passthrough (StructureOnly) is **Linux-only**; on FreeBSD it falls
+  back to daemon serving.
+
+macOS support is best-effort: CI builds there with `fuser`'s `macos-no-mount`
+feature, and the platform-specific logic is unit-tested. Mounted e2e on
+macOS/FUSE-T is not yet validated.
 
 ## Test tiers beyond `cargo test`
 
