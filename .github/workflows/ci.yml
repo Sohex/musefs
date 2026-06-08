@@ -167,6 +167,30 @@ jobs:
       - name: Test
         run: python -m pytest contrib/beets/tests -v
 
+  lidarr:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Lint
+        run: |
+          ruff check contrib/lidarr/
+          ruff format --check contrib/lidarr/
+      - name: Install python-musefs (local, unpublished dependency)
+        run: pip install -e contrib/python-musefs
+      - name: Install Lidarr integration
+        run: pip install -e "contrib/lidarr[test]"
+      - name: Test
+        run: python -m pytest contrib/lidarr/tests -v
+
   picard:
     needs: changes
     if: needs.changes.outputs.src == 'true'
@@ -254,7 +278,7 @@ jobs:
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, interop, python-musefs, beets, picard, e2e, macos, freebsd]
+    needs: [changes, check, interop, python-musefs, beets, lidarr, picard, e2e, macos, freebsd]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results

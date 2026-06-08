@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Lidarr integration:** a new `contrib/lidarr/` package that drives
+  symlink-based placeholder imports and syncs Lidarr metadata into the musefs
+  SQLite store.
 - **crates.io distribution:** the `musefs` binary is published to crates.io as of
   this release and installable with `cargo install musefs`. A new thin `musefs` wrapper crate
   owns the binary (`musefs-cli` is now a library crate), and a tag-triggered
@@ -21,6 +24,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Lidarr custom-script env var casing:** Lidarr stores custom-script
+  environment variables in a .NET `StringDictionary`, which lowercases every key,
+  so a Linux script actually receives `lidarr_sourcepath` / `lidarr_eventtype`
+  rather than the PascalCase names Lidarr's docs list. The integration read the
+  PascalCase names, so with a real Lidarr every import failed and every event
+  parsed as unsupported. Lidarr env vars are now resolved case-insensitively.
+  Found by the issue #141 real-instance smoke run.
 - **VorbisComment parse OOM (DoS):** a crafted comment block declaring a huge
   entry count made `Vec::with_capacity` attempt a multi-gigabyte allocation; the
   pre-allocation is now bounded by the readable byte count. Found by the new

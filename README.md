@@ -30,9 +30,10 @@ from the database, spliced in front of your original, untouched audio.
   the mount presents one consistent, template-driven tree for players and
   media managers.
 - **Tag editing without touching files.** Edit the SQLite store (directly,
-  or via the [beets plugin](contrib/beets/README.md) or
-  [Picard plugin](contrib/picard/README.md)) and the mounted view updates
-  live — no remount, no rewrite, no re-rip anxiety.
+  or via the [beets plugin](contrib/beets/README.md),
+  [Picard plugin](contrib/picard/README.md), or
+  [Lidarr integration](contrib/lidarr/README.md)) and the mounted view
+  updates live — no remount, no rewrite, no re-rip anxiety.
 - **Lossless-by-construction experimentation.** Try a retag, a different
   organization scheme, new cover art — the originals are physically
   read-only to the mount.
@@ -95,7 +96,7 @@ Two modes:
   only the directory tree is virtual.
 
 Edit tags or art in the database while mounted (another `scan`, a
-beets/Picard sync, raw SQL) and the view refreshes automatically.
+beets/Picard/Lidarr sync, raw SQL) and the view refreshes automatically.
 
 Run `musefs <command> --help` for the full flag list.
 
@@ -138,7 +139,8 @@ originals. Nothing is ever copied or rewritten.
 **Where do my edited tags live?**
 In the SQLite store (`--db`). Edit it with the
 [beets](contrib/beets/README.md) or [Picard](contrib/picard/README.md)
-plugins, or with plain SQL — the schema is a documented, stable contract
+plugins, the [Lidarr](contrib/lidarr/README.md) integration, or with plain
+SQL — the schema is a documented, stable contract
 (see [ARCHITECTURE.md](ARCHITECTURE.md#the-sqlite-store)).
 
 **Do edits show up without remounting?**
@@ -196,8 +198,8 @@ cargo install --git https://github.com/Sohex/musefs musefs
 All five formats ship with embedded cover art and binary-tag preservation.
 The serve path has been through a performance/concurrency hardening pass for
 real-world player and media-manager access against large libraries on
-HDD/SSD/NFS, and the parsers are continuously fuzzed. beets and Picard
-plugins ship in [`contrib/`](contrib/). See the
+HDD/SSD/NFS, and the parsers are continuously fuzzed. beets, Picard, and
+Lidarr plugins ship in [`contrib/`](contrib/). See the
 [CHANGELOG](CHANGELOG.md) for history.
 
 Deeper reading: [ARCHITECTURE.md](ARCHITECTURE.md) for how it works,

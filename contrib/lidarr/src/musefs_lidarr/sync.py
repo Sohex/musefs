@@ -1,0 +1,293 @@
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass
+
+from musefs_common import (
+    SyncStats,
+    check_schema_version,
+    connect,
+    prune_missing,
+    realpath_key,
+    run_scan,
+    sync_files,
+    track_id_for_path,
+)
+
+from .errors import ConfigError
+from .events import LidarrEvent
+from .import_link import LinkMode, parse_link_mode
+from .mapping import records_for_paths
+
+
+@dataclass(frozen=True)
+class SyncConfig:
+    """musefs-side sync settings: DB path, link mode, autoscan, scanner binary."""
+
+    db_path: str
+    link_mode: LinkMode
+    autoscan: bool = True
+    musefs_bin: str = "musefs"
+
+
+@dataclass(frozen=True)
+class EventPayloads:
+    """Lidarr API data for an event: paths plus track/album/artist lookups."""
+
+    paths: list[str]
+    track_files: list[dict]
+    tracks: list[dict]
+    albums_by_id: dict[int, dict]
+    artists_by_id: dict[int, dict]
+
+
+def _env_bool(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def config_from_env(environ: dict[str, str] | None = None) -> SyncConfig:
+    """Build a :class:`SyncConfig` from ``MUSEFS_*`` env vars.
+
+    Raises ``ConfigError`` if ``MUSEFS_DB`` is unset.
+    """
+    env = os.environ if environ is None else environ
+    db_path = env.get("MUSEFS_DB")
+    if not db_path:
+        raise ConfigError("MUSEFS_DB is required")
+    return SyncConfig(
+        db_path=db_path,
+        link_mode=parse_link_mode(env),
+        autoscan=_env_bool(env.get("MUSEFS_LIDARR_AUTOSCAN"), default=True),
+        musefs_bin=env.get("MUSEFS_BIN") or "musefs",
+    )
+
+
+def scan_if_enabled(*, config: SyncConfig, paths: list[str], runner=run_scan) -> None:
+    """Run ``musefs scan`` over ``paths`` when autoscan is on and paths exist."""
+    if not config.autoscan or not paths:
+        return
+    runner(config.musefs_bin, config.db_path, paths)
+
+
+def _log_skipped(skipped, *, warning_printer) -> None:
+    for item in skipped:
+        warning_printer(
+            f"musefs-lidarr-sync: skipped {item.path}: {item.reason}",
+            file=sys.stderr,
+        )
+
+
+def sync_records(
+    *,
+    config: SyncConfig,
+    event: LidarrEvent,
+    track_files: list[dict],
+    tracks: list[dict],
+    albums_by_id: dict[int, dict],
+    artists_by_id: dict[int, dict],
+    warning_printer=print,
+) -> SyncStats:
+    """Map the event's paths to records and write their tags into the store.
+
+    Paths with no matching track row (e.g. unscanned) are skipped and counted;
+    the write runs in a single transaction that rolls back on error.
+    """
+    records, skipped_paths = records_for_paths(
+        paths=event.paths,
+        track_files=track_files,
+        tracks=tracks,
+        albums_by_id=albums_by_id,
+        artists_by_id=artists_by_id,
+    )
+    _log_skipped(skipped_paths, warning_printer=warning_printer)
+
+    stats = SyncStats(skipped=len(skipped_paths))
+    conn = connect(config.db_path)
+    try:
+        check_schema_version(conn)
+        present_records = []
+        for record in records:
+            if track_id_for_path(conn, record.key) is None:
+                stats.skipped += 1
+                warning_printer(
+                    (
+                        "musefs-lidarr-sync: skipped "
+                        f"{record.key}: no matching musefs track row after scan"
+                    ),
+                    file=sys.stderr,
+                )
+                continue
+            present_records.append(record)
+
+        sync_files(conn, present_records, stats=stats)
+        conn.commit()
+        return stats
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def sync_rename_prune(*, config: SyncConfig, previous_paths: list[str]) -> int:
+    """Prune store rows for a rename's old paths; return the count pruned.
+
+    No-op in symlink mode (the backing path is the unchanged real file).
+    """
+    if config.link_mode is LinkMode.SYMLINK or not previous_paths:
+        return 0
+
+    previous_keys = [realpath_key(path) for path in previous_paths]
+    conn = connect(config.db_path)
+    try:
+        placeholders = ",".join("?" for _ in previous_keys)
+        rows = conn.execute(
+            f"SELECT id FROM tracks WHERE backing_path IN ({placeholders})",
+            previous_keys,
+        ).fetchall()
+        pruned = prune_missing(conn, [row[0] for row in rows])
+        conn.commit()
+        return pruned
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dedupe_ints(values) -> list[int]:
+    seen = set()
+    out = []
+    for value in values:
+        ident = _int_or_none(value)
+        if ident is None or ident in seen:
+            continue
+        seen.add(ident)
+        out.append(ident)
+    return out
+
+
+def _album_ids(track_files: list[dict]) -> list[int]:
+    return _dedupe_ints(track_file.get("albumId") for track_file in track_files)
+
+
+def _artist_ids(track_files: list[dict], *fallback_ids) -> list[int]:
+    values = [track_file.get("artistId") for track_file in track_files]
+    values.extend(fallback_ids)
+    return _dedupe_ints(values)
+
+
+def _album_artist_id(album: dict) -> int | None:
+    artist = album.get("artist") or {}
+    return _int_or_none(
+        album.get("artistId")
+        or album.get("artist_id")
+        or artist.get("artistId")
+        or artist.get("id")
+    )
+
+
+def collect_event_payloads(*, client, event: LidarrEvent) -> EventPayloads:
+    """Fetch the track/album/artist data an event needs from the Lidarr API.
+
+    Scopes the queries by album id when present, else by artist id; raises
+    ``ConfigError`` if the event carries neither.
+    """
+    if event.album_id is not None:
+        track_files = client.track_files(album_id=event.album_id)
+        tracks = client.tracks(album_id=event.album_id)
+        album = client.album(event.album_id)
+        album_id = _int_or_none(album.get("id"))
+        if album_id is None:
+            raise ConfigError("Lidarr album payload is missing an id")
+        album_artist_id = _album_artist_id(album)
+        artists_by_id = {
+            artist_id: client.artist(artist_id)
+            for artist_id in _artist_ids(track_files, event.artist_id, album_artist_id)
+        }
+        return EventPayloads(
+            paths=[track_file["path"] for track_file in track_files],
+            track_files=track_files,
+            tracks=tracks,
+            albums_by_id={album_id: album},
+            artists_by_id=artists_by_id,
+        )
+    if event.artist_id is not None:
+        track_files = client.track_files(artist_id=event.artist_id)
+        tracks = client.tracks(artist_id=event.artist_id)
+        albums_by_id = {album_id: client.album(album_id) for album_id in _album_ids(track_files)}
+        artists_by_id = {
+            artist_id: client.artist(artist_id)
+            for artist_id in _artist_ids(track_files, event.artist_id)
+        }
+        return EventPayloads(
+            paths=[track_file["path"] for track_file in track_files],
+            track_files=track_files,
+            tracks=tracks,
+            albums_by_id=albums_by_id,
+            artists_by_id=artists_by_id,
+        )
+    raise ConfigError("Lidarr event must include Lidarr_Artist_Id or Lidarr_Album_Id")
+
+
+def collect_all_payloads(*, client) -> EventPayloads:
+    """Fetch every artist's track/album data for a full ``--all`` backfill."""
+    artists = client.artists()
+    track_files = []
+    tracks = []
+    albums_by_id: dict[int, dict] = {}
+    artists_by_id: dict[int, dict] = {}
+
+    for artist in artists:
+        artist_id = _int_or_none(artist.get("id"))
+        if artist_id is None:
+            continue
+        artists_by_id[artist_id] = artist
+        artist_track_files = client.track_files(artist_id=artist_id)
+        artist_tracks = client.tracks(artist_id=artist_id)
+        track_files.extend(artist_track_files)
+        tracks.extend(artist_tracks)
+        for album_id in _album_ids(artist_track_files):
+            albums_by_id.setdefault(album_id, client.album(album_id))
+
+    return EventPayloads(
+        paths=[track_file["path"] for track_file in track_files],
+        track_files=track_files,
+        tracks=tracks,
+        albums_by_id=albums_by_id,
+        artists_by_id=artists_by_id,
+    )
+
+
+def sync_event_with_payloads(
+    *,
+    config: SyncConfig,
+    event: LidarrEvent,
+    track_files: list[dict],
+    tracks: list[dict],
+    albums_by_id: dict[int, dict],
+    artists_by_id: dict[int, dict],
+    scanner=run_scan,
+) -> SyncStats:
+    """Scan, write tags, then prune renames for one event; return its stats."""
+    scan_if_enabled(config=config, paths=event.paths, runner=scanner)
+    stats = sync_records(
+        config=config,
+        event=event,
+        track_files=track_files,
+        tracks=tracks,
+        albums_by_id=albums_by_id,
+        artists_by_id=artists_by_id,
+    )
+    sync_rename_prune(config=config, previous_paths=event.previous_paths)
+    return stats

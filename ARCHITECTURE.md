@@ -148,7 +148,10 @@ no longer matches its backing file, never undefined behavior.
 The shared Python library (`contrib/python-musefs/`) encodes this contract
 for plugin authors, including a generated copy of the schema
 (`musefs_common/schema.py`, regenerated from `schema.rs` by a drift-guarded
-test — see [CONTRIBUTING](CONTRIBUTING.md)).
+test — see [CONTRIBUTING](CONTRIBUTING.md)). The [Lidarr integration](contrib/lidarr/README.md)
+uses the same shared library from a Custom Script workflow. Its Lidarr
+destination tree is only a tracking aid, made of symlinks by default; musefs
+remains the consumer-facing filesystem.
 
 External tools can also offload path layout entirely: a plugin evaluates its own
 (arbitrarily complex) path logic, writes the resulting relative path into a
