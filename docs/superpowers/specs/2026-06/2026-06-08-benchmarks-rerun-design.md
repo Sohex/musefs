@@ -102,13 +102,12 @@ before-PR3), `32be8f0` (after-PR3), `0881b31` (after-#114), `9b49a63`
 - **`bandwidth` tier (~30 GiB)** lands on durable `/data` only (won't fit RAM);
   it is long-running, so a single run is acceptable unless cheap to repeat.
 
-## Gates handling
+## Gates removed entirely
 
 The per-pass "Gates" subsections (byte-identical proptests, in-diff mutation) are
-**correctness** results established at merge time, not performance. They are kept
-as concise historical notes (green at merge). The cheap byte-identical proptests
-are re-run **once on current `main`** as a freshness sanity check; the expensive
-in-diff mutation gate is **not** re-run. This file is about performance.
+**correctness** results, not performance, and are **dropped from `BENCHMARKS.md`
+entirely** — not re-run, not kept as notes. Correctness lives in the test suite,
+CI, and the per-PR history; this file is about performance only.
 
 ## Rewritten file structure (layered)
 
@@ -117,9 +116,8 @@ in-diff mutation gate is **not** re-run. This file is about performance.
 2. **Methodology** — the block above, written once (machine, before/after
    definition, run convention, storage mapping).
 3. **Per-pass detail sections** — same passes as today, each trimmed to: a
-   one-line "what changed", the before/after table with this-box numbers, the
-   reproduce command, and a one-line gate note. Repeated methodology boilerplate
-   removed.
+   one-line "what changed", the before/after table with this-box numbers, and the
+   reproduce command. No gate notes; repeated methodology boilerplate removed.
 
 ## Out of scope
 
