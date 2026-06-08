@@ -63,7 +63,7 @@ git -C "$WT" checkout <after_commit> -- <bench_file>   # after the before-checko
 
 **Capture:** tee every run to `$RAW/<pass>-<side>-<n>.txt` and transcribe the key number(s) into `$RESULTS` under that pass's heading.
 
-**Run counts:** ignored-test benches → 3 runs, record median (+ spread if noisy). Criterion → its own sampling via `--save-baseline before` then `--baseline before`; record Criterion's reported median + change %/p-value.
+**Run counts:** ignored-test benches → 3 runs, record median (+ spread if noisy). Criterion → its own sampling via `--save-baseline <pass>-before` then `--baseline <pass>-before`; **namespace the baseline name per task** (`sp3-before`, `sp4-before`, …) so a crash mid-plan can't compare against a clobbered baseline (all read_throughput tasks share one `CARGO_TARGET_DIR/criterion`). Record Criterion's reported median + change %/p-value.
 
 ---
 
@@ -153,7 +153,10 @@ git -C "$WT" checkout --detach ccbbfaa^ && git -C "$WT" reset --hard ccbbfaa^ &&
 Expected: detached at `ccbbfaa^`.
 
 - [ ] **Step 2: §1 — durable small-files, per-format sweep (BEFORE), 3 runs.**
+
+`corpus.rs::generate()` does `create_dir_all` but never clears the target dir, so a tier left behind would pollute the next scan. Clear before each tier:
 ```bash
+rm -rf /data/musefs-bench/corpus/*
 for n in 1 2 3; do MUSEFS_BENCH_TIER=ci MUSEFS_BENCH_DIR=/data/musefs-bench/corpus \
   cargo test --release -p musefs-core --features metrics --test bench_ingest \
   -- --ignored --nocapture bench_cold_scan_and_revalidate 2>&1 | tee "$RAW/sp1-s1-before-$n.txt"; done
@@ -162,6 +165,7 @@ Expected: per-format `wall_ms` / `scan_bytes_read` lines. Record per-format medi
 
 - [ ] **Step 3: §2 — durable bandwidth tier (BEFORE), 1 run (~30 GiB, long).**
 ```bash
+rm -rf /data/musefs-bench/corpus/*
 MUSEFS_BENCH_TIER=bandwidth MUSEFS_BENCH_FORMAT_MIX=flac MUSEFS_BENCH_DIR=/data/musefs-bench/corpus \
   cargo test --release -p musefs-core --features metrics --test bench_ingest \
   -- --ignored --nocapture bench_cold_scan_and_revalidate 2>&1 | tee "$RAW/sp1-s2-before.txt"
@@ -234,14 +238,14 @@ Criterion `read_throughput`, RAM. Benches: `sequential_read`, `concurrent_read_w
 ```bash
 source /data/musefs-bench/env.sh; cd "$WT"; export TMPDIR=/dev/shm
 git -C "$WT" checkout --detach 'e8d56bd^' && git -C "$WT" reset --hard 'e8d56bd^' && git -C "$WT" clean -fdx -e target
-cargo bench -p musefs-core --bench read_throughput -- --save-baseline before sequential_read concurrent_read_walk 2>&1 | tee "$RAW/sp3-before.txt"
+cargo bench -p musefs-core --bench read_throughput -- --save-baseline sp3-before sequential_read concurrent_read_walk 2>&1 | tee "$RAW/sp3-before.txt"
 ```
 Expected: per-format `sequential_read` medians + `m16_plus_walker`.
 
 - [ ] **Step 2: Checkout AFTER, compare to baseline.**
 ```bash
 git -C "$WT" checkout --detach e8d56bd && git -C "$WT" reset --hard e8d56bd && git -C "$WT" clean -fdx -e target
-cargo bench -p musefs-core --bench read_throughput -- --baseline before sequential_read concurrent_read_walk 2>&1 | tee "$RAW/sp3-after.txt"
+cargo bench -p musefs-core --bench read_throughput -- --baseline sp3-before sequential_read concurrent_read_walk 2>&1 | tee "$RAW/sp3-after.txt"
 ```
 Expected: Criterion prints change % + p-value per bench id. Record under `## SP3` (per-format Δ + the >10%-rise gate check + m16 contention Δ).
 
@@ -260,13 +264,13 @@ Expected: compiles. **If not** (new bench calls SP4-only API): record the failur
 
 - [ ] **Step 2: Save BEFORE baseline (ogg-focused, all formats for context).**
 ```bash
-cargo bench -p musefs-core --bench read_throughput -- --save-baseline before cold_first_read seek_read sequential_read 2>&1 | tee "$RAW/sp4-before.txt"
+cargo bench -p musefs-core --bench read_throughput -- --save-baseline sp4-before cold_first_read seek_read sequential_read 2>&1 | tee "$RAW/sp4-before.txt"
 ```
 
 - [ ] **Step 3: Checkout AFTER, compare.**
 ```bash
 git -C "$WT" checkout --detach a62453b && git -C "$WT" reset --hard a62453b && git -C "$WT" clean -fdx -e target
-cargo bench -p musefs-core --bench read_throughput -- --baseline before cold_first_read seek_read sequential_read 2>&1 | tee "$RAW/sp4-after.txt"
+cargo bench -p musefs-core --bench read_throughput -- --baseline sp4-before cold_first_read seek_read sequential_read 2>&1 | tee "$RAW/sp4-after.txt"
 ```
 Expected: ogg `cold_first_read`/`seek_read` big wins; other formats flat. Record under `## SP4`.
 
@@ -359,13 +363,13 @@ Criterion `read_throughput`, RAM. All four benches exist at `32be8f0^` (post-SP4
 ```bash
 source /data/musefs-bench/env.sh; cd "$WT"; export TMPDIR=/dev/shm
 git -C "$WT" checkout --detach '32be8f0^' && git -C "$WT" reset --hard '32be8f0^' && git -C "$WT" clean -fdx -e target
-cargo bench -p musefs-core --bench read_throughput -- --save-baseline before sequential_read concurrent_read_walk cold_first_read seek_read 2>&1 | tee "$RAW/pr3-before.txt"
+cargo bench -p musefs-core --bench read_throughput -- --save-baseline pr3-before sequential_read concurrent_read_walk cold_first_read seek_read 2>&1 | tee "$RAW/pr3-before.txt"
 ```
 
 - [ ] **Step 2: AFTER compare.**
 ```bash
 git -C "$WT" checkout --detach 32be8f0 && git -C "$WT" reset --hard 32be8f0 && git -C "$WT" clean -fdx -e target
-cargo bench -p musefs-core --bench read_throughput -- --baseline before sequential_read concurrent_read_walk cold_first_read seek_read 2>&1 | tee "$RAW/pr3-after.txt"
+cargo bench -p musefs-core --bench read_throughput -- --baseline pr3-before sequential_read concurrent_read_walk cold_first_read seek_read 2>&1 | tee "$RAW/pr3-after.txt"
 ```
 Expected: `sequential_read` all formats improve ~10–14% (no >10% rise); ogg cold/seek held or improved. Record under `## PR3`.
 
@@ -377,13 +381,13 @@ Criterion `read_throughput`, RAM. No overlay.
 ```bash
 source /data/musefs-bench/env.sh; cd "$WT"; export TMPDIR=/dev/shm
 git -C "$WT" checkout --detach '2e6674e^' && git -C "$WT" reset --hard '2e6674e^' && git -C "$WT" clean -fdx -e target
-cargo bench -p musefs-core --bench read_throughput -- --save-baseline before 2>&1 | tee "$RAW/h136-before.txt"
+cargo bench -p musefs-core --bench read_throughput -- --save-baseline h136-before 2>&1 | tee "$RAW/h136-before.txt"
 ```
 
 - [ ] **Step 2: AFTER compare.**
 ```bash
 git -C "$WT" checkout --detach 2e6674e && git -C "$WT" reset --hard 2e6674e && git -C "$WT" clean -fdx -e target
-cargo bench -p musefs-core --bench read_throughput -- --baseline before 2>&1 | tee "$RAW/h136-after.txt"
+cargo bench -p musefs-core --bench read_throughput -- --baseline h136-before 2>&1 | tee "$RAW/h136-after.txt"
 ```
 Expected: all workloads within noise; `seek_read` trends 2–6% faster. Record under `## #136`. Per the headline rule, this pass's at-a-glance entry is "within noise".
 
@@ -423,8 +427,15 @@ fi
 DB="$WORK/m.db"; rm -f "$DB"
 "$BIN" scan "$WORK/backing" --db "$DB" >/dev/null
 "$BIN" mount "$WORK/mnt" --db "$DB" --mode structure-only --template '$title' &
-MPID=$!; sleep 2
-VIRT=$(find "$WORK/mnt" -type f | head -1)
+MPID=$!
+# Poll for mount readiness instead of a fixed sleep (the CLI gives no ready signal).
+VIRT=""
+for _ in $(seq 1 60); do
+  VIRT=$(find "$WORK/mnt" -type f 2>/dev/null | head -1 || true)
+  [ -n "$VIRT" ] && break
+  sleep 0.5
+done
+if [ -z "$VIRT" ]; then echo "ERROR: mount never exposed a file" >&2; kill "$MPID" 2>/dev/null || true; exit 1; fi
 cat "$VIRT" > /dev/null   # warm backing into page cache
 for i in 1 2 3; do dd if="$VIRT" of=/dev/null bs=1M 2>&1 | tail -1; done
 fusermount3 -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt" 2>/dev/null || true
@@ -451,31 +462,35 @@ sudo rm -rf /dev/shm/pt-after
 ```
 Expected: passthrough path faster (old file: ~9.3 GB/s, ~3.3×). Record after median + ratio under `## #112`. **If the mount or scan errors** (e.g. WAV rejected, or passthrough not negotiated), record the exact error and fall back to the FLAC fixture approach from `musefs-fuse/tests/passthrough.rs`; do not report a number you didn't measure.
 
-### Task 11: Cumulative summary (`16caba4` → current `main`)
+### Task 11: Cumulative summary (derived — composed deltas + current-`main` absolutes)
 
-Current-`main` harness at **both** ends (the `16caba4` end predates the refresh sweep and cold/seek benches). Goal: per-subsystem before→after deltas for the at-a-glance table.
+**A same-harness `16caba4`→`main` measurement is infeasible and must NOT be attempted** (verified: `MountConfig.case_insensitive` and `scan_directory_with`/`ScanOptions`/`revalidate_with` don't exist at `16caba4`, so main's harnesses can't compile there; and the `16caba4`-era harness omits the now-required `case_insensitive` field, so it can't compile on `main` either). The cumulative summary is therefore **derived**: compose the per-pass isolated deltas already collected, anchored to current-`main` absolutes. No old-commit overlay build.
 
-- [ ] **Step 1: Overlay current-main harnesses onto `16caba4`.**
+- [ ] **Step 1: Measure current-`main` absolutes for the three representative benches (one-time, on `main`, native harness — no overlay).**
 ```bash
 source /data/musefs-bench/env.sh; cd "$WT"; export TMPDIR=/dev/shm
-git -C "$WT" checkout --detach 16caba4 && git -C "$WT" reset --hard 16caba4 && git -C "$WT" clean -fdx -e target
-git -C "$WT" checkout main -- musefs-core/tests/bench_ingest.rs musefs-core/tests/bench_refresh.rs musefs-core/benches/read_throughput.rs musefs-core/tests/common
-cargo bench -p musefs-core --bench read_throughput --no-run 2>&1 | tee "$RAW/cumulative-overlay-build.txt"
-cargo test --release -p musefs-core --test bench_refresh --no-run 2>&1 | tee -a "$RAW/cumulative-overlay-build.txt"
-cargo test --release -p musefs-core --features metrics --test bench_ingest --no-run 2>&1 | tee -a "$RAW/cumulative-overlay-build.txt"
-```
-Expected: all three compile. **If a harness won't build against `16caba4`** (likely — large API drift over the whole journey): record which, and for those subsystems report the cumulative delta against the **earliest commit whose harness does build** (e.g. SP1's `ccbbfaa^` for ingest), noting the baseline used. Do not fabricate a `16caba4` number.
-
-- [ ] **Step 2: Run one representative bench per subsystem (BEFORE = 16caba4-or-fallback).**
-- ingest: `MUSEFS_BENCH_TIER=ci MUSEFS_BENCH_DIR=/data/musefs-bench/corpus cargo test --release -p musefs-core --features metrics --test bench_ingest -- --ignored --nocapture bench_cold_scan_and_revalidate` (durable, flac row as headline) → `$RAW/cumulative-ingest-before.txt`
-- refresh: `cargo test -p musefs-core --release --test bench_refresh bench_refresh_one_across_library_sizes -- --ignored --nocapture` → `$RAW/cumulative-refresh-before.txt`
-- serve: `cargo bench -p musefs-core --bench read_throughput -- --save-baseline cum16 sequential_read seek_read` → `$RAW/cumulative-serve-before.txt`
-
-- [ ] **Step 3: Checkout AFTER = current `main`, run the same three.**
-```bash
 git -C "$WT" checkout --detach main && git -C "$WT" reset --hard main && git -C "$WT" clean -fdx -e target
+# ingest (durable flac, the SP1 headline tier):
+rm -rf /data/musefs-bench/corpus/*
+MUSEFS_BENCH_TIER=ci MUSEFS_BENCH_DIR=/data/musefs-bench/corpus \
+  cargo test --release -p musefs-core --features metrics --test bench_ingest \
+  -- --ignored --nocapture bench_cold_scan_and_revalidate 2>&1 | tee "$RAW/cumulative-ingest-main.txt"
+# refresh (the #69/#114 flat-vs-linear story):
+cargo test -p musefs-core --release --test bench_refresh \
+  bench_refresh_one_across_library_sizes -- --ignored --nocapture 2>&1 | tee "$RAW/cumulative-refresh-main.txt"
+# serve:
+cargo bench -p musefs-core --bench read_throughput -- sequential_read seek_read cold_first_read 2>&1 | tee "$RAW/cumulative-serve-main.txt"
 ```
-Re-run the three commands (serve uses `--baseline cum16`), writing `-after` raw files. Record per-subsystem before→after deltas under `## Cumulative`.
+Expected: today's absolute numbers per subsystem. Record under `## Cumulative` as the "current main" anchor.
+
+- [ ] **Step 2: Compose the per-subsystem cumulative delta from the isolated passes.**
+
+No new runs. Using the deltas already in `$RESULTS`, write one derived line per subsystem, naming the contributing passes and which one dominates:
+- **ingest** = SP1 (Task 1) ∘ PR2 (Task 7) — dominated by SP1's durable fsync win; PR2 is the −128 B/file + move-not-clone refinement.
+- **refresh** = SP2 (Task 2) ∘ #69 (Task 5) ∘ #114 (Task 6) — the O(N)→flat journey; quote refresh-1@largest-N then-vs-now.
+- **serve** = SP3 (Task 3) ∘ SP4 (Task 4) ∘ PR3 (Task 8) ∘ #136 (Task 9) — quote the `sequential_read` and ogg `cold_first_read` then-vs-now.
+
+Record under `## Cumulative` labelled **"composed from per-pass isolated deltas; non-isolating"**. Do not multiply unrelated speedups into a single headline number — present the chain and name the dominant pass.
 
 ---
 

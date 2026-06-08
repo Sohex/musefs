@@ -96,7 +96,7 @@ harness overlay (see Harness availability).
 | Phase 6 PR3 (#70) | `32be8f0^` | `32be8f0` | `read_throughput` | — | `/dev/shm` |
 | HeaderCache (#136) | `2e6674e^` | `2e6674e` | `read_throughput` | — | `/dev/shm` |
 | Issue #112 passthrough | `0881b31` (pre) | `faec017` | `dd` on real mount, **sudo** | n/a | RAM-cached backing |
-| **Cumulative** | `16caba4` | current `main` | all three (current-`main` harness at both ends) | n/a | matched per-bench |
+| **Cumulative** | `16caba4` (nominal) | current `main` | derived: composed per-pass deltas + current-`main` absolutes (no same-harness run — API drift; see Harness availability) | n/a | n/a |
 
 Resolved anchors: `16caba4` (baseline), SP1 `ccbbfaa`, SP2 `ed5f380`, SP3
 `e8d56bd`, SP4 `a62453b`, #69 `e7ae912`, PR2 `2d4faf3`, #114 `0881b31`, PR3
@@ -117,9 +117,18 @@ missing test fns), run, then restore.** This is sound because the harness only
 *measures* — it does not touch the optimization code under test, so the before
 column reflects the old code measured by the new yardstick. This is the same
 technique the current file already uses for #69 (BENCHMARKS.md "Before (main —
-apply 4-point sweep edit first)"). Apply it identically for the **cumulative**
-row, whose `16caba4` end predates both benches — use the current-`main` harness at
-both ends, labelled non-isolating.
+apply 4-point sweep edit first)").
+
+**The cumulative row cannot use this technique.** A same-harness `16caba4`↔`main`
+measurement is infeasible: the current-`main` harnesses require `MountConfig`'s
+`case_insensitive` field and `scan_directory_with`/`ScanOptions`/`revalidate_with`
+(none exist at `16caba4`), and the `16caba4`-era harness omits the now-required
+`case_insensitive` field (so it won't compile on `main` either). API drift over
+the whole journey makes any single harness incompatible with one end. The
+cumulative summary is therefore **derived, not freshly measured**: per subsystem,
+**compose the per-pass isolated deltas already collected** (Tasks 1–9) and anchor
+them to current-`main` absolute numbers measured once with the `main` harness.
+Labelled explicitly as composed / non-isolating.
 
 ## Known wrinkles
 
@@ -180,8 +189,10 @@ GB/s. The reproduce command in the rewritten §112 section points at the script.
 - **SP2/SP4 detail depth:** *keep* the richer "why" context — SP2's Stage A/B
   narrative and SP4's crc linear↔matrix↔memo evolution table stay. They explain
   the implementation journey; only repeated methodology boilerplate is trimmed.
-- **Cumulative row form:** per-subsystem before→after **deltas** (`16caba4` →
-  current `main`), one line each for ingest / refresh / serve.
+- **Cumulative row form:** per-subsystem **deltas**, one line each for ingest /
+  refresh / serve, composed from the per-pass isolated deltas and anchored to
+  current-`main` absolutes (a same-harness `16caba4`→`main` run is infeasible —
+  see Harness availability). Labelled composed / non-isolating.
 
 ## Out of scope
 
