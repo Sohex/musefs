@@ -96,6 +96,32 @@ pub fn locate_audio_bounded(prefix: &[u8], file_len: u64) -> Result<Extent<WavBo
     Ok(Extent::Complete(locate_audio(prefix)?))
 }
 
+/// Best-effort WAV bounds when the file exceeds the probe budget: the `fmt `/`data`
+/// chunk headers sit at the front and are present in `prefix`, but the `data`
+/// payload — and hence any metadata chunks trailing it — lie beyond what we are
+/// willing to read. Trusts the declared `data` length, validated against the real
+/// `file_len` so a corrupt header claiming a payload larger than the file is still
+/// rejected. Unlike [`locate_audio`] the payload need not be present in `prefix`;
+/// any tags trailing it are necessarily lost.
+pub fn locate_audio_at_ceiling(prefix: &[u8], file_len: u64) -> Result<WavBounds> {
+    riff_wave_start(prefix)?;
+    let chunks = walk_chunks(prefix);
+    let has_fmt = chunks.iter().any(|(id, _, _)| id == b"fmt ");
+    let data = chunks.iter().find(|(id, _, _)| id == b"data");
+    match (has_fmt, data) {
+        (true, Some(&(_, off, len))) => {
+            if (off as u64).saturating_add(len) > file_len {
+                return Err(FormatError::Malformed);
+            }
+            Ok(WavBounds {
+                audio_offset: off as u64,
+                audio_length: len,
+            })
+        }
+        _ => Err(FormatError::NotWav),
+    }
+}
+
 /// Read the preserved structural chunks (`fmt `, optional `fact`) from the front
 /// of the file (everything before the `data` payload). Errors if `fmt ` is absent
 /// or a preserved chunk's payload is truncated.
@@ -692,6 +718,76 @@ mod tests {
             Extent::NeedMore { up_to } => assert_eq!(up_to, file_len),
             other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
         }
+    }
+
+    /// A front-only RIFF/WAVE buffer: `fmt ` (16 bytes) plus a `data` chunk header
+    /// declaring `data_len` bytes of payload, with the payload itself absent — the
+    /// shape the ceiling probe sees when the audio runs past the read budget. The
+    /// `data` payload begins at offset 44.
+    fn wav_front(data_len: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fmt ");
+        body.extend_from_slice(&16u32.to_le_bytes());
+        body.extend(std::iter::repeat_n(0u8, 16));
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&u32::try_from(data_len).unwrap().to_le_bytes());
+        let mut v = b"RIFF".to_vec();
+        v.extend_from_slice(&0u32.to_le_bytes()); // size field unused by the walk
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(&body);
+        v
+    }
+
+    #[test]
+    fn locate_audio_at_ceiling_trusts_data_header_without_payload() {
+        let data_len = 200u64;
+        let front = wav_front(data_len);
+        let audio_offset = front.len() as u64; // 44
+        let file_len = audio_offset + data_len;
+        let b = locate_audio_at_ceiling(&front, file_len).unwrap();
+        assert_eq!(b.audio_offset, audio_offset);
+        assert_eq!(b.audio_length, data_len);
+    }
+
+    #[test]
+    fn locate_audio_at_ceiling_accepts_data_shorter_than_file() {
+        // Chunks trailing the payload make the file larger than `off + len`.
+        let data_len = 200u64;
+        let front = wav_front(data_len);
+        let audio_offset = front.len() as u64;
+        let file_len = audio_offset + data_len + 64;
+        let b = locate_audio_at_ceiling(&front, file_len).unwrap();
+        assert_eq!(b.audio_offset, audio_offset);
+        assert_eq!(b.audio_length, data_len);
+    }
+
+    #[test]
+    fn locate_audio_at_ceiling_rejects_data_running_past_file() {
+        // A header claiming more payload than the file holds is corrupt, not trusted.
+        let front = wav_front(1_000);
+        let audio_offset = front.len() as u64;
+        let file_len = audio_offset + 10;
+        assert_eq!(
+            locate_audio_at_ceiling(&front, file_len),
+            Err(FormatError::Malformed)
+        );
+    }
+
+    #[test]
+    fn locate_audio_at_ceiling_requires_fmt_chunk() {
+        // `data` present but no `fmt `: not a usable WAV, must be rejected.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&200u32.to_le_bytes());
+        let mut front = b"RIFF".to_vec();
+        front.extend_from_slice(&0u32.to_le_bytes());
+        front.extend_from_slice(b"WAVE");
+        front.extend_from_slice(&body);
+        let file_len = front.len() as u64 + 200;
+        assert_eq!(
+            locate_audio_at_ceiling(&front, file_len),
+            Err(FormatError::NotWav)
+        );
     }
 
     #[test]

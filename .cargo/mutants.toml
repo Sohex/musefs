@@ -72,20 +72,25 @@ exclude_re = [
     # only return `NeedMore{up_to}` with `up_to > want` (we widen precisely to a
     # block end past the prefix), so `up_to.min(probe_cap)` always wins the max and
     # the `want + 1` term is never selected. `+`->`-`/`*` are equivalent.
-    'musefs-core/src/scan\.rs:264:31:',
+    'musefs-core/src/scan\.rs:270:31:',
     # probe_file post-loop fallback guard `(prefix.len() as u64) < probe_cap`: when
     # it differs, the only effect is a redundant re-read up to the probe cap that
     # feeds the same `probe_full` result. The >8-retry path that could diverge is
     # unreachable given the probers' exact (FLAC/MP3/WAV) / geometric (Ogg) NeedMore.
-    'musefs-core/src/scan\.rs:271:30:',
-    # probe_file oversize-skip diagnostic `probed.is_none() && file_len >
-    # MAX_PROBE_BYTES`: gates only a `log::warn!` (mirroring the M4A
-    # `MetadataTooLarge` warn). It has no effect on the returned `Probed`/skip
-    # decision or any persisted state, so every mutation of the condition is
-    # unobservable — a pure observability shim, like the metrics counters above.
-    # Both operands (`&&` at :25, the `>` compare at :37) excluded.
-    'musefs-core/src/scan\.rs:275:25:',
-    'musefs-core/src/scan\.rs:275:37:',
+    'musefs-core/src/scan\.rs:277:30:',
+    # probe_file WAV ceiling-fallback guard `file_len > MAX_PROBE_BYTES` (`>` at
+    # :21): differs from `>=` only at file_len == MAX_PROBE_BYTES exactly, where the
+    # whole file already fits within probe_cap — so `probe_full` parses it (valid)
+    # or `locate_audio_at_ceiling` rejects it on the same off+len>file_len bound
+    # (corrupt), giving the identical skip either way. The ceiling branch is never
+    # the deciding path at the boundary, so the mutant is equivalent.
+    'musefs-core/src/scan\.rs:288:21:',
+    # probe_file oversize-skip diagnostic `file_len > MAX_PROBE_BYTES` (`>` at :17):
+    # gates only a `log::warn!` (mirroring the M4A `MetadataTooLarge` warn). It has
+    # no effect on the returned `Probed`/skip decision or any persisted state, so
+    # every mutation of the condition is unobservable — a pure observability shim,
+    # like the metrics counters above.
+    'musefs-core/src/scan\.rs:293:17:',
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     'musefs-core/src/scan\.rs:620:46:',

@@ -101,6 +101,23 @@ pub(crate) struct Probed {
     structural_blocks: Vec<(String, Vec<u8>)>,
 }
 
+/// Assemble a WAV [`Probed`] from located audio bounds, reading tags and pictures
+/// from `prefix`. Shared by the bounded, full-buffer, and ceiling probe paths.
+fn wav_probed(prefix: &[u8], bounds: &wav::WavBounds) -> Probed {
+    let (binary_tags, promoted) = wav::read_binary_tags(prefix);
+    let mut tags = wav::read_tags(prefix);
+    tags.extend(promoted);
+    Probed {
+        format: Format::Wav,
+        audio_offset: bounds.audio_offset,
+        audio_length: bounds.audio_length,
+        tags,
+        pictures: wav::read_pictures(prefix),
+        binary_tags,
+        structural_blocks: Vec::new(),
+    }
+}
+
 /// Full-buffer probe (legacy path). Retained as the reference implementation the
 /// bounded path is checked against (see the equivalence property test).
 pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
@@ -159,18 +176,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
         })
     } else if has_ext(path, "wav") {
         let bounds = wav::locate_audio(bytes).ok()?;
-        let (binary_tags, promoted) = wav::read_binary_tags(bytes);
-        let mut tags = wav::read_tags(bytes);
-        tags.extend(promoted);
-        Some(Probed {
-            format: Format::Wav,
-            audio_offset: bounds.audio_offset,
-            audio_length: bounds.audio_length,
-            tags,
-            pictures: wav::read_pictures(bytes),
-            binary_tags,
-            structural_blocks: Vec::new(),
-        })
+        Some(wav_probed(bytes, &bounds))
     } else {
         None
     }
@@ -271,14 +277,26 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
     if (prefix.len() as u64) < probe_cap {
         prefix = read_window(&file, usize_from(probe_cap))?;
     }
-    let probed = probe_full(path, &prefix);
-    if probed.is_none() && file_len > MAX_PROBE_BYTES {
+    if let Some(p) = probe_full(path, &prefix) {
+        return Ok(Some(p));
+    }
+    // A WAV whose `data` payload runs past the probe ceiling fails the strict
+    // full-buffer parse (the payload isn't present to bound), yet its `fmt `/`data`
+    // headers sit at the front: trust the declared bounds and serve the audio,
+    // accepting the loss of any tag chunks trailing the payload.
+    if has_ext(path, "wav")
+        && file_len > MAX_PROBE_BYTES
+        && let Ok(bounds) = wav::locate_audio_at_ceiling(&prefix, file_len)
+    {
+        return Ok(Some(wav_probed(&prefix, &bounds)));
+    }
+    if file_len > MAX_PROBE_BYTES {
         log::warn!(
             "skipping {}: no parseable metadata within first {MAX_PROBE_BYTES} bytes",
             path.display()
         );
     }
-    Ok(probed)
+    Ok(None)
 }
 
 /// Outcome of a single bounded dispatch attempt against the current `prefix`.
@@ -349,20 +367,7 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
         }
     } else if has_ext(path, "wav") {
         match wav::locate_audio_bounded(prefix, file_len) {
-            Ok(Extent::Complete(b)) => {
-                let (binary_tags, promoted) = wav::read_binary_tags(prefix);
-                let mut tags = wav::read_tags(prefix);
-                tags.extend(promoted);
-                Probe::Done(Probed {
-                    format: Format::Wav,
-                    audio_offset: b.audio_offset,
-                    audio_length: b.audio_length,
-                    tags,
-                    pictures: wav::read_pictures(prefix),
-                    binary_tags,
-                    structural_blocks: Vec::new(),
-                })
-            }
+            Ok(Extent::Complete(b)) => Probe::Done(wav_probed(prefix, &b)),
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
             Err(_) => Probe::Skip,
         }
@@ -1797,5 +1802,50 @@ mod bounded_probe_tests {
         drop(f);
 
         assert!(probe_file(&path, len, WINDOW).unwrap().is_none());
+    }
+
+    #[test]
+    fn oversize_wav_is_served_via_data_header() {
+        // A valid WAV whose `data` payload exceeds the probe ceiling (any
+        // recording more than a few minutes long) must still be ingested: the
+        // `data` chunk header sits at the front, so the declared audio bounds
+        // are known without reading the payload. Skipping it would drop every
+        // sufficiently long WAV in the library.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.wav");
+
+        let data_len: u64 = MAX_PROBE_BYTES + (16 << 20); // 80 MiB payload
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&44_100u32.to_le_bytes());
+        fmt.extend_from_slice(&88_200u32.to_le_bytes());
+        fmt.extend_from_slice(&2u16.to_le_bytes());
+        fmt.extend_from_slice(&16u16.to_le_bytes());
+
+        let mut front = b"RIFF".to_vec();
+        // The RIFF size field is not validated by the chunk walk; placeholder.
+        front.extend_from_slice(&0u32.to_le_bytes());
+        front.extend_from_slice(b"WAVE");
+        front.extend_from_slice(b"fmt ");
+        front.extend_from_slice(&u32::try_from(fmt.len()).unwrap().to_le_bytes());
+        front.extend_from_slice(&fmt);
+        front.extend_from_slice(b"data");
+        front.extend_from_slice(&u32::try_from(data_len).unwrap().to_le_bytes());
+        let audio_offset = front.len() as u64;
+        let file_len = audio_offset + data_len;
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&front).unwrap();
+        f.set_len(file_len).unwrap();
+        drop(f);
+
+        let probed = probe_file(&path, file_len, WINDOW)
+            .unwrap()
+            .expect("oversize wav should probe");
+        assert_eq!(probed.format, Format::Wav);
+        assert_eq!(probed.audio_offset, audio_offset);
+        assert_eq!(probed.audio_length, data_len);
     }
 }
