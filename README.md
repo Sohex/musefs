@@ -151,7 +151,9 @@ splice at stale offsets). Run `musefs scan --revalidate` to re-probe it.
 ## Requirements
 
 - Rust (2021 edition) and Cargo to build/install.
-- Linux with FUSE (`/dev/fuse` and libfuse) to mount.
+- A supported OS with FUSE to mount — Linux (`/dev/fuse` + libfuse) or FreeBSD
+  (`/dev/fuse` + the `fusefs` kernel module; no libfuse). macOS (FUSE-T) is
+  best-effort. See [Platform support](#platform-support) for details.
 
 ## Platform support
 
