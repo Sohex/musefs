@@ -15,6 +15,7 @@ fn config() -> MountConfig {
         default_fallback: "Unknown".to_string(),
         mode: Mode::Synthesis,
         poll_interval: Duration::ZERO, // no debounce: each poll actually polls
+        case_insensitive: false,
     }
 }
 

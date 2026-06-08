@@ -40,6 +40,9 @@ pub struct MountConfig {
     /// Minimum time between `data_version` polls; a metadata-op storm within this
     /// window skips the poll entirely. `Duration::ZERO` disables debouncing.
     pub poll_interval: std::time::Duration,
+    /// Compare filenames case-insensitively (dirs merge, files disambiguate).
+    /// Set by the CLI (`--case-insensitive`), default true on macOS.
+    pub case_insensitive: bool,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -321,7 +324,10 @@ impl Musefs {
         alloc: &mut InodeAllocator,
     ) -> Result<(VirtualTree, HashMap<i64, TrackRenderState>)> {
         let (entries, snapshot) = Self::render_entries(db, template, config)?;
-        Ok((VirtualTree::build_with(&entries, alloc), snapshot))
+        Ok((
+            VirtualTree::build_with_ci(&entries, alloc, config.case_insensitive),
+            snapshot,
+        ))
     }
 
     /// Rebuild the tree from the current DB contents (used after external edits).
@@ -356,7 +362,7 @@ impl Musefs {
             .pool
             .with(|db| Self::render_entries(db, &self.template, &self.config))?;
         let mut alloc = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes");
-        let tree = VirtualTree::build_with(&entries, &mut alloc);
+        let tree = VirtualTree::build_with_ci(&entries, &mut alloc, self.config.case_insensitive);
         alloc.prune_retired(&tree);
         drop(alloc);
         self.tree.store(Arc::new(tree));
@@ -504,7 +510,11 @@ impl Musefs {
                     let mut entries: Vec<(i64, String)> =
                         snap.iter().map(|(&id, s)| (id, s.path.clone())).collect();
                     entries.sort_by_key(|(id, _)| *id);
-                    let reference = VirtualTree::build_with(&entries, &mut ref_alloc);
+                    let reference = VirtualTree::build_with_ci(
+                        &entries,
+                        &mut ref_alloc,
+                        self.config.case_insensitive,
+                    );
                     debug_assert!(
                         tree.equiv(&reference),
                         "incremental tree diverged from build_with"
@@ -519,7 +529,7 @@ impl Musefs {
                 let mut entries: Vec<(i64, String)> =
                     snap.iter().map(|(&id, s)| (id, s.path.clone())).collect();
                 entries.sort_by_key(|(id, _)| *id);
-                VirtualTree::build_with(&entries, &mut alloc)
+                VirtualTree::build_with_ci(&entries, &mut alloc, self.config.case_insensitive)
             }
         };
         alloc.prune_retired(&tree);
@@ -636,6 +646,16 @@ impl Musefs {
         }
         // The guard clears `refreshing` on every exit path (incl. panic).
         let _guard = RefreshGuard(&self.refreshing);
+
+        // A folded tree can't use the incremental path (it navigates by exact
+        // rendered name, which a merged/folded tree mismatches), so always
+        // full-rebuild. This is intentional — NOT a changelog gap — so route
+        // through force_full_rebuild to keep the gap counter and the "changelog
+        // gap" diagnostics meaningful (the O(changed) fast path stays
+        // case-sensitive-only).
+        if self.config.case_insensitive {
+            return self.force_full_rebuild(&mut on_changed);
+        }
 
         let old_tree = self.tree.load_full();
         match self.rebuild_incremental() {
@@ -1156,6 +1176,7 @@ mod tests {
             default_fallback: "Unknown".to_string(),
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1247,6 +1268,7 @@ mod tests {
             default_fallback: "Unknown".to_string(),
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1337,6 +1359,7 @@ mod tests {
             default_fallback: "Unknown".to_string(),
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
         };
 
         let (entries, snapshot) =
@@ -1375,6 +1398,7 @@ mod tests {
             default_fallback: "Unknown".to_string(),
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1421,6 +1445,7 @@ mod tests {
             default_fallback: "Unknown".to_string(),
             mode: Mode::Synthesis,
             poll_interval: interval,
+            case_insensitive: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
         (dir, fs)
@@ -1487,6 +1512,7 @@ mod tests {
             default_fallback: "Unknown".to_string(),
             mode,
             poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
         };
 
         // StructureOnly: exposed, and the fd refers to the backing inode.

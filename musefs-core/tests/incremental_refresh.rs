@@ -22,6 +22,14 @@ fn config() -> MountConfig {
         default_fallback: "Unknown".into(),
         mode: Mode::Synthesis,
         poll_interval: Duration::ZERO,
+        case_insensitive: false,
+    }
+}
+
+fn config_ci() -> MountConfig {
+    MountConfig {
+        case_insensitive: true,
+        ..config()
     }
 }
 
@@ -82,6 +90,76 @@ fn incremental_refresh_matches_full_rebuild_over_edits() {
         tree_fingerprint(&fs).keys().collect::<Vec<_>>(),
         tree_fingerprint(&reference).keys().collect::<Vec<_>>(),
         "incremental and full-rebuild paths must match"
+    );
+}
+
+#[test]
+fn case_insensitive_refresh_merges_and_matches_full_rebuild() {
+    let target = small_corpus(2);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+
+    // Make the two tracks' artists differ only by case (same album so they share
+    // a parent): under folding the artist dir must MERGE.
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+    writer
+        .replace_tags(
+            ids[0],
+            &[
+                Tag::new("ARTIST", "Foo", 0),
+                Tag::new("ALBUM", "Al", 0),
+                Tag::new("TITLE", "One", 0),
+            ],
+        )
+        .unwrap();
+    writer
+        .replace_tags(
+            ids[1],
+            &[
+                Tag::new("ARTIST", "foo", 0),
+                Tag::new("ALBUM", "Al", 0),
+                Tag::new("TITLE", "Two", 0),
+            ],
+        )
+        .unwrap();
+
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config_ci()).unwrap();
+
+    // Exactly one top-level artist directory (the merged "Foo"/"foo").
+    let fp = tree_fingerprint(&fs);
+    let top_dirs: std::collections::BTreeSet<String> = fp
+        .keys()
+        .map(|p| p.split('/').next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        top_dirs.len(),
+        1,
+        "case-variant artists must merge into one dir"
+    );
+
+    // An external edit is still picked up - incremental is bypassed, so this goes
+    // through a full folded rebuild - and the result matches a fresh folded build.
+    writer
+        .replace_tags(
+            ids[1],
+            &[
+                Tag::new("ARTIST", "foo", 0),
+                Tag::new("ALBUM", "Al", 0),
+                Tag::new("TITLE", "Renamed", 0),
+            ],
+        )
+        .unwrap();
+    fs.poll_refresh().unwrap();
+
+    let reference = Musefs::open(Db::open(&db_path).unwrap(), config_ci()).unwrap();
+    assert_eq!(
+        tree_fingerprint(&fs).keys().collect::<Vec<_>>(),
+        tree_fingerprint(&reference).keys().collect::<Vec<_>>(),
+        "case-insensitive refresh (full rebuild) must match a fresh folded build"
     );
 }
 

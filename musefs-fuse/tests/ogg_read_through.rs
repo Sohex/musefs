@@ -62,6 +62,7 @@ fn config() -> MountConfig {
         default_fallback: "Unknown".to_string(),
         mode: musefs_core::Mode::Synthesis,
         poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
     }
 }
 

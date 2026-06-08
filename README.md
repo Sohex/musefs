@@ -94,6 +94,7 @@ All tuning flags have sensible defaults; adjust them to your backing store:
 | `--max-readahead-kib` | `512` | Kernel read-ahead window. Larger hides HDD/NFS latency during sequential playback (clamped to the kernel maximum). |
 | `--max-background` | `64` | Max outstanding background (read-ahead/async) requests the kernel keeps in flight. |
 | `--keep-cache` | disabled | Keep the kernel page cache across opens. External re-tags auto-invalidate the affected files, so cached bytes never go stale. |
+| `--case-insensitive <true\|false>` | OS default | Compare filenames case-insensitively. Case-variant directories merge into one (first-seen casing wins) and case-variant files get a numeric suffix (e.g. `Song (2)`). Defaults to `true` on macOS and `false` on Linux/FreeBSD; case-insensitive mounts refresh via a full rebuild rather than the incremental fast path. |
 
 ## Supported formats
 

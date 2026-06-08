@@ -74,6 +74,12 @@ pub struct MountArgs {
     /// changes.
     #[arg(long)]
     pub keep_cache: bool,
+    /// Compare filenames case-insensitively: case-variant directories merge and
+    /// case-variant files are disambiguated. Defaults to true on macOS (whose
+    /// volumes are usually case-insensitive), false on Linux/FreeBSD. Override
+    /// with `--case-insensitive false` (e.g. a case-sensitive APFS volume).
+    #[arg(long, default_value_t = cfg!(target_os = "macos"), action = clap::ArgAction::Set)]
+    pub case_insensitive: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -147,6 +153,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         default_fallback: args.default_fallback.clone(),
         mode: args.mode.into(),
         poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),
+        case_insensitive: args.case_insensitive,
     };
     let fuse_config = musefs_fuse::FuseConfig {
         ttl: std::time::Duration::from_millis(args.attr_ttl_ms),
@@ -248,11 +255,44 @@ mod tests {
         assert_eq!(config.default_fallback, "Unknown");
         assert_eq!(config.mode, musefs_core::Mode::Synthesis);
         assert!(!fuse_config.keep_cache);
+        assert_eq!(config.case_insensitive, cfg!(target_os = "macos"));
         // ms → Duration.
         assert_eq!(config.poll_interval, std::time::Duration::from_millis(250));
         assert_eq!(fuse_config.ttl, std::time::Duration::from_millis(750));
         // KiB → bytes.
         assert_eq!(fuse_config.max_readahead, 64 * 1024);
         assert_eq!(fuse_config.max_background, 32);
+    }
+
+    #[test]
+    fn case_insensitive_defaults_to_os() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "mount", "/mnt", "--db", "/tmp/x.db"]).unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected Mount");
+        };
+        let (config, _) = parse_mount_config(&args);
+        assert_eq!(config.case_insensitive, cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn case_insensitive_is_overridable() {
+        use clap::Parser;
+        for (val, want) in [("true", true), ("false", false)] {
+            let cli = Cli::try_parse_from([
+                "musefs",
+                "mount",
+                "/mnt",
+                "--db",
+                "/tmp/x.db",
+                "--case-insensitive",
+                val,
+            ])
+            .unwrap();
+            let Command::Mount(args) = cli.command else {
+                panic!("expected Mount");
+            };
+            assert_eq!(args.case_insensitive, want);
+        }
     }
 }

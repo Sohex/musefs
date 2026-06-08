@@ -190,6 +190,7 @@ fn bench_read_under_latency() {
         default_fallback: "Unknown".to_string(),
         mode: Mode::Synthesis,
         poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
     };
     fn first_inode(fs: &Musefs, dir: u64) -> Option<u64> {
         for (_, ino, is_dir) in fs.readdir(dir).unwrap() {
