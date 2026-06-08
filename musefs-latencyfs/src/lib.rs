@@ -427,8 +427,11 @@ impl fuser::Filesystem for PassthroughFs {
                 if unsafe { libc::statvfs(cstr.as_ptr(), s.as_mut_ptr()) } == 0 {
                     // SAFETY: statvfs returned 0, so it fully initialized `s`.
                     let s = unsafe { s.assume_init() };
-                    #[allow(clippy::unnecessary_cast)]
-                    // field types vary by platform (rust-lang/rust-clippy#17166)
+                    // statvfs field types vary by platform: the count fields are
+                    // u64 on Linux/FreeBSD (so `as u64` is unnecessary) but u32 on
+                    // macOS (so it's a lossless widening). Allow both lints rather
+                    // than branch per-OS (rust-lang/rust-clippy#17166).
+                    #[allow(clippy::unnecessary_cast, clippy::cast_lossless)]
                     return reply.statfs(
                         s.f_blocks as u64,
                         s.f_bfree as u64,
