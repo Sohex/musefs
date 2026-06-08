@@ -46,7 +46,9 @@ pub struct MountArgs {
     /// Path to the SQLite database.
     #[arg(long)]
     pub db: PathBuf,
-    /// Path template, e.g. "$albumartist/$album/$title".
+    /// Path template, e.g. "$albumartist/$album/$title". Supports ${a|b}
+    /// fallback chains, [...] conditional sections ($[/$] for literal
+    /// brackets), and $!{field} path fields that keep '/' as separators.
     #[arg(long, default_value = "$artist/$title")]
     pub template: String,
     /// Fallback value substituted for any missing template field.

@@ -63,13 +63,24 @@ musefs mount /path/to/mountpoint --db library.db \
 ```
 
 `mount` blocks until the filesystem is unmounted (`fusermount -u`, or
-Ctrl-C). Paths come from a beets-style template: `$field` or `${field}`
-substitutes a tag field (e.g. `$artist`, `$album`, `$title`, `$tracknumber`,
-`$date`, `$genre` — any tag key in the store works, matched
-case-insensitively); anything else is literal. A missing field renders as
-the `--default-fallback` value (default `Unknown`). Name collisions get a
-deterministic `(2)`, `(3)`, … suffix. The default template is
-`$artist/$title`.
+Ctrl-C). Paths come from a beets-style template (matched case-insensitively;
+any tag key in the store works):
+
+- `$field` / `${field}` — substitute a tag field (e.g. `$artist`, `$album`,
+  `$title`, `$tracknumber`, `$date`, `$genre`).
+- `${albumartist|artist}` — **fallback chain**: the first present field wins,
+  before the `--default-fallback` value (default `Unknown`) is used.
+- `[ … ]` — **conditional section**: the bracketed text is emitted only when at
+  least one field inside it is present. So `$album[ - CD $disc]` yields
+  `Album - CD 2`, or just `Album` on a single-disc release. Write `$[` / `$]`
+  for literal brackets.
+- `$!{field}` — **path field**: the value's `/` are kept as directory
+  separators (each segment sanitized; empty/`.`/`..` dropped). Lets an external
+  tool precompute a whole relative path into one tag and mount it as
+  `--template '$!{beets_path}'`.
+
+Anything else is literal. Name collisions get a deterministic `(2)`, `(3)`, …
+suffix. The default template is `$artist/$title`.
 
 Two modes:
 
