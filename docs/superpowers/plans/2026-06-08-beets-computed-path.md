@@ -32,7 +32,7 @@
 - Modify: `contrib/beets/tests/conftest.py` (extend `FakeItem`)
 - Test: `contrib/beets/tests/test_build_records.py`
 
-- [ ] **Step 1: Extend `FakeItem` with a `destination()` method**
+- [x] **Step 1: Extend `FakeItem` with a `destination()` method**
 
 In `contrib/beets/tests/conftest.py`, in `FakeItem.__init__`, the tail currently reads:
 
@@ -65,7 +65,7 @@ Replace that block with (adds two pops before the catch-all, and a `destination`
         return self._album
 ```
 
-- [ ] **Step 2: Write the failing `_core` tests**
+- [x] **Step 2: Write the failing `_core` tests**
 
 Append to `contrib/beets/tests/test_build_records.py`:
 
@@ -137,12 +137,12 @@ def test_build_records_uses_real_beets_destination(tmp_path):
 
 (`_core` and `SyncStats` are already imported at the top of `test_build_records.py`; if not, add `from beetsplug import _core` and `from musefs_common import SyncStats`. The `beets` import is local to the test — beets is installed in the venv.)
 
-- [ ] **Step 3: Run the new tests to verify they fail**
+- [x] **Step 3: Run the new tests to verify they fail**
 
 Run: `contrib/beets/.venv/bin/python -m pytest contrib/beets/tests/test_build_records.py -q`
 Expected: FAIL — `build_records` doesn't accept `write_path`/`log` yet and emits no `beets_path` pair (`TypeError: build_records() got an unexpected keyword argument 'write_path'` for the relevant cases; the first test fails its assertion).
 
-- [ ] **Step 4: Add the path helpers to `_core.py`**
+- [x] **Step 4: Add the path helpers to `_core.py`**
 
 In `contrib/beets/beetsplug/_core.py`, insert these two functions immediately above `build_records`:
 
@@ -175,7 +175,7 @@ def _computed_path_or_skip(item, log):
         return ""
 ```
 
-- [ ] **Step 5: Thread `write_path`/`log` through `build_records`**
+- [x] **Step 5: Thread `write_path`/`log` through `build_records`**
 
 In `contrib/beets/beetsplug/_core.py`, replace the whole `build_records` function with:
 
@@ -206,17 +206,17 @@ def build_records(items, *, fields=None, stats, write_path=True, log=None):
     return records
 ```
 
-- [ ] **Step 6: Run the `_core` tests to verify they pass**
+- [x] **Step 6: Run the `_core` tests to verify they pass**
 
 Run: `contrib/beets/.venv/bin/python -m pytest contrib/beets/tests/test_build_records.py -q`
 Expected: PASS (all five new tests — including the real-beets-`destination` one — plus the existing `build_records` tests).
 
-- [ ] **Step 7: Run the full beets suite + ruff to confirm no regressions**
+- [x] **Step 7: Run the full beets suite + ruff to confirm no regressions**
 
 Run: `contrib/beets/.venv/bin/python -m pytest contrib/beets/tests -q && ruff check contrib/beets && ruff format --check contrib/beets`
 Expected: PASS, no lint findings. (Existing tests use membership/specific-key assertions, so the added default `beets_path` pair is harmless.)
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add contrib/beets/beetsplug/_core.py contrib/beets/tests/conftest.py contrib/beets/tests/test_build_records.py
@@ -238,7 +238,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - Modify: `contrib/beets/beetsplug/musefs.py`
 - Test: `contrib/beets/tests/test_plugin.py`
 
-- [ ] **Step 1: Write the failing plugin tests**
+- [x] **Step 1: Write the failing plugin tests**
 
 Append to `contrib/beets/tests/test_plugin.py`:
 
@@ -305,12 +305,12 @@ def test_sync_omits_beets_path_when_disabled(
         conn.close()
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `contrib/beets/.venv/bin/python -m pytest contrib/beets/tests/test_plugin.py -q -k beets_path`
 Expected: FAIL — `_sync` doesn't pass `write_path`/`log` yet, and there's no `write_path` config default, so `_write_path()` doesn't exist. (The disabled test may pass spuriously since nothing reads the flag yet; the enabled test fails because `_write_path` is undefined once Step 3 lands — confirm both after Step 3.)
 
-- [ ] **Step 3: Register the `write_path` default and add the accessor**
+- [x] **Step 3: Register the `write_path` default and add the accessor**
 
 In `contrib/beets/beetsplug/musefs.py`, in `__init__`, replace this exact block:
 
@@ -342,7 +342,7 @@ Then add this accessor next to `_autoscan`/`_bin`:
         return bool(self.config["write_path"].get(bool))
 ```
 
-- [ ] **Step 4: Pass `write_path`/`log` into `build_records`**
+- [x] **Step 4: Pass `write_path`/`log` into `build_records`**
 
 In `contrib/beets/beetsplug/musefs.py`, in `_sync`, replace this line:
 
@@ -362,17 +362,17 @@ with:
         )
 ```
 
-- [ ] **Step 5: Run the plugin tests to verify they pass**
+- [x] **Step 5: Run the plugin tests to verify they pass**
 
 Run: `contrib/beets/.venv/bin/python -m pytest contrib/beets/tests/test_plugin.py -q`
 Expected: PASS (both new tests and all existing plugin tests).
 
-- [ ] **Step 6: Full beets suite + ruff**
+- [x] **Step 6: Full beets suite + ruff**
 
 Run: `contrib/beets/.venv/bin/python -m pytest contrib/beets/tests -q && ruff check contrib/beets && ruff format --check contrib/beets`
 Expected: PASS, no lint findings.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add contrib/beets/beetsplug/musefs.py contrib/beets/tests/test_plugin.py
@@ -391,7 +391,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 **Files:**
 - Modify: `contrib/beets/README.md`
 
-- [ ] **Step 1: Add the `$!{beets_path}` mount to the Workflow example**
+- [x] **Step 1: Add the `$!{beets_path}` mount to the Workflow example**
 
 In `contrib/beets/README.md`, in the `## Workflow (test drive)` code block, after these lines:
 
@@ -409,7 +409,7 @@ add:
 musefs mount ~/mnt --db ~/musefs.db --template '$!{beets_path}'
 ```
 
-- [ ] **Step 2: Add a Notes bullet documenting the tag and `write_path`**
+- [x] **Step 2: Add a Notes bullet documenting the tag and `write_path`**
 
 In `contrib/beets/README.md`, in the `## Notes` list, add this bullet (after the **Cover art** bullet):
 
@@ -424,12 +424,12 @@ In `contrib/beets/README.md`, in the `## Notes` list, add this bullet (after the
   computed-tag workflow in [ARCHITECTURE.md](../../ARCHITECTURE.md).
 ```
 
-- [ ] **Step 3: Verify docs render and links resolve**
+- [x] **Step 3: Verify docs render and links resolve**
 
 Run: `test -f ARCHITECTURE.md && grep -q "beets_path\|computed" ARCHITECTURE.md && echo "cross-ref target OK"`
 Expected: `cross-ref target OK` (the computed-tag workflow was documented in `ARCHITECTURE.md` by PR #170).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add contrib/beets/README.md
@@ -442,7 +442,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ## Final verification
 
-- [ ] **Full beets suite (incl. opt-in tiers off by default) + lint:**
+- [x] **Full beets suite (incl. opt-in tiers off by default) + lint:**
 
 Run: `contrib/beets/.venv/bin/python -m pytest contrib/beets/tests -v && ruff check contrib/beets && ruff format --check contrib/beets`
 Expected: all green, no lint findings.
