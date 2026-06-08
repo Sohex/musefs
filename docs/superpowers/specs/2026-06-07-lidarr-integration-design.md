@@ -27,6 +27,14 @@ The intended deployment is explicit:
 
 The local Lidarr source shows a viable strict path:
 
+> **Runtime casing note (added 2026-06-08):** the `Lidarr_*` names below match
+> Lidarr's source and docs, but Lidarr builds the child environment from a .NET
+> `StringDictionary`, which lowercases every key. A Linux script therefore
+> receives `lidarr_sourcepath` / `lidarr_eventtype`, etc. The integration
+> resolves these env vars case-insensitively (`musefs_lidarr/env.py`); the
+> PascalCase names here are the canonical/documented form, not the literal
+> runtime casing.
+
 - Lidarr has a media-management setting `UseScriptImport` and script path
   `ScriptImportPath` (`MediaManagementConfigResource` exposes both).
 - During import, Lidarr invokes the script with `Lidarr_SourcePath` and

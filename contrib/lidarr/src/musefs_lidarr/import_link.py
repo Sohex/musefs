@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from .env import lidarr_get
 from .errors import ConfigError, ImportLinkError
 
 
@@ -31,7 +32,7 @@ def parse_link_mode(environ: dict[str, str]) -> LinkMode:
 
 
 def _required_path(environ: dict[str, str], name: str) -> Path:
-    value = environ.get(name)
+    value = lidarr_get(environ, name)
     if not value:
         raise ConfigError(f"{name} is required")
     return Path(value)

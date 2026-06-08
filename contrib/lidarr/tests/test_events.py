@@ -66,6 +66,37 @@ def test_parse_track_retag_event():
     assert event.previous_paths == []
 
 
+def test_parse_album_download_event_with_lowercase_keys():
+    # Real Lidarr emits lowercased env var names (StringDictionary).
+    event = parse_event(
+        {
+            "lidarr_eventtype": "AlbumDownload",
+            "lidarr_artist_id": "12",
+            "lidarr_album_id": "34",
+            "lidarr_addedtrackpaths": "/music/a.flac|/music/b.flac",
+        }
+    )
+
+    assert event.event_type == EventType.ALBUM_DOWNLOAD
+    assert event.artist_id == 12
+    assert event.album_id == 34
+    assert event.paths == ["/music/a.flac", "/music/b.flac"]
+
+
+def test_parse_rename_event_with_lowercase_keys():
+    event = parse_event(
+        {
+            "lidarr_eventtype": "Rename",
+            "lidarr_trackfile_paths": "/new/a.flac",
+            "lidarr_trackfile_previouspaths": "/old/a.flac",
+        }
+    )
+
+    assert event.event_type == EventType.RENAME
+    assert event.paths == ["/new/a.flac"]
+    assert event.previous_paths == ["/old/a.flac"]
+
+
 def test_parse_unknown_event_is_unsupported():
     event = parse_event({"Lidarr_EventType": "Grab"})
 

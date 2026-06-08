@@ -3,13 +3,14 @@ from __future__ import annotations
 import os
 import sys
 
+from .env import lidarr_get
 from .errors import MusefsLidarrError
 from .import_link import ensure_link, parse_import_env
 
 
 def run(environ: dict[str, str] | None = None) -> int:
     env = os.environ if environ is None else environ
-    if env.get("Lidarr_EventType") == "Test":
+    if lidarr_get(env, "Lidarr_EventType") == "Test":
         print("musefs-lidarr-import: test ok")
         return 0
 

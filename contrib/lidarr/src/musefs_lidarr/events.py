@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .env import lidarr_get
+
 
 class EventType(Enum):
     TEST = "Test"
@@ -40,7 +42,7 @@ def _int_or_none(value: str | None) -> int | None:
 
 def parse_event(environ: dict[str, str] | None = None) -> LidarrEvent:
     env = os.environ if environ is None else environ
-    raw = env.get("Lidarr_EventType", "")
+    raw = lidarr_get(env, "Lidarr_EventType", "")
 
     if raw == EventType.TEST.value:
         event_type = EventType.TEST
@@ -56,16 +58,16 @@ def parse_event(environ: dict[str, str] | None = None) -> LidarrEvent:
     paths = []
     previous_paths = []
     if event_type is EventType.ALBUM_DOWNLOAD:
-        paths = split_paths(env.get("Lidarr_AddedTrackPaths"))
+        paths = split_paths(lidarr_get(env, "Lidarr_AddedTrackPaths"))
     elif event_type is EventType.RENAME:
-        paths = split_paths(env.get("Lidarr_TrackFile_Paths"))
-        previous_paths = split_paths(env.get("Lidarr_TrackFile_PreviousPaths"))
+        paths = split_paths(lidarr_get(env, "Lidarr_TrackFile_Paths"))
+        previous_paths = split_paths(lidarr_get(env, "Lidarr_TrackFile_PreviousPaths"))
 
     return LidarrEvent(
         event_type=event_type,
         raw_type=raw,
         paths=paths,
         previous_paths=previous_paths,
-        artist_id=_int_or_none(env.get("Lidarr_Artist_Id")),
-        album_id=_int_or_none(env.get("Lidarr_Album_Id")),
+        artist_id=_int_or_none(lidarr_get(env, "Lidarr_Artist_Id")),
+        album_id=_int_or_none(lidarr_get(env, "Lidarr_Album_Id")),
     )

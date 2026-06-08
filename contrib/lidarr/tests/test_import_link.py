@@ -36,6 +36,24 @@ def test_parse_import_env_reads_lidarr_paths(tmp_path):
     assert parsed.mode == LinkMode.SYMLINK
 
 
+def test_parse_import_env_reads_lowercase_lidarr_paths(tmp_path):
+    # Lidarr's script-import passes lowercased env var names.
+    src = tmp_path / "source.flac"
+    dst = tmp_path / "artist" / "album" / "dest.flac"
+    src.write_bytes(b"audio")
+
+    parsed = parse_import_env(
+        {
+            "lidarr_sourcepath": os.fsdecode(src),
+            "lidarr_destinationpath": os.fsdecode(dst),
+        }
+    )
+
+    assert parsed.source == src
+    assert parsed.destination == dst
+    assert parsed.mode == LinkMode.SYMLINK
+
+
 def test_parse_import_env_missing_paths_fails():
     with pytest.raises(ConfigError, match="Lidarr_SourcePath"):
         parse_import_env({})
