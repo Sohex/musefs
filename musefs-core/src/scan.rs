@@ -80,8 +80,12 @@ fn collect_audio(
     follow_symlinks: bool,
 ) -> std::io::Result<()> {
     let mut visited = HashSet::new();
-    if let (true, Ok(meta)) = (follow_symlinks, std::fs::metadata(root)) {
-        visited.insert(dir_key(&meta));
+    if follow_symlinks {
+        // Seed with the root's identity so a symlink pointing back to it is
+        // caught as a cycle on the first descent.
+        if let Ok(meta) = std::fs::metadata(root) {
+            visited.insert(dir_key(&meta));
+        }
     }
     collect_audio_inner(root, out, follow_symlinks, &mut visited)
 }
