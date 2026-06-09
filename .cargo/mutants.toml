@@ -108,7 +108,7 @@ exclude_re = [
     # instrumentation the in-diff gate does not build.
     # NB: line:col here (and for revalidate below) — `replace += with` and
     # `>=`/`||` repeat in run_pipeline (e.g. the killable `*scanned += 1` at
-    # 691), so these cannot be safely description-anchored. Re-verify these
+    # 712), so these cannot be safely description-anchored. Re-verify these
     # coordinates after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
     'musefs-core/src/scan\.rs:734:29:',
