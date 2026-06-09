@@ -70,5 +70,5 @@ def test_is_valid_version_rejects(version):
     assert not bp.is_valid_version(version)
 
 
-def test_main_rejects_bad_version(capsys):
+def test_main_rejects_bad_version():
     assert bp.main(["not a version"]) == 2
