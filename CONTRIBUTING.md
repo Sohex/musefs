@@ -205,6 +205,43 @@ Sharp edges:
   `.cargo/mutants.toml`, not test contortions. Note that cargo-mutants
   mutates `const` initializer expressions too — a constant is not a hiding
   place for arithmetic the gate flags.
+- **`exclude_re` entries are guarded against drift.** A few exclusions must
+  pin a specific `file:line:col:` (the operator+function alone isn't unique in
+  the function); those coordinates rot silently when `cargo fmt` shifts the
+  code, and a stale anchor can re-point onto a *killable* mutant — a silent
+  false pass. `scripts/check_mutant_anchors.py` prevents that: it lists the
+  full unfiltered mutant set (`cargo mutants --no-config --list --json`) and
+  re-validates every `exclude_re` entry. It runs in the per-PR `in-diff` job
+  (`.github/workflows/mutants.yml`) and its unit tests run in CI's
+  `python-musefs` job. Run it locally with:
+
+  ```bash
+  cargo mutants --no-config --list --json > /tmp/mutants-list.json
+  python3 scripts/check_mutant_anchors.py --mutants-json /tmp/mutants-list.json
+  ```
+
+  Each entry carries a machine-checked `# guard:` comment on the line directly
+  above it:
+  - **`file:line:col` anchors** — `# guard: op="<" fn="probe_file" rows=3`. The
+    guard asserts the matched mutants all share that operator and function,
+    occupy one site, and number exactly `rows` (use `fn=""` for a const-level
+    site with no enclosing function). A *narrowing* entry (one that embeds a
+    replacement to leave same-site siblings killable) sets `rows` to that
+    subset's size.
+  - **description anchors** — `# guard: count=N` (default 1) asserts the entry
+    matches mutants spanning exactly `N` distinct sites; this is what catches a
+    newly-added killable sibling silently joining the match set. A bare
+    single-site description entry needs no tag.
+
+  When the guard fails: a `found none` message means a line:col anchor drifted
+  — re-anchor it to the current coordinates from the listing **and re-confirm
+  the mutant there is still genuinely equivalent** (a reformat can change
+  surrounding logic, not just line numbers). A `count`/`rows` mismatch means a
+  sibling appeared or disappeared — investigate before bumping the number.
+  Every new `file:line:col` exclusion needs a `# guard:` tag (the guard rejects
+  an untagged one), and `exclude_re` patterns must stay within the
+  Rust-regex/Python-`re` shared subset the guard allows (`\. \d + | ^ ( ) *`,
+  no inline `(?...)` groups).
 
 ### Coverage
 
