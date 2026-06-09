@@ -46,4 +46,7 @@ trivially_copy_pass_by_ref = "allow" # `&[u8; 4]` FourCCs read better than `*b".
 items_after_statements = "allow"     # helper structs/consts defined adjacent to their use
 
 [profile.release]
-strip = true
+# "debuginfo" (not "symbols"/true): keep the symbol table so field panic
+# backtraces stay symbolicated, while still dropping the bulk of the size. This
+# profile also governs local `cargo build --release` debugging builds.
+strip = "debuginfo"

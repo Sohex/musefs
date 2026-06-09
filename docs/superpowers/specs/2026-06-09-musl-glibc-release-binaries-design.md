@@ -119,8 +119,40 @@ against the vendored source):
 
 So the handler instead runs the external **`fusermount3 -u <mountpoint>`** (the
 same command fuser's own pure-rust unmount path uses), falling back to
-`umount <mountpoint>`. Unmounting EOFs the `/dev/fuse` channel, the background
-session's worker returns, and `bg.join()` unblocks — clean exit, mount removed.
+`fusermount -u` then `umount`. Unmounting EOFs the `/dev/fuse` channel, the
+background session's worker returns, and `bg.join()` unblocks — clean exit,
+mount removed.
+
+The external-command design has a second, more durable justification than "the
+fuser API forces it": the handler thread **never touches core state** — not the
+slab, DB connections, or session locks. Pool workers and `poll_refresh` hold
+those guards; a handler that tried to manipulate session state from the signal
+thread could deadlock against an in-flight read. Shelling out and letting the
+kernel drive the unmount sidesteps that entirely.
+
+**Bounded exit (the unmount can fail or stall — don't hang past it):**
+
+A plain `fusermount3 -u` returns `EBUSY` when the mount is busy, and for a
+wedged backing store (dead NFS, a spun-down disk) an in-flight read may never
+drain — so the unmount does not free the channel and `bg.join()` would block
+indefinitely. Because installing the handler *replaces* SIGTERM's default
+"terminate immediately" disposition, an unbounded handler would be **worse than
+none** in that case: the process lingers until the init system's SIGKILL
+(systemd's default `TimeoutStopSec` is 90s). So the handler is bounded:
+
+1. First signal: attempt the unmount chain (errors are logged and **swallowed** —
+   the goal is exit, not unmount success; the mount may already be gone via a
+   manual `fusermount3 -u` or an `ENOTCONN` dead endpoint).
+2. If the blocking mount hasn't returned within a grace window (`GRACE`, 5s),
+   escalate to a lazy detach (`fusermount3 -u -z`, `MNT_DETACH`) and
+   `std::process::exit` — never wait on a join that may never come.
+3. **Second** SIGTERM/SIGINT while step 1–2 is in flight: hard-exit immediately
+   (`exit(130)`) — the operator/init system wants out now; "Ctrl-C twice does
+   nothing" is a real daemon footgun.
+
+On the happy path the unmount EOFs `/dev/fuse`, `bg.join()` returns, and `main`
+exits on its own well before `GRACE` (the handler thread is torn down with the
+process), so the escalation is invisible.
 
 **Placement and constraints:**
 
@@ -138,11 +170,15 @@ session's worker returns, and `bg.join()` unblocks — clean exit, mount removed
 **Test strategy (must land as a single green commit — the pre-commit hook runs
 the full workspace suite):**
 
-- An `--ignored` e2e test (in `musefs-fuse` tests or `musefs-cli`, gated on
-  `/dev/fuse` like the existing FUSE e2e): mount via the binary / a helper that
-  installs the handler, send `SIGTERM` to it, then assert the mountpoint is no
-  longer a FUSE mount (clean, not `ENOTCONN`). This exercises the real
+- An `--ignored` e2e test (gated on `/dev/fuse` like the existing FUSE e2e):
+  mount the real binary as a child, send `SIGTERM`, then assert it exited
+  cleanly and the mountpoint is no longer a FUSE mount. This exercises the real
   `fusermount3 -u` path.
+- A second `--ignored` e2e for the **bounded-exit** guarantee: hold an open fd
+  on a file inside the mount so a non-lazy unmount fails `EBUSY` (a
+  deterministic stand-in for the wedged-backing-store case), send `SIGTERM`, and
+  assert the daemon still exits within a bound (≈`GRACE`) via the lazy-detach +
+  forced-exit escalation — rather than hanging until SIGKILL.
 - Non-ignored unit coverage where feasible (e.g. the handler wiring / unmount
   command construction is unit-testable without an actual mount).
 - The default (non-ignored) suite must stay green without `/dev/fuse`, so the
@@ -164,9 +200,13 @@ toolchains.
   glibc binaries run on essentially any current distro. The local de-risking
   build (below) must confirm bundled SQLite compiles against this floor.
 - **musl:** static by default — no extra flags.
-- **Strip:** add `strip = true` to `[profile.release]` in the workspace
-  `Cargo.toml` (applies workspace-wide; acceptable). Avoids relying on a
-  zigbuild-specific strip flag.
+- **Strip:** add `strip = "debuginfo"` to `[profile.release]` in the workspace
+  `Cargo.toml`. Use `"debuginfo"` rather than `true`/`"symbols"`: it drops the
+  bulk of the size (debug info) but **keeps the symbol table**, so field panic
+  backtraces stay symbolicated. This profile also governs local `cargo build
+  --release` debugging builds, so a bus-factor-one maintainer keeps actionable
+  backtraces. (Panic *messages* print regardless of stripping; only backtrace
+  symbolication is at stake.)
 
 ### Packaging
 
