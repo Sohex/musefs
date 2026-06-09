@@ -146,3 +146,30 @@ jobs:
             -v "$PWD":/w -w /w \
             alpine:3.20 \
             sh -c 'apk add --no-cache fuse3 ffmpeg >/dev/null && sh scripts/smoke-binary.sh ./musefs'
+
+  release-assets:
+    needs: smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          # Create the release for this tag if it doesn't exist yet, then upload
+          # (idempotent on re-run via --clobber).
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Prebuilt binaries for ${GITHUB_REF_NAME}. Verify with: sha256sum -c <file>.sha256"
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --clobber
