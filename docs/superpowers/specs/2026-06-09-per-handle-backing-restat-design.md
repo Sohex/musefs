@@ -71,6 +71,15 @@ let served = self.pool.with(|db| -> Result<Option<()>> { /* unchanged */ })?;
   out-of-band backing rewrite is terminal — `?` returns `BackingChanged`
   straight to the caller. It must *not* be treated as a stale-layout/DB-retag
   race (which the loop retries); the loop is for DB-side version drift only.
+- **Complementary to `resolve()`'s path-stat, not redundant.** On a
+  gen-change iteration the loop re-resolves via `cache.resolve(...)`, which
+  stats the backing **by path** and can itself return `BackingChanged`
+  (`reader.rs:117-120`). The new call stats the **held fd**. These check
+  different things: the path-stat can pass while the held fd points at a
+  now-incoherent inode (and vice-versa after an atomic replace). The fd-stat
+  is therefore not dead code on the gen-change branch — it is the only check
+  that covers the live handle. The redundant fstat on that rare iteration is
+  the negligible cost already covered by the perf argument above.
 - **Independent of the DB.** A filesystem stat does not belong inside the
   `pool.with` / `begin_read` snapshot, so it sits just before it. It runs the
   same way for both the plain and the `has_binary_tag` branches.
@@ -107,10 +116,14 @@ Because the `fstat` runs *before* any `read_exact_at`:
 - **Same-length rewrite** → caught when the new `mtime_secs` differs from the
   captured one. The captured `backing_mtime_secs` comes from the DB scan
   (typically well in the past) and a live rewrite stamps a fresh mtime, so this
-  differs in virtually all real cases. ✓
+  differs in virtually all real cases. ✓ (The one window where it does *not* is
+  the same-second miss in the residual-limitations list below — it applies only
+  when the rewrite shares the scan's wall-clock second.)
 - **Truncate-shorter** → `len` differs → `BackingChanged`, caught by the stat
-  *before* the pread. This **normalizes** the previous raw-io-error behavior to
-  `BackingChanged` with no special-casing. ✓
+  *before* the pread, **regardless of the requested read range** (truncation
+  changes total len, so the size check fires for any offset). This
+  **normalizes** the previous raw-io-error behavior to `BackingChanged` with no
+  special-casing. ✓
 
 ### Residual, documented-as-inherent limitations
 
@@ -121,8 +134,11 @@ Because the `fstat` runs *before* any `read_exact_at`:
   the DB schema — out of scope (YAGNI for this fix).
 - **Stat→pread TOCTOU.** A rewrite landing in the narrow window *between* the
   `fstat` and a subsequent `read_exact_at` within one read call can still
-  surface a raw io error (e.g. truncate past EOF). No stat-then-read scheme can
-  close this; documented as inherent rather than normalized.
+  surface a raw io error (e.g. truncate past EOF). This is a strict shrink, not
+  a hole the fix opens: pre-fix, *every* read on a rewritten backing could
+  splice silently; post-fix the only surviving raw-io exposure is this
+  intra-call window. No stat-then-read scheme can close it; documented as
+  inherent rather than normalized.
 
 ## Testing
 
@@ -133,23 +149,44 @@ tests (`resolve_errors_when_backing_file_changes` at `tests/reader.rs:96`, the
 `validate_opened_backing` unit test at `facade.rs:1085`) exercise validation
 directly, never via `open_handle -> read`.
 
-Test shape:
+Common shape: build a store + backing file; `open_handle(inode)`; a first
+`read_into(.., Some(fh), ..)` succeeds (warms the per-handle path); then an
+**in-place** rewrite of the backing file at the **same inode** (open the
+existing path for write / truncate — never temp+rename); then assert the next
+`read_into` on the *same handle*. No DB change happens between reads, so any
+detection is purely backing-side.
 
-1. Build a store + backing file; `open_handle(inode)`.
-2. First `read_into(.., Some(fh), ..)` succeeds (warms the per-handle path).
-3. In-place rewrite the backing file at the **same inode** (open the existing
-   path for write / truncate, not temp+rename), in two variants:
-   - **rewrite-longer or same-length** with an advanced mtime → assert the next
-     `read_into` on the *same handle* returns `CoreError::BackingChanged`.
-   - **truncate-shorter** → assert the next `read_into` on the same handle also
-     returns `CoreError::BackingChanged` (confirms normalization, not a raw io
-     error).
-4. (Optional) Assert no DB change occurred between the reads, to make explicit
-   that the detection is backing-side, not DB-side.
+Three variants, asserted **separately** — they exercise different branches and
+must not be collapsed:
 
-mtime control: set the backing file's mtime explicitly (e.g. via
-`std::fs::File::set_times` / `filetime`) so the same-length variant is
-deterministic and not dependent on test wall-clock crossing a second boundary.
+1. **Rewrite-longer** → exercises the **size** branch. Next read returns
+   `CoreError::BackingChanged`. (Mtime irrelevant here — this is the same
+   branch the existing `resolve_errors_when_backing_file_changes` already
+   covers via `resolve()`; included only to confirm it also fires through the
+   per-handle path.)
+2. **Truncate-shorter** → exercises the **size** branch *and* the
+   normalization claim. Next read returns `CoreError::BackingChanged` (not a
+   raw io error from `read_exact_at` past EOF).
+3. **Same-length rewrite** → exercises the **mtime** branch and is the **only**
+   variant matching the issue's silent-corruption-at-unchanged-length mode.
+   This is the core gap; the other two are guards.
+4. **Positive guard** — after a no-op (no rewrite, no DB change), a second read
+   on the same handle still succeeds. Ensures the new `?` is not over-eager and
+   does not reject valid reads.
+
+**Mtime control is correctness-load-bearing for variant 3, not flake-avoidance.**
+`mtime_secs` is whole-seconds (`facade.rs:103-108`) and the scanner stamps
+`backing_mtime` from the file's real mtime at scan time. In a test, write →
+scan → first read → rewrite all occur within one wall-clock second, so a
+same-length rewrite leaves `mtime_secs` byte-identical to the captured value and
+`validate_opened_backing` returns `Ok` — the test would pass having detected
+nothing. Variant 3 **must** explicitly set the rewritten file's mtime to a
+distinct second (e.g. scan-time + 2s) after rewriting, or it silently no-ops.
+
+Use `std::fs::File::set_times` with `std::fs::FileTimes` (stable since Rust
+1.75; the workspace is edition 2024 / MSRV ≥ 1.85). Do **not** add a `filetime`
+dev-dependency — it is not currently a dependency and `set_times` makes it
+unnecessary, avoiding a `Cargo.lock` / vendoring change.
 
 ## Docs
 
