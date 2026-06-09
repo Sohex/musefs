@@ -10,6 +10,10 @@ __pycache__/
 # Python packaging metadata (editable installs of the contrib plugins)
 *.egg-info/
 
+# Python sdist/wheel build output (contrib plugins)
+dist/
+build/
+
 # cargo-mutants scratch + reports
 .mutants-tmp/
 mutants-out/
