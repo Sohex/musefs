@@ -33,6 +33,13 @@ exclude_globs = [
 # results, or live in unreachable defensive branches). Documented per class.
 # Anchored on file:line:col so only the proven-equivalent sites are suppressed;
 # killable siblings (e.g. flac `|`->`&`, scan 871 `+`->`*`) stay in scope.
+#
+# Every entry carries a machine-checked `# guard:` tag on the line directly above
+# it (`op=`/`fn=`/`rows=` for file:line:col anchors, `count=` for multi-site
+# description anchors). scripts/check_mutant_anchors.py re-validates them against
+# the live mutant set in CI so a `cargo fmt` line shift can't silently re-point an
+# anchor onto a killable mutant. See CONTRIBUTING.md "Mutation testing" before
+# editing; run the guard locally after any change here.
 exclude_re = [
     # musefs-format's sanctioned u64->usize helper: replacing its body with a
     # constant (`-> 0` / `-> 1`) is a MACHINE-KILLER, not an equivalent mutant.
