@@ -384,6 +384,9 @@ pub struct ScanOptions {
     pub window: usize,
     /// In-flight art-byte budget and per-batch byte-flush threshold.
     pub batch_bytes: u64,
+    /// Follow symlinks during collection. Off by default: symlinks are logged
+    /// and skipped, which keeps the walk immune to directory-symlink cycles.
+    pub follow_symlinks: bool,
 }
 
 impl Default for ScanOptions {
@@ -392,6 +395,7 @@ impl Default for ScanOptions {
             jobs: 0,
             window: WINDOW,
             batch_bytes: BATCH_BYTES,
+            follow_symlinks: false,
         }
     }
 }
@@ -1236,6 +1240,11 @@ mod hardening_tests {
         collect_audio(dir.path(), &mut out).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].ends_with("keep.flac"));
+    }
+
+    #[test]
+    fn scan_options_default_does_not_follow_symlinks() {
+        assert!(!ScanOptions::default().follow_symlinks);
     }
 
     #[test]
