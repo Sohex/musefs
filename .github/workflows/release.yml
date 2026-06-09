@@ -44,3 +44,56 @@ jobs:
             echo "=== publishing $c ==="
             cargo publish -p "$c" --locked
           done
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.17
+          - triple: aarch64-unknown-linux-gnu
+            zig_target: aarch64-unknown-linux-gnu.2.17
+          - triple: x86_64-unknown-linux-musl
+            zig_target: x86_64-unknown-linux-musl
+          - triple: aarch64-unknown-linux-musl
+            zig_target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: ${{ matrix.triple }}
+      - name: Install Zig and cargo-zigbuild
+        env:
+          ZIG_VERSION: "0.13.0"
+          CARGO_ZIGBUILD_VERSION: "0.22.3"
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" | tar -xJ
+          echo "$PWD/zig-linux-x86_64-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          curl -fsSL "https://github.com/rust-cross/cargo-zigbuild/releases/download/v${CARGO_ZIGBUILD_VERSION}/cargo-zigbuild-v${CARGO_ZIGBUILD_VERSION}.x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$HOME/.cargo/bin" cargo-zigbuild
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.triple }}
+      - name: Build
+        run: cargo zigbuild --release -p musefs --target ${{ matrix.zig_target }}
+      - name: Package
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="musefs-${VERSION}-${{ matrix.triple }}"
+          mkdir -p dist
+          tar -C "target/${{ matrix.triple }}/release" -czf "dist/${NAME}.tar.gz" musefs
+          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          ls -l dist
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: musefs-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
