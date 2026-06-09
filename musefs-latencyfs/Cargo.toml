@@ -8,7 +8,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-fuser = "0.17"
+# Pure-rust fusermount3 mount path; never enable `libfuse` (keeps workspace feature unification consistent).
+fuser = { version = "0.17", default-features = false }
 libc = "0.2"
 rustix = { version = "1", features = ["process", "fs"] }
 tempfile = "3"

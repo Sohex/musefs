@@ -10,7 +10,8 @@ repository.workspace = true
 metrics = ["musefs-core/metrics"]
 
 [dependencies]
-fuser = "0.17"
+# Pure-rust fusermount3 mount path; never enable `libfuse` (static musl can't link it).
+fuser = { version = "0.17", default-features = false }
 libc = "0.2"
 log = "0.4"
 rustix = { version = "1", features = ["process"] }
