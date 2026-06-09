@@ -97,11 +97,17 @@ pub fn install_unmount_on_signal(mountpoint: PathBuf) -> std::io::Result<()> {
                 }
                 graceful_started = true;
                 // Drive the bounded unmount on its own thread so this loop stays
-                // responsive to that second signal.
+                // responsive to that second signal. If the thread can't be
+                // spawned (resource exhaustion), unmount inline rather than
+                // swallow the signal and leave the mount up.
                 let mp = mountpoint.clone();
-                let _ = std::thread::Builder::new()
+                if let Err(e) = std::thread::Builder::new()
                     .name("musefs-unmount".into())
-                    .spawn(move || graceful_unmount_then_exit(&mp));
+                    .spawn(move || graceful_unmount_then_exit(&mp))
+                {
+                    eprintln!("musefs: could not spawn unmount thread ({e}); unmounting inline");
+                    graceful_unmount_then_exit(&mountpoint);
+                }
             }
         })?;
     Ok(())
