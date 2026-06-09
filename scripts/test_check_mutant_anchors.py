@@ -306,3 +306,20 @@ def test_check_uncompilable_regex_reported():
     entries = [g.Entry(r"replace \q foo", 1, None)]
     fails = g.check(entries, [], [])
     assert any("regex error" in f for f in fails)
+
+
+def test_load_mutants_from_json():
+    payload = (
+        '[{"name": "musefs-core/src/scan.rs:277:30: replace < with == in probe_file",'
+        ' "file": "musefs-core/src/scan.rs"}]'
+    )
+    muts = g.load_mutants(payload)
+    assert len(muts) == 1
+    assert muts[0].site == ("musefs-core/src/scan.rs", 277, 30)
+
+
+def test_load_mutants_empty_is_error():
+    import pytest
+
+    with pytest.raises(ValueError):
+        g.load_mutants("[]")
