@@ -309,6 +309,45 @@ Gotchas that have bitten before:
   is **hand-mirrored** from `musefs-core/src/scan.rs` — update both sides
   together.
 
+## Releasing the Python packages
+
+The `contrib/` Python packages (`python-musefs`, `beets-musefs`,
+`lidarr-musefs`, and the unpublished `musefs-picard`) share a single version,
+decoupled from the Rust crates and released on a `py-v*` tag. `musefs-picard`
+tracks the version but is not uploaded to PyPI (Picard has its own plugin
+registry; the shared library is vendored into it).
+
+**One-time setup (before the first release).** Trusted Publishing fails until
+the publisher exists on PyPI. For each of `python-musefs`, `beets-musefs`, and
+`lidarr-musefs`:
+
+1. Create/reserve the project on PyPI.
+2. Add a GitHub Actions trusted publisher pointing at: owner/repo `Sohex/musefs`,
+   workflow `release-python.yml`, environment `pypi`.
+
+Also create a GitHub environment named `pypi` in the repo settings (it gates the
+`publish` job).
+
+**Cutting a release:**
+
+1. Choose the new version `X.Y.Z` and run `python scripts/bump_python_version.py X.Y.Z`.
+   This rewrites every `contrib/*/pyproject.toml` version, the `__version__`
+   strings, the `python-musefs>=` dependency floors, and re-vendors python-musefs
+   into the Picard plugin.
+2. Review `git diff` — it should touch only the version/floor lines and the
+   Picard vendored `_common/` copy.
+3. Promote the `## [Unreleased]` section of `contrib/CHANGELOG.md` to
+   `## [X.Y.Z] - <date>`.
+4. Commit, then tag and push:
+   ```bash
+   git commit -am "release: python packages X.Y.Z"
+   git tag py-vX.Y.Z
+   git push origin HEAD --tags
+   ```
+5. `release-python.yml` runs the version gate, the four Python test suites, then
+   publishes `python-musefs`, `beets-musefs`, and `lidarr-musefs` to PyPI (in
+   that order).
+
 ## PRs & commits
 
 - Conventional-style subjects (`fix(format): …`, `docs: …`, `ci: …`), scoped
