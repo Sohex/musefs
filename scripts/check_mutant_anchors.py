@@ -4,6 +4,7 @@ mutants they document. See docs/superpowers/specs/2026-06-09-mutant-anchor-drift
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass
 
@@ -152,3 +153,71 @@ def parse_toml_entries(text: str) -> tuple[list[Entry], list[str]]:
             else:
                 globs.append(value)
     return entries, globs
+
+
+def _glob_match(glob: str, file: str) -> bool:
+    return fnmatch.fnmatch(file, glob)
+
+
+def _fmt(entry: Entry, msg: str) -> str:
+    return f"[mutants.toml:{entry.toml_line}] /{entry.regex}/ — {msg}"
+
+
+def _check_linecol(entry: Entry, matched: list[Mutant]) -> list[str]:
+    t = entry.tag
+    if t is None or t.op is None or not t.fn_present or t.rows is None:
+        return [_fmt(entry, "line:col entry needs `op=`, `fn=`, and `rows=` in its # guard: tag")]
+    if not matched:
+        return [
+            _fmt(
+                entry,
+                f"expected {t.rows} mutant(s), found none "
+                "(line likely shifted — re-anchor to current coordinates)",
+            )
+        ]
+    fails = []
+    sites = {m.site for m in matched}
+    if len(sites) != 1:
+        fails.append(_fmt(entry, f"expected one site, matched {len(sites)}: {sorted(sites)}"))
+    if len(matched) != t.rows:
+        names = [m.name for m in matched]
+        fails.append(_fmt(entry, f"expected rows={t.rows}, matched {len(matched)}: {names}"))
+    expected_fn = None if t.fn == "" else t.fn
+    bad = [m for m in matched if m.op != t.op or m.fn != expected_fn]
+    if bad:
+        names = [m.name for m in bad]
+        fails.append(_fmt(entry, f'expected op "{t.op}" in fn "{t.fn}", coordinate holds: {names}'))
+    return fails
+
+
+def _check_desc(entry: Entry, matched: list[Mutant]) -> list[str]:
+    count = entry.tag.count if entry.tag and entry.tag.count is not None else 1
+    if count < 1:
+        msg = f"count={count} is invalid; must suppress >=1 site (delete a dead rule)"
+        return [_fmt(entry, msg)]
+    sites = sorted({m.site for m in matched})
+    if len(sites) != count:
+        return [_fmt(entry, f"expected count={count} sites, matched {len(sites)}: {sites}")]
+    return []
+
+
+def check(entries: list[Entry], mutants: list[Mutant], globs: list[str]) -> list[str]:
+    failures: list[str] = []
+    for entry in entries:
+        try:
+            validate_regex_subset(entry.regex)
+            rx = re.compile(entry.regex)
+        except (ValueError, re.error) as ex:
+            failures.append(_fmt(entry, f"regex error: {ex}"))
+            continue
+        matched = [m for m in mutants if rx.search(m.name)]
+        glob_hits = [m for m in matched if any(_glob_match(g, m.file) for g in globs)]
+        if glob_hits:
+            names = [m.name for m in glob_hits]
+            failures.append(_fmt(entry, f"matches mutant(s) in an exclude_globs file: {names}"))
+            continue
+        if classify(entry.regex) == "linecol":
+            failures.extend(_check_linecol(entry, matched))
+        else:
+            failures.extend(_check_desc(entry, matched))
+    return failures
