@@ -247,6 +247,13 @@ Use the Serena editing tools for this change (it edits inside the `read_into`
 method body — `replace_content` with the three-line anchor above is the precise
 way).
 
+**Do NOT add a `metrics::on_stat()` call here.** `validate_opened_backing` does
+its fstat via `file.metadata()` and is deliberately *not* counted by the stat
+metric (the only `on_stat()` site is `reader.rs:117` in `resolve()`'s
+path-stat). `tests/metrics.rs:156` asserts `s.stats == 0` on the per-handle read
+path; that assertion stays green precisely because this fstat is uncounted.
+Adding an `on_stat()` call would break it.
+
 - [ ] **Step 7: Run the facade tests to confirm green**
 
 Run:
@@ -263,7 +270,8 @@ cargo test -p musefs-core 2>&1 | tail -20
 ```
 Expected: all pass. (Confirms no other test depended on the old
 serve-after-grow behavior. The only test asserting it was the one converted in
-Step 1.)
+Step 1. Note `tests/metrics.rs:156` asserts zero stats on the handle path — it
+stays green because the new fstat is uncounted; see the note in Step 6.)
 
 - [ ] **Step 9: Add the ARCHITECTURE.md freshness note**
 
