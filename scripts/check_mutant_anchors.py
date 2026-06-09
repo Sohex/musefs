@@ -17,6 +17,44 @@ class Tag:
     count: int | None = None
 
 
+@dataclass(frozen=True)
+class Mutant:
+    name: str
+    file: str
+    line: int
+    col: int
+    op: str | None
+    repl: str | None
+    fn: str | None
+
+    @property
+    def site(self) -> tuple[str, int, int]:
+        return (self.file, self.line, self.col)
+
+
+_NAME_RE = re.compile(r"^(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+): (?P<body>.*)$")
+_BINOP_RE = re.compile(r"^replace (?P<op>\S+) with (?P<repl>\S+)(?: in (?P<fn>.+))?$")
+
+
+def parse_mutant(name: str) -> Mutant:
+    m = _NAME_RE.match(name)
+    if not m:
+        raise ValueError(f"unparseable mutant name (no file:line:col prefix): {name!r}")
+    op = repl = fn = None
+    b = _BINOP_RE.match(m.group("body"))
+    if b:
+        op, repl, fn = b.group("op"), b.group("repl"), b.group("fn")
+    return Mutant(
+        name=name,
+        file=m.group("file"),
+        line=int(m.group("line")),
+        col=int(m.group("col")),
+        op=op,
+        repl=repl,
+        fn=fn,
+    )
+
+
 _TAG_FIELD = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
 
 
