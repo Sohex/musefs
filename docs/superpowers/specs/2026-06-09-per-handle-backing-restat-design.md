@@ -156,6 +156,15 @@ existing path for write / truncate — never temp+rename); then assert the next
 `read_into` on the *same handle*. No DB change happens between reads, so any
 detection is purely backing-side.
 
+**Existing test that encodes the bug.**
+`read_uses_cached_handle_after_backing_grows` (`tests/facade.rs:1041`) currently
+opens a handle, appends 64 bytes to the backing file in place, reads via the
+handle, and asserts the read *succeeds*. That is exactly the rewrite-longer
+behavior the fix now rejects (and is already inconsistent with `resolve()`,
+which errors on any size/mtime drift). This test must be **converted** into a
+regression test that asserts `CoreError::BackingChanged`, becoming variant 1
+below. It is not a separate addition — it is the rewrite-longer variant.
+
 Three variants, asserted **separately** — they exercise different branches and
 must not be collapsed:
 
@@ -208,5 +217,7 @@ not only through `resolve()`.
 
 - `musefs-core/src/facade.rs` — one `validate_opened_backing` call in
   `read_into`'s fast path.
-- `musefs-core/tests/facade.rs` — new through-the-handle test.
+- `musefs-core/tests/facade.rs` — convert `read_uses_cached_handle_after_backing_grows`
+  into the rewrite-longer regression test; add truncate-shorter, same-length, and
+  positive-guard tests.
 - `ARCHITECTURE.md` — one-line freshness note.
