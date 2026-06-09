@@ -115,3 +115,60 @@ fn sigterm_unmounts_cleanly() {
         "mount still present after SIGTERM (stale endpoint)"
     );
 }
+
+#[test]
+#[ignore = "requires /dev/fuse + fusermount3; run with: cargo test -p musefs -- --ignored"]
+fn sigterm_exits_bounded_when_mount_is_busy() {
+    let bin = env!("CARGO_BIN_EXE_musefs");
+
+    // Backing dir + on-disk DB scanned via the real binary.
+    let backing = tempfile::tempdir().unwrap();
+    std::fs::write(
+        backing.path().join("a.flac"),
+        make_flac(&["ARTIST=Alice", "TITLE=Song"], &[0xAB; 64]),
+    )
+    .unwrap();
+    let dbfile = tempfile::NamedTempFile::new().unwrap();
+    let db = dbfile.path().to_str().unwrap();
+    let scan = Command::new(bin)
+        .args(["scan", backing.path().to_str().unwrap(), "--db", db])
+        .status()
+        .unwrap();
+    assert!(scan.success(), "scan failed");
+
+    // Mount as a child process.
+    let mp = tempfile::tempdir().unwrap();
+    let mut child = Command::new(bin)
+        .args(["mount", mp.path().to_str().unwrap(), "--db", db])
+        .spawn()
+        .unwrap();
+
+    let song = mp.path().join("Alice").join("Song.flac");
+    assert!(
+        wait_until(|| song.exists(), Duration::from_secs(15)),
+        "mount did not come up"
+    );
+
+    // Hold an open fd on a file inside the mount: a non-lazy `fusermount3 -u`
+    // now fails EBUSY, so the daemon's normal unmount can't free the FUSE
+    // channel and it must fall back to lazy-detach + forced exit. This stands in
+    // — deterministically — for the real-world "in-flight read against a wedged
+    // backing store at SIGTERM" case, which is the same code path (unmount can't
+    // let the blocking mount return).
+    let busy = std::fs::File::open(&song).unwrap();
+
+    let pid = rustix::process::Pid::from_child(&child);
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+
+    // The daemon must still exit within a bound (the handler's GRACE is 5s)
+    // rather than hanging until the init system's SIGKILL.
+    let status = wait_exit(&mut child, Duration::from_secs(20))
+        .unwrap_or_else(|| panic!("daemon hung on SIGTERM with the mount busy"));
+    assert!(status.success(), "daemon exited non-zero: {status:?}");
+
+    // Release the fd and best-effort clean up the lazily-detached mountpoint.
+    drop(busy);
+    let _ = Command::new("fusermount3")
+        .args(["-u", "-z", mp.path().to_str().unwrap()])
+        .status();
+}
