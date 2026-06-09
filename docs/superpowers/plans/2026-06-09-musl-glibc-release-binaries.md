@@ -27,6 +27,7 @@ Artifact form throughout (build output, CI artifact, release asset): `musefs-<ve
 - `actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10`
 - `dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8`
 - `Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32`
+- `actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` (already used in `mutants.yml`/`fuzz.yml` — v4)
 
 ---
 
@@ -35,6 +36,8 @@ Artifact form throughout (build output, CI artifact, release asset): `musefs-<ve
 **Purpose:** Prove all four targets build + run before writing any CI, and capture the exact `zig` and `cargo-zigbuild` versions the workflow will pin. This is the spec's first milestone. The highest risk is `aarch64-unknown-linux-musl` + bundled SQLite and the glibc-2.17 floor.
 
 **Files:** none (local only).
+
+**Precondition:** Step 3 mounts a real FUSE filesystem, so the de-risk host needs `/dev/fuse` present and the `fuse3` package (`fusermount3`) installed. If the host lacks `/dev/fuse`, Steps 1–2 (the builds) still validate; Step 3 must be run somewhere with FUSE — flag this rather than treating a missing `/dev/fuse` as a code failure.
 
 - [ ] **Step 1: Install the toolchain locally**
 
@@ -74,10 +77,10 @@ Expected: all four compile (bundled SQLite cross-compiles); the musl binaries re
 - [ ] **Step 3: Confirm a real FUSE mount works with the pure-rust fuser path**
 
 ```bash
-cargo test -p musefs-fuse -- --ignored
+cargo test -p musefs-fuse --test mount -- --ignored
 ```
 
-Expected: the existing FUSE e2e tests pass (this is today's behavior; it confirms the mount path before any change).
+Expected: the `mount.rs` synthesis e2e tests pass (this is today's behavior; it confirms the mount path before any change). Scope to `--test mount` deliberately: a bare `-- --ignored` also runs `passthrough.rs`, whose backing-open ioctl is `CAP_SYS_ADMIN`-gated and only passes under sudo on the prebuilt test binary — running it here would be a false red.
 
 - [ ] **Step 4: Record the working versions**
 
@@ -128,7 +131,7 @@ Leave the macOS-only `fuser = { version = "0.17", features = ["macos-no-mount"] 
 
 - [ ] **Step 2: Add a release strip profile to the workspace root**
 
-Append to `/home/cfutro/git/musefs/Cargo.toml` (after the existing `[workspace.lints.*]` blocks):
+Append to `/home/cfutro/git/musefs/Cargo.toml` as a **new top-level table at end of file** (not nested under `[workspace.*]` — `[profile.release]` is a top-level manifest table):
 
 ```toml
 [profile.release]
@@ -142,8 +145,8 @@ Expected: clean build (no new warnings/errors).
 
 - [ ] **Step 4: Confirm the mount still works (manual, not in pre-commit)**
 
-Run: `cargo test -p musefs-fuse -- --ignored`
-Expected: PASS — mounting via the pure-rust path is unaffected.
+Run: `cargo test -p musefs-fuse --test mount -- --ignored`
+Expected: PASS — mounting via the pure-rust path is unaffected. (Scoped to `--test mount`; `passthrough.rs` is sudo-gated, see Task 0 Step 3.)
 
 - [ ] **Step 5: Commit**
 
@@ -236,8 +239,10 @@ fn run_unmount(mountpoint: &Path) {
             }
         }
     }
-    log::warn!(
-        "could not unmount {} after stop signal; run `fusermount3 -u {}` manually",
+    // Best-effort: a stop signal must never panic. Use eprintln! rather than a
+    // new `log` dependency on the CLI path.
+    eprintln!(
+        "musefs: could not unmount {} after stop signal; run `fusermount3 -u {}` manually",
         mountpoint.display(),
         mountpoint.display()
     );
@@ -268,10 +273,9 @@ In `musefs-cli/Cargo.toml`, under `[dependencies]`, add:
 
 ```toml
 signal-hook = "0.3"
-log = "0.4"
 ```
 
-(`log` is needed for the `log::warn!` in `run_unmount`; add it if not already present.)
+No `log` dependency — `run_unmount` uses `eprintln!` for its best-effort warning. After this step run `cargo build -p musefs-cli` to confirm `signal-hook` links cleanly (no unused-dep / `-D warnings` surprise at the Step 9 commit boundary).
 
 - [ ] **Step 5: Wire the module and installer into the CLI**
 
@@ -443,7 +447,7 @@ Run (compile-check, ignored, runs by default in pre-commit only as a compile):
 cargo test -p musefs --no-run
 cargo test -p musefs -- --ignored sigterm_unmounts_cleanly
 ```
-Expected: first compiles clean; second PASSES (mounts, SIGTERM, clean unmount). If `rustix::process::Signal::TERM` or `Pid::from_child` differ in the installed rustix `1.x`, adjust to the actual API (`rustix::process::test_kill_process`/`Signal` variants) — confirm via `cargo doc -p rustix --open` and keep it `unsafe`-free.
+Expected: first compiles clean; second PASSES (mounts, SIGTERM, clean unmount). The API used (`rustix::process::Pid::from_child`, `kill_process`, `Signal::TERM`) is correct for the locked rustix 1.x and is `unsafe`-free; if anything mismatches, confirm via `cargo doc -p rustix`.
 
 - [ ] **Step 9: Full gate + commit**
 
@@ -471,6 +475,8 @@ Expected: pre-commit passes (full suite green; ignored e2e compiled but not run)
 - Create: `scripts/smoke-binary.sh`
 
 POSIX `sh` so it runs under both bash (host) and busybox ash (Alpine). It scans an ffmpeg-generated FLAC, mounts the binary, reads the synthesized file, then SIGTERMs the daemon and asserts a clean unmount — exercising the real artifact and the Task 2 handler.
+
+Scope note: this smoke is a **liveness + format** check (the served file mounts, is readable, and is a valid non-empty FLAC). Byte-exact verification of the cardinal "audio bytes unchanged" invariant is already covered by the Rust e2e suite (`musefs-fuse/tests/`), which runs against the same code; the smoke deliberately keeps to a portable shell check rather than re-deriving byte equality in `sh`.
 
 - [ ] **Step 1: Write the script**
 
@@ -566,16 +572,17 @@ assert clean unmount) reused by the release smoke jobs for all four targets."
 
 Add a `build` matrix job that cross-builds all four targets on amd64 via `cargo-zigbuild`, packages each as a `.tar.gz` (+ `.sha256`), and uploads them as workflow artifacts. The existing `publish` (crates.io) job is left untouched.
 
-- [ ] **Step 1: Resolve and pin the artifact-action SHAs**
+- [ ] **Step 1: Pin the artifact-action SHAs**
 
-`upload-artifact`/`download-artifact` are new to this repo. Pin them to commit SHAs (the repo convention; the annotated-tag object SHA would fail at run time — use the commits endpoint):
+`upload-artifact` is **already used and pinned in this repo** (`mutants.yml`/`fuzz.yml`) at `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` (v4) — reuse that SHA verbatim, do not re-resolve.
+
+Only `download-artifact` is new. Resolve its commit SHA (the repo convention; the annotated-tag object SHA would fail at run time — use the commits endpoint), pinning the **same major (v4)** so it's compatible with the v4 upload action:
 
 ```bash
-gh api repos/actions/upload-artifact/commits/v4 --jq .sha
 gh api repos/actions/download-artifact/commits/v4 --jq .sha
 ```
 
-Use the returned 40-char SHAs in place of `<UPLOAD_ARTIFACT_SHA>` / `<DOWNLOAD_ARTIFACT_SHA>` below (and in Task 5).
+Use `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` for `<UPLOAD_ARTIFACT_SHA>` and the resolved SHA for `<DOWNLOAD_ARTIFACT_SHA>` below (and in Tasks 5–6).
 
 - [ ] **Step 2: Add the `build` job**
 
@@ -628,7 +635,7 @@ In `.github/workflows/release.yml`, keep `permissions: contents: read` at the to
           ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
           ls -l dist
       - name: Upload artifact
-        uses: actions/upload-artifact@<UPLOAD_ARTIFACT_SHA>
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: musefs-${{ matrix.triple }}
           path: dist/*
@@ -912,7 +919,7 @@ Expected: prints the new issue URL. Record it in the handoff.
 - Container packaging follow-up issue → Task 8. ✅
 - Optional CI `libfuse3-dev` cleanup → intentionally left out (spec marked it optional/harmless).
 
-**Placeholder scan:** The only intentionally-unresolved tokens are `<UPLOAD_ARTIFACT_SHA>` / `<DOWNLOAD_ARTIFACT_SHA>` (resolved by the exact `gh api` commands in Task 4 Step 1) and the `ZIG_VERSION` / `CARGO_ZIGBUILD_VERSION` values (resolved by Task 0 and carried forward). These are concrete resolve-then-fill steps, not vague placeholders.
+**Placeholder scan:** The only intentionally-unresolved token is `<DOWNLOAD_ARTIFACT_SHA>` (resolved by the exact `gh api` command in Task 4 Step 1; `upload-artifact` reuses the repo's existing `043fb46…` pin) and the `ZIG_VERSION` / `CARGO_ZIGBUILD_VERSION` values (resolved by Task 0 and carried forward). These are concrete resolve-then-fill steps, not vague placeholders.
 
 **Type/name consistency:** `unmount_commands` / `run_unmount` / `install_unmount_on_signal` are defined in Task 2 Step 3 and used in Steps 1/5/6; the smoke script name `scripts/smoke-binary.sh` and the artifact name pattern `musefs-${triple}` / `musefs-<version>-<triple>.tar.gz` are consistent across Tasks 3–7. Matrix `triple`/`zig_target`/`runner`/`mode` keys match between Tasks 4 and 5.
 
