@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use musefs_db::convert::usize_from;
@@ -74,18 +74,85 @@ fn is_supported_audio(path: &Path) -> bool {
         || has_ext(path, "wav")
 }
 
-fn collect_audio(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect_audio(
+    root: &Path,
+    out: &mut Vec<PathBuf>,
+    follow_symlinks: bool,
+) -> std::io::Result<()> {
+    let mut visited = HashSet::new();
+    if let (true, Ok(meta)) = (follow_symlinks, std::fs::metadata(root)) {
+        visited.insert(dir_key(&meta));
+    }
+    collect_audio_inner(root, out, follow_symlinks, &mut visited)
+}
+
+fn collect_audio_inner(
+    root: &Path,
+    out: &mut Vec<PathBuf>,
+    follow_symlinks: bool,
+    visited: &mut HashSet<(u64, u64)>,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
-            collect_audio(&path, out)?;
-        } else if ftype.is_file() && is_supported_audio(&path) {
-            out.push(path);
+            descend(&path, out, follow_symlinks, visited)?;
+        } else if ftype.is_file() {
+            if is_supported_audio(&path) {
+                out.push(path);
+            }
+        } else if ftype.is_symlink() {
+            if !follow_symlinks {
+                log::warn!(
+                    "skipping symlink {} (pass --follow-symlinks to scan it)",
+                    path.display()
+                );
+                continue;
+            }
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_dir() => descend(&path, out, follow_symlinks, visited)?,
+                Ok(meta) if meta.is_file() => {
+                    if is_supported_audio(&path) {
+                        out.push(path);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("skipping broken symlink {}: {e}", path.display());
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn descend(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    follow_symlinks: bool,
+    visited: &mut HashSet<(u64, u64)>,
+) -> std::io::Result<()> {
+    if !follow_symlinks {
+        return collect_audio_inner(path, out, follow_symlinks, visited);
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("skipping directory {}: {e}", path.display());
+            return Ok(());
+        }
+    };
+    if !visited.insert(dir_key(&meta)) {
+        log::warn!("skipping symlink cycle at {}", path.display());
+        return Ok(());
+    }
+    collect_audio_inner(path, out, follow_symlinks, visited)
+}
+
+fn dir_key(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
 }
 
 /// A backing file parsed into the fields a track row needs, plus its raw
@@ -614,7 +681,7 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
             files.push(root.to_path_buf());
         }
     } else {
-        collect_audio(root, &mut files)?;
+        collect_audio(root, &mut files, opts.follow_symlinks)?;
     }
     db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
     let stats = run_pipeline(db, files, opts)?;
@@ -783,7 +850,7 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
             files.push(root.to_path_buf());
         }
     } else {
-        collect_audio(root, &mut files)?;
+        collect_audio(root, &mut files, false)?;
     }
     let mut stats = ScanStats {
         scanned: 0,
@@ -825,7 +892,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             files.push(root.to_path_buf());
         }
     } else {
-        collect_audio(root, &mut files)?;
+        collect_audio(root, &mut files, opts.follow_symlinks)?;
     }
     db.apply_bulk_pragmas_self()?;
 
@@ -1237,7 +1304,7 @@ mod hardening_tests {
         std::fs::write(dir.path().join("keep.flac"), b"x").unwrap();
         std::fs::write(dir.path().join("skip.txt"), b"x").unwrap();
         let mut out = Vec::new();
-        collect_audio(dir.path(), &mut out).unwrap();
+        collect_audio(dir.path(), &mut out, false).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].ends_with("keep.flac"));
     }
@@ -1245,6 +1312,101 @@ mod hardening_tests {
     #[test]
     fn scan_options_default_does_not_follow_symlinks() {
         assert!(!ScanOptions::default().follow_symlinks);
+    }
+
+    #[test]
+    fn collect_audio_follows_symlinked_file_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.flac");
+        std::fs::write(&real, b"x").unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        std::os::unix::fs::symlink(&real, lib.join("link.flac")).unwrap();
+
+        let mut on = Vec::new();
+        collect_audio(&lib, &mut on, true).unwrap();
+        assert_eq!(
+            on.len(),
+            1,
+            "symlinked file should be collected when following"
+        );
+
+        let mut off = Vec::new();
+        collect_audio(&lib, &mut off, false).unwrap();
+        assert!(
+            off.is_empty(),
+            "symlinked file should be skipped by default"
+        );
+    }
+
+    #[test]
+    fn collect_audio_follows_symlinked_dir_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("music");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("song.flac"), b"x").unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&real_dir, root.join("linkdir")).unwrap();
+
+        let mut on = Vec::new();
+        collect_audio(&root, &mut on, true).unwrap();
+        assert_eq!(
+            on.len(),
+            1,
+            "files under a symlinked dir should be collected"
+        );
+
+        let mut off = Vec::new();
+        collect_audio(&root, &mut off, false).unwrap();
+        assert!(off.is_empty(), "symlinked dir should be skipped by default");
+    }
+
+    #[test]
+    fn collect_audio_terminates_on_symlink_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::write(a.join("song.flac"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path(), a.join("loop")).unwrap();
+
+        let mut out = Vec::new();
+        collect_audio(dir.path(), &mut out, true).unwrap();
+        assert_eq!(
+            out.iter().filter(|p| p.ends_with("song.flac")).count(),
+            1,
+            "each real file collected at most once despite the cycle"
+        );
+    }
+
+    #[test]
+    fn collect_audio_skips_broken_symlink_when_following() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.flac"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nonexistent"), dir.path().join("dangling"))
+            .unwrap();
+
+        let mut out = Vec::new();
+        let result = collect_audio(dir.path(), &mut out, true);
+        assert!(
+            result.is_ok(),
+            "a dangling symlink must not abort collection"
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with("real.flac"));
+    }
+
+    #[test]
+    fn collect_audio_does_not_follow_symlinks_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.flac"), b"x").unwrap();
+        let other = dir.path().join("other.flac");
+        std::fs::write(&other, b"x").unwrap();
+        std::os::unix::fs::symlink(&other, dir.path().join("link.flac")).unwrap();
+
+        let mut out = Vec::new();
+        collect_audio(dir.path(), &mut out, false).unwrap();
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
