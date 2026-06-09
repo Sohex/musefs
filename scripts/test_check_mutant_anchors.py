@@ -164,3 +164,145 @@ def test_parse_toml_entries_hash_inside_regex_not_a_comment():
     entries, _ = g.parse_toml_entries(toml)
     assert entries[0].regex == "replace # with x in foo"
     assert entries[0].tag is None
+
+
+def _m(name):
+    return g.parse_mutant(name)
+
+
+def test_check_linecol_ok():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:277:30:",
+            1,
+            g.Tag(op="<", fn="probe_file", fn_present=True, rows=3),
+        )
+    ]
+    muts = [
+        _m("musefs-core/src/scan.rs:277:30: replace < with == in probe_file"),
+        _m("musefs-core/src/scan.rs:277:30: replace < with > in probe_file"),
+        _m("musefs-core/src/scan.rs:277:30: replace < with <= in probe_file"),
+    ]
+    assert g.check(entries, muts, []) == []
+
+
+def test_check_linecol_drift_to_nothing():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:713:29:",
+            1,
+            g.Tag(op="+=", fn="run_pipeline", fn_present=True, rows=2),
+        )
+    ]
+    fails = g.check(entries, [], [])
+    assert len(fails) == 1 and "found none" in fails[0]
+
+
+def test_check_linecol_repoint_wrong_op():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:277:30:",
+            1,
+            g.Tag(op="<", fn="probe_file", fn_present=True, rows=1),
+        )
+    ]
+    muts = [_m("musefs-core/src/scan.rs:277:30: replace + with - in probe_file")]
+    fails = g.check(entries, muts, [])
+    assert any("expected op" in f for f in fails)
+
+
+def test_check_linecol_over_suppress_rows():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/ogg_index\.rs:216:15:",
+            1,
+            g.Tag(op="<", fn="serve_ogg_window", fn_present=True, rows=1),
+        )
+    ]
+    muts = [
+        _m("musefs-core/src/ogg_index.rs:216:15: replace < with == in serve_ogg_window"),
+        _m("musefs-core/src/ogg_index.rs:216:15: replace < with > in serve_ogg_window"),
+        _m("musefs-core/src/ogg_index.rs:216:15: replace < with <= in serve_ogg_window"),
+    ]
+    fails = g.check(entries, muts, [])
+    assert any("rows=1" in f for f in fails)
+
+
+def test_check_linecol_const_empty_fn():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/reader\.rs:71:60: replace / with [%*]",
+            1,
+            g.Tag(op="/", fn="", fn_present=True, rows=2),
+        )
+    ]
+    muts = [
+        _m("musefs-core/src/reader.rs:71:60: replace / with %"),
+        _m("musefs-core/src/reader.rs:71:60: replace / with *"),
+    ]
+    assert g.check(entries, muts, []) == []
+
+
+def test_check_linecol_missing_field():
+    entries = [g.Entry(r"musefs-core/src/scan\.rs:277:30:", 1, g.Tag(op="<"))]
+    muts = [_m("musefs-core/src/scan.rs:277:30: replace < with == in probe_file")]
+    fails = g.check(entries, muts, [])
+    assert any("needs `op=`, `fn=`, and `rows=`" in f for f in fails)
+
+
+def test_check_desc_site_count_ok_multisite():
+    entries = [g.Entry(r"replace \| with \^ in synchsafe_decode", 1, g.Tag(count=3))]
+    muts = [
+        _m("musefs-format/src/mp3.rs:10:5: replace | with ^ in synchsafe_decode"),
+        _m("musefs-format/src/mp3.rs:11:5: replace | with ^ in synchsafe_decode"),
+        _m("musefs-format/src/mp3.rs:12:5: replace | with ^ in synchsafe_decode"),
+    ]
+    assert g.check(entries, muts, []) == []
+
+
+def test_check_desc_sibling_mask():
+    entries = [g.Entry(r"replace \| with \^ in synchsafe_decode", 1, None)]
+    muts = [
+        _m("musefs-format/src/mp3.rs:10:5: replace | with ^ in synchsafe_decode"),
+        _m("musefs-format/src/mp3.rs:99:5: replace | with ^ in synchsafe_decode"),
+    ]
+    fails = g.check(entries, muts, [])
+    assert any("count=1" in f for f in fails)
+
+
+def test_check_desc_dead_entry_zero():
+    entries = [g.Entry(r"replace == with != in VirtualTree::gone", 1, None)]
+    fails = g.check(entries, [], [])
+    assert any("count=1" in f for f in fails)
+
+
+def test_check_desc_count_zero_rejected():
+    entries = [g.Entry(r"replace == with != in VirtualTree::gone", 1, g.Tag(count=0))]
+    fails = g.check(entries, [], [])
+    assert any("invalid" in f for f in fails)
+
+
+def test_check_desc_over_nonbinop_matches():
+    entries = [
+        g.Entry(r'replace truncate_component -> Cow<._, str> with Cow::Borrowed\(""\)', 1, None)
+    ]
+    muts = [
+        _m(
+            "musefs-core/src/tree.rs:848:5: replace truncate_component"
+            ' -> Cow<\'_, str> with Cow::Borrowed("")'
+        ),
+    ]
+    assert g.check(entries, muts, []) == []
+
+
+def test_check_glob_excluded_match_fails():
+    entries = [g.Entry(r"metrics\.rs:\d+:\d+: replace \+ with -", 1, None)]
+    muts = [_m("musefs-core/src/metrics.rs:5:5: replace + with - in bump")]
+    fails = g.check(entries, muts, ["musefs-core/src/metrics.rs"])
+    assert any("exclude_globs" in f for f in fails)
+
+
+def test_check_uncompilable_regex_reported():
+    entries = [g.Entry(r"replace \q foo", 1, None)]
+    fails = g.check(entries, [], [])
+    assert any("regex error" in f for f in fails)
