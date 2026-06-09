@@ -80,7 +80,10 @@ jobs:
         # llvm-cov); see docs/audits/2026-05-29-test-audit.md.
         run: cargo llvm-cov --workspace --exclude musefs-fuse --exclude musefs-latencyfs --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354
+        # v6.0.2: Codecov deleted the `codecovsecurity` keybase account that
+        # earlier versions fetch the CLI signing key from, so <=v6.0.1 fail
+        # signature verification deterministically. v6.0.2 moves to `codecovsecops`.
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f
         with:
           files: lcov.info
           fail_ci_if_error: true
