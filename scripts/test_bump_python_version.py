@@ -58,5 +58,17 @@ def test_bump_rewrites_tree(tmp_path):
         assert "python-musefs>=0.2.0" in (tmp_path / rel).read_text()
 
 
+@pytest.mark.parametrize(
+    "version", ["0.2.0", "1.2.3", "1.2.3a1", "1.2.3rc1", "1.2.3.post1", "1.2.3.dev1"]
+)
+def test_is_valid_version_accepts(version):
+    assert bp.is_valid_version(version)
+
+
+@pytest.mark.parametrize("version", ["", "v1.2.3", "1.2.3-beta", "not a version"])
+def test_is_valid_version_rejects(version):
+    assert not bp.is_valid_version(version)
+
+
 def test_main_rejects_bad_version(capsys):
     assert bp.main(["not a version"]) == 2
