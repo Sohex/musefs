@@ -585,11 +585,12 @@ A new workflow triggered by `py-v*` tags: a version gate (tag == every contrib p
 
 - [ ] **Step 1: Look up the pinned SHA for the publish action**
 
-The repo pins actions by commit SHA. Get the current `pypa/gh-action-pypi-publish` release SHA:
+The repo pins actions by **commit** SHA. Use the `commits/{ref}` endpoint, which dereferences a tag to the commit it points at — do **not** use `git/refs/tags/...` `.object.sha`, which for an *annotated* tag returns the tag-object SHA (not a commit), and GitHub Actions cannot resolve `uses: …@<tag-object-sha>` so the publish step would fail at release time:
 ```bash
-gh api repos/pypa/gh-action-pypi-publish/git/refs/tags/release/v1 --jq '.object.sha'
+LATEST="$(gh api repos/pypa/gh-action-pypi-publish/releases/latest --jq '.tag_name')"
+gh api "repos/pypa/gh-action-pypi-publish/commits/$LATEST" --jq '.sha'   # commit SHA to pin
 ```
-Use that SHA in Step 2 in place of `PINNED_PYPI_PUBLISH_SHA`. (If `gh` is unavailable, pin to the SHA the latest `release/v1` tag points at from the action's GitHub releases page.)
+Use that commit SHA in Step 2 in place of `PINNED_PYPI_PUBLISH_SHA`, optionally with a trailing `# <tag>` comment. Sanity-check that the value is a commit, not a tag object: `gh api repos/pypa/gh-action-pypi-publish/commits/<sha> --jq '.sha'` must echo the same SHA back (it 422s for a tag-object SHA).
 
 - [ ] **Step 2: Create `.github/workflows/release-python.yml`**
 

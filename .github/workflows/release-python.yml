@@ -155,7 +155,7 @@ jobs:
       - name: Check python-musefs
         run: twine check contrib/python-musefs/dist/*
       - name: Publish python-musefs
-        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: contrib/python-musefs/dist
       - name: Build beets-musefs
@@ -163,7 +163,7 @@ jobs:
       - name: Check beets-musefs
         run: twine check contrib/beets/dist/*
       - name: Publish beets-musefs
-        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: contrib/beets/dist
       - name: Build lidarr-musefs
@@ -171,6 +171,6 @@ jobs:
       - name: Check lidarr-musefs
         run: twine check contrib/lidarr/dist/*
       - name: Publish lidarr-musefs
-        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: contrib/lidarr/dist
