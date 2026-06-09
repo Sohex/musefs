@@ -49,7 +49,9 @@ musefs scan /path/to/music --db library.db --revalidate
 
 `scan` probes each audio file (FLAC, MP3, M4A/M4B, Ogg, WAV), recording its
 audio byte range, tags, and embedded art in the store. It takes one or more
-files or directories, and `--jobs N` controls probe parallelism. `--quiet`
+files or directories, and `--jobs N` controls probe parallelism.
+`--follow-symlinks` walks symlinked files and directories (off by default, so
+symlinks are logged and skipped). `--quiet`
 (`-q`) suppresses the per-target summary for scripting; scan failures still
 surface on stderr (raise detail with `RUST_LOG=info`).
 `--revalidate` is the maintenance pass: it skips unchanged files —

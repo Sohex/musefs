@@ -239,6 +239,14 @@ are bounded — the scanner never slurps whole files — and ingestion caps
 per-item sizes (`MAX_ART_BYTES`, `MAX_BINARY_TAG_BYTES`) so a crafted file
 cannot balloon the store.
 
+Symlinks are **not followed by default**: a symlinked file or directory is
+logged (`RUST_LOG=info`/`warn`) and skipped, which keeps the walk immune to
+directory-symlink cycles. Passing `--follow-symlinks` resolves them — symlinked
+audio files and directories are scanned — guarded by a visited `(dev, ino)` set
+so symlink cycles terminate. Broken symlinks are logged and skipped without
+aborting the scan. The `root` argument is always followed regardless of the
+flag; only links encountered during recursion are gated.
+
 `revalidate` is the maintenance pass (`scan --revalidate`): re-probe only
 files whose size/mtime changed (skipping unchanged files **preserves
 external tag edits** in the DB), delete tracks under the scanned root whose
