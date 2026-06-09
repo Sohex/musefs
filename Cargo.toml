@@ -44,3 +44,6 @@ similar_names = "allow"         # flags legitimately-distinct nearby bindings
 inline_always = "allow"         # a few deliberate hot-path annotations
 trivially_copy_pass_by_ref = "allow" # `&[u8; 4]` FourCCs read better than `*b"..."` call sites
 items_after_statements = "allow"     # helper structs/consts defined adjacent to their use
+
+[profile.release]
+strip = true
