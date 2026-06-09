@@ -1,13 +1,29 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lidarr-musefs"
 version = "0.1.0"
 description = "Sync Lidarr metadata into the musefs SQLite store"
+readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Conor Futro" }]
 dependencies = ["python-musefs>=0.1.0"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.urls]
+Homepage = "https://github.com/Sohex/musefs"
+Repository = "https://github.com/Sohex/musefs"
+Issues = "https://github.com/Sohex/musefs/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
