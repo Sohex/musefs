@@ -144,6 +144,8 @@ jobs:
         run: python -m pytest contrib/python-musefs/tests -v
       - name: Test bump script
         run: python -m pytest scripts/test_bump_python_version.py -v
+      - name: Test mutant-anchor guard
+        run: python -m pytest scripts/test_check_mutant_anchors.py -v
 
   beets:
     needs: changes
