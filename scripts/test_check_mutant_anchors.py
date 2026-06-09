@@ -79,3 +79,39 @@ def test_parse_mutant_rejects_no_prefix():
 
     with pytest.raises(ValueError):
         g.parse_mutant("not a mutant name")
+
+
+def test_classify_linecol_vs_desc():
+    assert g.classify(r"musefs-core/src/scan\.rs:277:30:") == "linecol"
+    pat = r"musefs-format/src/convert\.rs:\d+:\d+: replace usize_from -> usize"
+    assert g.classify(pat) == "desc"
+    assert g.classify(r"replace < with <= in Musefs::poll_due") == "desc"
+
+
+def test_validate_regex_subset_accepts_current_constructs():
+    patterns = [
+        r"musefs-core/src/scan\.rs:277:30:",
+        r"replace < with (==|>|<=) in crc_shift_zeros",
+        r"musefs-core/src/reader\.rs:71:60: replace / with [%*]",
+        r"replace match guard .* with false in VirtualTree::apply_changes",
+        r"replace \+ with \* in fixtures::wav",
+        r'replace truncate_component -> Cow<._, str> with Cow::Borrowed\(""\)',
+    ]
+    for pat in patterns:
+        g.validate_regex_subset(pat)  # must not raise
+
+
+def test_validate_regex_subset_rejects_divergent_escape():
+    import pytest
+
+    with pytest.raises(ValueError):
+        g.validate_regex_subset(r"replace \b foo")
+    with pytest.raises(ValueError):
+        g.validate_regex_subset(r"replace \w+ foo")
+
+
+def test_validate_regex_subset_rejects_inline_group():
+    import pytest
+
+    with pytest.raises(ValueError):
+        g.validate_regex_subset(r"foo(?=bar)")
