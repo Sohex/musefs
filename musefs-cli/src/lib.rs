@@ -104,6 +104,10 @@ pub enum Command {
         /// Probe worker threads (0 = available parallelism). 1 = sequential.
         #[arg(long, default_value_t = 0)]
         jobs: usize,
+        /// Follow symlinks while walking directories. Off by default: symlinked
+        /// files and directories are logged and skipped.
+        #[arg(long)]
+        follow_symlinks: bool,
         /// Suppress the per-target summary on stdout (failures still surface via
         /// the `log` facade on stderr; raise detail with `RUST_LOG=info`).
         #[arg(long, short)]
@@ -124,12 +128,14 @@ pub fn run_scan(
     targets: &[PathBuf],
     revalidate: bool,
     jobs: usize,
+    follow_symlinks: bool,
     quiet: bool,
 ) -> Result<()> {
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let opts = musefs_core::ScanOptions {
         jobs,
+        follow_symlinks,
         ..Default::default()
     };
     for target in targets {
@@ -205,8 +211,9 @@ pub fn run(cli: Cli) -> Result<()> {
             db,
             revalidate,
             jobs,
+            follow_symlinks,
             quiet,
-        } => run_scan(&db, &targets, revalidate, jobs, quiet),
+        } => run_scan(&db, &targets, revalidate, jobs, follow_symlinks, quiet),
         Command::Mount(args) => run_mount(&args),
     }
 }
@@ -244,6 +251,38 @@ mod tests {
                 Command::Scan { quiet, .. } => assert!(quiet),
                 Command::Mount(..) => panic!("expected Scan"),
             }
+        }
+    }
+
+    #[test]
+    fn scan_command_parses_follow_symlinks_flag() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "musefs",
+            "scan",
+            "/m",
+            "--db",
+            "/tmp/x.db",
+            "--follow-symlinks",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Scan {
+                follow_symlinks, ..
+            } => assert!(follow_symlinks),
+            Command::Mount(..) => panic!("expected scan command"),
+        }
+    }
+
+    #[test]
+    fn scan_command_follow_symlinks_defaults_off() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "scan", "/m", "--db", "/tmp/x.db"]).unwrap();
+        match cli.command {
+            Command::Scan {
+                follow_symlinks, ..
+            } => assert!(!follow_symlinks),
+            Command::Mount(..) => panic!("expected scan command"),
         }
     }
 
