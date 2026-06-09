@@ -136,12 +136,14 @@ jobs:
         run: pip install ruff
       - name: Lint
         run: |
-          ruff check contrib/python-musefs/
-          ruff format --check contrib/python-musefs/
+          ruff check contrib/python-musefs/ scripts/
+          ruff format --check contrib/python-musefs/ scripts/
       - name: Install library
         run: pip install -e "contrib/python-musefs[test]"
       - name: Test
         run: python -m pytest contrib/python-musefs/tests -v
+      - name: Test bump script
+        run: python -m pytest scripts/test_bump_python_version.py -v
 
   beets:
     needs: changes
