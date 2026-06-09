@@ -10,6 +10,7 @@ Exits with the guest command's exit code.
 
 Usage: serial-run.py <serial.sock> <console-log> <timeout-seconds> <command>
 """
+
 from __future__ import annotations
 
 import re
