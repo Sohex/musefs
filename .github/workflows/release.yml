@@ -97,3 +97,52 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            mode: host
+          - triple: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            mode: host
+          - triple: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            mode: alpine
+          - triple: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            mode: alpine
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - name: Download artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: musefs-${{ matrix.triple }}
+          path: dist
+      - name: Extract binary
+        run: |
+          set -euo pipefail
+          tar -xzf dist/musefs-*-${{ matrix.triple }}.tar.gz -C .
+          ./musefs --version || true   # glibc/musl host may differ; real check is the smoke
+      - name: Smoke (host)
+        if: matrix.mode == 'host'
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y fuse3 ffmpeg
+          ./scripts/smoke-binary.sh ./musefs
+      - name: Smoke (Alpine container)
+        if: matrix.mode == 'alpine'
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            -v "$PWD":/w -w /w \
+            alpine:3.20 \
+            sh -c 'apk add --no-cache fuse3 ffmpeg >/dev/null && sh scripts/smoke-binary.sh ./musefs'
