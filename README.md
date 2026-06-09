@@ -167,10 +167,39 @@ The most common cause is a backing file that changed since its last scan
 (musefs refuses to serve a file whose size or mtime drifted, rather than
 splice at stale offsets). Run `musefs scan --revalidate` to re-probe it.
 
+## Prebuilt binaries
+
+Each tagged release attaches static/portable Linux binaries for four targets:
+
+| Target | libc | Notes |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu`  | glibc | Pinned to glibc 2.17 — runs on essentially any current distro. |
+| `aarch64-unknown-linux-gnu` | glibc | glibc 2.17 floor, ARM64. |
+| `x86_64-unknown-linux-musl`  | musl | Fully static — runs on Alpine / scratch containers. |
+| `aarch64-unknown-linux-musl` | musl | Fully static, ARM64. |
+
+Download the tarball for your target from the
+[latest release](https://github.com/Sohex/musefs/releases/latest), verify it,
+and extract:
+
+```bash
+sha256sum -c musefs-<version>-<target>.tar.gz.sha256
+tar -xzf musefs-<version>-<target>.tar.gz   # yields ./musefs
+```
+
+**Runtime requirements:** the binaries mount via FUSE's `fusermount3` helper, so
+the target needs the FUSE userspace tools and `/dev/fuse`:
+
+- Debian/Ubuntu: `apt-get install fuse3`
+- Alpine: `apk add fuse3`
+
+No glibc/libfuse install is needed for the musl binaries beyond `fuse3`.
+
 ## Requirements
 
 - Rust (2024 edition) and Cargo to build/install.
-- A supported OS with FUSE to mount — Linux (`/dev/fuse` + libfuse) or FreeBSD
+- A supported OS with FUSE to mount — Linux (`/dev/fuse` + `fusermount3`, from
+  the `fuse3` package) or FreeBSD
   (`/dev/fuse` + the `fusefs` kernel module; no libfuse). macOS (FUSE-T) is
   best-effort. See [Platform support](#platform-support) for details.
 
