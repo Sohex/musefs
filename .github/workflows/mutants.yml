@@ -75,6 +75,10 @@ jobs:
         # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).
         run: cargo install cargo-mutants
+      - name: Check mutant-exclusion anchors
+        run: |
+          cargo mutants --no-config --list --json > mutants-list.json
+          python3 scripts/check_mutant_anchors.py --mutants-json mutants-list.json
       - name: Build the merge-base diff
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
