@@ -9,6 +9,8 @@ use clap::{Parser, Subcommand};
 use musefs_core::{MountConfig, Musefs};
 use musefs_db::Db;
 
+mod signal;
+
 /// Mount content mode (CLI surface for `musefs_core::Mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum CliMode {
@@ -188,6 +190,8 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
         Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
     let (config, fuse_config) = parse_mount_config(args);
     let core = Musefs::open(db, config).context("building the virtual filesystem")?;
+    signal::install_unmount_on_signal(args.mountpoint.clone())
+        .context("installing the stop-signal unmount handler")?;
     musefs_fuse::mount_with(core, &args.mountpoint, "musefs", fuse_config)
         .with_context(|| format!("mounting at {}", args.mountpoint.display()))?;
     Ok(())

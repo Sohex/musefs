@@ -18,5 +18,9 @@ clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 musefs-cli = { path = "../musefs-cli", version = "0.2.0" }
 
+[dev-dependencies]
+tempfile = "3"
+rustix = { version = "1", features = ["process"] }
+
 [lints]
 workspace = true
