@@ -1,0 +1,176 @@
+name: Release (Python)
+
+on:
+  push:
+    tags:
+      - 'py-v*'
+
+concurrency:
+  group: release-python-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - name: Verify tag matches every contrib package version
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#py-v}"
+          echo "tag=$TAG_VERSION"
+          fail=0
+          for f in \
+            contrib/python-musefs/pyproject.toml \
+            contrib/beets/pyproject.toml \
+            contrib/lidarr/pyproject.toml \
+            contrib/picard/pyproject.toml; do
+            V="$(grep -m1 '^version = ' "$f" | sed -E 's/version = "([^"]+)"/\1/')"
+            echo "$f => $V"
+            if [ "$V" != "$TAG_VERSION" ]; then
+              echo "::error file=$f::version $V does not match tag $TAG_VERSION"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ]
+
+  test-python-musefs:
+    needs: version-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Lint
+        run: |
+          ruff check contrib/python-musefs/ scripts/
+          ruff format --check contrib/python-musefs/ scripts/
+      - name: Install library
+        run: pip install -e "contrib/python-musefs[test]"
+      - name: Test
+        run: python -m pytest contrib/python-musefs/tests -v
+      - name: Test bump script
+        run: python -m pytest scripts/test_bump_python_version.py -v
+
+  test-beets:
+    needs: version-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check contrib/beets/ tests/interop/
+      - name: Format check
+        run: ruff format --check contrib/beets/ tests/interop/
+      - name: Install python-musefs (local, unpublished dependency)
+        run: pip install -e contrib/python-musefs
+      - name: Install beets
+        run: pip install -e "contrib/beets[test]"
+      - name: Test
+        run: python -m pytest contrib/beets/tests -v
+
+  test-lidarr:
+    needs: version-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Lint
+        run: |
+          ruff check contrib/lidarr/
+          ruff format --check contrib/lidarr/
+      - name: Install python-musefs (local, unpublished dependency)
+        run: pip install -e contrib/python-musefs
+      - name: Install Lidarr integration
+        run: pip install -e "contrib/lidarr[test]"
+      - name: Test
+        run: python -m pytest contrib/lidarr/tests -v
+
+  test-picard:
+    needs: version-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - name: Install Picard (system Python + PyQt5)
+        run: sudo apt-get update && sudo apt-get install -y picard
+      - name: Verify Picard module path
+        run: test -d /usr/lib/picard/picard || { echo "::error::picard package not at /usr/lib/picard; PYTHONPATH is stale"; exit 1; }
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      - name: Create venv on the system Python
+        run: uv venv --system-site-packages --python "$(which python3)"
+      - name: Install plugin test deps + ruff
+        run: uv pip install -e 'contrib/picard[test]' ruff
+      - name: Lint
+        run: |
+          .venv/bin/ruff check contrib/picard/
+          .venv/bin/ruff format --check contrib/picard/
+      - name: Test (real Picard, headless)
+        env:
+          PYTHONPATH: /usr/lib/picard
+          QT_QPA_PLATFORM: offscreen
+        run: .venv/bin/python -m pytest contrib/picard/tests -v
+
+  publish:
+    needs: [test-python-musefs, test-beets, test-lidarr, test-picard]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
+      - name: Install build tooling
+        run: pip install build twine
+      # python-musefs first (beets/lidarr depend on it).
+      - name: Build python-musefs
+        run: python -m build contrib/python-musefs
+      - name: Check python-musefs
+        run: twine check contrib/python-musefs/dist/*
+      - name: Publish python-musefs
+        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d
+        with:
+          packages-dir: contrib/python-musefs/dist
+      - name: Build beets-musefs
+        run: python -m build contrib/beets
+      - name: Check beets-musefs
+        run: twine check contrib/beets/dist/*
+      - name: Publish beets-musefs
+        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d
+        with:
+          packages-dir: contrib/beets/dist
+      - name: Build lidarr-musefs
+        run: python -m build contrib/lidarr
+      - name: Check lidarr-musefs
+        run: twine check contrib/lidarr/dist/*
+      - name: Publish lidarr-musefs
+        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d
+        with:
+          packages-dir: contrib/lidarr/dist
