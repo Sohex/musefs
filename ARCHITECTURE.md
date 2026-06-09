@@ -252,7 +252,10 @@ files whose size/mtime changed (skipping unchanged files **preserves
 external tag edits** in the DB), delete tracks under the scanned root whose
 backing file is gone, and garbage-collect now-unreferenced art. Pruning is
 scoped to the scanned root, so revalidating one library root never removes
-tracks belonging to another.
+tracks belonging to another. Because a track is keyed by its *canonical*
+backing path, a file scanned via `--follow-symlinks` whose real target lives
+outside the scanned root falls outside the prune scope: if that target later
+disappears, its stale row is not pruned by revalidating this root.
 
 ## The contrib ecosystem
 
