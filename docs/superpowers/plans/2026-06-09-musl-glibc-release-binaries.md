@@ -135,7 +135,9 @@ Append to `/home/cfutro/git/musefs/Cargo.toml` as a **new top-level table at end
 
 ```toml
 [profile.release]
-strip = true
+# "debuginfo" (not true/"symbols"): keep the symbol table so field panic
+# backtraces stay symbolicated, while still dropping the bulk of the size.
+strip = "debuginfo"
 ```
 
 - [ ] **Step 3: Build to confirm nothing broke**
