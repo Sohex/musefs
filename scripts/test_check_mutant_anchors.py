@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import check_mutant_anchors as g  # noqa: E402
@@ -31,10 +33,16 @@ def test_parse_guard_tag_count():
 
 
 def test_parse_guard_tag_rejects_unknown_field():
-    import pytest
-
     with pytest.raises(ValueError):
         g.parse_guard_tag(" bogus=1")
+
+
+def test_parse_guard_tag_rejects_malformed_residue():
+    # stray spaces around '=' would otherwise be silently dropped to defaults
+    with pytest.raises(ValueError):
+        g.parse_guard_tag(" count = 3")
+    with pytest.raises(ValueError):
+        g.parse_guard_tag(' op="<" garbage rows=3')
 
 
 def test_parse_mutant_binop_with_fn():
@@ -75,8 +83,6 @@ def test_parse_mutant_unary_delete_is_site_only():
 
 
 def test_parse_mutant_rejects_no_prefix():
-    import pytest
-
     with pytest.raises(ValueError):
         g.parse_mutant("not a mutant name")
 
@@ -102,8 +108,6 @@ def test_validate_regex_subset_accepts_current_constructs():
 
 
 def test_validate_regex_subset_rejects_divergent_escape():
-    import pytest
-
     with pytest.raises(ValueError):
         g.validate_regex_subset(r"replace \b foo")
     with pytest.raises(ValueError):
@@ -111,8 +115,6 @@ def test_validate_regex_subset_rejects_divergent_escape():
 
 
 def test_validate_regex_subset_rejects_inline_group():
-    import pytest
-
     with pytest.raises(ValueError):
         g.validate_regex_subset(r"foo(?=bar)")
 
@@ -166,7 +168,7 @@ def test_parse_toml_entries_hash_inside_regex_not_a_comment():
     assert entries[0].tag is None
 
 
-def _m(name):
+def _m(name: str) -> g.Mutant:
     return g.parse_mutant(name)
 
 
@@ -319,7 +321,5 @@ def test_load_mutants_from_json():
 
 
 def test_load_mutants_empty_is_error():
-    import pytest
-
     with pytest.raises(ValueError):
         g.load_mutants("[]")

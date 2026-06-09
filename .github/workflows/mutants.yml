@@ -7,6 +7,10 @@ on:
       - 'musefs-core/**'
       - 'musefs-format/**'
       - 'scripts/mutants.sh'
+      # The anchor guard validates these against the live mutant set, so a PR that
+      # only touches the exclusion config or the guard itself must still run it.
+      - '.cargo/mutants.toml'
+      - 'scripts/check_mutant_anchors.py'
       - '.github/workflows/mutants.yml'
   schedule:
     - cron: '0 4 * * 1'  # Mondays 04:00 UTC
