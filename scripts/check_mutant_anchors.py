@@ -55,6 +55,34 @@ def parse_mutant(name: str) -> Mutant:
     )
 
 
+_LITERAL_LINECOL = re.compile(r":[0-9]+:[0-9]+:")
+
+_ALLOWED_ESCAPES = set(".d+|^()*")
+
+
+def classify(regex: str) -> str:
+    return "linecol" if _LITERAL_LINECOL.search(regex) else "desc"
+
+
+def validate_regex_subset(regex: str) -> None:
+    i = 0
+    while i < len(regex):
+        c = regex[i]
+        if c == "\\":
+            if i + 1 >= len(regex):
+                raise ValueError("trailing backslash in regex")
+            nxt = regex[i + 1]
+            if nxt not in _ALLOWED_ESCAPES:
+                raise ValueError(
+                    rf"disallowed escape \{nxt} (outside the Rust/Python shared subset)"
+                )
+            i += 2
+            continue
+        if regex[i : i + 2] == "(?":
+            raise ValueError("inline group/flag (?...) not in the shared subset")
+        i += 1
+
+
 _TAG_FIELD = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
 
 
