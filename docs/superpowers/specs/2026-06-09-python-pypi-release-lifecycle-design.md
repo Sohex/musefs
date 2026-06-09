@@ -46,7 +46,7 @@ These were settled during brainstorming:
    single version, **decoupled from the Rust workspace version**, released on
    its own tag namespace **`py-v*`** (Rust keeps `v*`). A Python-only fix can
    ship without a Rust release.
-2. **Source of truth: a bump script.** `scripts/bump-python-version.py` is the
+2. **Source of truth: a bump script.** `scripts/bump_python_version.py` is the
    single entry point that rewrites the version everywhere. No setuptools
    dynamic-version machinery.
 3. **Trusted Publishing (OIDC).** No long-lived PyPI tokens in GitHub secrets.
@@ -61,8 +61,8 @@ These were settled during brainstorming:
 
 ## The bump script
 
-`scripts/bump-python-version.py <new-version>` is the single source of truth
-for the shared Python version. Invoked as e.g. `bump-python-version.py 0.2.0`,
+`scripts/bump_python_version.py <new-version>` is the single source of truth
+for the shared Python version. Invoked as e.g. `python scripts/bump_python_version.py 0.2.0`,
 it performs **only file edits** (no git operations):
 
 1. Rewrites `version = "X"` in all four `pyproject.toml`:
@@ -170,7 +170,7 @@ metadata for consistency even though it is not uploaded.
   `contrib/CHANGELOG.md` for the Python packages, so a reader of the main
   changelog discovers the separate cadence.
 - **`CONTRIBUTING.md`** gains a short "Releasing the Python packages" section
-  documenting the flow: run `bump-python-version.py`, update
+  documenting the flow: run `python scripts/bump_python_version.py`, update
   `contrib/CHANGELOG.md`, review the diff, commit, push a `py-v<version>` tag,
   and let `release-python.yml` publish. This mirrors how the Rust release is
   documented.
@@ -204,7 +204,7 @@ release section.
 
 ## Verification
 
-- `scripts/bump-python-version.py 0.2.0` updates all four pyprojects, both
+- `scripts/bump_python_version.py 0.2.0` updates all four pyprojects, both
   `__init__.py` versions, the beets/lidarr dependency floors, and re-vendors
   Picard; `git diff` shows exactly those edits and nothing else.
 - After a bump, the full Python test suite (incl. `test_vendor_sync.py`) passes
