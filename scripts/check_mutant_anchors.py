@@ -4,9 +4,14 @@ mutants they document. See docs/superpowers/specs/2026-06-09-mutant-anchor-drift
 
 from __future__ import annotations
 
+import argparse
 import fnmatch
+import json
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -221,3 +226,55 @@ def check(entries: list[Entry], mutants: list[Mutant], globs: list[str]) -> list
         else:
             failures.extend(_check_desc(entry, matched))
     return failures
+
+
+def load_mutants(json_text: str) -> list[Mutant]:
+    data = json.loads(json_text)
+    if not data:
+        raise ValueError("cargo mutants --list returned no mutants (build/feature problem?)")
+    return [parse_mutant(item["name"]) for item in data]
+
+
+def _run_cargo_list() -> str:
+    proc = subprocess.run(
+        ["cargo", "mutants", "--no-config", "--list", "--json"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(f"cargo mutants --list failed:\n{proc.stderr}")
+    return proc.stdout
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--mutants-json",
+        type=Path,
+        help="read the mutant list from this file instead of invoking cargo "
+        "(must be `cargo mutants --no-config --list --json` output)",
+    )
+    ap.add_argument(
+        "--toml",
+        type=Path,
+        default=Path(".cargo/mutants.toml"),
+        help="path to mutants.toml (default: .cargo/mutants.toml)",
+    )
+    args = ap.parse_args(argv)
+
+    entries, globs = parse_toml_entries(args.toml.read_text())
+    json_text = args.mutants_json.read_text() if args.mutants_json else _run_cargo_list()
+    mutants = load_mutants(json_text)
+
+    failures = check(entries, mutants, globs)
+    if failures:
+        print(f"{len(failures)} mutant-anchor failure(s):\n")
+        for f in failures:
+            print(f"  {f}")
+        return 1
+    print(f"OK: {len(entries)} exclude_re entries validated against {len(mutants)} mutants.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
