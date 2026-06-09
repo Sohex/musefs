@@ -28,6 +28,31 @@ if ! cargo test --workspace --quiet; then
     exit 1
 fi
 
+# Mutant-exclusion anchor drift guard. The .cargo/mutants.toml exclude_re entries
+# are anchored on file:line:col; a code edit that shifts a line can silently
+# re-point an anchor onto a killable mutant. Re-validate (mirroring the CI job in
+# mutants.yml) whenever the config, the guard script, or a mutation-scoped source
+# file (musefs-core / musefs-format) is staged. Skipped — not enforced — when
+# cargo-mutants is absent, since CI re-checks it on every PR regardless.
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+if echo "$STAGED" | grep -qE '^(\.cargo/mutants\.toml|scripts/check_mutant_anchors\.py|musefs-(core|format)/src/.*\.rs)$'; then
+    if command -v cargo-mutants >/dev/null 2>&1; then
+        echo "pre-commit: mutant-anchor drift guard"
+        MUTANTS_LIST=$(mktemp)
+        trap 'rm -f "$MUTANTS_LIST"' EXIT
+        if ! cargo mutants --no-config --list --json >"$MUTANTS_LIST"; then
+            echo "✗ mutant-anchor guard: 'cargo mutants --list' failed." >&2
+            exit 1
+        fi
+        if ! python3 scripts/check_mutant_anchors.py --mutants-json "$MUTANTS_LIST"; then
+            echo "✗ mutant-anchor guard: re-anchor .cargo/mutants.toml to the current coordinates." >&2
+            exit 1
+        fi
+    else
+        echo "pre-commit: cargo-mutants not installed — skipping anchor guard (CI enforces it)." >&2
+    fi
+fi
+
 # Lint the union of every path the beets, picard, lidarr, python-musefs, and
 # scripts CI jobs lint, so a commit can't pass the hook yet fail CI.
 RUFF_PATHS=(contrib/beets/ contrib/lidarr/ contrib/picard/ contrib/python-musefs/ scripts/ tests/interop/)
