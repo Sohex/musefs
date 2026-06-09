@@ -43,6 +43,12 @@ _BINOP_RE = re.compile(r"^replace (?P<op>\S+) with (?P<repl>\S+)(?: in (?P<fn>.+
 
 
 def parse_mutant(name: str) -> Mutant:
+    """Parse a cargo-mutants name into its site and (best-effort) op/repl/fn.
+
+    The site is always extracted; op/repl/fn are populated only for binary-operator
+    mutants (None for FnValue/MatchArm/UnaryOperator/etc., which the site-count
+    check handles fine). Raises ValueError if the name lacks a file:line:col prefix.
+    """
     m = _NAME_RE.match(name)
     if not m:
         raise ValueError(f"unparseable mutant name (no file:line:col prefix): {name!r}")
@@ -71,6 +77,13 @@ def classify(regex: str) -> str:
 
 
 def validate_regex_subset(regex: str) -> None:
+    """Reject patterns outside the Rust-regex/Python-re shared subset.
+
+    Only the escapes actually used by the toml (``.d+|^()*``) are allowed, and
+    inline groups ``(?...)`` are forbidden, so a future pattern relying on a
+    construct whose meaning diverges between the two engines fails loudly here
+    rather than silently matching a different set. Raises ValueError on violation.
+    """
     i = 0
     while i < len(regex):
         c = regex[i]
@@ -93,8 +106,18 @@ _TAG_FIELD = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
 
 
 def parse_guard_tag(text: str) -> Tag:
+    """Parse a ``# guard:`` body into a Tag, rejecting malformed residue.
+
+    Any non-whitespace outside the recognized ``key=value`` tokens (e.g. a typo'd
+    ``count = 3`` with stray spaces) raises ValueError rather than being silently
+    dropped, so a broken tag can't quietly degrade to the defaults.
+    """
     tag = Tag()
+    cursor = 0
     for m in _TAG_FIELD.finditer(text):
+        if text[cursor : m.start()].strip():
+            raise ValueError(f"malformed guard tag near: {text[cursor : m.start()]!r}")
+        cursor = m.end()
         key = m.group(1)
         val = m.group(2) if m.group(2) is not None else m.group(3)
         if key == "op":
@@ -108,6 +131,8 @@ def parse_guard_tag(text: str) -> Tag:
             tag.count = int(val)
         else:
             raise ValueError(f"unknown guard tag field: {key}")
+    if text[cursor:].strip():
+        raise ValueError(f"malformed guard tag near: {text[cursor:]!r}")
     return tag
 
 
@@ -126,6 +151,13 @@ def _unquote_toml_string(s: str) -> str:
 
 
 def parse_toml_entries(text: str) -> tuple[list[Entry], list[str]]:
+    """Raw-text parse of mutants.toml into (exclude_re entries, exclude_globs).
+
+    Raw text rather than a TOML library because the ``# guard:`` expectations live
+    in comments. Each entry is paired with the nearest preceding ``# guard:`` tag
+    (last one wins); a ``#`` only starts a comment at line start, never inside a
+    quoted regex.
+    """
     entries: list[Entry] = []
     globs: list[str] = []
     section: str | None = None  # "re" | "globs" | None
@@ -207,6 +239,12 @@ def _check_desc(entry: Entry, matched: list[Mutant]) -> list[str]:
 
 
 def check(entries: list[Entry], mutants: list[Mutant], globs: list[str]) -> list[str]:
+    """Validate every entry against the unfiltered mutant set; return failure lines.
+
+    Line:col anchors are checked by operator+function+row-count; description anchors
+    by distinct-site count. A match landing in an exclude_globs file is also a
+    failure (the pattern has drifted onto a non-gated file).
+    """
     failures: list[str] = []
     for entry in entries:
         try:
@@ -236,11 +274,15 @@ def load_mutants(json_text: str) -> list[Mutant]:
 
 
 def _run_cargo_list() -> str:
-    proc = subprocess.run(
-        ["cargo", "mutants", "--no-config", "--list", "--json"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["cargo", "mutants", "--no-config", "--list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as ex:
+        raise SystemExit("cargo mutants --list timed out after 600s") from ex
     if proc.returncode != 0:
         raise SystemExit(f"cargo mutants --list failed:\n{proc.stderr}")
     return proc.stdout
@@ -262,9 +304,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    entries, globs = parse_toml_entries(args.toml.read_text())
-    json_text = args.mutants_json.read_text() if args.mutants_json else _run_cargo_list()
-    mutants = load_mutants(json_text)
+    try:
+        entries, globs = parse_toml_entries(args.toml.read_text())
+        json_text = args.mutants_json.read_text() if args.mutants_json else _run_cargo_list()
+        mutants = load_mutants(json_text)
+    except (OSError, json.JSONDecodeError, ValueError, KeyError) as ex:
+        print(f"error: failed to load toml/mutants: {ex}", file=sys.stderr)
+        return 1
 
     failures = check(entries, mutants, globs)
     if failures:
