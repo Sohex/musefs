@@ -101,35 +101,98 @@ The set lives only for the duration of one `collect_audio` walk and is only
 populated when the flag is on, so the default path gains no per-directory `stat`
 overhead beyond the new symlink branch.
 
+## The root argument is always followed
+
+The flag governs symlinks **encountered during recursion**, not the `root`
+argument itself. Both `scan_directory_with` and `revalidate_with` dispatch on
+`root.is_file()` (which follows the link) before calling `collect_audio`, and
+`collect_audio`'s `read_dir(root)` likewise follows a symlinked root directory.
+So a symlinked-file root is already scanned and a symlinked-directory root is
+already walked **today, regardless of the flag** — and that does not change. Only
+links found *inside* the tree are gated. When following, the cycle guard is
+seeded with the followed root's `(dev, ino)`.
+
 ## Code shape
 
+### `collect_audio` signature and the cycle-guard ownership
+
+`collect_audio` is recursive and has **three production callers**
+(`find_referencing_symbols`): `scan_directory_with` (`scan.rs:596`),
+`revalidate_with` (`scan.rs:802`), and `scan_directory_full_oracle`
+(`scan.rs:771`, a `#[doc(hidden)]` test oracle) — plus one unit-test caller,
+`hardening_tests::collect_audio_skips_unsupported_files` (`scan.rs:1229`).
+
+To keep the public signature minimal and the visited-set bookkeeping
+encapsulated, split into two functions:
+
+- `collect_audio(root, out, follow_symlinks: bool)` — the entry point all callers
+  use. It creates the `HashSet<(u64, u64)>`, seeds it with `root`'s `(dev, ino)`
+  when `follow_symlinks` is true, then delegates to the recursive inner function.
+- a private recursive `collect_audio_inner(root, out, follow_symlinks, visited)`
+  carrying the set.
+
+This means each caller's call site changes only by passing one `bool`, not two
+new arguments.
+
+### Per-caller changes (all must be updated — the blocker)
+
+- `scan_directory_with` (`scan.rs:596`): pass `opts.follow_symlinks`.
+- `revalidate_with` (`scan.rs:802`): pass `opts.follow_symlinks`. **This is
+  required, not optional.** `revalidate_with` walks the same tree via
+  `collect_audio` and then prunes tracks under the root whose backing file is
+  gone. If scan follows symlinks but revalidate does not, symlinked tracks are
+  scanned once and then never re-probed on subsequent revalidations — a silent
+  scan/revalidate divergence. It already takes `&ScanOptions`, so threading the
+  flag through is the whole fix.
+- `scan_directory_full_oracle` (`scan.rs:771`): pass `false`. It is the legacy
+  test oracle, takes no `ScanOptions`, and does not need symlink support; it only
+  needs to satisfy the new signature.
+- `hardening_tests::collect_audio_skips_unsupported_files` (`scan.rs:1229`):
+  update the existing call to pass `false`.
+
+### `ScanOptions` and the symlink arm
+
 - `ScanOptions` (`scan.rs:378`) gains `follow_symlinks: bool`; its `Default` impl
-  sets it `false`.
-- `collect_audio` (`scan.rs:76`) gains the `follow` flag and a
-  `&mut HashSet<(u64, u64)>` visited set, threaded from `scan_directory_with`
-  (`scan.rs:596`). `scan_directory_with` seeds the set with the root directory's
-  `(dev, ino)` before the first call (when following).
-- A `ftype.is_symlink()` arm is added to `collect_audio`. The existing
+  (`scan.rs:387`) sets it `false`. Grep for `ScanOptions {` literals before
+  building — the CLI uses `..Default::default()` so it is unaffected, but any full
+  literal construction in tests must add the field.
+- A `ftype.is_symlink()` arm is added to `collect_audio_inner`. The existing
   `is_dir()` / `is_file()` arms behave exactly as today when the flag is off; the
-  directory arm consults the cycle guard when the flag is on.
-- CLI (`musefs-cli/src/lib.rs`): parse `--follow-symlinks` into
-  `opts.follow_symlinks`. The `scanned … skipped … failed` summary line is
-  unchanged.
+  directory descent consults the cycle guard when the flag is on.
+
+### CLI plumbing (`musefs-cli/src/lib.rs`)
+
+- The `Command::Scan` variant (`lib.rs:93`) gains `follow_symlinks: bool` with
+  `#[arg(long)]` (default false), mirroring the existing `jobs` / `quiet` flags.
+- `run_scan` (`lib.rs:122`) gains a `follow_symlinks: bool` parameter and builds
+  `ScanOptions { jobs, follow_symlinks, ..Default::default() }` (`lib.rs:131`).
+  Because `opts` is shared by both the scan and the revalidate branches, the
+  revalidate path honors the flag with no further change.
+- `run` (`lib.rs:201`) threads the parsed field into the `run_scan` call.
+- The `scanned … skipped … failed` summary line is unchanged.
 
 ## Testing
 
 Added to the existing `hardening_tests` module in `scan.rs`, creating links with
-`std::os::unix::fs::symlink`:
+`std::os::unix::fs::symlink`. The project has **no log-capture harness** (`log`
+is the only logging dep, no `testing_logger`/`logtest`), so tests assert on the
+**observable collection result** (the contents of the `out` vec, or `ScanStats`
+after a full scan) — not on log emission. The `log::warn!` lines are a diagnostic
+side effect, verified by inspection, not by assertion. Tests drive
+`collect_audio(root, &mut out, follow_symlinks)` directly where possible.
 
-- **symlinked audio file** — collected when the flag is on; logged and skipped
-  (not collected) when off.
-- **symlinked directory** — its contents are recursed into and scanned when on.
-- **cycle** — a directory symlink pointing to an ancestor terminates rather than
-  recursing infinitely.
-- **broken symlink, flag on** — logged, skipped, and the scan completes
-  successfully (does not abort).
-- **default-off regression** — real files are still scanned and symlinks are not
-  followed.
+- **symlinked audio file** — present in `out` when the flag is on; **absent** from
+  `out` when off (the observable form of "logged and skipped").
+- **symlinked directory** — files beneath it appear in `out` when on; absent when
+  off.
+- **cycle** — a directory symlink pointing to an ancestor: the call **returns**
+  (terminates) rather than recursing infinitely, and each real file appears in
+  `out` at most once. (A test that hangs on failure is acceptable here — the
+  assertion is "it completes.")
+- **broken symlink, flag on** — `collect_audio` returns `Ok(())` (does not abort
+  via `?`) and the valid sibling files are still collected.
+- **default-off regression** — real files are still collected and symlinks are
+  not followed (guards against a behavior change on the default path).
 
 ## Docs
 
