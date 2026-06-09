@@ -115,3 +115,52 @@ def test_validate_regex_subset_rejects_inline_group():
 
     with pytest.raises(ValueError):
         g.validate_regex_subset(r"foo(?=bar)")
+
+
+SAMPLE_TOML = """\
+exclude_globs = [
+    "musefs-fuse/**",
+    "musefs-core/src/metrics.rs",
+]
+exclude_re = [
+    # a bare line:col entry
+    # guard: op="<" fn="probe_file" rows=3
+    'musefs-core/src/scan\\.rs:277:30:',
+
+    # a description entry, multi-site (note the blank line above — must be skipped)
+    # guard: count=3
+    'replace \\| with \\^ in synchsafe_decode',
+    # an untagged description entry (defaults count=1)
+    'replace == with != in VirtualTree::ancestor_in',
+]
+"""
+
+
+def test_parse_toml_entries_pairs_tags():
+    entries, globs = g.parse_toml_entries(SAMPLE_TOML)
+    assert globs == ["musefs-fuse/**", "musefs-core/src/metrics.rs"]
+    assert len(entries) == 3
+    assert entries[0].regex == r"musefs-core/src/scan\.rs:277:30:"
+    assert entries[0].tag.op == "<" and entries[0].tag.rows == 3
+    assert entries[1].regex == r"replace \| with \^ in synchsafe_decode"
+    assert entries[1].tag.count == 3
+    assert entries[2].tag is None  # untagged → default later
+
+
+def test_parse_toml_entries_last_guard_wins():
+    toml = (
+        "exclude_re = [\n"
+        "    # guard: count=2\n"
+        "    # guard: count=5\n"
+        "    'replace a with b in foo',\n"
+        "]\n"
+    )
+    entries, _ = g.parse_toml_entries(toml)
+    assert entries[0].tag.count == 5
+
+
+def test_parse_toml_entries_hash_inside_regex_not_a_comment():
+    toml = "exclude_re = [\n    'replace # with x in foo',\n]\n"
+    entries, _ = g.parse_toml_entries(toml)
+    assert entries[0].regex == "replace # with x in foo"
+    assert entries[0].tag is None

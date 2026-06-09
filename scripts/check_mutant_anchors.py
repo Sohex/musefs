@@ -103,3 +103,52 @@ def parse_guard_tag(text: str) -> Tag:
         else:
             raise ValueError(f"unknown guard tag field: {key}")
     return tag
+
+
+@dataclass
+class Entry:
+    regex: str
+    toml_line: int
+    tag: Tag | None
+
+
+def _unquote_toml_string(s: str) -> str:
+    s = s.rstrip(",").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        return s[1:-1]
+    raise ValueError(f"malformed TOML string element: {s!r}")
+
+
+def parse_toml_entries(text: str) -> tuple[list[Entry], list[str]]:
+    entries: list[Entry] = []
+    globs: list[str] = []
+    section: str | None = None  # "re" | "globs" | None
+    pending: Tag | None = None
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        s = raw.strip()
+        if s.startswith("exclude_re"):
+            section, pending = "re", None
+            continue
+        if s.startswith("exclude_globs"):
+            section = "globs"
+            continue
+        if s == "]":
+            section, pending = None, None
+            continue
+        if section is None:
+            continue
+        if not s:
+            continue
+        if s.startswith("#"):
+            body = s[1:].strip()
+            if body.startswith("guard:"):
+                pending = parse_guard_tag(body[len("guard:") :])
+            continue
+        if s[:1] in "'\"":
+            value = _unquote_toml_string(s)
+            if section == "re":
+                entries.append(Entry(regex=value, toml_line=lineno, tag=pending))
+                pending = None
+            else:
+                globs.append(value)
+    return entries, globs
