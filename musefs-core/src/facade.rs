@@ -981,6 +981,11 @@ impl Musefs {
                     }
                     let resolved = h.resolved.load();
                     let r: &ResolvedFile = &resolved;
+                    // Re-stat the held fd every read: a pure in-place backing
+                    // rewrite (same inode) leaves both DB-side staleness signals
+                    // unchanged, so this is the only check that catches it. A
+                    // genuine drift is terminal — propagate, don't retry the loop.
+                    validate_opened_backing(&h.file, r)?;
                     let served = self.pool.with(|db| -> Result<Option<()>> {
                         if r.has_binary_tag {
                             // Snapshot-consistent: version check + blob reads see one

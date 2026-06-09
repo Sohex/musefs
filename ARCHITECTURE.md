@@ -178,7 +178,9 @@ default) of resolved layouts — keys each entry on it: a hit with a stale
 `content_version` rebuilds the layout. Independently of the cache, **every**
 resolve re-stats the backing file and errors with `BackingChanged` if its
 size or mtime drifted from the scanned values, so a silently replaced backing
-file is never spliced at stale offsets.
+file is never spliced at stale offsets. The per-handle read path re-stats the
+held descriptor on every read too, so this guarantee holds on the hot path and
+not only through `resolve()`.
 
 **`data_version`** (`PRAGMA data_version`, whole-DB) answers *"did anyone
 commit anything?"*. `Musefs::poll_refresh` compares it to the last seen
