@@ -187,21 +187,22 @@ fn all_supported_formats_decode_to_same_pcm_sha_as_source() {
 
     let backing = tempfile::tempdir().unwrap();
     let mut generated = Vec::new();
+    let mut missing = Vec::new();
     for case in playback_cases() {
         let src = backing.path().join(case.source_name);
         if make_audio_fixture(&src, case) {
             generated.push((case, src));
         } else {
-            eprintln!(
-                "ffmpeg codec/container unavailable for {}; skipping",
-                case.source_name
-            );
+            missing.push(case.source_name);
         }
     }
 
+    // ffmpeg is present (checked above), so a fixture that fails to generate is a
+    // missing codec or a broken invocation, not an absent toolchain — fail loudly
+    // naming it rather than passing on a degenerate subset of "all" formats.
     assert!(
-        !generated.is_empty(),
-        "no playback fixtures could be generated; ffmpeg codecs may be unavailable"
+        missing.is_empty(),
+        "ffmpeg fixtures failed to generate (codec missing or broken invocation): {missing:?}"
     );
 
     let db = musefs_db::Db::open_in_memory().unwrap();
