@@ -207,14 +207,25 @@ failure (no poisoned/corrupt cache entry).
 
 ### DB faults via real conditions
 
-DB failure paths are driven with real OS-level conditions rather than a mock:
+The read-path DB failure that is reachable in production is driven with a real
+condition rather than a mock:
 
-- an **exclusive lock** held by a second connection (SQLITE_BUSY/locked);
-- a **byte-corrupted** DB file;
-- a **read-only / `ENOSPC`** directory.
+- a **byte-corrupted** DB file → the read path surfaces a mapped `DbError`
+  (`CoreError::Db`), not a panic or a wrong-but-`Ok` result.
 
-Tests assert the DB error paths surface correctly (mapped, not a panic), and
-that the serve fails cleanly.
+`SQLITE_BUSY` / exclusive-lock and `ENOSPC` / read-only are **not** test targets
+on the serve path, and this is by design, not a gap:
+
+- The serve path opens **read-only WAL** connections, and WAL readers are
+  **contention-free** — that is the entire point of `DbPool::PerThread`. A
+  concurrent writer never makes a read return `SQLITE_BUSY`; only a pathological
+  `PRAGMA locking_mode=EXCLUSIVE` (which musefs never sets) could, so a lock test
+  would assert the behaviour of a configuration the product doesn't use. Lock
+  *contention correctness* (concurrent readers don't corrupt/deadlock) is proven
+  by the Workstream B concurrency tests instead.
+- `ENOSPC` / read-only are **write-path** conditions (scan, WAL checkpoint); the
+  read-only serve path cannot hit them. They remain the documented best-effort
+  case (see Open feasibility risks) and are out of scope for the read-time suite.
 
 ---
 
@@ -251,12 +262,11 @@ deliberately rather than discovered mid-implementation:
   `-Zbuild-std` proves too slow/flaky is ASan without it (still catches workspace
   + FFI-boundary memory errors). ASan is the required gate, so its config must be
   reliable; TSan can stay noisy.
-- **ENOSPC simulation in CI (C).** A genuine `ENOSPC` is awkward on a shared
-  runner. The plan must choose a concrete mechanism — a small fixed-size tmpfs or
-  loopback filesystem the test fills, or a writable dir made read-only to force
-  the write error — and confirm it works unprivileged on the Ubuntu runner. If no
-  unprivileged mechanism is reliable, `ENOSPC` may degrade to a documented
-  best-effort/local-only case while lock + corruption stay mandatory.
+- **DB read-path faults (C) — resolved.** Only **byte-corruption** is a
+  reachable, mandatory read-path DB fault and is covered. `SQLITE_BUSY`/lock is
+  unreachable on the read-only WAL serve path by design (see "DB faults via real
+  conditions"), and `ENOSPC`/read-only are write-path conditions — both are out
+  of scope for the read-time suite, not best-effort TODOs.
 - **Stress-test determinism (B).** The concurrent tests are a *required* gate, so
   they must be deterministic: bounded iteration counts, barrier/latch
   synchronization rather than sleeps, and assertions on *outcomes* (correct bytes,
