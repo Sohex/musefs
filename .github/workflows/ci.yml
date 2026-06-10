@@ -24,6 +24,7 @@ jobs:
     outputs:
       src: ${{ steps.filter.outputs.src }}
       fuse: ${{ steps.filter.outputs.fuse }}
+      lidarr: ${{ steps.filter.outputs.lidarr }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
@@ -46,6 +47,7 @@ jobs:
             echo "No usable base ref; treating as a source change."
             echo "src=true" >> "$GITHUB_OUTPUT"
             echo "fuse=true" >> "$GITHUB_OUTPUT"
+            echo "lidarr=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed="$(git diff --name-only "$base...HEAD")"
@@ -67,6 +69,11 @@ jobs:
             echo "fuse=true" >> "$GITHUB_OUTPUT"
           else
             echo "fuse=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$changed" | grep -qE '^(contrib/lidarr/|scripts/(lidarr|mock_lidarr|store_assert|configure_connection)|musefs-[a-z]+/src/|Cargo\.(toml|lock))'; then
+            echo "lidarr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "lidarr=false" >> "$GITHUB_OUTPUT"
           fi
 
   check:
@@ -201,6 +208,8 @@ jobs:
         run: python -m pytest scripts/test_release_gate.py -v
       - name: Test crates-index probe
         run: python -m pytest scripts/test_crates_index.py -v
+      - name: Test lidarr-smoke helpers
+        run: python -m pytest scripts/test_lidarr_smoke_lib.py scripts/test_mock_lidarr.py scripts/test_store_assert.py -v
 
   beets:
     needs: changes
@@ -401,13 +410,18 @@ jobs:
           prepare: sh scripts/freebsd-vm/provision.sh
           run: sh scripts/freebsd-vm/run-e2e.sh
 
+  lidarr-smoke:
+    needs: changes
+    if: needs.changes.outputs.lidarr == 'true'
+    uses: ./.github/workflows/lidarr-smoke.yml
+
   # Single required status check for branch protection. Always runs (even when
   # the heavy jobs were skipped on a docs-only change) so the check is always
   # reported; green when every needed job either succeeded or was skipped, red
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan]
+    needs: [changes, check, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan, lidarr-smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results
