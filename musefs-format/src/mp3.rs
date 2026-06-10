@@ -2130,4 +2130,40 @@ mod tests {
     fn find_sub(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
     }
+
+    /// On a whole buffer with the production tail (`Some(last 128 bytes)` when
+    /// the file is at least 128 bytes), `locate_audio_bounded` must agree with
+    /// `locate_audio`: same accept/reject, same `Mp3Bounds`. This pins the
+    /// equivalence the #212 fuzz oracle relies on.
+    fn assert_mp3_bounded_matches_full(data: &[u8]) {
+        let len = data.len() as u64;
+        let tail: Option<&[u8; 128]> = if data.len() >= 128 {
+            data[data.len() - 128..].try_into().ok()
+        } else {
+            None
+        };
+        match (locate_audio(data), locate_audio_bounded(data, len, tail)) {
+            (Ok(full), Ok(Extent::Complete(bounded))) => assert_eq!(full, bounded),
+            (Err(_), Err(_)) => {}
+            (full, bounded) => {
+                panic!("mp3 bounded/full divergence: full={full:?} bounded={bounded:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn mp3_bounded_matches_full_on_whole_buffer() {
+        // Plain ID3v2.4 + frame sync (no trailer, < 128 bytes -> tail None).
+        assert_mp3_bounded_matches_full(&crate::fuzz_check::fixtures::mp3());
+        // Carries a GEOB frame; longer file.
+        assert_mp3_bounded_matches_full(&crate::fuzz_check::fixtures::mp3_with_binary_frame());
+
+        // A >=128-byte MP3 with a trailing ID3v1 "TAG" block, so the tail-strip
+        // path is exercised and the tail argument is Some.
+        let mut with_trailer = crate::fuzz_check::fixtures::mp3();
+        with_trailer.resize(200, 0x00);
+        with_trailer.extend_from_slice(b"TAG");
+        with_trailer.resize(with_trailer.len() + 125, 0x00); // pad ID3v1 to 128 bytes
+        assert_mp3_bounded_matches_full(&with_trailer);
+    }
 }
