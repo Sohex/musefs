@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic musefs library re-scan
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

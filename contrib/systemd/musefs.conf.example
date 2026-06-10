@@ -1,0 +1,71 @@
+# musefs configuration — sourced by the systemd user units as an EnvironmentFile.
+#
+# Copy to ~/.config/musefs/musefs.conf and edit. This is systemd
+# EnvironmentFile syntax, NOT shell:
+#   - one KEY=value per line; the value is literal to end of line
+#   - no quote stripping, no $VAR expansion, no command substitution
+#   - systemd specifiers like %h are NOT expanded here (only in unit files);
+#     write real absolute paths
+#   - leave optional settings COMMENTED. A bare `KEY=` means "set to empty",
+#     which is treated as a value and breaks path/boolean settings.
+#
+# Booleans accept (case-insensitive): true/false, yes/no, on/off, 1/0.
+# Any other value is a hard error that stops the unit from starting.
+
+# --- Required ---------------------------------------------------------------
+
+# Directory to mount at (must exist and be empty). Replace /home/youruser.
+MUSEFS_MOUNTPOINT=/home/youruser/Music
+# Path to the SQLite store (shared by `mount` and `scan`).
+MUSEFS_DB=/home/youruser/.local/share/musefs/library.db
+
+# --- Mount: layout ----------------------------------------------------------
+
+# Path template. Supports ${a|b} fallback chains, [ ... ] conditionals
+# ($[ / $] for literal brackets), and $!{field} path fields.
+#MUSEFS_TEMPLATE=$albumartist/$album/$title
+# Value substituted for any missing template field.
+#MUSEFS_DEFAULT_FALLBACK=Unknown
+# How file contents are served: synthesis or structure-only.
+#MUSEFS_MODE=synthesis
+# Compare filenames case-insensitively. Default: false on Linux/FreeBSD,
+# true on macOS.
+#MUSEFS_CASE_INSENSITIVE=false
+
+# --- Mount: tuning ----------------------------------------------------------
+
+# Debounce window (ms) for picking up external DB edits.
+#MUSEFS_POLL_INTERVAL_MS=1000
+# Entry/attr cache TTL (ms) the kernel may trust before re-validating.
+#MUSEFS_ATTR_TTL_MS=1000
+# Kernel read-ahead window (KiB); clamped to the kernel maximum at mount.
+#MUSEFS_MAX_READAHEAD_KIB=512
+# Max outstanding background (readahead/async) requests the kernel queues.
+#MUSEFS_MAX_BACKGROUND=64
+# Keep the kernel page cache across opens.
+#MUSEFS_KEEP_CACHE=false
+
+# --- Mount: ownership & permissions ----------------------------------------
+
+# Owner presented for every entry: a username or numeric uid.
+# Default: the launching process's uid.
+#MUSEFS_OWNER=media
+# Group presented for every entry: a group name or numeric gid.
+# Default: the launching process's gid.
+#MUSEFS_GROUP=media
+# Permission bits for regular files, octal. Default: 444.
+#MUSEFS_FILE_MODE=444
+# Permission bits for directories, octal. Default: 555.
+#MUSEFS_DIR_MODE=555
+
+# --- Scan -------------------------------------------------------------------
+# (scan targets are set in musefs-scan.service, not here.)
+
+# Probe worker threads (0 = available parallelism).
+#MUSEFS_JOBS=0
+# Re-validate on scan: skip unchanged, prune missing, GC orphaned art.
+#MUSEFS_REVALIDATE=false
+# Follow symlinks while walking.
+#MUSEFS_FOLLOW_SYMLINKS=false
+# Suppress the per-target scan summary.
+#MUSEFS_QUIET=false

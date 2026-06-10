@@ -1,0 +1,10 @@
+[Unit]
+Description=musefs library re-scan
+Documentation=https://github.com/Sohex/musefs
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/musefs/musefs.conf
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin
+# Scan target(s) are not env-configurable; set your library path here.
+ExecStart=musefs scan %h/Music --revalidate

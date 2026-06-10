@@ -134,6 +134,29 @@ user.
 | `--file-mode <OCTAL>` | `444` | Permission bits for regular files, in octal. The mount is read-only, so write bits are advertised but writes still fail with `EROFS`. |
 | `--dir-mode <OCTAL>` | `555` | Permission bits for directories, in octal. |
 
+### Configuring with environment variables
+
+Every scalar `mount` and `scan` flag can also be set with a `MUSEFS_*`
+environment variable — uppercase the long flag and turn dashes into
+underscores (e.g. `--poll-interval-ms` → `MUSEFS_POLL_INTERVAL_MS`, the
+`mount` mountpoint → `MUSEFS_MOUNTPOINT`). An explicit flag always overrides
+its env var, which overrides the default. The repeatable `--fallback` and the
+`scan` targets are command-line only. See
+[`contrib/systemd/musefs.conf.example`](contrib/systemd/musefs.conf.example)
+for the full, canonical list.
+
+### Running as a systemd user service
+
+To run musefs on the host at login, drop-in units live in
+[`contrib/systemd/`](contrib/systemd/): a `musefs.service` mount daemon, an
+optional `musefs-scan.timer` for periodic re-scans, and a commented
+`musefs.conf.example` holding every `MUSEFS_*` setting. Copy the units to
+`~/.config/systemd/user/`, copy the config to `~/.config/musefs/musefs.conf`,
+edit `MUSEFS_MOUNTPOINT` and `MUSEFS_DB`, then
+`systemctl --user enable --now musefs.service`. See
+[`contrib/systemd/README.md`](contrib/systemd/README.md) for the full walkthrough
+and the `PATH` / linger gotchas.
+
 ## Supported formats
 
 | Format | Extensions | What synthesis does | Details |
