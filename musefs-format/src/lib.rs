@@ -15,7 +15,9 @@ pub mod wav;
 pub mod fuzz_check;
 
 pub use error::{FormatError, Result};
-pub use input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
+pub use input::{
+    ArtInput, BinaryTagInput, BlobLen, EmbeddedBinaryTag, EmbeddedPicture, PictureType, TagInput,
+};
 pub use layout::{LayoutError, RegionLayout, Segment};
 pub use ogg::{Codec, OggHeader, OggScan};
 pub use probe::Extent;
