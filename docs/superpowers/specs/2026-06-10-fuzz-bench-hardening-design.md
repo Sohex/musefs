@@ -24,9 +24,14 @@ see Workstream A.
   a bench join reorder so a reader-thread panic can't be masked, and a real
   binary-tag MP3 seed.
 
-The cardinal invariant is unchanged and is in fact what the new serve fuzzing
-asserts: **original audio bytes are never copied or modified** — served audio
-regions must be byte-identical to the untouched backing file.
+The cardinal invariant is unchanged and is what the new serve fuzzing guards:
+**original audio bytes are never copied or modified.** For passthrough formats
+(FLAC/WAV/MP3/M4A) the served audio region is byte-identical to the untouched
+backing. Ogg is the documented exception: `serve_ogg_window` rewrites page
+*headers* (sequence renumbering + CRC) while leaving every packet *payload*
+untouched — so the universal, format-agnostic serve oracle is **splice
+consistency** (any window equals the same slice of a single whole read), with
+backing byte-identity asserted only for the non-Ogg passthrough regions.
 
 ## Background
 
@@ -128,16 +133,19 @@ contract with the full parse. **Prerequisite:** every compared result type
 
 | Target | Bounded entry point | Compared against (full) | Oracle when whole buffer present |
 | ------ | ------------------- | ----------------------- | -------------------------------- |
-| `flac` | `flac::read_metadata_bounded(data) -> Extent<FlacMeta>` | `flac::read_metadata(data) -> FlacMeta` | **strict**: `Complete(m)` ⇒ `m == read_metadata(data)`; `NeedMore` cannot fire (prefix == file) |
+| `flac` | `flac::read_metadata_bounded(data) -> Extent<FlacMeta>` | `flac::read_metadata(data) -> FlacMeta` | **strict on `Complete`**: `Complete(m)` ⇒ `read_metadata(data)` is `Ok(m)`. `NeedMore` **can** fire at full buffer when a block declares a body past EOF — then assert `read_metadata(data)` is `Err` (genuinely unparseable). flac's bounded twin takes **no** `file_len`, so its `up_to` is a prefix-length request that may exceed the file; the `up_to <= file_len` invariant below does **not** apply to flac. |
 | `mp3`  | `mp3::locate_audio_bounded(data, file_len, tail) -> Extent<Mp3Bounds>` | `mp3::locate_audio(data)` | **strict on `(audio_offset, audio_length)`**, with `tail = (len>=128).then(\|\| &data[len-128..])` (matches production). The reject guard `audio_offset+2 > file_len` is equivalent to the full path's `audio_offset+1 >= len`, and the ID3v1-trailer strip reads the same last-128 bytes — so they must agree. The plan adds a unit test proving this equivalence before the fuzz assert relies on it; if it cannot be proven, mp3 drops to weak-invariants-only. |
 | `ogg`  | `ogg::read_metadata_bounded(data, file_len) -> Extent<OggHeader>` | `ogg::read_metadata(data) -> OggHeader` | **strict**: `Complete` only when `read_header(data)` already succeeds, so it must equal `read_metadata(data)`; `NeedMore` cannot fire (prefix == file). Note: compare against `read_metadata`, **not** the target's existing `locate_audio` (`OggScan` ≠ `OggHeader`). |
 | `wav`  | `wav::locate_audio_bounded(data, file_len) -> Extent<WavBounds>` | `wav::locate_audio(data)` | **strict**: with full buffer the bounded fn is literally `Complete(locate_audio(data))`, so equality is guaranteed. |
 | `wav`  | `wav::locate_audio_at_ceiling(data, file_len) -> WavBounds` | (none) | **weak only**: ceiling trusts a declared `data` length validated against `file_len`, so it can return `Ok` where `locate_audio` returns `Err`. Assert panic-freedom and `audio_offset + audio_length <= file_len`; no equality. |
 | `mp4`  | `mp4::read_structure_from(&mut Cursor::new(data), file_len) -> Mp4Scan` | `mp4::read_structure(data) -> Mp4Scan` | **strict**: both read headers and skip the mdat payload; assert equality. Cursor supplies the `Read + Seek` the seeking variant needs. |
 
-Across all formats, two invariants hold unconditionally and are always asserted:
-panic-freedom, and `Extent::NeedMore { up_to }` ⇒ `up_to <= file_len` (a bounded
-prober must never ask to widen past the file length it was given).
+Panic-freedom is asserted for every format unconditionally. The
+`Extent::NeedMore { up_to }` ⇒ `up_to <= file_len` invariant is asserted only for
+the probers that are **given** a `file_len` — mp3, ogg, wav (and for those, with
+a full buffer the `NeedMore` arm cannot fire at all, since `prefix.len() ==
+file_len`). It does **not** apply to flac (no `file_len` parameter; see its row)
+or mp4 (returns a plain `Result`, no `Extent`).
 
 ---
 
@@ -177,10 +185,18 @@ variants — the same strategy the format targets use. The input bytes decode as
 window — **not** `read_at`, which reopens the file on each call (`reader.rs:325`)
 and would be N opens per input. Assert:
    - no panic on any range (including boundary/zero/oversized ranges);
-   - **audio-byte identity** — bytes served from a `BackingAudio`/`OggAudio`
-     region equal the corresponding backing bytes (the cardinal invariant);
-   - concatenating sequential windows reconstructs the same bytes as a single
-     full-length read (splice consistency).
+   - the whole read has length `resolved.total_len`;
+   - **splice consistency (universal oracle)** — each random window equals the
+     same byte slice of the single whole read. This holds for every format,
+     including Ogg, and is what catches a `serve_ogg_window` splice/page-patch
+     defect or an `OggArtSlice` base64-windowing bug.
+
+   Backing byte-identity (served audio region == backing bytes) is **not**
+   asserted for OggAudio segments — `serve_ogg_window` legitimately rewrites
+   page headers (seq + CRC), so only the packet payloads match. It already holds
+   and is already proptested for the passthrough formats, so the serve fuzz
+   target relies on splice consistency as its cross-format invariant rather than
+   re-deriving per-format payload identity.
 
 **Seeding.** `generate_seeds.rs` gains a `serve` entry writing one seed per
 covered format: each seed is `[selector byte] ++ [a few window-spec bytes]` so a
@@ -192,11 +208,16 @@ format, rather than starting from nothing.
 `musefs-core/tests/proptest_read_fidelity.rs` already covers FLAC (`build`), WAV
 (`build_wav`), MP3 (`build_mp3`), and M4A (`build_m4a`) — **only Ogg is
 missing**. Add a `build_ogg` backing builder mirroring those (registering
-`Format::Ogg` and using the existing `common::write_ogg` helper at
-`common/mod.rs:223`) and add an Ogg `proptest!` block matching the per-format
-pattern already used for the others, so the Ogg serve path gets random-window
-`read_at` coverage in the normal (pre-commit-gated) `cargo test` run,
-complementing the adversarial fuzz target.
+`Format::Opus` and using the existing `common::write_ogg` helper at
+`common/mod.rs:223`) and a `build_ogg_with_art` variant (using
+`common::write_opus_with_art` + `picture_block_body`, producing an `OggArtSlice`
+segment). Add an Ogg `proptest!` block with the **splice-consistency** properties
+— partial-windows-match-whole and windows-spanning-header-seam — over both
+builders. These assert each random window equals the slice of a single whole
+read; they deliberately do **not** assert served-audio == original, because the
+Ogg serve path renumbers page headers (only payloads are preserved). This gives
+the Ogg serve path (`serve_ogg_window` + `OggArtSlice`) random-window coverage in
+the normal (pre-commit-gated) `cargo test` run, complementing the fuzz target.
 
 ---
 
