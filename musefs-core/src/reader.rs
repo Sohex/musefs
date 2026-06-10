@@ -293,6 +293,13 @@ impl HeaderCache {
             }
         };
 
+        // Defensive belt-and-suspenders: production layouts are already built via
+        // RegionLayout::validated, but re-validate at the cache boundary so a future
+        // construction path that skips validation cannot poison the cache.
+        layout
+            .validate()
+            .map_err(musefs_format::FormatError::InvalidLayout)?;
+
         let cache_bytes = layout
             .segments()
             .iter()
@@ -1121,6 +1128,15 @@ mod cache_bound_tests {
             .sum();
         assert!(inline_sum > 0);
         assert_eq!(resolved.cache_bytes, inline_sum);
+    }
+
+    #[test]
+    fn build_rejects_layout_failing_validation() {
+        // A layout with an empty Inline segment fails validate(); the defensive
+        // check at the cache boundary must surface it rather than cache it.
+        let bad = RegionLayout::new_unchecked(vec![Segment::Inline(vec![])]);
+        let err = bad.validate();
+        assert!(err.is_err());
     }
 
     fn write_flac_local(path: &std::path::Path) -> (u64, u64) {
