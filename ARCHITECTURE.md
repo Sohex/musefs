@@ -172,6 +172,14 @@ uses the same shared library from a Custom Script workflow. Its Lidarr
 destination tree is only a tracking aid, made of symlinks by default; musefs
 remains the consumer-facing filesystem.
 
+An external writer may **merge** rather than fully replace text tags — overwriting
+only the keys it manages and leaving the rest of the scan-seeded set in place —
+provided it tracks its own managed-key set out of band (the beets plugin uses a
+beets flexattr; the store is not the place for plugin state). musefs renders tags
+outside its native VOCAB (`musefs-format/src/tagmap.rs`) by passthrough (Vorbis
+uppercased, mp3 `TXXX`, mp4 freeform), so such tags appear but are not
+guaranteed byte-identical to a given tagger's own per-format encoding.
+
 External tools can also offload path layout entirely: a plugin evaluates its own
 (arbitrarily complex) path logic, writes the resulting relative path into a
 custom text tag — e.g. `INSERT INTO tags (track_id, key, value, ordinal) VALUES

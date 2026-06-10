@@ -602,3 +602,40 @@ def test_e2e_art_precedence_beets_wins(tmp_path):
     with _mounted(mnt, db, "$albumartist/$album/$title"):
         # beets art (external B) wins; the embedded A must not survive.
         _check_mount_art(cfg, env, mnt, external_sha)
+
+
+def test_e2e_full_fields_sticky_delete_and_restore(tmp_path):
+    """Rich fields reach the mount; a deleted file-embedded tag stays gone across
+    re-scans; --restore-backing brings the backing value back."""
+    cfg, env, db, mnt, library = _imported_library(tmp_path)
+    template = "$albumartist/$album/$title"
+
+    _beet(
+        cfg,
+        env,
+        "modify",
+        "-M",
+        "-y",
+        "format:FLAC",
+        "comments=from file",
+        "rg_track_gain=-7.5",
+        "mb_albumid=11111111-1111-1111-1111-111111111111",
+    )
+    _beet(cfg, env, "musefs")
+    with _mounted(mnt, db, template):
+        ft = FLAC(str(next(mnt.rglob("*.flac"))))
+        assert ft["replaygain_track_gain"][0].endswith("dB")
+        assert ft["musicbrainz_albumid"][0].startswith("11111111")
+        assert ft["comment"][0] == "from file"
+
+    _beet(cfg, env, "modify", "-W", "-M", "-y", "format:FLAC", "comments!")
+    _beet(cfg, env, "musefs")
+    _beet(cfg, env, "musefs")
+    with _mounted(mnt, db, template):
+        ft = FLAC(str(next(mnt.rglob("*.flac"))))
+        assert "comment" not in ft
+
+    _beet(cfg, env, "musefs", "--restore-backing")
+    with _mounted(mnt, db, template):
+        ft = FLAC(str(next(mnt.rglob("*.flac"))))
+        assert ft["comment"][0] == "from file"
