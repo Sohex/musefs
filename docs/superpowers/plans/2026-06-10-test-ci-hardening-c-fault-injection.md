@@ -11,6 +11,7 @@
 **Scope decisions (read before starting):**
 - The seam covers **EIO** and **short read** at the backing-read boundary. `BackingChanged` is NOT injected through the seam: the size/mtime re-validation lives in `HeaderCache::resolve` (`reader.rs:117-121`), not per-read, so it is triggered by mutating the real backing file before `resolve` — deterministic and seam-free.
 - DB read faults are covered by **byte-corruption** of the SQLite file (deterministic, fast). The serve path is read-only, so `ENOSPC`/read-only-dir faults belong to the *write* (scan) path and are **out of scope here** — they are the spec's documented best-effort case and not part of this plan.
+- **SQLITE_BUSY / exclusive-lock fault is intentionally not tested** (the spec lists it under "DB faults via real conditions"). The serve path opens WAL read-only connections, and WAL readers are **contention-free by design** — that is the entire point of `DbPool::PerThread` (a concurrent writer never makes a read return `SQLITE_BUSY`). The only way to force `SQLITE_BUSY` on a reader is a pathological `PRAGMA locking_mode=EXCLUSIVE`, a configuration musefs never sets. Writing such a test would assert the behaviour of a config the product doesn't use. Lock *contention* correctness (concurrent readers don't corrupt/deadlock) is instead proven by the Workstream B concurrency stress tests. **This is a deliberate deviation from the spec's "lock + corruption stay mandatory" wording and needs the maintainer's blessing; reconcile the spec's Workstream C / Open-risks sections to match once blessed.**
 - The seam is process-global (an atomic gate + RAII reset guard). Fault tests must run single-threaded within their own test binary (`#![cfg(feature = "metrics")]` at file top, like the existing `musefs-core/tests/fault_injection.rs`), because two tests setting the global fault concurrently would interfere.
 
 ---
@@ -218,8 +219,8 @@ Create `musefs-core/tests/reader_faults.rs`:
 mod common;
 
 use musefs_core::metrics::{set_backing_fault, BackingFault};
-use musefs_core::reader::{read_at, HeaderCache, Mode};
-use musefs_core::CoreError;
+use musefs_core::reader::{read_at, HeaderCache};
+use musefs_core::{CoreError, Mode}; // Mode is re-exported at the crate root, NOT in `reader`
 use musefs_db::Db;
 
 fn resolve_one_flac() -> (Db, std::sync::Arc<musefs_core::reader::ResolvedFile>, tempfile::TempDir) {
@@ -339,8 +340,8 @@ Create `musefs-core/tests/backing_changed_fault.rs`:
 //! fault seam needed.
 mod common;
 
-use musefs_core::reader::{HeaderCache, Mode};
-use musefs_core::CoreError;
+use musefs_core::reader::HeaderCache;
+use musefs_core::{CoreError, Mode}; // Mode is re-exported at the crate root, NOT in `reader`
 use musefs_db::Db;
 
 #[test]
@@ -504,9 +505,12 @@ fn eio_backing_read_surfaces_through_the_mount() {
     // file through the mount must fail with an I/O error, not succeed or hang.
     let _guard = set_backing_fault(BackingFault::Eio);
     let err = std::fs::read(&song).expect_err("read should fail under injected EIO");
-    assert!(
-        matches!(err.raw_os_error(), Some(5) | None) || err.kind() == std::io::ErrorKind::Other,
-        "expected an I/O error from the mount, got {err:?}"
+    // FUSE maps the reader's CoreError::Io(EIO) straight back to errno EIO, so a
+    // tight assertion guards against a false pass from an unrelated failure.
+    assert_eq!(
+        err.raw_os_error(),
+        Some(5),
+        "injected EIO should surface as EIO through the mount, got {err:?}"
     );
 
     drop(session);

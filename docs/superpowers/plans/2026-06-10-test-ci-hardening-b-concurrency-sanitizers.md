@@ -36,7 +36,8 @@ mod common;
 
 use std::sync::{Arc, Barrier};
 
-use musefs_core::reader::{read_at_with_file, HeaderCache, Mode};
+use musefs_core::reader::{read_at_with_file, HeaderCache};
+use musefs_core::Mode; // Mode is re-exported at the crate root, NOT in `reader`
 use musefs_db::Db;
 
 /// Build a file-backed store with `n` FLAC tracks (each a real backing file),
@@ -232,9 +233,10 @@ use std::sync::{Arc, Barrier};
 
 // --- copy these helpers verbatim from mount.rs / concurrency.rs ---
 // fn make_flac(comments: &[&str], audio: &[u8]) -> Vec<u8> { ... }
-// fn config() -> musefs_core::... { ... }
-// use musefs_core::scan::scan_directory;  // adjust to the real path
-// use musefs_fuse::Musefs;                // adjust to the real type/path
+// fn config() -> MountConfig { ... }
+// All of these are re-exported at the crate root (see concurrency.rs:12):
+//   use musefs_core::{Mode, MountConfig, Musefs, scan_directory};
+// NOT musefs_core::scan::... and NOT musefs_fuse::Musefs.
 // ------------------------------------------------------------------
 
 fn setup_mount() -> (tempfile::TempDir, tempfile::TempDir, /*session*/ impl Sized) {

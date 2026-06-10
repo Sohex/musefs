@@ -143,7 +143,8 @@ Create `musefs-core/tests/contract_emit.rs`:
 //! building one in-process.
 #![cfg(not(tarpaulin))] // (no-op cfg; keep the file in the default test set)
 
-use musefs_core::reader::{read_at_with_file, HeaderCache, Mode};
+use musefs_core::reader::{read_at_with_file, HeaderCache};
+use musefs_core::Mode; // Mode is re-exported at the crate root, NOT in `reader`
 use musefs_db::Db;
 
 #[test]
@@ -442,27 +443,32 @@ In `.github/workflows/ci.yml`, after the `interop` job, add:
           pip install -e contrib/python-musefs
           pip install -e "contrib/beets[test]"
           pip install -e "contrib/lidarr[test]"
-      - name: python-musefs musefs_bin tier (non-skipping)
-        run: python -m pytest contrib/python-musefs/tests -m musefs_bin -v
+      - name: Install picard plugin test deps
+        run: pip install -e "contrib/picard[test]"
       - name: beets musefs_bin tier (non-skipping)
         run: python -m pytest contrib/beets/tests -m musefs_bin -v
       - name: lidarr musefs_bin tier (non-skipping)
         run: python -m pytest contrib/lidarr/tests -m musefs_bin -v
+      - name: picard musefs_bin tier (non-skipping)
+        # picard's path-gate tests import `musefs._common` (the bundled plugin
+        # module), NOT the system `picard`/Qt package, so they run here with no
+        # system-Picard env — verified: contrib/picard/tests/test_path_gate.py:11.
+        run: python -m pytest contrib/picard/tests -m musefs_bin -v
       - name: Python -> Rust synthesis round trip
         run: bash scripts/contract-roundtrip.sh
 ```
 
-Note: `MUSEFS_BIN` is left unset so the plugins fall back to `target/debug/musefs` (just built). `MUSEFS_REQUIRE_BIN=1` makes a missing binary fail. If `python-musefs` has no `-m musefs_bin` tests, `pytest -m musefs_bin` exits code 5 ("no tests collected"); add `|| [ $? -eq 5 ]` to that step OR drop the step — verify with `python -m pytest contrib/python-musefs/tests -m musefs_bin --collect-only` first and keep the step only if it collects tests.
+Note: `MUSEFS_BIN` is left unset so the plugins fall back to `target/debug/musefs` (just built). `MUSEFS_REQUIRE_BIN=1` makes a missing binary fail. **There is intentionally no `python-musefs musefs_bin` step**: `python-musefs` has no `musefs_bin`-marked tests (verified — `grep -rl musefs_bin contrib/python-musefs/tests` is empty), so `pytest -m musefs_bin` there would exit 5 ("no tests collected") and fail the job. The python-musefs *store* write path is exercised by the round-trip harness (`scripts/contract_writer.py`) instead. The `musefs_bin` tiers that exist are beets, lidarr, and picard. Picard runs here (not in the `picard` job) because its path-gate tests import the bundled `musefs._common`, not system Picard.
 
 - [ ] **Step 2: Add `contract` to `ci-ok`**
 
-In the `ci-ok` job's `needs:` list, add `contract`:
+**Insert `contract` into the existing `needs:` list — do NOT retype the whole list, or you will drop `asan` (added by Workstream B, which lands before this).** Landing order is C → B → A, so when this task runs the list already contains `asan`. The result must contain BOTH `contract` and `asan`:
 
 ```yaml
-    needs: [changes, check, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd]
+    needs: [changes, check, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan]
 ```
 
-(If Workstream B already added `asan`, keep it: the list is order-independent; just ensure both `contract` and `asan` are present.)
+(`tsan` is deliberately absent — it is the non-required best-effort job.)
 
 - [ ] **Step 3: Validate the YAML**
 
@@ -480,54 +486,27 @@ git commit -m "ci: required Python->Rust contract tier (binary build + non-skipp
 
 ---
 
-### Task 6: Picard `musefs_bin` tier in the picard job
+### Task 6: Confirm Picard's `musefs_bin` tier is covered (no picard-job change)
 
-The `picard` job already provisions system Picard + PyQt5. Run its `musefs_bin` tier there, non-skipping, against the binary built in that job.
+Picard's `musefs_bin` tier runs in the `contract` job (Task 5), because `contrib/picard/tests/test_path_gate.py:11` imports the bundled `musefs._common` module, NOT system Picard/Qt — so it needs no `PYTHONPATH=/usr/lib/picard` / `QT_QPA_PLATFORM` setup. The heavyweight `picard` job is therefore left **unchanged**. This task only verifies that assumption holds.
 
-**Files:**
-- Modify: `.github/workflows/ci.yml` (the `picard` job)
+**Files:** none (verification only).
 
-- [ ] **Step 1: Confirm whether picard's `musefs_bin` tests import `picard`**
-
-```bash
-grep -n "import" contrib/picard/tests/test_path_gate.py
-```
-If they do NOT import the `picard` package (only shell out to the binary + use pure-python path logic), prefer moving the picard `musefs_bin` run into the `contract` job instead (add `pip install -e "contrib/picard[test]"` + a step there) and skip the rest of this task. Otherwise continue.
-
-- [ ] **Step 2: Add Rust + binary build + the musefs_bin run to the picard job**
-
-In the `picard` job, after the existing "Test (real Picard, headless)" step, add (and add a toolchain + libfuse install near the top of the job's steps):
-
-```yaml
-      - name: Install FUSE (runtime for the binary) + toolchain
-        run: sudo apt-get install -y fuse3 libfuse3-dev pkg-config
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-      - name: Build musefs binary
-        run: cargo build
-      - name: Picard musefs_bin tier (non-skipping)
-        env:
-          MUSEFS_REQUIRE_BIN: "1"
-          PYTHONPATH: /usr/lib/picard
-          QT_QPA_PLATFORM: offscreen
-        run: .venv/bin/python -m pytest contrib/picard/tests -m musefs_bin -v
-```
-
-(Place the toolchain/install steps before the build step; keep the existing lint/test steps.)
-
-- [ ] **Step 3: Validate the YAML**
+- [ ] **Step 1: Re-confirm picard's path-gate imports are environment-light**
 
 ```bash
-python -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml')); print('ok')"
+grep -n "^import\|^from" contrib/picard/tests/test_path_gate.py
 ```
-Expected: `ok`.
+Expected: imports `sqlite3`, `subprocess`, `pytest`, `from musefs._common import ...` — and crucially NOT `import picard` / `from picard...`. If that is true (it is, as of this writing), Task 5's `picard musefs_bin tier` step covers it and there is nothing to change. If a future picard test DID import system Picard, move only that test out of the `-m musefs_bin` contract run and into the `picard` job instead.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 2: Confirm the picard pyproject makes `musefs._common` importable under pytest**
 
 ```bash
-git add .github/workflows/ci.yml
-git commit -m "ci: run Picard musefs_bin tier non-skipping in the picard job (#204)"
+grep -n "pythonpath" contrib/picard/pyproject.toml
 ```
+Expected: `pythonpath = ["."]` — this is why `pytest contrib/picard/tests` resolves `musefs._common` without an install of the system package. No change needed.
+
+(No commit — verification only.)
 
 ---
 
@@ -612,9 +591,9 @@ Expected: all PASS. (`contract_emit` is `#[ignore]`, so `cargo test --workspace`
 - [ ] **Step 4: Validate the whole workflow once more**
 
 ```bash
-python -c "import yaml; d=yaml.safe_load(open('.github/workflows/ci.yml')); n=d['jobs']['ci-ok']['needs']; assert 'contract' in n; print('ci-ok needs:', n)"
+python -c "import yaml; d=yaml.safe_load(open('.github/workflows/ci.yml')); n=d['jobs']['ci-ok']['needs']; assert 'contract' in n, n; assert 'asan' in n, 'asan was dropped from ci-ok!'; assert 'tsan' not in n, n; print('ci-ok needs:', n)"
 ```
-Expected: `contract` present in the list.
+Expected: `contract` AND `asan` present (Workstream B's gate not regressed), `tsan` absent.
 
 ---
 
@@ -624,4 +603,5 @@ Expected: `contract` present in the list.
 - **Contract correctness:** the round trip enforces the ownership split by construction — `musefs scan` writes geometry (Task 4 step 2), python-musefs writes only tags/art (Task 3 uses only `replace_tags`/`upsert_art`/`replace_track_art`). This is the fix the spec review required.
 - **`ci-ok` discipline:** `contract` added to `needs:` (Task 5 Step 2), gated on `needs.changes.outputs.src`.
 - **Type/name consistency:** `MUSEFS_BIN`/`MUSEFS_REQUIRE_BIN`, `CONTRACT_TITLE`/`CONTRACT_ARTIST` constants are duplicated between `scripts/contract_writer.py` and `tests/contract/test_contract_roundtrip.py` — they MUST stay in sync (noted in both files). `Db::open_readonly`, `list_tracks`, `read_at_with_file`, `HeaderCache`, `Mode` match the `musefs-db`/`musefs-core` surface.
-- **Watch-outs:** (1) verify `python-musefs` actually has `-m musefs_bin` tests before keeping that step (Task 5 Step 1 note). (2) verify whether Picard's `musefs_bin` tests import `picard` to decide Task 6's placement. (3) `musefs_common.store.connect` opens with `PRAGMA foreign_keys = ON`, so `replace_track_art` referencing a real `art_id` is required — `upsert_art` returns it; do not reorder those calls.
+- **Resolved during plan review:** (1) `python-musefs` has NO `musefs_bin` tests — that step was removed (it would exit-5 and fail the job); its store contract is covered by the round-trip harness. (2) Picard's path-gate imports `musefs._common`, not system Picard, so its tier runs in the `contract` job; the `picard` job is unchanged (Task 6 is verification-only). (3) `Mode` is imported from the crate root (`use musefs_core::Mode;`), not `musefs_core::reader::Mode`.
+- **Watch-out:** `musefs_common.store.connect` opens with `PRAGMA foreign_keys = ON`, so `replace_track_art` referencing a real `art_id` is required — `upsert_art` returns it; do not reorder those calls in `contract_writer.py`.
