@@ -1,0 +1,738 @@
+# Mount-boundary read-consistency, mmap fidelity & read-only refusal — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add a FUSE e2e test module that exercises the kernel-facing read path of a live musefs mount — randomized pread/mmap consistency against an in-memory oracle, whole-file mmap fidelity, and a read-only write-refusal matrix — satisfying GitHub issues #215 and #214.
+
+**Architecture:** A single new `#[ignore]` integration test file (`musefs-fuse/tests/read_consistency.rs`) in the existing in-process-mount style (`musefs_fuse::spawn` → read through the mountpoint → drop to unmount). No production code changes: the FUSE layer is already `MountOption::RO` and serves reads through `read_at` in `Mode::Synthesis`. A deterministic inline `xorshift64` PRNG drives the randomized sweep; an in-memory `Vec<u8>` read of the served file is the oracle. Hermetic FLAC fixtures (hand-built, always run) form the floor; an ffmpeg-generated multi-format sweep adds breadth and skips unavailable codecs.
+
+**Tech Stack:** Rust, `fuser`/libfuse (via `musefs-fuse`), `memmap2` (new dev-dep), `libc` (existing dep), `tempfile`, ffmpeg (e2e fixtures, already in CI).
+
+**Reference spec:** `docs/superpowers/specs/2026-06-10-mount-read-consistency-design.md`
+
+---
+
+## Preconditions & conventions
+
+- **Run the new tests with:** `cargo test -p musefs-fuse --test read_consistency -- --ignored`
+  (requires `/dev/fuse` + libfuse; the breadth sweep also needs `ffmpeg`). These
+  tests are `#[ignore]`, so the pre-commit hook's full workspace test run does
+  **not** execute them — each commit stays green regardless. You must run them
+  manually to validate.
+- **`Mode::Synthesis` is mandatory** for every fixture's `config()`. In
+  `Mode::StructureOnly` the kernel reads the backing file directly (passthrough),
+  `read_at` never runs, and the mmap/oracle tests would compare the backing file
+  to itself. The copied `config()` already uses `Mode::Synthesis` — do not change
+  it.
+- **Per-file helper copies are intentional.** Each `tests/*.rs` is its own crate;
+  items in `mount.rs`/`playback_pcm.rs`/`ogg_read_through.rs` cannot be imported.
+  This plan copies the small helpers it needs (matching how `make_flac`/`config`
+  are already duplicated across `mount.rs`, `keep_cache.rs`, `passthrough.rs`,
+  `concurrency.rs`). Do **not** introduce a shared `tests/common/` module.
+- **The mount helper takes a closure** rather than returning a session struct: the
+  `BackgroundSession` type is generic over the private `MusefsFs`, so it is not
+  nameable from a test crate. `with_single_flac_mount(audio, |mountpoint, served| …)`
+  mounts, runs the closure, then drops the session to unmount.
+
+---
+
+## File structure
+
+- **Create:** `musefs-fuse/tests/read_consistency.rs` — the entire new test module:
+  copied fixture/mount helpers, the `XorShift64` PRNG, the `sweep_reads` oracle
+  helper, and four `#[ignore]` tests (mmap fidelity, hermetic randomized sweep,
+  write-refusal matrix, multi-format breadth sweep).
+- **Modify:** `musefs-fuse/Cargo.toml` — add `memmap2 = "0.9"` to
+  `[dev-dependencies]`.
+- **Modify:** `CONTRIBUTING.md` — one bullet documenting the new harness.
+
+---
+
+## Task 1: Dev-dependency, scaffold, and whole-file mmap fidelity (#214)
+
+**Files:**
+- Modify: `musefs-fuse/Cargo.toml` (`[dev-dependencies]`)
+- Create: `musefs-fuse/tests/read_consistency.rs`
+
+- [ ] **Step 1: Add the `memmap2` dev-dependency**
+
+In `musefs-fuse/Cargo.toml`, the `[dev-dependencies]` section currently reads:
+
+```toml
+[dev-dependencies]
+tempfile = "3"
+metaflac = "0.2"
+musefs-db = { path = "../musefs-db" }
+musefs-format = { path = "../musefs-format" }
+ogg = "0.9"
+sha2 = "0.11"
+```
+
+Add the `memmap2` line so it becomes:
+
+```toml
+[dev-dependencies]
+tempfile = "3"
+metaflac = "0.2"
+musefs-db = { path = "../musefs-db" }
+musefs-format = { path = "../musefs-format" }
+ogg = "0.9"
+sha2 = "0.11"
+memmap2 = "0.9"
+```
+
+- [ ] **Step 2: Create the test file with helpers + the mmap-fidelity test**
+
+Create `musefs-fuse/tests/read_consistency.rs` with exactly this content:
+
+```rust
+//! Mount-boundary read-consistency, mmap fidelity, and read-only refusal e2e.
+//!
+//! Exercises the kernel-facing read path of a live mount: randomized
+//! pread/mmap reads compared against an in-memory oracle, whole-file mmap
+//! fidelity, and that every mutating op is refused on the read-only mount.
+//! See docs/superpowers/specs/2026-06-10-mount-read-consistency-design.md.
+
+use std::collections::BTreeMap;
+use std::os::unix::fs::FileExt;
+use std::path::Path;
+
+use musefs_core::{MountConfig, Musefs, scan_directory};
+
+// --- minimal proven FLAC fixture (mirrors musefs-fuse/tests/mount.rs) ---
+
+fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push((if is_last { 0x80 } else { 0 }) | (block_type & 0x7F));
+    let len = body.len();
+    out.push(u8::try_from((len >> 16) & 0xFF).unwrap());
+    out.push(u8::try_from((len >> 8) & 0xFF).unwrap());
+    out.push(u8::try_from(len & 0xFF).unwrap());
+    out.extend_from_slice(body);
+    out
+}
+
+fn streaminfo_body() -> Vec<u8> {
+    let mut b = vec![
+        0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0xC4, 0x42, 0xF0, 0x00,
+        0x00, 0x00, 0x00,
+    ];
+    b.extend_from_slice(&[0u8; 16]);
+    b
+}
+
+fn vorbis_comment_body(vendor: &str, comments: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&u32::try_from(vendor.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(vendor.as_bytes());
+    out.extend_from_slice(&u32::try_from(comments.len()).unwrap().to_le_bytes());
+    for c in comments {
+        out.extend_from_slice(&u32::try_from(c.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(c.as_bytes());
+    }
+    out
+}
+
+fn make_flac(comments: &[&str], audio: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"fLaC");
+    out.extend_from_slice(&flac_block(0, &streaminfo_body(), false));
+    out.extend_from_slice(&flac_block(4, &vorbis_comment_body("orig", comments), true));
+    out.extend_from_slice(audio);
+    out
+}
+
+fn config() -> MountConfig {
+    MountConfig {
+        template: "$artist/$title".to_string(),
+        fallbacks: BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: musefs_core::Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
+    }
+}
+
+/// A deterministic backing-audio payload of `n` bytes. Distinct per-offset
+/// values make any splice/offset mismatch visible in the oracle compare.
+fn backing_audio(n: usize) -> Vec<u8> {
+    (0..n).map(|i| u8::try_from((i * 7 + 3) % 251).unwrap()).collect()
+}
+
+/// Mount a single-track backing dir holding one FLAC, run `f` with the mount
+/// root and the served file path, then drop the session to unmount.
+///
+/// Uses a closure because `BackgroundSession` is generic over the private
+/// `MusefsFs` and cannot be named from a test crate.
+fn with_single_flac_mount<R>(audio: &[u8], f: impl FnOnce(&Path, &Path) -> R) -> R {
+    let backing = tempfile::tempdir().unwrap();
+    let flac = make_flac(&["ARTIST=Alice", "TITLE=Song"], audio);
+    std::fs::write(backing.path().join("a.flac"), &flac).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, backing.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+    let mountpoint = tempfile::tempdir().unwrap();
+    let session = musefs_fuse::spawn(fs, mountpoint.path(), "musefs-readcons").unwrap();
+    let served = mountpoint.path().join("Alice").join("Song.flac");
+    let r = f(mountpoint.path(), &served);
+    drop(session); // unmounts
+    drop(backing);
+    r
+}
+
+#[test]
+#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
+fn mmap_whole_file_matches_pread() {
+    let audio = backing_audio(4096);
+    with_single_flac_mount(&audio, |_mountpoint, served| {
+        // Page-cache / readpage path: map the whole file MAP_SHARED/PROT_READ.
+        let via_pread = std::fs::read(served).unwrap();
+        assert!(!via_pread.is_empty(), "served file must be non-empty");
+        let file = std::fs::File::open(served).unwrap();
+        // SAFETY: file is a regular, non-empty read-only mount entry; the map is
+        // dropped before the session unmounts at the end of the closure.
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        assert_eq!(
+            &mmap[..],
+            &via_pread[..],
+            "mmap-served bytes must equal pread-served bytes (byte-identical-audio invariant)"
+        );
+    });
+}
+```
+
+- [ ] **Step 3: Build and run the test (expect PASS against real behavior)**
+
+Run: `cargo test -p musefs-fuse --test read_consistency mmap_whole_file_matches_pread -- --ignored`
+Expected: `test result: ok. 1 passed`. (A failure here would mean the mmap
+`readpage` path serves different bytes than `pread` — a real read bug, not a test
+bug.)
+
+- [ ] **Step 4: Lint and format**
+
+Run: `cargo clippy -p musefs-fuse --all-targets -- -D warnings && cargo fmt -p musefs-fuse -- --check`
+Expected: no warnings, no diff.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add musefs-fuse/Cargo.toml musefs-fuse/tests/read_consistency.rs
+git commit -m "test(fuse): mmap whole-file fidelity at the mount boundary (#214)"
+```
+
+---
+
+## Task 2: Deterministic PRNG + randomized read/mmap oracle sweep (#215)
+
+**Files:**
+- Modify: `musefs-fuse/tests/read_consistency.rs`
+
+- [ ] **Step 1: Add the PRNG, the `sweep_reads` helper, and the hermetic FLAC test**
+
+Append to `musefs-fuse/tests/read_consistency.rs`:
+
+```rust
+// --- deterministic, dependency-free PRNG for reproducible randomized reads ---
+
+const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    /// Uniform-ish value in `0..bound` (0 when `bound == 0`).
+    fn below(&mut self, bound: u64) -> u64 {
+        if bound == 0 { 0 } else { self.next_u64() % bound }
+    }
+}
+
+/// Read `served` fully as the oracle, then fire `iters` seeded `(offset, len)`
+/// reads at the live mount via both `pread` and `mmap`, asserting every in-bounds
+/// byte matches the oracle and that reads starting past EOF return 0.
+///
+/// `seam`, when known (hermetic FLAC), injects the synthesized/`BackingAudio`
+/// boundary and its neighbours into the offset set so the splice point is
+/// straddled every run. `read_exact_at` tolerates kernel mid-file short reads
+/// while still proving byte-fidelity at each offset/len.
+fn sweep_reads(served: &Path, seam: Option<u64>, iters: u32) {
+    let oracle = std::fs::read(served).unwrap();
+    let n = oracle.len() as u64;
+    assert!(n > 0, "served file must be non-empty: {}", served.display());
+
+    let file = std::fs::File::open(served).unwrap();
+    // SAFETY: regular read-only file; map outlives no unmount within this fn.
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    assert_eq!(mmap.len() as u64, n, "mmap length must equal file length");
+
+    let mut fixed: Vec<u64> = vec![0, 1, n.saturating_sub(1), n, n + 1];
+    if let Some(s) = seam {
+        for d in [0i64, -1, 1, -8, 8] {
+            let o = s as i64 + d;
+            if o >= 0 {
+                fixed.push(o as u64);
+            }
+        }
+    }
+
+    let mut rng = XorShift64::new(SEED);
+    for i in 0..iters {
+        let offset = if (i as usize) < fixed.len() {
+            fixed[i as usize]
+        } else {
+            rng.below(n + 2) // samples 0..=n+1, so past-EOF starts are covered
+        };
+        let len = match rng.below(4) {
+            0 => 0,
+            1 => 1,
+            2 => rng.below(n + 2),
+            // a read that starts in range but crosses EOF
+            _ => (n + 1).saturating_sub(offset.min(n)) + rng.below(4),
+        };
+
+        let start = offset.min(n) as usize;
+        let avail = (n - start as u64).min(len) as usize;
+
+        // pread fidelity: read exactly the in-bounds portion and compare.
+        let mut buf = vec![0u8; avail];
+        file.read_exact_at(&mut buf, offset).unwrap_or_else(|e| {
+            panic!(
+                "read_exact_at failed: SEED={SEED:#x} offset={offset} len={len} avail={avail} \
+                 n={n} file={}: {e}",
+                served.display()
+            )
+        });
+        assert_eq!(
+            &buf[..],
+            &oracle[start..start + avail],
+            "pread bytes mismatch: SEED={SEED:#x} offset={offset} len={len} file={}",
+            served.display()
+        );
+
+        if offset >= n {
+            // A read that starts at/after EOF must return 0 bytes.
+            let mut one = [0u8; 1];
+            let got = file.read_at(&mut one, offset).unwrap();
+            assert_eq!(
+                got, 0,
+                "read starting past EOF must return 0: SEED={SEED:#x} offset={offset} n={n} file={}",
+                served.display()
+            );
+        } else {
+            // mmap fidelity for the in-bounds slice.
+            let o = offset as usize;
+            assert_eq!(
+                &mmap[o..o + avail],
+                &oracle[o..o + avail],
+                "mmap bytes mismatch: SEED={SEED:#x} offset={offset} len={len} file={}",
+                served.display()
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
+fn randomized_reads_match_oracle_flac() {
+    // Sizable backing audio so the synthesized/BackingAudio seam sits well inside
+    // the file, not at an edge.
+    let audio = backing_audio(8192);
+    let audio_len = audio.len() as u64;
+    with_single_flac_mount(&audio, |_mountpoint, served| {
+        let n = std::fs::metadata(served).unwrap().len();
+        // The served FLAC is [synth metadata][original audio]; the trailing
+        // `audio_len` bytes are the BackingAudio segment, so the splice seam is
+        // at n - audio_len.
+        let seam = n - audio_len;
+        sweep_reads(served, Some(seam), 2000);
+    });
+}
+```
+
+- [ ] **Step 2: Run the new test (expect PASS)**
+
+Run: `cargo test -p musefs-fuse --test read_consistency randomized_reads_match_oracle_flac -- --ignored`
+Expected: `test result: ok. 1 passed`. (Any failure prints the exact
+`SEED`/`offset`/`len` to reproduce — a real splice/offset bug if it fires.)
+
+- [ ] **Step 3: Lint and format**
+
+Run: `cargo clippy -p musefs-fuse --all-targets -- -D warnings && cargo fmt -p musefs-fuse -- --check`
+Expected: no warnings, no diff.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add musefs-fuse/tests/read_consistency.rs
+git commit -m "test(fuse): seeded randomized pread/mmap oracle sweep on FLAC (#215)"
+```
+
+---
+
+## Task 3: Read-only write-refusal matrix (#214)
+
+**Files:**
+- Modify: `musefs-fuse/tests/read_consistency.rs`
+
+- [ ] **Step 1: Add the libc helpers and the write-refusal test**
+
+Append to `musefs-fuse/tests/read_consistency.rs`. Note the added imports at the
+top of this block — add them to the existing `use` lines at the top of the file
+(do not duplicate the file-level `use` section; place these alongside it):
+
+```rust
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+```
+
+Then append the helpers and test:
+
+```rust
+fn cstr(p: &Path) -> CString {
+    CString::new(p.as_os_str().as_bytes()).unwrap()
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap()
+}
+
+/// Assert a libc mutating call failed (`ret == -1`) with an errno in `accepted`.
+/// The contract is "mutation is refused", not "refused with exactly EROFS".
+fn assert_refused(ret: i32, accepted: &[i32], what: &str) {
+    assert_eq!(ret, -1, "{what} unexpectedly succeeded on a read-only mount");
+    let e = last_errno();
+    assert!(
+        accepted.contains(&e),
+        "{what}: errno {e} not in accepted set {accepted:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
+fn write_ops_are_refused_on_read_only_mount() {
+    let audio = backing_audio(1024);
+    with_single_flac_mount(&audio, |mountpoint, served| {
+        let existing = cstr(served);
+        let new_file = cstr(&mountpoint.join("Alice").join("new.flac"));
+        let new_dir = cstr(&mountpoint.join("Alice").join("newdir"));
+        let times = [libc::timeval { tv_sec: 0, tv_usec: 0 }; 2];
+
+        // SAFETY: all paths are valid CStrings; fds are closed below.
+        unsafe {
+            assert_refused(
+                libc::open(existing.as_ptr(), libc::O_WRONLY),
+                &[libc::EROFS],
+                "open(O_WRONLY)",
+            );
+            assert_refused(
+                libc::open(existing.as_ptr(), libc::O_RDWR),
+                &[libc::EROFS],
+                "open(O_RDWR)",
+            );
+            assert_refused(
+                libc::open(new_file.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o644),
+                &[libc::EROFS],
+                "open(O_CREAT) new path",
+            );
+            assert_refused(libc::unlink(existing.as_ptr()), &[libc::EROFS], "unlink");
+            assert_refused(libc::truncate(existing.as_ptr(), 0), &[libc::EROFS], "truncate");
+
+            // ftruncate on a read-only fd: EINVAL (fd not writable) is checked
+            // independently of the RO mount, so accept both.
+            let rofd = libc::open(existing.as_ptr(), libc::O_RDONLY);
+            assert!(rofd >= 0, "opening the served file O_RDONLY should succeed");
+            assert_refused(
+                libc::ftruncate(rofd, 0),
+                &[libc::EINVAL, libc::EROFS],
+                "ftruncate",
+            );
+            libc::close(rofd);
+
+            assert_refused(libc::mkdir(new_dir.as_ptr(), 0o755), &[libc::EROFS], "mkdir");
+            assert_refused(
+                libc::chmod(existing.as_ptr(), 0o644),
+                &[libc::EROFS, libc::EPERM],
+                "chmod",
+            );
+            assert_refused(
+                libc::utimes(existing.as_ptr(), times.as_ptr()),
+                &[libc::EROFS, libc::EPERM, libc::EACCES],
+                "utimes",
+            );
+        }
+    });
+}
+```
+
+- [ ] **Step 2: Run the test (expect PASS)**
+
+Run: `cargo test -p musefs-fuse --test read_consistency write_ops_are_refused_on_read_only_mount -- --ignored`
+Expected: `test result: ok. 1 passed`.
+
+If `open(O_CREAT)` fails to compile due to the variadic `mode` argument, change
+`0o644` to `0o644 as libc::c_uint`. Run again.
+
+- [ ] **Step 3: Lint and format**
+
+Run: `cargo clippy -p musefs-fuse --all-targets -- -D warnings && cargo fmt -p musefs-fuse -- --check`
+Expected: no warnings, no diff.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add musefs-fuse/tests/read_consistency.rs
+git commit -m "test(fuse): read-only write-refusal matrix at the mount boundary (#214)"
+```
+
+---
+
+## Task 4: Multi-format breadth sweep (#215)
+
+**Files:**
+- Modify: `musefs-fuse/tests/read_consistency.rs`
+
+- [ ] **Step 1: Add the ffmpeg fixture builder, tree walk, and breadth-sweep test**
+
+Append to `musefs-fuse/tests/read_consistency.rs`. Add these imports alongside the
+existing file-level `use` lines:
+
+```rust
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+```
+
+Then append:
+
+```rust
+struct SweepCase {
+    /// Backing filename; also seeds a distinct virtual title via `title`.
+    name: &'static str,
+    title: &'static str,
+    codec_args: &'static [&'static str],
+    /// Whether to attach a cover image (exercises ArtImage/BinaryTag/OggArtSlice).
+    cover: bool,
+}
+
+fn sweep_cases() -> &'static [SweepCase] {
+    &[
+        SweepCase { name: "flac.flac", title: "SweepFlac", codec_args: &["-c:a", "flac"], cover: true },
+        SweepCase { name: "mp3.mp3", title: "SweepMp3", codec_args: &["-c:a", "libmp3lame", "-q:a", "5"], cover: true },
+        SweepCase { name: "m4a.m4a", title: "SweepM4a", codec_args: &["-c:a", "aac", "-b:a", "64k"], cover: true },
+        SweepCase { name: "opus.opus", title: "SweepOpus", codec_args: &["-c:a", "libopus"], cover: true },
+        SweepCase { name: "vorbis.ogg", title: "SweepVorbis", codec_args: &["-c:a", "libvorbis"], cover: true },
+        SweepCase { name: "oggflac.oga", title: "SweepOggFlac", codec_args: &["-c:a", "flac", "-f", "ogg"], cover: true },
+        SweepCase { name: "wav.wav", title: "SweepWav", codec_args: &["-c:a", "pcm_s16le"], cover: false },
+    ]
+}
+
+/// 1x1 PNG used as a cover image.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+/// Encode `case` into `dir` with ffmpeg, optionally attaching a cover image.
+/// Returns `true` on success; `false` (skip) if ffmpeg/codec is unavailable.
+fn make_sweep_fixture(dir: &Path, case: &SweepCase) -> bool {
+    let out = dir.join(case.name);
+    let title = format!("title={}", case.title);
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    cmd.args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.3"]);
+
+    if case.cover {
+        let cover = dir.join(format!("{}.cover.png", case.name));
+        std::fs::write(&cover, TINY_PNG).unwrap();
+        cmd.args(["-i"]);
+        cmd.arg(&cover);
+        cmd.args(["-map", "0:a", "-map", "1:v"]);
+        cmd.args(case.codec_args);
+        cmd.args(["-metadata", title.as_str(), "-metadata", "artist=Sweep"]);
+        cmd.args(["-disposition:v", "attached_pic"]);
+    } else {
+        cmd.args(case.codec_args);
+        cmd.args(["-metadata", title.as_str(), "-metadata", "artist=Sweep"]);
+    }
+
+    cmd.arg(&out).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.status().is_ok_and(|s| s.success()) && out.exists()
+}
+
+/// All regular files under `dir`, recursively.
+fn walk_tree(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                out.extend(walk_tree(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires /dev/fuse + libfuse + ffmpeg; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
+fn randomized_reads_match_oracle_all_formats() {
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_or(true, |s| !s.success())
+    {
+        eprintln!("ffmpeg unavailable; skipping multi-format read-consistency sweep");
+        return;
+    }
+
+    let backing = tempfile::tempdir().unwrap();
+    let mut generated = 0usize;
+    for case in sweep_cases() {
+        if make_sweep_fixture(backing.path(), case) {
+            generated += 1;
+        } else {
+            eprintln!("ffmpeg codec unavailable for {}; skipping that format", case.name);
+        }
+    }
+    assert!(
+        generated > 0,
+        "no breadth-sweep fixtures could be generated; ffmpeg codecs may be unavailable"
+    );
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, backing.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+    let mountpoint = tempfile::tempdir().unwrap();
+    let session = musefs_fuse::spawn(fs, mountpoint.path(), "musefs-readcons-sweep").unwrap();
+
+    let served = walk_tree(mountpoint.path());
+    assert!(!served.is_empty(), "mount should expose at least one served file");
+    for path in &served {
+        // Seam unknown for ffmpeg-encoded fixtures; rely on boundary sampling.
+        // Reduced iteration count keeps the 7-format pass within e2e runtime.
+        sweep_reads(path, None, 500);
+    }
+
+    drop(session); // unmounts
+    drop(backing);
+}
+```
+
+- [ ] **Step 2: Run the test (expect PASS, or graceful skip of missing codecs)**
+
+Run: `cargo test -p musefs-fuse --test read_consistency randomized_reads_match_oracle_all_formats -- --ignored --nocapture`
+Expected: `test result: ok. 1 passed`. With `--nocapture` you should see "skipping
+that format" only for codecs your local ffmpeg lacks; at least one format must run.
+
+- [ ] **Step 3: Lint and format**
+
+Run: `cargo clippy -p musefs-fuse --all-targets -- -D warnings && cargo fmt -p musefs-fuse -- --check`
+Expected: no warnings, no diff.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add musefs-fuse/tests/read_consistency.rs
+git commit -m "test(fuse): multi-format randomized read-consistency sweep (#215)"
+```
+
+---
+
+## Task 5: Document the harness in CONTRIBUTING.md
+
+**Files:**
+- Modify: `CONTRIBUTING.md` (the e2e / test-tiers section)
+
+- [ ] **Step 1: Locate the e2e test-tier section**
+
+Run: `grep -n "ignored\|e2e\|end-to-end\|FUSE" CONTRIBUTING.md`
+Identify the bullet/paragraph describing the `cargo test -p musefs-fuse -- --ignored`
+FUSE e2e tier.
+
+- [ ] **Step 2: Add a bullet describing the new harness**
+
+Add the following bullet to that section (adjust surrounding markdown to match the
+existing list style):
+
+```markdown
+- **Read-consistency harness** (`musefs-fuse/tests/read_consistency.rs`): a seeded,
+  reproducible randomized `pread`/`mmap` sweep compares live-mount reads against an
+  in-memory oracle (the seed is printed on failure to reproduce). The hermetic FLAC
+  tests — whole-file mmap fidelity and the read-only write-refusal matrix — always
+  run; the multi-format breadth sweep generates fixtures with ffmpeg and skips any
+  format whose codec is unavailable.
+```
+
+- [ ] **Step 3: Verify ruff/markdown gates are unaffected and commit**
+
+Run: `git diff --stat CONTRIBUTING.md`
+Expected: only `CONTRIBUTING.md` changed.
+
+```bash
+git add CONTRIBUTING.md
+git commit -m "docs(contributing): document the read-consistency e2e harness (#215, #214)"
+```
+
+---
+
+## Task 6: Full verification pass
+
+**Files:** none (verification only)
+
+- [ ] **Step 1: Run the whole new module end-to-end**
+
+Run: `cargo test -p musefs-fuse --test read_consistency -- --ignored --nocapture`
+Expected: `test result: ok. 4 passed` (0 failed). The breadth-sweep test may log
+per-format skips but must report at least one format swept.
+
+- [ ] **Step 2: Confirm the rest of the FUSE e2e suite still passes**
+
+Run: `cargo test -p musefs-fuse -- --ignored`
+Expected: all `--ignored` tests pass (no regressions from the new file or the
+`memmap2` dev-dep).
+
+- [ ] **Step 3: Workspace lint, format, and non-ignored tests (pre-commit parity)**
+
+Run: `cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test --workspace`
+Expected: clean fmt, no clippy warnings, all workspace tests pass. (This mirrors
+the pre-commit hook; the `#[ignore]` tests are excluded here, which is expected.)
+
+- [ ] **Step 4: Confirm the fuzz crate still builds (format-layer untouched, but cheap to verify)**
+
+This change touches only `musefs-fuse` tests, so the out-of-workspace `fuzz/` crate
+is unaffected; no action required. (Listed for completeness — skip unless a
+format-layer signature changed, which this plan does not do.)
+
+---
+
+## Self-review notes (coverage map)
+
+- **#215 randomized read/seek/mmap sweep vs oracle** → Task 2 (`sweep_reads` +
+  `randomized_reads_match_oracle_flac`), reused in Task 4.
+- **#215 spans all ffmpeg-generatable formats, skips unavailable, asserts ≥1 ran**
+  → Task 4 (`sweep_cases`, `generated > 0`).
+- **#214 whole-file mmap fidelity (readpage path)** → Task 1
+  (`mmap_whole_file_matches_pread`).
+- **#214 write-refusal matrix with accepted errno sets** → Task 3
+  (`write_ops_are_refused_on_read_only_mount`).
+- **`Mode::Synthesis` invariant** → enforced by the copied `config()` in Task 1.
+- **Deterministic seam targeting (hermetic FLAC)** → Task 2 (`seam = n - audio_len`).
+- **Doc bullet** → Task 5.
+- **No production code, no new CI job** → confirmed; only `Cargo.toml` dev-dep,
+  the test file, and `CONTRIBUTING.md` change.
+```
