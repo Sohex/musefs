@@ -191,11 +191,17 @@ and reusable (`workflow_call`). Steps:
 1. **Generate** synthetic FLAC tracks with ffmpeg via a committed harness script
    (runnable in-tree script; no committed binary fixtures).
 2. **Real-instance exec proof.** Boot the pinned `linuxserver/lidarr` container
-   (pinned by digest) with `--device /dev/fuse --cap-add SYS_ADMIN
-   --security-opt apparmor=unconfined` (precedent: the release Alpine smoke,
-   `release.yml:144-148`). Configure a Custom Script connection pointing at the
-   installed `musefs-lidarr-import` and **fire the Test event**; assert the real
-   Lidarr execs the script and the lowercased-env resolution succeeds.
+   (pinned by digest), **bind-mounting the plugin source** (`contrib/lidarr/src`,
+   `contrib/python-musefs/src`) and a committed wrapper
+   (`scripts/lidarr_import_wrapper.sh`) into it. The Alpine/.NET image ships no
+   python3 and cannot see host-installed scripts, so: `docker exec` an
+   `apk add --no-cache python3` (~2s), point a Custom Script connection at the
+   in-container wrapper path, and **fire the Test event**. The wrapper runs the
+   real `musefs-lidarr-import` from the bind-mounted source under the container's
+   python3; a success return proves real Lidarr execs the real script and that
+   `lidarr_get` resolves Lidarr's lowercased env keys (the `StringDictionary`
+   case bug) end to end. (Verified locally 2026-06-10: env arrives as
+   `lidarr_eventtype=Test`, the wrapper returns 0, Lidarr's test returns 200.)
 3. **Mock Lidarr API.** Start a local stub HTTP server returning fixed JSON for
    the endpoints `-sync` calls: `config/metadataprovider` (`writeAudioTags=no`)
    and `config/mediamanagement` (`fileDate=none`, permissions off) so
