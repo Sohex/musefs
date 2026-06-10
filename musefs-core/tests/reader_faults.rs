@@ -1,6 +1,7 @@
-//! Reader failure paths under injected backing-read faults. Own single-test
-//! binary gated on `metrics`: the fault seam is process-global, so these run
-//! single-threaded (one test binary, default serial within it).
+//! Reader failure paths under injected backing-read faults. Gated on `metrics`.
+//! The fault seam is process-global, so `set_backing_fault` serializes on an
+//! internal lock held for the guard's lifetime — concurrent fault tests in this
+//! binary take turns rather than clobbering each other's kind.
 #![cfg(feature = "metrics")]
 
 mod common;

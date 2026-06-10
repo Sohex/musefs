@@ -25,8 +25,8 @@ pub use imp::*;
 
 #[cfg(feature = "metrics")]
 mod imp {
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
     static OPENS: AtomicU64 = AtomicU64::new(0);
@@ -46,6 +46,11 @@ mod imp {
     // the latency-only `set_fault_pread` hook above.
     static BACKING_FAULT_KIND: AtomicU8 = AtomicU8::new(0);
     static BACKING_FAULT_PREFIX: AtomicUsize = AtomicUsize::new(0);
+    // Serializes fault scopes: the seam is process-global, so two fault tests in
+    // the same test binary would otherwise clobber each other's kind when cargo
+    // runs them on parallel threads. `set_backing_fault` holds this for the life
+    // of its guard; the serve/worker path only loads the atomics, never locks.
+    static SEAM_LOCK: Mutex<()> = Mutex::new(());
 
     /// A simulated backing-read failure, set per test via [`set_backing_fault`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +62,14 @@ mod imp {
         ShortRead { prefix: usize },
     }
 
-    /// Clears the global backing fault when dropped, so a fault never leaks past
-    /// the test that set it.
+    /// Clears the global backing fault when dropped (and releases [`SEAM_LOCK`]),
+    /// so a fault never leaks past the test that set it.
     #[must_use = "the fault is cleared when this guard drops; bind it to a name"]
-    pub struct BackingFaultGuard(());
+    pub struct BackingFaultGuard(
+        // Held for the guard's lifetime to keep [`SEAM_LOCK`] locked; released on
+        // drop. Never read directly — the RAII effect is the point.
+        #[allow(dead_code)] MutexGuard<'static, ()>,
+    );
 
     impl Drop for BackingFaultGuard {
         fn drop(&mut self) {
@@ -68,10 +77,16 @@ mod imp {
         }
     }
 
-    /// Install a backing-read fault for the current test scope. Process-global:
-    /// tests using it must run single-threaded (their own `metrics`-gated test
-    /// binary), like `fault_injection.rs`.
+    /// Install a backing-read fault for the current test scope. The seam is
+    /// process-global; this serializes on [`SEAM_LOCK`] so concurrent fault tests
+    /// in one binary take turns rather than clobbering each other's kind. The
+    /// lock is held until the returned guard drops.
     pub fn set_backing_fault(fault: BackingFault) -> BackingFaultGuard {
+        // Recover from a poisoned lock: a panicking fault test fails on its own;
+        // it must not cascade into every later fault test.
+        let lock = SEAM_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match fault {
             BackingFault::Eio => {
                 BACKING_FAULT_KIND.store(1, Ordering::SeqCst);
@@ -81,7 +96,7 @@ mod imp {
                 BACKING_FAULT_KIND.store(2, Ordering::SeqCst);
             }
         }
-        BackingFaultGuard(())
+        BackingFaultGuard(lock)
     }
 
     /// Positioned backing read used by the serve path. Honors an injected fault
@@ -258,10 +273,24 @@ mod imp {
 
 #[cfg(all(test, feature = "metrics"))]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    // The counters and `reset()` are process-global, so these tests serialize on
+    // a shared lock rather than clobbering each other when run on parallel
+    // threads in this binary.
+    static COUNTERS_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_counters() -> std::sync::MutexGuard<'static, ()> {
+        COUNTERS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn counters_accumulate_and_reset() {
+        let _lock = lock_counters();
         reset();
         on_open();
         on_open();
@@ -280,6 +309,7 @@ mod tests {
 
     #[test]
     fn scan_counters_accumulate_and_reset() {
+        let _lock = lock_counters();
         reset();
         on_scan_open();
         on_scan_read(4096);
