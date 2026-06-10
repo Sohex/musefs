@@ -12,7 +12,10 @@
 # skip with a notice if their tool is absent.
 set -euo pipefail
 
-STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+# Include deletions (D) and disable rename collapsing so a removed/renamed-away
+# source path stays visible to the docs-only check below — otherwise deleting a
+# code file alongside a doc edit could be misread as a docs-only commit.
+STAGED=$(git diff --cached --name-only --no-renames --diff-filter=ACMRD)
 
 # The cargo gate (fmt/clippy/test) can't be affected by a commit that only
 # touches docs/ or Markdown, so skip it there. Any other staged path — source,
