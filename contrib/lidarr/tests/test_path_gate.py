@@ -15,7 +15,10 @@ def test_symlink_scan_matches_real_backing_path(tmp_path):
     repo_root = Path(__file__).resolve().parents[3]
     musefs_bin = Path(os.environ.get("MUSEFS_BIN") or repo_root / "target" / "debug" / "musefs")
     if not musefs_bin.exists():
-        pytest.skip("musefs binary not found; run `cargo build` or set MUSEFS_BIN")
+        msg = "musefs binary not found; run `cargo build` or set MUSEFS_BIN"
+        if os.environ.get("MUSEFS_REQUIRE_BIN"):
+            pytest.fail(msg)
+        pytest.skip(msg)
     if shutil.which("ffmpeg") is None:
         pytest.skip("ffmpeg not installed")
 
