@@ -284,6 +284,41 @@ jobs:
           cargo +nightly test -p musefs-core --test concurrent_reads
           --target x86_64-unknown-linux-gnu
 
+  tsan:
+    # ThreadSanitizer is BEST-EFFORT and deliberately NOT in ci-ok: it cannot
+    # instrument the system C libs (libfuse, libsqlite3), so it sees races in
+    # our code around the FFI but may miss or false-positive inside the C deps.
+    # continue-on-error keeps a noisy run from showing as a hard failure.
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - name: Install libfuse3
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: nightly
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: ThreadSanitizer (core concurrent reads)
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          TSAN_OPTIONS: "halt_on_error=0"
+        run: >-
+          cargo +nightly test -p musefs-core --test concurrent_reads
+          --target x86_64-unknown-linux-gnu
+      - name: ThreadSanitizer (mount concurrent reads, best-effort)
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          TSAN_OPTIONS: "halt_on_error=0"
+        run: >-
+          cargo +nightly test -p musefs-fuse --test concurrent_reads
+          --target x86_64-unknown-linux-gnu -- --ignored
+
   freebsd:
     # Expensive (a full in-VM build), so NOT on every PR: only when the
     # FUSE/mount surface or its harness changed, or on a release tag (`v*`).
