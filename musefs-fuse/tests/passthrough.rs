@@ -121,8 +121,8 @@ fn mount_one_track(
 
 /// The backing-open ioctl is CAP_SYS_ADMIN-gated; without it passthrough
 /// falls back to daemon reads and the zero-pread assert cannot hold.
-/// Mirrors the daemon's private `cap_eff_has_sys_admin` (src/lib.rs) — keep
-/// the two predicates in sync.
+/// Mirrors the daemon's `cap_eff_has_sys_admin` (src/convert.rs) — keep the two
+/// predicates in sync.
 fn have_cap_sys_admin() -> bool {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     status
