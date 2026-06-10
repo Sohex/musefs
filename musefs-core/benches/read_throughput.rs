@@ -145,16 +145,17 @@ fn bench_concurrent_read_and_walk(c: &mut Criterion) {
                     })
                 })
                 .collect();
-            // Join all readers first, then stop the walker — collecting results
-            // before unwrapping so a reader panic can't leave the walker spinning
-            // (stop is always set before we re-raise the panic).
+            // Collect reader results, signal stop, then re-raise any reader panic
+            // BEFORE joining the walker — a panicking `walker.join().unwrap()`
+            // must not mask an original reader-thread panic. `stop` is set before
+            // we re-raise, so re-raising first cannot leave the walker spinning.
             let reader_results: Vec<_> =
                 readers.into_iter().map(thread::JoinHandle::join).collect();
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            walker.join().unwrap();
             for r in reader_results {
                 r.unwrap();
             }
+            walker.join().unwrap();
         });
     });
     group.finish();
