@@ -132,6 +132,12 @@ plugins under `contrib/` write tags and art here out-of-band.
   on SQLite's nested trigger activation (on by default). Writers maintain the
   ring via the pruning trigger; the mount's read-only connections never need
   to.
+- **V4** — `CHECK` constraints on `tracks`, `tags`, `art`, and `track_art`
+  that move the contract invariants below from convention to commit-time
+  enforcement. SQLite cannot add a constraint in place, so V4 rebuilds the
+  four tables (stashing rows past the FK cascade) and recreates their
+  triggers after the bulk refill so the rebuild does not pump the
+  `track_changes` ring. A pre-existing violating row aborts the migration.
 
 ### The external-writer contract
 
@@ -140,10 +146,19 @@ scanner owns the structural columns of `tracks` (`id`, `backing_path`,
 `format`, `audio_offset`, `audio_length`, `backing_size`, `backing_mtime`,
 `content_version`, `updated_at`) and all of `structural_blocks`: those are
 derived from probing the file, and external tools must run `musefs scan`
-rather than compute them. Nothing in SQLite *prevents* an external writer
-from mutating scanner-owned fields — musefs treats such rows as untrusted
-input and degrades to a controlled `BackingChanged`/layout error when a row
-no longer matches its backing file, never undefined behavior.
+rather than compute them. As of V4, SQLite `CHECK` constraints reject the
+malformed *shapes* at commit — an unknown `format` string, a negative
+length/offset/size/version, an `audio_offset + audio_length` running past the
+stored `backing_size`, a binary tag row whose `value` is non-empty, an
+`art.byte_len` that disagrees with its blob or a `sha256` of the wrong length,
+a `picture_type` outside `0..=20` — so an external writer cannot persist them.
+What CHECKs cannot catch is a scanner-owned field mutated to a *well-formed*
+value that no longer matches the real file on disk: `backing_size` or
+`backing_mtime` that drift from the actual file's stat, or audio bounds that
+fit the stored `backing_size` but overrun the file once it has shrunk. musefs
+re-stats the backing file on every resolve and treats such rows as untrusted
+input, degrading to a controlled `BackingChanged`/layout error, never
+undefined behavior.
 Referential gaps are treated the same way: a `track_art` row whose `art_id`
 has no matching `art` row (an orphan an external writer can produce with FK
 enforcement disabled) fails the serve with `EIO` rather than silently dropping
