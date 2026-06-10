@@ -5,8 +5,11 @@ Issues: #216, #212, #213, #197
 
 ## Summary
 
-Four independent hardening changes to the fuzz and bench harnesses, all within
-one subsystem and with no cross-dependencies, grouped into one spec:
+Four largely independent hardening changes to the fuzz and bench harnesses, all
+within one subsystem, grouped into one spec. The only sequencing dependency: the
+#216 regressions replay job must derive its target list dynamically (or land
+after #213) so it does not reference the new `serve` target before it exists —
+see Workstream A.
 
 - **#216** — give fuzz-found crashes a durable regression home and a fast,
   deterministic replay that fails the build if a known reproducer panics again.
@@ -15,7 +18,8 @@ one subsystem and with no cross-dependencies, grouped into one spec:
   coverage, with a differential oracle against the full-buffer parse.
 - **#213** — fuzz the read-time serve path (`read_segments_into` /
   `serve_ogg_window` / `OggArtSlice`), which no target reaches today, and add
-  Ogg coverage to the read-fidelity proptest (currently FLAC/WAV only).
+  Ogg coverage to the read-fidelity proptest (which already covers FLAC, WAV,
+  MP3, and M4A — only Ogg is missing).
 - **#197** — three small polish items: a labelled OOB assert in the b64 harness,
   a bench join reorder so a reader-thread panic can't be masked, and a real
   binary-tag MP3 seed.
@@ -48,26 +52,37 @@ and no deterministic `-runs=0` replay pass.
 New directory `fuzz/regressions/<target>/` holding committed crash/oom
 reproducer **bytes**, one file per reproducer. This is separate from
 `fuzz/corpus/<target>/`, which `cargo fuzz cmin` minimizes — reproducers under
-`regressions/` are never pruned. Each target dir gets a `.gitkeep` so the
-replay glob does not error on an empty directory before the first reproducer
-lands.
+`regressions/` are never pruned.
 
 ### Deterministic replay
 
 New `regressions` job (or step) in `fuzz.yml` that runs on every PR (not
-time-boxed):
+time-boxed). It iterates the **regression directories that actually exist**
+rather than a hardcoded target list — so it self-adjusts when the `serve`
+target (Workstream C) is added and never references a target before it exists:
 
-```
-for t in flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment serve; do
-  cargo +nightly fuzz run "$t" fuzz/regressions/"$t"/* -- -runs=0
+```bash
+shopt -s nullglob
+for dir in fuzz/regressions/*/; do
+  target=$(basename "$dir")
+  files=("$dir"*)
+  [ ${#files[@]} -eq 0 ] && continue   # dir present but no reproducers yet
+  cargo +nightly fuzz run "$target" "${files[@]}" -- -runs=0
 done
 ```
 
-`-runs=0` replays each named input exactly once and exits non-zero if any input
-panics — a fast, deterministic, named check that fails the build on a known
-regression, independent of the time-boxed smoke window. The job must tolerate
-an empty `regressions/<target>/` (only the `.gitkeep` present): guard the glob
-so a target with no reproducers is a no-op rather than a "no such file" error.
+`-runs=0` replays each explicitly-named input exactly once and exits non-zero if
+any input panics — a fast, deterministic, named check that fails the build on a
+known regression, independent of the time-boxed smoke window. (`cargo fuzz run
+<target> <path...>` forwards the positional paths to libFuzzer as corpus inputs;
+`-runs=0` means "run the provided inputs, then stop" — no mutation.)
+
+Empty-directory handling is explicit: `nullglob` makes `"$dir"*` expand to
+nothing (not a literal `*`) when a directory holds no reproducers, and the
+`continue` guard skips it. A directory with no entries at all is also skipped.
+We do **not** rely on a `.gitkeep` to keep the glob safe (`*` would not match a
+dotfile anyway) — the directory simply may not exist until its first reproducer
+lands, and the `*/` loop handles that.
 
 ### Convention (documented in CONTRIBUTING.md)
 
@@ -91,34 +106,38 @@ CI `-runs=0` job's job; in-tree tests are about behavior.
 
 Extend the **existing** per-format targets (no new targets, no added smoke
 time, shared corpus). Each target, after its current full-buffer work, also
-drives its bounded twin and asserts a differential oracle:
+drives its bounded twin with `file_len = data.len() as u64` (the whole buffer is
+present, so the prober has the full file available).
 
-| Target | Bounded entry point | Notes |
-| ------ | ------------------- | ----- |
-| `flac` | `flac::read_metadata_bounded(data)` | |
-| `mp3`  | `mp3::locate_audio_bounded(prefix, file_len, tail)` | exercise the `tail: Option<&[u8;128]>` arm |
-| `ogg`  | `ogg::read_metadata_bounded(data, file_len)` | |
-| `wav`  | `wav::locate_audio_bounded(prefix, file_len)` and `wav::locate_audio_at_ceiling(prefix, file_len)` | |
-| `mp4`  | `mp4::read_structure_from(&mut Cursor::new(data), file_len)` | seeking variant; reads headers, skips mdat |
+### Relationship to the existing `probe_equivalence` test
 
-`file_len` is `data.len() as u64` (the whole buffer is present), so the bounded
-prober has the full file available.
+`musefs-core/tests/probe_equivalence.rs` already asserts bounded-scan-vs-full
+equivalence **at the DB-scan level**, for every format, via a forced-widen
+window. The #212 work is deliberately at a **lower level** — the prober
+functions themselves, driven by adversarial bytes rather than valid fixtures —
+so it is complementary, not redundant. The plan must not duplicate or contradict
+`probe_equivalence`; the new oracle lives in the fuzz targets only.
 
-**Differential oracle** — when the whole buffer is present:
+### Per-format oracle
 
-- If the bounded prober returns `Extent::Complete(x)`, assert `x` equals the
-  result of the corresponding full-buffer parse. A mismatch is a bug, not just
-  a panic.
-- If it returns `Extent::NeedMore { up_to }`, assert `up_to <= file_len` (it
-  must never ask to widen past the file it was told the length of).
-- `Err` on the bounded path when the full-buffer parse succeeded (or vice
-  versa) is a divergence worth asserting where the two are contractually
-  expected to agree; where they are *not* expected to agree (e.g. ceiling trusts
-  a declared length the full parse validates against present bytes), only the
-  panic-freedom and `up_to`/length-bound invariants are asserted.
+Each bounded result is compared against a named full-buffer twin. The oracle
+strength differs by format because the bounded probers do not all share a
+contract with the full parse. **Prerequisite:** every compared result type
+(`FlacMeta`, `Mp3Bounds`, `WavBounds`, `Mp4Scan`, `OggHeader`) must derive
+`PartialEq` (confirm and add where missing — `Mp4Scan` already does).
 
-The exact equality comparisons (which fields of `Mp3Bounds`/`FlacMeta`/etc.) are
-nailed in the implementation plan against each type's definition.
+| Target | Bounded entry point | Compared against (full) | Oracle when whole buffer present |
+| ------ | ------------------- | ----------------------- | -------------------------------- |
+| `flac` | `flac::read_metadata_bounded(data) -> Extent<FlacMeta>` | `flac::read_metadata(data) -> FlacMeta` | **strict**: `Complete(m)` ⇒ `m == read_metadata(data)`; `NeedMore` cannot fire (prefix == file) |
+| `mp3`  | `mp3::locate_audio_bounded(data, file_len, tail) -> Extent<Mp3Bounds>` | `mp3::locate_audio(data)` | **strict on `(audio_offset, audio_length)`**, with `tail = (len>=128).then(\|\| &data[len-128..])` (matches production). The reject guard `audio_offset+2 > file_len` is equivalent to the full path's `audio_offset+1 >= len`, and the ID3v1-trailer strip reads the same last-128 bytes — so they must agree. The plan adds a unit test proving this equivalence before the fuzz assert relies on it; if it cannot be proven, mp3 drops to weak-invariants-only. |
+| `ogg`  | `ogg::read_metadata_bounded(data, file_len) -> Extent<OggHeader>` | `ogg::read_metadata(data) -> OggHeader` | **strict**: `Complete` only when `read_header(data)` already succeeds, so it must equal `read_metadata(data)`; `NeedMore` cannot fire (prefix == file). Note: compare against `read_metadata`, **not** the target's existing `locate_audio` (`OggScan` ≠ `OggHeader`). |
+| `wav`  | `wav::locate_audio_bounded(data, file_len) -> Extent<WavBounds>` | `wav::locate_audio(data)` | **strict**: with full buffer the bounded fn is literally `Complete(locate_audio(data))`, so equality is guaranteed. |
+| `wav`  | `wav::locate_audio_at_ceiling(data, file_len) -> WavBounds` | (none) | **weak only**: ceiling trusts a declared `data` length validated against `file_len`, so it can return `Ok` where `locate_audio` returns `Err`. Assert panic-freedom and `audio_offset + audio_length <= file_len`; no equality. |
+| `mp4`  | `mp4::read_structure_from(&mut Cursor::new(data), file_len) -> Mp4Scan` | `mp4::read_structure(data) -> Mp4Scan` | **strict**: both read headers and skip the mdat payload; assert equality. Cursor supplies the `Read + Seek` the seeking variant needs. |
+
+Across all formats, two invariants hold unconditionally and are always asserted:
+panic-freedom, and `Extent::NeedMore { up_to }` ⇒ `up_to <= file_len` (a bounded
+prober must never ask to widen past the file length it was given).
 
 ---
 
@@ -126,37 +145,58 @@ nailed in the implementation plan against each type's definition.
 
 ### New `serve` fuzz target
 
-The fuzz crate gains a dependency on `musefs-core` (and `musefs-db`, plus
-whatever test-fixture helper is needed to build a `Db` and a backing file). New
-target `fuzz/fuzz_targets/serve.rs`, added to both the smoke loop and the
-scheduled matrix in `fuzz.yml`, and a `[[bin]]` entry in `fuzz/Cargo.toml`.
+The fuzz crate gains a dependency on `musefs-core` and `musefs-db`. New target
+`fuzz/fuzz_targets/serve.rs`, with a `[[bin]]` entry in `fuzz/Cargo.toml`.
 
-Behavior:
+**Placement: scheduled-only, not in the per-PR smoke loop.** A `serve` iteration
+opens an in-memory SQLite `Db`, upserts a track + tags/art, and writes a temp
+backing file before it can serve a single byte — intrinsically far lower
+exec/s than a format-only target. In the 15s smoke window it would execute too
+few cases to be meaningful while still adding build + run time to every PR. So:
+`serve` is **built** by `cargo +nightly fuzz build` (smoke job) to catch
+breakage, added to the **`scheduled` matrix**, but **excluded from the smoke
+run loop**. (The smoke loop's target list is explicit, so omitting `serve` is a
+one-line choice.)
 
-1. From the adversarial input, build an in-memory `Db` and a temp backing file
-   (covering at least the Ogg path so `serve_ogg_window`/`OggArtSlice` are
-   reached; a small per-format selector driven by fuzzer entropy is acceptable).
-2. Resolve a layout (`ResolvedFile`) for the track.
-3. Draw arbitrary `(offset, size)` windows from fuzzer entropy and call
-   `read_at`. Assert:
+**Input grammar.** A fully random backing almost never parses, so `resolve`
+would fail and the serve path would rarely be reached. Instead the target starts
+from a valid fixture and lets the corpus/mutator explore nearby malformed
+variants — the same strategy the format targets use. The input bytes decode as:
+
+1. A leading selector byte picks the backing format (bias toward Ogg so
+   `serve_ogg_window`/`OggArtSlice` are exercised; cover FLAC/WAV/MP3/M4A too).
+2. The target builds the chosen fixture's bytes (optionally mutated by remaining
+   entropy), writes them to a temp backing file, and builds an in-memory `Db`
+   with the track plus fuzzer-chosen tags/art (reusing `arb_tags`/`arb_arts`/
+   `arb_binary_tags`, bounded as today) so the layout contains `ArtImage`/
+   `BinaryTag`/`OggArtSlice` segments.
+3. The remaining entropy yields a sequence of `(offset, size)` windows.
+
+**Serving.** Open the backing file **once** per input and drive
+`read_at_with_file` / `read_at_with_file_into` (`reader.rs:460,448`) for every
+window — **not** `read_at`, which reopens the file on each call (`reader.rs:325`)
+and would be N opens per input. Assert:
    - no panic on any range (including boundary/zero/oversized ranges);
    - **audio-byte identity** — bytes served from a `BackingAudio`/`OggAudio`
      region equal the corresponding backing bytes (the cardinal invariant);
    - concatenating sequential windows reconstructs the same bytes as a single
      full-length read (splice consistency).
 
-Building a `Db` + temp file per input is heavier than a format-only target; the
-`MAX_INPUT` cap and bounded art/tag sizes keep each iteration cheap, mirroring
-the existing targets' cost discipline.
+**Seeding.** `generate_seeds.rs` gains a `serve` entry writing one seed per
+covered format: each seed is `[selector byte] ++ [a few window-spec bytes]` so a
+freshly-checked-out corpus immediately reaches `resolve` + a real read for each
+format, rather than starting from nothing.
 
 ### Ogg read-fidelity proptest
 
-`musefs-core/tests/proptest_read_fidelity.rs` currently builds only FLAC and
-WAV backings. Add an Ogg backing builder (mirroring `build`/`build_wav`, using
-the existing `common::write_*`/fixture helpers) and wire it into the existing
-random-window `read_at` property so the Ogg serve path gets proptest range
-coverage in the normal (pre-commit-gated) `cargo test` run, complementing the
-adversarial fuzz target.
+`musefs-core/tests/proptest_read_fidelity.rs` already covers FLAC (`build`), WAV
+(`build_wav`), MP3 (`build_mp3`), and M4A (`build_m4a`) — **only Ogg is
+missing**. Add a `build_ogg` backing builder mirroring those (registering
+`Format::Ogg` and using the existing `common::write_ogg` helper at
+`common/mod.rs:223`) and add an Ogg `proptest!` block matching the per-format
+pattern already used for the others, so the Ogg serve path gets random-window
+`read_at` coverage in the normal (pre-commit-gated) `cargo test` run,
+complementing the adversarial fuzz target.
 
 ---
 
@@ -169,11 +209,18 @@ adversarial fuzz target.
    slice-index panic. Cosmetic (the fuzzer already catches the bug), but makes
    the cause unambiguous.
 
-2. **Bench join reorder** — `musefs-core/benches/read_throughput.rs:151-156`:
-   after collecting `reader_results`, check them for panics (`for r in
-   reader_results { r.unwrap() }`) **before** `walker.join().unwrap()`, so a
-   panicking walker join can no longer hide an original reader-thread panic.
-   Bench-only diagnostics; a cheap reorder.
+2. **Bench join reorder** — `musefs-core/benches/read_throughput.rs:151-157`:
+   the live order is `collect reader_results` (152) → `stop.store(true)` (153) →
+   `walker.join().unwrap()` (154) → `for r in reader_results { r.unwrap() }`
+   (155-157). Because the walker join is unwrapped *before* the reader-result
+   loop, a panicking walker join skips the reader unwraps and hides an original
+   reader-thread panic — the defect is present, not already fixed. Move the
+   `for r in reader_results { r.unwrap() }` loop **before** `walker.join()
+   .unwrap()`. This preserves the existing comment's invariant ("stop is set
+   before we re-raise"): `stop.store(true)` at 153 still precedes both unwraps,
+   so re-raising a reader panic first cannot leave the walker spinning (it sees
+   `stop` and exits). Bench-only diagnostics; a cheap reorder. Update the
+   adjacent comment (148-150) to describe the new order.
 
 3. **Real binary-tag MP3 seed** — add a `fixtures` builder in
    `musefs-format/src/fuzz_check.rs` that produces a well-formed MP3 carrying a
@@ -195,9 +242,9 @@ adversarial fuzz target.
   `musefs-core`, widening the surface where out-of-workspace breakage can occur,
   so this is checked explicitly (the fuzz crate is not built by the normal
   workspace build/clippy).
-- **CI** (`fuzz.yml`): new `regressions` `-runs=0` replay job; `serve` target
-  added to the smoke loop and scheduled matrix; new `[[bin]]` in
-  `fuzz/Cargo.toml`.
+- **CI** (`fuzz.yml`): new `regressions` `-runs=0` replay job iterating
+  `fuzz/regressions/*/` dynamically; `serve` target added to the scheduled matrix
+  and built (not smoke-run) by the smoke job; new `[[bin]]` in `fuzz/Cargo.toml`.
 - **Docs**: `CONTRIBUTING.md` fuzzing section gains the regressions convention
   (reproducer bytes + behavioral test) and notes on the new bounded/serve
   coverage.
