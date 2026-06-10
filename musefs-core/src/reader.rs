@@ -1076,6 +1076,31 @@ mod cache_bound_tests {
     }
 
     #[test]
+    fn build_accepts_audio_region_ending_before_eof() {
+        // A valid track whose audio region ends strictly before EOF
+        // (audio_offset + audio_length < backing_size, allowed by TrackBounds)
+        // must still resolve: the bounds guard rejects only an over-EOF region.
+        // Pins the guard's `>` against `<`, which would spuriously reject every
+        // sub-EOF track.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        let (audio_offset, audio_length) = write_flac_local(&path);
+        // Append trailing bytes so the audio region no longer reaches EOF; the
+        // padded length becomes backing_size, leaving offset + length < it.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0u8; 64])
+            .unwrap();
+        let (db, id) = track_with_bounds(&path, audio_offset, audio_length);
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let resolved = cache.resolve(&db, id).expect("sub-EOF bounds must resolve");
+        assert!(resolved.total_len > 0);
+    }
+
+    #[test]
     fn build_cache_bytes_counts_inline_segments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.flac");
