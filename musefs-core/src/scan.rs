@@ -1880,8 +1880,8 @@ mod bounded_probe_tests {
             .get_track_by_path(&std::fs::canonicalize(&path).unwrap().to_string_lossy())
             .unwrap()
             .unwrap();
-        assert_eq!(track.audio_offset, full.audio_offset);
-        assert_eq!(track.audio_length, full.audio_length);
+        assert_eq!(track.bounds.audio_offset(), full.audio_offset);
+        assert_eq!(track.bounds.audio_length(), full.audio_length);
     }
 
     #[test]
@@ -1915,7 +1915,10 @@ mod bounded_probe_tests {
             .get_track_by_path(&std::fs::canonicalize(&p).unwrap().to_string_lossy())
             .unwrap()
             .unwrap();
-        assert_eq!(usize_from(track.audio_length), b"DIFFERENT-AUDIO".len());
+        assert_eq!(
+            usize_from(track.bounds.audio_length()),
+            b"DIFFERENT-AUDIO".len()
+        );
     }
 
     #[test]
@@ -1968,7 +1971,13 @@ mod bounded_probe_tests {
                 .list_tracks()
                 .unwrap()
                 .into_iter()
-                .map(|t| (t.backing_path, t.audio_offset, t.audio_length))
+                .map(|t| {
+                    (
+                        t.backing_path,
+                        t.bounds.audio_offset(),
+                        t.bounds.audio_length(),
+                    )
+                })
                 .collect();
             rows.sort();
             rows

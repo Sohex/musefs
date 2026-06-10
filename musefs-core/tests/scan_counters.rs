@@ -59,7 +59,13 @@ fn rows(db: &Db) -> Vec<(String, u64, u64)> {
         .list_tracks()
         .unwrap()
         .into_iter()
-        .map(|t| (t.backing_path, t.audio_offset, t.audio_length))
+        .map(|t| {
+            (
+                t.backing_path,
+                t.bounds.audio_offset(),
+                t.bounds.audio_length(),
+            )
+        })
         .collect();
     r.sort();
     r
@@ -144,8 +150,8 @@ fn widen_preserves_art_bytes_vs_oracle() {
     .unwrap();
 
     let track = db.list_tracks().unwrap().into_iter().next().unwrap();
-    assert_eq!(track.audio_offset, o_track.audio_offset);
-    assert_eq!(track.audio_length, o_track.audio_length);
+    assert_eq!(track.bounds.audio_offset(), o_track.bounds.audio_offset());
+    assert_eq!(track.bounds.audio_length(), o_track.bounds.audio_length());
     let art = db.get_track_art(track.id).unwrap();
     assert_eq!(art.len(), 1, "the embedded picture must survive the widen");
     let sha = db.get_art(art[0].art_id).unwrap().unwrap().sha256;

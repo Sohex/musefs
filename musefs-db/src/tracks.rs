@@ -1,4 +1,4 @@
-use crate::models::{Format, NewTrack, Track};
+use crate::models::{Format, NewTrack, Track, TrackBounds};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::{Row, params};
 
@@ -32,13 +32,22 @@ fn parse_format_col(fmt: &str) -> rusqlite::Result<Format> {
 fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
     let fmt: String = r.get("format")?;
     let format = parse_format_col(&fmt)?;
+    let audio_offset: u64 = r.get("audio_offset")?;
+    let audio_length: u64 = r.get("audio_length")?;
+    let backing_size: u64 = r.get("backing_size")?;
+    let bounds = TrackBounds::new(audio_offset, audio_length, backing_size).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            usize::MAX,
+            rusqlite::types::Type::Integer,
+            e.to_string().into(),
+        )
+    })?;
     Ok(Track {
         id: r.get("id")?,
         backing_path: r.get("backing_path")?,
         format,
-        audio_offset: r.get("audio_offset")?,
-        audio_length: r.get("audio_length")?,
-        backing_size: r.get("backing_size")?,
+        bounds,
+        backing_size,
         backing_mtime: r.get("backing_mtime")?,
         content_version: r.get("content_version")?,
         updated_at: r.get("updated_at")?,
@@ -270,6 +279,36 @@ mod negative_audio_bounds_tests {
         assert!(
             db.get_track(id).is_err(),
             "negative audio_offset must fail row-read, not wrap"
+        );
+    }
+
+    #[test]
+    fn out_of_range_bounds_error_at_row_read() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        // Plant offset+length > backing_size past the V4 CHECK (layer 1) so we can
+        // prove TrackBounds (layer 2) rejects it at row read.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        db.conn
+            .execute("UPDATE tracks SET audio_length = 5 WHERE id = ?1", [id])
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        assert!(
+            db.get_track(id).is_err(),
+            "audio_offset + audio_length > backing_size must fail row-read"
         );
     }
 }

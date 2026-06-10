@@ -12,7 +12,7 @@ pub use bulk::BulkWriter;
 pub use error::{DbError, Result};
 pub use models::{
     Art, ArtMeta, BinaryTag, BinaryTagRow, Format, NewArt, NewTrack, StructuralBlock, Tag, Track,
-    TrackArt,
+    TrackArt, TrackBounds,
 };
 pub use tracks::ChangelogRead;
 
