@@ -209,9 +209,10 @@ format, rather than starting from nothing.
 (`build_wav`), MP3 (`build_mp3`), and M4A (`build_m4a`) — **only Ogg is
 missing**. Add a `build_ogg` backing builder mirroring those (registering
 `Format::Opus` and using the existing `common::write_ogg` helper at
-`common/mod.rs:223`) and a `build_ogg_with_art` variant (using
-`common::write_opus_with_art` + `picture_block_body`, producing an `OggArtSlice`
-segment). Add an Ogg `proptest!` block with the **splice-consistency** properties
+`common/mod.rs:223`) and a `build_ogg_with_art` variant mirroring `build_with_art`
+(write_ogg backing + DB-sourced art via `upsert_art`/`set_track_art`, which Opus
+synthesis emits as an `OggArtSlice` segment). Add an Ogg `proptest!` block with
+the **splice-consistency** properties
 — partial-windows-match-whole and windows-spanning-header-seam — over both
 builders. These assert each random window equals the slice of a single whole
 read; they deliberately do **not** assert served-audio == original, because the
