@@ -1,3 +1,5 @@
+use crate::BlobLen;
+
 /// Validation errors discovered in a layout at synthesis time.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LayoutError {
@@ -7,6 +9,9 @@ pub enum LayoutError {
     /// Total length overflowed u64.
     #[error("total layout length overflowed u64")]
     TotalOverflow,
+    /// A backing-audio run's offset + length overflowed u64.
+    #[error("backing-audio range offset + length overflowed u64")]
+    BackingRangeOverflow,
 }
 
 /// One contiguous run of bytes in a synthesized virtual file.
@@ -15,7 +20,7 @@ pub enum Segment {
     /// Generated framing/text bytes, fully materialized.
     Inline(Vec<u8>),
     /// Image bytes the caller splices in from its art store; only the length is known here.
-    ArtImage { art_id: i64, len: u64 },
+    ArtImage { art_id: i64, len: BlobLen },
     /// A run of the original backing file's audio frames.
     BackingAudio { offset: u64, len: u64 },
     /// A run of original audio pages served with each page's sequence number
@@ -34,14 +39,14 @@ pub enum Segment {
     OggArtSlice {
         art_id: i64,
         offset: u64,
-        len: u64,
+        len: BlobLen,
         base64: bool,
         art_total: u64,
     },
     /// An opaque binary tag payload (e.g. an ID3 `PRIV` frame body or a FLAC
     /// `APPLICATION` block body) streamed from the DB at read time; only the
     /// length is known here. `payload_id` is the caller's `tags` rowid handle.
-    BinaryTag { payload_id: i64, len: u64 },
+    BinaryTag { payload_id: i64, len: BlobLen },
 }
 
 impl Segment {
@@ -49,10 +54,9 @@ impl Segment {
         match self {
             Segment::Inline(b) => b.len() as u64,
             Segment::ArtImage { len, .. }
-            | Segment::BackingAudio { len, .. }
-            | Segment::OggAudio { len, .. }
             | Segment::OggArtSlice { len, .. }
-            | Segment::BinaryTag { len, .. } => *len,
+            | Segment::BinaryTag { len, .. } => len.get(),
+            Segment::BackingAudio { len, .. } | Segment::OggAudio { len, .. } => *len,
         }
     }
 
@@ -134,6 +138,13 @@ impl RegionLayout {
             if len == 0 && !matches!(seg, Segment::BackingAudio { .. } | Segment::OggAudio { .. }) {
                 return Err(LayoutError::EmptySegment);
             }
+            if let Segment::BackingAudio { offset, len } | Segment::OggAudio { offset, len, .. } =
+                seg
+            {
+                offset
+                    .checked_add(*len)
+                    .ok_or(LayoutError::BackingRangeOverflow)?;
+            }
             total = total.checked_add(len).ok_or(LayoutError::TotalOverflow)?;
         }
         Ok(())
@@ -148,17 +159,13 @@ mod tests {
     fn binary_tag_segment_len_and_validate() {
         let seg = Segment::BinaryTag {
             payload_id: 5,
-            len: 12,
+            len: BlobLen::new(12).unwrap(),
         };
         assert_eq!(seg.len(), 12);
         // Non-empty binary tag passes validation.
         RegionLayout::validated(vec![seg, Segment::BackingAudio { offset: 0, len: 1 }]).unwrap();
-        // Empty binary tag is rejected (EmptySegment), like empty art.
-        let err = RegionLayout::validated(vec![Segment::BinaryTag {
-            payload_id: 5,
-            len: 0,
-        }]);
-        assert!(matches!(err, Err(LayoutError::EmptySegment)));
+        // Zero-length binary tag cannot be constructed (BlobLen rejects 0).
+        assert!(BlobLen::new(0).is_none());
     }
 
     #[test]
@@ -166,7 +173,7 @@ mod tests {
         let with = RegionLayout::new(vec![
             Segment::BinaryTag {
                 payload_id: 1,
-                len: 3,
+                len: BlobLen::new(3).unwrap(),
             },
             Segment::BackingAudio { offset: 0, len: 8 },
         ]);

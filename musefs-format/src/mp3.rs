@@ -354,7 +354,7 @@ pub fn build_id3v2_segments(
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::BinaryTag {
             payload_id: bt.payload_id,
-            len: bt.len.get(),
+            len: bt.len,
         });
         frames_len += 10 + bt.len.get();
     }
@@ -367,7 +367,7 @@ pub fn build_id3v2_segments(
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::ArtImage {
             art_id: art.art_id,
-            len: art.data_len.get(),
+            len: art.data_len,
         });
         frames_len += 10 + data_len;
     }
@@ -1075,7 +1075,7 @@ mod tests {
         let art_segs: Vec<_> = segments
             .iter()
             .filter_map(|s| match s {
-                Segment::ArtImage { art_id, len } => Some((*art_id, *len)),
+                Segment::ArtImage { art_id, len } => Some((*art_id, len.get())),
                 _ => None,
             })
             .collect();
@@ -2026,8 +2026,9 @@ mod tests {
                 s,
                 Segment::BinaryTag {
                     payload_id: 42,
-                    len: 3
-                }
+                    len,
+                    ..
+                } if len.get() == 3
             )),
             "opaque PRIV must stream as Segment::BinaryTag"
         );

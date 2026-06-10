@@ -294,7 +294,7 @@ pub fn synthesize_layout(
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::BinaryTag {
             payload_id: bt.payload_id,
-            len: bt.len.get(),
+            len: bt.len,
         });
         idx += 1;
     }
@@ -315,7 +315,7 @@ pub fn synthesize_layout(
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::ArtImage {
             art_id: art.art_id,
-            len: art.data_len.get(),
+            len: art.data_len,
         });
         idx += 1;
     }

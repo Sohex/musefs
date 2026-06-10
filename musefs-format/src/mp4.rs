@@ -677,7 +677,7 @@ fn build_udta(
         ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
         ilst_segments.push(Segment::BinaryTag {
             payload_id: bt.payload_id,
-            len: bt.len.get(),
+            len: bt.len,
         });
         streamed_total += bt.len.get();
     }
@@ -706,7 +706,7 @@ fn build_udta(
             ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
             ilst_segments.push(Segment::ArtImage {
                 art_id: a.art_id,
-                len: a.data_len.get(),
+                len: a.data_len,
             });
             streamed_total += a.data_len.get();
         }
@@ -1160,7 +1160,7 @@ mod tests {
         // The image streams as the final segment; the udta size field accounts for it.
         assert!(matches!(
             segs.last(),
-            Some(Segment::ArtImage { len: 100, .. })
+            Some(Segment::ArtImage { len, .. }) if len.get() == 100
         ));
         let inline_total: usize = segs
             .iter()
@@ -1271,7 +1271,7 @@ mod tests {
             match seg {
                 Segment::Inline(b) => out.extend_from_slice(b),
                 Segment::BinaryTag { len, .. } | Segment::ArtImage { len, .. } => {
-                    out.resize(out.len() + usize_from(*len), 0);
+                    out.resize(out.len() + usize_from(len.get()), 0);
                 }
                 other => panic!("unexpected segment in udta: {other:?}"),
             }
@@ -1407,7 +1407,7 @@ mod tests {
         };
         let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[art]).unwrap();
         let segs = layout.segments();
-        assert!(matches!(segs[1], Segment::ArtImage { art_id: 7, len: 50 }));
+        assert!(matches!(segs[1], Segment::ArtImage { art_id: 7, len, .. } if len.get() == 50));
         assert!(matches!(segs[2], Segment::Inline(_))); // mdat header
         assert!(matches!(segs.last().unwrap(), Segment::BackingAudio { .. }));
     }
@@ -1431,7 +1431,7 @@ mod tests {
         let segs = layout.segments();
         assert!(
             segs.iter()
-                .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len: 40 })),
+                .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len, .. } if len.get() == 40)),
             "the first nonempty art must be served"
         );
     }
@@ -1986,7 +1986,7 @@ mod tests {
         let art_segs: Vec<(i64, u64)> = segs
             .iter()
             .filter_map(|s| match s {
-                Segment::ArtImage { art_id, len } => Some((*art_id, *len)),
+                Segment::ArtImage { art_id, len } => Some((*art_id, len.get())),
                 _ => None,
             })
             .collect();
@@ -2215,7 +2215,7 @@ mod tests {
             .segments()
             .iter()
             .filter_map(|s| match s {
-                Segment::BinaryTag { payload_id, len } => Some((*payload_id, *len)),
+                Segment::BinaryTag { payload_id, len } => Some((*payload_id, len.get())),
                 _ => None,
             })
             .collect();
@@ -2325,7 +2325,7 @@ mod tests {
             .segments()
             .iter()
             .filter_map(|s| match s {
-                Segment::ArtImage { art_id, len } => Some((*art_id, *len)),
+                Segment::ArtImage { art_id, len } => Some((*art_id, len.get())),
                 _ => None,
             })
             .collect();

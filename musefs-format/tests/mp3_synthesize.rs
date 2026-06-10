@@ -77,7 +77,7 @@ fn synthesizes_apic_with_streamed_image_bytes() {
         layout
             .segments()
             .iter()
-            .any(|s| matches!(s, Segment::ArtImage { art_id: 7, len } if *len == 200))
+            .any(|s| matches!(s, Segment::ArtImage { art_id: 7, len, .. } if len.get() == 200))
     );
 
     let bytes = assemble(&layout, &audio, &[(7, &art_bytes)]);

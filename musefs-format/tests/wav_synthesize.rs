@@ -95,7 +95,7 @@ fn embeds_full_fidelity_id3_tag_with_art() {
         layout
             .segments()
             .iter()
-            .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len } if *len == 120))
+            .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len, .. } if len.get() == 120))
     );
 
     let bytes = assemble(&layout, &audio, &[(9, &art_bytes)]);
@@ -217,6 +217,6 @@ fn keeps_real_art_when_mixed_with_empty() {
     assert_eq!(art_segs.len(), 1, "only the real art survives");
     assert!(matches!(
         art_segs[0],
-        Segment::ArtImage { art_id: 2, len: 64 }
+        Segment::ArtImage { art_id: 2, len, .. } if len.get() == 64
     ));
 }

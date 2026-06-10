@@ -232,7 +232,7 @@ proptest! {
         for s in resolved.layout.segments() {
             match s {
                 Segment::ArtImage { len, .. } => {
-                    art_len = Some(*len);
+                    art_len = Some(len.get());
                     break;
                 }
                 Segment::Inline(bytes) => art_off += bytes.len() as u64,
@@ -331,7 +331,7 @@ proptest! {
         for s in resolved.layout.segments() {
             match s {
                 Segment::ArtImage { len, .. } => {
-                    art_len = Some(*len);
+                    art_len = Some(len.get());
                     break;
                 }
                 Segment::Inline(bytes) => art_off += bytes.len() as u64,
@@ -501,7 +501,7 @@ proptest! {
         for s in resolved.layout.segments() {
             match s {
                 Segment::ArtImage { len, .. } => {
-                    art_len = Some(*len);
+                    art_len = Some(len.get());
                     break;
                 }
                 Segment::Inline(bytes) => art_off += bytes.len() as u64,
@@ -781,7 +781,7 @@ proptest! {
         for s in resolved.layout.segments() {
             match s {
                 Segment::ArtImage { len, .. } => {
-                    art_len = Some(*len);
+                    art_len = Some(len.get());
                     break;
                 }
                 Segment::Inline(bytes) => art_off += bytes.len() as u64,
