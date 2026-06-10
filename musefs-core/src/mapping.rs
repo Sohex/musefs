@@ -37,19 +37,25 @@ pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, &str> {
 pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<ArtInput>> {
     let mut inputs = Vec::new();
     for ta in db.get_track_art(track_id)? {
-        // `track_art.art_id` is a foreign key into `art` (enforced, no ON DELETE),
-        // so the row always exists; the `if let` is defensive, not a real branch.
-        if let Some(meta) = db.get_art_meta(ta.art_id)? {
-            inputs.push(ArtInput {
+        // `track_art.art_id` is a foreign key into `art`, but SQLite FK
+        // enforcement is per-connection and external writers can disable it or
+        // import a partial DB. A missing `art` row is a contract violation we
+        // surface (the read fails) rather than silently dropping the art.
+        let Some(meta) = db.get_art_meta(ta.art_id)? else {
+            return Err(crate::error::CoreError::OrphanedArt {
+                track_id,
                 art_id: ta.art_id,
-                mime: meta.mime,
-                description: ta.description,
-                picture_type: ta.picture_type,
-                width: meta.width.unwrap_or(0),
-                height: meta.height.unwrap_or(0),
-                data_len: meta.byte_len,
             });
-        }
+        };
+        inputs.push(ArtInput {
+            art_id: ta.art_id,
+            mime: meta.mime,
+            description: ta.description,
+            picture_type: ta.picture_type,
+            width: meta.width.unwrap_or(0),
+            height: meta.height.unwrap_or(0),
+            data_len: meta.byte_len,
+        });
     }
     Ok(inputs)
 }
@@ -279,6 +285,69 @@ mod tests {
         assert!(
             super::track_art_to_inputs(&db, tid).is_err(),
             "negative byte_len must error at row-read, not be skipped"
+        );
+    }
+
+    #[test]
+    fn track_art_to_inputs_errors_on_orphaned_row() {
+        use crate::CoreError;
+        use musefs_db::{NewArt, TrackArt}; // NewTrack already in scope at module level
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("art.db");
+        let db = Db::open(&path).unwrap();
+        let tid = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        let orphan_id = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![1, 2, 3, 4],
+            })
+            .unwrap();
+        db.set_track_art(
+            tid,
+            &[TrackArt {
+                art_id: orphan_id,
+                picture_type: 3,
+                description: String::new(),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+
+        // Well-formed art resolves to one input (kills the "always error" mutant).
+        let inputs = super::track_art_to_inputs(&db, tid).unwrap();
+        assert_eq!(inputs.len(), 1);
+
+        // Orphan the track_art row: delete the referenced art row on a raw
+        // connection (FK enforcement off by default), leaving the track_art
+        // link dangling. The production Db sets foreign_keys=true, so the
+        // delete would RESTRICT-fail there.
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.pragma_update(None, "foreign_keys", false).unwrap();
+        let deleted = raw
+            .execute("DELETE FROM art WHERE id = ?1", [orphan_id])
+            .unwrap();
+        assert_eq!(deleted, 1, "delete must remove exactly one art row");
+        drop(raw);
+
+        let err = super::track_art_to_inputs(&db, tid).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::OrphanedArt { track_id, art_id }
+                    if track_id == tid && art_id == orphan_id
+            ),
+            "orphaned track_art must yield OrphanedArt with the offending ids, got {err:?}"
         );
     }
 
