@@ -22,16 +22,12 @@ jobs:
           python-version: '3.x'
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y fuse3 ffmpeg
-      - name: Build musefs (debug) and install the Lidarr plugin
-        run: |
-          set -euo pipefail
-          cargo build -p musefs
-          pip install -e contrib/python-musefs
-          pip install -e contrib/lidarr
-      - name: Run the Lidarr smoke
+      - name: Build musefs (debug)
+        run: cargo build -p musefs
+      - name: Run the Lidarr real-instance e2e
         env:
           # Pinned multi-arch index digest for linuxserver/lidarr 3.1.0.4875-ls30
           # (the version the 2026-06-07 manual smoke validated). Bump deliberately
           # and re-run the dispatch acceptance when changing it.
           LIDARR_IMAGE: lscr.io/linuxserver/lidarr@sha256:b08b2194fa4ddb7f7ace9d1bfd82bd9b26f457d79aa70f42d923d2e15a820f0e
-        run: ./scripts/lidarr-smoke.sh ./target/debug/musefs
+        run: ./scripts/lidarr-e2e/run-e2e.sh ./target/debug/musefs
