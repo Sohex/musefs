@@ -202,6 +202,69 @@ the target needs the FUSE userspace tools and `/dev/fuse`:
 
 No glibc/libfuse install is needed for the musl binaries beyond `fuse3`.
 
+## Container images
+
+Each tagged release also publishes multi-arch images to the GitHub Container
+Registry:
+
+| Image | libc | Platforms |
+| --- | --- | --- |
+| `ghcr.io/sohex/musefs:<version>`, `ghcr.io/sohex/musefs:latest` | glibc | amd64, arm64 |
+| `ghcr.io/sohex/musefs:<version>-musl`, `ghcr.io/sohex/musefs:musl` | musl | amd64, arm64 |
+
+`docker pull` selects the CPU architecture automatically. Use the `-musl` /
+`:musl` tags when slotting musefs into an Alpine-based stack; the default
+(glibc) tags suit everything else. Floating `:latest` / `:musl` track the most
+recent stable release only — prereleases publish version-pinned tags only.
+
+**Running musefs on the host is the simplest, best-supported option** — it is an
+ordinary FUSE daemon and the image exists mainly to colocate musefs with
+containerized media managers (e.g. Lidarr). If you do containerize, mind the
+gotchas below.
+
+### Required flags
+
+musefs mounts via FUSE, so the container needs `/dev/fuse` and the matching
+capability:
+
+```bash
+docker run --rm \
+  --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+  -v /path/to/library:/library:ro \
+  -v /path/to/store:/store \
+  ghcr.io/sohex/musefs:latest scan /library --db /store/musefs.db
+```
+
+Without `--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined`
+the mount cannot be established.
+
+### The mount-visibility gotcha (read this before sharing the mount)
+
+A FUSE mount made **inside** a container lives in that container's mount
+namespace. By default neither the host nor other containers can see it, so
+pointing a second container (your media manager) at musefs's output does not
+work out of the box. Two ways to share it:
+
+- **Prefer Podman in a shared pod** — put musefs and the consumer in the same
+  pod so they share namespaces and the mount is directly reachable:
+
+  ```bash
+  podman pod create --name media
+  podman run -d --pod media \
+    --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+    -v /path/to/library:/library:ro -v /path/to/store:/store \
+    ghcr.io/sohex/musefs:latest mount /mnt/musefs --db /store/musefs.db
+  # the consumer container, in the same pod, reads /mnt/musefs
+  ```
+
+- Or bind-mount the mount point with **`rshared` propagation** so the mount
+  escapes the container's namespace to the host (`--mount type=bind,...,bind-propagation=rshared`).
+  This is fiddlier than a shared pod, which is why the pod approach is
+  recommended.
+
+Both the glibc and musl images carry the `fuse3` userspace tools; pick `:musl`
+if your other containers are Alpine-based, otherwise the default tags are fine.
+
 ## Requirements
 
 - Rust (2024 edition) and Cargo to build/install.
