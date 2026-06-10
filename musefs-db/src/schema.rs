@@ -761,4 +761,140 @@ mod migration_v4_tests {
         );
         assert!(orphan.is_err(), "FK must still reject orphan child rows");
     }
+
+    fn rejected(conn: &Connection, sql: &str) {
+        assert!(
+            conn.execute(sql, []).is_err(),
+            "expected rejection for: {sql}"
+        );
+    }
+
+    #[test]
+    fn v4_tracks_rejects_unknown_format() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/x','aiff',0,0,0,0,0)",
+        );
+    }
+
+    #[test]
+    fn v4_tracks_accepts_every_pinned_format() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        for (i, fmt) in ["flac", "mp3", "m4a", "opus", "vorbis", "oggflac", "wav"]
+            .iter()
+            .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime, updated_at) \
+                 VALUES (?1, ?2, 0, 0, 0, 0, 0)",
+                rusqlite::params![format!("/t{i}"), fmt],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn v4_tracks_rejects_negative_audio_offset() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/x','flac',-1,0,0,0,0)",
+        );
+    }
+
+    #[test]
+    fn v4_tracks_rejects_negative_audio_length() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/x','flac',0,-1,0,0,0)",
+        );
+    }
+
+    #[test]
+    fn v4_tracks_rejects_negative_backing_size() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/x','flac',0,0,-1,0,0)",
+        );
+    }
+
+    #[test]
+    fn v4_tracks_rejects_negative_backing_mtime() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/x','flac',0,0,0,-1,0)",
+        );
+    }
+
+    #[test]
+    fn v4_tracks_rejects_negative_content_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, content_version, updated_at) \
+             VALUES ('/x','flac',0,0,0,0,-1,0)",
+        );
+    }
+
+    #[test]
+    fn v4_tracks_rejects_negative_updated_at() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/x','flac',0,0,0,0,-1)",
+        );
+    }
+
+    #[test]
+    fn v4_tracks_rejects_audio_range_past_backing_size() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/x','flac',5,10,14,0,0)",
+        );
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/ok','flac',5,10,15,0,0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_tracks_rejects_update_pushing_audio_past_backing() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/x.flac");
+        rejected(&conn, "UPDATE tracks SET backing_size = 0 WHERE id = 1");
+    }
 }
