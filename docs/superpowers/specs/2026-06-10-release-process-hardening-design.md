@@ -1,7 +1,7 @@
 # Release-process hardening design
 
 **Date:** 2026-06-10
-**Status:** Draft (brainstorming output)
+**Status:** Draft (brainstorming output; revised after spec-plan-reviewer pass)
 
 ## Purpose
 
@@ -16,7 +16,7 @@ Five issues, delivered as three components:
 
 | Component | Issues | Primary surface |
 | --------- | ------ | --------------- |
-| 1. Restructured Rust release graph | #164, #222, #163 | `.github/workflows/release.yml` |
+| 1. Restructured Rust release graph | #164, #222, #163 | `.github/workflows/release.yml`, `.github/workflows/coverage.yml` |
 | 2. Automated Lidarr real-instance gate | #224 | new `.github/workflows/lidarr-smoke.yml` + `release-python.yml` |
 | 3. Rust `v*` release procedure docs | #223 (+ #162 as a documented step) | `CONTRIBUTING.md` |
 
@@ -24,10 +24,13 @@ Five issues, delivered as three components:
 workflow change, so it is covered as a documented step in Component 3 rather
 than as code.
 
-The three components are independent enough to land as **three separate PRs**
-off the stream branch: the docs PR (Component 3) shares no files with the two
-workflow PRs, and `release.yml` (Component 1) and the new `lidarr-smoke.yml` /
-`release-python.yml` changes (Component 2) do not touch each other.
+The three components land as **three PRs** off the stream branch. Components 1
+and 2 are workflow-only and share no files. Component 3 is docs-only and owns
+**all** `CONTRIBUTING.md` edits — including replacing the prose Lidarr
+release-gate line (`CONTRIBUTING.md:365`) with a pointer to the Component 2
+workflow — so the two `CONTRIBUTING.md` touch points live in one PR and don't
+collide. Component 3 has a soft content dependency on 1 and 2 (it documents
+both) and is finalized last.
 
 ### Out of scope
 
@@ -68,35 +71,53 @@ One ordered DAG:
 gate ──► build (matrix) ──► smoke (matrix) ──► publish (crates) ──► release-assets
 ```
 
-**`gate`** (new, runs first — cheap, fail fast before the build matrix):
+**`gate`** (new, runs first — fail fast before the build matrix):
 
 1. Tag-equals-workspace-version check (moved here from `publish`).
-2. **#164 CI-green gate.** Resolve the tag's commit SHA and query
-   `gh api repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs`. Assert that **both
-   `ci-ok` and `coverage-ok`** have `conclusion == success`. Fail closed if
-   either check is missing, still pending/queued, or any non-success conclusion.
-   A tag on an unverified commit therefore cannot publish.
-   - `coverage-ok` is treated as a reliable required check (the 2026-06 Codecov
-     GPG-verification break was a one-time upstream issue fixed by the
-     codecov-action pin bump in PR #207, not a recurring flake).
+2. **#164 CI-green gate — gate on the tag's own fresh CI + coverage run.**
+   - `ci.yml` already triggers on `tags: ['v*']` (`ci.yml:6`); **add the same
+     `tags: ['v*']` trigger to `coverage.yml`** (today it triggers only on
+     `push: branches: [main]` + `pull_request`, so `coverage-ok` is *not*
+     produced for a tag push — without this change the gate can never see it).
+   - The `gate` job **polls** the GitHub Checks API
+     (`gh api repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs`) for the tag's
+     commit SHA until both required aggregator checks — `ci-ok` and
+     `coverage-ok` — reach `status == completed`, then asserts
+     `conclusion == success` for each.
+   - **Selection rule** (the API returns *all* check-runs of a name across runs,
+     and re-runs add new ones): for each of `ci-ok`/`coverage-ok`, take the
+     **latest by `completed_at`**; an `in_progress`/`queued` run is *waited on*,
+     not treated as failure. Fail closed only on: a completed non-success
+     conclusion, or the poll **timeout** (bound: 45 min, covering the full
+     matrix incl. the FreeBSD VM e2e; interval ~20 s) with the check still
+     absent or incomplete.
+   - Because the gate verifies the tagged tree passed the full suite *now*, it
+     does not need to assert the commit is an ancestor of `main` — "this exact
+     tree is green" is strictly stronger than "this commit was once on main."
    - Job permissions: `contents: read` + `checks: read`; uses the workflow
      `github.token`.
 
-**`build`** → `needs: gate`. Matrix otherwise unchanged.
+**`build`** → `needs: gate`. Matrix otherwise unchanged. (Note: the release's
+own `build`/`smoke` thus start only after CI's matrix is green — the duplicate
+build cost is accepted for the safety of one ordered graph.)
 
 **`smoke`** → `needs: build`. Unchanged.
 
 **`publish`** (crates) → **`needs: smoke`** (today: nothing).
-**#163 index-propagation waits:** after each `cargo publish -p <crate>
---locked`, poll until that exact `<name>@<version>` resolves from the crates.io
-index before publishing the next dependent crate. Bounded retry with a timeout;
-fail the job on exhaustion. Publish order is unchanged
-(`musefs-db musefs-format musefs-core musefs-fuse musefs-cli musefs`).
-Because `cargo publish` of an already-published version errors, the plan should
-decide whether the loop skips crates whose `<name>@<version>` already resolves
-from the index (making a whole-workflow re-run after a partial failure safe) or
-leaves resume-from-failure to the documented manual procedure (Component 3,
-step 5).
+- **#163 index-propagation waits.** After each `cargo publish -p <crate>
+  --locked`, poll until that exact `<name>@<version>` resolves before publishing
+  the next dependent crate. **Probe:** the sparse index
+  (`https://index.crates.io/<dir>/<crate>` JSON, checked for the `vers` entry) —
+  cheaper and more direct than `cargo search`. Bound: 10 min per crate,
+  interval ~10 s; fail the job on timeout.
+- **Re-run idempotency (decided).** Before publishing each crate, check whether
+  `<name>@<version>` already resolves from the index; if so, **skip** it.
+  `cargo publish` of an already-published version *errors*, so without this a
+  whole-workflow re-run after a mid-loop failure would die on crate 1 and leave
+  the release partially shipped (the exact #222 failure mode). Skipping makes a
+  re-run safe and idempotent, reusing the #163 index check. Publish order is
+  unchanged (`musefs-db musefs-format musefs-core musefs-fuse musefs-cli
+  musefs`).
 
 **`release-assets`** → **`needs: [smoke, publish]`** (today: only `smoke`).
 GitHub assets upload only after crates.io publishing succeeds. Upload remains
@@ -121,65 +142,87 @@ proves the real Lidarr Custom Script integration still works. A Python package
 release can therefore be cut without the integration the docs call out as
 release-gated ever being exercised.
 
-### Key architectural fact
+### Key architectural fact (verified against the code)
 
-On an `AlbumDownload` event the Custom Script
-(`musefs-lidarr-import`) receives `Lidarr_Album_Id` and
-`Lidarr_AddedTrackPaths`, then queries **Lidarr's REST API**
-(`LidarrClient`, `contrib/lidarr/src/musefs_lidarr/api.py`) for
-`track_files`/`tracks`/`albums_by_id`/`artists_by_id`
-(`sync.py` `EventPayloads`, `mapping.records_for_paths`) and writes *that*
-metadata into the musefs store. The rich tags do **not** come from the event
-env vars — they come from Lidarr's database. So for tag assertions to mean
-anything, the real Lidarr instance must actually hold an artist/album/tracks,
-and Lidarr populates its DB from MusicBrainz (`api.lidarr.audio`).
+On an `AlbumDownload` event the Custom Script (`musefs-lidarr-import`) receives
+`Lidarr_Album_Id` and `Lidarr_AddedTrackPaths`, then queries **Lidarr's REST
+API** (`LidarrClient`, `contrib/lidarr/src/musefs_lidarr/api.py`) for
+`track_files`/`tracks`/`album`/`artist` scoped by album id
+(`sync.py` `collect_event_payloads`, `mapping.records_for_paths`) and writes
+*that* metadata into the musefs store. The rich tags do **not** come from the
+event env vars — they come from Lidarr's database. So for tag assertions to
+mean anything, the real Lidarr instance must actually hold an artist/album/
+tracks, and Lidarr populates its DB from MusicBrainz (`api.lidarr.audio`).
 
 The Lidarr **Test event** carries no `Album_Id`/`SourcePath`, so it only proves
 that the real Lidarr process execs the script and the lowercased-env-var path
-resolves (the `StringDictionary` case bug the 2026-06-07 run caught). Content
-assertions need a known album.
+resolves (the `StringDictionary` case bug the 2026-06-07 run caught). The
+**content** assertions are driven entirely by the *constructed* `AlbumDownload`
+env (step 5 below), not by Lidarr firing `AlbumDownload` itself (it cannot
+without a download-client import — the out-of-scope gap).
 
 ### Design
 
 A new `.github/workflows/lidarr-smoke.yml`, dispatchable (`workflow_dispatch`)
-and reusable (`workflow_call`):
+and reusable (`workflow_call`). Seed mechanism: **API-driven, accepting a
+one-time live `api.lidarr.audio` metadata fetch** — chosen for schema-stability
+across Lidarr versions (it uses the same API surface the script exercises,
+rather than raw SQL coupled to an EF-Core schema). The cost, accepted
+explicitly: the seed step has a **network dependency** on `api.lidarr.audio`,
+so the gate can flake on upstream outage/rate-limit; the metadata-add step gets
+a bounded retry and a clear failure message distinguishing "upstream metadata
+unavailable" from "integration broken."
 
-1. **Generate** synthetic FLAC tracks with ffmpeg via a committed harness script
-   (runnable in-tree script; no committed binary fixtures — large artifacts stay
-   gitignored).
-2. **Boot the pinned `linuxserver/lidarr` container** (pinned by image digest)
-   with `--device /dev/fuse --cap-add SYS_ADMIN --security-opt
-   apparmor=unconfined` (same flags the release Alpine smoke already uses), and
-   apply a **seeded DB fixture**: one synthetic artist + album + tracks, fixed
-   MusicBrainz IDs, track paths matching the generated FLACs. The seed is
-   produced by a committed script (hand-written SQL or a snapshot-once helper);
-   a comment records that the seed must be regenerated when the image digest is
-   bumped, because it is coupled to that Lidarr version's schema. This keeps the
-   smoke fully offline and deterministic — the real Lidarr serves the seeded
-   rows over its own API.
-3. **Configure** the Custom Script connection via Lidarr's API and **fire the
-   Test event**; assert the real Lidarr execs `musefs-lidarr-import` and the
-   lowercased-env resolution succeeds.
-4. **Invoke** the script with a constructed `AlbumDownload` env (`Album_Id` +
-   `AddedTrackPaths` = the generated FLACs). The script queries the seeded
+Steps:
+
+1. **Generate** synthetic FLAC tracks with ffmpeg via a committed harness
+   script, laid out as `Artist/Album/NN Title.flac` under a directory that is
+   **bind-mounted into the Lidarr container** (runnable in-tree script; no
+   committed binary fixtures — large artifacts stay gitignored).
+2. **Boot the pinned `linuxserver/lidarr` container** (pinned by image digest
+   for reproducible Lidarr *behavior*) with `--device /dev/fuse --cap-add
+   SYS_ADMIN --security-opt apparmor=unconfined` (the precedent is the release
+   Alpine smoke, `release.yml:144-148`, which runs `docker run` with exactly
+   these flags on a stock `ubuntu-latest` runner).
+3. **Seed via Lidarr's API:**
+   - Set a root folder = the bind-mounted FLAC directory (in-container path).
+   - Set the two **safe-settings** config rows the script's preflight enforces
+     (`config/metadataprovider` `writeAudioTags == no`;
+     `config/mediamanagement` `fileDate == none`, permissions-setting off) —
+     `api.py` `run_preflight`/`check_safe_settings` *refuses to proceed* on
+     violation, so without seeding these the smoke aborts at preflight instead
+     of reaching its assertions.
+   - Add a fixed artist by MusicBrainz id (one-time live `api.lidarr.audio`
+     fetch), then trigger a scan / manual import so Lidarr creates
+     album/track/`trackfile` rows whose `path` values are the **in-container
+     realpath** of the generated FLACs.
+4. **Configure** the Custom Script connection via the API and **fire the Test
+   event**; assert the real Lidarr execs `musefs-lidarr-import` and the
+   lowercased-env resolution succeeds. (This proves exec only — no content.)
+5. **Invoke** the script with a constructed `AlbumDownload` env: `Album_Id` =
+   the seeded album, `AddedTrackPaths` = the **in-container realpath** of the
+   FLACs (must match Lidarr's seeded `trackfile.path`; `mapping.match_track_file`
+   compares both sides via `realpath_key()`, so a host/container path-namespace
+   mismatch would silently skip every track). The script queries the seeded
    Lidarr API and writes tags to the musefs store + creates symlinks.
-5. **Assert:** symlinks created for every track; store tags match the seeded
-   metadata; backing audio bytes unchanged (sha256 before/after); the served
-   mount carries the tags.
+6. **Assert:** symlinks created for every track; store tags match the metadata
+   Lidarr returned; backing audio bytes unchanged (sha256 before/after); the
+   served mount carries the tags; and — to defend against vacuous passes —
+   **`records > 0` and `skipped == 0`** (a path-namespace mismatch must fail
+   loud, not pass green).
 
 ### Enforcement and triggers
 
-- **Required gate in `release-python.yml`:** the `publish` job gains a `needs:`
-  on this smoke; a Python package release cannot publish without it green. This
-  is the non-forgettable mechanism #224 requires.
+- **Required gate in `release-python.yml`:** add a `lidarr-smoke` job that
+  `uses:` the reusable workflow, and add it to the `publish` job's `needs`
+  (today `needs: [test-python-musefs, test-beets, test-lidarr, test-picard]`,
+  `release-python.yml:138`). A Python package release cannot publish without it
+  green — the non-forgettable mechanism #224 requires.
 - **PR coverage:** also run on PRs touching `contrib/lidarr/**` or the musefs
   binary, so the gate stays continuously green rather than firing only at
   release time.
 - **Documented gap:** the download-client → `AlbumImportedEvent` path stays
   manual; the checklist records it as a known gap.
-
-The prose `release gate` line in `CONTRIBUTING.md` is updated to reference this
-workflow instead of describing an unenforced convention.
 
 ## Component 3 — Rust `v*` release procedure docs (#223, incl. #162)
 
@@ -196,30 +239,34 @@ retries, and partial-failure recovery.
 Add a "Releasing the Rust crates and binaries" section to `CONTRIBUTING.md`,
 mirroring the existing Python section's structure and tone. The workflow is the
 source of truth; the doc is the human checklist, not a re-explanation of the
-YAML.
+YAML. This PR also **replaces the prose Lidarr release-gate line**
+(`CONTRIBUTING.md:365`) with a pointer to the Component 2 workflow, keeping all
+`CONTRIBUTING.md` edits in one place.
 
 Contents:
 
-1. **Pre-flight** — clean tree; confirm current `main` is green
-   (`ci-ok` + `coverage-ok`), because the `gate` job (Component 1) fails closed
-   otherwise; required secrets/permissions present (`CARGO_REGISTRY_TOKEN`).
+1. **Pre-flight** — clean tree; confirm current `main` is green; required
+   secrets/permissions present (`CARGO_REGISTRY_TOKEN`). Note that the tag will
+   trigger a fresh full `ci.yml` + `coverage.yml` run that the release `gate`
+   job waits on, so a broken tree blocks the release automatically.
 2. **Version bump (#162)** — pick `X.Y.Z`; bump the workspace `version`; bump
    all internal `musefs-*` path-dependency constraints off the previous version;
    promote `CHANGELOG.md` `[Unreleased]` → `[X.Y.Z] - <date>`. Run a dry-run
-   check (`cargo package --locked` per crate) before tagging.
-3. **Tag & push** — exact `git tag vX.Y.Z` / push commands; note that the tag
-   must sit on a CI-green `main` commit or the `gate` job fails closed.
+   check (`cargo package --locked` per crate) before tagging — noting this
+   catches packaging errors but *not* the cross-crate index-propagation problem
+   (it uses path deps), which is what the in-workflow #163 wait handles.
+3. **Tag & push** — exact `git tag vX.Y.Z` / push commands; the tag push starts
+   both CI and the release workflow, and the `gate` job blocks publishing until
+   `ci-ok` + `coverage-ok` are green on the tagged tree.
 4. **What `release.yml` does** — the ordered DAG
    (`gate → build → smoke → publish → release-assets`), including the #163
-   index-propagation waits, so a releaser knows what to expect and where it can
-   stop.
-5. **Retry / rollback** — crates.io is yank-only (cannot un-publish). Partial
-   failure guidance: `cargo publish` of an already-published version *errors*
-   (it is not idempotent), so a blind re-run fails on the crates already up.
-   Recovery is to resume from the failed crate (publish only the remaining
-   crates) — note whether the publish loop should skip already-published
-   versions to make whole-workflow re-runs safe, or whether the releaser
-   resumes manually. Asset upload, by contrast, re-runs safely via `--clobber`.
+   index-propagation waits and the skip-if-already-published re-run behavior, so
+   a releaser knows what to expect and that re-running after a partial failure
+   is safe.
+5. **Retry / rollback** — crates.io is yank-only (cannot un-publish). Because
+   the publish loop skips crates already in the index, re-running the workflow
+   after a mid-loop failure resumes cleanly and then runs `release-assets`.
+   Asset upload re-runs via `--clobber`.
 6. **Post-release verification** — `cargo install musefs`; download a release
    binary and `sha256sum -c`; confirm all four target tarballs + checksums are
    attached to the GitHub release.
@@ -229,23 +276,40 @@ Contents:
 
 ## Testing / verification
 
-- **Component 1:** `release.yml` changes are exercised by the existing
-  smoke/build matrix; the new `gate` logic (SHA resolution, check-run query,
-  fail-closed behavior) is the part to verify carefully — validate the
-  `gh api` query shape and the missing/pending/failed branches. A dry-run of the
-  `gate` job logic against a known-green and a known-not-green commit SHA is the
-  acceptance evidence.
+- **Component 1:** the `gate` logic is the part to verify carefully. Acceptance
+  evidence: a dry-run of the gate's check-run query + selection against (a) a
+  commit with green `ci-ok`/`coverage-ok`, (b) one with a failed check, and
+  (c) one with an in-progress check (must wait, not fail). The publish-loop
+  skip/`#163`-wait is exercised by the existing smoke matrix; verify the sparse
+  index probe and the skip-if-present branch against a known-published version.
 - **Component 2:** the `lidarr-smoke.yml` job is itself the test; its PR-trigger
-  on `contrib/lidarr/**` gives continuous signal. Acceptance is a green run that
-  demonstrates all five assertions (symlinks, store tags == seeded metadata,
-  bytes unchanged, mounted tags, Test-event exec).
+  on `contrib/lidarr/**` gives continuous signal. Acceptance is a green run
+  demonstrating all assertions in step 6, including `skipped == 0`. Because the
+  seed step depends on `api.lidarr.audio`, an upstream-metadata failure must
+  surface as a distinct, recognizable error (not a generic red) so a flake is
+  not mistaken for an integration regression.
 - **Component 3:** docs; verified by review against the actual `release.yml`
   DAG and the #162 steps. No automated test.
 
 ## Sequencing within the stream
 
-The three components are independent and can proceed in parallel as three PRs.
-Recommended order if serialized: Component 1 (the core graph) first, then
-Component 2 (Lidarr gate), then Component 3 (docs), so the docs describe the
-already-merged graph. Component 3 has a soft dependency on 1 and 2 being
-settled (it documents both), but can be drafted in parallel and finalized last.
+Three PRs. Components 1 and 2 are independent (workflow-only, disjoint files)
+and can proceed in parallel. Component 3 (docs) documents both and owns all
+`CONTRIBUTING.md` edits, so it is finalized after 1 and 2 settle, though it can
+be drafted in parallel.
+
+## Decisions resolved during review
+
+- **CI-green gate:** run `ci-ok` + `coverage-ok` on the tag (add the tags
+  trigger to `coverage.yml`) and have `gate` poll-and-wait, selecting the
+  latest-completed run per name and failing closed only on a completed
+  non-success or timeout. Dissolves the tag-on-main question.
+- **Publish-loop idempotency:** skip crates already resolvable from the index,
+  reusing the #163 probe, so whole-workflow re-runs are safe (closes #222 on
+  re-run).
+- **Lidarr seed mechanism:** API-driven, accepting a one-time live
+  `api.lidarr.audio` fetch (schema-stable; network-flake risk accepted and
+  surfaced as a distinct error). Seed must also set the preflight safe-settings
+  config rows, and path-matching must assert `skipped == 0`.
+- **CONTRIBUTING.md ownership:** all edits (new Rust section + the `:365` Lidarr
+  gate line) live in Component 3's PR.
