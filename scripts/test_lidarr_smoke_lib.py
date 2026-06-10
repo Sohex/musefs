@@ -1,4 +1,11 @@
-from lidarr_smoke_lib import build_album_download_env, build_import_env
+import pytest
+from lidarr_smoke_lib import (
+    assert_bytes_unchanged,
+    build_album_download_env,
+    build_import_env,
+    parse_ffprobe_tags,
+    sha256_file,
+)
 
 
 def test_build_album_download_env_for_sync():
@@ -26,3 +33,29 @@ def test_build_import_env_for_symlink():
     assert env["Lidarr_EventType"] == "Download"
     assert env["Lidarr_SourcePath"] == "/music/Artist/Album/01.flac"
     assert env["Lidarr_DestinationPath"] == "/links/01.flac"
+
+
+def test_parse_ffprobe_tags_lowercases_keys():
+    payload = '{"format": {"tags": {"ARTIST": "Alice", "album": "Demo"}}}'
+    assert parse_ffprobe_tags(payload) == {"artist": "Alice", "album": "Demo"}
+
+
+def test_parse_ffprobe_tags_empty_when_no_tags():
+    assert parse_ffprobe_tags('{"format": {}}') == {}
+
+
+def test_sha256_file_roundtrip(tmp_path):
+    p = tmp_path / "a.bin"
+    p.write_bytes(b"hello")
+    assert sha256_file(str(p)) == (
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    )
+
+
+def test_assert_bytes_unchanged_passes_when_equal():
+    assert_bytes_unchanged({"a": "x"}, {"a": "x"})
+
+
+def test_assert_bytes_unchanged_raises_on_change():
+    with pytest.raises(AssertionError, match="a.flac"):
+        assert_bytes_unchanged({"a.flac": "x"}, {"a.flac": "y"})
