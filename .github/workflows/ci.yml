@@ -257,6 +257,33 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  asan:
+    # AddressSanitizer over the core-level concurrent test. Nightly + explicit
+    # target are required for -Zsanitizer. We do NOT use -Zbuild-std (kept fast
+    # and reliable); ASan still interposes malloc globally, so it catches heap
+    # errors reached in the C deps (libsqlite3) from this test. detect_leaks=0:
+    # this gate is about memory-safety (UAF/OOB), not leaks (sqlite/global
+    # statics produce benign LSan noise).
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: nightly
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: AddressSanitizer (core concurrent reads)
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=0"
+        run: >-
+          cargo +nightly test -p musefs-core --test concurrent_reads
+          --target x86_64-unknown-linux-gnu
+
   freebsd:
     # Expensive (a full in-VM build), so NOT on every PR: only when the
     # FUSE/mount surface or its harness changed, or on a release tag (`v*`).
@@ -284,7 +311,7 @@ jobs:
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, interop, python-musefs, beets, lidarr, picard, e2e, macos, freebsd]
+    needs: [changes, check, interop, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results
