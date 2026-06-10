@@ -24,6 +24,16 @@ DIRECT_FIELDS = {
     "tracknumber": "tracknumber",
     "discnumber": "discnumber",
     "date": "date",
+    "comment": "comment",
+    "lyrics": "lyrics",
+    "grouping": "grouping",
+    "isrc": "isrc",
+    "replaygain_track_gain": "replaygain_track_gain",
+    "replaygain_album_gain": "replaygain_album_gain",
+    "replaygain_track_peak": "replaygain_track_peak",
+    "replaygain_album_peak": "replaygain_album_peak",
+    "musicbrainz_albumid": "musicbrainz_albumid",
+    "musicbrainz_artistid": "musicbrainz_artistid",
 }
 
 # Keys whose value is dropped when it normalizes to zero (a 0 track/disc is noise).
