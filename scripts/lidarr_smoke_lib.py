@@ -61,5 +61,5 @@ def sha256_file(path: str) -> str:
 def assert_bytes_unchanged(before: dict[str, str], after: dict[str, str]) -> None:
     """Raise AssertionError if any file's sha256 changed (cardinal invariant)."""
     if before != after:
-        changed = [k for k in before if before.get(k) != after.get(k)]
+        changed = [k for k in set(before) | set(after) if before.get(k) != after.get(k)]
         raise AssertionError(f"backing audio bytes changed for: {changed}")
