@@ -350,15 +350,23 @@ impl Musefs {
         ))
     }
 
-    /// Rebuild the tree from the current DB contents (used after external edits).
+    /// Force an unconditional rebuild of the tree from the current DB contents.
+    /// Test-only: production code refreshes via `poll_refresh`.
     ///
-    /// Not single-flighted: do not run concurrently with `poll_refresh` (or another
-    /// `refresh`) — two overlapping rebuilds can publish a stale tree. The production
-    /// path goes through `poll_refresh`, which guards entry with the `refreshing` CAS;
-    /// this entry point exists for forced, unconditional rebuilds (e.g. tests). It
-    /// also refreshes the `content_version` snapshot, so it must not race a
-    /// `poll_refresh` whose change-diff relies on that snapshot.
-    pub fn refresh(&self) -> Result<()> {
+    /// Serialized against `poll_refresh` (and itself) through the same `refreshing`
+    /// single-flight gate the production path uses, so overlapping rebuilds can't
+    /// publish a stale tree or race the `content_version` snapshot the change-diff
+    /// relies on. Unlike `poll_refresh`, it blocks until it owns the gate rather than
+    /// bailing out, so the forced rebuild always happens.
+    pub fn refresh_for_test(&self) -> Result<()> {
+        while self
+            .refreshing
+            .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        let _guard = RefreshGuard(&self.refreshing);
         let snapshot = self.rebuild_full()?;
         *crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot") = snapshot;
         Ok(())
