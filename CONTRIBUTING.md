@@ -477,6 +477,88 @@ Also create a GitHub environment named `pypi` in the repo settings (it gates the
    publishes `python-musefs`, `beets-musefs`, and `lidarr-musefs` to PyPI (in
    that order).
 
+## Releasing the Rust crates and binaries
+
+The Rust workspace publishes to crates.io and ships prebuilt cross-compiled
+binaries on a `v*` tag, decoupled from the Python `py-v*` flow. `release.yml`
+runs one ordered graph — `gate → build → smoke → publish → release-assets` —
+and is the source of truth; this checklist is the human side.
+
+**Pre-flight.**
+
+1. Working tree clean, on the commit you intend to release.
+2. Confirm `main` is green (CI + coverage). The tag push triggers a fresh
+   `ci.yml` and `coverage.yml` run, and the release `gate` job **waits for
+   `ci-ok` and `coverage-ok` to be green on the tagged commit** before anything
+   builds or publishes — a red tree blocks the release automatically.
+3. `CARGO_REGISTRY_TOKEN` is present in repo secrets.
+
+**Version bump (do this in one commit before tagging).**
+
+1. Pick the new version `X.Y.Z`.
+2. Bump the workspace `version` in `Cargo.toml`.
+3. Bump every internal `musefs-*` path-dependency constraint that pins the old
+   version (e.g. `musefs-db = { version = "X.Y.Z", path = "..." }`) — a stale
+   internal floor fails the publish.
+4. Promote the `## [Unreleased]` section of `CHANGELOG.md` to
+   `## [X.Y.Z] - <date>`.
+5. Dry-run package each crate: `cargo package -p <crate> --locked` for each of
+   `musefs-db musefs-format musefs-core musefs-fuse musefs-cli musefs`. This
+   catches packaging errors but **not** the cross-crate index-propagation
+   problem (it resolves siblings via path deps); that is handled in-workflow
+   (next section).
+6. Commit, e.g. `git commit -am "release: vX.Y.Z"`.
+
+**Tag and push.**
+
+```bash
+git tag vX.Y.Z
+git push origin HEAD --tags
+```
+
+The tag push starts both CI and `release.yml`. The `gate` job blocks publishing
+until `ci-ok` + `coverage-ok` are green on the tagged tree (45-minute timeout,
+covering the full matrix including the FreeBSD VM e2e).
+
+**What `release.yml` does.**
+
+1. `gate` — verifies the tag matches the workspace version and waits for the
+   required CI checks to pass on the tagged commit (fails closed on a failed
+   check or timeout).
+2. `build` — cross-compiles the four target binaries.
+3. `smoke` — runs the binary smoke on each target (host + Alpine).
+4. `publish` — publishes crates in dependency order. For each crate it **skips**
+   the publish if `name@version` already resolves from the crates.io index, then
+   **waits** for that version to appear before publishing the next dependent
+   crate (index-propagation; #163). The skip makes a whole-workflow re-run after
+   a partial failure safe.
+5. `release-assets` — creates/updates the GitHub Release and uploads the binary
+   tarballs + checksums (only after crates publishing succeeds).
+
+**Retry / rollback.**
+
+- crates.io is **yank-only** — a published version cannot be un-published.
+- A partial failure (e.g. crate 3 of 6 published, then a transient error) is
+  recovered by **re-running the workflow**: the publish loop skips the crates
+  already in the index and resumes, then runs `release-assets`. No manual
+  cleanup of the published crates is needed.
+- GitHub asset upload is idempotent (`gh release upload --clobber`), so re-runs
+  re-upload safely.
+
+**Post-release verification.**
+
+1. `cargo install musefs` (or `cargo install musefs --version X.Y.Z`) from a
+   clean machine/container.
+2. Download a release tarball and verify its checksum:
+   `sha256sum -c musefs-X.Y.Z-<triple>.tar.gz.sha256`.
+3. Confirm all four target tarballs + `.sha256` files are attached to the
+   GitHub Release.
+
+**Lidarr gate at a v1.0.0 milestone.** The Lidarr real-instance smoke
+(`lidarr-smoke.yml`) gates the Python `py-v*` release, not this Rust flow. When
+a v1.0.0 milestone bundles both, ensure the Python release (and therefore its
+Lidarr smoke gate) is also run.
+
 ## PRs & commits
 
 - Conventional-style subjects (`fix(format): …`, `docs: …`, `ci: …`), scoped
