@@ -425,9 +425,15 @@ Gotchas that have bitten before:
 - The real-Picard tests `importorskip` Picard and Qt: without an importable
   Picard (e.g. the system package on `PYTHONPATH`), they **silently skip**.
   When touching the Picard plugin, make sure they actually ran.
-- The Lidarr real-instance smoke test is a release gate, not a default CI job.
-  It verifies Lidarr accepts script-created symlink destinations and emits the
-  expected Custom Script event.
+- The Lidarr smoke is automated as a release gate in
+  `.github/workflows/lidarr-smoke.yml`: a real Lidarr container proves the
+  Custom Script exec path (its Test event), and the content leg
+  (`musefs-lidarr-sync` tag-writes, `musefs-lidarr-import` symlink, served-mount
+  tags, unchanged backing bytes) runs against a local mock Lidarr API so it is
+  deterministic and network-free. It runs on PRs touching the Lidarr surface and
+  **gates the Python `py-v*` publish**. The download-client `AlbumImportedEvent`
+  path remains a documented manual gap (it only fires for `NewDownload`
+  imports); see `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`.
 - `musefs_common/schema.py` is **generated** from `musefs-db/src/schema.rs`.
   After a schema change:
   `MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py`, then
