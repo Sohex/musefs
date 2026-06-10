@@ -16,11 +16,13 @@
 | ---- | ----------------------- |
 | `musefs-format/src/layout.rs` | `Segment` metadata lengths become `BlobLen`; `RegionLayout` caches `total_len`/`header_len`, field `segments` goes private, `Default` removed; `new` → `pub(crate)` + `#[cfg(any(test, feature = "fuzzing"))] new_unchecked`; `validate()` gains backing-range bounds check. |
 | `musefs-format/Cargo.toml` | (no new feature) — reuse the existing `fuzzing` feature to gate the public test constructor. |
-| `musefs-format/src/flac.rs`, `mp3.rs`, `mp4.rs`, `wav.rs`, `ogg/mod.rs` | Synthesis builders now construct `Segment::ArtImage`/`BinaryTag`/`OggArtSlice` with `BlobLen`; already call `validated(...)`. |
-| `musefs-format/src/fuzz_check.rs` | Same-crate `#[cfg(test)]` builders switch to `new_unchecked` / `BlobLen`. |
+| `musefs-format/src/flac.rs`, `mp3.rs`, `mp4.rs` | Synthesis builders construct `Segment::ArtImage`/`BinaryTag` lengths from already-`BlobLen` `ArtInput`/`BinaryTagInput` fields — the edit is to **drop the `.get()`** at the segment-build sites (`flac.rs:297` `bt.len.get()`/`318` `art.data_len.get()`, `mp3.rs:357`/`370`, `mp4.rs:680`/`709`), passing the `BlobLen` through directly. `wav.rs` builds **no** such literal in production (delegates to `mp3::build_id3v2_segments`) — its only affected line is the `#[cfg(test)]` accessor sweep at `wav.rs:622`. |
+| `musefs-format/src/ogg/mod.rs` | **No production `Segment::ArtImage`/`BinaryTag` literal** (ogg art becomes `OggArtSlice` built in `page.rs`) — the only changes are `#[cfg(test)]` reader-helper reads of the `OggArtSlice` `len` field at `mod.rs:931`/`968` (`*len` → `len.get()`). |
+| `musefs-format/src/ogg/page.rs` | **(Reviewer-added — was missing.)** The real `Segment::OggArtSlice` is built in `emit_segments` at `page.rs:401` (`len: (oe - os) as u64`, a per-page art **slice width**, not a whole-payload length). Retype to `BlobLen::new((oe - os) as u64).expect("ogg art slice span is non-empty")`. Same-crate `#[cfg(test)]` consumers read the field: `page.rs:563` (`flatten`, `*offset + *len`), `page.rs:637` (`Some(*len)`) → `len.get()`; and the mutation-anchor test at `page.rs:642-646` (`matches!(… len: 0, …)`) cannot compile under `BlobLen` — see Task 2 Step 6 for its disposition and the `emit_segments` mutant it guards. |
+| `musefs-format/src/fuzz_check.rs` | **No change for `Segment`** — verified it builds none of the three metadata variants (grep: zero `ArtImage`/`BinaryTag`/`OggArtSlice` literals). It does carry `.cargo/mutants.toml` anchors (`fuzz_check.rs` entries at toml lines 187/198/337), so if a stray edit shifts its lines the pre-commit **mutant-anchor drift guard** rejects the commit — do not touch this file. |
 | `musefs-format/tests/layout.rs` | External integration tests: valid layouts → `validated`; invalid layouts (empty/overflow) → `new_unchecked` (gated by `fuzzing` dev-dep). |
-| `musefs-core/src/reader.rs` | `StructureOnly` raw `new` → `validated`; `.segments` field reads → `.segments()`; cached `total_len` sourced from `layout.total_len()`; defensive `layout.validate()?` before cache insert. |
-| `musefs-core/src/facade.rs`, `musefs-core/src/ogg_index.rs`, `musefs-core/tests/read_at.rs` (+ `reader.rs`/`proptest_read_fidelity.rs` test sites) | Field-access and `new` call-site sweep. |
+| `musefs-core/src/reader.rs` | `StructureOnly` raw `new` (`reader.rs:144`) → `validated(...).map_err(FormatError::InvalidLayout)?` (reuse the existing error route — see Task 3 Step 2); `.segments` field reads at `reader.rs:333`/`372` → `.segments()`; cached `total_len` at `reader.rs:290` already reads `layout.total_len()`; defensive `layout.validate()` before cache insert. The `#[cfg(test)]` `RegionLayout::new` callers (`reader.rs:509`, `782`, `833`, `865`, `1281`) are in `musefs-core`, foreign to `musefs-format`, so they break under `pub(crate) new` and migrate too — see Task 3 Step 5. |
+| `musefs-core/src/facade.rs` (`:1155`), `musefs-core/src/ogg_index.rs` (`:302`), `musefs-core/tests/read_at.rs` (`:114`) (+ `reader.rs`/`proptest_read_fidelity.rs` test sites) | Field-access and `new` call-site sweep. |
 
 ---
 
@@ -28,10 +30,12 @@
 
 Make `total_len`/`header_len` stored-at-construction values, make the `segments` field private (so a mutator can't desync the cache), hand-remove the derived `Default`, and migrate every direct `.segments` **field** read to the `.segments()` accessor — all in one green commit, because privatizing the field breaks foreign-crate reads simultaneously.
 
+> **Sequencing correction (do this exactly).** This task keeps `RegionLayout::new` **`pub`** — it ONLY privatizes the `segments` *field*. Demoting `new` to `pub(crate)` is deferred to Task 3, where it lands together with the migration of every foreign-crate `new` caller. (If you demote `new` here, the foreign `RegionLayout::new` callers in `musefs-core` — `facade.rs:1155`, `reader.rs:509/782/833/865/1281`, `tests/read_at.rs:114` — break and Task 1's commit goes red, which the pre-commit hook rejects.) Privatizing the field is independent: a `pub` constructor does not expose a private field, so foreign `new(...)` calls keep compiling while foreign `.segments` field reads are swept to `.segments()` in Step 4.
+
 **Files:**
 - `musefs-format/src/layout.rs` (struct `RegionLayout` lines 64–125; `new`/`validated`/`segments`/`total_len`/`header_len`/`validate`)
 - `musefs-format/src/wav.rs` (line 622, `#[cfg(test)]`)
-- `musefs-core/src/reader.rs` (lines 320, 359 production; cached total at 277/293)
+- `musefs-core/src/reader.rs` (`.segments` field reads at lines **333** and **372**; cached total already at **290** — verified against current `main`, the plan's old 320/359/277 were pre-Plan-C and are stale)
 - `musefs-core/src/ogg_index.rs` (line 302, `#[cfg(test)]`)
 - Test path (regression): `musefs-format/tests/layout.rs`
 
@@ -113,7 +117,9 @@ Make `total_len`/`header_len` stored-at-construction values, make the `segments`
           }
       }
 
-      pub(crate) fn new(segments: Vec<Segment>) -> RegionLayout {
+      // Stays `pub` in Task 1 (foreign `new` callers still need it); demoted to
+      // `pub(crate)` in Task 3 together with their migration.
+      pub fn new(segments: Vec<Segment>) -> RegionLayout {
           RegionLayout::from_segments(segments)
       }
 
@@ -145,20 +151,20 @@ Make `total_len`/`header_len` stored-at-construction values, make the `segments`
           self.header_len
       }
   ```
-  Leave `validate()` (lines 114–124) as-is for now; it still iterates `&self.segments` (same module, fine). `new` is now `pub(crate)`: same-crate `#[cfg(test)]` and `fuzz_check` callers still compile; the `pub` test constructor for foreign crates lands in Task 3.
+  Leave `validate()` (lines 114–124) as-is for now; it still iterates `&self.segments` (same module, fine). `new` stays **`pub`** in this task (see the Sequencing correction above) — all `new` callers, same-crate and foreign, keep compiling; its demotion to `pub(crate)` and the `new_unchecked` escape hatch land in Task 3.
 
 - [ ] **Step 3b: Fix the same-crate `validate()` caller of the overflow path.** `validate()` still recomputes `total` for the overflow check; that is correct and must stay (it is the *checked* construction path). No change needed beyond confirming it reads `&self.segments` (private but same-module — OK).
 
 - [ ] **Step 4: Sweep foreign-crate `.segments` field reads to `.segments()`.** The field is now private outside `musefs-format`. Edit:
-  - `musefs-core/src/reader.rs:320` `resolved.layout.segments` → `resolved.layout.segments()`
-  - `musefs-core/src/reader.rs:359` `for seg in &resolved.layout.segments` → `for seg in resolved.layout.segments()`
+  - `musefs-core/src/reader.rs:333` `…layout\n.segments` → `…layout.segments()` (a multi-line `.segments` field read; verify the exact span by grepping `\.segments\b` — it is NOT 320)
+  - `musefs-core/src/reader.rs:372` `for seg in &resolved.layout.segments` → `for seg in resolved.layout.segments()` (NOT 359)
   - `musefs-core/src/ogg_index.rs:302` `for seg in &layout.segments` → `for seg in layout.segments()` (this is a `#[cfg(test)]` mod in `musefs-core`, still foreign to `musefs-format`)
   - `musefs-format/src/wav.rs:622` `for s in &layout.segments` → `for s in layout.segments()` (same-crate `#[cfg(test)]`; the field is module-private, so the field read would still compile, but switch to the accessor for consistency)
   - External test crates touched in this commit: `musefs-format/tests/{synthesize_tags.rs, mp3_synthesize.rs, wav_synthesize.rs, synthesize_art.rs, common/mod.rs}` and `musefs-core/tests/{reader.rs, proptest_read_fidelity.rs}` each read `.segments` as a field. Convert every `layout.segments` / `resolved.layout.segments` field read to the `.segments()` accessor. Exact sites (from grep): `synthesize_tags.rs:100-102`, `mp3_synthesize.rs:11,78,135-137,223`, `wav_synthesize.rs:22,96,215,262`, `synthesize_art.rs:47,143,183`, `common/mod.rs:19`, `reader.rs:138,158`, `proptest_read_fidelity.rs:232,331,501,553,781`.
 
   > NOTE: `.segments().len()` and `.segments()[i]` index access work identically on the returned slice, so `layout.segments.len()` → `layout.segments().len()` and `layout.segments[0]` → `layout.segments()[0]`.
 
-- [ ] **Step 5: Migrate the `total` source in `reader.rs:277` (no behavior change, compile check).** `let total = layout.total_len();` (line 277) now reads the stored value — leave as-is. Confirm `cache_bytes` (line 282) already uses `.segments()`. No edit needed; this step is a verification that the production caching path compiles against the private field.
+- [ ] **Step 5: Migrate the `total` source in `reader.rs:290` (no behavior change, compile check).** `let total = layout.total_len();` (line **290**, not the old 277) already reads the stored value — leave as-is. No edit needed; this step is a verification that the production caching path compiles against the now-private field.
 
 - [ ] **Step 6: Run the workspace suite green.** Command:
   ```
@@ -300,10 +306,38 @@ Replace the raw `u64` length on `ArtImage`/`BinaryTag`/`OggArtSlice` with Plan C
   }
   ```
 
-- [ ] **Step 6: Fix every `ArtImage`/`BinaryTag`/`OggArtSlice` literal in the workspace.** Each `len: <expr>` becomes `len: BlobLen::new(<expr>).expect("…non-zero")` in production synthesis paths (where the value is already known non-zero), or `len: BlobLen::new(<expr>).unwrap()` in tests. Sites:
-  - **Production synthesis** (`flac.rs`, `mp3.rs`, `mp4.rs`, `wav.rs`, `ogg/mod.rs`): wherever these crates build the three variants. Art/binary payload lengths come from `ArtInput`/`BinaryTagInput` (Plan C typed those with `BlobLen` at the DB/scan boundary), so prefer threading the existing `BlobLen` through rather than `new(...).unwrap()`. Where a raw `u64` is still in hand and provably non-zero, use `BlobLen::new(x).expect("art/tag payload length is non-zero")` and leave a one-line WHY comment only if the non-zero source is non-obvious.
-  - **Same-crate tests** `fuzz_check.rs` (any literal building these variants — none in lines 324–404 today, but sweep the whole file) and `layout.rs` unit `tests` mod (`binary_tag_segment_len_and_validate` at line 132 builds `BinaryTag { len: 12 }` and `{ len: 0 }`). The `len: 0` case becomes impossible to express — replace that sub-assertion with `assert!(BlobLen::new(0).is_none());` and keep the non-empty validation path with `len: BlobLen::new(12).unwrap()`.
-  - **External tests**: `tests/read_at.rs:114` (`ArtImage { len: art.len() as u64 }` → `BlobLen::new(art.len() as u64).unwrap()`), and the OggArtSlice/BinaryTag/ArtImage literals in `reader.rs` unit tests (lines 769, 820, 852-no, 1233) and `proptest_read_fidelity.rs` / `synthesize_art.rs`. Grep `ArtImage {`, `OggArtSlice {`, `BinaryTag {` across `musefs-format` and `musefs-core` and fix each.
+- [ ] **Step 6: Retype every `ArtImage`/`BinaryTag`/`OggArtSlice` construction AND fix every pattern-match site.** Two distinct edit kinds — do not confuse them:
+
+  **(a) Production synthesis — DROP the `.get()`, do NOT wrap in `BlobLen::new().expect()`.** Plan C already typed `ArtInput.data_len` and `BinaryTagInput.len` as `BlobLen`; the segment builders currently call `.get()` to down-convert to the old `u64` field. With the field now `BlobLen`, the conversion disappears — pass the `BlobLen` straight through by deleting `.get()`:
+  - `musefs-format/src/flac.rs:297` `len: bt.len.get(),` → `len: bt.len,`
+  - `musefs-format/src/flac.rs:318` `len: art.data_len.get(),` → `len: art.data_len,`
+  - `musefs-format/src/mp3.rs:357` `len: bt.len.get(),` → `len: bt.len,`
+  - `musefs-format/src/mp3.rs:370` `len: art.data_len.get(),` → `len: art.data_len,`
+  - `musefs-format/src/mp4.rs:680` `len: bt.len.get(),` → `len: bt.len,`
+  - `musefs-format/src/mp4.rs:709` `len: a.data_len.get(),` → `len: a.data_len,`
+  (Re-grep `len: .*\.get()` in these files before editing in case Plan C's line numbers shift; the *pattern* is the anchor, not the line.)
+
+  **(b) Production OggArtSlice — `ogg/page.rs:401`, the slice width.** This is the ONE production site where the length is a freshly computed `u64`, not a threaded `BlobLen`. In `emit_segments`:
+  ```rust
+  len: BlobLen::new((oe - os) as u64)
+      .expect("ogg art slice span is non-empty"),
+  ```
+  The span is non-empty because `emit_segments` only emits an `OggArtSlice` for a real art run (`oe > os`). This `.expect()` is also load-bearing for the mutation gate — see the page.rs:646 note below.
+
+  **(c) Pattern-match / struct-pattern sites that won't compile under `BlobLen`** (you cannot bind `len: 0` or `len: 50` as a pattern against a newtype). These are `-D warnings`/compile breaks the original plan never listed — convert each to bind `len, ..` and compare via `.get()` (or `s.len()`):
+  - `musefs-format/src/mp4.rs:1163` `Some(Segment::ArtImage { len: 100, .. })` → bind `{ len, .. }` and assert `len.get() == 100`.
+  - `musefs-format/src/mp4.rs:1410` `matches!(segs[1], Segment::ArtImage { art_id: 7, len: 50 })` → `matches!(segs[1], Segment::ArtImage { art_id: 7, .. })` plus a `len.get() == 50` check, or compare `segs[1].len() == 50`.
+  - `musefs-format/src/mp4.rs:1434` `matches!(s, Segment::ArtImage { art_id: 9, len: 40 })` → same treatment.
+  - `musefs-format/tests/wav_synthesize.rs:220` `Segment::ArtImage { art_id: 2, len: 64 }` (a `matches!`/pattern) → same treatment.
+  - `musefs-format/src/ogg/page.rs:642-646` the mutation-anchor assertion `!matches!(s, Segment::OggArtSlice { len: 0, .. })` — **cannot compile** (`len: 0` against `BlobLen`) and is now **vacuous** (a zero-length `OggArtSlice` is unrepresentable). **Delete this assertion.** The mutant it guarded (`emit_segments` `<` → `<=`, per the comment) is still killed: that mutant forces a zero-width slice, which makes `BlobLen::new(0).expect(...)` at page.rs:401 **panic** inside this same test → mutant caught. The in-diff mutation gate re-tests `page.rs` (it is in the diff), so **verify the `emit_segments` mutant stays caught** after the change; if it survives, restore teeth with an explicit width assertion (e.g. assert each `OggArtSlice` slice width sums to `art_out.len()` — the `art_served` assertion just above already does this) rather than re-adding the impossible `len: 0` form.
+
+  **(d) Same-crate `#[cfg(test)]` OggArtSlice field reads** (`*len` → `len.get()`): `musefs-format/src/ogg/page.rs:563` (`flatten`: `*offset + *len`), `page.rs:637` (`Some(*len)`), `musefs-format/src/ogg/mod.rs:931` and `:968` (the `materialize_header` / read helpers: `b64_window(*offset, *len, …)` and `usize_from(*len)`).
+
+  **(e) `layout.rs` unit `tests` mod** — `binary_tag_segment_len_and_validate` builds `BinaryTag { len: 12 }` and `{ len: 0 }`. The `len: 0` case is now impossible to express — replace that sub-assertion with `assert!(BlobLen::new(0).is_none());` and keep the non-empty path with `len: BlobLen::new(12).unwrap()`.
+
+  **(f) `fuzz_check.rs` — NO change.** Verified: it builds none of the three metadata variants. Do not touch it (its mutants.toml anchors are line-fragile).
+
+  **(g) External tests**: `musefs-core/tests/read_at.rs:114` area (`ArtImage { len: art.len() as u64 }` → `len: BlobLen::new(art.len() as u64).unwrap()`); the `reader.rs`/`facade.rs` `#[cfg(test)]` literals (the `RegionLayout::new` callers migrated in Task 3 — `reader.rs:782` OggArtSlice `len: full_b64.len() as u64`, `:833` OggArtSlice, `:1281` BinaryTag) get `BlobLen::new(...).unwrap()`; and `proptest_read_fidelity.rs` / `synthesize_art.rs`. **Grep `ArtImage {`, `OggArtSlice {`, `BinaryTag {` across `musefs-format` and `musefs-core` and fix every construction AND every `matches!`/struct-pattern site** — the two are different edits (see (a) vs (c)).
 
 - [ ] **Step 7: Run green.** Commands:
   ```
@@ -316,9 +350,19 @@ Replace the raw `u64` length on `ArtImage`/`BinaryTag`/`OggArtSlice` with Plan C
 - [ ] **Step 8: Commit.** Stage by exact name (all files touched in Step 6 — list them explicitly, no `git add -A`):
   ```
   git add musefs-format/src/layout.rs musefs-format/src/flac.rs musefs-format/src/mp3.rs \
-    musefs-format/src/mp4.rs musefs-format/src/wav.rs musefs-format/src/ogg/mod.rs \
-    musefs-format/src/fuzz_check.rs musefs-format/tests/layout.rs musefs-format/tests/read_at.rs \
+    musefs-format/src/mp4.rs musefs-format/src/ogg/mod.rs musefs-format/src/ogg/page.rs \
+    musefs-format/tests/layout.rs musefs-format/tests/wav_synthesize.rs \
+    musefs-core/src/reader.rs musefs-core/tests/read_at.rs \
     <every other touched test file>
+  # NOTE 1: musefs-core/src/reader.rs IS staged — its #[cfg(test)] mod builds
+  # OggArtSlice/BinaryTag literals (:782/:833/:1281) whose `len:` now needs
+  # BlobLen::new(...).unwrap(). These keep `RegionLayout::new` here (still pub
+  # until Task 3); Task 3 later flips them to `validated`.
+  # NOTE 2: musefs-core/src/facade.rs is NOT touched by this task — its only
+  # Segment literal is BackingAudio (len stays raw u64). It changes in Task 3 only.
+  # NOTE 3: musefs-format/src/wav.rs and src/fuzz_check.rs are NOT staged —
+  # wav.rs has no production Segment literal (Task 1 handled its one test line) and
+  # fuzz_check.rs builds none of the three variants (verified).
   git commit -F - <<'EOF'
   feat(format): type Segment metadata lengths with BlobLen; backing-range check (#201)
 
@@ -334,14 +378,17 @@ Replace the raw `u64` length on `ArtImage`/`BinaryTag`/`OggArtSlice` with Plan C
 
 ## Task 3: Hide `new`; migrate all call sites; expose `new_unchecked` for invalid-layout tests
 
-`new` was already demoted to `pub(crate)` in Task 1, which keeps same-crate `#[cfg(test)]` and `fuzz_check` callers compiling. This task migrates the **production** `StructureOnly` site and the **external integration-test** crates that can no longer see `new`, deciding per site between `validated(...)` and a deliberately-public `new_unchecked` (gated behind the existing `fuzzing` feature).
+`new` is still `pub` (Task 1 deliberately did NOT demote it). **This task demotes `new` to `pub(crate)` AND migrates every foreign caller in the SAME commit** — that is the only way to keep the commit green (the moment `new` becomes `pub(crate)`, every `musefs-core` caller stops compiling). It adds the `fuzzing`-gated public `new_unchecked` escape hatch, migrates the **production** `StructureOnly` site, and migrates the **external (`musefs-core`) integration-test + `#[cfg(test)]`** call sites, deciding per site between `validated(...)` and `new_unchecked`.
 
 **Files:**
-- `musefs-format/src/layout.rs` (add `new_unchecked`)
-- `musefs-core/src/reader.rs:144` (production `StructureOnly`)
+- `musefs-format/src/layout.rs` (demote `fn new` to `pub(crate)`; add `new_unchecked`)
+- `musefs-core/src/reader.rs:144` (production `StructureOnly`) **and** its `#[cfg(test)]` `new` callers at `:509/:782/:833/:865/:1281`
+- `musefs-core/src/facade.rs:1155` (`#[cfg(test)]` `new` caller)
 - `musefs-format/tests/layout.rs` (external; mixes valid + intentionally-invalid layouts)
 - `musefs-core/tests/read_at.rs:114` (external; valid layout)
 - Test path: `musefs-format/tests/layout.rs`
+
+- [ ] **Step 0: Demote `new` to `pub(crate)`.** In `musefs-format/src/layout.rs`, change `pub fn new(segments: Vec<Segment>)` (left `pub` by Task 1) to `pub(crate) fn new(segments: Vec<Segment>)`. This is the breaking change; Steps 1–5 below are its in-commit fixups. After this edit the workspace will not build until every foreign `RegionLayout::new` caller (Step 5's list) is migrated — land them all in this one commit.
 
 - [ ] **Step 1: Add the public, feature-gated `new_unchecked` constructor.** Insert into `impl RegionLayout` in `musefs-format/src/layout.rs`, right after `validated`:
   ```rust
@@ -356,7 +403,9 @@ Replace the raw `u64` length on `ArtImage`/`BinaryTag`/`OggArtSlice` with Plan C
   ```
   No `Cargo.toml` edit is required: the `fuzzing` feature already exists (`musefs-format/Cargo.toml:17`) and is already enabled for `musefs-format`'s own test build (self dev-dep, line 29) and for `musefs-core`'s test build (`musefs-core/Cargo.toml:33`, `features = ["fuzzing"]`). External test crates therefore already see `new_unchecked` — no feature wiring to add.
 
-- [ ] **Step 2: Migrate the production `StructureOnly` site.** Edit `musefs-core/src/reader.rs:144`. The single `BackingAudio` layout is always valid, so use `validated` and surface the (practically-unreachable) error as the layout/synthesis error path:
+- [ ] **Step 2: Migrate the production `StructureOnly` site — reuse the existing `FormatError::InvalidLayout` route; do NOT add a new `CoreError` variant.** Edit `musefs-core/src/reader.rs:144`. The single `BackingAudio` layout is always valid, so use `validated` and surface the (practically-unreachable) error.
+
+  > **Verified error routing (do not invent a second path).** `LayoutError` already converts into `FormatError` via `FormatError::InvalidLayout(#[from] crate::layout::LayoutError)` at `musefs-format/src/error.rs:18`, and `FormatError` already converts into `CoreError::Format`. That is the single, existing route every synthesis path uses. **However**, Rust's `?` does NOT chain two `From`s automatically, so a bare `RegionLayout::validated(…)?` (which yields `Result<_, LayoutError>`) will **not** compile in a `Result<_, CoreError>` function. Bridge the first hop explicitly with `.map_err(FormatError::InvalidLayout)` so the `?` then uses the existing `From<FormatError> for CoreError`:
   ```rust
   Mode::StructureOnly => {
       // Pure passthrough: the synthesized "file" is the backing file itself.
@@ -365,11 +414,12 @@ Replace the raw `u64` length on `ArtImage`/`BinaryTag`/`OggArtSlice` with Plan C
       let layout = RegionLayout::validated(vec![Segment::BackingAudio {
           offset: 0,
           len: meta.len(),
-      }])?;
+      }])
+      .map_err(musefs_format::FormatError::InvalidLayout)?;
       (layout, meta.len(), track.backing_mtime)
   }
   ```
-  Confirm `CoreError: From<LayoutError>` exists (synthesis already does `RegionLayout::validated(segments)?` in the format crate and `?`-propagates through `synthesize_layout` → `CoreError::Format`); the `?` here needs `LayoutError → CoreError`. Check `musefs-core/src/error.rs` — if `LayoutError` is not yet a `CoreError` source (today it only ever flows up wrapped in `FormatError`), add a `#[from] LayoutError` arm (e.g. `CoreError::Layout(LayoutError)`) and map it to the same errno the format synthesis errors use. Verify with `find_referencing_symbols` on `LayoutError`.
+  Ensure `FormatError` is imported in `reader.rs` (or use the fully-qualified `musefs_format::FormatError::InvalidLayout` as above). **Do NOT add `CoreError::Layout(#[from] LayoutError)`** — it would create a second errno path for the same condition and an ambiguous `#[from]` (`LayoutError` would convert into both `FormatError` and `CoreError`). `musefs-core/src/error.rs` is therefore **unchanged** by this plan.
 
 - [ ] **Step 3: Migrate the external `read_at.rs` test (valid layout → `validated`).** Edit `musefs-core/tests/read_at.rs:114`:
   ```rust
@@ -412,7 +462,7 @@ Replace the raw `u64` length on `ArtImage`/`BinaryTag`/`OggArtSlice` with Plan C
   ```
   grep -rn "RegionLayout::new\b" --include=*.rs musefs-core musefs-format
   ```
-  Expected: only `pub(crate) fn new` / `new_unchecked` definition lines in `layout.rs`, plus same-crate `#[cfg(test)]` callers (`reader.rs` unit tests at 496/769/820/852/1233, `facade.rs:1137`, `fuzz_check.rs`, `layout.rs` unit tests). Those same-crate callers — wait: `reader.rs`/`facade.rs` unit tests are in `musefs-core`, which is a **foreign crate** to `musefs-format`, so `pub(crate) new` is invisible to them. **Migrate them too**: they all build valid layouts → switch to `RegionLayout::validated(...).unwrap()` (the `fuzzing` feature is on in `musefs-core`'s test build, but `validated` is the right call for these valid layouts; reserve `new_unchecked` only for the two intentionally-invalid `layout.rs` tests). Re-run the grep until only the `layout.rs` definitions and same-crate `musefs-format` `#[cfg(test)]` callers remain.
+  Expected after migration: only the `pub(crate) fn new` / `new_unchecked` definition lines in `layout.rs`, plus any same-crate `musefs-format` `#[cfg(test)]` callers (which CAN see `pub(crate) new`). **Every `RegionLayout::new` call in `musefs-core` is in a foreign crate and breaks under `pub(crate)`** — verified current sites (NOT the plan's old 496/769/820/852/1233/1137): `musefs-core/src/facade.rs:1155`, and `musefs-core/src/reader.rs:509`, `:782`, `:833`, `:865`, `:1281` (all `#[cfg(test)]`), plus `musefs-core/tests/read_at.rs:114`. They all build **valid** layouts → switch each to `RegionLayout::validated(...).unwrap()` (reserve `new_unchecked` only for the two intentionally-invalid `layout.rs` tests). The OggArtSlice/BinaryTag literals among them (`reader.rs:782`/`:833`/`:1281`) also need their `len:` wrapped in `BlobLen::new(...).unwrap()` per Task 2 Step 6(g). Re-run the grep until only the `layout.rs` definitions and same-crate `musefs-format` `#[cfg(test)]` callers remain.
 
   > Resolved ambiguity: the only `new_unchecked` consumers are the two intentionally-invalid tests in `musefs-format/tests/layout.rs`. Every other external call site builds a valid layout and migrates to `validated(...).unwrap()`. The `musefs-format` *same-crate* `#[cfg(test)]`/`fuzz_check` callers keep using `pub(crate) new` (they can see it); no churn there beyond the `BlobLen` literal changes from Task 2.
 
@@ -426,7 +476,10 @@ Replace the raw `u64` length on `ArtImage`/`BinaryTag`/`OggArtSlice` with Plan C
 - [ ] **Step 7: Commit.** Stage exact files:
   ```
   git add musefs-format/src/layout.rs musefs-core/src/reader.rs musefs-core/src/facade.rs \
-    musefs-core/src/error.rs musefs-format/tests/layout.rs musefs-core/tests/read_at.rs
+    musefs-format/tests/layout.rs musefs-core/tests/read_at.rs
+  # NOTE: musefs-core/src/error.rs is NOT staged — the existing
+  # FormatError::InvalidLayout -> CoreError::Format route is reused (Step 2),
+  # so no new CoreError variant is added.
   git commit -F - <<'EOF'
   feat(format): hide RegionLayout::new; production uses validated() (#201)
 
@@ -446,7 +499,7 @@ Replace the raw `u64` length on `ArtImage`/`BinaryTag`/`OggArtSlice` with Plan C
 Add a `layout.validate()?` in `HeaderCache::build` before the `ResolvedFile` is constructed and cached — belt-and-suspenders at the consuming boundary (the spec is explicit this call does not exist yet).
 
 **Files:**
-- `musefs-core/src/reader.rs` (after the `match self.mode { … }` block yields `(layout, total_len, mtime_secs_val)`, before constructing `ResolvedFile` at line 291)
+- `musefs-core/src/reader.rs` (after the `match self.mode { … }` block yields `(layout, total_len, mtime_secs_val)`, at the `let total = layout.total_len();` around **line 290**, before the `ResolvedFile` is constructed)
 - Test path (same-crate `#[cfg(test)]`): `musefs-core/src/reader.rs` tests mod
 
 - [ ] **Step 1: Write a failing test that the cache boundary rejects an invalid layout.** The cleanest seam is a small helper that takes a `RegionLayout` and runs the defensive check the build path uses. Add to the `reader.rs` `#[cfg(test)] mod tests`:
@@ -468,14 +521,16 @@ Add a `layout.validate()?` in `HeaderCache::build` before the `ResolvedFile` is 
   ```
   Expected: compile error (`new_unchecked`/helper not yet wired) or assertion to drive the implementation.
 
-- [ ] **Step 3: Add the defensive check in `build`.** In `musefs-core/src/reader.rs`, immediately after the `match self.mode { … }` expression binds `(layout, total_len, mtime_secs_val)` (line 280) and before computing `cache_bytes` (line 282), insert:
+- [ ] **Step 3: Add the defensive check in `build`.** In `musefs-core/src/reader.rs`, immediately after the `match self.mode { … }` expression binds `(layout, total_len, mtime_secs_val)` and before computing `cache_bytes` (around the `let total = layout.total_len();` at **line 290** — re-confirm by grep, the old 280/282 are stale), insert:
   ```rust
   // Defensive belt-and-suspenders: production layouts are already built via
   // RegionLayout::validated, but re-validate at the cache boundary so a future
   // construction path that skips validation cannot poison the cache.
-  layout.validate()?;
+  layout
+      .validate()
+      .map_err(musefs_format::FormatError::InvalidLayout)?;
   ```
-  This needs `LayoutError → CoreError` (the same `?` mapping added in Task 3 Step 2). If Task 3 added `CoreError::Layout(#[from] LayoutError)`, the `?` compiles directly.
+  This reuses the same `LayoutError → FormatError → CoreError::Format` bridge as Task 3 Step 2 (Rust's `?` will not chain the two `From`s, hence the explicit `.map_err`). No new `CoreError` variant.
 
   For the test seam, factor the predicate the test asserts on into the production code path itself rather than a parallel helper — the single `layout.validate()?` line is the production check; the unit test at Step 1 asserts the underlying `RegionLayout::validate()` behavior it relies on. Keep the test asserting `RegionLayout::new_unchecked(...).validate().is_err()` (a true regression guard that the boundary check has teeth).
 
@@ -539,6 +594,8 @@ Run the complete workspace gate plus the out-of-workspace fuzz build (Plan D cha
 ## Notes for the implementer
 
 - **One breaking change per commit, never split from its fixups.** Tasks 1, 2, and 3 each flip a visibility/type/field that breaks many call sites at once; the pre-commit hook runs the full workspace test suite + clippy `-D warnings` + fmt + ruff and rejects any red commit. Each such task's edits (type/visibility change AND every caller AND every test) must land together.
-- **`Default` removal:** the struct no longer derives `Default` (a defaulted empty-segments layout would cache `total_len = 0` honestly, but the spec mandates removing/hand-implementing it so a zero-value layout can't slip past `validated`). Grep `RegionLayout::default()` / `..Default::default()` for `RegionLayout` before Task 1's commit — the grep in investigation found none, but re-verify.
-- **`mutants` feature interaction (Plan C follow-through):** if any DTO embeds a `BlobLen` and derives `Default` under `feature = "mutants"`, that is Plan C's concern; `Segment`/`RegionLayout` are not `mutants`-defaulted DTOs, so Plan D adds no `mutants`-gated `Default`.
-- **`LayoutError → CoreError`:** verify the mapping once in Task 3 Step 2 and reuse it in Task 4; both the `StructureOnly` `validated()?` and the defensive `validate()?` depend on it.
+- **`Default` removal is safe — verified.** Grep for `RegionLayout::default()` / `..Default::default()` on `RegionLayout` across `musefs-format` + `musefs-core` returns **no callers** (checked against current `main`), so dropping the derived `Default` breaks nothing. Re-verify before Task 1's commit, but expect zero hits.
+- **`mutants` feature interaction (Plan C follow-through):** `Segment`/`RegionLayout` are not `mutants`-defaulted DTOs, so Plan D adds no `mutants`-gated `Default`.
+- **`LayoutError → CoreError` routing — reuse the EXISTING path, add nothing.** `FormatError::InvalidLayout(#[from] LayoutError)` (`musefs-format/src/error.rs:18`) plus the existing `From<FormatError> for CoreError` is the single route. Because `?` will not chain two `From`s, the two new `musefs-core` call sites (Task 3 Step 2 `validated()`, Task 4 Step 3 `validate()`) must `.map_err(musefs_format::FormatError::InvalidLayout)?`. Do **not** add `CoreError::Layout` — `musefs-core/src/error.rs` is untouched by this plan.
+- **Mutation gate — no `.cargo/mutants.toml` re-anchoring needed.** No `exclude_re` entry anchors a line in `layout.rs` or `ogg/page.rs`, and the production edits (dropping `.get()` at the synthesis sites) do not change line counts, so no existing anchor shifts. The pre-commit **mutant-anchor drift guard** validates all anchors on every commit, so any accidental drift is caught loudly — keep `fuzz_check.rs` untouched (it carries anchors and no `Segment` literals). Separately, the in-diff mutation gate WILL re-test `ogg/page.rs` (it is in the diff); confirm the `emit_segments` `<`→`<=` mutant stays caught after the `OggArtSlice` retype (Task 2 Step 6(c)).
+- **Retype direction (the easy-to-get-wrong part):** in production synthesis the `BlobLen` already exists on `ArtInput`/`BinaryTagInput` — the edit is to **delete `.get()`**, never to wrap a `u64` in `BlobLen::new().expect()`. Only `ogg/page.rs:401` (a freshly computed slice width) constructs a `BlobLen` from a raw `u64`. Construction literals are one edit; `matches!`/struct **patterns** (`len: 50`) are a different edit — bind `len, ..` and compare `.get()`.
