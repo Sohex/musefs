@@ -130,6 +130,21 @@ Limited to invariants SQLite enforces cheaply and that musefs already assumes:
 - Rust tests issue one invalid `INSERT`/`UPDATE` per `CHECK` against a migrated DB
   and assert SQLite rejects it; plus a smoke test that a fully-valid row set
   migrates and reads cleanly.
+- **Three-layer bounds defense (coordinate with Plan C).** Audio-bounds validity is
+  now guarded at three layers: (1) the DB `CHECK` at write [Plan A], (2) the
+  `TrackBounds` row-reader conversion [Plan C], and (3) the existing
+  `reader.rs:155` guard, which compares stored bounds against the **live** file size
+  (`meta.len()`) and so catches *backing-file drift* the first two cannot. These are
+  distinct conditions: `audio_offset + audio_length > backing_size` (the stored,
+  scan-time size) is what layers 1&2 reject; `audio_offset + audio_length >
+  meta.len()` (the current file) is what layer 3 rejects. Consequence for tests: a
+  test exercising layer 3 (`BackingChanged`) must use **valid stored bounds plus a
+  truncated backing file**, not invalid stored bounds — an invalid-stored-bounds row
+  cannot be committed (layer 1) and, even if injected via
+  `PRAGMA ignore_check_constraints`, is rejected by layer 2 at read before reaching
+  layer 3. Pre-existing tests that used `offset+length > backing_size` as a proxy for
+  "past live EOF" (e.g. `build_rejects_audio_region_past_end_of_file`) are reworked
+  to the truncation form. Layers 1 and 2 each get their own dedicated rejection test.
 - Regenerate the Python schema mirror
   (`MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py`) and re-vendor.
 - Update ARCHITECTURE.md's external-writer contract section: the listed invariants
@@ -153,11 +168,19 @@ rebuild paths.
 
 Sort entries by track `id` **in `render_entries`** — the single shared source of
 both `build_full` and `rebuild_full`. This makes the full-rebuild order
-self-established at one local point, covering both paths at once and rendering the
-Stage-B fallback's separate re-sort redundant-but-harmless. The `ORDER BY id` in
-`list_tracks` stays (harmless, good for locality) but is demoted from load-bearing
-to incidental; the test comment at `tree.rs:1350-1352` is updated to make this the
-documented spec of the behavior.
+self-established at one local point, covering both paths at once. Extract the sort
+into a small pure helper (`order_entries`) so it is directly unit-testable: a real
+`Db` can never hand `render_entries` an id-unordered slice (SQLite assigns ids
+ascending and `list_tracks` is `ORDER BY id`), so a test must drive the helper with
+a deliberately descending input to prove — and pin against mutation — that the sort
+is load-bearing. The `ORDER BY id` in `list_tracks` stays (harmless, good for
+locality) but is demoted from load-bearing to incidental; the test comment at
+`tree.rs:1350-1352` is updated to make this the documented spec of the behavior.
+
+Note: the `rebuild_incremental` Stage-B / debug-assert sorts (`facade.rs`) are **not**
+made redundant by this change — they sort a nondeterministic `HashMap` iteration
+that never flows through `render_entries`, so they remain load-bearing and are left
+in place.
 
 **Anti-option — do NOT sort inside `build_with_ci`.** Many `tree.rs` unit tests
 call `build_with`/`build_with_ci` with deliberately id-unordered entries and assert
@@ -170,9 +193,11 @@ oracle and production agree on where sorting lives.
 
 ### Test
 
-Feed the full-rebuild path deliberately id-unordered entries and assert it
-produces the same disambiguation (and thus the same inode assignment) as the
-incremental path for a colliding pair.
+The load-bearing test feeds the pure `order_entries` helper a descending-id pair
+and asserts ascending output — this is the test that fails (and kills the mutation)
+if the sort is removed. A complementary end-to-end test drives a colliding pair
+through `build_full` and asserts the lower id gets the bare name; it documents the
+contract but does not by itself bite (its DB-backed input is already id-ordered).
 
 ## Plan C — #200: pragmatic validated newtypes
 
