@@ -62,6 +62,9 @@ jobs:
 
   scheduled:
     if: github.event_name == 'schedule'
+    permissions:
+      contents: read
+      actions: read  # read prior runs' corpus artifacts
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -81,22 +84,43 @@ jobs:
         # Not --locked: cargo-fuzz's pinned Cargo.lock has an old rustix that
         # fails to compile on current nightly; let cargo resolve newer deps.
         run: cargo install cargo-fuzz
-      # actions/cache is immutable per key, so a static key restores but never
-      # re-saves an updated corpus. Use a dynamic key (always new) with a
-      # restore-keys prefix to restore the most recent prior corpus, so coverage
-      # accumulates across scheduled runs.
-      - name: Restore corpus
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
-        with:
-          path: fuzz/corpus/${{ matrix.target }}
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
-          restore-keys: |
-            fuzz-corpus-${{ matrix.target }}-
+      # Corpus accumulates across scheduled runs via artifacts, not the Actions
+      # cache. A cache is evicted after 7 days of no access and the cron is also
+      # 7 days, so a single skipped/delayed/failed run (or LRU eviction under the
+      # 10 GB cap) could silently drop the corpus back to committed seeds with no
+      # signal. Artifacts persist for retention-days regardless of access, so
+      # download the newest non-expired corpus artifact and overlay it on the
+      # committed seeds. The first run after a fresh start has no artifact and
+      # begins from seeds.
+      - name: Restore corpus from latest artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="fuzz-corpus-${{ matrix.target }}"
+          run_id=$(gh api \
+            "repos/${{ github.repository }}/actions/artifacts?name=$name&per_page=100" \
+            --jq '([.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .workflow_run.id) // empty' \
+            || true)
+          if [ -n "$run_id" ]; then
+            echo "Restoring $name from run $run_id"
+            gh run download "$run_id" -n "$name" -D "fuzz/corpus/${{ matrix.target }}" \
+              || echo "Download failed; starting from committed seeds"
+          else
+            echo "No prior corpus artifact; starting from committed seeds"
+          fi
       - name: Fuzz
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_len=131072 -rss_limit_mb=2048 -timeout=25 -max_total_time=180
       - name: Minimize corpus
         if: always()
         run: cargo +nightly fuzz cmin ${{ matrix.target }} -- -max_len=131072
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          retention-days: 90
+          if-no-files-found: warn
       - name: Upload crashes
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
