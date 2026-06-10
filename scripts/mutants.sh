@@ -2,8 +2,12 @@
 # Run cargo-mutants over the logic-bearing crates with a disk budget that fits a
 # small VPS. Known-good cargo-mutants version: 27.0.0.
 #
-# musefs-cli, musefs-fuse, and the `musefs` binary are thin glue with no real
-# logic and are excluded from mutation entirely via .cargo/mutants.toml.
+# musefs-fuse is mostly thin glue, but its src/convert.rs holds portable
+# pure helpers (to_file_attr, assemble_dir_listing, cap_eff_has_sys_admin) that
+# ARE mutation-tested: the `musefs-fuse` leg below mutates that one file with a
+# plain mountless `cargo test`. The Filesystem adapter, session glue, and
+# cfg(macos) platform code stay excluded via .cargo/mutants.toml, as do
+# musefs-cli and the `musefs` binary (thin glue with no gateable logic).
 # musefs-latencyfs is NOT thin (inode map, latency table, attr mapping, passthrough
 # ops): it has its own leg below, which runs the crate's #[ignore]d mounted tests
 # (`-- -- --include-ignored`) and so needs /dev/fuse + libfuse. The fast per-PR
@@ -132,6 +136,13 @@ for crate in "${crates[@]}"; do
         --file musefs-format/src/ogg/page.rs \
         --file musefs-format/src/ogg/crc.rs \
         --file musefs-format/src/ogg/b64.rs
+      ;;
+    musefs-fuse)
+      # Mountless: convert.rs's helpers are exercised by plain (non-#[ignore]d)
+      # unit tests, so this leg needs no /dev/fuse or libfuse mount (unlike the
+      # musefs-latencyfs leg). Scoped to the one in-scope file.
+      run_crate musefs-fuse --test-workspace=false \
+        --file musefs-fuse/src/convert.rs
       ;;
     musefs-latencyfs)
       # Every test in this crate is #[ignore]d (it mounts a real passthrough

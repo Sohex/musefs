@@ -160,6 +160,7 @@ jobs:
           - { crate: musefs-format, label: musefs-format-1, shard: 1/4 }
           - { crate: musefs-format, label: musefs-format-2, shard: 2/4 }
           - { crate: musefs-format, label: musefs-format-3, shard: 3/4 }
+          - { crate: musefs-fuse, label: musefs-fuse }
           # musefs-latencyfs carries real logic (inode map, latency table, attr
           # mapping, passthrough ops); scripts/mutants.sh runs its mounted
           # #[ignore]d tests, so this leg needs libfuse + /dev/fuse.

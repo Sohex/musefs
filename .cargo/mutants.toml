@@ -1,10 +1,29 @@
 # cargo-mutants workspace config.
 #
-# Crates permanently out of scope for mutation testing: thin glue with no real
-# logic. musefs-fuse is a thin fuser adapter, musefs-cli is thin CLI dispatch,
-# and the `musefs` binary is a one-line entrypoint — their behavior is covered by
-# e2e/integration tests, and mutating them yields only equivalent or trivially
-# untestable mutants. See docs/superpowers/specs/2026-05/2026-05-29-test-audit-design.md.
+# Crates / files out of scope for mutation testing, with the reason each is
+# excluded (the in-scope crates mutate a hand-picked --file allowlist in
+# scripts/mutants.sh; this list governs both that campaign and the per-PR
+# --in-diff gate). See
+# docs/superpowers/specs/2026-06/2026-06-10-mutants-fuse-convert-gating-design.md.
+#
+# musefs-fuse: only src/convert.rs is in scope — the portable, mutation-tested
+# pure helpers (to_file_attr, assemble_dir_listing, cap_eff_has_sys_admin),
+# killable by plain unit tests on the Linux runner. The rest is excluded:
+#   - src/lib.rs: the Filesystem trait adapter + session/mount glue (its mutants
+#     all survive plain `cargo test`), plus helpers whose only mutants are
+#     unviable (errno, open_flags), equivalent (reply_errno selects only a log
+#     level), or core-I/O (build_dir_listing takes &Musefs).
+#   - src/platform/**: the logic-bearing parts are #[cfg(target_os = "macos")]
+#     and uncoverable on the Linux mutation runner — the macOS code is cfg'd out
+#     there so its mutants always survive, and its tests only compile on macOS.
+#     Gating it needs a macOS mutation leg (deferred). NB: narrowing the glob to
+#     specific files means any future top-level musefs-fuse/src/*.rs becomes
+#     in-scope automatically — intended, but worth knowing.
+#
+# musefs-cli: parse_mount_config / From<CliMode> produce only unviable mutants;
+# unmount_commands is the lone caught helper and is not worth un-excluding
+# signal.rs's thread/exit() glue for. The `musefs` binary is a one-line
+# entrypoint. Both fully excluded.
 #
 # musefs-latencyfs is NOT excluded here: it carries real logic (the inode map,
 # latency table, attr mapping, passthrough op behavior), so it gets its own
@@ -22,7 +41,8 @@
 # functionally by the feature-gated tests in that file, so exclude them from
 # mutation rather than carry permanently-surviving mutants.
 exclude_globs = [
-    "musefs-fuse/**",
+    "musefs-fuse/src/lib.rs",
+    "musefs-fuse/src/platform/**",
     "musefs-cli/**",
     "musefs/**",
     "musefs-core/src/metrics.rs",
