@@ -196,11 +196,16 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),
         case_insensitive: args.case_insensitive,
     };
+    let defaults = musefs_fuse::FuseConfig::default();
     let fuse_config = musefs_fuse::FuseConfig {
         ttl: std::time::Duration::from_millis(args.attr_ttl_ms),
         max_readahead: args.max_readahead_kib.saturating_mul(1024),
         max_background: args.max_background,
         keep_cache: args.keep_cache,
+        uid: defaults.uid,
+        gid: defaults.gid,
+        file_mode: defaults.file_mode,
+        dir_mode: defaults.dir_mode,
     };
     (config, fuse_config)
 }

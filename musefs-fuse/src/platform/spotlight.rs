@@ -22,7 +22,7 @@ pub const MARKER_INO: u64 = u64::MAX;
 
 /// The marker's attributes: a zero-byte, read-only regular file owned by the
 /// mount, all timestamps set to `mtime` (matching synthetic-node stamping).
-pub fn marker_attr(uid: u32, gid: u32, mtime: SystemTime) -> FileAttr {
+pub fn marker_attr(uid: u32, gid: u32, file_mode: u16, mtime: SystemTime) -> FileAttr {
     FileAttr {
         ino: INodeNo(MARKER_INO),
         size: 0,
@@ -32,7 +32,7 @@ pub fn marker_attr(uid: u32, gid: u32, mtime: SystemTime) -> FileAttr {
         ctime: mtime,
         crtime: mtime,
         kind: FileType::RegularFile,
-        perm: 0o444,
+        perm: file_mode,
         nlink: 1,
         uid,
         gid,
@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn marker_attr_is_zero_byte_read_only_file() {
         let mt = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-        let a = marker_attr(501, 20, mt);
+        let a = marker_attr(501, 20, 0o444, mt);
         assert_eq!(a.ino, INodeNo(u64::MAX));
         assert_eq!(a.kind, FileType::RegularFile);
         assert_eq!(a.perm, 0o444);
