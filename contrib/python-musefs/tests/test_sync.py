@@ -1,4 +1,4 @@
-from conftest import JPEG, PNG, insert_track
+from conftest import JPEG, PNG, insert_track, text_tags
 
 from musefs_common import ArtImage, Record, SyncStats, connect, sync_files, sync_one
 from musefs_common.constants import MAX_ART_BYTES
@@ -282,17 +282,6 @@ def test_sync_one_all_images_over_cap_leaves_existing_art(db_path):
         conn.close()
 
 
-def _text_tags(conn, track_id):
-    rows = conn.execute(
-        "SELECT key, value FROM tags WHERE track_id=? AND value_blob IS NULL ORDER BY key, ordinal",
-        (track_id,),
-    ).fetchall()
-    out = {}
-    for key, value in rows:
-        out.setdefault(key, []).append(value)
-    return out
-
-
 def test_sync_files_merge_keeps_unmanaged_and_deletes(db_path):
     conn = connect(db_path)
     try:
@@ -302,7 +291,7 @@ def test_sync_files_merge_keeps_unmanaged_and_deletes(db_path):
         rec = Record(key="/m/a.flac", pairs=[("artist", "New")], delete_keys=["grouping"])
         sync_files(conn, [rec], merge=True, stats=SyncStats())
         conn.commit()
-        tags = _text_tags(conn, tid)
+        tags = text_tags(conn, tid)
         assert tags["artist"] == ["New"]  # merged
         assert tags["comment"] == ["keep"]  # untouched
         assert "grouping" not in tags  # deleted
@@ -320,7 +309,7 @@ def test_sync_files_default_is_full_replace(db_path):
         rec = Record(key="/m/b.flac", pairs=[("artist", "New")])
         sync_files(conn, [rec], stats=SyncStats())  # no merge=
         conn.commit()
-        tags = _text_tags(conn, tid)
+        tags = text_tags(conn, tid)
         assert tags["artist"] == ["New"]
         assert "comment" not in tags  # full replace wiped it
     finally:

@@ -22,6 +22,19 @@ def db_path(tmp_path):
     return str(path)
 
 
+def text_tags(conn, track_id):
+    """Return {key: [values in ordinal order]} for a track's text rows only
+    (binary tags excluded)."""
+    rows = conn.execute(
+        "SELECT key, value FROM tags WHERE track_id=? AND value_blob IS NULL ORDER BY key, ordinal",
+        (track_id,),
+    ).fetchall()
+    out = {}
+    for key, value in rows:
+        out.setdefault(key, []).append(value)
+    return out
+
+
 def insert_track(conn, backing_path, fmt="flac"):
     """Insert a minimal track row (as `musefs scan` would) and return its id."""
     now = int(time.time())

@@ -1,19 +1,7 @@
-from conftest import insert_track
+from conftest import insert_track, text_tags
 
 from musefs_common import connect
 from musefs_common.store import merge_tags, replace_tags
-
-
-def _text_tags(conn, track_id):
-    """Return {key: [values in ordinal order]} for text rows only."""
-    rows = conn.execute(
-        "SELECT key, value FROM tags WHERE track_id=? AND value_blob IS NULL ORDER BY key, ordinal",
-        (track_id,),
-    ).fetchall()
-    out = {}
-    for key, value in rows:
-        out.setdefault(key, []).append(value)
-    return out
 
 
 def test_merge_overwrites_managed_keeps_unmanaged(db_path):
@@ -31,7 +19,7 @@ def test_merge_overwrites_managed_keeps_unmanaged(db_path):
             conn, tid, [("artist", "New"), ("replaygain_track_gain", "-7.50 dB")], delete_keys=[]
         )
         conn.commit()
-        tags = _text_tags(conn, tid)
+        tags = text_tags(conn, tid)
         assert tags["artist"] == ["New"]  # M wins
         assert tags["comment"] == ["keep me"]  # unmanaged B persists
         assert tags["replaygain_track_gain"] == ["-7.50 dB"]
@@ -47,7 +35,7 @@ def test_merge_delete_keys_suppresses_backing(db_path):
         # M keeps artist; comment was managed before and is now dropped.
         merge_tags(conn, tid, [("artist", "Band")], delete_keys=["comment"])
         conn.commit()
-        tags = _text_tags(conn, tid)
+        tags = text_tags(conn, tid)
         assert tags["artist"] == ["Band"]
         assert "comment" not in tags  # suppressed
     finally:
@@ -64,7 +52,7 @@ def test_merge_multivalue_ordinals_contiguous(db_path):
             "SELECT ordinal FROM tags WHERE track_id=? AND key='artist' ORDER BY ordinal", (tid,)
         ).fetchall()
         assert [o[0] for o in ords] == [0, 1]  # 0..n per key
-        assert _text_tags(conn, tid)["artist"] == ["A", "B"]
+        assert text_tags(conn, tid)["artist"] == ["A", "B"]
     finally:
         conn.close()
 
@@ -85,6 +73,6 @@ def test_merge_preserves_binary_tags(db_path):
             "SELECT COUNT(*) FROM tags WHERE track_id=? AND value_blob IS NOT NULL", (tid,)
         ).fetchone()[0]
         assert bin_rows == 1
-        assert _text_tags(conn, tid)["comment"] == ["text"]
+        assert text_tags(conn, tid)["comment"] == ["text"]
     finally:
         conn.close()
