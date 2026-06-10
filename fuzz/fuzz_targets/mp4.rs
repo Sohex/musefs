@@ -15,6 +15,15 @@ fuzz_target!(|data: &[u8]| {
         Ok(s) => s,
         Err(_) => return,
     };
+
+    // #212: the seeking variant reads headers and skips the mdat payload; on a
+    // whole buffer it must produce the same Mp4Scan as the full-buffer parse.
+    let mut cursor = std::io::Cursor::new(data);
+    match mp4::read_structure_from(&mut cursor, data.len() as u64) {
+        Ok(s) => assert_eq!(s, scan, "mp4 read_structure_from != read_structure"),
+        Err(e) => panic!("mp4 read_structure_from Err but read_structure Ok: {e:?}"),
+    }
+
     let mut u = Unstructured::new(data);
     let tags = arb_tags(&mut u).unwrap_or_default();
     let binary = arb_binary_tags(&mut u).unwrap_or_default();
