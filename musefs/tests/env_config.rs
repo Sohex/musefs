@@ -138,3 +138,50 @@ fn mount_help_lists_env_vars() {
         "--fallback is flag-only and must not advertise an env var, stdout: {stdout}"
     );
 }
+
+#[test]
+fn invalid_boolean_env_is_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = unopenable_db(dir.path(), "env.db");
+    let out = musefs()
+        .arg("mount")
+        .arg(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .env("MUSEFS_KEEP_CACHE", "enabled") // not a boolish value
+        .output()
+        .unwrap();
+    // Hard error at parse time, not a silent false — and pinned to the boolean
+    // parse failure, not any exit-2.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("keep-cache") || stderr.contains("invalid value"),
+        "expected a keep-cache boolean parse error, stderr: {stderr}"
+    );
+}
+
+#[test]
+fn valid_boolean_env_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = unopenable_db(dir.path(), "env.db");
+    let out = musefs()
+        .arg("mount")
+        .arg(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .env("MUSEFS_KEEP_CACHE", "true")
+        .output()
+        .unwrap();
+    // Got past parse for the right reason (reached DB-open), not merely "not
+    // exit 2". Proves a valid boolish env value is accepted, not silently
+    // dropped.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("opening database"), "stderr: {stderr}");
+}
