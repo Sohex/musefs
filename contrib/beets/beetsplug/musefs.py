@@ -200,7 +200,7 @@ class MusefsPlugin(BeetsPlugin):
         finally:
             conn.close()
 
-    def _sync(self, db_path, items, dry_run=False):
+    def _sync(self, db_path, items, dry_run=False, restore_backing=False):
         if not os.path.exists(db_path):
             raise ui.UserError(
                 f"musefs: DB not found at {db_path}; enable `musefs.autoscan` "
@@ -210,18 +210,20 @@ class MusefsPlugin(BeetsPlugin):
         try:
             check_schema_version(conn)
             stats = SyncStats()
-            records = _core.build_records(
+            records, managed_writes = _core.build_records(
                 items,
                 fields=self._fields(),
                 stats=stats,
                 write_path=self._write_path(),
+                restore_backing=restore_backing,
                 log=self._log,
             )
-            sync_files(conn, records, dry_run=dry_run, stats=stats)
+            sync_files(conn, records, dry_run=dry_run, stats=stats, merge=True)
             if dry_run:
                 conn.rollback()
             else:
                 conn.commit()
+                _core.persist_managed(managed_writes)
             return stats
         except SchemaMismatch as exc:
             conn.rollback()

@@ -11,6 +11,29 @@ from musefs_common import MAX_ART_BYTES, ArtImage, Record, realpath_key, sniff_m
 
 MANAGED_FLEXATTR = "musefs_managed"
 
+
+def read_managed(item):
+    """Parse the per-item ``musefs_managed`` flexattr into a list of keys."""
+    raw = getattr(item, MANAGED_FLEXATTR, None)
+    if not raw:
+        return []
+    return [k for k in str(raw).split(",") if k]
+
+
+def format_managed(keys):
+    """Serialize a managed key set: sorted, de-duplicated, comma-joined."""
+    return ",".join(sorted(set(keys)))
+
+
+def persist_managed(writes):
+    """Persist each ``(item, managed_keys)`` pair into the beets DB via
+    ``item.store()``. Never calls ``item.write()`` — that writes the audio file and
+    fires ``after_write``, which would re-enter the plugin's reconcile loop."""
+    for item, keys in writes:
+        item[MANAGED_FLEXATTR] = format_managed(keys)
+        item.store()
+
+
 # beets field name -> canonical musefs (Vorbis-lowercase) key, where they differ.
 RENAME = {
     "track": "tracknumber",
@@ -269,14 +292,21 @@ def _computed_path_or_skip(item, log):
         return ""
 
 
-def build_records(items, *, fields=None, stats, write_path=True, log=None):
-    """Build ``Record``s for beets items: map tags and resolve album art (with a
-    per-run cache; unreadable/over-cap covers counted into ``stats.skipped_art``).
-    When ``write_path`` is set, also emit a ``beets_path`` tag with the track's
-    beets library-relative path (extension stripped); a failed computation is
-    skipped and warned through ``log``. ``stats`` is mutated and must be the same
-    instance passed to ``sync_files``."""
+def build_records(items, *, fields=None, stats, write_path=True, restore_backing=False, log=None):
+    """Build ``Record``s for beets items and the parallel managed-key writes.
+
+    Returns ``(records, managed_writes)`` where ``managed_writes`` is a list of
+    ``(item, managed_keys)`` the caller persists *after a successful commit* via
+    ``persist_managed``.
+
+    ``musefs_managed`` is an *accumulating* set (keys ever managed): each record's
+    ``delete_keys`` is ``prev - keys(M)`` and the persisted set is the union
+    ``prev | keys(M)``, so a key dropped from M stays a tombstone and keeps getting
+    re-deleted on every sync until it re-enters M or ``restore_backing`` clears it.
+    Under ``restore_backing`` no keys are deleted and the set is reset to ``keys(M)``
+    (tombstones forgotten), so restored backing values stay visible."""
     records = []
+    managed_writes = []
     art_cache = {}
     for item in items:
         cover = _read_album_art(item, art_cache, stats)
@@ -285,11 +315,21 @@ def build_records(items, *, fields=None, stats, write_path=True, log=None):
             path = _computed_path_or_skip(item, log)
             if path:
                 pairs.append(("beets_path", path))
+        keys_now = {key for key, _ in pairs}
+        prev = set(read_managed(item))
+        if restore_backing:
+            delete_keys = []
+            managed = sorted(keys_now)
+        else:
+            delete_keys = sorted(prev - keys_now)
+            managed = sorted(prev | keys_now)
         records.append(
             Record(
                 key=realpath_key(item.path),
                 pairs=pairs,
                 art=[ArtImage(*cover)] if cover else None,
+                delete_keys=delete_keys,
             )
         )
-    return records
+        managed_writes.append((item, managed))
+    return records, managed_writes
