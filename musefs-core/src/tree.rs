@@ -1347,9 +1347,12 @@ mod tests {
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         // Delete track 1 (the dir's min). Dir's introducing id rises to 9; file 5 (id 5 < 9)
         // should now claim base "X.flac" and the dir become "X.flac (2)".
-        // Production always feeds `build_with` entries sorted ascending by id
-        // (`list_tracks` ORDER BY id; `rebuild_incremental` sort_by_key). The
-        // reference must use that same canonical order to be a meaningful oracle.
+        // Production establishes the build path's canonical order by sorting
+        // ascending by id in `render_entries` (its `order_entries` helper, #188)
+        // — not by inheriting `list_tracks`'s ORDER BY. The reference must use
+        // that same canonical order to be a meaningful oracle; the inner build
+        // primitive deliberately does NOT sort (these tests feed it id-unordered
+        // inputs).
         let mut new_entries = vec![(9, "X.flac/b.flac".to_string()), (5, "X.flac".to_string())];
         new_entries.sort_by_key(|(id, _)| *id);
         let reference = VirtualTree::build(&new_entries);
@@ -1455,6 +1458,10 @@ mod tests {
     /// facade's debug-assert uses — AND that exactly `expected_rebuilds`
     /// subtree rebuilds ran (the O(changed) contract: a needless rebuild yields
     /// the same tree, so only the count can pin it).
+    ///
+    /// `after` is sorted ascending by id before building the reference, mirroring
+    /// the canonical order production establishes in `render_entries` (#188). The
+    /// `build_with` primitive itself does NOT sort, so the oracle must.
     fn assert_apply_matches_build(
         before: &[(i64, String)],
         after: &[(i64, String)],

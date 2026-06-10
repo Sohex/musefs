@@ -288,6 +288,13 @@ impl Musefs {
     /// DB read + path render with no allocator: the lock-free phase shared by
     /// `build_full` and `rebuild_full`. Confining all `Db` access here is what
     /// lets `rebuild_full` hold `inodes` only across the pure-CPU `build_with`.
+    ///
+    /// The returned entries are ordered by `order_entries` (ascending by track
+    /// `id`), which is what makes both full-rebuild paths establish disambiguation
+    /// order locally rather than inheriting it from `list_tracks`'s `ORDER BY id`
+    /// (#188): the build path's insertion order decides which member of a colliding
+    /// path keeps the bare name, and that must match the incremental path's min-id
+    /// rule regardless of the source query's ordering.
     #[allow(clippy::type_complexity)]
     fn render_entries<M>(
         db: &Db<M>,
@@ -313,7 +320,18 @@ impl Musefs {
             );
             entries.push((t.id, path));
         }
-        Ok((entries, snapshot))
+        Ok((Self::order_entries(entries), snapshot))
+    }
+
+    /// Establish the canonical full-rebuild order: ascending by track `id`. This
+    /// is the single point that fixes which member of a colliding rendered path
+    /// keeps the bare name in `build_with_ci`'s insertion order (#188); it must NOT
+    /// move into the build primitive, whose `tree.rs` tests feed it id-unordered
+    /// entries on purpose. Kept as a pure helper so its sort is observable (and
+    /// mutation-testable) independent of `list_tracks`'s incidental `ORDER BY id`.
+    fn order_entries(mut entries: Vec<(i64, String)>) -> Vec<(i64, String)> {
+        entries.sort_by_key(|(id, _)| *id);
+        entries
     }
 
     /// Full rebuild: render every track and build the tree from scratch. Used by
@@ -1552,5 +1570,91 @@ mod tests {
         let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
         let fh = fs.open_handle(file_inode).unwrap();
         assert!(fs.passthrough_fd(fh).is_none());
+    }
+
+    #[test]
+    fn order_entries_sorts_ascending_by_id() {
+        // A real Db never hands render_entries id-unordered rows (list_tracks is
+        // ORDER BY id), so this descending input is constructed directly to pin
+        // the sort itself. Deleting/mutating order_entries' sort fails this test.
+        let unordered = vec![
+            (9_i64, "z.flac".to_string()),
+            (2_i64, "a.flac".to_string()),
+            (5_i64, "m.flac".to_string()),
+        ];
+        let ordered = Musefs::order_entries(unordered);
+        let ids: Vec<i64> = ordered.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 5, 9],
+            "order_entries must sort ascending by id"
+        );
+        // The pairing is preserved, not just the id column.
+        assert_eq!(
+            ordered,
+            vec![
+                (2_i64, "a.flac".to_string()),
+                (5_i64, "m.flac".to_string()),
+                (9_i64, "z.flac".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
+        use musefs_db::{Format, NewTrack, Tag};
+        use std::collections::BTreeMap;
+
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        // Two tracks whose `$title` both render to "Same" -> colliding "Same.flac".
+        // Insertion order fixes ascending ids: id_a < id_b.
+        let id_a = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        let id_b = db
+            .upsert_track(&NewTrack {
+                backing_path: "/b.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        assert!(id_a < id_b, "insertion assigns ascending ids");
+        db.replace_tags(id_a, &[Tag::new("title", "Same", 0)])
+            .unwrap();
+        db.replace_tags(id_b, &[Tag::new("title", "Same", 0)])
+            .unwrap();
+
+        let config = MountConfig {
+            template: "$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+        };
+        let template = Template::parse(&config.template);
+
+        let mut alloc = InodeAllocator::new();
+        let (tree, _snapshot) = Musefs::build_full(&db, &template, &config, &mut alloc).unwrap();
+
+        let root = VirtualTree::ROOT;
+        let bare = tree.lookup(root, "Same.flac").expect("bare name exists");
+        let suffixed = tree
+            .lookup(root, "Same (2).flac")
+            .expect("suffixed name exists");
+        // The LOWER id owns the bare name; the higher id is disambiguated. This
+        // matches the incremental path's min-id rule (tree.rs introducing_id).
+        assert_eq!(tree.inode_of_track(id_a), Some(bare));
+        assert_eq!(tree.inode_of_track(id_b), Some(suffixed));
     }
 }
