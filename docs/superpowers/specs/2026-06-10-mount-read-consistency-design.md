@@ -63,6 +63,30 @@ gated with `#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse 
 like the rest of the suite and runs in the existing CI `e2e` job with no workflow
 change.
 
+**Fixture invariant — `Mode::Synthesis` is required.** Every fixture must mount in
+`Mode::Synthesis` (as `mount.rs::config()` does). This is load-bearing, not
+incidental: musefs requests `FUSE_PASSTHROUGH` in `init`
+(`musefs-fuse/src/platform/passthrough.rs`), and `Musefs::passthrough_fd`
+(`musefs-core/src/facade.rs`) hands the kernel a backing fd **only** in
+`Mode::StructureOnly`. Under StructureOnly the kernel reads the backing file
+directly, `read_at` never runs, and an mmap-fidelity test would compare the raw
+backing file to itself — testing nothing about synthesis. In `Mode::Synthesis`
+`passthrough_fd` returns `None`, so all reads and page faults traverse the
+daemon's `read_at` splice path, which is exactly what #215/#214 must exercise.
+Each fixture builder therefore treats "config uses `Mode::Synthesis`" as an
+invariant.
+
+**Fixture-helper sourcing.** Each `tests/*.rs` file is its own crate, so items in
+`mount.rs` / `playback_pcm.rs` / `ogg_read_through.rs` cannot be `use`d from the
+new file. The repo's established convention is per-file copies — `make_flac` and
+`config()` already appear independently in `mount.rs`, `keep_cache.rs`,
+`passthrough.rs`, and `concurrency.rs`. This spec follows that convention:
+`read_consistency.rs` copies the helpers it needs (`make_flac`, `config()`, the
+`scan → spawn → drop` boilerplate, and the `PlaybackCase` / `make_audio_fixture` /
+`mounted_path` / with-cover ffmpeg builders). Extracting a shared
+`tests/common/mod.rs` and refactoring the existing green test files onto it is
+deliberately out of scope — it would churn passing tests for no behavioral gain.
+
 ### Dev-dependency
 
 Add `memmap2 = "0.9"` to `[dev-dependencies]` of `musefs-fuse/Cargo.toml` — a
@@ -100,29 +124,51 @@ Format-agnostic helper `sweep_reads(served_path)`:
    (`std::os::unix::fs::FileExt::read_at`) and once via `memmap2::Mmap`
    (`MAP_SHARED`, `PROT_READ`) over the whole file.
 3. Run `ITERS` (~2000) seeded iterations. Each picks an `(offset, len)` biased
-   toward boundary cases rather than uniform random, drawing from:
-   - `offset` of `0`, `1`, `n - 1`, `n`, and a random in-range value;
-   - `len` of `0`, `1`, a random value, a value that spans EOF, and a value
-     entirely beyond EOF.
+   toward boundary cases rather than uniform random. The two variables carry
+   distinct "edge" conditions, kept unambiguous:
+   - `offset` drawn from `{0, 1, n - 1, n, a-random-in-range value}` plus the
+     **seam offsets** when known (see below). `offset == n` and `offset > n` are
+     the past-EOF cases.
+   - `len` drawn from `{0, 1, a-random value, a value that makes
+     offset + len > n}` — i.e. a read that starts in range but crosses EOF.
+   So the two distinct EOF cases are: (in-range `offset`, `len` crossing `n`) and
+   (`offset >= n`, any `len`). Both expect a read count of `0` for the past-EOF
+   start.
 
-   The sweep is format-agnostic and does not know synthesized segment-seam
-   offsets; with small fixtures and ~2000 boundary-biased iterations it crosses
-   the synthesized/`BackingAudio` seam statistically. Files are kept small so the
-   offset space is densely sampled.
+   **Seam targeting (hermetic FLAC case).** The format-agnostic sweep cannot know
+   where a synthesized `Inline` prefix meets the `BackingAudio` tail, and biasing
+   to `0/1/n-1/n` clusters at file *ends*, not at that interior seam. For the
+   hermetic `make_flac` fixture the test constructs the file, so the prefix length
+   (the synthesized `fLaC` + STREAMINFO + rewritten VORBIS_COMMENT bytes, i.e.
+   served length minus the known backing-audio length) is computable. The sweep
+   helper accepts an optional `seam: Option<u64>`; when `Some(s)` it adds
+   `s`, `s ± 1`, `s ± 8` to the biased offset set, so the synthesized/`BackingAudio`
+   boundary is straddled **deterministically every run** rather than
+   probabilistically. For the ffmpeg breadth sweep (component d) the seam is not
+   known, so `seam` is `None` and small fixtures keep the offset space densely
+   sampled.
 4. For each `(offset, len)`:
    - `read_at`: assert the returned byte count equals `min(len, n - min(offset, n))`
      (the expected short-read length) and the returned bytes equal
-     `oracle[offset..offset + count]`.
+     `oracle[offset..offset + count]`. This is correct for every case: `offset >= n`
+     yields `n - min(offset, n) == 0` → count `0`, and `len == 0` yields count `0`.
    - `mmap`: assert `mmap[offset..offset + clamped_len]` equals the same oracle
-     slice (mmap has no short-read; compare the clamped in-bounds slice).
+     slice (mmap has no short-read; compare the clamped in-bounds slice). The mmap
+     compare is skipped for `offset >= n` (nothing in-bounds to map-compare).
 5. On any mismatch the assertion message prints `SEED`, `offset`, `len`, and the
    format/path so the exact case reproduces deterministically.
 
 Boundary bias is deliberate: uniform random offsets over a large file rarely land
 on the low offsets and EOF edges where a kernel offset/length-split or short-read
-bug bites. Keeping fixtures small and over-sampling `0`/`1`/`n-1`/`n` densely
-covers the seam between a synthesized `Inline`/`ArtImage` prefix and the
-`BackingAudio` tail.
+bug bites. The explicit `0`/`1`/`n-1`/`n` sampling plus deterministic seam
+targeting (hermetic FLAC) covers both the file ends and the interior
+synthesized/`BackingAudio` boundary every run.
+
+**Page-fault safety (mmap).** The mount runs on a `BackgroundSession` whose worker
+pool serves `read` requests concurrently, so page faults on the `MAP_SHARED`
+region become FUSE reads served by that pool — faulting cannot deadlock the test
+thread. `memmap2::Mmap` requires a non-empty file, so fixtures are asserted
+non-empty before mapping.
 
 ### Component (b): whole-file mmap fidelity — #214
 
@@ -137,27 +183,34 @@ ffmpeg/codecs are unavailable.
 ### Component (c): read-only write-refusal matrix — #214
 
 `write_ops_are_refused(mountpoint, served_path)`: against the served file and the
-mount root, assert each mutating operation fails with the expected errno. Because
-the mount is `MountOption::RO`, the kernel enforces refusal at the VFS layer and
-returns `EROFS` for all of them. Operations covered:
+mount root, assert each mutating operation **fails** (return value `-1`) with an
+errno drawn from a documented accepted set. The contract under test is "mutation
+is refused," **not** "refused with exactly `EROFS`." The mount is
+`MountOption::RO`, so the kernel enforces refusal at the VFS layer — but the exact
+errno can vary by operation and kernel version (a write-unrelated check, e.g. fd
+writability, may fire before the RO check), so strict equality on `EROFS` would be
+flaky. Each row asserts `ret == -1 && accepted_set.contains(errno)`:
 
-| Operation                         | Target            | Expected errno |
-| --------------------------------- | ----------------- | -------------- |
-| `open(O_WRONLY)`                  | existing file     | `EROFS`        |
-| `open(O_RDWR)`                    | existing file     | `EROFS`        |
-| `open(O_CREAT)` / `creat`         | new path in mount | `EROFS`        |
-| `unlink`                          | existing file     | `EROFS`        |
-| `truncate`                        | existing file     | `EROFS`        |
-| `ftruncate` (on an `O_RDONLY` fd) | existing file     | `EINVAL`/`EROFS` |
-| `mkdir`                           | new dir in mount  | `EROFS`        |
-| `chmod` (setattr path)            | existing file     | `EROFS`        |
-| `utimes` (setattr path)           | existing file     | `EROFS`        |
+| Operation                         | Target            | Accepted errno set        |
+| --------------------------------- | ----------------- | ------------------------- |
+| `open(O_WRONLY)`                  | existing file     | `{EROFS}`                 |
+| `open(O_RDWR)`                    | existing file     | `{EROFS}`                 |
+| `open(O_CREAT)`, fresh path       | **new** path in mount | `{EROFS}`             |
+| `unlink`                          | existing file     | `{EROFS}`                 |
+| `truncate`                        | existing file     | `{EROFS}`                 |
+| `ftruncate` (on an `O_RDONLY` fd) | existing file     | `{EINVAL, EROFS}`         |
+| `mkdir`                           | new dir in mount  | `{EROFS}`                 |
+| `chmod` (setattr path)            | existing file     | `{EROFS, EPERM}`          |
+| `utimes` (setattr path)           | existing file     | `{EROFS, EPERM, EACCES}`  |
 
-Implemented with direct `libc` calls, checking `std::io::Error::last_os_error()` /
-`errno`. Where an operation could legitimately yield more than one POSIX-valid
-errno (noted above for `ftruncate`, which can return `EINVAL` because the fd is not
-writable), the assertion accepts the documented set rather than over-fitting to a
-single value. This test is also hermetic on `make_flac`.
+Notes: the `O_CREAT` row must target a genuinely new path (not the served file),
+so it exercises create-refusal rather than an existing-file open. `ftruncate` on an
+`O_RDONLY` fd commonly returns `EINVAL` (the fd is not writable — a check
+independent of the RO mount) rather than `EROFS`, hence the two-element set.
+`chmod`/`utimes` are normally `EROFS` on an RO mount but can surface `EPERM`/
+`EACCES` on some kernels before the RO check. Implemented with direct `libc`
+calls, reading `std::io::Error::last_os_error().raw_os_error()`. This test is
+hermetic on `make_flac`.
 
 ### Component (d): multi-format breadth sweep — #215
 
@@ -171,7 +224,10 @@ Per-format generation uses the suite's established **skip-if-codec-unavailable**
 pattern (`make_audio_fixture` returns `false` → log and skip that format). The
 test first checks `ffmpeg -version` and returns early if ffmpeg is entirely
 absent, and asserts that at least one fixture was generated so it cannot silently
-no-op on every format. This is where `Inline`, `ArtImage`, `BinaryTag`,
+no-op on every format. To bound total e2e runtime, the breadth sweep runs a
+reduced iteration count per format (~500, vs the hermetic FLAC sweep's ~2000)
+rather than the full count across all seven containers; the hermetic FLAC sweep
+carries the deep per-offset coverage. This is where `Inline`, `ArtImage`, `BinaryTag`,
 `OggAudio` (patched-in-place pages), and `OggArtSlice` (incremental base64) +
 `BackingAudio` segment splicing meets the kernel read boundary across containers.
 
@@ -185,6 +241,12 @@ no-op on every format. This is where `Inline`, `ArtImage`, `BinaryTag`,
 - The hermetic FLAC tests (components b and c) form the always-runs floor, so
   #214's read-only contract and whole-file mmap fidelity are never skipped even
   on a machine without ffmpeg.
+- Oracle stability: the served file is read once as the oracle, then all preads
+  compare against it. This is valid only if nothing retags mid-test. The fixtures
+  use `poll_interval: Duration::ZERO` (so `lookup`/`getattr`'s `fire_poll_refresh`
+  is a no-op) and the in-memory DB is not written during the test, so the served
+  bytes are immutable for the run. A future author copying this harness against a
+  live-polling mount would need to account for a racy oracle.
 
 ### Documentation
 
@@ -215,6 +277,6 @@ These additions are themselves the tests. Verification:
 - A whole-file `mmap` (`MAP_SHARED`/`PROT_READ`) fidelity test asserts mapped bytes
   equal `pread` bytes on a hermetic FLAC fixture (#214).
 - A write-refusal matrix asserts `open(O_WRONLY/O_RDWR)`, `create`, `unlink`,
-  `truncate`/`ftruncate`, `mkdir`, and `chmod`/`utimes` are refused with the
-  documented errno on a hermetic FLAC fixture (#214).
+  `truncate`/`ftruncate`, `mkdir`, and `chmod`/`utimes` each fail (`ret == -1`)
+  with an errno in the documented accepted set on a hermetic FLAC fixture (#214).
 - No production code changes; no new CI job; one `CONTRIBUTING.md` bullet added.
