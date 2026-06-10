@@ -35,8 +35,10 @@ thread_local! {
     static READ_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Fuse-layer mount knobs: kernel tuning + page-cache policy. Distinct from
-/// `musefs_core::MountConfig`, which governs how the virtual tree is rendered.
+/// Fuse-layer mount knobs: kernel tuning, page-cache policy, and the ownership
+/// (`uid`/`gid`) and permission bits (`file_mode`/`dir_mode`) presented for
+/// every entry. Distinct from `musefs_core::MountConfig`, which governs how the
+/// virtual tree is rendered.
 #[derive(Debug, Clone)]
 pub struct FuseConfig {
     /// Entry/attr cache lifetime the kernel may trust before re-validating.
@@ -53,6 +55,14 @@ pub struct FuseConfig {
     /// re-tag auto-invalidates the affected inode on refresh (`poll_refresh_notify`
     /// → `inval_inode`), so cached bytes are dropped when content changes.
     pub keep_cache: bool,
+    /// uid presented for every entry (the marker, synthetic dirs, real files).
+    pub uid: u32,
+    /// gid presented for every entry.
+    pub gid: u32,
+    /// Permission bits for regular files (bare mode word, no type bits).
+    pub file_mode: u16,
+    /// Permission bits for directories (bare mode word, no type bits).
+    pub dir_mode: u16,
 }
 
 impl Default for FuseConfig {
@@ -62,6 +72,10 @@ impl Default for FuseConfig {
             max_readahead: 512 * 1024,
             max_background: 64,
             keep_cache: false,
+            uid: rustix::process::getuid().as_raw(),
+            gid: rustix::process::getgid().as_raw(),
+            file_mode: 0o444,
+            dir_mode: 0o555,
         }
     }
 }
@@ -170,8 +184,8 @@ impl MusefsFs {
             // class of work; foreground reads are bounded only by client
             // concurrency, so a wide parallel read storm can still queue jobs.
             pool: ThreadPool::new(workers),
-            uid: rustix::process::getuid().as_raw(),
-            gid: rustix::process::getgid().as_raw(),
+            uid: config.uid,
+            gid: config.gid,
             mount_time: SystemTime::now(),
             config,
             notifier: Arc::new(OnceLock::new()),
@@ -255,7 +269,12 @@ impl Filesystem for MusefsFs {
             return reply.error(fuser::Errno::ENOENT);
         };
         if platform::spotlight::marker_lookup(parent.0, name).is_some() {
-            let attr = platform::spotlight::marker_attr(self.uid, self.gid, self.mount_time);
+            let attr = platform::spotlight::marker_attr(
+                self.uid,
+                self.gid,
+                self.config.file_mode,
+                self.mount_time,
+            );
             return reply.entry(&self.config.ttl, &attr, Generation(0));
         }
         // Inode resolution is an in-memory tree read; the attr (which may touch
@@ -264,9 +283,20 @@ impl Filesystem for MusefsFs {
             return reply.error(fuser::Errno::ENOENT);
         };
         let core = Arc::clone(&self.core);
-        let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
+        let (uid, gid, fm, dm, mt, ttl) = (
+            self.uid,
+            self.gid,
+            self.config.file_mode,
+            self.config.dir_mode,
+            self.mount_time,
+            self.config.ttl,
+        );
         self.pool.execute(move || match core.getattr(child) {
-            Ok(attr) => reply.entry(&ttl, &to_file_attr(&attr, uid, gid, mt), Generation(0)),
+            Ok(attr) => reply.entry(
+                &ttl,
+                &to_file_attr(&attr, uid, gid, fm, dm, mt),
+                Generation(0),
+            ),
             Err(e) => reply.error(reply_errno("lookup", child, &e)),
         });
     }
@@ -274,13 +304,25 @@ impl Filesystem for MusefsFs {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         self.fire_poll_refresh();
         if platform::spotlight::is_marker(ino.0) {
-            let attr = platform::spotlight::marker_attr(self.uid, self.gid, self.mount_time);
+            let attr = platform::spotlight::marker_attr(
+                self.uid,
+                self.gid,
+                self.config.file_mode,
+                self.mount_time,
+            );
             return reply.attr(&self.config.ttl, &attr);
         }
         let core = Arc::clone(&self.core);
-        let (uid, gid, mt, ttl) = (self.uid, self.gid, self.mount_time, self.config.ttl);
+        let (uid, gid, fm, dm, mt, ttl) = (
+            self.uid,
+            self.gid,
+            self.config.file_mode,
+            self.config.dir_mode,
+            self.mount_time,
+            self.config.ttl,
+        );
         self.pool.execute(move || match core.getattr(ino.0) {
-            Ok(attr) => reply.attr(&ttl, &to_file_attr(&attr, uid, gid, mt)),
+            Ok(attr) => reply.attr(&ttl, &to_file_attr(&attr, uid, gid, fm, dm, mt)),
             Err(e) => reply.error(reply_errno("getattr", ino.0, &e)),
         });
     }
@@ -559,6 +601,10 @@ mod tests {
         assert_eq!(c.max_readahead, 512 * 1024);
         assert_eq!(c.max_background, 64);
         assert!(!c.keep_cache);
+        assert_eq!(c.file_mode, 0o444);
+        assert_eq!(c.dir_mode, 0o555);
+        assert_eq!(c.uid, rustix::process::getuid().as_raw());
+        assert_eq!(c.gid, rustix::process::getgid().as_raw());
     }
 
     #[test]

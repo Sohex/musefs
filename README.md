@@ -93,7 +93,7 @@ Anything else is literal. Name collisions get a deterministic `(2)`, `(3)`, …
 suffix. Every rendered component is capped at 255 bytes (NAME_MAX, truncated on
 a UTF-8 boundary, extension preserved), and a plain field whose value is
 exactly `.` or `..` is dropped rather than creating an unusable directory. The
-default template is `$artist/$title`.
+default template is `$albumartist/$album/$title`.
 
 Two modes:
 
@@ -119,6 +119,20 @@ All tuning flags have sensible defaults; adjust them to your backing store:
 | `--max-background` | `64` | Max outstanding background (read-ahead/async) requests the kernel keeps in flight. |
 | `--keep-cache` | disabled | Keep the kernel page cache across opens. External re-tags auto-invalidate the affected files, so cached bytes never go stale. |
 | `--case-insensitive <true\|false>` | OS default | Compare filenames case-insensitively. Case-variant directories merge into one (first-seen casing wins) and case-variant files get a numeric suffix (e.g. `Song (2)`). Defaults to `true` on macOS and `false` on Linux/FreeBSD; case-insensitive mounts refresh via a full rebuild rather than the incremental fast path. |
+
+### Ownership and permissions
+
+By default the mount presents the launching process's uid/gid and read-only
+permission bits (`555` dirs, `444` files). Override them to present a specific
+owner — e.g. a media-server service account — without running musefs as that
+user.
+
+| Flag | Default | What it does |
+| ---- | ------- | ------------ |
+| `--owner <NAME\|UID>` | process uid | User presented as the owner of every entry. Accepts a username or a numeric uid. |
+| `--group <NAME\|GID>` | process gid | Group presented for every entry. Accepts a group name or a numeric gid. |
+| `--file-mode <OCTAL>` | `444` | Permission bits for regular files, in octal. The mount is read-only, so write bits are advertised but writes still fail with `EROFS`. |
+| `--dir-mode <OCTAL>` | `555` | Permission bits for directories, in octal. |
 
 ## Supported formats
 

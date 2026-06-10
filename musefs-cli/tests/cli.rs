@@ -131,6 +131,10 @@ fn parse_mount_config_defaults_are_sensible() {
         max_background: 64,
         keep_cache: false,
         case_insensitive: false,
+        owner: None,
+        group: None,
+        file_mode: None,
+        dir_mode: None,
     };
     let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.template, "$artist/$title");
@@ -159,6 +163,10 @@ fn parse_mount_config_keep_cache_sets_flag() {
         max_background: 32,
         keep_cache: true,
         case_insensitive: false,
+        owner: None,
+        group: None,
+        file_mode: None,
+        dir_mode: None,
     };
     let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.mode, Mode::StructureOnly);
@@ -183,6 +191,10 @@ fn parse_mount_config_saturating_readahead() {
         max_background: 64,
         keep_cache: false,
         case_insensitive: false,
+        owner: None,
+        group: None,
+        file_mode: None,
+        dir_mode: None,
     };
     let (_, fuse_config) = parse_mount_config(&args);
     assert_eq!(fuse_config.max_readahead, u32::MAX);
@@ -231,6 +243,10 @@ fn parse_mount_config_populates_per_field_fallbacks() {
         max_background: 64,
         keep_cache: false,
         case_insensitive: false,
+        owner: None,
+        group: None,
+        file_mode: None,
+        dir_mode: None,
     };
     let (config, _) = parse_mount_config(&args);
     assert_eq!(

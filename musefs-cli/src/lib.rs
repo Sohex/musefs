@@ -50,7 +50,7 @@ pub struct MountArgs {
     /// Path template, e.g. "$albumartist/$album/$title". Supports ${a|b}
     /// fallback chains, [...] conditional sections ($[/$] for literal
     /// brackets), and $!{field} path fields that keep '/' as separators.
-    #[arg(long, default_value = "$artist/$title")]
+    #[arg(long, default_value = "$albumartist/$album/$title")]
     pub template: String,
     /// Fallback value substituted for any missing template field.
     #[arg(long, default_value = "Unknown")]
@@ -88,6 +88,21 @@ pub struct MountArgs {
     /// with `--case-insensitive false` (e.g. a case-sensitive APFS volume).
     #[arg(long, default_value_t = cfg!(target_os = "macos"), action = clap::ArgAction::Set)]
     pub case_insensitive: bool,
+    /// Owning user for every entry: a username or numeric uid. Defaults to the
+    /// launching process's uid.
+    #[arg(long, value_name = "NAME|UID", value_parser = parse_owner)]
+    pub owner: Option<u32>,
+    /// Owning group for every entry: a group name or numeric gid. Defaults to
+    /// the launching process's gid.
+    #[arg(long, value_name = "NAME|GID", value_parser = parse_group)]
+    pub group: Option<u32>,
+    /// Permission bits for regular files, octal (e.g. 444). Defaults to 444.
+    /// The mount is read-only, so write bits are advertised but inert.
+    #[arg(long, value_name = "OCTAL", value_parser = parse_octal_mode)]
+    pub file_mode: Option<u16>,
+    /// Permission bits for directories, octal (e.g. 555). Defaults to 555.
+    #[arg(long, value_name = "OCTAL", value_parser = parse_octal_mode)]
+    pub dir_mode: Option<u16>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -185,6 +200,49 @@ fn parse_fallback(s: &str) -> Result<(String, String), String> {
     Ok((field.to_string(), value.to_string()))
 }
 
+/// Resolve `--owner`: a numeric uid is used directly; anything else is looked
+/// up as a username. An all-numeric string is always treated as an id (never a
+/// name), matching `chown`.
+fn parse_owner(s: &str) -> Result<u32, String> {
+    if let Ok(uid) = s.parse::<u32>() {
+        return Ok(uid);
+    }
+    uzers::get_user_by_name(s)
+        .map(|u| u.uid())
+        .ok_or_else(|| format!("no such user: {s}"))
+}
+
+/// Resolve `--group`: a numeric gid is used directly; anything else is looked
+/// up as a group name.
+fn parse_group(s: &str) -> Result<u32, String> {
+    if let Ok(gid) = s.parse::<u32>() {
+        return Ok(gid);
+    }
+    uzers::get_group_by_name(s)
+        .map(|g| g.gid())
+        .ok_or_else(|| format!("no such group: {s}"))
+}
+
+/// Parse a bare octal permission word (e.g. `644`, `0755`) — NOT decimal, and
+/// without an `0o` prefix. Range-checked to `0o7777`.
+fn parse_octal_mode(s: &str) -> Result<u16, String> {
+    let mode = u16::from_str_radix(s, 8).map_err(|_| format!("invalid octal mode: {s}"))?;
+    if mode > 0o7777 {
+        return Err(format!("octal mode out of range (max 7777): {s}"));
+    }
+    Ok(mode)
+}
+
+/// Warning text when a read-only mount is given a mode with write bits set;
+/// the bits are applied as requested, this only informs.
+fn write_bit_warning(flag: &str, mode: u16) -> Option<String> {
+    (mode & 0o222 != 0).then(|| {
+        format!(
+            "--{flag} {mode:o} sets write bits, but the mount is read-only; writes will fail with EROFS"
+        )
+    })
+}
+
 /// Parse mount CLI flags into `MountConfig` and `FuseConfig`. Pure function —
 /// no DB access, no mounting. Exported for unit testing.
 pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseConfig) {
@@ -196,11 +254,16 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),
         case_insensitive: args.case_insensitive,
     };
+    let defaults = musefs_fuse::FuseConfig::default();
     let fuse_config = musefs_fuse::FuseConfig {
         ttl: std::time::Duration::from_millis(args.attr_ttl_ms),
         max_readahead: args.max_readahead_kib.saturating_mul(1024),
         max_background: args.max_background,
         keep_cache: args.keep_cache,
+        uid: args.owner.unwrap_or(defaults.uid),
+        gid: args.group.unwrap_or(defaults.gid),
+        file_mode: args.file_mode.unwrap_or(defaults.file_mode),
+        dir_mode: args.dir_mode.unwrap_or(defaults.dir_mode),
     };
     (config, fuse_config)
 }
@@ -211,6 +274,11 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     let db =
         Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
     let (config, fuse_config) = parse_mount_config(args);
+    for (flag, mode) in [("file-mode", args.file_mode), ("dir-mode", args.dir_mode)] {
+        if let Some(w) = mode.and_then(|m| write_bit_warning(flag, m)) {
+            eprintln!("warning: {w}");
+        }
+    }
     let core = Musefs::open(db, config).context("building the virtual filesystem")?;
     signal::install_unmount_on_signal(args.mountpoint.clone())
         .context("installing the stop-signal unmount handler")?;
@@ -346,7 +414,7 @@ mod tests {
         };
         let (config, fuse_config) = parse_mount_config(&args);
         // Defaults survive the move into the struct.
-        assert_eq!(config.template, "$artist/$title");
+        assert_eq!(config.template, "$albumartist/$album/$title");
         assert_eq!(config.default_fallback, "Unknown");
         assert_eq!(config.mode, musefs_core::Mode::Synthesis);
         assert!(!fuse_config.keep_cache);
@@ -389,5 +457,85 @@ mod tests {
             };
             assert_eq!(args.case_insensitive, want);
         }
+    }
+
+    #[test]
+    fn octal_mode_parses_as_octal_not_decimal() {
+        assert_eq!(parse_octal_mode("644").unwrap(), 0o644);
+        assert_eq!(parse_octal_mode("644").unwrap(), 420);
+        assert_eq!(parse_octal_mode("0755").unwrap(), 0o755);
+    }
+
+    #[test]
+    fn octal_mode_rejects_out_of_range_and_non_octal() {
+        assert!(parse_octal_mode("10000").is_err());
+        assert!(parse_octal_mode("8").is_err());
+        assert!(parse_octal_mode("xyz").is_err());
+    }
+
+    #[test]
+    fn write_bit_warning_fires_only_for_write_bits() {
+        assert!(write_bit_warning("file-mode", 0o444).is_none());
+        assert!(write_bit_warning("dir-mode", 0o555).is_none());
+        assert!(write_bit_warning("file-mode", 0o664).is_some());
+        assert!(write_bit_warning("dir-mode", 0o775).is_some());
+    }
+
+    #[test]
+    fn owner_and_modes_flow_into_fuse_config() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "musefs",
+            "mount",
+            "/mnt",
+            "--db",
+            "/tmp/x.db",
+            "--owner",
+            "0",
+            "--group",
+            "0",
+            "--file-mode",
+            "640",
+            "--dir-mode",
+            "750",
+        ])
+        .unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected Mount");
+        };
+        let (_config, fuse_config) = parse_mount_config(&args);
+        assert_eq!(fuse_config.uid, 0);
+        assert_eq!(fuse_config.gid, 0);
+        assert_eq!(fuse_config.file_mode, 0o640);
+        assert_eq!(fuse_config.dir_mode, 0o750);
+    }
+
+    #[test]
+    fn owner_flags_default_to_process_identity() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "mount", "/mnt", "--db", "/tmp/x.db"]).unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected Mount");
+        };
+        let (_config, fuse_config) = parse_mount_config(&args);
+        let defaults = musefs_fuse::FuseConfig::default();
+        assert_eq!(fuse_config.uid, defaults.uid);
+        assert_eq!(fuse_config.gid, defaults.gid);
+        assert_eq!(fuse_config.file_mode, 0o444);
+        assert_eq!(fuse_config.dir_mode, 0o555);
+    }
+
+    #[test]
+    fn owner_accepts_numeric_and_rejects_unknown_name() {
+        assert_eq!(parse_owner("1234").unwrap(), 1234);
+        assert!(parse_owner("").is_err());
+        assert!(parse_owner("definitely-no-such-user-xyzzy").is_err());
+    }
+
+    #[test]
+    fn group_accepts_numeric_and_rejects_unknown_name() {
+        assert_eq!(parse_group("1234").unwrap(), 1234);
+        assert!(parse_group("").is_err());
+        assert!(parse_group("definitely-no-such-group-xyzzy").is_err());
     }
 }

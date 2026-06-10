@@ -13,13 +13,16 @@ use std::time::{Duration, SystemTime};
 use fuser::{FileAttr, FileType, INodeNo};
 use musefs_core::Attr;
 
-/// Translate a core `Attr` into a `fuser::FileAttr`. Read-only perms (`0o555`
-/// dirs, `0o444` files). A zero `mtime_secs` (e.g. synthetic directories) falls
+/// Translate a core `Attr` into a `fuser::FileAttr`. Permission bits come from
+/// `dir_mode`/`file_mode` (the mount is read-only, so these are advertised but
+/// inert for writes). A zero `mtime_secs` (e.g. synthetic directories) falls
 /// back to `fallback_mtime` so tools don't see a 1970 timestamp.
 pub(crate) fn to_file_attr(
     attr: &Attr,
     uid: u32,
     gid: u32,
+    file_mode: u16,
+    dir_mode: u16,
     fallback_mtime: SystemTime,
 ) -> FileAttr {
     let mtime = if attr.mtime_secs > 0 {
@@ -31,9 +34,9 @@ pub(crate) fn to_file_attr(
         fallback_mtime
     };
     let (kind, perm, nlink) = if attr.is_dir {
-        (FileType::Directory, 0o555, 2)
+        (FileType::Directory, dir_mode, 2)
     } else {
-        (FileType::RegularFile, 0o444, 1)
+        (FileType::RegularFile, file_mode, 1)
     };
     FileAttr {
         ino: INodeNo(attr.inode),
@@ -117,7 +120,7 @@ mod tests {
             size: 0,
             mtime_secs: 0,
         };
-        let fa = to_file_attr(&dir, 501, 20, fallback);
+        let fa = to_file_attr(&dir, 501, 20, 0o444, 0o555, fallback);
         assert_eq!(fa.ino, INodeNo(1));
         assert_eq!(fa.kind, FileType::Directory);
         assert_eq!(fa.perm, 0o555);
@@ -132,7 +135,7 @@ mod tests {
             size: 4096,
             mtime_secs: 1_700_000_000,
         };
-        let fa = to_file_attr(&file, 501, 20, fallback);
+        let fa = to_file_attr(&file, 501, 20, 0o444, 0o555, fallback);
         assert_eq!(fa.kind, FileType::RegularFile);
         assert_eq!(fa.perm, 0o444);
         assert_eq!(fa.size, 4096);
@@ -141,6 +144,28 @@ mod tests {
             fa.mtime,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
         );
+    }
+
+    #[test]
+    fn to_file_attr_applies_distinct_dir_and_file_modes() {
+        let fallback = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let dir = Attr {
+            inode: 1,
+            is_dir: true,
+            size: 0,
+            mtime_secs: 0,
+        };
+        let file = Attr {
+            inode: 2,
+            is_dir: false,
+            size: 0,
+            mtime_secs: 0,
+        };
+        // Deliberately asymmetric so a dir/file swap is observable.
+        let d = to_file_attr(&dir, 0, 0, 0o400, 0o700, fallback);
+        let f = to_file_attr(&file, 0, 0, 0o400, 0o700, fallback);
+        assert_eq!(d.perm, 0o700, "dir must get dir_mode");
+        assert_eq!(f.perm, 0o400, "file must get file_mode");
     }
 
     #[test]
