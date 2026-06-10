@@ -31,6 +31,18 @@ fn make_fixture(path: &std::path::Path, codec_args: &[&str]) -> bool {
         && path.exists()
 }
 
+/// Whether the ffmpeg binary is present. Distinguishes a genuinely-absent
+/// toolchain (legitimate skip) from a present ffmpeg whose codec/invocation
+/// failed to produce a fixture (a real failure to surface, not swallow).
+fn ffmpeg_available() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Read every Ogg packet's data. The `ogg` crate validates page CRCs while
 /// reading, so a corrupt page makes `read_packet` error (panicking the test).
 fn read_packets(bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -186,13 +198,13 @@ fn make_fixture_with_cover(
 #[test]
 #[ignore = "requires /dev/fuse + libfuse + ffmpeg; run with --ignored"]
 fn opus_read_through_preserves_embedded_art() {
-    let backing = tempfile::tempdir().unwrap();
-    let Some((src, _cover)) =
-        make_fixture_with_cover(backing.path(), "in.opus", &["-c:a", "libopus"])
-    else {
-        eprintln!("ffmpeg/libopus unavailable; skipping");
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg unavailable; skipping");
         return;
-    };
+    }
+    let backing = tempfile::tempdir().unwrap();
+    let (src, _cover) = make_fixture_with_cover(backing.path(), "in.opus", &["-c:a", "libopus"])
+        .expect("ffmpeg present but the libopus cover fixture failed to generate");
 
     // The source's own embedded art (as the scanner will ingest it).
     let source_bytes = std::fs::read(&src).unwrap();
@@ -219,36 +231,48 @@ fn opus_read_through_preserves_embedded_art() {
 #[test]
 #[ignore = "requires /dev/fuse + libfuse + ffmpeg; run with --ignored"]
 fn opus_read_through_validates_pages_and_audio() {
-    let backing = tempfile::tempdir().unwrap();
-    let src = backing.path().join("in.opus");
-    if !make_fixture(&src, &["-c:a", "libopus"]) {
-        eprintln!("ffmpeg/libopus unavailable; skipping");
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg unavailable; skipping");
         return;
     }
+    let backing = tempfile::tempdir().unwrap();
+    let src = backing.path().join("in.opus");
+    assert!(
+        make_fixture(&src, &["-c:a", "libopus"]),
+        "ffmpeg present but the libopus fixture failed to generate"
+    );
     mount_and_validate(&src);
 }
 
 #[test]
 #[ignore = "requires /dev/fuse + libfuse + ffmpeg; run with --ignored"]
 fn vorbis_read_through_validates_pages_and_audio() {
-    let backing = tempfile::tempdir().unwrap();
-    let src = backing.path().join("in.ogg");
-    if !make_fixture(&src, &["-c:a", "libvorbis"]) {
-        eprintln!("ffmpeg/libvorbis unavailable; skipping");
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg unavailable; skipping");
         return;
     }
+    let backing = tempfile::tempdir().unwrap();
+    let src = backing.path().join("in.ogg");
+    assert!(
+        make_fixture(&src, &["-c:a", "libvorbis"]),
+        "ffmpeg present but the libvorbis fixture failed to generate"
+    );
     mount_and_validate(&src);
 }
 
 #[test]
 #[ignore = "requires /dev/fuse + libfuse + ffmpeg; run with --ignored"]
 fn oggflac_read_through_validates_pages_and_audio() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg unavailable; skipping");
+        return;
+    }
     let backing = tempfile::tempdir().unwrap();
     let src = backing.path().join("in.oga");
     // FLAC-in-Ogg: flac codec in the ogg container.
-    if !make_fixture(&src, &["-c:a", "flac", "-f", "ogg"]) {
-        eprintln!("ffmpeg/flac-in-ogg unavailable; skipping");
-        return;
-    }
+    assert!(
+        make_fixture(&src, &["-c:a", "flac", "-f", "ogg"]),
+        "ffmpeg present but the flac-in-ogg fixture failed to generate"
+    );
     mount_and_validate(&src);
 }
