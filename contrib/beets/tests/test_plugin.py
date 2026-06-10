@@ -5,6 +5,7 @@ import pytest
 pytest.importorskip("beets")
 
 from beets.library import Item  # noqa: E402
+from conftest import FakeItem, insert_track  # noqa: E402
 from musefs_common import connect  # noqa: E402
 
 from beetsplug._core import map_fields  # noqa: E402
@@ -342,3 +343,109 @@ def test_sync_omits_beets_path_when_disabled(db_path, make_track, fake_item, tmp
         )
     finally:
         conn.close()
+
+
+# --- restore_backing tests ------------------------------------------------
+
+
+def _seed_track_with_tag(db_path, real_path, key, value):
+    conn = connect(db_path)
+    tid = insert_track(conn, real_path)
+    conn.execute(
+        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?,?,?,0)", (tid, key, value)
+    )
+    conn.commit()
+    conn.close()
+    return tid
+
+
+def _text_tags(db_path, tid):
+    conn = connect(db_path)
+    rows = dict(
+        conn.execute("SELECT key, value FROM tags WHERE track_id=? AND value_blob IS NULL", (tid,))
+    )
+    conn.close()
+    return rows
+
+
+def test_sync_merges_keeps_unmanaged_and_persists(db_path, tmp_path, monkeypatch):
+    """Command path: B persists, M wins, managed flexattr written via store()."""
+    p = tmp_path / "a.flac"
+    p.write_bytes(b"")
+    real = os.path.realpath(str(p))
+    tid = _seed_track_with_tag(db_path, real, "comment", "keep")
+
+    item = FakeItem(str(p).encode(), artist="New")
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin,
+        "config",
+        FakeConfigView({
+            "db": db_path,
+            "fields": {},
+            "write_path": False,
+            "restore_backing": False,
+        }),
+        raising=False,
+    )
+    plugin._sync(db_path, [item], dry_run=False, restore_backing=False)
+
+    tags = _text_tags(db_path, tid)
+    assert tags["artist"] == "New"  # M wins
+    assert tags["comment"] == "keep"  # unmanaged B persists (merge, not replace)
+    assert "artist" in item.musefs_managed  # managed set persisted via store()
+
+
+def test_reconcile_path_merges_and_sticky_deletes(db_path, tmp_path, monkeypatch):
+    """Passive cli_exit path runs the same merge + managed-state cycle, and a key
+    dropped from a prior managed set is deleted (tombstone)."""
+    p = tmp_path / "b.flac"
+    p.write_bytes(b"")
+    real = os.path.realpath(str(p))
+    tid = _seed_track_with_tag(db_path, real, "grouping", "old")
+
+    item = FakeItem(str(p).encode(), title="T")
+    item["musefs_managed"] = "grouping,title"  # grouping managed before; now dropped
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin,
+        "config",
+        FakeConfigView({
+            "db": db_path,
+            "fields": {},
+            "write_path": False,
+            "autoscan": False,
+            "restore_backing": False,
+        }),
+        raising=False,
+    )
+    monkeypatch.setattr(plugin, "_run_scan", lambda db, targets: None)
+    plugin._pending = [item]
+    plugin._reconcile_pending(lib=None)
+
+    tags = _text_tags(db_path, tid)
+    assert tags.get("title") == "T"  # merged on the reconcile path
+    assert "grouping" not in tags  # tombstoned delete applied on the reconcile path
+
+
+def test_restore_backing_skips_deletes(db_path, tmp_path, monkeypatch):
+    """With restore_backing, a previously-managed-now-dropped key is NOT deleted."""
+    p = tmp_path / "c.flac"
+    p.write_bytes(b"")
+    real = os.path.realpath(str(p))
+    tid = _seed_track_with_tag(db_path, real, "grouping", "frombacking")
+
+    item = FakeItem(str(p).encode(), title="T")
+    item["musefs_managed"] = "grouping,title"
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin,
+        "config",
+        FakeConfigView({"db": db_path, "fields": {}, "write_path": False, "restore_backing": True}),
+        raising=False,
+    )
+    plugin._sync(db_path, [item], dry_run=False, restore_backing=True)
+
+    tags = _text_tags(db_path, tid)
+    assert tags["grouping"] == "frombacking"  # backing value left in place
+    assert set(item.musefs_managed.split(",")) == {"title"}  # tombstones cleared
