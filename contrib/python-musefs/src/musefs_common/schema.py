@@ -118,6 +118,126 @@ CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
     DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
 END;
 PRAGMA user_version = 3;
+
+-- ── MIGRATION_V4 ──
+CREATE TEMP TABLE _m4_tracks AS SELECT * FROM tracks;
+CREATE TEMP TABLE _m4_tags AS SELECT * FROM tags;
+CREATE TEMP TABLE _m4_art AS SELECT * FROM art;
+CREATE TEMP TABLE _m4_track_art AS SELECT * FROM track_art;
+
+DROP TABLE track_art;
+DROP TABLE tags;
+DROP TABLE art;
+DROP TABLE tracks;
+
+CREATE TABLE tracks (
+    id              INTEGER PRIMARY KEY,
+    backing_path    TEXT NOT NULL UNIQUE,
+    format          TEXT NOT NULL,
+    audio_offset    INTEGER NOT NULL,
+    audio_length    INTEGER NOT NULL,
+    backing_size    INTEGER NOT NULL,
+    backing_mtime   INTEGER NOT NULL,
+    content_version INTEGER NOT NULL DEFAULT 0,
+    updated_at      INTEGER NOT NULL,
+    CHECK (format IN ('flac','mp3','m4a','opus','vorbis','oggflac','wav')),
+    CHECK (audio_offset >= 0),
+    CHECK (audio_length >= 0),
+    CHECK (backing_size >= 0),
+    CHECK (backing_mtime >= 0),
+    CHECK (content_version >= 0),
+    CHECK (updated_at >= 0),
+    CHECK (audio_offset + audio_length <= backing_size)
+);
+
+CREATE TABLE tags (
+    track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    ordinal    INTEGER NOT NULL DEFAULT 0,
+    value_blob BLOB,
+    PRIMARY KEY (track_id, key, ordinal),
+    CHECK (ordinal >= 0),
+    CHECK (value_blob IS NULL OR value = '')
+);
+
+CREATE TABLE art (
+    id       INTEGER PRIMARY KEY,
+    sha256   TEXT NOT NULL UNIQUE,
+    mime     TEXT NOT NULL,
+    width    INTEGER,
+    height   INTEGER,
+    byte_len INTEGER NOT NULL,
+    data     BLOB NOT NULL,
+    CHECK (byte_len = length(data)),
+    CHECK (length(sha256) = 64),
+    CHECK (width IS NULL OR width >= 0),
+    CHECK (height IS NULL OR height >= 0)
+);
+
+CREATE TABLE track_art (
+    track_id     INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    art_id       INTEGER NOT NULL REFERENCES art(id),
+    picture_type INTEGER NOT NULL DEFAULT 3,
+    description  TEXT NOT NULL DEFAULT '',
+    ordinal      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (track_id, ordinal),
+    CHECK (picture_type BETWEEN 0 AND 20),
+    CHECK (ordinal >= 0)
+);
+
+INSERT INTO tracks SELECT * FROM _m4_tracks;
+INSERT INTO art SELECT * FROM _m4_art;
+INSERT INTO tags SELECT * FROM _m4_tags;
+INSERT INTO track_art SELECT * FROM _m4_track_art;
+
+DROP TABLE _m4_track_art;
+DROP TABLE _m4_tags;
+DROP TABLE _m4_art;
+DROP TABLE _m4_tracks;
+
+CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_au AFTER UPDATE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER track_art_ai AFTER INSERT ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_au AFTER UPDATE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (OLD.id);
+END;
+PRAGMA user_version = 4;
 """
 
-USER_VERSION = 3
+USER_VERSION = 4

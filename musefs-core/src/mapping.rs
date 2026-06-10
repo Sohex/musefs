@@ -235,14 +235,6 @@ mod tests {
                 data: vec![9, 9, 9, 9, 9],
             })
             .unwrap();
-        let zero = db
-            .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
-                data: vec![5, 5, 5],
-            })
-            .unwrap();
         db.set_track_art(
             tid,
             &[
@@ -258,28 +250,20 @@ mod tests {
                     description: String::new(),
                     ordinal: 1,
                 },
-                TrackArt {
-                    art_id: zero,
-                    picture_type: 3,
-                    description: String::new(),
-                    ordinal: 2,
-                },
             ],
         )
         .unwrap();
 
-        // byte_len == 0 is valid and must still be served (was the old
-        // strict-`<` pin; now pins that zero passes the u64 row-read).
-        let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute("UPDATE art SET byte_len = 0 WHERE id = ?1", [zero])
-            .unwrap();
-        let inputs = super::track_art_to_inputs(&db, tid).unwrap();
-        let ids: Vec<i64> = inputs.iter().map(|a| a.art_id).collect();
-        assert_eq!(ids, vec![good, bad, zero]);
-
         // A negative byte_len is a malformed external write to the contract
-        // column: it now errors at row-read instead of being skipped.
+        // column: the V4 `byte_len = length(data)` CHECK rejects it on a normal
+        // connection, so bypass CHECK enforcement to plant the bad row — the
+        // row-reader defensive path (not the CHECK) is what this test pins.
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         raw.execute("UPDATE art SET byte_len = -1 WHERE id = ?1", [bad])
+            .unwrap();
+        raw.pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
         drop(raw);
         assert!(

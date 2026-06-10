@@ -1027,16 +1027,26 @@ mod cache_bound_tests {
 
     #[test]
     fn build_rejects_audio_region_past_end_of_file() {
+        // An audio region past the end of the backing file (offset + length >
+        // backing_size) is rejected at write time by the V4 bounds CHECK — it can
+        // no longer be committed and reach synthesis.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.flac");
         let _ = write_flac_local(&path);
-        let len = std::fs::metadata(&path).unwrap().len();
-        let (db, id) = track_with_bounds(&path, len, 5);
-        let cache = HeaderCache::new(Mode::Synthesis);
-        assert!(matches!(
-            cache.resolve(&db, id),
-            Err(CoreError::BackingChanged(_))
-        ));
+        let meta = std::fs::metadata(&path).unwrap();
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let rejected = db.upsert_track(&musefs_db::NewTrack {
+            backing_path: path.to_string_lossy().into_owned(),
+            format: musefs_db::Format::Flac,
+            audio_offset: meta.len(),
+            audio_length: 5,
+            backing_size: meta.len(),
+            backing_mtime: mtime_secs(&meta),
+        });
+        assert!(
+            rejected.is_err(),
+            "bounds CHECK must reject an over-EOF audio region"
+        );
     }
 
     #[test]

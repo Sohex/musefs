@@ -61,9 +61,14 @@ fn resolve_caches_until_content_version_changes() {
 }
 
 #[test]
-fn resolve_errors_when_audio_bounds_overrun_the_file() {
-    let (dir, db, _id) = setup();
+fn bounds_check_rejects_audio_region_overrunning_the_file() {
+    // An audio range that overruns the backing file can no longer be committed:
+    // the V4 `audio_offset + audio_length <= backing_size` CHECK rejects it at
+    // write time, so synthesis never sees an out-of-file region.
+    let dir = tempfile::tempdir().unwrap();
     let flac = dir.path().join("song.flac");
+    let audio = vec![0x5A; 120];
+    let _ = write_flac(&flac, &["TITLE=Orig"], &audio);
     let meta = std::fs::metadata(&flac).unwrap();
     let mtime = i64::try_from(
         meta.modified()
@@ -73,24 +78,20 @@ fn resolve_errors_when_audio_bounds_overrun_the_file() {
             .as_secs(),
     )
     .unwrap();
-    // Re-upsert the same path with an audio_length that runs past EOF (the offset
-    // is valid, but offset + length exceeds the file size).
-    let id = db
-        .upsert_track(&NewTrack {
-            backing_path: flac.to_string_lossy().into_owned(),
-            format: Format::Flac,
-            audio_offset: 0,
-            audio_length: meta.len() + 1,
-            backing_size: meta.len(),
-            backing_mtime: mtime,
-        })
-        .unwrap();
 
-    let cache = HeaderCache::new(Mode::Synthesis);
-    assert!(matches!(
-        cache.resolve(&db, id),
-        Err(musefs_core::CoreError::BackingChanged(_))
-    ));
+    let db = Db::open_in_memory().unwrap();
+    let overrun = db.upsert_track(&NewTrack {
+        backing_path: flac.to_string_lossy().into_owned(),
+        format: Format::Flac,
+        audio_offset: 0,
+        audio_length: meta.len() + 1,
+        backing_size: meta.len(),
+        backing_mtime: mtime,
+    });
+    assert!(
+        overrun.is_err(),
+        "bounds CHECK must reject audio_length overrunning backing_size"
+    );
 }
 
 #[test]
