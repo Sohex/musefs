@@ -2,7 +2,7 @@ use musefs_format::{BlobLen, LayoutError, RegionLayout, Segment};
 
 #[test]
 fn lengths_sum_segments_and_exclude_audio_from_header() {
-    let layout = RegionLayout::new(vec![
+    let layout = RegionLayout::validated(vec![
         Segment::Inline(vec![0u8; 10]),
         Segment::ArtImage {
             art_id: 7,
@@ -13,7 +13,8 @@ fn lengths_sum_segments_and_exclude_audio_from_header() {
             offset: 200,
             len: 1000,
         },
-    ]);
+    ])
+    .unwrap();
 
     assert_eq!(layout.header_len(), 10 + 100 + 5);
     assert_eq!(layout.total_len(), 10 + 100 + 5 + 1000);
@@ -35,31 +36,33 @@ fn segment_len_reports_each_variant() {
 
 #[test]
 fn empty_single_segment_layout_fails_validation() {
-    let layout = RegionLayout::new(vec![Segment::Inline(vec![])]);
+    let layout = RegionLayout::new_unchecked(vec![Segment::Inline(vec![])]);
     assert_eq!(layout.validate(), Err(LayoutError::EmptySegment));
 }
 
 #[test]
 fn valid_layout_passes_validation() {
-    let layout = RegionLayout::new(vec![
+    let layout = RegionLayout::validated(vec![
         Segment::Inline(b"header".to_vec()),
         Segment::BackingAudio {
             offset: 0,
             len: 100,
         },
-    ]);
+    ])
+    .unwrap();
     assert!(layout.validate().is_ok());
 }
 
 #[test]
 fn empty_backing_segment_passes_validation() {
-    let layout = RegionLayout::new(vec![Segment::BackingAudio { offset: 0, len: 0 }]);
+    let layout =
+        RegionLayout::validated(vec![Segment::BackingAudio { offset: 0, len: 0 }]).unwrap();
     assert!(layout.validate().is_ok());
 }
 
 #[test]
 fn total_overflow_detected() {
-    let layout = RegionLayout::new(vec![
+    let layout = RegionLayout::new_unchecked(vec![
         Segment::BackingAudio {
             offset: 0,
             len: u64::MAX,

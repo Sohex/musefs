@@ -111,13 +111,14 @@ fn read_at_streams_art_image_segments() {
         })
         .unwrap();
 
-    let layout = RegionLayout::new(vec![
+    let layout = RegionLayout::validated(vec![
         Segment::Inline(vec![0xAA, 0xBB]),
         Segment::ArtImage {
             art_id,
             len: BlobLen::new(art.len() as u64).unwrap(),
         },
-    ]);
+    ])
+    .unwrap();
     let total_len = layout.total_len();
     let resolved = ResolvedFile {
         layout,
