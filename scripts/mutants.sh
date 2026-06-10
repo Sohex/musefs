@@ -31,7 +31,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 # Scratch parent. cargo-mutants copies the source tree into a build dir under
 # TMPDIR, so the scratch parent MUST live OUTSIDE this repo — a dir inside the
@@ -49,6 +49,7 @@ case "$SCRATCH_PARENT" in
 esac
 mkdir -p "$SCRATCH_PARENT"
 CREATED_TMPS=()
+# shellcheck disable=SC2329  # invoked via 'trap cleanup EXIT' below
 cleanup() {
   # Remove only the unique per-crate scratch children we created (never the
   # possibly-shared parent), even on abnormal exit.

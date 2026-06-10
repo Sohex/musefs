@@ -11,7 +11,9 @@ the FUSE end-to-end tests you need a FUSE-capable OS: Linux with `/dev/fuse` and
 libfuse (`libfuse3-dev` / `libfuse3` plus `pkg-config`), or FreeBSD with
 `/dev/fuse` and the `fusefs` kernel module (no libfuse — see [FreeBSD
 e2e](#freebsd-e2e) for the in-tree VM harness). The Python plugin suites
-additionally want Python 3 with `ruff` and `pytest`.
+additionally want Python 3 with `ruff` and `pytest`. The pre-commit hook's
+shell and YAML lint legs use `shellcheck` and `yamllint` — both optional, each
+skips with a notice if not installed.
 
 Enable the repo's pre-commit hook once per clone:
 
@@ -21,16 +23,23 @@ git config core.hooksPath .githooks
 
 The hook (`.githooks/pre-commit`) runs, in order: `cargo fmt --all --check`,
 `cargo clippy --all-targets -- -D warnings`, **the full workspace test
-suite** (`cargo test --workspace`), and `ruff check` + `ruff format --check`
-over `contrib/beets/`, `contrib/picard/`, `contrib/lidarr/`,
-`contrib/python-musefs/`, and `tests/interop/`. Two consequences worth
-internalizing:
+suite** (`cargo test --workspace`), `shellcheck` over every tracked shell
+script, `yamllint` (relaxed [`.yamllint`](.yamllint)) over every tracked YAML
+file, and `ruff check` + `ruff format --check` over `contrib/beets/`,
+`contrib/picard/`, `contrib/lidarr/`, `contrib/python-musefs/`, and
+`tests/interop/`. A few consequences worth internalizing:
 
 - A commit with red tests is always rejected — there is no
   "commit-now-fix-later" workflow here.
 - Python-only changes hit the hook too: the ruff gate lints exactly the
   union of paths the CI jobs lint, so a commit can't pass the hook yet fail
   CI lint.
+- The cargo gate (fmt/clippy/test) is skipped when every staged path is under
+  `docs/` or is a Markdown file, so a docs-only commit stays fast.
+- The `shellcheck`/`yamllint` legs fire only when a shell or YAML file is
+  staged, and skip with a notice when the tool is absent; when they do run they
+  lint *all* tracked files of that type, so a sibling file can't drift
+  unnoticed.
 
 ## Build & test
 

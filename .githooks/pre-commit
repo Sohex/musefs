@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# musefs pre-commit hook: formatting + curated clippy gate.
+# musefs pre-commit hook: formatting + curated clippy gate + shell/YAML lint.
 #
 # Canonical (version-controlled) copy. `.git/hooks/pre-commit` symlinks here so
 # the hook is active locally. To enable in a fresh clone, run one of:
@@ -8,24 +8,40 @@
 #
 # The clippy lint policy (pedantic, minus intentional/noisy groups) lives in the
 # root Cargo.toml under [workspace.lints]; this hook just denies any warning.
+# The shellcheck/yamllint legs need `shellcheck` and `yamllint` on PATH; both
+# skip with a notice if their tool is absent.
 set -euo pipefail
 
-echo "pre-commit: cargo fmt --check"
-if ! cargo fmt --all -- --check; then
-    echo "✗ formatting: run 'cargo fmt' and re-stage." >&2
-    exit 1
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+
+# The cargo gate (fmt/clippy/test) can't be affected by a commit that only
+# touches docs/ or Markdown, so skip it there. Any other staged path — source,
+# Cargo.toml, fixtures, CI, scripts — runs the full gate.
+docs_only=false
+if [ -n "$STAGED" ] && ! echo "$STAGED" | grep -qvE '^(docs/.*|.*\.md)$'; then
+    docs_only=true
 fi
 
-echo "pre-commit: cargo clippy --all-targets -- -D warnings"
-if ! cargo clippy --all-targets --quiet -- -D warnings; then
-    echo "✗ clippy: fix the warnings above and re-stage." >&2
-    exit 1
-fi
+if $docs_only; then
+    echo "pre-commit: docs-only commit — skipping cargo fmt/clippy/test"
+else
+    echo "pre-commit: cargo fmt --check"
+    if ! cargo fmt --all -- --check; then
+        echo "✗ formatting: run 'cargo fmt' and re-stage." >&2
+        exit 1
+    fi
 
-echo "pre-commit: cargo test --workspace"
-if ! cargo test --workspace --quiet; then
-    echo "✗ tests: fix the failures above and re-stage." >&2
-    exit 1
+    echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+    if ! cargo clippy --all-targets --quiet -- -D warnings; then
+        echo "✗ clippy: fix the warnings above and re-stage." >&2
+        exit 1
+    fi
+
+    echo "pre-commit: cargo test --workspace"
+    if ! cargo test --workspace --quiet; then
+        echo "✗ tests: fix the failures above and re-stage." >&2
+        exit 1
+    fi
 fi
 
 # Mutant-exclusion anchor drift guard. The .cargo/mutants.toml exclude_re entries
@@ -34,7 +50,6 @@ fi
 # mutants.yml) whenever the config, the guard script, or a mutation-scoped source
 # file (musefs-core / musefs-format) is staged. Skipped — not enforced — when
 # cargo-mutants is absent, since CI re-checks it on every PR regardless.
-STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
 if echo "$STAGED" | grep -qE '^(\.cargo/mutants\.toml|scripts/check_mutant_anchors\.py|musefs-(core|format)/src/.*\.rs)$'; then
     if command -v cargo-mutants >/dev/null 2>&1; then
         echo "pre-commit: mutant-anchor drift guard"
@@ -50,6 +65,35 @@ if echo "$STAGED" | grep -qE '^(\.cargo/mutants\.toml|scripts/check_mutant_ancho
         fi
     else
         echo "pre-commit: cargo-mutants not installed — skipping anchor guard (CI enforces it)." >&2
+    fi
+fi
+
+# Shell lint: when any shell script is staged, run shellcheck over every tracked
+# script (plus this hook), so a change can't pass yet break a sibling script.
+if echo "$STAGED" | grep -qE '(\.sh$|^\.githooks/pre-commit$)'; then
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "pre-commit: shellcheck"
+        mapfile -t SH_FILES < <(git ls-files '*.sh' .githooks/pre-commit)
+        if ! shellcheck "${SH_FILES[@]}"; then
+            echo "✗ shellcheck: fix the findings above and re-stage." >&2
+            exit 1
+        fi
+    else
+        echo "pre-commit: shellcheck not installed — skipping." >&2
+    fi
+fi
+
+# yamllint: same all-tracked policy for YAML, using the relaxed .yamllint config.
+if echo "$STAGED" | grep -qE '\.ya?ml$'; then
+    if command -v yamllint >/dev/null 2>&1; then
+        echo "pre-commit: yamllint"
+        mapfile -t YML_FILES < <(git ls-files '*.yml' '*.yaml')
+        if ! yamllint -c .yamllint "${YML_FILES[@]}"; then
+            echo "✗ yamllint: fix the findings above and re-stage." >&2
+            exit 1
+        fi
+    else
+        echo "pre-commit: yamllint not installed — skipping." >&2
     fi
 fi
 

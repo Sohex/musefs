@@ -1,0 +1,19 @@
+---
+# Relaxed yamllint policy used by the pre-commit hook. GitHub Actions workflows
+# drive the relaxations: long lines, the `on:` trigger key, `${{ }}`/flow-map
+# spacing, and `# vX.Y` action-pin comments are all idiomatic there. Genuine
+# errors (syntax, duplicate keys, inconsistent indentation, trailing whitespace,
+# truthy *values*) still gate.
+extends: default
+
+rules:
+  line-length: disable
+  document-start: disable
+  truthy:
+    check-keys: false
+  braces:
+    max-spaces-inside: 1
+  comments:
+    min-spaces-from-content: 1
+  indentation:
+    indent-sequences: consistent
