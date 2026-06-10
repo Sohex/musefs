@@ -186,6 +186,17 @@ exclude_re = [
     # The `|`->`&` sibling IS caught and stays in scope.
     'musefs-format/src/fuzz_check\.rs:\d+:\d+: replace \| with \^ in fixtures::flac_block',
 
+    # fuzz_check fixtures::mp3_with_binary_frame::synchsafe ID3v2.4 size encoder
+    # `(v >> 21|14|7) & 0x7F` -> `<<`: every size this fixture encodes is < 128
+    # (GEOB body = 27 B, frame = 37 B), so only the low 7-bit byte is ever non-zero
+    # and the three high bytes are 0 regardless of shift direction — `>>` and `<<`
+    # produce identical output for every input the fixture feeds in. Equivalent
+    # mutants, description-anchored so `cargo fmt` line drift can't retire them. The
+    # `& 0x7F` masks and the low-byte `v & 0x7F` stay in scope (those mutants are
+    # caught).
+    # guard: count=3
+    'musefs-format/src/fuzz_check\.rs:\d+:\d+: replace >> with << in fixtures::mp3_with_binary_frame::synchsafe',
+
     # SP2 incremental tree refresh — equivalent mutants in apply_changes & friends.
     # The whole design contract is "the incrementally-mutated tree is byte-identical
     # to a full VirtualTree::build_with over the same final track set" (enforced by
