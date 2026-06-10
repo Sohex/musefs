@@ -40,5 +40,16 @@ fn main() {
         "seed0",
         &fixtures::wav(&[0i16, 1, -1, 100, -100, 32767, -32768]),
     );
+    // serve target: one seed per covered format selector. Byte 0 picks the format
+    // (int_in_range(0..=6)); the trailing bytes drive tags/art + read windows.
+    for (name, sel) in [
+        ("seed_flac", 0u8),
+        ("seed_wav", 1u8),
+        ("seed_mp3", 2u8),
+        ("seed_m4a", 3u8),
+        ("seed_opus", 6u8),
+    ] {
+        write("serve", name, &[sel, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+    }
     println!("seeds written under fuzz/corpus/");
 }
