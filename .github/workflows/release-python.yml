@@ -134,12 +134,12 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: .venv/bin/python -m pytest contrib/picard/tests -v
 
-  lidarr-smoke:
+  lidarr-e2e:
     needs: version-gate
-    uses: ./.github/workflows/lidarr-smoke.yml
+    uses: ./.github/workflows/lidarr-e2e.yml
 
   publish:
-    needs: [test-python-musefs, test-beets, test-lidarr, test-picard, lidarr-smoke]
+    needs: [test-python-musefs, test-beets, test-lidarr, test-picard, lidarr-e2e]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

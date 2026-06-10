@@ -38,10 +38,16 @@ both) and is finalized last.
 
 - The other pre-v1.0.0 release blockers #184 (PyPI trusted-publisher setup) and
   the broader contract/test-hardening streams (#200/#201/#203, #204/#208/#209).
-- The Lidarr **download-client** import path (`AlbumImportedEvent` /
-  `On Release Import`, which only fires for `NewDownload` imports). It remains a
-  documented, manually-exercised gap, as the 2026-06-07 checklist already
-  records.
+
+> **Update (post-design):** Component 2 was first scoped to a mock-API smoke,
+> leaving the Lidarr **download-client** path (`AlbumImportedEvent`, which only
+> fires for `NewDownload` imports) as a manual gap. That gap was subsequently
+> **closed** by a full real-instance e2e (`.github/workflows/lidarr-e2e.yml`,
+> `scripts/lidarr-e2e/run-e2e.sh`): local metadata/indexer/qBittorrent mocks
+> drive a real Lidarr through a genuine download-client import → `OnReleaseImport`
+> → the real musefs scripts, asserting the served file carries Lidarr-supplied
+> tags. The two tiers below are the final state: the **mock-API smoke** is the
+> fast PR check; the **full e2e** is the release gate on the Python publish.
 
 ## Component 1 — Restructured release.yml (#164 + #222 + #163)
 
@@ -230,11 +236,14 @@ and reusable (`workflow_call`). Steps:
   (today `needs: [test-python-musefs, test-beets, test-lidarr, test-picard]`,
   `release-python.yml:138`). A Python package release cannot publish without it
   green — the non-forgettable mechanism #224 requires.
-- **PR coverage:** also run on PRs touching `contrib/lidarr/**` or the musefs
-  binary, so the gate stays continuously green rather than firing only at
-  release time.
-- **Documented gap:** the download-client → `AlbumImportedEvent` path stays
-  manual; the checklist records it as a known gap.
+- **PR coverage:** the mock-API smoke (`lidarr-smoke.yml`) runs on PRs touching
+  `contrib/lidarr/**` or the musefs binary, so the integration stays
+  continuously green rather than firing only at release time.
+- **Release gate:** the **full real-instance e2e** (`lidarr-e2e.yml`) is the
+  job in `publish`'s `needs` — a Python release cannot publish without it green.
+- **Download-client path: now covered** (no longer a manual gap) — the full e2e
+  drives a real `NewDownload` import → `OnReleaseImport`; see the post-design
+  update under *Out of scope*.
 
 ## Component 3 — Rust `v*` release procedure docs (#223, incl. #162)
 
