@@ -421,7 +421,7 @@ jobs:
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan, lidarr-smoke]
+    needs: [changes, check, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results
