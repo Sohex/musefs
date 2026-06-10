@@ -38,6 +38,21 @@ jobs:
         run: cargo install cargo-fuzz
       - name: Build targets
         run: cargo +nightly fuzz build
+      - name: Replay committed reproducers (-runs=0)
+        run: |
+          shopt -s nullglob
+          status=0
+          for dir in fuzz/regressions/*/; do
+            target=$(basename "$dir")
+            files=("$dir"*)
+            if [ ${#files[@]} -eq 0 ]; then
+              echo "== $target: no reproducers, skipping =="
+              continue
+            fi
+            echo "== $target: replaying ${#files[@]} reproducer(s) =="
+            cargo +nightly fuzz run "$target" "${files[@]}" -- -runs=0 || status=1
+          done
+          exit $status
       - name: Smoke-run each target
         run: |
           for t in flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment; do
@@ -51,7 +66,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [flac, mp3, mp4, ogg, wav, ogg_page, b64, vorbiscomment]
+        target: [flac, mp3, mp4, ogg, wav, ogg_page, b64, vorbiscomment, serve]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
