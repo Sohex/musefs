@@ -58,8 +58,11 @@ Consult these before exploring by hand; they are kept current.
 ## Repo-operational facts
 
 - The pre-commit hook runs fmt, clippy (`-D warnings`), the **full workspace
-  test suite**, and ruff over the Python paths — a commit with red tests is
-  always rejected, so TDD plans need each commit green.
+  test suite**, `shellcheck`/`yamllint` over tracked shell/YAML files, and ruff
+  over the Python paths — a commit with red tests is always rejected, so TDD
+  plans need each commit green. The cargo gate is skipped for docs-only commits
+  (every staged path under `docs/` or a `*.md` file); the shell/YAML legs skip
+  when their tool is absent.
 - The `fuzz/` crate is outside the workspace: format-layer API changes can
   break it silently — `cargo +nightly fuzz build` to check
   ([CONTRIBUTING.md](CONTRIBUTING.md#coverage-guided-fuzzing)).

@@ -45,6 +45,7 @@ HTTP_PIDFILE="$WORK/http.pid"
 
 log() { printf '\n=== %s ===\n' "$*"; }
 
+# shellcheck disable=SC2329  # invoked via 'trap cleanup EXIT INT TERM' below
 cleanup() {
     for pf in "$PIDFILE" "$HTTP_PIDFILE"; do
         if [ -f "$pf" ]; then
