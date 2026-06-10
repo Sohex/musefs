@@ -1,9 +1,9 @@
 #![no_main]
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
-use musefs_core::{read_at_with_file, HeaderCache, Mode};
+use musefs_core::{HeaderCache, Mode, read_at_with_file};
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
-use musefs_fuzz::{arb_arts, arb_tags, MAX_INPUT};
+use musefs_fuzz::{MAX_INPUT, arb_arts, arb_tags};
 use std::io::Write;
 
 /// Build a one-track in-memory DB over `backing` written to a temp file, and
@@ -16,10 +16,7 @@ fn setup(
 ) -> Option<(tempfile::TempDir, Db, i64)> {
     let dir = tempfile::tempdir().ok()?;
     let path = dir.path().join("backing");
-    std::fs::File::create(&path)
-        .ok()?
-        .write_all(backing)
-        .ok()?;
+    std::fs::File::create(&path).ok()?.write_all(backing).ok()?;
     let meta = std::fs::metadata(&path).ok()?;
     let db = Db::open_in_memory().ok()?;
     let id = db
@@ -39,8 +36,7 @@ fn setup(
             .ok()?,
         })
         .ok()?;
-    db.replace_tags(id, &[Tag::new("title", "T", 0)])
-        .ok()?;
+    db.replace_tags(id, &[Tag::new("title", "T", 0)]).ok()?;
     Some((dir, db, id))
 }
 
@@ -171,8 +167,8 @@ fuzz_target!(|data: &[u8]| {
         if expected > 0 {
             assert_eq!(
                 got.as_slice(),
-                &whole[usize::try_from(offset).unwrap()
-                    ..usize::try_from(offset + expected).unwrap()],
+                &whole
+                    [usize::try_from(offset).unwrap()..usize::try_from(offset + expected).unwrap()],
                 "window != clamped slice of whole read",
             );
         }

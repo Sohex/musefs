@@ -49,7 +49,11 @@ fn main() {
         ("seed_m4a", 3u8),
         ("seed_opus", 6u8),
     ] {
-        write("serve", name, &[sel, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+        write(
+            "serve",
+            name,
+            &[sel, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+        );
     }
     println!("seeds written under fuzz/corpus/");
 }

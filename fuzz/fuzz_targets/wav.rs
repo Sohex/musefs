@@ -1,8 +1,8 @@
 #![no_main]
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
-use musefs_format::{fuzz_check::assert_backing_covers_audio, wav, Extent};
-use musefs_fuzz::{arb_arts, arb_tags, MAX_INPUT};
+use musefs_format::{Extent, fuzz_check::assert_backing_covers_audio, wav};
+use musefs_fuzz::{MAX_INPUT, arb_arts, arb_tags};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_INPUT {
