@@ -87,6 +87,49 @@ short-circuits the scan for sequential reads. A page walk that overruns the
 scanned audio bounds is a hard `Malformed` error — corrupt or misaligned
 data is refused, not served.
 
+## CRC patching: the linear-CRC trick
+
+This is the neatest thing in the Ogg path. Every Ogg page carries a CRC-32 over
+its *entire* contents — header **and** payload, with the 4-byte CRC field
+treated as zero during the computation (`musefs-format/src/ogg/crc.rs`).
+Renumbering shifts every audio page's sequence number by Δ, which changes 4
+header bytes (offsets 18..22). Naively, repairing the CRC means re-checksumming
+the whole page — including the up-to-64 KB payload that musefs has gone out of
+its way *never* to pull into memory.
+
+It doesn't have to. The Ogg CRC uses init 0, no input/output reflection, and no
+final XOR, which makes it **linear over GF(2)**: for two equal-length messages,
+`crc32(A ⊕ B) == crc32(A) ⊕ crc32(B)`. Take `A` = the original page and `B` = a
+*delta* page the same length as the original but all zeros except bytes 18..22,
+which hold `old_seq ⊕ new_seq`. Then `A ⊕ B` is exactly the renumbered page, so:
+
+```text
+new_crc = old_crc ⊕ crc32(DELTA)
+```
+
+and the payload — identical in `A` and `A ⊕ B` — cancels out entirely. The
+patched CRC depends only on the old CRC (already in the header) and the 4-byte
+sequence delta. The payload is never read.
+
+Computing `crc32(DELTA)` also avoids walking the page. The 18 leading zero bytes
+leave the running CRC at 0 (`TABLE[0] = 0`, so each step is a no-op), so the
+computation starts directly from the 4-byte seq delta, then only has to "advance
+the CRC over" the trailing zeros (the rest of the header plus the whole payload
+length, read straight from the segment table). That advance is `crc_shift_zeros`
+— the CRC-32 of *appending n zero bytes*. Appending one zero byte is a fixed
+linear map on the 32-bit CRC state, so appending `n` of them is that 32×32 GF(2)
+matrix raised to the `n`-th power by repeated squaring: **O(log n)**, independent
+of page size. Small, typical pages take a cheaper per-byte loop; only a huge
+single packet laced into max-size pages crosses the matrix threshold.
+
+The net effect is that `patch_page_header_algebraic`
+(`musefs-format/src/ogg/page.rs`) repairs each served audio page's header from
+just its `27 + seg_count` header bytes, in work bounded independent of payload
+size — and the audio payload stays untouched on disk, spliced in verbatim by
+positioned reads. That is what lets the [Ogg invariant](#the-ogg-invariant)
+("renumbering patches, never recopies") hold at serve time without a per-page
+in-memory index.
+
 ## Quirks & invariants
 
 - Page and header sizes are bounded at parse and serve time
