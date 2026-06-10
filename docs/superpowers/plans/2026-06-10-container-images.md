@@ -323,7 +323,7 @@ is known to work. Note which path you took in the commit/PR.
 
 - [ ] **Step 6: Clean up the scratch context (do not commit binaries)**
 
-Run: `rm -rf ctx target/release/musefs.d 2>/dev/null; rm -rf ctx`
+Run: `rm -rf ctx target/release/musefs.d 2>/dev/null`
 Expected: `ctx/` gone. Confirm `git status --short` shows only `docker/Dockerfile.glibc` as new.
 
 - [ ] **Step 7: Commit**
@@ -468,12 +468,12 @@ resolved SHAs from Step 1:
         with:
           python-version: '3.x'
       - name: Download amd64 artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: musefs-${{ matrix.amd64_triple }}
           path: dl/amd64
       - name: Download arm64 artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: musefs-${{ matrix.arm64_triple }}
           path: dl/arm64

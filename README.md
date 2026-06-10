@@ -215,7 +215,7 @@ Registry:
 `docker pull` selects the CPU architecture automatically. Use the `-musl` /
 `:musl` tags when slotting musefs into an Alpine-based stack; the default
 (glibc) tags suit everything else. Floating `:latest` / `:musl` track the most
-recent stable release only — prereleases publish version-pinned tags only.
+recent stable release only — prereleases publish only version-pinned tags.
 
 **Running musefs on the host is the simplest, best-supported option** — it is an
 ordinary FUSE daemon and the image exists mainly to colocate musefs with
@@ -237,6 +237,11 @@ docker run --rm \
 
 Without `--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined`
 the mount cannot be established.
+
+Note that `CAP_SYS_ADMIN` is a broadly privileged capability — it grants far more
+than FUSE mounting (mounting arbitrary filesystems, and more). It is unavoidable
+for an in-container FUSE mount, but it is another reason to prefer running musefs
+on the host, which needs no such capability.
 
 ### The mount-visibility gotcha (read this before sharing the mount)
 
