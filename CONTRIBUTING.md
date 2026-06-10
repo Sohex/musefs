@@ -158,6 +158,28 @@ cargo +nightly fuzz coverage <target>             # confirm coverage reaches the
 cargo run --manifest-path fuzz/Cargo.toml --bin generate_seeds   # (re)build seeds
 ```
 
+### Fuzz crash regressions
+
+When you fix a fuzz-found crash:
+
+1. Drop the reproducer bytes into `fuzz/regressions/<target>/` (one file per
+   reproducer). The per-PR fuzz `smoke` job's replay step runs every committed
+   reproducer with `cargo +nightly fuzz run <target> <files> -- -runs=0` — a
+   deterministic single pass that fails the build if any known input panics
+   again. This is separate from `fuzz/corpus/`, which `cargo fuzz cmin`
+   minimizes (and would prune reproducers from).
+2. Where the crash exposed a real logic/behavior defect, also add a focused
+   behavioral test for that logic in the owning crate's suite (the pre-commit
+   hook gates it). The byte replay proves the exact input no longer panics; the
+   behavioral test documents and locks in the fix. They are not interchangeable.
+
+Coverage notes: the per-format targets also drive the bounded/ceiling probers
+(`*_bounded`, `locate_audio_at_ceiling`, `read_structure_from`) and assert a
+differential oracle against the full-buffer parse. The `serve` target fuzzes the
+read-time serve path (`read_at_with_file` over adversarial layouts, including
+`serve_ogg_window`/`OggArtSlice`) and is scheduled-only (built per-PR, not
+smoke-run) because it builds a DB + temp backing file per input.
+
 ### Independent-reader interop (mutagen)
 
 Asserts that an independent ecosystem reader sees the tags musefs
