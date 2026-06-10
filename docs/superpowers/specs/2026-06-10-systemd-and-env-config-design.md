@@ -274,9 +274,12 @@ default below. Specific requirements:
 - Boolean vars list the exact accepted spellings inline
   (`true`/`false`/`yes`/`no`/`on`/`off`/`1`/`0`, case-insensitive), since an
   unrecognized value is a hard error, not a silent false.
-- Use **absolute paths** (or none): under a `--user` unit the working directory
-  defaults to `%h`, so a relative `MUSEFS_DB` resolves against home, which is
-  surprising.
+- Use **absolute paths**. Two reasons: under a `--user` unit the working
+  directory defaults to home, so a relative `MUSEFS_DB` resolves there; and
+  `%h` (and other systemd specifiers) are **not** expanded inside an
+  `EnvironmentFile` — only in unit directives — so `MUSEFS_DB=%h/...` would
+  pass the literal string `%h/...` to musefs. The example uses a
+  `/home/youruser/...` placeholder and tells the user to edit it.
 
 systemd's `EnvironmentFile` parses `KEY=value` lines (no shell quoting, values
 are literal to end of line — no `$VAR` expansion, no quote stripping); the
