@@ -81,20 +81,35 @@ A new CI job, `contract`, that:
 2. Runs each plugin's `musefs_bin` tier (`-m musefs_bin`) for `python-musefs`,
    beets, Picard, and Lidarr — **with skip-on-missing-binary turned into a hard
    failure.** Today a missing binary silently skips; under this job a missing or
-   unset `MUSEFS_BIN` must fail. This is enforced in the shared pytest
-   conftest/fixture: when an opt-in "require binary" signal is set (e.g.
-   `MUSEFS_REQUIRE_BIN=1`), the fixture raises instead of `pytest.skip`.
-3. Runs a **synthesis round-trip test** (the part that catches "misinterprets"):
-   - a small backing audio file is placed on disk;
-   - `python-musefs` writes a track row + tags + art into a fresh DB, pointing
-     the track at that backing file (the same store API exercised by
-     `test_store_db` / `test_store_art`);
-   - a Rust harness opens that externally-written DB and synthesizes the served
-     bytes via `reader::read_at` (no FUSE mount). This is the `interop_emit`
-     synthesis + read-back machinery, generalized to source rows from an
-     existing DB instead of building its own in-process; the exact form (a
-     `--ignored` cargo test pointed at `MUSEFS_DB`, vs. a `musefs` binary render
-     path) is settled in the plan;
+   unset `MUSEFS_BIN` must fail. The binary-discovery logic is **not currently
+   uniform** — each plugin has its own `conftest.py` / discovery fixture — so the
+   plan must wire a single shared signal (e.g. `MUSEFS_REQUIRE_BIN=1`, set by the
+   `contract` job) into each plugin's discovery fixture, converting `pytest.skip`
+   → hard failure consistently across all four. The default opt-out
+   (`-m 'not musefs_bin and not e2e'`) is untouched, so local default runs still
+   skip.
+3. Runs a **synthesis round-trip test** (the part that catches "misinterprets").
+   The external-writer contract (`ARCHITECTURE.md` "The external-writer
+   contract") splits ownership: the **scanner** owns the `tracks` geometry
+   columns (`backing_path`, `format`, `audio_offset`, `audio_length`,
+   `backing_size`, `backing_mtime`, …) and `structural_blocks`; **external
+   writers** (python-musefs) own only `tags`, `art`, `track_art`. The round trip
+   must respect that split:
+   - a small real backing audio file is placed on disk;
+   - **`musefs scan`** (the binary this job already builds) is run over it,
+     creating the `tracks` row + geometry + `structural_blocks` — python-musefs
+     cannot and must not write these (its store API is tags/art only:
+     `replace_tags` / `replace_track_art`, no geometry write);
+   - `python-musefs` then writes tags + art for that scanned track (the store
+     API exercised by `test_store_db` / `test_store_art`);
+   - a **new** Rust harness opens that externally-written DB read-only via
+     `Db::open_readonly` (`musefs-db/src/lib.rs`) and synthesizes the served
+     bytes via `reader::read_at` (no FUSE mount). It reuses `interop_emit`'s
+     read-back / mutagen assertion helpers but **not** its DB construction
+     (`interop_emit` builds its own DB in-process and cannot be pointed at an
+     external one). Form: a `--ignored` cargo test in `musefs-core` pointed at a
+     `MUSEFS_DB` env path, run by the `contract` job after the scan + Python
+     write;
    - the synthesized bytes are asserted to parse and the tags/art are read back
      and compared to what Python wrote, using the same independent-reader
      (mutagen) assertions the existing `interop` job already relies on.
@@ -171,6 +186,12 @@ the existing `metrics` feature** (not `cfg(test)`), so:
   metrics-feature tests`) and the single-test-binary pattern used for the
   global `set_fault_pread` `OnceLock`.
 
+The seam sits at the **positioned backing-read call in the per-handle read
+path** — the same call site that `metrics::on_pread` already instruments
+(`musefs-core/src/reader.rs`, around the positioned read feeding `on_pread`).
+That is the choke point every backing read passes through, so it can intercept
+the read result before the reader's size/mtime re-validation runs.
+
 The seam is **distinct from** `set_fault_pread`: it is a properly-scoped,
 per-test configurable injector (not the latency-only global hook, which stays
 latency-only). It can be configured to produce, on a backing read:
@@ -218,6 +239,29 @@ that the serve fails cleanly.
   (no red-test commits — `musefs-prepush-checks`).
 - Any in-tree harness (e.g. the round-trip script) is committed as a runnable
   script that CI invokes, per the repo convention for test harnesses.
+
+## Open feasibility risks the plan must resolve
+
+These are deferred to the plan, but flagged here so they are decided
+deliberately rather than discovered mid-implementation:
+
+- **Sanitizers over C deps (B).** ASan/TSan need a nightly toolchain. Whether to
+  use `-Zbuild-std` for instrumented std, and whether `libsqlite3-sys` /
+  `fuser`'s C is built with usable symbolization, must be pinned. The fallback if
+  `-Zbuild-std` proves too slow/flaky is ASan without it (still catches workspace
+  + FFI-boundary memory errors). ASan is the required gate, so its config must be
+  reliable; TSan can stay noisy.
+- **ENOSPC simulation in CI (C).** A genuine `ENOSPC` is awkward on a shared
+  runner. The plan must choose a concrete mechanism — a small fixed-size tmpfs or
+  loopback filesystem the test fills, or a writable dir made read-only to force
+  the write error — and confirm it works unprivileged on the Ubuntu runner. If no
+  unprivileged mechanism is reliable, `ENOSPC` may degrade to a documented
+  best-effort/local-only case while lock + corruption stay mandatory.
+- **Stress-test determinism (B).** The concurrent tests are a *required* gate, so
+  they must be deterministic: bounded iteration counts, barrier/latch
+  synchronization rather than sleeps, and assertions on *outcomes* (correct bytes,
+  no error, no deadlock within a timeout) rather than on timing. A test that is
+  merely "usually" green cannot gate `ci-ok`.
 
 ## Sequencing
 
