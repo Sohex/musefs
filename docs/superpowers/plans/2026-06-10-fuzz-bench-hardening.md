@@ -267,12 +267,12 @@ with:
 
 Run:
 ```bash
-cargo run -p musefs-fuzz --bin generate_seeds
+( cd fuzz && cargo run --bin generate_seeds )
 cmp -s fuzz/corpus/mp3/seed0 fuzz/corpus/mp3/seed_binary && echo "IDENTICAL (BAD)" || echo "DIFFER (GOOD)"
 ```
 Expected: prints `DIFFER (GOOD)`.
 
-Note: `generate_seeds` is a bin in the fuzz crate; run it from the repo root with `-p musefs-fuzz`. If cargo cannot find the package (separate workspace), `cd fuzz && cargo run --bin generate_seeds` instead.
+Note: `fuzz/` is in the root workspace's `exclude` list (it is its own workspace), so `cargo run -p musefs-fuzz` from the repo root fails with "did not match any packages". Always run the generator from inside `fuzz/`.
 
 - [ ] **Step 7: Commit**
 
@@ -333,23 +333,18 @@ In `musefs-format/src/mp3.rs`, inside `#[cfg(test)] mod tests` (which already ex
     }
 ```
 
-Note: `mod tests` needs `Extent` in scope. If `use super::*;` does not bring it in, add `use crate::Extent;` at the top of `mod tests`.
+Note on imports: `mod tests` already has `use super::*;`, and `mp3.rs` imports `Extent` at the top (`use crate::probe::Extent;` — line 5), so `Extent` is already in scope inside `mod tests`. Do **not** add another `use crate::Extent;` — a redundant import trips the pre-commit `-D warnings` gate. This also depends on Task 3 (it adds `fixtures::mp3_with_binary_frame()`), so do Task 3 first.
 
-- [ ] **Step 2: Run the test to verify it fails (compile error on the new fixture is acceptable as failure)**
+- [ ] **Step 2: Run the characterization test — it should PASS immediately**
 
-Run: `cargo test -p musefs-format --features fuzzing mp3_bounded_matches_full -- --nocapture`
-Expected: FAIL (test not yet present prior to this edit, or a real assertion failure if the equivalence does not hold — if it asserts-fails, STOP: the #212 mp3 oracle must drop to weak-invariants-only and the fuzz target in Step 4 must be adjusted accordingly; record this).
-
-- [ ] **Step 3: (No production code change needed — the test pins existing behavior)**
-
-This test pins the existing `mp3.rs` behavior; if Step 2 passed already, proceed. If it failed on the assertion (not compilation), the equivalence is false and the plan's mp3 fuzz oracle (Step 4) must use only panic-freedom + the `up_to <= file_len` bound rather than `assert_eq!`.
-
-- [ ] **Step 4: Run the test to verify it passes**
+This is a characterization test that pins the *existing* `mp3.rs` behavior (it asserts the bounded and full probers already agree), so it passes on the first green run — there is no red-to-green cycle here.
 
 Run: `cargo test -p musefs-format --features fuzzing mp3_bounded_matches_full -- --nocapture`
 Expected: PASS.
 
-- [ ] **Step 5: Add the bounded oracle to the mp3 fuzz target**
+If instead it fails on an **assertion** (not a compile error), STOP: the bounded/full equivalence is false, so the #212 mp3 fuzz oracle in Step 3 must drop to weak-invariants-only (panic-freedom + `up_to <= file_len`) instead of `assert_eq!`. If it fails to **compile** with "no function `mp3_with_binary_frame`", Task 3 has not been done yet — do it first.
+
+- [ ] **Step 3: Add the bounded oracle to the mp3 fuzz target**
 
 In `fuzz/fuzz_targets/mp3.rs`, change the imports line:
 
@@ -386,12 +381,12 @@ insert:
     }
 ```
 
-- [ ] **Step 6: Build and short-run the target**
+- [ ] **Step 4: Build and short-run the target**
 
 Run: `cargo +nightly fuzz build mp3 && cargo +nightly fuzz run mp3 -- -runs=5000 -max_total_time=20`
 Expected: compiles; run exits 0 with no crash artifact.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add musefs-format/src/mp3.rs fuzz/fuzz_targets/mp3.rs
@@ -1024,23 +1019,34 @@ fuzz_target!(|data: &[u8]| {
     let whole = read_at_with_file(&resolved, &db, &file, 0, total).unwrap();
     assert_eq!(whole.len() as u64, total, "whole read length != total_len");
 
-    // Draw up to 8 arbitrary windows; each must equal the matching slice of whole.
+    // Draw up to 8 windows, including ranges that start at/after EOF or run past
+    // it (offset/size range up to total+64). read_segments_into clamps the read
+    // to [offset, total); an oversized/past-EOF range must not panic and must
+    // return the clamped length (0 when offset >= total), and the bytes must
+    // equal the clamped slice of the whole read.
+    let slack = total.saturating_add(64);
     for _ in 0..8 {
-        let offset = match u.int_in_range(0..=total) {
+        let offset = match u.int_in_range(0..=slack) {
             Ok(v) => v,
             Err(_) => break,
         };
-        let size = match u.int_in_range(0..=total.saturating_sub(offset)) {
+        let size = match u.int_in_range(0..=slack) {
             Ok(v) => v,
             Err(_) => break,
         };
         let got = read_at_with_file(&resolved, &db, &file, offset, size).unwrap();
-        assert_eq!(got.len() as u64, size, "window length != requested size");
-        assert_eq!(
-            got.as_slice(),
-            &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + size).unwrap()],
-            "window != slice of whole read",
-        );
+        // Mirror read_segments_into's clamp: served = [min(offset,total), min(offset+size,total)).
+        let end = offset.saturating_add(size).min(total);
+        let expected = end.saturating_sub(offset.min(total));
+        assert_eq!(got.len() as u64, expected, "clamped window length mismatch");
+        if expected > 0 {
+            assert_eq!(
+                got.as_slice(),
+                &whole[usize::try_from(offset).unwrap()
+                    ..usize::try_from(offset + expected).unwrap()],
+                "window != clamped slice of whole read",
+            );
+        }
     }
 });
 ```
@@ -1091,10 +1097,10 @@ In `fuzz/src/bin/generate_seeds.rs`, before the final `println!`, add seeds that
 
 Run:
 ```bash
-cargo run -p musefs-fuzz --bin generate_seeds || (cd fuzz && cargo run --bin generate_seeds)
+( cd fuzz && cargo run --bin generate_seeds )
 ls fuzz/corpus/serve/
 ```
-Expected: lists `seed_flac seed_m4a seed_mp3 seed_opus seed_wav`.
+Expected: lists `seed_flac seed_m4a seed_mp3 seed_opus seed_wav`. (Run from inside `fuzz/` — `fuzz` is excluded from the root workspace, so `cargo run -p musefs-fuzz` from the root fails.)
 
 - [ ] **Step 3: Run serve over the new corpus**
 
@@ -1148,29 +1154,11 @@ done
 ```
 Expected: prints `skip <target> (no reproducers)` for every target (the `.gitkeep` is a dotfile and `*` does not match it, so `files` is empty). No errors.
 
-- [ ] **Step 3: Add the `regressions` job to `fuzz.yml`**
+- [ ] **Step 3: Add the deterministic replay as a step in the existing `smoke` job**
 
-In `.github/workflows/fuzz.yml`, add a new job after the `smoke` job (and before or after `scheduled`). It mirrors `smoke`'s toolchain/cargo-fuzz setup, then runs the deterministic replay:
+The `smoke` job already does `cargo install cargo-fuzz` + `cargo +nightly fuzz build` (which now also builds `serve`, pulling in `musefs-core`). Reuse that build: add the replay as a step in `smoke` **right after the "Build targets" step and before the "Smoke-run each target" step**, so the fast deterministic regression check runs first and a second `musefs-core`-dependent build is avoided. In `.github/workflows/fuzz.yml`, in the `smoke` job's `steps:`, insert:
 
 ```yaml
-  regressions:
-    # Per-PR: deterministic single-pass replay of every committed crash
-    # reproducer. Fails the build if a known input panics again. Not time-boxed.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          toolchain: nightly
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-        with:
-          workspaces: 'fuzz'
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
-      - name: Build targets
-        run: cargo +nightly fuzz build
       - name: Replay committed reproducers (-runs=0)
         run: |
           shopt -s nullglob
@@ -1187,6 +1175,8 @@ In `.github/workflows/fuzz.yml`, add a new job after the `smoke` job (and before
           done
           exit $status
 ```
+
+So the `smoke` job step order becomes: checkout → toolchain → rust-cache → Install cargo-fuzz → Build targets → **Replay committed reproducers (-runs=0)** → Smoke-run each target. The replay is not time-boxed (no `-max_total_time`); it deterministically replays each committed reproducer once and fails the job if any panics.
 
 - [ ] **Step 4: Add `serve` to the `scheduled` matrix only (NOT the smoke loop)**
 
@@ -1213,7 +1203,7 @@ Find the fuzzing section in `CONTRIBUTING.md` (search for `cargo +nightly fuzz` 
 When you fix a fuzz-found crash:
 
 1. Drop the reproducer bytes into `fuzz/regressions/<target>/` (one file per
-   reproducer). The per-PR `regressions` CI job replays every committed
+   reproducer). The per-PR fuzz `smoke` job's replay step runs every committed
    reproducer with `cargo +nightly fuzz run <target> <files> -- -runs=0` — a
    deterministic single pass that fails the build if any known input panics
    again. This is separate from `fuzz/corpus/`, which `cargo fuzz cmin`
