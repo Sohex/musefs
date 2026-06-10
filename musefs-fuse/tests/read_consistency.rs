@@ -6,6 +6,7 @@
 //! See docs/superpowers/specs/2026-06-10-mount-read-consistency-design.md.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use musefs_core::{MountConfig, Musefs, scan_directory};
@@ -114,5 +115,145 @@ fn mmap_whole_file_matches_pread() {
             &via_pread[..],
             "mmap-served bytes must equal pread-served bytes (byte-identical-audio invariant)"
         );
+    });
+}
+
+// --- deterministic, dependency-free PRNG for reproducible randomized reads ---
+
+const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    /// Uniform-ish value in `0..bound` (0 when `bound == 0`).
+    fn below(&mut self, bound: u64) -> u64 {
+        if bound == 0 {
+            0
+        } else {
+            self.next_u64() % bound
+        }
+    }
+}
+
+/// Read `served` fully as the oracle, then fire `iters` seeded `(offset, len)`
+/// reads at the live mount via both `pread` and `mmap`, asserting every in-bounds
+/// byte matches the oracle and that reads starting past EOF return 0.
+///
+/// `seam`, when known (hermetic FLAC), injects the synthesized/`BackingAudio`
+/// boundary and its neighbours into the offset set so the splice point is
+/// straddled every run. `read_exact_at` tolerates kernel mid-file short reads
+/// while still proving byte-fidelity at each offset/len.
+#[expect(
+    unsafe_code,
+    reason = "mmap the served file to compare the readpage path against pread"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "bounded offset/length arithmetic over a small in-test file (n fits usize)"
+)]
+fn sweep_reads(served: &Path, seam: Option<u64>, iters: u32) {
+    let oracle = std::fs::read(served).unwrap();
+    let n = oracle.len() as u64;
+    assert!(n > 0, "served file must be non-empty: {}", served.display());
+
+    let file = std::fs::File::open(served).unwrap();
+    // SAFETY: regular read-only file; map outlives no unmount within this fn.
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    assert_eq!(mmap.len() as u64, n, "mmap length must equal file length");
+
+    let mut fixed: Vec<u64> = vec![0, 1, n.saturating_sub(1), n, n + 1];
+    if let Some(s) = seam {
+        for d in [0i64, -1, 1, -8, 8] {
+            let o = s as i64 + d;
+            if o >= 0 {
+                fixed.push(o as u64);
+            }
+        }
+    }
+
+    let mut rng = XorShift64::new(SEED);
+    for i in 0..iters {
+        let offset = if (i as usize) < fixed.len() {
+            fixed[i as usize]
+        } else {
+            rng.below(n + 2) // samples 0..=n+1, so past-EOF starts are covered
+        };
+        let len = match rng.below(4) {
+            0 => 0,
+            1 => 1,
+            2 => rng.below(n + 2),
+            // a read that starts in range but crosses EOF
+            _ => (n + 1).saturating_sub(offset.min(n)) + rng.below(4),
+        };
+
+        let start = offset.min(n) as usize;
+        let avail = (n - start as u64).min(len) as usize;
+
+        // pread fidelity: read exactly the in-bounds portion and compare.
+        let mut buf = vec![0u8; avail];
+        file.read_exact_at(&mut buf, offset).unwrap_or_else(|e| {
+            panic!(
+                "read_exact_at failed: SEED={SEED:#x} offset={offset} len={len} avail={avail} \
+                 n={n} file={}: {e}",
+                served.display()
+            )
+        });
+        assert_eq!(
+            &buf[..],
+            &oracle[start..start + avail],
+            "pread bytes mismatch: SEED={SEED:#x} offset={offset} len={len} file={}",
+            served.display()
+        );
+
+        if offset >= n {
+            // A read that starts at/after EOF must return 0 bytes.
+            let mut one = [0u8; 1];
+            let got = file.read_at(&mut one, offset).unwrap();
+            assert_eq!(
+                got,
+                0,
+                "read starting past EOF must return 0: SEED={SEED:#x} offset={offset} n={n} file={}",
+                served.display()
+            );
+        } else {
+            // mmap fidelity for the in-bounds slice.
+            let o = offset as usize;
+            assert_eq!(
+                &mmap[o..o + avail],
+                &oracle[o..o + avail],
+                "mmap bytes mismatch: SEED={SEED:#x} offset={offset} len={len} file={}",
+                served.display()
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
+fn randomized_reads_match_oracle_flac() {
+    // Sizable backing audio so the synthesized/BackingAudio seam sits well inside
+    // the file, not at an edge.
+    let audio = backing_audio(8192);
+    let audio_len = audio.len() as u64;
+    with_single_flac_mount(&audio, |_mountpoint, served| {
+        let n = std::fs::metadata(served).unwrap().len();
+        // The served FLAC is [synth metadata][original audio]; the trailing
+        // `audio_len` bytes are the BackingAudio segment, so the splice seam is
+        // at n - audio_len.
+        let seam = n - audio_len;
+        sweep_reads(served, Some(seam), 2000);
     });
 }
