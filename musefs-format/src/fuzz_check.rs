@@ -268,6 +268,49 @@ pub mod fixtures {
         out.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
         out
     }
+
+    /// A well-formed ID3v2.4 MP3 carrying one binary `GEOB` frame (General
+    /// Encapsulated Object) ahead of the audio. `GEOB` is not a text/`COMM`/
+    /// `USLT`/`APIC` frame, so `mp3::read_binary_tags` classifies it as opaque —
+    /// exercising the binary-tag synthesis path immediately, without the fuzzer
+    /// having to mutate its way there from the empty-tag `mp3()` seed.
+    pub fn mp3_with_binary_frame() -> Vec<u8> {
+        // ID3v2.4 frame size is synchsafe (7 bits/byte).
+        fn synchsafe(v: u32) -> [u8; 4] {
+            [
+                ((v >> 21) & 0x7F) as u8,
+                ((v >> 14) & 0x7F) as u8,
+                ((v >> 7) & 0x7F) as u8,
+                (v & 0x7F) as u8,
+            ]
+        }
+        // GEOB body: a minimal, structurally-valid General Encapsulated Object
+        // (text-encoding byte, empty MIME/filename/description C-strings, payload).
+        let mut body = vec![
+            0x00, // text encoding: ISO-8859-1
+            0x00, // MIME type: empty C-string
+            0x00, // filename: empty C-string
+            0x00, // content description: empty C-string
+        ];
+        body.extend_from_slice(b"musefs-fuzz-binary-seed");
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"GEOB");
+        frame.extend_from_slice(&synchsafe(u32::try_from(body.len()).unwrap())); // v2.4 synchsafe size
+        frame.extend_from_slice(&[0x00, 0x00]); // frame flags
+        frame.extend_from_slice(&body);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ID3");
+        out.push(0x04); // major version 4
+        out.push(0x00); // revision 0
+        out.push(0x00); // flags
+        out.extend_from_slice(&synchsafe(u32::try_from(frame.len()).unwrap())); // tag body size
+        out.extend_from_slice(&frame);
+        // MPEG frame sync (matches `mp3()`): 0xFF 0xFB + 2 bytes.
+        out.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +484,19 @@ mod fixtures_tests {
     fn mp3_fixture_parses() {
         let f = fixtures::mp3();
         crate::mp3::locate_audio(&f).unwrap();
+    }
+
+    #[test]
+    fn mp3_with_binary_frame_parses_and_carries_binary_tag() {
+        let f = fixtures::mp3_with_binary_frame();
+        // The file is a well-formed MP3: locate_audio accepts it.
+        let bounds = crate::mp3::locate_audio(&f).unwrap();
+        assert!(bounds.audio_length >= 1);
+        // It carries a binary (non-text, non-APIC) ID3 frame, so read_binary_tags
+        // returns a non-empty opaque list — this is the synthesis path the seed
+        // is meant to reach immediately.
+        let (opaque, _promoted) = crate::mp3::read_binary_tags(&f);
+        assert!(!opaque.is_empty(), "expected an opaque binary ID3 frame");
     }
 
     #[test]
