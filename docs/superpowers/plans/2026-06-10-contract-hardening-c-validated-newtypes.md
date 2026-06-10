@@ -22,16 +22,19 @@
 | `musefs-format/src/lib.rs` | re-export `PictureType`, `BlobLen` | modified |
 | `musefs-format/src/flac.rs` | FLAC parser builds `EmbeddedPicture.picture_type` via `PictureType::new` (clamp out-of-range to 0, matching scan's current policy); synthesis read sites use `.get()` | modified |
 | `musefs-format/src/mp3.rs` | mp3 parser/synthesis use `PictureType`/`BlobLen` accessors | modified |
-| `musefs-format/src/mp4.rs` | mp4 parser/synthesis use `PictureType`/`BlobLen` accessors | modified |
-| `musefs-format/src/ogg/mod.rs` | ogg synthesis uses `.get()` on `meta.data_len` | modified |
-| `musefs-format/src/wav.rs` (tests) | test `ArtInput`/`BinaryTagInput` literals updated | modified |
-| `musefs-format/tests/*.rs` | integration-test `ArtInput`/`BinaryTagInput`/`EmbeddedPicture` literals updated | modified |
+| `musefs-format/src/mp4.rs` | mp4 parser/synthesis use `PictureType`/`BlobLen` accessors (incl. binary-tag `bt.len` at 670-684 + zero-guard removal) | modified |
+| `musefs-format/src/ogg/mod.rs` | ogg synthesis uses `.get()` on `meta.data_len`; zero-art filter removed | modified |
+| `musefs-format/src/wav.rs` | **no change** — synthesis delegates to `build_id3v2_segments`; no `ArtInput`/`BinaryTagInput` literals; `wav_front` is unrelated | unchanged |
+| `musefs-format/tests/*.rs` | integration-test `ArtInput`/`BinaryTagInput` literals (Task 4) + `EmbeddedPicture` asserts in `flac_pictures.rs:36` / `mp3_pictures.rs:23` (Task 3) | modified |
 | `musefs-core/src/mapping.rs` | db→format bridge: build `ArtInput`/`BinaryTagInput` with `PictureType::new`/`BlobLen::new`, dropping zero-length entries at construction | modified |
-| `musefs-core/src/scan.rs` | scan boundary: `pic.picture_type` is now a validated `PictureType` (clamp redundancy removed); `track.bounds()` reads in db-comparison tests | modified |
-| `musefs-core/src/reader.rs` | read hot path reads `track.bounds().audio_offset()` / `.audio_length()` | modified |
-| `musefs-core/tests/*.rs` | `Track` audio-field reads updated to `bounds()` accessors | modified |
+| `musefs-core/src/error.rs` | new `CoreError::InvalidPictureType` for the bridge's out-of-range picture type | modified |
+| `musefs-fuse/src/lib.rs` | add `InvalidPictureType` to the exhaustive `errno` match (→ EIO) | modified |
+| `musefs-core/src/scan.rs` | scan boundary: `pic.picture_type` is now a validated `PictureType` (clamp redundancy removed); `track.bounds` reads in db-comparison tests (incl. `:1971`) | modified |
+| `musefs-core/src/reader.rs` | read hot path reads `track.bounds.audio_offset()` / `.audio_length()` (incl. the `:155` guard expression). The in-module over-EOF test is owned by Plan A, not this plan. | modified |
+| `musefs-db/tests/tracks.rs` | `Track` audio-field reads → `bounds()` accessors; bounds-valid fix in `upsert_conflict_updates_all_mutable_columns` | modified |
+| `musefs-core/tests/{scan,scan_counters,probe_equivalence}.rs` | `Track` audio-field reads → `bounds()` accessors (`tests/reader.rs` and `tests/external_contract.rs` are NOT touched here — Plan A owns their over-EOF tests) | modified |
 | `fuzz/src/lib.rs` | `arb_arts`/`arb_binary_tags` build `PictureType`/`BlobLen` (drop zero-length art) | modified |
-| `fuzz/fuzz_targets/ogg.rs` | `ArtInput` literal updated | modified |
+| `fuzz/fuzz_targets/ogg.rs` | `ArtInput` literal updated; zero `data_len` bounded/dropped | modified |
 
 ---
 
@@ -39,7 +42,7 @@
 
 These two design decisions were resolved against the actual code; the tasks below depend on them.
 
-1. **`BlobLen` is non-zero, but `data_len == 0` / `len == 0` are today legal, load-bearing `ArtInput`/`BinaryTagInput` values.** Every synthesis path filters degenerate empty art/tags by an in-band zero check — `flac.rs:254,301`, `mp3.rs:347,365`, `mp4.rs:836`, `ogg/mod.rs:262` — with comments calling out that a zero-length `ArtImage`/`BinaryTag` segment would fail `RegionLayout::validate` (`EmptySegment`). A strictly non-zero `BlobLen` makes `data_len == 0` unrepresentable. **Resolution:** move the zero-drop to the *construction boundaries* (the db→format bridge in `mapping.rs`, the scan path, and the fuzz builders). A zero-length entry is dropped before the `ArtInput`/`BinaryTagInput` is built — observably identical to today, since synthesis would have skipped it anyway. The now-unreachable in-synthesis `== 0` skip branches are removed (their guard can never fire once the field is a `NonZeroU64`), and the format-internal tests that fed zero-length art/tags to exercise the skip are re-pointed at the construction boundary or deleted as dead. This honors the prompt's "apply `BlobLen` only to the DTO length fields and call `.get()` at segment build" while keeping the EmptySegment invariant intact for Plan D.
+1. **`BlobLen` is non-zero, but `data_len == 0` / `len == 0` are today legal, load-bearing `ArtInput`/`BinaryTagInput` values.** Every synthesis path filters degenerate empty art/tags by an in-band zero check — `flac.rs:254` (art count filter) & `300-303` (art guard), `mp3.rs:347-350` (binary guard) & `365-369` (art guard), `mp4.rs:670-673` (binary guard) & `835-836` (art filter), `ogg/mod.rs:260-264` (art filter) — with comments calling out that a zero-length `ArtImage`/`BinaryTag` segment would fail `RegionLayout::validate` (`EmptySegment`). (FLAC binary `APPLICATION`/`CUESHEET` tags are never zero-dropped today — they ride through `valid_binary` with a `> MAX_BLOCK_BODY` cap only — but `BlobLen` makes them non-zero by type regardless.) A strictly non-zero `BlobLen` makes `data_len == 0` unrepresentable. **Resolution:** move the zero-drop to the *construction boundaries* (the db→format bridge in `mapping.rs`, the scan path, and the fuzz builders). A zero-length entry is dropped before the `ArtInput`/`BinaryTagInput` is built — observably identical to today, since synthesis would have skipped it anyway. The now-unreachable in-synthesis `== 0` skip branches are removed (their guard can never fire once the field is a `NonZeroU64`), and the format-internal tests that fed zero-length art/tags to exercise the skip are re-pointed at the construction boundary or deleted as dead. This honors the prompt's "apply `BlobLen` only to the DTO length fields and call `.get()` at segment build" while keeping the EmptySegment invariant intact for Plan D.
 
 2. **Scan-boundary picture-type policy = clamp to 0 (not skip, not error).** Today `scan.rs:571-575` and `:656-660` *clamp* an out-of-range `pic.picture_type` to `0` — never dropping or erroring the picture. Because `EmbeddedPicture.picture_type` becomes a `PictureType` built in the format parsers, the validation moves to the actual untrusted-bytes entry point, the FLAC parser (`flac.rs:386`, the only parser reading a picture-type from raw file bytes; mp3 derives it from the already-valid `id3` enum, mp4 hardcodes `3`). To preserve today's observable behavior, the FLAC parser clamps an out-of-range byte to `PictureType::new(0)` (`PictureType::new(raw).unwrap_or(PictureType::ZERO)`), and `scan.rs`'s now-redundant `if pic.picture_type <= 20 { … } else { 0 }` clamp is replaced by `pic.picture_type.get()`. The integration test asserts that a FLAC file with an out-of-range picture-type byte is ingested with stored picture_type `0`.
 
@@ -53,14 +56,23 @@ Define the newtype, add its error variant, embed it in `Track`, and validate it 
 
 **Files:**
 - `musefs-db/src/error.rs` (add variant)
-- `musefs-db/src/models.rs` (lines 83-95 `Track`; add `TrackBounds` near it)
-- `musefs-db/src/tracks.rs` (lines 31-45 `row_to_track`; tests at 239-265)
+- `musefs-db/src/models.rs` (lines 86-95 `Track`; add `TrackBounds` near it)
+- `musefs-db/src/tracks.rs` (lines 32-46 `row_to_track`; tests at 239-265)
 - `musefs-db/src/lib.rs` (lines 13-16 re-export block)
-- `musefs-core/src/reader.rs` (lines 155, 178, 196-197, 204-205, 245, 249-250, 257, 270-271)
-- `musefs-core/src/scan.rs` (test asserts at 1883-1884, 1918)
+- `musefs-db/tests/tracks.rs` (Track audio-field reads at lines 14, 34, 133-134; **and** the `upsert_conflict_updates_all_mutable_columns` bounds fix — see Step 1.12)
+- `musefs-core/src/reader.rs` (production reads at lines 155, 178, 196-197, 204-205, 245, 249-250, 257, 270-271 — Step 1.11. The in-module over-EOF test is owned by Plan A.)
+- `musefs-core/src/scan.rs` (test asserts at 1883-1884, 1918; **plus the `norm` closure read at line 1971**)
+- `musefs-core/tests/scan.rs` (Track audio-field reads at lines 43, 114, 115)
 - `musefs-core/tests/probe_equivalence.rs` (line 42)
-- `musefs-core/tests/scan_counters.rs` (lines 147-148)
+- `musefs-core/tests/scan_counters.rs` (the `rows` closure read at line 62 **and** the asserts at lines 147-148)
+- (`musefs-core/tests/reader.rs` and `tests/external_contract.rs` are NOT modified by this plan — Plan A owns their over-EOF tests, which assert the V4 CHECK rejection and read no `Track` audio fields.)
 - Test path: `musefs-db/src/models.rs` (unit tests for `TrackBounds`), `musefs-db/src/tracks.rs` (row-read integration)
+
+> **Verified read-site inventory (Track values only; `NewTrack` literals keep raw `u64` and are unaffected).** Every site below reads `audio_offset`/`audio_length` off a `Track` returned by `get_track`/`list_tracks` and so breaks the instant the fields move into `bounds`:
+> - Production: `reader.rs:155,178,196-197,204-205,245,249-250,257,270-271`.
+> - In-crate tests: `scan.rs:1883-1884,1918,1971`.
+> - Integration tests: `tests/scan.rs:43,114,115`; `tests/probe_equivalence.rs:42`; `tests/scan_counters.rs:62,147-148`; `db tests/tracks.rs:14,34,133-134`.
+> Sites that LOOK like reads but are NOT `Track` values (do not touch): `scan.rs:183-242` (`Probed` built from format-crate bounds), `tests/external_contract.rs:32-33` / `tests/interop_emit.rs` `b.*` (a `musefs_format::*::AudioBounds`/`WavBounds`), `bulk.rs:191` (`list_tracks().len()` only). `mapping.rs`/`facade.rs`/`metrics.rs`/`incremental_refresh.rs`/`structural.rs`/`tags.rs`/`art.rs`/`bulk.rs` `audio_offset:`/`audio_length:` are all `NewTrack` literals — unchanged.
 
 - [ ] **Step 1.1: Write failing unit tests for `TrackBounds`.** Append a `#[cfg(test)] mod track_bounds_tests` to `musefs-db/src/models.rs`:
   ```rust
@@ -214,7 +226,7 @@ Define the newtype, add its error variant, embed it in `Track`, and validate it 
   ```
   Add `use crate::models::TrackBounds;` to the existing `use crate::models::{...}` import at `tracks.rs:1`.
 
-- [ ] **Step 1.8: Fix db-internal test readers.** In `musefs-db/src/tracks.rs` the `negative_audio_bounds_tests` mod (239-265) still passes — it only asserts `get_track(id).is_err()` on a negative `audio_offset` (the `u64` row-read already fails). No body change needed there. Add a new test in that mod proving the `TrackBounds` invariant fires on a bounds violation that the per-column `u64` read alone would NOT catch:
+- [ ] **Step 1.8: Fix db-internal test readers.** In `musefs-db/src/tracks.rs` the `negative_audio_bounds_tests` mod (239-265) still passes — it only asserts `get_track(id).is_err()` on a negative `audio_offset` (the `u64` row-read already fails). No body change needed there. Add a new test in that mod proving the `TrackBounds` invariant (layer 2) fires on a bounds violation that the per-column `u64` read alone would NOT catch. Because Plan A's V4 `audio_offset + audio_length <= backing_size` CHECK (already merged when Plan C runs) rejects such a row at write, the test must plant it via `PRAGMA ignore_check_constraints` — which is exactly the point: a row that somehow slips past the SQLite CHECK is still rejected by the Rust row reader:
   ```rust
   #[test]
   fn out_of_range_bounds_error_at_row_read() {
@@ -229,9 +241,16 @@ Define the newtype, add its error variant, embed it in `Track`, and validate it 
               backing_mtime: 0,
           })
           .unwrap();
-      // offset+length now exceeds backing_size: caught by TrackBounds, not by the u64 read.
+      // Plant offset+length > backing_size past the V4 CHECK (layer 1) so we can
+      // prove TrackBounds (layer 2) rejects it at row read.
+      db.conn
+          .pragma_update(None, "ignore_check_constraints", true)
+          .unwrap();
       db.conn
           .execute("UPDATE tracks SET audio_length = 5 WHERE id = ?1", [id])
+          .unwrap();
+      db.conn
+          .pragma_update(None, "ignore_check_constraints", false)
           .unwrap();
       assert!(
           db.get_track(id).is_err(),
@@ -261,18 +280,32 @@ Define the newtype, add its error variant, embed it in `Track`, and validate it 
   ```
   Apply the same `.bounds.audio_offset()` / `.bounds.audio_length()` substitution at every other listed line.
 
-- [ ] **Step 1.12: Fix core test consumers.** Update the `Track`-typed reads:
+- [ ] **Step 1.12: Fix db-crate integration test readers (`musefs-db/tests/tracks.rs`).** Three reads of a `Track` returned by `get_track` break; one also needs a bounds-valid `NewTrack`:
+  - Line 14: `assert_eq!(by_id.bounds.audio_offset(), 100);` (`new_track` sets offset 100, length 1000, backing_size 1100 → 1100 ≤ 1100, valid).
+  - Line 34: `assert_eq!(db.get_track(id).unwrap().unwrap().bounds.audio_offset(), 222);` (`changed.audio_offset = 222` is a write to the `NewTrack` field — keep as-is; only the read on line 34 changes).
+  - Lines 133-134: `assert_eq!(t.bounds.audio_offset(), 222);` / `assert_eq!(t.bounds.audio_length(), 333);`.
+  - **Bounds fix in `upsert_conflict_updates_all_mutable_columns` (lines 120-136):** the `changed` `NewTrack` uses `audio_offset: 222, audio_length: 333, backing_size: 444` — `222 + 333 = 555 > 444`, so `get_track(id)` at line 131 now FAILS `TrackBounds::new` at row read. Bump `backing_size` so the row is readable; change `backing_size: 444` to `backing_size: 555` and update the assert at line 135 to `assert_eq!(t.backing_size, 555);`. (The test's purpose — every mutable column round-trips on conflict-update — is preserved; only the now-invalid bounds combination is corrected.)
+
+- [ ] **Step 1.13: Fix core in-crate + integration test readers.** Update the `Track`-typed reads:
   - `musefs-core/src/scan.rs:1883-1884`: `assert_eq!(track.bounds.audio_offset(), full.bounds.audio_offset());` / `assert_eq!(track.bounds.audio_length(), full.bounds.audio_length());`
   - `musefs-core/src/scan.rs:1918`: `assert_eq!(usize_from(track.bounds.audio_length()), b"DIFFERENT-AUDIO".len());`
+  - `musefs-core/src/scan.rs:1971` (the `norm` closure): `.map(|t| (t.backing_path, t.bounds.audio_offset(), t.bounds.audio_length()))`.
+  - `musefs-core/tests/scan.rs:43`: `assert!(a_track.bounds.audio_length() == 30);`
+  - `musefs-core/tests/scan.rs:114-115`: `assert_eq!(t.bounds.audio_offset(), audio_offset);` / `assert_eq!(t.bounds.audio_length(), audio_len);`
   - `musefs-core/tests/probe_equivalence.rs:42`: `out.push((t.backing_path, t.bounds.audio_offset(), t.bounds.audio_length(), tags, art));`
+  - `musefs-core/tests/scan_counters.rs:62` (the `rows` closure): `.map(|t| (t.backing_path, t.bounds.audio_offset(), t.bounds.audio_length()))`.
   - `musefs-core/tests/scan_counters.rs:147-148`: `assert_eq!(track.bounds.audio_offset(), o_track.bounds.audio_offset());` / `assert_eq!(track.bounds.audio_length(), o_track.bounds.audio_length());`
 
-- [ ] **Step 1.13: Run + see workspace green.** `cargo test -p musefs-db -p musefs-core` — all pass. Then `cargo clippy --all-targets -p musefs-db -p musefs-core -- -D warnings`.
+  > **Note on the over-EOF error-assertion tests.** Plan A (already merged) rewrote the three over-EOF-bounds tests — `build_rejects_audio_region_past_end_of_file` (`musefs-core/src/reader.rs`), `bounds_check_rejects_audio_region_overrunning_the_file` (`musefs-core/tests/reader.rs`), and `scanner_owned_bounds_mutation_is_rejected_by_the_contract` (`musefs-core/tests/external_contract.rs`) — to assert the V4 CHECK rejects the over-EOF **write**. They no longer commit an over-EOF row, call `resolve`, or read `Track` audio fields, so this plan does **not** touch them and they are unaffected by the `Track` field rename. `TrackBounds` (layer 2) is the row-read defense and is tested directly by `out_of_range_bounds_error_at_row_read` (Step 1.8). The `reader.rs:155` production guard — whose expression Step 1.11 rewrites to `track.bounds.…()` — is now logically unreachable (line 119 enforces `meta.len() == backing_size`, and `TrackBounds` enforces `offset + length <= backing_size`, so `offset + length <= meta.len()` always holds in Synthesis); it is left in place as a deliberate defense-in-depth guard.
 
-- [ ] **Step 1.14: Commit.** Stage exactly the files touched:
+- [ ] **Step 1.14: Run + see workspace green.** `cargo test -p musefs-db -p musefs-core` — all pass. Then `cargo clippy --all-targets -p musefs-db -p musefs-core -- -D warnings`.
+
+- [ ] **Step 1.15: Commit.** Stage exactly the files touched (the read-site fixups in `reader.rs`, both `tracks.rs`, and `tests/scan.rs` MUST land in this same commit, or the workspace build/tests go red — the pre-commit hook rejects that). Note: `tests/reader.rs` and `tests/external_contract.rs` are NOT in this set — Plan A owns them and this plan does not modify them:
   ```bash
   git add musefs-db/src/error.rs musefs-db/src/models.rs musefs-db/src/tracks.rs \
-          musefs-db/src/lib.rs musefs-core/src/reader.rs musefs-core/src/scan.rs \
+          musefs-db/src/lib.rs musefs-db/tests/tracks.rs \
+          musefs-core/src/reader.rs musefs-core/src/scan.rs \
+          musefs-core/tests/scan.rs \
           musefs-core/tests/probe_equivalence.rs musefs-core/tests/scan_counters.rs
   git commit -F - <<'EOF'
   feat(db): add validated TrackBounds newtype (#200)
@@ -281,6 +314,12 @@ Define the newtype, add its error variant, embed it in `Track`, and validate it 
   constructor enforcing offset + length <= backing_size at the row
   reader — the untrusted SQL->type boundary. Track embeds it; the
   reader hot path and tests read via the accessors.
+
+  This adds the layer-2 (Rust row-reader) defense beneath Plan A's
+  layer-1 SQLite CHECK: a row that slips past the CHECK is rejected at
+  get_track (DbError::AudioBoundsOutOfRange -> CoreError::Db). The
+  reader.rs:155 live-file guard is now logically unreachable but kept
+  as defense-in-depth.
 
   Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
   EOF
@@ -399,12 +438,16 @@ Define both newtypes (with their unit tests) in `input.rs` and re-export them, B
 Change `EmbeddedPicture.picture_type` to `PictureType`, fix the three parsers and every read/test site in one green commit. `EmbeddedPicture` is built only inside the format crate (FLAC/MP3/MP4 parsers) and consumed by core's scan; this commit covers the format side, the next handles `ArtInput`.
 
 **Files:**
-- `musefs-format/src/input.rs` (line 38 `EmbeddedPicture.picture_type`)
-- `musefs-format/src/flac.rs` (line 386 read, 418-425 construct, 675 test assert, 955 test literal)
+- `musefs-format/src/input.rs` (`EmbeddedPicture.picture_type` field)
+- `musefs-format/src/flac.rs` (line 386 read, 420 construct, 675 test assert; line 955 is an `ArtInput` literal — Task 4)
 - `musefs-format/src/mp3.rs` (line 545 construct)
 - `musefs-format/src/mp4.rs` (line 460 construct)
-- `musefs-core/src/scan.rs` (lines 571-575, 656-660 clamp; test literal at 1048)
+- `musefs-format/tests/flac_pictures.rs` (`EmbeddedPicture` read assert at line 36)
+- `musefs-format/tests/mp3_pictures.rs` (`EmbeddedPicture` read assert at line 23)
+- `musefs-core/src/scan.rs` (lines 571-575, 656-660 clamp; test closure literal at 1048-1050)
 - Test path: `musefs-format` parser tests + `musefs-core` scan tests
+
+> **Verified `EmbeddedPicture.picture_type` read sites (all break when the field becomes `PictureType`):** construct at `flac.rs:420`, `mp3.rs:545`, `mp4.rs:460`; in-crate test asserts `flac.rs:675`; **integration-test asserts `tests/flac_pictures.rs:36` and `tests/mp3_pictures.rs:23`** (both `assert_eq!(p.picture_type, 3)` on a parsed `EmbeddedPicture` — the review flagged these were missing). `mp3_pictures.rs:11` (`id3::frame::PictureType::CoverFront`) is the upstream `id3` crate type — unaffected. `tests/proptest_flac.rs:21,35` only build `Vec::<ArtInput>::new()` — no literal, no change.
 
 - [ ] **Step 3.1: Write a failing format-side test pinning the FLAC clamp policy.** Add to the existing FLAC test module (near the picture tests at `flac.rs:675`) a test that an out-of-range picture-type byte is clamped to 0 at parse:
   ```rust
@@ -459,9 +502,14 @@ Change `EmbeddedPicture.picture_type` to `PictureType`, fix the three parsers an
   ```rust
   let picture_type = pic.picture_type.get();
   ```
-  Update the scan test `EmbeddedPicture` literal at `scan.rs:1048` (`let pic = |n: usize| EmbeddedPicture { … picture_type: n as u32, … }` or similar) to wrap with `PictureType::new(n as u32).unwrap()` (confirm the exact body via `find_symbol`). `TrackArt.picture_type` stays raw `u32` (guarded by the #199 CHECK) — `scan.rs` stores `picture_type` (a `u32` from `.get()`) into `TrackArt`, so no further change there.
+  Update the scan test `EmbeddedPicture` closure at `scan.rs:1048-1050`. Verified body: `let pic = |n: usize| EmbeddedPicture { mime: …, picture_type: 3, …, data: vec![0u8; n] }` — `n` sizes the `data`, and `picture_type` is the hardcoded literal `3` (NOT `n`). Change only that field to `picture_type: PictureType::new(3).unwrap(),` (leave `n`/`data` alone). `TrackArt.picture_type` stays raw `u32` (guarded by the #199 CHECK) — `scan.rs` stores `picture_type` (a `u32` from `.get()`) into `TrackArt`, so no further change there.
 
-- [ ] **Step 3.8: Run + see pass.** `cargo test -p musefs-format -p musefs-core` — all pass, including the new clamp test. `cargo clippy --all-targets -p musefs-format -p musefs-core -- -D warnings`.
+- [ ] **Step 3.7a: Fix the format integration-test `EmbeddedPicture` read asserts.** These read `picture_type` off a parsed `EmbeddedPicture` and break the moment the field is a `PictureType`:
+  - `musefs-format/tests/flac_pictures.rs:36`: `assert_eq!(p.picture_type, 3);` → `assert_eq!(p.picture_type.get(), 3);`
+  - `musefs-format/tests/mp3_pictures.rs:23`: `assert_eq!(p.picture_type, 3);` → `assert_eq!(p.picture_type.get(), 3);`
+  (Both are `--all-targets`/`cargo test` integration targets — they compile in this commit, so they must be fixed here or the commit lands red.)
+
+- [ ] **Step 3.8: Run + see pass.** `cargo test -p musefs-format -p musefs-core` — all pass, including the new clamp test and the two integration-test asserts above. `cargo clippy --all-targets -p musefs-format -p musefs-core -- -D warnings`.
 
 - [ ] **Step 3.9: Write the core integration test for the scan policy.** Add to `musefs-core/tests/scan.rs` (or the nearest existing scan-art test file — confirm by listing `musefs-core/tests/`) a test that ingesting a FLAC with an out-of-range picture-type byte stores `picture_type == 0`:
   ```rust
@@ -483,7 +531,9 @@ Change `EmbeddedPicture.picture_type` to `PictureType`, fix the three parsers an
 - [ ] **Step 3.11: Commit.**
   ```bash
   git add musefs-format/src/input.rs musefs-format/src/flac.rs musefs-format/src/mp3.rs \
-          musefs-format/src/mp4.rs musefs-core/src/scan.rs musefs-core/tests/scan.rs
+          musefs-format/src/mp4.rs musefs-format/tests/flac_pictures.rs \
+          musefs-format/tests/mp3_pictures.rs \
+          musefs-core/src/scan.rs musefs-core/tests/scan.rs
   git commit -F - <<'EOF'
   feat(format): type EmbeddedPicture.picture_type as PictureType (#200)
 
@@ -502,14 +552,15 @@ Change `EmbeddedPicture.picture_type` to `PictureType`, fix the three parsers an
 Change `ArtInput.picture_type` to `PictureType`, `ArtInput.data_len` and `BinaryTagInput.len` to `BlobLen`. Fix the bridge (`mapping.rs`), every synthesis read site, and every test literal in one green commit. This is the largest ripple — plan it as one cohesive change.
 
 **Files:**
-- `musefs-format/src/input.rs` (lines 27, 30 `ArtInput`; line 54 `BinaryTagInput.len`)
-- `musefs-format/src/flac.rs` (208 picture_type; 226, 254, 301, 305, 319 data_len; 283, 289, 296 binary len; test literals 949-955, 999-1003)
-- `musefs-format/src/mp3.rs` (199 picture_type; 347, 355, 359, 361 binary len; 365, 372, 378 data_len; test literals)
-- `musefs-format/src/mp4.rs` (678 binary len; 690, 699, 711, 713, 836 data_len; many test literals)
-- `musefs-format/src/ogg/mod.rs` (262, 297, 315, 357, 407, 420, 468, 481 — `meta.data_len` + picture_type; test literals)
-- `musefs-format/src/wav.rs` (test literals only)
-- `musefs-format/tests/*.rs` (all `ArtInput`/`BinaryTagInput` literals — see ripple list)
-- `musefs-core/src/mapping.rs` (lines 50-58 `ArtInput`, 71-75 `BinaryTagInput`, 86 `read_art_chunk(... a.data_len ...)`)
+- `musefs-format/src/input.rs` (`ArtInput.picture_type`, `ArtInput.data_len`; `BinaryTagInput.len`)
+- `musefs-format/src/flac.rs` (208 picture_type; 226, 254, 300-303 guard, 305, 319 data_len; 283, 289, 296 binary len; test closures `mk` at 951 / 1003; test asserts/literals)
+- `musefs-format/src/mp3.rs` (199 picture_type; 347-350 binary-len guard, 355, 359, 361; 365-369 art guard, 372, 378 data_len; test closures `mk` at 1032 / 1101; tests 1065, 1099 — see Step 4.10a)
+- `musefs-format/src/mp4.rs` (**670-673 binary-len guard removal, 678, 682, 684 binary len**; 690, 699, 711, 713 data_len; 835-836 art filter; tests 1417, 1450, 2348 — see Step 4.10a)
+- `musefs-format/src/ogg/mod.rs` (260-264 filter; 297 picture_type; 315, 357, 407, 420, 468, 481 `meta.data_len`; `art_input` helper at 1005; test 1119 — see Step 4.10a)
+- `musefs-format/src/wav.rs` (**no `ArtInput`/`BinaryTagInput` literals — verified: synthesis delegates to `build_id3v2_segments`; the `wav_front(data_len)` helper at line 727 is a RIFF `data` chunk size `u64`, NOT `ArtInput.data_len` — DO NOT touch it**)
+- `musefs-format/tests/*.rs` — verified literal-bearing files: `proptest_mp4.rs`, `proptest_mp3.rs`, `proptest_wav.rs`, `mp4_oracle.rs`, `synthesize_art.rs`, `mp3_synthesize.rs`, `wav_synthesize.rs`, `roundtrip.rs` (see Step 4.10). `flac_pictures.rs`/`mp3_pictures.rs` `EmbeddedPicture` asserts are handled in Task 3; `proptest_flac.rs` only builds `Vec::<ArtInput>::new()` (no change).
+- `musefs-core/src/mapping.rs` (verified: `track_art_to_inputs` lines 33-60 build `ArtInput`; `binary_tags_to_inputs` 62-76 build `BinaryTagInput`; `track_art_images` line 86 reads `a.data_len`)
+- `musefs-core/src/error.rs` (add `CoreError::InvalidPictureType` — see Step 4.9)
 - Test path: `musefs-format` synthesis tests + `musefs-core/src/mapping.rs` tests
 
 - [ ] **Step 4.1: Write failing bridge tests.** In `musefs-core/src/mapping.rs` `mod tests`, add tests proving the bridge drops zero-length entries and rejects an out-of-range picture type at construction. Because `track_art_to_inputs` reads `picture_type`/`byte_len` from db rows, malformed values are guarded by #199 at the DB but the bridge must still handle the zero-length-drop:
@@ -575,16 +626,19 @@ Change `ArtInput.picture_type` to `PictureType`, `ArtInput.data_len` and `Binary
   - binary: 347 `if bt.len == 0` guard — unreachable, remove it (every `bt.len` is non-zero); 355 `usize_from(bt.len.get())`; 359 `len: bt.len.get(),`; 361 `frames_len += 10 + bt.len.get();`
   - art: 365 `if art.data_len == 0` guard — unreachable, remove; 372 `framing.len() as u64 + art.data_len.get()`; 378 `len: art.data_len.get(),`.
 
-- [ ] **Step 4.6: Fix the MP4 synthesis read sites.** In `musefs-format/src/mp4.rs`:
-  - 678: `freeform_binary_prefix(mean, name, bt.len.get())?`
-  - 690: `…map(|a| 16 + a.data_len.get()).sum::<u64>()`
+- [ ] **Step 4.6: Fix the MP4 synthesis read sites.** In `musefs-format/src/mp4.rs`, the binary-tag loop in `build_udta` (verified lines 669-685) and the covr loop (687-714):
+  - **670-673: remove the `if bt.len == 0 { … continue; }` guard entirely** — `bt.len` is now a non-zero `BlobLen`, so the guard can never fire (it would also fail to compile: `BlobLen == 0`). Delete the three-line `if` block (including its `EmptySegment` comment); the loop body runs for every binary tag.
+  - 678: `ilst_inline.extend_from_slice(&freeform_binary_prefix(mean, name, bt.len.get())?);`
+  - 682: `len: bt.len.get(),`
+  - 684: `streamed_total += bt.len.get();`
+  - 690: `let covr_size: u64 = 8 + arts.iter().map(|a| 16 + a.data_len.get()).sum::<u64>();`
   - 699: `let data_size = 8 + 8 + a.data_len.get();`
   - 711: `len: a.data_len.get(),`
   - 713: `streamed_total += a.data_len.get();`
-  - 836: the `arts.iter().filter(|a| a.data_len > 0)` filter is now total — replace with `arts.to_vec()` (or drop the filter and keep `arts.iter().cloned().collect()`). Keep the binding shape `let arts: Vec<ArtInput> = …;`.
+  - 835-836 (in `synthesize_layout`, BEFORE `build_udta` is called): the `let arts: Vec<ArtInput> = arts.iter().filter(|a| a.data_len > 0).cloned().collect();` filter is now total. Replace with `let arts: Vec<ArtInput> = arts.to_vec();` and delete the preceding "Skip zero-byte art" comment. (Keep the `let arts` rebinding — `build_udta` takes `&[ArtInput]` and the local Vec keeps the call shape; `arts.to_vec()` is the idiomatic clippy-clean form.)
 
 - [ ] **Step 4.7: Fix the Ogg synthesis read sites.** In `musefs-format/src/ogg/mod.rs` (`meta` is `&ArtInput`):
-  - 262: `.filter(|a| a.meta.data_len > 0)` is now total — remove the filter (the `arts` are all non-empty); keep `.copied().collect()`.
+  - 260-264: the `let arts: Vec<OggArt> = arts.iter().filter(|a| a.meta.data_len > 0).copied().collect();` filter is now total. **Delete the whole rebinding (lines 257-264, including the "Exclude zero-byte art" comment) and use the `arts` parameter directly** in the following `build_packets_with_art(header, tags, arts)?` call. Keeping `arts.iter().copied().collect()` without the filter would be a needless clone that `clippy -D warnings` may flag — drop the rebinding entirely instead.
   - 297: `out.extend_from_slice(&art.picture_type.get().to_be_bytes());`
   - 315: `&u32::try_from(art.data_len.get())…`
   - 357: `+ b64_len(a.meta.data_len.get());`
@@ -594,17 +648,26 @@ Change `ArtInput.picture_type` to `PictureType`, `ArtInput.data_len` and `Binary
   - 481: `art_total: art.meta.data_len.get(),`
   - (`picture_prefix` at 297/315 takes a `&ArtInput`, so its `art.picture_type`/`art.data_len` reads are the ones above.)
 
-- [ ] **Step 4.8: Fix the WAV synthesis (if any data_len read).** WAV synthesis filters zero art in `synthesize_layout`; confirm via `find_symbol` whether it reads `a.data_len` directly. If it has a `data_len > 0` filter, make it total like the others; otherwise WAV touches only test literals.
+- [ ] **Step 4.8: WAV synthesis — no change.** Verified: `wav.rs` `synthesize_layout` (line 255) delegates art/binary handling to `crate::mp3::build_id3v2_segments(tags, binary_tags, arts)` and reads NEITHER `a.data_len` NOR `bt.len` directly — the zero-drop and `.get()` calls all happen inside `build_id3v2_segments` (Step 4.5). WAV has no `ArtInput`/`BinaryTagInput` literals in its own test module, and the `wav_front(data_len)` helper at line 727 is an unrelated RIFF `data`-chunk size `u64` — DO NOT touch it. WAV synthesis needs no edit; only the `tests/wav_synthesize.rs` / `tests/proptest_wav.rs` literals (Step 4.10) change.
 
-- [ ] **Step 4.9: Fix the bridge in `mapping.rs`.** Rewrite `track_art_to_inputs` (lines 50-58) to construct `PictureType`/`BlobLen`, dropping zero-length art:
+- [ ] **Step 4.9: Fix the bridge in `mapping.rs`.** First add the picture-type error variant to `musefs-core/src/error.rs` `enum CoreError` (verified: it has `OrphanedArt { track_id, art_id }` but NO picture-type variant). `OrphanedArt` is the wrong label here (the art row is present, not orphaned), so add a dedicated variant and map it to `EIO` alongside the others (match the existing `OrphanedArt` mapping in the FUSE/errno layer — grep for `OrphanedArt` to find the errno arm and add `InvalidPictureType` next to it):
+  ```rust
+  #[error("track {track_id} art {art_id} has out-of-range picture_type {value} (expected 0..=20)")]
+  InvalidPictureType { track_id: i64, art_id: i64, value: u32 },
+  ```
+  **The `errno` match in `musefs-fuse/src/lib.rs:82-93` is exhaustive over `CoreError`** (verified) — add `| CoreError::InvalidPictureType { .. }` to the existing `=> fuser::Errno::EIO` arm (next to `OrphanedArt` at line 91), or `musefs-fuse` fails to compile (non-exhaustive match) and the commit lands red. (`reply_errno` at line 100 has a `_ =>` wildcard — verified — so it needs no change.)
+
+  Then rewrite the `track_art_to_inputs` loop body (verified lines 33-60; the `ArtInput { … }` push is at 51-59) to construct `PictureType`/`BlobLen`, dropping zero-length art and surfacing an out-of-range picture type (`#199` CHECK makes the latter unreachable in practice — defense-in-depth):
   ```rust
   let Some(data_len) = musefs_format::BlobLen::new(meta.byte_len) else {
-      continue; // zero-length art: synthesis would skip it anyway.
+      continue; // zero-length art: synthesis would skip it anyway (now type-level).
   };
   let Some(picture_type) = musefs_format::PictureType::new(ta.picture_type) else {
-      // #199 CHECK guarantees 0..=20; out of range means a malformed
-      // external write that bypassed the constraint — surface it.
-      return Err(crate::error::CoreError::OrphanedArt { track_id, art_id: ta.art_id });
+      return Err(crate::error::CoreError::InvalidPictureType {
+          track_id,
+          art_id: ta.art_id,
+          value: ta.picture_type,
+      });
   };
   inputs.push(ArtInput {
       art_id: ta.art_id,
@@ -616,8 +679,8 @@ Change `ArtInput.picture_type` to `PictureType`, `ArtInput.data_len` and `Binary
       data_len,
   });
   ```
-  (Decide the picture-type-out-of-range error: reuse `OrphanedArt` only if it semantically fits; otherwise add a dedicated `CoreError::InvalidPictureType { track_id, art_id, value }` variant — check `musefs-core/src/error.rs` via `get_symbols_overview` and pick the cleaner option, documenting it in the commit. The simplest spec-faithful choice: the #199 CHECK makes this unreachable in practice, so a dedicated variant kept for defense-in-depth is the honest fit.)
-  Fix `binary_tags_to_inputs` (71-75) to drop zero-length tags:
+  (`ta.picture_type` is `u32` and `meta.byte_len` is `u64` — verified — so `PictureType::new`/`BlobLen::new` typecheck directly.)
+  Fix `binary_tags_to_inputs` (verified lines 62-76; the `.map(...)` is at 70-74) to drop zero-length tags:
   ```rust
   .filter_map(|row| {
       musefs_format::BlobLen::new(row.byte_len).map(|len| BinaryTagInput {
@@ -627,24 +690,33 @@ Change `ArtInput.picture_type` to `PictureType`, `ArtInput.data_len` and `Binary
       })
   })
   ```
-  Fix `track_art_images` (line 86): `usize_from(a.data_len.get())`.
+  Fix `track_art_images` (verified line 86): `db.read_art_chunk(a.art_id, 0, musefs_db::convert::usize_from(a.data_len.get()))?`.
 
-- [ ] **Step 4.10: Fix every format test literal.** Update all `ArtInput { … picture_type: N, … data_len: L, … }` and `BinaryTagInput { … len: L }` literals across `musefs-format/src/{flac,mp3,mp4,ogg/mod,wav}.rs` test modules and `musefs-format/tests/*.rs`:
+- [ ] **Step 4.10: Fix every (non-zero-feeding) format test literal.** Update all `ArtInput { … picture_type: N, … data_len: L, … }` and `BinaryTagInput { … len: L }` literals that pass NON-ZERO values, across `musefs-format/src/{flac,mp3,mp4,ogg/mod}.rs` test modules and the verified `musefs-format/tests/*.rs` files:
   - `picture_type: 3` → `picture_type: PictureType::new(3).unwrap()`
   - `data_len: 40` → `data_len: BlobLen::new(40).unwrap()`
   - `len: 7` → `len: BlobLen::new(7).unwrap()`
-  - For literals/closures that intentionally pass `0` to exercise the (now-removed) skip (e.g. `mp4.rs:1455` `empty` with `data_len: 0`, `mp3.rs:1070` `empty`, `flac.rs` empty-art tests): these tested the in-synthesis skip that no longer exists. Convert each to the new contract — either drop the zero-art literal from the input vec and assert the remaining non-empty art is served, or delete the test if its sole purpose was the in-synthesis zero-skip (the drop now happens upstream, covered by `bridge_drops_zero_length_art`). Document each deletion in the commit body.
-  - Closures like `let mk = |data_len: u64| ArtInput { … data_len, … }` (flac.rs:951, mp3.rs:1032, ogg/mod.rs:1354) and `art_input(art_id, mime, len: usize)` (ogg/mod.rs:1005): change the parameter to take the raw value and wrap inside — `data_len: BlobLen::new(data_len).unwrap()` — OR change the closure signature to accept a `BlobLen`. Pick per call-site readability; the closures are only fed non-zero values except the explicit empty-art tests handled above.
-  - proptest/oracle literals (`tests/proptest_mp4.rs:23,57`, `tests/proptest_mp3.rs:114`, `tests/proptest_wav.rs:166`, `tests/mp4_oracle.rs:85,94`, `tests/synthesize_art.rs:17-18,106`, `tests/roundtrip.rs`, `tests/mp3_synthesize.rs`, `tests/wav_synthesize.rs`): wrap `len`/`data_len`/`picture_type`. For proptest generators producing `len`/`data_len`, constrain the strategy to non-zero (e.g. `1u64..=N`) and wrap, OR `prop_filter` out zero — note the coverage change in a comment.
+  - Closures fed only non-zero values — `let mk = |data_len: u64| ArtInput { … data_len: BlobLen::new(data_len).unwrap(), … picture_type: PictureType::new(3).unwrap(), … }` (verified: `flac.rs:951`, `mp3.rs:1032`, `mp3.rs:1101`, `ogg/mod.rs:1354`), `let mk = |len: u64| BinaryTagInput { … len: BlobLen::new(len).unwrap() }` (`flac.rs:1003`), and `fn art_input(art_id, mime, len: usize)` (`ogg/mod.rs:1005`, used by several non-skip tests): wrap inside the body so callers keep passing the raw integer. The `art_input` helper also has `picture_type: 3` → wrap it too.
+  - proptest/oracle literals (`tests/proptest_mp4.rs:23,57`, `tests/proptest_mp3.rs:114`, `tests/proptest_wav.rs:166`, `tests/mp4_oracle.rs:85,94`, `tests/synthesize_art.rs:17-18,106`, `tests/roundtrip.rs`, `tests/mp3_synthesize.rs`, `tests/wav_synthesize.rs`): wrap `len`/`data_len`/`picture_type`. For proptest generators producing `len`/`data_len`, constrain the strategy to non-zero (`1u64..=N`) and wrap, OR `prop_filter` out zero — note the coverage change in a comment. (Confirm each file's exact literals via grep before editing; the line numbers above are the current anchors.)
 
-- [ ] **Step 4.11: Run + see pass.** `cargo test -p musefs-format -p musefs-core` — all pass. `cargo clippy --all-targets -p musefs-format -p musefs-core -- -D warnings` (watch for now-`unused` imports or dead `MAX`-comparison code revealed by the removed guards).
+- [ ] **Step 4.10a: Dispose of the six in-synthesis zero-skip tests (verified inventory + per-test disposition).** With `BlobLen` non-zero, these tests can no longer construct a `data_len: 0` literal AND their assertion (an in-synthesis skip that no longer exists) is dead. The zero-drop is now covered upstream by `bridge_drops_zero_length_art` (Step 4.1). Disposition per test:
+  - **`musefs-format/src/mp3.rs:1065` `build_id3v2_segments_skips_zero_byte_art`** — sole purpose is the in-synthesis skip of a `data_len: 0` art. **DELETE** (remove the whole `#[test] fn`).
+  - **`musefs-format/src/mp3.rs:1099` `build_id3v2_segments_keeps_real_art_when_mixed_with_empty`** — feeds `mk(1, 0)` + `mk(2, 16)`, asserts only `(2,16)` emits. The `mk(1, 0)` is now unconstructible. **MIGRATE:** drop the zero entry, feed `&[mk(2, 16)]`, and assert `art_segs == vec![(2_i64, 16_u64)]` (the `mk` closure is migrated per Step 4.10 to wrap `BlobLen::new(data_len).unwrap()`; it is now only fed non-zero). The migrated test still pins that a real art emits one `ArtImage` segment with the right `(art_id, len)`.
+  - **`musefs-format/src/mp4.rs:1417` `synthesize_skips_zero_length_art`** — sole purpose is the in-synthesis skip (asserts no `ArtImage`/`covr` for a `data_len: 0` art). **DELETE.**
+  - **`musefs-format/src/mp4.rs:1450` `synthesize_picks_first_nonempty_art`** — feeds `empty` (`data_len: 0`) + `real` (`data_len: 40`), asserts `Segment::ArtImage { art_id: 9, len: 40 }` is served. **MIGRATE:** drop the `empty` literal, feed `&[real]`, keep the same assertion (the real art with `data_len: BlobLen::new(40).unwrap()` still streams). Rename intent to "real art is served" or keep the name; the point that art reaches synthesis survives.
+  - **`musefs-format/src/mp4.rs:2348` `synthesize_layout_emits_all_nonzero_arts`** — its `art = |id, len|` closure feeds `art(1,5), art(2,0), art(3,7)`, asserts `art_segs == vec![(1,5),(3,7)]`. **MIGRATE:** migrate the closure to wrap `BlobLen::new(len).unwrap()` (Step 4.10), drop the `art(2,0)` entry, feed `&[art(1,5), art(3,7)]`, and keep `assert_eq!(art_segs, vec![(1,5),(3,7)])`. This still pins input-order preservation across multiple streamed arts (its real value).
+  - **`musefs-format/src/ogg/mod.rs:1119` `synthesize_opus_skips_zero_byte_art`** — builds `art_input(1, "image/jpeg", 0)` (zero) ahead of a real one, asserts the zero is dropped at synthesis. The `art_input` helper can no longer take `0` (it now wraps `BlobLen::new(len).unwrap()`, which panics on 0). **DELETE** (the in-synthesis ogg filter at 260-264 is removed; the drop is upstream/type-level).
+  - After these edits, **remove the now-dead in-synthesis skip branches** they exercised: `flac.rs` `nonempty_art` filter (Step 4.4), `mp3.rs` both `== 0` guards (Step 4.5), `mp4.rs` `bt.len == 0` guard + `data_len > 0` art filter (Step 4.6), `ogg/mod.rs` `filter(|a| a.meta.data_len > 0)` (Step 4.7). Each removed branch is matched by the upstream `mapping.rs` drop (Step 4.9) — verified `mapping.rs` is the SOLE production producer of `ArtInput`/`BinaryTagInput`, so no zero can reach synthesis once the bridge drops it before `BlobLen::new`.
 
-- [ ] **Step 4.12: Commit.**
+- [ ] **Step 4.11: Run + see pass.** `cargo test -p musefs-format -p musefs-core -p musefs-fuse` — all pass (include `musefs-fuse` because the new `CoreError::InvalidPictureType` variant touches its exhaustive `errno` match). `cargo clippy --all-targets -p musefs-format -p musefs-core -p musefs-fuse -- -D warnings` (watch for now-`unused` imports or dead `MAX`-comparison code revealed by the removed guards).
+
+- [ ] **Step 4.12: Commit.** Stage the type change WITH the bridge, the new error variant, its FUSE errno arm, every synthesis-read fixup, and every test literal/disposition — all in one commit (the pre-commit hook runs the full workspace, so a missing call-site fixup rejects it). Note `musefs-format/src/wav.rs` is NOT staged — it has no edits (Step 4.8):
   ```bash
   git add musefs-format/src/input.rs musefs-format/src/flac.rs musefs-format/src/mp3.rs \
-          musefs-format/src/mp4.rs musefs-format/src/ogg/mod.rs musefs-format/src/wav.rs \
-          musefs-format/tests musefs-core/src/mapping.rs
-  # plus musefs-core/src/error.rs if a new variant was added
+          musefs-format/src/mp4.rs musefs-format/src/ogg/mod.rs \
+          musefs-format/tests \
+          musefs-core/src/mapping.rs musefs-core/src/error.rs \
+          musefs-fuse/src/lib.rs
   git commit -F - <<'EOF'
   feat: type ArtInput/BinaryTagInput lengths as BlobLen, picture_type as PictureType (#200)
 
@@ -652,7 +724,12 @@ Change `ArtInput.picture_type` to `PictureType`, `ArtInput.data_len` and `Binary
   ArtInput.picture_type becomes PictureType. The db->format bridge drops
   zero-length payloads at construction (synthesis already skipped them),
   so the in-synthesis zero-skip branches are removed and the EmptySegment
-  invariant is now type-level for Plan D.
+  invariant is now type-level for Plan D. An out-of-range picture_type at
+  the bridge is surfaced as the new CoreError::InvalidPictureType (mapped
+  to EIO; #199 CHECK makes it unreachable in practice). The four src tests
+  that only exercised the removed in-synthesis zero-skip are deleted; the
+  three mixed-art tests are migrated to feed only non-zero art (the drop is
+  now covered by mapping's bridge_drops_zero_length_art).
 
   Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
   EOF
@@ -690,7 +767,26 @@ The out-of-workspace `fuzz/` crate constructs `ArtInput`/`BinaryTagInput` and is
   len: musefs_format::BlobLen::new(u.int_in_range(1..=4096u64)?).expect("1..=4096 is non-zero"),
   ```
 
-- [ ] **Step 5.3: Fix `fuzz/fuzz_targets/ogg.rs:41`.** Wrap the `ArtInput` literal's `picture_type`/`data_len` (confirm exact values via reading lines 41-50) with `PictureType::new(...).unwrap()` / `BlobLen::new(...)` — if the target can generate zero data_len, `prop`-style drop it or bound to non-zero.
+- [ ] **Step 5.3: Fix `fuzz/fuzz_targets/ogg.rs` (verified lines 37-50).** The loop draws `let len = u.int_in_range(0..=8192usize)...` then `let bytes = u.bytes(len)...` and builds `ArtInput { picture_type: u.int_in_range(0..=20u32).unwrap_or(3), …, data_len: bytes.len() as u64 }`. Both `len == 0` and a short `u.bytes` read make `data_len == 0` reachable, which would panic `BlobLen::new(...).unwrap()`. Skip the zero case BEFORE constructing the `ArtInput` so empty art is dropped (mirrors the bridge), and wrap both fields:
+  ```rust
+  let len = u.int_in_range(1..=8192usize).unwrap_or(1);
+  let bytes = u.bytes(len).map(<[u8]>::to_vec).unwrap_or_default();
+  if bytes.is_empty() {
+      continue; // empty art is dropped at the construction boundary.
+  }
+  inputs.push(ArtInput {
+      art_id: i as i64,
+      mime: "image/png".to_string(),
+      description: String::new(),
+      picture_type: musefs_format::PictureType::new(u.int_in_range(0..=20u32).unwrap_or(3))
+          .unwrap_or(musefs_format::PictureType::ZERO),
+      width: 0,
+      height: 0,
+      data_len: musefs_format::BlobLen::new(bytes.len() as u64).expect("non-empty"),
+  });
+  images.push(bytes);
+  ```
+  (Keep `images.push(bytes)` paired with the input so the later `zip` stays aligned; the `continue` drops both.) Add `PictureType`/`BlobLen` to the `use musefs_format::{…}` import at the top of the target.
 
 - [ ] **Step 5.4: Verify the fuzz build.** `cargo +nightly fuzz build` — must succeed (this is the only way to catch the out-of-workspace breakage). Expect: `Compiling musefs-fuzz` then `Finished` with no errors.
 
@@ -727,3 +823,6 @@ The out-of-workspace `fuzz/` crate constructs `ArtInput`/`BinaryTagInput` and is
 - **fuzz follow-through**: Task 5 fixes the builders and runs `cargo +nightly fuzz build`. ✓
 - Exact signatures for `PictureType`/`BlobLen`/`TrackBounds` match the prompt verbatim (Steps 1.4, 2.3). ✓
 - Each type-change commit bundles the field change with all call-site + test fixups to stay green (Tasks 1, 3, 4). ✓
+- **Layer-2 row-reader defense (Task 1):** `TrackBounds` rejects an out-of-file audio range at `get_track`/`row_to_track` (`DbError::AudioBoundsOutOfRange` → `CoreError::Db`), beneath Plan A's layer-1 SQLite CHECK. Tested directly by `out_of_range_bounds_error_at_row_read` (Step 1.8), which plants the bad row past the CHECK via `ignore_check_constraints`. The over-EOF *integration* tests are owned by Plan A (they assert the CHECK rejects the write); this plan does not touch `tests/reader.rs`/`tests/external_contract.rs`. The `reader.rs:155` guard becomes logically unreachable but is kept as defense-in-depth. ✓
+- **New error variant (Task 4):** the bridge's out-of-range `picture_type` is surfaced via `CoreError::InvalidPictureType` (added to `error.rs` and the FUSE `errno` EIO arm in the SAME commit); `#199` CHECK makes it unreachable in practice. ✓
+- **Six zero-feeding format tests (Task 4, Step 4.10a):** 3 DELETED (sole-purpose in-synthesis skip: `mp3.rs:1065`, `mp4.rs:1417`, `ogg/mod.rs:1119`), 3 MIGRATED to feed only non-zero art (`mp3.rs:1099`, `mp4.rs:1450`, `mp4.rs:2348`). The zero-drop they covered is replaced by `mapping.rs::bridge_drops_zero_length_art`. ✓
