@@ -360,8 +360,6 @@ fn read_segments_into<M>(
     size: u64,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    use std::os::unix::fs::FileExt;
-
     if offset >= resolved.total_len || size == 0 {
         return Ok(());
     }
@@ -391,7 +389,7 @@ fn read_segments_into<M>(
                     // so this path is documented rather than covered.
                     let start = out.len();
                     out.resize(start + n, 0);
-                    f.read_exact_at(&mut out[start..], bo + within)?;
+                    crate::metrics::backing_read_exact_at(f, &mut out[start..], bo + within)?;
                     crate::metrics::on_pread(n as u64);
                 }
                 Segment::ArtImage { art_id, .. } => {
