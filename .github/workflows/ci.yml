@@ -152,8 +152,13 @@ jobs:
           pip install -e contrib/python-musefs
           pip install -e "contrib/beets[test]"
           pip install -e "contrib/lidarr[test]"
-      - name: Install picard plugin test deps
-        run: pip install -e "contrib/picard[test]"
+      - name: Install picard plugin (no Qt test extra)
+        # Plain install, NOT `[test]`: that extra pulls in pytest-qt, an
+        # auto-loaded plugin that imports a Qt binding at startup and would
+        # abort collection on this Qt-free runner. The path-gate musefs_bin
+        # test needs only the bundled `musefs._common`; the Qt sibling modules
+        # `importorskip` themselves, so they skip cleanly.
+        run: pip install -e contrib/picard
       - name: beets musefs_bin tier (non-skipping)
         run: python -m pytest contrib/beets/tests -m musefs_bin -v
       - name: lidarr musefs_bin tier (non-skipping)
@@ -161,7 +166,7 @@ jobs:
       - name: picard musefs_bin tier (non-skipping)
         # picard's path-gate tests import `musefs._common` (the bundled plugin
         # module), NOT the system `picard`/Qt package, so they run here with no
-        # system-Picard env — verified: contrib/picard/tests/test_path_gate.py:11.
+        # system-Picard env — verified: contrib/picard/tests/test_path_gate.py:12.
         run: python -m pytest contrib/picard/tests -m musefs_bin -v
       - name: Python -> Rust synthesis round trip
         run: bash scripts/contract-roundtrip.sh

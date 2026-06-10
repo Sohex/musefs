@@ -443,8 +443,11 @@ In `.github/workflows/ci.yml`, after the `interop` job, add:
           pip install -e contrib/python-musefs
           pip install -e "contrib/beets[test]"
           pip install -e "contrib/lidarr[test]"
-      - name: Install picard plugin test deps
-        run: pip install -e "contrib/picard[test]"
+      - name: Install picard plugin (no Qt test extra)
+        # NOT `[test]` — that extra pulls pytest-qt, which auto-loads a Qt
+        # binding at startup and aborts collection on a Qt-free runner. The
+        # path-gate test needs only the bundled `musefs._common`.
+        run: pip install -e contrib/picard
       - name: beets musefs_bin tier (non-skipping)
         run: python -m pytest contrib/beets/tests -m musefs_bin -v
       - name: lidarr musefs_bin tier (non-skipping)
