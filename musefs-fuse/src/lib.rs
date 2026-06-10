@@ -541,6 +541,15 @@ mod tests {
             .code(),
             libc::EIO
         );
+        assert_eq!(
+            errno(&CoreError::InvalidPictureType {
+                track_id: 1,
+                art_id: 2,
+                value: 99,
+            })
+            .code(),
+            libc::EIO
+        );
     }
 
     #[test]
