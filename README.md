@@ -148,6 +148,13 @@ its env var, which overrides the default. The repeatable `--fallback` and the
 [`contrib/systemd/musefs.conf.example`](contrib/systemd/musefs.conf.example)
 for the full, canonical list.
 
+These variables are read the same way no matter how musefs is launched:
+exported into the shell before running the binary directly
+(`MUSEFS_DB=… musefs mount`), set via a systemd `EnvironmentFile=` or
+`Environment=` directive, or passed into a container with `-e`/`--env-file`.
+The configuration surface is identical across all three; the sections below
+just show the per-deployment wiring.
+
 ### Running as a systemd user service
 
 To run musefs on the host at login, drop-in units live in
