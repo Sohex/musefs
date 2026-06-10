@@ -619,10 +619,17 @@ def map_fields(item, extra_fields=None):
     return [(key, value) for key, values in emitted.items() for value in values]
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [ ] **Step 4: Run the rewritten file, then the WHOLE beets suite**
 
 Run: `cd contrib/beets && python -m pytest tests/test_map_fields.py -v`
 Expected: PASS (all tests in the rewritten file).
+
+Then run the full suite — the new `map_fields` must not regress `test_build_records.py`
+or `test_plugin.py`, which exercise it via `build_records` with conftest `FakeItem`
+stubs that expose **no** `_media_tag_fields` (so `map_fields` uses `FALLBACK_TAG_FIELDS`):
+
+Run: `cd contrib/beets && python -m pytest -q`
+Expected: PASS (whole suite green at this commit).
 
 - [ ] **Step 5: Commit**
 
@@ -633,60 +640,56 @@ git commit -m "feat(beets): map full _media_tag_fields with rename, twins, forma
 
 ---
 
-## Task 4: Managed-state helpers + `build_records` delete-keys wiring
+## Task 4: Managed-state helpers, accumulating delete-keys, and merge-wired `_sync`
+
+This task adds the managed-state helpers, rewrites `build_records` to use the
+**accumulating-union** model (a deleted tag stays deleted across re-scans), and —
+critically — updates `_sync` in the same commit, because `build_records`'s return
+shape changes from a list to a `(records, managed_writes)` tuple and `_sync` is its
+only production caller. Splitting these would leave the suite red at the commit.
 
 **Files:**
-- Modify: `contrib/beets/beetsplug/_core.py` (add helpers; change `build_records` signature/return)
-- Test: `contrib/beets/tests/test_build_records.py` (extend) and `contrib/beets/tests/test_managed_state.py` (create)
+- Modify: `contrib/beets/beetsplug/_core.py` (add helpers; rewrite `build_records`)
+- Modify: `contrib/beets/beetsplug/musefs.py` (`_sync` → tuple unpack + merge + persist)
+- Modify: `contrib/beets/tests/conftest.py` (`FakeItem` gains flexattr write + `store()`)
+- Test: `contrib/beets/tests/test_build_records.py` (fix call sites), `contrib/beets/tests/test_managed_state.py` (create)
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Teach the conftest `FakeItem` to persist a flexattr**
 
-Create `contrib/beets/tests/test_managed_state.py`:
+`build_records` reads the `musefs_managed` flexattr (via `getattr`, already works)
+and `_sync` writes it via `persist_managed` → `item[key] = value` + `item.store()`.
+The real beets Item supports both; the conftest stub does not yet. In
+`contrib/beets/tests/conftest.py`, add these two methods to `FakeItem` (right after
+its `get_album` method):
 
 ```python
+    def __setitem__(self, key, value):
+        # beets flexattr write; readable back via getattr (used by read_managed).
+        setattr(self, key, value)
+
+    def store(self):
+        self.stored = getattr(self, "stored", 0) + 1
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `contrib/beets/tests/test_managed_state.py` (reuses the conftest `FakeItem`,
+now flexattr-capable):
+
+```python
+from conftest import FakeItem
+
 from musefs_common import SyncStats
 
 from beetsplug import _core
 
 
-class FakeStoreItem:
-    """Item stub that supports flexattr read (getattr), write (item[k]=v) and
-    store(); records whether write() (the file-writing method) was called."""
-
-    def __init__(self, path=b"/m/a.flac", **fields):
-        self.path = path
-        self._flex = {}
-        self.stored = 0
-        self.wrote_file = False
-        self._media_tag_fields = _core.FALLBACK_TAG_FIELDS
-        for k, v in fields.items():
-            setattr(self, k, v)
-
-    # flexattr read path used by read_managed
-    def __getattr__(self, name):
-        flex = self.__dict__.get("_flex", {})
-        if name in flex:
-            return flex[name]
-        raise AttributeError(name)
-
-    def __setitem__(self, key, value):
-        self._flex[key] = value
-
-    def store(self):
-        self.stored += 1
-
-    def write(self):
-        self.wrote_file = True
-
-    def destination(self, relative_to_libdir=False):
-        return self.path
-
-    def get_album(self):
-        return None
+def _item(**kw):
+    return FakeItem(b"/m/a.flac", **kw)
 
 
 def test_read_managed_empty_and_parsed():
-    it = FakeStoreItem()
+    it = _item()
     assert _core.read_managed(it) == []
     it["musefs_managed"] = "artist,comment,title"
     assert _core.read_managed(it) == ["artist", "comment", "title"]
@@ -696,52 +699,55 @@ def test_format_managed_sorts_and_dedupes():
     assert _core.format_managed(["title", "artist", "artist"]) == "artist,title"
 
 
-def test_persist_managed_uses_store_not_write():
-    it = FakeStoreItem()
+def test_persist_managed_writes_flexattr_via_store():
+    # store() persists to the beets DB; it does NOT call write() (which writes the
+    # audio file and fires after_write). The stub has no write() at all, so a
+    # regression to write() would raise here. The real guarantee is beets' event
+    # model (store != after_write) plus the e2e reconcile path (Task 8).
+    it = _item()
     _core.persist_managed([(it, ["artist", "title"])])
-    assert it._flex["musefs_managed"] == "artist,title"
+    assert it.musefs_managed == "artist,title"
     assert it.stored == 1
-    assert it.wrote_file is False   # must not call write() (would fire after_write)
 
 
-def test_build_records_computes_delete_keys_from_prev_managed():
-    it = FakeStoreItem(title="T", artist="A")
-    it["musefs_managed"] = "artist,title,grouping"   # grouping managed last time
+def test_build_records_delete_keys_and_union_persist():
+    it = _item(title="T", artist="A")
+    it["musefs_managed"] = "artist,title,grouping"   # grouping was managed before
     records, writes = _core.build_records(
         [it], fields={}, stats=SyncStats(), write_path=False, restore_backing=False)
     rec = records[0]
-    # grouping no longer in M -> queued for deletion; title/artist not deleted.
-    assert rec.delete_keys == ["grouping"]
+    assert rec.delete_keys == ["grouping"]           # dropped from M -> delete
     assert ("title", "T") in rec.pairs and ("artist", "A") in rec.pairs
-    # managed_writes carries the new key set for persistence.
     item, managed = writes[0]
     assert item is it
-    assert set(managed) == {"title", "artist"}
+    # UNION: grouping stays in musefs_managed as a tombstone so the delete sticks
+    # across future re-scans (not just one cycle).
+    assert set(managed) == {"title", "artist", "grouping"}
 
 
-def test_build_records_restore_backing_disables_deletes():
-    it = FakeStoreItem(title="T")
+def test_build_records_restore_backing_clears_deletes_and_tombstones():
+    it = _item(title="T")
     it["musefs_managed"] = "title,grouping"
-    records, _ = _core.build_records(
+    records, writes = _core.build_records(
         [it], fields={}, stats=SyncStats(), write_path=False, restore_backing=True)
-    assert records[0].delete_keys == []   # restore-backing -> never delete
+    assert records[0].delete_keys == []              # no deletes under the flag
+    assert set(writes[0][1]) == {"title"}            # tombstones cleared (reset to M)
 
 
 def test_build_records_beets_path_is_managed():
-    it = FakeStoreItem(title="T", destination=b"Artist/Album/01 T.flac")
+    it = _item(title="T", destination=b"Artist/Album/01 T.flac")
     records, writes = _core.build_records(
         [it], fields={}, stats=SyncStats(), write_path=True, restore_backing=False)
-    keys = {k for k, _ in records[0].pairs}
-    assert "beets_path" in keys
-    assert "beets_path" in writes[0][1]   # included in managed set
+    assert "beets_path" in {k for k, _ in records[0].pairs}
+    assert "beets_path" in writes[0][1]              # included in the managed set
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [ ] **Step 3: Run to verify failure**
 
 Run: `cd contrib/beets && python -m pytest tests/test_managed_state.py -v`
 Expected: FAIL — `AttributeError: module 'beetsplug._core' has no attribute 'read_managed'` (and `build_records` returns a list, not a tuple).
 
-- [ ] **Step 3: Add the helpers and rewrite `build_records`**
+- [ ] **Step 4: Add the helpers and rewrite `build_records`**
 
 In `contrib/beets/beetsplug/_core.py`, add the three helpers (anywhere after `MANAGED_FLEXATTR`):
 
@@ -760,7 +766,7 @@ def format_managed(keys):
 
 
 def persist_managed(writes):
-    """Persist each ``(item, managed_keys)`` pair's key set into the beets DB via
+    """Persist each ``(item, managed_keys)`` pair into the beets DB via
     ``item.store()``. Never calls ``item.write()`` — that writes the audio file and
     fires ``after_write``, which would re-enter the plugin's reconcile loop."""
     for item, keys in writes:
@@ -768,16 +774,22 @@ def persist_managed(writes):
         item.store()
 ```
 
-Then replace the existing `build_records` with:
+Then replace the existing `build_records` with the accumulating-union version:
 
 ```python
 def build_records(items, *, fields=None, stats, write_path=True, restore_backing=False, log=None):
     """Build ``Record``s for beets items and the parallel managed-key writes.
 
     Returns ``(records, managed_writes)`` where ``managed_writes`` is a list of
-    ``(item, managed_keys)`` for the caller to persist *after a successful commit*
-    via ``persist_managed``. Each record's ``delete_keys`` is the set of keys the
-    item managed last sync but no longer does (empty when ``restore_backing``)."""
+    ``(item, managed_keys)`` the caller persists *after a successful commit* via
+    ``persist_managed``.
+
+    ``musefs_managed`` is an *accumulating* set (keys ever managed): each record's
+    ``delete_keys`` is ``prev - keys(M)`` and the persisted set is the union
+    ``prev | keys(M)``, so a key dropped from M stays a tombstone and keeps getting
+    re-deleted on every sync until it re-enters M or ``restore_backing`` clears it.
+    Under ``restore_backing`` no keys are deleted and the set is reset to ``keys(M)``
+    (tombstones forgotten), so restored backing values stay visible."""
     records = []
     managed_writes = []
     art_cache = {}
@@ -788,9 +800,14 @@ def build_records(items, *, fields=None, stats, write_path=True, restore_backing
             path = _computed_path_or_skip(item, log)
             if path:
                 pairs.append(("beets_path", path))
-        managed = sorted({key for key, _ in pairs})
-        prev = read_managed(item)
-        delete_keys = [] if restore_backing else sorted(set(prev) - set(managed))
+        keys_now = {key for key, _ in pairs}
+        prev = set(read_managed(item))
+        if restore_backing:
+            delete_keys = []
+            managed = sorted(keys_now)
+        else:
+            delete_keys = sorted(prev - keys_now)
+            managed = sorted(prev | keys_now)
         records.append(
             Record(
                 key=realpath_key(item.path),
@@ -803,125 +820,13 @@ def build_records(items, *, fields=None, stats, write_path=True, restore_backing
     return records, managed_writes
 ```
 
-- [ ] **Step 4: Fix the existing `build_records` test for the new return shape**
+- [ ] **Step 5: Update `_sync` to the merge + persist version (same commit)**
 
-`contrib/beets/tests/test_build_records.py` currently unpacks a single list. Update each `build_records(...)` call site to `records, _ = build_records(...)` (and add a focused assertion if the test inspects records). Run the file to find call sites:
+In `contrib/beets/beetsplug/musefs.py`, replace `_sync` so it unpacks the new tuple,
+syncs with `merge=True`, and persists managed state after commit. The
+`restore_backing` parameter defaults `False` here; Task 5 wires the config/flag that
+feeds it (until then, callers use the default and behavior is "deletions stick"):
 
-Run: `cd contrib/beets && python -m pytest tests/test_build_records.py -v`
-Fix each failure by destructuring the tuple. Re-run until green.
-
-- [ ] **Step 5: Run both test files**
-
-Run: `cd contrib/beets && python -m pytest tests/test_build_records.py tests/test_managed_state.py -v`
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add contrib/beets/beetsplug/_core.py \
-        contrib/beets/tests/test_managed_state.py \
-        contrib/beets/tests/test_build_records.py
-git commit -m "feat(beets): managed-key flexattr state and delete-key computation"
-```
-
----
-
-## Task 5: Wire the adapter — merge sync, persist, `--restore-backing`, both paths
-
-**Files:**
-- Modify: `contrib/beets/beetsplug/musefs.py`
-- Test: `contrib/beets/tests/test_plugin.py` (extend)
-
-- [ ] **Step 1: Write the failing test**
-
-Append to `contrib/beets/tests/test_plugin.py` (mirror the file's existing plugin-construction pattern; if it builds a plugin via a fixture, reuse it). Minimal direct-call tests:
-
-```python
-def test_sync_uses_merge_and_persists_managed(tmp_path, monkeypatch):
-    """A real DB round-trip: B persists, M wins, managed flexattr written."""
-    import sqlite3
-    from musefs_common.schema import SCHEMA_SQL
-    from musefs_common import connect
-    from beetsplug.musefs import MusefsPlugin
-    from beetsplug import _core
-
-    db = tmp_path / "musefs.db"
-    raw = sqlite3.connect(str(db)); raw.executescript(SCHEMA_SQL); raw.commit()
-    raw.execute("INSERT INTO tracks (backing_path, format, audio_offset, "
-                "audio_length, backing_size, backing_mtime, updated_at) "
-                "VALUES ('/m/a.flac','flac',0,0,0,0,0)")
-    tid = raw.execute("SELECT id FROM tracks").fetchone()[0]
-    raw.execute("INSERT INTO tags (track_id,key,value,ordinal) VALUES (?,?,?,0)",
-                (tid, "comment", "keep"))
-    raw.commit(); raw.close()
-
-    # Item stub: real path on disk so realpath_key matches the inserted row.
-    p = tmp_path / "a.flac"; p.write_bytes(b"")
-    from tests.test_managed_state import FakeStoreItem  # reuse stub
-    item = FakeStoreItem(path=str(p).encode())
-    item._media_tag_fields = _core.FALLBACK_TAG_FIELDS
-    item.artist = "New"
-
-    # Point the inserted track at the real temp path.
-    conn = connect(str(db))
-    conn.execute("UPDATE tracks SET backing_path=? WHERE id=?",
-                 (__import__("os").path.realpath(str(p)), tid))
-    conn.commit(); conn.close()
-
-    plugin = MusefsPlugin()
-    plugin.config["db"] = str(db)
-    plugin._sync(str(db), [item], dry_run=False, restore_backing=False)
-
-    conn = connect(str(db))
-    tags = dict((k, v) for k, v in conn.execute(
-        "SELECT key,value FROM tags WHERE track_id=? AND value_blob IS NULL", (tid,)))
-    conn.close()
-    assert tags["artist"] == "New"      # M wins
-    assert tags["comment"] == "keep"    # unmanaged B persists (merge, not replace)
-    assert item._flex.get("musefs_managed")   # managed set persisted
-    assert item.wrote_file is False           # store(), not write()
-```
-
-(If `MusefsPlugin()` cannot be constructed bare in the test env, gate this test behind the same marker the existing plugin tests use, or construct via the project's existing plugin fixture.)
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `cd contrib/beets && python -m pytest tests/test_plugin.py -v -k merge_and_persists`
-Expected: FAIL — `_sync()` has no `restore_backing` parameter and still full-replaces (comment wiped).
-
-- [ ] **Step 3: Update the adapter**
-
-In `contrib/beets/beetsplug/musefs.py`:
-
-(a) Add the config default in `__init__`'s `self.config.add({...})`:
-```python
-            "restore_backing": False,  # on delete, let the backing tag value reappear
-```
-
-(b) Add the command option in `commands()` (after the `--dry-run` option):
-```python
-        cmd.parser.add_option(
-            "--restore-backing",
-            dest="restore_backing",
-            action="store_true",
-            default=False,
-            help="when a tag is removed in beets, let the backing file's value reappear",
-        )
-```
-
-(c) Add a config helper near `_write_path`:
-```python
-    def _restore_backing(self):
-        return bool(self.config["restore_backing"].get(bool))
-```
-
-(d) In `_command`, resolve the effective flag and pass it through:
-```python
-        restore_backing = bool(opts.restore_backing) or self._restore_backing()
-        stats = self._sync(db_path, items, dry_run=opts.dry_run, restore_backing=restore_backing)
-```
-
-(e) Replace `_sync` with the merge + persist version:
 ```python
     def _sync(self, db_path, items, dry_run=False, restore_backing=False):
         if not os.path.exists(db_path):
@@ -955,21 +860,212 @@ In `contrib/beets/beetsplug/musefs.py`:
             conn.close()
 ```
 
-(f) In `_reconcile_pending`, thread the config default into the sync call. Change the `self._sync(db_path, items)` call to:
+- [ ] **Step 6: Fix existing `test_build_records.py` call sites**
+
+`test_build_records.py` unpacks `build_records(...)` as a single list. Update each
+call site to `records, _ = build_records(...)`. Run the file and fix every failure:
+
+Run: `cd contrib/beets && python -m pytest tests/test_build_records.py -v`
+Expected after fixes: PASS.
+
+- [ ] **Step 7: Run the WHOLE beets suite (catches the `_sync`/`FakeItem` coupling)**
+
+Run: `cd contrib/beets && python -m pytest -q`
+Expected: PASS. This must include `test_plugin.py` — those tests drive `_command`/
+`_reconcile_pending` → `_sync` → `persist_managed`, which now calls `item.store()` on
+the conftest `FakeItem` (Step 1) and goes through `merge_tags` (Task 2). They use
+`FALLBACK_TAG_FIELDS` because `FakeItem` exposes no `_media_tag_fields`, and the
+`make_track` fixture seeds no text tags, so merge produces the same rows full-replace
+did. If any `test_plugin.py` test is red here, the coupling above is the cause.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add contrib/beets/beetsplug/_core.py contrib/beets/beetsplug/musefs.py \
+        contrib/beets/tests/conftest.py \
+        contrib/beets/tests/test_managed_state.py \
+        contrib/beets/tests/test_build_records.py
+git commit -m "feat(beets): accumulating managed-state flexattr + merge-wired _sync"
+```
+
+---
+
+## Task 5: Config + flag + both-paths wiring (`--restore-backing`)
+
+`_sync` already merges and persists (Task 4). This task adds the `restore_backing`
+config/flag and threads it into both sync paths, then proves the merge + sticky-delete
+behavior end to end through the plugin (including the passive `cli_exit` path).
+
+**Files:**
+- Modify: `contrib/beets/beetsplug/musefs.py` (config key, command option, helper, `_command`, `_reconcile_pending`)
+- Test: `contrib/beets/tests/test_plugin.py` (extend — reuse its `FakeConfigView` + `monkeypatch` pattern)
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `contrib/beets/tests/test_plugin.py`. Reuse the module's existing
+`FakeConfigView` (defined at the top of that file) and the `monkeypatch.setattr(plugin,
+"config", FakeConfigView({...}), raising=False)` pattern used by the existing tests —
+do **not** assign `plugin.config[...] = ...` (the real config view is read-only here):
+
+```python
+import os
+import sqlite3
+
+from musefs_common import connect
+from musefs_common.schema import SCHEMA_SQL
+
+from beetsplug.musefs import MusefsPlugin
+from conftest import FakeItem, insert_track
+
+
+def _seed_track_with_tag(db_path, real_path, key, value):
+    conn = connect(db_path)
+    tid = insert_track(conn, real_path)
+    conn.execute("INSERT INTO tags (track_id, key, value, ordinal) VALUES (?,?,?,0)",
+                 (tid, key, value))
+    conn.commit()
+    conn.close()
+    return tid
+
+
+def _text_tags(db_path, tid):
+    conn = connect(db_path)
+    rows = dict(conn.execute(
+        "SELECT key, value FROM tags WHERE track_id=? AND value_blob IS NULL", (tid,)))
+    conn.close()
+    return rows
+
+
+def test_sync_merges_keeps_unmanaged_and_persists(db_path, tmp_path, monkeypatch):
+    """Command path: B persists, M wins, managed flexattr written via store()."""
+    p = tmp_path / "a.flac"; p.write_bytes(b"")
+    real = os.path.realpath(str(p))
+    tid = _seed_track_with_tag(db_path, real, "comment", "keep")
+
+    item = FakeItem(str(p).encode(), artist="New")
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin, "config",
+        FakeConfigView({"db": db_path, "fields": {}, "write_path": False,
+                        "restore_backing": False}),
+        raising=False,
+    )
+    plugin._sync(db_path, [item], dry_run=False, restore_backing=False)
+
+    tags = _text_tags(db_path, tid)
+    assert tags["artist"] == "New"      # M wins
+    assert tags["comment"] == "keep"    # unmanaged B persists (merge, not replace)
+    assert "artist" in item.musefs_managed   # managed set persisted via store()
+
+
+def test_reconcile_path_merges_and_sticky_deletes(db_path, tmp_path, monkeypatch):
+    """Passive cli_exit path runs the same merge + managed-state cycle, and a key
+    dropped from a prior managed set is deleted (tombstone)."""
+    p = tmp_path / "b.flac"; p.write_bytes(b"")
+    real = os.path.realpath(str(p))
+    tid = _seed_track_with_tag(db_path, real, "grouping", "old")
+
+    item = FakeItem(str(p).encode(), title="T")
+    item["musefs_managed"] = "grouping,title"   # grouping managed before; now dropped
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin, "config",
+        FakeConfigView({"db": db_path, "fields": {}, "write_path": False,
+                        "autoscan": False, "restore_backing": False}),
+        raising=False,
+    )
+    monkeypatch.setattr(plugin, "_run_scan", lambda db, targets: None)
+    plugin._pending = [item]
+    plugin._reconcile_pending(lib=None)
+
+    tags = _text_tags(db_path, tid)
+    assert tags.get("title") == "T"     # merged on the reconcile path
+    assert "grouping" not in tags       # tombstoned delete applied on the reconcile path
+
+
+def test_restore_backing_skips_deletes(db_path, tmp_path, monkeypatch):
+    """With restore_backing, a previously-managed-now-dropped key is NOT deleted."""
+    p = tmp_path / "c.flac"; p.write_bytes(b"")
+    real = os.path.realpath(str(p))
+    tid = _seed_track_with_tag(db_path, real, "grouping", "frombacking")
+
+    item = FakeItem(str(p).encode(), title="T")
+    item["musefs_managed"] = "grouping,title"
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin, "config",
+        FakeConfigView({"db": db_path, "fields": {}, "write_path": False,
+                        "restore_backing": True}),
+        raising=False,
+    )
+    plugin._sync(db_path, [item], dry_run=False, restore_backing=True)
+
+    tags = _text_tags(db_path, tid)
+    assert tags["grouping"] == "frombacking"   # backing value left in place
+    assert set(item.musefs_managed.split(",")) == {"title"}  # tombstones cleared
+```
+
+Note: the existing `FakeConfigView` (`test_plugin.py` top) returns raw data and its
+`get(template)` ignores the template, so the existing tests whose config dicts omit
+`restore_backing` still work — `self.config["restore_backing"].get(bool)` degrades to
+`None` → `bool(None)` = `False`. Do **not** edit those existing fixtures.
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cd contrib/beets && python -m pytest tests/test_plugin.py -v -k "restore_backing or merges"`
+Expected: FAIL — `_restore_backing` / `--restore-backing` not present; `_command`/
+`_reconcile_pending` don't thread `restore_backing`.
+
+- [ ] **Step 3: Update the adapter**
+
+In `contrib/beets/beetsplug/musefs.py`:
+
+(a) Add the config default in `__init__`'s `self.config.add({...})`:
+```python
+            "restore_backing": False,  # on delete, let the backing tag value reappear
+```
+
+(b) Add the command option in `commands()` (after the `--dry-run` option):
+```python
+        cmd.parser.add_option(
+            "--restore-backing",
+            dest="restore_backing",
+            action="store_true",
+            default=False,
+            help="when a tag is removed in beets, let the backing file's value reappear",
+        )
+```
+
+(c) Add a config helper near `_write_path`:
+```python
+    def _restore_backing(self):
+        return bool(self.config["restore_backing"].get(bool))
+```
+
+(d) In `_command`, resolve the effective flag and pass it through (replace the existing
+`stats = self._sync(db_path, items, dry_run=opts.dry_run)` line):
+```python
+        restore_backing = bool(opts.restore_backing) or self._restore_backing()
+        stats = self._sync(db_path, items, dry_run=opts.dry_run, restore_backing=restore_backing)
+```
+
+(e) In `_reconcile_pending`, thread the config default (replace the existing
+`self._sync(db_path, items)` call):
 ```python
             self._sync(db_path, items, restore_backing=self._restore_backing())
 ```
 
-- [ ] **Step 4: Run the test + full beets unit suite**
+- [ ] **Step 4: Run the full beets suite**
 
 Run: `cd contrib/beets && python -m pytest -q`
-Expected: PASS. (If the new plugin test must be marker-gated for env reasons, the rest of the suite must still be green.)
+Expected: PASS (new tests green; existing `FakeConfigView` tests unaffected — see the
+Step 1 note on the benign `restore_backing` default).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add contrib/beets/beetsplug/musefs.py contrib/beets/tests/test_plugin.py
-git commit -m "feat(beets): merge sync with managed-state persistence and --restore-backing"
+git commit -m "feat(beets): restore_backing config + --restore-backing on both sync paths"
 ```
 
 ---
@@ -977,7 +1073,7 @@ git commit -m "feat(beets): merge sync with managed-state persistence and --rest
 ## Task 6: Picard naming additions (no merge)
 
 **Files:**
-- Modify: `contrib/picard/musefs/_core.py` (`DIRECT_FIELDS`, `_MULTI_VALUE_KEYS`)
+- Modify: `contrib/picard/musefs/_core.py` (`DIRECT_FIELDS` only — the additions are all single-valued, so `_MULTI_VALUE_KEYS` is unchanged)
 - Test: `contrib/picard/tests/test_map_fields.py` (extend)
 
 - [ ] **Step 1: Write the failing test**
@@ -1110,35 +1206,65 @@ git commit -m "docs: document beets merge sync, musefs_managed, merge_tags contr
 **Files:**
 - Modify: `contrib/beets/tests/test_e2e.py`
 
-- [ ] **Step 1: Add the e2e assertions**
+This tier is **skip-acceptable**: it is gated on `ffmpeg` + `/dev/fuse` +
+`fusermount` and skips cleanly when absent. The unit/integration tiers (Tasks 1–5)
+carry the correctness load; this is the real-mount confirmation, and notably the
+**multi-cycle** sticky-delete check that would have caught the one-cycle bug.
 
-The `e2e` tier (marker `e2e`, gated on `ffmpeg` + `/dev/fuse` + `fusermount`) already imports audio, retags, syncs, mounts, and verifies tags + byte-identical audio. Extend it (or add a sibling `@pytest.mark.e2e` test mirroring the existing one's setup/mount helpers) to assert the new behavior:
+- [ ] **Step 1: Add a concrete e2e test**
+
+Add a new `@pytest.mark.e2e` test to `contrib/beets/tests/test_e2e.py`, built from the
+file's real helpers (`_imported_library` → `(cfg, env, db, mnt, library)`,
+`_beet(cfg, env, *args)`, the `_mounted(mnt, db, template)` context manager) and
+modeled on `test_e2e_import_retag_mount_playback`. Read tags with `FLAC(str(path))`
+(already imported as `from mutagen.flac import FLAC`) so Vorbis keys like
+`replaygain_track_gain` / `musicbrainz_albumid` are visible — `easy=True` would hide
+them. FLAC-focused so the assertions are format-idiomatic per the spec §2 fidelity note.
 
 ```python
-# After the existing import + `beet musefs` sync + mount, with the item carrying
-# ReplayGain, a MusicBrainz album id, and a custom field:
-mounted = read_tags_from_mount(mount_dir, rel_path)   # reuse the file's helper
-assert mounted["replaygain_track_gain"].endswith("dB")
-assert mounted["musicbrainz_albumid"]
-assert mounted["comment"]                              # an arbitrary mapped field
+def test_e2e_full_fields_sticky_delete_and_restore(tmp_path):
+    """Rich fields reach the mount; a deleted file-embedded tag stays gone across
+    re-scans; --restore-backing brings the backing value back."""
+    cfg, env, db, mnt, library = _imported_library(tmp_path)
+    template = "$albumartist/$album/$title"
 
-# Deletion sticks: clear the comment in beets, re-sync, remount, assert absent.
-clear_tag_in_beets(item, "comments"); run_beet_musefs()
-mounted = read_tags_from_mount(mount_dir, rel_path)
-assert "comment" not in mounted
+    # Embed a comment INTO the FLAC (no -W -> beets writes the file), so the tag
+    # exists in the backing file (B), not just the beets DB.
+    _beet(cfg, env, "modify", "-M", "-y", "format:FLAC",
+          "comments=from file", "rg_track_gain=-7.5",
+          "mb_albumid=11111111-1111-1111-1111-111111111111")
+    _beet(cfg, env, "musefs")
+    with _mounted(mnt, db, template):
+        ft = FLAC(str(next(mnt.rglob("*.flac"))))
+        assert ft["replaygain_track_gain"][0].endswith("dB")
+        assert ft["musicbrainz_albumid"][0].startswith("11111111")
+        assert ft["comment"][0] == "from file"
 
-# With --restore-backing, the embedded value returns.
-run_beet_musefs(extra_args=["--restore-backing"])
-mounted = read_tags_from_mount(mount_dir, rel_path)
-assert mounted.get("comment")                          # backing value reappeared
+    # Delete the comment in beets WITHOUT writing the file (-W): the FLAC on disk
+    # still embeds "from file", so this is the case the union model must handle.
+    _beet(cfg, env, "modify", "-W", "-M", "-y", "format:FLAC", "comments!")
+    _beet(cfg, env, "musefs")                       # cycle 1: delete applied
+    _beet(cfg, env, "musefs")                       # cycle 2: must STAY gone
+    with _mounted(mnt, db, template):
+        ft = FLAC(str(next(mnt.rglob("*.flac"))))
+        assert "comment" not in ft                  # tombstone held across re-scan
+
+    # --restore-backing: the file's embedded "from file" comment returns.
+    _beet(cfg, env, "musefs", "--restore-backing")
+    with _mounted(mnt, db, template):
+        ft = FLAC(str(next(mnt.rglob("*.flac"))))
+        assert ft["comment"][0] == "from file"
 ```
 
-Use the test file's existing helpers for mounting and reading; the pseudo-calls above (`read_tags_from_mount`, `run_beet_musefs`, `clear_tag_in_beets`) name the operations the existing e2e already performs — wire them to the real helpers in that file.
+If beets' field name for a tag differs on your beets version (e.g. it rejects
+`rg_track_gain` as a settable field), set it via the `fields:` config or skip that one
+assertion — the comment sticky-delete cycle is the load-bearing check.
 
 - [ ] **Step 2: Run the e2e tier (requires tools)**
 
 Run: `cd contrib/beets && python -m pytest -m e2e -v`
-Expected: PASS if `ffmpeg` + `/dev/fuse` + `fusermount` are present; otherwise the tier skips cleanly (acceptable — note the skip).
+Expected: PASS if `ffmpeg` + `/dev/fuse` + `fusermount` are present; otherwise the tier
+skips cleanly (acceptable — record the skip rather than treating it as success).
 
 - [ ] **Step 3: Commit**
 
@@ -1176,9 +1302,11 @@ cd ../picard && python -m pytest -q
 - `beets_path` is a managed key → Task 4 (`build_records`, `test_build_records_beets_path_is_managed`).
 - `merge_tags` with `value_blob IS NULL` scoping + per-key ordinals → Task 1.
 - `Record.delete_keys` + `merge` flag (Picard unaffected by default) → Task 2 (`test_sync_files_default_is_full_replace`).
-- `musefs_managed` flexattr read/compute/write; `item.store()` not `write()` → Task 4 (`persist_managed`, `test_persist_managed_uses_store_not_write`).
-- Both sync paths (command + `_reconcile_pending`) → Task 5 (`_sync` shared by both; `_reconcile_pending` threads `restore_backing`).
-- `--restore-backing` / `restore_backing` default off → Task 5.
+- `musefs_managed` flexattr read/compute/write via `item.store()` → Task 4 (`persist_managed`, `test_persist_managed_writes_flexattr_via_store`).
+- **Accumulating-union model — deletions stay deleted across re-scans** (spec §4 union) → Task 4 (`build_records` persists `prev | keys(M)`, `test_build_records_delete_keys_and_union_persist`) + Task 8 multi-cycle e2e.
+- Both sync paths (command + `_reconcile_pending`) → Task 4 (`_sync` shared by both) + Task 5 (`_reconcile_pending` threads `restore_backing`; `test_reconcile_path_merges_and_sticky_deletes`).
+- `--restore-backing` / `restore_backing` default off; resets tombstones → Task 5 (`test_restore_backing_skips_deletes`).
 - Picard naming-only → Task 6.
 - Docs (beets, python-musefs, ARCHITECTURE) → Task 7.
 - e2e + autoscan-off caveat documented → Task 8 + Task 7.
+- Query/partial syncs per-item safe (spec §5) → true by construction (`build_records` iterates only passed `items`; each owns its flexattr); not separately tested — noted as a known minor coverage gap.

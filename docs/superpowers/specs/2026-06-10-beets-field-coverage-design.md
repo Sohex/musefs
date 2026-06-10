@@ -163,10 +163,13 @@ beets' `sync_one`/`sync_files` path switches from `replace_tags` to
 
 ### 4. Stateful deletion via a beets flexattr — on **both** sync paths
 
-Per item, the plugin stores `musefs_managed` — the sorted list of canonical keys
-written in the last sync, including `beets_path` when emitted — as a beets
-**flexattr** (lives in the beets DB; never written to the audio file, never sent
-to the musefs store).
+Per item, the plugin stores `musefs_managed` — the sorted set of canonical keys
+the plugin has **ever** managed for this track (including `beets_path` when
+emitted) — as a beets **flexattr** (lives in the beets DB; never written to the
+audio file, never sent to the musefs store). It is an accumulating set, not just
+"last sync's keys": once a key has been managed, it stays in `musefs_managed` as
+a tombstone until the key is re-managed or `--restore-backing` clears it. This is
+what makes a deletion *stay* deleted across re-scans (see the why below).
 
 Each sync (the explicit `beet musefs` command **and** the passive
 `_reconcile_pending` `cli_exit` hook — see §4a):
@@ -176,13 +179,25 @@ Each sync (the explicit `beet musefs` command **and** the passive
 3. Read `prev` from `musefs_managed`; `delete_keys = prev − keys(M)`.
 4. `merge_tags(conn, track_id, M, delete_keys)` — unless restore-backing is set
    (§5), in which case pass `delete_keys = ∅`.
-5. Persist `keys(M)` back to `musefs_managed` via `item.store()` (skipped only on
-   the command path's `-n` dry-run, which writes nothing).
+5. Persist `prev ∪ keys(M)` back to `musefs_managed` (the **union** — accumulate
+   tombstones) via `item.store()`, skipped only on the command path's `-n`
+   dry-run. `--restore-backing` instead persists just `keys(M)` (clears
+   tombstones — §5).
 
 First-ever sync has no `prev` → no deletions, just writes `M`. A key the user
-never managed is never in `prev`, so it is never deleted → `B` persists. A key
-the user managed then dropped is in `prev` but not `M` → deleted and, because the
-plugin re-applies this after every autoscan, stays deleted.
+never managed is never in `prev`, so it is never deleted → `B` persists.
+
+**Why the union, not just `keys(M)`.** Consider a tag embedded in the file
+(`comment="x"`) that the user deletes in beets with a metadata-only edit (no file
+write). Sync B: autoscan reseeds `B={comment}`, `M` drops it, `delete_keys =
+prev − M = {comment}` → deleted. If we persisted only `keys(M)`, `comment` would
+leave `musefs_managed`, and at Sync C the autoscan would reseed `comment="x"` with
+nothing left in `prev` to suppress it — the deletion would silently undo after one
+cycle. Persisting the union keeps `comment` in `prev` as a tombstone, so
+`delete_keys` re-suppresses it on every sync until the user re-adds it in beets
+(it re-enters `M`, leaving `delete_keys`) or runs `--restore-backing`. Tags that
+only ever lived in beets (never in `B`) are unaffected either way — autoscan never
+reseeds them — so the union costs nothing for them.
 
 #### 4a. Both paths, identically — the passive `cli_exit` path is primary
 
@@ -214,8 +229,11 @@ is command-only.)
 - **Default (off):** deletions stick — `delete_keys` is applied, suppressing the
   backing value for any key dropped from `M`.
 - **On:** `delete_keys` is skipped, so after the autoscan reset, `B`'s embedded
-  value for a dropped key reappears in the view. (Synthesized keys like
-  `beets_path` have no `B` and are deleted regardless — §1.)
+  value for a dropped key reappears in the view. It also persists `musefs_managed`
+  as just `keys(M)` (clearing accumulated tombstones), so the restored backing
+  values *stay* visible on subsequent default-mode syncs rather than being
+  re-suppressed. (Synthesized keys like `beets_path` have no `B` and are deleted
+  regardless — §1.)
 
 **Caveat — the guarantee is contingent on the store holding `B` at sync time.**
 That is what `autoscan: yes` (the default) guarantees by resetting the store
