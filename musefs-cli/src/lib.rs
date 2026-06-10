@@ -1,7 +1,6 @@
 //! The `musefs` command-line interface: `scan` (ingest a backing directory into a
 //! SQLite store) and `mount` (serve a read-only FUSE view of that store).
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -56,6 +55,11 @@ pub struct MountArgs {
     /// Fallback value substituted for any missing template field.
     #[arg(long, default_value = "Unknown")]
     pub default_fallback: String,
+    /// Per-field fallback `FIELD=VALUE`, overriding `--default-fallback` for
+    /// just that field when it is missing. Repeatable, e.g. `--fallback
+    /// albumartist="Unknown Artist" --fallback genre=Misc`.
+    #[arg(long = "fallback", value_name = "FIELD=VALUE", value_parser = parse_fallback)]
+    pub fallbacks: Vec<(String, String)>,
     /// How file contents are served.
     #[arg(long, value_enum, default_value_t = CliMode::Synthesis)]
     pub mode: CliMode,
@@ -169,12 +173,24 @@ pub fn run_scan(
     Ok(())
 }
 
+/// Split a `--fallback FIELD=VALUE` argument. The value may contain '=' (only
+/// the first one separates); the field name must be non-empty.
+fn parse_fallback(s: &str) -> Result<(String, String), String> {
+    let (field, value) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected FIELD=VALUE, got `{s}`"))?;
+    if field.is_empty() {
+        return Err(format!("empty field name in `{s}`"));
+    }
+    Ok((field.to_string(), value.to_string()))
+}
+
 /// Parse mount CLI flags into `MountConfig` and `FuseConfig`. Pure function —
 /// no DB access, no mounting. Exported for unit testing.
 pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseConfig) {
     let config = MountConfig {
         template: args.template.clone(),
-        fallbacks: BTreeMap::new(),
+        fallbacks: args.fallbacks.iter().cloned().collect(),
         default_fallback: args.default_fallback.clone(),
         mode: args.mode.into(),
         poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),

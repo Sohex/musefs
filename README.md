@@ -64,6 +64,7 @@ backing file is gone, and garbage-collects orphaned art.
 musefs mount /path/to/mountpoint --db library.db \
     --template '$albumartist/$album/$title' \
     --default-fallback Unknown \
+    --fallback albumartist='Unknown Artist' \
     --mode synthesis        # or: structure-only
 ```
 
@@ -75,6 +76,10 @@ any tag key in the store works):
   `$title`, `$tracknumber`, `$date`, `$genre`).
 - `${albumartist|artist}` — **fallback chain**: the first present field wins,
   before the `--default-fallback` value (default `Unknown`) is used.
+- A missing field resolves in order: the field's value, then a **per-field
+  fallback** from `--fallback FIELD=VALUE` (repeatable, e.g. `--fallback
+  albumartist='Unknown Artist'`), then `--default-fallback`. Per-field
+  fallbacks let one field default differently from the rest.
 - `[ … ]` — **conditional section**: the bracketed text is emitted only when at
   least one field inside it is present. So `$album[ - CD $disc]` yields
   `Album - CD 2`, or just `Album` on a single-disc release. Write `$[` / `$]`
