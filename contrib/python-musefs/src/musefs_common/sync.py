@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .constants import MAX_ART_BYTES
-from .store import replace_tags, replace_track_art, track_id_for_path, upsert_art
+from .store import merge_tags, replace_tags, replace_track_art, track_id_for_path, upsert_art
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,7 @@ class Record:
     key: str
     pairs: list = field(default_factory=list)
     art: object = None  # list[ArtImage] | None
+    delete_keys: object = None  # list[str] of keys to clear without rewrite (merge mode)
 
 
 @dataclass
@@ -42,10 +43,12 @@ class SyncStats:
         )
 
 
-def sync_one(conn, record, stats, *, dry_run=False):
+def sync_one(conn, record, stats, *, dry_run=False, merge=False):
     """Sync one ``Record`` into the DB, mutating ``stats``. Caller owns the
-    transaction. Tags are always fully replaced (scanner-written binary tags
-    survive — see ``replace_tags``). Art is replaced when at least one image is
+    transaction. With ``merge=False`` (the default) all plugin-owned text tags are
+    replaced; with ``merge=True`` only the keys in ``record.pairs`` and
+    ``record.delete_keys`` are touched (see ``merge_tags``). Either way,
+    scanner-written binary tags survive. Art is replaced when at least one image is
     within ``MAX_ART_BYTES``; each over-cap image bumps ``skipped_art``, and if
     every provided image is over cap any scan-seeded ``track_art`` is left
     untouched."""
@@ -63,7 +66,10 @@ def sync_one(conn, record, stats, *, dry_run=False):
     will_link_art = bool(kept)
 
     if not dry_run:
-        replace_tags(conn, track_id, record.pairs)
+        if merge:
+            merge_tags(conn, track_id, record.pairs, record.delete_keys or [])
+        else:
+            replace_tags(conn, track_id, record.pairs)
         if will_link_art:
             arts = [
                 (upsert_art(conn, img.data, img.mime), img.picture_type, img.description)
@@ -76,7 +82,7 @@ def sync_one(conn, record, stats, *, dry_run=False):
     stats.synced += 1
 
 
-def sync_files(conn, records, *, dry_run=False, stats=None):
+def sync_files(conn, records, *, dry_run=False, stats=None, merge=False):
     """Sync an iterable of ``Record``s, returning the ``SyncStats``. Pass
     ``stats`` to accumulate into a caller-seeded instance (e.g. beets pre-counts
     unreadable art); otherwise a fresh one is created. Caller owns the
@@ -84,5 +90,5 @@ def sync_files(conn, records, *, dry_run=False, stats=None):
     if stats is None:
         stats = SyncStats()
     for record in records:
-        sync_one(conn, record, stats, dry_run=dry_run)
+        sync_one(conn, record, stats, dry_run=dry_run, merge=merge)
     return stats

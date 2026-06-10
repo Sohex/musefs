@@ -12,7 +12,7 @@ def test_core_imports_without_beets():
     code = (
         "import sys; sys.modules['beets'] = None; "
         "import beetsplug._core as c; "
-        "assert c.DIRECT_FIELDS and c.map_fields and c.build_records"
+        "assert c.RENAME and c.map_fields and c.build_records"
     )
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
     subprocess.run([sys.executable, "-c", code], check=True, env=env)

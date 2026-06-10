@@ -32,6 +32,7 @@ class MusefsPlugin(BeetsPlugin):
             "bin": "musefs",  # musefs executable (PATH name or full path)
             "autoscan": True,  # run `musefs scan` automatically before syncing
             "write_path": True,  # emit a beets_path tag for $!{beets_path} mounts
+            "restore_backing": False,  # on delete, let the backing tag value reappear
         })
         # beets has no file-move event, and `after_write` fires *before* a move
         # (at the old path). So imports/writes are recorded and reconciled once
@@ -61,6 +62,13 @@ class MusefsPlugin(BeetsPlugin):
             default=False,
             help="report what would change without writing",
         )
+        cmd.parser.add_option(
+            "--restore-backing",
+            dest="restore_backing",
+            action="store_true",
+            default=False,
+            help="when a tag is removed in beets, let the backing file's value reappear",
+        )
         cmd.func = self._command
         return [cmd]
 
@@ -86,7 +94,8 @@ class MusefsPlugin(BeetsPlugin):
                 [os.fsdecode(i.path) for i in items] if query else [os.fsdecode(lib.directory)]
             )
             self._run_scan(db_path, targets)
-        stats = self._sync(db_path, items, dry_run=opts.dry_run)
+        restore_backing = bool(opts.restore_backing) or self._restore_backing()
+        stats = self._sync(db_path, items, dry_run=opts.dry_run, restore_backing=restore_backing)
         if opts.dry_run:
             pruned = 0
         else:
@@ -121,7 +130,7 @@ class MusefsPlugin(BeetsPlugin):
         try:
             if self._autoscan():
                 self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
-            self._sync(db_path, items)
+            self._sync(db_path, items, restore_backing=self._restore_backing())
             self._prune_missing(db_path)
         except (ui.UserError, sqlite3.Error, OSError, subprocess.SubprocessError) as exc:
             # A passive cli_exit hook must never abort the beets operation for an
@@ -147,6 +156,9 @@ class MusefsPlugin(BeetsPlugin):
 
     def _write_path(self):
         return bool(self.config["write_path"].get(bool))
+
+    def _restore_backing(self):
+        return bool(self.config["restore_backing"].get(bool))
 
     def _bin(self):
         return self.config["bin"].get(str) or "musefs"
@@ -200,7 +212,7 @@ class MusefsPlugin(BeetsPlugin):
         finally:
             conn.close()
 
-    def _sync(self, db_path, items, dry_run=False):
+    def _sync(self, db_path, items, dry_run=False, restore_backing=False):
         if not os.path.exists(db_path):
             raise ui.UserError(
                 f"musefs: DB not found at {db_path}; enable `musefs.autoscan` "
@@ -210,18 +222,20 @@ class MusefsPlugin(BeetsPlugin):
         try:
             check_schema_version(conn)
             stats = SyncStats()
-            records = _core.build_records(
+            records, managed_writes = _core.build_records(
                 items,
                 fields=self._fields(),
                 stats=stats,
                 write_path=self._write_path(),
+                restore_backing=restore_backing,
                 log=self._log,
             )
-            sync_files(conn, records, dry_run=dry_run, stats=stats)
+            sync_files(conn, records, dry_run=dry_run, stats=stats, merge=True)
             if dry_run:
                 conn.rollback()
             else:
                 conn.commit()
+                _core.persist_managed(managed_writes)
             return stats
         except SchemaMismatch as exc:
             conn.rollback()

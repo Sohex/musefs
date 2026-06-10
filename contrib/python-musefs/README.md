@@ -12,6 +12,11 @@ Field mapping stays in each plugin — beets expands multi-valued
 `genres`/`composers` into one tag each, Picard takes the first value — so this
 library deliberately does not own it.
 
+- `merge_tags(conn, track_id, managed_pairs, delete_keys)` — per-key replacement
+  of plugin-managed text tags. Unlike `replace_tags` (which clears all text rows),
+  `merge_tags` clears only the keys it rewrites plus `delete_keys`, leaving other
+  scan-seeded text tags intact. Scanner-written binary tags survive either way.
+
 ## Consumers
 
 - **beets** depends on this package via pip (`contrib/beets/pyproject.toml`).

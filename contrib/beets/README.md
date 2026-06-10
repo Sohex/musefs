@@ -69,6 +69,21 @@ first; the hooks then skip gracefully if the DB is missing.
 
 ## Notes
 
+- **Field coverage:** every tag beets writes to a file (its `_media_tag_fields`)
+  is synced — ReplayGain, MusicBrainz IDs, comment, lyrics, grouping, isrc,
+  multi-valued artists, and any custom field — under canonical musefs keys.
+  Read-only file facts (bitrate, length, …) are never written as tags.
+- **Merge, not replace:** beets' values win for the fields it manages; any other
+  tag already embedded in the file is preserved in the view.
+- **Deletions stick:** the plugin records the keys it manages per track in a
+  `musefs_managed` beets flexattr (stored in the beets DB only — never in your
+  audio files or the musefs store). Remove a tag in beets and it is removed from
+  the view and stays gone across re-scans.
+- **`--restore-backing`** (or `restore_backing: yes`): when you remove a tag in
+  beets, let the file's original embedded value reappear instead of disappearing.
+- **Caveat:** sticky deletion relies on `autoscan: yes` (the default), which
+  re-derives the file's embedded tags before each sync. With `autoscan: no`, a
+  deletion only takes effect after your next manual `musefs scan`.
 - **Cover art:** taken from the album's `artpath` (beets' external cover file).
   beets art wins when present; otherwise any art `musefs scan` ingested from
   embedded pictures is preserved.

@@ -73,6 +73,34 @@ def replace_tags(conn, track_id, pairs):
     )
 
 
+def merge_tags(conn, track_id, managed_pairs, delete_keys):
+    """Per-key replace of the plugin-managed text tags, leaving unmanaged text
+    rows (the scan-seeded baseline) intact. ``managed_pairs`` is an ordered list
+    of (key, value); every key it names is cleared and rewritten with contiguous
+    ordinals. ``delete_keys`` names keys to clear without rewriting (tags the
+    plugin previously managed and the user has now removed). Both deletes are
+    scoped to ``value_blob IS NULL`` so scanner-written binary tags survive."""
+    by_key = {}
+    for key, value in managed_pairs:
+        by_key.setdefault(key, []).append(value)
+
+    for key in set(by_key) | set(delete_keys or ()):
+        conn.execute(
+            "DELETE FROM tags WHERE track_id = ? AND key = ? AND value_blob IS NULL",
+            (track_id, key),
+        )
+
+    rows = [
+        (track_id, key, value, ordinal)
+        for key, values in by_key.items()
+        for ordinal, value in enumerate(values)
+    ]
+    conn.executemany(
+        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, ?, ?, ?)",
+        rows,
+    )
+
+
 _EXT_MIME = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",

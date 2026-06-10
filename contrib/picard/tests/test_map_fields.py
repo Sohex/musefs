@@ -61,3 +61,19 @@ def test_extra_field_remaps_existing_key(fake_metadata):
     d = dict(map_fields(fake_metadata(title="Song"), extra_fields={"title": "subtitle"}))
     assert d["subtitle"] == "Song"
     assert "title" not in d
+
+
+def test_replaygain_and_musicbrainz_and_comment_mapped(fake_metadata):
+    md = fake_metadata(
+        replaygain_track_gain="-7.50 dB",
+        musicbrainz_albumid="abc",
+        comment="hello",
+        lyrics="la",
+        grouping="set",
+        isrc="US-X",
+    )
+    d = dict(map_fields(md))
+    assert d["replaygain_track_gain"] == "-7.50 dB"
+    assert d["musicbrainz_albumid"] == "abc"
+    assert d["comment"] == "hello"
+    assert d["lyrics"] == "la" and d["grouping"] == "set" and d["isrc"] == "US-X"

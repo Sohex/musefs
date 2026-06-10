@@ -24,9 +24,10 @@ def _plugin(monkeypatch, *, sync_raises=None):
     plugin._pending = [SimpleNamespace(path=b"/music/a.flac")]
     plugin._db_path = lambda: "/db.sqlite"
     plugin._autoscan = lambda: False
+    plugin._restore_backing = lambda: False
     plugin._prune_missing = lambda db: None
 
-    def _sync(db, items):
+    def _sync(db, items, **kwargs):
         if sync_raises is not None:
             raise sync_raises
 

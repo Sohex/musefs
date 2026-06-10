@@ -73,6 +73,13 @@ class FakeItem:
     def get_album(self):
         return self._album
 
+    def __setitem__(self, key, value):
+        # beets flexattr write; readable back via getattr (used by read_managed).
+        setattr(self, key, value)
+
+    def store(self):
+        self.stored = getattr(self, "stored", 0) + 1
+
 
 @pytest.fixture
 def fake_item():
