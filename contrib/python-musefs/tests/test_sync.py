@@ -123,11 +123,12 @@ def test_tags_fully_replaced(db_path):
 def test_no_art_leaves_existing_track_art_untouched(db_path):
     conn, tid = _seed(db_path)
     try:
+        sha = "deadbeef" * 8  # 64-char hex to satisfy the length(sha256)=64 CHECK
         conn.execute(
-            "INSERT INTO art (sha256, mime, byte_len, data) VALUES "
-            "('deadbeef', 'image/jpeg', 3, X'aabbcc')"
+            "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?, 'image/jpeg', 3, X'aabbcc')",
+            (sha,),
         )
-        art_id = conn.execute("SELECT id FROM art WHERE sha256='deadbeef'").fetchone()[0]
+        art_id = conn.execute("SELECT id FROM art WHERE sha256=?", (sha,)).fetchone()[0]
         conn.execute("INSERT INTO track_art (track_id, art_id) VALUES (?, ?)", (tid, art_id))
         conn.commit()
         stats = SyncStats()
@@ -252,11 +253,12 @@ def test_sync_one_per_image_cap_keeps_survivors(db_path):
 def test_sync_one_all_images_over_cap_leaves_existing_art(db_path):
     conn, tid = _seed(db_path)
     try:
+        sha = "deadbeef" * 8  # 64-char hex to satisfy the length(sha256)=64 CHECK
         conn.execute(
-            "INSERT INTO art (sha256, mime, byte_len, data) VALUES "
-            "('deadbeef', 'image/jpeg', 3, X'aabbcc')"
+            "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?, 'image/jpeg', 3, X'aabbcc')",
+            (sha,),
         )
-        art_id = conn.execute("SELECT id FROM art WHERE sha256='deadbeef'").fetchone()[0]
+        art_id = conn.execute("SELECT id FROM art WHERE sha256=?", (sha,)).fetchone()[0]
         conn.execute("INSERT INTO track_art (track_id, art_id) VALUES (?, ?)", (tid, art_id))
         conn.commit()
         big = b"x" * (MAX_ART_BYTES + 1)
