@@ -318,6 +318,8 @@ Expected: the dependency downloads and the crate builds (no source changes yet).
 
 Add these tests inside the existing `#[cfg(test)] mod tests` block in `musefs-cli/src/lib.rs` (e.g. after `mount_args_parse_into_configs`, around line 360). They reference `parse_octal_mode`, `write_bit_warning`, and the new `--owner`/`--file-mode` flags that don't exist yet.
 
+(Note: the spec suggested *extending* the existing `mount_args_parse_into_configs` test for the flag-flow and default-equivalence assertions. This plan instead adds two focused tests — `owner_and_modes_flow_into_fuse_config` and `owner_flags_default_to_process_identity` — and leaves `mount_args_parse_into_configs` untouched. Coverage is equivalent; the split keeps each test single-purpose.)
+
 ```rust
     #[test]
     fn octal_mode_parses_as_octal_not_decimal() {
@@ -380,6 +382,13 @@ Add these tests inside the existing `#[cfg(test)] mod tests` block in `musefs-cl
         assert_eq!(parse_owner("1234").unwrap(), 1234);
         assert!(parse_owner("").is_err());
         assert!(parse_owner("definitely-no-such-user-xyzzy").is_err());
+    }
+
+    #[test]
+    fn group_accepts_numeric_and_rejects_unknown_name() {
+        assert_eq!(parse_group("1234").unwrap(), 1234);
+        assert!(parse_group("").is_err());
+        assert!(parse_group("definitely-no-such-group-xyzzy").is_err());
     }
 ```
 
@@ -502,25 +511,29 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `README.md` (CLI flags / mount options section)
 
-- [ ] **Step 1: Find the mount-flags section in the README**
+- [ ] **Step 1: Locate the mount flag documentation in the README**
 
-Run: `grep -n -- '--keep-cache\|--attr-ttl-ms\|--case-insensitive\|## .*[Mm]ount' README.md`
-Expected: the line numbers of the existing `mount` flag documentation (the four new flags go alongside these).
+Run: `grep -n -- '### Tuning\|### Supported formats\|case-insensitive' README.md`
+Expected: `### Tuning` at ~110 (a Markdown table of mount flags at ~114-121) and `## Supported formats` at ~123. The four new flags are ownership/permission concerns, not kernel tuning, so they get their **own subsection inserted between the `### Tuning` table and `## Supported formats`** — not appended to the Tuning table.
 
-- [ ] **Step 2: Add the four flags to the README**
+- [ ] **Step 2: Add an "Ownership and permissions" subsection**
 
-In the `mount` flags list (next to `--case-insensitive` / `--keep-cache`), add entries matching the surrounding style. Use the wording:
+Insert this new subsection immediately after the `### Tuning` table (after the `--case-insensitive` row, ~line 121) and before `## Supported formats`. It mirrors the Tuning table's `| Flag | Default | What it does |` format; note the `\|` escapes inside the `NAME\|UID` cells so the table stays well-formed:
 
 ```markdown
-- `--owner <NAME|UID>` — user presented as the owner of every entry. Accepts a
-  username or a numeric uid. Default: the launching process's uid.
-- `--group <NAME|GID>` — group presented for every entry. Accepts a group name
-  or numeric gid. Default: the launching process's gid.
-- `--file-mode <OCTAL>` — permission bits for regular files, in octal (e.g.
-  `444`). Default: `444`. The mount is read-only, so write bits are advertised
-  but writes still fail with `EROFS`.
-- `--dir-mode <OCTAL>` — permission bits for directories, in octal (e.g.
-  `555`). Default: `555`.
+### Ownership and permissions
+
+By default the mount presents the launching process's uid/gid and read-only
+permission bits (`555` dirs, `444` files). Override them to present a specific
+owner — e.g. a media-server service account — without running musefs as that
+user.
+
+| Flag | Default | What it does |
+| ---- | ------- | ------------ |
+| `--owner <NAME\|UID>` | process uid | User presented as the owner of every entry. Accepts a username or a numeric uid. |
+| `--group <NAME\|GID>` | process gid | Group presented for every entry. Accepts a group name or a numeric gid. |
+| `--file-mode <OCTAL>` | `444` | Permission bits for regular files, in octal. The mount is read-only, so write bits are advertised but writes still fail with `EROFS`. |
+| `--dir-mode <OCTAL>` | `555` | Permission bits for directories, in octal. |
 ```
 
 - [ ] **Step 3: Verify the docs build/render and the binary help matches**
@@ -531,7 +544,7 @@ Expected: the four flags appear in the generated help with the documented value 
 - [ ] **Step 4: Confirm FreeBSD portability of `uzers` (verification, see spec Portability)**
 
 Run: `cargo build --target x86_64-unknown-freebsd -p musefs-cli 2>&1 | tail -15`
-Expected: builds. (`uzers` does not advertise a FreeBSD target on docs.rs but, as a `users` fork, builds via libc.) If it does **not** build, do not work around it here — stop and apply the spec's contingency: drop `uzers` and resolve names with `getpwnam_r`/`getgrnam_r` via `libc` behind a safe wrapper in `musefs-cli`, then re-run Tasks 2-3. If the FreeBSD target is not installed locally, note that the FreeBSD CI job is the gate and proceed.
+Expected: builds. (`uzers` does not advertise a FreeBSD target on docs.rs but, as a `users` fork, builds via libc.) If it does **not** build, do not work around it here — stop and apply the spec's contingency: drop `uzers` and resolve names with `getpwnam_r`/`getgrnam_r` via `libc` behind a safe wrapper in `musefs-cli` (this adds `libc` as a new `musefs-cli` dependency — it is currently only a `musefs-fuse` dep), then re-run Tasks 2-3. If the FreeBSD target is not installed locally, note that the FreeBSD CI job is the gate and proceed.
 
 - [ ] **Step 5: Commit**
 
