@@ -315,6 +315,9 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
+          # Disabled deliberately: provenance attestations add unknown/unknown
+          # entries to the manifest list, which some registries/tools mis-parse.
+          # Build metadata is still recorded via the OCI labels below.
           provenance: false
           tags: ${{ steps.tags.outputs.list }}
           labels: |

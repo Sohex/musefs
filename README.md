@@ -250,8 +250,9 @@ namespace. By default neither the host nor other containers can see it, so
 pointing a second container (your media manager) at musefs's output does not
 work out of the box. Two ways to share it:
 
-- **Prefer Podman in a shared pod** — put musefs and the consumer in the same
-  pod so they share namespaces and the mount is directly reachable:
+- **Prefer Podman in a shared pod** — Docker has no first-class pod primitive,
+  but Podman does, so this is the cleanest path: put musefs and the consumer in
+  the same pod so they share namespaces and the mount is directly reachable:
 
   ```bash
   podman pod create --name media
