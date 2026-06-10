@@ -14,12 +14,16 @@ CONTRACT_TITLE = "Contract Roundtrip Title"
 CONTRACT_ARTIST = "Contract Roundtrip Artist"
 
 
-def _audio_files():
-    d = os.environ["MUSEFS_INTEROP_DIR"]
+def _audio_files() -> list[str]:
+    """Sorted synthesized flac/mp3 paths from MUSEFS_INTEROP_DIR."""
+    d = os.environ.get("MUSEFS_INTEROP_DIR")
+    if not d:
+        raise RuntimeError("MUSEFS_INTEROP_DIR must be set (see scripts/contract-roundtrip.sh)")
     return sorted(glob.glob(os.path.join(d, "*.flac")) + glob.glob(os.path.join(d, "*.mp3")))
 
 
-def test_python_written_tags_survive_synthesis():
+def test_python_written_tags_survive_synthesis() -> None:
+    """The title/artist written via the python store read back via mutagen."""
     files = _audio_files()
     assert files, "no synthesized contract files found in MUSEFS_INTEROP_DIR"
     for path in files:
@@ -29,7 +33,8 @@ def test_python_written_tags_survive_synthesis():
         assert f.get("artist", [None])[0] == CONTRACT_ARTIST, f"artist wrong in {path}"
 
 
-def test_synthesized_files_carry_embedded_art():
+def test_synthesized_files_carry_embedded_art() -> None:
+    """Cover art written via the python store survives into the synthesized file."""
     for path in _audio_files():
         f = mutagen.File(path)
         has_art = bool(getattr(f, "pictures", None)) or (
