@@ -425,15 +425,21 @@ Gotchas that have bitten before:
 - The real-Picard tests `importorskip` Picard and Qt: without an importable
   Picard (e.g. the system package on `PYTHONPATH`), they **silently skip**.
   When touching the Picard plugin, make sure they actually ran.
-- The Lidarr smoke is automated as a release gate in
-  `.github/workflows/lidarr-smoke.yml`: a real Lidarr container proves the
-  Custom Script exec path (its Test event), and the content leg
-  (`musefs-lidarr-sync` tag-writes, `musefs-lidarr-import` symlink, served-mount
-  tags, unchanged backing bytes) runs against a local mock Lidarr API so it is
-  deterministic and network-free. It runs on PRs touching the Lidarr surface and
-  **gates the Python `py-v*` publish**. The download-client `AlbumImportedEvent`
-  path remains a documented manual gap (it only fires for `NewDownload`
-  imports); see `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`.
+- The Lidarr integration is gated by two automated tiers, both deterministic
+  and network-free (Lidarr's metadata server is mocked too):
+  - **PR check — `.github/workflows/lidarr-smoke.yml`** (`scripts/lidarr-smoke.sh`):
+    a fast smoke that proves the Custom Script exec path on a real Lidarr (its
+    Test event) and runs the content leg (`musefs-lidarr-sync` tag-writes,
+    `musefs-lidarr-import` symlink, served-mount tags, unchanged bytes) against a
+    local mock Lidarr API. Runs on PRs touching the Lidarr surface.
+  - **Release gate — `.github/workflows/lidarr-e2e.yml`** (`scripts/lidarr-e2e/run-e2e.sh`):
+    the full real-instance e2e. A real Lidarr, driven by local
+    metadata/indexer/qBittorrent mocks, performs a genuine **download-client
+    import** of a real CC0 album as a `NewDownload`, firing `OnReleaseImport`,
+    which execs the real musefs scripts; the served mount is then asserted to
+    carry Lidarr-supplied metadata the backing file lacked, bytes unchanged. This
+    **gates the Python `py-v*` publish** and closes what used to be the manual
+    download-client gap. The vendored CC0 fixture is `scripts/lidarr-e2e/fixtures/`.
 - `musefs_common/schema.py` is **generated** from `musefs-db/src/schema.rs`.
   After a schema change:
   `MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py`, then
@@ -560,10 +566,10 @@ covering the full matrix including the FreeBSD VM e2e).
 3. Confirm all four target tarballs + `.sha256` files are attached to the
    GitHub Release.
 
-**Lidarr gate at a v1.0.0 milestone.** The Lidarr real-instance smoke
-(`lidarr-smoke.yml`) gates the Python `py-v*` release, not this Rust flow. When
-a v1.0.0 milestone bundles both, ensure the Python release (and therefore its
-Lidarr smoke gate) is also run.
+**Lidarr gate at a v1.0.0 milestone.** The Lidarr real-instance e2e
+(`lidarr-e2e.yml`) gates the Python `py-v*` release, not this Rust flow. When a
+v1.0.0 milestone bundles both, ensure the Python release (and therefore its
+Lidarr e2e gate) is also run.
 
 ## PRs & commits
 

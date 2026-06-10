@@ -27,6 +27,14 @@ This plan is Component 2 of the release-process hardening spec:
 > and the spec's Component 2 for the as-built design; the full harness was run
 > green locally (both legs).
 
+> **Extended (2026-06-10):** this plan's mock-API smoke was kept as the fast PR
+> check, and the download-client gap it left was then **closed** by a full
+> real-instance e2e — `scripts/lidarr-e2e/run-e2e.sh` + `.github/workflows/lidarr-e2e.yml`,
+> which gates the Python publish. Local metadata/indexer/qBittorrent mocks drive
+> a real Lidarr through a genuine `NewDownload` import → `OnReleaseImport` → the
+> real musefs scripts, proving the served file carries Lidarr-supplied tags. The
+> "documented manual gap" wording in this plan is superseded by that e2e.
+
 ---
 
 ## Background the executor needs (verified against the code)
