@@ -55,10 +55,17 @@ def main(argv=None, stdin_text=None):
     args = parser.parse_args(argv)
 
     text = stdin_text if stdin_text is not None else sys.stdin.read()
-    payload = json.loads(text)
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        # Empty/garbled input — e.g. a transient `gh api` failure left checks.json
+        # empty — must degrade to "wait" so the poll loop retries, not crash and
+        # abort the release.
+        print("Could not parse check-runs JSON; will retry.")
+        return 2
     # `or []` (not `.get(..., [])`): a present-but-null check_runs key — which a
     # mis-slurped gh payload can produce — must degrade to "wait", not raise.
-    runs = payload.get("check_runs") or []
+    runs = (payload.get("check_runs") if isinstance(payload, dict) else None) or []
 
     result = decide(runs, args.names)
     if result is Decision.FAIL:

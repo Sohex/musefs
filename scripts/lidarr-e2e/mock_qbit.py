@@ -13,21 +13,20 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-CFG = {}  # filled by main(): hash, category, save_path, content_path, name
 
-
-def make_handler():
+def make_handler(cfg):
+    # cfg: hash, category, save_path, content_path, name
     def torrent():
         return {
-            "hash": CFG["hash"],
-            "name": CFG["name"],
+            "hash": cfg["hash"],
+            "name": cfg["name"],
             "size": 30000,
             "progress": 1.0,
             "eta": 0,
             "state": "uploading",  # finished + seeding -> Completed (QBittorrent.cs)
-            "category": CFG["category"],
-            "save_path": CFG["save_path"],
-            "content_path": CFG["content_path"],  # != save_path -> OutputPath set
+            "category": cfg["category"],
+            "save_path": cfg["save_path"],
+            "content_path": cfg["content_path"],  # != save_path -> OutputPath set
             "ratio": 1.0,
             "ratio_limit": -2,
             "seeding_time": 1,
@@ -61,7 +60,7 @@ def make_handler():
                 self._text("2.8.19")
             elif path == "/api/v2/app/preferences":
                 self._json({
-                    "save_path": CFG["save_path"],
+                    "save_path": cfg["save_path"],
                     "max_ratio_enabled": False,
                     "max_ratio": -1,
                     "max_seeding_time_enabled": False,
@@ -70,13 +69,13 @@ def make_handler():
                     "dht": True,
                 })
             elif path == "/api/v2/torrents/categories":
-                self._json({CFG["category"]: {"name": CFG["category"], "savePath": ""}})
+                self._json({cfg["category"]: {"name": cfg["category"], "savePath": ""}})
             elif path == "/api/v2/torrents/info":
                 self._json([torrent()])
             elif path == "/api/v2/torrents/properties":
-                self._json({"hash": CFG["hash"], "save_path": CFG["save_path"], "seeding_time": 1})
+                self._json({"hash": cfg["hash"], "save_path": cfg["save_path"], "seeding_time": 1})
             elif path == "/api/v2/torrents/files":
-                self._json([{"name": CFG["name"]}])
+                self._json([{"name": cfg["name"]}])
             else:
                 # createCategory/setCategory/add/delete/setShareLimits/topPrio/...
                 self._text("Ok.")
@@ -106,14 +105,14 @@ def main(argv=None):
     p.add_argument("--content-path", required=True)
     p.add_argument("--name", default="Komiku - The adventure goes on, vol.1")
     a = p.parse_args(argv)
-    CFG.update(
-        hash=a.hash.lower(),
-        category=a.category,
-        save_path=a.save_path,
-        content_path=a.content_path,
-        name=a.name,
-    )
-    ThreadingHTTPServer(("0.0.0.0", a.port), make_handler()).serve_forever()
+    cfg = {
+        "hash": a.hash.lower(),
+        "category": a.category,
+        "save_path": a.save_path,
+        "content_path": a.content_path,
+        "name": a.name,
+    }
+    ThreadingHTTPServer(("0.0.0.0", a.port), make_handler(cfg)).serve_forever()
 
 
 if __name__ == "__main__":  # pragma: no cover

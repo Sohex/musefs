@@ -47,7 +47,8 @@ ffmpeg -hide_banner -loglevel error -y -i "$HERE/fixtures/komiku-the-calling.fla
   -metadata MUSICBRAINZ_TRACKID=c6c102b4-755a-4fff-ab96-f2bbd6d39deb \
   "$DL/01 - The calling.flac" || fail "ffmpeg tag"
 BACKING="$DL/01 - The calling.flac"
-SHA_BEFORE="$(sha256sum "$BACKING" | awk '{print $1}')"
+SHA_BEFORE="$(sha256sum "$BACKING" | awk '{print $1}')" || fail "sha256 of backing file"
+[ -n "$SHA_BEFORE" ] || fail "empty sha256 for backing file"
 
 # wrappers + env into the bind dir
 cp "$HERE/import_wrapper.sh" "$HERE/sync_wrapper.sh" "$W/bin/"; chmod +x "$W/bin/"*.sh

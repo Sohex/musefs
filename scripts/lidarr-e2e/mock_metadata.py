@@ -14,11 +14,11 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-FIX = os.path.join(os.path.dirname(__file__), "fixtures", "metadata")
+FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "metadata")
 
 
 def _load(name):
-    with open(os.path.join(FIX, name)) as fh:
+    with open(os.path.join(FIXTURES_DIR, name)) as fh:
         return json.load(fh)
 
 
