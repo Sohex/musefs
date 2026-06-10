@@ -11,18 +11,19 @@ use std::time::{Duration, SystemTime};
 
 use threadpool::ThreadPool;
 
+use crate::convert::{assemble_dir_listing, to_file_attr};
 use fuser::{
-    BackgroundSession, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
+    BackgroundSession, Config, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
+    InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
 };
-use musefs_core::Attr;
 use musefs_core::CoreError;
 use musefs_core::Fh;
 use musefs_core::Musefs;
 use musefs_core::convert::usize_from;
 use std::num::NonZeroU64;
 
+mod convert;
 mod platform;
 
 /// Per-worker read scratch buffer: each threadpool worker reuses one Vec across
@@ -104,66 +105,6 @@ fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
         _ => log::warn!("{op}({ino}) failed: {err}"),
     }
     errno(err)
-}
-
-/// Translate a core `Attr` into a `fuser::FileAttr`. Read-only perms (`0o555`
-/// dirs, `0o444` files). A zero `mtime_secs` (e.g. synthetic directories) falls
-/// back to `fallback_mtime` so tools don't see a 1970 timestamp.
-pub fn to_file_attr(attr: &Attr, uid: u32, gid: u32, fallback_mtime: SystemTime) -> FileAttr {
-    let mtime = if attr.mtime_secs > 0 {
-        SystemTime::UNIX_EPOCH
-            + Duration::from_secs(
-                u64::try_from(attr.mtime_secs).expect("guarded by mtime_secs > 0"),
-            )
-    } else {
-        fallback_mtime
-    };
-    let (kind, perm, nlink) = if attr.is_dir {
-        (FileType::Directory, 0o555, 2)
-    } else {
-        (FileType::RegularFile, 0o444, 1)
-    };
-    FileAttr {
-        ino: INodeNo(attr.inode),
-        size: attr.size,
-        blocks: attr.size.div_ceil(512),
-        atime: mtime,
-        mtime,
-        ctime: mtime,
-        crtime: mtime,
-        kind,
-        perm,
-        nlink,
-        uid,
-        gid,
-        rdev: 0,
-        blksize: 512,
-        flags: 0,
-    }
-}
-/// Assemble a directory's readdir listing: `.`, `..`, the children, then the
-/// optional Spotlight marker. Pure (no DB/tree access) so it is unit-testable.
-fn assemble_dir_listing(
-    ino: u64,
-    parent: u64,
-    entries: Vec<(String, u64, bool)>,
-    marker: Option<(u64, FileType, String)>,
-) -> Vec<(u64, FileType, String)> {
-    let mut listing: Vec<(u64, FileType, String)> = Vec::with_capacity(entries.len() + 2);
-    listing.push((ino, FileType::Directory, ".".to_string()));
-    listing.push((parent, FileType::Directory, "..".to_string()));
-    for (name, child, is_dir) in entries {
-        let kind = if is_dir {
-            FileType::Directory
-        } else {
-            FileType::RegularFile
-        };
-        listing.push((child, kind, name));
-    }
-    if let Some(entry) = marker {
-        listing.push(entry);
-    }
-    listing
 }
 
 /// Build a directory's full readdir listing once. Shared by `opendir`
@@ -573,10 +514,8 @@ pub fn spawn_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuser::FileType;
-    use musefs_core::Attr;
     use musefs_core::CoreError;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     #[test]
     fn maps_core_errors_to_errno() {
@@ -592,42 +531,6 @@ mod tests {
         assert_eq!(errno(&io).code(), libc::ENOENT);
         let io_other = CoreError::Io(std::io::Error::other("boom"));
         assert_eq!(errno(&io_other).code(), libc::EIO);
-    }
-
-    #[test]
-    fn converts_dir_and_file_attrs() {
-        let fallback = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-
-        let dir = Attr {
-            inode: 1,
-            is_dir: true,
-            size: 0,
-            mtime_secs: 0,
-        };
-        let fa = to_file_attr(&dir, 501, 20, fallback);
-        assert_eq!(fa.ino, INodeNo(1));
-        assert_eq!(fa.kind, FileType::Directory);
-        assert_eq!(fa.perm, 0o555);
-        assert_eq!(fa.uid, 501);
-        assert_eq!(fa.gid, 20);
-        // mtime_secs == 0 falls back to the supplied mount time.
-        assert_eq!(fa.mtime, fallback);
-
-        let file = Attr {
-            inode: 9,
-            is_dir: false,
-            size: 4096,
-            mtime_secs: 1_700_000_000,
-        };
-        let fa = to_file_attr(&file, 501, 20, fallback);
-        assert_eq!(fa.kind, FileType::RegularFile);
-        assert_eq!(fa.perm, 0o444);
-        assert_eq!(fa.size, 4096);
-        assert_eq!(fa.blocks, 8); // 4096 / 512
-        assert_eq!(
-            fa.mtime,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
-        );
     }
 
     #[test]
@@ -701,23 +604,6 @@ mod tests {
             !fs.poll_pending.load(Ordering::SeqCst),
             "guard must clear the gate after the task finishes"
         );
-    }
-
-    #[test]
-    fn assemble_dir_listing_puts_dot_and_dotdot_first() {
-        let entries = vec![
-            ("Song.flac".to_string(), 42, false),
-            ("Sub".to_string(), 43, true),
-        ];
-        let listing = assemble_dir_listing(7, 3, entries, None);
-        assert_eq!(listing.len(), 4);
-        assert_eq!(listing[0], (7, FileType::Directory, ".".to_string()));
-        assert_eq!(listing[1], (3, FileType::Directory, "..".to_string()));
-        assert_eq!(
-            listing[2],
-            (42, FileType::RegularFile, "Song.flac".to_string())
-        );
-        assert_eq!(listing[3], (43, FileType::Directory, "Sub".to_string()));
     }
 }
 

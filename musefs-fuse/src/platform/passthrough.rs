@@ -92,50 +92,8 @@ mod imp {
     fn definitely_lacks_cap_sys_admin() -> bool {
         std::fs::read_to_string("/proc/self/status")
             .ok()
-            .and_then(|s| cap_eff_has_sys_admin(&s))
+            .and_then(|s| crate::convert::cap_eff_has_sys_admin(&s))
             .is_some_and(|has| !has)
-    }
-
-    /// Parse the `CapEff:` line; None when absent or malformed.
-    fn cap_eff_has_sys_admin(status: &str) -> Option<bool> {
-        const CAP_SYS_ADMIN_BIT: u32 = 21;
-        let hex = status
-            .lines()
-            .find_map(|l| l.strip_prefix("CapEff:"))?
-            .trim();
-        let mask = u64::from_str_radix(hex, 16).ok()?;
-        Some(mask & (1 << CAP_SYS_ADMIN_BIT) != 0)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::cap_eff_has_sys_admin;
-
-        #[test]
-        fn cap_eff_parser_root_mask_has_sys_admin() {
-            assert_eq!(
-                cap_eff_has_sys_admin("CapPrm:\t0000003fffffffff\nCapEff:\t0000003fffffffff\n"),
-                Some(true)
-            );
-        }
-
-        #[test]
-        fn cap_eff_parser_zero_mask_lacks_sys_admin() {
-            assert_eq!(
-                cap_eff_has_sys_admin("CapEff:\t0000000000000000\n"),
-                Some(false)
-            );
-        }
-
-        #[test]
-        fn cap_eff_parser_missing_line_returns_none() {
-            assert_eq!(cap_eff_has_sys_admin("Name:\tfoo\nUid:\t1000\n"), None);
-        }
-
-        #[test]
-        fn cap_eff_parser_garbage_hex_returns_none() {
-            assert_eq!(cap_eff_has_sys_admin("CapEff:\tnothex\n"), None);
-        }
     }
 }
 
