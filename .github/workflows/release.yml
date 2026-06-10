@@ -214,6 +214,120 @@ jobs:
             alpine:3.20 \
             sh -c 'apk add --no-cache fuse3 ffmpeg >/dev/null && sh scripts/smoke-binary.sh ./musefs'
 
+  images:
+    needs: smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: glibc
+            dockerfile: docker/Dockerfile.glibc
+            amd64_triple: x86_64-unknown-linux-gnu
+            arm64_triple: aarch64-unknown-linux-gnu
+            ffmpeg_install: apt-get update >/dev/null && apt-get install -y --no-install-recommends ffmpeg >/dev/null
+          - variant: musl
+            dockerfile: docker/Dockerfile.musl
+            amd64_triple: x86_64-unknown-linux-musl
+            arm64_triple: aarch64-unknown-linux-musl
+            ffmpeg_install: apk add --no-cache ffmpeg >/dev/null
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
+      - name: Download amd64 artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: musefs-${{ matrix.amd64_triple }}
+          path: dl/amd64
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: musefs-${{ matrix.arm64_triple }}
+          path: dl/arm64
+      - name: Stage binaries into the build context
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${REF#v}"
+          stage() {  # $1=docker_arch  $2=rust_triple
+            arch="$1"; triple="$2"; dir="dl/${arch}"
+            tarball="musefs-${VERSION}-${triple}.tar.gz"
+            ( cd "$dir" && sha256sum -c "${tarball}.sha256" )
+            mkdir -p "ctx/${arch}"
+            tar -xzf "${dir}/${tarball}" -C "ctx/${arch}"
+            test -x "ctx/${arch}/musefs"
+          }
+          stage amd64 "${{ matrix.amd64_triple }}"
+          stage arm64 "${{ matrix.arm64_triple }}"
+          ls -lR ctx
+      - name: Compute image tags
+        id: tags
+        env:
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAGS="$(python scripts/container_tags.py --repo "$REPO" --ref "$REF" --variant "${{ matrix.variant }}")"
+          test -n "$TAGS"   # fail fast rather than hand build-push-action an empty tag list
+          echo "computed tags:"; printf '%s\n' "$TAGS"
+          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+          {
+            echo "list<<EOF"
+            printf '%s\n' "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build amd64 image for smoke
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: ctx
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          load: true
+          tags: musefs-smoke:${{ matrix.variant }}
+      - name: Smoke the built image (amd64, native)
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            -v "$PWD/scripts":/scripts:ro --entrypoint sh \
+            "musefs-smoke:${{ matrix.variant }}" \
+            -c '${{ matrix.ffmpeg_install }} && sh /scripts/smoke-binary.sh /usr/local/bin/musefs'
+      - name: Build and push multi-arch manifest
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: ctx
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Disabled deliberately: provenance attestations add unknown/unknown
+          # entries to the manifest list, which some registries/tools mis-parse.
+          # Build metadata is still recorded via the OCI labels below.
+          provenance: false
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.title=musefs
+            org.opencontainers.image.description=Read-only passthrough FUSE filesystem presenting a re-tagged view of a music library
+
   release-assets:
     needs: [smoke, publish]
     runs-on: ubuntu-latest
