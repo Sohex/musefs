@@ -197,6 +197,10 @@ jobs:
         run: python -m pytest scripts/test_bump_python_version.py -v
       - name: Test mutant-anchor guard
         run: python -m pytest scripts/test_check_mutant_anchors.py -v
+      - name: Test release gate
+        run: python -m pytest scripts/test_release_gate.py -v
+      - name: Test crates-index probe
+        run: python -m pytest scripts/test_crates_index.py -v
 
   beets:
     needs: changes
