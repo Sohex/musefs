@@ -2,7 +2,7 @@
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 use musefs_format::ogg::OggArt;
-use musefs_format::{fuzz_check::assert_backing_covers_audio, ogg, ArtInput};
+use musefs_format::{fuzz_check::assert_backing_covers_audio, ogg, ArtInput, Extent};
 use musefs_fuzz::{arb_tags, MAX_INPUT};
 
 fuzz_target!(|data: &[u8]| {
@@ -19,6 +19,16 @@ fuzz_target!(|data: &[u8]| {
         Ok(h) => h,
         Err(_) => return,
     };
+    // #212: ogg::read_metadata == read_header; the bounded twin Completes only
+    // when read_header succeeds, and cannot return NeedMore at a whole buffer.
+    let len = data.len() as u64;
+    match ogg::read_metadata_bounded(data, len) {
+        Ok(Extent::Complete(h)) => assert_eq!(h, header, "ogg bounded != read_metadata"),
+        Ok(Extent::NeedMore { up_to }) => {
+            panic!("ogg bounded NeedMore at whole buffer: up_to={up_to}")
+        }
+        Err(_) => panic!("ogg bounded Err but read_metadata succeeded"),
+    }
     let mut u = Unstructured::new(data);
     let tags = arb_tags(&mut u).unwrap_or_default();
 
