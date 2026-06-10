@@ -4,9 +4,30 @@
 
 **Goal:** Make the full-rebuild tree path establish its disambiguation order locally by sorting entries by track `id` inside `render_entries`, instead of silently inheriting that order from `list_tracks`'s `ORDER BY id`.
 
-**Architecture:** `render_entries` (`musefs-core/src/facade.rs`) is the single lock-free render phase shared by both full-rebuild paths (`build_full` and `rebuild_full`); both feed its `Vec<(i64, String)>` into `VirtualTree::build_with_ci`, whose insertion order decides which member of a colliding path keeps the bare name. Sorting that `Vec` ascending by `id` in `render_entries` makes the full-rebuild order self-established at one point, matches the incremental path's min-id rule, and renders the Stage-B fallback's separate re-sort redundant-but-harmless. The sort is deliberately NOT placed in `build_with_ci`, because many `tree.rs` unit tests feed that primitive id-unordered entries and assert insertion-order-dependent flips that an inner sort would mask.
+**Architecture:** `render_entries` (`musefs-core/src/facade.rs`) is the single lock-free render phase shared by both full-rebuild paths (`build_full` and `rebuild_full`); both feed its `Vec<(i64, String)>` into `VirtualTree::build_with_ci`, whose insertion order decides which member of a colliding path keeps the bare name (`disambiguate` gives the bare name to the first inserted, ` (k)` to later ones — `tree.rs:277`). Sorting that `Vec` ascending by `id` in `render_entries` makes the full-rebuild order self-established at one point and matches the incremental path's min-id rule. The sort is deliberately NOT placed in `build_with_ci`, because many `tree.rs` unit tests feed that primitive id-unordered entries and assert insertion-order-dependent flips that an inner sort would mask.
 
 **Tech Stack:** Rust, musefs-core virtual tree
+
+---
+
+## The mutation-gate problem this plan must solve (read before Task 1)
+
+The per-PR mutation gate (`.github/workflows/mutants.yml`, `in-diff` job) mutates every Rust line this PR changes in `musefs-core/**`. So the production sort statement we add WILL be mutated, and a committed test must KILL that mutant or the gate fails.
+
+Here is the trap: `list_tracks` is hard-coded `ORDER BY id` (`musefs-db/src/tracks.rs:66-70`), SQLite assigns `id` ascending by insertion, and `render_entries` is fed ONLY by `list_tracks` (its two callers `build_full` and `rebuild_full` pass nothing else; verified via references). **So a real `Db` can never hand `render_entries` id-unordered rows.** A sort statement placed bare inside `render_entries` is therefore a *no-op on every reachable input* — removing it changes no DB-backed output, the mutant survives, and the gate (or a manual reviewer) is right to flag it. Investigation confirmed there is **no** production producer of id-unordered entries into `render_entries`; `list_tracks`'s clause is the sole upstream order, so option (a) "find a real unordered scenario" is impossible.
+
+**Resolution chosen: option (b) — extract the sort into a small pure helper and unit-test that helper directly.** `render_entries` calls `Self::order_entries(entries)` as part of its `Ok((..))` return. The helper
+
+```rust
+fn order_entries(mut entries: Vec<(i64, String)>) -> Vec<(i64, String)> {
+    entries.sort_by_key(|(id, _)| *id);
+    entries
+}
+```
+
+is mutated by cargo-mutants into bodies that return the *unsorted* `entries` (statement deleted) or an empty/`Default` `Vec`. A direct unit test that feeds a **descending** id pair and asserts **ascending** output kills both classes — the sort logic is now load-bearing under a committed test, independent of `list_tracks`. Because the call lives inside the function's return expression (not as a standalone deletable statement), `render_entries` itself gains no surviving call-site mutant: its only function-level mutant ("replace body with `Ok(Default::default())`") is already killed by the existing `render_entries_returns_paths_and_snapshot` test (`facade.rs:1341`).
+
+Honest framing of the two higher-level tests: a DB-backed test through `build_full`/`render_entries` documents the end-to-end guarantee (lower id owns the bare colliding name) but does **not** by itself bite if the sort is removed, precisely because the DB input is already id-ordered. The `order_entries` unit test is the regression guard. The plan says so explicitly rather than pretending a DB-backed test fails.
 
 ---
 
@@ -14,111 +35,41 @@
 
 | File | Responsibility / change |
 | ---- | ----------------------- |
-| `musefs-core/src/facade.rs` | **Production change:** sort `entries` ascending by `id` at the end of `render_entries` (~287-316). **Tests:** add a `render_entries`-ordering unit test and a full-rebuild-vs-incremental disambiguation-agreement test in the existing `mod tests` (~1108). |
-| `musefs-core/src/tree.rs` | **Anti-sort (no code change to the build primitive).** Update the coupling comment at ~1350-1352 to document the new behavior; sweep the `assert_apply_matches_build` oracle (~1467, ~1477) and the dir-vs-file flip test comment so the oracle and production agree that sorting lives in `render_entries`. |
-| `musefs-db/src/tracks.rs` | **No change.** Confirm `list_tracks` keeps `track_select!("ORDER BY id")` (~line 68); it is demoted from load-bearing to incidental, not removed. |
+| `musefs-core/src/facade.rs` | **Production change:** add a pure `order_entries` helper next to `render_entries` and call it in `render_entries`'s return (`render_entries` body is `facade.rs:287-316`). **Tests:** add the `order_entries` regression unit test (the mutation-gate killer) plus a DB-backed full-rebuild disambiguation test, in the existing `mod tests` (begins `facade.rs:1108`). |
+| `musefs-core/src/tree.rs` | **Anti-sort (no code change to the build primitive).** Update the coupling comment in `apply_changes_handles_dir_vs_file_min_id_flip` (`tree.rs:1353-1355`) and the `assert_apply_matches_build` doc comment (`tree.rs:1451-1456`) so the oracle and production agree that sorting lives in `render_entries`, not `list_tracks`. |
+| `musefs-db/src/tracks.rs` | **No change.** Confirm `list_tracks` keeps `track_select!("ORDER BY id")` (`tracks.rs:67`); it is demoted from load-bearing to incidental, not removed. |
 
 Note: the pre-commit hook runs fmt + clippy `-D warnings` + the **full workspace test suite** + ruff and rejects any red-test commit. Each task below bundles its failing test with the implementation (or comment/sweep change) so every commit is green.
 
 ---
 
-## Task 1: Sort entries by id in `render_entries`, with a render-ordering unit test
+## Task 1: Extract `order_entries`, sort `render_entries`, with the mutation-gate-killing unit test
 
-The single production change of this plan, plus the unit test that pins the new local guarantee at the `render_entries` boundary.
+The single production change of this plan: a pure `order_entries(Vec) -> Vec` helper that `render_entries` calls in its return, plus the direct unit test on that helper that fails (and kills the mutant) if the sort is removed.
 
 **Files:**
-- Production: `musefs-core/src/facade.rs` — `render_entries` body, lines 287-316 (the `for t in &tracks { … }` loop ends at line 314 with `entries.push((t.id, path));`, then `Ok((entries, snapshot))`).
-- Test: `musefs-core/src/facade.rs` — inside `mod tests` (begins line 1108), append a new `#[test] fn`.
+- Production: `musefs-core/src/facade.rs` — `render_entries` body (`facade.rs:287-316`); add `order_entries` immediately after it.
+- Test: `musefs-core/src/facade.rs` — inside `mod tests` (begins `facade.rs:1108`), append two new `#[test] fn`s.
 
 ### Test seam decision
 
-`render_entries` is crate-private and reads from `Db`; `list_tracks` returns `ORDER BY id`, so we cannot make a real `Db` hand it id-unordered rows without editing SQL. The honest local guarantee to pin is therefore the **post-condition of `render_entries`: its returned `Vec<(i64, String)>` is ascending by `id`** — which the new sort statement guarantees unconditionally (independent of `list_tracks`'s clause). The test builds an in-memory `Db<ReadWrite>`, `upsert_track`s two tracks whose rendered template path **collides**, calls `Musefs::render_entries` directly (same-crate access), and asserts the entries come back id-ascending and the lower id owns the bare colliding path. Task 2 adds the complementary "feed the build path id-unordered entries and match the sorted oracle" test, which is the part that bites if the sort statement is ever removed.
+`render_entries` is crate-private and fed only by `list_tracks` (`ORDER BY id`), so no DB-backed input is ever id-unordered — a bare sort inside `render_entries` is unobservable through the public path and would survive the mutation gate. We therefore extract the sort into the pure helper `order_entries` and pin it with a direct unit test that constructs a **descending** id input the DB could never produce. That test is the committed regression guard: it fails if the sort body is removed or mutated. The DB-backed test (Task 2 / Step 3 below) documents the end-to-end disambiguation guarantee but is not the bite.
 
 ### Steps
 
-- [ ] **Step 1: Write the failing render-ordering test.** Append this complete test to `musefs-core/src/facade.rs` inside `mod tests` (after the final existing test, before the closing `}` of the module). It uses `Db::open_in_memory()` and `upsert_track` (both confirmed present: `musefs-db/src/lib.rs:61`, `musefs-db/src/tracks.rs:178`), a `$title`-only template so both tracks render to the same `"Same.flac"` path, and `Musefs::render_entries` (the crate-private fn under test):
-
-  ```rust
-      #[test]
-      fn render_entries_sorts_ascending_by_id() {
-          use musefs_db::{Format, NewTrack, Tag};
-          use std::collections::BTreeMap;
-
-          let db = musefs_db::Db::open_in_memory().unwrap();
-          // Two tracks whose `$title` both render to "Same" -> colliding "Same.flac".
-          let id_a = db
-              .upsert_track(&NewTrack {
-                  backing_path: "/a.flac".into(),
-                  format: Format::Flac,
-                  audio_offset: 0,
-                  audio_length: 1,
-                  backing_size: 1,
-                  backing_mtime: 0,
-              })
-              .unwrap();
-          let id_b = db
-              .upsert_track(&NewTrack {
-                  backing_path: "/b.flac".into(),
-                  format: Format::Flac,
-                  audio_offset: 0,
-                  audio_length: 1,
-                  backing_size: 1,
-                  backing_mtime: 0,
-              })
-              .unwrap();
-          assert!(id_a < id_b, "insertion assigns ascending ids");
-          db.replace_tags(id_a, &[Tag::new("title", "Same", 0)]).unwrap();
-          db.replace_tags(id_b, &[Tag::new("title", "Same", 0)]).unwrap();
-
-          let template = Template::parse("$title").unwrap();
-          let config = MountConfig {
-              template: "$title".to_string(),
-              fallbacks: BTreeMap::new(),
-              default_fallback: "Unknown".to_string(),
-              mode: Mode::Synthesis,
-              poll_interval: std::time::Duration::ZERO,
-              case_insensitive: false,
-          };
-
-          let db = db.into_read_only();
-          let (entries, _snapshot) = Musefs::render_entries(&db, &template, &config).unwrap();
-
-          let ids: Vec<i64> = entries.iter().map(|(id, _)| *id).collect();
-          let mut sorted = ids.clone();
-          sorted.sort_unstable();
-          assert_eq!(ids, sorted, "render_entries must return entries ascending by id");
-          // Both render to the same path; the bare name belongs to the lower id
-          // (it is inserted first by the full-rebuild build path).
-          assert!(entries.iter().all(|(_, p)| p == "Same.flac"));
-      }
-  ```
-
-  Before running, verify the helper names against the actual files in this session:
-  - `Template::parse` and `MountConfig` are already in scope in `facade.rs` (used elsewhere in `mod tests`); `Tag::new`, `Format`, `NewTrack` come from `musefs_db`; `Db::open_in_memory` / `into_read_only` are `musefs-db/src/lib.rs:61,92`; `replace_tags` is used at `facade.rs:1197`. If `Template::parse`'s exact constructor name differs, grep `musefs-core/src/template.rs` (`grep -n "pub fn parse\|pub fn new" musefs-core/src/template.rs`) and use the real one — do not guess.
-
-- [ ] **Step 2: Run the test, see it fail.** Run:
-
-  ```
-  cargo test -p musefs-core render_entries_sorts_ascending_by_id
-  ```
-
-  Expected: the test FAILS on the second assertion — without the sort, the bare name `"Same.flac"` goes to whichever the build path inserts first, and (more importantly) the ordering contract is only coincidentally satisfied. With the current code the `ids == sorted` assertion may pass by `list_tracks` coincidence, but the test is meant to lock the guarantee at this boundary; it becomes load-bearing alongside Task 2. If `ids == sorted` already passes here, that is acceptable — Task 2's oracle is what fails without the sort. Either way, do NOT commit until Step 4 is green.
-
-  (If the test fails to *compile* — e.g. a helper name mismatch — fix the name against the real source, not the assertion.)
-
-- [ ] **Step 3: Implement the sort in `render_entries`.** Use `replace_symbol_body` on `impl Musefs/render_entries` (or edit the tail of the function). Add the sort immediately before the `Ok((entries, snapshot))` return. The complete new body:
+- [ ] **Step 1: Extract the helper and call it from `render_entries`.** Use `replace_symbol_body` on `impl Musefs/render_entries` to change only the return line, then `insert_after_symbol` (after `render_entries`) to add `order_entries`. The complete new `render_entries` body:
 
   ```rust
       /// DB read + path render with no allocator: the lock-free phase shared by
       /// `build_full` and `rebuild_full`. Confining all `Db` access here is what
       /// lets `rebuild_full` hold `inodes` only across the pure-CPU `build_with`.
       ///
-      /// Sorting `entries` ascending by track `id` here is what makes both
-      /// full-rebuild paths establish disambiguation order locally rather than
-      /// inheriting it from `list_tracks`'s `ORDER BY id` (#188): the build path's
-      /// insertion order decides which member of a colliding path keeps the bare
-      /// name, and that must match the incremental path's min-id rule regardless of
-      /// the source query's ordering.
+      /// The returned entries are ordered by `order_entries` (ascending by track
+      /// `id`), which is what makes both full-rebuild paths establish disambiguation
+      /// order locally rather than inheriting it from `list_tracks`'s `ORDER BY id`
+      /// (#188): the build path's insertion order decides which member of a colliding
+      /// path keeps the bare name, and that must match the incremental path's min-id
+      /// rule regardless of the source query's ordering.
       #[allow(clippy::type_complexity)]
       fn render_entries<M>(
           db: &Db<M>,
@@ -144,26 +95,75 @@ The single production change of this plan, plus the unit test that pins the new 
               );
               entries.push((t.id, path));
           }
+          Ok((Self::order_entries(entries), snapshot))
+      }
+
+      /// Establish the canonical full-rebuild order: ascending by track `id`. This
+      /// is the single point that fixes which member of a colliding rendered path
+      /// keeps the bare name in `build_with_ci`'s insertion order (#188); it must NOT
+      /// move into the build primitive, whose `tree.rs` tests feed it id-unordered
+      /// entries on purpose. Kept as a pure helper so its sort is observable (and
+      /// mutation-testable) independent of `list_tracks`'s incidental `ORDER BY id`.
+      fn order_entries(mut entries: Vec<(i64, String)>) -> Vec<(i64, String)> {
           entries.sort_by_key(|(id, _)| *id);
-          Ok((entries, snapshot))
+          entries
       }
   ```
 
-- [ ] **Step 4: Run the test, see it pass.** Run:
+- [ ] **Step 2: Write the regression unit test for `order_entries`.** Append to `musefs-core/src/facade.rs` inside `mod tests` (after the final existing test, before the module's closing `}`). This is the test that FAILS if the sort is removed or mutated — it feeds a descending pair a real `Db` could never produce:
+
+  ```rust
+      #[test]
+      fn order_entries_sorts_ascending_by_id() {
+          // A real Db never hands render_entries id-unordered rows (list_tracks is
+          // ORDER BY id), so this descending input is constructed directly to pin
+          // the sort itself. Deleting/mutating order_entries' sort fails this test.
+          let unordered = vec![
+              (9_i64, "z.flac".to_string()),
+              (2_i64, "a.flac".to_string()),
+              (5_i64, "m.flac".to_string()),
+          ];
+          let ordered = Musefs::order_entries(unordered);
+          let ids: Vec<i64> = ordered.iter().map(|(id, _)| *id).collect();
+          assert_eq!(ids, vec![2, 5, 9], "order_entries must sort ascending by id");
+          // The pairing is preserved, not just the id column.
+          assert_eq!(
+              ordered,
+              vec![
+                  (2_i64, "a.flac".to_string()),
+                  (5_i64, "m.flac".to_string()),
+                  (9_i64, "z.flac".to_string()),
+              ]
+          );
+      }
+  ```
+
+- [ ] **Step 3: Run the regression test, confirm it passes with the sort in place.** Run:
 
   ```
-  cargo test -p musefs-core render_entries_sorts_ascending_by_id
+  cargo test -p musefs-core order_entries_sorts_ascending_by_id
   ```
 
-  Expected: `test ... ok`. Then run the broader facade suite to confirm no regression:
+  Expected: `test ... ok` (the sort is present).
+
+- [ ] **Step 4: Prove the test bites — remove the sort, see it FAIL, then restore.** This is the verification that the committed test actually guards the production sort (not a coincidence). Temporarily change `order_entries`'s body to `entries` (drop the `sort_by_key` line) and run:
 
   ```
+  cargo test -p musefs-core order_entries_sorts_ascending_by_id
+  ```
+
+  Expected: the test FAILS — `assertion `left == right` failed`, `left: [9, 2, 5]`, `right: [2, 5, 9]`. **Restore the `entries.sort_by_key(|(id, _)| *id);` line immediately.** No commit happens in this step; it is the manual bite-check that mirrors what the mutation gate does to this line.
+
+- [ ] **Step 5: Re-run green and run the broader facade suite.** With the sort restored:
+
+  ```
+  cargo test -p musefs-core order_entries_sorts_ascending_by_id
   cargo test -p musefs-core facade
   ```
 
-  Expected: all pass.
+  Expected: all pass (including the unchanged `render_entries_returns_paths_and_snapshot`, which exercises `render_entries` end-to-end through `order_entries`).
 
-- [ ] **Step 5: Commit (green).** Stage the single changed file plus the test (same file) and commit:
+- [ ] **Step 6: Commit (green).** Stage the single changed file (production helper + test live in it) and commit:
 
   ```
   git add musefs-core/src/facade.rs
@@ -172,10 +172,13 @@ The single production change of this plan, plus the unit test that pins the new 
 
   Both full-rebuild paths (build_full, rebuild_full) sourced their entry
   order purely from list_tracks's ORDER BY id, so a track's inode could
-  flip if that clause changed or the source stopped being id-ordered. Sort
-  the shared render_entries output ascending by id so the order is
-  self-established at one local point, matching the incremental min-id rule
-  and rendering the Stage-B re-sort redundant-but-harmless.
+  flip if that clause changed or the source stopped being id-ordered.
+  Extract the ordering into a pure order_entries helper that render_entries
+  calls in its return, so the order is self-established at one local point
+  matching the incremental min-id rule. The helper is unit-tested directly
+  on a descending input (which a real Db can never produce), making the
+  sort observable and mutation-testable independent of list_tracks's now
+  incidental ORDER BY id.
 
   Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
   EOF
@@ -183,90 +186,100 @@ The single production change of this plan, plus the unit test that pins the new 
 
 ---
 
-## Task 2: Full-rebuild-vs-incremental agreement test on deliberately id-unordered entries
+## Task 2: DB-backed full-rebuild disambiguation test (end-to-end documentation)
 
-The spec's headline test: feed the full-rebuild build path id-unordered entries and assert identical disambiguation (and thus identical inode assignment) to the incremental path for a colliding pair. This is the test that *fails if the Task 1 sort is removed*, because it exercises the exact seam (`build_with_ci` insertion order) the sort protects.
+A test that drives a colliding pair through the **production** full-rebuild path (`render_entries` → `build_full` → `build_with_ci`) on a real `Db` and asserts the lower id owns the bare name — identical to the incremental path's min-id rule. This documents the end-to-end guarantee. It is NOT the regression bite (the DB input is already id-ordered, so it passes with or without the sort); Task 1's `order_entries` test is the bite. This test's value is pinning the *observable contract* — that the production path gives the bare colliding name to the lower id.
 
 **Files:**
-- Test: `musefs-core/src/facade.rs` — inside `mod tests` (line 1108), append a new `#[test] fn`.
+- Test: `musefs-core/src/facade.rs` — inside `mod tests` (begins `facade.rs:1108`), append a new `#[test] fn`.
 
 ### Why this seam
 
-`build_full`/`rebuild_full` get their entries only from `render_entries`, which now sorts; we cannot inject un-ordered entries through them without a Db that produces un-ordered rows. The faithful, deterministic proxy is to model `render_entries`'s output as an id-**unordered** `Vec<(i64, String)>` for a colliding pair, then verify that the full-rebuild build primitive **after the same sort `render_entries` applies** yields the bare name to the lower id — identical to the incremental min-id outcome. The test applies `entries.sort_by_key(|(id, _)| *id)` (mirroring the production sort, citing `facade.rs` `render_entries`) and asserts the lower id wins, then asserts an *unsorted* build would have given the bare name to the wrong (higher-id-first) entry — pinning that the sort is load-bearing.
+`build_full`/`rebuild_full` get their entries only from `render_entries`, so we cannot inject id-unordered entries through them. Instead we build a real in-memory `Db`, upsert two tracks whose `$title` both render to `"Same"` (→ colliding `"Same.flac"`), and call `build_full` (the production full-rebuild) on it. SQLite assigns the first-inserted track the lower id; `build_full` inserts ascending by id (via `order_entries`), so the lower id claims `"Same.flac"` and the higher gets `"Same (2).flac"` — matching `tree.rs`'s `introducing_id` min-id rule. The assertion is on the observable disambiguation, not on re-sorting entries in the test body.
 
 ### Steps
 
-- [ ] **Step 1: Write the agreement test.** Append to `musefs-core/src/facade.rs` inside `mod tests`. It uses `VirtualTree::build_with_ci` and `InodeAllocator` (both in scope in `musefs-core`; `VirtualTree` is already imported in `facade.rs`):
+- [ ] **Step 1: Write the DB-backed full-rebuild test.** Append to `musefs-core/src/facade.rs` inside `mod tests`. It uses `Db::open_in_memory` (`musefs-db/src/lib.rs:61`), `upsert_track` (`musefs-db/src/tracks.rs:178`), `replace_tags` + `Tag::new` (`musefs-db/src/tags.rs:174`, `musefs-db/src/models.rs:125`), `Musefs::build_full` (`facade.rs:318`), and `InodeAllocator::new` (in scope via the module-level `use crate::tree::{InodeAllocator, ...}` at `facade.rs:16`):
 
   ```rust
       #[test]
-      fn full_rebuild_disambiguation_is_id_ordered_not_source_ordered() {
-          use crate::tree::InodeAllocator;
+      fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
+          use musefs_db::{Format, NewTrack, Tag};
+          use std::collections::BTreeMap;
 
-          // A colliding pair rendered to the same path, presented id-DESCENDING
-          // (id 2 before id 1) — the order a non-id-ordered source could hand
-          // render_entries.
-          let unordered = vec![
-              (2_i64, "Same.flac".to_string()),
-              (1_i64, "Same.flac".to_string()),
-          ];
+          let db = musefs_db::Db::open_in_memory().unwrap();
+          // Two tracks whose `$title` both render to "Same" -> colliding "Same.flac".
+          // Insertion order fixes ascending ids: id_a < id_b.
+          let id_a = db
+              .upsert_track(&NewTrack {
+                  backing_path: "/a.flac".into(),
+                  format: Format::Flac,
+                  audio_offset: 0,
+                  audio_length: 1,
+                  backing_size: 1,
+                  backing_mtime: 0,
+              })
+              .unwrap();
+          let id_b = db
+              .upsert_track(&NewTrack {
+                  backing_path: "/b.flac".into(),
+                  format: Format::Flac,
+                  audio_offset: 0,
+                  audio_length: 1,
+                  backing_size: 1,
+                  backing_mtime: 0,
+              })
+              .unwrap();
+          assert!(id_a < id_b, "insertion assigns ascending ids");
+          db.replace_tags(id_a, &[Tag::new("title", "Same", 0)]).unwrap();
+          db.replace_tags(id_b, &[Tag::new("title", "Same", 0)]).unwrap();
 
-          // render_entries sorts ascending by id (facade.rs); replicate that here.
-          let mut sorted = unordered.clone();
-          sorted.sort_by_key(|(id, _)| *id);
+          let config = MountConfig {
+              template: "$title".to_string(),
+              fallbacks: BTreeMap::new(),
+              default_fallback: "Unknown".to_string(),
+              mode: Mode::Synthesis,
+              poll_interval: std::time::Duration::ZERO,
+              case_insensitive: false,
+          };
+          let template = Template::parse(&config.template);
 
           let mut alloc = InodeAllocator::new();
-          let tree = VirtualTree::build_with_ci(&sorted, &mut alloc, false);
+          let (tree, _snapshot) = Musefs::build_full(&db, &template, &config, &mut alloc).unwrap();
+
           let root = VirtualTree::ROOT;
           let bare = tree.lookup(root, "Same.flac").expect("bare name exists");
           let suffixed = tree.lookup(root, "Same (2).flac").expect("suffixed name exists");
           // The LOWER id owns the bare name; the higher id is disambiguated. This
           // matches the incremental path's min-id rule (tree.rs introducing_id).
-          assert_eq!(tree.inode_of_track(1), Some(bare));
-          assert_eq!(tree.inode_of_track(2), Some(suffixed));
-
-          // Guard: building from the UNSORTED order would give the bare name to the
-          // higher id (inserted first), i.e. a different inode assignment — proving
-          // the render_entries sort is load-bearing, not cosmetic.
-          let mut alloc2 = InodeAllocator::new();
-          let wrong = VirtualTree::build_with_ci(&unordered, &mut alloc2, false);
-          assert_eq!(
-              wrong.inode_of_track(2),
-              wrong.lookup(root, "Same.flac"),
-              "unsorted build mis-assigns the bare name to the higher id"
-          );
+          assert_eq!(tree.inode_of_track(id_a), Some(bare));
+          assert_eq!(tree.inode_of_track(id_b), Some(suffixed));
       }
   ```
 
-  Verify the accessor names against `tree.rs` in this session: `inode_of_track` is used at `tree.rs:1243,1256,1313`; `lookup` at `tree.rs:1231,1244`; `VirtualTree::ROOT` at `tree.rs:1231`; `InodeAllocator::new()` at `tree.rs:1226`. `build_with_ci` is `tree.rs:117`. If any name differs, use the real one — do not guess.
+  Helper names verified this session: `Template::parse(&str) -> Template` is **infallible** (`template.rs:29`, returns `Template`, NOT `Result`) — call it WITHOUT `.unwrap()`; the existing `render_entries_returns_paths_and_snapshot` test calls it the same way (`facade.rs:1369`). `build_full<M>(db, template, config, alloc)` returns `Result<(VirtualTree, HashMap<...>)>` (`facade.rs:318`). `render_entries` is generic over `M`, so passing the `Db<ReadWrite>` from `open_in_memory` directly works — no `into_read_only` needed. `lookup(parent, name) -> Option<u64>` (`tree.rs:170`), `inode_of_track(id) -> Option<u64>` (`tree.rs:193`), `VirtualTree::ROOT` (used at `tree.rs:1230`). `Tag::new(key, value, ordinal)` (`models.rs:125`). `Format::Flac` → `render_one` appends `.flac`.
 
-- [ ] **Step 2: Run, see it pass (sort already landed in Task 1).** Run:
-
-  ```
-  cargo test -p musefs-core full_rebuild_disambiguation_is_id_ordered_not_source_ordered
-  ```
-
-  Expected: `test ... ok`. (This test passes because Task 1 landed the sort; its purpose is regression protection — confirm it FAILS if the sort is reverted by temporarily removing the `entries.sort_by_key` line in `render_entries`, then restore it. This is a manual sanity check, not a committed state.)
-
-- [ ] **Step 3: Confirm the regression-bite of the test (manual, do not commit the broken state).** Temporarily comment out `entries.sort_by_key(|(id, _)| *id);` in `render_entries`, run the full facade suite, and confirm `render_entries_sorts_ascending_by_id` (Task 1) fails — this proves the Task 1 test guards the production sort. **Restore the line immediately.** No commit happens in this step.
+- [ ] **Step 2: Run the test, confirm it passes.** Run:
 
   ```
-  cargo test -p musefs-core facade
+  cargo test -p musefs-core full_rebuild_gives_bare_colliding_name_to_lower_id
   ```
 
-  (With the line restored: all green.)
+  Expected: `test ... ok`. (Honest note: this passes with OR without the Task 1 sort, because the DB hands `render_entries` id-ascending rows either way — `list_tracks` is `ORDER BY id`. It documents the observable contract; the bite against sort removal is Task 1's `order_entries_sorts_ascending_by_id`, verified in Task 1 Step 4. Do NOT expect this test to fail when the sort is removed.)
 
-- [ ] **Step 4: Commit (green).** Stage and commit:
+- [ ] **Step 3: Commit (green).** Stage and commit:
 
   ```
   git add musefs-core/src/facade.rs
   git commit -F - <<'EOF'
-  test(core): pin full-rebuild disambiguation to id order, not source order (#188)
+  test(core): pin full-rebuild colliding-name disambiguation to id order (#188)
 
-  Feeds the build path a colliding pair id-descending and asserts the lower
-  id owns the bare name after render_entries' sort, matching the incremental
-  min-id rule; a guard arm proves an unsorted build mis-assigns the bare
-  name, so the sort is load-bearing.
+  Drives a colliding pair through the production full-rebuild path
+  (render_entries -> build_full -> build_with_ci) on a real in-memory Db
+  and asserts the lower id owns the bare "Same.flac" while the higher id is
+  disambiguated to "Same (2).flac", matching the incremental min-id rule.
+  Documents the observable contract; the order_entries unit test is the
+  regression guard for the sort itself.
 
   Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
   EOF
@@ -276,26 +289,26 @@ The spec's headline test: feed the full-rebuild build path id-unordered entries 
 
 ## Task 3: Update the coupling comment and sweep the oracle for consistency
 
-The spec requires (a) updating the test comment at `tree.rs:1350-1352` so it documents the new behavior as the spec rather than a coincidence, and (b) sweeping `assert_apply_matches_build` (`tree.rs:1467,1477`) for consistency so the oracle and production agree that sorting lives in `render_entries`. No production code changes here — the build primitive must NOT sort (the anti-requirement).
+The spec requires (a) updating the test comment in `apply_changes_handles_dir_vs_file_min_id_flip` (`tree.rs:1353-1355`) so it documents the new behavior as the spec rather than a coincidence, and (b) sweeping `assert_apply_matches_build` (`tree.rs:1451-1485`) for consistency so the oracle and production agree that sorting lives in `render_entries`. No production code changes here — the build primitive must NOT sort (the anti-requirement).
 
 **Files:**
-- `musefs-core/src/tree.rs` — comment at `apply_changes_handles_dir_vs_file_min_id_flip` (~1350-1352); oracle helper `assert_apply_matches_build` (~1458-1486, with the explicit `sort_by_key` at ~1469 and `build_with` calls at ~1467, ~1479).
+- `musefs-core/src/tree.rs` — comment in `apply_changes_handles_dir_vs_file_min_id_flip` (`tree.rs:1353-1355`); oracle helper `assert_apply_matches_build` doc comment (`tree.rs:1451-1456`, with the explicit `after_sorted.sort_by_key` at `tree.rs:1469` and `build_with` calls at `tree.rs:1466`, `tree.rs:1478`).
 
 ### Context (verified this session)
 
-- `tree.rs:1350-1352` currently reads:
+- `tree.rs:1353-1355` currently reads:
   ```
-  // Production always feeds `build_with` entries sorted ascending by id
-  // (`list_tracks` ORDER BY id; `rebuild_incremental` sort_by_key). The
-  // reference must use that same canonical order to be a meaningful oracle.
+          // Production always feeds `build_with` entries sorted ascending by id
+          // (`list_tracks` ORDER BY id; `rebuild_incremental` sort_by_key). The
+          // reference must use that same canonical order to be a meaningful oracle.
   ```
-  This attributes the ordering to `list_tracks`'s `ORDER BY` and the incremental `sort_by_key` — exactly the coincidence #188 removes. After the fix the canonical order is established by `render_entries`'s sort.
-- `assert_apply_matches_build` (`tree.rs:1458`) already sorts `after` by id (`after_sorted.sort_by_key(|(id, _)| *id)`, line 1469) before both the `apply_changes` `new_paths` map and the `build_with` reference (line 1479). This is correct and stays — it mirrors production: the reference oracle must use the same id-sorted order production now establishes in `render_entries`. The sweep confirms the *attribution* in comments points at `render_entries`, not `list_tracks`.
-- The facade debug-assert/Stage-B fallback (`facade.rs:512-514`, `:531-533`) also sort `snap` entries by id before `build_with_ci`. Per the spec these are now redundant-but-harmless (Task 1 made `render_entries` the single source). They are NOT removed in this plan — leave them; the comment sweep is scoped to `tree.rs` oracle/test comments.
+  This attributes the ordering to `list_tracks`'s `ORDER BY` and the incremental `sort_by_key` — exactly the coincidence #188 removes. After the fix the canonical order is established by `render_entries`'s `order_entries` sort.
+- `assert_apply_matches_build` (`tree.rs:1451`) already sorts `after` by id (`after_sorted.sort_by_key(|(id, _)| *id)`, `tree.rs:1469`) before both the `apply_changes` `new_paths` map and the `build_with` reference (`tree.rs:1478`). This is correct and stays — it mirrors production: the reference oracle must use the same id-sorted order production now establishes in `render_entries`. The sweep confirms the *attribution* in comments points at `render_entries`, not `list_tracks`.
+- The facade debug-assert and Stage-B fallback in `rebuild_incremental` (`facade.rs:409-546`) build their `entries` from `snap.iter()` — a `HashMap`, so iteration order is nondeterministic — and `sort_by_key(|(id, _)| *id)` them before `build_with_ci`. **These sorts are load-bearing in their own right and are NOT made redundant by the `render_entries` sort** (they never pass through `render_entries`; they sort an unordered HashMap snapshot directly). The spec's "redundant-but-harmless" wording refers only to the abstract Stage-B *re-sort vs. the render order* and is loose; do NOT remove these sorts. They are out of scope for this plan; the comment sweep is scoped to `tree.rs` oracle/test comments only.
 
 ### Steps
 
-- [ ] **Step 1: Update the dir-vs-file flip comment to document the new spec.** Replace the comment block at `tree.rs:1350-1352`. Use `replace_content` (or built-in Edit on this comment) to change:
+- [ ] **Step 1: Update the dir-vs-file flip comment to document the new spec.** Use `replace_content` (literal mode) on `musefs-core/src/tree.rs` to change:
 
   ```
           // Production always feeds `build_with` entries sorted ascending by id
@@ -307,15 +320,15 @@ The spec requires (a) updating the test comment at `tree.rs:1350-1352` so it doc
 
   ```
           // Production establishes the build path's canonical order by sorting
-          // ascending by id in `render_entries` (#188) — not by inheriting
-          // `list_tracks`'s ORDER BY. The reference must use that same canonical
-          // order to be a meaningful oracle; the inner build primitive
-          // deliberately does NOT sort (these tests feed it id-unordered inputs).
+          // ascending by id in `render_entries` (its `order_entries` helper, #188)
+          // — not by inheriting `list_tracks`'s ORDER BY. The reference must use
+          // that same canonical order to be a meaningful oracle; the inner build
+          // primitive deliberately does NOT sort (these tests feed it id-unordered
+          // inputs).
   ```
 
-- [ ] **Step 2: Add the sweep note to the oracle helper.** The `assert_apply_matches_build` doc comment (`tree.rs:1452-1457`) describes the oracle. Extend it to state where the canonical order comes from, so the oracle's `after_sorted.sort_by_key` is documented as mirroring `render_entries`, not the build primitive. Use `replace_content` to change the existing doc block ending:
+- [ ] **Step 2: Add the sweep note to the oracle helper doc.** The `assert_apply_matches_build` doc comment (`tree.rs:1451-1456`) describes the oracle. Use `replace_content` (literal mode) to change:
 
-  Find:
   ```
       /// Oracle helper for the collision pins below: apply `changed`/`added`/`removed`
       /// against `before`, then require full `equiv` (inodes included) with a
@@ -325,7 +338,8 @@ The spec requires (a) updating the test comment at `tree.rs:1350-1352` so it doc
       /// the same tree, so only the count can pin it).
   ```
 
-  Replace with:
+  to:
+
   ```
       /// Oracle helper for the collision pins below: apply `changed`/`added`/`removed`
       /// against `before`, then require full `equiv` (inodes included) with a
@@ -339,13 +353,13 @@ The spec requires (a) updating the test comment at `tree.rs:1350-1352` so it doc
       /// `build_with` primitive itself does NOT sort, so the oracle must.
   ```
 
-- [ ] **Step 3: Confirm no production sort crept into the build primitive (anti-requirement check).** Grep to prove `build_with`/`build_with_ci` still do not sort:
+- [ ] **Step 3: Confirm no production sort crept into the build primitive (anti-requirement check).** Run the `tree.rs` suite:
 
   ```
   cargo test -p musefs-core tree
   ```
 
-  Expected: all `tree.rs` tests pass — critically `introducing_id_is_min_descendant_track_id` (`tree.rs:1224`), `apply_changes_handles_dir_vs_file_min_id_flip` (`tree.rs:1337`), and `apply_changes_handles_add_side_min_id_flip` (`tree.rs:1369`), which feed `build_with` id-unordered entries and would fail if the primitive sorted. Their passing confirms the sort stayed out of the build path.
+  Expected: all `tree.rs` tests pass — critically `introducing_id_is_min_descendant_track_id` (`tree.rs:1223`), `apply_changes_handles_dir_vs_file_min_id_flip` (`tree.rs:1336`), and `apply_changes_handles_add_side_min_id_flip` (`tree.rs:1368`), which feed `build_with` id-unordered entries and would fail if the primitive sorted. Their passing confirms the sort stayed out of the build path.
 
 - [ ] **Step 4: Commit (green).** Comment-only changes; the suite is unchanged-green. Stage and commit:
 
@@ -356,8 +370,8 @@ The spec requires (a) updating the test comment at `tree.rs:1350-1352` so it doc
 
   Update the dir-vs-file min-id flip comment and the assert_apply_matches_build
   oracle doc to document that production's canonical id order is established by
-  render_entries' sort, and that the build primitive deliberately does not sort
-  (its tests feed it id-unordered inputs). No behavior change.
+  render_entries' order_entries sort, and that the build primitive deliberately
+  does not sort (its tests feed it id-unordered inputs). No behavior change.
 
   Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
   EOF
@@ -379,7 +393,7 @@ Run the complete gate the pre-commit hook enforces, across the workspace, to con
   cargo test -p musefs-core
   ```
 
-  Expected: all tests pass, including `render_entries_sorts_ascending_by_id`, `full_rebuild_disambiguation_is_id_ordered_not_source_ordered`, and the unchanged `tree.rs` min-id flip tests.
+  Expected: all tests pass, including `order_entries_sorts_ascending_by_id`, `full_rebuild_gives_bare_colliding_name_to_lower_id`, and the unchanged `tree.rs` min-id flip tests.
 
 - [ ] **Step 2: Workspace tests (the hook runs the full suite).** Run:
 
@@ -411,17 +425,27 @@ Run the complete gate the pre-commit hook enforces, across the workspace, to con
   grep -n 'ORDER BY id' musefs-db/src/tracks.rs
   ```
 
-  Expected: `68:        let mut stmt = self.conn.prepare_cached(track_select!("ORDER BY id"))?;` still present. The plan must NOT have removed it.
+  Expected: `67:        let mut stmt = self.conn.prepare_cached(track_select!("ORDER BY id"))?;` still present (the `ORDER BY id` is on the `prepare_cached` line; `list_tracks` spans `tracks.rs:66-70`). The plan must NOT have removed it.
+
+- [ ] **Step 6: Local mutation bite on the changed lines (optional but recommended — matches the CI in-diff gate).** The CI `in-diff` job (`.github/workflows/mutants.yml`) mutates exactly the lines this PR changed. Run it locally over the diff to confirm `order_entries`'s sort is killed and no survivor is introduced:
+
+  ```
+  git diff main...HEAD -- '*.rs' > /tmp/b188.diff
+  cargo mutants --in-diff /tmp/b188.diff -j2 --exclude 'musefs-latencyfs/**'
+  ```
+
+  Expected: no surviving mutants. In particular the `order_entries` sort mutants (return-unsorted / return-empty) are CAUGHT by `order_entries_sorts_ascending_by_id`. If a survivor appears, the fix is not protected — do not merge.
 
 ---
 
 ## Self-review against the spec's Plan B section
 
-- **Sort in `render_entries`** → Task 1, Step 3 (the `entries.sort_by_key(|(id, _)| *id);` before `Ok(...)`). ✔
+- **Sort in `render_entries`** → Task 1, Step 1 (the `order_entries` helper, sorting ascending by id, called from `render_entries`'s return). ✔
 - **Anti-sort in `build_with_ci`/`build_with`** → No production edit to `tree.rs`'s build primitive; Task 3 Step 3 explicitly verifies the id-unordered build tests (`introducing_id_is_min_descendant_track_id`, both min-id flip tests) still pass, proving the sort stayed out of the primitive. ✔
-- **Comment update at `tree.rs:1350-1352`** → Task 3, Step 1. ✔
-- **Sweep `assert_apply_matches_build` (`tree.rs:1467,1477`)** → Task 3, Step 2 documents that the oracle's existing id-sort mirrors `render_entries`; the build calls at 1467/1479 are confirmed correct and unchanged. ✔
-- **Test feeding the full-rebuild path id-unordered entries → identical disambiguation/inode as incremental for a colliding pair** → Task 2 (`full_rebuild_disambiguation_is_id_ordered_not_source_ordered`), plus the `render_entries`-boundary post-condition test in Task 1. ✔
+- **Comment update at the dir-vs-file flip test** → Task 3, Step 1 (`tree.rs:1353-1355`). ✔
+- **Sweep `assert_apply_matches_build`** → Task 3, Step 2 documents that the oracle's existing id-sort (`tree.rs:1469`) mirrors `render_entries`; the `build_with` calls (`tree.rs:1466`, `tree.rs:1478`) are confirmed correct and unchanged. ✔
+- **Test feeding the full-rebuild path a colliding pair → lower id keeps the bare name (matching incremental disambiguation)** → Task 2 (`full_rebuild_gives_bare_colliding_name_to_lower_id`), through the real `render_entries`→`build_full` path. ✔
+- **Committed test that fails if the production sort is removed** → Task 1's `order_entries_sorts_ascending_by_id` (the regression guard; bite verified in Task 1 Step 4 and by the local mutation run in Task 4 Step 6). The DB-backed Task 2 test does NOT bite (DB input is already id-ordered) and the plan says so honestly. ✔
 - **`list_tracks` `ORDER BY id` kept (demoted, not removed)** → Task 4, Step 5 verifies. ✔
-- **No red-test commits** → every code/comment change is bundled with its green state; the only failing-test state (Task 2 Step 3 regression-bite) is explicitly manual and never committed. ✔
-- **No placeholders; real symbol names** → all code verified against `facade.rs` (`render_entries` 287-316, `mod tests` 1108, `replace_tags` usage 1197), `tree.rs` (`build_with_ci` 117, `InodeAllocator`/`lookup`/`inode_of_track`/`ROOT`), `lib.rs` (`open_in_memory` 61, `into_read_only` 92), `tracks.rs` (`upsert_track` 178, `list_tracks` 67-68), `models.rs` (`NewTrack`/`Track`). ✔
+- **No red-test commits** → every code/comment change is bundled with its green state; the only failing-test states (Task 1 Step 4 bite-check) are explicitly manual and never committed. ✔
+- **No placeholders; real symbol names** → all code verified against `template.rs` (`parse` infallible, `:29`), `facade.rs` (`render_entries` `:287-316`, `build_full` `:318`, `mod tests` `:1108`, `render_entries_returns_paths_and_snapshot` `:1341`, module import of `InodeAllocator`/`VirtualTree` `:16`), `tree.rs` (`build_with_ci` `:117`, `lookup` `:170`, `inode_of_track` `:193`, `disambiguate` `:277`, `ROOT` use `:1230`, dir-vs-file flip `:1336`, `assert_apply_matches_build` `:1451`), `lib.rs` (`open_in_memory` `:61`), `tracks.rs` (`upsert_track` `:178`, `list_tracks` `:66-70`), `tags.rs` (`replace_tags` `:174`), `models.rs` (`NewTrack` `:97`, `Tag::new` `:125`). ✔
