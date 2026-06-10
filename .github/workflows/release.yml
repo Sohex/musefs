@@ -51,8 +51,11 @@ jobs:
             # flattens every page's check_runs into a single {check_runs: [...]}
             # object (plain --paginate would emit one object per page, which is
             # not valid single-document JSON).
+            # `|| true`: tolerate a transient gh/API failure — release_gate.py
+            # treats an empty/garbled checks.json as "wait", so the loop retries
+            # rather than aborting the release on a single blip.
             gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
-              --paginate --slurp -q '{check_runs: [.[].check_runs[]]}' > checks.json
+              --paginate --slurp -q '{check_runs: [.[].check_runs[]]}' > checks.json || true
             set +e
             python scripts/release_gate.py --names ci-ok coverage-ok < checks.json
             rc=$?

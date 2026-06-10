@@ -167,6 +167,10 @@ Replace it with:
   imports); see `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`.
 ```
 
+> **Superseded:** the shipped `CONTRIBUTING.md` describes the final two-tier
+> setup, and the full real-instance e2e (`lidarr-e2e.yml`) **closes** the
+> download-client gap above — this fenced block is the original proposed text.
+
 - [ ] **Step 2: Verify**
 
 Run: `grep -n "lidarr-smoke.yml" CONTRIBUTING.md`

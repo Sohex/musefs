@@ -62,7 +62,7 @@ def test_decide_wait_when_a_check_still_running():
     assert decide(runs, ["ci-ok", "coverage-ok"]) is Decision.WAIT
 
 
-def test_cli_pass_exit_zero(capsys, tmp_path):
+def test_cli_pass_exit_zero():
     payload = {
         "check_runs": [
             _run("ci-ok", "completed", "success", "2026-06-10T11:00:00Z"),
@@ -94,3 +94,9 @@ def test_cli_handles_null_check_runs():
     # A mis-slurped gh payload can yield {"check_runs": null}; must wait, not raise.
     rc = main(["--names", "ci-ok"], stdin_text='{"check_runs": null}')
     assert rc == 2
+
+
+def test_cli_handles_empty_or_garbled_input():
+    # A failed `gh api` can leave checks.json empty/garbled; must wait, not crash.
+    for bad in ("", "   ", "not json", "null"):
+        assert main(["--names", "ci-ok"], stdin_text=bad) == 2
