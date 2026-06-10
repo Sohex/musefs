@@ -93,8 +93,8 @@ impl RegionLayout {
         }
     }
 
-    // Stays `pub` in Task 1 (foreign `new` callers still need it); demoted to
-    // `pub(crate)` in Task 3 together with their migration.
+    // Unvalidated construction is crate-internal: only same-crate tests build
+    // layouts this way; production code reaches a layout solely via `validated`.
     #[allow(dead_code)] // used only in #[cfg(test)] / #[cfg(feature = "fuzzing")] paths
     pub(crate) fn new(segments: Vec<Segment>) -> RegionLayout {
         RegionLayout::from_segments(segments)
