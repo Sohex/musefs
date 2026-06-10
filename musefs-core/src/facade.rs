@@ -173,7 +173,9 @@ pub struct Musefs {
     /// `read_into` to report a stale layout, simulating a writer committing to
     /// the same track on every retry. Lets a test pin the exact retry bound
     /// without racing a real concurrent writer (the mismatch window is too
-    /// narrow to hit deterministically). Counts down; 0 disables.
+    /// narrow to hit deterministically). Counts down; 0 disables. Test-only:
+    /// the field and its hot-path check are absent from release builds.
+    #[cfg(test)]
     force_version_mismatch: AtomicU64,
     /// Polls that took the changelog-gap full-rebuild path (observability for
     /// tests: incremental vs gap is invisible in the resulting tree).
@@ -268,6 +270,7 @@ impl Musefs {
             snapshot: Mutex::new(snapshot),
             force_rebuild_error: AtomicBool::new(false),
             force_apply_fail: AtomicBool::new(false),
+            #[cfg(test)]
             force_version_mismatch: AtomicU64::new(0),
             gap_fallbacks: AtomicU64::new(0),
             needs_rebuild: AtomicBool::new(false),
@@ -850,8 +853,8 @@ impl Musefs {
     /// Force the next `count` binary-tag `content_version` guard checks in
     /// `read_into` to report a stale layout, as if a writer re-tagged this track
     /// between every retry. Used to exercise the retry-exhaustion bound.
-    #[doc(hidden)]
-    pub fn force_version_mismatches_for_test(&self, count: u64) {
+    #[cfg(test)]
+    fn force_version_mismatches_for_test(&self, count: u64) {
         self.force_version_mismatch.store(count, Ordering::Release);
     }
 
@@ -1038,13 +1041,16 @@ impl Musefs {
                             let res = (|| {
                                 // A test seam forces the first N checks stale to
                                 // drive the same-track retry-exhaustion path
-                                // deterministically; 0 in production.
+                                // deterministically; compiled out of release builds.
+                                #[cfg(test)]
                                 let forced = self
                                     .force_version_mismatch
                                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                                         n.checked_sub(1)
                                     })
                                     .is_ok();
+                                #[cfg(not(test))]
+                                let forced = false;
                                 if forced
                                     || db.track_content_version(h.track_id)? != r.content_version
                                 {
