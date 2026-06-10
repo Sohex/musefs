@@ -632,6 +632,78 @@ fn build_m4a_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
     (dir, db, id)
 }
 
+fn build_ogg(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("song.opus");
+    let (audio_offset, audio_length) = common::write_ogg(&path, audio);
+    let meta = std::fs::metadata(&path).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: path.to_string_lossy().into_owned(),
+            format: Format::Opus,
+            audio_offset,
+            audio_length,
+            backing_size: meta.len(),
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
+        })
+        .unwrap();
+    db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
+    (dir, db, id, audio.to_vec())
+}
+
+fn build_ogg_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempDir, Db, i64) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("song.opus");
+    let (audio_offset, audio_length) = common::write_ogg(&path, audio);
+    let meta = std::fs::metadata(&path).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: path.to_string_lossy().into_owned(),
+            format: Format::Opus,
+            audio_offset,
+            audio_length,
+            backing_size: meta.len(),
+            backing_mtime: i64::try_from(
+                meta.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap(),
+        })
+        .unwrap();
+    db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
+    let art_id = db
+        .upsert_art(&NewArt {
+            mime: "image/png".to_string(),
+            width: Some(8),
+            height: Some(8),
+            data: art.to_vec(),
+        })
+        .unwrap();
+    db.set_track_art(
+        id,
+        &[TrackArt {
+            art_id,
+            picture_type: 3,
+            description: "front".to_string(),
+            ordinal: 0,
+        }],
+    )
+    .unwrap();
+    (dir, db, id)
+}
+
 // Finding #5, non-FLAC dimension: the same read-fidelity invariants over the M4A
 // synthesis path (rebuilt `moov` + verbatim `mdat` payload, plus a `covr` art
 // window). Mirrors the FLAC/MP3 blocks above; the WAV dimension lands in its own
@@ -726,6 +798,65 @@ proptest! {
         let local_off = (a as u64) % (art_len + 1);
         let offset = art_off + local_off;
         let len = (b as u64) % (art_len - local_off + 1);
+        let got = read_at(&resolved, &db, offset, len).unwrap();
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn ogg_read_at_partial_windows_match_whole(
+        audio in proptest::collection::vec(any::<u8>(), 1..512),
+        title in "[ -~]{0,32}",
+        a in 0usize..4096,
+        b in 0usize..4096,
+    ) {
+        let (_dir, db, id, _orig) = build_ogg(&audio, &title);
+        let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
+        let total = resolved.total_len;
+        let whole = read_at(&resolved, &db, 0, total).unwrap();
+        prop_assert_eq!(whole.len() as u64, total);
+        let offset = (a as u64) % (total + 1);
+        let len = (b as u64) % (total - offset + 1);
+        let got = read_at(&resolved, &db, offset, len).unwrap();
+        prop_assert_eq!(got.len() as u64, len);
+        prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
+    }
+
+    #[test]
+    fn ogg_read_at_windows_spanning_header_seam(
+        audio in proptest::collection::vec(any::<u8>(), 1..512),
+        title in "[ -~]{0,32}",
+        before in 0usize..4096,
+        after in 0usize..4096,
+    ) {
+        let (_dir, db, id, _orig) = build_ogg(&audio, &title);
+        let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
+        let total = resolved.total_len;
+        let hlen = resolved.layout.header_len();
+        prop_assume!(hlen > 0 && hlen < total);
+        let start = hlen - 1 - (before as u64 % hlen);
+        let end = hlen + 1 + (after as u64 % (total - hlen));
+        let whole = read_at(&resolved, &db, 0, total).unwrap();
+        let got = read_at(&resolved, &db, start, end - start).unwrap();
+        prop_assert_eq!(&got[..], &whole[usize::try_from(start).unwrap()..usize::try_from(end).unwrap()]);
+    }
+
+    #[test]
+    fn ogg_with_art_partial_windows_match_whole(
+        audio in proptest::collection::vec(any::<u8>(), 1..256),
+        art in proptest::collection::vec(any::<u8>(), 1..256),
+        a in 0usize..4096,
+        b in 0usize..4096,
+    ) {
+        let (_dir, db, id) = build_ogg_with_art(&audio, "T", &art);
+        let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
+        let total = resolved.total_len;
+        let whole = read_at(&resolved, &db, 0, total).unwrap();
+        let offset = (a as u64) % (total + 1);
+        let len = (b as u64) % (total - offset + 1);
         let got = read_at(&resolved, &db, offset, len).unwrap();
         prop_assert_eq!(&got[..], &whole[usize::try_from(offset).unwrap()..usize::try_from(offset + len).unwrap()]);
     }
