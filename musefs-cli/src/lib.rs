@@ -43,17 +43,22 @@ pub struct Cli {
 #[derive(clap::Args, Debug)]
 pub struct MountArgs {
     /// Empty directory to mount at.
+    #[arg(env = "MUSEFS_MOUNTPOINT")]
     pub mountpoint: PathBuf,
     /// Path to the SQLite database.
-    #[arg(long)]
+    #[arg(long, env = "MUSEFS_DB")]
     pub db: PathBuf,
     /// Path template, e.g. "$albumartist/$album/$title". Supports ${a|b}
     /// fallback chains, [...] conditional sections ($[/$] for literal
     /// brackets), and $!{field} path fields that keep '/' as separators.
-    #[arg(long, default_value = "$albumartist/$album/$title")]
+    #[arg(
+        long,
+        env = "MUSEFS_TEMPLATE",
+        default_value = "$albumartist/$album/$title"
+    )]
     pub template: String,
     /// Fallback value substituted for any missing template field.
-    #[arg(long, default_value = "Unknown")]
+    #[arg(long, env = "MUSEFS_DEFAULT_FALLBACK", default_value = "Unknown")]
     pub default_fallback: String,
     /// Per-field fallback `FIELD=VALUE`, overriding `--default-fallback` for
     /// just that field when it is missing. Repeatable, e.g. `--fallback
@@ -61,47 +66,47 @@ pub struct MountArgs {
     #[arg(long = "fallback", value_name = "FIELD=VALUE", value_parser = parse_fallback)]
     pub fallbacks: Vec<(String, String)>,
     /// How file contents are served.
-    #[arg(long, value_enum, default_value_t = CliMode::Synthesis)]
+    #[arg(long, value_enum, env = "MUSEFS_MODE", default_value_t = CliMode::Synthesis)]
     pub mode: CliMode,
     /// Debounce window (ms) for picking up external DB edits.
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, env = "MUSEFS_POLL_INTERVAL_MS", default_value_t = 1000)]
     pub poll_interval_ms: u64,
     /// Entry/attr cache TTL (ms) the kernel may trust before re-validating.
     /// Higher cuts lookup/getattr traffic but slows visibility of DB edits.
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, env = "MUSEFS_ATTR_TTL_MS", default_value_t = 1000)]
     pub attr_ttl_ms: u64,
     /// Kernel read-ahead window (KiB). Larger hides HDD/NFS latency while
     /// streaming; clamped to the kernel maximum at mount.
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, env = "MUSEFS_MAX_READAHEAD_KIB", default_value_t = 512)]
     pub max_readahead_kib: u32,
     /// Max outstanding background (readahead/async) requests the kernel queues.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, env = "MUSEFS_MAX_BACKGROUND", default_value_t = 64)]
     pub max_background: u16,
     /// Keep the kernel page cache across opens. External re-tags auto-invalidate
     /// the affected inodes on refresh, so cached bytes are dropped when content
     /// changes.
-    #[arg(long)]
+    #[arg(long, env = "MUSEFS_KEEP_CACHE")]
     pub keep_cache: bool,
     /// Compare filenames case-insensitively: case-variant directories merge and
     /// case-variant files are disambiguated. Defaults to true on macOS (whose
     /// volumes are usually case-insensitive), false on Linux/FreeBSD. Override
     /// with `--case-insensitive false` (e.g. a case-sensitive APFS volume).
-    #[arg(long, default_value_t = cfg!(target_os = "macos"), action = clap::ArgAction::Set)]
+    #[arg(long, env = "MUSEFS_CASE_INSENSITIVE", default_value_t = cfg!(target_os = "macos"), action = clap::ArgAction::Set)]
     pub case_insensitive: bool,
     /// Owning user for every entry: a username or numeric uid. Defaults to the
     /// launching process's uid.
-    #[arg(long, value_name = "NAME|UID", value_parser = parse_owner)]
+    #[arg(long, env = "MUSEFS_OWNER", value_name = "NAME|UID", value_parser = parse_owner)]
     pub owner: Option<u32>,
     /// Owning group for every entry: a group name or numeric gid. Defaults to
     /// the launching process's gid.
-    #[arg(long, value_name = "NAME|GID", value_parser = parse_group)]
+    #[arg(long, env = "MUSEFS_GROUP", value_name = "NAME|GID", value_parser = parse_group)]
     pub group: Option<u32>,
     /// Permission bits for regular files, octal (e.g. 444). Defaults to 444.
     /// The mount is read-only, so write bits are advertised but inert.
-    #[arg(long, value_name = "OCTAL", value_parser = parse_octal_mode)]
+    #[arg(long, env = "MUSEFS_FILE_MODE", value_name = "OCTAL", value_parser = parse_octal_mode)]
     pub file_mode: Option<u16>,
     /// Permission bits for directories, octal (e.g. 555). Defaults to 555.
-    #[arg(long, value_name = "OCTAL", value_parser = parse_octal_mode)]
+    #[arg(long, env = "MUSEFS_DIR_MODE", value_name = "OCTAL", value_parser = parse_octal_mode)]
     pub dir_mode: Option<u16>,
 }
 

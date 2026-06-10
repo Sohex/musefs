@@ -9,7 +9,7 @@ keywords = ["fuse", "music", "metadata", "filesystem", "audio"]
 categories = ["filesystem", "multimedia::audio", "command-line-utilities"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 musefs-db = { path = "../musefs-db", version = "0.2.0" }
 musefs-core = { path = "../musefs-core", version = "0.2.0" }
