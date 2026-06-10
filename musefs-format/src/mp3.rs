@@ -198,7 +198,7 @@ fn apic_framing(art: &ArtInput) -> Vec<u8> {
         clippy::cast_possible_truncation,
         reason = "ID3 APIC type is one byte; valid picture types are 0..=20"
     )]
-    d.push(art.picture_type as u8);
+    d.push(art.picture_type.get() as u8);
     d.extend_from_slice(art.description.as_bytes());
     d.push(0x00);
     d
@@ -346,38 +346,28 @@ pub fn build_id3v2_segments(
 
     // Opaque binary frames: header (inline) + streamed body (BinaryTag segment).
     for bt in binary_tags {
-        if bt.len == 0 {
-            // An empty BinaryTag fails `RegionLayout::validate` (`EmptySegment`).
-            continue;
-        }
         // Defensive: ID3 opaque keys are 4-byte frame ids.
         let Ok(id): std::result::Result<[u8; 4], _> = bt.key.as_bytes().try_into() else {
             continue;
         };
-        push_frame_header(&mut buf, &id, usize_from(bt.len))?;
+        push_frame_header(&mut buf, &id, usize_from(bt.len.get()))?;
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::BinaryTag {
             payload_id: bt.payload_id,
-            len: bt.len,
+            len: bt.len.get(),
         });
-        frames_len += 10 + bt.len;
+        frames_len += 10 + bt.len.get();
     }
 
     for art in arts {
-        if art.data_len == 0 {
-            // Skip degenerate empty art: an `ArtImage { len: 0 }` segment fails
-            // `RegionLayout::validate` (`EmptySegment`) and would make the whole
-            // track unreadable at serve time (finding #16).
-            continue;
-        }
         let framing = apic_framing(art);
-        let data_len = framing.len() as u64 + art.data_len;
+        let data_len = framing.len() as u64 + art.data_len.get();
         push_frame_header(&mut buf, b"APIC", usize_from(data_len))?;
         buf.extend_from_slice(&framing);
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::ArtImage {
             art_id: art.art_id,
-            len: art.data_len,
+            len: art.data_len.get(),
         });
         frames_len += 10 + data_len;
     }
@@ -695,6 +685,7 @@ fn classify_binary_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{BlobLen, PictureType};
 
     /// Build a minimal ID3v2.3 tag with a single frame whose declared size
     /// overflows the tag bounds, and assert the guard rejects it.
@@ -1036,10 +1027,10 @@ mod tests {
             art_id: 1,
             mime: "image/png".to_string(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len,
+            data_len: BlobLen::new(data_len).unwrap(),
         };
         assert_eq!(
             build_id3v2_segments(&[], &[], &[mk(0x1000_0000)]).err(),
@@ -1065,52 +1056,20 @@ mod tests {
     }
 
     #[test]
-    fn build_id3v2_segments_skips_zero_byte_art() {
-        // A zero-byte APIC would emit `Segment::ArtImage { len: 0 }`, which
-        // `RegionLayout::validate` rejects as `EmptySegment` -> the whole track
-        // becomes unreadable at serve time. Degenerate empty art must be skipped
-        // at synthesis (mirrors the FLAC fix for finding #16).
-        let empty = ArtInput {
-            art_id: 1,
-            mime: "image/png".to_string(),
-            description: String::new(),
-            picture_type: 3,
-            width: 0,
-            height: 0,
-            data_len: 0,
-        };
-        let (segments, _len) = build_id3v2_segments(&[], &[], &[empty]).unwrap();
-        assert!(
-            !segments
-                .iter()
-                .any(|s| matches!(s, Segment::ArtImage { .. })),
-            "zero-byte art must not emit an ArtImage segment"
-        );
-        let mut buf = Vec::new();
-        for seg in &segments {
-            if let Segment::Inline(b) = seg {
-                buf.extend_from_slice(b);
-            }
-        }
-        assert!(
-            !buf.windows(4).any(|w| w == b"APIC"),
-            "zero-byte art must not emit an APIC frame"
-        );
-    }
-
-    #[test]
     fn build_id3v2_segments_keeps_real_art_when_mixed_with_empty() {
         // An empty art alongside a real one: only the non-empty art is emitted.
+        // (Zero-length art is now dropped at the bridge, so the in-synthesis skip
+        // is dead code; this test verifies the real art still works.)
         let mk = |art_id: i64, data_len: u64| ArtInput {
             art_id,
             mime: "image/png".to_string(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len,
+            data_len: BlobLen::new(data_len).unwrap(),
         };
-        let (segments, _len) = build_id3v2_segments(&[], &[], &[mk(1, 0), mk(2, 16)]).unwrap();
+        let (segments, _len) = build_id3v2_segments(&[], &[], &[mk(2, 16)]).unwrap();
         let art_segs: Vec<_> = segments
             .iter()
             .filter_map(|s| match s {
@@ -1965,7 +1924,7 @@ mod tests {
         let bin = vec![BinaryTagInput {
             key: "PRIV".into(),
             payload_id: 1,
-            len: 7,
+            len: BlobLen::new(7).unwrap(),
         }];
         let (_segs, total) = build_id3v2_segments(&[], &bin, &[]).unwrap();
         assert_eq!(total, 10 + 10 + 7, "opaque binary frame length accounting");
@@ -2056,7 +2015,7 @@ mod tests {
         let bin = vec![BinaryTagInput {
             key: "PRIV".into(),
             payload_id: 42,
-            len: 3,
+            len: BlobLen::new(3).unwrap(),
         }];
         let (segments, _len) = super::build_id3v2_segments(&tags, &bin, &[]).unwrap();
 

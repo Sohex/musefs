@@ -207,7 +207,7 @@ pub fn split_preserved(
 
 fn picture_body_framing(art: &ArtInput) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&art.picture_type.to_be_bytes());
+    out.extend_from_slice(&art.picture_type.get().to_be_bytes());
     out.extend_from_slice(
         &u32::try_from(art.mime.len())
             .map_err(|_| FormatError::TooLarge)?
@@ -225,7 +225,7 @@ fn picture_body_framing(art: &ArtInput) -> Result<Vec<u8>> {
     out.extend_from_slice(&0u32.to_be_bytes()); // color depth (unknown)
     out.extend_from_slice(&0u32.to_be_bytes()); // number of colors (non-indexed)
     out.extend_from_slice(
-        &u32::try_from(art.data_len)
+        &u32::try_from(art.data_len.get())
             .map_err(|_| FormatError::TooLarge)?
             .to_be_bytes(),
     ); // picture data length
@@ -253,7 +253,7 @@ pub fn synthesize_layout(
         .filter(|bt| matches!(bt.key.as_str(), "APPLICATION" | "CUESHEET"))
         .collect();
 
-    let nonempty_art = arts.iter().filter(|a| a.data_len > 0).count();
+    let nonempty_art = arts.len();
     let num_blocks = ordered.len() + 1 + valid_binary.len() + nonempty_art;
     let last_index = num_blocks - 1;
 
@@ -282,29 +282,26 @@ pub fn synthesize_layout(
             "CUESHEET" => BLOCK_CUESHEET,
             _ => continue,
         };
-        if bt.len > MAX_BLOCK_BODY {
+        if bt.len.get() > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
         push_block_header(
             &mut buf,
             block_type,
-            crate::convert::usize_from(bt.len),
+            crate::convert::usize_from(bt.len.get()),
             idx == last_index,
         )?;
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::BinaryTag {
             payload_id: bt.payload_id,
-            len: bt.len,
+            len: bt.len.get(),
         });
         idx += 1;
     }
 
     for art in arts {
-        if art.data_len == 0 {
-            continue;
-        }
         let framing = picture_body_framing(art)?;
-        let body_len = framing.len() as u64 + art.data_len;
+        let body_len = framing.len() as u64 + art.data_len.get();
         if body_len > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
@@ -318,7 +315,7 @@ pub fn synthesize_layout(
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
         segments.push(Segment::ArtImage {
             art_id: art.art_id,
-            len: art.data_len,
+            len: art.data_len.get(),
         });
         idx += 1;
     }
@@ -462,6 +459,7 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{BlobLen, PictureType};
     use crate::probe::Extent;
 
     /// Build a minimal FLAC: marker + a single last STREAMINFO (type 0, 34-byte
@@ -961,15 +959,15 @@ mod tests {
             art_id: 1,
             mime: "image/png".to_string(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len,
+            data_len: BlobLen::new(data_len).unwrap(),
         };
         // Derive the exact framing length from production rather than hardcoding it
         // (it is independent of the data_len *value* — that field is always 4 bytes).
         // This keeps the boundary correct regardless of the framing's field count.
-        let framing_len = picture_body_framing(&mk(0)).unwrap().len() as u64;
+        let framing_len = picture_body_framing(&mk(1)).unwrap().len() as u64;
         let at_limit = 0x00FF_FFFF - framing_len; // body_len == 0x00FF_FFFF exactly
         // original `>` accepts the inclusive boundary; the `>=` mutant rejects it.
         // (data_len is only a count; no large allocation occurs.)
@@ -1012,7 +1010,7 @@ mod tests {
         let mk = |len: u64| BinaryTagInput {
             key: "APPLICATION".to_string(),
             payload_id: 1,
-            len,
+            len: BlobLen::new(len).unwrap(),
         };
         // len == 0x00FF_FFFF exactly must succeed.
         assert!(synthesize_layout(&[], 0, 0, &[], &[mk(0x00FF_FFFF)], &[]).is_ok());

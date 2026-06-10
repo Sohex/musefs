@@ -3,7 +3,7 @@
 //! samples read through OUR patched chunk offsets are byte-identical to the
 //! originals — proving the offset surgery.
 
-use musefs_format::{ArtInput, RegionLayout, Segment, TagInput, mp4};
+use musefs_format::{ArtInput, BlobLen, PictureType, RegionLayout, Segment, TagInput, mp4};
 use std::io::Cursor;
 
 fn materialize(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {
@@ -86,19 +86,19 @@ fn m4a_synthesis_includes_every_cover_art() {
         art_id: 1,
         mime: "image/jpeg".to_string(),
         description: "cover".to_string(),
-        picture_type: 3,
+        picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
-        data_len: 100,
+        data_len: BlobLen::new(100).unwrap(),
     };
     let art2 = ArtInput {
         art_id: 2,
         mime: "image/png".to_string(),
         description: "back".to_string(),
-        picture_type: 0,
+        picture_type: PictureType::new(0).unwrap(),
         width: 0,
         height: 0,
-        data_len: 200,
+        data_len: BlobLen::new(200).unwrap(),
     };
 
     let layout_no_art = mp4::synthesize_layout(&scan, &[], &[], &[]).unwrap();

@@ -111,7 +111,7 @@ proptest! {
         db.set_binary_tags(tid, &db_tags).unwrap();
         let rows = db.get_binary_tags(tid).unwrap();
         let binary_tag_inputs: Vec<BinaryTagInput> = rows.iter().map(|r| {
-            BinaryTagInput { key: r.key.clone(), payload_id: r.rowid, len: r.byte_len }
+            BinaryTagInput { key: r.key.clone(), payload_id: r.rowid, len: musefs_format::BlobLen::new(r.byte_len).unwrap() }
         }).collect();
 
         // Step 3: Build promoted text tags.

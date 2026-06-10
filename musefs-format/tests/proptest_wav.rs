@@ -1,6 +1,6 @@
 #![cfg(feature = "fuzzing")]
 use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
-use musefs_format::{ArtInput, BinaryTagInput, RegionLayout, Segment, TagInput, wav};
+use musefs_format::{ArtInput, BinaryTagInput, BlobLen, RegionLayout, Segment, TagInput, wav};
 use proptest::prelude::*;
 
 proptest! {
@@ -163,7 +163,7 @@ proptest! {
         db.set_binary_tags(tid, &rows).unwrap();
         let stored = db.get_binary_tags(tid).unwrap();
         let inputs: Vec<BinaryTagInput> = stored.iter().map(|r| {
-            BinaryTagInput { key: r.key.clone(), payload_id: r.rowid, len: r.byte_len }
+            BinaryTagInput { key: r.key.clone(), payload_id: r.rowid, len: BlobLen::new(r.byte_len).unwrap() }
         }).collect();
         let mut map: HashMap<i64, Vec<u8>> = HashMap::new();
         for r in &stored {

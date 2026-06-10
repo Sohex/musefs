@@ -254,14 +254,8 @@ pub fn synthesize_layout(
     tags: &[TagInput],
     arts: &[OggArt],
 ) -> Result<RegionLayout> {
-    // Exclude zero-byte art: an empty image yields a meaningless
-    // METADATA_BLOCK_PICTURE comment (and an empty OggArtSlice run). Mirrors the
-    // FLAC/MP3/MP4/WAV synthesis skip so every format drops degenerate art.
-    let arts: Vec<OggArt> = arts
-        .iter()
-        .filter(|a| a.meta.data_len > 0)
-        .copied()
-        .collect();
+    // All art inputs are non-zero-length (the bridge drops zero-length at construction).
+    let arts: Vec<OggArt> = arts.to_vec();
     let packet_chunks = build_packets_with_art(header, tags, &arts)?;
     let mut segments: Vec<Segment> = Vec::new();
     let mut seq = 0u32;
@@ -294,7 +288,7 @@ fn picture_prefix(art: &crate::input::ArtInput) -> Result<Vec<u8>> {
     let description = format!("{}{}", art.description, " ".repeat(pad));
 
     let mut out = Vec::new();
-    out.extend_from_slice(&art.picture_type.to_be_bytes());
+    out.extend_from_slice(&art.picture_type.get().to_be_bytes());
     out.extend_from_slice(
         &u32::try_from(art.mime.len())
             .map_err(|_| FormatError::TooLarge)?
@@ -312,7 +306,7 @@ fn picture_prefix(art: &crate::input::ArtInput) -> Result<Vec<u8>> {
     out.extend_from_slice(&0u32.to_be_bytes()); // depth
     out.extend_from_slice(&0u32.to_be_bytes()); // colors
     out.extend_from_slice(
-        &u32::try_from(art.data_len)
+        &u32::try_from(art.data_len.get())
             .map_err(|_| FormatError::TooLarge)?
             .to_be_bytes(),
     ); // image data length
@@ -354,7 +348,7 @@ fn build_packets_with_art(
                 let b64_prefix_len = b64_len(prefix.len() as u64);
                 let value_len = METADATA_BLOCK_PICTURE_KEY.len() as u64
                     + b64_prefix_len
-                    + b64_len(a.meta.data_len);
+                    + b64_len(a.meta.data_len.get());
                 if value_len > u64::from(u32::MAX) {
                     return Err(FormatError::TooLarge);
                 }
@@ -404,7 +398,7 @@ fn comment_packet_chunks(
         let b64_prefix = b64_encode(&prefix);
         let value_len = METADATA_BLOCK_PICTURE_KEY.len()
             + b64_prefix.len()
-            + crate::convert::usize_from(b64_len(art.meta.data_len));
+            + crate::convert::usize_from(b64_len(art.meta.data_len.get()));
         head.extend_from_slice(
             &u32::try_from(value_len)
                 .map_err(|_| FormatError::TooLarge)?
@@ -417,7 +411,7 @@ fn comment_packet_chunks(
             art_id: art.meta.art_id,
             out: b64_encode(art.image),
             base64: true,
-            art_total: art.meta.data_len,
+            art_total: art.meta.data_len.get(),
         });
     }
     if framing_bit {
@@ -465,7 +459,7 @@ fn oggflac_packets_with_art(
     block_packets.push(vec![PayloadChunk::Bytes(comment)]);
     for art in arts {
         let prefix = picture_prefix(art.meta)?;
-        let body_len = prefix.len() as u64 + art.meta.data_len;
+        let body_len = prefix.len() as u64 + art.meta.data_len.get();
         if body_len > crate::flac::MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
@@ -478,7 +472,7 @@ fn oggflac_packets_with_art(
                 art_id: art.meta.art_id,
                 out: art.image.to_vec(),
                 base64: false,
-                art_total: art.meta.data_len,
+                art_total: art.meta.data_len.get(),
             },
         ]);
     }
@@ -911,10 +905,10 @@ mod tests {
             art_id: 7,
             mime: "image/jpeg".to_string(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 64,
             height: 64,
-            data_len: image.len() as u64,
+            data_len: crate::input::BlobLen::new(image.len() as u64).unwrap(),
         };
         let layout = synthesize_layout(
             &header,
@@ -1007,10 +1001,10 @@ mod tests {
             art_id,
             mime: mime.to_string(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 10,
             height: 10,
-            data_len: len as u64,
+            data_len: crate::input::BlobLen::new(len as u64).unwrap(),
         }
     }
 
@@ -1116,52 +1110,13 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_opus_skips_zero_byte_art() {
-        let mut data = opus_headers();
-        let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 64]);
-        data.extend_from_slice(&audio);
-        let scan = locate_audio(&data).unwrap();
-        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
-
-        let img: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
-        let empty: Vec<u8> = Vec::new();
-        let meta_empty = art_input(1, "image/jpeg", 0);
-        let meta_real = art_input(2, "image/png", img.len());
-        // Empty art listed first: it must be dropped without disturbing the real one.
-        let layout = synthesize_layout(
-            &header,
-            scan.audio_offset,
-            scan.audio_length,
-            &[TagInput::new("title", "Skip")],
-            &[
-                OggArt {
-                    meta: &meta_empty,
-                    image: &empty,
-                },
-                OggArt {
-                    meta: &meta_real,
-                    image: &img,
-                },
-            ],
-        )
-        .unwrap();
-
-        let bytes = materialize_header(&layout, &[(2, &img)]);
-        let h = read_header(&bytes).unwrap();
-        assert_eq!(h.codec, Codec::Opus);
-        let pics = read_pictures(&bytes).unwrap();
-        assert_eq!(pics.len(), 1, "zero-byte art must be skipped at synthesis");
-        assert_eq!(pics[0].data, img);
-    }
-
-    #[test]
     fn oversized_full_art_value_rejected_by_build_packets() {
         let meta = crate::input::ArtInput {
             art_id: 0,
             mime: "image/jpeg".to_string(),
             description: String::new(),
-            data_len: u64::from(u32::MAX),
-            picture_type: 3,
+            data_len: crate::input::BlobLen::new(u64::from(u32::MAX)).unwrap(),
+            picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
         };
@@ -1188,8 +1143,8 @@ mod tests {
             art_id: 0,
             mime: "image/png".to_string(),
             description: "x".repeat(256),
-            data_len: 3_221_225_470, // b64_len = 4_294_967_294 < u32::MAX
-            picture_type: 3,
+            data_len: crate::input::BlobLen::new(3_221_225_470).unwrap(),
+            picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
         };
@@ -1223,8 +1178,8 @@ mod tests {
             art_id: 0,
             mime: "image/png".to_string(),
             description: String::new(),
-            data_len: 3_221_225_412,
-            picture_type: 3,
+            data_len: crate::input::BlobLen::new(3_221_225_412).unwrap(),
+            picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
         };
@@ -1252,10 +1207,10 @@ mod tests {
             art_id: 1,
             mime: "image/png".to_string(), // 9 -> base = 32+9+0 = 41 -> pad 1
             description: String::new(),
-            picture_type: 3,
+            picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 1,
             height: 1,
-            data_len: 12345,
+            data_len: crate::input::BlobLen::new(12345).unwrap(),
         };
         let p = picture_prefix(&art).unwrap();
         assert_eq!(p.len() % 3, 0);
@@ -1355,12 +1310,12 @@ mod tests {
             art_id: 1,
             mime: "image/png".to_string(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len,
+            data_len: crate::input::BlobLen::new(data_len).unwrap(),
         };
-        let framing_len = picture_prefix(&mk(0)).unwrap().len() as u64;
+        let framing_len = picture_prefix(&mk(1)).unwrap().len() as u64;
         let at_limit = mk(crate::flac::MAX_BLOCK_BODY - framing_len);
         let arts = [OggArt {
             meta: &at_limit,
@@ -1429,10 +1384,10 @@ mod tests {
             art_id: 1,
             mime: "image/png".into(), // 9
             description: "x".into(),  // 1 -> base = 42, 42 % 3 == 0 -> pad 0
-            picture_type: 3,
+            picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 1,
             height: 1,
-            data_len: 100,
+            data_len: crate::input::BlobLen::new(100).unwrap(),
         };
         let prefix = picture_prefix(&art).unwrap();
         assert_eq!(prefix.len() % 3, 0);

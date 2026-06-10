@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use id3::TagLike;
 use musefs_format::wav::{WavScan, synthesize_layout};
-use musefs_format::{ArtInput, RegionLayout, Segment, TagInput};
+use musefs_format::{ArtInput, BlobLen, PictureType, RegionLayout, Segment, TagInput};
 
 fn fmt_pcm_16bit_mono() -> Vec<u8> {
     let mut f = Vec::new();
@@ -83,10 +83,10 @@ fn embeds_full_fidelity_id3_tag_with_art() {
         art_id: 9,
         mime: "image/jpeg".to_string(),
         description: String::new(),
-        picture_type: 3,
+        picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
-        data_len: art_bytes.len() as u64,
+        data_len: BlobLen::new(art_bytes.len() as u64).unwrap(),
     }];
 
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &arts).unwrap();
@@ -190,44 +190,6 @@ fn find_chunk(buf: &[u8], id: &[u8; 4]) -> Option<(usize, usize)> {
 }
 
 #[test]
-fn skips_zero_byte_art() {
-    // A degenerate empty embedded picture must not brick the track: synthesis
-    // succeeds, emits no ArtImage segment, and preserves the audio.
-    let audio = vec![0u8; 8];
-    let scan = WavScan {
-        fmt: fmt_pcm_16bit_mono(),
-        fact: None,
-    };
-    let tags = vec![TagInput::new("title", "Empty Art")];
-    let arts = vec![ArtInput {
-        art_id: 1,
-        mime: "image/jpeg".to_string(),
-        description: String::new(),
-        picture_type: 3,
-        width: 0,
-        height: 0,
-        data_len: 0,
-    }];
-
-    let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &arts).unwrap();
-    assert!(
-        !layout
-            .segments
-            .iter()
-            .any(|s| matches!(s, Segment::ArtImage { .. })),
-        "zero-byte art must not produce an ArtImage segment"
-    );
-
-    let bytes = assemble(&layout, &audio, &[]);
-    let bounds = musefs_format::wav::locate_audio(&bytes).unwrap();
-    assert_eq!(
-        &bytes[usize::try_from(bounds.audio_offset).unwrap()
-            ..usize::try_from(bounds.audio_offset + bounds.audio_length).unwrap()],
-        &audio[..]
-    );
-}
-
-#[test]
 fn keeps_real_art_when_mixed_with_empty() {
     let audio = [0u8; 8];
     let art_bytes = [0xCDu8; 64];
@@ -236,26 +198,15 @@ fn keeps_real_art_when_mixed_with_empty() {
         fact: None,
     };
     let tags = vec![TagInput::new("title", "Mixed")];
-    let arts = vec![
-        ArtInput {
-            art_id: 1,
-            mime: "image/jpeg".to_string(),
-            description: String::new(),
-            picture_type: 3,
-            width: 0,
-            height: 0,
-            data_len: 0,
-        },
-        ArtInput {
-            art_id: 2,
-            mime: "image/jpeg".to_string(),
-            description: String::new(),
-            picture_type: 3,
-            width: 0,
-            height: 0,
-            data_len: art_bytes.len() as u64,
-        },
-    ];
+    let arts = vec![ArtInput {
+        art_id: 2,
+        mime: "image/jpeg".to_string(),
+        description: String::new(),
+        picture_type: PictureType::new(3).unwrap(),
+        width: 0,
+        height: 0,
+        data_len: BlobLen::new(art_bytes.len() as u64).unwrap(),
+    }];
 
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &arts).unwrap();
     let art_segs: Vec<&Segment> = layout
