@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use musefs_core::{MountConfig, Musefs, scan_directory};
 
@@ -351,4 +352,169 @@ fn write_ops_are_refused_on_read_only_mount() {
             );
         }
     });
+}
+
+struct SweepCase {
+    /// Backing filename; also seeds a distinct virtual title via `title`.
+    name: &'static str,
+    title: &'static str,
+    codec_args: &'static [&'static str],
+    /// Whether to attach a cover image (exercises ArtImage/BinaryTag/OggArtSlice).
+    cover: bool,
+}
+
+fn sweep_cases() -> &'static [SweepCase] {
+    &[
+        SweepCase {
+            name: "flac.flac",
+            title: "SweepFlac",
+            codec_args: &["-c:a", "flac"],
+            cover: true,
+        },
+        SweepCase {
+            name: "mp3.mp3",
+            title: "SweepMp3",
+            codec_args: &["-c:a", "libmp3lame", "-q:a", "5"],
+            cover: true,
+        },
+        SweepCase {
+            name: "m4a.m4a",
+            title: "SweepM4a",
+            codec_args: &["-c:a", "aac", "-b:a", "64k"],
+            cover: true,
+        },
+        SweepCase {
+            name: "opus.opus",
+            title: "SweepOpus",
+            codec_args: &["-c:a", "libopus"],
+            cover: true,
+        },
+        SweepCase {
+            name: "vorbis.ogg",
+            title: "SweepVorbis",
+            codec_args: &["-c:a", "libvorbis"],
+            cover: true,
+        },
+        SweepCase {
+            name: "oggflac.oga",
+            title: "SweepOggFlac",
+            codec_args: &["-c:a", "flac", "-f", "ogg"],
+            cover: true,
+        },
+        SweepCase {
+            name: "wav.wav",
+            title: "SweepWav",
+            codec_args: &["-c:a", "pcm_s16le"],
+            cover: false,
+        },
+    ]
+}
+
+/// 1x1 PNG used as a cover image.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+/// Encode `case` into `dir` with ffmpeg, optionally attaching a cover image.
+/// Returns `true` on success; `false` (skip) if ffmpeg/codec is unavailable.
+fn make_sweep_fixture(dir: &Path, case: &SweepCase) -> bool {
+    let out = dir.join(case.name);
+    let title = format!("title={}", case.title);
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    cmd.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=48000:cl=stereo",
+        "-t",
+        "0.3",
+    ]);
+
+    if case.cover {
+        let cover = dir.join(format!("{}.cover.png", case.name));
+        std::fs::write(&cover, TINY_PNG).unwrap();
+        cmd.args(["-i"]);
+        cmd.arg(&cover);
+        cmd.args(["-map", "0:a", "-map", "1:v"]);
+        cmd.args(case.codec_args);
+        cmd.args(["-metadata", title.as_str(), "-metadata", "artist=Sweep"]);
+        cmd.args(["-disposition:v", "attached_pic"]);
+    } else {
+        cmd.args(case.codec_args);
+        cmd.args(["-metadata", title.as_str(), "-metadata", "artist=Sweep"]);
+    }
+
+    cmd.arg(&out).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.status().is_ok_and(|s| s.success()) && out.exists()
+}
+
+/// All regular files under `dir`, recursively.
+fn walk_tree(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                out.extend(walk_tree(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires /dev/fuse + libfuse + ffmpeg; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
+fn randomized_reads_match_oracle_all_formats() {
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_or(true, |s| !s.success())
+    {
+        eprintln!("ffmpeg unavailable; skipping multi-format read-consistency sweep");
+        return;
+    }
+
+    let backing = tempfile::tempdir().unwrap();
+    let mut generated = 0usize;
+    for case in sweep_cases() {
+        if make_sweep_fixture(backing.path(), case) {
+            generated += 1;
+        } else {
+            eprintln!(
+                "ffmpeg codec unavailable for {}; skipping that format",
+                case.name
+            );
+        }
+    }
+    assert!(
+        generated > 0,
+        "no breadth-sweep fixtures could be generated; ffmpeg codecs may be unavailable"
+    );
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, backing.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+    let mountpoint = tempfile::tempdir().unwrap();
+    let session = musefs_fuse::spawn(fs, mountpoint.path(), "musefs-readcons-sweep").unwrap();
+
+    let served = walk_tree(mountpoint.path());
+    assert!(
+        !served.is_empty(),
+        "mount should expose at least one served file"
+    );
+    for path in &served {
+        sweep_reads(path, None, 500);
+    }
+
+    drop(session);
+    drop(backing);
 }
