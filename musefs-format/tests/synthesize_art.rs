@@ -119,7 +119,7 @@ fn synthesize_errors_on_oversized_picture() {
 }
 
 #[test]
-fn zero_byte_art_skipped_among_valid_art_keeps_block_framing_valid() {
+fn multiple_valid_art_keeps_block_framing_valid() {
     // Guards the `is_last` flag: with only valid art, the final PICTURE block
     // carries its last-block bit. metaflac parsing the whole chain validates that.
     let (file, _audio) = fixture();

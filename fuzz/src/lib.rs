@@ -1,5 +1,5 @@
 use arbitrary::{Arbitrary, Unstructured};
-use musefs_format::{ArtInput, BlobLen, BinaryTagInput, PictureType, TagInput};
+use musefs_format::{ArtInput, BinaryTagInput, BlobLen, PictureType, TagInput};
 
 /// Cap fuzz input size to avoid pathological slow paths / false-positive
 /// timeouts on chunk/frame parsers (64-128 KiB is ample for full coverage).
