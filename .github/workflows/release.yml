@@ -13,16 +13,18 @@ permissions:
   contents: read
 
 jobs:
-  publish:
+  gate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           persist-credentials: false
-      - name: Install libfuse3
-        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
       - name: Verify tag matches workspace version
         run: |
           set -euo pipefail
@@ -33,19 +35,81 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match workspace version $WS_VERSION"
             exit 1
           fi
+      - name: Wait for required CI checks to be green on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Poll the Checks API until ci-ok and coverage-ok complete on this
+          # commit. release_gate.py decides: exit 0 = all green, 2 = keep
+          # waiting, 1 = a required check failed. The tag also triggers ci.yml
+          # and coverage.yml, so these checks are (re)generated for this tree.
+          deadline=$(( $(date +%s) + 45 * 60 ))   # 45 min covers the full matrix
+          while :; do
+            # --slurp collects all pages into one JSON array; the jq filter then
+            # flattens every page's check_runs into a single {check_runs: [...]}
+            # object (plain --paginate would emit one object per page, which is
+            # not valid single-document JSON).
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
+              --paginate --slurp -q '{check_runs: [.[].check_runs[]]}' > checks.json || true
+            set +e
+            python scripts/release_gate.py --names ci-ok coverage-ok < checks.json
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then break; fi
+            if [ "$rc" -eq 1 ]; then exit 1; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for ci-ok/coverage-ok on ${SHA}"
+              exit 1
+            fi
+            sleep 20
+          done
+
+  publish:
+    needs: smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - name: Install libfuse3
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
           # Keep this list in sync with the workspace members in Cargo.toml,
           # in dependency order (a crate must come after everything it depends on).
           for c in musefs-db musefs-format musefs-core musefs-fuse musefs-cli musefs; do
-            echo "=== publishing $c ==="
-            cargo publish -p "$c" --locked
+            if python scripts/crates_index.py "$c" "$VERSION"; then
+              echo "=== $c@$VERSION already published; skipping ==="
+            else
+              echo "=== publishing $c ==="
+              cargo publish -p "$c" --locked
+            fi
+            # Wait for the just-published (or pre-existing) version to be
+            # resolvable before the next dependent crate publishes (#163).
+            echo "=== waiting for $c@$VERSION to appear in the index ==="
+            deadline=$(( $(date +%s) + 10 * 60 ))
+            until python scripts/crates_index.py "$c" "$VERSION"; do
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::$c@$VERSION did not appear in the crates.io index within 10m"
+                exit 1
+              fi
+              sleep 10
+            done
           done
 
   build:
+    needs: gate
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -148,7 +212,7 @@ jobs:
             sh -c 'apk add --no-cache fuse3 ffmpeg >/dev/null && sh scripts/smoke-binary.sh ./musefs'
 
   release-assets:
-    needs: smoke
+    needs: [smoke, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
