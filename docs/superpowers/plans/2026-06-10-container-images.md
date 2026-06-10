@@ -206,7 +206,9 @@ reports a diff, run `ruff format scripts/container_tags.py scripts/test_containe
 
 - [ ] **Step 6: Wire the test into CI**
 
-In `.github/workflows/ci.yml`, the `python` job runs a series of pytest steps.
+In `.github/workflows/ci.yml`, the `python-musefs` job (job key at the top level
+of `jobs:`, gated by `if: needs.changes.outputs.src == 'true'` — same gate as the
+existing scripts tests, so no change needed there) runs a series of pytest steps.
 After the existing block ending at the crates-index step:
 
 ```yaml
@@ -221,10 +223,20 @@ add immediately after it:
         run: python -m pytest scripts/test_container_tags.py -v
 ```
 
-- [ ] **Step 7: Verify the CI YAML still parses**
+- [ ] **Step 7: Verify the CI YAML parses and the step landed in `python-musefs`**
 
-Run: `python -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml')); print('ci.yml OK')"`
-Expected: `ci.yml OK`.
+Run:
+```bash
+python - <<'PY'
+import yaml
+wf = yaml.safe_load(open(".github/workflows/ci.yml"))
+steps = wf["jobs"]["python-musefs"]["steps"]
+names = [s.get("name", "") for s in steps]
+assert "Test container-tags helper" in names, names
+print("ci.yml python-musefs wiring OK")
+PY
+```
+Expected: `ci.yml python-musefs wiring OK`.
 
 - [ ] **Step 8: Commit**
 
@@ -489,10 +501,13 @@ resolved SHAs from Step 1:
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          TAGS="$(python scripts/container_tags.py --repo "$REPO" --ref "$REF" --variant "${{ matrix.variant }}")"
+          test -n "$TAGS"   # fail fast rather than hand build-push-action an empty tag list
+          echo "computed tags:"; printf '%s\n' "$TAGS"
           echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
           {
             echo "list<<EOF"
-            python scripts/container_tags.py --repo "$REPO" --ref "$REF" --variant "${{ matrix.variant }}"
+            printf '%s\n' "$TAGS"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@<SHA-setup-qemu>
@@ -709,6 +724,12 @@ settings (cannot be done from the workflow on first run).
 - **Failure isolation:** if `images` fails, the release still ships binaries
   (GitHub Release + crates.io publish are independent jobs) and the floating
   tags simply stay put. Intended tradeoff, not an oversight.
+- **Context-root layout:** the spec describes a per-variant context root
+  (`ctx/glibc/`, `ctx/musl/`). Because the `images` job runs one matrix leg per
+  variant, each leg has its own checkout and stages into a single `ctx/`
+  (`ctx/amd64/musefs`, `ctx/arm64/musefs`), built with `context: ctx`. That
+  per-job `ctx/` *is* the per-variant root — `COPY ${TARGETARCH}/musefs` resolves
+  identically; only the directory name differs from the spec's prose.
 - **Out of scope:** out-of-order stable tags moving `:latest` backwards
   (releases assumed monotonic); bit-for-bit reproducible image layers; arm64
   in-CI runtime smoke (manifest is built/pushed but only amd64 is run, matching
