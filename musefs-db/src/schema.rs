@@ -897,4 +897,176 @@ mod migration_v4_tests {
         insert_track(&conn, "/x.flac");
         rejected(&conn, "UPDATE tracks SET backing_size = 0 WHERE id = 1");
     }
+
+    fn seed_track_and_art(conn: &Connection) {
+        insert_track(conn, "/seed.flac");
+        conn.execute(
+            "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?1,'image/png',1,X'00')",
+            [&"c".repeat(64)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_tags_rejects_negative_ordinal() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        rejected(
+            &conn,
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','A',-1)",
+        );
+    }
+
+    #[test]
+    fn v4_tags_rejects_blob_with_nonempty_value() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        rejected(
+            &conn,
+            "INSERT INTO tags (track_id, key, value, ordinal, value_blob) \
+             VALUES (1,'cover','nonempty',0,X'00')",
+        );
+    }
+
+    #[test]
+    fn v4_tags_accepts_blob_with_empty_value() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal, value_blob) \
+             VALUES (1,'cover','',0,X'00')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_tags_accepts_empty_text_value_without_blob() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'comment','',0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_art_rejects_byte_len_mismatch() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO art (sha256, mime, byte_len, data) \
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',\
+             'image/png',5,X'00')",
+        );
+    }
+
+    #[test]
+    fn v4_art_rejects_sha256_wrong_length() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO art (sha256, mime, byte_len, data) \
+             VALUES ('tooshort','image/png',1,X'00')",
+        );
+    }
+
+    #[test]
+    fn v4_art_rejects_negative_width() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO art (sha256, mime, width, byte_len, data) \
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',\
+             'image/png',-1,1,X'00')",
+        );
+    }
+
+    #[test]
+    fn v4_art_rejects_negative_height() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        rejected(
+            &conn,
+            "INSERT INTO art (sha256, mime, height, byte_len, data) \
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',\
+             'image/png',-1,1,X'00')",
+        );
+    }
+
+    #[test]
+    fn v4_art_accepts_null_dimensions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',\
+             'image/png',NULL,NULL,1,X'00')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_track_art_rejects_picture_type_above_range() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        rejected(
+            &conn,
+            "INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
+             VALUES (1,1,21,0)",
+        );
+    }
+
+    #[test]
+    fn v4_track_art_rejects_negative_picture_type() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        rejected(
+            &conn,
+            "INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
+             VALUES (1,1,-1,0)",
+        );
+    }
+
+    #[test]
+    fn v4_track_art_accepts_picture_type_bounds() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
+             VALUES (1,1,0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
+             VALUES (1,1,20,1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_track_art_rejects_negative_ordinal() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        rejected(
+            &conn,
+            "INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
+             VALUES (1,1,3,-1)",
+        );
+    }
 }
