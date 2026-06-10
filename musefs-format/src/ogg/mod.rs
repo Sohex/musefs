@@ -143,7 +143,12 @@ pub fn read_tags(data: &[u8]) -> Result<Vec<(String, String)>> {
         return Ok(Vec::new()); // no comment packet present
     }
     let body = comment_body(header.codec, &header.packets[idx])?;
-    crate::vorbiscomment::parse(body)
+    let mut tags = crate::vorbiscomment::parse(body)?;
+    // Cover art rides in the comment as a base64 METADATA_BLOCK_PICTURE entry, but
+    // it has its own channel (read_pictures). Excluding it keeps read_tags
+    // text-only and prevents the art being stored — and re-synthesized — twice.
+    tags.retain(|(field, _)| !field.eq_ignore_ascii_case("METADATA_BLOCK_PICTURE"));
+    Ok(tags)
 }
 
 use crate::input::EmbeddedPicture;
@@ -565,6 +570,44 @@ mod tests {
 
         let tags = read_tags(&data).unwrap();
         assert_eq!(tags, vec![("title".to_string(), "Sun".to_string())]);
+    }
+
+    #[test]
+    fn read_tags_excludes_metadata_block_picture() {
+        // A METADATA_BLOCK_PICTURE comment whose value is a base64 FLAC picture
+        // block carrying a 1-byte image, plus one ordinary text tag.
+        let mut block = Vec::new();
+        block.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
+        block.extend_from_slice(&9u32.to_be_bytes());
+        block.extend_from_slice(b"image/png");
+        block.extend_from_slice(&0u32.to_be_bytes()); // description length
+        block.extend_from_slice(&1u32.to_be_bytes()); // width
+        block.extend_from_slice(&1u32.to_be_bytes()); // height
+        block.extend_from_slice(&8u32.to_be_bytes()); // depth
+        block.extend_from_slice(&0u32.to_be_bytes()); // colors used
+        block.extend_from_slice(&1u32.to_be_bytes()); // image length
+        block.push(0xAB);
+        let pic_value = base64::engine::general_purpose::STANDARD.encode(&block);
+
+        let body = crate::vorbiscomment::build(&[
+            crate::input::TagInput::new("title", "Sun"),
+            crate::input::TagInput::new("METADATA_BLOCK_PICTURE", &pic_value),
+        ])
+        .unwrap();
+        let mut tags_pkt = b"OpusTags".to_vec();
+        tags_pkt.extend_from_slice(&body);
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let (mut data, _) = crate::ogg::page::build_header(7, &[&head, &tags_pkt]);
+        let (audio, _) = crate::ogg::page::lace_packet(7, 2, false, 960, &[0u8; 50]);
+        data.extend_from_slice(&audio);
+
+        // read_tags returns only the text tag — the picture comment is excluded...
+        let tags = read_tags(&data).unwrap();
+        assert_eq!(tags, vec![("title".to_string(), "Sun".to_string())]);
+        // ...while read_pictures still finds the embedded art.
+        let pics = read_pictures(&data).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].data, vec![0xAB]);
     }
 
     #[test]
