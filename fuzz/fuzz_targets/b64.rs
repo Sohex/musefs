@@ -36,6 +36,13 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return,
     };
     let win = b64_window(out_off, take, img.len() as u64);
+    assert!(
+        win.in_start + win.in_len <= img.len() as u64,
+        "b64_window returned OOB range: in_start={} in_len={} img_len={}",
+        win.in_start,
+        win.in_len,
+        img.len(),
+    );
     let windowed = encode_b64_slice(
         &img[win.in_start as usize..(win.in_start + win.in_len) as usize],
         win.skip,
