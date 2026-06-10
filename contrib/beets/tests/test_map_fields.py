@@ -139,3 +139,24 @@ def test_extra_fields_override_wins():
 
 def test_bpm_int_no_trailing_dot_zero():
     assert dict(map_fields(item(bpm=120)))["bpm"] == "120"
+
+
+def test_real_item_bare_emits_no_zero_sentinel_fields():
+    """Against a REAL beets Item (not a stub), the integer fields beets defaults to
+    0 as an 'unset' sentinel must not leak as "0" tags. This exercises the real
+    `_media_tag_fields` boundary that the SimpleNamespace tests above do not."""
+    import pytest
+
+    beets_library = pytest.importorskip("beets.library")
+    it = beets_library.Item()
+    it.title = "Bare"
+    it.artist = "X"
+    d = dict(map_fields(it))
+    for noise in ("bpm", "original_year", "original_month", "original_day"):
+        assert noise not in d, f"{noise} leaked as {d.get(noise)!r}"
+    # A real value still comes through (we drop the zero sentinel, not the field).
+    it.original_year = 1999
+    it.bpm = 128
+    d = dict(map_fields(it))
+    assert d["original_year"] == "1999"
+    assert d["bpm"] == "128"

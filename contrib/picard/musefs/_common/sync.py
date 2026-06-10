@@ -48,8 +48,10 @@ class SyncStats:
 
 def sync_one(conn, record, stats, *, dry_run=False, merge=False):
     """Sync one ``Record`` into the DB, mutating ``stats``. Caller owns the
-    transaction. Tags are always fully replaced (scanner-written binary tags
-    survive — see ``replace_tags``). Art is replaced when at least one image is
+    transaction. With ``merge=False`` (the default) all plugin-owned text tags are
+    replaced; with ``merge=True`` only the keys in ``record.pairs`` and
+    ``record.delete_keys`` are touched (see ``merge_tags``). Either way,
+    scanner-written binary tags survive. Art is replaced when at least one image is
     within ``MAX_ART_BYTES``; each over-cap image bumps ``skipped_art``, and if
     every provided image is over cap any scan-seeded ``track_art`` is left
     untouched."""

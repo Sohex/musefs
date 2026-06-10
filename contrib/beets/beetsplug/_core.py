@@ -72,10 +72,22 @@ TWINS = {
 # Assembled into `date`; never emitted under their own names.
 _DATE_PARTS = ("year", "month", "day")
 
-# Output keys dropped when their numeric value is zero (0 is noise here). `comp`
-# is a 0/1 int in beets, so dropping on zero covers both the int and bool forms
-# of a non-compilation.
-_DROP_IF_ZERO = {"tracknumber", "discnumber", "tracktotal", "disctotal", "comp"}
+# Output keys dropped when their numeric value is zero, because beets uses 0 as
+# the "unset" sentinel for these integer fields, so a stored 0 is noise rather
+# than a real value. `comp` is a 0/1 int, so this covers both its int and bool
+# forms. (ReplayGain is exempt — beets defaults it to None, not 0.0, so a stored
+# 0.00 dB is a real measured value and must survive.)
+_DROP_IF_ZERO = {
+    "tracknumber",
+    "discnumber",
+    "tracktotal",
+    "disctotal",
+    "comp",
+    "bpm",
+    "original_year",
+    "original_month",
+    "original_day",
+}
 
 # Used when an item has no _media_tag_fields (older beets / non-beets test stubs).
 FALLBACK_TAG_FIELDS = (
