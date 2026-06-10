@@ -17,8 +17,8 @@ proptest! {
         let file = fixtures::m4a(&payload);
         let scan = mp4::read_structure(&file).unwrap();
         let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
-        // (kind, len) pairs: kind 1 = jpeg, 2 = png; len 0 exercises the
-        // zero-byte filter in synthesize_layout.
+        // (kind, len) pairs: kind 1 = jpeg, 2 = png; len is always non-zero
+        // (BlobLen invariant) so zero-byte art is never tested here.
         let arts: Vec<ArtInput> = arts
             .iter()
             .enumerate()

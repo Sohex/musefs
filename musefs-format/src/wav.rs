@@ -249,9 +249,8 @@ pub fn synthesize_layout(
     }
 
     // Embedded `id3 ` chunk: 8-byte chunk header + the ID3v2 tag segments, padded.
-    // `build_id3v2_segments` already skips degenerate zero-byte art (finding #16) —
-    // an empty `ArtImage { len: 0 }` would fail `RegionLayout::validate` and brick
-    // the track — so WAV inherits that handling by delegating to it.
+    // Zero-length art inputs are impossible (BlobLen is non-zero by construction),
+    // so WAV inherits that invariant by delegating to `build_id3v2_segments`.
     let (tag_segments, tag_len) = crate::mp3::build_id3v2_segments(tags, binary_tags, arts)?;
     let tag_len_u32 = u32::try_from(tag_len).map_err(|_| FormatError::TooLarge)?;
     segments.push(Segment::Inline(chunk_header(b"id3 ", tag_len_u32).to_vec()));
