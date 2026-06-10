@@ -2,8 +2,8 @@
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 use musefs_format::ogg::OggArt;
-use musefs_format::{ArtInput, BlobLen, Extent, PictureType, fuzz_check::assert_backing_covers_audio, ogg};
-use musefs_fuzz::{MAX_INPUT, arb_tags};
+use musefs_format::{Extent, fuzz_check::assert_backing_covers_audio, ogg};
+use musefs_fuzz::{MAX_INPUT, arb_arts, arb_tags};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_INPUT {
@@ -32,30 +32,24 @@ fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
     let tags = arb_tags(&mut u).unwrap_or_default();
 
-    let n = u.int_in_range(0..=2u8).unwrap_or(0);
-    let mut images: Vec<Vec<u8>> = Vec::new();
-    let mut inputs: Vec<ArtInput> = Vec::new();
-    for i in 0..n {
-        let len = u.int_in_range(1..=8192usize).unwrap_or(1);
-        let bytes = u.bytes(len).map(<[u8]>::to_vec).unwrap_or_default();
-        if bytes.is_empty() {
-            continue;
-        }
-        inputs.push(ArtInput {
-            art_id: i as i64,
-            mime: "image/png".to_string(),
-            description: String::new(),
-            picture_type: PictureType::new(u.int_in_range(0..=20u32).unwrap_or(3))
-                .unwrap_or(PictureType::ZERO),
-            width: 0,
-            height: 0,
-            data_len: BlobLen::new(bytes.len() as u64).expect("non-empty"),
-        });
-        images.push(bytes);
-    }
-    let arts: Vec<OggArt> = inputs
+    // Derive art metadata from the shared helper (so OGG exercises the same
+    // randomized width/height/data_len as every other format target), then
+    // generate each image's bytes independently. OGG is the one synthesis path
+    // carrying both a `data_len` field and a separate `image` slice, so their
+    // lengths must be free to disagree. Images stay non-empty: synthesize_layout
+    // documents that the bridge drops zero-length art at construction.
+    let arts_meta = arb_arts(&mut u).unwrap_or_default();
+    let images: Vec<Vec<u8>> = arts_meta
+        .iter()
+        .map(|_| {
+            let len = u.int_in_range(1..=8192usize).unwrap_or(1);
+            u.bytes(len).map(<[u8]>::to_vec).unwrap_or_default()
+        })
+        .collect();
+    let arts: Vec<OggArt> = arts_meta
         .iter()
         .zip(images.iter())
+        .filter(|(_, image)| !image.is_empty())
         .map(|(meta, image)| OggArt {
             meta,
             image: image.as_slice(),
