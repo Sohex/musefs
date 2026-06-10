@@ -59,7 +59,7 @@ Define the newtype, add its error variant, embed it in `Track`, and validate it 
 - `musefs-db/src/models.rs` (lines 86-95 `Track`; add `TrackBounds` near it)
 - `musefs-db/src/tracks.rs` (lines 32-46 `row_to_track`; tests at 239-265)
 - `musefs-db/src/lib.rs` (lines 13-16 re-export block)
-- `musefs-db/tests/tracks.rs` (Track audio-field reads at lines 14, 34, 133-134; **and** the `upsert_conflict_updates_all_mutable_columns` bounds fix — see Step 1.12)
+- `musefs-db/tests/tracks.rs` (Track audio-field reads at lines 14, 35, 135-136 — read-accessor substitutions only; the `upsert_conflict` bounds fix already landed on `main` via #199 — see Step 1.12)
 - `musefs-core/src/reader.rs` (production reads at lines 155, 178, 196-197, 204-205, 245, 249-250, 257, 270-271 — Step 1.11. The in-module over-EOF test is owned by Plan A.)
 - `musefs-core/src/scan.rs` (test asserts at 1883-1884, 1918; **plus the `norm` closure read at line 1971**)
 - `musefs-core/tests/scan.rs` (Track audio-field reads at lines 43, 114, 115)
@@ -280,11 +280,10 @@ Define the newtype, add its error variant, embed it in `Track`, and validate it 
   ```
   Apply the same `.bounds.audio_offset()` / `.bounds.audio_length()` substitution at every other listed line.
 
-- [ ] **Step 1.12: Fix db-crate integration test readers (`musefs-db/tests/tracks.rs`).** Three reads of a `Track` returned by `get_track` break; one also needs a bounds-valid `NewTrack`:
+- [ ] **Step 1.12: Fix db-crate integration test readers (`musefs-db/tests/tracks.rs`).** Three reads of a `Track` returned by `get_track` break. (The bounds combinations these tests write are already valid on `main`: Plan A (#199) bumped `upsert_conflict_updates_all_mutable_columns` to `backing_size: 555` and the other tests' bounds when the V4 CHECK landed — no `NewTrack` value changes are needed here, only the read-accessor substitutions below.)
   - Line 14: `assert_eq!(by_id.bounds.audio_offset(), 100);` (`new_track` sets offset 100, length 1000, backing_size 1100 → 1100 ≤ 1100, valid).
-  - Line 34: `assert_eq!(db.get_track(id).unwrap().unwrap().bounds.audio_offset(), 222);` (`changed.audio_offset = 222` is a write to the `NewTrack` field — keep as-is; only the read on line 34 changes).
-  - Lines 133-134: `assert_eq!(t.bounds.audio_offset(), 222);` / `assert_eq!(t.bounds.audio_length(), 333);`.
-  - **Bounds fix in `upsert_conflict_updates_all_mutable_columns` (lines 120-136):** the `changed` `NewTrack` uses `audio_offset: 222, audio_length: 333, backing_size: 444` — `222 + 333 = 555 > 444`, so `get_track(id)` at line 131 now FAILS `TrackBounds::new` at row read. Bump `backing_size` so the row is readable; change `backing_size: 444` to `backing_size: 555` and update the assert at line 135 to `assert_eq!(t.backing_size, 555);`. (The test's purpose — every mutable column round-trips on conflict-update — is preserved; only the now-invalid bounds combination is corrected.)
+  - Line 35: `assert_eq!(db.get_track(id).unwrap().unwrap().bounds.audio_offset(), 222);` (`changed.audio_offset = 222` is a write to the `NewTrack` field — keep as-is; only the read on line 35 changes).
+  - Lines 135-136: `assert_eq!(t.bounds.audio_offset(), 222);` / `assert_eq!(t.bounds.audio_length(), 333);`.
 
 - [ ] **Step 1.13: Fix core in-crate + integration test readers.** Update the `Track`-typed reads:
   - `musefs-core/src/scan.rs:1883-1884`: `assert_eq!(track.bounds.audio_offset(), full.bounds.audio_offset());` / `assert_eq!(track.bounds.audio_length(), full.bounds.audio_length());`
