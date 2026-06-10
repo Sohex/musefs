@@ -16,7 +16,7 @@ pub fn resolve_layout(
     binary_tags: &HashMap<i64, Vec<u8>>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    for seg in &layout.segments {
+    for seg in layout.segments() {
         match seg {
             Segment::Inline(b) => out.extend_from_slice(b),
             Segment::ArtImage { art_id, len } => {

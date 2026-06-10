@@ -97,7 +97,7 @@ fn vorbis_comment_block_is_the_last_metadata_block_when_no_art() {
     )
     .unwrap();
 
-    assert_eq!(layout.segments.len(), 2);
-    assert!(matches!(layout.segments[0], Segment::Inline(_)));
-    assert!(matches!(layout.segments[1], Segment::BackingAudio { .. }));
+    assert_eq!(layout.segments().len(), 2);
+    assert!(matches!(layout.segments()[0], Segment::Inline(_)));
+    assert!(matches!(layout.segments()[1], Segment::BackingAudio { .. }));
 }

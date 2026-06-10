@@ -61,3 +61,24 @@ fn total_overflow_detected() {
     ]);
     assert_eq!(layout.validate(), Err(LayoutError::TotalOverflow));
 }
+
+#[test]
+fn cached_totals_equal_segment_sum() {
+    let layout = RegionLayout::validated(vec![
+        Segment::Inline(vec![0u8; 10]),
+        Segment::ArtImage {
+            art_id: 7,
+            len: 100,
+        },
+        Segment::Inline(vec![0u8; 5]),
+        Segment::BackingAudio {
+            offset: 200,
+            len: 1000,
+        },
+    ])
+    .unwrap();
+    assert_eq!(layout.total_len(), 10 + 100 + 5 + 1000);
+    assert_eq!(layout.header_len(), 10 + 100 + 5);
+    let sum: u64 = layout.segments().iter().map(Segment::len).sum();
+    assert_eq!(layout.total_len(), sum);
+}

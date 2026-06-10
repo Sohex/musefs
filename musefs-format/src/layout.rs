@@ -62,19 +62,41 @@ impl Segment {
 }
 
 /// An ordered description of a synthesized virtual file: the metadata region
-/// (inline framing + art images) followed by the backing audio.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// (inline framing + art images) followed by the backing audio. Totals are
+/// computed once at construction; `segments` is private so they cannot desync.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionLayout {
-    pub segments: Vec<Segment>,
+    segments: Vec<Segment>,
+    total_len: u64,
+    header_len: u64,
 }
 
 impl RegionLayout {
+    fn from_segments(segments: Vec<Segment>) -> RegionLayout {
+        let total_len = segments
+            .iter()
+            .map(Segment::len)
+            .fold(0u64, u64::saturating_add);
+        let header_len = segments
+            .iter()
+            .filter(|s| !matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }))
+            .map(Segment::len)
+            .fold(0u64, u64::saturating_add);
+        RegionLayout {
+            segments,
+            total_len,
+            header_len,
+        }
+    }
+
+    // Stays `pub` in Task 1 (foreign `new` callers still need it); demoted to
+    // `pub(crate)` in Task 3 together with their migration.
     pub fn new(segments: Vec<Segment>) -> RegionLayout {
-        RegionLayout { segments }
+        RegionLayout::from_segments(segments)
     }
 
     pub fn validated(segments: Vec<Segment>) -> Result<RegionLayout, LayoutError> {
-        let layout = RegionLayout::new(segments);
+        let layout = RegionLayout::from_segments(segments);
         layout.validate()?;
         Ok(layout)
     }
@@ -84,27 +106,21 @@ impl RegionLayout {
         &self.segments
     }
 
-    /// True if any segment streams an opaque binary tag payload from the DB. Used by
-    /// the reader to decide whether a read needs the transactional content_version
-    /// guard (plain Inline/BackingAudio layouts don't).
+    /// True if any segment streams an opaque binary tag payload from the DB.
     pub fn has_binary_tag(&self) -> bool {
         self.segments
             .iter()
             .any(|s| matches!(s, Segment::BinaryTag { .. }))
     }
 
-    /// Total size of the synthesized virtual file in bytes.
+    /// Total size of the synthesized virtual file in bytes (stored at construction).
     pub fn total_len(&self) -> u64 {
-        self.segments.iter().map(Segment::len).sum()
+        self.total_len
     }
 
-    /// Size of the synthesized metadata region preceding the backing audio.
+    /// Size of the synthesized metadata region preceding the backing audio (stored).
     pub fn header_len(&self) -> u64 {
-        self.segments
-            .iter()
-            .filter(|s| !matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }))
-            .map(Segment::len)
-            .sum()
+        self.header_len
     }
 
     /// Validate basic producer invariants. Returns `Ok(())` if the layout is
