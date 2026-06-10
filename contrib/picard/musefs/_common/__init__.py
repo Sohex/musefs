@@ -16,6 +16,7 @@ from .scan import run_scan
 from .store import (
     check_schema_version,
     connect,
+    merge_tags,
     prune_missing,
     replace_tags,
     replace_track_art,
@@ -39,6 +40,7 @@ __all__ = [
     "check_schema_version",
     "track_id_for_path",
     "prune_missing",
+    "merge_tags",
     "replace_tags",
     "upsert_art",
     "replace_track_art",
