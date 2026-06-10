@@ -73,7 +73,7 @@ pub struct ArtInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedPicture {
     pub mime: String,
-    pub picture_type: u32,
+    pub picture_type: PictureType,
     pub description: String,
     pub width: u32,
     pub height: u32,

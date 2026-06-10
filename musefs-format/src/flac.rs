@@ -139,7 +139,9 @@ pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
     })
 }
 
-use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
+use crate::input::{
+    ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, PictureType, TagInput,
+};
 use crate::layout::{RegionLayout, Segment};
 
 /// Inclusive maximum body length of a FLAC metadata block (24-bit length field).
@@ -417,7 +419,7 @@ pub(crate) fn parse_picture_block(body: &[u8]) -> Result<EmbeddedPicture> {
     }
     Ok(EmbeddedPicture {
         mime,
-        picture_type,
+        picture_type: PictureType::new(picture_type).unwrap_or(PictureType::ZERO),
         description,
         width,
         height,
@@ -672,12 +674,19 @@ mod tests {
     fn parse_picture_block_roundtrips_fields() {
         let body = picture_body(3, "image/png", "desc", 4, 5, b"PIXELS");
         let p = parse_picture_block(&body).unwrap();
-        assert_eq!(p.picture_type, 3);
+        assert_eq!(p.picture_type.get(), 3);
         assert_eq!(p.mime, "image/png");
         assert_eq!(p.description, "desc");
         assert_eq!(p.width, 4);
         assert_eq!(p.height, 5);
         assert_eq!(p.data, b"PIXELS");
+    }
+
+    #[test]
+    fn read_picture_clamps_out_of_range_type() {
+        let body = picture_body(99, "png", "", 0, 0, &[0xAB]);
+        let pic = parse_picture_block(&body).unwrap();
+        assert_eq!(pic.picture_type.get(), 0, "out-of-range type clamps to 0");
     }
 
     #[test]

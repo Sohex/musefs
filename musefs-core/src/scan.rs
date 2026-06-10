@@ -567,12 +567,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
             height: (pic.height != 0).then_some(pic.height),
             data: pic.data,
         })?;
-        // Valid ID3/FLAC picture types are 0..=20; clamp anything out of range.
-        let picture_type = if pic.picture_type <= 20 {
-            pic.picture_type
-        } else {
-            0
-        };
+        let picture_type = pic.picture_type.get();
         track_arts.push(TrackArt {
             art_id,
             picture_type,
@@ -653,11 +648,7 @@ fn ingest_bulk(
             height: (pic.height != 0).then_some(pic.height),
             data: pic.data,
         })?;
-        let picture_type = if pic.picture_type <= 20 {
-            pic.picture_type
-        } else {
-            0
-        };
+        let picture_type = pic.picture_type.get();
         track_arts.push(TrackArt {
             art_id,
             picture_type,
@@ -974,6 +965,7 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
 #[cfg(test)]
 mod scan_unit_tests {
     use super::*;
+    use musefs_format::PictureType;
     use std::io::Write;
 
     // --- ScanOptions defaults (WINDOW L16, BATCH_BYTES L12) ---
@@ -1047,7 +1039,7 @@ mod scan_unit_tests {
     fn payload_weight_sums_all_buffered_payloads() {
         let pic = |n: usize| EmbeddedPicture {
             mime: "image/png".to_string(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             description: String::new(),
             width: 0,
             height: 0,

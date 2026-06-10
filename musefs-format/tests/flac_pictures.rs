@@ -33,7 +33,7 @@ fn extracts_picture_blocks() {
     let pics = read_pictures(&flac).unwrap();
     assert_eq!(pics.len(), 1);
     let p = &pics[0];
-    assert_eq!(p.picture_type, 3);
+    assert_eq!(p.picture_type.get(), 3);
     assert_eq!(p.mime, "image/png");
     assert_eq!(p.description, "front");
     assert_eq!(p.width, 10);

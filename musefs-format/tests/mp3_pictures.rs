@@ -20,7 +20,7 @@ fn extracts_apic_pictures() {
     assert_eq!(pics.len(), 1);
     let p = &pics[0];
     assert_eq!(p.mime, "image/jpeg");
-    assert_eq!(p.picture_type, 3); // front cover
+    assert_eq!(p.picture_type.get(), 3); // front cover
     assert_eq!(p.description, "cover");
     assert_eq!(p.data, img);
 }
