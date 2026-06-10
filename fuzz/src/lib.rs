@@ -1,5 +1,5 @@
 use arbitrary::{Arbitrary, Unstructured};
-use musefs_format::{ArtInput, BinaryTagInput, TagInput};
+use musefs_format::{ArtInput, BlobLen, BinaryTagInput, PictureType, TagInput};
 
 /// Cap fuzz input size to avoid pathological slow paths / false-positive
 /// timeouts on chunk/frame parsers (64-128 KiB is ample for full coverage).
@@ -26,10 +26,12 @@ pub fn arb_arts(u: &mut Unstructured) -> arbitrary::Result<Vec<ArtInput>> {
             art_id: i as i64,
             mime: "image/png".to_string(),
             description: String::arbitrary(u)?,
-            picture_type: u.int_in_range(0..=20u32)?,
+            picture_type: PictureType::new(u.int_in_range(0..=20u32)?)
+                .expect("0..=20 is valid"),
             width: u.int_in_range(0..=4096u32)?,
             height: u.int_in_range(0..=4096u32)?,
-            data_len: u.int_in_range(0..=8192u64)?,
+            data_len: BlobLen::new(u.int_in_range(1..=8192u64)?)
+                .expect("1..=8192 is non-zero"),
         });
     }
     Ok(out)
@@ -45,7 +47,7 @@ pub fn arb_binary_tags(u: &mut Unstructured) -> arbitrary::Result<Vec<BinaryTagI
         out.push(BinaryTagInput {
             key: format!("----:com.apple.iTunes:{name}"),
             payload_id: i as i64 + 1,
-            len: u.int_in_range(1..=4096u64)?,
+            len: BlobLen::new(u.int_in_range(1..=4096u64)?).expect("1..=4096 is non-zero"),
         });
     }
     Ok(out)

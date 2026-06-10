@@ -112,7 +112,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let arts = arb_arts(&mut u).unwrap_or_default();
     if let Some(a) = arts.first() {
-        let blob = vec![0xABu8; usize::try_from(a.data_len.min(4096)).unwrap_or(0)];
+        let blob = vec![0xABu8; usize::try_from(a.data_len.get().min(4096)).unwrap_or(0)];
         if !blob.is_empty()
             && let Ok(art_id) = db.upsert_art(&NewArt {
                 mime: a.mime.clone(),

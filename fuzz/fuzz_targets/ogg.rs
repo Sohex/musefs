@@ -2,7 +2,7 @@
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 use musefs_format::ogg::OggArt;
-use musefs_format::{ArtInput, Extent, fuzz_check::assert_backing_covers_audio, ogg};
+use musefs_format::{ArtInput, BlobLen, Extent, PictureType, fuzz_check::assert_backing_covers_audio, ogg};
 use musefs_fuzz::{MAX_INPUT, arb_tags};
 
 fuzz_target!(|data: &[u8]| {
@@ -36,16 +36,20 @@ fuzz_target!(|data: &[u8]| {
     let mut images: Vec<Vec<u8>> = Vec::new();
     let mut inputs: Vec<ArtInput> = Vec::new();
     for i in 0..n {
-        let len = u.int_in_range(0..=8192usize).unwrap_or(0);
+        let len = u.int_in_range(1..=8192usize).unwrap_or(1);
         let bytes = u.bytes(len).map(<[u8]>::to_vec).unwrap_or_default();
+        if bytes.is_empty() {
+            continue;
+        }
         inputs.push(ArtInput {
             art_id: i as i64,
             mime: "image/png".to_string(),
             description: String::new(),
-            picture_type: u.int_in_range(0..=20u32).unwrap_or(3),
+            picture_type: PictureType::new(u.int_in_range(0..=20u32).unwrap_or(3))
+                .unwrap_or(PictureType::ZERO),
             width: 0,
             height: 0,
-            data_len: bytes.len() as u64,
+            data_len: BlobLen::new(bytes.len() as u64).expect("non-empty"),
         });
         images.push(bytes);
     }
