@@ -8,7 +8,7 @@ use musefs_format::{ArtInput, BlobLen, PictureType, RegionLayout, Segment, TagIn
 /// segment and the matching bytes for each `ArtImage` segment.
 fn assemble(layout: &RegionLayout, audio: &[u8], arts: &[(i64, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
-    for seg in &layout.segments {
+    for seg in layout.segments() {
         match seg {
             Segment::Inline(b) => out.extend_from_slice(b),
             Segment::BackingAudio { .. } => out.extend_from_slice(audio),
@@ -75,7 +75,7 @@ fn synthesizes_apic_with_streamed_image_bytes() {
     // The image is a streamed segment, not materialized inline.
     assert!(
         layout
-            .segments
+            .segments()
             .iter()
             .any(|s| matches!(s, Segment::ArtImage { art_id: 7, len } if *len == 200))
     );
@@ -132,9 +132,12 @@ fn empty_tag_when_no_tags_or_art() {
     let layout = synthesize_layout(0, audio.len() as u64, &[], &[], &[]).unwrap();
 
     // Exactly two segments: the 10-byte inline header and the backing audio.
-    assert_eq!(layout.segments.len(), 2);
-    assert!(matches!(&layout.segments[0], Segment::Inline(b) if b.len() == 10));
-    assert!(matches!(&layout.segments[1], Segment::BackingAudio { .. }));
+    assert_eq!(layout.segments().len(), 2);
+    assert!(matches!(&layout.segments()[0], Segment::Inline(b) if b.len() == 10));
+    assert!(matches!(
+        &layout.segments()[1],
+        Segment::BackingAudio { .. }
+    ));
 
     let bytes = assemble(&layout, &audio, &[]);
 
@@ -220,7 +223,7 @@ fn multiple_art_frames_keep_order() {
 
     // The layout must contain ArtImage segments for art_id 1 then 2.
     let art_segs: Vec<i64> = layout
-        .segments
+        .segments()
         .iter()
         .filter_map(|s| match s {
             Segment::ArtImage { art_id, .. } => Some(*art_id),

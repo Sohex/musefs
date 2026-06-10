@@ -44,7 +44,7 @@ fn art_becomes_an_artimage_segment_and_lengths_are_exact() {
     .unwrap();
 
     let art_segs: Vec<&Segment> = layout
-        .segments
+        .segments()
         .iter()
         .filter(|s| matches!(s, Segment::ArtImage { .. }))
         .collect();
@@ -137,7 +137,7 @@ fn multiple_valid_art_keeps_block_framing_valid() {
     .unwrap();
 
     let art_segs: Vec<_> = layout
-        .segments
+        .segments()
         .iter()
         .filter(|s| matches!(s, Segment::ArtImage { .. }))
         .collect();

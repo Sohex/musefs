@@ -618,7 +618,7 @@ mod tests {
     /// first four bytes are `fourcc`. Used to assert RIFF word-alignment.
     fn inline_offset_of(layout: &RegionLayout, fourcc: &[u8; 4]) -> u64 {
         let mut off = 0u64;
-        for s in &layout.segments {
+        for s in layout.segments() {
             if let Segment::Inline(b) = s
                 && b.len() >= 4
                 && &b[0..4] == fourcc

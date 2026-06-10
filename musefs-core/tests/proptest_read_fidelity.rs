@@ -229,7 +229,7 @@ proptest! {
         // false-positive when a tiny blob coincidentally matches audio bytes.)
         let mut art_off = 0u64;
         let mut art_len = None;
-        for s in &resolved.layout.segments {
+        for s in resolved.layout.segments() {
             match s {
                 Segment::ArtImage { len, .. } => {
                     art_len = Some(*len);
@@ -328,7 +328,7 @@ proptest! {
         // of the segments before it.
         let mut art_off = 0u64;
         let mut art_len = None;
-        for s in &resolved.layout.segments {
+        for s in resolved.layout.segments() {
             match s {
                 Segment::ArtImage { len, .. } => {
                     art_len = Some(*len);
@@ -498,7 +498,7 @@ proptest! {
         // byte-search would false-positive).
         let mut art_off = 0u64;
         let mut art_len = None;
-        for s in &resolved.layout.segments {
+        for s in resolved.layout.segments() {
             match s {
                 Segment::ArtImage { len, .. } => {
                     art_len = Some(*len);
@@ -550,7 +550,7 @@ proptest! {
 
         let resolved = HeaderCache::new(Mode::Synthesis).resolve(&db, id).unwrap();
         prop_assert!(
-            resolved.layout.segments.iter().any(|s| matches!(s, Segment::BinaryTag { .. })),
+            resolved.layout.segments().iter().any(|s| matches!(s, Segment::BinaryTag { .. })),
             "resolve did not emit a BinaryTag segment"
         );
         let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
@@ -778,7 +778,7 @@ proptest! {
         // byte-search would false-positive).
         let mut art_off = 0u64;
         let mut art_len = None;
-        for s in &resolved.layout.segments {
+        for s in resolved.layout.segments() {
             match s {
                 Segment::ArtImage { len, .. } => {
                     art_len = Some(*len);

@@ -19,7 +19,7 @@ fn fmt_pcm_16bit_mono() -> Vec<u8> {
 /// matching bytes for each `ArtImage` segment.
 fn assemble(layout: &RegionLayout, audio: &[u8], arts: &[(i64, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
-    for seg in &layout.segments {
+    for seg in layout.segments() {
         match seg {
             Segment::Inline(b) => out.extend_from_slice(b),
             Segment::BackingAudio { .. } => out.extend_from_slice(audio),
@@ -93,7 +93,7 @@ fn embeds_full_fidelity_id3_tag_with_art() {
     // Art is a streamed segment, never materialized inline.
     assert!(
         layout
-            .segments
+            .segments()
             .iter()
             .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len } if *len == 120))
     );
@@ -210,7 +210,7 @@ fn keeps_real_art_when_mixed_with_empty() {
 
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &arts).unwrap();
     let art_segs: Vec<&Segment> = layout
-        .segments
+        .segments()
         .iter()
         .filter(|s| matches!(s, Segment::ArtImage { .. }))
         .collect();

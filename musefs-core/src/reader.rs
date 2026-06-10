@@ -330,7 +330,7 @@ pub fn read_at_into<M>(
     }
     let needs_file = resolved
         .layout
-        .segments
+        .segments()
         .iter()
         .any(|s| matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }));
     if needs_file {
@@ -367,7 +367,7 @@ fn read_segments_into<M>(
     out.reserve(usize_from(end - offset));
 
     let mut seg_start = 0u64;
-    for seg in &resolved.layout.segments {
+    for seg in resolved.layout.segments() {
         let seg_len = seg.len();
         let seg_end = seg_start + seg_len;
         let ov_start = offset.max(seg_start);

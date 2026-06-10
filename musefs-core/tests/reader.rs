@@ -136,7 +136,7 @@ fn resolve_includes_art_image_segments() {
     let cache = HeaderCache::new(Mode::Synthesis);
     let resolved = cache.resolve(&db, id).unwrap();
     assert!(
-        resolved.layout.segments.iter().any(
+        resolved.layout.segments().iter().any(
             |s| matches!(s, Segment::ArtImage { art_id: a, len } if *a == art_id && *len == 80)
         )
     );
@@ -156,8 +156,8 @@ fn structure_only_resolves_to_whole_backing_file() {
     // Passthrough: one whole-file backing segment, size == the real file.
     assert_eq!(resolved.total_len, original.len() as u64);
     assert_eq!(
-        resolved.layout.segments,
-        vec![Segment::BackingAudio {
+        resolved.layout.segments(),
+        &[Segment::BackingAudio {
             offset: 0,
             len: original.len() as u64
         }]

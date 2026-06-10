@@ -299,7 +299,7 @@ mod tests {
         use musefs_format::Segment;
         let mut header = Vec::new();
         let mut params = None;
-        for seg in &layout.segments {
+        for seg in layout.segments() {
             match seg {
                 Segment::Inline(b) => header.extend_from_slice(b),
                 Segment::OggAudio {
