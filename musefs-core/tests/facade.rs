@@ -84,10 +84,10 @@ fn refresh_rebuilds_tree_after_new_tracks() {
     assert!(fs.lookup(VirtualTree::ROOT, "Alice").is_some());
     assert!(fs.lookup(VirtualTree::ROOT, "Bob").is_none());
 
-    // This test only asserts refresh() runs and the tree is rebuilt from the DB;
-    // adding rows would require a handle to the DB, which Musefs now owns. So we
-    // simply confirm refresh() succeeds and the existing entry is still present.
-    fs.refresh().unwrap();
+    // This test only asserts refresh_for_test() runs and the tree is rebuilt from
+    // the DB; adding rows would require a handle to the DB, which Musefs now owns.
+    // So we simply confirm it succeeds and the existing entry is still present.
+    fs.refresh_for_test().unwrap();
     assert!(fs.lookup(VirtualTree::ROOT, "Alice").is_some());
 }
 
@@ -1017,7 +1017,7 @@ fn refresh_picks_up_externally_added_track() {
         )
         .unwrap();
     }
-    fs.refresh().unwrap();
+    fs.refresh_for_test().unwrap();
     assert!(
         fs.lookup(VirtualTree::ROOT, "Bob").is_some(),
         "refresh must rebuild the tree"
@@ -1202,4 +1202,82 @@ fn getattr_reresolves_size_after_content_version_bump() {
         size_after > size_before,
         "size must reflect the larger retagged header"
     );
+}
+
+/// Regression for #203: `refresh_for_test` and `poll_refresh` share the
+/// `refreshing` single-flight gate, so two rebuilds can never overlap and
+/// publish a stale tree. We churn `data_version` from a writer thread while a
+/// forced-refresh thread and a poll thread race; if a stale rebuild published an
+/// outdated tree last, tracks committed after it would be missing. This is a
+/// stress test — it is reliably green with the gate, and probabilistic at
+/// catching an un-gated regression — so we run enough iterations to make a race
+/// likely.
+#[test]
+fn forced_refresh_and_poll_refresh_never_publish_stale_tree() {
+    use musefs_db::{Format, NewTrack, Tag};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn insert(db: &musefs_db::Db, n: usize) {
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: format!("/x/track{n}.flac"),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[
+                Tag::new("artist", &format!("A{n}"), 0),
+                Tag::new("title", &format!("T{n}"), 0),
+            ],
+        )
+        .unwrap();
+    }
+
+    const N: usize = 80;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        insert(&db, 0);
+    }
+
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+    let done = AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        // Writer: commit tracks one at a time, churning `data_version`.
+        s.spawn(|| {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            for n in 1..=N {
+                insert(&db, n);
+            }
+            done.store(true, Ordering::Release);
+        });
+        // Forced full rebuilds, racing the writer and the poller.
+        s.spawn(|| {
+            while !done.load(Ordering::Acquire) {
+                fs.refresh_for_test().unwrap();
+            }
+        });
+        // Production refresh path (incremental, with full-rebuild fallback).
+        s.spawn(|| {
+            while !done.load(Ordering::Acquire) {
+                let _ = fs.poll_refresh().unwrap();
+            }
+        });
+    });
+
+    // Settle on the final committed state, then assert nothing was lost.
+    fs.refresh_for_test().unwrap();
+    for n in 0..=N {
+        assert!(
+            fs.lookup(VirtualTree::ROOT, &format!("A{n}")).is_some(),
+            "track A{n} missing — a stale rebuild published an outdated tree"
+        );
+    }
 }
