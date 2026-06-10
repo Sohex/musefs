@@ -33,6 +33,18 @@
   `BackgroundSession` type is generic over the private `MusefsFs`, so it is not
   nameable from a test crate. `with_single_flac_mount(audio, |mountpoint, served| …)`
   mounts, runs the closure, then drops the session to unmount.
+- **Workspace lint posture (load-bearing — the test file must satisfy it).** The
+  workspace sets `unsafe_code = "deny"` and clippy `pedantic` (incl.
+  `cast_possible_truncation`, `cast_sign_loss`, `cast_possible_wrap` = `warn`),
+  inherited by every crate's test targets via `[lints] workspace = true`. The
+  pre-commit hook runs `clippy --all-targets -- -D warnings`, which **compiles the
+  test file** and promotes those warnings to errors — so even though the
+  `#[ignore]` tests don't *run* in the hook, the file must compile warning-clean.
+  This file needs `unsafe` (mmap + libc mutation probes) and offset/length casts,
+  so each `unsafe`-using function and the cast-using helper carry a **function-level
+  `#[expect(...)]`** with a `reason`, matching the repo convention of greppable,
+  review-visible per-site opt-ins. (Function-level, not expression-level: attributes
+  on `unsafe { … }` expressions are not stable Rust.)
 
 ---
 
@@ -182,6 +194,7 @@ fn with_single_flac_mount<R>(audio: &[u8], f: impl FnOnce(&Path, &Path) -> R) ->
 
 #[test]
 #[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
+#[expect(unsafe_code, reason = "mmap a served file to exercise the kernel readpage path")]
 fn mmap_whole_file_matches_pread() {
     let audio = backing_audio(4096);
     with_single_flac_mount(&audio, |_mountpoint, served| {
@@ -264,6 +277,13 @@ impl XorShift64 {
 /// boundary and its neighbours into the offset set so the splice point is
 /// straddled every run. `read_exact_at` tolerates kernel mid-file short reads
 /// while still proving byte-fidelity at each offset/len.
+#[expect(unsafe_code, reason = "mmap the served file to compare the readpage path against pread")]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "bounded offset/length arithmetic over a small in-test file (n fits usize)"
+)]
 fn sweep_reads(served: &Path, seam: Option<u64>, iters: u32) {
     let oracle = std::fs::read(served).unwrap();
     let n = oracle.len() as u64;
@@ -418,6 +438,7 @@ fn assert_refused(ret: i32, accepted: &[i32], what: &str) {
 
 #[test]
 #[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
+#[expect(unsafe_code, reason = "raw libc mutation syscalls to probe read-only refusal at the mount")]
 fn write_ops_are_refused_on_read_only_mount() {
     let audio = backing_audio(1024);
     with_single_flac_mount(&audio, |mountpoint, served| {
@@ -478,8 +499,9 @@ fn write_ops_are_refused_on_read_only_mount() {
 Run: `cargo test -p musefs-fuse --test read_consistency write_ops_are_refused_on_read_only_mount -- --ignored`
 Expected: `test result: ok. 1 passed`.
 
-If `open(O_CREAT)` fails to compile due to the variadic `mode` argument, change
-`0o644` to `0o644 as libc::c_uint`. Run again.
+The bare `0o644` literal infers to `libc::mode_t` for the variadic `mode`
+argument and compiles cleanly — do **not** add an `as` cast (a bare cast would
+trip the `cast_*` lints under `-D warnings`, and none is needed here).
 
 - [ ] **Step 3: Lint and format**
 
@@ -553,6 +575,9 @@ fn make_sweep_fixture(dir: &Path, case: &SweepCase) -> bool {
     cmd.args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.3"]);
 
     if case.cover {
+        // The .png sibling lives in the backing dir; scan_directory ignores
+        // non-audio extensions, so it is not scanned as a track (same as the
+        // existing opus-cover e2e test).
         let cover = dir.join(format!("{}.cover.png", case.name));
         std::fs::write(&cover, TINY_PNG).unwrap();
         cmd.args(["-i"]);
