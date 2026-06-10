@@ -8,6 +8,18 @@ updates:
     directory: "/contrib/beets"
     schedule:
       interval: "weekly"
+  - package-ecosystem: "pip"
+    directory: "/contrib/python-musefs"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "pip"
+    directory: "/contrib/picard"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "pip"
+    directory: "/tests/interop"
+    schedule:
+      interval: "weekly"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
