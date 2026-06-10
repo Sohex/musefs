@@ -6,6 +6,8 @@
 //! See docs/superpowers/specs/2026-06-10-mount-read-consistency-design.md.
 
 use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -255,5 +257,98 @@ fn randomized_reads_match_oracle_flac() {
         // at n - audio_len.
         let seam = n - audio_len;
         sweep_reads(served, Some(seam), 2000);
+    });
+}
+
+fn cstr(p: &Path) -> CString {
+    CString::new(p.as_os_str().as_bytes()).unwrap()
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap()
+}
+
+/// Assert a libc mutating call failed (`ret == -1`) with an errno in `accepted`.
+/// The contract is "mutation is refused", not "refused with exactly EROFS".
+fn assert_refused(ret: i32, accepted: &[i32], what: &str) {
+    assert_eq!(
+        ret, -1,
+        "{what} unexpectedly succeeded on a read-only mount"
+    );
+    let e = last_errno();
+    assert!(
+        accepted.contains(&e),
+        "{what}: errno {e} not in accepted set {accepted:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
+#[expect(
+    unsafe_code,
+    reason = "raw libc mutation syscalls to probe read-only refusal at the mount"
+)]
+fn write_ops_are_refused_on_read_only_mount() {
+    let audio = backing_audio(1024);
+    with_single_flac_mount(&audio, |mountpoint, served| {
+        let existing = cstr(served);
+        let new_file = cstr(&mountpoint.join("Alice").join("new.flac"));
+        let new_dir = cstr(&mountpoint.join("Alice").join("newdir"));
+        let times = [libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        }; 2];
+
+        // SAFETY: all paths are valid CStrings; fds are closed below.
+        unsafe {
+            assert_refused(
+                libc::open(existing.as_ptr(), libc::O_WRONLY),
+                &[libc::EROFS],
+                "open(O_WRONLY)",
+            );
+            assert_refused(
+                libc::open(existing.as_ptr(), libc::O_RDWR),
+                &[libc::EROFS],
+                "open(O_RDWR)",
+            );
+            assert_refused(
+                libc::open(new_file.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o644),
+                &[libc::EROFS],
+                "open(O_CREAT) new path",
+            );
+            assert_refused(libc::unlink(existing.as_ptr()), &[libc::EROFS], "unlink");
+            assert_refused(
+                libc::truncate(existing.as_ptr(), 0),
+                &[libc::EROFS],
+                "truncate",
+            );
+
+            // ftruncate on a read-only fd: EINVAL (fd not writable) is checked
+            // independently of the RO mount, so accept both.
+            let rofd = libc::open(existing.as_ptr(), libc::O_RDONLY);
+            assert!(rofd >= 0, "opening the served file O_RDONLY should succeed");
+            assert_refused(
+                libc::ftruncate(rofd, 0),
+                &[libc::EINVAL, libc::EROFS],
+                "ftruncate",
+            );
+            libc::close(rofd);
+
+            assert_refused(
+                libc::mkdir(new_dir.as_ptr(), 0o755),
+                &[libc::EROFS],
+                "mkdir",
+            );
+            assert_refused(
+                libc::chmod(existing.as_ptr(), 0o644),
+                &[libc::EROFS, libc::EPERM],
+                "chmod",
+            );
+            assert_refused(
+                libc::utimes(existing.as_ptr(), times.as_ptr()),
+                &[libc::EROFS, libc::EPERM, libc::EACCES],
+                "utimes",
+            );
+        }
     });
 }
