@@ -98,7 +98,7 @@ fn reading_past_eof_returns_empty() {
 #[test]
 fn read_at_streams_art_image_segments() {
     use musefs_core::{ResolvedFile, read_at};
-    use musefs_format::{RegionLayout, Segment};
+    use musefs_format::{BlobLen, RegionLayout, Segment};
 
     let db = Db::open_in_memory().unwrap();
     let art = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
@@ -115,7 +115,7 @@ fn read_at_streams_art_image_segments() {
         Segment::Inline(vec![0xAA, 0xBB]),
         Segment::ArtImage {
             art_id,
-            len: art.len() as u64,
+            len: BlobLen::new(art.len() as u64).unwrap(),
         },
     ]);
     let total_len = layout.total_len();

@@ -401,7 +401,8 @@ fn emit_segments(
                     segments.push(Segment::OggArtSlice {
                         art_id: *art_id,
                         offset: (os - cs) as u64,
-                        len: (oe - os) as u64,
+                        len: crate::BlobLen::new((oe - os) as u64)
+                            .expect("ogg art slice span is non-empty"),
                         base64: *base64,
                         art_total: *art_total,
                     });
@@ -569,7 +570,7 @@ mod tests {
                     assert!(*base64);
                     v.extend_from_slice(
                         &art_out[usize::try_from(*offset).unwrap()
-                            ..usize::try_from(*offset + *len).unwrap()],
+                            ..usize::try_from(*offset + len.get()).unwrap()],
                     );
                 }
                 other => panic!("unexpected segment {other:?}"),
@@ -634,17 +635,11 @@ mod tests {
         let art_served: u64 = segments
             .iter()
             .filter_map(|s| match s {
-                Segment::OggArtSlice { len, .. } => Some(*len),
+                Segment::OggArtSlice { len, .. } => Some(len.get()),
                 _ => None,
             })
             .sum();
         assert_eq!(art_served, art_out.len() as u64);
-        // No OggArtSlice may be zero-length (kills emit_segments:337 < -> <=).
-        assert!(
-            segments
-                .iter()
-                .all(|s| !matches!(s, Segment::OggArtSlice { len: 0, .. }))
-        );
     }
 
     #[test]

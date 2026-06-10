@@ -936,13 +936,13 @@ mod tests {
                     ..
                 } => {
                     assert!(*base64);
-                    let w = b64_window(*offset, *len, *art_total);
+                    let w = b64_window(*offset, len.get(), *art_total);
                     let raw = &image[crate::convert::usize_from(w.in_start)
                         ..crate::convert::usize_from(w.in_start + w.in_len)];
                     bytes.extend_from_slice(&encode_b64_slice(
                         raw,
                         w.skip,
-                        crate::convert::usize_from(*len),
+                        crate::convert::usize_from(len.get()),
                     ));
                 }
                 Segment::OggAudio { .. } => break, // header region ends here
@@ -974,18 +974,18 @@ mod tests {
                 } => {
                     let img = images.iter().find(|(id, _)| id == art_id).expect("image").1;
                     if *base64 {
-                        let w = b64_window(*offset, *len, *art_total);
+                        let w = b64_window(*offset, len.get(), *art_total);
                         let raw = &img[crate::convert::usize_from(w.in_start)
                             ..crate::convert::usize_from(w.in_start + w.in_len)];
                         bytes.extend_from_slice(&encode_b64_slice(
                             raw,
                             w.skip,
-                            crate::convert::usize_from(*len),
+                            crate::convert::usize_from(len.get()),
                         ));
                     } else {
                         bytes.extend_from_slice(
                             &img[crate::convert::usize_from(*offset)
-                                ..crate::convert::usize_from(*offset + *len)],
+                                ..crate::convert::usize_from(*offset + len.get())],
                         );
                     }
                 }

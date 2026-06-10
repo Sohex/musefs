@@ -50,10 +50,10 @@ fn art_becomes_an_artimage_segment_and_lengths_are_exact() {
         .collect();
     assert_eq!(art_segs.len(), 1);
     assert_eq!(
-        *art_segs[0],
-        Segment::ArtImage {
+        art_segs[0],
+        &Segment::ArtImage {
             art_id: 42,
-            len: 1234
+            len: musefs_format::BlobLen::new(1234).unwrap()
         }
     );
 

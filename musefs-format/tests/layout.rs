@@ -1,4 +1,4 @@
-use musefs_format::{LayoutError, RegionLayout, Segment};
+use musefs_format::{BlobLen, LayoutError, RegionLayout, Segment};
 
 #[test]
 fn lengths_sum_segments_and_exclude_audio_from_header() {
@@ -6,7 +6,7 @@ fn lengths_sum_segments_and_exclude_audio_from_header() {
         Segment::Inline(vec![0u8; 10]),
         Segment::ArtImage {
             art_id: 7,
-            len: 100,
+            len: BlobLen::new(100).unwrap(),
         },
         Segment::Inline(vec![0u8; 5]),
         Segment::BackingAudio {
@@ -22,7 +22,14 @@ fn lengths_sum_segments_and_exclude_audio_from_header() {
 #[test]
 fn segment_len_reports_each_variant() {
     assert_eq!(Segment::Inline(vec![1, 2, 3]).len(), 3);
-    assert_eq!(Segment::ArtImage { art_id: 1, len: 42 }.len(), 42);
+    assert_eq!(
+        Segment::ArtImage {
+            art_id: 1,
+            len: BlobLen::new(42).unwrap()
+        }
+        .len(),
+        42
+    );
     assert_eq!(Segment::BackingAudio { offset: 0, len: 9 }.len(), 9);
 }
 
@@ -68,7 +75,7 @@ fn cached_totals_equal_segment_sum() {
         Segment::Inline(vec![0u8; 10]),
         Segment::ArtImage {
             art_id: 7,
-            len: 100,
+            len: BlobLen::new(100).unwrap(),
         },
         Segment::Inline(vec![0u8; 5]),
         Segment::BackingAudio {
@@ -81,4 +88,18 @@ fn cached_totals_equal_segment_sum() {
     assert_eq!(layout.header_len(), 10 + 100 + 5);
     let sum: u64 = layout.segments().iter().map(Segment::len).sum();
     assert_eq!(layout.total_len(), sum);
+}
+
+#[test]
+fn zero_length_metadata_is_unrepresentable() {
+    assert!(BlobLen::new(0).is_none());
+}
+
+#[test]
+fn out_of_bounds_backing_range_is_rejected() {
+    let err = RegionLayout::validated(vec![Segment::BackingAudio {
+        offset: u64::MAX,
+        len: 1,
+    }]);
+    assert_eq!(err, Err(LayoutError::BackingRangeOverflow));
 }

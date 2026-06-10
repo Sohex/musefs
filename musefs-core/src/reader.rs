@@ -782,7 +782,7 @@ mod ogg_art_serve_tests {
             Segment::OggArtSlice {
                 art_id,
                 offset: 0,
-                len: full_b64.len() as u64,
+                len: musefs_format::BlobLen::new(full_b64.len() as u64).unwrap(),
                 base64: true,
                 art_total: image.len() as u64,
             },
@@ -831,7 +831,7 @@ mod ogg_art_serve_tests {
         let layout = RegionLayout::new(vec![Segment::OggArtSlice {
             art_id,
             offset: 0,
-            len: image.len() as u64,
+            len: musefs_format::BlobLen::new(image.len() as u64).unwrap(),
             base64: false,
             art_total: image.len() as u64,
         }]);
@@ -1278,7 +1278,7 @@ mod binary_tag_serve_tests {
         let resolved = ResolvedFile {
             layout: RegionLayout::new(vec![Segment::BinaryTag {
                 payload_id: rowid,
-                len: 4,
+                len: musefs_format::BlobLen::new(4).unwrap(),
             }]),
             total_len: 4,
             content_version: 0,

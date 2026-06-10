@@ -135,11 +135,9 @@ fn resolve_includes_art_image_segments() {
 
     let cache = HeaderCache::new(Mode::Synthesis);
     let resolved = cache.resolve(&db, id).unwrap();
-    assert!(
-        resolved.layout.segments().iter().any(
-            |s| matches!(s, Segment::ArtImage { art_id: a, len } if *a == art_id && *len == 80)
-        )
-    );
+    assert!(resolved.layout.segments().iter().any(
+        |s| matches!(s, Segment::ArtImage { art_id: a, len, .. } if *a == art_id && len.get() == 80)
+    ));
 }
 
 #[test]

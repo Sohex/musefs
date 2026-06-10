@@ -21,7 +21,7 @@ pub fn resolve_layout(
             Segment::Inline(b) => out.extend_from_slice(b),
             Segment::ArtImage { art_id, len } => {
                 let img = art.get(art_id).expect("art bytes provided");
-                assert_eq!(img.len() as u64, *len, "art length mismatch in layout");
+                assert_eq!(img.len() as u64, len.get(), "art length mismatch in layout");
                 out.extend_from_slice(img);
             }
             Segment::BackingAudio { offset, len } => {
@@ -37,7 +37,7 @@ pub fn resolve_layout(
                     .expect("binary tag bytes provided");
                 assert_eq!(
                     payload.len() as u64,
-                    *len,
+                    len.get(),
                     "binary tag length mismatch in layout"
                 );
                 out.extend_from_slice(payload);
