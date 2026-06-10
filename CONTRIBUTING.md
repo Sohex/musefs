@@ -191,6 +191,25 @@ MUSEFS_INTEROP_DIR=/tmp/i cargo test -p musefs-core --test interop_emit -- --ign
 MUSEFS_INTEROP_DIR=/tmp/i python -m pytest tests/interop
 ```
 
+### Failure-path fault injection
+
+The reader and DB error paths are exercised under simulated runtime faults.
+`musefs_core::metrics::set_backing_fault(BackingFault::{Eio,ShortRead})`
+(behind the `metrics` feature) installs a process-global fault at the positioned
+backing-read site, cleared by the returned RAII guard. Because it is global, the
+tests run in their own `metrics`-gated binaries.
+
+```bash
+cargo test -p musefs-core --features metrics --test reader_faults
+cargo test -p musefs-core --test backing_changed_fault   # real file mutation
+cargo test -p musefs-core --test db_corruption_fault      # byte-corrupt DB
+cargo test -p musefs-fuse --features metrics -- --ignored # EIO through the mount (needs /dev/fuse)
+```
+
+`BackingChanged` (re-validated in `HeaderCache::resolve`) and DB corruption are
+driven by real conditions, not the seam. `ENOSPC`/read-only faults are write-path
+concerns and are out of scope for the read-time suite.
+
 ### Mutation testing
 
 `scripts/mutants.sh` wraps `cargo-mutants` for the logic-bearing crates;
