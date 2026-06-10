@@ -1,0 +1,34 @@
+name: lidarr-smoke
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lidarr-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y fuse3 ffmpeg
+      - name: Build musefs (debug) and install the Lidarr plugin
+        run: |
+          set -euo pipefail
+          cargo build -p musefs
+          pip install -e contrib/python-musefs
+          pip install -e contrib/lidarr
+      - name: Run the Lidarr smoke
+        env:
+          # Pin a linuxserver/lidarr digest; bump deliberately and re-dispatch.
+          LIDARR_IMAGE: lscr.io/linuxserver/lidarr@sha256:REPLACE_WITH_PINNED_DIGEST
+        run: ./scripts/lidarr-smoke.sh ./target/debug/musefs
