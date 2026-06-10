@@ -109,15 +109,18 @@ Run `musefs <command> --help` for the full flag list.
 
 ### Tuning
 
-All tuning flags have sensible defaults; adjust them to your backing store:
+The defaults are sensible for most setups. On slow backing storage (HDD, NFS) the one
+flag worth changing is `--keep-cache`; the read-ahead / background knobs have little
+measurable effect on musefs (see [BENCHMARKS.md](BENCHMARKS.md#storage-tunables)
+for the methodology and numbers).
 
 | Flag | Default | What it does |
 | ---- | ------- | ------------ |
 | `--poll-interval-ms` | `1000` | Debounce window for detecting external DB edits. |
-| `--attr-ttl-ms` | `1000` | How long the kernel may trust cached entry/attr lookups. Higher cuts `lookup`/`getattr` traffic; bounds how fast external edits become visible. |
-| `--max-readahead-kib` | `512` | Kernel read-ahead window. Larger hides HDD/NFS latency during sequential playback (clamped to the kernel maximum). |
-| `--max-background` | `64` | Max outstanding background (read-ahead/async) requests the kernel keeps in flight. |
-| `--keep-cache` | disabled | Keep the kernel page cache across opens. External re-tags auto-invalidate the affected files, so cached bytes never go stale. |
+| `--keep-cache` | disabled | Keep the kernel page cache across opens. **Worth enabling on HDD/NFS:** repeat opens of a file are then served from cache instead of re-read over slow storage (~3× faster reopen in our benches). External re-tags auto-invalidate the affected files, so cached bytes never go stale. |
+| `--attr-ttl-ms` | `1000` | How long the kernel may trust cached entry/attr lookups. Higher cuts `lookup`/`getattr` traffic — useful for metadata-heavy clients (library scanners) over high-latency backing — but bounds how fast external edits become visible. |
+| `--max-readahead-kib` | `512` | Kernel read-ahead window (clamped to the kernel maximum). In practice this does **not** speed up musefs streaming: reads reach the daemon in fixed FUSE-sized chunks and a single stream is served serially, so a larger window doesn't reduce per-read latency. On HDD, values well above the default can even hurt. Leave at the default unless your own profiling shows otherwise. |
+| `--max-background` | `64` | Max outstanding background (read-ahead/async) requests the kernel keeps in flight. Does **not** bound foreground reads (those scale with client concurrency), so it has little effect on read throughput; left for completeness. |
 | `--case-insensitive <true\|false>` | OS default | Compare filenames case-insensitively. Case-variant directories merge into one (first-seen casing wins) and case-variant files get a numeric suffix (e.g. `Song (2)`). Defaults to `true` on macOS and `false` on Linux/FreeBSD; case-insensitive mounts refresh via a full rebuild rather than the incremental fast path. |
 
 ### Ownership and permissions
