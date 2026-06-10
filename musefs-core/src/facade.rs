@@ -169,6 +169,12 @@ pub struct Musefs {
     snapshot: Mutex<HashMap<i64, TrackRenderState>>,
     force_rebuild_error: AtomicBool,
     force_apply_fail: AtomicBool,
+    /// Forces the next N binary-tag `content_version` guard checks in
+    /// `read_into` to report a stale layout, simulating a writer committing to
+    /// the same track on every retry. Lets a test pin the exact retry bound
+    /// without racing a real concurrent writer (the mismatch window is too
+    /// narrow to hit deterministically). Counts down; 0 disables.
+    force_version_mismatch: AtomicU64,
     /// Polls that took the changelog-gap full-rebuild path (observability for
     /// tests: incremental vs gap is invisible in the resulting tree).
     gap_fallbacks: AtomicU64,
@@ -262,6 +268,7 @@ impl Musefs {
             snapshot: Mutex::new(snapshot),
             force_rebuild_error: AtomicBool::new(false),
             force_apply_fail: AtomicBool::new(false),
+            force_version_mismatch: AtomicU64::new(0),
             gap_fallbacks: AtomicU64::new(0),
             needs_rebuild: AtomicBool::new(false),
             last_seq: AtomicI64::new(last_seq),
@@ -840,6 +847,14 @@ impl Musefs {
         self.force_apply_fail.store(on, Ordering::Release);
     }
 
+    /// Force the next `count` binary-tag `content_version` guard checks in
+    /// `read_into` to report a stale layout, as if a writer re-tagged this track
+    /// between every retry. Used to exercise the retry-exhaustion bound.
+    #[doc(hidden)]
+    pub fn force_version_mismatches_for_test(&self, count: u64) {
+        self.force_version_mismatch.store(count, Ordering::Release);
+    }
+
     /// How many polls took the changelog-gap full-rebuild path. Test-only
     /// observability: the gap and incremental paths produce identical trees, so
     /// only this counter distinguishes them.
@@ -988,8 +1003,11 @@ impl Musefs {
         if let Some(fh) = fh {
             let handle = self.handles.get(fh.slab_key()).map(|g| Arc::clone(&g));
             if let Some(h) = handle {
-                // Bounded retry absorbs a refresh landing mid-read; out-of-band
-                // re-tags are human/batch-paced, so >1 attempt is already rare.
+                // Bounded retry absorbs a refresh or same-track re-tag landing
+                // mid-read. A batch import touching distinct tracks won't loop
+                // here, but a writer tight-looping commits to *this* track can
+                // race every attempt and exhaust the bound — see the
+                // `BackingChanged` return below for what that surfaces.
                 for _attempt in 0..4 {
                     out.clear();
                     let cur = self.refresh_gen.load(Ordering::Acquire);
@@ -1018,7 +1036,18 @@ impl Musefs {
                             // WAL snapshot, so a reused rowid can't be served.
                             db.begin_read()?;
                             let res = (|| {
-                                if db.track_content_version(h.track_id)? != r.content_version {
+                                // A test seam forces the first N checks stale to
+                                // drive the same-track retry-exhaustion path
+                                // deterministically; 0 in production.
+                                let forced = self
+                                    .force_version_mismatch
+                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                                        n.checked_sub(1)
+                                    })
+                                    .is_ok();
+                                if forced
+                                    || db.track_content_version(h.track_id)? != r.content_version
+                                {
                                     return Ok(None); // stale layout — retry after re-resolve
                                 }
                                 read_at_with_file_into(r, db, &h.file, offset, size, out)?;
@@ -1363,6 +1392,92 @@ mod tests {
                 "stale handle served torn/reused-rowid bytes instead of re-resolving"
             );
         }
+        fs.release_handle(fh);
+    }
+
+    /// The per-handle fast-path read loop retries a stale binary-tag layout a
+    /// bounded number of times (`0..4`) before surfacing a retryable
+    /// `BackingChanged`, which the FUSE layer maps to `EIO`. A writer
+    /// tight-looping commits to one track can lose the `content_version` race on
+    /// every attempt; this pins the exact bound — three forced same-track misses
+    /// still serve on the final attempt, a fourth exhausts the loop and errors.
+    /// (#187)
+    #[test]
+    fn same_track_retag_storm_exhausts_read_retry_into_backing_changed() {
+        use crate::scan::scan_directory;
+        use id3::frame::{Content, Unknown};
+        use id3::{Encoder, Frame, TagLike, Version};
+        use std::collections::BTreeMap;
+
+        let needle = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // PRIV-only tag → a binary-tag layout under the fallback path, so the
+            // transactional `content_version` guard (and its test seam) is live.
+            let mut tag = id3::Tag::new();
+            tag.add_frame(Frame::with_content(
+                "PRIV",
+                Content::Unknown(Unknown {
+                    data: needle.to_vec(),
+                    version: Version::Id3v24,
+                }),
+            ));
+            let mut bytes = Vec::new();
+            Encoder::new()
+                .version(Version::Id3v24)
+                .encode(&tag, &mut bytes)
+                .unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00, 0, 0, 0, 0]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+
+        let artist = fs
+            .lookup(VirtualTree::ROOT, "Unknown")
+            .expect("fallback artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+        let fh = fs.open_handle(file_inode).unwrap();
+
+        let baseline = fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap();
+        assert!(
+            baseline.windows(needle.len()).any(|w| w == needle),
+            "baseline read must serve the binary-tag layout"
+        );
+
+        // bound-1 same-track misses: attempts retry, the final attempt serves.
+        fs.force_version_mismatches_for_test(3);
+        let after_three = fs
+            .read(file_inode, Some(fh), 0, 1 << 20)
+            .expect("three retries must still serve on the final attempt");
+        assert_eq!(
+            after_three, baseline,
+            "bytes served after surviving the retries must match the layout"
+        );
+
+        // One miss per attempt with none left over: the loop exhausts.
+        fs.force_version_mismatches_for_test(4);
+        match fs.read(file_inode, Some(fh), 0, 1 << 20) {
+            Err(CoreError::BackingChanged(_)) => {}
+            other => panic!("exhausted retry must return BackingChanged, got {other:?}"),
+        }
+
+        // Seam drained: the handle is otherwise healthy and serves again.
+        let recovered = fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap();
+        assert_eq!(recovered, baseline, "handle must recover after the storm");
         fs.release_handle(fh);
     }
 
