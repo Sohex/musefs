@@ -40,7 +40,7 @@ fn scans_flac_files_seeding_tracks_and_tags() {
     let tags = db.get_tags(a_track.id).unwrap();
     assert!(tags.iter().any(|t| t.key == "title" && t.value == "A"));
     assert!(tags.iter().any(|t| t.key == "artist" && t.value == "X"));
-    assert!(a_track.audio_length == 30);
+    assert!(a_track.bounds.audio_length() == 30);
 }
 
 #[test]
@@ -111,8 +111,8 @@ fn scans_mp3_files_seeding_tracks_and_tags() {
     assert_eq!(tracks.len(), 1);
     let t = &tracks[0];
     assert_eq!(t.format, Format::Mp3);
-    assert_eq!(t.audio_offset, audio_offset);
-    assert_eq!(t.audio_length, audio_len);
+    assert_eq!(t.bounds.audio_offset(), audio_offset);
+    assert_eq!(t.bounds.audio_length(), audio_len);
 
     let tags = db.get_tags(t.id).unwrap();
     assert!(

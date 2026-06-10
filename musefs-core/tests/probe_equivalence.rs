@@ -39,7 +39,13 @@ fn normalized(db: &Db) -> Vec<NormalizedTrack> {
                 (sha, a.picture_type, a.description, a.ordinal)
             })
             .collect();
-        out.push((t.backing_path, t.audio_offset, t.audio_length, tags, art));
+        out.push((
+            t.backing_path,
+            t.bounds.audio_offset(),
+            t.bounds.audio_length(),
+            tags,
+            art,
+        ));
     }
     out.sort();
     out

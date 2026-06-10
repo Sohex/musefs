@@ -81,14 +81,54 @@ mod binary_tag_models_tests {
     }
 }
 
+/// Validated audio-region bounds for a track: `audio_offset + audio_length`
+/// is guaranteed to fit within `backing_size`, so the reader can splice the
+/// audio region without re-checking. Built at the `tracks` row reader.
+#[cfg_attr(feature = "mutants", derive(Default))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackBounds {
+    audio_offset: u64,
+    audio_length: u64,
+}
+
+impl TrackBounds {
+    /// Err if `audio_offset + audio_length` overflows or exceeds `backing_size`.
+    pub fn new(
+        audio_offset: u64,
+        audio_length: u64,
+        backing_size: u64,
+    ) -> Result<TrackBounds, crate::DbError> {
+        let end = audio_offset
+            .checked_add(audio_length)
+            .filter(|&end| end <= backing_size)
+            .ok_or(crate::DbError::AudioBoundsOutOfRange {
+                audio_offset,
+                audio_length,
+                backing_size,
+            })?;
+        let _ = end;
+        Ok(TrackBounds {
+            audio_offset,
+            audio_length,
+        })
+    }
+
+    pub fn audio_offset(&self) -> u64 {
+        self.audio_offset
+    }
+
+    pub fn audio_length(&self) -> u64 {
+        self.audio_length
+    }
+}
+
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: i64,
     pub backing_path: String,
     pub format: Format,
-    pub audio_offset: u64,
-    pub audio_length: u64,
+    pub bounds: TrackBounds,
     pub backing_size: u64,
     pub backing_mtime: i64,
     pub content_version: i64,
@@ -190,4 +230,40 @@ pub struct StructuralBlock {
     pub kind: String,
     pub ordinal: u64,
     pub body: Vec<u8>,
+}
+
+#[cfg(test)]
+mod track_bounds_tests {
+    use super::TrackBounds;
+
+    #[test]
+    fn accepts_in_range() {
+        let b = TrackBounds::new(10, 20, 100).unwrap();
+        assert_eq!(b.audio_offset(), 10);
+        assert_eq!(b.audio_length(), 20);
+    }
+
+    #[test]
+    fn accepts_exact_fit() {
+        let b = TrackBounds::new(30, 70, 100).unwrap();
+        assert_eq!(b.audio_offset(), 30);
+        assert_eq!(b.audio_length(), 70);
+    }
+
+    #[test]
+    fn accepts_zero_length() {
+        // A zero-length audio run is valid (e.g. structure-only edge).
+        let b = TrackBounds::new(0, 0, 0).unwrap();
+        assert_eq!(b.audio_length(), 0);
+    }
+
+    #[test]
+    fn rejects_exceeding_backing_size() {
+        assert!(TrackBounds::new(50, 60, 100).is_err());
+    }
+
+    #[test]
+    fn rejects_offset_plus_length_overflow() {
+        assert!(TrackBounds::new(u64::MAX, 1, u64::MAX).is_err());
+    }
 }

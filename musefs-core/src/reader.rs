@@ -152,7 +152,12 @@ impl HeaderCache {
                 // bound, or an audio region that runs past the end of the backing file,
                 // means the row no longer matches the file. Only synthesis splices at
                 // these bounds, so the check is scoped to this mode.
-                if track.audio_offset.saturating_add(track.audio_length) > meta.len() {
+                if track
+                    .bounds
+                    .audio_offset()
+                    .saturating_add(track.bounds.audio_length())
+                    > meta.len()
+                {
                     return Err(CoreError::BackingChanged(track.backing_path.clone()));
                 }
 
@@ -174,8 +179,10 @@ impl HeaderCache {
                         // are not emitted twice.
                         let (structural, binary_tags): (Vec<MetadataBlock>, &[BinaryTagInput]) =
                             if rows.is_empty() {
-                                let front =
-                                    read_front(Path::new(&track.backing_path), track.audio_offset)?;
+                                let front = read_front(
+                                    Path::new(&track.backing_path),
+                                    track.bounds.audio_offset(),
+                                )?;
                                 (flac::read_metadata(&front)?.preserved, &[])
                             } else {
                                 let structural = rows
@@ -193,16 +200,16 @@ impl HeaderCache {
                             };
                         flac::synthesize_layout(
                             &structural,
-                            track.audio_offset,
-                            track.audio_length,
+                            track.bounds.audio_offset(),
+                            track.bounds.audio_length(),
                             &inputs,
                             binary_tags,
                             &art_inputs,
                         )?
                     }
                     Format::Mp3 => mp3::synthesize_layout(
-                        track.audio_offset,
-                        track.audio_length,
+                        track.bounds.audio_offset(),
+                        track.bounds.audio_length(),
                         &inputs,
                         &binary_tag_inputs,
                         &art_inputs,
@@ -242,19 +249,25 @@ impl HeaderCache {
                     Format::Wav => {
                         // Read only the front (RIFF header + fmt/fact); the data
                         // payload is served from the backing file at read time.
-                        let front = read_front(Path::new(&track.backing_path), track.audio_offset)?;
+                        let front = read_front(
+                            Path::new(&track.backing_path),
+                            track.bounds.audio_offset(),
+                        )?;
                         let scan = wav::read_structure(&front)?;
                         wav::synthesize_layout(
                             &scan,
-                            track.audio_offset,
-                            track.audio_length,
+                            track.bounds.audio_offset(),
+                            track.bounds.audio_length(),
                             &inputs,
                             &binary_tag_inputs,
                             &art_inputs,
                         )?
                     }
                     Format::Opus | Format::Vorbis | Format::OggFlac => {
-                        let front = read_front(Path::new(&track.backing_path), track.audio_offset)?;
+                        let front = read_front(
+                            Path::new(&track.backing_path),
+                            track.bounds.audio_offset(),
+                        )?;
                         let header = musefs_format::ogg::read_metadata(&front)?;
                         let art_images = crate::mapping::track_art_images(db, &art_inputs)?;
                         let arts: Vec<musefs_format::ogg::OggArt> = art_inputs
@@ -267,8 +280,8 @@ impl HeaderCache {
                             .collect();
                         musefs_format::ogg::synthesize_layout(
                             &header,
-                            track.audio_offset,
-                            track.audio_length,
+                            track.bounds.audio_offset(),
+                            track.bounds.audio_length(),
                             &inputs,
                             &arts,
                         )?
