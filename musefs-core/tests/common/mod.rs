@@ -9,6 +9,19 @@ pub use musefs_format::fuzz_check::fixtures::{
     flac_block, make_flac, streaminfo_body, vorbis_comment_body,
 };
 
+/// Return the mtime of `p` as seconds since the Unix epoch (truncated, not
+/// rounded), matching what `scan_directory` stores in the DB.
+pub fn real_mtime(p: &std::path::Path) -> i64 {
+    std::fs::metadata(p)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .cast_signed()
+}
+
 /// Write a simple FLAC (STREAMINFO + comment + audio) to `path`,
 /// returning (audio_offset, audio_length).
 pub fn write_flac(path: &Path, comments: &[&str], audio: &[u8]) -> (u64, u64) {
