@@ -254,9 +254,18 @@ mod negative_audio_bounds_tests {
                 backing_mtime: 0,
             })
             .unwrap();
-        // Simulate a malformed external write to a contract column.
+        // Simulate a malformed external write to a contract column. The V4
+        // `audio_offset >= 0` CHECK would reject this on a normal connection, so
+        // bypass CHECK enforcement to plant the bad row — the row-reader defensive
+        // path (not the CHECK) is what this test pins.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         db.conn
             .execute("UPDATE tracks SET audio_offset = -1 WHERE id = ?1", [id])
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
         assert!(
             db.get_track(id).is_err(),

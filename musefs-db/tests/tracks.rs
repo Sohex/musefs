@@ -28,6 +28,7 @@ fn upsert_updates_existing_row_keeping_same_id() {
 
     let mut changed = new_track("/music/a.flac");
     changed.audio_offset = 222;
+    changed.backing_size = 1222;
     let id2 = db.upsert_track(&changed).unwrap();
 
     assert_eq!(id, id2);
@@ -59,7 +60,8 @@ fn rescan_does_not_reset_content_version() {
     // Re-scan the same path with updated offsets; this must NOT reset the
     // version counter, which tracks tag/art edits.
     let mut rescan = new_track("/music/a.flac");
-    rescan.audio_offset = 999;
+    rescan.audio_offset = 100;
+    rescan.audio_length = 900;
     db.upsert_track(&rescan).unwrap();
 
     assert_eq!(
@@ -122,7 +124,7 @@ fn upsert_conflict_updates_all_mutable_columns() {
         format: Format::Mp3,
         audio_offset: 222,
         audio_length: 333,
-        backing_size: 444,
+        backing_size: 555,
         backing_mtime: 555,
     };
     let id2 = db.upsert_track(&changed).unwrap();
@@ -132,7 +134,7 @@ fn upsert_conflict_updates_all_mutable_columns() {
     assert_eq!(t.format, Format::Mp3);
     assert_eq!(t.audio_offset, 222);
     assert_eq!(t.audio_length, 333);
-    assert_eq!(t.backing_size, 444);
+    assert_eq!(t.backing_size, 555);
     assert_eq!(t.backing_mtime, 555);
 }
 
