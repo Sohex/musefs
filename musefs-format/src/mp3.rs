@@ -1,6 +1,8 @@
 use crate::convert::usize_from;
 use crate::error::{FormatError, Result};
-use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
+use crate::input::{
+    ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, PictureType, TagInput,
+};
 use crate::layout::{RegionLayout, Segment};
 use crate::probe::Extent;
 
@@ -542,7 +544,8 @@ pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
     tag.pictures()
         .map(|p| EmbeddedPicture {
             mime: p.mime_type.clone(),
-            picture_type: u8::from(p.picture_type).into(),
+            picture_type: PictureType::new(u8::from(p.picture_type).into())
+                .expect("id3 picture_type is always 0..=20"),
             description: p.description.clone(),
             width: 0,
             height: 0,

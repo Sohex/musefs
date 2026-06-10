@@ -5,7 +5,9 @@
 
 use crate::convert::usize_from;
 use crate::error::{FormatError, Result};
-use crate::input::{ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, TagInput};
+use crate::input::{
+    ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, PictureType, TagInput,
+};
 use crate::layout::{RegionLayout, Segment};
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -457,7 +459,7 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
             };
             out.push(EmbeddedPicture {
                 mime: mime.to_string(),
-                picture_type: 3,
+                picture_type: PictureType::new(3).expect("3 is in range"),
                 description: String::new(),
                 width: 0,
                 height: 0,

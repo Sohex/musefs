@@ -1268,7 +1268,7 @@ mod tests {
         body.extend(std::iter::repeat_n(0u8, 12345));
         let pic = crate::flac::parse_picture_block(&body).unwrap();
         assert_eq!(pic.mime, "image/png");
-        assert_eq!(pic.picture_type, 3);
+        assert_eq!(pic.picture_type.get(), 3);
     }
 
     #[test]
