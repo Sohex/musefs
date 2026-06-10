@@ -191,6 +191,24 @@ MUSEFS_INTEROP_DIR=/tmp/i cargo test -p musefs-core --test interop_emit -- --ign
 MUSEFS_INTEROP_DIR=/tmp/i python -m pytest tests/interop
 ```
 
+### External-writer contract round trip
+
+CI's `contract` job mandatorily proves the Python -> Rust DB contract: it builds
+the binary, runs each binary-only plugin's `musefs_bin` tier with
+`MUSEFS_REQUIRE_BIN=1` (a missing binary fails instead of skipping), and runs the
+round-trip harness. The harness is the single source of truth, run locally with:
+
+```bash
+pip install -r tests/contract/requirements.txt pytest && pip install -e contrib/python-musefs
+bash scripts/contract-roundtrip.sh
+```
+
+It scans real ffmpeg-generated audio (so `musefs scan` owns the track geometry),
+writes tags/art through `musefs_common.store`, synthesizes the served bytes via
+`cargo test --test contract_emit`, and asserts with mutagen that the Python tags
+and art survived. Picard's `musefs_bin` tier runs in the `picard` job (it needs
+the system-Picard environment).
+
 ### Failure-path fault injection
 
 The reader and DB error paths are exercised under simulated runtime faults.
