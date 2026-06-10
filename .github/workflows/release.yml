@@ -52,7 +52,7 @@ jobs:
             # object (plain --paginate would emit one object per page, which is
             # not valid single-document JSON).
             gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
-              --paginate --slurp -q '{check_runs: [.[].check_runs[]]}' > checks.json || true
+              --paginate --slurp -q '{check_runs: [.[].check_runs[]]}' > checks.json
             set +e
             python scripts/release_gate.py --names ci-ok coverage-ok < checks.json
             rc=$?
