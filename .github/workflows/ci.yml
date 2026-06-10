@@ -121,6 +121,51 @@ jobs:
       - name: mutagen interop assertions
         run: MUSEFS_INTEROP_DIR="$RUNNER_TEMP/interop" python -m pytest tests/interop -v
 
+  contract:
+    # Mandatory Python -> Rust external-writer contract (#204): builds the
+    # binary, runs the binary-only plugin musefs_bin tiers with skip-on-missing
+    # turned into a hard failure (MUSEFS_REQUIRE_BIN), then the synthesis round
+    # trip (scan owns geometry; python-musefs writes tags/art; Rust synthesizes;
+    # mutagen reads back). Picard's musefs_bin tier runs in the `picard` job
+    # (it needs the system-Picard env).
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-latest
+    env:
+      MUSEFS_REQUIRE_BIN: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - name: Install FUSE + ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config ffmpeg
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.x'
+      - name: Build musefs binary
+        run: cargo build
+      - name: Install Python deps (plugins + mutagen + pytest)
+        run: |
+          pip install -r tests/contract/requirements.txt pytest
+          pip install -e contrib/python-musefs
+          pip install -e "contrib/beets[test]"
+          pip install -e "contrib/lidarr[test]"
+      - name: Install picard plugin test deps
+        run: pip install -e "contrib/picard[test]"
+      - name: beets musefs_bin tier (non-skipping)
+        run: python -m pytest contrib/beets/tests -m musefs_bin -v
+      - name: lidarr musefs_bin tier (non-skipping)
+        run: python -m pytest contrib/lidarr/tests -m musefs_bin -v
+      - name: picard musefs_bin tier (non-skipping)
+        # picard's path-gate tests import `musefs._common` (the bundled plugin
+        # module), NOT the system `picard`/Qt package, so they run here with no
+        # system-Picard env — verified: contrib/picard/tests/test_path_gate.py:11.
+        run: python -m pytest contrib/picard/tests -m musefs_bin -v
+      - name: Python -> Rust synthesis round trip
+        run: bash scripts/contract-roundtrip.sh
+
   python-musefs:
     needs: changes
     if: needs.changes.outputs.src == 'true'
@@ -346,7 +391,7 @@ jobs:
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, interop, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan]
+    needs: [changes, check, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results
