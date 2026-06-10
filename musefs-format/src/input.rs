@@ -1,3 +1,41 @@
+use std::num::NonZeroU64;
+
+/// An ID3/FLAC picture type, validated to the `0..=20` range (the #199
+/// `track_art` CHECK, mirrored Rust-side at the synthesis-input boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PictureType(u8);
+
+impl PictureType {
+    /// The "Other" picture type (0); the clamp target for an out-of-range byte.
+    pub const ZERO: PictureType = PictureType(0);
+
+    pub fn new(v: u32) -> Option<PictureType> {
+        let b = u8::try_from(v).ok()?;
+        if b > 20 { None } else { Some(PictureType(b)) }
+    }
+
+    pub fn get(self) -> u32 {
+        u32::from(self.0)
+    }
+}
+
+/// A non-zero payload length for an art image or binary tag. The non-zero
+/// invariant encodes the layout's `EmptySegment` rule at the type level:
+/// a degenerate empty payload is dropped at the construction boundary, so a
+/// metadata segment can never carry a zero length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobLen(NonZeroU64);
+
+impl BlobLen {
+    pub fn new(v: u64) -> Option<BlobLen> {
+        NonZeroU64::new(v).map(BlobLen)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// One Vorbis/ID3 tag value to synthesize. Multi-valued tags are passed as
 /// multiple `TagInput`s in the desired order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,5 +125,29 @@ mod tests {
         };
         assert_eq!(e.key, "PRIV");
         assert_eq!(e.payload.len(), 3);
+    }
+
+    #[test]
+    fn picture_type_accepts_full_range() {
+        for v in 0..=20u32 {
+            assert_eq!(super::PictureType::new(v).unwrap().get(), v);
+        }
+    }
+
+    #[test]
+    fn picture_type_rejects_out_of_range() {
+        assert!(super::PictureType::new(21).is_none());
+        assert!(super::PictureType::new(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn blob_len_rejects_zero() {
+        assert!(super::BlobLen::new(0).is_none());
+    }
+
+    #[test]
+    fn blob_len_round_trips_nonzero() {
+        assert_eq!(super::BlobLen::new(1).unwrap().get(), 1);
+        assert_eq!(super::BlobLen::new(u64::MAX).unwrap().get(), u64::MAX);
     }
 }
