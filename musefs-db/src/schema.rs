@@ -1069,4 +1069,90 @@ mod migration_v4_tests {
              VALUES (1,1,3,-1)",
         );
     }
+
+    fn count_changes(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM track_changes", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn v4_rebuild_does_not_pump_changelog_ring() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(super::MIGRATIONS[0]).unwrap();
+        conn.execute_batch(super::MIGRATIONS[1]).unwrap();
+        conn.execute_batch(super::MIGRATIONS[2]).unwrap();
+        conn.pragma_update(None, "user_version", 3i64).unwrap();
+        insert_track(&conn, "/a.flac");
+        insert_track(&conn, "/b.flac");
+        conn.execute("DELETE FROM track_changes", []).unwrap();
+
+        super::migrate(&mut conn).unwrap();
+        assert_eq!(
+            count_changes(&conn),
+            0,
+            "the V4 bulk refill must not fire tracks_changelog_ai"
+        );
+    }
+
+    #[test]
+    fn v4_metadata_edit_bumps_version_and_appends_one_changelog_row() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        let cv_before: i64 = conn
+            .query_row("SELECT content_version FROM tracks WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let changes_before = count_changes(&conn);
+
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','A',0)",
+            [],
+        )
+        .unwrap();
+
+        let cv_after: i64 = conn
+            .query_row("SELECT content_version FROM tracks WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(cv_after, cv_before + 1, "content_version must bump by one");
+        assert_eq!(
+            count_changes(&conn),
+            changes_before + 1,
+            "exactly one changelog row from the edit (nested trigger)"
+        );
+    }
+
+    #[test]
+    fn v4_recreates_all_destroyed_triggers() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for expected in [
+            "tags_ai",
+            "tags_au",
+            "tags_ad",
+            "track_art_ai",
+            "track_art_au",
+            "track_art_ad",
+            "tracks_changelog_ai",
+            "tracks_changelog_au",
+            "tracks_changelog_ad",
+            "track_changes_prune",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing trigger after V4: {expected}"
+            );
+        }
+    }
 }
