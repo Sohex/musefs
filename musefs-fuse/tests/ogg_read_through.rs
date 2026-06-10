@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use base64::Engine as _;
 use musefs_core::{MountConfig, Musefs, scan_directory};
 
 /// Encode a tiny tagged fixture with ffmpeg. `args` are the codec-specific ffmpeg
@@ -116,49 +117,70 @@ fn mount_and_validate(src: &std::path::Path) {
     drop(session);
 }
 
-/// Generate a fixture with an attached cover image (a tiny PNG) via ffmpeg.
-/// Returns the cover bytes if encoding succeeded, else None (skip).
+/// A valid 4x4 PNG cover image. ffmpeg 8's PNG decoder rejects malformed chunks,
+/// so this must be a real, decodable image.
+const COVER_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x02, 0x00, 0x00, 0x00, 0x26, 0x93, 0x09,
+    0x29, 0x00, 0x00, 0x00, 0x09, 0x70, 0x48, 0x59, 0x73, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x4F, 0x25, 0xC4, 0xD6, 0x00, 0x00, 0x00, 0x14, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C,
+    0x63, 0x64, 0x60, 0xF8, 0xC7, 0x00, 0x03, 0x2C, 0x0C, 0x48, 0x00, 0x37, 0x07, 0x00, 0x32, 0x3E,
+    0x01, 0x0C, 0x1C, 0xDB, 0xAF, 0x41, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+    0x60, 0x82,
+];
+
+/// Build a FLAC METADATA PICTURE block body: picture type, MIME, description,
+/// dimensions, then the image. Base64-encoded, this is a Vorbis
+/// `METADATA_BLOCK_PICTURE` comment value. Big-endian.
+fn flac_picture_block(png: &[u8]) -> Vec<u8> {
+    let mime: &[u8] = b"image/png";
+    let mut out = Vec::new();
+    out.extend_from_slice(&3u32.to_be_bytes()); // type: front cover
+    out.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(mime);
+    out.extend_from_slice(&0u32.to_be_bytes()); // description length (empty)
+    out.extend_from_slice(&4u32.to_be_bytes()); // width
+    out.extend_from_slice(&4u32.to_be_bytes()); // height
+    out.extend_from_slice(&24u32.to_be_bytes()); // color depth
+    out.extend_from_slice(&0u32.to_be_bytes()); // colors used (0 = non-indexed)
+    out.extend_from_slice(&u32::try_from(png.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(png);
+    out
+}
+
+/// Generate an Ogg fixture carrying a cover image via a base64
+/// `METADATA_BLOCK_PICTURE` comment — ffmpeg cannot mux an `attached_pic` stream
+/// into an Ogg container, so this is the only route Opus/Vorbis art takes. `-t`
+/// precedes `-i anullsrc` to bound the otherwise-infinite audio input. Returns the
+/// cover image bytes if encoding succeeded, else None (skip).
 fn make_fixture_with_cover(
     dir: &std::path::Path,
     audio_name: &str,
     codec_args: &[&str],
 ) -> Option<(std::path::PathBuf, Vec<u8>)> {
-    // 1x1 PNG.
-    let png: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
-        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
-        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-    ];
-    let cover = dir.join("cover.png");
-    std::fs::write(&cover, png).ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(flac_picture_block(COVER_PNG));
+    let mbp = format!("METADATA_BLOCK_PICTURE={b64}");
     let out = dir.join(audio_name);
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args([
+        "-t",
+        "0.3",
         "-f",
         "lavfi",
         "-i",
         "anullsrc=r=48000:cl=stereo",
-        "-t",
-        "0.3",
     ]);
-    cmd.args(["-i"]);
-    cmd.arg(&cover);
-    cmd.args(["-map", "0:a", "-map", "1:v"]);
     cmd.args(codec_args);
-    cmd.args([
-        "-metadata",
-        "title=Cover",
-        "-disposition:v",
-        "attached_pic",
-        "-y",
-    ]);
+    cmd.args(["-metadata", "title=Cover", "-metadata", mbp.as_str(), "-y"]);
     cmd.arg(&out)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let ok = cmd.status().is_ok_and(|s| s.success()) && out.exists();
-    if ok { Some((out, png.to_vec())) } else { None }
+    if ok {
+        Some((out, COVER_PNG.to_vec()))
+    } else {
+        None
+    }
 }
 
 #[test]
