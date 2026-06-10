@@ -29,6 +29,7 @@ musefs-format = { path = "../musefs-format" }
 ogg = "0.9"
 sha2 = "0.11"
 memmap2 = "0.9"
+base64 = "0.22"
 
 [lints]
 workspace = true

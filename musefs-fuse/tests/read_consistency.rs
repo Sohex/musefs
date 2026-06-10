@@ -12,6 +12,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use base64::Engine as _;
 use musefs_core::{MountConfig, Musefs, scan_directory};
 
 // --- minimal proven FLAC fixture (mirrors musefs-fuse/tests/mount.rs) ---
@@ -354,13 +355,24 @@ fn write_ops_are_refused_on_read_only_mount() {
     });
 }
 
+/// How a fixture embeds cover art. ffmpeg's Ogg muxer rejects a mapped
+/// `attached_pic` stream ("codec none"), so Ogg formats carry art via a
+/// `METADATA_BLOCK_PICTURE` comment tag instead; the others use an
+/// attached-picture video stream.
+#[derive(Clone, Copy, PartialEq)]
+enum Art {
+    AttachedPic,
+    MetadataBlock,
+    None,
+}
+
 struct SweepCase {
     /// Backing filename; also seeds a distinct virtual title via `title`.
     name: &'static str,
     title: &'static str,
     codec_args: &'static [&'static str],
-    /// Whether to attach a cover image (exercises ArtImage/BinaryTag/OggArtSlice).
-    cover: bool,
+    /// How cover art is embedded (drives the ArtImage/BinaryTag/OggArtSlice paths).
+    art: Art,
 }
 
 fn sweep_cases() -> &'static [SweepCase] {
@@ -369,84 +381,137 @@ fn sweep_cases() -> &'static [SweepCase] {
             name: "flac.flac",
             title: "SweepFlac",
             codec_args: &["-c:a", "flac"],
-            cover: true,
+            art: Art::AttachedPic,
         },
         SweepCase {
             name: "mp3.mp3",
             title: "SweepMp3",
             codec_args: &["-c:a", "libmp3lame", "-q:a", "5"],
-            cover: true,
+            art: Art::AttachedPic,
         },
         SweepCase {
             name: "m4a.m4a",
             title: "SweepM4a",
             codec_args: &["-c:a", "aac", "-b:a", "64k"],
-            cover: true,
+            art: Art::AttachedPic,
         },
         SweepCase {
             name: "opus.opus",
             title: "SweepOpus",
             codec_args: &["-c:a", "libopus"],
-            cover: true,
+            art: Art::MetadataBlock,
         },
         SweepCase {
             name: "vorbis.ogg",
             title: "SweepVorbis",
             codec_args: &["-c:a", "libvorbis"],
-            cover: true,
+            art: Art::MetadataBlock,
         },
         SweepCase {
+            // OggFLAC carries art as a native PICTURE packet, which ffmpeg won't
+            // write into an Ogg container (attached_pic fails; the
+            // METADATA_BLOCK_PICTURE comment is read only for Opus/Vorbis). It is
+            // still swept for read consistency, just without an art segment.
             name: "oggflac.oga",
             title: "SweepOggFlac",
             codec_args: &["-c:a", "flac", "-f", "ogg"],
-            cover: true,
+            art: Art::None,
         },
         SweepCase {
             name: "wav.wav",
             title: "SweepWav",
             codec_args: &["-c:a", "pcm_s16le"],
-            cover: false,
+            art: Art::None,
         },
     ]
 }
 
-/// 1x1 PNG used as a cover image.
-const TINY_PNG: &[u8] = &[
+/// A valid 4x4 PNG cover image. ffmpeg 8's PNG decoder rejects malformed chunks,
+/// so this must be a real, decodable image.
+const COVER_PNG: &[u8] = &[
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
-    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
-    0x42, 0x60, 0x82,
+    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x02, 0x00, 0x00, 0x00, 0x26, 0x93, 0x09,
+    0x29, 0x00, 0x00, 0x00, 0x09, 0x70, 0x48, 0x59, 0x73, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x4F, 0x25, 0xC4, 0xD6, 0x00, 0x00, 0x00, 0x14, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C,
+    0x63, 0x64, 0x60, 0xF8, 0xC7, 0x00, 0x03, 0x2C, 0x0C, 0x48, 0x00, 0x37, 0x07, 0x00, 0x32, 0x3E,
+    0x01, 0x0C, 0x1C, 0xDB, 0xAF, 0x41, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+    0x60, 0x82,
 ];
 
-/// Encode `case` into `dir` with ffmpeg, optionally attaching a cover image.
-/// Returns `true` on success; `false` (skip) if ffmpeg/codec is unavailable.
+/// Build a FLAC METADATA PICTURE block body (the same structure used verbatim in a
+/// FLAC `PICTURE` block and, base64-encoded, in a Vorbis `METADATA_BLOCK_PICTURE`
+/// tag): picture type, MIME, description, dimensions, then the image. Big-endian.
+fn flac_picture_block(png: &[u8]) -> Vec<u8> {
+    let mime: &[u8] = b"image/png";
+    let mut out = Vec::new();
+    out.extend_from_slice(&3u32.to_be_bytes()); // type: front cover
+    out.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(mime);
+    out.extend_from_slice(&0u32.to_be_bytes()); // description length (empty)
+    out.extend_from_slice(&4u32.to_be_bytes()); // width
+    out.extend_from_slice(&4u32.to_be_bytes()); // height
+    out.extend_from_slice(&24u32.to_be_bytes()); // color depth
+    out.extend_from_slice(&0u32.to_be_bytes()); // colors used (0 = non-indexed)
+    out.extend_from_slice(&u32::try_from(png.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(png);
+    out
+}
+
+/// Number of embedded pictures in `path`, via musefs's own readers, for the
+/// formats whose art the sweep verifies (FLAC and the Ogg family). `None` for
+/// formats without a reader used here (mp3/m4a/wav).
+fn embedded_pic_count(path: &Path) -> Option<usize> {
+    let bytes = std::fs::read(path).ok()?;
+    match path.extension()?.to_str()? {
+        "flac" => Some(musefs_format::flac::read_pictures(&bytes).ok()?.len()),
+        "opus" | "ogg" | "oga" => Some(musefs_format::ogg::read_pictures(&bytes).ok()?.len()),
+        _ => None,
+    }
+}
+
+/// Encode `case` into `dir` with ffmpeg, embedding cover art per `case.art`.
+/// `-t` precedes `-i anullsrc` so it bounds the otherwise-infinite audio input —
+/// placing it after leaves the audio unbounded and an attached_pic mux never
+/// terminates. Returns `true` on success; `false` if ffmpeg/the codec is missing.
 fn make_sweep_fixture(dir: &Path, case: &SweepCase) -> bool {
     let out = dir.join(case.name);
     let title = format!("title={}", case.title);
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
     cmd.args([
+        "-t",
+        "0.3",
         "-f",
         "lavfi",
         "-i",
         "anullsrc=r=48000:cl=stereo",
-        "-t",
-        "0.3",
     ]);
 
-    if case.cover {
-        let cover = dir.join(format!("{}.cover.png", case.name));
-        std::fs::write(&cover, TINY_PNG).unwrap();
-        cmd.args(["-i"]);
-        cmd.arg(&cover);
-        cmd.args(["-map", "0:a", "-map", "1:v"]);
-        cmd.args(case.codec_args);
-        cmd.args(["-metadata", title.as_str(), "-metadata", "artist=Sweep"]);
-        cmd.args(["-disposition:v", "attached_pic"]);
-    } else {
-        cmd.args(case.codec_args);
-        cmd.args(["-metadata", title.as_str(), "-metadata", "artist=Sweep"]);
+    match case.art {
+        Art::AttachedPic => {
+            let cover = dir.join(format!("{}.cover.png", case.name));
+            std::fs::write(&cover, COVER_PNG).unwrap();
+            cmd.args(["-i"]);
+            cmd.arg(&cover);
+            cmd.args(["-map", "0:a", "-map", "1:v"]);
+            cmd.args(case.codec_args);
+            cmd.args(["-metadata", title.as_str(), "-metadata", "artist=Sweep"]);
+            // Explicit cover codec: the mp4/ipod muxer's default video-encoder
+            // selection fails for attached_pic, so pin it (png works for all three).
+            cmd.args(["-c:v", "png", "-disposition:v", "attached_pic"]);
+        }
+        Art::MetadataBlock => {
+            let b64 =
+                base64::engine::general_purpose::STANDARD.encode(flac_picture_block(COVER_PNG));
+            let mbp = format!("METADATA_BLOCK_PICTURE={b64}");
+            cmd.args(case.codec_args);
+            cmd.args(["-metadata", title.as_str(), "-metadata", "artist=Sweep"]);
+            cmd.args(["-metadata", mbp.as_str()]);
+        }
+        Art::None => {
+            cmd.args(case.codec_args);
+            cmd.args(["-metadata", title.as_str(), "-metadata", "artist=Sweep"]);
+        }
     }
 
     cmd.arg(&out).stdout(Stdio::null()).stderr(Stdio::null());
@@ -484,21 +549,24 @@ fn randomized_reads_match_oracle_all_formats() {
     }
 
     let backing = tempfile::tempdir().unwrap();
-    let mut generated = 0usize;
-    for case in sweep_cases() {
-        if make_sweep_fixture(backing.path(), case) {
-            generated += 1;
-        } else {
-            eprintln!(
-                "ffmpeg codec unavailable for {}; skipping that format",
-                case.name
-            );
+    let missing: Vec<&str> = sweep_cases()
+        .iter()
+        .filter(|case| !make_sweep_fixture(backing.path(), case))
+        .map(|case| case.name)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "fixtures failed to generate (ffmpeg codec missing or broken invocation): {missing:?}"
+    );
+
+    // The cover art must actually be embedded, or the ArtImage/OggArtSlice splice
+    // segments this sweep exists to exercise would silently be absent. Verify it
+    // with musefs's own readers for the formats they cover.
+    for case in sweep_cases().iter().filter(|c| c.art != Art::None) {
+        if let Some(pics) = embedded_pic_count(&backing.path().join(case.name)) {
+            assert!(pics > 0, "{} should carry embedded cover art", case.name);
         }
     }
-    assert!(
-        generated > 0,
-        "no breadth-sweep fixtures could be generated; ffmpeg codecs may be unavailable"
-    );
 
     let db = musefs_db::Db::open_in_memory().unwrap();
     scan_directory(&db, backing.path()).unwrap();
@@ -507,9 +575,10 @@ fn randomized_reads_match_oracle_all_formats() {
     let session = musefs_fuse::spawn(fs, mountpoint.path(), "musefs-readcons-sweep").unwrap();
 
     let served = walk_tree(mountpoint.path());
-    assert!(
-        !served.is_empty(),
-        "mount should expose at least one served file"
+    assert_eq!(
+        served.len(),
+        sweep_cases().len(),
+        "every generated fixture should be served exactly once: {served:?}"
     );
     for path in &served {
         sweep_reads(path, None, 500);
