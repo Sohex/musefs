@@ -11,6 +11,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
+musefs-core = { path = "../musefs-core" }
+musefs-db = { path = "../musefs-db" }
+tempfile = "3"
 
 [lib]
 path = "src/lib.rs"
@@ -75,6 +78,13 @@ bench = false
 [[bin]]
 name = "vorbiscomment"
 path = "fuzz_targets/vorbiscomment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "serve"
+path = "fuzz_targets/serve.rs"
 test = false
 doc = false
 bench = false
