@@ -10,7 +10,7 @@
 
 **Design decisions (read before starting):**
 - The required sanitizer gate runs the **core-level** test, not the FUSE mount, because a sanitizer-instrumented FUSE mount in CI is the flaky part the spec flagged. ASan still interposes `malloc` globally, so it catches heap errors in the C deps reached from the core test too.
-- **No `-Zbuild-std`** in the required ASan job (the spec's stated fallback: keep it fast and reliable). `-Zbuild-std` is left as an optional enhancement noted in Task 3, not implemented.
+- **No `-Zbuild-std`** in the required ASan job (the spec's stated fallback: keep it fast and reliable) — valid because ASan is ABI-compatible with an uninstrumented std. **TSan is different:** it changes the ABI, so the best-effort `tsan` job **requires** `-Zbuild-std` (+ `rust-src`) or nightly refuses to compile. (Corrected 2026-06-10 after actually running the tsan job, which the original plan had not.)
 - Stress tests use **no cargo feature** so the existing `e2e` job (which runs `cargo test -p musefs-fuse -- --ignored`) picks up the mount-level test, and the default `check` job (`cargo test --workspace`) picks up the core-level test, with zero extra wiring.
 - Determinism: bounded iteration counts, a `Barrier` to start threads together (no sleeps), assertions on **bytes/outcomes** (correct content, no panic, completes within the test harness — no timing thresholds).
 
@@ -406,7 +406,7 @@ RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS="detect_leaks=0" \
 ```
 Expected: PASS, no ASan report. If ASan reports a real error, that is the kind of defect this gate exists to catch → systematic-debugging, do not suppress.
 
-> Optional enhancement (NOT implemented here): adding `-Zbuild-std` (with `components: rust-src` and `-Z build-std`) instruments std for deeper coverage at a large build-time cost. Leave it out unless a defect demands it.
+> `-Zbuild-std` is genuinely optional **for ASan** (it would instrument std for deeper coverage at a large build-time cost; left out to keep the required gate fast). Note this does **not** apply to TSan — Task 4's tsan job requires `-Zbuild-std` to compile at all (TSan changes the ABI).
 
 - [ ] **Step 5: Commit**
 
@@ -432,6 +432,10 @@ In `.github/workflows/ci.yml`, after the `asan` job, add:
     # instrument the system C libs (libfuse, libsqlite3), so it sees races in
     # our code around the FFI but may miss or false-positive inside the C deps.
     # continue-on-error keeps a noisy run from showing as a hard failure.
+    #
+    # TSan changes the ABI (unlike ASan), so nightly rejects linking tsan crates
+    # against a non-tsan std: this job MUST use -Zbuild-std (+ rust-src) to
+    # rebuild std with the sanitizer.
     needs: changes
     if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
@@ -446,20 +450,21 @@ In `.github/workflows/ci.yml`, after the `asan` job, add:
         with:
           toolchain: nightly
           targets: x86_64-unknown-linux-gnu
+          components: rust-src
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - name: ThreadSanitizer (core concurrent reads)
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
           TSAN_OPTIONS: "halt_on_error=0"
         run: >-
-          cargo +nightly test -p musefs-core --test concurrent_reads
+          cargo +nightly test -p musefs-core -Zbuild-std --test concurrent_reads
           --target x86_64-unknown-linux-gnu
       - name: ThreadSanitizer (mount concurrent reads, best-effort)
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
           TSAN_OPTIONS: "halt_on_error=0"
         run: >-
-          cargo +nightly test -p musefs-fuse --test concurrent_reads
+          cargo +nightly test -p musefs-fuse -Zbuild-std --test concurrent_reads
           --target x86_64-unknown-linux-gnu -- --ignored
 ```
 
@@ -472,10 +477,11 @@ Expected: `ok: [... 'asan']` (asan present, tsan absent).
 
 Run:
 ```bash
+rustup component add rust-src --toolchain nightly
 RUSTFLAGS="-Zsanitizer=thread" TSAN_OPTIONS="halt_on_error=0" \
-  cargo +nightly test -p musefs-core --test concurrent_reads --target x86_64-unknown-linux-gnu || true
+  cargo +nightly test -p musefs-core -Zbuild-std --test concurrent_reads --target x86_64-unknown-linux-gnu || true
 ```
-Expected: completes (may print TSan warnings — that is acceptable for the non-required signal). A *workspace-code* data-race report is worth investigating; C-dep noise is expected.
+Expected: completes (may print TSan warnings — that is acceptable for the non-required signal). A *workspace-code* data-race report is worth investigating; C-dep noise is expected. (Verified 2026-06-10: 3 passed, 0 races. Without `-Zbuild-std` nightly hard-errors on the tsan/non-tsan std ABI mismatch — it is required, not optional.)
 
 - [ ] **Step 4: Commit**
 
@@ -508,14 +514,17 @@ cargo test -p musefs-fuse --test concurrent_reads -- --ignored  # mount: DbPool:
 CI runs the core test under **AddressSanitizer** as a required gate (`asan` job)
 and both tests under **ThreadSanitizer** as a non-required best-effort signal
 (`tsan` job, `continue-on-error`). TSan cannot instrument the system C libraries
-(libfuse, libsqlite3), so it is a signal, not a gate — reproduce locally with:
+(libfuse, libsqlite3), so it is a signal, not a gate. ASan is ABI-compatible with
+an uninstrumented std; TSan is not, so it needs `-Zbuild-std` (+ `rust-src`).
+Reproduce locally with:
 
 ```bash
 rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly   # for TSan's -Zbuild-std
 RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS="detect_leaks=0" \
   cargo +nightly test -p musefs-core --test concurrent_reads --target x86_64-unknown-linux-gnu
-RUSTFLAGS="-Zsanitizer=thread" \
-  cargo +nightly test -p musefs-core --test concurrent_reads --target x86_64-unknown-linux-gnu
+RUSTFLAGS="-Zsanitizer=thread" TSAN_OPTIONS="halt_on_error=0" \
+  cargo +nightly test -p musefs-core -Zbuild-std --test concurrent_reads --target x86_64-unknown-linux-gnu
 ```
 ```
 
