@@ -95,7 +95,8 @@ impl RegionLayout {
 
     // Stays `pub` in Task 1 (foreign `new` callers still need it); demoted to
     // `pub(crate)` in Task 3 together with their migration.
-    pub fn new(segments: Vec<Segment>) -> RegionLayout {
+    #[allow(dead_code)] // used only in #[cfg(test)] / #[cfg(feature = "fuzzing")] paths
+    pub(crate) fn new(segments: Vec<Segment>) -> RegionLayout {
         RegionLayout::from_segments(segments)
     }
 
@@ -103,6 +104,15 @@ impl RegionLayout {
         let layout = RegionLayout::from_segments(segments);
         layout.validate()?;
         Ok(layout)
+    }
+
+    /// Build a layout **without** validation. Test-only escape hatch for
+    /// integration tests that deliberately construct invalid layouts to exercise
+    /// `validate()`. Gated behind the `fuzzing` feature so production code (which
+    /// has only `validated`) cannot reach it.
+    #[cfg(feature = "fuzzing")]
+    pub fn new_unchecked(segments: Vec<Segment>) -> RegionLayout {
+        RegionLayout::from_segments(segments)
     }
 
     /// The ordered segments composing the synthesized virtual file.

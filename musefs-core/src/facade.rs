@@ -1152,7 +1152,8 @@ mod tests {
         let replacement = std::fs::File::open(&replacement_path).unwrap();
 
         let resolved = ResolvedFile {
-            layout: RegionLayout::new(vec![Segment::BackingAudio { offset: 0, len: 8 }]),
+            layout: RegionLayout::validated(vec![Segment::BackingAudio { offset: 0, len: 8 }])
+                .unwrap(),
             total_len: 8,
             content_version: 1,
             backing_path: expected_path,

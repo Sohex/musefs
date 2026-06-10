@@ -141,10 +141,11 @@ impl HeaderCache {
                 // Pure passthrough: the synthesized "file" is the backing file itself.
                 // The stored audio bounds are irrelevant here — the whole file is served
                 // verbatim — so they are not validated in this mode.
-                let layout = RegionLayout::new(vec![Segment::BackingAudio {
+                let layout = RegionLayout::validated(vec![Segment::BackingAudio {
                     offset: 0,
                     len: meta.len(),
-                }]);
+                }])
+                .map_err(musefs_format::FormatError::InvalidLayout)?;
                 (layout, meta.len(), track.backing_mtime)
             }
             Mode::Synthesis => {
@@ -504,14 +505,15 @@ mod ogg_serve_tests {
             .write_all(&file_bytes)
             .unwrap();
 
-        let layout = RegionLayout::new(vec![
+        let layout = RegionLayout::validated(vec![
             Segment::Inline(b"HDRBYTES".to_vec()), // 8 inline header bytes
             Segment::OggAudio {
                 offset: audio_offset,
                 len: audio.len() as u64,
                 seq_delta: 1, // 3->4, 4->5
             },
-        ]);
+        ])
+        .unwrap();
         let total = layout.total_len();
         let resolved = ResolvedFile {
             layout,
@@ -777,7 +779,7 @@ mod ogg_art_serve_tests {
             })
             .unwrap();
 
-        let layout = RegionLayout::new(vec![
+        let layout = RegionLayout::validated(vec![
             Segment::Inline(b"HEAD".to_vec()),
             Segment::OggArtSlice {
                 art_id,
@@ -787,7 +789,8 @@ mod ogg_art_serve_tests {
                 art_total: image.len() as u64,
             },
             Segment::Inline(b"XY".to_vec()),
-        ]);
+        ])
+        .unwrap();
         let total = layout.total_len();
         let resolved = ResolvedFile {
             layout,
@@ -828,13 +831,14 @@ mod ogg_art_serve_tests {
                 data: image.clone(),
             })
             .unwrap();
-        let layout = RegionLayout::new(vec![Segment::OggArtSlice {
+        let layout = RegionLayout::validated(vec![Segment::OggArtSlice {
             art_id,
             offset: 0,
             len: musefs_format::BlobLen::new(image.len() as u64).unwrap(),
             base64: false,
             art_total: image.len() as u64,
-        }]);
+        }])
+        .unwrap();
         let total = layout.total_len();
         let resolved = ResolvedFile {
             layout,
@@ -860,7 +864,7 @@ mod cache_bound_tests {
 
     fn entry(content_version: i64, inline_len: usize) -> Arc<ResolvedFile> {
         Arc::new(ResolvedFile {
-            layout: RegionLayout::new(vec![Segment::Inline(vec![0u8; inline_len])]),
+            layout: RegionLayout::new_unchecked(vec![Segment::Inline(vec![0u8; inline_len])]),
             total_len: inline_len as u64,
             content_version,
             backing_path: std::path::PathBuf::from("/nonexistent"),
@@ -1276,10 +1280,11 @@ mod binary_tag_serve_tests {
         let rowid = db.get_binary_tags(id).unwrap()[0].rowid;
 
         let resolved = ResolvedFile {
-            layout: RegionLayout::new(vec![Segment::BinaryTag {
+            layout: RegionLayout::validated(vec![Segment::BinaryTag {
                 payload_id: rowid,
                 len: musefs_format::BlobLen::new(4).unwrap(),
-            }]),
+            }])
+            .unwrap(),
             total_len: 4,
             content_version: 0,
             backing_path: PathBuf::from("/x.mp3"),
