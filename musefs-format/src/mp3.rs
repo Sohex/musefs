@@ -1056,10 +1056,9 @@ mod tests {
     }
 
     #[test]
-    fn build_id3v2_segments_keeps_real_art_when_mixed_with_empty() {
-        // An empty art alongside a real one: only the non-empty art is emitted.
-        // (Zero-length art is now dropped at the bridge, so the in-synthesis skip
-        // is dead code; this test verifies the real art still works.)
+    fn build_id3v2_segments_emits_art_segment_with_correct_id_and_len() {
+        // Feed a single art entry and verify the emitted ArtImage segment carries
+        // the correct art_id and data length.
         let mk = |art_id: i64, data_len: u64| ArtInput {
             art_id,
             mime: "image/png".to_string(),
