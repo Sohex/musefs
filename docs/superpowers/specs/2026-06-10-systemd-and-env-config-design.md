@@ -44,6 +44,9 @@ while the user configures everything in one place.
   `targets`). See "List-valued arguments" below.
 - Packaging for distro repositories (deb/rpm), AUR, Homebrew, etc.
 - A bespoke config-file format. systemd's `EnvironmentFile` is the config file.
+- `Type=notify` mount-readiness signalling (an sd_notify call so consumer units
+  can order after the mount is live). The shipped unit is `Type=simple`; see the
+  readiness caveat under `musefs.service`.
 
 ## Part A — env-var support
 
@@ -66,6 +69,14 @@ clap's resolution order is exactly what we want and needs no custom code:
 
 An env var also satisfies a `required` argument, so `--db` and the `mountpoint`
 positional can come entirely from the environment.
+
+**Present-but-empty is a value, not "unset".** systemd's `EnvironmentFile`
+distinguishes an unset key from `KEY=` (set to the empty string). clap sees a
+present env var and uses `""` as the value: for `--db` that yields
+`PathBuf::from("")`, which passes clap's required check and fails later at
+store-open; for a boolean it is an invalid bool and hard-errors (see below).
+The conf example therefore comments out optional keys rather than leaving them
+empty, and the README warns against bare `KEY=` lines.
 
 ### Naming convention
 
@@ -105,18 +116,28 @@ scan (`Command::Scan`):
 | `MUSEFS_QUIET` | `--quiet` |
 
 `MUSEFS_DB` is deliberately shared between `mount` and `scan`: a single
-`EnvironmentFile` can point both subcommands at the same store.
+`EnvironmentFile` can point both subcommands at the same store. A shared conf
+also means mount-only vars (e.g. `MUSEFS_MODE`) are in the environment when
+`scan` runs; this is harmless — clap only consults the env vars declared on the
+subcommand being parsed and ignores the rest.
 
 ### Boolean flags
 
 `--keep-cache`, `--revalidate`, `--follow-symlinks`, `--quiet` are
-`ArgAction::SetTrue` flags. With clap's `env`, their env var is truthy on the
-usual values; the env value is parsed as a bool. `--case-insensitive` already
-uses `ArgAction::Set` with an explicit `true`/`false` value and a
-`cfg!(target_os = "macos")` default — its env var takes `true`/`false`.
+`ArgAction::SetTrue` flags. With clap's `env`, the env var is parsed by clap's
+`BoolishValueParser`, which accepts a **fixed, case-insensitive set** —
+`true`/`false`, `t`/`f`, `yes`/`no`, `y`/`n`, `on`/`off`, `1`/`0` — and
+**hard-errors on anything else** (including an empty string). It does not
+silently fall back to false: `MUSEFS_QUIET=enabled` or a typo is a clap parse
+error. `--case-insensitive` already uses `ArgAction::Set` with an explicit
+`true`/`false` value and a `cfg!(target_os = "macos")` default; its env var
+takes the same boolish set.
 
-The conf example documents the accepted boolean spellings so users are not left
-guessing.
+Consequence under systemd: with `Type=simple` a bad boolean spelling in the
+conf makes the unit fail to start (fast and loud — arguably desirable, but it is
+not a silent no-op). The conf example therefore enumerates the **exact** accepted
+spellings rather than saying "the usual values," and the implementation must
+verify the hard-error behavior in tests (see Testing).
 
 ### List-valued arguments (flag-only, by design)
 
@@ -146,16 +167,27 @@ Shipped under `contrib/systemd/`, matching the existing `contrib/` convention
 [Unit]
 Description=musefs read-only re-tagging FUSE mount
 Documentation=https://github.com/Sohex/musefs
-After=default.target
 
 [Service]
 Type=simple
 EnvironmentFile=-%h/.config/musefs/musefs.conf
+# The --user manager does not inherit a login shell's PATH, so a cargo-installed
+# binary in ~/.cargo/bin is not found by a bare `musefs`. Adjust this PATH (or
+# use an absolute ExecStart) to match where musefs is installed.
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin
 ExecStart=musefs mount
 # musefs unmounts cleanly on SIGTERM (systemd's default stop signal), so no
 # ExecStop is required. Uncomment as a fallback if a mount is ever left behind:
 #ExecStop=-fusermount3 -u ${MUSEFS_MOUNTPOINT}
 Restart=on-failure
+RestartSec=5
+# A misconfigured unit (missing/invalid MUSEFS_* value) exits non-zero on every
+# start; the default start-limiter eventually stops retrying.
+
+# NoNewPrivileges is safe for a FUSE mount. Do NOT add ProtectHome=,
+# PrivateMounts=, or MountFlags=private: they put the mount in a private
+# namespace, hiding it from the rest of your session.
+NoNewPrivileges=true
 
 [Install]
 WantedBy=default.target
@@ -166,18 +198,27 @@ Notes:
 - `EnvironmentFile=-...` — the leading `-` makes the file optional, so the unit
   still starts if the user has not created the conf yet (and is relying on a
   drop-in or inline `Environment=`).
+- No `After=` ordering. For a `--user` unit `WantedBy=default.target` already
+  starts it once the user session is up; ordering `After=default.target` (the
+  top of the user boot) is both unnecessary and self-referential, so it is
+  omitted.
 - `ExecStart=musefs mount` carries no arguments; everything comes from the
   environment. Required values (`MUSEFS_MOUNTPOINT`, `MUSEFS_DB`) must therefore
   be present in the conf or a drop-in, or the unit fails fast with clap's
   "required argument not provided" error.
-- We do **not** embed commented `Environment=` example lines in the unit.
-  Inline overrides are supported the systemd-native way via
+- **`Type=simple` readiness caveat.** `run_mount` blocks (it calls
+  `musefs_fuse::mount_with`), so `Type=simple` is the correct type. But systemd
+  marks the unit "active" the instant it forks — *before* the FUSE mount is
+  actually established. Nothing should assume the mount is live merely because
+  the service is active; mount-ready ordering for a consumer unit is out of
+  scope (would require `Type=notify` + an sd_notify call, see Non-goals).
+- We do **not** embed commented `Environment=` example lines for `MUSEFS_*` in
+  the unit. Inline overrides are supported the systemd-native way via
   `systemctl --user edit musefs`, which writes an upgrade-safe drop-in. The conf
   file is the documented place for the full variable list.
-- `musefs` must be on the unit's `PATH`. The README instructions note that a
-  `cargo install` binary in `~/.cargo/bin` may need either an absolute
-  `ExecStart` path or `Environment=PATH=...`; this is called out rather than
-  guessed at in the unit.
+- `%h` is the unit-file home expansion; `~` only expands in a shell. The README
+  uses `~/...` for human readability — warn against pasting those `~` paths
+  verbatim into unit directives, where they would be taken literally.
 
 ### `musefs-scan.service` + `musefs-scan.timer` (optional periodic re-scan)
 
@@ -194,6 +235,7 @@ Documentation=https://github.com/Sohex/musefs
 [Service]
 Type=oneshot
 EnvironmentFile=-%h/.config/musefs/musefs.conf
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin
 # Set the library path(s) here; targets are not env-configurable.
 ExecStart=musefs scan %h/Music --revalidate
 ```
@@ -213,30 +255,48 @@ WantedBy=timers.target
 ```
 
 `MUSEFS_DB` and other scan knobs come from the shared conf; only the target
-path is inlined.
+path is inlined. A `--user` timer only fires while the user manager is running;
+on a headless server where the user is not logged in, the contrib README must
+tell users to run `loginctl enable-linger <user>` so the timer fires when
+logged out.
 
 ### `musefs.conf.example`
 
 A fully commented file listing every scalar `MUSEFS_*` variable with its
 default value, shipped for the user to copy to `~/.config/musefs/musefs.conf`.
 Structure: required vars uncommented with placeholder values at the top
-(`MUSEFS_MOUNTPOINT`, `MUSEFS_DB`), every optional var commented with its
-default below. Documents accepted boolean spellings.
+(`MUSEFS_MOUNTPOINT`, `MUSEFS_DB`), every optional var **commented** with its
+default below. Specific requirements:
+
+- Optional vars are left commented (`#MUSEFS_MODE=synthesis`), never set to an
+  empty value — `KEY=` is "present and empty", which clap treats as a value and
+  which breaks required-path and boolean args (see "Present-but-empty" above).
+- Boolean vars list the exact accepted spellings inline
+  (`true`/`false`/`yes`/`no`/`on`/`off`/`1`/`0`, case-insensitive), since an
+  unrecognized value is a hard error, not a silent false.
+- Use **absolute paths** (or none): under a `--user` unit the working directory
+  defaults to `%h`, so a relative `MUSEFS_DB` resolves against home, which is
+  surprising.
 
 systemd's `EnvironmentFile` parses `KEY=value` lines (no shell quoting, values
-are literal to end of line); the example is written within those constraints
-and notes them.
+are literal to end of line — no `$VAR` expansion, no quote stripping); the
+example is written within those constraints and notes them.
 
 ## Documentation
 
 - **README** — add a "Running as a systemd user service" subsection in the
   host-run discussion: how to install the binary, where to put the unit and
   conf, and the `systemctl --user enable --now musefs` flow, including the
-  `PATH`/absolute-`ExecStart` note. Add an env-var note (and/or an "Env var"
-  column) to the existing mount/scan flag tables so the mapping is discoverable.
+  `PATH` note (the shipped unit sets `PATH` for the `~/.cargo/bin` case; users
+  with a different install location adjust it) and the `%h`-vs-`~` warning. Add
+  an env-var note (and/or an "Env var" column) to the existing mount/scan flag
+  tables so the mapping is discoverable. To bound drift across the three places
+  the mapping lives (code attributes, conf example, README), treat
+  `musefs.conf.example` as the canonical list and have the README point to it.
 - **contrib/systemd/** — a short `README.md` is acceptable here (the other
-  `contrib/` integrations each have one) describing the three files and install
-  steps. This is the one place a new doc file is warranted.
+  `contrib/` integrations each have one) describing the three files, the install
+  steps, and `loginctl enable-linger` for the timer on headless servers. This is
+  the one place a new doc file is warranted.
 
 ## Testing
 
@@ -259,6 +319,10 @@ binary** with a controlled environment:
   - An explicit flag overrides the corresponding env var (e.g.
     `MUSEFS_MODE=structure-only` on the env but `--mode synthesis` on the
     command line resolves to synthesis) — asserted via an observable difference.
+  - Boolean-from-env behavior on a `SetTrue` flag (e.g. `MUSEFS_KEEP_CACHE`): a
+    valid truthy value is accepted, and an invalid spelling (e.g.
+    `MUSEFS_KEEP_CACHE=enabled`) is a clap parse error — guarding the hard-error
+    semantics the conf relies on.
 - Scalar-arg parse coverage that does not need real env (e.g. confirming the
   `env` attribute is present and named correctly) can also be asserted by
   reading the generated clap help/`--help` output where convenient.
