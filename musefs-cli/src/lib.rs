@@ -50,7 +50,7 @@ pub struct MountArgs {
     /// Path template, e.g. "$albumartist/$album/$title". Supports ${a|b}
     /// fallback chains, [...] conditional sections ($[/$] for literal
     /// brackets), and $!{field} path fields that keep '/' as separators.
-    #[arg(long, default_value = "$artist/$title")]
+    #[arg(long, default_value = "$albumartist/$album/$title")]
     pub template: String,
     /// Fallback value substituted for any missing template field.
     #[arg(long, default_value = "Unknown")]
@@ -414,7 +414,7 @@ mod tests {
         };
         let (config, fuse_config) = parse_mount_config(&args);
         // Defaults survive the move into the struct.
-        assert_eq!(config.template, "$artist/$title");
+        assert_eq!(config.template, "$albumartist/$album/$title");
         assert_eq!(config.default_fallback, "Unknown");
         assert_eq!(config.mode, musefs_core::Mode::Synthesis);
         assert!(!fuse_config.keep_cache);
