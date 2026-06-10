@@ -57,6 +57,12 @@ Create `musefs/tests/env_config.rs` with the shared helpers and the first three 
 //! an isolated environment, so they are parallel-safe and need no /dev/fuse:
 //! the children fail fast at arg-parse (exit 2) or DB-open (exit 1), never
 //! reaching a mount.
+//!
+//! `env_clear()` is deliberate: it guarantees no ambient MUSEFS_* leaks in from
+//! the developer's shell. It is safe here — the binary is launched by absolute
+//! path (`CARGO_BIN_EXE_musefs`), and the assertions key on the
+//! `opening database at <path>` stderr, which `main` emits via anyhow/eprintln,
+//! not through env_logger — so a cleared `RUST_LOG` does not suppress it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -128,12 +134,70 @@ fn explicit_db_flag_overrides_env_db() {
         "env db should have been overridden, stderr: {stderr}"
     );
 }
+
+// Precedence on a value-bearing, non-required flag (the spec's --mode example).
+// A bogus MUSEFS_MODE alone is rejected at parse (proves env is read); the same
+// bogus env with an explicit --mode is accepted (proves the flag wins and env is
+// not consulted). Observable purely via exit codes — no mount needed.
+#[test]
+fn invalid_mode_env_is_rejected_but_flag_overrides_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = unopenable_db(dir.path(), "env.db");
+
+    let env_only = musefs()
+        .arg("mount")
+        .arg(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .env("MUSEFS_MODE", "bogus")
+        .output()
+        .unwrap();
+    assert_eq!(
+        env_only.status.code(),
+        Some(2),
+        "bogus MUSEFS_MODE should be a usage error, stderr: {}",
+        String::from_utf8_lossy(&env_only.stderr)
+    );
+
+    let flag_wins = musefs()
+        .arg("mount")
+        .arg(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .arg("--mode")
+        .arg("synthesis")
+        .env("MUSEFS_MODE", "bogus")
+        .output()
+        .unwrap();
+    // --mode on the CLI wins; the bogus env is never parsed. We fall through to
+    // DB-open (exit 1), not a usage error.
+    let stderr = String::from_utf8_lossy(&flag_wins.stderr);
+    assert_ne!(flag_wins.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("opening database"), "stderr: {stderr}");
+}
+
+// Locks the per-flag env wiring: clap's `env` feature renders `[env: NAME=]` in
+// help for annotated args. Catches a dropped `env=` that the precedence tests
+// might miss, and confirms the list-valued carve-out (--fallback) has no env.
+#[test]
+fn mount_help_lists_env_vars() {
+    let out = musefs().args(["mount", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MUSEFS_DB"), "stdout: {stdout}");
+    assert!(stdout.contains("MUSEFS_MODE"), "stdout: {stdout}");
+    assert!(stdout.contains("MUSEFS_MOUNTPOINT"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("MUSEFS_FALLBACK"),
+        "--fallback is flag-only and must not advertise an env var, stdout: {stdout}"
+    );
+}
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p musefs --test env_config`
-Expected: `missing_required_mount_args_is_usage_error` PASSES (db is already required), but `env_satisfies_required_mount_args` and `explicit_db_flag_overrides_env_db` FAIL — without the `env` wiring, `MUSEFS_MOUNTPOINT`/`MUSEFS_DB` are ignored, so the binary exits 2 with a "required" error instead of reaching DB-open.
+Expected: `missing_required_mount_args_is_usage_error` PASSES (db is already required). The others FAIL without the `env` wiring: `env_satisfies_required_mount_args` and `explicit_db_flag_overrides_env_db` exit 2 with a "required" error instead of reaching DB-open; `invalid_mode_env_is_rejected_but_flag_overrides_it` sees its bogus `MUSEFS_MODE` ignored (so the env-only case is not a usage error); and `mount_help_lists_env_vars` finds no `[env: ...]` in help.
 
 - [ ] **Step 3: Enable the clap `env` feature**
 
@@ -235,8 +299,13 @@ Expected: clean (no warnings).
 
 - [ ] **Step 7: Commit**
 
+`clap`'s `env` lives in `clap_builder`, which is already in the tree, so flipping
+the feature normally leaves `Cargo.lock` unchanged — stage it only if `git status`
+shows it changed.
+
 ```bash
-git add musefs-cli/Cargo.toml musefs-cli/src/lib.rs musefs/tests/env_config.rs Cargo.lock
+git add musefs-cli/Cargo.toml musefs-cli/src/lib.rs musefs/tests/env_config.rs
+git status --short Cargo.lock && git add Cargo.lock   # only if it changed
 git commit -m "feat(cli): MUSEFS_* env vars for mount flags
 
 Enable clap's env feature and annotate every scalar MountArgs field with
@@ -271,12 +340,18 @@ fn invalid_boolean_env_is_usage_error() {
         .env("MUSEFS_KEEP_CACHE", "enabled") // not a boolish value
         .output()
         .unwrap();
-    // Hard error at parse time, not a silent false.
+    // Hard error at parse time, not a silent false — and pinned to the boolean
+    // parse failure, not any exit-2.
     assert_eq!(
         out.status.code(),
         Some(2),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("keep-cache") || stderr.contains("invalid value"),
+        "expected a keep-cache boolean parse error, stderr: {stderr}"
     );
 }
 
@@ -292,20 +367,19 @@ fn valid_boolean_env_is_accepted() {
         .env("MUSEFS_KEEP_CACHE", "true")
         .output()
         .unwrap();
-    // Parsed fine; failed later at DB-open (exit 1), not a usage error (exit 2).
-    assert_ne!(
-        out.status.code(),
-        Some(2),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // Got past parse for the right reason (reached DB-open), not merely "not
+    // exit 2". Proves a valid boolish env value is accepted, not silently
+    // dropped.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("opening database"), "stderr: {stderr}");
 }
 ```
 
 - [ ] **Step 2: Run the tests to verify they pass**
 
 Run: `cargo test -p musefs --test env_config`
-Expected: all five tests PASS.
+Expected: all seven tests PASS (the five from Task 1 plus these two — they need no new wiring, since Task 1 already enabled env on `--keep-cache`).
 
 - [ ] **Step 3: Commit**
 
@@ -346,12 +420,21 @@ fn scan_reads_db_from_env() {
     );
     assert!(db.exists(), "scan should create the DB at the MUSEFS_DB path");
 }
+
+#[test]
+fn scan_help_lists_env_vars() {
+    let out = musefs().args(["scan", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MUSEFS_DB"), "stdout: {stdout}");
+    assert!(stdout.contains("MUSEFS_JOBS"), "stdout: {stdout}");
+}
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p musefs --test env_config scan_reads_db_from_env`
-Expected: FAIL — without env on `scan`, `--db` is unset, so the binary exits 2 with a "required" error and `out.status.success()` is false.
+Run: `cargo test -p musefs --test env_config scan`
+Expected: both FAIL — without env on `scan`, `scan_reads_db_from_env` exits 2 with a "required" error (so `success()` is false), and `scan_help_lists_env_vars` finds no `MUSEFS_*` in the scan help.
 
 - [ ] **Step 3: Add `env` attributes to the `Scan` variant**
 
@@ -390,10 +473,10 @@ pub enum Command {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p musefs --test env_config`
-Expected: all six tests PASS.
+Expected: all nine tests PASS (seven from Tasks 1-2 plus these two).
 
 - [ ] **Step 5: Lint**
 
@@ -417,7 +500,7 @@ git commit -m "feat(cli): MUSEFS_* env vars for scan flags"
 - Create: `contrib/systemd/musefs-scan.timer`
 - Create: `contrib/systemd/musefs.conf.example`
 
-No automated test gate applies (these are not Rust, shell, or YAML, so the pre-commit hook does not lint them). Verification is `systemd-analyze` if available.
+No *linter* gate applies to these files (they are not Rust, shell, or YAML, so the pre-commit hook does not lint them). Note this does **not** mean the Task 4 commit skips the cargo gate: it adds `contrib/systemd/*.service`/`.timer`/`.conf.example` (none under `docs/` or a `*.md`), so the hook still runs the full fmt/clippy/test suite on this commit — it passes because the tree is already green from Task 3. Unit-syntax verification is `systemd-analyze` if available.
 
 - [ ] **Step 1: Create `contrib/systemd/musefs.service`**
 
@@ -556,7 +639,7 @@ MUSEFS_DB=/home/youruser/.local/share/musefs/library.db
 - [ ] **Step 5: Verify the units parse (best-effort)**
 
 Run: `command -v systemd-analyze >/dev/null && systemd-analyze --user verify contrib/systemd/musefs.service contrib/systemd/musefs-scan.service contrib/systemd/musefs-scan.timer; echo done`
-Expected: prints `done`. A warning like "Failed to resolve executable musefs" / "Command musefs is not executable" is **expected** (musefs is not installed in this environment) and is not a failure; any *syntax* error must be fixed. If `systemd-analyze` is absent, skip this step.
+Expected: prints `done`. Treat only genuine syntax errors as failures — lines containing `Failed to parse`, `Invalid`, or `Unknown lvalue`. The following are **expected and harmless**: `Failed to resolve executable musefs` / `... is not executable` (musefs is not installed here), and any advisory `Notice:`/hint lines (e.g. about `NoNewPrivileges` or an inactive bound unit). If `systemd-analyze` is absent, skip this step.
 
 - [ ] **Step 6: Commit**
 
@@ -629,7 +712,11 @@ systemctl --user enable --now musefs-scan.timer
 
 - [ ] **Step 2: Add the README subsection**
 
-In `README.md`, immediately after the "Ownership and permissions" table (the line `| `--dir-mode <OCTAL>` | `555` | Permission bits for directories, in octal. |`) and before `## Supported formats`, insert:
+The spec floated an optional per-flag "Env var" column on the flag tables; we
+deliberately use a short prose note plus a pointer to the canonical
+`musefs.conf.example` instead, to avoid maintaining the mapping in a third place
+(the README has a mount table and an ownership table but no scan table). In
+`README.md`, immediately after the "Ownership and permissions" table (the line `| `--dir-mode <OCTAL>` | `555` | Permission bits for directories, in octal. |`) and before `## Supported formats`, insert:
 
 ```markdown
 ### Configuring with environment variables
@@ -675,4 +762,4 @@ git commit -m "docs: document MUSEFS_* env vars and systemd user units"
 - [ ] **Full workspace test suite** — Run: `cargo test`. Expected: passes (this is what the pre-commit hook runs).
 - [ ] **Lint** — Run: `cargo clippy --all-targets -- -D warnings`. Expected: clean.
 - [ ] **Format** — Run: `cargo fmt --all --check`. Expected: no diff.
-- [ ] **Help output sanity** — Run: `cargo run -p musefs -- mount --help`. Expected: each documented flag shows its `[env: MUSEFS_*=]` annotation (clap renders env names in help automatically), and `--fallback` does not.
+- [ ] **Help output sanity** — Run: `cargo run -p musefs -- mount --help`. Expected: each annotated flag shows its `[env: MUSEFS_*=]` (clap renders env names in help automatically), and `--fallback` does not. This is now also enforced by the `mount_help_lists_env_vars` / `scan_help_lists_env_vars` tests; the manual run is just a final eyeball.
