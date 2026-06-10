@@ -1599,4 +1599,62 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
+        use musefs_db::{Format, NewTrack, Tag};
+        use std::collections::BTreeMap;
+
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        // Two tracks whose `$title` both render to "Same" -> colliding "Same.flac".
+        // Insertion order fixes ascending ids: id_a < id_b.
+        let id_a = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        let id_b = db
+            .upsert_track(&NewTrack {
+                backing_path: "/b.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        assert!(id_a < id_b, "insertion assigns ascending ids");
+        db.replace_tags(id_a, &[Tag::new("title", "Same", 0)])
+            .unwrap();
+        db.replace_tags(id_b, &[Tag::new("title", "Same", 0)])
+            .unwrap();
+
+        let config = MountConfig {
+            template: "$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+        };
+        let template = Template::parse(&config.template);
+
+        let mut alloc = InodeAllocator::new();
+        let (tree, _snapshot) = Musefs::build_full(&db, &template, &config, &mut alloc).unwrap();
+
+        let root = VirtualTree::ROOT;
+        let bare = tree.lookup(root, "Same.flac").expect("bare name exists");
+        let suffixed = tree
+            .lookup(root, "Same (2).flac")
+            .expect("suffixed name exists");
+        // The LOWER id owns the bare name; the higher id is disambiguated. This
+        // matches the incremental path's min-id rule (tree.rs introducing_id).
+        assert_eq!(tree.inode_of_track(id_a), Some(bare));
+        assert_eq!(tree.inode_of_track(id_b), Some(suffixed));
+    }
 }
