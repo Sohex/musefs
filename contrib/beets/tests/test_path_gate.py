@@ -13,10 +13,18 @@ from musefs_common import connect, realpath_key, track_id_for_path
 pytestmark = pytest.mark.musefs_bin
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-# Prefer debug build (fastest iteration); fall back to release.
-_debug = REPO_ROOT / "target" / "debug" / "musefs"
-_release = REPO_ROOT / "target" / "release" / "musefs"
-MUSEFS_BIN = _debug if _debug.exists() else _release
+
+
+def _resolve_musefs_bin():
+    env = os.environ.get("MUSEFS_BIN")
+    if env:
+        return Path(env)
+    debug = REPO_ROOT / "target" / "debug" / "musefs"
+    release = REPO_ROOT / "target" / "release" / "musefs"
+    return debug if debug.exists() else release
+
+
+MUSEFS_BIN = _resolve_musefs_bin()
 
 # A minimal valid FLAC: 'fLaC' + a STREAMINFO metadata block (last-block flag set,
 # type 0, length 34) of 34 zero bytes. Enough for `musefs scan` to probe. If a
@@ -61,9 +69,11 @@ def _stored_paths(db):
 @pytest.fixture(autouse=True)
 def require_binary():
     if not MUSEFS_BIN.exists():
-        pytest.skip(f"musefs binary not built at {MUSEFS_BIN}; run `cargo build`")
-    # The gate's whole point is catching Rust/Python key divergence; a stale
-    # binary would pass falsely. Warn (don't skip) if it predates the sources.
+        msg = f"musefs binary not built at {MUSEFS_BIN}; run `cargo build` or set MUSEFS_BIN"
+        # In CI's contract tier a missing binary is a hard failure, not a skip.
+        if os.environ.get("MUSEFS_REQUIRE_BIN"):
+            pytest.fail(msg)
+        pytest.skip(msg)
     if MUSEFS_BIN.stat().st_mtime < _newest_rs_mtime():
         warnings.warn(
             f"{MUSEFS_BIN} is older than the musefs Rust sources; rebuild with "
