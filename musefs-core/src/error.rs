@@ -26,6 +26,14 @@ pub enum CoreError {
         "track {track_id} references art {art_id}, which has no metadata row (orphaned track_art — DB contract violation)"
     )]
     OrphanedArt { track_id: i64, art_id: i64 },
+    #[error(
+        "track {track_id} art {art_id} has out-of-range picture_type {value} (expected 0..=20)"
+    )]
+    InvalidPictureType {
+        track_id: i64,
+        art_id: i64,
+        value: u32,
+    },
     #[error("track {0} not found")]
     TrackNotFound(i64),
     #[error("no such inode: {0}")]

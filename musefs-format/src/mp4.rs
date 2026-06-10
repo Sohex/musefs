@@ -669,27 +669,23 @@ fn build_udta(
     let mut streamed_total: u64 = 0;
 
     for bt in binary_tags {
-        if bt.len == 0 {
-            // An empty BinaryTag fails `RegionLayout::validate` (EmptySegment).
-            continue;
-        }
         let Some((mean, name)) = parse_freeform_key(&bt.key) else {
             // Not a `----:<mean>:<name>` key; skip defensively (no double-store path).
             continue;
         };
-        ilst_inline.extend_from_slice(&freeform_binary_prefix(mean, name, bt.len)?);
+        ilst_inline.extend_from_slice(&freeform_binary_prefix(mean, name, bt.len.get())?);
         ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
         ilst_segments.push(Segment::BinaryTag {
             payload_id: bt.payload_id,
-            len: bt.len,
+            len: bt.len.get(),
         });
-        streamed_total += bt.len;
+        streamed_total += bt.len.get();
     }
 
     if !arts.is_empty() {
         // One covr atom; each art is its own `data` child (the iTunes
         // convention for multiple artworks).
-        let covr_size: u64 = 8 + arts.iter().map(|a| 16 + a.data_len).sum::<u64>();
+        let covr_size: u64 = 8 + arts.iter().map(|a| 16 + a.data_len.get()).sum::<u64>();
         ilst_inline.extend_from_slice(
             &u32::try_from(covr_size)
                 .map_err(|_| FormatError::TooLarge)?
@@ -698,7 +694,7 @@ fn build_udta(
         ilst_inline.extend_from_slice(b"covr");
         for a in arts {
             let type_code: u32 = if a.mime == "image/png" { 14 } else { 13 };
-            let data_size = 8 + 8 + a.data_len; // data header + type + locale + image
+            let data_size = 8 + 8 + a.data_len.get(); // data header + type + locale + image
             ilst_inline.extend_from_slice(
                 &u32::try_from(data_size)
                     .map_err(|_| FormatError::TooLarge)?
@@ -710,9 +706,9 @@ fn build_udta(
             ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
             ilst_segments.push(Segment::ArtImage {
                 art_id: a.art_id,
-                len: a.data_len,
+                len: a.data_len.get(),
             });
-            streamed_total += a.data_len;
+            streamed_total += a.data_len.get();
         }
     } else if !ilst_inline.is_empty() {
         ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
@@ -834,8 +830,8 @@ pub fn synthesize_layout(
         }
     }
 
-    // Skip zero-byte art (an empty ArtImage segment fails layout validation).
-    let arts: Vec<ArtInput> = arts.iter().filter(|a| a.data_len > 0).cloned().collect();
+    // All art inputs are non-zero-length (the bridge drops zero-length at construction).
+    let arts: Vec<ArtInput> = arts.to_vec();
     let (udta_segments, _streamed_total) = build_udta(tags, binary_tags, &arts)?;
     let udta_total: u64 = udta_segments.iter().map(Segment::len).sum();
 
@@ -884,6 +880,7 @@ pub fn synthesize_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{BlobLen, PictureType};
 
     /// Build a 32-bit-size box: [size][type][payload].
     fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -1153,10 +1150,10 @@ mod tests {
             art_id: 1,
             mime: "image/png".into(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len: 100,
+            data_len: BlobLen::new(100).unwrap(),
         };
         let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], &[art]).unwrap();
         assert_eq!(streamed, 100);
@@ -1187,10 +1184,10 @@ mod tests {
             art_id: 1,
             mime: "image/jpeg".into(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len: u64::from(u32::MAX) + 1,
+            data_len: BlobLen::new(u64::from(u32::MAX) + 1).unwrap(),
         };
         assert!(matches!(
             build_udta(&[TagInput::new("title", "T")], &[], &[art]),
@@ -1403,10 +1400,10 @@ mod tests {
             art_id: 7,
             mime: "image/jpeg".into(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len: 50,
+            data_len: BlobLen::new(50).unwrap(),
         };
         let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[art]).unwrap();
         let segs = layout.segments();
@@ -1416,64 +1413,21 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_skips_zero_length_art() {
-        // A zero-byte art must be skipped at synthesis (mirrors flac.rs finding
-        // #16): an ArtImage { len: 0 } segment fails layout validation
-        // (EmptySegment), making the track unreadable. The track must still
-        // synthesize with its tags, just without a cover-art segment or covr box.
-        let buf = mk_mp4(false, b"AUDIODATA", &[0]);
-        let scan = read_structure(&buf).unwrap();
-        let art = ArtInput {
-            art_id: 7,
-            mime: "image/jpeg".into(),
-            description: String::new(),
-            picture_type: 3,
-            width: 0,
-            height: 0,
-            data_len: 0,
-        };
-        let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[art]).unwrap();
-        let segs = layout.segments();
-        assert!(
-            !segs.iter().any(|s| matches!(s, Segment::ArtImage { .. })),
-            "zero-byte art must not emit an ArtImage segment"
-        );
-        let Segment::Inline(head) = &segs[0] else {
-            panic!("first segment should be the inline head");
-        };
-        assert!(
-            head.windows(4).all(|w| w != b"covr"),
-            "no covr box should be emitted for zero-byte art"
-        );
-        assert!(matches!(segs.last().unwrap(), Segment::BackingAudio { .. }));
-    }
-
-    #[test]
     fn synthesize_picks_first_nonempty_art() {
-        // With a zero-byte art ahead of a real one, the real art must still be
-        // served (the first nonempty art wins, not merely the first art).
+        // With multiple non-empty arts, the real art must be served.
         let buf = mk_mp4(false, b"AUDIODATA", &[0]);
         let scan = read_structure(&buf).unwrap();
-        let empty = ArtInput {
-            art_id: 1,
-            mime: "image/jpeg".into(),
-            description: String::new(),
-            picture_type: 3,
-            width: 0,
-            height: 0,
-            data_len: 0,
-        };
         let real = ArtInput {
             art_id: 9,
             mime: "image/png".into(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len: 40,
+            data_len: BlobLen::new(40).unwrap(),
         };
         let layout =
-            synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[empty, real]).unwrap();
+            synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[real]).unwrap();
         let segs = layout.segments();
         assert!(
             segs.iter()
@@ -1942,10 +1896,10 @@ mod tests {
                 art_id: 1,
                 mime: mime.into(),
                 description: String::new(),
-                picture_type: 3,
+                picture_type: PictureType::new(3).unwrap(),
                 width: 0,
                 height: 0,
-                data_len: 10,
+                data_len: BlobLen::new(10).unwrap(),
             };
             let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art]).unwrap();
             let prefix = materialize_udta(&segs);
@@ -1965,10 +1919,10 @@ mod tests {
             art_id: 1,
             mime: "image/jpeg".into(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len: 10,
+            data_len: BlobLen::new(10).unwrap(),
         };
         let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art]).unwrap();
         let prefix = materialize_udta(&segs);
@@ -1985,10 +1939,10 @@ mod tests {
             art_id: id,
             mime: mime.into(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len: len,
+            data_len: BlobLen::new(len).unwrap(),
         };
         let arts = [art(1, "image/jpeg", 10), art(2, "image/png", 20)];
         let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], &arts).unwrap();
@@ -2047,10 +2001,10 @@ mod tests {
             art_id: id,
             mime: mime.into(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len: len,
+            data_len: BlobLen::new(len).unwrap(),
         };
         let arts = [art(1, "image/jpeg", 5), art(2, "image/png", 9)];
         let (segs, _) = build_udta(&[TagInput::new("title", "Song")], &[], &arts).unwrap();
@@ -2079,19 +2033,19 @@ mod tests {
                 art_id: 1,
                 mime: "image/jpeg".into(),
                 description: String::new(),
-                picture_type: 3,
+                picture_type: PictureType::new(3).unwrap(),
                 width: 0,
                 height: 0,
-                data_len,
+                data_len: BlobLen::new(data_len).unwrap(),
             }
         }
         // Derive the fixed overhead from the udta size field (segs[0] inline), with
-        // data_len 0, without materializing any image bytes.
-        let (segs0, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art(0)]).unwrap();
+        // data_len 1 (BlobLen is non-zero), without materializing any image bytes.
+        let (segs0, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art(1)]).unwrap();
         let Segment::Inline(h0) = &segs0[0] else {
             panic!("inline head")
         };
-        let overhead = u64::from(u32::from_be_bytes(h0[0..4].try_into().unwrap()));
+        let overhead = u64::from(u32::from_be_bytes(h0[0..4].try_into().unwrap())) - 1;
         let max_len = u64::from(u32::MAX) - overhead;
 
         let (segs_max, streamed) =
@@ -2252,7 +2206,7 @@ mod tests {
         let bins = vec![BinaryTagInput {
             key: "----:com.serato.dj:analysis".into(),
             payload_id: 7,
-            len: payload.len() as u64,
+            len: BlobLen::new(payload.len() as u64).unwrap(),
         }];
         let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &bins, &[]).unwrap();
 
@@ -2317,10 +2271,10 @@ mod tests {
                 art_id: 1,
                 mime: "image/jpeg".into(),
                 description: String::new(),
-                picture_type: 3,
+                picture_type: PictureType::new(3).unwrap(),
                 width: 0,
                 height: 0,
-                data_len,
+                data_len: BlobLen::new(data_len).unwrap(),
             }
         }
         let buf = mk_mp4(true, b"AUDIO", &[0]);
@@ -2348,15 +2302,15 @@ mod tests {
 
     #[test]
     fn synthesize_layout_emits_all_nonzero_arts() {
-        // Zero-byte art is filtered; both non-empty arts stream, in input order.
+        // Both non-empty arts stream, in input order.
         let art = |id: i64, len: u64| ArtInput {
             art_id: id,
             mime: "image/jpeg".into(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len: len,
+            data_len: BlobLen::new(len).unwrap(),
         };
         let buf = mk_mp4(true, b"AUDIO", &[0]);
         let scan = read_structure(&buf).unwrap();
@@ -2364,7 +2318,7 @@ mod tests {
             &scan,
             &[TagInput::new("title", "T")],
             &[],
-            &[art(1, 5), art(2, 0), art(3, 7)],
+            &[art(1, 5), art(3, 7)],
         )
         .unwrap();
         let art_segs: Vec<(i64, u64)> = layout

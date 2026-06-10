@@ -6,7 +6,7 @@ use common::{make_flac, resolve_layout, streaminfo_body, vorbis_comment_body};
 use musefs_format::flac::MetadataBlock;
 use musefs_format::flac::{locate_audio, synthesize_layout};
 use musefs_format::fuzz_check::fixtures::flac_block;
-use musefs_format::{ArtInput, BinaryTagInput, Segment, TagInput};
+use musefs_format::{ArtInput, BinaryTagInput, BlobLen, PictureType, Segment, TagInput};
 
 #[test]
 fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
@@ -35,19 +35,19 @@ fn full_roundtrip_preserved_blocks_multivalue_tags_and_two_pictures() {
             art_id: 1,
             mime: "image/png".into(),
             description: "front".into(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 600,
             height: 600,
-            data_len: front.len() as u64,
+            data_len: BlobLen::new(front.len() as u64).unwrap(),
         },
         ArtInput {
             art_id: 2,
             mime: "image/png".into(),
             description: "back".into(),
-            picture_type: 4,
+            picture_type: PictureType::new(4).unwrap(),
             width: 600,
             height: 600,
-            data_len: back.len() as u64,
+            data_len: BlobLen::new(back.len() as u64).unwrap(),
         },
     ];
 
@@ -116,7 +116,7 @@ fn application_block_streams_and_metaflac_reads_it() {
     let binary = vec![BinaryTagInput {
         key: "APPLICATION".into(),
         payload_id: 100,
-        len: app_body.len() as u64,
+        len: BlobLen::new(app_body.len() as u64).unwrap(),
     }];
     let layout = synthesize_layout(
         &structural,
@@ -166,12 +166,12 @@ fn application_and_cuesheet_framing_is_valid_and_last_block_correct() {
         BinaryTagInput {
             key: "APPLICATION".into(),
             payload_id: 1,
-            len: app_body.len() as u64,
+            len: BlobLen::new(app_body.len() as u64).unwrap(),
         },
         BinaryTagInput {
             key: "CUESHEET".into(),
             payload_id: 2,
-            len: cue_body.len() as u64,
+            len: BlobLen::new(cue_body.len() as u64).unwrap(),
         },
     ];
     let layout = synthesize_layout(
@@ -212,7 +212,7 @@ fn binary_tag_over_24bit_limit_errors() {
     let binary = vec![BinaryTagInput {
         key: "APPLICATION".into(),
         payload_id: 1,
-        len: 0x0100_0000,
+        len: BlobLen::new(0x0100_0000).unwrap(),
     }];
     assert_eq!(
         synthesize_layout(&structural, 0, 0, &[], &binary, &[]),

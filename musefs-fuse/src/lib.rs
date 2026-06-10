@@ -89,6 +89,7 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::DbOpen { .. }
         | CoreError::Mp4MetadataTooLarge { .. }
         | CoreError::OrphanedArt { .. }
+        | CoreError::InvalidPictureType { .. }
         | CoreError::Format(_) => fuser::Errno::EIO,
     }
 }

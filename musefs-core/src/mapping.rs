@@ -47,14 +47,24 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
                 art_id: ta.art_id,
             });
         };
+        let Some(data_len) = musefs_format::BlobLen::new(meta.byte_len) else {
+            continue; // zero-length art: synthesis would skip it anyway (now type-level).
+        };
+        let Some(picture_type) = musefs_format::PictureType::new(ta.picture_type) else {
+            return Err(crate::error::CoreError::InvalidPictureType {
+                track_id,
+                art_id: ta.art_id,
+                value: ta.picture_type,
+            });
+        };
         inputs.push(ArtInput {
             art_id: ta.art_id,
             mime: meta.mime,
             description: ta.description,
-            picture_type: ta.picture_type,
+            picture_type,
             width: meta.width.unwrap_or(0),
             height: meta.height.unwrap_or(0),
-            data_len: meta.byte_len,
+            data_len,
         });
     }
     Ok(inputs)
@@ -68,10 +78,12 @@ pub(crate) fn binary_tags_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<
     Ok(db
         .get_binary_tags(track_id)?
         .into_iter()
-        .map(|row| BinaryTagInput {
-            key: row.key,
-            payload_id: row.rowid,
-            len: row.byte_len,
+        .filter_map(|row| {
+            musefs_format::BlobLen::new(row.byte_len).map(|len| BinaryTagInput {
+                key: row.key,
+                payload_id: row.rowid,
+                len,
+            })
         })
         .collect())
 }
@@ -83,7 +95,11 @@ pub(crate) fn binary_tags_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<
 pub(crate) fn track_art_images<M>(db: &Db<M>, inputs: &[ArtInput]) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::with_capacity(inputs.len());
     for a in inputs {
-        out.push(db.read_art_chunk(a.art_id, 0, musefs_db::convert::usize_from(a.data_len))?);
+        out.push(db.read_art_chunk(
+            a.art_id,
+            0,
+            musefs_db::convert::usize_from(a.data_len.get()),
+        )?);
     }
     Ok(out)
 }
@@ -139,6 +155,64 @@ mod tests {
     }
 
     #[test]
+    fn bridge_drops_zero_length_art() {
+        use musefs_db::{NewArt, TrackArt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("z.db");
+        let db = Db::open(&path).unwrap();
+        let tid = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+        let nonempty = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![1, 2, 3],
+            })
+            .unwrap();
+        let empty = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![],
+            })
+            .unwrap();
+        db.set_track_art(
+            tid,
+            &[
+                TrackArt {
+                    art_id: nonempty,
+                    picture_type: 3,
+                    description: String::new(),
+                    ordinal: 0,
+                },
+                TrackArt {
+                    art_id: empty,
+                    picture_type: 3,
+                    description: String::new(),
+                    ordinal: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let inputs = super::track_art_to_inputs(&db, tid).unwrap();
+        // The zero-length art is dropped at construction (synthesis would skip it).
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].art_id, nonempty);
+        assert_eq!(inputs[0].data_len.get(), 3);
+        assert_eq!(inputs[0].picture_type.get(), 3);
+    }
+
+    #[test]
     fn binary_tags_to_inputs_maps_rows() {
         let db = Db::open_in_memory().unwrap();
         let tid = db
@@ -164,7 +238,7 @@ mod tests {
         let inputs = super::binary_tags_to_inputs(&db, tid).unwrap();
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].key, "PRIV");
-        assert_eq!(inputs[0].len, 4);
+        assert_eq!(inputs[0].len.get(), 4);
         // payload_id is the streaming handle (the tags rowid).
         let rowid = db.get_binary_tags(tid).unwrap()[0].rowid;
         assert_eq!(inputs[0].payload_id, rowid);

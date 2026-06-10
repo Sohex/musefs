@@ -1,6 +1,8 @@
 #![cfg(feature = "fuzzing")]
 use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
-use musefs_format::{ArtInput, BinaryTagInput, RegionLayout, Segment, TagInput, mp4};
+use musefs_format::{
+    ArtInput, BinaryTagInput, BlobLen, PictureType, RegionLayout, Segment, TagInput, mp4,
+};
 use proptest::prelude::*;
 
 proptest! {
@@ -10,7 +12,7 @@ proptest! {
     fn mp4_synthesis_preserves_audio(
         payload in proptest::collection::vec(any::<u8>(), 1..256),
         tags in proptest::collection::vec(("[A-Z]{1,12}", "[ -~]{0,40}"), 0..8),
-        arts in proptest::collection::vec((1..3u8, 0..500u64), 0..3),
+        arts in proptest::collection::vec((1..3u8, 1..500u64), 0..3),
     ) {
         let file = fixtures::m4a(&payload);
         let scan = mp4::read_structure(&file).unwrap();
@@ -24,10 +26,10 @@ proptest! {
                 art_id: i64::try_from(i).unwrap() + 1,
                 mime: if *kind == 1 { "image/jpeg".into() } else { "image/png".into() },
                 description: String::new(),
-                picture_type: 3,
+                picture_type: PictureType::new(3).unwrap(),
                 width: 0,
                 height: 0,
-                data_len: *len,
+                data_len: BlobLen::new(*len).unwrap(),
             })
             .collect();
         if let Ok(layout) = mp4::synthesize_layout(&scan, &taginputs, &[], &arts) {
@@ -57,7 +59,7 @@ proptest! {
             inputs.push(BinaryTagInput {
                 key: format!("----:com.apple.iTunes:{name}"),
                 payload_id: id,
-                len: bytes.len() as u64,
+                len: BlobLen::new(bytes.len() as u64).unwrap(),
             });
             map.insert(id, bytes.clone());
         }

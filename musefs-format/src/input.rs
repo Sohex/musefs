@@ -62,10 +62,10 @@ pub struct ArtInput {
     pub art_id: i64,
     pub mime: String,
     pub description: String,
-    pub picture_type: u32,
+    pub picture_type: PictureType,
     pub width: u32,
     pub height: u32,
-    pub data_len: u64,
+    pub data_len: BlobLen,
 }
 
 /// An embedded picture extracted from a backing file at scan time (a FLAC PICTURE
@@ -89,7 +89,7 @@ pub struct EmbeddedPicture {
 pub struct BinaryTagInput {
     pub key: String,
     pub payload_id: i64,
-    pub len: u64,
+    pub len: BlobLen,
 }
 
 /// A binary tag frame extracted at scan time: the format-private identifier
@@ -104,17 +104,17 @@ pub struct EmbeddedBinaryTag {
 
 #[cfg(test)]
 mod tests {
-    use super::BinaryTagInput;
+    use super::{BinaryTagInput, BlobLen};
 
     #[test]
     fn binary_tag_input_constructs() {
         let b = BinaryTagInput {
             key: "PRIV".into(),
             payload_id: 7,
-            len: 3,
+            len: BlobLen::new(3).unwrap(),
         };
         assert_eq!(b.payload_id, 7);
-        assert_eq!(b.len, 3);
+        assert_eq!(b.len.get(), 3);
     }
 
     #[test]

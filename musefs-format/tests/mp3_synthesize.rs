@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use id3::TagLike;
 use musefs_format::mp3::synthesize_layout;
-use musefs_format::{ArtInput, RegionLayout, Segment, TagInput};
+use musefs_format::{ArtInput, BlobLen, PictureType, RegionLayout, Segment, TagInput};
 
 /// Flatten a layout into a byte buffer, substituting `audio` for the backing-audio
 /// segment and the matching bytes for each `ArtImage` segment.
@@ -65,10 +65,10 @@ fn synthesizes_apic_with_streamed_image_bytes() {
         art_id: 7,
         mime: "image/jpeg".to_string(),
         description: String::new(),
-        picture_type: 3, // front cover
+        picture_type: PictureType::new(3).unwrap(), // front cover
         width: 0,
         height: 0,
-        data_len: art_bytes.len() as u64,
+        data_len: BlobLen::new(art_bytes.len() as u64).unwrap(),
     }];
     let layout = synthesize_layout(0, audio.len() as u64, &tags, &[], &arts).unwrap();
 
@@ -102,10 +102,10 @@ fn embedded_size_field_matches_the_frame_region() {
         art_id: 1,
         mime: "image/jpeg".to_string(),
         description: String::new(),
-        picture_type: 3,
+        picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
-        data_len: art_bytes.len() as u64,
+        data_len: BlobLen::new(art_bytes.len() as u64).unwrap(),
     }];
     let layout = synthesize_layout(0, audio.len() as u64, &tags, &[], &arts).unwrap();
     let bytes = assemble(&layout, &audio, &[(1, &art_bytes)]);
@@ -201,19 +201,19 @@ fn multiple_art_frames_keep_order() {
             art_id: 1,
             mime: "image/jpeg".to_string(),
             description: String::new(),
-            picture_type: 3,
+            picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
-            data_len: art1.len() as u64,
+            data_len: BlobLen::new(art1.len() as u64).unwrap(),
         },
         ArtInput {
             art_id: 2,
             mime: "image/png".to_string(),
             description: String::new(),
-            picture_type: 4,
+            picture_type: PictureType::new(4).unwrap(),
             width: 0,
             height: 0,
-            data_len: art2.len() as u64,
+            data_len: BlobLen::new(art2.len() as u64).unwrap(),
         },
     ];
     let layout = synthesize_layout(0, audio.len() as u64, &[], &[], &arts).unwrap();
@@ -246,10 +246,10 @@ fn synthesize_errors_on_oversized_frame() {
         art_id: 1,
         mime: "image/jpeg".to_string(),
         description: String::new(),
-        picture_type: 3,
+        picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
-        data_len: 0x1000_0000, // 256 MiB, over the per-frame limit
+        data_len: BlobLen::new(0x1000_0000).unwrap(), // 256 MiB, over the per-frame limit
     }];
     assert_eq!(
         synthesize_layout(0, 0, &[], &[], &arts),
@@ -266,10 +266,10 @@ fn synthesize_errors_when_frames_sum_past_the_tag_limit() {
         art_id: id,
         mime: "image/jpeg".to_string(),
         description: String::new(),
-        picture_type: u32::try_from(id).unwrap(),
+        picture_type: PictureType::new(u32::try_from(id).unwrap()).unwrap(),
         width: 0,
         height: 0,
-        data_len: 0x0800_0000, // 128 MiB each; two sum past the 256 MiB tag limit
+        data_len: BlobLen::new(0x0800_0000).unwrap(), // 128 MiB each; two sum past the 256 MiB tag limit
     };
     let arts = vec![art(1), art(2)];
     assert_eq!(
