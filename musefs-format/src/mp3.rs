@@ -534,8 +534,11 @@ pub fn read_pictures(data: &[u8]) -> Vec<EmbeddedPicture> {
     tag.pictures()
         .map(|p| EmbeddedPicture {
             mime: p.mime_type.clone(),
+            // The id3 crate's PictureType has an `Undefined(u8)` variant that can
+            // exceed 20; clamp out-of-range to 0, matching the FLAC parser and
+            // scan's prior policy.
             picture_type: PictureType::new(u8::from(p.picture_type).into())
-                .expect("id3 picture_type is always 0..=20"),
+                .unwrap_or(PictureType::ZERO),
             description: p.description.clone(),
             width: 0,
             height: 0,
