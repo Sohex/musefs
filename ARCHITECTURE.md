@@ -144,6 +144,10 @@ rather than compute them. Nothing in SQLite *prevents* an external writer
 from mutating scanner-owned fields — musefs treats such rows as untrusted
 input and degrades to a controlled `BackingChanged`/layout error when a row
 no longer matches its backing file, never undefined behavior.
+Referential gaps are treated the same way: a `track_art` row whose `art_id`
+has no matching `art` row (an orphan an external writer can produce with FK
+enforcement disabled) fails the serve with `EIO` rather than silently dropping
+the art.
 
 The shared Python library (`contrib/python-musefs/`) encodes this contract
 for plugin authors, including a generated copy of the schema
