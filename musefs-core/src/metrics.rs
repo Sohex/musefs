@@ -26,7 +26,7 @@ pub use imp::*;
 #[cfg(feature = "metrics")]
 mod imp {
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     static OPENS: AtomicU64 = AtomicU64::new(0);
@@ -39,6 +39,75 @@ mod imp {
     static SCAN_PREADS: AtomicU64 = AtomicU64::new(0);
     static SCAN_BYTES_READ: AtomicU64 = AtomicU64::new(0);
     static PREAD_FAULT: OnceLock<Option<Duration>> = OnceLock::new();
+
+    // Backing-read fault seam (test-only; process-global so it reaches the FUSE
+    // worker thread that actually performs the read — a thread-local set on the
+    // test thread would not). Kind: 0=none, 1=EIO, 2=short read. Distinct from
+    // the latency-only `set_fault_pread` hook above.
+    static BACKING_FAULT_KIND: AtomicU8 = AtomicU8::new(0);
+    static BACKING_FAULT_PREFIX: AtomicUsize = AtomicUsize::new(0);
+
+    /// A simulated backing-read failure, set per test via [`set_backing_fault`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BackingFault {
+        /// Return `EIO` instead of reading any bytes.
+        Eio,
+        /// Fill the first `prefix` bytes from the file, then return
+        /// `UnexpectedEof` (simulating a truncated/short pread).
+        ShortRead { prefix: usize },
+    }
+
+    /// Clears the global backing fault when dropped, so a fault never leaks past
+    /// the test that set it.
+    #[must_use = "the fault is cleared when this guard drops; bind it to a name"]
+    pub struct BackingFaultGuard(());
+
+    impl Drop for BackingFaultGuard {
+        fn drop(&mut self) {
+            BACKING_FAULT_KIND.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// Install a backing-read fault for the current test scope. Process-global:
+    /// tests using it must run single-threaded (their own `metrics`-gated test
+    /// binary), like `fault_injection.rs`.
+    pub fn set_backing_fault(fault: BackingFault) -> BackingFaultGuard {
+        match fault {
+            BackingFault::Eio => {
+                BACKING_FAULT_KIND.store(1, Ordering::SeqCst);
+            }
+            BackingFault::ShortRead { prefix } => {
+                BACKING_FAULT_PREFIX.store(prefix, Ordering::SeqCst);
+                BACKING_FAULT_KIND.store(2, Ordering::SeqCst);
+            }
+        }
+        BackingFaultGuard(())
+    }
+
+    /// Positioned backing read used by the serve path. Honors an injected fault
+    /// when one is set; otherwise a plain `read_exact_at`. The no-fault path is a
+    /// single relaxed atomic load.
+    pub fn backing_read_exact_at(
+        f: &std::fs::File,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        match BACKING_FAULT_KIND.load(Ordering::SeqCst) {
+            // EIO is 5 on Linux, macOS, and FreeBSD.
+            1 => return Err(std::io::Error::from_raw_os_error(5)),
+            2 => {
+                let p = BACKING_FAULT_PREFIX.load(Ordering::SeqCst).min(buf.len());
+                f.read_exact_at(&mut buf[..p], offset)?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "injected short backing read",
+                ));
+            }
+            _ => {}
+        }
+        f.read_exact_at(buf, offset)
+    }
 
     /// Sleep for the duration named by `var` (microseconds), parsed once.
     fn fault(var: &'static str, cell: &OnceLock<Option<Duration>>) {
@@ -163,6 +232,15 @@ mod imp {
     #[inline(always)]
     pub fn set_fault_pread(_d: Option<std::time::Duration>) {}
     #[inline(always)]
+    pub fn backing_read_exact_at(
+        f: &std::fs::File,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(buf, offset)
+    }
+    #[inline(always)]
     pub fn on_art_chunk() {}
     #[inline(always)]
     pub fn on_binary_tag_chunk() {}
@@ -212,5 +290,54 @@ mod tests {
         assert_eq!(s.scan_bytes_read, 4096 + 128);
         reset();
         assert_eq!(snapshot(), Snapshot::default());
+    }
+
+    #[test]
+    fn backing_fault_injects_eio_then_clears_on_drop() {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"hello world").unwrap();
+        let f = std::fs::File::open(tmp.path()).unwrap();
+
+        // No fault: real read succeeds.
+        let mut buf = [0u8; 5];
+        backing_read_exact_at(&f, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"hello");
+
+        {
+            let _guard = set_backing_fault(BackingFault::Eio);
+            let err = backing_read_exact_at(&f, &mut buf, 0).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(5), "EIO == 5");
+        }
+
+        // Guard dropped: fault cleared, real read works again.
+        let mut buf2 = [0u8; 5];
+        backing_read_exact_at(&f, &mut buf2, 6).unwrap();
+        assert_eq!(&buf2, b"world");
+
+        // Sanity: the std read path still fills the same bytes.
+        let mut direct = [0u8; 5];
+        f.read_exact_at(&mut direct, 0).unwrap();
+        assert_eq!(&direct, b"hello");
+    }
+
+    #[test]
+    fn backing_fault_short_read_fills_prefix_then_errors() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"abcdefgh").unwrap();
+        let f = std::fs::File::open(tmp.path()).unwrap();
+
+        let mut buf = [0u8; 8];
+        let _guard = set_backing_fault(BackingFault::ShortRead { prefix: 3 });
+        let err = backing_read_exact_at(&f, &mut buf, 0).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            &buf[..3],
+            b"abc",
+            "prefix bytes were filled before the fault"
+        );
     }
 }
