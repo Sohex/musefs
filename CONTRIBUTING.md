@@ -321,14 +321,18 @@ cargo test -p musefs-fuse --test concurrent_reads -- --ignored  # mount: DbPool:
 CI runs the core test under **AddressSanitizer** as a required gate (`asan` job)
 and both tests under **ThreadSanitizer** as a non-required best-effort signal
 (`tsan` job, `continue-on-error`). TSan cannot instrument the system C libraries
-(libfuse, libsqlite3), so it is a signal, not a gate — reproduce locally with:
+(libfuse, libsqlite3), so it is a signal, not a gate. ASan is ABI-compatible with
+an uninstrumented std, but TSan is not — so the TSan command needs `-Zbuild-std`
+(and the `rust-src` component) to rebuild std with the sanitizer. Reproduce
+locally with:
 
 ```bash
 rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly   # for TSan's -Zbuild-std
 RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS="detect_leaks=0" \
   cargo +nightly test -p musefs-core --test concurrent_reads --target x86_64-unknown-linux-gnu
-RUSTFLAGS="-Zsanitizer=thread" \
-  cargo +nightly test -p musefs-core --test concurrent_reads --target x86_64-unknown-linux-gnu
+RUSTFLAGS="-Zsanitizer=thread" TSAN_OPTIONS="halt_on_error=0" \
+  cargo +nightly test -p musefs-core -Zbuild-std --test concurrent_reads --target x86_64-unknown-linux-gnu
 ```
 
 ### Coverage

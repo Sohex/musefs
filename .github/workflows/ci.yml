@@ -334,6 +334,11 @@ jobs:
     # instrument the system C libs (libfuse, libsqlite3), so it sees races in
     # our code around the FFI but may miss or false-positive inside the C deps.
     # continue-on-error keeps a noisy run from showing as a hard failure.
+    #
+    # Unlike AddressSanitizer (which is ABI-compatible with an uninstrumented
+    # std), ThreadSanitizer changes the ABI, so nightly rejects linking tsan
+    # crates against a non-tsan std. We therefore rebuild std with the sanitizer
+    # via `-Zbuild-std` (needs the `rust-src` component).
     needs: changes
     if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
@@ -348,20 +353,21 @@ jobs:
         with:
           toolchain: nightly
           targets: x86_64-unknown-linux-gnu
+          components: rust-src
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - name: ThreadSanitizer (core concurrent reads)
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
           TSAN_OPTIONS: "halt_on_error=0"
         run: >-
-          cargo +nightly test -p musefs-core --test concurrent_reads
+          cargo +nightly test -p musefs-core -Zbuild-std --test concurrent_reads
           --target x86_64-unknown-linux-gnu
       - name: ThreadSanitizer (mount concurrent reads, best-effort)
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
           TSAN_OPTIONS: "halt_on_error=0"
         run: >-
-          cargo +nightly test -p musefs-fuse --test concurrent_reads
+          cargo +nightly test -p musefs-fuse -Zbuild-std --test concurrent_reads
           --target x86_64-unknown-linux-gnu -- --ignored
 
   freebsd:

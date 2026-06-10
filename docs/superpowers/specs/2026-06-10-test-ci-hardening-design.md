@@ -256,12 +256,13 @@ on the serve path, and this is by design, not a gap:
 These are deferred to the plan, but flagged here so they are decided
 deliberately rather than discovered mid-implementation:
 
-- **Sanitizers over C deps (B).** ASan/TSan need a nightly toolchain. Whether to
-  use `-Zbuild-std` for instrumented std, and whether `libsqlite3-sys` /
-  `fuser`'s C is built with usable symbolization, must be pinned. The fallback if
-  `-Zbuild-std` proves too slow/flaky is ASan without it (still catches workspace
-  + FFI-boundary memory errors). ASan is the required gate, so its config must be
-  reliable; TSan can stay noisy.
+- **Sanitizers over C deps (B) — resolved.** ASan/TSan need a nightly toolchain.
+  ASan is ABI-compatible with an uninstrumented std, so the **required** ASan gate
+  runs without `-Zbuild-std` (fast, reliable; still catches workspace + FFI-boundary
+  memory errors via global malloc interposition). TSan is **not** ABI-compatible —
+  nightly hard-errors linking tsan crates against a non-tsan std — so the
+  best-effort TSan job **must** use `-Zbuild-std` (+ `rust-src`); it is not optional.
+  Both verified locally: ASan and TSan core runs are clean (3 passed, 0 races).
 - **DB read-path faults (C) — resolved.** Only **byte-corruption** is a
   reachable, mandatory read-path DB fault and is covered. `SQLITE_BUSY`/lock is
   unreachable on the read-only WAL serve path by design (see "DB faults via real
