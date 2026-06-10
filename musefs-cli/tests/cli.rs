@@ -123,6 +123,7 @@ fn parse_mount_config_defaults_are_sensible() {
         db: "/tmp/x.db".into(),
         template: "$artist/$title".to_string(),
         default_fallback: "Unknown".to_string(),
+        fallbacks: vec![],
         mode: musefs_cli::CliMode::Synthesis,
         poll_interval_ms: 1000,
         attr_ttl_ms: 1000,
@@ -150,6 +151,7 @@ fn parse_mount_config_keep_cache_sets_flag() {
         db: "/tmp/x.db".into(),
         template: "$title".to_string(),
         default_fallback: "Unknown".to_string(),
+        fallbacks: vec![],
         mode: musefs_cli::CliMode::StructureOnly,
         poll_interval_ms: 250,
         attr_ttl_ms: 5000,
@@ -173,6 +175,7 @@ fn parse_mount_config_saturating_readahead() {
         db: "/tmp/x.db".into(),
         template: "$title".to_string(),
         default_fallback: "Unknown".to_string(),
+        fallbacks: vec![],
         mode: musefs_cli::CliMode::Synthesis,
         poll_interval_ms: 1000,
         attr_ttl_ms: 1000,
@@ -183,4 +186,110 @@ fn parse_mount_config_saturating_readahead() {
     };
     let (_, fuse_config) = parse_mount_config(&args);
     assert_eq!(fuse_config.max_readahead, u32::MAX);
+}
+
+#[test]
+fn parses_repeatable_fallback_flag() {
+    let cli = Cli::parse_from([
+        "musefs",
+        "mount",
+        "/mnt/x",
+        "--db",
+        "/tmp/m.db",
+        "--fallback",
+        "albumartist=Unknown Artist",
+        "--fallback",
+        "genre=Misc",
+    ]);
+    match cli.command {
+        Command::Mount(args) => assert_eq!(
+            args.fallbacks,
+            vec![
+                ("albumartist".to_string(), "Unknown Artist".to_string()),
+                ("genre".to_string(), "Misc".to_string()),
+            ]
+        ),
+        Command::Scan { .. } => panic!("expected mount"),
+    }
+}
+
+#[test]
+fn parse_mount_config_populates_per_field_fallbacks() {
+    let args = MountArgs {
+        mountpoint: "/mnt/x".into(),
+        db: "/tmp/x.db".into(),
+        template: "$albumartist/$title".to_string(),
+        default_fallback: "Unknown".to_string(),
+        fallbacks: vec![
+            ("albumartist".to_string(), "Unknown Artist".to_string()),
+            ("genre".to_string(), "Misc".to_string()),
+        ],
+        mode: musefs_cli::CliMode::Synthesis,
+        poll_interval_ms: 1000,
+        attr_ttl_ms: 1000,
+        max_readahead_kib: 512,
+        max_background: 64,
+        keep_cache: false,
+        case_insensitive: false,
+    };
+    let (config, _) = parse_mount_config(&args);
+    assert_eq!(
+        config.fallbacks.get("albumartist").map(String::as_str),
+        Some("Unknown Artist")
+    );
+    assert_eq!(
+        config.fallbacks.get("genre").map(String::as_str),
+        Some("Misc")
+    );
+}
+
+#[test]
+fn fallback_value_may_contain_equals_and_last_duplicate_wins() {
+    let cli = Cli::parse_from([
+        "musefs",
+        "mount",
+        "/mnt/x",
+        "--db",
+        "/tmp/m.db",
+        "--fallback",
+        "comment=a=b",
+        "--fallback",
+        "artist=first",
+        "--fallback",
+        "artist=second",
+    ]);
+    let args = match cli.command {
+        Command::Mount(args) => args,
+        Command::Scan { .. } => panic!("expected mount"),
+    };
+    // Only the first '=' separates; the value keeps the rest verbatim.
+    assert_eq!(
+        args.fallbacks[0],
+        ("comment".to_string(), "a=b".to_string())
+    );
+    let (config, _) = parse_mount_config(&args);
+    // Duplicate field: the last value wins in the resulting map.
+    assert_eq!(
+        config.fallbacks.get("artist").map(String::as_str),
+        Some("second")
+    );
+    assert_eq!(
+        config.fallbacks.get("comment").map(String::as_str),
+        Some("a=b")
+    );
+}
+
+#[test]
+fn fallback_without_equals_is_rejected() {
+    let err = Cli::try_parse_from([
+        "musefs",
+        "mount",
+        "/mnt/x",
+        "--db",
+        "/tmp/m.db",
+        "--fallback",
+        "noequals",
+    ])
+    .unwrap_err();
+    assert!(err.to_string().contains("FIELD=VALUE"), "{err}");
 }
