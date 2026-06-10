@@ -1,0 +1,93 @@
+{
+ "id": "0520eabc-e117-48ce-b229-a6ea84c349aa",
+ "oldids": [],
+ "disambiguation": "",
+ "title": "The adventure goes on, vol.1",
+ "aliases": [],
+ "type": "Album",
+ "secondarytypes": [],
+ "releasedate": "2020-05-03",
+ "artistid": "fca800c1-6fc3-4bfb-a5de-8c2398c27bc0",
+ "rating": {
+  "Count": 0,
+  "Value": null
+ },
+ "links": [],
+ "genres": [],
+ "images": [
+  {
+   "CoverType": "Cover",
+   "Url": "https://images.lidarr.audio/cache/https://coverartarchive.org/release/59d2fc91-8a6a-45da-9e12-51b01d2a50d7/37224917897-1200.jpg",
+   "remoteUrl": "https://coverartarchive.org/release/59d2fc91-8a6a-45da-9e12-51b01d2a50d7/37224917897-1200.jpg"
+  }
+ ],
+ "Releases": [
+  {
+   "Id": "59d2fc91-8a6a-45da-9e12-51b01d2a50d7",
+   "OldIds": [],
+   "Title": "The adventure goes on, vol.1",
+   "Status": "Official",
+   "Disambiguation": "",
+   "Country": [
+    "[Worldwide]"
+   ],
+   "Label": [],
+   "Media": [
+    {
+     "Position": 1,
+     "Name": "",
+     "Format": "Digital Media"
+    }
+   ],
+   "ReleaseDate": "2020-05-03",
+   "TrackCount": 1,
+   "Tracks": [
+    {
+     "Id": "7fe0e7ac-d373-4c34-9a47-f4582ed345ef",
+     "OldIds": [],
+     "ArtistId": "fca800c1-6fc3-4bfb-a5de-8c2398c27bc0",
+     "RecordingId": "c6c102b4-755a-4fff-ab96-f2bbd6d39deb",
+     "OldRecordingIds": [],
+     "TrackName": "The calling",
+     "TrackNumber": "1",
+     "TrackPosition": 1,
+     "DurationMs": 2000,
+     "MediumNumber": 1
+    }
+   ]
+  }
+ ],
+ "overview": null,
+ "artists": [
+  {
+   "artistaliases": [],
+   "artistname": "Komiku",
+   "disambiguation": "music for non-existing videogame",
+   "genres": [],
+   "id": "fca800c1-6fc3-4bfb-a5de-8c2398c27bc0",
+   "images": [],
+   "links": [
+    {
+     "target": "http://loyaltyfreakmusic.com/",
+     "type": "loyaltyfreakmusic"
+    },
+    {
+     "target": "http://freemusicarchive.org/music/Komiku/",
+     "type": "freemusicarchive"
+    }
+   ],
+   "oldids": [],
+   "overview": null,
+   "rating": {
+    "Count": 0,
+    "Value": null
+   },
+   "sortname": "Komiku",
+   "status": "active",
+   "type": "Person"
+  }
+ ],
+ "releasestatuses": [
+  "Official"
+ ]
+}
