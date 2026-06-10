@@ -33,7 +33,7 @@ def _http_fetch(url: str) -> str:
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             raise FileNotFoundError(url) from exc
-        raise
+        raise RuntimeError(f"HTTP {exc.code} fetching {url}: {exc.reason}") from exc
 
 
 def is_published(name: str, version: str, *, fetch=_http_fetch) -> bool:
@@ -47,7 +47,11 @@ def is_published(name: str, version: str, *, fetch=_http_fetch) -> bool:
         line = line.strip()
         if not line:
             continue
-        if json.loads(line).get("vers") == version:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("vers") == version:
             return True
     return False
 

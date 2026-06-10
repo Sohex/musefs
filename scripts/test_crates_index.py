@@ -36,5 +36,5 @@ def test_is_published_uses_correct_url():
         seen["url"] = url
         return '{"vers":"1.0.0"}\n'
 
-    is_published("musefs-db", "1.0.0", fetch=fetch)
+    assert is_published("musefs-db", "1.0.0", fetch=fetch) is True
     assert seen["url"] == "https://index.crates.io/mu/se/musefs-db"
