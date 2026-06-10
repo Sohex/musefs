@@ -17,6 +17,16 @@ This plan is Component 2 of the release-process hardening spec:
 > a green `workflow_dispatch` run (Task 7). Do not claim the integration works
 > until that run is green.
 
+> **Superseded (2026-06-10 acceptance run):** Task 5's real-Lidarr leg as first
+> drafted (point Lidarr at the host-installed `musefs-lidarr-import`) does **not**
+> work — Lidarr runs in an Alpine/.NET container that cannot see host paths and
+> ships no python3 (Lidarr returns `400 "File does not exist"`). The shipped
+> harness instead bind-mounts the plugin source + a committed wrapper
+> (`scripts/lidarr_import_wrapper.sh`), `docker exec`s `apk add python3` (~2s),
+> and points the Custom Script at the in-container wrapper. See `scripts/lidarr-smoke.sh`
+> and the spec's Component 2 for the as-built design; the full harness was run
+> green locally (both legs).
+
 ---
 
 ## Background the executor needs (verified against the code)

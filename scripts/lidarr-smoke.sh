@@ -14,7 +14,12 @@ set -euo pipefail
 
 MUSEFS="${1:?usage: lidarr-smoke.sh /path/to/musefs}"
 LIDARR_IMAGE="${LIDARR_IMAGE:?set LIDARR_IMAGE to a pinned linuxserver/lidarr@sha256:... digest}"
+# Overridable for local runs (e.g. a host already running Lidarr on 8686, or
+# podman instead of docker); CI uses the defaults.
+: "${DOCKER:=docker}"
+: "${LIDARR_HOST_PORT:=8686}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d)"
 CID=""; MOCK_PID=""; MOUNT_PID=""
 API_KEY="musefssmoke0000000000000000000000"
@@ -25,7 +30,7 @@ cleanup() {
   [ -n "$MOUNT_PID" ] && kill "$MOUNT_PID" 2>/dev/null || true
   fusermount3 -u "$WORK/mnt" 2>/dev/null || true
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
-  [ -n "$CID" ] && docker rm -f "$CID" >/dev/null 2>&1 || true
+  [ -n "$CID" ] && "$DOCKER" rm -f "$CID" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -45,15 +50,26 @@ print(json.dumps({p: sha256_file(p) for p in sys.argv[1:]}))
 PY
 
 # ---- (A) Real-instance exec proof -----------------------------------------
-CID="$(docker run -d --rm -e PUID=0 -e PGID=0 -e TZ=UTC \
-  -e LIDARR__AUTH__APIKEY="$API_KEY" -p 8686:8686 "$LIDARR_IMAGE")"
+# Boot real Lidarr with the plugin source bind-mounted and the wrapper as its
+# Custom Script. The Alpine/.NET image has no python3, so install it in the
+# container (~2s from Alpine's repos); the wrapper then runs the REAL
+# musefs-lidarr-import. Firing the Test event proves Lidarr execs the real
+# script and that lidarr_get resolves Lidarr's lowercased env keys end to end.
+BASE="http://localhost:${LIDARR_HOST_PORT}"
+CID="$("$DOCKER" run -d --rm -e PUID=0 -e PGID=0 -e TZ=UTC \
+  -e LIDARR__AUTH__APIKEY="$API_KEY" -p "${LIDARR_HOST_PORT}:8686" \
+  -v "$REPO/contrib/lidarr/src":/musefs/lidarr-src:ro \
+  -v "$REPO/contrib/python-musefs/src":/musefs/common-src:ro \
+  -v "$HERE/lidarr_import_wrapper.sh":/musefs/bin/import.sh:ro \
+  "$LIDARR_IMAGE")"
 for _ in $(seq 1 60); do
-  curl -fsS -H "X-Api-Key: $API_KEY" "http://localhost:8686/api/v1/system/status" >/dev/null 2>&1 && break
+  curl -fsS -H "X-Api-Key: $API_KEY" "$BASE/api/v1/system/status" >/dev/null 2>&1 && break
   sleep 2
 done
-curl -fsS -H "X-Api-Key: $API_KEY" "http://localhost:8686/api/v1/system/status" >/dev/null
-python3 "$HERE/configure_connection.py" --url "http://localhost:8686" --api-key "$API_KEY" \
-  --script "$(command -v musefs-lidarr-import)"
+curl -fsS -H "X-Api-Key: $API_KEY" "$BASE/api/v1/system/status" >/dev/null
+"$DOCKER" exec --user 0 "$CID" apk add --no-cache python3 >/dev/null
+python3 "$HERE/configure_connection.py" --url "$BASE" --api-key "$API_KEY" \
+  --script /musefs/bin/import.sh
 
 # ---- (B) Content leg against the mock --------------------------------------
 python3 "$HERE/mock_lidarr.py" --port "$PORT" \
