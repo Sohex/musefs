@@ -1414,6 +1414,24 @@ mod hardening_tests {
     }
 
     #[test]
+    fn collect_audio_ignores_symlink_to_non_file_target_when_following() {
+        let dir = tempfile::tempdir().unwrap();
+        // A unix socket is neither a regular file nor a directory.
+        let sock = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Name the link with a supported audio extension so the only thing
+        // keeping it out of `out` is the resolved target's is_file() check.
+        std::os::unix::fs::symlink(&sock, dir.path().join("link.flac")).unwrap();
+
+        let mut out = Vec::new();
+        collect_audio(dir.path(), &mut out, true).unwrap();
+        assert!(
+            out.is_empty(),
+            "a symlink to a non-file, non-dir target must not be collected"
+        );
+    }
+
+    #[test]
     fn probe_returns_none_for_supported_ext_with_garbage_contents() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["bad.flac", "bad.mp3", "bad.m4a", "bad.wav", "bad.opus"] {
