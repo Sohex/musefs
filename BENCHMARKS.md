@@ -641,3 +641,104 @@ ogg cold/seek collapse.
 _Criterion's own `change:` lines compare against the previous on-machine baseline
 (itself already optimized); the absolutes above are the reliable end-to-end
 signal._
+
+---
+
+## Storage tunables
+
+A proposed `--storage-profile {ssd,hdd,nfs}` preset would have bumped
+`--max-readahead-kib` and `--max-background` (and enabled `--keep-cache`) per medium,
+on the premise that "larger read-ahead hides HDD/NFS latency." Measured against real
+storage, **that premise does not hold** — only `--keep-cache` shows a benefit — so the
+preset was dropped and these flags keep their defaults. This section records the
+evidence.
+
+### Methodology
+
+Unlike the optimization passes above (tmpfs, in-process Criterion), these run through a
+**real kernel mount with a real reader**, because the tunables are kernel↔FUSE
+negotiation parameters invisible to an in-process driver:
+
+- **Backing:** real RAID-1 HDD (`/home`, `/dev/md127`) and a btrfs HDD span (`/data`,
+  `/dev/sda3`); for NFS, a loopback **NFSv4.2** export (`exportfs` + `mount -t nfs
+  localhost:…`) whose backing is tmpfs (isolates the RPC tax) or HDD (RPC + seeks).
+- **Latency:** `tc qdisc add dev lo root netem delay <X>ms` adds `X` per packet
+  → ≈`2X` RTT per NFS RPC. Tested at 8 ms, 50 ms, and 200 ms RTT (the last ≈ a
+  trans-Pacific server).
+- **Cold reads:** `sync; echo 3 > /proc/sys/vm/drop_caches` before each measured read —
+  without it the page cache serves repeats and hides all backing latency.
+- **Mode: `synthesis`, not `structure-only`.** Structure-only triggers kernel FUSE
+  passthrough when the process is privileged (these run as root), which serves the
+  backing fd directly and **bypasses the daemon read path** — and with it every tunable
+  that acts on that path. Synthesis splices `BackingAudio` reads through the daemon,
+  the real serving path.
+- **Why not the injected `MUSEFS_FAULT_*_US` model:** it cannot show a read-ahead
+  effect. FUSE delivers reads to the daemon in fixed ≤256 KiB chunks (`max_pages`,
+  already pinned at the kernel's 1 MiB ceiling by `fuser`'s 16 MiB default
+  `max_write`), so the per-`pread` count — and thus any per-`pread` injected latency
+  total — is independent of `max_readahead`.
+
+Reproduce: `benches/storage_tunables_bench.sh` (needs `/dev/fuse`, root, and for the
+NFS rows `nfs-kernel-server` + `tc`). HDD numbers are noisy (±10–15%); the trends, not
+the digits, are the signal.
+
+### `--max-readahead-kib` — no benefit anywhere; hurts on HDD
+
+Cold single-stream sequential throughput (MB/s), `synthesis`:
+
+| readahead KiB | HDD /home (RAID1) | HDD /data (btrfs) | NFS 8 ms | NFS-on-HDD 50 ms | NFS-on-HDD 200 ms |
+|--------------:|------------------:|------------------:|---------:|-----------------:|------------------:|
+| 512 (default) | 248 | 127 | 30.8 | 4.7 | 1.3 |
+| 2048          | 191 | 72  | 30.6 | 4.9 | 1.3 |
+| 4096          | 153 | 84  | 30.5 | 4.9 | 1.3 |
+| 32 (probe)    | 237 | 75  | —    | —   | —   |
+
+(File sizes differ per column — 512 MiB local, 96 MiB at 50 ms, 48 MiB at 200 ms — so
+compare *within* a column, not across. The 200 ms column ≈ a trans-Pacific server:
+flat to the last digit.)
+
+The window size barely moves throughput, and on HDD values ≥2048 KiB are among the
+**slowest** (peak is ~128–512 KiB). The reason is visible on NFS: 512 MiB ÷ 256 KiB ×
+8 ms ≈ 16 s ≈ the observed 31 MB/s — a single stream is served **serially**, one
+≤256 KiB read at a time, each paying the full RTT, with no prefetch overlap that a
+larger window could exploit.
+
+### `--max-background` — no effect on read throughput
+
+Wall time (s) for N concurrent cold streams over distinct tracks:
+
+| max_background | HDD /home (16 streams) | NFS 8 ms (16) | NFS-on-HDD 50 ms (80) | NFS-on-HDD 200 ms (24) |
+|---------------:|-----------------------:|--------------:|----------------------:|-----------------------:|
+| 64 (default)   | 4.55 | 5.16 | 177.8 | 238.5 |
+| 128            | 5.05 | 5.18 | 175.7 | 237.4 |
+
+64 ≈ 128 even with 80 > 64 streams. Expected: musefs's `FuseConfig` notes
+`max_background` caps *background* work and that "foreground reads are bounded only by
+client concurrency, not by this." The concurrent reads here are foreground.
+(Concurrency *does* hide latency — 16 NFS streams reach ~10× single-stream aggregate —
+but that is client parallelism, which `max_background` does not gate.)
+
+### `--keep-cache` — the one real win (~3×)
+
+Cold read then immediate reopen (no cache drop between); `reopen_s` is the signal:
+
+| keep_cache | HDD reopen (s) | NFS 8 ms reopen (s) | NFS-on-HDD 50 ms reopen (s) |
+|-----------:|---------------:|--------------------:|----------------------------:|
+| false      | 0.224 | 0.207 | 0.039 |
+| true       | 0.062 | 0.060 | 0.014 |
+
+With `--keep-cache` the kernel retains the page cache across opens, so a re-opened file
+is served from RAM instead of re-fetched over slow storage — **~3× faster reopen**,
+consistent across HDD and NFS. This is the only tunable worth changing for slow backing
+(relevant for players/scanners that re-open files), and it needs no preset.
+
+### Conclusions
+
+- **Drop the `--storage-profile` preset.** Of the four knobs it would have set, three
+  (`max_readahead`, `max_background`, and by extension a per-medium combination of them)
+  show no benefit; `max_readahead` ≥2048 KiB actively hurts on HDD. The only justified
+  change — enable `--keep-cache` on HDD/NFS — does not need an abstraction.
+- **Latent finding (future work):** single-stream reads are serialized, so per-read
+  latency is never hidden by prefetch. The real lever for slow backing would be a
+  **concurrent backing-prefetch pipeline in the daemon** (issue several `BackingAudio`
+  reads ahead in parallel), an architectural change tracked separately.
