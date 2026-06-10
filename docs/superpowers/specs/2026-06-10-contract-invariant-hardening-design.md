@@ -206,13 +206,26 @@ with no validatable invariant (`art_id`, `payload_id`/`rowid`, `track_id`) stay 
 
 ### Placement
 
-`TryFrom`/validated constructors live at the `musefs-db` row readers (untrusted SQL
-row → validated type) and the scanner's picture-extraction path (untrusted file
-bytes → validated type), rejecting bad rows/bytes at the boundary rather than deep
-in a consumer. `musefs-format` synthesis inputs (`ArtInput`, `BinaryTagInput`)
-accept the validated types instead of bare primitives. Two follow-throughs the plan
-must honor: (1) the fuzz crate builds these inputs, so `cargo +nightly fuzz build`
-is part of Plan C verification; (2) the DTOs carry
+`musefs-db` and `musefs-format` are **independent sibling crates** (format depends
+on db only as a dev-dependency); `musefs-core` depends on both and bridges them.
+Type homes follow from that:
+
+- **`TrackBounds`** lives in `musefs-db` — it wraps `tracks` columns, so its
+  `TryFrom` validation lives at the `tracks` row reader (untrusted SQL row →
+  validated type), exactly the boundary the spec wants.
+- **`PictureType`** and **`BlobLen`** live in `musefs-format` — they are
+  synthesis-input/segment concerns (`ArtInput`, `BinaryTagInput`, `EmbeddedPicture`,
+  `Segment`). `musefs-db` cannot name them (it does not depend on format), so the
+  DB row types (`TrackArt.picture_type`, `art.byte_len`) stay raw and are guarded at
+  runtime by the #199 CHECKs. The validated construction happens in `musefs-core`,
+  at the two real boundaries it owns: the scan path (untrusted file bytes →
+  `PictureType`/`BlobLen` when building `EmbeddedPicture`) and the db→format bridge
+  (validated db row → `ArtInput`/`BinaryTagInput`). This is defense at *both* the DB
+  boundary (CHECK) and the format-construction boundary (newtype), without a shared
+  cross-crate type or a new production dependency.
+
+Two follow-throughs the plan must honor: (1) the fuzz crate builds these inputs, so
+`cargo +nightly fuzz build` is part of Plan C verification; (2) the DTOs carry
 `#[cfg_attr(feature = "mutants", derive(Default))]` (`models.rs`), so any newtype
 embedded in them must also derive/implement `Default` under the `mutants` feature or
 the mutation-gate build breaks.
