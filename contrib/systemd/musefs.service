@@ -1,0 +1,24 @@
+[Unit]
+Description=musefs read-only re-tagging FUSE mount
+Documentation=https://github.com/Sohex/musefs
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/musefs/musefs.conf
+# The --user manager does not inherit a login shell's PATH, so a cargo-installed
+# binary in ~/.cargo/bin is not found by a bare `musefs`. Adjust this PATH (or
+# replace ExecStart with an absolute path) to match where musefs is installed.
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin
+ExecStart=musefs mount
+# musefs unmounts cleanly on SIGTERM (systemd's default stop signal), so no
+# ExecStop is required. Uncomment as a fallback if a mount is ever left behind:
+#ExecStop=-fusermount3 -u ${MUSEFS_MOUNTPOINT}
+Restart=on-failure
+RestartSec=5
+# NoNewPrivileges is safe for a FUSE mount. Do NOT add ProtectHome=,
+# PrivateMounts=, or MountFlags=private: they place the mount in a private
+# namespace and hide it from the rest of your session.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
