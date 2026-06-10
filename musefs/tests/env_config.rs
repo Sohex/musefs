@@ -185,3 +185,35 @@ fn valid_boolean_env_is_accepted() {
     assert_ne!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("opening database"), "stderr: {stderr}");
 }
+
+#[test]
+fn scan_reads_db_from_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("library");
+    std::fs::create_dir(&target).unwrap();
+    let db = dir.path().join("scan-env.db");
+    let out = musefs()
+        .arg("scan")
+        .arg(&target) // targets stay command-line only
+        .env("MUSEFS_DB", &db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        db.exists(),
+        "scan should create the DB at the MUSEFS_DB path"
+    );
+}
+
+#[test]
+fn scan_help_lists_env_vars() {
+    let out = musefs().args(["scan", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MUSEFS_DB"), "stdout: {stdout}");
+    assert!(stdout.contains("MUSEFS_JOBS"), "stdout: {stdout}");
+}

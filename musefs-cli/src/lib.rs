@@ -119,22 +119,22 @@ pub enum Command {
         #[arg(required = true, num_args = 1..)]
         targets: Vec<PathBuf>,
         /// Path to the SQLite database (created if absent).
-        #[arg(long)]
+        #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
         /// Re-validate: skip unchanged files, prune tracks whose backing file is
         /// gone, and garbage-collect orphaned art.
-        #[arg(long)]
+        #[arg(long, env = "MUSEFS_REVALIDATE")]
         revalidate: bool,
         /// Probe worker threads (0 = available parallelism). 1 = sequential.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, env = "MUSEFS_JOBS", default_value_t = 0)]
         jobs: usize,
         /// Follow symlinks while walking directories. Off by default: symlinked
         /// files and directories are logged and skipped.
-        #[arg(long)]
+        #[arg(long, env = "MUSEFS_FOLLOW_SYMLINKS")]
         follow_symlinks: bool,
         /// Suppress the per-target summary on stdout (failures still surface via
         /// the `log` facade on stderr; raise detail with `RUST_LOG=info`).
-        #[arg(long, short)]
+        #[arg(long, short, env = "MUSEFS_QUIET")]
         quiet: bool,
     },
     /// Mount a read-only FUSE view of the store.
