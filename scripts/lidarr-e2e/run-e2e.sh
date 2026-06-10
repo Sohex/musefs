@@ -28,9 +28,13 @@ ART_ID=1
 W="$(mktemp -d)"; CID=lidarr-e2e-$$; M1=""; M2=""; M3=""
 cleanup(){ for p in $M1 $M2 $M3; do kill "$p" 2>/dev/null||true; done
   [ -n "${MOUNT_PID:-}" ] && kill "$MOUNT_PID" 2>/dev/null||true; fusermount3 -u "$W/mnt" 2>/dev/null||true
-  "$DOCKER" rm -f "$CID" >/dev/null 2>&1||true; rm -rf "$W"; }
+  "$DOCKER" rm -f "$CID" >/dev/null 2>&1||true; reown "$W"; rm -rf "$W"; }
 trap cleanup EXIT
 fail(){ echo "FAIL: $*" >&2; exit 1; }
+# Rootful Docker writes bind-mounted files as real root; chown them back to the
+# runner so the host can edit/read/delete them. No-op under rootless podman
+# (already mapped to the host user) and where passwordless sudo is unavailable.
+reown(){ sudo -n chown -R "$(id -u):$(id -g)" "$@" 2>/dev/null || true; }
 api(){ curl -sS -H "X-Api-Key: $KEY" -H "Content-Type: application/json" "$@"; }
 jq1(){ python3 -c "import json,sys;d=json.load(sys.stdin);print($1)"; }
 
@@ -66,6 +70,7 @@ sleep 1
 
 echo "=== boot Lidarr ==="
 "$DOCKER" run -d --name "$CID" -e PUID=0 -e PGID=0 -e TZ=UTC -e LIDARR__AUTH__APIKEY="$KEY" \
+  --add-host=host.containers.internal:host-gateway \
   -p "${LIDARR_HOST_PORT}:8686" -v "$W/config":/config \
   -v "$W/downloads":"$W/downloads" -v "$LIB":"$LIB" -v "$W/store":/musefs/store -v "$W/bin":/musefs/bin \
   -v "$REPO/contrib/lidarr/src":/musefs/lidarr-src:ro -v "$REPO/contrib/python-musefs/src":/musefs/common-src:ro \
@@ -74,6 +79,7 @@ for _ in $(seq 1 90); do curl -fsS -H "X-Api-Key: $KEY" "$B/system/status" >/dev
 "$DOCKER" exec --user 0 "$CID" apk add --no-cache python3 >/dev/null 2>&1 || fail "apk python3"
 DB=$(find "$W/config" -name lidarr.db|head -1)
 "$DOCKER" stop -t 20 "$CID" >/dev/null
+reown "$W/config"   # lidarr.db is root-owned under rootful Docker; make it host-writable
 python3 -c "import sqlite3;c=sqlite3.connect('$DB');c.execute(\"INSERT OR REPLACE INTO Config (Key,Value) VALUES ('metadatasource',?)\",('http://$HC:9701/api/v0.4',));c.commit();c.close()" || fail "metadatasource"
 "$DOCKER" start "$CID" >/dev/null
 for _ in $(seq 1 90); do curl -fsS -H "X-Api-Key: $KEY" "$B/system/status" >/dev/null 2>&1 && break; sleep 2; done
@@ -103,6 +109,9 @@ for _ in $(seq 1 24); do
 done
 [ -n "$IMPORTED" ] || { echo "--- lidarr log ---"; "$DOCKER" exec "$CID" sh -c 'tail -n 40 /config/logs/lidarr.txt'|grep -iE 'import|reject|script|sync'|tail -15; fail "import did not complete"; }
 
+# The in-container sync/import (root under rootful Docker) wrote the store +
+# library symlinks; chown the tree so the host musefs read/mount/assert path works.
+reown "$W"
 echo "=== assertions ==="
 LIBFILE="$LIB/Komiku/01 - The calling.flac"
 [ -L "$LIBFILE" ] || fail "library entry is not a symlink (import script didn't run): $(ls -l "$LIBFILE")"
