@@ -291,6 +291,28 @@ Sharp edges:
   Rust-regex/Python-`re` shared subset the guard allows (`\. \d + | ^ ( ) *`,
   no inline `(?...)` groups).
 
+### Concurrency + sanitizers
+
+Concurrent-reader coverage exists at two levels:
+
+```bash
+cargo test -p musefs-core --test concurrent_reads          # core: HeaderCache + WAL reads (default suite)
+cargo test -p musefs-fuse --test concurrent_reads -- --ignored  # mount: DbPool::PerThread (needs /dev/fuse)
+```
+
+CI runs the core test under **AddressSanitizer** as a required gate (`asan` job)
+and both tests under **ThreadSanitizer** as a non-required best-effort signal
+(`tsan` job, `continue-on-error`). TSan cannot instrument the system C libraries
+(libfuse, libsqlite3), so it is a signal, not a gate — reproduce locally with:
+
+```bash
+rustup toolchain install nightly
+RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS="detect_leaks=0" \
+  cargo +nightly test -p musefs-core --test concurrent_reads --target x86_64-unknown-linux-gnu
+RUSTFLAGS="-Zsanitizer=thread" \
+  cargo +nightly test -p musefs-core --test concurrent_reads --target x86_64-unknown-linux-gnu
+```
+
 ### Coverage
 
 ```bash
