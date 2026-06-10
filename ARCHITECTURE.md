@@ -181,6 +181,10 @@ keys, any number of such tags (`beets_path`, `lidarr_path`, …) can back
 different concurrent mounts. The path field keeps embedded `/` as directory
 separators but sanitizes each segment and drops empty/`.`/`..` segments, so a
 misbehaving writer cannot inject traversal or empty components into the tree.
+CI proves this contract end to end in the `contract` job (see
+[CONTRIBUTING](CONTRIBUTING.md)): a Python writer's tags/art, layered on a
+scanned track, are synthesized by the Rust serve path and read back by an
+independent reader.
 
 Connections are mode-typed (`Db<ReadWrite>` / `Db<ReadOnly>`), opened in WAL
 mode with a busy timeout. The serve path uses a `DbPool` whose per-thread
