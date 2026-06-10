@@ -277,20 +277,24 @@ mod tests {
 
     use super::*;
 
-    // The counters and `reset()` are process-global, so these tests serialize on
-    // a shared lock rather than clobbering each other when run on parallel
-    // threads in this binary.
-    static COUNTERS_LOCK: Mutex<()> = Mutex::new(());
+    // The counters/`reset()` and the backing-fault seam are process-global, so
+    // every test that touches them serializes on this shared lock rather than
+    // clobbering each other when cargo runs them on parallel threads in this
+    // binary. The fault tests must hold it for their WHOLE body (not just the
+    // `set_backing_fault` window) because they also do un-guarded baseline reads
+    // through the seam. It is distinct from `SEAM_LOCK` (which `set_backing_fault`
+    // takes internally) so holding it here can't deadlock against that.
+    static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
 
-    fn lock_counters() -> std::sync::MutexGuard<'static, ()> {
-        COUNTERS_LOCK
+    fn lock_global_state() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_STATE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]
     fn counters_accumulate_and_reset() {
-        let _lock = lock_counters();
+        let _lock = lock_global_state();
         reset();
         on_open();
         on_open();
@@ -309,7 +313,7 @@ mod tests {
 
     #[test]
     fn scan_counters_accumulate_and_reset() {
-        let _lock = lock_counters();
+        let _lock = lock_global_state();
         reset();
         on_scan_open();
         on_scan_read(4096);
@@ -326,6 +330,11 @@ mod tests {
     fn backing_fault_injects_eio_then_clears_on_drop() {
         use std::io::Write;
         use std::os::unix::fs::FileExt;
+
+        // Held for the whole test: the baseline (no-fault) reads below run
+        // outside the `set_backing_fault` guard, so without this a concurrent
+        // fault test could inject a fault into them.
+        let _lock = lock_global_state();
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"hello world").unwrap();
@@ -356,6 +365,7 @@ mod tests {
     #[test]
     fn backing_fault_short_read_fills_prefix_then_errors() {
         use std::io::Write;
+        let _lock = lock_global_state();
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"abcdefgh").unwrap();
         let f = std::fs::File::open(tmp.path()).unwrap();

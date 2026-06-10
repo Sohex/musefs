@@ -38,4 +38,6 @@ def main(db_path):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: python scripts/contract_writer.py <db_path>")
     main(sys.argv[1])

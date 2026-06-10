@@ -126,8 +126,9 @@ jobs:
     # binary, runs the binary-only plugin musefs_bin tiers with skip-on-missing
     # turned into a hard failure (MUSEFS_REQUIRE_BIN), then the synthesis round
     # trip (scan owns geometry; python-musefs writes tags/art; Rust synthesizes;
-    # mutagen reads back). Picard's musefs_bin tier runs in the `picard` job
-    # (it needs the system-Picard env).
+    # mutagen reads back). All three plugins' musefs_bin tiers run here,
+    # including Picard's (it imports the bundled `musefs._common`, not the
+    # system-Picard env). The separate `picard` job runs the full Picard suite.
     needs: changes
     if: needs.changes.outputs.src == 'true'
     runs-on: ubuntu-latest
