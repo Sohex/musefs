@@ -156,14 +156,15 @@ Find the bullet (currently at `CONTRIBUTING.md:365`):
 Replace it with:
 
 ```markdown
-- The Lidarr real-instance smoke is automated as a release gate in
-  `.github/workflows/lidarr-smoke.yml`: it boots a real Lidarr container, seeds
-  it via the Lidarr API, drives the real Custom Script, and asserts symlinks,
-  store tags, and unchanged backing bytes. It runs on PRs touching the Lidarr
-  surface and **gates the Python `py-v*` publish**. The download-client
-  `AlbumImportedEvent` path remains a documented manual gap (it only fires for
-  `NewDownload` imports); see
-  `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`.
+- The Lidarr smoke is automated as a release gate in
+  `.github/workflows/lidarr-smoke.yml`: a real Lidarr container proves the
+  Custom Script exec path (its Test event), and the content leg
+  (`musefs-lidarr-sync` tag-writes, `musefs-lidarr-import` symlink, served-mount
+  tags, unchanged backing bytes) runs against a local mock Lidarr API so it is
+  deterministic and network-free. It runs on PRs touching the Lidarr surface and
+  **gates the Python `py-v*` publish**. The download-client `AlbumImportedEvent`
+  path remains a documented manual gap (it only fires for `NewDownload`
+  imports); see `docs/superpowers/specs/2026-06-07-lidarr-smoke-checklist.md`.
 ```
 
 - [ ] **Step 2: Verify**

@@ -175,6 +175,14 @@ def test_cli_fail_exit_one():
 
     rc = main(["--names", "ci-ok", "coverage-ok"], stdin_text=json.dumps(payload))
     assert rc == 1
+
+
+def test_cli_handles_null_check_runs():
+    # A mis-slurped gh payload can yield {"check_runs": null}; must wait, not raise.
+    from release_gate import main
+
+    rc = main(["--names", "ci-ok"], stdin_text='{"check_runs": null}')
+    assert rc == 2
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -247,7 +255,9 @@ def main(argv=None, stdin_text=None):
 
     text = stdin_text if stdin_text is not None else sys.stdin.read()
     payload = json.loads(text)
-    runs = payload.get("check_runs", [])
+    # `or []` (not `.get(..., [])`): a present-but-null check_runs key — which a
+    # mis-slurped gh payload can produce — must degrade to "wait", not raise.
+    runs = payload.get("check_runs") or []
 
     result = decide(runs, args.names)
     if result is Decision.FAIL:
@@ -267,7 +277,7 @@ if __name__ == "__main__":  # pragma: no cover
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest scripts/test_release_gate.py -v`
-Expected: PASS (9 passed).
+Expected: PASS (10 passed).
 
 - [ ] **Step 5: Lint**
 
@@ -452,6 +462,11 @@ git commit -m "feat(release): add crates_index.py sparse-index publish probe (#1
 
 The `python-musefs` job already runs the other `scripts/test_*.py` files. Add ours so they gate every PR.
 
+> **Cross-plan sequencing:** this plan and the Lidarr-gate plan both append steps
+> to the same `python-musefs` job in `ci.yml`. Merge **this plan first**; the
+> Lidarr plan re-anchors its new step after the `Test crates-index probe` step
+> added here. Do not run the two `ci.yml` edits concurrently.
+
 - [ ] **Step 1: Add the test steps**
 
 In `.github/workflows/ci.yml`, after the existing block:
@@ -565,7 +580,7 @@ jobs:
           done
 ```
 
-Note: `--paginate` with `-q '{check_runs: [.check_runs[]]}'` flattens paginated pages into a single `{check_runs: [...]}` object that `release_gate.py` parses.
+Note: `--paginate --slurp` collects all pages into a JSON **array** (one element per page); the filter `{check_runs: [.[].check_runs[]]}` then flattens every page's `check_runs` into a single object `release_gate.py` parses. (Do not drop `--slurp` or change the filter to `.check_runs[]` — that operates on a per-page object and is wrong for the slurped array.)
 
 - [ ] **Step 2: Strip the now-duplicated version check from `publish` and gate it on smoke**
 

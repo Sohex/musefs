@@ -25,7 +25,9 @@ workflow change, so it is covered as a documented step in Component 3 rather
 than as code.
 
 The three components land as **three PRs** off the stream branch. Components 1
-and 2 are workflow-only and share no files. Component 3 is docs-only and owns
+and 2 are workflow-only; they overlap **only** in appending unit-test steps to
+the same `python-musefs` job in `ci.yml` (merge Component 1 first — see
+Sequencing). Component 3 is docs-only and owns
 **all** `CONTRIBUTING.md` edits — including replacing the prose Lidarr
 release-gate line (`CONTRIBUTING.md:365`) with a pointer to the Component 2
 workflow — so the two `CONTRIBUTING.md` touch points live in one PR and don't
@@ -142,74 +144,78 @@ proves the real Lidarr Custom Script integration still works. A Python package
 release can therefore be cut without the integration the docs call out as
 release-gated ever being exercised.
 
-### Key architectural fact (verified against the code)
+### Key architectural facts (verified against the code)
 
-On an `AlbumDownload` event the Custom Script (`musefs-lidarr-import`) receives
-`Lidarr_Album_Id` and `Lidarr_AddedTrackPaths`, then queries **Lidarr's REST
-API** (`LidarrClient`, `contrib/lidarr/src/musefs_lidarr/api.py`) for
-`track_files`/`tracks`/`album`/`artist` scoped by album id
-(`sync.py` `collect_event_payloads`, `mapping.records_for_paths`) and writes
-*that* metadata into the musefs store. The rich tags do **not** come from the
-event env vars — they come from Lidarr's database. So for tag assertions to
-mean anything, the real Lidarr instance must actually hold an artist/album/
-tracks, and Lidarr populates its DB from MusicBrainz (`api.lidarr.audio`).
+The integration is split across **two** console scripts
+(`contrib/lidarr/pyproject.toml`):
+
+- **`musefs-lidarr-import`** (`cli_import.py`) creates the symlink for one import.
+  For any non-Test event it **requires** `Lidarr_SourcePath` and
+  `Lidarr_DestinationPath` (`import_link.py:parse_import_env`) and makes the link
+  — it never touches the API and never writes tags.
+- **`musefs-lidarr-sync`** (`cli_sync.py`) is the tag-writer. On an
+  `AlbumDownload` event it reads `Lidarr_Album_Id`/`Lidarr_AddedTrackPaths`,
+  runs `run_preflight`, queries **Lidarr's REST API** (`LidarrClient`,
+  `api.py`: `/api/v1/config/*`, `/api/v1/trackfile`, `/api/v1/track`,
+  `/api/v1/album/{id}`, `/api/v1/artist/{id}`) via `collect_event_payloads`, and
+  writes the returned metadata into the musefs store
+  (`mapping.build_pairs` emits lowercase keys like `artist`).
+
+So a faithful smoke drives **both**: `-sync` for the store-tag assertions and
+`-import` for the symlink assertion. (The earlier draft of this spec wrongly
+named `-import` as the API/tag path — corrected here.)
 
 The Lidarr **Test event** carries no `Album_Id`/`SourcePath`, so it only proves
 that the real Lidarr process execs the script and the lowercased-env-var path
-resolves (the `StringDictionary` case bug the 2026-06-07 run caught). The
-**content** assertions are driven entirely by the *constructed* `AlbumDownload`
-env (step 5 below), not by Lidarr firing `AlbumDownload` itself (it cannot
-without a download-client import — the out-of-scope gap).
+resolves (the `StringDictionary` case bug the 2026-06-07 run caught).
+
+### Why we don't import a real album into Lidarr
+
+Lidarr only creates `trackfile` rows when its MusicBrainz track-matcher maps a
+file to a monitored album track; synthetic ffmpeg tones never match, so a
+`RescanArtist` seed produces **zero** trackfiles and the gate would be red on
+every run. Forcing matches (ManualImport, MB-matching fixtures) is brittle and
+network-coupled to `api.lidarr.audio`. **Decision:** keep a *real* Lidarr only
+to prove the **Test-event exec path**, and drive the **content** assertions
+against a **local mock Lidarr API** returning fixed JSON for the generated
+FLACs. This is deterministic and network-free (no MusicBrainz dependency, so no
+upstream-outage release-blocking). Accepted tradeoff: the smoke no longer
+catches real-Lidarr REST **schema drift** — that risk is carried by the
+`contrib/lidarr` unit suite and the documented manual checklist.
 
 ### Design
 
 A new `.github/workflows/lidarr-smoke.yml`, dispatchable (`workflow_dispatch`)
-and reusable (`workflow_call`). Seed mechanism: **API-driven, accepting a
-one-time live `api.lidarr.audio` metadata fetch** — chosen for schema-stability
-across Lidarr versions (it uses the same API surface the script exercises,
-rather than raw SQL coupled to an EF-Core schema). The cost, accepted
-explicitly: the seed step has a **network dependency** on `api.lidarr.audio`,
-so the gate can flake on upstream outage/rate-limit; the metadata-add step gets
-a bounded retry and a clear failure message distinguishing "upstream metadata
-unavailable" from "integration broken."
+and reusable (`workflow_call`). Steps:
 
-Steps:
-
-1. **Generate** synthetic FLAC tracks with ffmpeg via a committed harness
-   script, laid out as `Artist/Album/NN Title.flac` under a directory that is
-   **bind-mounted into the Lidarr container** (runnable in-tree script; no
-   committed binary fixtures — large artifacts stay gitignored).
-2. **Boot the pinned `linuxserver/lidarr` container** (pinned by image digest
-   for reproducible Lidarr *behavior*) with `--device /dev/fuse --cap-add
-   SYS_ADMIN --security-opt apparmor=unconfined` (the precedent is the release
-   Alpine smoke, `release.yml:144-148`, which runs `docker run` with exactly
-   these flags on a stock `ubuntu-latest` runner).
-3. **Seed via Lidarr's API:**
-   - Set a root folder = the bind-mounted FLAC directory (in-container path).
-   - Set the two **safe-settings** config rows the script's preflight enforces
-     (`config/metadataprovider` `writeAudioTags == no`;
-     `config/mediamanagement` `fileDate == none`, permissions-setting off) —
-     `api.py` `run_preflight`/`check_safe_settings` *refuses to proceed* on
-     violation, so without seeding these the smoke aborts at preflight instead
-     of reaching its assertions.
-   - Add a fixed artist by MusicBrainz id (one-time live `api.lidarr.audio`
-     fetch), then trigger a scan / manual import so Lidarr creates
-     album/track/`trackfile` rows whose `path` values are the **in-container
-     realpath** of the generated FLACs.
-4. **Configure** the Custom Script connection via the API and **fire the Test
-   event**; assert the real Lidarr execs `musefs-lidarr-import` and the
-   lowercased-env resolution succeeds. (This proves exec only — no content.)
-5. **Invoke** the script with a constructed `AlbumDownload` env: `Album_Id` =
-   the seeded album, `AddedTrackPaths` = the **in-container realpath** of the
-   FLACs (must match Lidarr's seeded `trackfile.path`; `mapping.match_track_file`
-   compares both sides via `realpath_key()`, so a host/container path-namespace
-   mismatch would silently skip every track). The script queries the seeded
-   Lidarr API and writes tags to the musefs store + creates symlinks.
-6. **Assert:** symlinks created for every track; store tags match the metadata
-   Lidarr returned; backing audio bytes unchanged (sha256 before/after); the
+1. **Generate** synthetic FLAC tracks with ffmpeg via a committed harness script
+   (runnable in-tree script; no committed binary fixtures).
+2. **Real-instance exec proof.** Boot the pinned `linuxserver/lidarr` container
+   (pinned by digest) with `--device /dev/fuse --cap-add SYS_ADMIN
+   --security-opt apparmor=unconfined` (precedent: the release Alpine smoke,
+   `release.yml:144-148`). Configure a Custom Script connection pointing at the
+   installed `musefs-lidarr-import` and **fire the Test event**; assert the real
+   Lidarr execs the script and the lowercased-env resolution succeeds.
+3. **Mock Lidarr API.** Start a local stub HTTP server returning fixed JSON for
+   the endpoints `-sync` calls: `config/metadataprovider` (`writeAudioTags=no`)
+   and `config/mediamanagement` (`fileDate=none`, permissions off) so
+   `run_preflight` passes; and `trackfile`/`track`/`album/{id}`/`artist/{id}`
+   describing one artist/album whose `trackfile.path` values are the
+   **realpath** of the generated FLACs. Point `MUSEFS_LIDARR_URL` at the stub.
+4. **Content leg — tags.** Run `musefs-lidarr-sync` with a constructed
+   `AlbumDownload` env (`Lidarr_Album_Id`, `Lidarr_AddedTrackPaths` = the FLAC
+   realpaths, which must equal the stub's `trackfile.path` — `match_track_file`
+   compares both sides via `realpath_key()`). It queries the stub and writes
+   tags to the store.
+5. **Content leg — symlink.** Run `musefs-lidarr-import` with
+   `Lidarr_SourcePath`/`Lidarr_DestinationPath` set to a generated FLAC and a
+   target path; assert the symlink is created.
+6. **Serve + assert.** Mount the store with the real binary
+   (`musefs mount <mountpoint> --db <db>`) and assert: store tags match the
+   stub metadata; backing audio bytes unchanged (sha256 before/after); the
    served mount carries the tags; and — to defend against vacuous passes —
-   **`records > 0` and `skipped == 0`** (a path-namespace mismatch must fail
-   loud, not pass green).
+   **at least the seeded track count carry an `artist` tag** (a path-namespace
+   mismatch would skip every track and must fail loud, not pass green).
 
 ### Enforcement and triggers
 
@@ -282,21 +288,23 @@ Contents:
   (c) one with an in-progress check (must wait, not fail). The publish-loop
   skip/`#163`-wait is exercised by the existing smoke matrix; verify the sparse
   index probe and the skip-if-present branch against a known-published version.
-- **Component 2:** the `lidarr-smoke.yml` job is itself the test; its PR-trigger
-  on `contrib/lidarr/**` gives continuous signal. Acceptance is a green run
-  demonstrating all assertions in step 6, including `skipped == 0`. Because the
-  seed step depends on `api.lidarr.audio`, an upstream-metadata failure must
-  surface as a distinct, recognizable error (not a generic red) so a flake is
-  not mistaken for an integration regression.
+- **Component 2:** the pure helpers (env builder, ffprobe-tag parse, byte
+  equality, the mock-API responses) are unit-tested. The full `lidarr-smoke.yml`
+  job needs Docker + `/dev/fuse` and its acceptance evidence is a green
+  `workflow_dispatch` run demonstrating all step-6 assertions; it cannot be
+  proven on a dev box without those. Because the content leg runs against a
+  local mock (not `api.lidarr.audio`), the gate is deterministic and network-free.
 - **Component 3:** docs; verified by review against the actual `release.yml`
   DAG and the #162 steps. No automated test.
 
 ## Sequencing within the stream
 
-Three PRs. Components 1 and 2 are independent (workflow-only, disjoint files)
-and can proceed in parallel. Component 3 (docs) documents both and owns all
-`CONTRIBUTING.md` edits, so it is finalized after 1 and 2 settle, though it can
-be drafted in parallel.
+Three PRs. Components 1 and 2 both append steps to the same `python-musefs` job
+in `ci.yml` (unit-test steps), so they are **not** fully independent: **merge
+Component 1 first**, then Component 2 re-anchors its test step after Component
+1's. Otherwise their file surfaces are disjoint. Component 3 (docs) documents
+both and owns all `CONTRIBUTING.md` edits, so it is finalized after 1 and 2
+settle, though it can be drafted in parallel.
 
 ## Decisions resolved during review
 
@@ -307,9 +315,15 @@ be drafted in parallel.
 - **Publish-loop idempotency:** skip crates already resolvable from the index,
   reusing the #163 probe, so whole-workflow re-runs are safe (closes #222 on
   re-run).
-- **Lidarr seed mechanism:** API-driven, accepting a one-time live
-  `api.lidarr.audio` fetch (schema-stable; network-flake risk accepted and
-  surfaced as a distinct error). Seed must also set the preflight safe-settings
-  config rows, and path-matching must assert `skipped == 0`.
+- **Lidarr smoke shape:** a real Lidarr proves only the **Test-event exec path**
+  (it cannot deterministically import synthetic files — its MB matcher rejects
+  them); the **content** assertions (`-sync` tags, `-import` symlink, served
+  tags, bytes unchanged) run against a **local mock Lidarr API**. Deterministic
+  and network-free; the tradeoff is no real-Lidarr REST schema-drift coverage.
+  Supersedes the earlier "API-driven seed with a live `api.lidarr.audio` fetch"
+  decision (RescanArtist could not create trackfiles for synthetic tones).
+- **Binary roles (correction):** `musefs-lidarr-sync` queries the API and writes
+  tags; `musefs-lidarr-import` only makes the symlink and requires
+  `Lidarr_SourcePath`/`Lidarr_DestinationPath`. An earlier draft conflated them.
 - **CONTRIBUTING.md ownership:** all edits (new Rust section + the `:365` Lidarr
   gate line) live in Component 3's PR.
