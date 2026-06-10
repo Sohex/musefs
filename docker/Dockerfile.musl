@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1
+FROM alpine:3.20
+
+# fuse3 provides the setuid `fusermount3` helper musefs execs at mount/unmount.
+RUN apk add --no-cache fuse3
+
+# TARGETARCH is auto-populated by buildx per platform (amd64 / arm64); the build
+# context root holds <arch>/musefs for each.
+ARG TARGETARCH
+COPY ${TARGETARCH}/musefs /usr/local/bin/musefs
+
+ENTRYPOINT ["musefs"]
