@@ -1,0 +1,41 @@
+{
+ "id": "fca800c1-6fc3-4bfb-a5de-8c2398c27bc0",
+ "artistname": "Komiku",
+ "sortname": "Komiku",
+ "artistaliases": [],
+ "disambiguation": "music for non-existing videogame",
+ "overview": null,
+ "links": [
+  {
+   "target": "http://loyaltyfreakmusic.com/",
+   "type": "loyaltyfreakmusic"
+  },
+  {
+   "target": "http://freemusicarchive.org/music/Komiku/",
+   "type": "freemusicarchive"
+  }
+ ],
+ "images": [],
+ "rating": {
+  "Count": 0,
+  "Value": null
+ },
+ "status": "active",
+ "genres": [],
+ "type": "Person",
+ "Albums": [
+  {
+   "Id": "0520eabc-e117-48ce-b229-a6ea84c349aa",
+   "OldIds": [],
+   "Title": "The adventure goes on, vol.1",
+   "Type": "Album",
+   "SecondaryTypes": [],
+   "ReleaseStatuses": [
+    "Official"
+   ],
+   "ReleaseDate": "2020-05-03",
+   "Rating": null
+  }
+ ],
+ "oldids": []
+}

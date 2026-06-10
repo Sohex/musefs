@@ -239,3 +239,11 @@ Deeper reading: [ARCHITECTURE.md](ARCHITECTURE.md) for how it works,
 ## License
 
 Licensed under the [MIT License](LICENSE).
+
+## Acknowledgements
+
+The Lidarr real-instance end-to-end test plays a real album through a real
+Lidarr. With thanks to **[Komiku](https://loyaltyfreakmusic.com/)** (Loyalty
+Freak Music), whose track *"The calling"* (from *The Adventure Goes On, Vol. 1*)
+is dedicated to the public domain under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)
+and vendored as that test's fixture — thank you for releasing music freely.
