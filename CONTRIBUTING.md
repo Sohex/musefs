@@ -58,6 +58,13 @@ cargo test -p musefs-fuse --no-run
 sudo target/debug/deps/<e2e_test_binary> --ignored <passthrough_test_name>
 ```
 
+- **Read-consistency harness** (`musefs-fuse/tests/read_consistency.rs`): a seeded,
+  reproducible randomized `pread`/`mmap` sweep compares live-mount reads against an
+  in-memory oracle (the seed is printed on failure to reproduce). The hermetic FLAC
+  tests — whole-file mmap fidelity and the read-only write-refusal matrix — always
+  run; the multi-format breadth sweep generates fixtures with ffmpeg and skips any
+  format whose codec is unavailable.
+
 ### FreeBSD e2e
 
 The FUSE e2e suite also runs on FreeBSD, via the scripts in
