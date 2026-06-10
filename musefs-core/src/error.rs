@@ -22,6 +22,10 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
     #[error("backing file changed since scan: {0}")]
     BackingChanged(String),
+    #[error(
+        "track {track_id} references art {art_id}, which has no metadata row (orphaned track_art — DB contract violation)"
+    )]
+    OrphanedArt { track_id: i64, art_id: i64 },
     #[error("track {0} not found")]
     TrackNotFound(i64),
     #[error("no such inode: {0}")]

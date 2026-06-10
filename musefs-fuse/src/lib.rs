@@ -88,6 +88,7 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::Db(_)
         | CoreError::DbOpen { .. }
         | CoreError::Mp4MetadataTooLarge { .. }
+        | CoreError::OrphanedArt { .. }
         | CoreError::Format(_) => fuser::Errno::EIO,
     }
 }
@@ -531,6 +532,14 @@ mod tests {
         assert_eq!(errno(&io).code(), libc::ENOENT);
         let io_other = CoreError::Io(std::io::Error::other("boom"));
         assert_eq!(errno(&io_other).code(), libc::EIO);
+        assert_eq!(
+            errno(&CoreError::OrphanedArt {
+                track_id: 1,
+                art_id: 2
+            })
+            .code(),
+            libc::EIO
+        );
     }
 
     #[test]
