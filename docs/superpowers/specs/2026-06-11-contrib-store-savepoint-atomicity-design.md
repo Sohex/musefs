@@ -89,7 +89,7 @@ A single private helper in `store.py`, used at all sites:
 import contextlib
 import sqlite3
 
-_LEGACY = sqlite3.LEGACY_TRANSACTION_CONTROL  # == -1; absent-attr fallback below
+_LEGACY = getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", -1)  # 3.12+ const; == -1, absent on <3.12
 
 def _is_autocommit(conn):
     ac = getattr(conn, "autocommit", _LEGACY)  # 3.12+ attribute; _LEGACY on <3.12
@@ -264,5 +264,10 @@ stable on CPython 3.8/3.11/3.12/3.14 during design.
   docstrings.
 - `contrib/python-musefs/src/musefs_common/sync.py` — import `_savepoint`, wrap
   `sync_one` write block.
+- `contrib/picard/musefs/_common/{store,sync}.py` — **regenerated** by running
+  `contrib/python-musefs/vendor_to_picard.py`. Picard does not pip-install the
+  library; it vendors a byte-identical copy, and `contrib/picard/tests/
+  test_vendor_sync.py` fails CI if the canonical lib changes without re-vendoring.
+  This is also what propagates the #191 fix to the Picard consumer.
 - `ARCHITECTURE.md` — one sentence in the external-writer contract section.
 - `contrib/python-musefs/tests/` — new atomicity tests.

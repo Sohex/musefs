@@ -19,6 +19,7 @@
 - **Run the Python suite from the package dir:** `cd contrib/python-musefs` then `python3 -m pytest -q`. The baseline is **56 passed**.
 - **Why `sqlite3.Connection` can't be monkeypatched:** instances disallow attribute assignment, so failure-injection tests use a `Connection` *subclass* via `factory=` (provided in Task 1's test file) rather than `monkeypatch.setattr(conn, "executemany", ...)`.
 - **Autocommit test connections** must enable foreign keys *and* switch to autocommit: open the connection, `PRAGMA foreign_keys = ON`, then set `conn.isolation_level = None`. A bare `sqlite3.connect(path, isolation_level=None)` leaves FKs off and would make the FK-violation test a silent no-op.
+- **Picard vendors a byte-identical copy of the library.** `contrib/picard/musefs/_common/` holds generated copies of every `musefs_common/*.py` (Picard can't pip-install deps). After changing canonical `store.py`/`sync.py` you MUST re-vendor with `python3 contrib/python-musefs/vendor_to_picard.py` and stage the regenerated `_common/` file(s); otherwise `contrib/picard/tests/test_vendor_sync.py` fails CI **and the #191 fix never reaches the Picard consumer**. The pre-commit hook does NOT run pytest (only cargo + ruff), so it will not catch drift — re-vendoring is on you. The regenerated files are byte-identical to canonical plus a 3-line `# GENERATED …` header, so they stay ruff-clean. Each task below that edits canonical includes a re-vendor step.
 
 ## File structure
 
@@ -27,6 +28,7 @@
 | `contrib/python-musefs/src/musefs_common/store.py` | the store contract: connect, schema check, tag/art writes | Add `_savepoint`/`_is_autocommit`/`_is_legacy`; wrap three functions; docstrings |
 | `contrib/python-musefs/src/musefs_common/sync.py` | per-file sync write-loop | Import `_savepoint`; wrap the `sync_one` write block |
 | `contrib/python-musefs/tests/test_atomicity.py` | **new** — atomicity/rollback tests for A and C | Create, grow across Tasks 1–4 |
+| `contrib/picard/musefs/_common/{store,sync}.py` | vendored byte-identical copy for Picard | Regenerated via `vendor_to_picard.py` in each canonical-changing task |
 | `ARCHITECTURE.md` | external-writer contract docs | One sentence in the contract section |
 
 ---
@@ -130,7 +132,9 @@ import sqlite3
 Then insert these definitions immediately before `def connect(` (currently `store.py:9`):
 
 ```python
-_LEGACY = sqlite3.LEGACY_TRANSACTION_CONTROL  # == -1; the getattr default for <3.12
+# sqlite3.LEGACY_TRANSACTION_CONTROL is 3.12+; it is == -1. Use getattr so this
+# module still imports on the 3.8 floor (where the constant does not exist).
+_LEGACY = getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", -1)
 
 
 def _is_autocommit(conn):
@@ -227,10 +231,15 @@ The hook enforces ruff's import-sorting (`I`) and formatting, so let ruff arrang
 Run: `cd /home/cfutro/git/musefs && ruff check --fix contrib/python-musefs/ && ruff format contrib/python-musefs/ && ruff check contrib/python-musefs/ && ruff format --check contrib/python-musefs/`
 Expected: the first two commands may rewrite imports/formatting; the final two report no errors. Re-stage any files ruff touched.
 
-- [ ] **Step 7: Commit** (runs the full pre-commit hook incl. the Rust suite)
+- [ ] **Step 7: Re-vendor to Picard**
+
+Run: `cd /home/cfutro/git/musefs && python3 contrib/python-musefs/vendor_to_picard.py`
+This regenerates `contrib/picard/musefs/_common/store.py` (byte-identical to canonical + a 3-line header). Confirm it changed: `git status --short contrib/picard/musefs/_common/`.
+
+- [ ] **Step 8: Commit** (runs the full pre-commit hook incl. the Rust suite)
 
 ```bash
-git add contrib/python-musefs/src/musefs_common/store.py contrib/python-musefs/tests/test_atomicity.py
+git add contrib/python-musefs/src/musefs_common/store.py contrib/python-musefs/tests/test_atomicity.py contrib/picard/musefs/_common/store.py
 git commit -m "fix(contrib): make replace_tags atomic via savepoint (#191)"
 ```
 
@@ -327,10 +336,15 @@ Expected: atomicity tests PASS; full suite **59 passed**.
 Run: `cd /home/cfutro/git/musefs && ruff check --fix contrib/python-musefs/ && ruff format contrib/python-musefs/ && ruff check contrib/python-musefs/ && ruff format --check contrib/python-musefs/`
 Expected: the final two commands report no errors. Re-stage any files ruff touched.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Re-vendor to Picard**
+
+Run: `cd /home/cfutro/git/musefs && python3 contrib/python-musefs/vendor_to_picard.py`
+Regenerates `contrib/picard/musefs/_common/store.py`. Confirm: `git status --short contrib/picard/musefs/_common/`.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add contrib/python-musefs/src/musefs_common/store.py contrib/python-musefs/tests/test_atomicity.py
+git add contrib/python-musefs/src/musefs_common/store.py contrib/python-musefs/tests/test_atomicity.py contrib/picard/musefs/_common/store.py
 git commit -m "fix(contrib): make merge_tags atomic via savepoint (#191)"
 ```
 
@@ -417,10 +431,15 @@ Expected: atomicity tests PASS; full suite **60 passed**.
 Run: `cd /home/cfutro/git/musefs && ruff check --fix contrib/python-musefs/ && ruff format contrib/python-musefs/ && ruff check contrib/python-musefs/ && ruff format --check contrib/python-musefs/`
 Expected: the final two commands report no errors. Re-stage any files ruff touched.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Re-vendor to Picard**
+
+Run: `cd /home/cfutro/git/musefs && python3 contrib/python-musefs/vendor_to_picard.py`
+Regenerates `contrib/picard/musefs/_common/store.py`. Confirm: `git status --short contrib/picard/musefs/_common/`.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add contrib/python-musefs/src/musefs_common/store.py contrib/python-musefs/tests/test_atomicity.py
+git add contrib/python-musefs/src/musefs_common/store.py contrib/python-musefs/tests/test_atomicity.py contrib/picard/musefs/_common/store.py
 git commit -m "fix(contrib): make replace_track_art atomic via savepoint (#191)"
 ```
 
@@ -608,10 +627,15 @@ Expected: all atomicity tests PASS; full suite **63 passed** (60 + 3 new).
 Run: `cd /home/cfutro/git/musefs && ruff check --fix contrib/python-musefs/ && ruff format contrib/python-musefs/ && ruff check contrib/python-musefs/ && ruff format --check contrib/python-musefs/`
 Expected: the final two commands report no errors. Re-stage any files ruff touched. (Importing the underscore-prefixed `_savepoint` across modules is fine; ruff's `F401`/`N` rules don't object to a used private import.)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Re-vendor to Picard**
+
+Run: `cd /home/cfutro/git/musefs && python3 contrib/python-musefs/vendor_to_picard.py`
+Regenerates `contrib/picard/musefs/_common/sync.py` (this task changed `sync.py`). Confirm: `git status --short contrib/picard/musefs/_common/`.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add contrib/python-musefs/src/musefs_common/sync.py contrib/python-musefs/tests/test_atomicity.py
+git add contrib/python-musefs/src/musefs_common/sync.py contrib/python-musefs/tests/test_atomicity.py contrib/picard/musefs/_common/sync.py
 git commit -m "fix(contrib): make sync_one record write atomic via savepoint (#191)"
 ```
 
@@ -669,11 +693,16 @@ Expected: **63 passed**.
 Run: `cd /home/cfutro/git/musefs && ruff check contrib/python-musefs/ && ruff format --check contrib/python-musefs/`
 Expected: no errors.
 
-- [ ] **Step 3: Confirm the fuzz/contract jobs are unaffected**
+- [ ] **Step 3: Picard vendored copy is in sync**
 
-No Rust signatures changed and no schema change was made, so the `fuzz/` crate and the schema-mirror regen are untouched. No action needed — just confirm `git status` shows only the four files from this plan were modified.
+Run: `cd /home/cfutro/git/musefs && python3 contrib/python-musefs/vendor_to_picard.py && python3 -m pytest contrib/picard/tests/test_vendor_sync.py -q`
+Expected: the vendor run produces no further `git status` changes under `contrib/picard/musefs/_common/` (already re-vendored per task), and `test_vendor_sync.py` reports **2 passed** (file-set matches + bodies byte-identical). This test only imports `pathlib`, so it runs without the Picard/Qt environment.
 
-- [ ] **Step 4 (optional): cross-version sanity on the 3.8 floor**
+- [ ] **Step 4: Confirm scope of changes**
+
+No Rust signatures changed and no schema change was made, so the `fuzz/` crate and the schema-mirror regen are untouched. Confirm `git status` across the whole feature branch shows exactly: `store.py`, `sync.py`, `tests/test_atomicity.py`, `contrib/picard/musefs/_common/store.py`, `contrib/picard/musefs/_common/sync.py`, and `ARCHITECTURE.md` — six files, nothing else.
+
+- [ ] **Step 5 (optional): cross-version sanity on the 3.8 floor**
 
 The helper's behavior is mode- and version-sensitive in principle. If a 3.8 interpreter is available, run the suite under it: `cd contrib/python-musefs && python3.8 -m pytest -q`. (Behavior was confirmed stable on CPython 3.8/3.11/3.12/3.14 during design.)
 
@@ -688,5 +717,6 @@ The helper's behavior is mode- and version-sensitive in principle. If a 3.8 inte
 - FK-on test setup + assert `IntegrityError` fires: Task 3. ✓
 - Whole-record autocommit atomicity + deferred batch atomicity tests: Task 4. ✓
 - Docstring updates on all four functions: Tasks 1–4. ✓
+- Picard re-vendor (propagates the fix to the vendored consumer + satisfies the drift guard): Tasks 1–4 + final verification. ✓
 - `ARCHITECTURE.md` contract sentence: Task 5. ✓
 - Non-goals respected: no Python version bump, no `connect()` enforcement, no cross-record atomicity. ✓
