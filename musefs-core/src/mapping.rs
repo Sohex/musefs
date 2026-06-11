@@ -86,6 +86,22 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
     Ok(inputs)
 }
 
+/// `ArtSource` over the SQLite blob store, used by Ogg synthesis to stream art
+/// bytes for page CRCs. Read failures (e.g. a deleted/short blob) are logged with
+/// the underlying DB error and surfaced as `FormatError::ArtRead`.
+pub(crate) struct DbArtSource<'a, M>(pub &'a Db<M>);
+
+impl<M> musefs_format::ogg::ArtSource for DbArtSource<'_, M> {
+    fn read_window(&self, art_id: i64, offset: u64, buf: &mut [u8]) -> musefs_format::Result<()> {
+        self.0
+            .read_art_chunk_into(art_id, offset, buf)
+            .map_err(|e| {
+                log::warn!("ogg synthesis: art {art_id} read failed at offset {offset}: {e}");
+                musefs_format::FormatError::ArtRead { art_id }
+            })
+    }
+}
+
 /// Map a track's binary tag rows to `BinaryTagInput`s for synthesis. Never reads
 /// the payload bytes — only `(rowid, key, byte_len)`; the bytes stream at read
 /// time. Ordered by (key, ordinal), matching `get_binary_tags`.
@@ -102,22 +118,6 @@ pub(crate) fn binary_tags_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<
             })
         })
         .collect())
-}
-
-/// Read each embedded image's raw bytes for synthesis (Ogg needs the bytes to
-/// compute page CRCs at resolve). Parallel to `track_art_to_inputs`; returns the
-/// same order. Only the Ogg synthesis path calls this — FLAC/MP3/MP4 stream art
-/// via `ArtImage` and never materialize it.
-pub(crate) fn track_art_images<M>(db: &Db<M>, inputs: &[ArtInput]) -> Result<Vec<Vec<u8>>> {
-    let mut out = Vec::with_capacity(inputs.len());
-    for a in inputs {
-        out.push(db.read_art_chunk(
-            a.art_id,
-            0,
-            musefs_db::convert::usize_from(a.data_len.get()),
-        )?);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -422,66 +422,6 @@ mod tests {
                     if track_id == tid && art_id == orphan_id
             ),
             "orphaned track_art must yield OrphanedArt with the offending ids, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn track_art_images_reads_stored_blob_bytes() {
-        use musefs_db::{NewArt, TrackArt};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("art.db");
-        let db = Db::open(&path).unwrap();
-        let tid = db
-            .upsert_track(&NewTrack {
-                backing_path: "/a.flac".into(),
-                format: Format::Flac,
-                audio_offset: 0,
-                audio_length: 0,
-                backing_size: 0,
-                backing_mtime: 0,
-            })
-            .unwrap();
-        let first = db
-            .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
-                data: vec![1, 2, 3, 4],
-            })
-            .unwrap();
-        let second = db
-            .upsert_art(&NewArt {
-                mime: "image/jpeg".into(),
-                width: None,
-                height: None,
-                data: vec![7, 8, 9],
-            })
-            .unwrap();
-        db.set_track_art(
-            tid,
-            &[
-                TrackArt {
-                    art_id: first,
-                    picture_type: 3,
-                    description: String::new(),
-                    ordinal: 0,
-                },
-                TrackArt {
-                    art_id: second,
-                    picture_type: 4,
-                    description: String::new(),
-                    ordinal: 1,
-                },
-            ],
-        )
-        .unwrap();
-
-        let inputs = super::track_art_to_inputs(&db, tid).unwrap();
-        let images = super::track_art_images(&db, &inputs).unwrap();
-        assert_eq!(
-            images,
-            vec![vec![1, 2, 3, 4], vec![7, 8, 9]],
-            "must return each stored blob's exact bytes, in input order"
         );
     }
 

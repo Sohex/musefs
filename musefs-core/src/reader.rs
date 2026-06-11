@@ -270,21 +270,18 @@ impl HeaderCache {
                             track.bounds.audio_offset(),
                         )?;
                         let header = musefs_format::ogg::read_metadata(&front)?;
-                        let art_images = crate::mapping::track_art_images(db, &art_inputs)?;
                         let arts: Vec<musefs_format::ogg::OggArt> = art_inputs
                             .iter()
-                            .zip(art_images.iter())
-                            .map(|(meta, image)| musefs_format::ogg::OggArt {
-                                meta,
-                                image: image.as_slice(),
-                            })
+                            .map(|meta| musefs_format::ogg::OggArt { meta })
                             .collect();
+                        let src = crate::mapping::DbArtSource(db);
                         musefs_format::ogg::synthesize_layout(
                             &header,
                             track.bounds.audio_offset(),
                             track.bounds.audio_length(),
                             &inputs,
                             &arts,
+                            &src,
                         )?
                     }
                 };
