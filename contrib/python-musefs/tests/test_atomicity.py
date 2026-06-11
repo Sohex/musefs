@@ -3,7 +3,7 @@ import sqlite3
 import pytest
 from conftest import insert_track, text_tags
 
-from musefs_common import connect, replace_tags
+from musefs_common import connect, merge_tags, replace_tags
 
 
 class _FailInsert(sqlite3.Connection):
@@ -61,5 +61,28 @@ def test_replace_tags_no_premature_commit_in_deferred_mode(db_path):
     check = connect(db_path)
     try:
         assert text_tags(check, tid) == {}
+    finally:
+        check.close()
+
+
+def test_merge_tags_atomic_on_autocommit_failure(db_path):
+    conn = _autocommit(db_path, factory=_FailInsert)
+    try:
+        tid = insert_track(conn, "/m/a.flac")
+        # Seed both a managed key we'll overwrite and an unmanaged baseline key.
+        merge_tags(conn, tid, [("artist", "ORIG")], [])
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, 'genre', 'Jazz', 0)",
+            (tid,),
+        )
+        conn.fail = True
+        with pytest.raises(RuntimeError):
+            merge_tags(conn, tid, [("artist", "NEW")], [])
+    finally:
+        conn.close()
+    check = connect(db_path)
+    try:
+        # The failed merge rolled back: both the managed and baseline rows remain.
+        assert text_tags(check, tid) == {"artist": ["ORIG"], "genre": ["Jazz"]}
     finally:
         check.close()

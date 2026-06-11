@@ -143,26 +143,31 @@ def merge_tags(conn, track_id, managed_pairs, delete_keys):
     of (key, value); every key it names is cleared and rewritten with contiguous
     ordinals. ``delete_keys`` names keys to clear without rewriting (tags the
     plugin previously managed and the user has now removed). Both deletes are
-    scoped to ``value_blob IS NULL`` so scanner-written binary tags survive."""
-    by_key = {}
-    for key, value in managed_pairs:
-        by_key.setdefault(key, []).append(value)
+    scoped to ``value_blob IS NULL`` so scanner-written binary tags survive.
 
-    for key in set(by_key) | set(delete_keys or ()):
-        conn.execute(
-            "DELETE FROM tags WHERE track_id = ? AND key = ? AND value_blob IS NULL",
-            (track_id, key),
+    Atomic via an internal savepoint (see ``_savepoint``): the per-key deletes
+    and the rewrite either all land or none do, even on an autocommit
+    connection."""
+    with _savepoint(conn, "musefs_merge_tags"):
+        by_key = {}
+        for key, value in managed_pairs:
+            by_key.setdefault(key, []).append(value)
+
+        for key in set(by_key) | set(delete_keys or ()):
+            conn.execute(
+                "DELETE FROM tags WHERE track_id = ? AND key = ? AND value_blob IS NULL",
+                (track_id, key),
+            )
+
+        rows = [
+            (track_id, key, value, ordinal)
+            for key, values in by_key.items()
+            for ordinal, value in enumerate(values)
+        ]
+        conn.executemany(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, ?, ?, ?)",
+            rows,
         )
-
-    rows = [
-        (track_id, key, value, ordinal)
-        for key, values in by_key.items()
-        for ordinal, value in enumerate(values)
-    ]
-    conn.executemany(
-        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, ?, ?, ?)",
-        rows,
-    )
 
 
 _EXT_MIME = {
