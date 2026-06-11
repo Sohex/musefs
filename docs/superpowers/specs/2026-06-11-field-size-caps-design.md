@@ -99,12 +99,29 @@ Extend `MIGRATION_V4` (the existing constraint migration) with:
 | `structural_blocks.body` | `length(body) <= 16777215` | 16 MiB − 1 |
 
 `structural_blocks` is **added to V4's rebuild set**: stash its rows → drop it
-*before* `tracks` (it is a child via `track_id` → `tracks(id) ON DELETE
-CASCADE`) → recreate it *after* `tracks` is recreated → refill from the stash.
-It has no triggers, so nothing is recreated for it. The V4 doc comment's
+*before* `tracks` → recreate it *after* `tracks` is recreated → refill from the
+stash. It has no triggers, so nothing is recreated for it. The V4 doc comment's
 "`structural_blocks` … NOT rebuilt" note is corrected. As with the other V4
 tables, a pre-existing violating row aborts the migration at the `INSERT…SELECT`
 refill.
+
+**Ordering is load-bearing and fixes a latent data-loss bug.**
+`structural_blocks.track_id` references `tracks(id) ON DELETE CASCADE`, and the
+V4 migration runs with `foreign_keys` ON (set by `configure`; a transaction
+cannot toggle the pragma). `DROP TABLE tracks` therefore performs an implicit
+`DELETE` of every `tracks` row, which fires the cascade on any still-present
+child. The *current* V4 drops only `tags`/`art`/`track_art` before `tracks` and
+leaves `structural_blocks` in place — so dropping `tracks` cascade-empties
+`structural_blocks` (verified empirically: populated rows go to zero on
+SQLite 3.46). For a fresh migration this is invisible (the table is empty), but
+any previously-scanned V2/V3 DB upgraded to V4 silently loses its FLAC
+`STREAMINFO`/`SEEKTABLE` blocks and falls back to front-reads until re-scanned.
+Folding `structural_blocks` into the rebuild fixes this **only because** its
+stash (`CREATE TEMP TABLE … AS SELECT * FROM structural_blocks`) runs at the top
+*before* any `DROP`, and its `DROP` is sequenced before `DROP TABLE tracks`. The
+plan must pin both: stash with the other three at the top, and drop it in the
+children-first group ahead of `tracks`. A regression test asserting structural
+rows survive a V2/V3→V4 migration is required (see Section 6).
 
 The `structural_blocks.body` ceiling equals FLAC's 24-bit block-length limit
 (`MAX_BLOCK_BODY` in `musefs-format/src/flac.rs`); the value is duplicated as a
@@ -123,19 +140,56 @@ Named constants in `musefs-db`:
   `MAX_BLOCK_BODY`; db cannot import the format layer)
 - `MAX_TAGS_PER_TRACK = 4096`
 
-Guards at the DB read boundary, each returning a new error rather than
-allocating:
+**Check length in SQL, before materializing.** A Rust-side check that runs
+*after* `r.get::<String>(col)` has already allocated the (potentially
+multi-GiB) value does not prevent the allocation DoS — it only rejects after the
+damage. Every guarded query therefore selects `length(col)` as an extra column
+(SQLite computes it without transferring the payload), and the row mapper
+rejects an over-cap row **before** calling `r.get::<String>`/`get::<Vec<u8>>`.
+The guard is thus genuinely allocation-free.
 
-- `get_structural_blocks` (`structural.rs`) — reject a `body` over
-  `MAX_STRUCTURAL_BODY_LEN`, an unknown `kind`, or a negative `ordinal`.
-- tag reader (`tags.rs`) — reject a `key`/`value` over its cap, and reject more
-  than `MAX_TAGS_PER_TRACK` rows materialized for one track.
-- art reader (`art.rs`) — reject a `mime` over cap.
-- track_art reader — reject a `description` over cap.
+**Guard every reader that materializes a capped field — not a generic "reader."**
+The serve surface has multiple readers per field, and the hot paths do not go
+through the single-item ones:
 
-Each error propagates to the serve path and maps to `EIO`, exactly like the
-existing orphan-`art_id` case: a controlled failure, never an OOM or undefined
-behavior.
+- `tags.value` / `tags.key` — guarded in **all four** tag readers
+  (`get_tags`, `tags_for_tracks`, `tags_grouped`, `tags_grouped_for_keys`),
+  routed through one shared validated row-mapper so a future tag reader cannot
+  silently bypass the cap. The live serve paths are `tags_grouped_for_keys`
+  (`facade.rs:317`, path rendering), `tags_for_tracks` (`facade.rs:497`, bulk
+  rendering), and `get_tags` (`reader.rs:165`, synthesis); `tags_grouped` is the
+  unfiltered variant.
+- `art.mime` — guarded in `get_art_meta` (`art.rs`), the method the art path
+  actually calls via `mapping.rs:44`. (`get_art` reads the blob for streaming
+  and is already bounded by `art.byte_len`/`MAX_ART_BYTES`; `mime` does not flow
+  through it.)
+- `track_art.description` — guarded in `get_track_art` (`art.rs`, used at
+  `mapping.rs:39`).
+- `structural_blocks.body`/`kind`/`ordinal` — guarded in `get_structural_blocks`
+  (`structural.rs`, used at `reader.rs:174`): reject a `body` over
+  `MAX_STRUCTURAL_BODY_LEN` (via `length(body)` pre-check), an unknown `kind`, or
+  a negative `ordinal`.
+
+**`MAX_TAGS_PER_TRACK` semantics (per-track row count).** The multi-value
+explosion vector is a single track accumulating thousands of tag rows. The cap
+is therefore a **per-track** count, enforced as rows are streamed:
+
+- `get_tags` (single track, full load — the synthesis path that materializes
+  *all* of a track's tags) is the primary site: error if the track yields more
+  than `MAX_TAGS_PER_TRACK` rows.
+- `tags_for_tracks` and `tags_grouped` (bulk, full tag set keyed by track):
+  maintain a per-`track_id` running count while streaming and error if any track
+  exceeds the cap — not a global `LIMIT`, which would silently truncate.
+- `tags_grouped_for_keys` (key-filtered) only loads the template's keys, so it
+  cannot see a track's *total* tag count; there the per-track count bounds the
+  returned subset. The full-load guard on `get_tags` plus the per-key value
+  ordering already bound this path, so the subset count is belt-and-suspenders,
+  not the primary defense.
+
+Each guard error propagates to the serve path and maps to `EIO`, exactly like
+the existing orphan-`art_id` case: a controlled failure, never an OOM or
+undefined behavior. `SchemaMismatch` is the exception (surfaces at open, not as
+an errno — Section 1).
 
 Because `tags.value` is capped at the read boundary, template rendering never
 sees an oversized string, so #267's "make rendering budget-aware" half is
@@ -177,14 +231,26 @@ directly rather than as an errno.
   (run a scan).
 - **CHECKs:** an oversize `INSERT` on a normal connection aborts — both at the V4
   refill and at ordinary write time.
-- **Reader guards:** craft a row via `PRAGMA ignore_check_constraints=ON` +
-  oversize `INSERT` (schema fingerprint still canonical) → the reader returns
-  `FieldTooLarge` and the serve fails closed, asserting no large allocation
-  occurs; more than `MAX_TAGS_PER_TRACK` rows → `TooManyValues`.
+- **Reader guards:** craft an over-cap row via `PRAGMA
+  ignore_check_constraints=ON` + oversize `INSERT` (schema fingerprint still
+  canonical) → the reader returns `FieldTooLarge`. Cover **each** guarded method
+  (`get_tags`, `tags_for_tracks`, `tags_grouped`, `tags_grouped_for_keys`,
+  `get_art_meta`, `get_track_art`, `get_structural_blocks`), since the shared
+  mapper is the single point that must not be bypassed. Because the length check
+  is SQL-side, assert the guard rejects without materializing the payload — e.g.
+  insert a row whose `length(value)` exceeds the cap but is cheap to store, or
+  assert the error fires on a `length()`-only query path; a "no large
+  allocation" claim is only meaningful if the over-cap value is never `get()`-ed.
+- **Per-track count:** more than `MAX_TAGS_PER_TRACK` rows for one track →
+  `TooManyValues`, exercised on `get_tags` (single-track) and on a bulk reader
+  (`tags_for_tracks`) where one track in the batch exceeds the cap while others
+  do not.
 - **Drift:** the V4 SQL embeds each constant; `schema.py` regeneration matches.
 - **Migration:** existing V4 tests extended for the new `CHECK`s and the
   `structural_blocks` rebuild, including that a pre-existing violating row aborts
-  the migration.
+  the migration. **Regression for the cascade bug:** a V2/V3 DB seeded with
+  `structural_blocks` rows migrates to V4 with those rows preserved (guards
+  against the current cascade-on-`DROP TABLE tracks` data loss).
 - **Fuzz:** format-layer signatures are unchanged, so `fuzz/` is unaffected;
   confirm with `cargo +nightly fuzz build`.
 
