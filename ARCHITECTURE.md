@@ -258,8 +258,7 @@ size/mtime), and FLAC structural-block changes (V5). It is therefore a
 superset key — the one input it cannot cover is an on-disk backing change with
 no DB write, which `resolve` (and, since #279, a size-cache `getattr` hit)
 catches by re-statting the backing file and degrading to `BackingChanged`.
-The
-`HeaderCache` (`reader.rs`) — a byte-budgeted concurrent cache (64 MiB
+The `HeaderCache` (`reader.rs`) — a byte-budgeted concurrent cache (64 MiB
 default) of resolved layouts — keys each entry on it: a hit with a stale
 `content_version` rebuilds the layout. Independently of the cache, **every**
 resolve re-stats the backing file and errors with `BackingChanged` if its
