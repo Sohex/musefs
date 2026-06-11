@@ -170,6 +170,30 @@ mod identity_tests {
     }
 
     #[test]
+    fn honest_schema_with_rows_passes() {
+        // A written-to DB gains `sqlite_sequence` (track_changes is AUTOINCREMENT,
+        // pumped by the tracks_changelog trigger on insert). The `sqlite_%` filter
+        // excludes it from both sides, so an honest populated DB must still pass —
+        // this guards against the gate ever false-rejecting a real mount.
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) VALUES ('/a.flac','flac',0,1,1,0,0)",
+            [],
+        )
+        .unwrap();
+        let has_seq: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sqlite_sequence'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_seq, 1, "precondition: insert created sqlite_sequence");
+        validate_identity(&conn).unwrap();
+    }
+
+    #[test]
     fn missing_trigger_is_rejected() {
         let conn = migrated();
         conn.execute_batch("DROP TRIGGER tags_ai").unwrap();
@@ -378,9 +402,35 @@ fn open_readonly_accepts_honest_schema() {
     Db::open(&path).unwrap();
     Db::open_readonly(&path).unwrap();
 }
+
+#[test]
+fn open_readonly_rejects_foreign_key_violation() {
+    // The read-only mount never sets `PRAGMA foreign_keys = ON`, so this proves
+    // `foreign_key_check` (which is independent of the enforcement pragma)
+    // catches an orphan on the actual RO path (spec Section 6).
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let path = file.path().to_path_buf();
+    {
+        let db = Db::open(&path).unwrap();
+        db.conn
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF; \
+                 INSERT INTO art (sha256, mime, byte_len, data) VALUES ('a','image/png',1,X'00'); \
+                 INSERT INTO track_art (track_id, art_id, picture_type, ordinal) VALUES (999, 1, 3, 0);",
+            )
+            .unwrap();
+    }
+    let err = Db::open_readonly(&path).unwrap_err();
+    match err {
+        crate::DbError::SchemaMismatch { object } => assert!(object.contains("foreign key")),
+        other => panic!("expected SchemaMismatch (fk) on RO open, got {other:?}"),
+    }
+}
 ```
 
 Note: `Db::open` uses WAL; `open_readonly`'s doc notes it needs a writable directory for the `-shm` index — `NamedTempFile` lives in a writable tmp dir, so this works.
+
+**Serve-path coverage (for the reviewer of this plan):** `DbPool::new` seeds the pool from a connection opened by `Db::open(...).into_read_only()` (`db_pool.rs:54`), whose identity was already validated by the post-`migrate` gate in `configure`; per-thread additional connections are opened via `Db::open_readonly` (`db_pool.rs:90`), gated by the new call site here. Both serve-path connection kinds are therefore covered; `into_read_only` itself needs no gate (it only re-types an already-validated connection).
 
 - [ ] **Step 7: Run the full db suite + lint**
 
@@ -702,7 +752,7 @@ Fail closed at `get_structural_blocks` for a smuggled oversize body / unknown ki
 - Modify: `musefs-db/src/error.rs` (add `FieldTooLarge`, `InvalidStructuralBlock`)
 - Modify: `musefs-db/src/structural.rs` (`get_structural_blocks` body)
 
-- [ ] **Step 1: Add the error variants**
+- [ ] **Step 1: Add the error variants and the shared length-only guard helper**
 
 In `musefs-db/src/error.rs`, add to `DbError`:
 
@@ -716,6 +766,39 @@ In `musefs-db/src/error.rs`, add to `DbError`:
     },
     #[error("structural block for track {track_id} is invalid: {detail} (crafted or corrupt DB)")]
     InvalidStructuralBlock { track_id: i64, detail: String },
+```
+
+Then add the shared guard helper at module scope in `error.rs` (every reader guard routes its length check through this — it is a **pure function of the SQL-computed `length(col)`** and never receives the value, which is the observable proof that rejection is allocation-free, spec N13):
+
+```rust
+/// Reject a field whose SQL-computed `length()` exceeds `max`, before the value
+/// is ever materialized. Takes only the length, so by construction it cannot
+/// touch the (potentially huge) payload — the allocation-free guarantee the
+/// reader guards rely on (spec N13).
+pub(crate) fn check_field_len(
+    table: &'static str,
+    field: &'static str,
+    len: i64,
+    max: i64,
+) -> Result<()> {
+    if len > max {
+        return Err(DbError::FieldTooLarge { table, field, len, max });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod guard_helper_tests {
+    use super::check_field_len;
+
+    #[test]
+    fn rejects_on_length_only_inclusive_boundary() {
+        // The decision is a pure function of length — the value is never passed
+        // in, so an over-cap row provably cannot be materialized to reject it.
+        assert!(check_field_len("tags", "value", 262_145, 262_144).is_err());
+        assert!(check_field_len("tags", "value", 262_144, 262_144).is_ok());
+    }
+}
 ```
 
 - [ ] **Step 2: Write the failing tests**
@@ -791,6 +874,25 @@ mod guard_tests {
         let err = db.get_structural_blocks(id).unwrap_err();
         assert!(matches!(err, DbError::InvalidStructuralBlock { .. }), "{err:?}");
     }
+
+    #[test]
+    fn rejects_negative_ordinal() {
+        // Reading ordinal as i64 (not u64) is what lets this reach our guard
+        // instead of failing as DbError::Sqlite(OutOfRange) at the column read.
+        let (db, id) = db_with_track();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (?1, 'STREAMINFO', -1, X'00')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        let err = db.get_structural_blocks(id).unwrap_err();
+        assert!(matches!(err, DbError::InvalidStructuralBlock { .. }), "{err:?}");
+    }
 }
 ```
 
@@ -813,6 +915,11 @@ Replace the body of `get_structural_blocks` (`musefs-db/src/structural.rs:15-31`
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             let kind: String = r.get(0)?;
+            // Read ordinal as i64, NOT u64: `StructuralBlock.ordinal` is u64, but
+            // rusqlite's `fallible_uint` would reject a smuggled negative value at
+            // `get::<u64>` as DbError::Sqlite(OutOfRange) — masking it before our
+            // own check and yielding the wrong error variant. Read i64, validate,
+            // then cast.
             let ordinal: i64 = r.get(1)?;
             let body_len: i64 = r.get(2)?;
             if !crate::limits::STRUCTURAL_KINDS.contains(&kind.as_str()) {
@@ -827,17 +934,15 @@ Replace the body of `get_structural_blocks` (`musefs-db/src/structural.rs:15-31`
                     detail: format!("negative ordinal {ordinal}"),
                 });
             }
-            if body_len > crate::limits::MAX_STRUCTURAL_BODY_LEN {
-                return Err(DbError::FieldTooLarge {
-                    table: "structural_blocks",
-                    field: "body",
-                    len: body_len,
-                    max: crate::limits::MAX_STRUCTURAL_BODY_LEN,
-                });
-            }
+            crate::error::check_field_len(
+                "structural_blocks",
+                "body",
+                body_len,
+                crate::limits::MAX_STRUCTURAL_BODY_LEN,
+            )?;
             out.push(StructuralBlock {
                 kind,
-                ordinal,
+                ordinal: u64::try_from(ordinal).expect("ordinal guarded >= 0 above"),
                 body: r.get(3)?,
             });
         }
@@ -885,8 +990,8 @@ Guard `tags.key`/`tags.value` length and per-track row count across all five `ta
 In `musefs-db/src/error.rs`, add to `DbError`:
 
 ```rust
-    #[error("track {track_id} has more than {max} tag rows (crafted or corrupt DB)")]
-    TooManyValues { track_id: i64, max: usize },
+    #[error("track {track_id} has {count} tag rows, exceeds the {max}-row cap (crafted or corrupt DB)")]
+    TooManyValues { track_id: i64, count: usize, max: usize },
 ```
 
 - [ ] **Step 2: Write the failing tests**
@@ -989,24 +1094,21 @@ Expected: FAIL (variants/behavior not implemented).
 At the top of the `impl<M> Db<M>` block in `tags.rs` (or as a free function in the module), add:
 
 ```rust
-use crate::error::DbError;
+use crate::error::{check_field_len, DbError};
 use crate::limits::{MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS_PER_TRACK};
 
 /// Reject an over-cap text-tag row from its `length(key)`/`length(value)`
-/// columns *before* the strings are materialized. SQLite computes `length()`
-/// without transferring the payload, so the guard is allocation-free.
+/// columns *before* the strings are materialized. Routes through the shared
+/// `check_field_len`, so the allocation-free guarantee is the same one its
+/// unit test pins (spec N13).
 fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
-    if key_len > MAX_TAG_KEY_LEN {
-        return Err(DbError::FieldTooLarge { table: "tags", field: "key", len: key_len, max: MAX_TAG_KEY_LEN });
-    }
-    if value_len > MAX_TAG_VALUE_LEN {
-        return Err(DbError::FieldTooLarge { table: "tags", field: "value", len: value_len, max: MAX_TAG_VALUE_LEN });
-    }
+    check_field_len("tags", "key", key_len, MAX_TAG_KEY_LEN)?;
+    check_field_len("tags", "value", value_len, MAX_TAG_VALUE_LEN)?;
     Ok(())
 }
 ```
 
-(Place the `fn` at module scope, not inside `impl`. Keep existing `use` lines.)
+Place these `use` lines and the free `fn check_tag_lengths` at **module scope** (e.g. immediately after the existing `use` block at the top of `tags.rs`, before `impl<M> Db<M>`) — a free `fn` cannot live inside an `impl`. `DbError` is needed for the `TooManyValues` returns below.
 
 - [ ] **Step 5: Rewrite `get_tags`**
 
@@ -1022,7 +1124,7 @@ fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
             check_tag_lengths(r.get(0)?, r.get(1)?)?;
             out.push(Tag { key: r.get(2)?, value: r.get(3)?, ordinal: r.get(4)? });
             if out.len() > MAX_TAGS_PER_TRACK {
-                return Err(DbError::TooManyValues { track_id, max: MAX_TAGS_PER_TRACK });
+                return Err(DbError::TooManyValues { track_id, count: out.len(), max: MAX_TAGS_PER_TRACK });
             }
         }
         Ok(out)
@@ -1031,9 +1133,10 @@ fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
 
 - [ ] **Step 6: Rewrite `tags_for_tracks` and `tags_grouped` (bulk, per-track streaming count)**
 
-`tags_for_tracks` — change the SQL to select the length columns and replace the `query_map` block with a manual loop that guards lengths and the per-track count via the entry vec:
+`tags_for_tracks` — keep the existing `for chunk in track_ids.chunks(CHUNK)` loop **and the `let placeholders = vec!["?"; chunk.len()].join(",");` line that precedes the `format!`**. Replace only from the `let sql = format!(...)` line through the end of the existing `for row in rows { … }` block with the manual loop below (the `format!` SQL gains the two `length(...)` columns):
 
 ```rust
+            let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 "SELECT track_id, length(key), length(value), key, value, ordinal FROM tags \
                  WHERE track_id IN ({placeholders}) AND value_blob IS NULL \
@@ -1048,7 +1151,7 @@ fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
                 let entry = out.entry(track_id).or_default();
                 entry.push(Tag { key: r.get(3)?, value: r.get(4)?, ordinal: r.get(5)? });
                 if entry.len() > MAX_TAGS_PER_TRACK {
-                    return Err(DbError::TooManyValues { track_id, max: MAX_TAGS_PER_TRACK });
+                    return Err(DbError::TooManyValues { track_id, count: entry.len(), max: MAX_TAGS_PER_TRACK });
                 }
             }
 ```
@@ -1069,7 +1172,7 @@ fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
             let entry = out.entry(track_id).or_default();
             entry.push(Tag { key: r.get(3)?, value: r.get(4)?, ordinal: r.get(5)? });
             if entry.len() > MAX_TAGS_PER_TRACK {
-                return Err(DbError::TooManyValues { track_id, max: MAX_TAGS_PER_TRACK });
+                return Err(DbError::TooManyValues { track_id, count: entry.len(), max: MAX_TAGS_PER_TRACK });
             }
         }
         Ok(out)
@@ -1078,7 +1181,11 @@ fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
 
 - [ ] **Step 7: Rewrite `tags_grouped_for_keys` (key-filtered, subset count)**
 
+Keep the existing `for chunk in keys.chunks(CHUNK)` loop **and the `let lowered: Vec<String> = …` and `let placeholders = vec!["?"; lowered.len()].join(",");` lines** that precede the `format!`. Replace only from `let sql = format!(...)` through the `for row in rows { … }` block:
+
 ```rust
+            let lowered: Vec<String> = chunk.iter().map(|k| k.to_ascii_lowercase()).collect();
+            let placeholders = vec!["?"; lowered.len()].join(",");
             let sql = format!(
                 "SELECT track_id, length(key), length(value), key, value, ordinal FROM tags \
                  WHERE value_blob IS NULL AND lower(key) IN ({placeholders}) \
@@ -1093,7 +1200,7 @@ fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
                 let entry = out.entry(track_id).or_default();
                 entry.push(Tag { key: r.get(3)?, value: r.get(4)?, ordinal: r.get(5)? });
                 if entry.len() > MAX_TAGS_PER_TRACK {
-                    return Err(DbError::TooManyValues { track_id, max: MAX_TAGS_PER_TRACK });
+                    return Err(DbError::TooManyValues { track_id, count: entry.len(), max: MAX_TAGS_PER_TRACK });
                 }
             }
 ```
@@ -1104,9 +1211,9 @@ Replace the self-referential doc comment ("Ordered by (key, ordinal) to match `g
 
 ```rust
     /// Binary tag rows for a track: streaming handle (rowid), key, and payload
-    /// length. Ordered by (key, ordinal) to match `read_binary_tag_chunk_into`
-    /// and the layout builder. The blob bytes stream at read time; only `key`
-    /// (materialized here) is length-guarded, plus the per-track row count.
+    /// length. Ordered by (key, ordinal) to match the layout builder's emission
+    /// order. The blob bytes stream at read time; only `key` (materialized here)
+    /// is length-guarded, plus the per-track row count.
     pub fn get_binary_tags(&self, track_id: i64) -> Result<Vec<BinaryTagRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT length(key), rowid, key, length(value_blob) FROM tags \
@@ -1115,13 +1222,10 @@ Replace the self-referential doc comment ("Ordered by (key, ordinal) to match `g
         let mut rows = stmt.query(params![track_id])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            let key_len: i64 = r.get(0)?;
-            if key_len > MAX_TAG_KEY_LEN {
-                return Err(DbError::FieldTooLarge { table: "tags", field: "key", len: key_len, max: MAX_TAG_KEY_LEN });
-            }
+            check_field_len("tags", "key", r.get(0)?, MAX_TAG_KEY_LEN)?;
             out.push(BinaryTagRow { rowid: r.get(1)?, key: r.get(2)?, byte_len: r.get(3)? });
             if out.len() > MAX_TAGS_PER_TRACK {
-                return Err(DbError::TooManyValues { track_id, max: MAX_TAGS_PER_TRACK });
+                return Err(DbError::TooManyValues { track_id, count: out.len(), max: MAX_TAGS_PER_TRACK });
             }
         }
         Ok(out)
@@ -1228,7 +1332,7 @@ Expected: FAIL (behavior not implemented).
 
 - [ ] **Step 3: Implement the guards**
 
-Add `use crate::error::DbError;` and `use crate::limits::{MAX_ART_MIME_LEN, MAX_ART_DESCRIPTION_LEN};` to the top of `art.rs`. Rewrite `get_art_meta` to select `length(mime)` first:
+Add `use crate::error::check_field_len;` and `use crate::limits::{MAX_ART_MIME_LEN, MAX_ART_DESCRIPTION_LEN};` to the top of `art.rs`. Rewrite `get_art_meta` to select `length(mime)` first:
 
 ```rust
     pub fn get_art_meta(&self, id: i64) -> Result<Option<ArtMeta>> {
@@ -1238,10 +1342,7 @@ Add `use crate::error::DbError;` and `use crate::limits::{MAX_ART_MIME_LEN, MAX_
         let mut rows = stmt.query(params![id])?;
         match rows.next()? {
             Some(r) => {
-                let mime_len: i64 = r.get(0)?;
-                if mime_len > MAX_ART_MIME_LEN {
-                    return Err(DbError::FieldTooLarge { table: "art", field: "mime", len: mime_len, max: MAX_ART_MIME_LEN });
-                }
+                check_field_len("art", "mime", r.get(0)?, MAX_ART_MIME_LEN)?;
                 Ok(Some(ArtMeta { mime: r.get(1)?, width: r.get(2)?, height: r.get(3)?, byte_len: r.get(4)? }))
             }
             None => Ok(None),
@@ -1260,10 +1361,7 @@ Rewrite `get_track_art` to select `length(description)` and guard each row:
         let mut rows = stmt.query(params![track_id])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            let desc_len: i64 = r.get(0)?;
-            if desc_len > MAX_ART_DESCRIPTION_LEN {
-                return Err(DbError::FieldTooLarge { table: "track_art", field: "description", len: desc_len, max: MAX_ART_DESCRIPTION_LEN });
-            }
+            check_field_len("track_art", "description", r.get(0)?, MAX_ART_DESCRIPTION_LEN)?;
             out.push(TrackArt { art_id: r.get(1)?, picture_type: r.get(2)?, description: r.get(3)?, ordinal: r.get(4)? });
         }
         Ok(out)
@@ -1372,7 +1470,9 @@ EOF
 
 - [ ] **Step 1: Update the external-writer contract**
 
-In `ARCHITECTURE.md`'s "The external-writer contract" section (the paragraph listing what V4 `CHECK`s reject), extend the list of rejected shapes to include: a `tags.key` over 256 chars or `tags.value` over 256 KiB, a `value_blob` over `MAX_BINARY_TAG_BYTES`, an `art.mime` over 255 / `byte_len` over `MAX_ART_BYTES`, a `track_art.description` over 1 KiB, and a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body` over the FLAC block limit. Add a sentence that the read-only mount now also validates schema identity at open (a `sqlite_master` + `foreign_key_check` gate, `schema::validate_identity`) and rejects anything that is not the canonical latest schema with a "run `musefs scan`" message. Note `structural_blocks` is now a constrained, rebuilt-in-V4 table. Match the section's existing prose style.
+Anchor: the section headed `### The external-writer contract` in `ARCHITECTURE.md` (find it with `grep -n "external-writer contract" ARCHITECTURE.md`). Its existing sentence enumerates the V4-rejected shapes — it begins "As of V4, SQLite `CHECK` constraints reject the malformed *shapes* at commit — an unknown `format` string, …". Extend that enumeration to also list: a `tags.key` over 256 chars or `tags.value` over 256 KiB, a `value_blob` over `MAX_BINARY_TAG_BYTES`, an `art.mime` over 255 chars or `byte_len` over `MAX_ART_BYTES`, a `track_art.description` over 1 KiB, and a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body` over the FLAC 24-bit block limit. Then add one sentence to the same section stating that the read-only mount now also validates schema identity at open (`schema::validate_identity`: a `sqlite_master` comparison against a freshly-migrated reference plus `PRAGMA foreign_key_check`) and rejects anything that is not the canonical latest schema with a message telling the user to run `musefs scan`. Update the V2 bullet (or the V4 bullet) that currently calls `structural_blocks` "not part of the editable contract" only if it also implies it is unconstrained — it is now a constrained, rebuilt-in-V4 table.
+
+Verify the edit landed: `grep -n "256 KiB\|validate_identity\|schema identity" ARCHITECTURE.md` should return your new lines (this is the green-check for an otherwise un-gated docs step).
 
 - [ ] **Step 2: Verify the fuzz crate still builds (format API unchanged except a pub widening)**
 
@@ -1407,4 +1507,4 @@ EOF
 - [ ] All eight tasks committed; `cargo test` green workspace-wide.
 - [ ] `MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py` produces no diff (mirror is current).
 - [ ] Picard vendored copy in sync (`python contrib/python-musefs/vendor_to_picard.py` produces no diff).
-- [ ] Spec requirements traced: #270 gate (Task 2), tags.key/value + count (Task 5), value_blob/art blob CHECKs (Task 3), structural_blocks body/kind/ordinal CHECK + guard (Tasks 3, 4), art.mime/description (Tasks 3, 6), drift + cross-layer equality (Tasks 3, 7), error→errno via existing `CoreError::Db` arm (no change needed — verified in Task notes), ARCHITECTURE.md (Task 8).
+- [ ] Spec requirements traced: #270 gate (Task 2, incl. honest-with-rows + RO foreign-key-violation tests), tags.key/value + per-track count incl. binary (Task 5), value_blob/art blob CHECKs (Task 3), structural_blocks body/kind/ordinal CHECK + reader guard incl. negative-ordinal test (Tasks 3, 4), art.mime/description (Tasks 3, 6), drift + cross-layer equality (Tasks 3, 7), N13 observable allocation-free guard via the pure `check_field_len` helper + its unit test (Task 4, reused by Tasks 5–6), error→errno via existing `CoreError::Db` arm (no change needed — verified), ARCHITECTURE.md (Task 8).
