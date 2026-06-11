@@ -10,8 +10,9 @@ mount shows a clean library while your files stay exactly as they are.
 ## Quick start
 
 ```bash
-cargo install musefs    # compiles from source: needs a Rust toolchain,
-                        # libfuse3-dev and pkg-config — see Requirements
+cargo install musefs    # compiles from source — needs a Rust toolchain,
+                        # libfuse3-dev and pkg-config; prebuilt binaries
+                        # and container images: see Installing
 
 musefs scan ~/Music --db library.db        # ingest your library
 mkdir -p ~/mnt/music
@@ -37,6 +38,134 @@ from the database, spliced in front of your original, untouched audio.
 - **Lossless-by-construction experimentation.** Try a retag, a different
   organization scheme, new cover art — the originals are physically
   read-only to the mount.
+
+## Installing
+
+Three ways to get musefs: a [prebuilt binary](#prebuilt-binaries) (no
+toolchain needed), [building from source](#building-from-source), or a
+[container image](#container-images).
+Whichever you pick, mounting needs a FUSE-capable OS — see
+[Platform support](#platform-support).
+
+### Prebuilt binaries
+
+Each tagged release attaches static/portable Linux binaries for four targets:
+
+| Target | libc | Notes |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu`  | glibc | Pinned to glibc 2.17 — runs on essentially any current distro. |
+| `aarch64-unknown-linux-gnu` | glibc | glibc 2.17 floor, ARM64. |
+| `x86_64-unknown-linux-musl`  | musl | Fully static — runs on Alpine / scratch containers. |
+| `aarch64-unknown-linux-musl` | musl | Fully static, ARM64. |
+
+Download the tarball for your target from the
+[latest release](https://github.com/Sohex/musefs/releases/latest), verify it,
+and extract:
+
+```bash
+sha256sum -c musefs-<version>-<target>.tar.gz.sha256
+tar -xzf musefs-<version>-<target>.tar.gz   # yields ./musefs
+```
+
+**Runtime requirements:** the binaries mount via FUSE's `fusermount3` helper, so
+the target needs the FUSE userspace tools and `/dev/fuse`:
+
+- Debian/Ubuntu: `apt-get install fuse3`
+- Alpine: `apk add fuse3`
+
+No glibc/libfuse install is needed for the musl binaries beyond `fuse3`.
+
+### Building from source
+
+`cargo install musefs` compiles the latest release; building needs a stable
+Rust toolchain (2024 edition) plus the FUSE headers (`libfuse3-dev`) and
+`pkg-config`. To install the latest development version instead:
+
+```bash
+cargo install --git https://github.com/Sohex/musefs musefs
+```
+
+The same `fuse3` runtime requirement as the prebuilt binaries applies.
+
+### Container images
+
+Each tagged release also publishes multi-arch images to the GitHub Container
+Registry:
+
+| Image | libc | Platforms |
+| --- | --- | --- |
+| `ghcr.io/sohex/musefs:<version>`, `ghcr.io/sohex/musefs:latest` | glibc | amd64, arm64 |
+| `ghcr.io/sohex/musefs:<version>-musl`, `ghcr.io/sohex/musefs:musl` | musl | amd64, arm64 |
+
+`docker pull` selects the CPU architecture automatically. Use the `-musl` /
+`:musl` tags when slotting musefs into an Alpine-based stack; the default
+(glibc) tags suit everything else. Floating `:latest` / `:musl` track the most
+recent stable release only — prereleases publish only version-pinned tags.
+
+**Running musefs on the host is the simplest, best-supported option** — it is an
+ordinary FUSE daemon and the image exists mainly to colocate musefs with
+containerized media managers (e.g. Lidarr). If you do containerize, mind the
+gotchas below.
+
+#### Required flags
+
+musefs mounts via FUSE, so the container needs `/dev/fuse` and the matching
+capability:
+
+```bash
+docker run --rm \
+  --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+  -v /path/to/library:/library:ro \
+  -v /path/to/store:/store \
+  ghcr.io/sohex/musefs:latest scan /library --db /store/musefs.db
+```
+
+Without `--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined`
+the mount cannot be established.
+
+Note that `CAP_SYS_ADMIN` is a broadly privileged capability — it grants far more
+than FUSE mounting (mounting arbitrary filesystems, and more). It is unavoidable
+for an in-container FUSE mount, but it is another reason to prefer running musefs
+on the host, which needs no such capability.
+
+#### The mount-visibility gotcha (read this before sharing the mount)
+
+A FUSE mount made **inside** a container lives in that container's mount
+namespace. By default neither the host nor other containers can see it, so
+pointing a second container (your media manager) at musefs's output does not
+work out of the box. Two ways to share it:
+
+- **Prefer Podman in a shared pod** — Docker has no first-class pod primitive,
+  but Podman does, so this is the cleanest path: put musefs and the consumer in
+  the same pod so they share namespaces and the mount is directly reachable:
+
+  ```bash
+  podman pod create --name media
+  podman run -d --pod media \
+    --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+    -v /path/to/library:/library:ro -v /path/to/store:/store \
+    ghcr.io/sohex/musefs:latest mount /mnt/musefs --db /store/musefs.db
+  # the consumer container, in the same pod, reads /mnt/musefs
+  ```
+
+- Or bind-mount the mount point with **`rshared` propagation** so the mount
+  escapes the container's namespace to the host (`--mount type=bind,...,bind-propagation=rshared`).
+  This is fiddlier than a shared pod, which is why the pod approach is
+  recommended.
+
+Both the glibc and musl images carry the `fuse3` userspace tools; pick `:musl`
+if your other containers are Alpine-based, otherwise the default tags are fine.
+
+### Platform support
+
+| Platform | FUSE | Kernel passthrough (StructureOnly) | Notes |
+| --- | --- | --- | --- |
+| Linux | Yes (`/dev/fuse` + `fusermount3`, from the `fuse3` package) | Yes (6.9+, falls back to daemon serving otherwise) | Full support. |
+| FreeBSD | Yes (pure-rust `/dev/fuse` backend; `fusefs` kernel module, no libfuse) | No | Full FUSE support. |
+| macOS (FUSE-T) | Best-effort | No | Compiles and runs unit tests with `macos-no-mount`; mounted e2e is not yet validated. |
+
+On platforms without kernel passthrough, `--mode structure-only` still serves
+the original bytes, just through the daemon instead of the kernel.
 
 ## Usage
 
@@ -69,7 +198,23 @@ musefs mount /path/to/mountpoint --db library.db \
 ```
 
 `mount` blocks until the filesystem is unmounted (`fusermount -u`, or
-Ctrl-C). Paths come from a beets-style template (matched case-insensitively;
+Ctrl-C).
+
+Two modes:
+
+- **`synthesis`** (default) — files carry metadata freshly generated from
+  the store, spliced ahead of the original audio bytes.
+- **`structure-only`** — files are served byte-for-byte as they are on disk;
+  only the directory tree is virtual.
+
+Edit tags or art in the database while mounted (another `scan`, a
+beets/Picard/Lidarr sync, raw SQL) and the view refreshes automatically.
+
+Run `musefs <command> --help` for the full flag list.
+
+#### Path templates
+
+Paths come from a beets-style template (matched case-insensitively;
 any tag key in the store works):
 
 - `$field` / `${field}` — substitute a tag field (e.g. `$artist`, `$album`,
@@ -94,18 +239,6 @@ suffix. Every rendered component is capped at 255 bytes (NAME_MAX, truncated on
 a UTF-8 boundary, extension preserved), and a plain field whose value is
 exactly `.` or `..` is dropped rather than creating an unusable directory. The
 default template is `$albumartist/$album/$title`.
-
-Two modes:
-
-- **`synthesis`** (default) — files carry metadata freshly generated from
-  the store, spliced ahead of the original audio bytes.
-- **`structure-only`** — files are served byte-for-byte as they are on disk;
-  only the directory tree is virtual.
-
-Edit tags or art in the database while mounted (another `scan`, a
-beets/Picard/Lidarr sync, raw SQL) and the view refreshes automatically.
-
-Run `musefs <command> --help` for the full flag list.
 
 ### Tuning
 
@@ -206,9 +339,6 @@ keep working.
 No — and it's not planned. Out-of-band editing against the store *is* the
 design: it's what guarantees your originals can never be corrupted.
 
-**What platforms?**
-See [Platform support](#platform-support).
-
 **Is it fast enough for a big library on a NAS?**
 That's the design target: synthesized headers are cached, blocking reads run
 on a worker pool so a slow disk never stalls the filesystem, and read-ahead,
@@ -220,130 +350,6 @@ via FUSE passthrough (needs `CAP_SYS_ADMIN`).
 The most common cause is a backing file that changed since its last scan
 (musefs refuses to serve a file whose size or mtime drifted, rather than
 splice at stale offsets). Run `musefs scan --revalidate` to re-probe it.
-
-## Prebuilt binaries
-
-Each tagged release attaches static/portable Linux binaries for four targets:
-
-| Target | libc | Notes |
-| --- | --- | --- |
-| `x86_64-unknown-linux-gnu`  | glibc | Pinned to glibc 2.17 — runs on essentially any current distro. |
-| `aarch64-unknown-linux-gnu` | glibc | glibc 2.17 floor, ARM64. |
-| `x86_64-unknown-linux-musl`  | musl | Fully static — runs on Alpine / scratch containers. |
-| `aarch64-unknown-linux-musl` | musl | Fully static, ARM64. |
-
-Download the tarball for your target from the
-[latest release](https://github.com/Sohex/musefs/releases/latest), verify it,
-and extract:
-
-```bash
-sha256sum -c musefs-<version>-<target>.tar.gz.sha256
-tar -xzf musefs-<version>-<target>.tar.gz   # yields ./musefs
-```
-
-**Runtime requirements:** the binaries mount via FUSE's `fusermount3` helper, so
-the target needs the FUSE userspace tools and `/dev/fuse`:
-
-- Debian/Ubuntu: `apt-get install fuse3`
-- Alpine: `apk add fuse3`
-
-No glibc/libfuse install is needed for the musl binaries beyond `fuse3`.
-
-## Container images
-
-Each tagged release also publishes multi-arch images to the GitHub Container
-Registry:
-
-| Image | libc | Platforms |
-| --- | --- | --- |
-| `ghcr.io/sohex/musefs:<version>`, `ghcr.io/sohex/musefs:latest` | glibc | amd64, arm64 |
-| `ghcr.io/sohex/musefs:<version>-musl`, `ghcr.io/sohex/musefs:musl` | musl | amd64, arm64 |
-
-`docker pull` selects the CPU architecture automatically. Use the `-musl` /
-`:musl` tags when slotting musefs into an Alpine-based stack; the default
-(glibc) tags suit everything else. Floating `:latest` / `:musl` track the most
-recent stable release only — prereleases publish only version-pinned tags.
-
-**Running musefs on the host is the simplest, best-supported option** — it is an
-ordinary FUSE daemon and the image exists mainly to colocate musefs with
-containerized media managers (e.g. Lidarr). If you do containerize, mind the
-gotchas below.
-
-### Required flags
-
-musefs mounts via FUSE, so the container needs `/dev/fuse` and the matching
-capability:
-
-```bash
-docker run --rm \
-  --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-  -v /path/to/library:/library:ro \
-  -v /path/to/store:/store \
-  ghcr.io/sohex/musefs:latest scan /library --db /store/musefs.db
-```
-
-Without `--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined`
-the mount cannot be established.
-
-Note that `CAP_SYS_ADMIN` is a broadly privileged capability — it grants far more
-than FUSE mounting (mounting arbitrary filesystems, and more). It is unavoidable
-for an in-container FUSE mount, but it is another reason to prefer running musefs
-on the host, which needs no such capability.
-
-### The mount-visibility gotcha (read this before sharing the mount)
-
-A FUSE mount made **inside** a container lives in that container's mount
-namespace. By default neither the host nor other containers can see it, so
-pointing a second container (your media manager) at musefs's output does not
-work out of the box. Two ways to share it:
-
-- **Prefer Podman in a shared pod** — Docker has no first-class pod primitive,
-  but Podman does, so this is the cleanest path: put musefs and the consumer in
-  the same pod so they share namespaces and the mount is directly reachable:
-
-  ```bash
-  podman pod create --name media
-  podman run -d --pod media \
-    --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-    -v /path/to/library:/library:ro -v /path/to/store:/store \
-    ghcr.io/sohex/musefs:latest mount /mnt/musefs --db /store/musefs.db
-  # the consumer container, in the same pod, reads /mnt/musefs
-  ```
-
-- Or bind-mount the mount point with **`rshared` propagation** so the mount
-  escapes the container's namespace to the host (`--mount type=bind,...,bind-propagation=rshared`).
-  This is fiddlier than a shared pod, which is why the pod approach is
-  recommended.
-
-Both the glibc and musl images carry the `fuse3` userspace tools; pick `:musl`
-if your other containers are Alpine-based, otherwise the default tags are fine.
-
-## Requirements
-
-- Rust (2024 edition) and Cargo to build/install.
-- A supported OS with FUSE to mount — Linux (`/dev/fuse` + `fusermount3`, from
-  the `fuse3` package) or FreeBSD
-  (`/dev/fuse` + the `fusefs` kernel module; no libfuse). macOS (FUSE-T) is
-  best-effort. See [Platform support](#platform-support) for details.
-
-## Platform support
-
-| Platform | FUSE | Kernel passthrough (StructureOnly) | Notes |
-| --- | --- | --- | --- |
-| Linux | Yes | Yes (6.9+, falls back to daemon serving otherwise) | Full support. |
-| FreeBSD | Yes (pure-rust `/dev/fuse` backend; `fusefs` kernel module) | No | Full FUSE support. |
-| macOS (FUSE-T) | Best-effort | No | Compiles and runs unit tests with `macos-no-mount`; mounted e2e is not yet validated. |
-
-On platforms without kernel passthrough, `--mode structure-only` still serves
-the original bytes, just through the daemon instead of the kernel.
-
-`cargo install` compiles from source, so the same prerequisites as a local
-build apply: a Rust toolchain plus FUSE headers (`libfuse3-dev`) and
-`pkg-config`. To install the latest development version:
-
-```bash
-cargo install --git https://github.com/Sohex/musefs musefs
-```
 
 ## Status
 

@@ -4,16 +4,36 @@ The working manual for building, testing, and landing a change. For what the
 pieces *are*, read [ARCHITECTURE.md](ARCHITECTURE.md) first; for per-format
 behavior, the docs under [`docs/`](docs/).
 
+Map of this document:
+
+- [Getting set up](#getting-set-up) — prerequisites and the pre-commit hook.
+- [Build & test](#build--test) — everyday commands, the FUSE e2e suite, the
+  [FreeBSD VM harness](#freebsd-e2e).
+- [Test tiers beyond `cargo test`](#test-tiers-beyond-cargo-test) — property
+  tests, fuzzing, interop, the contract round trip, fault injection, mutation
+  testing, sanitizers, coverage.
+- [Code conventions](#code-conventions) — errors, integer casts, lints,
+  `unsafe`, layering.
+- [Adding a format](#adding-a-format) — the four-step recipe.
+- [Python plugins (contrib)](#python-plugins-contrib) — per-suite commands and
+  the gotchas.
+- [Releasing](#releasing-the-python-packages) — the Python (`py-v*`) and
+  [Rust (`v*`)](#releasing-the-rust-crates-and-binaries) release flows.
+- [PRs & commits](#prs--commits) — conventions and the
+  [before-you-push checklist](#before-you-push).
+
 ## Getting set up
 
-You need stable Rust (edition 2024) with `rustfmt` and `clippy`. To mount or run
-the FUSE end-to-end tests you need a FUSE-capable OS: Linux with `/dev/fuse` and
-libfuse (`libfuse3-dev` / `libfuse3` plus `pkg-config`), or FreeBSD with
-`/dev/fuse` and the `fusefs` kernel module (no libfuse — see [FreeBSD
-e2e](#freebsd-e2e) for the in-tree VM harness). The Python plugin suites
-additionally want Python 3 with `ruff` and `pytest`. The pre-commit hook's
-shell and YAML lint legs use `shellcheck` and `yamllint` — both optional, each
-skips with a notice if not installed.
+Prerequisites:
+
+- **Rust** — stable (edition 2024) with `rustfmt` and `clippy`.
+- **FUSE** (to mount, or to run the FUSE end-to-end tests) — Linux with
+  `/dev/fuse` and libfuse (`libfuse3-dev` / `libfuse3` plus `pkg-config`), or
+  FreeBSD with `/dev/fuse` and the `fusefs` kernel module (no libfuse — see
+  [FreeBSD e2e](#freebsd-e2e) for the in-tree VM harness).
+- **Python 3** with `ruff` and `pytest` — only for the Python plugin suites.
+- **`shellcheck` and `yamllint`** — optional; the pre-commit hook's shell and
+  YAML lint legs each skip with a notice if not installed.
 
 Enable the repo's pre-commit hook once per clone:
 
@@ -600,5 +620,22 @@ Lidarr e2e gate) is also run.
   report.
 - Benchmark results, when a change warrants them, are recorded in
   [BENCHMARKS.md](BENCHMARKS.md).
-- Run the in-diff mutation gate (above) for logic changes — it is CI parity,
-  not optional polish.
+
+### Before you push
+
+The pre-commit hook already gates fmt, clippy, the workspace tests, and the
+Python/shell/YAML lints on every commit. What it does **not** run — check the
+ones your change triggers:
+
+- **Logic changes** → the [in-diff mutation gate](#mutation-testing). It is CI
+  parity, not optional polish.
+- **Format-layer API changes** → `cargo +nightly fuzz build`; the `fuzz/`
+  crate is outside the workspace, so nothing else compiles it
+  ([coverage-guided fuzzing](#coverage-guided-fuzzing)).
+- **`musefs-db` schema changes** → regenerate and re-vendor the Python schema
+  mirror ([Python plugins](#python-plugins-contrib)).
+- **Picard plugin changes** → make sure the real-Picard tests actually ran
+  rather than silently skipped ([gotchas](#python-plugins-contrib)).
+- **FUSE/mount-surface changes** → run the `--ignored` e2e suite locally
+  ([Build & test](#build--test)); the FreeBSD CI leg only runs on PRs that
+  touch that surface.

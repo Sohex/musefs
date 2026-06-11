@@ -141,30 +141,55 @@ plugins under `contrib/` write tags and art here out-of-band.
 
 ### The external-writer contract
 
-External tools get full read/write on `tags`, `art`, and `track_art`. The
-scanner owns the structural columns of `tracks` (`id`, `backing_path`,
-`format`, `audio_offset`, `audio_length`, `backing_size`, `backing_mtime`,
-`content_version`, `updated_at`) and all of `structural_blocks`: those are
-derived from probing the file, and external tools must run `musefs scan`
-rather than compute them. As of V4, SQLite `CHECK` constraints reject the
-malformed *shapes* at commit — an unknown `format` string, a negative
-length/offset/size/version, an `audio_offset + audio_length` running past the
-stored `backing_size`, a binary tag row whose `value` is non-empty, an
-`art.byte_len` that disagrees with its blob or a `sha256` of the wrong length,
-a `picture_type` outside `0..=20` — so an external writer cannot persist them.
-What CHECKs cannot catch is a scanner-owned field mutated to a *well-formed*
-value that no longer matches the real file on disk: `backing_size` or
-`backing_mtime` that drift from the actual file's stat, or audio bounds that
-fit the stored `backing_size` but overrun the file once it has shrunk. musefs
-re-stats the backing file on every resolve and treats such rows as untrusted
-input, degrading to a controlled `BackingChanged`/layout error, never
-undefined behavior.
-Referential gaps are treated the same way: a `track_art` row whose `art_id`
-has no matching `art` row (an orphan an external writer can produce with FK
-enforcement disabled) fails the serve with `EIO` rather than silently dropping
-the art.
+**Ownership.** External tools get full read/write on `tags`, `art`, and
+`track_art`. The scanner owns the structural columns of `tracks` (`id`,
+`backing_path`, `format`, `audio_offset`, `audio_length`, `backing_size`,
+`backing_mtime`, `content_version`, `updated_at`) and all of
+`structural_blocks`: those are derived from probing the file, and external
+tools must run `musefs scan` rather than compute them.
 
-The shared Python library (`contrib/python-musefs/`) encodes this contract
+**What the store enforces.** As of V4, SQLite `CHECK` constraints reject the
+malformed *shapes* at commit, so an external writer cannot persist them:
+
+- an unknown `format` string, or a negative length/offset/size/version;
+- an `audio_offset + audio_length` running past the stored `backing_size`;
+- a binary tag row whose `value` is non-empty;
+- an `art.byte_len` that disagrees with its blob, or a `sha256` of the wrong
+  length;
+- a `picture_type` outside `0..=20`.
+
+**What musefs defends at serve time.** CHECKs cannot catch a scanner-owned
+field mutated to a *well-formed* value that no longer matches the real file
+on disk: `backing_size` or `backing_mtime` that drift from the actual file's
+stat, or audio bounds that fit the stored `backing_size` but overrun the file
+once it has shrunk. musefs re-stats the backing file on every resolve and
+treats such rows as untrusted input, degrading to a controlled
+`BackingChanged`/layout error, never undefined behavior. Referential gaps are
+treated the same way: a `track_art` row whose `art_id` has no matching `art`
+row (an orphan an external writer can produce with FK enforcement disabled)
+fails the serve with `EIO` rather than silently dropping the art.
+
+**Merge vs. replace.** An external writer may **merge** rather than fully
+replace text tags — overwriting only the keys it manages and leaving the rest
+of the scan-seeded set in place — provided it tracks its own managed-key set
+out of band (the beets plugin uses a beets flexattr; the store is not the
+place for plugin state). musefs renders tags outside its native VOCAB
+(`musefs-format/src/tagmap.rs`) by passthrough (Vorbis uppercased, mp3
+`TXXX`, mp4 freeform), so such tags appear but are not guaranteed
+byte-identical to a given tagger's own per-format encoding.
+
+**Path layout offload.** External tools can also offload path layout
+entirely: a plugin evaluates its own (arbitrarily complex) path logic, writes
+the resulting relative path into a custom text tag — e.g. `INSERT INTO tags
+(track_id, key, value, ordinal) VALUES (?, 'beets_path', 'Pink
+Floyd/Animals/01 Pigs', 0)` — and the user mounts with `--template
+'$!{beets_path}'`. Because the field map is just the (lowercased) tag keys,
+any number of such tags (`beets_path`, `lidarr_path`, …) can back different
+concurrent mounts. The path field keeps embedded `/` as directory separators
+but sanitizes each segment and drops empty/`.`/`..` segments, so a
+misbehaving writer cannot inject traversal or empty components into the tree.
+
+**The shared Python library.** `contrib/python-musefs/` encodes this contract
 for plugin authors, including a generated copy of the schema
 (`musefs_common/schema.py`, regenerated from `schema.rs` by a drift-guarded
 test — see [CONTRIBUTING](CONTRIBUTING.md)). Its tag/art replace operations
@@ -175,23 +200,6 @@ uses the same shared library from a Custom Script workflow. Its Lidarr
 destination tree is only a tracking aid, made of symlinks by default; musefs
 remains the consumer-facing filesystem.
 
-An external writer may **merge** rather than fully replace text tags — overwriting
-only the keys it manages and leaving the rest of the scan-seeded set in place —
-provided it tracks its own managed-key set out of band (the beets plugin uses a
-beets flexattr; the store is not the place for plugin state). musefs renders tags
-outside its native VOCAB (`musefs-format/src/tagmap.rs`) by passthrough (Vorbis
-uppercased, mp3 `TXXX`, mp4 freeform), so such tags appear but are not
-guaranteed byte-identical to a given tagger's own per-format encoding.
-
-External tools can also offload path layout entirely: a plugin evaluates its own
-(arbitrarily complex) path logic, writes the resulting relative path into a
-custom text tag — e.g. `INSERT INTO tags (track_id, key, value, ordinal) VALUES
-(?, 'beets_path', 'Pink Floyd/Animals/01 Pigs', 0)` — and the user mounts with
-`--template '$!{beets_path}'`. Because the field map is just the (lowercased) tag
-keys, any number of such tags (`beets_path`, `lidarr_path`, …) can back
-different concurrent mounts. The path field keeps embedded `/` as directory
-separators but sanitizes each segment and drops empty/`.`/`..` segments, so a
-misbehaving writer cannot inject traversal or empty components into the tree.
 CI proves this contract end to end in the `contract` job (see
 [CONTRIBUTING](CONTRIBUTING.md)): a Python writer's tags/art, layered on a
 scanned track, are synthesized by the Rust serve path and read back by an
