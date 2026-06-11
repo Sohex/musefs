@@ -1484,6 +1484,34 @@ mod identity_tests {
     }
 
     #[test]
+    fn altered_object_with_no_other_diffs_is_rejected() {
+        // `art` has no triggers and (when empty) no FK children to cascade, so
+        // recreating it with a different shape makes the *altered* table the
+        // ONLY schema difference — isolating the `r != a` guard so a
+        // `r != a -> false` mutant cannot survive on the back of an unrelated
+        // missing/extra object.
+        let conn = migrated();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; \
+             DROP TABLE art; \
+             CREATE TABLE art (id INTEGER PRIMARY KEY, sha256 TEXT, mime TEXT, \
+                width INTEGER, height INTEGER, byte_len INTEGER, data BLOB);",
+        )
+        .unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => {
+                assert!(object.contains("art"), "names the object: {object}");
+                assert!(
+                    object.contains("altered"),
+                    "classifies it as altered: {object}"
+                );
+            }
+            other => panic!("expected SchemaMismatch (altered), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn foreign_key_violation_is_rejected() {
         let conn = migrated();
         conn.execute_batch(

@@ -59,6 +59,20 @@ pub(crate) fn check_field_len(
     Ok(())
 }
 
+/// Reject a track whose materialized tag-row count exceeds the per-track cap.
+/// Centralizing the comparison keeps a single boundary site (one mutation
+/// target) shared by every tag reader, instead of one per reader.
+pub(crate) fn check_tag_count(track_id: i64, count: usize) -> Result<()> {
+    if count > crate::limits::MAX_TAGS_PER_TRACK {
+        return Err(DbError::TooManyValues {
+            track_id,
+            count,
+            max: crate::limits::MAX_TAGS_PER_TRACK,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod guard_helper_tests {
     use super::check_field_len;
@@ -69,5 +83,14 @@ mod guard_helper_tests {
         // in, so an over-cap row provably cannot be materialized to reject it.
         assert!(check_field_len("tags", "value", 262_145, 262_144).is_err());
         assert!(check_field_len("tags", "value", 262_144, 262_144).is_ok());
+    }
+
+    #[test]
+    fn tag_count_accepts_at_cap_rejects_above() {
+        use crate::limits::MAX_TAGS_PER_TRACK;
+        // Boundary is inclusive: exactly the cap is accepted, one over rejected.
+        // Pins the single `>` site so a `>`→`>=`/`==` mutant cannot survive.
+        assert!(super::check_tag_count(1, MAX_TAGS_PER_TRACK).is_ok());
+        assert!(super::check_tag_count(1, MAX_TAGS_PER_TRACK + 1).is_err());
     }
 }

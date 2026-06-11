@@ -1,5 +1,5 @@
-use crate::error::{DbError, check_field_len};
-use crate::limits::{MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS_PER_TRACK};
+use crate::error::{check_field_len, check_tag_count};
+use crate::limits::{MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN};
 use crate::models::{BinaryTag, BinaryTagRow, Tag};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
@@ -29,13 +29,7 @@ impl<M> Db<M> {
                 value: r.get(3)?,
                 ordinal: r.get(4)?,
             });
-            if out.len() > MAX_TAGS_PER_TRACK {
-                return Err(DbError::TooManyValues {
-                    track_id,
-                    count: out.len(),
-                    max: MAX_TAGS_PER_TRACK,
-                });
-            }
+            check_tag_count(track_id, out.len())?;
         }
         Ok(out)
     }
@@ -65,13 +59,7 @@ impl<M> Db<M> {
                     value: r.get(4)?,
                     ordinal: r.get(5)?,
                 });
-                if entry.len() > MAX_TAGS_PER_TRACK {
-                    return Err(DbError::TooManyValues {
-                        track_id,
-                        count: entry.len(),
-                        max: MAX_TAGS_PER_TRACK,
-                    });
-                }
+                check_tag_count(track_id, entry.len())?;
             }
         }
         Ok(out)
@@ -93,13 +81,7 @@ impl<M> Db<M> {
                 value: r.get(4)?,
                 ordinal: r.get(5)?,
             });
-            if entry.len() > MAX_TAGS_PER_TRACK {
-                return Err(DbError::TooManyValues {
-                    track_id,
-                    count: entry.len(),
-                    max: MAX_TAGS_PER_TRACK,
-                });
-            }
+            check_tag_count(track_id, entry.len())?;
         }
         Ok(out)
     }
@@ -130,13 +112,7 @@ impl<M> Db<M> {
                     value: r.get(4)?,
                     ordinal: r.get(5)?,
                 });
-                if entry.len() > MAX_TAGS_PER_TRACK {
-                    return Err(DbError::TooManyValues {
-                        track_id,
-                        count: entry.len(),
-                        max: MAX_TAGS_PER_TRACK,
-                    });
-                }
+                check_tag_count(track_id, entry.len())?;
             }
         }
         Ok(out)
@@ -160,13 +136,7 @@ impl<M> Db<M> {
                 key: r.get(2)?,
                 byte_len: r.get(3)?,
             });
-            if out.len() > MAX_TAGS_PER_TRACK {
-                return Err(DbError::TooManyValues {
-                    track_id,
-                    count: out.len(),
-                    max: MAX_TAGS_PER_TRACK,
-                });
-            }
+            check_tag_count(track_id, out.len())?;
         }
         Ok(out)
     }
