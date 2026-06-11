@@ -40,36 +40,111 @@ no premature commits, and `sync_one`'s `dry_run` rollback still works.
   defend a consumer who flips autocommit or brings their own connection.
   Out of scope.
 
+## Transaction semantics: the two modes
+
+A single helper must serve two caller classes with *different* desired
+behavior, and the helper picks behavior from the connection's autocommit
+setting:
+
+- **Caller-managed connection** (the shipped contract: deferred legacy mode, or
+  3.12+ `autocommit=False`): the helper must make its block atomic via a nested
+  `SAVEPOINT` and **never** commit or roll back the enclosing transaction. The
+  caller's eventual single `commit()`/`rollback()` governs. This preserves
+  batch atomicity (beets syncs N records then commits once) and `dry_run`
+  rollback.
+- **Autocommit connection** (`isolation_level=None`, or 3.12+
+  `autocommit=True`): no one else will commit, so the helper **owns** a
+  transaction for the operation — `commit()` on success, `rollback()` on
+  failure — making the `DELETE`+`INSERT` atomic and durable.
+
+### The legacy-mode trap (why a bare savepoint is wrong)
+
+Python's `sqlite3` in **legacy mode** (`isolation_level=""`, the default that
+`connect()` at `store.py:11` returns) auto-issues an implicit `BEGIN` *only*
+before `INSERT`/`UPDATE`/`DELETE`/`REPLACE` — **not** before `SAVEPOINT`. So a
+`SAVEPOINT` issued as the *first* write of a batch becomes the **outermost**
+transaction, and its matching `RELEASE` **commits durably**. A later caller
+`rollback()` then no-ops. Verified empirically on CPython 3.8, 3.11, 3.12, and
+3.14.
+
+Concrete impact on the shipped beets path (`musefs.py:221-238`): `connect()`
+(legacy) → `check_schema_version()` (a `PRAGMA` *read*, opens no transaction) →
+`sync_files`. A naive savepoint in the first `sync_one` would be the first
+write, so `RELEASE` commits that record durably; every later record then
+self-commits too. beets' final `conn.commit()` becomes a no-op, **batch
+atomicity is lost**, and records are committed *before* `persist_managed` runs.
+(beets `dry_run` is unaffected either way — it skips the write block at
+`sync.py:68`, so no savepoint is opened.)
+
+The fix: in legacy mode, force an explicit `BEGIN` when no transaction is open,
+so the `SAVEPOINT` *nests* instead of becoming the outermost. PEP-249 modes
+(3.12+ `autocommit` attribute) auto-begin before any statement, so they need no
+such nudge.
+
 ## Core mechanism: a savepoint context manager
 
-A single private helper in `store.py`, used at all sites. `SAVEPOINT` nests
-inside the caller's transaction *without committing it*, and self-commits only
-when there is no enclosing transaction (the direct-autocommit-caller case).
+A single private helper in `store.py`, used at all sites:
 
 ```python
 import contextlib
+import sqlite3
+
+_LEGACY = sqlite3.LEGACY_TRANSACTION_CONTROL  # == -1; absent-attr fallback below
+
+def _is_autocommit(conn):
+    ac = getattr(conn, "autocommit", _LEGACY)  # 3.12+ attribute; _LEGACY on <3.12
+    if ac is True:
+        return True
+    if ac is False:
+        return False
+    return conn.isolation_level is None  # legacy control: None == autocommit
+
+def _is_legacy(conn):
+    return getattr(conn, "autocommit", _LEGACY) == _LEGACY
 
 @contextlib.contextmanager
 def _savepoint(conn, name):
-    """Make a block atomic within the caller's transaction. Nests harmlessly
-    inside a caller-owned transaction (RELEASE merges, does not commit); on an
-    autocommit connection the outermost savepoint provides the atomic unit."""
+    """Make a DELETE+INSERT block atomic regardless of the connection's
+    transaction mode. On a caller-managed connection it nests via SAVEPOINT and
+    never commits the enclosing transaction; on an autocommit connection it owns
+    a transaction for the block (commit on success, rollback on failure)."""
+    autocommit = _is_autocommit(conn)
+    # Legacy mode never auto-BEGINs before SAVEPOINT, so a savepoint opened as
+    # the first statement would become the outermost txn and commit on RELEASE.
+    # Force a nesting BEGIN there. PEP-249 modes auto-begin already.
+    if _is_legacy(conn) and (autocommit or not conn.in_transaction):
+        conn.execute("BEGIN")
     conn.execute(f"SAVEPOINT {name}")
     try:
         yield
     except BaseException:
-        conn.execute(f"ROLLBACK TO {name}")
-        conn.execute(f"RELEASE {name}")
+        try:
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+            if autocommit:
+                conn.rollback()
+        except sqlite3.Error:
+            pass  # never mask the original exception with a cleanup failure
         raise
     else:
         conn.execute(f"RELEASE {name}")
+        if autocommit:
+            conn.commit()
 ```
 
 - `name` is a fixed, hardcoded identifier per call site (no user input → no
   injection). Distinct names per site keep nested `RELEASE`/`ROLLBACK TO`
   unambiguous.
 - `ROLLBACK TO` does not pop the savepoint from the stack, so the error path
-  must also `RELEASE` it before re-raising.
+  also `RELEASE`s it before re-raising.
+- The error-path cleanup is wrapped so that a secondary `sqlite3.Error` (e.g. a
+  savepoint already discarded by a `SQLITE_BUSY`/`SQLITE_FULL` auto-rollback)
+  cannot mask the original failure.
+
+This is verified across all relevant scenarios (see Testing): legacy
+deferred batch + single commit, legacy deferred first-statement + caller
+rollback (the trap), legacy autocommit success/failure, and 3.12+
+`autocommit=True`/`False`.
 
 ## A — per-function atomicity (`store.py`)
 
@@ -85,21 +160,30 @@ Defends anyone calling these directly on an autocommit connection — exactly
 
 ## C — whole-record atomicity (`sync.py`)
 
-In `sync_one`, wrap the `if not dry_run:` write block — the
-`merge_tags`/`replace_tags` call *plus* the `replace_track_art` call — in
-`_savepoint(conn, "musefs_sync_one")`. This closes the "tags replaced, then
-crash before art" gap *between* the two function calls for an autocommit sync
-caller. It nests cleanly over A's inner savepoints. `dry_run` is unaffected:
-it skips the write block, so no savepoint is opened.
+In `sync_one`, wrap the **entire** `if not dry_run:` write block in
+`_savepoint(conn, "musefs_sync_one")` — that means everything inside it: the
+`merge_tags`/`replace_tags` call, the `upsert_art` blob inserts, *and* the
+`replace_track_art` call (`sync.py:69-78`). This closes the "tags replaced,
+then crash before art" gap *between* those calls for an autocommit sync caller,
+and rolls back any content-addressed art inserted via `upsert_art` if the
+record fails. It nests cleanly over A's inner savepoints. `dry_run` is
+unaffected: it skips the write block, so no savepoint is opened.
 
 `_savepoint` is imported into `sync.py` from `store`.
 
-## Behavior on the shipped paths (unchanged)
+## Behavior on the shipped paths
 
-beets `_sync` and Picard run in default deferred mode with one final `commit()`.
-The new savepoints nest inside their open transaction and `RELEASE` merges into
-it — still one commit, same outcome. No behavior change; only added robustness
-for autocommit/direct callers.
+beets `_sync` and Picard run in default deferred (legacy) mode with one final
+`commit()`. With the corrected helper, the first wrapped call issues an explicit
+`BEGIN` (because no transaction is open yet — `check_schema_version` is only a
+read), and every savepoint thereafter nests inside that one transaction and
+`RELEASE`s without committing. The caller's single `commit()` (or, for beets
+`dry_run`/error, `rollback()`) still governs the whole batch — **batch
+atomicity is preserved** and records are still committed only after
+`persist_managed` is reached. The only observable change is that the
+previously-implicit transaction is now opened by an explicit `BEGIN`; the commit
+boundary is identical. Added robustness accrues only to autocommit/direct
+callers.
 
 ## Docs
 
@@ -115,34 +199,58 @@ for autocommit/direct callers.
 `contrib/python-musefs/tests/`, pytest, using the existing fixtures/helpers
 (`db_path`, `make_track`, `text_tags`, `musefs_connect`). TDD — tests first.
 
-1. **`replace_track_art` atomicity (natural failure):** seed art + `track_art`,
-   then call with an `art_id` absent from `art` → FK violation on the `INSERT`
-   *after* the `DELETE`. On an autocommit connection (`isolation_level=None`),
-   assert the original `track_art` rows survive.
+All test connections that exercise autocommit must be opened via the project's
+`connect()` (which sets `PRAGMA foreign_keys = ON`) and *then* switched to
+autocommit (`conn.isolation_level = None`), **not** via a bare
+`sqlite3.connect(..., isolation_level=None)` — the latter leaves FKs off, which
+silently neuters test 1.
+
+1. **`replace_track_art` atomicity (natural FK failure):** seed art +
+   `track_art`, then call with an `art_id` absent from `art`. With
+   `foreign_keys = ON`, the `INSERT` *after* the `DELETE` raises
+   `sqlite3.IntegrityError`. On an autocommit connection assert (a) the call
+   raised `IntegrityError` (so the torn window was genuinely entered — guards
+   against a future FK-off regression turning this into a no-op) **and** (b) the
+   original `track_art` rows survive.
 2. **`replace_tags` atomicity:** seed tags; force the `executemany` to raise
    (monkeypatch) on an autocommit connection; assert original text tags survive
-   and binary tags are untouched.
+   and binary tags (`value_blob NOT NULL`) are untouched.
 3. **`merge_tags` atomicity:** same shape — failure leaves the pre-existing
    managed + unmanaged rows intact.
 4. **C whole-record atomicity:** `sync_one` on an autocommit connection where
    art linking fails → assert tags *also* rolled back (record is all-or-nothing).
-5. **No premature commit (regression):** in deferred mode, call `replace_tags`
-   then `conn.rollback()`; assert nothing persisted — proves the savepoint did
-   not commit the caller's transaction.
-6. **Happy path unchanged:** existing `test_sync.py`, `test_store_art.py`,
+5. **The legacy-mode trap guard (primary regression test):** in default
+   deferred mode, call `replace_tags`, then `conn.rollback()`; assert nothing
+   persisted (check via a second connection). This is the exact scenario that
+   fails against a *bare* savepoint helper, so it is the guard that proves the
+   nesting `BEGIN` is in place and the caller's rollback still wins.
+6. **Deferred batch atomicity:** in deferred mode, sync several records via
+   `sync_files`, then a single `conn.commit()`; assert all persist — and a
+   variant where a mid-batch record fails and the caller `rollback()`s leaves
+   *nothing* persisted (proves no per-record premature commit).
+7. **Happy path unchanged:** existing `test_sync.py`, `test_store_art.py`,
    `test_merge_tags.py` continue to pass.
+
+The helper's mode-handling is version-sensitive in principle (legacy vs. 3.12+
+PEP-249 attribute), so the implementation plan should note running the suite on
+the 3.8 floor in addition to the dev interpreter. The behavior was confirmed
+stable on CPython 3.8/3.11/3.12/3.14 during design.
 
 ## Scope / non-goals
 
-- No Python version bump (stays `>=3.8`; savepoints are portable).
+- No Python version bump (stays `>=3.8`). The SQL `SAVEPOINT` statement is
+  portable; the Python `sqlite3` *driver's* transaction management around it is
+  **not** uniform across modes, which is exactly why the helper detects the
+  connection mode rather than assuming nesting.
 - No connection-level autocommit enforcement in `connect()`.
 - No batch-level (cross-record) atomicity — that remains the caller's
   transaction to own.
 
 ## Files touched
 
-- `contrib/python-musefs/src/musefs_common/store.py` — `_savepoint` helper +
-  wrap three functions + docstrings.
+- `contrib/python-musefs/src/musefs_common/store.py` — `_savepoint` helper
+  (plus `_is_autocommit`/`_is_legacy` mode detection) + wrap three functions +
+  docstrings.
 - `contrib/python-musefs/src/musefs_common/sync.py` — import `_savepoint`, wrap
   `sync_one` write block.
 - `ARCHITECTURE.md` — one sentence in the external-writer contract section.
