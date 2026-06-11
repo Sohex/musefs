@@ -250,6 +250,9 @@ fn rescan_with_changed_geometry_bumps_content_version() {
     rescan.audio_length = 900;
     db.upsert_track(&rescan).unwrap();
 
+    // Exactly +1 (not just ">") is deliberate: it asserts the WHEN guard halts
+    // the geometry trigger's own nested UPDATE, mirroring
+    // geometry_change_bumps_content_version_by_exactly_one in triggers.rs.
     assert_eq!(
         db.track_content_version(id).unwrap(),
         cv_before + 1,
@@ -276,6 +279,9 @@ In `track_art_to_inputs_errors_on_negative_byte_len` (starts at `musefs-core/src
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.pragma_update(None, "ignore_check_constraints", true)
             .unwrap();
+        // 5 bytes of data with byte_len = -1 is the deliberate malformation
+        // under test (data length and byte_len disagree, and byte_len is
+        // negative) — do not "fix" the mismatch.
         raw.execute(
             "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
              VALUES (?1, 'image/png', NULL, NULL, -1, X'0909090909')",
@@ -329,6 +335,7 @@ Expected: FAIL. Specifically:
 - `triggers::structural_block_change_bumps_content_version` — fails (no structural trigger).
 - `tracks::rescan_with_changed_geometry_bumps_content_version` — fails (no bump yet).
 - The seven `assert_eq!(uv, 4)` assertions still pass at this point (we change them in Step 7).
+- `schema_sql_matches_migrate` and `schema_py_fixture_is_fresh` also still pass here — both derive from `MIGRATIONS`, which has not yet grown. They go red only *after* Step 6 adds `MIGRATION_V5`, and `schema_py_fixture_is_fresh` is fixed by Step 8's regen. So a `cargo test` run between Steps 6 and 8 will show `schema_py_fixture_is_fresh` failing; that interim red is expected, not a mistake.
 
 This confirms the new tests fail for the right reason before implementing the migration.
 
@@ -428,6 +435,27 @@ The latest `user_version` is now 5. Update each of these assertions in `musefs-d
 
 (Line numbers will drift after inserting `MIGRATION_V5`; if so, search for `assert_eq!(uv, 4)` and `assert_eq!(uv2, 4)` and update every occurrence — each is a "migrate reaches latest version" assertion. Do NOT touch the `pragma_update(None, "user_version", 1i64/2i64/3i64)` lines, which deliberately set a starting version for partial-upgrade tests.)
 
+- [ ] **Step 7b: Fix the now-false `set_format_for_test` doc-comment in `musefs-db/src/tracks.rs`**
+
+The `tracks_geometry_au` trigger's WHEN clause includes `NEW.format <> OLD.format`, so `set_format_for_test`'s `UPDATE tracks SET format = ...` now bumps `content_version` — which falsifies its doc-comment. No test asserts `content_version` here (the consumers `set_format_for_test_persists_the_new_format` and `incremental_refresh.rs`'s `format_only_change_notifies_old_inode` assert format persistence / inode notification only), so this is doc drift, not a green-commit hazard — but it lives in the same crate as this commit and the project polices drift (CLAUDE.md, PRs #259-263). Replace the doc-comment at `musefs-db/src/tracks.rs:225-228`:
+
+```rust
+    /// Test-only: force a track's format column directly (no rescan), bumping
+    /// data_version. The only way to exercise a format-only change — production
+    /// never mutates format without a rescan. content_version is NOT bumped (no
+    /// trigger fires on the tracks.format column), so this is a pure format-only edit.
+```
+
+with:
+
+```rust
+    /// Test-only: force a track's format column directly (no rescan), bumping
+    /// data_version. The only way to exercise a format-only change — production
+    /// never mutates format without a rescan. As of V5 this also bumps
+    /// content_version (the `tracks_geometry_au` format guard); it is no longer a
+    /// content_version-neutral edit.
+```
+
 - [ ] **Step 8: Regenerate the Python schema mirror and re-vendor**
 
 The `schema_py_fixture_is_fresh` test compares the vendored `schema.py` to one rendered from `MIGRATIONS`; it is stale until regenerated. Run:
@@ -452,7 +480,8 @@ Expected: no warnings, no formatting diff.
 - [ ] **Step 10: Commit**
 
 ```bash
-git add musefs-db/src/schema.rs musefs-db/tests/triggers.rs musefs-db/tests/tracks.rs \
+git add musefs-db/src/schema.rs musefs-db/src/tracks.rs \
+        musefs-db/tests/triggers.rs musefs-db/tests/tracks.rs \
         musefs-core/src/mapping.rs \
         contrib/python-musefs/src/musefs_common/schema.py
 # Add any files vendor_to_picard.py modified (check `git status` for the Picard copy):
@@ -776,6 +805,7 @@ EOF
 - Migration V5 append-only → Task 1 Steps 6-7. ✓
 - Python schema mirror regen + vendor → Task 1 Step 8. ✓
 - mapping.rs malformed-row test rework (the spec's flagged blocker) → Task 1 Step 4. ✓
+- `set_format_for_test` doc-comment drift (the geometry trigger's `format` guard falsifies its "content_version is NOT bumped" claim) → Task 1 Step 7b. ✓
 - Changelog double-pump → no over-tight changelog-row-count assertion is written (the new tests assert `content_version`, not `track_changes` counts), consistent with the spec's warning. ✓
 - Docs (ARCHITECTURE + contrib) → Task 3. ✓
 - Fuzz crate → unaffected (no format-layer signature change); no step needed, matching the spec. ✓
