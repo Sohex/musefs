@@ -498,4 +498,43 @@ mod tests {
             "oversize art must yield ArtTooLarge with the offending ids, got {err:?}"
         );
     }
+
+    #[test]
+    fn db_art_source_reads_windows_and_maps_failures_to_artread() {
+        use musefs_db::NewArt;
+        use musefs_format::ogg::ArtSource;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("src.db")).unwrap();
+        let art_id = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![10, 20, 30, 40, 50],
+            })
+            .unwrap();
+        let src = super::DbArtSource(&db);
+
+        // In-bounds window returns the exact stored bytes.
+        let mut buf = [0u8; 3];
+        src.read_window(art_id, 1, &mut buf).unwrap();
+        assert_eq!(buf, [20, 30, 40]);
+
+        // Reading past the blob end is a short read from the DB, mapped to ArtRead.
+        let mut over = [0u8; 4];
+        let err = src.read_window(art_id, 2, &mut over).unwrap_err();
+        assert!(
+            matches!(err, musefs_format::FormatError::ArtRead { art_id: a } if a == art_id),
+            "out-of-range read must map to ArtRead, got {err:?}"
+        );
+
+        // A missing art row likewise surfaces ArtRead, naming the offending id.
+        let missing = art_id + 999;
+        let mut one = [0u8; 1];
+        let err = src.read_window(missing, 0, &mut one).unwrap_err();
+        assert!(
+            matches!(err, musefs_format::FormatError::ArtRead { art_id: a } if a == missing),
+            "missing art row must map to ArtRead, got {err:?}"
+        );
+    }
 }

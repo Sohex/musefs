@@ -1082,6 +1082,52 @@ mod tests {
     }
 
     #[test]
+    fn synthesize_oggflac_embeds_large_art_spanning_pages_round_trips() {
+        // A >64 KiB raw PICTURE block forces the art run across multiple pages,
+        // exercising the non-base64 streaming-CRC path at page boundaries (the
+        // base64 path is covered by the lacer test; this pins the raw path).
+        let mut data = oggflac_headers();
+        let (audio, _) = crate::ogg::page::lace_packet(77, 3, false, 4096, &[0u8; 64]);
+        data.extend_from_slice(&audio);
+        let scan = locate_audio(&data).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
+
+        let image: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let meta = art_input(31, "image/png", image.len());
+        let src = MapArtSource::new([(meta.art_id, image.clone())]);
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("title", "Big")],
+            &[OggArt { meta: &meta }],
+            &src,
+        )
+        .unwrap();
+
+        // The art run must split across pages: more than one raw OggArtSlice.
+        let art_slices = layout
+            .segments()
+            .iter()
+            .filter(|s| matches!(s, Segment::OggArtSlice { base64: false, .. }))
+            .count();
+        assert!(
+            art_slices >= 2,
+            "expected the raw art to span multiple pages, got {art_slices} slice(s)"
+        );
+
+        let bytes = materialize_header(&layout, &[(31, &image)]);
+        let h = read_header(&bytes).unwrap();
+        assert_eq!(h.codec, Codec::OggFlac);
+        let pics = read_pictures(&bytes).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(
+            pics[0].data, image,
+            "large art must round-trip byte-for-byte"
+        );
+    }
+
+    #[test]
     fn synthesize_opus_embeds_multiple_images() {
         let mut data = opus_headers();
         let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 64]);
