@@ -124,10 +124,12 @@ CREATE TEMP TABLE _m4_tracks AS SELECT * FROM tracks;
 CREATE TEMP TABLE _m4_tags AS SELECT * FROM tags;
 CREATE TEMP TABLE _m4_art AS SELECT * FROM art;
 CREATE TEMP TABLE _m4_track_art AS SELECT * FROM track_art;
+CREATE TEMP TABLE _m4_structural AS SELECT * FROM structural_blocks;
 
 DROP TABLE track_art;
 DROP TABLE tags;
 DROP TABLE art;
+DROP TABLE structural_blocks;
 DROP TABLE tracks;
 
 CREATE TABLE tracks (
@@ -158,7 +160,10 @@ CREATE TABLE tags (
     value_blob BLOB,
     PRIMARY KEY (track_id, key, ordinal),
     CHECK (ordinal >= 0),
-    CHECK (value_blob IS NULL OR value = '')
+    CHECK (value_blob IS NULL OR value = ''),
+    CHECK (length(key) <= 256),
+    CHECK (length(value) <= 262144),
+    CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
 );
 
 CREATE TABLE art (
@@ -172,7 +177,9 @@ CREATE TABLE art (
     CHECK (byte_len = length(data)),
     CHECK (length(sha256) = 64),
     CHECK (width IS NULL OR width >= 0),
-    CHECK (height IS NULL OR height >= 0)
+    CHECK (height IS NULL OR height >= 0),
+    CHECK (length(mime) <= 255),
+    CHECK (byte_len <= 16711680)
 );
 
 CREATE TABLE track_art (
@@ -183,17 +190,31 @@ CREATE TABLE track_art (
     ordinal      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (track_id, ordinal),
     CHECK (picture_type BETWEEN 0 AND 20),
-    CHECK (ordinal >= 0)
+    CHECK (ordinal >= 0),
+    CHECK (length(description) <= 1024)
+);
+
+CREATE TABLE structural_blocks (
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    ordinal  INTEGER NOT NULL DEFAULT 0,
+    body     BLOB NOT NULL,
+    PRIMARY KEY (track_id, kind, ordinal),
+    CHECK (kind IN ('STREAMINFO','SEEKTABLE')),
+    CHECK (ordinal >= 0),
+    CHECK (length(body) <= 16777215)
 );
 
 INSERT INTO tracks SELECT * FROM _m4_tracks;
 INSERT INTO art SELECT * FROM _m4_art;
 INSERT INTO tags SELECT * FROM _m4_tags;
 INSERT INTO track_art SELECT * FROM _m4_track_art;
+INSERT INTO structural_blocks SELECT * FROM _m4_structural;
 
 DROP TABLE _m4_track_art;
 DROP TABLE _m4_tags;
 DROP TABLE _m4_art;
+DROP TABLE _m4_structural;
 DROP TABLE _m4_tracks;
 
 CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN

@@ -72,6 +72,11 @@ impl Db<ReadWrite> {
         })
     }
 
+    /// Apply shared connection pragmas, then migrate. `wal` enables write-ahead
+    /// logging (file-backed DBs only) so a reader (the FUSE mount) and a writer
+    /// (e.g. a beets-plugin sync) don't block each other; the busy timeout lets
+    /// brief lock contention retry instead of failing immediately with
+    /// SQLITE_BUSY.
     fn configure(conn: &mut Connection, wal: bool) -> Result<()> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", true)?;
