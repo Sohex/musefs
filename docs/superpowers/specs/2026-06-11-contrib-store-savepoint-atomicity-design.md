@@ -1,0 +1,149 @@
+# Design: Harden contrib store mutations against torn DELETE+INSERT state (#191)
+
+## Problem
+
+`replace_tags`, `merge_tags`, and `replace_track_art` in
+`contrib/python-musefs/src/musefs_common/store.py` each perform a `DELETE`
+followed by an `executemany` `INSERT` with no transaction of their own. They
+rely entirely on the load-bearing **"caller owns the transaction"** contract
+(`sync.py`). The shipped callers (beets `_sync`, Picard) are safe: they run in
+Python's default deferred mode and `commit()` once at the end, so a crash
+before that commit rolls back cleanly.
+
+The torn-state window opens only for a consumer that deliberately uses an
+autocommit connection (`isolation_level=None` / `autocommit=True`) or calls
+these functions directly on one: a crash between the `DELETE` and the `INSERT`
+leaves a track with its tags/art wiped and not replaced until the next sync or
+scan. The contract is undefended against autocommit consumers.
+
+This library is the external-writer contract for plugin authors
+(beets/Picard/Lidarr), so a documented-only footgun is too weak; we defend it.
+
+## Goal & invariant
+
+Make the destructive replace operations atomic regardless of the connection's
+transaction mode, while preserving the "caller owns the transaction" contract:
+no premature commits, and `sync_one`'s `dry_run` rollback still works.
+
+## Why not other approaches
+
+- **Require Python >= 3.12 / use the `autocommit` attribute.** Buys nothing for
+  atomicity (autocommit-mode connections still exist in 3.12) and the correct
+  primitive is still `SAVEPOINT`. Drops 3.8-3.11 — a real adoption cost for a
+  plugin-author library whose consumers (and Picard's bundled runtime) are often
+  on older Pythons. Rejected.
+- **`with conn:` transaction context manager.** Wrong on every version: it
+  *commits* at block exit, which violates "caller owns the transaction" (commits
+  the caller's in-progress batch early) and breaks `dry_run` rollback.
+- **Connection-level enforcement in `connect()`** (e.g. force
+  `autocommit=False`). Doesn't make the functions internally atomic and doesn't
+  defend a consumer who flips autocommit or brings their own connection.
+  Out of scope.
+
+## Core mechanism: a savepoint context manager
+
+A single private helper in `store.py`, used at all sites. `SAVEPOINT` nests
+inside the caller's transaction *without committing it*, and self-commits only
+when there is no enclosing transaction (the direct-autocommit-caller case).
+
+```python
+import contextlib
+
+@contextlib.contextmanager
+def _savepoint(conn, name):
+    """Make a block atomic within the caller's transaction. Nests harmlessly
+    inside a caller-owned transaction (RELEASE merges, does not commit); on an
+    autocommit connection the outermost savepoint provides the atomic unit."""
+    conn.execute(f"SAVEPOINT {name}")
+    try:
+        yield
+    except BaseException:
+        conn.execute(f"ROLLBACK TO {name}")
+        conn.execute(f"RELEASE {name}")
+        raise
+    else:
+        conn.execute(f"RELEASE {name}")
+```
+
+- `name` is a fixed, hardcoded identifier per call site (no user input → no
+  injection). Distinct names per site keep nested `RELEASE`/`ROLLBACK TO`
+  unambiguous.
+- `ROLLBACK TO` does not pop the savepoint from the stack, so the error path
+  must also `RELEASE` it before re-raising.
+
+## A — per-function atomicity (`store.py`)
+
+Wrap the `DELETE`+`INSERT` body of each function in `_savepoint`:
+
+- `replace_tags` → `_savepoint(conn, "musefs_replace_tags")`
+- `merge_tags` → `_savepoint(conn, "musefs_merge_tags")` (same pattern; folded
+  in even though #191 names only the other two)
+- `replace_track_art` → `_savepoint(conn, "musefs_replace_track_art")`
+
+Defends anyone calling these directly on an autocommit connection — exactly
+#191's stated exposure.
+
+## C — whole-record atomicity (`sync.py`)
+
+In `sync_one`, wrap the `if not dry_run:` write block — the
+`merge_tags`/`replace_tags` call *plus* the `replace_track_art` call — in
+`_savepoint(conn, "musefs_sync_one")`. This closes the "tags replaced, then
+crash before art" gap *between* the two function calls for an autocommit sync
+caller. It nests cleanly over A's inner savepoints. `dry_run` is unaffected:
+it skips the write block, so no savepoint is opened.
+
+`_savepoint` is imported into `sync.py` from `store`.
+
+## Behavior on the shipped paths (unchanged)
+
+beets `_sync` and Picard run in default deferred mode with one final `commit()`.
+The new savepoints nest inside their open transaction and `RELEASE` merges into
+it — still one commit, same outcome. No behavior change; only added robustness
+for autocommit/direct callers.
+
+## Docs
+
+- Tighten the docstrings of the four functions: they run inside a caller-owned
+  transaction and are now individually atomic via an internal savepoint (so safe
+  on autocommit connections too).
+- Add one sentence to `ARCHITECTURE.md` §"The external-writer contract" noting
+  the library opens nested savepoints within the caller's transaction, so the
+  contract holds regardless of the caller's autocommit setting.
+
+## Testing
+
+`contrib/python-musefs/tests/`, pytest, using the existing fixtures/helpers
+(`db_path`, `make_track`, `text_tags`, `musefs_connect`). TDD — tests first.
+
+1. **`replace_track_art` atomicity (natural failure):** seed art + `track_art`,
+   then call with an `art_id` absent from `art` → FK violation on the `INSERT`
+   *after* the `DELETE`. On an autocommit connection (`isolation_level=None`),
+   assert the original `track_art` rows survive.
+2. **`replace_tags` atomicity:** seed tags; force the `executemany` to raise
+   (monkeypatch) on an autocommit connection; assert original text tags survive
+   and binary tags are untouched.
+3. **`merge_tags` atomicity:** same shape — failure leaves the pre-existing
+   managed + unmanaged rows intact.
+4. **C whole-record atomicity:** `sync_one` on an autocommit connection where
+   art linking fails → assert tags *also* rolled back (record is all-or-nothing).
+5. **No premature commit (regression):** in deferred mode, call `replace_tags`
+   then `conn.rollback()`; assert nothing persisted — proves the savepoint did
+   not commit the caller's transaction.
+6. **Happy path unchanged:** existing `test_sync.py`, `test_store_art.py`,
+   `test_merge_tags.py` continue to pass.
+
+## Scope / non-goals
+
+- No Python version bump (stays `>=3.8`; savepoints are portable).
+- No connection-level autocommit enforcement in `connect()`.
+- No batch-level (cross-record) atomicity — that remains the caller's
+  transaction to own.
+
+## Files touched
+
+- `contrib/python-musefs/src/musefs_common/store.py` — `_savepoint` helper +
+  wrap three functions + docstrings.
+- `contrib/python-musefs/src/musefs_common/sync.py` — import `_savepoint`, wrap
+  `sync_one` write block.
+- `ARCHITECTURE.md` — one sentence in the external-writer contract section.
+- `contrib/python-musefs/tests/` — new atomicity tests.
