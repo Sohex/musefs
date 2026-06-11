@@ -3,18 +3,32 @@ import sqlite3
 import pytest
 from conftest import JPEG, insert_track, text_tags
 
-from musefs_common import connect, merge_tags, replace_tags, replace_track_art, upsert_art
+from musefs_common import (
+    ArtImage,
+    Record,
+    SyncStats,
+    connect,
+    merge_tags,
+    replace_tags,
+    replace_track_art,
+    sync_files,
+    sync_one,
+    upsert_art,
+)
 
 
 class _FailInsert(sqlite3.Connection):
-    """Connection that raises on the next INSERT executemany, to enter the
-    DELETE-then-INSERT torn window deterministically."""
+    """Connection that raises on a chosen INSERT executemany, to enter a
+    DELETE-then-INSERT torn window deterministically. ``fail`` may be:
+    False (never), True (any INSERT), or "art" (only the track_art INSERT)."""
 
     fail = False
 
     def executemany(self, sql, parameters):
-        if self.fail and sql.lstrip().upper().startswith("INSERT"):
-            raise RuntimeError("boom")
+        upper = sql.lstrip().upper()
+        if upper.startswith("INSERT"):
+            if self.fail is True or (self.fail == "art" and "TRACK_ART" in upper):
+                raise RuntimeError("boom")
         return super().executemany(sql, parameters)
 
 
@@ -111,3 +125,78 @@ def test_replace_track_art_atomic_on_fk_violation(db_path):
     # The DELETE + the content_version trigger bump both rolled back with the FK failure.
     assert rows == [(art_id, 3, 0)]
     assert after_cv == before_cv
+
+
+def test_sync_one_whole_record_atomic_on_autocommit(db_path):
+    # On an autocommit connection, if art linking fails the tags written earlier
+    # in the same record must roll back too (record is all-or-nothing).
+    conn = _autocommit(db_path, factory=_FailInsert)
+    try:
+        tid = insert_track(conn, "/m/a.flac")
+        # _FailInsert fails the FIRST insert executemany once fail=True. In
+        # sync_one the tag INSERT runs before the art INSERT, so to target the
+        # art step specifically we let tags write, then fail on the art INSERT.
+        conn.fail = "art"  # sentinel handled below
+        with pytest.raises(RuntimeError):
+            sync_one(
+                conn,
+                Record(key="/m/a.flac", pairs=[("title", "T")], art=[ArtImage(JPEG, "image/jpeg")]),
+                SyncStats(),
+            )
+    finally:
+        conn.close()
+    check = connect(db_path)
+    try:
+        assert text_tags(check, tid) == {}
+        assert check.execute("SELECT COUNT(*) FROM track_art").fetchone()[0] == 0
+    finally:
+        check.close()
+
+
+def test_sync_files_deferred_batch_commits_atomically(db_path):
+    # Shipped beets-style path: deferred mode, several records, one final commit.
+    conn = connect(db_path)
+    try:
+        insert_track(conn, "/m/a.flac")
+        insert_track(conn, "/m/b.flac")
+        conn.commit()
+        records = [
+            Record(key="/m/a.flac", pairs=[("title", "A")]),
+            Record(key="/m/b.flac", pairs=[("title", "B")]),
+        ]
+        stats = sync_files(conn, records)
+        assert stats.synced == 2
+        conn.commit()
+    finally:
+        conn.close()
+    check = connect(db_path)
+    try:
+        got = {
+            path: check.execute(
+                "SELECT value FROM tags t JOIN tracks tr ON tr.id = t.track_id "
+                "WHERE tr.backing_path = ? AND t.key = 'title'",
+                (path,),
+            ).fetchone()[0]
+            for path in ("/m/a.flac", "/m/b.flac")
+        }
+        assert got == {"/m/a.flac": "A", "/m/b.flac": "B"}
+    finally:
+        check.close()
+
+
+def test_sync_files_deferred_batch_rolls_back_as_unit(db_path):
+    # Deferred mode: per-record savepoints must NOT self-commit, so a caller
+    # rollback abandons the whole batch.
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, "/m/a.flac")
+        conn.commit()
+        sync_one(conn, Record(key="/m/a.flac", pairs=[("title", "A")]), SyncStats())
+        conn.rollback()  # caller abandons the batch after the write
+    finally:
+        conn.close()
+    check = connect(db_path)
+    try:
+        assert text_tags(check, tid) == {}
+    finally:
+        check.close()
