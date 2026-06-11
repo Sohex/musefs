@@ -1,9 +1,9 @@
 import sqlite3
 
 import pytest
-from conftest import insert_track, text_tags
+from conftest import JPEG, insert_track, text_tags
 
-from musefs_common import connect, merge_tags, replace_tags
+from musefs_common import connect, merge_tags, replace_tags, replace_track_art, upsert_art
 
 
 class _FailInsert(sqlite3.Connection):
@@ -86,3 +86,28 @@ def test_merge_tags_atomic_on_autocommit_failure(db_path):
         assert text_tags(check, tid) == {"artist": ["ORIG"], "genre": ["Jazz"]}
     finally:
         check.close()
+
+
+def test_replace_track_art_atomic_on_fk_violation(db_path):
+    conn = _autocommit(db_path)  # FK on, autocommit; no failure injection needed
+    try:
+        tid = insert_track(conn, "/m/a.flac")
+        art_id = upsert_art(conn, JPEG, "image/jpeg")
+        replace_track_art(conn, tid, [(art_id, 3, "")])
+        before_cv = conn.execute(
+            "SELECT content_version FROM tracks WHERE id = ?", (tid,)
+        ).fetchone()[0]
+        # 999999 has no row in `art`: the INSERT (after the DELETE) trips the FK.
+        with pytest.raises(sqlite3.IntegrityError):
+            replace_track_art(conn, tid, [(999999, 3, "")])
+        rows = conn.execute(
+            "SELECT art_id, picture_type, ordinal FROM track_art WHERE track_id = ?", (tid,)
+        ).fetchall()
+        after_cv = conn.execute(
+            "SELECT content_version FROM tracks WHERE id = ?", (tid,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    # The DELETE + the content_version trigger bump both rolled back with the FK failure.
+    assert rows == [(art_id, 3, 0)]
+    assert after_cv == before_cv

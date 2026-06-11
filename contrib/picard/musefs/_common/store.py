@@ -207,13 +207,18 @@ def upsert_art(conn, data, mime):
 def replace_track_art(conn, track_id, arts):
     """Replace the track's art rows. ``arts`` is an ordered list of
     ``(art_id, picture_type, description)``; each row's ``ordinal`` is its
-    list index."""
-    conn.execute("DELETE FROM track_art WHERE track_id = ?", (track_id,))
-    conn.executemany(
-        "INSERT INTO track_art (track_id, art_id, picture_type, description, "
-        "ordinal) VALUES (?, ?, ?, ?, ?)",
-        [
-            (track_id, art_id, picture_type, description, i)
-            for i, (art_id, picture_type, description) in enumerate(arts)
-        ],
-    )
+    list index.
+
+    Atomic via an internal savepoint (see ``_savepoint``): the DELETE and the
+    re-insert either both land or neither does, even on an autocommit
+    connection."""
+    with _savepoint(conn, "musefs_replace_track_art"):
+        conn.execute("DELETE FROM track_art WHERE track_id = ?", (track_id,))
+        conn.executemany(
+            "INSERT INTO track_art (track_id, art_id, picture_type, description, "
+            "ordinal) VALUES (?, ?, ?, ?, ?)",
+            [
+                (track_id, art_id, picture_type, description, i)
+                for i, (art_id, picture_type, description) in enumerate(arts)
+            ],
+        )
