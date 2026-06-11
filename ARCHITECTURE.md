@@ -156,7 +156,18 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - a binary tag row whose `value` is non-empty;
 - an `art.byte_len` that disagrees with its blob, or a `sha256` of the wrong
   length;
-- a `picture_type` outside `0..=20`.
+- a `picture_type` outside `0..=20`;
+- a `tags.key` over 256 chars or `tags.value` over 256 KiB;
+- a `value_blob` over `MAX_BINARY_TAG_BYTES`;
+- an `art.mime` over 255 chars or `byte_len` over `MAX_ART_BYTES`;
+- a `track_art.description` over 1 KiB;
+- a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
+  over the FLAC 24-bit block limit.
+
+**Schema identity.** On open, musefs also validates schema identity: a
+`sqlite_master` comparison against a freshly-migrated reference plus `PRAGMA
+foreign_key_check`, rejecting anything that is not the canonical latest schema
+with a message telling the user to run `musefs scan`.
 
 **What musefs defends at serve time.** CHECKs cannot catch a scanner-owned
 field mutated to a *well-formed* value that no longer matches the real file
