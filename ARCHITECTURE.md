@@ -140,6 +140,15 @@ plugins under `contrib/` write tags and art here out-of-band.
   four tables (stashing rows past the FK cascade) and recreates their
   triggers after the bulk refill so the rebuild does not pump the
   `track_changes` ring. A pre-existing violating row aborts the migration.
+- **V5** — freshness-superset triggers that make `content_version` cover every
+  DB-knowable input to synthesized bytes, not only tag/`track_art` edits:
+  `art_reject_content_update` (rejects in-place mutation of an `art` row's
+  content columns — art is content-addressed, so a changed image is a new row),
+  `art_ad` (bumps every track referencing a deleted `art` row, so an orphaned
+  reference rebuilds to a clean serve-time error rather than streaming stale
+  bytes), `tracks_geometry_au` (bumps when scanner-owned geometry — `format`,
+  audio bounds, backing size/mtime — changes), and `structural_blocks_ai`/`_ad`
+  (bump when FLAC structural blocks change).
 
 ### The external-writer contract
 
@@ -170,6 +179,16 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 `sqlite_master` comparison against a freshly-migrated reference plus `PRAGMA
 foreign_key_check`, rejecting anything that is not the canonical latest schema
 with a message telling the user to run `musefs scan`.
+
+**Art is immutable once written.** `art` rows are content-addressed by
+`sha256`; as of V5 a trigger rejects any in-place `UPDATE` of an art row's
+content columns (`data`, `sha256`, `mime`, `byte_len`, `width`, `height`) with
+`RAISE(ABORT)` — a multi-row `UPDATE art` touching any content column aborts the
+whole statement. To change a track's art, insert a new content-addressed row
+and relink it via `track_art` (which bumps `content_version`); do not mutate an
+existing row. Deleting an `art` row still referenced by `track_art` (possible
+only with `foreign_keys` OFF) bumps every referencing track so the mount serves
+a clean `EIO` on the now-orphaned reference instead of stale bytes.
 
 **What musefs defends at serve time.** CHECKs cannot catch a scanner-owned
 field mutated to a *well-formed* value that no longer matches the real file
@@ -232,7 +251,14 @@ variant hands each reader thread its own connection — WAL reads never contend.
 Two distinct counters drive correctness; they answer different questions.
 
 **`content_version`** (per-track column) answers *"did this track's served
-bytes change?"*. The DB triggers increment it on any tag/art edit. The
+bytes change?"*. The DB triggers increment it on any input the database can see that changes
+synthesized bytes: tag and `track_art` edits, `art`-row deletes that orphan a
+reference, scanner-owned geometry changes (`format`, audio bounds, backing
+size/mtime), and FLAC structural-block changes (V5). It is therefore a
+superset key — the one input it cannot cover is an on-disk backing change with
+no DB write, which `resolve` (and, since #279, a size-cache `getattr` hit)
+catches by re-statting the backing file and degrading to `BackingChanged`.
+The
 `HeaderCache` (`reader.rs`) — a byte-budgeted concurrent cache (64 MiB
 default) of resolved layouts — keys each entry on it: a hit with a stale
 `content_version` rebuilds the layout. Independently of the cache, **every**
