@@ -84,7 +84,11 @@ In `musefs-core/src/mapping.rs`, inside `mod tests`, add this test. It inserts a
 ```rust
     #[test]
     fn track_art_to_inputs_enforces_art_cap() {
-        use musefs_db::{NewArt, TrackArt};
+        use crate::CoreError;
+        use musefs_db::{NewArt, TrackArt}; // NewTrack already in scope at module level
+        // The boundary uses the real MAX_ART_BYTES (not a smaller test value) so the
+        // mutation gate catches a `>`→`>=` flip; this hashes ~32 MiB across the two
+        // blobs, which is fine here — do not "optimize" the boundary away.
         let cap = crate::scan::MAX_ART_BYTES;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path().join("cap.db")).unwrap();
@@ -511,7 +515,7 @@ pub(crate) fn lace_chunks_to_segments(
 }
 ```
 
-(`emit_segments` is unchanged — it already reads only `art_id`/`base64`/`art_total`, never bytes.)
+(`emit_segments` keeps its logic — it already reads only `art_id`/`base64`/`art_total`, never bytes. One tidy-up: its `PayloadChunk::Art { art_id, base64, art_total, .. }` destructure (`page.rs:392`) now binds every field, so drop the trailing `..`.)
 
 - [ ] **Step 7: Stop materializing art in the packet producers**
 
@@ -633,7 +637,7 @@ In `musefs-core/src/reader.rs`, in `HeaderCache::build`, replace the `Format::Op
             .unwrap();
 ```
 
-(Confirm the import path of `synthesize_layout` in that file; if it is `use musefs_format::ogg::synthesize_layout`, the `MapArtSource` path above is correct.)
+(`ogg_index.rs:335` already has `use musefs_format::ogg::{locate_audio, read_header, synthesize_layout};`; the fully-qualified `MapArtSource` path above resolves regardless.)
 
 `musefs-format/tests/proptest_ogg.rs:18` — pass an empty source:
 
@@ -666,7 +670,9 @@ For each test that calls `synthesize_layout(...)` with non-empty `arts`, add a t
 
 (Inside the `ogg` module use `MapArtSource` directly, not the `musefs_format::ogg::` prefix.)
 
-Sites to update (verified by grep; `synthesize_layout` callers in `ogg/mod.rs` tests at approx. lines 618, 725, 857, 913, 1022, 1053, 1085 and the `OggArt` constructions at 918, 1027, 1058, 1091, 1095, 1123, 1151, 1186, 1320, 1327). Tests calling `build_packets_with_art` directly (the `oversized_full_art_value_rejected_by_build_packets`, `sum_overflow_art_value_rejected_by_build_packets`, `art_value_at_u32_max_boundary_is_accepted_by_build_packets` at ~1110-1200, and ~1320) only need the `image` field dropped — `build_packets_with_art` takes no source and reads no bytes.
+**Every** `synthesize_layout` call in `ogg/mod.rs` tests needs the trailing source argument — the ones with non-empty `arts` get a `MapArtSource` built from their images (as above); the **zero-art** ones (`synthesize_layout(&header, …, &[], &[])`) get `&MapArtSource::default()`. Do not rely on the line numbers below as a complete list — they drift; treat `cargo build --all-targets` (Step 15) as the authoritative finder and migrate every site the compiler flags.
+
+Sites to update (verified via `find_referencing_symbols`): `synthesize_layout` callers in `ogg/mod.rs` tests at approx. lines 617, **663, 676** (these two are zero-art → `&MapArtSource::default()`), 724, 856, 912, 1021, 1052, 1084; and the `OggArt` constructions at ~918, 1027, 1058, 1091, 1095, 1123, 1151, 1186, 1320, 1327. Tests calling `build_packets_with_art` directly (`oversized_full_art_value_rejected_by_build_packets`, `sum_overflow_art_value_rejected_by_build_packets`, `art_value_at_u32_max_boundary_is_accepted_by_build_packets` at ~1110-1200, and the test at ~1320) only need the `image` field dropped — `build_packets_with_art` takes no source and reads no bytes.
 
 Then rewrite the lacer test in `page.rs` (`chunk_lacer_splits_art_across_pages_and_crcs_validate`, ~line 585) so the art is byte-consistent (image length == `art_total`) and base64 output spans pages. Replace its `chunks`/setup and the `lace_chunks_to_segments` call:
 
@@ -707,7 +713,17 @@ In `musefs-format/src/ogg/mod.rs` `mod tests`, add a counting source asserting n
             }
         }
 
-        let (header, scan) = opus_header_and_scan(); // existing test helper that yields an Opus header
+        // Inline Opus fixture, mirroring synthesize_opus_emits_valid_header_and_audio_segment.
+        let mut data = opus_headers();
+        let scan = locate_audio({
+            let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 80]);
+            data.extend_from_slice(&audio);
+            &data
+        })
+        .unwrap();
+        let header =
+            read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
+
         let image: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
         let meta = crate::input::ArtInput {
             art_id: 7,

@@ -139,9 +139,10 @@ Five edits. The format layer stays pure (no DB dependency) and fuzzable.
    `musefs-core` implements the trait over `read_art_chunk_into` (the existing
    streaming read); format-layer tests and the `fuzz/` target implement it over an
    in-memory `art_id → &[u8]` map (infallible). `synthesize_layout` takes art
-   metadata plus `&dyn ArtSource` instead of `&[OggArt]` carrying bytes. Adding the
-   `ArtRead` variant requires extending the `From<FormatError> for CoreError`
-   conversion in `musefs-core`.
+   metadata plus `&dyn ArtSource` instead of `&[OggArt]` carrying bytes. The
+   `ArtRead` variant needs no conversion code: `CoreError` already takes
+   `FormatError` via `#[from]` (`musefs-core/src/error.rs`), so it reaches the FUSE
+   layer unchanged in shape.
 
 4. **Incremental CRC.** Add `crc32_update(state: u32, chunk: &[u8]) -> u32` to
    `musefs-format/src/ogg/crc.rs`. The existing `crc32` starts at state 0 with no
