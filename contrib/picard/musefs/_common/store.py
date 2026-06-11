@@ -1,12 +1,71 @@
 # GENERATED from python-musefs/src/musefs_common/store.py — do not edit.
 # Run contrib/python-musefs/vendor_to_picard.py after changing the library.
 #
+import contextlib
 import hashlib
 import os
 import sqlite3
 
 from .constants import EXPECTED_USER_VERSION
 from .errors import SchemaMismatch
+
+# sqlite3.LEGACY_TRANSACTION_CONTROL is 3.12+; it is == -1. Use getattr so this
+# module still imports on the 3.8 floor (where the constant does not exist).
+_LEGACY = getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", -1)
+
+
+def _is_autocommit(conn):
+    """True if the connection auto-commits each statement (no caller-owned
+    transaction will be committed for us)."""
+    ac = getattr(conn, "autocommit", _LEGACY)  # 3.12+ attribute; _LEGACY on <3.12
+    if ac is True:
+        return True
+    if ac is False:
+        return False
+    return conn.isolation_level is None  # legacy transaction control
+
+
+def _is_legacy(conn):
+    """True if the connection uses legacy transaction control (the <3.12 default
+    and the 3.12+ LEGACY_TRANSACTION_CONTROL mode)."""
+    return getattr(conn, "autocommit", _LEGACY) == _LEGACY
+
+
+@contextlib.contextmanager
+def _savepoint(conn, name):
+    """Make a DELETE+INSERT block atomic regardless of the connection's
+    transaction mode. On a caller-managed connection it nests via SAVEPOINT and
+    never commits the enclosing transaction; on an autocommit connection the
+    outermost call owns a transaction for the block (commit on success, rollback
+    on failure). Nested calls only nest -- they never BEGIN or commit -- so a
+    sync_one savepoint may wrap these per-function savepoints safely.
+
+    ``name`` must be a hardcoded SQL identifier (it is interpolated into the SQL,
+    so never pass caller-controlled text)."""
+    autocommit = _is_autocommit(conn)
+    owns = not conn.in_transaction  # outermost call: it opens & owns the txn
+    # Legacy mode never auto-BEGINs before SAVEPOINT, so a savepoint opened as
+    # the first statement of a batch would become the outermost transaction and
+    # commit durably on RELEASE. Force a nesting BEGIN there. PEP-249 modes
+    # auto-begin before any statement, so they need no nudge.
+    if owns and _is_legacy(conn):
+        conn.execute("BEGIN")
+    conn.execute(f"SAVEPOINT {name}")
+    try:
+        yield
+    except BaseException:
+        try:
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+            if owns and autocommit:
+                conn.rollback()
+        except sqlite3.Error:
+            pass  # never mask the original exception with a cleanup failure
+        raise
+    else:
+        conn.execute(f"RELEASE {name}")
+        if owns and autocommit:
+            conn.commit()
 
 
 def connect(db_path):
@@ -57,20 +116,25 @@ def prune_missing(conn, track_ids=None):
 
 def replace_tags(conn, track_id, pairs):
     """Replace all tags for a track. Duplicate keys get incrementing ordinals
-    (mirroring musefs scan ingest)."""
+    (mirroring musefs scan ingest).
+
+    Atomic via an internal savepoint (see ``_savepoint``), so a crash between the
+    DELETE and the INSERT can never leave the track's text tags wiped -- safe
+    even when called on an autocommit connection."""
     # Scope to the plugin-owned text rows: scanner-written binary tags
     # (value_blob NOT NULL) must survive a sync (#82).
-    conn.execute("DELETE FROM tags WHERE track_id = ? AND value_blob IS NULL", (track_id,))
-    ordinals = {}
-    rows = []
-    for key, value in pairs:
-        ordinal = ordinals.get(key, 0)
-        ordinals[key] = ordinal + 1
-        rows.append((track_id, key, value, ordinal))
-    conn.executemany(
-        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, ?, ?, ?)",
-        rows,
-    )
+    with _savepoint(conn, "musefs_replace_tags"):
+        conn.execute("DELETE FROM tags WHERE track_id = ? AND value_blob IS NULL", (track_id,))
+        ordinals = {}
+        rows = []
+        for key, value in pairs:
+            ordinal = ordinals.get(key, 0)
+            ordinals[key] = ordinal + 1
+            rows.append((track_id, key, value, ordinal))
+        conn.executemany(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?, ?, ?, ?)",
+            rows,
+        )
 
 
 def merge_tags(conn, track_id, managed_pairs, delete_keys):
