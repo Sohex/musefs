@@ -51,6 +51,9 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
             continue; // zero-length art: synthesis would skip it anyway (now type-level).
         };
 
+        // Backstop to the V4 `byte_len <= MAX_ART_BYTES` schema CHECK (#291): a
+        // writer that disables check enforcement can still plant an oversize row,
+        // and Component B would stream it with bounded memory, but we refuse it.
         if data_len.get() > crate::scan::MAX_ART_BYTES as u64 {
             log::warn!(
                 "track {track_id} art {} is {} bytes, exceeds the {}-byte art cap; refusing to serve",
@@ -428,13 +431,20 @@ mod tests {
     #[test]
     fn track_art_to_inputs_enforces_art_cap() {
         use crate::CoreError;
-        use musefs_db::{NewArt, TrackArt}; // NewTrack already in scope at module level
-        // The boundary uses the real MAX_ART_BYTES (not a smaller test value) so the
-        // mutation gate catches a `>`→`>=` flip; this hashes ~32 MiB across the two
-        // blobs, which is fine here — do not "optimize" the boundary away.
+        use musefs_db::TrackArt; // NewTrack already in scope at module level
+        // The V4 schema CHECK (byte_len <= MAX_ART_BYTES, #291) already rejects
+        // oversize art at write time. The only way an oversize row reaches the
+        // reader is a writer that disables CHECK enforcement (PRAGMA
+        // ignore_check_constraints / writable_schema) — which also evades the
+        // schema-identity gate, since the schema text is unchanged. This
+        // resolve-time cap is the backstop for exactly that, so the test plants
+        // the adversarial rows on a raw connection with checks off (empty blobs;
+        // track_art_to_inputs reads byte_len only) and pins the boundary so the
+        // mutation gate catches a `>`->`>=` flip.
         let cap = crate::scan::MAX_ART_BYTES;
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("cap.db")).unwrap();
+        let path = dir.path().join("cap.db");
+        let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
                 backing_path: "/a.opus".into(),
@@ -446,15 +456,21 @@ mod tests {
             })
             .unwrap();
 
-        // Exactly at the cap: accepted.
-        let at_cap = db
-            .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
-                data: vec![0u8; cap],
-            })
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch("PRAGMA ignore_check_constraints = ON;")
             .unwrap();
+        let plant = |byte_len: i64, sha: &str| {
+            raw.execute(
+                "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?1, 'image/png', ?2, X'')",
+                rusqlite::params![sha, byte_len],
+            )
+            .unwrap();
+            raw.last_insert_rowid()
+        };
+        let at_cap = plant(i64::try_from(cap).unwrap(), &"a".repeat(64));
+        let over = plant(i64::try_from(cap + 1).unwrap(), &"b".repeat(64));
+
+        // Exactly at the cap: accepted.
         db.set_track_art(
             tid,
             &[TrackArt {
@@ -469,14 +485,6 @@ mod tests {
         assert_eq!(ok.len(), 1, "art exactly at the cap must be accepted");
 
         // One byte over the cap: rejected with ArtTooLarge naming the offending ids.
-        let over = db
-            .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
-                data: vec![0u8; cap + 1],
-            })
-            .unwrap();
         db.set_track_art(
             tid,
             &[TrackArt {

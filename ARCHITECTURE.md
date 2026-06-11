@@ -177,9 +177,11 @@ on disk: `backing_size` or `backing_mtime` that drift from the actual file's
 stat, or audio bounds that fit the stored `backing_size` but overrun the file
 once it has shrunk. musefs re-stats the backing file on every resolve and
 treats such rows as untrusted input, degrading to a controlled
-`BackingChanged`/layout error, never undefined behavior. Art exceeding
-`MAX_ART_BYTES` (16 MiB − 64 KiB) is rejected at resolve with `ArtTooLarge`
-for all formats; the scanner's ingest-time drop is tracked in #284.
+`BackingChanged`/layout error, never undefined behavior. The store's V4
+`CHECK` rejects art over `MAX_ART_BYTES` (16 MiB − 64 KiB) at write time;
+resolve also re-checks it (`ArtTooLarge`, all formats) to backstop a writer
+that disables check enforcement, and the scanner's ingest-time drop is
+tracked in #284.
 Referential gaps are treated the same way: a `track_art` row whose `art_id`
 has no matching `art` row (an orphan an external writer can produce with FK
 enforcement disabled) fails the serve with `EIO` rather than silently dropping
