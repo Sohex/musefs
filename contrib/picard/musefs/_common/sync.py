@@ -6,7 +6,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .constants import MAX_ART_BYTES
-from .store import merge_tags, replace_tags, replace_track_art, track_id_for_path, upsert_art
+from .store import (
+    _savepoint,
+    merge_tags,
+    replace_tags,
+    replace_track_art,
+    track_id_for_path,
+    upsert_art,
+)
 
 
 @dataclass(frozen=True)
@@ -69,16 +76,17 @@ def sync_one(conn, record, stats, *, dry_run=False, merge=False):
     will_link_art = bool(kept)
 
     if not dry_run:
-        if merge:
-            merge_tags(conn, track_id, record.pairs, record.delete_keys or [])
-        else:
-            replace_tags(conn, track_id, record.pairs)
-        if will_link_art:
-            arts = [
-                (upsert_art(conn, img.data, img.mime), img.picture_type, img.description)
-                for img in kept
-            ]
-            replace_track_art(conn, track_id, arts)
+        with _savepoint(conn, "musefs_sync_one"):
+            if merge:
+                merge_tags(conn, track_id, record.pairs, record.delete_keys or [])
+            else:
+                replace_tags(conn, track_id, record.pairs)
+            if will_link_art:
+                arts = [
+                    (upsert_art(conn, img.data, img.mime), img.picture_type, img.description)
+                    for img in kept
+                ]
+                replace_track_art(conn, track_id, arts)
 
     if will_link_art:
         stats.art_linked += 1
