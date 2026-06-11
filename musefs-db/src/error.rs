@@ -12,6 +12,11 @@ pub enum DbError {
         audio_length: u64,
         backing_size: u64,
     },
+    #[error(
+        "database schema does not match the version musefs expects (mismatch at {object}); \
+         regenerate the store by running `musefs scan` against the library"
+    )]
+    SchemaMismatch { object: String },
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

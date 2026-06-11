@@ -24,7 +24,9 @@ use std::time::Duration;
 
 /// Type-state markers for [`Db`]: the connection's write capability, at the
 /// type level. Write APIs exist only on `Db<ReadWrite>`.
+#[derive(Debug)]
 pub struct ReadOnly;
+#[derive(Debug)]
 pub struct ReadWrite;
 
 /// A SQLite connection whose mode parameter says whether write APIs resolve.
@@ -41,6 +43,7 @@ pub struct ReadWrite;
 /// let db = musefs_db::Db::open_in_memory().unwrap().into_read_only();
 /// db.upsert_track(unimplemented!());
 /// ```
+#[derive(Debug)]
 pub struct Db<M = ReadWrite> {
     conn: Connection,
     path: Option<PathBuf>,
@@ -69,11 +72,6 @@ impl Db<ReadWrite> {
         })
     }
 
-    /// Apply shared connection pragmas, then migrate. `wal` enables write-ahead
-    /// logging (file-backed DBs only) so a reader (the FUSE mount) and a writer
-    /// (e.g. a beets-plugin sync) don't block each other; the busy timeout lets
-    /// brief lock contention retry instead of failing immediately with
-    /// SQLITE_BUSY.
     fn configure(conn: &mut Connection, wal: bool) -> Result<()> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -83,6 +81,7 @@ impl Db<ReadWrite> {
             let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         }
         schema::migrate(conn)?;
+        schema::validate_identity(conn)?;
         Ok(())
     }
 
@@ -112,6 +111,7 @@ impl Db<ReadOnly> {
         // No configure()/migrate and no foreign_keys pragma: the schema already
         // exists and no writes are possible on a read-only connection.
         conn.busy_timeout(Duration::from_secs(5))?;
+        schema::validate_identity(&conn)?;
         Ok(Db {
             conn,
             path: Some(p),
@@ -214,5 +214,52 @@ mod tests {
     fn in_memory_has_no_path() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.path().is_none());
+    }
+
+    #[test]
+    fn open_readonly_rejects_tampered_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.conn.execute_batch("DROP TRIGGER tags_ai").unwrap();
+        }
+        let err = Db::open_readonly(&path).unwrap_err();
+        assert!(
+            matches!(err, crate::DbError::SchemaMismatch { .. }),
+            "tampered RO open must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn open_readonly_accepts_honest_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        Db::open(&path).unwrap();
+        Db::open_readonly(&path).unwrap();
+    }
+
+    #[test]
+    fn open_readonly_rejects_foreign_key_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF; \
+                     INSERT INTO art (sha256, mime, byte_len, data) \
+                     VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+                             'image/png', 1, X'00'); \
+                     INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
+                     VALUES (999, 1, 3, 0);",
+                )
+                .unwrap();
+        }
+        let err = Db::open_readonly(&path).unwrap_err();
+        match err {
+            crate::DbError::SchemaMismatch { object } => assert!(object.contains("foreign key")),
+            other => panic!("expected SchemaMismatch (fk) on RO open, got {other:?}"),
+        }
     }
 }

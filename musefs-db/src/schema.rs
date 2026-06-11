@@ -284,6 +284,71 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn reference_objects() -> &'static std::collections::BTreeMap<(String, String), String> {
+    static REF: std::sync::OnceLock<std::collections::BTreeMap<(String, String), String>> =
+        std::sync::OnceLock::new();
+    REF.get_or_init(|| {
+        let mut conn =
+            Connection::open_in_memory().expect("in-memory connection for schema reference");
+        migrate(&mut conn).expect("reference migration must succeed on a fresh DB");
+        read_schema_objects(&conn).expect("reading reference schema must succeed")
+    })
+}
+
+fn read_schema_objects(
+    conn: &Connection,
+) -> crate::Result<std::collections::BTreeMap<(String, String), String>> {
+    let mut stmt = conn.prepare(
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_master \
+         WHERE name NOT LIKE 'sqlite_%'",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut map = std::collections::BTreeMap::new();
+    for row in rows {
+        let ((ty, name), sql) = row?;
+        map.insert((ty, name), sql);
+    }
+    Ok(map)
+}
+
+fn schema_mismatch(key: &(String, String), what: &str) -> crate::error::DbError {
+    crate::error::DbError::SchemaMismatch {
+        object: format!("{} {} ({what})", key.0, key.1),
+    }
+}
+
+pub(crate) fn validate_identity(conn: &Connection) -> crate::Result<()> {
+    let reference = reference_objects();
+    let actual = read_schema_objects(conn)?;
+
+    let mut keys: Vec<&(String, String)> = reference.keys().chain(actual.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        match (reference.get(key), actual.get(key)) {
+            (Some(r), Some(a)) if r != a => return Err(schema_mismatch(key, "altered")),
+            (Some(_), None) => return Err(schema_mismatch(key, "missing")),
+            (None, Some(_)) => return Err(schema_mismatch(key, "unexpected")),
+            _ => {}
+        }
+    }
+
+    let mut fk = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = fk.query([])?;
+    if let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        return Err(crate::error::DbError::SchemaMismatch {
+            object: format!("foreign key violation in table {table}"),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod migration_v2_tests {
     use rusqlite::Connection;
@@ -1153,6 +1218,116 @@ mod migration_v4_tests {
                 names.iter().any(|n| n == expected),
                 "missing trigger after V4: {expected}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::error::DbError;
+
+    fn migrated() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn honest_schema_passes() {
+        let conn = migrated();
+        validate_identity(&conn).unwrap();
+    }
+
+    #[test]
+    fn honest_schema_with_rows_passes() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) VALUES ('/a.flac','flac',0,1,1,0,0)",
+            [],
+        )
+        .unwrap();
+        let has_seq: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sqlite_sequence'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_seq, 1, "precondition: insert created sqlite_sequence");
+        validate_identity(&conn).unwrap();
+    }
+
+    #[test]
+    fn missing_trigger_is_rejected() {
+        let conn = migrated();
+        conn.execute_batch("DROP TRIGGER tags_ai").unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => {
+                assert!(object.contains("tags_ai"), "names the object: {object}");
+                assert!(object.contains("missing"), "classifies it: {object}");
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_object_is_rejected() {
+        let conn = migrated();
+        conn.execute_batch("CREATE TABLE sneaky (x)").unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        assert!(matches!(err, DbError::SchemaMismatch { .. }));
+    }
+
+    #[test]
+    fn altered_table_is_rejected() {
+        let conn = migrated();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; \
+             DROP TABLE tags; \
+             CREATE TABLE tags (track_id INTEGER NOT NULL, key TEXT, value TEXT, \
+                ordinal INTEGER, value_blob BLOB, PRIMARY KEY (track_id, key, ordinal));",
+        )
+        .unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => assert!(object.contains("tags")),
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_key_violation_is_rejected() {
+        let conn = migrated();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; \
+             INSERT INTO art (sha256, mime, byte_len, data) \
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+                     'image/png', 1, X'00'); \
+             INSERT INTO track_art (track_id, art_id, picture_type, ordinal) VALUES (999, 1, 3, 0);",
+        )
+        .unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => assert!(object.contains("foreign key")),
+            other => panic!("expected SchemaMismatch (fk), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_offender_is_deterministic_in_type_name_order() {
+        let conn = migrated();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; DROP TRIGGER track_art_ai; DROP TRIGGER tags_ai;",
+        )
+        .unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => assert!(object.contains("tags_ai"), "{object}"),
+            other => panic!("expected SchemaMismatch, got {other:?}"),
         }
     }
 }
