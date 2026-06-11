@@ -106,13 +106,16 @@ def _is_legacy(conn):
 def _savepoint(conn, name):
     """Make a DELETE+INSERT block atomic regardless of the connection's
     transaction mode. On a caller-managed connection it nests via SAVEPOINT and
-    never commits the enclosing transaction; on an autocommit connection it owns
-    a transaction for the block (commit on success, rollback on failure)."""
+    never commits the enclosing transaction; on an autocommit connection the
+    *outermost* call owns a transaction for the block (commit on success,
+    rollback on failure). Nested calls (e.g. C's sync_one savepoint wrapping A's
+    per-function savepoints) only nest — they never BEGIN or commit."""
     autocommit = _is_autocommit(conn)
+    owns = not conn.in_transaction  # outermost call: it opens & owns the txn
     # Legacy mode never auto-BEGINs before SAVEPOINT, so a savepoint opened as
     # the first statement would become the outermost txn and commit on RELEASE.
     # Force a nesting BEGIN there. PEP-249 modes auto-begin already.
-    if _is_legacy(conn) and (autocommit or not conn.in_transaction):
+    if owns and _is_legacy(conn):
         conn.execute("BEGIN")
     conn.execute(f"SAVEPOINT {name}")
     try:
@@ -121,20 +124,27 @@ def _savepoint(conn, name):
         try:
             conn.execute(f"ROLLBACK TO {name}")
             conn.execute(f"RELEASE {name}")
-            if autocommit:
+            if owns and autocommit:
                 conn.rollback()
         except sqlite3.Error:
             pass  # never mask the original exception with a cleanup failure
         raise
     else:
         conn.execute(f"RELEASE {name}")
-        if autocommit:
+        if owns and autocommit:
             conn.commit()
 ```
 
 - `name` is a fixed, hardcoded identifier per call site (no user input → no
   injection). Distinct names per site keep nested `RELEASE`/`ROLLBACK TO`
   unambiguous.
+- **`owns` guard is load-bearing.** Only the outermost `_savepoint` (the one
+  that found no transaction open on entry) issues `BEGIN` and, in autocommit
+  mode, the final `commit()`/`rollback()`. Without it, C's `sync_one` savepoint
+  wrapping A's `replace_tags` savepoint on an autocommit connection would (a)
+  attempt a second `BEGIN` inside the open transaction and (b) let the inner
+  call `commit()` early — committing tags before art and destroying whole-record
+  atomicity. The inner calls must only nest.
 - `ROLLBACK TO` does not pop the savepoint from the stack, so the error path
   also `RELEASE`s it before re-raising.
 - The error-path cleanup is wrapped so that a secondary `sqlite3.Error` (e.g. a
@@ -143,8 +153,9 @@ def _savepoint(conn, name):
 
 This is verified across all relevant scenarios (see Testing): legacy
 deferred batch + single commit, legacy deferred first-statement + caller
-rollback (the trap), legacy autocommit success/failure, and 3.12+
-`autocommit=True`/`False`.
+rollback (the trap), legacy autocommit success/failure, **nested C-over-A on an
+autocommit connection (success and inner-failure)**, and the 3.12+
+`autocommit=True`/`False` equivalents.
 
 ## A — per-function atomicity (`store.py`)
 
