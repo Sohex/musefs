@@ -55,7 +55,9 @@ sum to the served file size. Six variants:
   metadata blocks, a RIFF front), fully materialized at resolve time.
 - `ArtImage { art_id, len }` — embedded cover art; only the length lives in
   the layout. Image bytes stream from the DB blob in chunks at read time and
-  are never buffered whole.
+  are never buffered whole. This invariant also holds for Ogg synthesis,
+  where page CRCs are computed from page-bounded `ArtSource` windows
+  (previously the documented exception).
 - `BackingAudio { offset, len }` — a run of the original file's audio frames,
   served by positioned reads (`read_exact_at`) against the backing file.
 - `OggAudio { offset, len, seq_delta }` — original Ogg audio pages served
@@ -175,10 +177,13 @@ on disk: `backing_size` or `backing_mtime` that drift from the actual file's
 stat, or audio bounds that fit the stored `backing_size` but overrun the file
 once it has shrunk. musefs re-stats the backing file on every resolve and
 treats such rows as untrusted input, degrading to a controlled
-`BackingChanged`/layout error, never undefined behavior. Referential gaps are
-treated the same way: a `track_art` row whose `art_id` has no matching `art`
-row (an orphan an external writer can produce with FK enforcement disabled)
-fails the serve with `EIO` rather than silently dropping the art.
+`BackingChanged`/layout error, never undefined behavior. Art exceeding
+`MAX_ART_BYTES` (16 MiB − 64 KiB) is rejected at resolve with `ArtTooLarge`
+for all formats; the scanner's ingest-time drop is tracked in #284.
+Referential gaps are treated the same way: a `track_art` row whose `art_id`
+has no matching `art` row (an orphan an external writer can produce with FK
+enforcement disabled) fails the serve with `EIO` rather than silently dropping
+the art.
 
 **Merge vs. replace.** An external writer may **merge** rather than fully
 replace text tags — overwriting only the keys it manages and leaving the rest
