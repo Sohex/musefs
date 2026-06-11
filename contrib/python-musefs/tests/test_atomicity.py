@@ -188,14 +188,21 @@ def test_sync_files_deferred_batch_rolls_back_as_unit(db_path):
     # rollback abandons the whole batch.
     conn = connect(db_path)
     try:
-        tid = insert_track(conn, "/m/a.flac")
+        insert_track(conn, "/m/a.flac")
+        insert_track(conn, "/m/b.flac")
         conn.commit()
-        sync_one(conn, Record(key="/m/a.flac", pairs=[("title", "A")]), SyncStats())
+        sync_files(
+            conn,
+            [
+                Record(key="/m/a.flac", pairs=[("title", "A")]),
+                Record(key="/m/b.flac", pairs=[("title", "B")]),
+            ],
+        )
         conn.rollback()  # caller abandons the batch after the write
     finally:
         conn.close()
     check = connect(db_path)
     try:
-        assert text_tags(check, tid) == {}
+        assert check.execute("SELECT COUNT(*) FROM tags").fetchone()[0] == 0
     finally:
         check.close()
