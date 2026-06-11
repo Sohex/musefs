@@ -145,7 +145,7 @@ use crate::input::{
 use crate::layout::{RegionLayout, Segment};
 
 /// Inclusive maximum body length of a FLAC metadata block (24-bit length field).
-pub(crate) const MAX_BLOCK_BODY: u64 = 0x00FF_FFFF;
+pub const MAX_BLOCK_BODY: u64 = 0x00FF_FFFF;
 
 pub(crate) fn push_block_header(
     out: &mut Vec<u8>,

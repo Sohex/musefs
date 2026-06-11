@@ -1277,6 +1277,18 @@ mod hardening_tests {
     }
 
     #[test]
+    fn scan_caps_match_db_limits() {
+        assert_eq!(
+            i64::try_from(MAX_ART_BYTES).unwrap(),
+            musefs_db::limits::MAX_ART_BYTES
+        );
+        assert_eq!(
+            i64::try_from(MAX_BINARY_TAG_BYTES).unwrap(),
+            musefs_db::limits::MAX_BINARY_TAG_BYTES
+        );
+    }
+
+    #[test]
     fn is_supported_audio_accepts_known_and_rejects_unknown() {
         for ok in [
             "a.flac", "a.mp3", "a.m4a", "a.m4b", "a.ogg", "a.oga", "a.opus", "a.wav",
