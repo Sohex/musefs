@@ -74,8 +74,9 @@ First public release.
 ### Notes
 
 - Read-only mount; tag edits happen out-of-band against the SQLite store and are
-  picked up automatically (`PRAGMA data_version` polling). See the README "Tag
-  handling" section for round-trip limitations.
+  picked up automatically (`PRAGMA data_version` polling). See the README
+  [Supported formats](README.md#supported-formats) section and the per-format
+  docs (`docs/{FLAC,MP3,M4A,OGG,WAV}.md`) for round-trip limitations.
 
 ## [0.1.0]
 

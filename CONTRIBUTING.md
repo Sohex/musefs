@@ -23,11 +23,14 @@ git config core.hooksPath .githooks
 
 The hook (`.githooks/pre-commit`) runs, in order: `cargo fmt --all --check`,
 `cargo clippy --all-targets -- -D warnings`, **the full workspace test
-suite** (`cargo test --workspace`), `shellcheck` over every tracked shell
-script, `yamllint` (relaxed [`.yamllint`](.yamllint)) over every tracked YAML
-file, and `ruff check` + `ruff format --check` over `contrib/beets/`,
-`contrib/picard/`, `contrib/lidarr/`, `contrib/python-musefs/`, and
-`tests/interop/`. A few consequences worth internalizing:
+suite** (`cargo test --workspace`), a conditional cargo-mutants anchor-drift
+guard (only when `.cargo/mutants.toml`, `scripts/check_mutant_anchors.py`, or
+a `musefs-core`/`musefs-format` source file is staged), `shellcheck` over
+every tracked shell script, `yamllint` (relaxed [`.yamllint`](.yamllint)) over
+every tracked YAML file, and `ruff check` + `ruff format --check` over
+`contrib/beets/`, `contrib/picard/`, `contrib/lidarr/`,
+`contrib/python-musefs/`, `scripts/`, and `tests/interop/`. A few consequences
+worth internalizing:
 
 - A commit with red tests is always rejected — there is no
   "commit-now-fix-later" workflow here.
@@ -40,6 +43,11 @@ file, and `ruff check` + `ruff format --check` over `contrib/beets/`,
   staged, and skip with a notice when the tool is absent; when they do run they
   lint *all* tracked files of that type, so a sibling file can't drift
   unnoticed.
+- The mutant-anchor guard fires only when the mutants config, its check
+  script, or a `musefs-core`/`musefs-format` source file is staged, and skips
+  with a notice when `cargo-mutants` is absent (CI re-checks it regardless). It
+  re-validates that the `.cargo/mutants.toml` `exclude_re` anchors still point
+  at their intended `file:line:col` after a line-shifting edit.
 
 ## Build & test
 
@@ -348,13 +356,14 @@ RUSTFLAGS="-Zsanitizer=thread" TSAN_OPTIONS="halt_on_error=0" \
 
 ```bash
 cargo install cargo-llvm-cov
-cargo llvm-cov --workspace --exclude musefs-fuse --open
-cargo llvm-cov --workspace --exclude musefs-fuse --lcov --output-path lcov.info
+cargo llvm-cov --workspace --exclude musefs-fuse --exclude musefs-latencyfs --open
+cargo llvm-cov --workspace --exclude musefs-fuse --exclude musefs-latencyfs --lcov --output-path lcov.info
 ```
 
-`musefs-fuse` is excluded because its tests need a real mount; the FUSE
-behavior is covered by the separate `e2e` CI job. CI (`coverage.yml`) runs
-this on every push/PR and uploads to Codecov (`CODECOV_TOKEN` repo secret).
+`musefs-fuse` and `musefs-latencyfs` are excluded because these FUSE crates'
+tests need a real mount; their behavior is covered by the separate `e2e` CI
+job rather than `llvm-cov`. CI (`coverage.yml`) runs this on every push/PR and
+uploads to Codecov (`CODECOV_TOKEN` repo secret).
 
 ## Code conventions
 

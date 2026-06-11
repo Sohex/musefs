@@ -296,8 +296,10 @@ disappears, its stale row is not pruned by revalidating this root.
 External writers live under `contrib/`: `python-musefs` is the shared
 store-contract library (schema-version check, tag/art writes, sha256 art
 content-addressing, the `musefs scan` shell-out); the
-[beets plugin](contrib/beets/README.md) and the
-[Picard plugin](contrib/picard/README.md) build host-specific tag mapping on
-top of it. Each plugin's README covers its own setup and behavior;
+[beets plugin](contrib/beets/README.md), the
+[Picard plugin](contrib/picard/README.md), and the
+[Lidarr integration](contrib/lidarr/README.md) (a Custom Script workflow)
+build host-specific tag mapping on top of it. Each one's README covers its own
+setup and behavior;
 [CONTRIBUTING](CONTRIBUTING.md) covers their test suites and the
 generated-schema/vendoring mechanics.
