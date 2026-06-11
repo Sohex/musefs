@@ -50,6 +50,22 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
         let Some(data_len) = musefs_format::BlobLen::new(meta.byte_len) else {
             continue; // zero-length art: synthesis would skip it anyway (now type-level).
         };
+
+        if data_len.get() > crate::scan::MAX_ART_BYTES as u64 {
+            log::warn!(
+                "track {track_id} art {} is {} bytes, exceeds the {}-byte art cap; refusing to serve",
+                ta.art_id,
+                data_len.get(),
+                crate::scan::MAX_ART_BYTES,
+            );
+            return Err(crate::error::CoreError::ArtTooLarge {
+                track_id,
+                art_id: ta.art_id,
+                byte_len: data_len.get(),
+                cap: crate::scan::MAX_ART_BYTES as u64,
+            });
+        }
+
         let Some(picture_type) = musefs_format::PictureType::new(ta.picture_type) else {
             return Err(crate::error::CoreError::InvalidPictureType {
                 track_id,
@@ -466,6 +482,80 @@ mod tests {
             images,
             vec![vec![1, 2, 3, 4], vec![7, 8, 9]],
             "must return each stored blob's exact bytes, in input order"
+        );
+    }
+
+    #[test]
+    fn track_art_to_inputs_enforces_art_cap() {
+        use crate::CoreError;
+        use musefs_db::{NewArt, TrackArt}; // NewTrack already in scope at module level
+        // The boundary uses the real MAX_ART_BYTES (not a smaller test value) so the
+        // mutation gate catches a `>`→`>=` flip; this hashes ~32 MiB across the two
+        // blobs, which is fine here — do not "optimize" the boundary away.
+        let cap = crate::scan::MAX_ART_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("cap.db")).unwrap();
+        let tid = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.opus".into(),
+                format: Format::Opus,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime: 0,
+            })
+            .unwrap();
+
+        // Exactly at the cap: accepted.
+        let at_cap = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![0u8; cap],
+            })
+            .unwrap();
+        db.set_track_art(
+            tid,
+            &[TrackArt {
+                art_id: at_cap,
+                picture_type: 3,
+                description: String::new(),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        let ok = super::track_art_to_inputs(&db, tid).unwrap();
+        assert_eq!(ok.len(), 1, "art exactly at the cap must be accepted");
+
+        // One byte over the cap: rejected with ArtTooLarge naming the offending ids.
+        let over = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![0u8; cap + 1],
+            })
+            .unwrap();
+        db.set_track_art(
+            tid,
+            &[TrackArt {
+                art_id: over,
+                picture_type: 3,
+                description: String::new(),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        let err = super::track_art_to_inputs(&db, tid).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::ArtTooLarge { track_id, art_id, byte_len, cap: c }
+                    if track_id == tid && art_id == over
+                        && byte_len == (cap as u64) + 1 && c == cap as u64
+            ),
+            "oversize art must yield ArtTooLarge with the offending ids, got {err:?}"
         );
     }
 }

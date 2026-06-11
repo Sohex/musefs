@@ -34,6 +34,13 @@ pub enum CoreError {
         art_id: i64,
         value: u32,
     },
+    #[error("track {track_id} art {art_id} is {byte_len} bytes, exceeds the {cap}-byte art cap")]
+    ArtTooLarge {
+        track_id: i64,
+        art_id: i64,
+        byte_len: u64,
+        cap: u64,
+    },
     #[error("track {0} not found")]
     TrackNotFound(i64),
     #[error("no such inode: {0}")]
