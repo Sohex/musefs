@@ -117,16 +117,31 @@ Five edits. The format layer stays pure (no DB dependency) and fuzzable.
    }
    ```
 
-   where `Result` is `musefs-format`'s `Result<T, FormatError>`. `FormatError` is
-   currently a closed enum of structural errors with no I/O/DB variant, so a new
-   `FormatError::ArtRead(Box<dyn std::error::Error + Send + Sync>)` variant is
-   added: the core impl maps its typed `DbError` from `read_art_chunk_into` into it
-   (the inner error stays downcastable), keeping `synthesize_layout`'s return type
-   non-generic `Result<RegionLayout, FormatError>`. `musefs-core` implements the
-   trait over `read_art_chunk_into` (the existing streaming read); format-layer
-   tests and the `fuzz/` target implement it over an in-memory `art_id → &[u8]` map
-   (infallible). `synthesize_layout` takes art metadata plus `&dyn ArtSource`
-   instead of `&[OggArt]` carrying bytes.
+   where `Result` is `musefs-format`'s `Result<T, FormatError>`. `FormatError`
+   currently `#[derive(Debug, Error, PartialEq, Eq)]` (`error.rs:3`) and is compared
+   with `assert_eq!`/`matches!` across the format crate's tests, so the new variant
+   **must stay `PartialEq + Eq`** — a `Box<dyn std::error::Error>` payload would
+   break the derive and every comparison site. The variant is therefore
+   `FormatError::ArtRead { art_id: i64 }` (an `i64` is `Eq`). The core `ArtSource`
+   impl logs the underlying typed `DbError` from `read_art_chunk_into` (with art id
+   and offset) at the point of failure, then returns `ArtRead { art_id }`; the
+   typed error is preserved in the log, not in the enum. This keeps
+   `synthesize_layout`'s return type non-generic `Result<RegionLayout, FormatError>`
+   and leaves the `Eq` derive intact.
+
+   Rejected alternative: making `ArtSource` carry an associated `Error` and
+   `synthesize_layout` generic over it. It avoids a new `FormatError` variant but
+   ripples a generic error parameter through `synthesize_layout` →
+   `lace_chunks_to_segments` → the CRC feeder, and the read path already flattens
+   every art-read failure to `CoreError` at the `reader.rs` boundary, so the typed
+   error buys nothing the log doesn't already give.
+
+   `musefs-core` implements the trait over `read_art_chunk_into` (the existing
+   streaming read); format-layer tests and the `fuzz/` target implement it over an
+   in-memory `art_id → &[u8]` map (infallible). `synthesize_layout` takes art
+   metadata plus `&dyn ArtSource` instead of `&[OggArt]` carrying bytes. Adding the
+   `ArtRead` variant requires extending the `From<FormatError> for CoreError`
+   conversion in `musefs-core`.
 
 4. **Incremental CRC.** Add `crc32_update(state: u32, chunk: &[u8]) -> u32` to
    `musefs-format/src/ogg/crc.rs`. The existing `crc32` starts at state 0 with no
@@ -158,6 +173,55 @@ Five edits. The format layer stays pure (no DB dependency) and fuzzable.
 
 Peak synthesis memory after B: running CRC state + one page-sized raw window + its
 base64 buffer — independent of art size.
+
+#### Coupling: `art_total` now equals the art's byte length
+
+Today `PayloadChunk::Art` carries `out` (the actual output bytes; geometry follows
+`out.len()`) *and* a separate `art_total` (metadata for the read-time
+`OggArtSlice`). Because `out` is self-consistent, the two are free to disagree, and
+the `fuzz/fuzz_targets/ogg.rs` target and the `chunk_lacer_splits_art_across_pages_
+and_crcs_validate` test in `page.rs` deliberately exercise that disagreement
+(e.g. `art_total: 12345` with a 70 000-byte `out`).
+
+After B there is no `out`: geometry is derived from `art_total` (`out_len()` =
+`b64_len(art_total)` or `art_total`) and the bytes come from the `ArtSource`. So
+`art_total` must equal the number of bytes the source yields — the two can no
+longer diverge. This is sound in production: `musefs-db/src/schema.rs` enforces
+`CHECK (byte_len = length(data))` on the `art` table (test
+`v4_art_rejects_byte_len_mismatch`), and `data_len`/`art_total` derive from
+`byte_len`, so the stored blob is always exactly `art_total` bytes.
+
+Consequence for the harnesses (both must change in Component B):
+
+- `fuzz/fuzz_targets/ogg.rs`: drop the "lengths must be free to disagree"
+  decoupling; generate each image with length equal to its `data_len` (or derive
+  `data_len` from the generated image) and feed it through the in-memory
+  `ArtSource`. The current comment documenting the divergence is removed.
+- `page.rs` `chunk_lacer_splits_art_across_pages_and_crcs_validate`: construct
+  `PayloadChunk::Art { art_id, base64, art_total: N }` with a matching in-memory
+  source of exactly `N` bytes (choosing `N` large enough that `b64_len(N)` still
+  spans pages).
+
+### Callers / migration surface
+
+Signature changes ripple to a bounded, mostly-test set (verified by grep):
+
+- `synthesize_layout` (now metadata + `&dyn ArtSource`): real caller
+  `reader.rs:282`; zero-art callers passing `&[]` (`ogg_index.rs:339`,
+  `proptest_ogg.rs:18`, several `ogg/mod.rs` tests) adapt trivially; with-art test
+  callers in `ogg/mod.rs` (≈ lines 918, 1027, 1058, 1091, 1123, 1151, 1186, 1320)
+  and `fuzz/fuzz_targets/ogg.rs:53` migrate to the in-memory `ArtSource`.
+- `OggArt` (loses `image`): all ~13 construction sites are tests + `reader.rs:277`
+  + `fuzz`.
+- `PayloadChunk::Art` (loses `out`): producers `ogg/mod.rs:410`
+  (`comment_packet_chunks`), `ogg/mod.rs:471` (`oggflac_packets_with_art`),
+  `page.rs:591` (test); consumers `out_len` (`page.rs:283`), `copy_payload`
+  (`page.rs:365`, rewritten), `emit_segments` (`page.rs:392`, already byte-free).
+- `track_art_images`: delete the fn (`mapping.rs:95`), its test
+  (`mapping.rs:413`), and the `reader.rs:273` call site.
+- The `flatten`/reconstruct verify helpers (`page.rs:557`, `ogg/mod.rs` header
+  region) already take an `art_id → bytes` map and become the in-memory
+  `ArtSource`.
 
 ### Data flow (Ogg resolve, after)
 
