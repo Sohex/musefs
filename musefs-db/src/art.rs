@@ -184,18 +184,24 @@ mod guard_tests {
 
     #[test]
     fn get_art_meta_rejects_oversize_mime() {
-        let (db, _t, art) = db_track_art();
+        let (db, _t, _art) = db_track_art();
         db.conn
             .execute_batch("PRAGMA ignore_check_constraints=ON")
             .unwrap();
+        // art rows are immutable under the V5 `art_reject_content_update`
+        // trigger (which `ignore_check_constraints` does not disable), so plant
+        // the oversize-mime row with a fresh INSERT — the trigger guards only
+        // UPDATE — rather than mutating an existing row in place.
         let mime = "x".repeat(256);
         db.conn
             .execute(
-                "UPDATE art SET mime = ?1 WHERE id = ?2",
-                rusqlite::params![mime, art],
+                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+                 VALUES (?1, ?2, NULL, NULL, 1, X'00')",
+                rusqlite::params!["b".repeat(64), mime],
             )
             .unwrap();
-        let err = db.get_art_meta(art).unwrap_err();
+        let bad = db.conn.last_insert_rowid();
+        let err = db.get_art_meta(bad).unwrap_err();
         assert!(
             matches!(
                 err,
