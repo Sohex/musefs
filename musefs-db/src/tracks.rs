@@ -224,8 +224,9 @@ impl Db<ReadWrite> {
 
     /// Test-only: force a track's format column directly (no rescan), bumping
     /// data_version. The only way to exercise a format-only change — production
-    /// never mutates format without a rescan. content_version is NOT bumped (no
-    /// trigger fires on the tracks.format column), so this is a pure format-only edit.
+    /// never mutates format without a rescan. As of V5 this also bumps
+    /// content_version (the `tracks_geometry_au` format guard); it is no longer a
+    /// content_version-neutral edit.
     #[doc(hidden)]
     pub fn set_format_for_test(&self, id: i64, fmt: Format) -> Result<()> {
         self.conn.execute(

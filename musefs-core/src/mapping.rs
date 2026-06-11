@@ -320,14 +320,27 @@ mod tests {
                 data: vec![1, 2, 3, 4],
             })
             .unwrap();
-        let bad = db
-            .upsert_art(&NewArt {
-                mime: "image/png".into(),
-                width: None,
-                height: None,
-                data: vec![9, 9, 9, 9, 9],
-            })
+
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.pragma_update(None, "ignore_check_constraints", true)
             .unwrap();
+        raw.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1, 'image/png', NULL, NULL, -1, X'0909090909')",
+            [&"9".repeat(64)],
+        )
+        .unwrap();
+        raw.pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        let bad: i64 = raw
+            .query_row(
+                "SELECT id FROM art WHERE sha256 = ?1",
+                [&"9".repeat(64)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(raw);
+
         db.set_track_art(
             tid,
             &[
@@ -347,18 +360,6 @@ mod tests {
         )
         .unwrap();
 
-        // A negative byte_len is a malformed external write to the contract
-        // column: the V4 `byte_len = length(data)` CHECK rejects it on a normal
-        // connection, so bypass CHECK enforcement to plant the bad row — the
-        // row-reader defensive path (not the CHECK) is what this test pins.
-        let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.pragma_update(None, "ignore_check_constraints", true)
-            .unwrap();
-        raw.execute("UPDATE art SET byte_len = -1 WHERE id = ?1", [bad])
-            .unwrap();
-        raw.pragma_update(None, "ignore_check_constraints", false)
-            .unwrap();
-        drop(raw);
         assert!(
             super::track_art_to_inputs(&db, tid).is_err(),
             "negative byte_len must error at row-read, not be skipped"

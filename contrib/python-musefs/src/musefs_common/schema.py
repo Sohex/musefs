@@ -259,6 +259,45 @@ CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (OLD.id);
 END;
 PRAGMA user_version = 4;
+
+-- ── MIGRATION_V5 ──
+CREATE TRIGGER art_reject_content_update
+BEFORE UPDATE ON art
+WHEN NEW.data   <> OLD.data
+  OR NEW.sha256 <> OLD.sha256
+  OR NEW.mime   <> OLD.mime
+  OR NEW.byte_len <> OLD.byte_len
+  OR NEW.width  IS NOT OLD.width
+  OR NEW.height IS NOT OLD.height
+BEGIN
+    SELECT RAISE(ABORT,
+        'art rows are immutable; insert a new content-addressed row and relink via track_art');
+END;
+
+CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
+END;
+
+CREATE TRIGGER tracks_geometry_au
+AFTER UPDATE ON tracks
+WHEN NEW.format        <> OLD.format
+  OR NEW.audio_offset  <> OLD.audio_offset
+  OR NEW.audio_length  <> OLD.audio_length
+  OR NEW.backing_size  <> OLD.backing_size
+  OR NEW.backing_mtime <> OLD.backing_mtime
+BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER structural_blocks_ai AFTER INSERT ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
+END;
+PRAGMA user_version = 5;
 """
 
-USER_VERSION = 4
+USER_VERSION = 5
