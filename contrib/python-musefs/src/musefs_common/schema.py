@@ -259,6 +259,72 @@ CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (OLD.id);
 END;
 PRAGMA user_version = 4;
+
+-- ── MIGRATION_V5 ──
+-- art rows are content-addressed by sha256: once written, their content
+-- columns are immutable. A writer needing different bytes/metadata inserts a
+-- NEW row and relinks via track_art (which bumps content_version through the
+-- V1 track_art triggers). This closes #271, where an in-place art edit changed
+-- served bytes without bumping any referencing track. width/height use IS NOT
+-- (NULL-safe) because they are nullable; the NOT NULL columns use <>.
+CREATE TRIGGER art_reject_content_update
+BEFORE UPDATE ON art
+WHEN NEW.data   <> OLD.data
+  OR NEW.sha256 <> OLD.sha256
+  OR NEW.mime   <> OLD.mime
+  OR NEW.byte_len <> OLD.byte_len
+  OR NEW.width  IS NOT OLD.width
+  OR NEW.height IS NOT OLD.height
+BEGIN
+    SELECT RAISE(ABORT,
+        'art rows are immutable; insert a new content-addressed row and relink via track_art');
+END;
+
+-- Index the reverse art -> track_art edge. track_art is keyed (track_id,
+-- ordinal), so without this both the art_ad trigger below and SQLite's own
+-- REFERENCES art(id) check on art deletes scan the whole join table per
+-- deleted row, which makes bulk orphan-GC O(deletes * rows).
+CREATE INDEX track_art_art_id_idx ON track_art(art_id);
+
+-- Deleting an art row that still has track_art references (an orphan an
+-- external writer can produce with foreign_keys OFF) bumps every referencing
+-- track, so the mount rebuilds and serves a clean EIO on the orphan rather
+-- than streaming stale bytes from an old cached layout. Inert on the normal
+-- gc_orphan_art path, where the deleted row has no references.
+CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
+END;
+
+-- Scanner-owned geometry feeds the synthesized layout, but upsert_track does
+-- not touch content_version. Bump it whenever a geometry column actually
+-- changes, making content_version a true superset of served-byte inputs
+-- (#272). The WHEN guard is false on this trigger's own nested UPDATE (only
+-- content_version changes), so the recursion terminates after exactly one bump.
+CREATE TRIGGER tracks_geometry_au
+AFTER UPDATE ON tracks
+WHEN NEW.format        <> OLD.format
+  OR NEW.audio_offset  <> OLD.audio_offset
+  OR NEW.audio_length  <> OLD.audio_length
+  OR NEW.backing_size  <> OLD.backing_size
+  OR NEW.backing_mtime <> OLD.backing_mtime
+BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
+END;
+
+-- FLAC structural blocks feed synthesized headers and flip the synthesis path
+-- (legacy front-read fallback vs streamed fast path), so a change must bump.
+-- set_structural_blocks is DELETE-then-INSERT (no UPDATE path exists), so these
+-- fire on every rewrite; the resulting over-bump on a byte-identical re-probe
+-- is harmless monotone churn (content_version is compared only for equality).
+CREATE TRIGGER structural_blocks_ai AFTER INSERT ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
+END;
+PRAGMA user_version = 5;
 """
 
-USER_VERSION = 4
+USER_VERSION = 5

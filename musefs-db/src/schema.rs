@@ -282,7 +282,79 @@ CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
 END;
 ";
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
+const MIGRATION_V5: &str = r"
+-- art rows are content-addressed by sha256: once written, their content
+-- columns are immutable. A writer needing different bytes/metadata inserts a
+-- NEW row and relinks via track_art (which bumps content_version through the
+-- V1 track_art triggers). This closes #271, where an in-place art edit changed
+-- served bytes without bumping any referencing track. width/height use IS NOT
+-- (NULL-safe) because they are nullable; the NOT NULL columns use <>.
+CREATE TRIGGER art_reject_content_update
+BEFORE UPDATE ON art
+WHEN NEW.data   <> OLD.data
+  OR NEW.sha256 <> OLD.sha256
+  OR NEW.mime   <> OLD.mime
+  OR NEW.byte_len <> OLD.byte_len
+  OR NEW.width  IS NOT OLD.width
+  OR NEW.height IS NOT OLD.height
+BEGIN
+    SELECT RAISE(ABORT,
+        'art rows are immutable; insert a new content-addressed row and relink via track_art');
+END;
+
+-- Index the reverse art -> track_art edge. track_art is keyed (track_id,
+-- ordinal), so without this both the art_ad trigger below and SQLite's own
+-- REFERENCES art(id) check on art deletes scan the whole join table per
+-- deleted row, which makes bulk orphan-GC O(deletes * rows).
+CREATE INDEX track_art_art_id_idx ON track_art(art_id);
+
+-- Deleting an art row that still has track_art references (an orphan an
+-- external writer can produce with foreign_keys OFF) bumps every referencing
+-- track, so the mount rebuilds and serves a clean EIO on the orphan rather
+-- than streaming stale bytes from an old cached layout. Inert on the normal
+-- gc_orphan_art path, where the deleted row has no references.
+CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
+END;
+
+-- Scanner-owned geometry feeds the synthesized layout, but upsert_track does
+-- not touch content_version. Bump it whenever a geometry column actually
+-- changes, making content_version a true superset of served-byte inputs
+-- (#272). The WHEN guard is false on this trigger's own nested UPDATE (only
+-- content_version changes), so the recursion terminates after exactly one bump.
+CREATE TRIGGER tracks_geometry_au
+AFTER UPDATE ON tracks
+WHEN NEW.format        <> OLD.format
+  OR NEW.audio_offset  <> OLD.audio_offset
+  OR NEW.audio_length  <> OLD.audio_length
+  OR NEW.backing_size  <> OLD.backing_size
+  OR NEW.backing_mtime <> OLD.backing_mtime
+BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
+END;
+
+-- FLAC structural blocks feed synthesized headers and flip the synthesis path
+-- (legacy front-read fallback vs streamed fast path), so a change must bump.
+-- set_structural_blocks is DELETE-then-INSERT (no UPDATE path exists), so these
+-- fire on every rewrite; the resulting over-bump on a byte-identical re-probe
+-- is harmless monotone churn (content_version is compared only for equality).
+CREATE TRIGGER structural_blocks_ai AFTER INSERT ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
+END;
+";
+
+const MIGRATIONS: &[&str] = &[
+    MIGRATION_V1,
+    MIGRATION_V2,
+    MIGRATION_V3,
+    MIGRATION_V4,
+    MIGRATION_V5,
+];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let latest = i64::try_from(MIGRATIONS.len()).expect("MIGRATIONS count must fit i64");
@@ -383,7 +455,7 @@ mod migration_v2_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 4);
+        assert_eq!(uv, 5);
 
         // value_blob exists on tags and defaults to NULL.
         conn.execute(
@@ -420,7 +492,7 @@ mod migration_v2_tests {
         let uv2: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv2, 4);
+        assert_eq!(uv2, 5);
     }
 
     #[test]
@@ -449,7 +521,7 @@ mod migration_v2_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 4);
+        assert_eq!(uv, 5);
 
         // The pre-existing row survived unchanged, with value_blob defaulted NULL.
         let (value, blob_is_null): (String, bool) = conn
@@ -501,20 +573,20 @@ mod migration_v3_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 4);
+        assert_eq!(uv, 5);
 
         insert_track(&conn, "/a.flac"); // tracks AI -> 1 row
         assert_eq!(count_changes(&conn), 1);
 
         conn.execute(
-            "UPDATE tracks SET backing_mtime = 1 WHERE id = 1", // tracks AU -> 1 row
+            "UPDATE tracks SET backing_mtime = 1 WHERE id = 1", // tracks AU -> 2 rows (geometry trigger nested UPDATE)
             [],
         )
         .unwrap();
-        assert_eq!(count_changes(&conn), 2);
+        assert_eq!(count_changes(&conn), 3);
 
         conn.execute("DELETE FROM tracks WHERE id = 1", []).unwrap(); // tracks AD -> 1 row
-        assert_eq!(count_changes(&conn), 3);
+        assert_eq!(count_changes(&conn), 4);
 
         let ids: Vec<i64> = conn
             .prepare("SELECT track_id FROM track_changes ORDER BY seq")
@@ -523,7 +595,7 @@ mod migration_v3_tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(ids, vec![1, 1, 1]);
+        assert_eq!(ids, vec![1, 1, 1, 1]);
     }
 
     /// Load-bearing nested-trigger dependency (see spec): a bare tag write fires
@@ -593,13 +665,13 @@ mod migration_v3_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 4);
+        assert_eq!(uv, 5);
         // Pre-migration rows produce no retroactive changelog entries...
         assert_eq!(count_changes(&conn), 0);
         // ...but post-migration edits do.
         conn.execute("UPDATE tracks SET backing_mtime = 9 WHERE id = 1", [])
             .unwrap();
-        assert_eq!(count_changes(&conn), 1);
+        assert_eq!(count_changes(&conn), 2);
     }
 
     /// The SQL literal and the exported constant must not drift.
@@ -742,7 +814,7 @@ mod migration_v4_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 4);
+        assert_eq!(uv, 5);
 
         insert_track(&conn, "/a.flac");
         conn.execute(
@@ -817,7 +889,7 @@ mod migration_v4_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 4);
+        assert_eq!(uv, 5);
 
         // Children survived the parent rebuild (no cascade-delete).
         let tags: i64 = conn
@@ -1541,5 +1613,130 @@ mod identity_tests {
             DbError::SchemaMismatch { object } => assert!(object.contains("tags_ai"), "{object}"),
             other => panic!("expected SchemaMismatch, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_v5_tests {
+    use rusqlite::{Connection, params};
+
+    /// A fresh, fully-migrated DB with `foreign_keys` OFF — that is what lets
+    /// `deleting_referenced_art_bumps_tracks` produce the orphan case.
+    fn migrated() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::migrate(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn
+    }
+
+    fn insert_track(conn: &Connection, path: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES (?1,'flac',0,1,1,0,0)",
+            [path],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_art(conn: &Connection, sha: &str, data: &[u8]) -> i64 {
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1,'image/png',NULL,NULL,?2,?3)",
+            params![sha, i64::try_from(data.len()).unwrap(), data],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn migration_reaches_user_version_5() {
+        let conn = migrated();
+        let uv: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 5);
+    }
+
+    #[test]
+    fn art_content_update_is_rejected() {
+        let conn = migrated();
+        let a = insert_art(&conn, &"a".repeat(64), &[1, 2, 3]);
+        assert!(
+            conn.execute("UPDATE art SET mime='image/jpeg' WHERE id=?1", [a])
+                .is_err()
+        );
+        assert!(
+            conn.execute("UPDATE art SET byte_len=99 WHERE id=?1", [a])
+                .is_err()
+        );
+        assert!(
+            conn.execute("UPDATE art SET data=X'04050607' WHERE id=?1", [a])
+                .is_err()
+        );
+        assert!(
+            conn.execute("UPDATE art SET width=10 WHERE id=?1", [a])
+                .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE art SET sha256=?1 WHERE id=?2",
+                params![&"b".repeat(64), a],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn art_noop_update_is_allowed() {
+        let conn = migrated();
+        let a = insert_art(&conn, &"a".repeat(64), &[1, 2, 3]);
+        conn.execute("UPDATE art SET mime=mime WHERE id=?1", [a])
+            .unwrap();
+    }
+
+    #[test]
+    fn deleting_referenced_art_bumps_tracks() {
+        let conn = migrated();
+        let t = insert_track(&conn, "/a.flac");
+        let a = insert_art(&conn, &"a".repeat(64), &[1, 2, 3]);
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
+             VALUES (?1,?2,3,0)",
+            [t, a],
+        )
+        .unwrap();
+        let cv0: i64 = conn
+            .query_row("SELECT content_version FROM tracks WHERE id=?1", [t], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute("DELETE FROM art WHERE id=?1", [a]).unwrap();
+        let cv1: i64 = conn
+            .query_row("SELECT content_version FROM tracks WHERE id=?1", [t], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(cv1, cv0 + 1, "art delete must bump the referencing track");
+    }
+
+    #[test]
+    fn deleting_unreferenced_art_bumps_nothing() {
+        let conn = migrated();
+        let t = insert_track(&conn, "/a.flac");
+        let a = insert_art(&conn, &"a".repeat(64), &[1, 2, 3]);
+        let cv0: i64 = conn
+            .query_row("SELECT content_version FROM tracks WHERE id=?1", [t], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute("DELETE FROM art WHERE id=?1", [a]).unwrap();
+        let cv1: i64 = conn
+            .query_row("SELECT content_version FROM tracks WHERE id=?1", [t], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(cv1, cv0, "deleting an unreferenced art row must not bump");
     }
 }

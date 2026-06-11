@@ -141,6 +141,10 @@ that bite plugin authors:
   `CHECK` on the row).
 - **Content-address art** through `upsert_art` (sha256 de-dup) rather than
   inserting `art` rows by hand; `sync_files` does this for you.
+- **Art rows are immutable.** As of V5 a trigger rejects in-place updates of an
+  `art` row's content columns (`data`, `sha256`, `mime`, `byte_len`, `width`,
+  `height`). To change a track's art, insert a new content-addressed row via
+  `upsert_art` and relink it via `replace_track_art`.
 - **Path layout is just a tag.** To drive a reorganized mount, write your
   computed relative path into a custom tag (e.g. `beets_path`) and mount with
   `--template '$!{beets_path}'`. musefs sanitizes each path segment, so a writer
