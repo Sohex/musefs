@@ -1,28 +1,39 @@
+use crate::error::{check_field_len, check_tag_count};
+use crate::limits::{MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN};
 use crate::models::{BinaryTag, BinaryTagRow, Tag};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
 
+/// Reject an over-cap text-tag row from its `length(key)`/`length(value)`
+/// columns *before* the strings are materialized. Routes through the shared
+/// `check_field_len`, so the allocation-free guarantee is the same one its
+/// unit test pins (spec N13).
+fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
+    check_field_len("tags", "key", key_len, MAX_TAG_KEY_LEN)?;
+    check_field_len("tags", "value", value_len, MAX_TAG_VALUE_LEN)?;
+    Ok(())
+}
+
 impl<M> Db<M> {
     pub fn get_tags(&self, track_id: i64) -> Result<Vec<Tag>> {
         let mut stmt = self.conn.prepare(
-            "SELECT key, value, ordinal FROM tags \
+            "SELECT length(key), length(value), key, value, ordinal FROM tags \
              WHERE track_id = ?1 AND value_blob IS NULL ORDER BY key, ordinal",
         )?;
-        let rows = stmt.query_map(params![track_id], |r| {
-            Ok(Tag {
-                key: r.get(0)?,
-                value: r.get(1)?,
-                ordinal: r.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut rows = stmt.query(params![track_id])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            check_tag_lengths(r.get(0)?, r.get(1)?)?;
+            out.push(Tag {
+                key: r.get(2)?,
+                value: r.get(3)?,
+                ordinal: r.get(4)?,
+            });
+            check_tag_count(track_id, out.len())?;
+        }
+        Ok(out)
     }
 
-    /// Tags for a specific set of track ids, grouped by track id, ordered within each
-    /// track by `key, ordinal` (same as `tags_grouped`, so `tags_to_fields` sees the
-    /// lowest-ordinal value of each key first). The `IN (…)` list is chunked to stay
-    /// under SQLite's bound-variable limit. Used by incremental refresh to render only
-    /// changed/added tracks. See SP2 Component 2.
     pub fn tags_for_tracks(
         &self,
         track_ids: &[i64],
@@ -32,61 +43,49 @@ impl<M> Db<M> {
         for chunk in track_ids.chunks(CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT track_id, key, value, ordinal FROM tags \
+                "SELECT track_id, length(key), length(value), key, value, ordinal FROM tags \
                  WHERE track_id IN ({placeholders}) AND value_blob IS NULL \
                  ORDER BY track_id, key, ordinal"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let params = rusqlite::params_from_iter(chunk.iter());
-            let rows = stmt.query_map(params, |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    Tag {
-                        key: r.get(1)?,
-                        value: r.get(2)?,
-                        ordinal: r.get(3)?,
-                    },
-                ))
-            })?;
-            for row in rows {
-                let (track_id, tag) = row?;
-                out.entry(track_id).or_default().push(tag);
+            let mut rows = stmt.query(params)?;
+            while let Some(r) = rows.next()? {
+                let track_id: i64 = r.get(0)?;
+                check_tag_lengths(r.get(1)?, r.get(2)?)?;
+                let entry = out.entry(track_id).or_default();
+                entry.push(Tag {
+                    key: r.get(3)?,
+                    value: r.get(4)?,
+                    ordinal: r.get(5)?,
+                });
+                check_tag_count(track_id, entry.len())?;
             }
         }
         Ok(out)
     }
 
-    /// All tags for all tracks in one query, grouped by track id. Matches
-    /// `get_tags`'s per-track ordering (`key, ordinal`), so callers can use it as
-    /// a drop-in batch replacement for N calls to `get_tags`.
     pub fn tags_grouped(&self) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT track_id, key, value, ordinal FROM tags \
+            "SELECT track_id, length(key), length(value), key, value, ordinal FROM tags \
              WHERE value_blob IS NULL ORDER BY track_id, key, ordinal",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                Tag {
-                    key: r.get(1)?,
-                    value: r.get(2)?,
-                    ordinal: r.get(3)?,
-                },
-            ))
-        })?;
+        let mut rows = stmt.query([])?;
         let mut out: std::collections::HashMap<i64, Vec<Tag>> = std::collections::HashMap::new();
-        for row in rows {
-            let (track_id, tag) = row?;
-            out.entry(track_id).or_default().push(tag);
+        while let Some(r) = rows.next()? {
+            let track_id: i64 = r.get(0)?;
+            check_tag_lengths(r.get(1)?, r.get(2)?)?;
+            let entry = out.entry(track_id).or_default();
+            entry.push(Tag {
+                key: r.get(3)?,
+                value: r.get(4)?,
+                ordinal: r.get(5)?,
+            });
+            check_tag_count(track_id, entry.len())?;
         }
         Ok(out)
     }
 
-    /// Text tags whose key matches one of `keys` case-insensitively, grouped by
-    /// track id and ordered `track_id, key, ordinal` (same as `tags_grouped`). The
-    /// `IN (…)` list is chunked under SQLite's bound-variable limit. Empty `keys`
-    /// yields an empty map (no query). Used by the virtual-tree build to load only
-    /// the fields a path template references (#177).
     pub fn tags_grouped_for_keys(
         &self,
         keys: &[&str],
@@ -97,45 +96,49 @@ impl<M> Db<M> {
             let lowered: Vec<String> = chunk.iter().map(|k| k.to_ascii_lowercase()).collect();
             let placeholders = vec!["?"; lowered.len()].join(",");
             let sql = format!(
-                "SELECT track_id, key, value, ordinal FROM tags \
+                "SELECT track_id, length(key), length(value), key, value, ordinal FROM tags \
                  WHERE value_blob IS NULL AND lower(key) IN ({placeholders}) \
                  ORDER BY track_id, key, ordinal"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let params = rusqlite::params_from_iter(lowered.iter());
-            let rows = stmt.query_map(params, |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    Tag {
-                        key: r.get(1)?,
-                        value: r.get(2)?,
-                        ordinal: r.get(3)?,
-                    },
-                ))
-            })?;
-            for row in rows {
-                let (track_id, tag) = row?;
-                out.entry(track_id).or_default().push(tag);
+            let mut rows = stmt.query(params)?;
+            while let Some(r) = rows.next()? {
+                let track_id: i64 = r.get(0)?;
+                check_tag_lengths(r.get(1)?, r.get(2)?)?;
+                let entry = out.entry(track_id).or_default();
+                entry.push(Tag {
+                    key: r.get(3)?,
+                    value: r.get(4)?,
+                    ordinal: r.get(5)?,
+                });
+                check_tag_count(track_id, entry.len())?;
             }
         }
         Ok(out)
     }
 
     /// Binary tag rows for a track: streaming handle (rowid), key, and payload
-    /// length. Ordered by (key, ordinal) to match `get_binary_tags`/synthesis order.
+    /// length. Ordered by (key, ordinal) to match the layout builder's emission
+    /// order. The blob bytes stream at read time; only `key` (materialized here)
+    /// is length-guarded, plus the per-track row count.
     pub fn get_binary_tags(&self, track_id: i64) -> Result<Vec<BinaryTagRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT rowid, key, length(value_blob) FROM tags \
+            "SELECT length(key), rowid, key, length(value_blob) FROM tags \
              WHERE track_id = ?1 AND value_blob IS NOT NULL ORDER BY key, ordinal",
         )?;
-        let rows = stmt.query_map(params![track_id], |r| {
-            Ok(BinaryTagRow {
-                rowid: r.get(0)?,
-                key: r.get(1)?,
-                byte_len: r.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut rows = stmt.query(params![track_id])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            check_field_len("tags", "key", r.get(0)?, MAX_TAG_KEY_LEN)?;
+            out.push(BinaryTagRow {
+                rowid: r.get(1)?,
+                key: r.get(2)?,
+                byte_len: r.get(3)?,
+            });
+            check_tag_count(track_id, out.len())?;
+        }
+        Ok(out)
     }
 
     /// Stream binary-tag bytes at `offset` directly into `buf` via incremental blob
@@ -369,6 +372,117 @@ mod tags_for_tracks_tests {
         assert!(tags.iter().any(|t| t.value == "Pix"), "ARTIST matched");
         assert!(tags.iter().any(|t| t.value == "Song"), "Title matched");
         assert!(!tags.iter().any(|t| t.value == "la la"), "LYRICS excluded");
+    }
+
+    #[test]
+    fn get_tags_rejects_oversize_value() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        let big = "v".repeat(262_145);
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', ?2, 0)",
+                rusqlite::params![a, big],
+            )
+            .unwrap();
+        let err = db.get_tags(a).unwrap_err();
+        assert!(
+            matches!(err, crate::DbError::FieldTooLarge { field: "value", .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn get_tags_accepts_value_at_cap() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let at = "v".repeat(262_144);
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', ?2, 0)",
+                rusqlite::params![a, at],
+            )
+            .unwrap();
+        assert_eq!(db.get_tags(a).unwrap()[0].value.len(), 262_144);
+    }
+
+    #[test]
+    fn get_binary_tags_rejects_oversize_key() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        let key = "k".repeat(257);
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, value_blob, ordinal) VALUES (?1, ?2, '', X'00', 0)",
+                rusqlite::params![a, key],
+            )
+            .unwrap();
+        let err = db.get_binary_tags(a).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::DbError::FieldTooLarge {
+                    table: "tags",
+                    field: "key",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn per_track_count_cap_text_and_binary() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        // 4097 text rows -> TooManyValues on get_tags.
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', 'v', ?2)",
+                )
+                .unwrap();
+            for i in 0..4097 {
+                stmt.execute(rusqlite::params![a, i]).unwrap();
+            }
+            drop(stmt);
+            tx.commit().unwrap();
+        }
+        let err = db.get_tags(a).unwrap_err();
+        assert!(
+            matches!(err, crate::DbError::TooManyValues { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn bulk_reader_rejects_one_oversized_track_in_batch() {
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let b = db.upsert_track(&new_track("/b.flac")).unwrap();
+        db.replace_tags(b, &[Tag::new("ok", "fine", 0)]).unwrap();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        let big = "v".repeat(262_145);
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', ?2, 0)",
+                rusqlite::params![a, big],
+            )
+            .unwrap();
+        let err = db.tags_for_tracks(&[a, b]).unwrap_err();
+        assert!(
+            matches!(err, crate::DbError::FieldTooLarge { field: "value", .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

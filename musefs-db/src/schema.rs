@@ -138,17 +138,20 @@ END;
 //      track_art_ai/au/ad, and the V3 tracks_changelog_ai/au/ad. Recreating
 //      them only after step 4 means the bulk refill of `tracks` does NOT fire
 //      tracks_changelog_ai and pump the self-pruning track_changes ring.
-//      track_changes_prune (ON track_changes) and structural_blocks are NOT
-//      rebuilt and keep their triggers/data untouched.
+//      track_changes_prune (ON track_changes) is NOT rebuilt. structural_blocks
+//      IS now rebuilt — its rows are stashed before the tracks DROP so they
+//      survive the cascade, then restored with the new CHECK constraints.
 const MIGRATION_V4: &str = r"
 CREATE TEMP TABLE _m4_tracks AS SELECT * FROM tracks;
 CREATE TEMP TABLE _m4_tags AS SELECT * FROM tags;
 CREATE TEMP TABLE _m4_art AS SELECT * FROM art;
 CREATE TEMP TABLE _m4_track_art AS SELECT * FROM track_art;
+CREATE TEMP TABLE _m4_structural AS SELECT * FROM structural_blocks;
 
 DROP TABLE track_art;
 DROP TABLE tags;
 DROP TABLE art;
+DROP TABLE structural_blocks;
 DROP TABLE tracks;
 
 CREATE TABLE tracks (
@@ -179,7 +182,10 @@ CREATE TABLE tags (
     value_blob BLOB,
     PRIMARY KEY (track_id, key, ordinal),
     CHECK (ordinal >= 0),
-    CHECK (value_blob IS NULL OR value = '')
+    CHECK (value_blob IS NULL OR value = ''),
+    CHECK (length(key) <= 256),
+    CHECK (length(value) <= 262144),
+    CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
 );
 
 CREATE TABLE art (
@@ -193,7 +199,9 @@ CREATE TABLE art (
     CHECK (byte_len = length(data)),
     CHECK (length(sha256) = 64),
     CHECK (width IS NULL OR width >= 0),
-    CHECK (height IS NULL OR height >= 0)
+    CHECK (height IS NULL OR height >= 0),
+    CHECK (length(mime) <= 255),
+    CHECK (byte_len <= 16711680)
 );
 
 CREATE TABLE track_art (
@@ -204,17 +212,31 @@ CREATE TABLE track_art (
     ordinal      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (track_id, ordinal),
     CHECK (picture_type BETWEEN 0 AND 20),
-    CHECK (ordinal >= 0)
+    CHECK (ordinal >= 0),
+    CHECK (length(description) <= 1024)
+);
+
+CREATE TABLE structural_blocks (
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    ordinal  INTEGER NOT NULL DEFAULT 0,
+    body     BLOB NOT NULL,
+    PRIMARY KEY (track_id, kind, ordinal),
+    CHECK (kind IN ('STREAMINFO','SEEKTABLE')),
+    CHECK (ordinal >= 0),
+    CHECK (length(body) <= 16777215)
 );
 
 INSERT INTO tracks SELECT * FROM _m4_tracks;
 INSERT INTO art SELECT * FROM _m4_art;
 INSERT INTO tags SELECT * FROM _m4_tags;
 INSERT INTO track_art SELECT * FROM _m4_track_art;
+INSERT INTO structural_blocks SELECT * FROM _m4_structural;
 
 DROP TABLE _m4_track_art;
 DROP TABLE _m4_tags;
 DROP TABLE _m4_art;
+DROP TABLE _m4_structural;
 DROP TABLE _m4_tracks;
 
 CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
@@ -281,6 +303,71 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+fn reference_objects() -> &'static std::collections::BTreeMap<(String, String), String> {
+    static REF: std::sync::OnceLock<std::collections::BTreeMap<(String, String), String>> =
+        std::sync::OnceLock::new();
+    REF.get_or_init(|| {
+        let mut conn =
+            Connection::open_in_memory().expect("in-memory connection for schema reference");
+        migrate(&mut conn).expect("reference migration must succeed on a fresh DB");
+        read_schema_objects(&conn).expect("reading reference schema must succeed")
+    })
+}
+
+fn read_schema_objects(
+    conn: &Connection,
+) -> crate::Result<std::collections::BTreeMap<(String, String), String>> {
+    let mut stmt = conn.prepare(
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_master \
+         WHERE name NOT LIKE 'sqlite_%'",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut map = std::collections::BTreeMap::new();
+    for row in rows {
+        let ((ty, name), sql) = row?;
+        map.insert((ty, name), sql);
+    }
+    Ok(map)
+}
+
+fn schema_mismatch(key: &(String, String), what: &str) -> crate::error::DbError {
+    crate::error::DbError::SchemaMismatch {
+        object: format!("{} {} ({what})", key.0, key.1),
+    }
+}
+
+pub(crate) fn validate_identity(conn: &Connection) -> crate::Result<()> {
+    let reference = reference_objects();
+    let actual = read_schema_objects(conn)?;
+
+    let mut keys: Vec<&(String, String)> = reference.keys().chain(actual.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        match (reference.get(key), actual.get(key)) {
+            (Some(r), Some(a)) if r != a => return Err(schema_mismatch(key, "altered")),
+            (Some(_), None) => return Err(schema_mismatch(key, "missing")),
+            (None, Some(_)) => return Err(schema_mismatch(key, "unexpected")),
+            _ => {}
+        }
+    }
+
+    let mut fk = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = fk.query([])?;
+    if let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        return Err(crate::error::DbError::SchemaMismatch {
+            object: format!("foreign key violation in table {table}"),
+        });
+    }
     Ok(())
 }
 
@@ -1127,6 +1214,168 @@ mod migration_v4_tests {
     }
 
     #[test]
+    fn v4_tags_rejects_oversize_key() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        let key = "k".repeat(257);
+        rejected(
+            &conn,
+            &format!(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, '{key}', 'v', 0)"
+            ),
+        );
+    }
+
+    #[test]
+    fn v4_tags_accepts_key_at_cap() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        let key = "k".repeat(256);
+        conn.execute(
+            &format!(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, '{key}', 'v', 0)"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_tags_rejects_oversize_value() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        let big = "v".repeat(262_145);
+        rejected(
+            &conn,
+            &format!(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'k', '{big}', 0)"
+            ),
+        );
+    }
+
+    #[test]
+    fn v4_structural_rejects_unknown_kind_and_negative_ordinal_and_oversize_body() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        rejected(
+            &conn,
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) VALUES (1, 'APPLICATION', 0, X'00')",
+        );
+        rejected(
+            &conn,
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) VALUES (1, 'STREAMINFO', -1, X'00')",
+        );
+        // length(body) cap: a blob of MAX+1 zero bytes via zeroblob().
+        rejected(
+            &conn,
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) VALUES (1, 'STREAMINFO', 0, zeroblob(16777216))",
+        );
+    }
+
+    #[test]
+    fn v4_structural_accepts_body_at_cap() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) VALUES (1, 'STREAMINFO', 0, zeroblob(16777215))",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_art_rejects_oversize_mime_and_byte_len() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        let mime = "x".repeat(256);
+        rejected(
+            &conn,
+            &format!(
+                "INSERT INTO art (sha256, mime, byte_len, data) VALUES ('{}', '{mime}', 1, X'00')",
+                "a".repeat(64)
+            ),
+        );
+        // byte_len cap (byte_len must equal length(data), so use a zeroblob).
+        rejected(
+            &conn,
+            &format!(
+                "INSERT INTO art (sha256, mime, byte_len, data) VALUES ('{}', 'image/png', 16711681, zeroblob(16711681))",
+                "b".repeat(64)
+            ),
+        );
+    }
+
+    #[test]
+    fn v4_track_art_rejects_oversize_description() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        let desc = "d".repeat(1025);
+        rejected(
+            &conn,
+            &format!(
+                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) VALUES (1, 1, 3, '{desc}', 0)"
+            ),
+        );
+    }
+
+    #[test]
+    fn v4_rebuild_preserves_structural_blocks() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(super::MIGRATIONS[0]).unwrap();
+        conn.execute_batch(super::MIGRATIONS[1]).unwrap();
+        conn.execute_batch(super::MIGRATIONS[2]).unwrap();
+        conn.pragma_update(None, "user_version", 3i64).unwrap();
+
+        insert_track(&conn, "/legacy.flac");
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) VALUES (1, 'STREAMINFO', 0, X'AABB')",
+            [],
+        )
+        .unwrap();
+
+        super::migrate(&mut conn).unwrap();
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM structural_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "structural_blocks must survive the V4 tracks rebuild");
+        let body: Vec<u8> = conn
+            .query_row(
+                "SELECT body FROM structural_blocks WHERE track_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn v4_check_literals_match_limits_constants() {
+        use crate::limits::*;
+        let v4 = super::MIGRATION_V4;
+        assert!(v4.contains(&format!("length(key) <= {MAX_TAG_KEY_LEN}")));
+        assert!(v4.contains(&format!("length(value) <= {MAX_TAG_VALUE_LEN}")));
+        assert!(v4.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
+        assert!(v4.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
+        assert!(v4.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
+        assert!(v4.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
+        assert!(v4.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));
+        let kinds = STRUCTURAL_KINDS
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(v4.contains(&format!("kind IN ({kinds})")));
+    }
+
+    #[test]
     fn v4_recreates_all_destroyed_triggers() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
@@ -1153,6 +1402,144 @@ mod migration_v4_tests {
                 names.iter().any(|n| n == expected),
                 "missing trigger after V4: {expected}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::error::DbError;
+
+    fn migrated() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn honest_schema_passes() {
+        let conn = migrated();
+        validate_identity(&conn).unwrap();
+    }
+
+    #[test]
+    fn honest_schema_with_rows_passes() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) VALUES ('/a.flac','flac',0,1,1,0,0)",
+            [],
+        )
+        .unwrap();
+        let has_seq: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sqlite_sequence'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_seq, 1, "precondition: insert created sqlite_sequence");
+        validate_identity(&conn).unwrap();
+    }
+
+    #[test]
+    fn missing_trigger_is_rejected() {
+        let conn = migrated();
+        conn.execute_batch("DROP TRIGGER tags_ai").unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => {
+                assert!(object.contains("tags_ai"), "names the object: {object}");
+                assert!(object.contains("missing"), "classifies it: {object}");
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_object_is_rejected() {
+        let conn = migrated();
+        conn.execute_batch("CREATE TABLE sneaky (x)").unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        assert!(matches!(err, DbError::SchemaMismatch { .. }));
+    }
+
+    #[test]
+    fn altered_table_is_rejected() {
+        let conn = migrated();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; \
+             DROP TABLE tags; \
+             CREATE TABLE tags (track_id INTEGER NOT NULL, key TEXT, value TEXT, \
+                ordinal INTEGER, value_blob BLOB, PRIMARY KEY (track_id, key, ordinal));",
+        )
+        .unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => assert!(object.contains("tags")),
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn altered_object_with_no_other_diffs_is_rejected() {
+        // `art` has no triggers and (when empty) no FK children to cascade, so
+        // recreating it with a different shape makes the *altered* table the
+        // ONLY schema difference — isolating the `r != a` guard so a
+        // `r != a -> false` mutant cannot survive on the back of an unrelated
+        // missing/extra object.
+        let conn = migrated();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; \
+             DROP TABLE art; \
+             CREATE TABLE art (id INTEGER PRIMARY KEY, sha256 TEXT, mime TEXT, \
+                width INTEGER, height INTEGER, byte_len INTEGER, data BLOB);",
+        )
+        .unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => {
+                assert!(object.contains("art"), "names the object: {object}");
+                assert!(
+                    object.contains("altered"),
+                    "classifies it as altered: {object}"
+                );
+            }
+            other => panic!("expected SchemaMismatch (altered), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_key_violation_is_rejected() {
+        let conn = migrated();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; \
+             INSERT INTO art (sha256, mime, byte_len, data) \
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+                     'image/png', 1, X'00'); \
+             INSERT INTO track_art (track_id, art_id, picture_type, ordinal) VALUES (999, 1, 3, 0);",
+        )
+        .unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => assert!(object.contains("foreign key")),
+            other => panic!("expected SchemaMismatch (fk), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_offender_is_deterministic_in_type_name_order() {
+        let conn = migrated();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; DROP TRIGGER track_art_ai; DROP TRIGGER tags_ai;",
+        )
+        .unwrap();
+        let err = validate_identity(&conn).unwrap_err();
+        match err {
+            DbError::SchemaMismatch { object } => assert!(object.contains("tags_ai"), "{object}"),
+            other => panic!("expected SchemaMismatch, got {other:?}"),
         }
     }
 }
