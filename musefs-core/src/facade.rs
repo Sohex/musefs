@@ -83,12 +83,16 @@ impl std::os::fd::AsFd for PassthroughFd {
     }
 }
 
-/// A cached file size/attr entry: validated at `content_version`.
+/// A cached file size/attr entry: validated at `content_version`, plus the
+/// backing-file stamp it was built from so `getattr` can re-stat on a hit and
+/// catch an on-disk backing change that left `content_version` untouched (#279).
 #[derive(Clone, Copy)]
 struct SizeEntry {
     content_version: i64,
     total_len: u64,
     mtime_secs: i64,
+    backing_size: u64,
+    backing_mtime_secs: i64,
 }
 
 /// Resets a single-flight flag on drop, so a panic (or early return) during a
@@ -949,10 +953,16 @@ impl Musefs {
             if let Some(e) = self.size_cache.get(&track_id).map(|e| *e)
                 && e.content_version == track.content_version
             {
-                // Hit: no backing stat, no synthesis. NOTE: a backing file
-                // changed in place without a rescan would leave mtime/size
-                // stale until the next scan bumps content_version — acceptable
-                // for a read-only mount (reads still validate at open()).
+                // Hit: re-stat the backing file (no synthesis) and compare to
+                // the stamp the cached attrs were built from. An on-disk change
+                // that left content_version untouched would otherwise let
+                // getattr advertise stale attrs — the one metadata surface that
+                // could outrun a backing change (read/open already re-stat).
+                crate::metrics::on_stat();
+                let meta = std::fs::metadata(&track.backing_path)?;
+                if meta.len() != e.backing_size || mtime_secs(&meta) != e.backing_mtime_secs {
+                    return Err(CoreError::BackingChanged(track.backing_path.clone()));
+                }
                 return Ok((e.total_len, e.mtime_secs));
             }
             // Miss: full resolve (validates via stat, builds + caches the layout).
@@ -963,6 +973,8 @@ impl Musefs {
                     content_version: track.content_version,
                     total_len: resolved.total_len,
                     mtime_secs: resolved.mtime_secs,
+                    backing_size: resolved.backing_size,
+                    backing_mtime_secs: resolved.backing_mtime_secs,
                 },
             );
             Ok((resolved.total_len, resolved.mtime_secs))
@@ -1786,5 +1798,67 @@ mod tests {
         // matches the incremental path's min-id rule (tree.rs introducing_id).
         assert_eq!(tree.inode_of_track(id_a), Some(bare));
         assert_eq!(tree.inode_of_track(id_b), Some(suffixed));
+    }
+
+    #[test]
+    fn getattr_size_cache_hit_detects_backing_change() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("a.mp3");
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(&backing, &bytes).unwrap();
+        }
+
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+
+        // First getattr populates size_cache (miss path: full resolve).
+        let attr1 = fs.getattr(file_inode).unwrap();
+        assert!(attr1.size > 0, "baseline attr must be non-empty");
+
+        // Second getattr with the file unchanged is a clean cache hit.
+        let attr2 = fs.getattr(file_inode).unwrap();
+        assert_eq!(attr1.size, attr2.size, "unchanged backing must stay a hit");
+
+        // Change the backing file out-of-band, without any DB write — so
+        // content_version is unchanged and the size_cache would otherwise hit.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&backing)
+                .unwrap();
+            f.write_all(&[0u8; 64]).unwrap();
+        }
+
+        // getattr must now refuse to advertise stale attrs.
+        assert!(
+            matches!(fs.getattr(file_inode), Err(CoreError::BackingChanged(_))),
+            "getattr must degrade to BackingChanged after an on-disk backing change"
+        );
     }
 }
