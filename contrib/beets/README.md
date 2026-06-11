@@ -15,19 +15,22 @@ a re-tagged view of your library without rewriting any audio.
   just the touched file and then sync. musefs's auto-refresh shows changes live —
   no remount, and **no separate scan step**.
 
-## Install (local / development)
+## Install
 
-No install needed — point beets at the plugin's `beetsplug` directory. beets adds
-`pluginpath` entries directly to the `beetsplug` package path, so it must be the
-`beetsplug` dir itself (not its parent). In your beets `config.yaml`:
-
-The plugin depends on the shared `python-musefs` library, which is unpublished
-and lives in this repo. Install it from the working tree **before** the plugin:
+Whichever path you choose below, the plugin needs the shared `python-musefs`
+library as a **runtime dependency**. It's unpublished and lives in this repo,
+so install it from the working tree first:
 
 ```bash
 pip install -e contrib/python-musefs
-pip install -e "contrib/beets[test]"
 ```
+
+### Use via pluginpath (no package install)
+
+The plugin itself doesn't need to be installed — point beets at the plugin's
+`beetsplug` directory and it loads at runtime. beets adds `pluginpath` entries
+directly to the `beetsplug` package path, so it must be the `beetsplug` dir
+itself (not its parent). In your beets `config.yaml`:
 
 ```yaml
 pluginpath: /path/to/musefs/contrib/beets/beetsplug
@@ -40,6 +43,15 @@ musefs:
   #                        # manage scanning yourself (hooks then best-effort).
   # fields:                # optional: map extra beets fields to musefs keys
   #   comments: comment
+```
+
+### Development / test install
+
+To run the test suite — or if you'd rather install the plugin as a package
+than wire up `pluginpath` — install it editable instead:
+
+```bash
+pip install -e "contrib/beets[test]"
 ```
 
 ## Workflow (test drive)
