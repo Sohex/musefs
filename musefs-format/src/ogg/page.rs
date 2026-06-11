@@ -1,4 +1,5 @@
-use super::crc::{crc_shift_zeros, crc32};
+use super::art_source::ArtSource;
+use super::crc::{crc_shift_zeros, crc32, crc32_update};
 use crate::error::{FormatError, Result};
 
 pub const CAPTURE: &[u8; 4] = b"OggS";
@@ -264,13 +265,12 @@ use crate::layout::Segment;
 pub(crate) enum PayloadChunk {
     /// Literal bytes copied verbatim into the layout as `Inline`.
     Bytes(Vec<u8>),
-    /// An art run. `out` holds the run's full OUTPUT bytes (base64(image) when
-    /// `base64`, else raw image) — used here only to compute page CRCs and lengths,
-    /// then dropped; the layout stores an `OggArtSlice` referencing `art_id` so the
-    /// bytes are re-derived at read time. `art_total` is the raw image length.
+    /// An art run. Carries no bytes: its OUTPUT length is derived from `art_total`
+    /// (base64-expanded when `base64`), and its bytes are streamed from an
+    /// `ArtSource` to compute page CRCs, then never stored — the layout keeps an
+    /// `OggArtSlice` referencing `art_id`. `art_total` is the raw image length.
     Art {
         art_id: i64,
-        out: Vec<u8>,
         base64: bool,
         art_total: u64,
     },
@@ -280,29 +280,38 @@ impl PayloadChunk {
     fn out_len(&self) -> usize {
         match self {
             PayloadChunk::Bytes(b) => b.len(),
-            PayloadChunk::Art { out, .. } => out.len(),
+            PayloadChunk::Art {
+                base64, art_total, ..
+            } => {
+                let n = if *base64 {
+                    crate::ogg::b64::b64_len(*art_total)
+                } else {
+                    *art_total
+                };
+                crate::convert::usize_from(n)
+            }
         }
     }
 }
 
-/// Lace one packet (described as a chunk list) into pages starting at sequence
-/// `seq_start`, emitting layout segments: page headers + literal payload as
-/// `Inline` (CRCs baked in), and art runs as `OggArtSlice` (no bytes stored). The
-/// art `out` bytes are materialized only to compute page CRCs, then dropped.
-/// Returns `(segments, pages_used)`.
+/// Lace one packet (a chunk list) into pages from sequence `seq_start`, emitting
+/// layout segments: page headers + literal payload as `Inline` (CRCs baked in),
+/// art runs as `OggArtSlice` (no bytes stored). Art bytes are streamed from `src`
+/// only to compute page CRCs. Returns `(segments, pages_used)`.
 pub(crate) fn lace_chunks_to_segments(
     serial: u32,
     seq_start: u32,
     bos: bool,
     chunks: &[PayloadChunk],
-) -> (Vec<Segment>, u32) {
+    src: &dyn ArtSource,
+) -> crate::error::Result<(Vec<Segment>, u32)> {
     let total: usize = chunks.iter().map(PayloadChunk::out_len).sum();
     let laces = lacing_values(total);
 
     let mut segments: Vec<Segment> = Vec::new();
     let mut seq = seq_start;
     let mut lace_pos = 0usize;
-    let mut payload_pos = 0usize; // absolute position within the packet payload
+    let mut payload_pos = 0usize;
     let mut first = true;
 
     while first || lace_pos < laces.len() {
@@ -318,41 +327,43 @@ pub(crate) fn lace_chunks_to_segments(
             header_type |= FLAG_CONTINUED;
         }
 
-        // Assemble full page bytes (with art materialized) to compute the CRC.
-        let mut page = Vec::with_capacity(27 + seg_count + page_payload);
-        page.extend_from_slice(CAPTURE);
-        page.push(0);
-        page.push(header_type);
-        page.extend_from_slice(&0u64.to_le_bytes()); // granule 0 (header page)
-        page.extend_from_slice(&serial.to_le_bytes());
-        page.extend_from_slice(&seq.to_le_bytes());
-        page.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
-        page.push(u8::try_from(seg_count).expect("seg_count is .min(255) so fits in u8"));
-        page.extend_from_slice(table);
-        copy_payload(&mut page, chunks, payload_pos, page_payload);
-        let crc = crc32(&page);
-        page[22..26].copy_from_slice(&crc.to_le_bytes());
-
+        // Build the page header + lacing table only (CRC field zeroed), then stream
+        // the page CRC over header+payload without materializing the payload.
         let header_len = 27 + seg_count;
-        emit_segments(
-            &mut segments,
-            &page[..header_len],
-            chunks,
-            payload_pos,
-            page_payload,
-        );
+        let mut header = Vec::with_capacity(header_len);
+        header.extend_from_slice(CAPTURE);
+        header.push(0);
+        header.push(header_type);
+        header.extend_from_slice(&0u64.to_le_bytes()); // granule 0 (header page)
+        header.extend_from_slice(&serial.to_le_bytes());
+        header.extend_from_slice(&seq.to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
+        header.push(u8::try_from(seg_count).expect("seg_count is .min(255) so fits in u8"));
+        header.extend_from_slice(table);
+
+        let mut crc = crc32_update(0, &header);
+        crc_feed_payload(&mut crc, chunks, src, payload_pos, page_payload)?;
+        header[22..26].copy_from_slice(&crc.to_le_bytes());
+
+        emit_segments(&mut segments, &header, chunks, payload_pos, page_payload);
 
         payload_pos += page_payload;
         lace_pos += seg_count;
         seq += 1;
         first = false;
     }
-    (segments, seq - seq_start)
+    Ok((segments, seq - seq_start))
 }
 
-/// Append payload bytes `[p0, p0+plen)` (in packet-payload coordinates) into `dst`
-/// by copying from the chunk list (materializing art `out`).
-fn copy_payload(dst: &mut Vec<u8>, chunks: &[PayloadChunk], p0: usize, plen: usize) {
+/// Fold payload bytes `[p0, p0+plen)` (packet-payload coordinates) into `crc`,
+/// reading art runs from `src` instead of materializing them.
+fn crc_feed_payload(
+    crc: &mut u32,
+    chunks: &[PayloadChunk],
+    src: &dyn ArtSource,
+    p0: usize,
+    plen: usize,
+) -> crate::error::Result<()> {
     let end = p0 + plen;
     let mut cs = 0usize;
     for c in chunks {
@@ -360,14 +371,55 @@ fn copy_payload(dst: &mut Vec<u8>, chunks: &[PayloadChunk], p0: usize, plen: usi
         let os = p0.max(cs);
         let oe = end.min(ce);
         if os < oe {
-            let bytes: &[u8] = match c {
-                PayloadChunk::Bytes(b) => b,
-                PayloadChunk::Art { out, .. } => out,
-            };
-            dst.extend_from_slice(&bytes[os - cs..oe - cs]);
+            match c {
+                PayloadChunk::Bytes(b) => {
+                    *crc = crc32_update(*crc, &b[os - cs..oe - cs]);
+                }
+                PayloadChunk::Art {
+                    art_id,
+                    base64,
+                    art_total,
+                } => {
+                    crc_feed_art(
+                        crc,
+                        src,
+                        *art_id,
+                        *base64,
+                        *art_total,
+                        (os - cs) as u64,
+                        oe - os,
+                    )?;
+                }
+            }
         }
         cs = ce;
     }
+    Ok(())
+}
+
+/// Fold one art window — output bytes `[out_off, out_off+out_len)` of the run —
+/// into `crc`, base64-encoding on the fly when `base64`. `out_len` is page-bounded.
+fn crc_feed_art(
+    crc: &mut u32,
+    src: &dyn ArtSource,
+    art_id: i64,
+    base64: bool,
+    art_total: u64,
+    out_off: u64,
+    out_len: usize,
+) -> crate::error::Result<()> {
+    if base64 {
+        let w = crate::ogg::b64::b64_window(out_off, out_len as u64, art_total);
+        let mut raw = vec![0u8; crate::convert::usize_from(w.in_len)];
+        src.read_window(art_id, w.in_start, &mut raw)?;
+        let enc = crate::ogg::b64::encode_b64_slice(&raw, w.skip, out_len);
+        *crc = crc32_update(*crc, &enc);
+    } else {
+        let mut raw = vec![0u8; out_len];
+        src.read_window(art_id, out_off, &mut raw)?;
+        *crc = crc32_update(*crc, &raw);
+    }
+    Ok(())
 }
 
 /// Emit the page header + payload `[p0, p0+plen)` as layout segments: `Inline` for
@@ -393,7 +445,6 @@ fn emit_segments(
                     art_id,
                     base64,
                     art_total,
-                    ..
                 } => {
                     if !buf.is_empty() {
                         segments.push(Segment::Inline(std::mem::take(&mut buf)));
@@ -581,25 +632,32 @@ mod tests {
 
     #[test]
     fn chunk_lacer_splits_art_across_pages_and_crcs_validate() {
-        // A packet: 50 literal bytes, then a 70_000-byte art run (spans pages), then
+        use super::super::art_source::MapArtSource;
+        // A packet: 50 literal bytes, then a 60_000-byte art run (spans pages), then
         // 10 trailing literal bytes.
         let head = vec![0xA0u8; 50];
-        let art_out: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        // 60_000 raw bytes -> b64 output ~80_000 > one page (65025), so it spans pages.
+        let image: Vec<u8> = (0..60_000u32).map(|i| (i % 251) as u8).collect();
+        let art_out = crate::ogg::b64::encode_b64_slice(
+            &image,
+            0,
+            crate::convert::usize_from(crate::ogg::b64::b64_len(image.len() as u64)),
+        );
         let tail = vec![0xB0u8; 10];
         let chunks = vec![
             PayloadChunk::Bytes(head.clone()),
             PayloadChunk::Art {
                 art_id: 42,
-                out: art_out.clone(),
                 base64: true,
-                art_total: 12345,
+                art_total: image.len() as u64,
             },
             PayloadChunk::Bytes(tail.clone()),
         ];
-        let (segments, pages) = lace_chunks_to_segments(0x1234, 0, true, &chunks);
+        let src = MapArtSource::new([(42i64, image.clone())]);
+        let (segments, pages) = lace_chunks_to_segments(0x1234, 0, true, &chunks, &src).unwrap();
         assert!(pages >= 2, "art run should span multiple pages");
 
-        // Reassemble the packet payload and confirm it equals head ++ art ++ tail.
+        // Reassemble the packet payload and confirm it equals head ++ art_out ++ tail.
         let flat = flatten(&segments, &art_out);
         // Walk pages: validate CRC + collect payloads.
         let mut pos = 0usize;

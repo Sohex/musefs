@@ -24,11 +24,11 @@ const MAX_WIDEN_RETRIES: usize = 8;
 /// giant `NeedMore` widen.
 const MAX_PROBE_BYTES: u64 = 64 << 20; // 64 MiB
 
-/// Skip embedded art whose image bytes exceed this. The binding limit is FLAC's
-/// 24-bit PICTURE block length (~16 MiB for the whole block); reserve 64 KiB of
-/// headroom so the block framing + mime + description can never push a near-cap
-/// image past the limit at synthesis time. Real cover art is far smaller.
-const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
+/// The artwork-size ceiling. Enforced here at ingest (oversize scanned art is
+/// dropped) and at resolve in `mapping::track_art_to_inputs` (oversize art from
+/// any writer is rejected). Sized to clear FLAC's 24-bit block length with
+/// headroom for the picture-block framing.
+pub(crate) const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 
 /// Per-frame cap for opaque binary tags, mirroring `MAX_ART_BYTES`. Oversize
 /// payloads (e.g. a GEOB embedding a multi-MB file) are logged-and-skipped.

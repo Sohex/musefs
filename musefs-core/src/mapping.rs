@@ -50,6 +50,25 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
         let Some(data_len) = musefs_format::BlobLen::new(meta.byte_len) else {
             continue; // zero-length art: synthesis would skip it anyway (now type-level).
         };
+
+        // Backstop to the V4 `byte_len <= MAX_ART_BYTES` schema CHECK (#291): a
+        // writer that disables check enforcement can still plant an oversize row,
+        // and Component B would stream it with bounded memory, but we refuse it.
+        if data_len.get() > crate::scan::MAX_ART_BYTES as u64 {
+            log::warn!(
+                "track {track_id} art {} is {} bytes, exceeds the {}-byte art cap; refusing to serve",
+                ta.art_id,
+                data_len.get(),
+                crate::scan::MAX_ART_BYTES,
+            );
+            return Err(crate::error::CoreError::ArtTooLarge {
+                track_id,
+                art_id: ta.art_id,
+                byte_len: data_len.get(),
+                cap: crate::scan::MAX_ART_BYTES as u64,
+            });
+        }
+
         let Some(picture_type) = musefs_format::PictureType::new(ta.picture_type) else {
             return Err(crate::error::CoreError::InvalidPictureType {
                 track_id,
@@ -70,6 +89,22 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
     Ok(inputs)
 }
 
+/// `ArtSource` over the SQLite blob store, used by Ogg synthesis to stream art
+/// bytes for page CRCs. Read failures (e.g. a deleted/short blob) are logged with
+/// the underlying DB error and surfaced as `FormatError::ArtRead`.
+pub(crate) struct DbArtSource<'a, M>(pub &'a Db<M>);
+
+impl<M> musefs_format::ogg::ArtSource for DbArtSource<'_, M> {
+    fn read_window(&self, art_id: i64, offset: u64, buf: &mut [u8]) -> musefs_format::Result<()> {
+        self.0
+            .read_art_chunk_into(art_id, offset, buf)
+            .map_err(|e| {
+                log::warn!("ogg synthesis: art {art_id} read failed at offset {offset}: {e}");
+                musefs_format::FormatError::ArtRead { art_id }
+            })
+    }
+}
+
 /// Map a track's binary tag rows to `BinaryTagInput`s for synthesis. Never reads
 /// the payload bytes — only `(rowid, key, byte_len)`; the bytes stream at read
 /// time. Ordered by (key, ordinal), matching `get_binary_tags`.
@@ -86,22 +121,6 @@ pub(crate) fn binary_tags_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<
             })
         })
         .collect())
-}
-
-/// Read each embedded image's raw bytes for synthesis (Ogg needs the bytes to
-/// compute page CRCs at resolve). Parallel to `track_art_to_inputs`; returns the
-/// same order. Only the Ogg synthesis path calls this — FLAC/MP3/MP4 stream art
-/// via `ArtImage` and never materialize it.
-pub(crate) fn track_art_images<M>(db: &Db<M>, inputs: &[ArtInput]) -> Result<Vec<Vec<u8>>> {
-    let mut out = Vec::with_capacity(inputs.len());
-    for a in inputs {
-        out.push(db.read_art_chunk(
-            a.art_id,
-            0,
-            musefs_db::convert::usize_from(a.data_len.get()),
-        )?);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -410,62 +429,120 @@ mod tests {
     }
 
     #[test]
-    fn track_art_images_reads_stored_blob_bytes() {
-        use musefs_db::{NewArt, TrackArt};
+    fn track_art_to_inputs_enforces_art_cap() {
+        use crate::CoreError;
+        use musefs_db::TrackArt; // NewTrack already in scope at module level
+        // The V4 schema CHECK (byte_len <= MAX_ART_BYTES, #291) already rejects
+        // oversize art at write time. The only way an oversize row reaches the
+        // reader is a writer that disables CHECK enforcement (PRAGMA
+        // ignore_check_constraints / writable_schema) — which also evades the
+        // schema-identity gate, since the schema text is unchanged. This
+        // resolve-time cap is the backstop for exactly that, so the test plants
+        // the adversarial rows on a raw connection with checks off (empty blobs;
+        // track_art_to_inputs reads byte_len only) and pins the boundary so the
+        // mutation gate catches a `>`->`>=` flip.
+        let cap = crate::scan::MAX_ART_BYTES;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("art.db");
+        let path = dir.path().join("cap.db");
         let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.flac".into(),
-                format: Format::Flac,
+                backing_path: "/a.opus".into(),
+                format: Format::Opus,
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
                 backing_mtime: 0,
             })
             .unwrap();
-        let first = db
+
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        let plant = |byte_len: i64, sha: &str| {
+            raw.execute(
+                "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?1, 'image/png', ?2, X'')",
+                rusqlite::params![sha, byte_len],
+            )
+            .unwrap();
+            raw.last_insert_rowid()
+        };
+        let at_cap = plant(i64::try_from(cap).unwrap(), &"a".repeat(64));
+        let over = plant(i64::try_from(cap + 1).unwrap(), &"b".repeat(64));
+
+        // Exactly at the cap: accepted.
+        db.set_track_art(
+            tid,
+            &[TrackArt {
+                art_id: at_cap,
+                picture_type: 3,
+                description: String::new(),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        let ok = super::track_art_to_inputs(&db, tid).unwrap();
+        assert_eq!(ok.len(), 1, "art exactly at the cap must be accepted");
+
+        // One byte over the cap: rejected with ArtTooLarge naming the offending ids.
+        db.set_track_art(
+            tid,
+            &[TrackArt {
+                art_id: over,
+                picture_type: 3,
+                description: String::new(),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        let err = super::track_art_to_inputs(&db, tid).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::ArtTooLarge { track_id, art_id, byte_len, cap: c }
+                    if track_id == tid && art_id == over
+                        && byte_len == (cap as u64) + 1 && c == cap as u64
+            ),
+            "oversize art must yield ArtTooLarge with the offending ids, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn db_art_source_reads_windows_and_maps_failures_to_artread() {
+        use musefs_db::NewArt;
+        use musefs_format::ogg::ArtSource;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("src.db")).unwrap();
+        let art_id = db
             .upsert_art(&NewArt {
                 mime: "image/png".into(),
                 width: None,
                 height: None,
-                data: vec![1, 2, 3, 4],
+                data: vec![10, 20, 30, 40, 50],
             })
             .unwrap();
-        let second = db
-            .upsert_art(&NewArt {
-                mime: "image/jpeg".into(),
-                width: None,
-                height: None,
-                data: vec![7, 8, 9],
-            })
-            .unwrap();
-        db.set_track_art(
-            tid,
-            &[
-                TrackArt {
-                    art_id: first,
-                    picture_type: 3,
-                    description: String::new(),
-                    ordinal: 0,
-                },
-                TrackArt {
-                    art_id: second,
-                    picture_type: 4,
-                    description: String::new(),
-                    ordinal: 1,
-                },
-            ],
-        )
-        .unwrap();
+        let src = super::DbArtSource(&db);
 
-        let inputs = super::track_art_to_inputs(&db, tid).unwrap();
-        let images = super::track_art_images(&db, &inputs).unwrap();
-        assert_eq!(
-            images,
-            vec![vec![1, 2, 3, 4], vec![7, 8, 9]],
-            "must return each stored blob's exact bytes, in input order"
+        // In-bounds window returns the exact stored bytes.
+        let mut buf = [0u8; 3];
+        src.read_window(art_id, 1, &mut buf).unwrap();
+        assert_eq!(buf, [20, 30, 40]);
+
+        // Reading past the blob end is a short read from the DB, mapped to ArtRead.
+        let mut over = [0u8; 4];
+        let err = src.read_window(art_id, 2, &mut over).unwrap_err();
+        assert!(
+            matches!(err, musefs_format::FormatError::ArtRead { art_id: a } if a == art_id),
+            "out-of-range read must map to ArtRead, got {err:?}"
+        );
+
+        // A missing art row likewise surfaces ArtRead, naming the offending id.
+        let missing = art_id + 999;
+        let mut one = [0u8; 1];
+        let err = src.read_window(missing, 0, &mut one).unwrap_err();
+        assert!(
+            matches!(err, musefs_format::FormatError::ArtRead { art_id: a } if a == missing),
+            "missing art row must map to ArtRead, got {err:?}"
         );
     }
 }

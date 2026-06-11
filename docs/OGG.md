@@ -72,10 +72,15 @@ Verified by `musefs-format/tests/proptest_ogg.rs` (crate feature `fuzzing`),
    `METADATA_BLOCK_PICTURE` comments (the decoded bytes are a FLAC PICTURE
    block body): each image is an `OggArtSlice` run — a window of
    `base64(image)` encoded **incrementally at read time** from the blob
-   store, never materialized whole. FLAC-in-Ogg instead carries one native
-   FLAC `PICTURE` block packet per image (raw `OggArtSlice` runs, no
-   base64); the last metadata packet's last-block flag and packet 0's
-   16-bit following-packet count are recomputed to match.
+   store, never materialized whole. Artwork is streamed at synthesis time:
+   page CRCs are computed from page-bounded `ArtSource` windows, and the
+   full image and its base64 copy are never materialized. FLAC-in-Ogg
+   instead carries one native FLAC `PICTURE` block packet per image (raw
+   `OggArtSlice` runs, no base64); the last metadata packet's last-block
+   flag and packet 0's 16-bit following-packet count are recomputed to
+   match. Art exceeding `MAX_ART_BYTES` (16 MiB − 64 KiB) is rejected by the
+   store's V4 `CHECK`, with a resolve-time cap backstopping a writer that
+   disables check enforcement.
 3. `OggAudio` — one compact segment covering all original audio pages, with
    the page-count delta to apply to every sequence number.
 

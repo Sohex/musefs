@@ -103,6 +103,7 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::DbOpen { .. }
         | CoreError::Mp4MetadataTooLarge { .. }
         | CoreError::OrphanedArt { .. }
+        | CoreError::ArtTooLarge { .. }
         | CoreError::InvalidPictureType { .. }
         | CoreError::Format(_) => fuser::Errno::EIO,
     }
@@ -588,6 +589,16 @@ mod tests {
                 track_id: 1,
                 art_id: 2,
                 value: 99,
+            })
+            .code(),
+            libc::EIO
+        );
+        assert_eq!(
+            errno(&CoreError::ArtTooLarge {
+                track_id: 1,
+                art_id: 2,
+                byte_len: 16_711_681,
+                cap: 16_711_680,
             })
             .code(),
             libc::EIO

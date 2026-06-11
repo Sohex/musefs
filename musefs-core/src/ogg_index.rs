@@ -335,8 +335,15 @@ mod tests {
         use musefs_format::ogg::{locate_audio, read_header, synthesize_layout};
         let scan = locate_audio(file).unwrap();
         let header = read_header(file).unwrap();
-        let layout =
-            synthesize_layout(&header, scan.audio_offset, scan.audio_length, &[], &[]).unwrap();
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[],
+            &[],
+            &musefs_format::ogg::MapArtSource::default(),
+        )
+        .unwrap();
         let (hdr_bytes, ao, alen, delta) = materialize_header_and_audio_params(&layout);
 
         let dir = tempfile::tempdir().unwrap();
