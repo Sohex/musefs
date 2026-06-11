@@ -283,6 +283,12 @@ END;
 ";
 
 const MIGRATION_V5: &str = r"
+-- art rows are content-addressed by sha256: once written, their content
+-- columns are immutable. A writer needing different bytes/metadata inserts a
+-- NEW row and relinks via track_art (which bumps content_version through the
+-- V1 track_art triggers). This closes #271, where an in-place art edit changed
+-- served bytes without bumping any referencing track. width/height use IS NOT
+-- (NULL-safe) because they are nullable; the NOT NULL columns use <>.
 CREATE TRIGGER art_reject_content_update
 BEFORE UPDATE ON art
 WHEN NEW.data   <> OLD.data
@@ -296,12 +302,22 @@ BEGIN
         'art rows are immutable; insert a new content-addressed row and relink via track_art');
 END;
 
+-- Deleting an art row that still has track_art references (an orphan an
+-- external writer can produce with foreign_keys OFF) bumps every referencing
+-- track, so the mount rebuilds and serves a clean EIO on the orphan rather
+-- than streaming stale bytes from an old cached layout. Inert on the normal
+-- gc_orphan_art path, where the deleted row has no references.
 CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
     UPDATE tracks SET content_version = content_version + 1,
                       updated_at = CAST(strftime('%s','now') AS INTEGER)
     WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
 END;
 
+-- Scanner-owned geometry feeds the synthesized layout, but upsert_track does
+-- not touch content_version. Bump it whenever a geometry column actually
+-- changes, making content_version a true superset of served-byte inputs
+-- (#272). The WHEN guard is false on this trigger's own nested UPDATE (only
+-- content_version changes), so the recursion terminates after exactly one bump.
 CREATE TRIGGER tracks_geometry_au
 AFTER UPDATE ON tracks
 WHEN NEW.format        <> OLD.format
@@ -313,6 +329,11 @@ BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
 END;
 
+-- FLAC structural blocks feed synthesized headers and flip the synthesis path
+-- (legacy front-read fallback vs streamed fast path), so a change must bump.
+-- set_structural_blocks is DELETE-then-INSERT (no UPDATE path exists), so these
+-- fire on every rewrite; the resulting over-bump on a byte-identical re-probe
+-- is harmless monotone churn (content_version is compared only for equality).
 CREATE TRIGGER structural_blocks_ai AFTER INSERT ON structural_blocks BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.track_id;
 END;
@@ -552,7 +573,7 @@ mod migration_v3_tests {
         assert_eq!(count_changes(&conn), 1);
 
         conn.execute(
-            "UPDATE tracks SET backing_mtime = 1 WHERE id = 1", // tracks AU -> 1 row
+            "UPDATE tracks SET backing_mtime = 1 WHERE id = 1", // tracks AU -> 2 rows (geometry trigger nested UPDATE)
             [],
         )
         .unwrap();
