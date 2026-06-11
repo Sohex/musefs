@@ -280,6 +280,12 @@ BEGIN
         'art rows are immutable; insert a new content-addressed row and relink via track_art');
 END;
 
+-- Index the reverse art -> track_art edge. track_art is keyed (track_id,
+-- ordinal), so without this both the art_ad trigger below and SQLite's own
+-- REFERENCES art(id) check on art deletes scan the whole join table per
+-- deleted row, which makes bulk orphan-GC O(deletes * rows).
+CREATE INDEX track_art_art_id_idx ON track_art(art_id);
+
 -- Deleting an art row that still has track_art references (an orphan an
 -- external writer can produce with foreign_keys OFF) bumps every referencing
 -- track, so the mount rebuilds and serves a clean EIO on the orphan rather
