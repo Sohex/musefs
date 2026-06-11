@@ -30,7 +30,13 @@ impl ArtSource for MapArtSource {
             .images
             .get(&art_id)
             .ok_or(FormatError::ArtRead { art_id })?;
-        let start = crate::convert::usize_from(offset);
+        // Guard the u64 -> usize narrowing: an offset past `usize::MAX` (only
+        // reachable on a 32-bit target) must fail closed, not truncate and read
+        // the wrong bytes.
+        let start = usize::try_from(offset)
+            .ok()
+            .filter(|&s| s <= img.len())
+            .ok_or(FormatError::ArtRead { art_id })?;
         let end = start
             .checked_add(buf.len())
             .filter(|&e| e <= img.len())

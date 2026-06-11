@@ -244,8 +244,9 @@ read_at (read time, unchanged)
   `track_art_to_inputs`, preceded by a `log::warn!`. It propagates like other
   resolve errors (e.g. `OrphanedArt`) and makes the track unreadable until the row
   is corrected — the same outcome FLAC already produces for oversize art.
-- `ArtSource::read_window` returns `Result<(), FormatError>`; the core impl wraps
-  its `DbError` in the new `FormatError::ArtRead(Box<…>)` variant, which
+- `ArtSource::read_window` returns `Result<(), FormatError>`; the core impl logs
+  its `DbError` and returns the new `FormatError::ArtRead { art_id }` variant (an
+  `i64` payload, so `FormatError`'s `PartialEq + Eq` derive stays valid), which
   `synthesize_layout` surfaces without buffering. `reader.rs` already converts
   `FormatError` into `CoreError`, so the read failure reaches the FUSE layer
   unchanged in shape.

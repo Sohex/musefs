@@ -593,6 +593,16 @@ mod tests {
             .code(),
             libc::EIO
         );
+        assert_eq!(
+            errno(&CoreError::ArtTooLarge {
+                track_id: 1,
+                art_id: 2,
+                byte_len: 16_711_681,
+                cap: 16_711_680,
+            })
+            .code(),
+            libc::EIO
+        );
     }
 
     #[test]
