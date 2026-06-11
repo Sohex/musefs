@@ -26,6 +26,14 @@ pub enum DbError {
     },
     #[error("structural block for track {track_id} is invalid: {detail} (crafted or corrupt DB)")]
     InvalidStructuralBlock { track_id: i64, detail: String },
+    #[error(
+        "track {track_id} has {count} tag rows, exceeds the {max}-row cap (crafted or corrupt DB)"
+    )]
+    TooManyValues {
+        track_id: i64,
+        count: usize,
+        max: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
