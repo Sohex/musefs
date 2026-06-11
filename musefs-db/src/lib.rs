@@ -2,6 +2,7 @@ mod art;
 mod bulk;
 pub mod convert;
 mod error;
+pub mod limits;
 mod models;
 mod schema;
 mod structural;
