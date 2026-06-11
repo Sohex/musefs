@@ -133,10 +133,9 @@ def test_sync_one_whole_record_atomic_on_autocommit(db_path):
     conn = _autocommit(db_path, factory=_FailInsert)
     try:
         tid = insert_track(conn, "/m/a.flac")
-        # _FailInsert fails the FIRST insert executemany once fail=True. In
-        # sync_one the tag INSERT runs before the art INSERT, so to target the
-        # art step specifically we let tags write, then fail on the art INSERT.
-        conn.fail = "art"  # sentinel handled below
+        # fail="art" makes _FailInsert raise only on the track_art INSERT, so
+        # tags write first and the failure lands on the later art step.
+        conn.fail = "art"
         with pytest.raises(RuntimeError):
             sync_one(
                 conn,
