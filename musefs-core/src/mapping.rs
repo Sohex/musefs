@@ -321,9 +321,19 @@ mod tests {
             })
             .unwrap();
 
+        // Plant a malformed art row directly. art rows are immutable once
+        // written (the V5 `art_reject_content_update` trigger blocks UPDATEs of
+        // content columns), and the V4 `byte_len = length(data)` CHECK rejects
+        // byte_len = -1 — so INSERT the bad row on a raw connection with CHECK
+        // enforcement off. The trigger guards only UPDATE, so a fresh malformed
+        // INSERT (the realistic FK/CHECK-disabled external write) still reaches
+        // the row-reader defensive path this test pins.
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.pragma_update(None, "ignore_check_constraints", true)
             .unwrap();
+        // byte_len = -1 against 5 bytes of data is the deliberate malformation
+        // under test (length and byte_len disagree, and byte_len is negative) —
+        // do not "fix" the mismatch.
         raw.execute(
             "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
              VALUES (?1, 'image/png', NULL, NULL, -1, X'0909090909')",

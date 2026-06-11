@@ -65,6 +65,9 @@ fn rescan_with_changed_geometry_bumps_content_version() {
     rescan.audio_length = 900;
     db.upsert_track(&rescan).unwrap();
 
+    // Exactly +1 (not just ">") is deliberate: it asserts the `tracks_geometry_au`
+    // WHEN guard halts the trigger's own nested content_version UPDATE, so the
+    // recursion terminates after a single bump rather than running away.
     assert_eq!(
         db.track_content_version(id).unwrap(),
         cv_before + 1,
