@@ -617,8 +617,8 @@ fn freeform_binary_prefix(mean: &str, name: &str, payload_len: u64) -> Result<Ve
     name_body.extend_from_slice(name.as_bytes());
     let name_box = boxed(b"name", &name_body)?;
 
-    let data_size = 8 + 8 + payload_len; // data header + type + locale + payload
-    let inner_len = mean_box.len() as u64 + name_box.len() as u64 + data_size;
+    let data_size = size::checked_add(16, payload_len)?; // data header + type + locale + payload
+    let inner_len = size::checked_sum([mean_box.len() as u64, name_box.len() as u64, data_size])?;
 
     let mut out = u32::try_from(8 + inner_len)
         .map_err(|_| FormatError::TooLarge)?
@@ -2455,6 +2455,22 @@ mod tests {
         };
         assert_eq!(
             build_udta(&[], &[], &[mk(u64::MAX)]).err(),
+            Some(FormatError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn build_udta_checked_binary_tag_len_rejects_overflow() {
+        // A hostile freeform binary-tag len near u64::MAX must fail closed with
+        // TooLarge inside freeform_binary_prefix's data_size/inner_len arithmetic,
+        // not panic (debug) / wrap (release) before the u32 box-size narrowing.
+        let bins = vec![crate::input::BinaryTagInput {
+            key: "----:com.example:x".to_string(),
+            payload_id: 1,
+            len: BlobLen::new(u64::MAX).unwrap(),
+        }];
+        assert_eq!(
+            build_udta(&[], &bins, &[]).err(),
             Some(FormatError::TooLarge)
         );
     }
