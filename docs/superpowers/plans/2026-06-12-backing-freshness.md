@@ -348,7 +348,7 @@ to:
 
 Do **not** add `backing_ctime_ns` to the trigger (spec: pure freshness identity, not a served-byte input).
 
-Then fix the in-file test SQL: every `INSERT INTO tracks (... backing_mtime ...)` and any `UPDATE tracks SET backing_mtime ...` in `schema.rs`'s `#[cfg(test)]` modules must use `backing_mtime_ns` (grep `backing_mtime` within `schema.rs`; the `backing_ctime_ns` default of 0 lets you omit it from INSERT column lists).
+Then fix the in-file test SQL: every `INSERT INTO tracks (... backing_mtime ...)` and any `UPDATE tracks SET backing_mtime ...` in `schema.rs`'s `#[cfg(test)]` modules must use `backing_mtime_ns` (grep `backing_mtime` within `schema.rs`; the `backing_ctime_ns` default of 0 lets you omit it from INSERT column lists). The densest cluster is the `migration_v4_tests` module (raw `INSERT INTO tracks` strings around `schema.rs:462, 507, 561, 801, 937-1046`), including `v4_tracks_rejects_negative_backing_mtime` — these are **runtime** failures (the compiler does not check SQL strings), so sweep the whole module rather than relying on build errors.
 
 - [ ] **Step 4: Rename the model fields (`musefs-db/src/models.rs`)**
 
@@ -491,13 +491,13 @@ with
 
 Update every `ResolvedFile { ... }` literal in `reader.rs`'s `#[cfg(test)]` module (and the construction above): replace `backing_size: N, backing_mtime_secs: M,` with `stamp: crate::freshness::BackingStamp { size: N, mtime_ns: M, ctime_ns: 0 },`.
 
-Deleting the `mtime_secs` helper also orphans its in-file test callers (reader.rs ~603, 643, 700, 739, 898, 926, 962, 994, 1041, 1063 — each `backing_mtime: mtime_secs(&meta),` inside a `NewTrack`/`Track` literal). Add a small test helper at the top of the `#[cfg(test)]` module and use it at each site:
+Deleting the `mtime_secs` helper also orphans its in-file test callers — every `backing_mtime:` field in a `NewTrack`/`Track`/`ResolvedFile` literal in `reader.rs`'s `#[cfg(test)]` module that the compiler now flags. These appear in several forms: `backing_mtime: mtime_secs(&meta),`, inline `backing_mtime: meta.modified()…as_secs().cast_signed(),`, and bare `backing_mtime: 0,`. Add a small test helper at the top of the `#[cfg(test)]` module and use it for the file-backed sites:
 ```rust
 fn meta_stamp(p: &std::path::Path) -> crate::freshness::BackingStamp {
     crate::freshness::BackingStamp::from_metadata(&std::fs::metadata(p).unwrap())
 }
 ```
-Then each `backing_mtime: mtime_secs(&meta),` becomes `backing_mtime_ns: meta_stamp(&path).mtime_ns, backing_ctime_ns: meta_stamp(&path).ctime_ns,` (use the `path` each test already has; if a site only has `meta`, build the stamp via `BackingStamp::from_metadata(&meta)` inline).
+Then a file-backed `backing_mtime: <secs>,` becomes `backing_mtime_ns: meta_stamp(&path).mtime_ns, backing_ctime_ns: meta_stamp(&path).ctime_ns,` (use the `path`/`meta` each test already has — `BackingStamp::from_metadata(&meta)` inline where only `meta` is in scope). A bare `backing_mtime: 0,` (don't-care, no real file) becomes `backing_mtime_ns: 0, backing_ctime_ns: 0,`. Do not assume a fixed line set — fix each site the compiler reports.
 
 - [ ] **Step 11: Switch the serve path in `facade.rs`**
 
@@ -625,9 +625,26 @@ fn ingest_bulk(
 ```
 and update the in-file `ingest(` test callers (scan.rs ~1724, ~1790) similarly (`crate::freshness::BackingStamp::from_metadata(&meta)` in place of `&meta`).
 
+The two in-file `ingest_bulk(` test callers pass `meta_len`/`meta_mtime` **positionally** and must also change:
+- `scan.rs:1748` — `ingest_bulk(&mut bw, "/a.mp3", 1, 0, probed_with_mixed_binary_tags())` → replace the `1, 0` with `crate::freshness::BackingStamp { size: 1, mtime_ns: 0, ctime_ns: 0 }`.
+- `scan.rs:1814` — the multi-line `ingest_bulk(` call; replace its `meta_len, meta_mtime` (`1, 0`) args with `crate::freshness::BackingStamp { size: 1, mtime_ns: 0, ctime_ns: 0 }`.
+(These back synthetic `/a.*` paths never stat-compared, so a zero stamp is fine.)
+
 - [ ] **Step 13: Fix core test fixtures and regenerate the Python mirrors**
 
-Across `musefs-core` tests (the files from `grep -rln backing_mtime musefs-core/tests`), update each `NewTrack`/`Track` literal: `backing_mtime: X` → `backing_mtime_ns: X, backing_ctime_ns: 0`. For `tests/backing_changed_fault.rs`'s pre-existing `shrinking_the_backing_file...` test, replace `backing_mtime: common::real_mtime(&src),` with:
+Across `musefs-core` tests, update each `NewTrack`/`Track` literal. The compiler enumerates them; the named sites below need specific handling (do not blanket-replace, because some pass a **seconds** value that must become **nanoseconds**):
+
+- **`tests/metrics.rs:230`** — a `/x/ghost.mp3` track never stat-compared: `backing_mtime: 0,` → `backing_mtime_ns: 0, backing_ctime_ns: 0,`. (Re-compiled by the Step 14 `--features metrics` run.)
+- **`tests/external_contract.rs:34`** and **`tests/interop_emit.rs:170, :233`** — these back **real on-disk files** and pass each file's whole-second `real_mtime(...)` (a local helper in each file returning seconds). A seconds value in a `_ns` field would mismatch the real file's nanosecond stat and spuriously trip `BackingChanged`. Replace `backing_mtime: real_mtime(x),` with a real nanosecond stamp:
+  ```rust
+  backing_mtime_ns: { use std::os::unix::fs::MetadataExt; let m = std::fs::metadata(x).unwrap(); m.mtime() * 1_000_000_000 + m.mtime_nsec() },
+  backing_ctime_ns: { use std::os::unix::fs::MetadataExt; let m = std::fs::metadata(x).unwrap(); m.ctime() * 1_000_000_000 + m.ctime_nsec() },
+  ```
+  (`x` is `&audio_path` / `src` respectively.) Their now-unused local `real_mtime` helpers can be deleted, or kept if still referenced elsewhere in the file.
+- **`fuzz/fuzz_targets/serve.rs:29`** — the `fuzz/` crate is **outside the workspace**, so `cargo test`/`cargo build`/`clippy --all-targets` never compile it; this rename will break it invisibly to the Task-14 gates. Fix it here in the slice: change `backing_mtime: i64::try_from(...)` to `backing_mtime_ns: i64::try_from(...)` (keep the same value expression) and add `backing_ctime_ns: 0,`. This track backs a fuzz-synthesized file; a zero ctime is acceptable for the harness.
+- All other flagged `NewTrack`/`Track` literals (e.g. `tests/read_at.rs`, `tests/reader.rs`, `tests/concurrent_reads.rs`, `tests/flac_binary_tags.rs`, `tests/incremental_refresh.rs`, `tests/proptest_read_fidelity.rs`, `tests/reader_faults.rs`, `tests/db_corruption_fault.rs`): if the value is a real file's mtime, use the nanosecond form above (or the `common::real_stamp` helper); if it is a don't-care `0`, use `backing_mtime_ns: 0, backing_ctime_ns: 0`.
+
+For `tests/backing_changed_fault.rs`'s pre-existing `shrinking_the_backing_file...` test, replace `backing_mtime: common::real_mtime(&src),` with:
 ```rust
             backing_mtime_ns: { let m = std::fs::metadata(&src).unwrap(); use std::os::unix::fs::MetadataExt; m.mtime() * 1_000_000_000 + m.mtime_nsec() },
             backing_ctime_ns: { let m = std::fs::metadata(&src).unwrap(); use std::os::unix::fs::MetadataExt; m.ctime() * 1_000_000_000 + m.ctime_nsec() },
@@ -646,8 +663,9 @@ python contrib/python-musefs/vendor_to_picard.py
 cargo test 2>&1 | tail -30
 cargo test -p musefs-core --features metrics 2>&1 | tail -30
 cargo test -p musefs-core --test backing_changed_fault --test facade 2>&1 | tail -20
+cargo +nightly fuzz build serve 2>&1 | tail -5   # out-of-workspace; not covered by `cargo test`
 ```
-Expected: all PASS, including the four new tests. The `metrics` run must still pass with **no** assertion edits (the serve-path stat counts are unchanged — one `metadata` per getattr hit).
+Expected: all PASS, including the four new tests. The `metrics` run must still pass with **no** assertion edits (the serve-path stat counts are unchanged — one `metadata` per getattr hit). The fuzz build must succeed — the `NewTrack` rename touched `fuzz/fuzz_targets/serve.rs` (Step 13) and the fuzz crate is invisible to the other gates.
 
 - [ ] **Step 15: Lint + format**
 
@@ -971,9 +989,9 @@ cargo fmt --all --check
 cargo clippy --all-targets 2>&1 | tail -10
 cargo test 2>&1 | tail -20
 cargo test -p musefs-core --features metrics 2>&1 | tail -20
-cargo +nightly fuzz build 2>&1 | tail -5   # format-layer signatures untouched; smoke only
+cargo +nightly fuzz build 2>&1 | tail -5   # re-confirm; serve.rs was fixed in Task 2 Step 13
 ```
-Expected: all green. (The fuzz build is a precaution; no format-layer signature changed, so it should pass unchanged.)
+Expected: all green. (The `fuzz/` crate is out-of-workspace and consumes `NewTrack` in `serve.rs`; it was updated and built in Task 2. This is a final re-confirmation that the whole fuzz crate still builds.)
 
 - [ ] **Step 3: Commit**
 
