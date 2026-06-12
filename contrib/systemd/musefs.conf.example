@@ -57,6 +57,11 @@ MUSEFS_DB=/home/youruser/.local/share/musefs/library.db
 #MUSEFS_FILE_MODE=444
 # Permission bits for directories, octal. Default: 555.
 #MUSEFS_DIR_MODE=555
+# Mount with allow_other + default_permissions so accounts other than the
+# mounting user can reach the mount and the owner/mode bits are enforced.
+# Implied by MUSEFS_OWNER/MUSEFS_GROUP. Non-root mounts also need
+# 'user_allow_other' in /etc/fuse.conf. Default: false.
+#MUSEFS_ALLOW_OTHER=true
 
 # --- Scan -------------------------------------------------------------------
 # (scan targets are set in musefs-scan.service, not here.)
