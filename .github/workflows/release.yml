@@ -330,7 +330,11 @@ jobs:
       - name: Smoke the built image (amd64, native)
         run: |
           set -euo pipefail
-          docker run --rm \
+          # --user 0:0: the image runs as a non-root user by default (hardening),
+          # but the smoke installs ffmpeg at runtime and mounts FUSE, both of
+          # which need root. This overrides only the smoke run; the pushed image
+          # keeps its non-root default.
+          docker run --rm --user 0:0 \
             --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
             -v "$PWD/scripts":/scripts:ro --entrypoint sh \
             "musefs-smoke:${{ matrix.variant }}" \
