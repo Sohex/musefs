@@ -55,7 +55,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unsupported files were not counted at all (#301).
 - **Symlink scans no longer double-count:** with `--follow-symlinks`, a file
   reached via both its real path and a symlink is ingested and counted once
-  instead of inflating `scanned` (#302).
+  instead of inflating `scanned`; multiple hardlinks to the same inode are
+  likewise collapsed to a single track (#302).
 
 ## [0.2.0] - 2026-05-27
 
