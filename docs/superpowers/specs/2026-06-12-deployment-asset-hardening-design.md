@@ -4,6 +4,32 @@
 **Issues:** #317 (scanner unit), #318 (mount unit), #319 (container user)
 **Tracking:** #280 · Audit: Task 29 (`docker-systemd-assets`)
 
+## Outcome (what live testing changed)
+
+This section records where implementation diverged from the design below; the
+design text is left intact as the original intent. Verified on the dev box
+(systemd 259, setuid fusermount3 3.18.2, kernel 7.0).
+
+- **#317 (scanner) — landed, with a `--user` trim.** The full sandbox below
+  assumed a system-manager-grade capability set. Under the **`--user` manager**
+  (where these units run) any directive needing a capability-bounding-set drop
+  fails with `218/CAPABILITIES`: `CapabilityBoundingSet=`, `PrivateDevices`,
+  `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectClock` were dropped (no
+  loss — the process is already capability-less). `ProtectHostname` was dropped
+  as a no-op that warns. Result: a still-strong sandbox, `systemd-analyze --user
+  security` ≈ **5.3 MEDIUM**.
+- **#318 (mount unit) — inverted into a fix; issue closed, not implemented.**
+  The premise (the mount unit can take "mount-visible" directives) is false for
+  a `--user` FUSE mount: musefs mounts via the **setuid** `fusermount3`, and
+  `NoNewPrivileges=true` — plus *every* directive that implies it (any seccomp
+  filter forces the kernel `no_new_privs` flag, even with `NoNewPrivileges=no`)
+  — disables the setuid escalation, so the mount fails `Operation not permitted`.
+  The shipped unit's existing `NoNewPrivileges=true` was itself a latent,
+  never-tested mount-breaker. Resolution: **remove `NoNewPrivileges`**, document
+  why a `--user` FUSE mount unit cannot be sandboxed, and close #318.
+- **#319 (containers) — landed as designed**, including the build-arg UID.
+  Verified non-root mount end-to-end (rootless podman) on both glibc and musl.
+
 ## Problem
 
 The shipped deployment assets carry defense-in-depth hardening gaps. None is a
