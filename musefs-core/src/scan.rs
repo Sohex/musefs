@@ -1870,6 +1870,55 @@ mod hardening_tests {
         assert_eq!(got[1].body, vec![0xB2]);
     }
 
+    /// Probed with two tags of the SAME key, to make the per-key ordinal
+    /// increment (`*ord += 1` in the tag loop) observable. The production
+    /// `ingest_bulk` path is exercised with a multi-value tag elsewhere, but the
+    /// oracle-only `ingest` is not, so without this its tag-ordinal mutants
+    /// survive. Distinct values under one key: a collapsed ordinal (the `-=`/`*=`
+    /// mutants) either underflows or duplicates the `(track_id, key, ordinal)`
+    /// primary key — both observable.
+    fn probed_with_duplicate_tag_key() -> Probed {
+        Probed {
+            format: musefs_db::Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            tags: vec![
+                ("ARTIST".to_string(), "A".to_string()),
+                ("ARTIST".to_string(), "B".to_string()),
+            ],
+            pictures: Vec::new(),
+            binary_tags: Vec::new(),
+            structural_blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ingest_assigns_sequential_tag_ordinals_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        std::fs::write(&path, b"x").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let db = Db::open_in_memory().unwrap();
+
+        ingest(
+            &db,
+            &path.to_string_lossy(),
+            &meta,
+            probed_with_duplicate_tag_key(),
+        )
+        .unwrap();
+
+        let tid = db.list_tracks().unwrap()[0].id;
+        let got = db.get_tags(tid).unwrap();
+        // get_tags is ORDER BY key, ordinal: the two same-key tags must hold
+        // ordinals 0 then 1 (the `-=`/`*=` mutants collapse or invert this).
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].ordinal, 0);
+        assert_eq!(got[0].value, "A");
+        assert_eq!(got[1].ordinal, 1);
+        assert_eq!(got[1].value, "B");
+    }
+
     #[test]
     fn ingest_bulk_assigns_sequential_structural_ordinals_per_kind() {
         let db = Db::open_in_memory().unwrap();

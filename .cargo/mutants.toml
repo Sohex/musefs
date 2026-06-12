@@ -323,6 +323,15 @@ exclude_re = [
     # const being out of reach.)
     # guard: op="/" fn="" rows=2
     'musefs-core/src/reader\.rs:71:60: replace / with [%*]',
+    # read_segments_into splice loop's overlap guard `if ov_start < ov_end`,
+    # `<`->`<=`: the same equivalence class as serve_ogg_window's overlap-emit
+    # guards above. When the bound is equal the overlap is empty (n = ov_end -
+    # ov_start = 0), so every match arm extends by an empty slice / reads 0 payload
+    # bytes and the spliced output is byte-identical (the byte-fidelity proptest and
+    # the read_at tests pass with the mutation applied). The `<`->`==`/`>` siblings
+    # flip real behavior and ARE caught; the sole `<` in this fn, so
+    # description-anchored against `cargo fmt` line drift.
+    'replace < with <= in read_segments_into',
 
     # wav walk_chunks advance guard `next <= buf.len() as u64` -> `true`: forcing
     # the guard true sets `pos = next` even when `next > buf.len()`, but the loop's
