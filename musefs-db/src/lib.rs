@@ -142,6 +142,17 @@ impl<M> Db<M> {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+
+    /// TEST/FUZZ ONLY (the `fuzzing` feature). Hands the raw rusqlite connection
+    /// to `f` so fuzz harnesses can plant rows the validating public API cannot
+    /// produce — e.g. negative geometry under `PRAGMA ignore_check_constraints`,
+    /// or orphaned `track_art` under `PRAGMA foreign_keys = OFF`. Never compiled
+    /// in production: the `fuzzing` feature is enabled only by the out-of-workspace
+    /// fuzz crate.
+    #[cfg(feature = "fuzzing")]
+    pub fn with_raw_conn<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> R) -> R {
+        f(&self.conn)
+    }
 }
 
 #[cfg(feature = "mutants")]
@@ -266,5 +277,52 @@ mod tests {
             crate::DbError::SchemaMismatch { object } => assert!(object.contains("foreign key")),
             other => panic!("expected SchemaMismatch (fk) on RO open, got {other:?}"),
         }
+    }
+}
+
+#[cfg(all(test, feature = "fuzzing"))]
+mod fuzzing_accessor_tests {
+    use super::*;
+    use crate::models::NewTrack;
+
+    #[test]
+    fn with_raw_conn_plants_a_constraint_violating_row() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/x".to_string(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
+            })
+            .unwrap();
+
+        db.with_raw_conn(|conn| {
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+                .unwrap();
+            conn.execute(
+                "UPDATE tracks SET audio_offset = -1 WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .unwrap();
+        });
+
+        let off: i64 = db.with_raw_conn(|conn| {
+            conn.query_row(
+                "SELECT audio_offset FROM tracks WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            off, -1,
+            "ignore_check_constraints let the negative offset land"
+        );
     }
 }
