@@ -1,4 +1,4 @@
-use crate::error::check_field_len;
+use crate::error::{check_art_count, check_field_len};
 use crate::limits::{MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN};
 use crate::models::{Art, ArtMeta, NewArt, TrackArt};
 use crate::{Db, ReadWrite, Result};
@@ -95,6 +95,7 @@ impl<M> Db<M> {
                 description: r.get(3)?,
                 ordinal: r.get(4)?,
             });
+            check_art_count(track_id, out.len())?;
         }
         Ok(out)
     }
@@ -261,5 +262,45 @@ mod guard_tests {
         )
         .unwrap();
         assert_eq!(db.get_track_art(track).unwrap()[0].description.len(), 1024);
+    }
+
+    #[test]
+    fn get_track_art_rejects_excess_rows() {
+        let (db, track, art) = db_track_art();
+        // 4097 track_art rows sharing one art_id -> TooManyArtRows. Raw INSERT
+        // (not set_track_art) keeps the fixture to a single planted blob; the
+        // PRIMARY KEY (track_id, ordinal) is satisfied by the distinct ordinals.
+        let tx = db.conn.unchecked_transaction().unwrap();
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+                 VALUES (?1, ?2, 3, '', ?3)",
+            )
+            .unwrap();
+        for i in 0..4097 {
+            stmt.execute(rusqlite::params![track, art, i]).unwrap();
+        }
+        drop(stmt);
+        tx.commit().unwrap();
+        let err = db.get_track_art(track).unwrap_err();
+        assert!(matches!(err, DbError::TooManyArtRows { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn get_track_art_accepts_rows_at_cap() {
+        let (db, track, art) = db_track_art();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+                 VALUES (?1, ?2, 3, '', ?3)",
+            )
+            .unwrap();
+        for i in 0..4096 {
+            stmt.execute(rusqlite::params![track, art, i]).unwrap();
+        }
+        drop(stmt);
+        tx.commit().unwrap();
+        assert_eq!(db.get_track_art(track).unwrap().len(), 4096);
     }
 }
