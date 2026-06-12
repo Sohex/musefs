@@ -1,8 +1,17 @@
-//! Bench-only passthrough FUSE that mirrors a backing directory and sleeps a
-//! configurable amount per operation, so HDD/NFS latency profiles are
-//! reproducible on one machine. The corpus AND the SQLite DB live under the
-//! mount, so backing reads and SQLite fsyncs are both delayed (and fsyncs
-//! counted). Not for production; requires /dev/fuse.
+//! Bench-only passthrough FUSE that forwards reads, writes, and directory ops
+//! to a backing directory and sleeps a configurable amount per operation, so
+//! HDD/NFS latency profiles are reproducible on one machine. The corpus AND the
+//! SQLite DB live under the mount, so backing reads and SQLite fsyncs are both
+//! delayed (and fsyncs counted). Not for production; requires /dev/fuse.
+//!
+//! Passthrough scope is deliberately narrow — only what the corpus + SQLite
+//! benches exercise; this is NOT full POSIX passthrough:
+//! - `setattr` honors `size` only (the one attr SQLite's WAL needs) and
+//!   accepts-but-ignores mode/uid/gid/atime/mtime/ctime/flags.
+//! - `access` always replies ok; the later backing op still enforces the real
+//!   permissions, so a probe can disagree with it.
+//! - symlinks are reported by `readdir`/`getattr` but `readlink` is
+//!   unimplemented — the bench corpus never resolves one.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -433,6 +442,8 @@ impl fuser::Filesystem for PassthroughFs {
     }
 
     fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        // Bench scope: always ok. A probe may disagree with the later backing
+        // op, which enforces the real permissions (see the crate doc).
         reply.ok();
     }
 
@@ -578,9 +589,11 @@ impl fuser::Filesystem for PassthroughFs {
         let Some(p) = self.ipath(ino.0) else {
             return reply.error(fuser::Errno::ENOENT);
         };
-        // The only attr SQLite needs: truncate/extend the WAL. Propagate any
-        // failure rather than replying ok with the stale (un-truncated) size,
-        // which would lie to the kernel and desync the WAL on disk.
+        // Bench scope: only `size` is applied — it truncates/extends the WAL,
+        // the one attr SQLite needs. mode/uid/gid/times/flags are accepted but
+        // intentionally ignored (see the crate doc). Propagate any size failure
+        // rather than replying ok with the stale (un-truncated) size, which
+        // would lie to the kernel and desync the WAL on disk.
         if let Some(sz) = size
             && let Err(e) = OpenOptions::new()
                 .write(true)
