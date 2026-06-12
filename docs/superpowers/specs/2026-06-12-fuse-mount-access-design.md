@@ -39,6 +39,11 @@ Two GitHub issues concern FUSE mount-access behaviour the docs don't reflect:
 - No change to the default mode bits (`444` files, `555` dirs) — they stay
   world-readable so the cross-user case works out of the box.
 - No `allow_root` support (out of scope; `allow_other` covers the use case).
+- **No `AutoUnmount`.** `allow_other` mounts are a classic motivation for
+  `AutoUnmount` (a crashed daemon leaves a mount other users are stuck on), but
+  we do not add it here — cleanup stays the existing signal-handler path that
+  shells out to `fusermount3 -u` (`musefs-cli/src/signal.rs`). Adding
+  `AutoUnmount` is a separate decision.
 
 ## #294 — user-facing contract
 
@@ -51,15 +56,50 @@ Two GitHub issues concern FUSE mount-access behaviour the docs don't reflect:
   being cosmetic. `--allow-other false` does **not** override the auto-enable
   when `--owner`/`--group` is present (simplest rule: auto-enable wins).
 - `default_permissions` makes the kernel enforce the presented owner/mode bits.
-  Defaults stay `444`/`555` (world-readable), so the service account can read
+  Defaults stay `444`/`555` (world-readable), so any account can read
   immediately; tightening `--file-mode`/`--dir-mode` now becomes real access
   control rather than cosmetic.
+
+### Permission model under `default_permissions`
+
+With `default_permissions` on, the kernel checks the caller's identity against
+the **presented** owner/group/mode of each entry. The **world (other) bits are
+the load-bearing mechanism** for the default cross-user case — access is granted
+via the world-read bit, not via an owner/group match. The matrix for the default
+`444`/`555` (world-readable) entries:
+
+| Caller \ `--owner svc` | not set (owner = mounting user) | set to `svc` |
+| ---------------------- | ------------------------------- | ------------ |
+| mounting user          | read (owner bit, and world bit) | read (world bit) |
+| `svc` service account  | read (world bit)                | read (owner bit, and world bit) |
+| any other user         | read (world bit)                | read (world bit) |
+
+Implication to document: making the mount *private* to the presented owner/group
+requires dropping the world bits (e.g. `--file-mode 440 --dir-mode 550`); only
+then does `--owner`/`--group` restrict access rather than merely label it. Bare
+`--allow-other` (no `--owner`) keeps the mounting user as owner and simply lets
+other real users browse the world-readable tree — that is its standalone use
+case.
+
 - **Pre-flight check (Linux, non-root):** before mounting, if `allow_other` is
-  effective, we are not root, and `/etc/fuse.conf` lacks an active
-  `user_allow_other` directive, fail fast with an actionable error (what line to
-  add to `/etc/fuse.conf`, and that running as root is exempt) instead of letting
-  fusermount3 emit a cryptic `Permission denied`. On non-Linux the check is a
-  no-op.
+  effective, we are not root (`geteuid() != 0`), and `/etc/fuse.conf` lacks an
+  active `user_allow_other` directive, fail fast with an actionable, **self-
+  contained** error (it must read well even when the CLI wraps it as
+  `mounting at <path>: …`, so it states the exact line to add to
+  `/etc/fuse.conf` and that root is exempt) instead of letting fusermount3 emit a
+  cryptic `Permission denied`. Root is exempt because libfuse only enforces
+  `user_allow_other` for non-root callers. On non-Linux the check is a no-op.
+
+  **`user_allow_other` detection semantics.** For each line: strip a trailing
+  `#…` comment, then trim surrounding whitespace; the directive is *active* iff
+  the remaining token equals exactly `user_allow_other`. Therefore
+  `   user_allow_other   ` ⇒ active; `user_allow_other # note` ⇒ active;
+  `# user_allow_other` and `#user_allow_other` ⇒ inactive; `mount_max=10` and
+  other directives ⇒ ignored. **Any read failure is treated as "not permitted"**
+  — missing file, `EACCES`, dangling symlink, etc. — so the actionable error
+  fires. A false positive here is harmless because fusermount3 would have failed
+  the mount anyway; failing safe gives the user the helpful message instead of
+  the cryptic one.
 
 ## #294 — implementation
 
@@ -77,24 +117,36 @@ fusermount3 (unlike `max_readahead`/`max_background`, which are negotiated at
   `MountOption::DefaultPermissions` when `allow_other` is true (both exist in
   fuser 0.17).
 - The pre-flight check lives in `musefs-fuse` `platform::mount` (Linux-gated),
-  invoked from `new_session` before `Session::new`. It returns an
-  `io::Error` that the CLI surfaces with context. A small `/etc/fuse.conf`
-  parser detects an active `user_allow_other` directive, ignoring comment
-  (`#`) and whitespace-only lines and treating a missing file as "not
-  permitted".
-- CLI (`musefs-cli/src/lib.rs`): add `--allow-other` to `MountArgs`; in the
-  `FuseConfig` builder set
+  invoked from `new_session` **before acquiring the `MOUNT_SETUP` mutex** — the
+  conf-file read is unrelated to the racy fusermount3 handshake the lock guards,
+  so it must not extend that critical section. It returns a self-contained
+  `io::Error` (see the contract above; the CLI wraps mount errors as
+  `mounting at <path>: …`, so the message cannot rely on additional context).
+  The `/etc/fuse.conf` parser implements the detection semantics defined above.
+- CLI (`musefs-cli/src/lib.rs`): add `--allow-other` to `MountArgs`
+  (`env = "MUSEFS_ALLOW_OTHER"`). In `parse_mount_config` (the `(MountConfig,
+  FuseConfig)` builder, ~cli.rs:254–275), set the new field in the `FuseConfig`
+  struct literal:
   `allow_other: args.allow_other || args.owner.is_some() || args.group.is_some()`.
+- **Struct-literal sites to update** (adding a field to `FuseConfig` breaks
+  exhaustive literals): `FuseConfig::default` (lib.rs:~70) and the
+  `parse_mount_config` literal (cli.rs:~264). The `keep_cache` test site uses
+  `..Default::default()` and is unaffected. The plan should grep for
+  `FuseConfig {` and `MountArgs {` literals to confirm no other exhaustive sites
+  exist (existing CLI tests construct `MountArgs` via argv parsing, not bare
+  literals, so they are non-breaking — verify).
 
 ## #293 + #294 — documentation
 
 - **#293** (README **Mount** section): note that an arbitrary mountpoint (e.g.
   `/data/...`) may be rejected by the `fusermount3` AppArmor profile on
   Ubuntu 24.04+/libfuse ≥ 3.17, with the `apparmor="DENIED" operation="mount"`
-  audit-log signature, and the two fixes: mount under a permitted prefix
-  (`$HOME`, `/mnt`, `/media`, `/tmp`, `$XDG_RUNTIME_DIR`, …) or whitelist the
-  desired prefix via `/etc/apparmor.d/local/fusermount3` (the shipped profile
-  already ends with `include if exists <local/fusermount3>`).
+  audit-log signature, and the two fixes: mount under a permitted prefix (the
+  shipped profile allows `$HOME/**`, `/mnt`, `/media`, `/tmp`, `/cvmfs`,
+  `$XDG_RUNTIME_DIR`, plus flatpak dirs) or whitelist the desired prefix via
+  `/etc/apparmor.d/local/fusermount3` (the shipped profile already ends with
+  `include if exists <local/fusermount3>`). The README may show a representative
+  subset of this list; keep the two consistent.
 - **#294** (README **Ownership and permissions** section): rewrite to document
   `--allow-other`, the auto-enable on `--owner`/`--group`, that
   `default_permissions` makes mode/owner bits enforced (not cosmetic), and the
@@ -106,14 +158,22 @@ fusermount3 (unlike `max_readahead`/`max_background`, which are negotiated at
 
 - `options()` unit tests: `allow_other=true` adds both `AllowOther` and
   `DefaultPermissions`; `allow_other=false` adds neither.
-- `/etc/fuse.conf` parser unit tests: detects `user_allow_other`, ignores
-  commented and whitespace-only lines, treats a missing file as not permitted.
-- Pre-flight unit tests: root-exemption path and the missing-config error path,
-  injecting the conf contents and root-ness rather than touching real `/etc`.
-- CLI tests: `--owner`/`--group` each auto-enable `allow_other` in the built
-  `FuseConfig`; explicit `--allow-other` works; default is off.
+- `/etc/fuse.conf` parser unit tests covering the detection vectors above:
+  `user_allow_other`, leading/trailing whitespace, trailing inline comment (all
+  active); `# user_allow_other`, `#user_allow_other`, `mount_max=10`, empty file
+  (all inactive); and read failure / missing file ⇒ not permitted.
+- Pre-flight unit tests: root-exemption path and the not-permitted error path,
+  injecting the conf contents and root-ness rather than touching real `/etc`;
+  assert the error message is self-contained (mentions `/etc/fuse.conf` +
+  `user_allow_other`) so it survives the CLI's `mounting at …` wrapper.
+- CLI tests: `--owner` alone and `--group` alone each auto-enable `allow_other`
+  in the built `FuseConfig`; explicit `--allow-other` works; default is off; and
+  the env path — `MUSEFS_OWNER` set with `MUSEFS_ALLOW_OTHER=false` still yields
+  effective `true` (auto-enable wins).
 - Existing FUSE e2e (ignored) remains; a privileged cross-user e2e is out of
   scope (needs two real accounts).
+- The README changes (#293, #294) are docs-only and the pre-commit cargo gate
+  skips them, so they can land as a separate green commit from the code.
 
 ## Risks / trade-offs
 
