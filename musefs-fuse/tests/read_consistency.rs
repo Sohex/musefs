@@ -287,6 +287,11 @@ fn assert_refused(ret: i32, accepted: &[i32], what: &str) {
 /// Assert a libc *read* call (getxattr/listxattr) did not error as if it were a
 /// write: it either succeeds (`ret >= 0`) or fails with a non-mutation errno in
 /// `accepted`. Refusing a read on a read-only mount would itself be the bug.
+///
+/// Linux-gated to match its only call sites (the xattr probes), so the macOS /
+/// FreeBSD workspace build that compiles this `#[ignore]` test does not see it
+/// as dead code under `-D warnings`.
+#[cfg(target_os = "linux")]
 fn assert_read_safe(ret: isize, accepted: &[i32], what: &str) {
     if ret >= 0 {
         return;
