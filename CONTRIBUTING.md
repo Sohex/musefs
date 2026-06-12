@@ -190,7 +190,7 @@ pushing a format-layer API change:
 ```bash
 cargo install cargo-fuzz                          # one-time; needs nightly
 cargo +nightly fuzz build                         # what the CI smoke job runs
-cargo +nightly fuzz run <target>                  # flac|mp3|mp4|ogg|wav|ogg_page|b64|vorbiscomment
+cargo +nightly fuzz run <target>                  # flac|mp3|mp4|ogg|wav|ogg_page|b64|vorbiscomment|serve
 cargo +nightly fuzz coverage <target>             # confirm coverage reaches the parser
 cargo run --manifest-path fuzz/Cargo.toml --bin generate_seeds   # (re)build seeds
 ```
