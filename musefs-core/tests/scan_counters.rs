@@ -454,3 +454,56 @@ fn follow_symlinks_counts_unsupported_symlink_target_as_skipped() {
     // notes.txt (regular) + link.txt (symlink target) → both skipped.
     assert_eq!(stats.skipped, 2);
 }
+
+/// A single unsupported file passed directly as the scan root is counted as
+/// skipped (kills the `scan_directory_with` single-file-root `skipped += 1`
+/// mutants — `-=` underflow-panics from 0, `*=` pins at 0).
+#[test]
+fn scan_single_unsupported_file_root_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let txt = dir.path().join("notes.txt");
+    std::fs::write(&txt, b"hi").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, &txt).unwrap();
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.skipped, 1);
+}
+
+/// Same single-unsupported-file root, via the full-probe oracle (kills the
+/// oracle's single-file-root `skipped += 1` mutants).
+#[test]
+fn oracle_single_unsupported_file_root_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let txt = dir.path().join("notes.txt");
+    std::fs::write(&txt, b"hi").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory_full_oracle(&db, &txt).unwrap();
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.skipped, 1);
+}
+
+/// Under follow, an unsupported file inside a directory that is ALSO reached via
+/// a directory symlink is counted as skipped exactly once: the directory-cycle
+/// guard skips the symlinked re-entry. Unsupported files are not file-deduped,
+/// so a missing guard would double-count `skipped` (kills the `descend`
+/// `if !follow_symlinks` gate mutant). The symlink targets a sibling real dir,
+/// not a cycle, so the walk terminates.
+#[test]
+fn follow_symlinks_mirrored_dir_counts_unsupported_file_once() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("notes.txt"), b"not audio").unwrap();
+    symlink(&real, dir.path().join("mirror")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.skipped, 1, "notes.txt is skipped once, not twice");
+}
