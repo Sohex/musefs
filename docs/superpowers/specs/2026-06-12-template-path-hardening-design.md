@@ -47,15 +47,31 @@ render time and must not be able to fail the mount, so it is clamped.
   template) fails `Musefs::open()` with a clear, actionable message.
 - `Template::parse` changes signature to
   `pub fn parse(template: &str) -> Result<Template, TemplateError>`.
-  - `parse_parts` gains a `depth: usize` parameter. Each `[` that opens a section
-    recurses with `depth + 1`; if `depth` would exceed `MAX_SECTION_DEPTH`, parse
-    returns `Err(TemplateError::NestingTooDeep { limit: MAX_SECTION_DEPTH })`.
-  - While accumulating literal text, any `char` with scalar value `< 0x20`
-    (covers NUL and all C0 control bytes) returns
-    `Err(TemplateError::ControlByte { byte })`. `/` remains legal in literals — it
-    is the structural path separator. (`< 0x20` matches the existing
-    `sanitize_into` rule exactly, so field-value and literal policy stay aligned.)
-  - The `Infallible` line in `Template::parse`'s doc comment is updated.
+  - **`parse_parts` itself becomes fallible** — its return type changes from
+    `Vec<Part>` to `Result<Vec<Part>, TemplateError>`. Both the recursive call in
+    the `'['` arm and `Template::parse`'s top-level call propagate with `?`. The
+    helpers it calls (`parse_braced_names`, `parse_unbraced_name`, `push_literal`)
+    stay infallible.
+  - **`depth` replaces the existing `in_section: bool` parameter** rather than
+    being added alongside it: `parse_parts(chars, depth: usize)`, with
+    `depth > 0` meaning "inside a section" (so every current use of `in_section`
+    becomes `depth > 0`). `Template::parse` calls `parse_parts(&mut chars, 0)`.
+  - Each `[` that opens a section recurses with `depth + 1`; reject with
+    `Err(TemplateError::NestingTooDeep { limit: MAX_SECTION_DEPTH })` when
+    `depth + 1 > MAX_SECTION_DEPTH`. Thus a template nested `MAX_SECTION_DEPTH`
+    sections deep parses and one `MAX_SECTION_DEPTH + 1` deep is rejected (the
+    comparison is `>`, not `>=`).
+  - **Control-byte check goes in the catch-all `_ =>` ordinary-character arm of
+    `parse_parts`**, before `literal.push(c)` — that is the only place a raw input
+    control byte can land (the `$[`/`$]`/`$!`/`$` escape arms only push bracket and
+    `$`/`!` literals). Reject the **first** offending char:
+    `if (c as u32) < 0x20 { return Err(TemplateError::ControlByte { byte: c as u8 }); }`.
+    The `c as u8` cast is lossless precisely because the `< 0x20` guard restricts
+    `c` to scalars that fit in `u8`. `/` remains legal in literals — it is the
+    structural path separator. (`< 0x20` matches the existing `sanitize_into` rule
+    exactly, so field-value and literal policy stay aligned.)
+  - The `Infallible` line in `impl Template`'s `parse` doc comment
+    (`template.rs:28`) is updated; no other doc references infallibility.
 
 **Why this bounds everything once:** because `parse` rejects deep nesting, a
 constructed `Template` *structurally cannot* exceed `MAX_SECTION_DEPTH`. Therefore
@@ -65,24 +81,35 @@ construction point.
 
 **Call sites (blast radius — larger than first estimated).** `Template::parse`
 is `pub` and has 34 call sites workspace-wide:
-- `facade.rs:255` — the single **production** site; propagate with `?` (already a
-  `Result` fn).
-- `facade.rs:1530`, `facade.rs:1787` and one in-module `template.rs` test —
-  `.expect(...)`.
+- `facade.rs:255` — the single **production** site. The concrete edit is
+  `let template = Template::parse(&config.template);` →
+  `let template = Template::parse(&config.template)?;` (the enclosing `open()`
+  already returns `Result`, and `#[from] TemplateError` makes `?` convert into
+  `CoreError::InvalidTemplate`).
+- `facade.rs:1530`, `facade.rs:1787` and the one in-module `template.rs` test
+  (line 315) — `.expect(...)`.
 - **30 calls in `musefs-core/tests/template.rs`** — every one breaks when the
   signature becomes fallible. The pre-commit gate runs the full workspace test
   suite, so all of these must compile (and stay green) in the same commit. To keep
-  the churn mechanical and readable, add a private test helper
+  the churn mechanical and readable, add a **file-scope** helper
   `fn parse(t: &str) -> Template { Template::parse(t).expect("valid template") }`
-  in that test module and the in-module `tests`, and rewrite the existing
-  call sites to use it; only the new negative-path tests call `Template::parse`
-  directly to assert `Err`. The implementation plan must list this rename as an
-  explicit step, not leave it implicit.
+  in `tests/template.rs` alongside the existing free `fields`/`owned` helpers
+  (this test file is **not** wrapped in a `mod`), and rewrite the 30 existing call
+  sites to use it. The in-module `template.rs` test has a single call site — leave
+  that one inline as `Template::parse(...).expect(...)` rather than adding a second
+  helper. Only the new negative-path tests call `Template::parse` directly to
+  assert `Err`. The implementation plan must list this rename as an explicit step,
+  not leave it implicit.
 
 ### 2. #303 — path-field segment cap (contain)
 
 - `sanitize_path` caps the number of **surviving** segments at
-  `MAX_PATH_FIELD_SEGMENTS`. Once the cap is reached, remaining `/`-separated
+  `MAX_PATH_FIELD_SEGMENTS`, counted **post-filter**: only segments that pass the
+  existing empty/`.`/`..` guard consume cap budget (increment the counter after the
+  `continue` guards, stop once it reaches `MAX_PATH_FIELD_SEGMENTS`). So a value
+  like `././a/./b` is not prematurely truncated by its dropped `.` segments, and
+  the existing `path_field_neutralizes_traversal_values` test
+  (`tests/template.rs:279`) stays green. Once the cap is reached, remaining
   segments are dropped. A 256 KiB `a/a/a/…` value therefore yields at most
   `MAX_PATH_FIELD_SEGMENTS` directory levels instead of tens of thousands, bounding
   the CPU/allocation/inode-map/refresh cost.
@@ -125,13 +152,18 @@ existing FUSE regression coverage):
   - `$[` / `$]` escapes and ordinary `/` separators still parse successfully.
   - Field-derived hostile values remain sanitized as today (unchanged behaviour).
 - **#304**
-  - A template with nesting deeper than `MAX_SECTION_DEPTH` → `NestingTooDeep`.
-  - A template nested exactly at the limit parses successfully.
+  - Boundary pair: a template nested exactly `MAX_SECTION_DEPTH` (64) sections
+    deep parses successfully; one nested `MAX_SECTION_DEPTH + 1` (65) deep returns
+    `NestingTooDeep` (pins the `>` comparison, not `>=`).
 - **#303**
   - A `$!{field}` value with many `/`-segments renders to at most
     `MAX_PATH_FIELD_SEGMENTS` components.
   - Values at/under the cap are unaffected; `.`/`..`/empty segments still dropped;
     per-segment control sanitization unchanged.
+  - Path-field **values** remain *sanitized* (control bytes → `_`, never
+    rejected) — only template *literals* are rejected. So the proptest's
+    `value in ".{0,64}"` strategy needs no change; the rewrite below touches only
+    the `tmpl` half.
 - **Existing proptest adaptation** (`render_never_panics_and_path_fields_stay_safe`,
   `tests/template.rs:261`). Its `tmpl in ".{0,64}"` strategy generates control
   bytes and `[` runs, which `Template::parse` now legitimately *rejects*. The
