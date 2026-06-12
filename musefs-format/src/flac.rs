@@ -40,6 +40,7 @@ fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
         return Err(FormatError::NotFlac);
     }
     let mut pos = 4usize;
+    let mut index = 0usize;
     let mut preserved = Vec::new();
     loop {
         if pos + 4 > data.len() {
@@ -54,6 +55,7 @@ fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
         if body_end > data.len() {
             return Err(FormatError::Malformed);
         }
+        check_streaminfo_position(index, block_type, len)?;
         match block_type {
             BLOCK_STREAMINFO | BLOCK_APPLICATION | BLOCK_SEEKTABLE | BLOCK_CUESHEET => {
                 preserved.push(MetadataBlock {
@@ -64,6 +66,7 @@ fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
             _ => {}
         }
         pos = body_end;
+        index += 1;
         if is_last {
             break;
         }
@@ -90,6 +93,7 @@ pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
         return Err(FormatError::NotFlac);
     }
     let mut pos = 4usize;
+    let mut index = 0usize;
     let mut preserved = Vec::new();
     loop {
         if pos + 4 > prefix.len() {
@@ -109,6 +113,7 @@ pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
                 up_to: body_end as u64,
             });
         }
+        check_streaminfo_position(index, block_type, len)?;
         match block_type {
             BLOCK_STREAMINFO | BLOCK_APPLICATION | BLOCK_SEEKTABLE | BLOCK_CUESHEET => {
                 preserved.push(MetadataBlock {
@@ -119,6 +124,7 @@ pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
             _ => {}
         }
         pos = body_end;
+        index += 1;
         if is_last {
             break;
         }
@@ -147,6 +153,26 @@ use crate::layout::{RegionLayout, Segment};
 
 /// Inclusive maximum body length of a FLAC metadata block (24-bit length field).
 pub const MAX_BLOCK_BODY: u64 = 0x00FF_FFFF;
+
+/// FLAC mandates a single STREAMINFO metadata block, first in the sequence, with
+/// a fixed 34-byte body.
+const STREAMINFO_BODY_LEN: usize = 34;
+
+/// Enforce FLAC's STREAMINFO rule for the metadata block at position `index`:
+/// the first block must be STREAMINFO with a 34-byte body, and STREAMINFO must
+/// not appear anywhere else (so it appears exactly once). Any violation is
+/// `FormatError::Malformed`.
+fn check_streaminfo_position(index: usize, block_type: u8, body_len: usize) -> Result<()> {
+    let is_streaminfo = block_type == BLOCK_STREAMINFO;
+    if index == 0 {
+        if !is_streaminfo || body_len != STREAMINFO_BODY_LEN {
+            return Err(FormatError::Malformed);
+        }
+    } else if is_streaminfo {
+        return Err(FormatError::Malformed);
+    }
+    Ok(())
+}
 
 pub(crate) fn push_block_header(
     out: &mut Vec<u8>,
@@ -246,6 +272,14 @@ pub fn synthesize_layout(
     binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<RegionLayout> {
+    let streaminfo: Vec<&MetadataBlock> = structural
+        .iter()
+        .filter(|b| b.block_type == BLOCK_STREAMINFO)
+        .collect();
+    if streaminfo.len() != 1 || streaminfo[0].body.len() != STREAMINFO_BODY_LEN {
+        return Err(FormatError::Malformed);
+    }
+
     let mut ordered: Vec<&MetadataBlock> = structural.iter().collect();
     ordered.sort_by_key(|b| b.block_type);
 
@@ -540,6 +574,59 @@ mod tests {
         f
     }
 
+    /// A structural STREAMINFO block with a valid 34-byte body, for synthesis tests.
+    fn valid_streaminfo() -> MetadataBlock {
+        MetadataBlock {
+            block_type: BLOCK_STREAMINFO,
+            body: vec![0u8; 34],
+        }
+    }
+
+    #[test]
+    fn locate_audio_rejects_missing_streaminfo() {
+        // First (and only) block is VORBIS_COMMENT, no STREAMINFO at all.
+        let file = flac_with(&[raw_block(BLOCK_VORBIS_COMMENT, &[], true, None)]);
+        assert_eq!(locate_audio(&file), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn locate_audio_rejects_streaminfo_wrong_body_len() {
+        // STREAMINFO present and first, but body is 10 bytes, not 34.
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[0u8; 10], true, None)]);
+        assert_eq!(locate_audio(&file), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn locate_audio_rejects_duplicate_streaminfo() {
+        let file = flac_with(&[
+            raw_block(BLOCK_STREAMINFO, &[0u8; 34], false, None),
+            raw_block(BLOCK_STREAMINFO, &[0u8; 34], true, None),
+        ]);
+        assert_eq!(locate_audio(&file), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn read_metadata_bounded_rejects_duplicate_streaminfo() {
+        let file = flac_with(&[
+            raw_block(BLOCK_STREAMINFO, &[0u8; 34], false, None),
+            raw_block(BLOCK_STREAMINFO, &[0u8; 34], true, None),
+        ]);
+        assert_eq!(read_metadata_bounded(&file), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn synthesize_layout_rejects_structural_without_streaminfo() {
+        // Hostile DB rows: a SEEKTABLE but no STREAMINFO.
+        let structural = [MetadataBlock {
+            block_type: BLOCK_SEEKTABLE,
+            body: vec![0u8; 4],
+        }];
+        assert_eq!(
+            synthesize_layout(&structural, 0, 0, &[], &[], &[]),
+            Err(FormatError::Malformed)
+        );
+    }
+
     #[test]
     fn parse_blocks_rejects_short_and_wrong_marker() {
         // :37 `< -> ==`: 3-byte input -> original short-circuits NotFlac; the mutant
@@ -561,12 +648,12 @@ mod tests {
 
     #[test]
     fn parse_blocks_accepts_header_flush_with_end() {
-        // Single last STREAMINFO, empty body, no audio: the final header occupies the
-        // last 4 bytes, so pos+4 == data.len() at the loop guard. Original (`>`)
-        // proceeds and returns audio_offset == len; the :43 `> -> >=` mutant rejects.
-        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, None)]);
+        // Single last STREAMINFO with a valid 34-byte body, no audio: the final header
+        // still flushes at the buffer end (pos+4 == data.len() at the loop guard), so
+        // this keeps the :43 `> -> >=` mutant coverage while obeying STREAMINFO rules.
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[0u8; 34], true, None)]);
         let meta = parse_blocks(&file).unwrap();
-        assert_eq!(meta.audio_offset, 8);
+        assert_eq!(meta.audio_offset, 42); // 4 marker + 4 header + 34 body
     }
 
     #[test]
@@ -766,38 +853,36 @@ mod tests {
 
     #[test]
     fn bounded_needmore_up_to_is_pos_plus_4_for_truncated_header() {
-        // Marker + a non-last STREAMINFO (empty body) then truncated: after the
-        // first block, pos = 4 + 4 + 0 = 8. The prefix ends exactly there, so the
-        // loop guard `pos + 4 > prefix.len()` fires with pos == 8.
-        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], false, None)]);
-        // file is fLaC(4) + header(4) = 8 bytes; pos lands at 8 == prefix.len().
-        assert_eq!(file.len(), 8);
+        // Marker + a non-last STREAMINFO (valid 34-byte body) then truncated: after the
+        // first block, pos = 4 + 4 + 34 = 42. The prefix ends exactly there, so the
+        // loop guard `pos + 4 > prefix.len()` fires with pos == 42.
+        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[0u8; 34], false, None)]);
+        // file is fLaC(4) + header(4) + body(34) = 42 bytes; pos lands at 42 == prefix.len().
+        assert_eq!(file.len(), 42);
         match read_metadata_bounded(&file).unwrap() {
             // kills flac L96 `pos + 4 > prefix.len()` `+` -> `-`: with `pos - 4`
-            // (8-4=4) the comparison 4 > 8 is false, so it would NOT return NeedMore
-            // and instead panic reading prefix[8..]. NeedMore here kills it.
-            // kills flac L99 up_to `(pos + 4)` `+` -> `-`/`*`: pos==8 -> correct
-            // up_to == 12. `pos - 4` gives 4; `pos * 4` gives 32. Exact 12 kills both.
-            Extent::NeedMore { up_to } => assert_eq!(up_to, 12),
-            other @ Extent::Complete(_) => panic!("expected NeedMore{{up_to:12}}, got {other:?}"),
+            // (42-4=38) the comparison 38 > 42 is false, so it would NOT return NeedMore
+            // and instead panic reading prefix[42..]. NeedMore here kills it.
+            // kills flac L99 up_to `(pos + 4)` `+` -> `-`/`*`: pos==42 -> correct
+            // up_to == 46. `pos - 4` gives 38; `pos * 4` gives 168. Exact 46 kills both.
+            Extent::NeedMore { up_to } => assert_eq!(up_to, 46),
+            other @ Extent::Complete(_) => panic!("expected NeedMore{{up_to:46}}, got {other:?}"),
         }
     }
 
     #[test]
     fn bounded_is_last_flag_continues_past_nonlast_block() {
-        // Two blocks: first NON-last STREAMINFO (body 0xAA*2), then a LAST
-        // STREAMINFO (body 0xBB*3) + no audio. audio_offset must span BOTH.
-        let b1 = raw_block(BLOCK_STREAMINFO, &[0xAA, 0xAA], false, None); // 4+2=6
-        let b2 = raw_block(BLOCK_STREAMINFO, &[0xBB, 0xBB, 0xBB], true, None); // 4+3=7
+        // First NON-last STREAMINFO (valid 34-byte body), then a LAST SEEKTABLE.
+        // audio_offset must span BOTH, proving we walked past the non-last block.
+        let b1 = raw_block(BLOCK_STREAMINFO, &[0u8; 34], false, None); // 4+34 = 38
+        let b2 = raw_block(BLOCK_SEEKTABLE, &[0xBB, 0xBB, 0xBB], true, None); // 4+3 = 7
         let file = flac_with(&[b1, b2]);
-        let expected_offset = (4 + 6 + 7) as u64; // marker + block1 + block2
+        let expected_offset = (4 + 38 + 7) as u64; // marker + block1 + block2
         match read_metadata_bounded(&file).unwrap() {
             Extent::Complete(meta) => {
-                // kills flac L103 `header & 0x80` `&` -> `|`: `header | 0x80` is always
-                // nonzero -> is_last always true -> it would stop after block 1 with
-                // audio_offset == 4+6 == 10. Spanning both blocks (17) kills it.
+                // kills flac `header & 0x80` `&` -> `|`: that mutant stops after block 1
+                // (audio_offset == 4+38 == 42). Spanning both blocks (49) kills it.
                 assert_eq!(meta.audio_offset, expected_offset);
-                // both STREAMINFO blocks preserved -> proves we walked past block 1.
                 assert_eq!(meta.preserved.len(), 2);
             }
             other @ Extent::NeedMore { .. } => panic!("expected Complete, got {other:?}"),
@@ -806,8 +891,8 @@ mod tests {
 
     #[test]
     fn bounded_block_type_mask_preserves_streaminfo() {
-        // A single last STREAMINFO (type 0) with a known body.
-        let body = vec![0x5A; 8];
+        // A single last STREAMINFO (type 0) with a known 34-byte body.
+        let body = vec![0x5A; 34];
         let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &body, true, None)]);
         match read_metadata_bounded(&file).unwrap() {
             Extent::Complete(meta) => {
@@ -826,13 +911,16 @@ mod tests {
 
     #[test]
     fn bounded_decodes_24bit_length_exactly() {
-        // Single last block whose declared length = 0x010203 (bytes 0x01,0x02,0x03),
-        // exercising all three length positions. Body is that many bytes so the block
-        // fits and we get a Complete with an exact audio_offset.
+        // STREAMINFO (valid, non-last) then a LAST SEEKTABLE whose declared length =
+        // 0x010203 (bytes 0x01,0x02,0x03), exercising all three length positions.
+        // Body is that many bytes so the block fits and we get a Complete with an
+        // exact audio_offset.
+        let b1 = raw_block(BLOCK_STREAMINFO, &[0u8; 34], false, None); // 4+34 = 38
         let len = 0x01_0203usize;
         let body = vec![0u8; len];
-        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &body, true, None)]);
-        let expected_offset = (4 + 4 + len) as u64;
+        let b2 = raw_block(BLOCK_SEEKTABLE, &body, true, None); // 4+len
+        let file = flac_with(&[b1, b2]);
+        let expected_offset = (4 + 38 + 4 + len) as u64;
         match read_metadata_bounded(&file).unwrap() {
             Extent::Complete(meta) => {
                 // The exact audio_offset pins all three bytes of the 24-bit length
@@ -862,11 +950,12 @@ mod tests {
 
     #[test]
     fn bounded_body_end_equal_to_prefix_is_complete() {
-        // A single LAST STREAMINFO whose body ends EXACTLY at the prefix end (no
-        // audio). body_end == prefix.len().
-        let body = vec![0xCC; 6];
-        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &body, true, None)]);
-        let total = file.len() as u64; // 4 + 4 + 6 == 14
+        // A STREAMINFO (valid 34-byte body, non-last) then a LAST SEEKTABLE whose
+        // body ends EXACTLY at the prefix end (no audio). body_end == prefix.len().
+        let b1 = raw_block(BLOCK_STREAMINFO, &[0u8; 34], false, None); // 4+34 = 38
+        let b2 = raw_block(BLOCK_SEEKTABLE, &[0xCC; 6], true, None); // 4+6 = 10
+        let file = flac_with(&[b1, b2]);
+        let total = file.len() as u64; // 4 + 38 + 10 == 52
         match read_metadata_bounded(&file).unwrap() {
             // kills flac L110 `body_end > prefix.len()` `>` -> `>=`: with `>=`,
             // body_end == prefix.len() is true -> wrongly returns NeedMore. Original
@@ -883,7 +972,7 @@ mod tests {
         // kills flac L116 (delete the STREAMINFO|APPLICATION|SEEKTABLE|CUESHEET arm):
         // a prefix containing each preserved type must yield all four in `preserved`.
         // Deleting the arm makes `preserved` empty -> these assertions fail.
-        let b_si = raw_block(BLOCK_STREAMINFO, &[0x01], false, None);
+        let b_si = raw_block(BLOCK_STREAMINFO, &[0x01; 34], false, None);
         let b_app = raw_block(BLOCK_APPLICATION, &[0x02, 0x02], false, None);
         let b_seek = raw_block(BLOCK_SEEKTABLE, &[0x03, 0x03, 0x03], false, None);
         let b_cue = raw_block(BLOCK_CUESHEET, &[0x04], true, None);
@@ -900,7 +989,7 @@ mod tests {
                         BLOCK_CUESHEET,
                     ]
                 );
-                assert_eq!(meta.preserved[0].body, vec![0x01]);
+                assert_eq!(meta.preserved[0].body, vec![0x01; 34]);
                 assert_eq!(meta.preserved[1].body, vec![0x02, 0x02]);
                 assert_eq!(meta.preserved[2].body, vec![0x03, 0x03, 0x03]);
                 assert_eq!(meta.preserved[3].body, vec![0x04]);
@@ -972,10 +1061,10 @@ mod tests {
         let at_limit = 0x00FF_FFFF - framing_len; // body_len == 0x00FF_FFFF exactly
         // original `>` accepts the inclusive boundary; the `>=` mutant rejects it.
         // (data_len is only a count; no large allocation occurs.)
-        assert!(synthesize_layout(&[], 0, 0, &[], &[], &[mk(at_limit)]).is_ok());
+        assert!(synthesize_layout(&[valid_streaminfo()], 0, 0, &[], &[], &[mk(at_limit)]).is_ok());
         // one byte over must still error, pinning the high side of the boundary.
         assert_eq!(
-            synthesize_layout(&[], 0, 0, &[], &[], &[mk(at_limit + 1)]),
+            synthesize_layout(&[valid_streaminfo()], 0, 0, &[], &[], &[mk(at_limit + 1)]),
             Err(FormatError::TooLarge)
         );
     }
@@ -992,12 +1081,12 @@ mod tests {
             .len() as u64;
         let at_limit = "x".repeat(crate::convert::usize_from(MAX_BLOCK_BODY - overhead));
         let tags = [TagInput::new("title", at_limit.as_str())];
-        assert!(synthesize_layout(&[], 0, 0, &tags, &[], &[]).is_ok());
+        assert!(synthesize_layout(&[valid_streaminfo()], 0, 0, &tags, &[], &[]).is_ok());
         // one byte over must still error, pinning the high side of the boundary.
         let over = format!("{at_limit}x");
         let tags = [TagInput::new("title", over.as_str())];
         assert_eq!(
-            synthesize_layout(&[], 0, 0, &tags, &[], &[]),
+            synthesize_layout(&[valid_streaminfo()], 0, 0, &tags, &[], &[]),
             Err(FormatError::TooLarge)
         );
     }
@@ -1017,7 +1106,7 @@ mod tests {
             data_len: BlobLen::new(data_len).unwrap(),
         };
         assert_eq!(
-            synthesize_layout(&[], 0, 0, &[], &[], &[mk(u64::MAX)]),
+            synthesize_layout(&[valid_streaminfo()], 0, 0, &[], &[], &[mk(u64::MAX)]),
             Err(FormatError::TooLarge)
         );
     }
@@ -1034,10 +1123,12 @@ mod tests {
             len: BlobLen::new(len).unwrap(),
         };
         // len == 0x00FF_FFFF exactly must succeed.
-        assert!(synthesize_layout(&[], 0, 0, &[], &[mk(0x00FF_FFFF)], &[]).is_ok());
+        assert!(
+            synthesize_layout(&[valid_streaminfo()], 0, 0, &[], &[mk(0x00FF_FFFF)], &[]).is_ok()
+        );
         // one byte over must still error, pinning the high side of the boundary.
         assert_eq!(
-            synthesize_layout(&[], 0, 0, &[], &[mk(0x0100_0000)], &[]),
+            synthesize_layout(&[valid_streaminfo()], 0, 0, &[], &[mk(0x0100_0000)], &[]),
             Err(FormatError::TooLarge)
         );
     }

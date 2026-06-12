@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use common::{make_flac, resolve_layout, streaminfo_body, vorbis_comment_body};
-use musefs_format::flac::{locate_audio, synthesize_layout};
+use musefs_format::flac::{MetadataBlock, locate_audio, synthesize_layout};
 use musefs_format::{ArtInput, BlobLen, PictureType, Segment, TagInput};
 
 fn fixture() -> (Vec<u8>, Vec<u8>) {
@@ -112,8 +112,12 @@ fn synthesize_errors_on_oversized_picture() {
         height: 0,
         data_len: BlobLen::new(0x0100_0000).unwrap(), // just over the 24-bit FLAC PICTURE block limit
     };
+    let streaminfo = [MetadataBlock {
+        block_type: 0,
+        body: streaminfo_body(),
+    }];
     assert_eq!(
-        synthesize_layout(&[], 0, 0, &[], &[], &[art]),
+        synthesize_layout(&streaminfo, 0, 0, &[], &[], &[art]),
         Err(FormatError::TooLarge)
     );
 }
