@@ -331,11 +331,11 @@ fn sanitize_path(value: &str) -> String {
     let mut out = String::new();
     let mut count = 0usize;
     for segment in value.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            continue;
-        }
         if count == MAX_PATH_FIELD_SEGMENTS {
             break;
+        }
+        if segment.is_empty() || segment == "." || segment == ".." {
+            continue;
         }
         if !out.is_empty() {
             out.push('/');
