@@ -15,10 +15,19 @@ ExecStart=musefs mount
 #ExecStop=-fusermount3 -u ${MUSEFS_MOUNTPOINT}
 Restart=on-failure
 RestartSec=5
-# NoNewPrivileges is safe for a FUSE mount. Do NOT add ProtectHome=,
-# PrivateMounts=, or MountFlags=private: they place the mount in a private
-# namespace and hide it from the rest of your session.
-NoNewPrivileges=true
+# This unit is deliberately NOT sandboxed, and that cannot be changed without
+# breaking the mount. musefs mounts via the *setuid* fusermount3 helper, and
+# NoNewPrivileges=true disables the setuid escalation, so the mount fails with
+# "fusermount3: mount failed: Operation not permitted". Crucially, nearly every
+# systemd hardening directive (SystemCallFilter=, Restrict*, LockPersonality=,
+# MemoryDenyWriteExecute=, ProtectKernel*, ProtectControlGroups=, ...) forces
+# the kernel no_new_privs flag — it is required to install a seccomp filter for
+# an unprivileged process — which breaks the mount the same way, *even with*
+# NoNewPrivileges=no. So none of them can be added here.
+# Do NOT add ProtectHome=, PrivateMounts=, or MountFlags=private either: those
+# place the mount in a private namespace and hide it from the rest of your
+# session.
+# (The scanner, musefs-scan.service, creates no mount and IS fully sandboxed.)
 
 [Install]
 WantedBy=default.target
