@@ -507,3 +507,27 @@ fn follow_symlinks_mirrored_dir_counts_unsupported_file_once() {
     assert_eq!(stats.scanned, 0);
     assert_eq!(stats.skipped, 1, "notes.txt is skipped once, not twice");
 }
+
+/// Two hardlinks to the same inode collapse to a single track under follow: the
+/// `(dev, ino)` dedup keys on inode identity, so hardlinks dedup like symlinks.
+/// Locks in the documented #302 side effect.
+#[test]
+fn follow_symlinks_dedups_hardlinks_to_same_inode() {
+    let dir = tempfile::tempdir().unwrap();
+    let song = dir.path().join("song.flac");
+    std::fs::write(&song, flac_minimal(b"AUDIO-SONG")).unwrap();
+    std::fs::hard_link(&song, dir.path().join("link.flac")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(
+        stats.scanned, 1,
+        "hardlinks to one inode ingest once under follow"
+    );
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
