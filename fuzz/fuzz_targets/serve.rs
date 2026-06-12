@@ -5,6 +5,7 @@ use musefs_core::{HeaderCache, Mode, read_at_with_file};
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_fuzz::{MAX_INPUT, arb_arts, arb_tags};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 
 /// Build a one-track in-memory DB over `backing` written to a temp file, and
 /// return (tempdir, db, track_id). Returns None on any setup error.
@@ -26,14 +27,8 @@ fn setup(
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .ok()?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()?
-                    .as_secs(),
-            )
-            .ok()?,
+            backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
         })
         .ok()?;
     db.replace_tags(id, &[Tag::new("title", "T", 0)]).ok()?;

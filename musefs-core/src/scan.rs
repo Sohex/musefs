@@ -7,6 +7,8 @@ use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, 
 
 use crate::byte_budget::ByteBudget;
 use crate::error::Result;
+use crate::freshness::BackingStamp;
+use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::sync_channel;
 
 const BATCH_FILES: usize = 256;
@@ -47,13 +49,6 @@ pub struct RevalidateStats {
     pub unchanged: u64,
     pub pruned: u64,
     pub failed: u64,
-}
-
-fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs().cast_signed())
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
@@ -481,8 +476,7 @@ fn effective_jobs(jobs: usize) -> usize {
 /// One probed file ready to write, plus its art-byte weight for backpressure.
 struct Unit {
     abs_path: String,
-    meta_len: u64,
-    meta_mtime: i64,
+    stamp: BackingStamp,
     probed: Probed,
     weight: u64,
 }
@@ -505,13 +499,15 @@ fn payload_weight(p: &Probed) -> u64 {
 /// Upsert a track from a probed backing file: write the track row, replace its
 /// seeded tags, and ingest its embedded art (capped, deduped, clamped).
 fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
+    let stamp = BackingStamp::from_metadata(meta);
     let track_id = db.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
         format: probed.format,
         audio_offset: probed.audio_offset,
         audio_length: probed.audio_length,
         backing_size: meta.len(),
-        backing_mtime: mtime_secs(meta),
+        backing_mtime_ns: stamp.mtime_ns,
+        backing_ctime_ns: stamp.ctime_ns,
     })?;
 
     let mut tags = Vec::new();
@@ -584,8 +580,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
 fn ingest_bulk(
     bw: &mut musefs_db::BulkWriter<'_>,
     abs_path: &str,
-    meta_len: u64,
-    meta_mtime: i64,
+    stamp: BackingStamp,
     probed: Probed,
 ) -> Result<()> {
     let track_id = bw.upsert_track(&NewTrack {
@@ -593,8 +588,9 @@ fn ingest_bulk(
         format: probed.format,
         audio_offset: probed.audio_offset,
         audio_length: probed.audio_length,
-        backing_size: meta_len,
-        backing_mtime: meta_mtime,
+        backing_size: stamp.size,
+        backing_mtime_ns: stamp.mtime_ns,
+        backing_ctime_ns: stamp.ctime_ns,
     })?;
 
     let mut tags = Vec::new();
@@ -731,8 +727,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                         budget.acquire(weight); // backpressure on in-flight art bytes
                         let unit = Unit {
                             abs_path: abs.to_string_lossy().into_owned(),
-                            meta_len: meta.len(),
-                            meta_mtime: mtime_secs(&meta),
+                            stamp: BackingStamp::from_metadata(&meta),
                             probed,
                             weight,
                         };
@@ -767,14 +762,13 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         let mut weights = Vec::with_capacity(batch.len());
         for Unit {
             abs_path,
-            meta_len,
-            meta_mtime,
+            stamp,
             probed,
             weight,
         } in batch.drain(..)
         {
             weights.push(weight);
-            ingest_bulk(&mut bw, &abs_path, meta_len, meta_mtime, probed)?;
+            ingest_bulk(&mut bw, &abs_path, stamp, probed)?;
             *scanned += 1;
         }
         bw.commit()?;
@@ -899,7 +893,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         .map(|t| {
             (
                 t.backing_path,
-                (t.backing_size, t.backing_mtime, t.id, t.format),
+                (t.backing_size, t.backing_mtime_ns, t.id, t.format),
             )
         })
         .collect();
@@ -923,7 +917,10 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         let key = abs.to_string_lossy().into_owned();
         if let Some(&(size, mtime, id, format)) = existing.get(&key) {
             let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
-            if size == meta.len() && mtime == mtime_secs(&meta) && !needs_backfill {
+            if size == meta.len()
+                && mtime == meta.mtime() * 1_000_000_000 + meta.mtime_nsec()
+                && !needs_backfill
+            {
                 unchanged += 1;
                 continue;
             }
@@ -1679,7 +1676,8 @@ mod hardening_tests {
             audio_offset: 0,
             audio_length: 0,
             backing_size: 0,
-            backing_mtime: 0,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
         })
         .unwrap();
 
@@ -1809,7 +1807,17 @@ mod hardening_tests {
         let db = Db::open_in_memory().unwrap();
         {
             let mut bw = db.bulk_writer().unwrap();
-            ingest_bulk(&mut bw, "/a.mp3", 1, 0, probed_with_mixed_binary_tags()).unwrap();
+            ingest_bulk(
+                &mut bw,
+                "/a.mp3",
+                BackingStamp {
+                    size: 1,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                },
+                probed_with_mixed_binary_tags(),
+            )
+            .unwrap();
             bw.commit().unwrap();
         }
         let tid = db.list_tracks().unwrap()[0].id;
@@ -1927,8 +1935,11 @@ mod hardening_tests {
             ingest_bulk(
                 &mut bw,
                 "/a.flac",
-                1,
-                0,
+                BackingStamp {
+                    size: 1,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                },
                 probed_with_duplicate_structural_kind(),
             )
             .unwrap();

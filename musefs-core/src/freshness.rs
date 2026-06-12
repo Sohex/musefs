@@ -12,13 +12,12 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 /// adversarial backstop: a writer can reset mtime with `utimensat`, but ctime
 /// is bumped by any write and cannot be set backward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BackingStamp {
+pub struct BackingStamp {
     pub size: u64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
 }
 
-#[allow(dead_code)]
 impl BackingStamp {
     pub fn from_metadata(meta: &std::fs::Metadata) -> BackingStamp {
         BackingStamp {
@@ -31,6 +30,14 @@ impl BackingStamp {
                 .ctime()
                 .saturating_mul(NANOS_PER_SEC)
                 .saturating_add(meta.ctime_nsec()),
+        }
+    }
+
+    pub fn from_track(t: &musefs_db::Track) -> BackingStamp {
+        BackingStamp {
+            size: t.backing_size,
+            mtime_ns: t.backing_mtime_ns,
+            ctime_ns: t.backing_ctime_ns,
         }
     }
 

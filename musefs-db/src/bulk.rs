@@ -39,14 +39,15 @@ impl BulkWriter<'_> {
     pub fn upsert_track(&mut self, t: &NewTrack) -> Result<i64> {
         self.tx.execute(
             "INSERT INTO tracks
-                (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))
+                (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns, backing_ctime_ns, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CAST(strftime('%s','now') AS INTEGER))
              ON CONFLICT(backing_path) DO UPDATE SET
                 format=excluded.format, audio_offset=excluded.audio_offset,
                 audio_length=excluded.audio_length, backing_size=excluded.backing_size,
-                backing_mtime=excluded.backing_mtime,
+                backing_mtime_ns=excluded.backing_mtime_ns,
+                backing_ctime_ns=excluded.backing_ctime_ns,
                 updated_at=CAST(strftime('%s','now') AS INTEGER)",
-            params![t.backing_path, t.format.as_str(), t.audio_offset, t.audio_length, t.backing_size, t.backing_mtime],
+            params![t.backing_path, t.format.as_str(), t.audio_offset, t.audio_length, t.backing_size, t.backing_mtime_ns, t.backing_ctime_ns],
         )?;
         Ok(self.tx.query_row(
             "SELECT id FROM tracks WHERE backing_path = ?1",
@@ -162,7 +163,8 @@ mod tests {
                         audio_offset: 100,
                         audio_length: 200,
                         backing_size: 300,
-                        backing_mtime: 1,
+                        backing_mtime_ns: 1,
+                        backing_ctime_ns: 0,
                     })
                     .unwrap();
                 bw.replace_tags(id, &[Tag::new("title", &format!("t{i}"), 0)])
@@ -261,7 +263,8 @@ mod tests {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.set_binary_tags(
@@ -302,7 +305,8 @@ mod tests {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         {
@@ -343,7 +347,8 @@ mod tests {
                     audio_offset: 0,
                     audio_length: 1,
                     backing_size: 1,
-                    backing_mtime: 0,
+                    backing_mtime_ns: 0,
+                    backing_ctime_ns: 0,
                 })
                 .unwrap();
             bw.set_structural_blocks(
@@ -383,7 +388,8 @@ mod tests {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
             // Dropped here without `commit()` → Transaction rolls back.

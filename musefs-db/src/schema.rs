@@ -283,6 +283,11 @@ END;
 ";
 
 const MIGRATION_V5: &str = r"
+ALTER TABLE tracks RENAME COLUMN backing_mtime TO backing_mtime_ns;
+ALTER TABLE tracks ADD COLUMN backing_ctime_ns INTEGER NOT NULL DEFAULT 0
+    CHECK (backing_ctime_ns >= 0);
+
+
 -- art rows are content-addressed by sha256: once written, their content
 -- columns are immutable. A writer needing different bytes/metadata inserts a
 -- NEW row and relinks via track_art (which bumps content_version through the
@@ -330,7 +335,7 @@ WHEN NEW.format        <> OLD.format
   OR NEW.audio_offset  <> OLD.audio_offset
   OR NEW.audio_length  <> OLD.audio_length
   OR NEW.backing_size  <> OLD.backing_size
-  OR NEW.backing_mtime <> OLD.backing_mtime
+  OR NEW.backing_mtime_ns <> OLD.backing_mtime_ns
 BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
 END;
@@ -460,7 +465,7 @@ mod migration_v2_tests {
         // value_blob exists on tags and defaults to NULL.
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/a.flac','flac',0,1,1,0,0)",
             [],
         )
@@ -559,7 +564,7 @@ mod migration_v3_tests {
     fn insert_track(conn: &Connection, path: &str) {
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES (?1,'flac',0,1,1,0,0)",
             [path],
         )
@@ -579,7 +584,7 @@ mod migration_v3_tests {
         assert_eq!(count_changes(&conn), 1);
 
         conn.execute(
-            "UPDATE tracks SET backing_mtime = 1 WHERE id = 1", // tracks AU -> 2 rows (geometry trigger nested UPDATE)
+            "UPDATE tracks SET backing_mtime_ns = 1 WHERE id = 1", // tracks AU -> 2 rows (geometry trigger nested UPDATE)
             [],
         )
         .unwrap();
@@ -634,7 +639,7 @@ mod migration_v3_tests {
         insert_track(&conn, "/a.flac");
         // Drive CAP + 100 changelog inserts via track updates.
         for i in 0..(super::CHANGELOG_CAP + 100) {
-            conn.execute("UPDATE tracks SET backing_mtime = ?1 WHERE id = 1", [i])
+            conn.execute("UPDATE tracks SET backing_mtime_ns = ?1 WHERE id = 1", [i])
                 .unwrap();
         }
         let (min_seq, max_seq, rows): (i64, i64, i64) = conn
@@ -659,7 +664,14 @@ mod migration_v3_tests {
         conn.execute_batch(super::MIGRATIONS[0]).unwrap();
         conn.execute_batch(super::MIGRATIONS[1]).unwrap();
         conn.pragma_update(None, "user_version", 2i64).unwrap();
-        insert_track(&conn, "/legacy.flac");
+        // V2 schema has `backing_mtime` (pre-rename); use it directly.
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime, updated_at) \
+             VALUES ('/legacy.flac','flac',0,1,1,0,0)",
+            [],
+        )
+        .unwrap();
 
         super::migrate(&mut conn).unwrap();
         let uv: i64 = conn
@@ -669,7 +681,7 @@ mod migration_v3_tests {
         // Pre-migration rows produce no retroactive changelog entries...
         assert_eq!(count_changes(&conn), 0);
         // ...but post-migration edits do.
-        conn.execute("UPDATE tracks SET backing_mtime = 9 WHERE id = 1", [])
+        conn.execute("UPDATE tracks SET backing_mtime_ns = 9 WHERE id = 1", [])
             .unwrap();
         assert_eq!(count_changes(&conn), 2);
     }
@@ -796,10 +808,20 @@ mod migration_v4_tests {
         super::migrate(conn).unwrap();
     }
 
-    fn insert_track(conn: &Connection, path: &str) {
+    fn insert_track_v3(conn: &Connection, path: &str) {
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime, updated_at) \
+             VALUES (?1,'flac',0,1,1,0,0)",
+            [path],
+        )
+        .unwrap();
+    }
+
+    fn insert_track(conn: &Connection, path: &str) {
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES (?1,'flac',0,1,1,0,0)",
             [path],
         )
@@ -866,7 +888,7 @@ mod migration_v4_tests {
         conn.execute_batch(super::MIGRATIONS[2]).unwrap();
         conn.pragma_update(None, "user_version", 3i64).unwrap();
 
-        insert_track(&conn, "/legacy.flac");
+        insert_track_v3(&conn, "/legacy.flac");
         conn.execute(
             "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?1,'image/png',1,X'00')",
             [&"b".repeat(64)],
@@ -935,7 +957,7 @@ mod migration_v4_tests {
         rejected(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/x','aiff',0,0,0,0,0)",
         );
     }
@@ -950,7 +972,7 @@ mod migration_v4_tests {
         {
             conn.execute(
                 "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-                 backing_size, backing_mtime, updated_at) \
+                 backing_size, backing_mtime_ns, updated_at) \
                  VALUES (?1, ?2, 0, 0, 0, 0, 0)",
                 rusqlite::params![format!("/t{i}"), fmt],
             )
@@ -965,7 +987,7 @@ mod migration_v4_tests {
         rejected(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/x','flac',-1,0,0,0,0)",
         );
     }
@@ -977,7 +999,7 @@ mod migration_v4_tests {
         rejected(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/x','flac',0,-1,0,0,0)",
         );
     }
@@ -989,19 +1011,19 @@ mod migration_v4_tests {
         rejected(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/x','flac',0,0,-1,0,0)",
         );
     }
 
     #[test]
-    fn v4_tracks_rejects_negative_backing_mtime() {
+    fn v4_tracks_rejects_negative_backing_mtime_ns() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
         rejected(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/x','flac',0,0,0,-1,0)",
         );
     }
@@ -1013,7 +1035,7 @@ mod migration_v4_tests {
         rejected(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, content_version, updated_at) \
+             backing_size, backing_mtime_ns, content_version, updated_at) \
              VALUES ('/x','flac',0,0,0,0,-1,0)",
         );
     }
@@ -1025,7 +1047,7 @@ mod migration_v4_tests {
         rejected(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/x','flac',0,0,0,0,-1)",
         );
     }
@@ -1037,12 +1059,12 @@ mod migration_v4_tests {
         rejected(
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/x','flac',5,10,14,0,0)",
         );
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES ('/ok','flac',5,10,15,0,0)",
             [],
         )
@@ -1242,8 +1264,8 @@ mod migration_v4_tests {
         conn.execute_batch(super::MIGRATIONS[1]).unwrap();
         conn.execute_batch(super::MIGRATIONS[2]).unwrap();
         conn.pragma_update(None, "user_version", 3i64).unwrap();
-        insert_track(&conn, "/a.flac");
-        insert_track(&conn, "/b.flac");
+        insert_track_v3(&conn, "/a.flac");
+        insert_track_v3(&conn, "/b.flac");
         conn.execute("DELETE FROM track_changes", []).unwrap();
 
         super::migrate(&mut conn).unwrap();
@@ -1405,7 +1427,7 @@ mod migration_v4_tests {
         conn.execute_batch(super::MIGRATIONS[2]).unwrap();
         conn.pragma_update(None, "user_version", 3i64).unwrap();
 
-        insert_track(&conn, "/legacy.flac");
+        insert_track_v3(&conn, "/legacy.flac");
         conn.execute(
             "INSERT INTO structural_blocks (track_id, kind, ordinal, body) VALUES (1, 'STREAMINFO', 0, X'AABB')",
             [],
@@ -1501,7 +1523,7 @@ mod identity_tests {
         let conn = migrated();
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) VALUES ('/a.flac','flac',0,1,1,0,0)",
+             backing_size, backing_mtime_ns, updated_at) VALUES ('/a.flac','flac',0,1,1,0,0)",
             [],
         )
         .unwrap();
@@ -1632,7 +1654,7 @@ mod migration_v5_tests {
     fn insert_track(conn: &Connection, path: &str) -> i64 {
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
+             backing_size, backing_mtime_ns, updated_at) \
              VALUES (?1,'flac',0,1,1,0,0)",
             [path],
         )

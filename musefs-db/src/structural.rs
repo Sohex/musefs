@@ -92,7 +92,8 @@ mod guard_tests {
                 audio_offset: 0,
                 audio_length: 1,
                 backing_size: 1,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         (db, id)
@@ -188,7 +189,8 @@ mod tests {
                 audio_offset: 0,
                 audio_length: 1,
                 backing_size: 1,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.set_structural_blocks(

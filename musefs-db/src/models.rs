@@ -130,7 +130,8 @@ pub struct Track {
     pub format: Format,
     pub bounds: TrackBounds,
     pub backing_size: u64,
-    pub backing_mtime: i64,
+    pub backing_mtime_ns: i64,
+    pub backing_ctime_ns: i64,
     pub content_version: i64,
     pub updated_at: i64,
 }
@@ -142,7 +143,8 @@ pub struct NewTrack {
     pub audio_offset: u64,
     pub audio_length: u64,
     pub backing_size: u64,
-    pub backing_mtime: i64,
+    pub backing_mtime_ns: i64,
+    pub backing_ctime_ns: i64,
 }
 
 #[derive(Debug, Clone)]

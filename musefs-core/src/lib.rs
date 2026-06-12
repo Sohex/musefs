@@ -2,7 +2,7 @@ mod byte_budget;
 mod db_pool;
 mod error;
 mod facade;
-mod freshness;
+pub mod freshness;
 mod lock;
 mod mapping;
 pub mod metrics;

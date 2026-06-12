@@ -22,7 +22,8 @@ fn resolve_one_flac() -> (Db, std::sync::Arc<ResolvedFile>, tempfile::TempDir) {
             audio_offset,
             audio_length,
             backing_size: std::fs::metadata(&src).unwrap().len(),
-            backing_mtime: common::real_mtime(&src),
+            backing_mtime_ns: common::real_mtime_ns(&src),
+            backing_ctime_ns: common::real_ctime_ns(&src),
         })
         .unwrap();
     db.replace_tags(id, &[musefs_db::Tag::new("title", "Faulty", 0)])
