@@ -264,6 +264,11 @@ END;
 PRAGMA user_version = 4;
 
 -- ── MIGRATION_V5 ──
+ALTER TABLE tracks RENAME COLUMN backing_mtime TO backing_mtime_ns;
+ALTER TABLE tracks ADD COLUMN backing_ctime_ns INTEGER NOT NULL DEFAULT 0
+    CHECK (backing_ctime_ns >= 0);
+
+
 -- art rows are content-addressed by sha256: once written, their content
 -- columns are immutable. A writer needing different bytes/metadata inserts a
 -- NEW row and relinks via track_art (which bumps content_version through the
@@ -311,7 +316,7 @@ WHEN NEW.format        <> OLD.format
   OR NEW.audio_offset  <> OLD.audio_offset
   OR NEW.audio_length  <> OLD.audio_length
   OR NEW.backing_size  <> OLD.backing_size
-  OR NEW.backing_mtime <> OLD.backing_mtime
+  OR NEW.backing_mtime_ns <> OLD.backing_mtime_ns
 BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
 END;

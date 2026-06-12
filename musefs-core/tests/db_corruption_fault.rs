@@ -18,7 +18,8 @@ fn corrupt_db_header_errors_instead_of_panicking() {
             audio_offset: 0,
             audio_length: 1,
             backing_size: 1,
-            backing_mtime: 0,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
         })
         .unwrap();
     } // connection dropped, file flushed

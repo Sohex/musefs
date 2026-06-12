@@ -85,7 +85,8 @@ fn delete_track_cascades_tags_and_track_art() {
             audio_offset: 0,
             audio_length: 0,
             backing_size: 0,
-            backing_mtime: 0,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("artist", "A", 0)]).unwrap();
@@ -129,7 +130,8 @@ fn upsert_conflict_updates_all_mutable_columns() {
         audio_offset: 222,
         audio_length: 333,
         backing_size: 555,
-        backing_mtime: 555,
+        backing_mtime_ns: 555,
+        backing_ctime_ns: 666,
     };
     let id2 = db.upsert_track(&changed).unwrap();
     assert_eq!(id, id2, "conflict update must keep the same id");
@@ -139,7 +141,8 @@ fn upsert_conflict_updates_all_mutable_columns() {
     assert_eq!(t.bounds.audio_offset(), 222);
     assert_eq!(t.bounds.audio_length(), 333);
     assert_eq!(t.backing_size, 555);
-    assert_eq!(t.backing_mtime, 555);
+    assert_eq!(t.backing_mtime_ns, 555);
+    assert_eq!(t.backing_ctime_ns, 666);
 }
 
 #[test]

@@ -435,7 +435,7 @@ proptest! {
                     let new = musefs_db::NewTrack {
                         backing_path: format!("/virt/added-{add_seq}.flac"),
                         format: musefs_db::Format::Flac,
-                        audio_offset: 0, audio_length: 1, backing_size: 1, backing_mtime: 0,
+                        audio_offset: 0, audio_length: 1, backing_size: 1, backing_mtime_ns: 0, backing_ctime_ns: 0,
                     };
                     // Surface DB errors instead of vacuously skipping the op.
                     let id = writer.upsert_track(&new).unwrap();

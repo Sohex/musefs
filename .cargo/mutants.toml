@@ -95,37 +95,37 @@ exclude_re = [
     # candidates is pinned by the disambiguation and collision-gate tests; only
     # the un-rankable constant replacements are excluded.
     'replace suffix_candidate -> String with',
-    # probe_file widen loop: `.max(want + 1)` is dominated — the bounded probers
+    # probe_body widen loop: `.max(want + 1)` is dominated — the bounded probers
     # only return `NeedMore{up_to}` with `up_to > want` (we widen precisely to a
     # block end past the prefix), so `up_to.min(probe_cap)` always wins the max and
     # the `want + 1` term is never selected. `+`->`-`/`*` are equivalent.
-    # guard: op="+" fn="probe_file" rows=2
-    'musefs-core/src/scan\.rs:341:31:',
-    # probe_file post-loop fallback guard `(prefix.len() as u64) < probe_cap`: when
+    # guard: op="+" fn="probe_body" rows=2
+    'musefs-core/src/scan\.rs:396:31:',
+    # probe_body post-loop fallback guard `(prefix.len() as u64) < probe_cap`: when
     # it differs, the only effect is a redundant re-read up to the probe cap that
     # feeds the same `probe_full` result. The >8-retry path that could diverge is
     # unreachable given the probers' exact (FLAC/MP3/WAV) / geometric (Ogg) NeedMore.
-    # guard: op="<" fn="probe_file" rows=3
-    'musefs-core/src/scan\.rs:348:30:',
-    # probe_file WAV ceiling-fallback guard `file_len > MAX_PROBE_BYTES` (`>` at
+    # guard: op="<" fn="probe_body" rows=3
+    'musefs-core/src/scan\.rs:403:30:',
+    # probe_body WAV ceiling-fallback guard `file_len > MAX_PROBE_BYTES` (`>` at
     # :21): differs from `>=` only at file_len == MAX_PROBE_BYTES exactly, where the
     # whole file already fits within probe_cap — so `probe_full` parses it (valid)
     # or `locate_audio_at_ceiling` rejects it on the same off+len>file_len bound
     # (corrupt), giving the identical skip either way. The ceiling branch is never
     # the deciding path at the boundary, so the mutant is equivalent.
-    # guard: op=">" fn="probe_file" rows=3
-    'musefs-core/src/scan\.rs:359:21:',
-    # probe_file oversize-skip diagnostic `file_len > MAX_PROBE_BYTES` (`>` at :17):
+    # guard: op=">" fn="probe_body" rows=3
+    'musefs-core/src/scan\.rs:414:21:',
+    # probe_body oversize-skip diagnostic `file_len > MAX_PROBE_BYTES` (`>` at :17):
     # gates only a `log::warn!` (mirroring the M4A `MetadataTooLarge` warn). It has
     # no effect on the returned `Probed`/skip decision or any persisted state, so
     # every mutation of the condition is unobservable — a pure observability shim,
     # like the metrics counters above.
-    # guard: op=">" fn="probe_file" rows=3
-    'musefs-core/src/scan\.rs:364:17:',
+    # guard: op=">" fn="probe_body" rows=3
+    'musefs-core/src/scan\.rs:419:17:',
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:707:46:',
+    'musefs-core/src/scan\.rs:764:46:',
     # run_pipeline flush cadence (batch_bytes accounting + the
     # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
     # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on
@@ -133,26 +133,26 @@ exclude_re = [
     # cadence mutation persists the identical track set. The win is fewer commits
     # (fsyncs), a performance property only observable via the `metrics`
     # instrumentation the in-diff gate does not build.
-    # NB: line:col here (and for revalidate below) — `replace += with` and
-    # `>=`/`||` repeat in run_pipeline (e.g. the killable `*scanned += 1` at
-    # 778), so these cannot be safely description-anchored. Re-verify these
-    # coordinates after any change that reformats scan.rs.
+    # NB: line:col here (and for revalidate below) — `+=` and `>=`/`||` repeat in
+    # run_pipeline (e.g. the killable `*scanned += 1` at 833), so these cannot be
+    # safely description-anchored. Re-verify these coordinates (via
+    # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:800:29:',
+    'musefs-core/src/scan\.rs:855:29:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:802:32:',
+    'musefs-core/src/scan\.rs:857:32:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:802:47:',
+    'musefs-core/src/scan\.rs:857:47:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:802:62:',
+    'musefs-core/src/scan\.rs:857:62:',
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:810:37:',
+    'musefs-core/src/scan\.rs:865:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:812:40:',
+    'musefs-core/src/scan\.rs:867:40:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:812:55:',
+    'musefs-core/src/scan\.rs:867:55:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:812:70:',
+    'musefs-core/src/scan\.rs:867:70:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
@@ -160,11 +160,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:916:25:',
+    'musefs-core/src/scan\.rs:977:25:',
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:920:25:',
+    'musefs-core/src/scan\.rs:981:25:',
     # guard: op="+" fn="revalidate_with" rows=1
-    'musefs-core/src/scan\.rs:956:29: replace \+ with -',
+    'musefs-core/src/scan\.rs:1017:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are

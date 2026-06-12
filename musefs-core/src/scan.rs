@@ -7,6 +7,7 @@ use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, 
 
 use crate::byte_budget::ByteBudget;
 use crate::error::Result;
+use crate::freshness::BackingStamp;
 use std::sync::mpsc::sync_channel;
 
 const BATCH_FILES: usize = 256;
@@ -34,11 +35,44 @@ pub(crate) const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 /// payloads (e.g. a GEOB embedding a multi-MB file) are logged-and-skipped.
 const MAX_BINARY_TAG_BYTES: usize = MAX_ART_BYTES;
 
+/// Outcome of probing one backing file. `Raced` means the file changed under us
+/// between the pre- and post-probe `fstat` — the probe may be torn, so nothing
+/// is committed for it (#276).
+#[derive(Debug)]
+enum ProbeOutcome {
+    Probed(Probed, BackingStamp),
+    Unsupported,
+    Raced,
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_S1_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn fire_after_s1() {
+    AFTER_S1_HOOK.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+#[cfg(test)]
+fn set_after_s1_hook(f: impl FnMut() + 'static) {
+    AFTER_S1_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+#[cfg(test)]
+fn clear_after_s1_hook() {
+    AFTER_S1_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanStats {
     pub scanned: u64,
     pub skipped: u64,
     pub failed: u64,
+    pub raced: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,13 +81,7 @@ pub struct RevalidateStats {
     pub unchanged: u64,
     pub pruned: u64,
     pub failed: u64,
-}
-
-fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs().cast_signed())
+    pub raced: u64,
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
@@ -161,6 +189,7 @@ fn dir_key(meta: &std::fs::Metadata) -> (u64, u64) {
 
 /// A backing file parsed into the fields a track row needs, plus its raw
 /// `(key, value)` tags to seed.
+#[derive(Debug)]
 pub(crate) struct Probed {
     format: Format,
     audio_offset: u64,
@@ -277,22 +306,48 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
     Ok(Some(buf))
 }
 
-/// Bounded probe of one backing file: open once, read a bounded window, dispatch
-/// per format, widening on `NeedMore`. Never reads the audio payload (M4A uses
-/// the seek reader; front-anchored formats read only the metadata extent).
-/// Returns `Ok(None)` for an unsupported/unparseable file (to be skipped).
+/// Bounded probe of one backing file: open once, fstat before and after the
+/// probe, and report `Raced` when the file moved mid-probe — so the stored
+/// stamp and the probed bytes provably share one inode held still across the
+/// probe. Never reads the audio payload (M4A uses the seek reader;
+/// front-anchored formats read only the metadata extent).
 ///
-/// Metrics note: `on_scan_read` counts the front-anchored prefix/widen/tail
-/// reads only. The M4A seek reader does its own positioned reads internally, so
-/// its bytes are not reflected in `SCAN_BYTES_READ` (only `on_scan_open` fires
-/// for M4A); its win shows up in wall time and peak RSS instead.
-fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Option<Probed>> {
+/// Returns `ProbeOutcome::Unsupported` for an unsupported/unparseable file (to
+/// be skipped) and `ProbeOutcome::Raced` if the file changed under us.
+fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
+    let s1 = BackingStamp::from_metadata(&file.metadata()?);
+    #[cfg(test)]
+    fire_after_s1();
 
+    let probed = probe_body(path, &file, s1.size, window)?;
+
+    let s2 = BackingStamp::from_metadata(&file.metadata()?);
+    if s1 != s2 {
+        log::warn!("skipping {}: changed during probe", path.display());
+        return Ok(ProbeOutcome::Raced);
+    }
+    Ok(match probed {
+        Some(p) => ProbeOutcome::Probed(p, s1),
+        None => ProbeOutcome::Unsupported,
+    })
+}
+
+/// The per-format metadata dispatch for one already-opened backing file, over
+/// its first `file_len` bytes. Split out of `probe_file` so the fstat-sandwich
+/// wrapper stays legible. Never reads the audio payload (M4A uses the seek
+/// reader; front-anchored formats read only the metadata extent). Returns
+/// `Ok(None)` for an unsupported/unparseable file.
+fn probe_body(
+    path: &Path,
+    file: &std::fs::File,
+    file_len: u64,
+    window: usize,
+) -> std::io::Result<Option<Probed>> {
     // M4A: seek reader, never touches mdat.
     if has_ext(path, "m4a") || has_ext(path, "m4b") {
-        let mut f = &file;
+        let mut f = file;
         let scan = match mp4::read_structure_from(&mut f, file_len) {
             Ok(s) => s,
             Err(e) => {
@@ -317,7 +372,7 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
     // arm of probe_prefix consumes the ID3v1 tail, and dispatch is by
     // extension — so only .mp3 pays the tail read (#67).
     let tail = if has_ext(path, "mp3") {
-        read_tail_128(&file, file_len)?
+        read_tail_128(file, file_len)?
     } else {
         None
     };
@@ -325,7 +380,7 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
     // (possibly corrupt) header asks for via `NeedMore`.
     let probe_cap = file_len.min(MAX_PROBE_BYTES);
     let mut want = usize_from((window as u64).min(probe_cap));
-    let mut prefix = read_window(&file, want)?;
+    let mut prefix = read_window(file, want)?;
     for _ in 0..MAX_WIDEN_RETRIES {
         match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
             Probe::Done(p) => return Ok(Some(p)),
@@ -340,13 +395,13 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
                 want = usize_from(up_to.min(probe_cap))
                     .max(want + 1)
                     .min(usize_from(probe_cap));
-                prefix = read_window(&file, want)?;
+                prefix = read_window(file, want)?;
             }
         }
     }
     // Fallback: full-buffer probe over the bytes we were willing to read.
     if (prefix.len() as u64) < probe_cap {
-        prefix = read_window(&file, usize_from(probe_cap))?;
+        prefix = read_window(file, usize_from(probe_cap))?;
     }
     if let Some(p) = probe_full(path, &prefix) {
         return Ok(Some(p));
@@ -481,8 +536,7 @@ fn effective_jobs(jobs: usize) -> usize {
 /// One probed file ready to write, plus its art-byte weight for backpressure.
 struct Unit {
     abs_path: String,
-    meta_len: u64,
-    meta_mtime: i64,
+    stamp: BackingStamp,
     probed: Probed,
     weight: u64,
 }
@@ -505,13 +559,15 @@ fn payload_weight(p: &Probed) -> u64 {
 /// Upsert a track from a probed backing file: write the track row, replace its
 /// seeded tags, and ingest its embedded art (capped, deduped, clamped).
 fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
+    let stamp = BackingStamp::from_metadata(meta);
     let track_id = db.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
         format: probed.format,
         audio_offset: probed.audio_offset,
         audio_length: probed.audio_length,
         backing_size: meta.len(),
-        backing_mtime: mtime_secs(meta),
+        backing_mtime_ns: stamp.mtime_ns,
+        backing_ctime_ns: stamp.ctime_ns,
     })?;
 
     let mut tags = Vec::new();
@@ -584,8 +640,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
 fn ingest_bulk(
     bw: &mut musefs_db::BulkWriter<'_>,
     abs_path: &str,
-    meta_len: u64,
-    meta_mtime: i64,
+    stamp: BackingStamp,
     probed: Probed,
 ) -> Result<()> {
     let track_id = bw.upsert_track(&NewTrack {
@@ -593,8 +648,9 @@ fn ingest_bulk(
         format: probed.format,
         audio_offset: probed.audio_offset,
         audio_length: probed.audio_length,
-        backing_size: meta_len,
-        backing_mtime: meta_mtime,
+        backing_size: stamp.size,
+        backing_mtime_ns: stamp.mtime_ns,
+        backing_ctime_ns: stamp.ctime_ns,
     })?;
 
     let mut tags = Vec::new();
@@ -701,6 +757,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     let budget = Arc::new(ByteBudget::new(cap));
     let skipped = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
+    let raced = Arc::new(AtomicU64::new(0));
 
     // Work queue: a shared iterator behind a mutex (cheap; probing dominates).
     let work = Arc::new(std::sync::Mutex::new(files.into_iter()));
@@ -713,16 +770,13 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         let budget = Arc::clone(&budget);
         let skipped = Arc::clone(&skipped);
         let failed = Arc::clone(&failed);
+        let raced = Arc::clone(&raced);
         workers.push(std::thread::spawn(move || {
             loop {
                 let next = { work.lock().unwrap().next() };
                 let Some(path) = next else { break };
-                let Ok(meta) = std::fs::metadata(&path) else {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                match probe_file(&path, meta.len(), window) {
-                    Ok(Some(probed)) => {
+                match probe_file(&path, window) {
+                    Ok(ProbeOutcome::Probed(probed, stamp)) => {
                         let Ok(abs) = std::fs::canonicalize(&path) else {
                             failed.fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -731,8 +785,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                         budget.acquire(weight); // backpressure on in-flight art bytes
                         let unit = Unit {
                             abs_path: abs.to_string_lossy().into_owned(),
-                            meta_len: meta.len(),
-                            meta_mtime: mtime_secs(&meta),
+                            stamp,
                             probed,
                             weight,
                         };
@@ -741,8 +794,11 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                             break;
                         }
                     }
-                    Ok(None) => {
+                    Ok(ProbeOutcome::Unsupported) => {
                         skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(ProbeOutcome::Raced) => {
+                        raced.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => {
                         failed.fetch_add(1, Ordering::Relaxed);
@@ -767,14 +823,13 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         let mut weights = Vec::with_capacity(batch.len());
         for Unit {
             abs_path,
-            meta_len,
-            meta_mtime,
+            stamp,
             probed,
             weight,
         } in batch.drain(..)
         {
             weights.push(weight);
-            ingest_bulk(&mut bw, &abs_path, meta_len, meta_mtime, probed)?;
+            ingest_bulk(&mut bw, &abs_path, stamp, probed)?;
             *scanned += 1;
         }
         bw.commit()?;
@@ -832,6 +887,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         scanned,
         skipped: skipped.load(Ordering::Relaxed),
         failed: failed.load(Ordering::Relaxed),
+        raced: raced.load(Ordering::Relaxed),
     })
 }
 
@@ -851,6 +907,7 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
         scanned: 0,
         skipped: 0,
         failed: 0,
+        raced: 0,
     };
     for path in files {
         let bytes = std::fs::read(&path)?;
@@ -867,7 +924,7 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 }
 
 /// Re-validate an already-scanned library root: re-probe only files whose
-/// size/mtime changed since the last scan (skipping unchanged ones so external
+/// size/mtime/ctime changed since the last scan (skipping unchanged ones so external
 /// tag edits in the DB are preserved), then delete tracks **under `root`** whose
 /// backing file is gone (cascading tags/art links) and garbage-collect
 /// now-unreferenced art. `root` may be a single audio file (only that file is
@@ -891,15 +948,19 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     }
     db.apply_bulk_pragmas_self()?;
 
-    // Main-thread pre-dispatch skip pass: load existing (path -> size,mtime,id,format) once,
+    // Main-thread pre-dispatch skip pass: load existing (path -> stamp,id,format) once,
     // stat each candidate, keep only changed files. Workers stay DB-free.
-    let existing: HashMap<String, (u64, i64, i64, Format)> = db
+    let existing: HashMap<String, (crate::freshness::BackingStamp, i64, Format)> = db
         .list_tracks()?
         .into_iter()
         .map(|t| {
             (
-                t.backing_path,
-                (t.backing_size, t.backing_mtime, t.id, t.format),
+                t.backing_path.clone(),
+                (
+                    crate::freshness::BackingStamp::from_track(&t),
+                    t.id,
+                    t.format,
+                ),
             )
         })
         .collect();
@@ -921,9 +982,9 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             continue;
         };
         let key = abs.to_string_lossy().into_owned();
-        if let Some(&(size, mtime, id, format)) = existing.get(&key) {
+        if let Some((stamp, id, format)) = existing.get(&key).copied() {
             let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
-            if size == meta.len() && mtime == mtime_secs(&meta) && !needs_backfill {
+            if crate::freshness::BackingStamp::from_metadata(&meta) == stamp && !needs_backfill {
                 unchanged += 1;
                 continue;
             }
@@ -954,6 +1015,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         unchanged,
         pruned,
         failed: scan.failed + skip_failed,
+        raced: scan.raced,
     })
 }
 
@@ -1171,9 +1233,10 @@ mod scan_unit_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oversized_art.m4a");
         std::fs::write(&path, &bytes).unwrap();
-        let probed = probe_file(&path, bytes.len() as u64, 0)
-            .unwrap()
-            .expect("m4a should probe");
+        let probed = match probe_file(&path, 0).unwrap() {
+            ProbeOutcome::Probed(p, _) => p,
+            other => panic!("expected Probed, got {other:?}"),
+        };
         assert_eq!(probed.format, Format::M4a);
         assert!(
             probed.pictures.is_empty(),
@@ -1190,9 +1253,10 @@ mod scan_unit_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oversized_bin.m4a");
         std::fs::write(&path, &bytes).unwrap();
-        let probed = probe_file(&path, bytes.len() as u64, 0)
-            .unwrap()
-            .expect("m4a should probe");
+        let probed = match probe_file(&path, 0).unwrap() {
+            ProbeOutcome::Probed(p, _) => p,
+            other => panic!("expected Probed, got {other:?}"),
+        };
         assert_eq!(probed.format, Format::M4a);
         assert!(
             probed.binary_tags.is_empty(),
@@ -1679,7 +1743,8 @@ mod hardening_tests {
             audio_offset: 0,
             audio_length: 0,
             backing_size: 0,
-            backing_mtime: 0,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
         })
         .unwrap();
 
@@ -1809,7 +1874,17 @@ mod hardening_tests {
         let db = Db::open_in_memory().unwrap();
         {
             let mut bw = db.bulk_writer().unwrap();
-            ingest_bulk(&mut bw, "/a.mp3", 1, 0, probed_with_mixed_binary_tags()).unwrap();
+            ingest_bulk(
+                &mut bw,
+                "/a.mp3",
+                BackingStamp {
+                    size: 1,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                },
+                probed_with_mixed_binary_tags(),
+            )
+            .unwrap();
             bw.commit().unwrap();
         }
         let tid = db.list_tracks().unwrap()[0].id;
@@ -1927,8 +2002,11 @@ mod hardening_tests {
             ingest_bulk(
                 &mut bw,
                 "/a.flac",
-                1,
-                0,
+                BackingStamp {
+                    size: 1,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                },
                 probed_with_duplicate_structural_kind(),
             )
             .unwrap();
@@ -2120,7 +2198,10 @@ mod bounded_probe_tests {
         f.set_len(len).unwrap();
         drop(f);
 
-        assert!(probe_file(&path, len, WINDOW).unwrap().is_none());
+        assert!(matches!(
+            probe_file(&path, WINDOW).unwrap(),
+            ProbeOutcome::Unsupported
+        ));
     }
 
     #[test]
@@ -2160,11 +2241,46 @@ mod bounded_probe_tests {
         f.set_len(file_len).unwrap();
         drop(f);
 
-        let probed = probe_file(&path, file_len, WINDOW)
-            .unwrap()
-            .expect("oversize wav should probe");
+        let probed = match probe_file(&path, WINDOW).unwrap() {
+            ProbeOutcome::Probed(p, _) => p,
+            other => panic!("expected Probed, got {other:?}"),
+        };
         assert_eq!(probed.format, Format::Wav);
         assert_eq!(probed.audio_offset, audio_offset);
         assert_eq!(probed.audio_length, data_len);
+    }
+
+    #[test]
+    fn probe_file_reports_raced_on_mid_probe_mutation() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+
+        // Minimal valid WAV the probe accepts (fmt + tiny data).
+        let mut fmt = Vec::new();
+        for v in [1u16, 1, 0, 0, 0, 16] {
+            fmt.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut front = b"RIFF".to_vec();
+        front.extend_from_slice(&0u32.to_le_bytes());
+        front.extend_from_slice(b"WAVE");
+        front.extend_from_slice(b"fmt ");
+        front.extend_from_slice(&u32::try_from(fmt.len()).unwrap().to_le_bytes());
+        front.extend_from_slice(&fmt);
+        front.extend_from_slice(b"data");
+        front.extend_from_slice(&64u32.to_le_bytes());
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&front).unwrap();
+        f.set_len(front.len() as u64 + 64).unwrap();
+        drop(f);
+
+        let pc = path.clone();
+        set_after_s1_hook(move || {
+            let mut g = std::fs::OpenOptions::new().append(true).open(&pc).unwrap();
+            g.write_all(&[0u8; 4096]).unwrap(); // size moves -> S2 != S1
+        });
+        let out = probe_file(&path, WINDOW);
+        clear_after_s1_hook();
+        assert!(matches!(out, Ok(ProbeOutcome::Raced)), "got {out:?}");
     }
 }

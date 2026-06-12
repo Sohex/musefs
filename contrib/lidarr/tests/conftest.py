@@ -71,7 +71,7 @@ def insert_track(conn, backing_path, fmt="flac"):
     now = int(time.time())
     cur = conn.execute(
         "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
-        "backing_size, backing_mtime, updated_at) VALUES (?, ?, 0, 0, 0, 0, ?)",
+        "backing_size, backing_mtime_ns, updated_at) VALUES (?, ?, 0, 0, 0, 0, ?)",
         (backing_path, fmt, now),
     )
     return cur.lastrowid

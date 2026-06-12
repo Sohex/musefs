@@ -21,14 +21,8 @@ fn build(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>) {
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -51,14 +45,8 @@ fn build_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempDir, 
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -97,14 +85,8 @@ fn build_wav(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -126,14 +108,8 @@ fn build_wav_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -366,14 +342,8 @@ fn build_mp3(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -393,14 +363,8 @@ fn build_mp3_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -573,14 +537,8 @@ fn build_m4a(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -600,14 +558,8 @@ fn build_m4a_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -645,14 +597,8 @@ fn build_ogg(audio: &[u8], title: &str) -> (tempfile::TempDir, Db, i64, Vec<u8>)
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();
@@ -672,14 +618,8 @@ fn build_ogg_with_art(audio: &[u8], title: &str, art: &[u8]) -> (tempfile::TempD
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", title, 0)]).unwrap();

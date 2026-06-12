@@ -1,17 +1,16 @@
 use musefs_db::{Db, Format, NewTrack};
 use musefs_format::fuzz_check::fixtures;
 
-fn real_mtime(path: &std::path::Path) -> i64 {
-    i64::try_from(
-        std::fs::metadata(path)
-            .unwrap()
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    )
-    .unwrap()
+fn real_mtime_ns(path: &std::path::Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).unwrap();
+    meta.mtime() * 1_000_000_000 + meta.mtime_nsec()
+}
+
+fn real_ctime_ns(path: &std::path::Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).unwrap();
+    meta.ctime() * 1_000_000_000 + meta.ctime_nsec()
 }
 
 #[test]
@@ -31,7 +30,8 @@ fn scanner_owned_bounds_mutation_is_rejected_by_the_contract() {
             audio_offset: bounds.audio_offset,
             audio_length: bounds.audio_length,
             backing_size: bytes.len() as u64,
-            backing_mtime: real_mtime(&audio_path),
+            backing_mtime_ns: real_mtime_ns(&audio_path),
+            backing_ctime_ns: real_ctime_ns(&audio_path),
         })
         .unwrap();
 

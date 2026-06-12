@@ -104,7 +104,8 @@ fn gc_orphan_art_removes_unreferenced_rows() {
             audio_offset: 0,
             audio_length: 0,
             backing_size: 0,
-            backing_mtime: 0,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
         })
         .unwrap();
     let referenced = db

@@ -9,6 +9,7 @@ use musefs_db::{Db, Format};
 
 use crate::db_pool::DbPool;
 use crate::error::{CoreError, Result};
+use crate::freshness::BackingStamp;
 use crate::mapping::tags_to_fields;
 use crate::reader::{HeaderCache, ResolvedFile, read_at_into, read_at_with_file_into};
 use crate::refresh_diff::{ChangeSet, TrackRenderState, partition_changelog};
@@ -91,8 +92,7 @@ struct SizeEntry {
     content_version: i64,
     total_len: u64,
     mtime_secs: i64,
-    backing_size: u64,
-    backing_mtime_secs: i64,
+    stamp: BackingStamp,
 }
 
 /// Resets a single-flight flag on drop, so a panic (or early return) during a
@@ -105,16 +105,9 @@ impl Drop for RefreshGuard<'_> {
     }
 }
 
-fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs().cast_signed())
-}
-
 fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Result<()> {
     let meta = file.metadata()?;
-    if meta.len() != resolved.backing_size || mtime_secs(&meta) != resolved.backing_mtime_secs {
+    if BackingStamp::from_metadata(&meta) != resolved.stamp {
         return Err(CoreError::BackingChanged(
             resolved.backing_path.to_string_lossy().into_owned(),
         ));
@@ -960,7 +953,7 @@ impl Musefs {
                 // could outrun a backing change (read/open already re-stat).
                 crate::metrics::on_stat();
                 let meta = std::fs::metadata(&track.backing_path)?;
-                if meta.len() != e.backing_size || mtime_secs(&meta) != e.backing_mtime_secs {
+                if BackingStamp::from_metadata(&meta) != e.stamp {
                     return Err(CoreError::BackingChanged(track.backing_path.clone()));
                 }
                 return Ok((e.total_len, e.mtime_secs));
@@ -973,8 +966,7 @@ impl Musefs {
                     content_version: track.content_version,
                     total_len: resolved.total_len,
                     mtime_secs: resolved.mtime_secs,
-                    backing_size: resolved.backing_size,
-                    backing_mtime_secs: resolved.backing_mtime_secs,
+                    stamp: resolved.stamp,
                 },
             );
             Ok((resolved.total_len, resolved.mtime_secs))
@@ -1212,9 +1204,9 @@ mod tests {
             total_len: 8,
             content_version: 1,
             backing_path: expected_path,
-            backing_size: expected_meta.len(),
-            backing_mtime_secs: mtime_secs(&expected_meta),
-            mtime_secs: mtime_secs(&expected_meta),
+            stamp: crate::freshness::BackingStamp::from_metadata(&expected_meta),
+            mtime_secs: crate::freshness::BackingStamp::from_metadata(&expected_meta)
+                .display_secs(),
             last_page: std::sync::Mutex::new(None),
             cache_bytes: 0,
             has_binary_tag: false,
@@ -1761,7 +1753,8 @@ mod tests {
                 audio_offset: 0,
                 audio_length: 1,
                 backing_size: 1,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         let id_b = db
@@ -1771,7 +1764,8 @@ mod tests {
                 audio_offset: 0,
                 audio_length: 1,
                 backing_size: 1,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         assert!(id_a < id_b, "insertion assigns ascending ids");
