@@ -26,7 +26,7 @@ from .store import (
 )
 from .sync import ArtImage, Record, SyncStats, sync_files, sync_one
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "EXPECTED_USER_VERSION",

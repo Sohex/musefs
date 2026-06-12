@@ -4,7 +4,7 @@ members = ["musefs-db", "musefs-format", "musefs-core", "musefs-fuse", "musefs-c
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Sohex/musefs"

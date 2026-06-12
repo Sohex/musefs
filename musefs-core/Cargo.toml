@@ -14,8 +14,8 @@ arc-swap = "1"
 dashmap = "6"
 im = "15"
 log = "0.4"
-musefs-db = { path = "../musefs-db", version = "0.2.0" }
-musefs-format = { path = "../musefs-format", version = "0.2.0" }
+musefs-db = { path = "../musefs-db", version = "1.0.0" }
+musefs-format = { path = "../musefs-format", version = "1.0.0" }
 once_cell = "1"
 parking_lot = "0.12"
 quick_cache = "0.6.23"

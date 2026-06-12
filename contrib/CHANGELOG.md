@@ -10,6 +10,10 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-12
+
+First stable release.
+
 ### Added
 
 - PyPI distribution: `python-musefs`, `beets-musefs`, and `lidarr-musefs` are
