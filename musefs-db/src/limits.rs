@@ -24,6 +24,12 @@ pub const MAX_STRUCTURAL_BODY_LEN: i64 = 0x00FF_FFFF;
 /// Max tag rows materialized per track, applied to the text and binary sets
 /// independently.
 pub const MAX_TAGS_PER_TRACK: usize = 4096;
+/// Max `track_art` rows materialized per track on the serve path. Art is
+/// low-cardinality (cover/back/leaflet/per-disc), so this is a crafted-DB
+/// corruption backstop, not a semantic limit. Mirrors `MAX_TAGS_PER_TRACK`'s
+/// reader-guard role (a per-track row COUNT cannot be a column CHECK, so there is
+/// no write-time enforcement to lean on).
+pub const MAX_ART_ROWS_PER_TRACK: usize = 4096;
 /// Valid `structural_blocks.kind` values. Single source for the V4 `CHECK`
 /// (asserted by a drift test) and the `get_structural_blocks` guard.
 pub const STRUCTURAL_KINDS: [&str; 2] = ["STREAMINFO", "SEEKTABLE"];
@@ -47,5 +53,6 @@ mod tests {
         assert_eq!(MAX_BINARY_TAG_BYTES, 16 * 1024 * 1024 - 64 * 1024);
         assert_eq!(MAX_ART_BYTES, 16 * 1024 * 1024 - 64 * 1024);
         assert_eq!(STRUCTURAL_KINDS, ["STREAMINFO", "SEEKTABLE"]);
+        assert_eq!(MAX_ART_ROWS_PER_TRACK, 4096);
     }
 }
