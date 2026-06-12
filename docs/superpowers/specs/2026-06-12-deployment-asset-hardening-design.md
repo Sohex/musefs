@@ -212,13 +212,14 @@ cross-container / owner-presenting case, and is harmless when unused.
 - `contrib/systemd/README.md` — short "Hardening" note: the units ship
   sandboxed; no per-user path edits are required (the scanner uses
   `ProtectSystem=true`, not `strict`). Mention the opt-in mount-unit directives.
-- `README.md` Docker section (post-#339 line numbers) — the image runs as uid
-  1000; the bind-mounted store dir must be owned by / writable to 1000 (or pass
-  `--user`). Update the `docker run` example (`README.md:116-120`) and the
-  "mount-visibility gotcha" pod example (`README.md:145-148`) so uid-1000
-  guidance does not contradict their `--security-opt apparmor=unconfined` lines.
-  Cross-reference the new "Non-root mounts need `user_allow_other`" note
-  (`README.md:297-302`) from the pod example, since the non-root image now
+- `README.md` Docker section — the image runs as a non-root user (default uid
+  1000); the bind-mounted store dir must be owned by / writable to that uid (or
+  pass `--user`, or build with `--build-arg MUSEFS_UID=$(id -u)`). Add this as a
+  single central "Runs as a non-root user" note inserted between the `docker run`
+  example and the pod example (rather than editing each example inline — keeps
+  the examples copy-pasteable and the guidance in one place). Cross-reference the
+  "Non-root mounts need `user_allow_other`" note (`README.md:297-302`), since the
+  non-root image now
   relies on the image-baked `user_allow_other` for that pattern.
 - Inline comments in each unit / Dockerfile justifying the non-obvious
   directives.

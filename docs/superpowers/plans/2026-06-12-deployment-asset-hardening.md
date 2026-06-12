@@ -40,7 +40,7 @@ Files created or modified by this plan:
 - `contrib/systemd/musefs-scan.service` — **modify**: append the full sandbox block (Task 1).
 - `contrib/systemd/musefs.service` — **modify**: extend the do-NOT-add comment, append safe directives + commented opt-in block (Task 2).
 - `contrib/systemd/README.md` — **modify**: add a `## Hardening` section (Task 3).
-- `docker/Dockerfile.glibc` — **modify**: add non-root user, `user_allow_other`, `USER` (Task 4).
+- `docker/Dockerfile.glibc` — **modify**: add non-root user (`MUSEFS_UID`/`MUSEFS_GID` args, default 1000), `user_allow_other`, `USER` (Task 4).
 - `docker/Dockerfile.musl` — **modify**: same, Alpine flavour (Task 4).
 - `README.md` — **modify**: non-root container note + `user_allow_other` cross-ref (Task 4).
 
@@ -66,25 +66,37 @@ systemctl --user is-system-running
 Expected: either "no existing musefs user units", or a list you will leave
 untouched. The manager state should print `running` (or `degraded` — fine).
 
-- [ ] **Step 2: Point at the real library and create scratch dirs**
+- [ ] **Step 2: Write the shared env file and create scratch dirs**
+
+**Critical:** each `Run:` block in this plan executes in a *fresh shell* — shell
+variables do **not** persist between steps. So all scratch paths live in one
+sourced env file that every later block reads with
+`source "$HOME/.musefs-harden-env.sh"`. Edit `LIB` in this file *once* to narrow
+the corpus; the narrowing then persists across every step.
 
 The dedicated server has a real music library at `/data/media/music`. The
 scanner reads it directly — AppArmor only gates FUSE *mounts* under `/data`, not
 reads, and `ProtectSystem=true` leaves `/data` readable. A full scan of the
-whole library can be slow (HDD); for a sandbox smoke test, narrow `LIB` to a
-single artist/album.
+whole library is slow (HDD); narrow `LIB` to a single artist/album for the smoke
+test.
 
 Run:
 ```bash
+mkdir -p "$HOME/.cache/musefs-harden-test"/{db,custom-db,mnt}
+cat > "$HOME/.musefs-harden-env.sh" <<EOF
 export HARDEN="$HOME/.cache/musefs-harden-test"
-export LIB="/data/media/music"          # for speed: set to one album, e.g. "$LIB/<artist>/<album>"
-rm -rf "$HARDEN"
-mkdir -p "$HARDEN"/{db,custom-db,mnt}
+export LIB="/data/media/music"          # EDIT to one album for a faster test, e.g. /data/media/music/<artist>/<album>
+export BIN="$PWD/target/release/musefs"
+export MUSL_BIN="$PWD/target/x86_64-unknown-linux-musl/release/musefs"
+export CTX="/tmp/musefs-harden-ctx"
+export STORE="/tmp/musefs-harden-store"
+EOF
+source "$HOME/.musefs-harden-env.sh"
 test -r "$LIB" && find "$LIB" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.ogg' -o -iname '*.wav' \) | head -3
+echo "env: HARDEN=$HARDEN LIB=$LIB"
 ```
 Expected: `$LIB` is readable and at least one audio file is listed. (If
-`/data/media/music` is unavailable, fall back to a scratch lib:
-`mkdir -p "$HARDEN/lib" && cp musefs-format/tests/fixtures/sample.m4a "$HARDEN/lib/" && export LIB="$HARDEN/lib"`.)
+`/data/media/music` is unavailable, fall back: `mkdir -p "$HOME/.cache/musefs-harden-test/lib" && cp musefs-format/tests/fixtures/sample.m4a "$HOME/.cache/musefs-harden-test/lib/"`, then edit `LIB` in the env file to that dir.)
 
 - [ ] **Step 3: Build the host (glibc) binary for the systemd tests**
 
@@ -119,9 +131,9 @@ in a temp context so the repo tree stays clean.
 
 Run:
 ```bash
-export CTX=/tmp/musefs-harden-ctx
+source "$HOME/.musefs-harden-env.sh"
 rm -rf "$CTX"; mkdir -p "$CTX/amd64"
-cp target/x86_64-unknown-linux-musl/release/musefs "$CTX/amd64/musefs"
+cp "$MUSL_BIN" "$CTX/amd64/musefs"
 chmod +x "$CTX/amd64/musefs"
 ls -l "$CTX/amd64/"
 ```
@@ -184,9 +196,7 @@ directives under test come verbatim from the edited file*.
 
 Run:
 ```bash
-export HARDEN="$HOME/.cache/musefs-harden-test"
-export LIB="${LIB:-/data/media/music}"
-export BIN="$PWD/target/release/musefs"
+source "$HOME/.musefs-harden-env.sh"
 install -Dm644 contrib/systemd/musefs-scan.service \
   ~/.config/systemd/user/musefs-harden-scan.service
 mkdir -p ~/.config/systemd/user/musefs-harden-scan.service.d
@@ -205,6 +215,7 @@ Expected: no error from `daemon-reload`.
 
 Run:
 ```bash
+source "$HOME/.musefs-harden-env.sh"
 systemctl --user start musefs-harden-scan.service
 systemctl --user status musefs-harden-scan.service --no-pager | sed -n '1,6p'
 ls -l "$HARDEN/db/"
@@ -225,14 +236,19 @@ broken — `$HARDEN/custom-db` is nowhere near `~/.local/share/musefs`.
 
 Run:
 ```bash
+source "$HOME/.musefs-harden-env.sh"
 sed -i "s#--db $HARDEN/db/library.db#--db $HARDEN/custom-db/lib.db#" \
   ~/.config/systemd/user/musefs-harden-scan.service.d/override.conf
 systemctl --user daemon-reload
 systemctl --user start musefs-harden-scan.service
 ls -l "$HARDEN/custom-db/"
+# restore the override to the default DB so Task 2's mount finds it:
+sed -i "s#--db $HARDEN/custom-db/lib.db#--db $HARDEN/db/library.db#" \
+  ~/.config/systemd/user/musefs-harden-scan.service.d/override.conf
 ```
 Expected: `$HARDEN/custom-db/lib.db` written, exit 0 — confirming
-`ProtectSystem=true` needs no per-path config.
+`ProtectSystem=true` needs no per-path config. (The restore keeps
+`$HARDEN/db/library.db` from Step 3 as the canonical DB for Task 2.)
 
 - [ ] **Step 5: Record the exposure score as evidence**
 
@@ -317,14 +333,16 @@ SystemCallArchitectures=native
 
 - [ ] **Step 2: Install the mount unit under a test name with a scratch drop-in**
 
-This reuses the DB built in Task 1. The mountpoint is under `$HOME`, which the
-AppArmor `fusermount3` profile permits (mounting under `/data` would be denied —
-that is an AppArmor policy, not a musefs bug).
+This **depends on `$HARDEN/db/library.db` built in Task 1 Step 3** — `mount`
+hard-rejects a missing DB (the merged #309 fix), so do not run this task after a
+fresh Task 0 without re-running Task 1 Step 3 first. The mountpoint is under
+`$HOME`, which the AppArmor `fusermount3` profile permits (mounting under `/data`
+would be denied — that is an AppArmor policy, not a musefs bug).
 
 Run:
 ```bash
-export HARDEN="$HOME/.cache/musefs-harden-test"
-export BIN="$PWD/target/release/musefs"
+source "$HOME/.musefs-harden-env.sh"
+test -f "$HARDEN/db/library.db" || { echo "MISSING DB — run Task 1 Step 3 first"; exit 1; }
 install -Dm644 contrib/systemd/musefs.service \
   ~/.config/systemd/user/musefs-harden-mount.service
 mkdir -p ~/.config/systemd/user/musefs-harden-mount.service.d
@@ -337,12 +355,13 @@ ExecStart=$BIN mount $HARDEN/mnt --db $HARDEN/db/library.db
 EOF
 systemctl --user daemon-reload
 ```
-Expected: `daemon-reload` succeeds.
+Expected: the DB check passes and `daemon-reload` succeeds.
 
 - [ ] **Step 3: Start the mount and verify it is visible in the session**
 
 Run:
 ```bash
+source "$HOME/.musefs-harden-env.sh"
 systemctl --user start musefs-harden-mount.service
 sleep 1
 mountpoint "$HARDEN/mnt" && echo "MOUNT VISIBLE"
@@ -362,6 +381,7 @@ the comment's "uncomment one at a time" guidance is real.
 
 Run:
 ```bash
+source "$HOME/.musefs-harden-env.sh"
 systemctl --user stop musefs-harden-mount.service
 fusermount3 -u "$HARDEN/mnt" 2>/dev/null || true
 cat > ~/.config/systemd/user/musefs-harden-mount.service.d/optin.conf <<'EOF'
@@ -372,9 +392,14 @@ systemctl --user daemon-reload
 systemctl --user start musefs-harden-mount.service
 sleep 1
 mountpoint "$HARDEN/mnt" && echo "OPT-IN MOUNT OK"
+# tear down the opt-in spot-check (leave the mount unit installed for Step 5):
+systemctl --user stop musefs-harden-mount.service
+fusermount3 -u "$HARDEN/mnt" 2>/dev/null || true
+rm ~/.config/systemd/user/musefs-harden-mount.service.d/optin.conf
+systemctl --user daemon-reload
 ```
 Expected: `OPT-IN MOUNT OK` (validates `@mount` works on kernel 7.0 / systemd
-259). Then tear down: `systemctl --user stop musefs-harden-mount.service; fusermount3 -u "$HARDEN/mnt" 2>/dev/null || true; rm ~/.config/systemd/user/musefs-harden-mount.service.d/optin.conf; systemctl --user daemon-reload`.
+259), then a clean teardown of the opt-in drop-in.
 
 - [ ] **Step 5: Record the exposure score as evidence**
 
@@ -460,7 +485,7 @@ EOF
 
 ---
 
-## Task 4: #319 — Non-root container images (uid 1000)
+## Task 4: #319 — Non-root container images (default uid 1000, build-arg configurable)
 
 **Files:**
 - Modify: `docker/Dockerfile.glibc`
@@ -480,13 +505,17 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends fuse3 \
  && rm -rf /var/lib/apt/lists/*
 
-# Run as a dedicated unprivileged user (uid/gid 1000). musefs mounts via the
-# setuid fusermount3 helper and needs no root, so a bind-mounted store volume
-# must be writable by uid 1000 (or pass `--user $(id -u):$(id -g)`).
+# Run as a dedicated unprivileged user. musefs mounts via the setuid fusermount3
+# helper and needs no root. The uid/gid default to 1000 but are build-arg
+# configurable: build with `--build-arg MUSEFS_UID=$(id -u) --build-arg
+# MUSEFS_GID=$(id -g)` to match your host owner and skip the store chown.
+# A bind-mounted store volume must be writable by the chosen uid.
 # user_allow_other lets a non-root --allow-other / --owner mount pass musefs's
 # /etc/fuse.conf pre-flight check (needed for the multi-container pod pattern).
-RUN groupadd -g 1000 musefs \
- && useradd -u 1000 -g 1000 -M -s /usr/sbin/nologin musefs \
+ARG MUSEFS_UID=1000
+ARG MUSEFS_GID=1000
+RUN groupadd -g "${MUSEFS_GID}" musefs \
+ && useradd -u "${MUSEFS_UID}" -g "${MUSEFS_GID}" -M -s /usr/sbin/nologin musefs \
  && echo 'user_allow_other' >> /etc/fuse.conf
 
 # TARGETARCH is auto-populated by buildx per platform (amd64 / arm64); the build
@@ -509,13 +538,17 @@ FROM alpine:3.20
 # fuse3 provides the setuid `fusermount3` helper musefs execs at mount/unmount.
 RUN apk add --no-cache fuse3
 
-# Run as a dedicated unprivileged user (uid/gid 1000). musefs mounts via the
-# setuid fusermount3 helper and needs no root, so a bind-mounted store volume
-# must be writable by uid 1000 (or pass `--user $(id -u):$(id -g)`).
+# Run as a dedicated unprivileged user. musefs mounts via the setuid fusermount3
+# helper and needs no root. The uid/gid default to 1000 but are build-arg
+# configurable: build with `--build-arg MUSEFS_UID=$(id -u) --build-arg
+# MUSEFS_GID=$(id -g)` to match your host owner and skip the store chown.
+# A bind-mounted store volume must be writable by the chosen uid.
 # user_allow_other lets a non-root --allow-other / --owner mount pass musefs's
 # /etc/fuse.conf pre-flight check (needed for the multi-container pod pattern).
-RUN addgroup -g 1000 musefs \
- && adduser -u 1000 -G musefs -H -D -s /sbin/nologin musefs \
+ARG MUSEFS_UID=1000
+ARG MUSEFS_GID=1000
+RUN addgroup -g "${MUSEFS_GID}" musefs \
+ && adduser -u "${MUSEFS_UID}" -G musefs -H -D -s /sbin/nologin musefs \
  && echo 'user_allow_other' >> /etc/fuse.conf
 
 # TARGETARCH is auto-populated by buildx per platform (amd64 / arm64); the build
@@ -531,24 +564,28 @@ ENTRYPOINT ["musefs"]
 
 Run:
 ```bash
-export CTX=/tmp/musefs-harden-ctx
+source "$HOME/.musefs-harden-env.sh"
 cp docker/Dockerfile.glibc docker/Dockerfile.musl "$CTX/"
 podman build -f "$CTX/Dockerfile.glibc" --build-arg TARGETARCH=amd64 -t musefs-harden:glibc "$CTX"
 podman build -f "$CTX/Dockerfile.musl"  --build-arg TARGETARCH=amd64 -t musefs-harden:musl  "$CTX"
+# build-arg override: an image whose user matches a custom uid
+podman build -f "$CTX/Dockerfile.glibc" --build-arg TARGETARCH=amd64 \
+  --build-arg MUSEFS_UID=1234 --build-arg MUSEFS_GID=1234 -t musefs-harden:uid1234 "$CTX"
 ```
-Expected: both builds succeed. (If the glibc image errors on `useradd`/`nologin`,
-those are in `bookworm-slim` by default — re-check the RUN line.)
+Expected: all three builds succeed. (If the glibc image errors on
+`useradd`/`nologin`, those ship in `bookworm-slim` — re-check the RUN line.)
 
-- [ ] **Step 4: Verify the entrypoint runs as uid 1000 (both images)**
+- [ ] **Step 4: Verify the entrypoint runs as the expected uid (default + override)**
 
 Run:
 ```bash
 for tag in glibc musl; do
-  echo "== $tag =="
-  podman run --rm --entrypoint id "musefs-harden:$tag" -u
+  printf '%s -> ' "$tag"; podman run --rm --entrypoint id "musefs-harden:$tag" -u
 done
+printf 'uid1234 -> '; podman run --rm --entrypoint id musefs-harden:uid1234 -u
 ```
-Expected: each prints `1000`.
+Expected: `glibc -> 1000`, `musl -> 1000`, `uid1234 -> 1234` (the last proves
+the `MUSEFS_UID` build arg takes effect).
 
 - [ ] **Step 5: Verify a non-root `scan` writes the store (ownership friction)**
 
@@ -557,8 +594,8 @@ store must be made writable for that mapping — the real-world ownership step.
 
 Run:
 ```bash
-export STORE=/tmp/musefs-harden-store; rm -rf "$STORE"; mkdir -p "$STORE"
-export LIB="${LIB:-/data/media/music}"         # narrow to one album for a fast container scan
+source "$HOME/.musefs-harden-env.sh"
+rm -rf "$STORE"; mkdir -p "$STORE"
 podman unshare chown 1000:1000 "$STORE"        # "make the store writable by uid 1000"
 podman run --rm \
   -v "$LIB":/library:ro \
@@ -572,29 +609,39 @@ store-ownership requirement and that a non-root scan works.)
 - [ ] **Step 6: Verify the `/etc/fuse.conf` pre-flight check both ways**
 
 The baked `user_allow_other` must satisfy musefs's pre-flight; masking
-`/etc/fuse.conf` with an empty file must trigger the explicit error. The
-pre-flight runs *before* the privileged `mount()` syscall, so this validates the
-fuse.conf plumbing without needing a successful in-container mount.
+`/etc/fuse.conf` with `/dev/null` (read as an empty string, so `user_allow_other`
+is absent) must trigger the explicit error. The pre-flight runs *before* the
+privileged `mount()` syscall, so this validates the fuse.conf plumbing without
+needing a successful in-container mount. Both images are checked — Alpine's
+`fusermount3` honouring `/etc/fuse.conf` is the musl-specific regression risk.
+
+The exact error substring musefs emits when the line is missing is
+`does not enable 'user_allow_other'` (from `ALLOW_OTHER_HELP` in
+`musefs-fuse/src/platform/mount.rs`); the assertions grep for it rather than
+eyeballing output.
 
 Run:
 ```bash
-echo "== WITH baked user_allow_other (expect: past pre-flight) =="
-podman run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-  -v /tmp/musefs-harden-store:/store --entrypoint sh musefs-harden:glibc \
-  -c 'mkdir -p /tmp/m && musefs mount /tmp/m --db /store/library.db --allow-other 2>&1 | head -5' || true
+source "$HOME/.musefs-harden-env.sh"
+ERR="does not enable 'user_allow_other'"
+for tag in glibc musl; do
+  echo "== $tag : WITH baked user_allow_other (pre-flight should PASS) =="
+  out=$(podman run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+    -v "$STORE":/store --entrypoint sh "musefs-harden:$tag" \
+    -c 'mkdir -p /tmp/m && musefs mount /tmp/m --db /store/library.db --allow-other 2>&1' || true)
+  echo "$out" | grep -qF "$ERR" && echo "  FAIL: pre-flight wrongly fired" || echo "  OK: past pre-flight"
 
-echo "== WITHOUT user_allow_other (mask fuse.conf; expect: explicit error) =="
-podman run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-  -v /dev/null:/etc/fuse.conf:ro \
-  -v /tmp/musefs-harden-store:/store --entrypoint sh musefs-harden:glibc \
-  -c 'mkdir -p /tmp/m && musefs mount /tmp/m --db /store/library.db --allow-other 2>&1 | head -5' || true
+  echo "== $tag : WITHOUT user_allow_other (mask /etc/fuse.conf; pre-flight should FIRE) =="
+  out=$(podman run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+    -v /dev/null:/etc/fuse.conf:ro -v "$STORE":/store --entrypoint sh "musefs-harden:$tag" \
+    -c 'mkdir -p /tmp/m && musefs mount /tmp/m --db /store/library.db --allow-other 2>&1' || true)
+  echo "$out" | grep -qF "$ERR" && echo "  OK: pre-flight fired" || echo "  FAIL: error missing"
+done
 ```
-Expected: the WITH run does **not** print the "add `user_allow_other` to
-`/etc/fuse.conf`" error (it gets past the check; any later failure is the
-unprivileged-mount step, acceptable here). The WITHOUT run prints exactly that
-pre-flight error. Repeat the WITH run with `musefs-harden:musl` to confirm
-Alpine's `fusermount3` honours `/etc/fuse.conf` identically (the musl-specific
-regression risk).
+Expected: every WITH line prints `OK: past pre-flight` and every WITHOUT line
+prints `OK: pre-flight fired` — for **both** glibc and musl. (In the WITH case
+the mount may then fail at the unprivileged `mount()` step in rootless Podman;
+that is irrelevant — the assertion is only that the pre-flight did not fire.)
 
 - [ ] **Step 7: (Optional) Full in-container mount under rootful Podman**
 
@@ -602,12 +649,14 @@ A real mount needs unnamespaced `CAP_SYS_ADMIN`; rootless Podman cannot grant
 it (see the project's FUSE/CAP_SYS_ADMIN note). Skip unless you want end-to-end
 confirmation:
 ```bash
+source "$HOME/.musefs-harden-env.sh"
 sudo podman run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-  -v /tmp/musefs-harden-store:/store --entrypoint sh musefs-harden:glibc \
+  -v "$STORE":/store --entrypoint sh musefs-harden:glibc \
   -c 'mkdir -p /tmp/m && musefs mount /tmp/m --db /store/library.db & sleep 1; mountpoint /tmp/m'
 ```
-Expected (if run): `/tmp/m is a mountpoint`. Note: running under `sudo` writes
-the store as root, so do this *after* Step 5's ownership assertion, not before.
+Expected (if run): `/tmp/m is a mountpoint`. The mount only *reads* `/store`
+(the `--rm` container's mountpoint is in-container and ephemeral), so this leaves
+no root-owned files on the host. Run it *after* Step 5's ownership assertion.
 
 - [ ] **Step 8: Update `README.md` — non-root container note**
 
@@ -619,14 +668,17 @@ before the `#### The mount-visibility gotcha` heading), insert:
 
 #### Runs as a non-root user
 
-The images run as a dedicated unprivileged user (uid/gid 1000), not root —
-musefs mounts via the setuid `fusermount3` helper and needs no root of its own.
-Two consequences for the commands above:
+The images run as a dedicated unprivileged user (default uid/gid 1000), not
+root — musefs mounts via the setuid `fusermount3` helper and needs no root of
+its own. Consequences for the commands above:
 
-- The bind-mounted **store** volume must be writable by uid 1000. Either
+- The bind-mounted **store** volume must be writable by that uid. Either
   `chown 1000:1000 /path/to/store` on the host, or add `--user $(id -u):$(id -g)`
   to run as your own uid. The **library** volume is mounted `:ro`, so its
   ownership does not matter.
+- To bake an image whose user matches your host account (so no `chown` or
+  `--user` is needed), build from source with
+  `--build-arg MUSEFS_UID=$(id -u) --build-arg MUSEFS_GID=$(id -g)`.
 - The images include `user_allow_other` in `/etc/fuse.conf`, so a non-root
   `--allow-other` / `--owner` / `--group` mount (used by the pod pattern below)
   passes musefs's pre-flight check. See
@@ -649,15 +701,17 @@ that paragraph (after "...not a musefs restriction.)"):
 ```bash
 git add docker/Dockerfile.glibc docker/Dockerfile.musl README.md
 git commit -m "$(cat <<'EOF'
-feat(docker): run the musefs container as non-root uid 1000 (#319)
+feat(docker): run the musefs container as a non-root user (#319)
 
-Both images create a dedicated uid/gid 1000 user and USER it, and bake
+Both images create a dedicated non-root user (default uid/gid 1000,
+overridable via MUSEFS_UID/MUSEFS_GID build args) and USER it, and bake
 user_allow_other into /etc/fuse.conf so a non-root --allow-other mount
 passes musefs's post-#339 pre-flight check (the multi-container pod
-pattern). Documents the store-volume ownership requirement. Verified
-live: entrypoint runs as 1000, non-root scan writes a 1000-owned DB,
-fuse.conf pre-flight passes with the baked line and fails cleanly when
-masked, on both glibc and musl images.
+pattern). Documents the store-volume ownership requirement and the
+build-arg escape hatch. Verified live: entrypoint runs as the default
+and an overridden uid, non-root scan writes a 1000-owned DB, fuse.conf
+pre-flight passes with the baked line and fails cleanly when masked, on
+both glibc and musl images.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
@@ -674,12 +728,16 @@ Leaves no test units, mounts, images, or scratch dirs behind. **No commit.**
 
 Run:
 ```bash
+source "$HOME/.musefs-harden-env.sh"
 systemctl --user stop musefs-harden-mount.service musefs-harden-scan.service 2>/dev/null || true
-fusermount3 -u "$HOME/.cache/musefs-harden-test/mnt" 2>/dev/null || true
+fusermount3 -u "$HARDEN/mnt" 2>/dev/null || true
 rm -rf ~/.config/systemd/user/musefs-harden-scan.service ~/.config/systemd/user/musefs-harden-scan.service.d
 rm -rf ~/.config/systemd/user/musefs-harden-mount.service ~/.config/systemd/user/musefs-harden-mount.service.d
 systemctl --user daemon-reload
-rm -rf "$HOME/.cache/musefs-harden-test" /tmp/musefs-harden-ctx /tmp/musefs-harden-store
+# $STORE was chowned to a mapped subuid (Task 4 Step 5), so remove it inside the
+# user namespace; the rest is plain-owned.
+podman unshare rm -rf "$STORE" 2>/dev/null || true
+rm -rf "$HARDEN" "$CTX" "$HOME/.musefs-harden-env.sh"
 ```
 Expected: no errors; `ls ~/.config/systemd/user/ | grep harden` returns nothing.
 
@@ -687,7 +745,7 @@ Expected: no errors; `ls ~/.config/systemd/user/ | grep harden` returns nothing.
 
 Run:
 ```bash
-podman rmi musefs-harden:glibc musefs-harden:musl 2>/dev/null || true
+podman rmi musefs-harden:glibc musefs-harden:musl musefs-harden:uid1234 2>/dev/null || true
 ```
 
 - [ ] **Step 3: Confirm the tree is clean and on-branch**
@@ -707,17 +765,21 @@ on top of the rebased branch.
 **Spec coverage:**
 - #317 full path-agnostic scanner sandbox → Task 1 (directive block matches the spec's #317 block exactly, `ProtectSystem=true`, no `ReadWritePaths`).
 - #318 mount-visible subset + commented opt-in → Task 2 (matches the spec's safe set + the four opt-in directives).
-- #319 non-root uid 1000 + `user_allow_other` → Task 4.
-- Doc updates: `contrib/systemd/README.md` → Task 3; `README.md` Docker + ownership → Task 4 Steps 8–9; inline unit/Dockerfile comments → Tasks 1, 2, 4.
-- Verification (live, dedi): scanner default+custom DB path + journald (Task 1), mount visibility + opt-in spot-check + exposure scores (Task 2), uid 1000 + store ownership + fuse.conf pre-flight both ways on both images (Task 4).
+- #319 non-root user (default uid/gid 1000, `MUSEFS_UID`/`MUSEFS_GID` build args) + `user_allow_other` → Task 4.
+- Doc updates: `contrib/systemd/README.md` → Task 3; `README.md` central "Runs as a non-root user" note (build arg + store ownership) + ownership cross-ref → Task 4 Steps 8–9; inline unit/Dockerfile comments → Tasks 1, 2, 4. (Per the spec, the two inline `docker run` examples are covered by the adjacent central note, not edited individually.)
+- Verification (live, dedi): scanner default+custom DB path + journald (Task 1), mount visibility + opt-in spot-check + exposure scores (Task 2), default+overridden uid + store ownership + fuse.conf pre-flight both ways on both images (Task 4).
 - "Known sharp edges" (`ProcSubset=pid`, `ProtectControlGroups` on `--user`) → captured as inline comments in Task 1.
 
 **Placeholder scan:** none — every edit shows full file/block content; every verification step has an exact command and expected output.
 
-**Consistency:** the scratch env vars (`HARDEN`, `BIN`, `CTX`, `STORE`) and test
-unit names (`musefs-harden-scan`, `musefs-harden-mount`) and image tags
-(`musefs-harden:glibc|musl`) are used identically across Tasks 0–5. Task 5 cleans
-up exactly what Tasks 0–4 create.
+**Shell-state safety:** each `Run:` block executes in a fresh shell (env vars do
+not persist), so Task 0 Step 2 writes `$HOME/.musefs-harden-env.sh` and every
+later block begins with `source "$HOME/.musefs-harden-env.sh"`. Narrowing the
+corpus is a one-time edit to `LIB` in that file. Scratch vars (`HARDEN`, `LIB`,
+`BIN`, `MUSL_BIN`, `CTX`, `STORE`), test unit names (`musefs-harden-scan`,
+`musefs-harden-mount`), and image tags (`musefs-harden:glibc|musl|uid1234`) are
+used identically across Tasks 0–5. Task 5 cleans up exactly what Tasks 0–4
+create (including the subuid-owned `$STORE` via `podman unshare rm`).
 
 **Scope:** deployment-asset config only; no source/schema/FUSE-path changes, no
 CI harness (per the spec's explicit live-test-not-CI decision).
