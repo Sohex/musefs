@@ -494,4 +494,18 @@ mod tags_for_tracks_tests {
         let got = db.tags_grouped_for_keys(&[]).unwrap();
         assert!(got.is_empty());
     }
+
+    #[test]
+    fn replace_tags_rejects_floor_violating_keys() {
+        let db = open_mem();
+        let t = db.upsert_track(&new_track("/a.flac")).unwrap();
+        // A row violating the floor aborts the whole row-by-row transactional insert.
+        assert!(db.replace_tags(t, &[Tag::new("", "v", 0)]).is_err());
+        assert!(db.replace_tags(t, &[Tag::new("\u{7}", "v", 0)]).is_err());
+        // '=' passes the DB floor (only the Vorbis path bars it).
+        db.replace_tags(t, &[Tag::new("a=b", "c", 0)]).unwrap();
+        let got = db.get_tags(t).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, "a=b");
+    }
 }

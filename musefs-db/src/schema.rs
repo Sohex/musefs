@@ -184,6 +184,8 @@ CREATE TABLE tags (
     CHECK (ordinal >= 0),
     CHECK (value_blob IS NULL OR value = ''),
     CHECK (length(key) <= 256),
+    CHECK (length(key) >= 1
+           AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
     CHECK (length(value) <= 262144),
     CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
 );
@@ -1497,6 +1499,33 @@ mod migration_v4_tests {
                 "missing trigger after V4: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn v4_tags_rejects_empty_and_control_char_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, updated_at) \
+             VALUES ('/x','flac',0,0,0,0,0)",
+            [],
+        )
+        .unwrap();
+        rejected(
+            &conn,
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'','v',0)",
+        );
+        rejected(
+            &conn,
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,char(7),'v',0)",
+        );
+        // '=' is NOT a DB-floor violation — only Vorbis synthesis bars it.
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'a=b','c',0)",
+            [],
+        )
+        .unwrap();
     }
 }
 
