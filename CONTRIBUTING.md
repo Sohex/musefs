@@ -215,7 +215,11 @@ Coverage notes: the per-format targets also drive the bounded/ceiling probers
 differential oracle against the full-buffer parse. The `serve` target fuzzes the
 read-time serve path (`read_at_with_file` over adversarial layouts, including
 `serve_ogg_window`/`OggArtSlice`) and is scheduled-only (built per-PR, not
-smoke-run) because it builds a DB + temp backing file per input.
+smoke-run) because it builds a DB + temp backing file per input. The `serve`
+target also exercises hostile DB rows (negative/oversized geometry,
+invalid formats, orphaned/oversized art, stale binary-tag handles, content-version
+mismatch) via the `musefs-db` `fuzzing`-gated `with_raw_conn`, plus binary-tag
+streaming and distinct Opus/Vorbis/OggFLAC fixtures.
 
 ### Independent-reader interop (mutagen)
 
@@ -382,7 +386,10 @@ cargo llvm-cov --workspace --exclude musefs-fuse --exclude musefs-latencyfs --lc
 
 `musefs-fuse` and `musefs-latencyfs` are excluded because these FUSE crates'
 tests need a real mount; their behavior is covered by the separate `e2e` CI
-job rather than `llvm-cov`. CI (`coverage.yml`) runs this on every push/PR and
+job rather than `llvm-cov`. The CI `e2e` job also runs the binary-level
+`cargo test -p musefs -- --ignored` and
+`cargo test -p musefs-latencyfs -- --ignored` suites so they cannot silently
+rot (they require `/dev/fuse` + `fusermount3`). CI (`coverage.yml`) runs this on every push/PR and
 uploads to Codecov (`CODECOV_TOKEN` repo secret).
 
 ## Code conventions
