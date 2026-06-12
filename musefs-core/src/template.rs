@@ -322,6 +322,11 @@ fn sanitize_into(out: &mut String, value: &str) {
     }
 }
 
+/// Split `value` on '/', drop empty / `.` / `..` segments, sanitize each
+/// surviving segment, and rejoin with '/'. Guarantees no empty, `.`, `..`, or
+/// leading/trailing-slash components reach the virtual tree. Stops after
+/// `MAX_PATH_FIELD_SEGMENTS` surviving segments, bounding the depth a single
+/// hostile path-field value can amplify into (#303).
 fn sanitize_path(value: &str) -> String {
     let mut out = String::new();
     let mut count = 0usize;
