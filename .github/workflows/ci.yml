@@ -304,6 +304,10 @@ jobs:
         run: cargo test -p musefs-fuse -- --ignored
       - name: FUSE fault-injection + concurrency (metrics feature)
         run: cargo test -p musefs-fuse --features metrics -- --ignored
+      - name: Binary-level end-to-end tests (musefs)
+        run: cargo test -p musefs -- --ignored
+      - name: latencyfs end-to-end tests
+        run: cargo test -p musefs-latencyfs -- --ignored
 
   macos:
     needs: changes

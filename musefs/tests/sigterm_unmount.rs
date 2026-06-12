@@ -93,7 +93,14 @@ fn sigterm_unmounts_cleanly() {
     // Mount as a child process.
     let mp = tempfile::tempdir().unwrap();
     let mut child = Command::new(bin)
-        .args(["mount", mp.path().to_str().unwrap(), "--db", db])
+        .args([
+            "mount",
+            mp.path().to_str().unwrap(),
+            "--db",
+            db,
+            "--template",
+            "$artist/$title",
+        ])
         .spawn()
         .unwrap();
 
@@ -139,7 +146,14 @@ fn sigterm_exits_bounded_when_mount_is_busy() {
     // Mount as a child process.
     let mp = tempfile::tempdir().unwrap();
     let mut child = Command::new(bin)
-        .args(["mount", mp.path().to_str().unwrap(), "--db", db])
+        .args([
+            "mount",
+            mp.path().to_str().unwrap(),
+            "--db",
+            db,
+            "--template",
+            "$artist/$title",
+        ])
         .spawn()
         .unwrap();
 
