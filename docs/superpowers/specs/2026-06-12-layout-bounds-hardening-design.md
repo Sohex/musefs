@@ -77,6 +77,27 @@ can trip the overflow. Inside `validate`, base64 slices use `b64_len_checked`
 and treat `None` as a bounds failure (fail closed): a `None` permitted length
 maps to `OggArtSliceRangeOverflow`.
 
+### Why this keeps the reader safe (no read-path change needed)
+
+`b64_window` (`musefs-format/src/ogg/b64.rs`) computes its read plan with
+unchecked `+`/`*` (`(out_offset + take - 1) / 4`, then `(g1 + 1) * 3`). It is a
+format-layer helper, and the reader calls it as
+`b64_window(*offset + within, n, *art_total)` where `within + n <= len`
+(reads are clipped to the segment). The new Part A invariant is exactly what
+bounds those inputs:
+
+- `b64_len_checked(art_total)` is `Some`, so `b64_len(art_total) <= u64::MAX`.
+- `offset + len <= b64_len(art_total)`, and `within + n <= len`, so
+  `out_offset + take = offset + within + n <= offset + len <= b64_len(art_total)
+  <= u64::MAX` — the `out_offset + take - 1` cannot overflow.
+- Hence `g1 = (out_offset + take - 1) / 4 <= u64::MAX / 4`, so
+  `(g1 + 1) * 3 <= ~0.75 * u64::MAX` and `g0 * 3 <= ~0.75 * u64::MAX` — no
+  multiplication overflow.
+
+So for any layout that passes the extended `validate`, `b64_window` is
+overflow-free. `b64_window` itself is left unchanged; the read path is not
+touched. A boundary test (below) pins this invariant.
+
 ### Error variants
 
 `LayoutError` gains two variants, mirroring the existing split between an
@@ -85,8 +106,8 @@ overflow error (`BackingRangeOverflow`) and a semantic violation
 
 ```rust
 /// An Ogg art slice's offset + length overflowed u64, or its base64 output
-/// length overflowed u64.
-#[error("ogg art slice range offset + length overflowed u64")]
+/// length (`b64_len(art_total)`) overflowed u64.
+#[error("ogg art slice range (offset + length, or base64 output length) overflowed u64")]
 OggArtSliceRangeOverflow,
 /// An Ogg art slice names an output window past the end of its source art.
 #[error("ogg art slice output window exceeds the source art length")]
@@ -102,6 +123,10 @@ OggArtSliceOutOfBounds,
   `OggArtSliceRangeOverflow`
 - passing boundary: raw `end == art_total` and base64 `end == b64_len(art_total)`
   both validate `Ok`
+- reader-safety boundary (in `ogg/b64.rs` tests): a base64 window at the very end
+  of a maximal validated slice (`out_offset = b64_len(art_total) - take`) produces
+  a sane `B64Window` with no arithmetic overflow — locks the invariant the
+  "reader safe" argument above relies on
 
 ## Part B — checked aggregate length math in builders (#274)
 
@@ -130,21 +155,45 @@ pub(crate) fn checked_sum(iter: impl IntoIterator<Item = u64>) -> Result<u64> {
 `SYNCHSAFE_MAX` filter), but now take an **already checked** `u64`, so the `+`
 inside the `try_from` argument can no longer wrap.
 
+**Conversion rule.** Any aggregate expression that contains a DB-derived term is
+converted *in full* — including the constant and local-`Vec::len()` operands —
+because the wrap happens at the `+` regardless of which operand is large (e.g.
+`8 + kept.len() as u64 + udta_total` becomes a `checked_add` chain even though
+only `udta_total` is DB-derived). Additions over *only* freshly built local
+buffer lengths, with no DB-derived term, are left as-is.
+
 ### Sites
 
 - **`mp3.rs`** (`build_id3v2_segments`): every `frames_len += 10 + …` accumulation
   (the per-frame `10 + data.len()`, `10 + bt.len.get()`, `10 + data_len` cases)
   and the final returned `10 + frames_len`.
-- **`mp4.rs`** (`build_udta` / `synthesize`): `streamed_total += …`;
-  `covr_size = 8 + Σ(16 + data_len)`; `ilst_size` / `meta_size` / `udta_size`
-  (`8 + inline_len + streamed_total`); `new_moov_size`
-  (`8 + kept.len() + udta_total`); `new_mdat_payload_pos`
-  (`ftyp.len() + new_moov_size + mdat_header.len()`).
+- **`mp4.rs`** (`build_udta` / `synthesize`): the `streamed_total += bt.len.get()`
+  / `+= a.data_len.get()` accumulators (per-iteration `checked_add`, matching the
+  mp3 `frames_len` pattern); `covr_size = 8 + Σ(16 + data_len)` (a `checked_sum`
+  fold); `ilst_size` / `meta_size` / `udta_size` (`8 + inline_len +
+  streamed_total`); `new_moov_size` (`8 + kept.len() + udta_total`);
+  `new_mdat_payload_pos` (`ftyp.len() + new_moov_size + mdat_header.len()`).
 - **`wav.rs`**: `body_len + 4` inside the `riff_size` `u32::try_from`.
-- **`flac.rs`**: picture/body aggregate lengths
-  (`framing.len() as u64 + art_len`, comment/body length sums).
-- **`ogg/mod.rs`**: `b64_prefix_len + b64_len(...)`,
-  `prefix.len() as u64 + b64_len(data_len)`, and Vorbis/MBP value-length sums.
+- **`flac.rs`**: the one DB-derived aggregate, `body_len = framing.len() as u64 +
+  art.data_len.get()` (`flac.rs:304`), guarded immediately after by
+  `> MAX_BLOCK_BODY` — the `+` must not be allowed to wrap past that guard. (The
+  comment block uses `vc.len()` of an already-materialized `Vec` and binary tags
+  use `bt.len.get()` directly; neither is an unchecked aggregate, so neither is
+  touched.)
+- **`ogg/mod.rs`**: two computations of the VorbisComment picture `value_len`
+  over the DB-derived image length — the pre-flight `> u32::MAX` guard
+  (`mod.rs:347-350`, `u64`) and the emitted value in `comment_packet_chunks`
+  (`mod.rs:396-405`, `usize`). Both currently call the **panicking** `b64_len`
+  over `art.meta.data_len` *before* the `u32` guard, so a hostile `data_len`
+  panics (debug) or wraps (release) ahead of the check. Both call sites switch to
+  `b64_len_checked(...).ok_or(FormatError::TooLarge)?` and use checked adds for
+  the `KEY.len() + b64_prefix.len() + b64_len(data_len)` sum (the emitted one in
+  `usize`, the pre-flight in `u64`).
+
+  (Issue #274 also mentions "Vorbis/MBP value-length sums", but
+  `vorbiscomment::build` length-prefixes each comment individually with a guarded
+  `u32::try_from(comment.len())` over a single materialized `String` — there is no
+  unchecked aggregate there, so it is not touched.)
 
 Each `+` / `+=` / `sum::<u64>()` over a DB-derived length becomes a
 `size::checked_add` / `size::checked_sum` returning `FormatError::TooLarge`.
@@ -160,7 +209,9 @@ lengths near `u64::MAX` (or several `i64::MAX`-sized inputs that sum past
 `u64::MAX`) and assert `Err(FormatError::TooLarge)` rather than a panic. These
 sit alongside the existing per-format overflow tests
 (`synthesize_rejects_riff_size_overflow`, the mp3 `frames_len` boundary tests,
-the mp4 `new_moov_size` boundary tests).
+the mp4 `new_moov_size` boundary tests). For ogg specifically, add a test with an
+art `data_len` near `u64::MAX` asserting `Err(FormatError::TooLarge)` rather than
+a `b64_len` panic, covering both the pre-flight guard and the emitted value.
 
 ## Non-goals
 
@@ -184,6 +235,12 @@ green:
 3. Per-format builder conversions to the helpers, each commit carrying its own
    `TooLarge` tests (mp3, mp4, wav, flac, ogg).
 
-The `fuzz/` crate is outside the workspace and consumes format-layer APIs;
-run `cargo +nightly fuzz build` after the `b64`/signature touchpoints to confirm
-no silent breakage.
+The `fuzz/` crate is outside the workspace and consumes format-layer APIs, so it
+breaks only in CI's smoke job. There are two fuzz-visible touchpoints; run
+`cargo +nightly fuzz build` after each:
+
+- after commit 2 — `b64_len_checked` is added and `b64_len`'s body changes;
+- after the ogg commit (commit 3) — the ogg builder call sites change.
+
+(`b64_len_checked` lands in commit 2, so the ogg builder commit that depends on
+it must come after.)
