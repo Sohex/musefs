@@ -25,16 +25,18 @@ fi
 
 mkdir -p "$WORK/backing" "$WORK/mnt"
 
-# 1s tagged FLAC fixture.
+# 1s tagged FLAC fixture. Tags must cover the default virtual-tree template
+# ($albumartist/$album/$title) or the served path falls back to "Unknown ...".
 ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=1" \
-  -metadata artist=Alice -metadata title=Song "$WORK/backing/a.flac"
+  -metadata album_artist=Alice -metadata album=Greatest -metadata title=Song \
+  "$WORK/backing/a.flac"
 
 "$MUSEFS" scan "$WORK/backing" --db "$WORK/smoke.db"
 
 "$MUSEFS" mount "$WORK/mnt" --db "$WORK/smoke.db" &
 PID=$!
 
-SONG="$WORK/mnt/Alice/Song.flac"
+SONG="$WORK/mnt/Alice/Greatest/Song.flac"
 i=0
 while [ ! -f "$SONG" ]; do
   i=$((i + 1))
