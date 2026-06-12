@@ -6,12 +6,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from release_gate import Decision, decide, latest_completed_by_name, main  # noqa: E402
 
 
-def _run(name, status, conclusion, completed_at):
+def _run(name, status, conclusion, completed_at, started_at=None):
     return {
         "name": name,
         "status": status,
         "conclusion": conclusion,
         "completed_at": completed_at,
+        "started_at": started_at,
     }
 
 
@@ -100,3 +101,52 @@ def test_cli_handles_empty_or_garbled_input():
     # A failed `gh api` can leave checks.json empty/garbled; must wait, not crash.
     for bad in ("", "   ", "not json", "null"):
         assert main(["--names", "ci-ok"], stdin_text=bad) == 2
+
+
+def test_decide_since_waits_when_only_stale_completed_runs():
+    # Stale main-branch successes (started before the tag) must not satisfy the
+    # gate: the tag-triggered aggregator check-runs have not appeared yet.
+    runs = [
+        _run("ci-ok", "completed", "success", "2026-06-10T11:00:00Z", "2026-06-10T10:30:00Z"),
+        _run("coverage-ok", "completed", "success", "2026-06-10T11:05:00Z", "2026-06-10T10:35:00Z"),
+    ]
+    assert decide(runs, ["ci-ok", "coverage-ok"], since="2026-06-11T00:00:00Z") is Decision.WAIT
+
+
+def test_decide_since_passes_on_fresh_success():
+    runs = [
+        _run("ci-ok", "completed", "success", "2026-06-11T00:30:00Z", "2026-06-11T00:05:00Z"),
+        _run("coverage-ok", "completed", "success", "2026-06-11T00:32:00Z", "2026-06-11T00:06:00Z"),
+    ]
+    assert decide(runs, ["ci-ok", "coverage-ok"], since="2026-06-11T00:00:00Z") is Decision.PASS
+
+
+def test_decide_since_ignores_stale_success_and_waits_for_fresh_inprogress():
+    # The reported reproducer: a stale completed success plus a fresh, still
+    # running tag-triggered run for the same name must WAIT, not pass.
+    runs = [
+        _run("ci-ok", "completed", "success", "2026-06-10T11:00:00Z", "2026-06-10T10:30:00Z"),
+        _run("ci-ok", "in_progress", None, None, "2026-06-11T00:05:00Z"),
+    ]
+    assert decide(runs, ["ci-ok"], since="2026-06-11T00:00:00Z") is Decision.WAIT
+
+
+def test_decide_since_fails_on_fresh_failure_despite_stale_success():
+    runs = [
+        _run("ci-ok", "completed", "success", "2026-06-10T11:00:00Z", "2026-06-10T10:30:00Z"),
+        _run("ci-ok", "completed", "failure", "2026-06-11T00:30:00Z", "2026-06-11T00:05:00Z"),
+    ]
+    assert decide(runs, ["ci-ok"], since="2026-06-11T00:00:00Z") is Decision.FAIL
+
+
+def test_cli_since_waits_on_stale_completed():
+    payload = {
+        "check_runs": [
+            _run("ci-ok", "completed", "success", "2026-06-10T11:00:00Z", "2026-06-10T10:30:00Z"),
+        ]
+    }
+    rc = main(
+        ["--names", "ci-ok", "--since", "2026-06-11T00:00:00Z"],
+        stdin_text=json.dumps(payload),
+    )
+    assert rc == 2

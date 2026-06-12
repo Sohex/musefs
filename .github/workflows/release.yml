@@ -45,6 +45,24 @@ jobs:
           # commit. release_gate.py decides: exit 0 = all green, 2 = keep
           # waiting, 1 = a required check failed. The tag also triggers ci.yml
           # and coverage.yml, so these checks are (re)generated for this tree.
+          # ci-ok/coverage-ok are late aggregator jobs, so the tag-triggered
+          # runs only appear minutes in. Until then a still-green run from the
+          # earlier main-branch push is the only completed one on this commit —
+          # trusting it would let the release skip the tag-only legs (e.g. the
+          # unconditional FreeBSD e2e). Gate on this release run's own start
+          # time: discard check-runs that began before the tag triggered us.
+          SINCE=""
+          for _ in 1 2 3; do
+            SINCE="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              -q .run_started_at || true)"
+            [ -n "$SINCE" ] && break
+            sleep 5
+          done
+          if [ -z "$SINCE" ]; then
+            echo "::error::Could not determine this run's start time; refusing to gate on possibly-stale checks."
+            exit 1
+          fi
+          echo "Gating on check-runs started at/after ${SINCE} (the tag trigger)."
           deadline=$(( $(date +%s) + 45 * 60 ))   # 45 min covers the full matrix
           while :; do
             # --slurp collects all pages into one JSON array; the jq filter then
@@ -57,7 +75,7 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
               --paginate --slurp -q '{check_runs: [.[].check_runs[]]}' > checks.json || true
             set +e
-            python scripts/release_gate.py --names ci-ok coverage-ok < checks.json
+            python scripts/release_gate.py --names ci-ok coverage-ok --since "$SINCE" < checks.json
             rc=$?
             set -e
             if [ "$rc" -eq 0 ]; then break; fi
