@@ -437,6 +437,8 @@ EOF
 
 `fuzz_check` compiles under `#[cfg(any(test, feature = "fuzzing"))]`, so `cargo test -p musefs-format` runs the recognition tests — a real red/green loop. The Ogg page helpers are `crate::ogg::page_test_support::{build_header_pub, lace_packet_pub, vorbis_body_empty}`. `detect_codec` keys on the first packet's magic (`\x01vorbis`, `\x7FFLAC`); `read_header` reads 3 header packets for Vorbis and `1 + count` for OggFLAC (`count` = big-endian `u16` at mapping-header bytes 7..9).
 
+**Clean-path synthesis is safe by construction** (relevant once Task 5 feeds these through the full resolve+read path): Ogg synthesis clones the identification/setup/mapping packets verbatim and **rebuilds the comment packet from the DB `tags` table** — it never parses the fixture's VorbisComment body or STREAMINFO. So the deliberately-omitted framing bit and the all-zero STREAMINFO are never read on the synthesis path; a fixture that `read_header` recognizes will synthesize cleanly. The recognition tests below are therefore a sufficient gate.
+
 - [ ] **Step 1: Write the failing recognition tests**
 
 In `musefs-format/src/fuzz_check.rs`, inside `mod fixtures_tests` (after the existing FLAC/m4a tests), add:
@@ -640,12 +642,13 @@ After the `arb_arts` / `set_track_art` block (the `if let Some(a) = arts.first()
 ```rust
     // Optionally attach DB binary tags so synthesis materializes a
     // Segment::BinaryTag and the read windows exercise read_binary_tag_chunk_into.
-    // Use format-appropriate opaque keys (MP3 GEOB frame, M4a freeform atom).
-    if u.arbitrary::<bool>().unwrap_or(false) {
+    // Only MP3 (4-byte frame id) and M4a (`----:<mean>:<name>` freeform atom)
+    // synthesize opaque binary tags from the DB; for any other format the row is
+    // silently dropped at synthesis, so restrict the opt-in to those two.
+    if matches!(format, Format::Mp3 | Format::M4a) && u.arbitrary::<bool>().unwrap_or(false) {
         let key = match format {
             Format::Mp3 => "GEOB".to_string(),
-            Format::M4a => "----:com.apple.iTunes:FUZZ".to_string(),
-            _ => "PRIV".to_string(),
+            _ => "----:com.apple.iTunes:FUZZ".to_string(),
         };
         let _ = db.set_binary_tags(
             id,
@@ -750,50 +753,76 @@ Replace it with:
 After the `setup` function (before the `fuzz_target!` macro), add:
 
 ```rust
-/// Plant one hostile mutation via the fuzzing-only raw accessor. Each variant is
-/// best-effort (`let _ =`): the production read path must reject the resulting
-/// state with `Err`, never UB. Pragmas are restored so a later well-formed write
-/// in the same iteration is not silently un-checked.
+/// Plant one hostile mutation via the fuzzing-only raw accessor. The production
+/// read path must reject the resulting state with `Err`, never UB. Each fuzz
+/// iteration uses a fresh in-memory DB (`setup`), so dropping a trigger / leaving
+/// a pragma toggled is scoped to that iteration's connection.
+///
+/// Variants whose target row ALWAYS exists (0, 1, 5 — the single `tracks` row)
+/// assert `n == 1` so a future schema rename cannot silently turn the mutation
+/// into a swallowed no-op (this exact trap hid a `backing_mtime` -> `backing_mtime_ns`
+/// rename during planning). Variants 2/3/4 are genuinely conditional (they need an
+/// art row or binary-tag row that the earlier stages may not have created), so
+/// they stay best-effort (`let _ =`).
 fn apply_hostile(db: &Db, id: i64, variant: u8, val: i64) {
     db.with_raw_conn(|conn| match variant {
         // 0: negative/oversized integer geometry (resolve rejects at the bounds check).
         0 => {
-            let _ = conn.execute_batch("PRAGMA ignore_check_constraints = ON");
-            let _ = conn.execute(
-                "UPDATE tracks SET audio_offset = ?1 WHERE id = ?2",
-                rusqlite::params![val, id],
-            );
-            let _ = conn.execute_batch("PRAGMA ignore_check_constraints = OFF");
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+                .unwrap();
+            let n = conn
+                .execute(
+                    "UPDATE tracks SET audio_offset = ?1, audio_length = ?1 WHERE id = ?2",
+                    rusqlite::params![val, id],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "variant 0 must mutate the tracks row");
+            conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .unwrap();
         }
         // 1: invalid format discriminant (model deserialization must Err, not panic).
         1 => {
-            let _ = conn.execute_batch("PRAGMA ignore_check_constraints = ON");
-            let _ = conn.execute(
-                "UPDATE tracks SET format = 'bogus' WHERE id = ?1",
-                rusqlite::params![id],
-            );
-            let _ = conn.execute_batch("PRAGMA ignore_check_constraints = OFF");
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+                .unwrap();
+            let n = conn
+                .execute(
+                    "UPDATE tracks SET format = 'bogus' WHERE id = ?1",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "variant 1 must mutate the tracks row");
+            conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .unwrap();
         }
-        // 2: orphaned track_art (art_id -> no art row) under FK off.
+        // 2: orphaned track_art (art_id -> no art row) under FK off. No-op when no
+        // art row was attached this iteration.
         2 => {
-            let _ = conn.execute_batch("PRAGMA foreign_keys = OFF");
+            conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
             let _ = conn.execute(
                 "UPDATE track_art SET art_id = 999999 WHERE track_id = ?1",
                 rusqlite::params![id],
             );
-            let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+            conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
         }
-        // 3: oversized art mime (rejected before materialization).
+        // 3: oversized art mime. `art` rows are immutable via the
+        // `art_reject_content_update` trigger, and `ignore_check_constraints` does
+        // NOT disable triggers, so the trigger must be dropped first (the length(mime)
+        // CHECK still needs the pragma). No-op when no art row was attached.
         3 => {
-            let _ = conn.execute_batch("PRAGMA ignore_check_constraints = ON");
+            conn.execute_batch(
+                "PRAGMA ignore_check_constraints = ON; DROP TRIGGER art_reject_content_update;",
+            )
+            .unwrap();
             let _ = conn.execute(
                 "UPDATE art SET mime = ?1 \
                  WHERE id IN (SELECT art_id FROM track_art WHERE track_id = ?2)",
                 rusqlite::params!["x".repeat(100_000), id],
             );
-            let _ = conn.execute_batch("PRAGMA ignore_check_constraints = OFF");
+            conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .unwrap();
         }
         // 4: stale binary-tag handle (delete the blob rows the layout will read).
+        // No-op unless the binary-tag opt-in fired for an MP3/M4a track.
         4 => {
             let _ = conn.execute(
                 "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL",
@@ -802,12 +831,15 @@ fn apply_hostile(db: &Db, id: i64, variant: u8, val: i64) {
         }
         // 5: backing-geometry / content-version mismatch (per-read freshness guard).
         _ => {
-            let _ = conn.execute(
-                "UPDATE tracks SET backing_size = backing_size + 1, \
-                 backing_mtime = backing_mtime + 1, \
-                 content_version = content_version + 1 WHERE id = ?1",
-                rusqlite::params![id],
-            );
+            let n = conn
+                .execute(
+                    "UPDATE tracks SET backing_size = backing_size + 1, \
+                     backing_mtime_ns = backing_mtime_ns + 1, \
+                     content_version = content_version + 1 WHERE id = ?1",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "variant 5 must mutate the tracks row");
         }
     });
 }
