@@ -5,7 +5,7 @@ mod page;
 
 pub use art_source::{ArtSource, MapArtSource};
 
-pub use b64::{B64Window, b64_len, b64_window, encode_b64_slice};
+pub use b64::{B64Window, b64_len, b64_len_checked, b64_window, encode_b64_slice};
 pub use page::{
     PageHeader, parse_page, patch_page_header, patch_page_header_algebraic, verify_page_crc,
 };
