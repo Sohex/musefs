@@ -18,6 +18,25 @@ The DB schema (`musefs-db/src/schema.rs`) only enforces nonnegative bounds and
 (64 MiB) cap is **not** enforced at serve time, so a direct external writer
 bypasses it.
 
+### Threat model (refined by existing guards)
+
+Two pre-existing guards in `reader.rs` bound the attack before `read_front` is
+reached, so the precise residual capability the cap closes is narrower than
+"insert a row and read":
+
+- `resolve` (`reader.rs:119`) rejects unless `meta.len() == track.backing_size`.
+- `build` (Synthesis, `reader.rs:156-163`) rejects unless
+  `audio_offset + audio_length <= meta.len()`.
+
+Chained with the schema constraint, reaching `read_front` with
+`audio_offset > MAX_PROBE_BYTES` therefore requires a **real backing file at
+least `audio_offset + audio_length` bytes long** whose size matches
+`backing_size`. The realistic attack: a multi-GB **sparse** file (cheap — no
+disk used) plus a row pointing `audio_offset` deep into it, forcing a
+multi-GB *contiguous* front allocation. The cap bounds that single allocation
+to 64 MiB even when such a validly-sized large file exists — it is the only
+thing standing between the guards and an unbounded `Vec` allocation.
+
 ## Invariant being protected
 
 The scanner refuses to ingest a file whose parseable metadata does not appear
@@ -64,7 +83,7 @@ fn read_front(path: &Path, n: u64) -> crate::Result<Vec<u8>> {
     use std::io::Read;
     if n > crate::scan::MAX_PROBE_BYTES {
         return Err(CoreError::HeaderTooLarge {
-            audio_offset: n,
+            requested: n,
             cap: crate::scan::MAX_PROBE_BYTES,
         });
     }
@@ -85,15 +104,33 @@ Placing the check before `on_open()` means a rejected hostile read never
 increments the metrics open-counter, so the exact-count metrics tests are
 unaffected.
 
+The cap also retires a latent footgun: `usize_from(n)` is lossless only on
+64-bit targets, so bounding `n` to 64 MiB removes any 32-bit truncation risk in
+the allocation length.
+
+**Precedence.** The cap check sits *inside* `read_front`, which runs after both
+pre-existing guards (`resolve`'s `backing_size`/mtime check and `build`'s
+`audio_offset + audio_length <= meta.len()` check). So a row that is both stale
+*and* over-cap surfaces as `BackingChanged`, not `HeaderTooLarge`: stale-file
+detection deliberately wins, and the cap fires only for an in-bounds-but-
+oversized front. This is the single enforcement point by design — no future
+non-`read_front` front allocator is anticipated, so no defense-in-depth check is
+added at the `resolve`/`build` boundary.
+
 ### 3. New error variant → EIO
 
 Add to `CoreError` (`musefs-core/src/error.rs`), mirroring the existing
 `Mp4MetadataTooLarge` / `ArtTooLarge` variants:
 
 ```rust
-#[error("front/header read of {audio_offset} bytes exceeds the {cap}-byte serve cap")]
-HeaderTooLarge { audio_offset: u64, cap: u64 },
+#[error("front/header read of {requested} bytes exceeds the {cap}-byte serve cap")]
+HeaderTooLarge { requested: u64, cap: u64 },
 ```
+
+The field is named `requested` (bytes asked of `read_front`), not `audio_offset`
+— at every current call site it equals `audio_offset`, but the variant lives in
+the generic allocator and should stay honest if a non-`audio_offset` caller is
+ever added.
 
 Map it to `EIO` in `musefs-fuse/src/lib.rs` by adding it to the existing
 structural-error arm alongside `Mp4MetadataTooLarge` and `ArtTooLarge`. This
@@ -106,12 +143,23 @@ since all three reach the shared header-build path.
   before any file open (no backing file required — proves the fail-closed
   ordering ahead of allocation).
 - **End-to-end serve test, one per vulnerable path** (FLAC legacy fallback,
-  WAV, Ogg): insert a `tracks` row with a hostile `audio_offset` and a matching
-  sparse backing file (~`MAX_PROBE_BYTES + 1`, backed on tmpfs per the
-  latency-bench storage note), drive resolve / `read_at`, and assert
-  `HeaderTooLarge` surfaces past the `BackingChanged` size/mtime guard. The
-  sparse file is required so the `meta.len()` vs tracked-size guard
-  (`reader.rs`) passes and execution actually reaches `read_front`.
+  WAV, Ogg): insert a `tracks` row with a hostile `audio_offset >
+  MAX_PROBE_BYTES` and drive resolve / `read_at`, asserting `HeaderTooLarge`.
+  The fixture must satisfy **both** pre-existing guards to reach `read_front`,
+  which pins the sizes:
+  - `audio_offset = MAX_PROBE_BYTES + 1`, `audio_length = 1`.
+  - sparse backing file of **`MAX_PROBE_BYTES + 2` bytes** (= `audio_offset +
+    audio_length`), so `build`'s `audio_offset + audio_length <= meta.len()`
+    holds. A file of exactly `MAX_PROBE_BYTES + 1` with positive `audio_length`
+    would fail that guard and surface `BackingChanged` instead — so the earlier
+    "positive length" repro and an exactly-`+1` file are mutually exclusive.
+  - `backing_size = MAX_PROBE_BYTES + 2` to match `meta.len()` (resolve guard).
+  - Back the sparse file on tmpfs per the latency-bench storage note; `set_len`
+    keeps it sparse so no real 64 MiB is written.
+  - **FLAC fixture specifically** must insert **zero** `track_structural_blocks`
+    rows so the legacy fallback branch (`rows.is_empty()`) is taken. Because the
+    cap fires before `flac::read_metadata`, the garbage/sparse front is never
+    parsed — the test asserts `HeaderTooLarge`, not a FLAC `Format` error.
 - **errno test:** `errno(&CoreError::HeaderTooLarge { .. }).code() == libc::EIO`
   in `maps_core_errors_to_errno` (`musefs-fuse/src/lib.rs`).
 
