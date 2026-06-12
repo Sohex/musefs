@@ -70,7 +70,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912
         with:
           tool: cargo-llvm-cov
       - name: Collect coverage
