@@ -28,6 +28,31 @@ Enable the periodic re-scan too (edit the library path in
 systemctl --user enable --now musefs-scan.timer
 ```
 
+## Hardening
+
+These units run under the `--user` manager, which constrains what systemd
+sandboxing is possible. The two units differ sharply:
+
+- **`musefs-scan.service` is fully sandboxed.** The scanner creates no FUSE
+  mount, so it takes a strong sandbox (`ProtectSystem=true`, `SystemCallFilter=`,
+  plus namespace and seccomp restrictions). `ProtectSystem=true` (not `strict`)
+  keeps system directories read-only while leaving your library and `MUSEFS_DB`
+  writable, so a custom DB location needs no `ReadWritePaths=` edit. A few
+  directives that require capability-bounding-set drops
+  (`CapabilityBoundingSet=`, `PrivateDevices`, `ProtectKernelModules`,
+  `ProtectKernelLogs`, `ProtectClock`) are omitted: the unprivileged user
+  manager cannot apply them, and the process is already capability-less, so
+  nothing is lost. Inspect with
+  `systemd-analyze --user security musefs-scan.service`.
+
+- **`musefs.service` is intentionally *not* sandboxed, and cannot be.** musefs
+  mounts via the **setuid** `fusermount3` helper. `NoNewPrivileges=true` — and
+  nearly every other systemd hardening directive, since installing a seccomp
+  filter for an unprivileged process forces the kernel `no_new_privs` flag —
+  disables the setuid escalation, and the mount then fails with `fusermount3:
+  mount failed: Operation not permitted`. The unit comment explains this in
+  full.
+
 ## Notes
 
 - **Binary location.** The `--user` manager does not inherit your shell's
