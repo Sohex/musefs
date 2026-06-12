@@ -183,6 +183,14 @@ files or directories, and `--jobs N` controls probe parallelism.
 symlinks are logged and skipped). `--quiet`
 (`-q`) suppresses the per-target summary for scripting; scan failures still
 surface on stderr (raise detail with `RUST_LOG=info`).
+
+The per-target summary reads `scanned N: … skipped X, failed Y`. `skipped`
+counts every file that isn't a supported audio format — cover art, `.cue` /
+`.log` / `.nfo` sidecars, and anything else non-audio — so a large `skipped`
+number (hundreds or thousands on a big library) is expected, not an error.
+`failed` is the one to watch: those are audio files musefs recognised by
+extension but could not parse.
+
 `--revalidate` is the maintenance pass: it skips unchanged files —
 **preserving any tag edits you made in the store** — prunes tracks whose
 backing file is gone, and garbage-collects orphaned art.
