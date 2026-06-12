@@ -339,7 +339,11 @@ offset/length, tags, pictures, structural blocks) on a parallel probe
 pipeline feeding a single DB writer, committing in batches. Probing reads
 are bounded — the scanner never slurps whole files — and ingestion caps
 per-item sizes (`MAX_ART_BYTES`, `MAX_BINARY_TAG_BYTES`) so a crafted file
-cannot balloon the store.
+cannot balloon the store. An over-cap picture or binary tag is dropped and
+logged (`RUST_LOG=warn`) rather than vanishing silently, so a track that
+appears to have lost its cover art has an explanation in the logs; a
+supported-extension file that fails to parse, or errors mid-probe, is
+likewise logged with the reason and counted `failed`.
 
 Symlinks are **not followed by default**: a symlinked file or directory is
 logged (`RUST_LOG=info`/`warn`) and skipped, which keeps the walk immune to

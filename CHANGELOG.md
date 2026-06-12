@@ -50,6 +50,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Scanner no longer drops files and embedded art silently:** embedded cover
+  art over `MAX_ART_BYTES` (and binary tags over `MAX_BINARY_TAG_BYTES`) were
+  filtered out at ingest with no log line, so a track whose art exceeded the cap
+  appeared to simply have none — indistinguishable from a scan bug. The drop is
+  now logged (`RUST_LOG=warn`). Likewise, a supported-extension file that fails
+  to parse or errors mid-probe was counted `failed` with the underlying error
+  discarded; the reason is now logged. Note: oversized art in `.m4a`/`.m4b`
+  files is dropped earlier, inside the format layer, and is not yet logged
+  (#284, #343).
 - **Lidarr custom-script env var casing:** Lidarr stores custom-script
   environment variables in a .NET `StringDictionary`, which lowercases every key,
   so a Linux script actually receives `lidarr_sourcepath` / `lidarr_eventtype`
