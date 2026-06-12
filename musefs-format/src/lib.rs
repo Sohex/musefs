@@ -7,6 +7,7 @@ pub mod mp3;
 pub mod mp4;
 pub mod ogg;
 pub mod probe;
+mod size;
 mod tagmap;
 mod vorbiscomment;
 pub mod wav;
