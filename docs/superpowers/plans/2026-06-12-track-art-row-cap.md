@@ -16,7 +16,7 @@
 
 - `musefs-db/src/limits.rs` — add `MAX_ART_ROWS_PER_TRACK` next to `MAX_TAGS_PER_TRACK`; extend the `cap_values_are_pinned` test.
 - `musefs-db/src/error.rs` — add `DbError::TooManyArtRows` variant and the `check_art_count` helper; extend the `guard_helper_tests` module with a boundary test.
-- `musefs-db/src/art.rs` — call `check_art_count` inside `get_track_art`; add two integration tests to the `guard_tests` module.
+- `musefs-db/src/art.rs` — call `check_art_count` inside `get_track_art`; add two integration tests to the `guard_tests` module (closing brace at line 264).
 
 No other files change. No schema migration, no `user_version` bump, no Python schema-mirror regeneration.
 
@@ -132,7 +132,7 @@ Expected: PASS (1 test). (The helper is not yet called from non-test code; that 
 
 - [ ] **Step 5: Write the failing integration tests**
 
-In `musefs-db/src/art.rs`, inside `mod guard_tests`, add these two tests before the module's closing brace (currently line 265). They reuse the existing `db_track_art()` helper (returns `(Db, track_id, art_id)`) and plant rows via raw `INSERT` sharing the one `art_id`, mirroring the tag-count test `per_track_count_cap_text_and_binary` (`tags.rs:440-463`):
+In `musefs-db/src/art.rs`, inside `mod guard_tests`, add these two tests before the module's closing brace (currently line 264). They reuse the existing `db_track_art()` helper (returns `(Db, track_id, art_id)`) and plant rows via raw `INSERT` sharing the one `art_id`, mirroring the tag-count test `per_track_count_cap_text_and_binary` (`tags.rs:440-463`):
 
 ```rust
     #[test]
@@ -241,7 +241,7 @@ No code changes — this task confirms the bound propagates to the core serve pa
 
 - [ ] **Step 1: Confirm the error reaches `CoreError` with no core change**
 
-The conversion already exists: `mapping::track_art_to_inputs` calls `db.get_track_art(track_id)?` (`musefs-core/src/mapping.rs:39`), and `CoreError` has `Db(#[from] musefs_db::DbError)` (`musefs-core/src/error.rs:3`). So `DbError::TooManyArtRows` becomes `CoreError::Db` automatically. Verify by reading those two lines — no edit expected.
+The conversion already exists: `mapping::track_art_to_inputs` calls `db.get_track_art(track_id)?` (`musefs-core/src/mapping.rs:38`), and `CoreError` has `Db(#[from] musefs_db::DbError)` (`musefs-core/src/error.rs:6`). So `DbError::TooManyArtRows` becomes `CoreError::Db` automatically. Verify by reading those two lines — no edit expected.
 
 Run: `cargo build -p musefs-core`
 Expected: compiles (sanity check that the new variant did not break the `#[from]` conversion).
