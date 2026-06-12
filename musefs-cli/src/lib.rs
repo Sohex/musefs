@@ -45,7 +45,8 @@ pub struct MountArgs {
     /// Empty directory to mount at.
     #[arg(env = "MUSEFS_MOUNTPOINT")]
     pub mountpoint: PathBuf,
-    /// Path to the SQLite database.
+    /// Path to the SQLite database (must already exist; unlike `scan`, mount
+    /// never creates it).
     #[arg(long, env = "MUSEFS_DB")]
     pub db: PathBuf,
     /// Path template, e.g. "$albumartist/$album/$title". Supports ${a|b}
@@ -274,8 +275,13 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
 }
 
 /// Build a `Musefs` from the DB at `args.db` and mount it (blocking) at
-/// `args.mountpoint`.
+/// `args.mountpoint`. Unlike `scan`, mount never creates the store: a missing
+/// database path is a configuration error (a typo would otherwise silently
+/// mount an empty view), so it is rejected before any FUSE setup.
 pub fn run_mount(args: &MountArgs) -> Result<()> {
+    if !args.db.exists() {
+        anyhow::bail!("database does not exist: {}", args.db.display());
+    }
     let db =
         Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
     let (config, fuse_config) = parse_mount_config(args);
