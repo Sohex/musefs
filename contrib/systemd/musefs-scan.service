@@ -8,3 +8,40 @@ EnvironmentFile=-%h/.config/musefs/musefs.conf
 Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin
 # Scan target(s) are not env-configurable; set your library path here.
 ExecStart=musefs scan %h/Music --revalidate
+
+# --- Sandbox -------------------------------------------------------------
+# The scanner creates no FUSE mount, so it can take a strong systemd sandbox
+# (unlike musefs.service). None of these directives needs to know where your
+# library or DB live: ProtectSystem=true keeps system dirs read-only while
+# leaving $HOME and data volumes writable, so a custom MUSEFS_DB path works
+# with no ReadWritePaths= edit.
+#
+# NOTE: these run under the --user manager (see README). Directives that drop
+# capability-bounding-set bits fail there with 218/CAPABILITIES — the
+# unprivileged user manager cannot manipulate the bounding set. So the following
+# are deliberately OMITTED: CapabilityBoundingSet=, PrivateDevices,
+# ProtectKernelModules, ProtectKernelLogs, ProtectClock. They lose nothing here:
+# the process is already capability-less (unprivileged + NoNewPrivileges), so it
+# cannot exercise CAP_MKNOD / CAP_SYS_MODULE / CAP_SYSLOG / CAP_SYS_TIME anyway.
+NoNewPrivileges=true
+ProtectSystem=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# ProtectHostname is omitted too: under --user it is a no-op and logs a
+# "UTS namespace setup is prohibited" warning on every run.
+# ProcSubset=pid hides non-pid /proc; a future parser reading /proc/cpuinfo for
+# SIMD detection would need this relaxed.
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+# AF_UNIX is REQUIRED for journald logging; do NOT drop to none.
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+UMask=077
