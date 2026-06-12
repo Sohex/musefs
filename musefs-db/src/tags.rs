@@ -508,4 +508,24 @@ mod tags_for_tracks_tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].key, "a=b");
     }
+
+    #[test]
+    fn replace_tags_rolls_back_a_mixed_valid_invalid_batch() {
+        let db = open_mem();
+        let t = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.replace_tags(t, &[Tag::new("artist", "Alice", 0)])
+            .unwrap();
+        // replace_tags DELETEs the existing text rows before re-inserting; a CHECK
+        // violation later in the batch must roll the whole transaction back —
+        // including the DELETE — so the original rows survive rather than the batch
+        // half-applying.
+        assert!(
+            db.replace_tags(t, &[Tag::new("title", "ok", 0), Tag::new("", "bad", 0)])
+                .is_err()
+        );
+        let got = db.get_tags(t).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, "artist");
+        assert_eq!(got[0].value, "Alice");
+    }
 }

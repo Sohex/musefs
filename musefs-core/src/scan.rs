@@ -1953,6 +1953,7 @@ mod hardening_tests {
                 ("artist", "Alice"),
                 ("", "dropped"),        // empty key
                 ("a\u{7}b", "dropped"), // control char
+                ("a\u{0}b", "dropped"), // embedded NUL — DB CHECK can't see it, the floor can
                 ("a=b", "kept"),        // '=' is NOT a floor violation
             ]),
         )
@@ -1986,6 +1987,7 @@ mod hardening_tests {
                     ("artist", "Alice"),
                     ("", "dropped"),
                     ("a\u{7}b", "dropped"),
+                    ("a\u{0}b", "dropped"), // embedded NUL — floor drops it
                     ("a=b", "kept"),
                 ]),
             )

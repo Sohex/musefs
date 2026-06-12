@@ -206,7 +206,13 @@ impl HeaderCache {
                                     .collect();
                                 (structural, &binary_tag_inputs)
                             };
-                        warn_invalid_vorbis_keys(track.id, &inputs);
+                        for key in invalid_vorbis_keys(&inputs) {
+                            log::warn!(
+                                "track {}: dropping tag key {key:?} from Vorbis \
+                                 synthesis (not a valid field name)",
+                                track.id
+                            );
+                        }
                         flac::synthesize_layout(
                             &structural,
                             track.bounds.audio_offset(),
@@ -283,7 +289,13 @@ impl HeaderCache {
                             .map(|meta| musefs_format::ogg::OggArt { meta })
                             .collect();
                         let src = crate::mapping::DbArtSource(db);
-                        warn_invalid_vorbis_keys(track.id, &inputs);
+                        for key in invalid_vorbis_keys(&inputs) {
+                            log::warn!(
+                                "track {}: dropping tag key {key:?} from Vorbis \
+                                 synthesis (not a valid field name)",
+                                track.id
+                            );
+                        }
                         musefs_format::ogg::synthesize_layout(
                             &header,
                             track.bounds.audio_offset(),
@@ -361,19 +373,18 @@ pub fn read_at_into<M>(
     }
 }
 
-/// Warn about user-defined tag keys that the Vorbis synthesis path will drop,
-/// so a silently-dropped key is observable. Runs during layout resolution (a
-/// cache miss), not per `read_at`, so a malformed key warns once per resolution.
-fn warn_invalid_vorbis_keys(track_id: i64, inputs: &[musefs_format::TagInput]) {
-    for t in inputs {
-        if !musefs_format::is_valid_vorbis_key(&t.key) {
-            log::warn!(
-                "track {track_id}: dropping tag key {:?} from Vorbis synthesis \
-                 (not a valid field name)",
-                t.key
-            );
-        }
-    }
+/// The distinct user-defined keys in `inputs` that the Vorbis synthesis path
+/// drops because they are not valid field names. Pure and unit-tested; the
+/// caller logs them so a silently-dropped key is observable. Deduped so a
+/// multi-valued bad key warns once, not once per value.
+fn invalid_vorbis_keys(inputs: &[musefs_format::TagInput]) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    inputs
+        .iter()
+        .map(|t| t.key.as_str())
+        .filter(|k| !musefs_format::is_valid_vorbis_key(k))
+        .filter(|k| seen.insert(*k))
+        .collect()
 }
 
 /// Allocating form of `read_at_into` (tests and non-hot-path callers).
@@ -658,6 +669,19 @@ mod resolve_ogg_tests {
             tags.iter()
                 .any(|(k, v)| k == "title" && v == "Telephasic Workshop")
         );
+    }
+
+    #[test]
+    fn invalid_vorbis_keys_reports_distinct_out_of_grammar_keys() {
+        use musefs_format::TagInput;
+        let inputs = vec![
+            TagInput::new("artist", "A"),
+            TagInput::new("a=b", "c"),
+            TagInput::new("a=b", "d"), // same bad key twice -> reported once
+            TagInput::new("title", "S"),
+        ];
+        // Only the out-of-grammar key, deduped; valid keys are not flagged.
+        assert_eq!(invalid_vorbis_keys(&inputs), vec!["a=b"]);
     }
 
     #[test]
