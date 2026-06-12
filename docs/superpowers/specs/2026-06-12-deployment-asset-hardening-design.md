@@ -59,8 +59,9 @@ friction and without risking the mount**. This yields three proportionate tiers:
 2. **Mount unit** — only the safe-anywhere, friction-free directives. The
    mount-capable / namespace / syscall-filter directives are **opt-in**, because
    they can trap the mount on kernels older than the dev box.
-3. **Container** — drop from root to a fixed unprivileged uid/gid 1000. Mostly a
-   docs change (volume ownership), plus the now-required `user_allow_other` line.
+3. **Container** — drop from root to an unprivileged user (default uid/gid 1000,
+   build-arg configurable). Mostly a docs change (volume ownership), plus the
+   now-required `user_allow_other` line.
 
 ## Facts grounding the design
 
@@ -175,26 +176,30 @@ known-recent platform can uncomment them after confirming the mount still
 appears. We do not ship them on, because the dedi (kernel 7.0 / systemd 259) is
 not representative — "works here" does not generalize to Debian 12.
 
-### #319 — Dockerfiles: non-root uid 1000
+### #319 — Dockerfiles: non-root user (default uid/gid 1000, build-arg configurable)
 
-Both images: create a `musefs` group+user at gid/uid **1000**, add
-`user_allow_other` to `/etc/fuse.conf` (now **required** for the non-root pod
-pattern — post-#339 musefs pre-flight-checks for it and hard-fails an
-`allow_other`/`--owner`/`--group` mount without it), then `USER musefs`.
+Both images: create a `musefs` group+user at a **build-arg-configurable** uid/gid
+(`ARG MUSEFS_UID=1000` / `MUSEFS_GID=1000`), add `user_allow_other` to
+`/etc/fuse.conf` (now **required** for the non-root pod pattern — post-#339
+musefs pre-flight-checks for it and hard-fails an `allow_other`/`--owner`/
+`--group` mount without it), then `USER musefs`.
 
 - **glibc / Debian:**
-  `groupadd -g 1000 musefs && useradd -u 1000 -g 1000 -M -s /usr/sbin/nologin musefs`
+  `groupadd -g "$MUSEFS_GID" musefs && useradd -u "$MUSEFS_UID" -g "$MUSEFS_GID" -M -s /usr/sbin/nologin musefs`
 - **musl / Alpine:**
-  `addgroup -g 1000 musefs && adduser -u 1000 -G musefs -H -D -s /sbin/nologin musefs`
+  `addgroup -g "$MUSEFS_GID" musefs && adduser -u "$MUSEFS_UID" -G musefs -H -D -s /sbin/nologin musefs`
 - `RUN echo 'user_allow_other' >> /etc/fuse.conf` (created if absent). **Musl
   caveat:** confirm Alpine's `fusermount3` reads `/etc/fuse.conf` and honours
   `user_allow_other` — verified in the live test, not assumed.
-- `USER musefs`
+- `USER musefs` (by name — works regardless of the chosen numeric uid).
 
-The store volume must be writable by uid 1000 — **this is the real friction**:
-the existing copy-paste `docker run -v /store …` breaks unless the host store
-dir is owned by 1000 or `--user $(id -u):$(id -g)` is passed. This is a docs
-change as much as an image change. Confirm no base image / compose default
+The store volume must be writable by the chosen uid — **this is the real
+friction**: the existing copy-paste `docker run -v /store …` breaks unless the
+host store dir is owned by that uid, or `--user $(id -u):$(id -g)` is passed.
+The build arg is the friction-reducer for self-builders: `--build-arg
+MUSEFS_UID=$(id -u) --build-arg MUSEFS_GID=$(id -g)` bakes an image whose user
+matches the host owner, so no chown or `--user` is needed at run time (the
+published image defaults to 1000). Confirm no base image / compose default
 injects `NoNewPrivileges` (would block the setuid escalation the container
 relies on).
 
@@ -247,7 +252,8 @@ is the manual live run; do not commit an untested directive set.
    gate* — the mount unit intentionally scores higher than the scanner.
    Spot-check that uncommenting one opt-in directive and restarting still mounts,
    to document the opt-in path.
-3. **#319:** build **both** images; for each assert uid 1000 can open
+3. **#319:** build **both** images at the default uid and confirm a build-arg
+   override (`--build-arg MUSEFS_UID=…`) takes effect; for each assert the uid can open
    `/dev/fuse`, run `scan` + `mount` non-root with
    `--cap-add SYS_ADMIN --device /dev/fuse`. Confirm the store write is
    uid-1000-owned, and that a non-root `--allow-other` (or `--owner`) mount
@@ -258,7 +264,6 @@ is the manual live run; do not commit an untested directive set.
 ## Out of scope (YAGNI)
 
 - CI smoke harness — verification is the live dedi run.
-- Build-arg-configurable container UID — fixed 1000 + doc note.
 - Write-path confinement on the scanner (`ProtectSystem=strict` +
   `ReadWritePaths`) — dropped for friction; revisit only if a concrete
   parser-write threat appears.
