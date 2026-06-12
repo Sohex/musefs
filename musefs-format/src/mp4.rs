@@ -620,7 +620,8 @@ fn freeform_binary_prefix(mean: &str, name: &str, payload_len: u64) -> Result<Ve
     let data_size = size::checked_add(16, payload_len)?; // data header + type + locale + payload
     let inner_len = size::checked_sum([mean_box.len() as u64, name_box.len() as u64, data_size])?;
 
-    let mut out = u32::try_from(8 + inner_len)
+    let outer_len = size::checked_add(8, inner_len)?;
+    let mut out = u32::try_from(outer_len)
         .map_err(|_| FormatError::TooLarge)?
         .to_be_bytes()
         .to_vec();
@@ -2471,6 +2472,19 @@ mod tests {
         }];
         assert_eq!(
             build_udta(&[], &bins, &[]).err(),
+            Some(FormatError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn freeform_binary_prefix_checked_outer_box_size_rejects_overflow() {
+        // A payload_len that slips past the data_size and inner_len checks can
+        // still overflow the outer `8 + inner_len` box-size add. With 1-char
+        // mean/name each boxed mean/name is 13 bytes, so inner_len = 26 + data_size
+        // = 42 + payload_len; payload_len = u64::MAX - 42 drives inner_len to exactly
+        // u64::MAX, so the outer add must fail closed, not panic (debug) / wrap (release).
+        assert_eq!(
+            freeform_binary_prefix("m", "n", u64::MAX - 42).err(),
             Some(FormatError::TooLarge)
         );
     }
