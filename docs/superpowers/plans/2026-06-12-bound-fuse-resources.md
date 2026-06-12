@@ -88,6 +88,8 @@ Append these three tests inside `mod tests` (just before its closing brace at `l
         let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
         assert_eq!(fh, Some(12), "a freed slot admits again");
         assert_eq!(handles.len(), 2);
+        assert!(!handles.contains_key(&10), "the freed handle stays gone");
+        assert!(handles.contains_key(&12), "the new handle fills the freed slot");
     }
 ```
 
@@ -215,6 +217,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ---
 
 ## Task 2: Part B — bound foreground read work (#308)
+
+> **Anchor on the quoted text, not the line numbers.** Task 1 inserts ~30 lines, so every line number below is pre-Task-1 and will have shifted. Each step gives an unambiguous textual anchor — use it.
 
 **Files:**
 - Modify: `musefs-fuse/src/lib.rs` (add `AtomicUsize` import at line 8; add const + guard + helper after the `PollPendingGuard` Drop impl ~line 146; add field to `MusefsFs` ~line 175; init in `new` ~line 198; rewrite `read` at 419–452; edit `FuseConfig::max_background` doc)
@@ -383,7 +387,10 @@ Replace the body of `read` (`lib.rs:419-452`) with:
         };
         let core = Arc::clone(&self.core);
         self.pool.execute(move || {
-            // Held until the read completes (or the worker panics), then released.
+            // `_slot` (named) holds the guard until the read completes or the
+            // worker panics, then releases it. Do NOT simplify to bare `_`: that
+            // drops the guard immediately, releasing the slot before the work
+            // runs and neutering the cap.
             let _slot = slot;
             READ_BUF.with(|b| {
                 let mut buf = b.borrow_mut();
@@ -407,7 +414,16 @@ Replace the body of `read` (`lib.rs:419-452`) with:
 
 - [ ] **Step 9: Update the `FuseConfig::max_background` doc comment**
 
-Replace the doc comment on `max_background` (`lib.rs` `FuseConfig`, the three `///` lines ending `not by this.`):
+Find this exact doc comment on the `max_background` field in `FuseConfig`:
+
+```rust
+    /// Max outstanding background (readahead/async) requests the kernel queues.
+    /// Caps that class of work delivered to the pool; foreground reads are
+    /// bounded only by client concurrency, not by this.
+    pub max_background: u16,
+```
+
+Replace it with (only the final clause changes):
 
 ```rust
     /// Max outstanding background (readahead/async) requests the kernel queues.
