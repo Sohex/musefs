@@ -293,7 +293,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build amd64 image for smoke
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
         with:
           context: ctx
           file: ${{ matrix.dockerfile }}
@@ -309,7 +309,7 @@ jobs:
             "musefs-smoke:${{ matrix.variant }}" \
             -c '${{ matrix.ffmpeg_install }} && sh /scripts/smoke-binary.sh /usr/local/bin/musefs'
       - name: Build and push multi-arch manifest
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
         with:
           context: ctx
           file: ${{ matrix.dockerfile }}
