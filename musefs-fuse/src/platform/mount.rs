@@ -21,6 +21,10 @@ pub fn options(fs_name: &str, allow_other: bool) -> Vec<MountOption> {
 /// a non-root user unless `/etc/fuse.conf` enables `user_allow_other`. Check it
 /// up front to replace fusermount3's cryptic "Permission denied" with actionable
 /// guidance. Non-Linux platforms don't gate on `/etc/fuse.conf`, so it's a no-op.
+// On non-Linux the body unconditionally returns `Ok`, which trips
+// `clippy::unnecessary_wraps`; the Linux build genuinely returns `Err`, so keep
+// the `Result` and silence the lint only where it fires.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub fn check_allow_other(allow_other: bool) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
