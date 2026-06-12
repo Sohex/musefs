@@ -110,8 +110,12 @@ done
 [ -n "$IMPORTED" ] || { echo "--- lidarr log ---"; "$DOCKER" exec "$CID" sh -c 'tail -n 40 /config/logs/lidarr.txt'|grep -iE 'import|reject|script|sync'|tail -15; fail "import did not complete"; }
 
 # The in-container sync/import (root under rootful Docker) wrote the store +
-# library symlinks; chown the tree so the host musefs read/mount/assert path works.
-reown "$W"
+# library symlinks; chown those back so the host musefs read/mount/assert path
+# works. Deliberately NOT $W/downloads: the backing file is host-created and only
+# read in-container, so chowning it would bump its ctime after the store recorded
+# its freshness stamp — tripping the (size, mtime, ctime) backing-changed guard
+# (musefs-core freshness, #276) and failing the serve with an I/O error.
+reown "$W/store" "$LIB" "$W/config"
 echo "=== assertions ==="
 LIBFILE="$LIB/Komiku/01 - The calling.flac"
 [ -L "$LIBFILE" ] || fail "library entry is not a symlink (import script didn't run): $(ls -l "$LIBFILE")"
