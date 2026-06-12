@@ -14,16 +14,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Lidarr integration:** a new `contrib/lidarr/` package that drives
   symlink-based placeholder imports and syncs Lidarr metadata into the musefs
   SQLite store.
+- **FUSE mount-access controls:** new `--allow-other`, `--owner`, and `--group`
+  flags mount with `allow_other` + `default_permissions` so accounts other than
+  the mounting user can reach the view and the presented owner/group/mode bits
+  are enforced; `--owner`/`--group` imply `--allow-other`. A non-root
+  `allow_other` mount is pre-flight checked against `/etc/fuse.conf`
+  `user_allow_other` and fails early with guidance if it is missing. See the
+  README [Ownership and permissions](README.md#ownership-and-permissions)
+  section (#293, #294).
+- **Hardened deployment assets:** the container image runs as a dedicated
+  unprivileged user with a build-arg-configurable UID/GID, and the
+  `musefs-scan.service` systemd unit ships a strong sandbox (the FUSE-mounting
+  `musefs.service` deliberately cannot be sandboxed). See
+  [contrib/systemd/README.md](contrib/systemd/README.md#hardening)
+  (#317, #318, #319).
 - **crates.io distribution:** the `musefs` binary is published to crates.io as of
   this release and installable with `cargo install musefs`. A new thin `musefs` wrapper crate
   owns the binary (`musefs-cli` is now a library crate), and a tag-triggered
   release workflow publishes all crates in dependency order.
 - **Fuzzing & property tests:** coverage-guided `cargo-fuzz` targets for every
-  format parser (FLAC, MP3, MP4, Ogg, WAV) and the byte-level primitives (Ogg
-  page parsing, base64 windowing, VorbisComment), plus `proptest` invariants —
+  format parser (FLAC, MP3, MP4, Ogg, WAV), the byte-level primitives (Ogg
+  page parsing, base64 windowing, VorbisComment), and the serve path — the
+  latter drives the full synthesis pipeline over hostile DB rows and binary tags
+  via a fuzzing-gated `Db::with_raw_conn`. Plus `proptest` invariants —
   panic-freedom, the byte-identical audio guarantee, and tag round-trip — an
   end-to-end read-fidelity property, and a `mutagen` interop test asserting an
   independent reader sees the tags we synthesize.
+
+### Changed
+
+- **`mount --db` now requires an existing store.** Mounting against a missing
+  database path is rejected before any FUSE setup instead of silently creating
+  and migrating an empty store, so a mistyped `--db` fails loudly rather than
+  mounting an empty view. `scan --db` still creates the store if absent (#309).
 
 ### Fixed
 
@@ -58,6 +81,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reached via both its real path and a symlink is ingested and counted once
   instead of inflating `scanned`; multiple hardlinks to the same inode are
   likewise collapsed to a single track (#302).
+- **Stable inodes on case-insensitive mounts:** the inode allocator is now keyed
+  on the case-folded path in case-insensitive mode, so an unrelated deletion that
+  flips a merged directory's display casing no longer reassigns a survivor's
+  inode (#305).
+- **Lidarr autoscan now honors the scan timeout:** an import/release-triggered
+  autoscan applies the shared 120s scan timeout, matching the beets and Picard
+  integrations, so a wedged `musefs scan` fails with a controlled timeout instead
+  of blocking the custom-script process indefinitely (#312).
 
 ## [0.2.0] - 2026-05-27
 
