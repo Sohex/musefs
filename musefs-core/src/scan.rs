@@ -109,6 +109,7 @@ fn collect_audio(
     follow_symlinks: bool,
 ) -> std::io::Result<u64> {
     let mut visited = HashSet::new();
+    let mut files_visited = HashSet::new();
     let mut skipped = 0u64;
     if follow_symlinks {
         // Seed with the root's identity so a symlink pointing back to it is
@@ -117,7 +118,14 @@ fn collect_audio(
             visited.insert(dir_key(&meta));
         }
     }
-    collect_audio_inner(root, out, follow_symlinks, &mut visited, &mut skipped)?;
+    collect_audio_inner(
+        root,
+        out,
+        follow_symlinks,
+        &mut visited,
+        &mut files_visited,
+        &mut skipped,
+    )?;
     Ok(skipped)
 }
 
@@ -126,6 +134,7 @@ fn collect_audio_inner(
     out: &mut Vec<PathBuf>,
     follow_symlinks: bool,
     visited: &mut HashSet<(u64, u64)>,
+    files_visited: &mut HashSet<(u64, u64)>,
     skipped: &mut u64,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
@@ -133,10 +142,10 @@ fn collect_audio_inner(
         let path = entry.path();
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
-            descend(&path, out, follow_symlinks, visited, skipped)?;
+            descend(&path, out, follow_symlinks, visited, files_visited, skipped)?;
         } else if ftype.is_file() {
             if is_supported_audio(&path) {
-                out.push(path);
+                push_file(&path, out, follow_symlinks, files_visited, None);
             } else {
                 *skipped += 1;
             }
@@ -150,11 +159,11 @@ fn collect_audio_inner(
             }
             match std::fs::metadata(&path) {
                 Ok(meta) if meta.is_dir() => {
-                    descend(&path, out, follow_symlinks, visited, skipped)?;
+                    descend(&path, out, follow_symlinks, visited, files_visited, skipped)?;
                 }
                 Ok(meta) if meta.is_file() => {
                     if is_supported_audio(&path) {
-                        out.push(path);
+                        push_file(&path, out, follow_symlinks, files_visited, Some(&meta));
                     } else {
                         *skipped += 1;
                     }
@@ -174,10 +183,11 @@ fn descend(
     out: &mut Vec<PathBuf>,
     follow_symlinks: bool,
     visited: &mut HashSet<(u64, u64)>,
+    files_visited: &mut HashSet<(u64, u64)>,
     skipped: &mut u64,
 ) -> std::io::Result<()> {
     if !follow_symlinks {
-        return collect_audio_inner(path, out, follow_symlinks, visited, skipped);
+        return collect_audio_inner(path, out, follow_symlinks, visited, files_visited, skipped);
     }
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -190,12 +200,42 @@ fn descend(
         log::warn!("skipping symlink cycle at {}", path.display());
         return Ok(());
     }
-    collect_audio_inner(path, out, follow_symlinks, visited, skipped)
+    collect_audio_inner(path, out, follow_symlinks, visited, files_visited, skipped)
 }
 
 fn dir_key(meta: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (meta.dev(), meta.ino())
+}
+
+/// Collect one supported-extension file into `out`, deduplicating by target
+/// identity when following symlinks so a real file and a symlink to it (or a
+/// file reached via two symlink paths) are ingested once. `known_meta` is the
+/// already-resolved target metadata when the caller has it (the symlink arm),
+/// avoiding a second `stat`. Dedup is best-effort: if the target cannot be
+/// `stat`ed we push it and let the probe pipeline count it rather than dropping
+/// it silently.
+fn push_file(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    follow_symlinks: bool,
+    files_visited: &mut HashSet<(u64, u64)>,
+    known_meta: Option<&std::fs::Metadata>,
+) {
+    if !follow_symlinks {
+        out.push(path.to_path_buf());
+        return;
+    }
+    let key = match known_meta {
+        Some(m) => Some(dir_key(m)),
+        None => std::fs::metadata(path).ok().map(|m| dir_key(&m)),
+    };
+    match key {
+        Some(k) if !files_visited.insert(k) => {
+            log::debug!("skipping duplicate backing target {}", path.display());
+        }
+        _ => out.push(path.to_path_buf()),
+    }
 }
 
 /// A backing file parsed into the fields a track row needs, plus its raw
@@ -768,6 +808,7 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
     }
     db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
     let mut stats = run_pipeline(db, files, opts)?;
+    // skipped is tallied during the walk, not the pipeline
     stats.skipped = skipped;
     Ok(stats)
 }
@@ -913,7 +954,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
 
     Ok(ScanStats {
         scanned,
-        skipped: 0,
+        skipped: 0, // counted at walk time; filled in by scan_directory_with
         failed: failed.load(Ordering::Relaxed),
         raced: raced.load(Ordering::Relaxed),
     })

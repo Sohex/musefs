@@ -355,6 +355,79 @@ fn oracle_counts_scanned_failed_and_skipped_exactly() {
     assert_eq!(stats.scanned, 1, "exactly the one valid FLAC is scanned");
     assert_eq!(stats.failed, 1, "the garbage .flac is a failure");
     assert_eq!(stats.skipped, 1, "the .txt is skipped at collection");
+}
+
+// === Symlink dedup under --follow-symlinks (#302) ===
+
+/// A real file and a symlink to it in the same directory ingest once: file-level
+/// (dev, ino) dedup (the directory-cycle guard does not apply to file symlinks).
+#[test]
+fn follow_symlinks_dedups_file_and_sibling_symlink() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let song = dir.path().join("song.flac");
+    std::fs::write(&song, flac_minimal(b"AUDIO-SONG")).unwrap();
+    symlink(&song, dir.path().join("link.flac")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 1, "real file and its symlink ingest once");
+    assert_eq!(stats.skipped, 0);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
+
+/// The same file reached through two directory paths — one real, one a file
+/// symlink in a sibling directory — ingests once. Exercises cross-directory
+/// file-level dedup.
+#[test]
+fn follow_symlinks_dedups_file_across_directories() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let song = a.join("song.flac");
+    std::fs::write(&song, flac_minimal(b"AUDIO-SONG")).unwrap();
+    symlink(&song, b.join("alias.flac")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 1);
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
+
+/// A symlinked directory pointing at an already-walked directory reaches the
+/// same file by two paths but ingests once. (Handled by the existing
+/// directory-cycle guard; this locks in the combined behavior.)
+#[test]
+fn follow_symlinks_dedups_via_symlinked_directory() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("song.flac"), flac_minimal(b"AUDIO-SONG")).unwrap();
+    symlink(&real, dir.path().join("mirror")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 1);
     assert_eq!(db.list_tracks().unwrap().len(), 1);
 }
 

@@ -113,13 +113,13 @@ exclude_re = [
     # block end past the prefix), so `up_to.min(probe_cap)` always wins the max and
     # the `want + 1` term is never selected. `+`->`-`/`*` are equivalent.
     # guard: op="+" fn="probe_body" rows=2
-    'musefs-core/src/scan\.rs:408:31:',
+    'musefs-core/src/scan\.rs:448:31:',
     # probe_body post-loop fallback guard `(prefix.len() as u64) < probe_cap`: when
     # it differs, the only effect is a redundant re-read up to the probe cap that
     # feeds the same `probe_full` result. The >8-retry path that could diverge is
     # unreachable given the probers' exact (FLAC/MP3/WAV) / geometric (Ogg) NeedMore.
     # guard: op="<" fn="probe_body" rows=3
-    'musefs-core/src/scan\.rs:415:30:',
+    'musefs-core/src/scan\.rs:455:30:',
     # probe_body WAV ceiling-fallback guard `file_len > MAX_PROBE_BYTES` (`>` at
     # :21): differs from `>=` only at file_len == MAX_PROBE_BYTES exactly, where the
     # whole file already fits within probe_cap — so `probe_full` parses it (valid)
@@ -127,18 +127,18 @@ exclude_re = [
     # (corrupt), giving the identical skip either way. The ceiling branch is never
     # the deciding path at the boundary, so the mutant is equivalent.
     # guard: op=">" fn="probe_body" rows=3
-    'musefs-core/src/scan\.rs:426:21:',
+    'musefs-core/src/scan\.rs:466:21:',
     # probe_body oversize-skip diagnostic `file_len > MAX_PROBE_BYTES` (`>` at :17):
     # gates only a `log::warn!` (mirroring the M4A `MetadataTooLarge` warn). It has
     # no effect on the returned `Probed`/skip decision or any persisted state, so
     # every mutation of the condition is unobservable — a pure observability shim,
     # like the metrics counters above.
     # guard: op=">" fn="probe_body" rows=3
-    'musefs-core/src/scan\.rs:431:17:',
+    'musefs-core/src/scan\.rs:471:17:',
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:796:46:',
+    'musefs-core/src/scan\.rs:837:46:',
     # run_pipeline flush cadence (batch_bytes accounting + the
     # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
     # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on
@@ -147,25 +147,25 @@ exclude_re = [
     # (fsyncs), a performance property only observable via the `metrics`
     # instrumentation the in-diff gate does not build.
     # NB: line:col here (and for revalidate below) — `+=` and `>=`/`||` repeat in
-    # run_pipeline (e.g. the killable `*scanned += 1` at 861), so these cannot be
+    # run_pipeline (e.g. the killable `*scanned += 1` at 902), so these cannot be
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:883:29:',
+    'musefs-core/src/scan\.rs:924:29:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:885:32:',
+    'musefs-core/src/scan\.rs:926:32:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:885:47:',
+    'musefs-core/src/scan\.rs:926:47:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:885:62:',
+    'musefs-core/src/scan\.rs:926:62:',
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:893:37:',
+    'musefs-core/src/scan\.rs:934:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:895:40:',
+    'musefs-core/src/scan\.rs:936:40:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:895:55:',
+    'musefs-core/src/scan\.rs:936:55:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:895:70:',
+    'musefs-core/src/scan\.rs:936:70:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
@@ -173,11 +173,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:1008:25:',
+    'musefs-core/src/scan\.rs:1049:25:',
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:1012:25:',
+    'musefs-core/src/scan\.rs:1053:25:',
     # guard: op="+" fn="revalidate_with" rows=1
-    'musefs-core/src/scan\.rs:1048:29: replace \+ with -',
+    'musefs-core/src/scan\.rs:1089:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
