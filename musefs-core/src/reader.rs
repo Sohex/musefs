@@ -77,8 +77,18 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .map_or(0, |d| d.as_secs().cast_signed())
 }
 
-fn read_front(path: &Path, n: u64) -> std::io::Result<Vec<u8>> {
+fn read_front(path: &Path, n: u64) -> crate::Result<Vec<u8>> {
     use std::io::Read;
+    // Fail closed before any allocation/open: a hostile DB row can request an
+    // arbitrary `audio_offset`, but no legitimately-scanned file has a front
+    // larger than the scanner's probe ceiling. Bounding `n` here also retires a
+    // 32-bit `usize_from` truncation footgun.
+    if n > crate::scan::MAX_PROBE_BYTES {
+        return Err(CoreError::HeaderTooLarge {
+            requested: n,
+            cap: crate::scan::MAX_PROBE_BYTES,
+        });
+    }
     crate::metrics::on_open();
     let mut f = std::fs::File::open(path)?;
     let mut buf = vec![0u8; usize_from(n)];
@@ -1311,5 +1321,117 @@ mod binary_tag_serve_tests {
         // No BackingAudio segment, so read_at opens no file.
         let got = read_at(&resolved, &db, 1, 2).unwrap();
         assert_eq!(got, vec![20, 30]);
+    }
+}
+
+#[cfg(test)]
+mod serve_cap_tests {
+    use super::*;
+    use musefs_db::{Db, Format, NewTrack};
+
+    const CAP: u64 = crate::scan::MAX_PROBE_BYTES;
+
+    /// A sparse backing file of `len` bytes (no real bytes written — `set_len`
+    /// only extends the file's logical size, which tmpfs keeps sparse).
+    fn sparse_file(dir: &std::path::Path, name: &str, len: u64) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(len).unwrap();
+        path
+    }
+
+    /// Insert a `tracks` row whose `audio_offset` exceeds the cap while still
+    /// satisfying both serve guards (`backing_size == meta.len()` and
+    /// `audio_offset + audio_length <= meta.len()`). Returns the track id.
+    /// Takes `&Db` (= `Db<ReadWrite>`) because `upsert_track` is defined on
+    /// `impl Db<ReadWrite>`, not the generic `impl<M> Db<M>`.
+    fn hostile_track(db: &Db, path: &std::path::Path, format: Format) -> i64 {
+        let meta = std::fs::metadata(path).unwrap();
+        db.upsert_track(&NewTrack {
+            backing_path: path.to_string_lossy().into_owned(),
+            format,
+            audio_offset: CAP + 1,
+            audio_length: 1,
+            backing_size: meta.len(),
+            backing_mtime: mtime_secs(&meta),
+        })
+        .unwrap()
+    }
+
+    /// Assert a resolve attempt fails closed with the cap error for `audio_offset`.
+    fn assert_capped(result: crate::Result<std::sync::Arc<ResolvedFile>>) {
+        match result {
+            Err(CoreError::HeaderTooLarge { requested, cap }) => {
+                assert_eq!(requested, CAP + 1);
+                assert_eq!(cap, CAP);
+            }
+            Err(other) => panic!("expected HeaderTooLarge, got {other:?}"),
+            Ok(_) => panic!("expected HeaderTooLarge, resolve unexpectedly succeeded"),
+        }
+    }
+
+    #[test]
+    fn wav_serve_caps_hostile_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "hostile.wav", CAP + 2);
+        let db = Db::open_in_memory().unwrap();
+        let track_id = hostile_track(&db, &path, Format::Wav);
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        assert_capped(cache.resolve(&db, track_id));
+    }
+
+    #[test]
+    fn ogg_serve_caps_hostile_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "hostile.opus", CAP + 2);
+        let db = Db::open_in_memory().unwrap();
+        let track_id = hostile_track(&db, &path, Format::Opus);
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        assert_capped(cache.resolve(&db, track_id));
+    }
+
+    #[test]
+    fn flac_legacy_serve_caps_hostile_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "hostile.flac", CAP + 2);
+        let db = Db::open_in_memory().unwrap();
+        // No structural-block rows inserted -> build() takes the legacy fallback
+        // branch (rows.is_empty()) that calls read_front.
+        let track_id = hostile_track(&db, &path, Format::Flac);
+        assert!(db.get_structural_blocks(track_id).unwrap().is_empty());
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        assert_capped(cache.resolve(&db, track_id));
+    }
+
+    #[test]
+    fn read_front_rejects_oversize_before_open() {
+        // Nonexistent path: if the cap check did NOT fire first, File::open would
+        // error and we'd get an Io error instead of HeaderTooLarge. So this also
+        // pins the fail-closed ordering (check precedes any open/allocation).
+        let err =
+            read_front(std::path::Path::new("/nonexistent/musefs/front"), CAP + 1).unwrap_err();
+        match err {
+            CoreError::HeaderTooLarge { requested, cap } => {
+                assert_eq!(requested, CAP + 1);
+                assert_eq!(cap, CAP);
+            }
+            other => panic!("expected HeaderTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_front_allows_exactly_cap() {
+        // Boundary: `n == CAP` must NOT be rejected — the check is `>`, not `>=`.
+        // With a nonexistent path the call still fails, but with an Io error from
+        // File::open, never HeaderTooLarge. This pins the boundary and kills the
+        // `> -> >=` mutant.
+        let err = read_front(std::path::Path::new("/nonexistent/musefs/front"), CAP).unwrap_err();
+        assert!(
+            matches!(err, CoreError::Io(_)),
+            "expected Io error at the cap boundary, got {err:?}"
+        );
     }
 }
