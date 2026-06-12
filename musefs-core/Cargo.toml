@@ -24,6 +24,7 @@ thiserror = "2"
 
 [dev-dependencies]
 musefs-latencyfs = { path = "../musefs-latencyfs" }
+libc = "0.2"
 tempfile = "3"
 metaflac = "0.2"
 id3 = "1"
