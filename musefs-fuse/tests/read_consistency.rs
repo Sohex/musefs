@@ -404,9 +404,18 @@ fn write_ops_are_refused_on_read_only_mount() {
             );
             // mknod a regular file (no privilege needed); ENOSYS tolerates a
             // platform/FUSE build that does not implement the callback at all.
+            // EINVAL: FreeBSD's mknod(2) only creates special files and rejects
+            // S_IFREG at the syscall layer before the FUSE RO check — still a
+            // refusal (no node is created), which is all this test asserts.
             assert_refused(
                 libc::mknod(new_file.as_ptr(), libc::S_IFREG | 0o644, 0),
-                &[libc::EROFS, libc::EPERM, libc::EACCES, libc::ENOSYS],
+                &[
+                    libc::EROFS,
+                    libc::EPERM,
+                    libc::EACCES,
+                    libc::ENOSYS,
+                    libc::EINVAL,
+                ],
                 "mknod",
             );
             assert_refused(
@@ -415,9 +424,11 @@ fn write_ops_are_refused_on_read_only_mount() {
                 "link",
             );
 
-            // xattr syscalls differ in signature across platforms (Linux vs
-            // macOS); this test only ever *runs* on Linux (/dev/fuse), so gate
-            // the xattr probes so the macOS workspace build still compiles.
+            // xattr syscall signatures and names differ across platforms (Linux
+            // setxattr vs the BSD/macOS extattr_* family), so gate the probes to
+            // Linux: on macOS/FreeBSD the workspace build still compiles, and on
+            // FreeBSD (where this test *does* run, via fusefs) they are skipped
+            // rather than calling a syscall this code isn't written against.
             #[cfg(target_os = "linux")]
             {
                 let xval = [0u8; 4];
