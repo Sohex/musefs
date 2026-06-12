@@ -29,6 +29,9 @@ Verified by `musefs-format/tests/proptest_ogg.rs` (crate feature `fuzzing`),
   builder as FLAC: canonical keys map to their conventional field names via
   the shared vocabulary (`musefs-format/src/tagmap.rs`); any other field
   round-trips verbatim by its own name, in order, multi-values included.
+  User-defined keys outside the Vorbis field-name grammar (empty, containing `=`,
+  control characters, or non-ASCII — outside ASCII `0x20`–`0x7D` minus `=`) are
+  dropped on synthesis and logged.
 - **Embedded pictures**, with MIME type, picture type, description, and
   dimensions — in both art encodings (see below).
 - **Codec headers.** The identification packet (`OpusHead`, Vorbis

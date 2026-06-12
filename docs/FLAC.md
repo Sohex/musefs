@@ -11,6 +11,9 @@ model these layouts plug into, see
   `date`, `tracknumber`, …) map to their conventional Vorbis field names via
   the shared vocabulary (`musefs-format/src/tagmap.rs`); any other field
   round-trips verbatim by its own name. Multi-value fields keep their order.
+  User-defined keys that are not legal Vorbis field names (empty, containing `=`,
+  control characters, or non-ASCII bytes — i.e. outside ASCII `0x20`–`0x7D` minus
+  `=`) are dropped on synthesis and logged; they cannot round-trip by name.
 - **Binary metadata blocks.** `APPLICATION` and `CUESHEET` blocks are
   captured at scan time as binary tags (an `APPLICATION` payload includes its
   4-byte application id) and re-emitted on synthesis, streamed from the DB
