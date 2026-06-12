@@ -2023,6 +2023,37 @@ mod hardening_tests {
         assert_eq!(rows[0].byte_len, 3);
     }
 
+    #[test]
+    fn accept_pictures_keeps_at_cap_and_drops_over_cap() {
+        let mk = |len: usize| EmbeddedPicture {
+            mime: "image/jpeg".to_string(),
+            picture_type: musefs_format::PictureType::new(3).unwrap(),
+            description: String::new(),
+            width: 0,
+            height: 0,
+            data: vec![0u8; len],
+        };
+        // A picture exactly at the cap is kept; one byte over is dropped. The
+        // boundary pins `>` against `>=` (an at-cap drop would be silent loss).
+        let kept = accept_pictures("/x.flac", vec![mk(MAX_ART_BYTES), mk(MAX_ART_BYTES + 1)]);
+        assert_eq!(kept.len(), 1, "exactly the at-cap picture survives");
+        assert_eq!(kept[0].data.len(), MAX_ART_BYTES);
+    }
+
+    #[test]
+    fn accept_binary_tags_keeps_at_cap_and_drops_over_cap() {
+        let mk = |len: usize| EmbeddedBinaryTag {
+            key: "PRIV".to_string(),
+            payload: vec![0u8; len],
+        };
+        let kept = accept_binary_tags(
+            "/x.mp3",
+            vec![mk(MAX_BINARY_TAG_BYTES), mk(MAX_BINARY_TAG_BYTES + 1)],
+        );
+        assert_eq!(kept.len(), 1, "exactly the at-cap binary tag survives");
+        assert_eq!(kept[0].payload.len(), MAX_BINARY_TAG_BYTES);
+    }
+
     fn probed_with_text_tags(tags: &[(&str, &str)]) -> Probed {
         Probed {
             format: musefs_db::Format::Mp3,
