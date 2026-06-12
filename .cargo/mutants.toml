@@ -333,6 +333,21 @@ exclude_re = [
     # description-anchored against `cargo fmt` line drift.
     'replace < with <= in read_segments_into',
 
+    # warn_invalid_vorbis_keys is a pure observability shim — it does nothing but
+    # `log::warn!` the user-defined keys that the Vorbis path drops. The drop
+    # itself happens independently in `vorbiscomment::build` (pinned by the
+    # format-layer build_skips_* tests and the end-to-end
+    # synthesis_drops_invalid_vorbis_key_end_to_end test), so neither replacing
+    # the body with `()` nor deleting the `!` on its `is_valid_vorbis_key` guard
+    # changes any synthesized byte or persisted state — the only observable is the
+    # log line. Same class as the probe_body `log::warn!` and the metrics counters
+    # above; the repo excludes log shims rather than carrying a log-capture test.
+    # Description-anchored so reader.rs line drift can't retire them.
+    # guard: count=1
+    'replace warn_invalid_vorbis_keys with \(\)',
+    # guard: count=1
+    'delete ! in warn_invalid_vorbis_keys',
+
     # wav walk_chunks advance guard `next <= buf.len() as u64` -> `true`: forcing
     # the guard true sets `pos = next` even when `next > buf.len()`, but the loop's
     # `while pos + 8 <= buf.len()` test is then immediately false (next can't wrap —
