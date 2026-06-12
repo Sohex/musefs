@@ -49,7 +49,7 @@ fn path_field_segment_count_is_capped() {
     // MAX_PATH_FIELD_SEGMENTS is a private const = 64 in template.rs. A hostile
     // 256 KiB `a/a/a/...` tag would expand to tens of thousands of segments; the
     // cap clamps the rendered path to at most 64 directory components.
-    let value: String = std::iter::repeat("a").take(200).collect::<Vec<_>>().join("/");
+    let value = vec!["a"; 200].join("/");
     let f = fields(&[("p", value.as_str())]);
     let rendered = Template::parse("$!{p}").render(&f, &BTreeMap::new(), "Unknown", "flac");
     let body = rendered.strip_suffix(".flac").expect("ext appended");
@@ -387,9 +387,11 @@ proptest! {
 
 (The `value in ".{0,64}"` half is unchanged: path-field *values* are still sanitized — control bytes → `_` — never rejected.)
 
+This proptest is a **no-panic guard**, not the rejection test: the `.` strategy can generate `[`/control bytes, but the `if let Ok(t)` arm silently skips every rejected template, so it proves "parse-or-render never panics", not "bad templates are rejected". The actual rejection behaviour is pinned deterministically by the Step 11 tests (NUL, `0x01`, and the 64/65 nesting boundary).
+
 - [ ] **Step 11: Add the #275 / #304 acceptance tests**
 
-Add the #275 parse-rejection tests to `musefs-core/tests/template.rs` (needs `TemplateError` in scope — add `use musefs_core::TemplateError;` to the imports):
+Add the #275 parse-rejection tests to `musefs-core/tests/template.rs` (needs `TemplateError` in scope — merge it into the existing import so line 1 reads `use musefs_core::{Template, TemplateError};`):
 
 ```rust
 #[test]
@@ -475,6 +477,8 @@ cargo test
 ```
 
 Expected: clean build; no clippy warnings; all tests pass, including the new #275/#303/#304 tests, the rewritten proptest, and every renamed site.
+
+`cargo fmt --all` formats the whole workspace. If it reports changes in any file **outside** the five this task touches, stop and investigate — the by-name `git add` in Step 14 would otherwise leave that stray diff unstaged, and the pre-commit hook's `fmt --check` over tracked files would then reject the commit.
 
 - [ ] **Step 14: Commit**
 

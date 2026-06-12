@@ -71,7 +71,7 @@ render time and must not be able to fail the mount, so it is clamped.
     structural path separator. (`< 0x20` matches the existing `sanitize_into` rule
     exactly, so field-value and literal policy stay aligned.)
   - The `Infallible` line in `impl Template`'s `parse` doc comment
-    (`template.rs:28`) is updated; no other doc references infallibility.
+    (`template.rs:30`) is updated; no other doc references infallibility.
 
 **Why this bounds everything once:** because `parse` rejects deep nesting, a
 constructed `Template` *structurally cannot* exceed `MAX_SECTION_DEPTH`. Therefore
