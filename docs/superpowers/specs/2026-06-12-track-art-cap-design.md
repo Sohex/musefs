@@ -87,9 +87,13 @@ Vec grows.
    },
    ```
 
-   and a `check_art_count(track_id, count)` helper mirroring `check_tag_count`,
-   keeping a single `>` boundary site (one mutation target) shared by every art
-   reader. Add a boundary unit test `art_count_accepts_at_cap_rejects_above`
+   and a `pub(crate) fn check_art_count(track_id, count)` helper (same visibility
+   and module as `check_tag_count`, `error.rs:65`) mirroring `check_tag_count`.
+   There is only one art reader (`get_track_art`), so the helper is not about
+   multi-caller sharing the way the tag helper is; the reasons to factor it out are
+   pattern fidelity with `check_tag_count` and keeping the single `>` comparison as
+   one mutation-gate target. Add a boundary unit test
+   `art_count_accepts_at_cap_rejects_above`
    mirroring `tag_count_accepts_at_cap_rejects_above` (accepts at the cap, rejects
    one over) to pin the `>` against `>=`/`==` mutants.
 
@@ -99,17 +103,30 @@ Vec grows.
    Import `check_art_count` alongside the existing `check_field_len`. Add two
    integration tests mirroring the existing description-cap pair
    (`get_track_art_rejects_oversize_description` /
-   `get_track_art_accepts_description_at_cap`): 4096 rows → `Ok`, 4097 rows →
-   `Err(TooManyArtRows)`.
+   `get_track_art_accepts_description_at_cap`): 4096 rows → `Ok` (asserts the
+   returned `Vec` len), 4097 rows → `Err(TooManyArtRows)`. Both tests call
+   `get_track_art` directly — neither drives `track_art_to_inputs`, so the at-cap
+   case does not issue 4096 `get_art_meta` round-trips.
+
+   **Fixture strategy** (this is the one non-obvious implementation detail —
+   planting thousands of rows interacts with the schema's write guards): mirror the
+   tag-count test `per_track_count_cap_text_and_binary` (`tags.rs:440-463`), which
+   raw-`INSERT`s 4097 rows inside an `unchecked_transaction` rather than going
+   through the write API. For art, `upsert_art` **one** `art` row, then raw-`INSERT`
+   4097 `track_art` rows referencing that single `art_id` with distinct `ordinal`s.
+   This satisfies the `art_id` FK without planting 4097 blobs and exercises only
+   the count guard.
 
 ### Data flow
 
 Crafted DB → `get_track_art` materializes rows one at a time → errors at row 4097
 → `DbError::TooManyArtRows` → `?` → `CoreError::Db` (via the existing
-`#[from] musefs_db::DbError`, `musefs-core/src/error.rs:6`) → resolve fails with a
-controlled error instead of allocating attacker-proportional vectors.
-`track_art_to_inputs` needs no change: it inherits the bound (returns at most 4096
-`ArtInput`s, or the propagated error).
+`Db(#[from] musefs_db::DbError)` variant, `musefs-core/src/error.rs:3`) → resolve
+fails with a controlled error instead of allocating attacker-proportional vectors.
+`track_art_to_inputs` needs no change: it inherits the bound. The resulting
+`ArtInput` count is an *upper* bound of 4096, not an equality — zero-length art is
+skipped (`continue`, `mapping.rs:49`) — so any test assertion must use `<=`, not
+`==`, against the row count.
 
 ### No schema/migration change
 
@@ -123,6 +140,7 @@ no Python schema-mirror regeneration, no `picard` `user_version == N` test churn
 - `error.rs`: `art_count_accepts_at_cap_rejects_above` inclusive-boundary unit
   test (the mutation-gate anchor for the single `>` site).
 - `art.rs`: two `get_track_art` integration tests — at cap `Ok`, over cap
-  `TooManyArtRows`.
+  `TooManyArtRows` (fixture: raw-`INSERT` loop sharing one `art_id`, per the
+  strategy in §Changes).
 - The full workspace suite stays green at the single commit (no red-test
   intermediate), satisfying the pre-commit gate and the in-diff mutation gate.
