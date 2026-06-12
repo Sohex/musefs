@@ -68,12 +68,13 @@ unit-testable with tiny buffers.
 
 ### `musefs-core/src/scan.rs`
 
-Pass the existing private constants `MAX_ART_BYTES` / `MAX_BINARY_TAG_BYTES` at
-both probe sites:
+Pass the existing module constants `MAX_ART_BYTES` (`pub(crate)`) and
+`MAX_BINARY_TAG_BYTES` (private) at both probe sites — both are already in scope,
+no visibility change is needed:
 
-- buffer probe path (the `.m4a`/`.m4b` arm calling `mp4::read_pictures(bytes)` /
-  `mp4::read_binary_tags(bytes)`)
-- seek probe path (`probe_file`, calling the same on `&scan.moov`)
+- `probe_full` — the buffer-path `.m4a`/`.m4b` arm calling
+  `mp4::read_pictures(bytes)` / `mp4::read_binary_tags(bytes)`
+- `probe_file` — the seek path, calling the same on `&scan.moov`
 
 `ingest`'s `<= MAX_ART_BYTES` / `<= MAX_BINARY_TAG_BYTES` filters are left
 **unchanged**. They remain the universal backstop for the formats that still
@@ -85,16 +86,23 @@ longer allocates throwaway copies.
 
 Callers that intend to extract everything pass `usize::MAX`:
 
-- inline `#[cfg(test)]` callers in `musefs-format/src/mp4.rs`
+- inline `#[cfg(test)]` callers in `musefs-format/src/mp4.rs` — **update all of
+  them**. As of writing there are ~14: ten `read_pictures` calls and four
+  `read_binary_tags` calls (including the `read_pictures(&[])` / `(garbage)`
+  edge-case tests, which become `read_pictures(&[], usize::MAX)` etc.). Do not
+  rely on these line numbers; grep `read_pictures\|read_binary_tags` within
+  `mp4.rs` and update every call site so the suite stays green.
 - `musefs-format/tests/proptest_mp4.rs` (`read_binary_tags`)
 - `musefs-format/src/fuzz_check.rs` (`read_pictures`)
-- `fuzz/fuzz_targets/mp4.rs` (`read_pictures`) — out-of-workspace; not built by
-  the workspace, so update manually and verify with `cargo +nightly fuzz build mp4`
+- `fuzz/fuzz_targets/mp4.rs` (`read_pictures` only — no `read_binary_tags` call
+  there) — out-of-workspace; not built by the workspace, so update manually and
+  verify with `cargo +nightly fuzz build mp4`
 
 ## Tests
 
-New unit tests in `musefs-format/src/mp4.rs`, using small budgets so no
-multi-megabyte buffers are needed:
+### Format layer — `musefs-format/src/mp4.rs`
+
+Unit tests using small budgets so no multi-megabyte buffers are needed:
 
 1. A `covr` JPEG/PNG payload one byte over a small budget is skipped
    (`read_pictures` returns empty).
@@ -103,14 +111,31 @@ multi-megabyte buffers are needed:
 3. Boundary: a payload *exactly* at the budget is still accepted — one case for
    art, one for binary.
 
+### Core layer — `musefs-core/src/scan.rs`
+
+The format-layer tests only exercise the budget *parameter*. They do not prove
+the scan call sites pass the real caps — wiring `usize::MAX` at a probe site
+would compile, pass every format-layer test, and silently reintroduce the bug
+(the `ingest` backstop would still drop the payload, masking the regression).
+So add a core-level test that proves the skip happens *before* `ingest*:
+
+- Build an MP4 buffer with a `covr` (and a `----`) payload larger than the cap,
+  probe it via `probe_full`, and assert the oversized payload is **absent from
+  `Probed.pictures` / `Probed.binary_tags`** — i.e. it was skipped at extraction,
+  not merely filtered later by `ingest`. Model this on the existing
+  `probe_full_surfaces_mp4_binary_freeform` test (`scan.rs:1119`).
+
 The existing `ingest` oversize-filter tests in `scan.rs` are unaffected: they
-construct `Probed` directly, so they continue to exercise the backstop filter.
+construct `Probed` directly, so they continue to exercise the backstop filter
+for the formats that still produce unbounded payloads.
 
 ## Docs
 
-Check `docs/M4A.md`. If it documents art/binary extraction caps, add a line
-noting the cap is now enforced at extraction (skip-before-copy). This may be a
-no-op if the doc does not cover these caps.
+`docs/M4A.md` does not document the per-payload art/binary byte caps (it
+describes which `covr`/`----` atoms are ingested and a separate resolve-time
+structural cap), so **no doc change is required**. Its "every `data` child of a
+`covr` atom is ingested" wording was already subject to the `ingest` cap and is
+left as-is.
 
 ## Verification
 
