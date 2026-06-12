@@ -6,13 +6,11 @@
 use crate::error::{FormatError, Result};
 
 /// `a + b`, mapping `u64` overflow to `FormatError::TooLarge`.
-#[allow(dead_code)]
 pub(crate) fn checked_add(a: u64, b: u64) -> Result<u64> {
     a.checked_add(b).ok_or(FormatError::TooLarge)
 }
 
 /// Sum an iterator of `u64`, mapping any `u64` overflow to `FormatError::TooLarge`.
-#[allow(dead_code)]
 pub(crate) fn checked_sum(iter: impl IntoIterator<Item = u64>) -> Result<u64> {
     iter.into_iter().try_fold(0u64, checked_add)
 }
