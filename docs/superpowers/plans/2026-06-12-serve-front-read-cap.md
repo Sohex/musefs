@@ -229,7 +229,9 @@ Then add these helpers (after the `const CAP` line, before the existing `read_fr
     /// Insert a `tracks` row whose `audio_offset` exceeds the cap while still
     /// satisfying both serve guards (`backing_size == meta.len()` and
     /// `audio_offset + audio_length <= meta.len()`). Returns the track id.
-    fn hostile_track<M>(db: &Db<M>, path: &std::path::Path, format: Format) -> i64 {
+    /// Takes `&Db` (= `Db<ReadWrite>`) because `upsert_track` is defined on
+    /// `impl Db<ReadWrite>`, not the generic `impl<M> Db<M>`.
+    fn hostile_track(db: &Db, path: &std::path::Path, format: Format) -> i64 {
         let meta = std::fs::metadata(path).unwrap();
         db.upsert_track(&NewTrack {
             backing_path: path.to_string_lossy().into_owned(),
