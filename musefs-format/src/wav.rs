@@ -1,6 +1,7 @@
 use crate::error::{FormatError, Result};
 use crate::input::{BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture};
 use crate::probe::Extent;
+use crate::size;
 use std::collections::HashSet;
 
 /// The served audio bounds of a WAV: the `data` chunk's payload.
@@ -272,8 +273,9 @@ pub fn synthesize_layout(
     }
 
     // RIFF size = (everything after the 8-byte "RIFF"+size prefix) = body + "WAVE".
-    let body_len: u64 = segments.iter().map(Segment::len).sum();
-    let riff_size = u32::try_from(body_len + 4).map_err(|_| FormatError::TooLarge)?;
+    let body_len: u64 = size::checked_sum(segments.iter().map(Segment::len))?;
+    let riff_size =
+        u32::try_from(size::checked_add(body_len, 4)?).map_err(|_| FormatError::TooLarge)?;
     let mut header = Vec::with_capacity(12);
     header.extend_from_slice(b"RIFF");
     header.extend_from_slice(&riff_size.to_le_bytes());

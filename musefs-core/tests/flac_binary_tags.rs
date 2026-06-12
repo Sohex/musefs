@@ -130,14 +130,8 @@ fn legacy_flac_without_structural_rows_serves_via_front_read_fallback() {
             audio_offset: scan.audio_offset,
             audio_length: scan.audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&path),
+            backing_ctime_ns: common::real_ctime_ns(&path),
         })
         .unwrap();
     db.replace_tags(

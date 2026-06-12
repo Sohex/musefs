@@ -1,5 +1,6 @@
 use crate::error::{FormatError, Result};
 use crate::probe::Extent;
+use crate::size;
 
 pub(crate) const FLAC_MARKER: &[u8; 4] = b"fLaC";
 
@@ -145,7 +146,7 @@ use crate::input::{
 use crate::layout::{RegionLayout, Segment};
 
 /// Inclusive maximum body length of a FLAC metadata block (24-bit length field).
-pub(crate) const MAX_BLOCK_BODY: u64 = 0x00FF_FFFF;
+pub const MAX_BLOCK_BODY: u64 = 0x00FF_FFFF;
 
 pub(crate) fn push_block_header(
     out: &mut Vec<u8>,
@@ -301,7 +302,7 @@ pub fn synthesize_layout(
 
     for art in arts {
         let framing = picture_body_framing(art)?;
-        let body_len = framing.len() as u64 + art.data_len.get();
+        let body_len = size::checked_add(framing.len() as u64, art.data_len.get())?;
         if body_len > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
@@ -997,6 +998,26 @@ mod tests {
         let tags = [TagInput::new("title", over.as_str())];
         assert_eq!(
             synthesize_layout(&[], 0, 0, &tags, &[], &[]),
+            Err(FormatError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn synthesize_layout_checked_picture_len_rejects_overflow() {
+        // A hostile art data_len near u64::MAX must fail closed with TooLarge at
+        // the checked add, not panic (debug) / wrap (release) past the
+        // MAX_BLOCK_BODY guard.
+        let mk = |data_len: u64| ArtInput {
+            art_id: 1,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: PictureType::new(3).unwrap(),
+            width: 0,
+            height: 0,
+            data_len: BlobLen::new(data_len).unwrap(),
+        };
+        assert_eq!(
+            synthesize_layout(&[], 0, 0, &[], &[], &[mk(u64::MAX)]),
             Err(FormatError::TooLarge)
         );
     }

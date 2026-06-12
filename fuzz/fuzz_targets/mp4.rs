@@ -10,7 +10,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let _ = mp4::locate_audio(data);
     let _ = mp4::read_tags(data);
-    let _ = mp4::read_pictures(data);
+    let _ = mp4::read_pictures(data, usize::MAX);
     let scan = match mp4::read_structure(data) {
         Ok(s) => s,
         Err(_) => return,

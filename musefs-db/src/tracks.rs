@@ -10,7 +10,7 @@ macro_rules! track_select {
     ($tail:literal) => {
         concat!(
             "SELECT id, backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, content_version, updated_at \
+             backing_size, backing_mtime_ns, backing_ctime_ns, content_version, updated_at \
              FROM tracks ",
             $tail
         )
@@ -48,7 +48,8 @@ fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
         format,
         bounds,
         backing_size,
-        backing_mtime: r.get("backing_mtime")?,
+        backing_mtime_ns: r.get("backing_mtime_ns")?,
+        backing_ctime_ns: r.get("backing_ctime_ns")?,
         content_version: r.get("content_version")?,
         updated_at: r.get("updated_at")?,
     })
@@ -188,14 +189,15 @@ impl Db<ReadWrite> {
     pub fn upsert_track(&self, t: &NewTrack) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO tracks
-                (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))
+                (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns, backing_ctime_ns, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CAST(strftime('%s','now') AS INTEGER))
              ON CONFLICT(backing_path) DO UPDATE SET
                 format        = excluded.format,
                 audio_offset  = excluded.audio_offset,
                 audio_length  = excluded.audio_length,
                 backing_size  = excluded.backing_size,
-                backing_mtime = excluded.backing_mtime,
+                backing_mtime_ns = excluded.backing_mtime_ns,
+                backing_ctime_ns = excluded.backing_ctime_ns,
                 updated_at    = CAST(strftime('%s','now') AS INTEGER)",
             params![
                 t.backing_path,
@@ -203,7 +205,8 @@ impl Db<ReadWrite> {
                 t.audio_offset,
                 t.audio_length,
                 t.backing_size,
-                t.backing_mtime,
+                t.backing_mtime_ns,
+                t.backing_ctime_ns,
             ],
         )?;
         let id = self.conn.query_row(
@@ -224,8 +227,9 @@ impl Db<ReadWrite> {
 
     /// Test-only: force a track's format column directly (no rescan), bumping
     /// data_version. The only way to exercise a format-only change — production
-    /// never mutates format without a rescan. content_version is NOT bumped (no
-    /// trigger fires on the tracks.format column), so this is a pure format-only edit.
+    /// never mutates format without a rescan. As of V5 this also bumps
+    /// content_version (the `tracks_geometry_au` format guard); it is no longer a
+    /// content_version-neutral edit.
     #[doc(hidden)]
     pub fn set_format_for_test(&self, id: i64, fmt: Format) -> Result<()> {
         self.conn.execute(
@@ -260,7 +264,8 @@ mod negative_audio_bounds_tests {
                 audio_offset: 0,
                 audio_length: 1,
                 backing_size: 1,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         // Simulate a malformed external write to a contract column. The V4
@@ -292,7 +297,8 @@ mod negative_audio_bounds_tests {
                 audio_offset: 0,
                 audio_length: 1,
                 backing_size: 1,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         // Plant offset+length > backing_size past the V4 CHECK (layer 1) so we can
@@ -329,7 +335,8 @@ mod render_key_tests {
             audio_offset: 0,
             audio_length: 1,
             backing_size: 1,
-            backing_mtime: 0,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
         }
     }
 

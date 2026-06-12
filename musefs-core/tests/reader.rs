@@ -18,14 +18,8 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&flac),
+            backing_ctime_ns: common::real_ctime_ns(&flac),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", "Real Title", 0)])
@@ -70,14 +64,8 @@ fn bounds_check_rejects_audio_region_overrunning_the_file() {
     let audio = vec![0x5A; 120];
     let _ = write_flac(&flac, &["TITLE=Orig"], &audio);
     let meta = std::fs::metadata(&flac).unwrap();
-    let mtime = i64::try_from(
-        meta.modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    )
-    .unwrap();
+    let mtime_ns = common::real_mtime_ns(&flac);
+    let ctime_ns = common::real_ctime_ns(&flac);
 
     let db = Db::open_in_memory().unwrap();
     let overrun = db.upsert_track(&NewTrack {
@@ -86,7 +74,8 @@ fn bounds_check_rejects_audio_region_overrunning_the_file() {
         audio_offset: 0,
         audio_length: meta.len() + 1,
         backing_size: meta.len(),
-        backing_mtime: mtime,
+        backing_mtime_ns: mtime_ns,
+        backing_ctime_ns: ctime_ns,
     });
     assert!(
         overrun.is_err(),

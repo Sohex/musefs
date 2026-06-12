@@ -55,7 +55,9 @@ sum to the served file size. Six variants:
   metadata blocks, a RIFF front), fully materialized at resolve time.
 - `ArtImage { art_id, len }` — embedded cover art; only the length lives in
   the layout. Image bytes stream from the DB blob in chunks at read time and
-  are never buffered whole.
+  are never buffered whole. This invariant also holds for Ogg synthesis,
+  where page CRCs are computed from page-bounded `ArtSource` windows
+  (previously the documented exception).
 - `BackingAudio { offset, len }` — a run of the original file's audio frames,
   served by positioned reads (`read_exact_at`) against the backing file.
 - `OggAudio { offset, len, seq_delta }` — original Ogg audio pages served
@@ -115,7 +117,7 @@ The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
 - **V1** — the core tables: `tracks` (one row per backing file: path, format,
-  audio byte range, size/mtime stamps, `content_version`), `tags` (multi-value
+  audio byte range, size/nanosecond-mtime/ctime stamps, `content_version`), `tags` (multi-value
   key/value rows ordered by `ordinal`), `art` (content-addressed by sha256,
   deduplicated image blobs), and `track_art` (per-track art links with
   picture type and ordering). Deleting a track cascades to its `tags` and
@@ -138,15 +140,26 @@ plugins under `contrib/` write tags and art here out-of-band.
   four tables (stashing rows past the FK cascade) and recreates their
   triggers after the bulk refill so the rebuild does not pump the
   `track_changes` ring. A pre-existing violating row aborts the migration.
+- **V5** — freshness-superset triggers that make `content_version` cover every
+  DB-knowable input to synthesized bytes, not only tag/`track_art` edits:
+  `art_reject_content_update` (rejects in-place mutation of an `art` row's
+  content columns — art is content-addressed, so a changed image is a new row),
+  `art_ad` (bumps every track referencing a deleted `art` row, so an orphaned
+  reference rebuilds to a clean serve-time error rather than streaming stale
+  bytes), `tracks_geometry_au` (bumps when scanner-owned geometry — `format`,
+  audio bounds, backing size/nanosecond-mtime — changes; keys on
+  `backing_mtime_ns` only — `backing_ctime_ns` is pure freshness identity, not a
+  served-byte input), and `structural_blocks_ai`/`_ad`
+  (bump when FLAC structural blocks change).
 
 ### The external-writer contract
 
 **Ownership.** External tools get full read/write on `tags`, `art`, and
 `track_art`. The scanner owns the structural columns of `tracks` (`id`,
 `backing_path`, `format`, `audio_offset`, `audio_length`, `backing_size`,
-`backing_mtime`, `content_version`, `updated_at`) and all of
-`structural_blocks`: those are derived from probing the file, and external
-tools must run `musefs scan` rather than compute them.
+`backing_mtime_ns`, `backing_ctime_ns`, `content_version`, `updated_at`) and
+all of `structural_blocks`: those are derived from probing the file, and
+external tools must run `musefs scan` rather than compute them.
 
 **What the store enforces.** As of V4, SQLite `CHECK` constraints reject the
 malformed *shapes* at commit, so an external writer cannot persist them:
@@ -156,18 +169,45 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - a binary tag row whose `value` is non-empty;
 - an `art.byte_len` that disagrees with its blob, or a `sha256` of the wrong
   length;
-- a `picture_type` outside `0..=20`.
+- a `picture_type` outside `0..=20`;
+- a `tags.key` over 256 chars or `tags.value` over 256 KiB;
+- a `value_blob` over `MAX_BINARY_TAG_BYTES`;
+- an `art.mime` over 255 chars or `byte_len` over `MAX_ART_BYTES`;
+- a `track_art.description` over 1 KiB;
+- a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
+  over the FLAC 24-bit block limit.
+
+**Schema identity.** On open, musefs also validates schema identity: a
+`sqlite_master` comparison against a freshly-migrated reference plus `PRAGMA
+foreign_key_check`, rejecting anything that is not the canonical latest schema
+with a message telling the user to run `musefs scan`.
+
+**Art is immutable once written.** `art` rows are content-addressed by
+`sha256`; as of V5 a trigger rejects any in-place `UPDATE` of an art row's
+content columns (`data`, `sha256`, `mime`, `byte_len`, `width`, `height`) with
+`RAISE(ABORT)` — a multi-row `UPDATE art` touching any content column aborts the
+whole statement. To change a track's art, insert a new content-addressed row
+and relink it via `track_art` (which bumps `content_version`); do not mutate an
+existing row. Deleting an `art` row still referenced by `track_art` (possible
+only with `foreign_keys` OFF) bumps every referencing track so the mount serves
+a clean `EIO` on the now-orphaned reference instead of stale bytes.
 
 **What musefs defends at serve time.** CHECKs cannot catch a scanner-owned
 field mutated to a *well-formed* value that no longer matches the real file
-on disk: `backing_size` or `backing_mtime` that drift from the actual file's
-stat, or audio bounds that fit the stored `backing_size` but overrun the file
-once it has shrunk. musefs re-stats the backing file on every resolve and
-treats such rows as untrusted input, degrading to a controlled
-`BackingChanged`/layout error, never undefined behavior. Referential gaps are
-treated the same way: a `track_art` row whose `art_id` has no matching `art`
-row (an orphan an external writer can produce with FK enforcement disabled)
-fails the serve with `EIO` rather than silently dropping the art.
+on disk: `backing_size` or `backing_mtime_ns`/`backing_ctime_ns` that drift
+from the actual file's stat, or audio bounds that fit the stored
+`backing_size` but overrun the file once it has shrunk. musefs re-stats the
+backing file on every resolve and treats such rows as untrusted input,
+degrading to a controlled
+`BackingChanged`/layout error, never undefined behavior. The store's V4
+`CHECK` rejects art over `MAX_ART_BYTES` (16 MiB − 64 KiB) at write time;
+resolve also re-checks it (`ArtTooLarge`, all formats) to backstop a writer
+that disables check enforcement, and the scanner's ingest-time drop is
+tracked in #284.
+Referential gaps are treated the same way: a `track_art` row whose `art_id`
+has no matching `art` row (an orphan an external writer can produce with FK
+enforcement disabled) fails the serve with `EIO` rather than silently dropping
+the art.
 
 **Merge vs. replace.** An external writer may **merge** rather than fully
 replace text tags — overwriting only the keys it manages and leaving the rest
@@ -214,15 +254,25 @@ variant hands each reader thread its own connection — WAL reads never contend.
 Two distinct counters drive correctness; they answer different questions.
 
 **`content_version`** (per-track column) answers *"did this track's served
-bytes change?"*. The DB triggers increment it on any tag/art edit. The
+bytes change?"*. The DB triggers increment it on any input the database can see that changes
+synthesized bytes: tag and `track_art` edits, `art`-row deletes that orphan a
+reference, scanner-owned geometry changes (`format`, audio bounds, backing
+size/nanosecond-mtime), and FLAC structural-block changes (V5). It is
+therefore a superset key — the one input it cannot cover is an on-disk backing
+change with no DB write, which `resolve` (and, since #279, a size-cache
+`getattr` hit) catches by re-statting the backing file and degrading to
+`BackingChanged`. The scanner stamps the backing file's `(size, mtime_ns,
+ctime_ns)` tuple from the **probed file descriptor** using a pre/post `fstat`
+sandwich: if the file's metadata changes between the two stats, the entry is
+dropped. `ctime` defeats an mtime-forging writer (e.g. `touch -m`). The
 `HeaderCache` (`reader.rs`) — a byte-budgeted concurrent cache (64 MiB
 default) of resolved layouts — keys each entry on it: a hit with a stale
 `content_version` rebuilds the layout. Independently of the cache, **every**
 resolve re-stats the backing file and errors with `BackingChanged` if its
-size or mtime drifted from the scanned values, so a silently replaced backing
-file is never spliced at stale offsets. The per-handle read path re-stats the
-held descriptor on every read too, so this guarantee holds on the hot path and
-not only through `resolve()`.
+size, mtime, or ctime drifted from the scanned values, so a silently replaced
+backing file is never spliced at stale offsets. The per-handle read path
+re-stats the held descriptor on every read too, so this guarantee holds on the
+hot path and not only through `resolve()`.
 
 **`data_version`** (`PRAGMA data_version`, whole-DB) answers *"did anyone
 commit anything?"*. `Musefs::poll_refresh` compares it to the last seen
@@ -290,8 +340,10 @@ aborting the scan. The `root` argument is always followed regardless of the
 flag; only links encountered during recursion are gated.
 
 `revalidate` is the maintenance pass (`scan --revalidate`): re-probe only
-files whose size/mtime changed (skipping unchanged files **preserves
-external tag edits** in the DB), delete tracks under the scanned root whose
+files whose `(size, mtime_ns, ctime_ns)` freshness stamp changed — a
+ctime-only move (e.g. a forged-mtime in-place rewrite) is still re-probed
+(skipping unchanged files **preserves external tag edits** in the DB),
+delete tracks under the scanned root whose
 backing file is gone, and garbage-collect now-unreferenced art. Pruning is
 scoped to the scanned root, so revalidating one library root never removes
 tracks belonging to another. Because a track is keyed by its *canonical*

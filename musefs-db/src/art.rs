@@ -1,3 +1,5 @@
+use crate::error::{check_art_count, check_field_len};
+use crate::limits::{MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN};
 use crate::models::{Art, ArtMeta, NewArt, TrackArt};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
@@ -40,15 +42,18 @@ impl<M> Db<M> {
     pub fn get_art_meta(&self, id: i64) -> Result<Option<ArtMeta>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT mime, width, height, byte_len FROM art WHERE id = ?1")?;
+            .prepare("SELECT length(mime), mime, width, height, byte_len FROM art WHERE id = ?1")?;
         let mut rows = stmt.query(params![id])?;
         match rows.next()? {
-            Some(r) => Ok(Some(ArtMeta {
-                mime: r.get(0)?,
-                width: r.get(1)?,
-                height: r.get(2)?,
-                byte_len: r.get(3)?,
-            })),
+            Some(r) => {
+                check_field_len("art", "mime", r.get(0)?, MAX_ART_MIME_LEN)?;
+                Ok(Some(ArtMeta {
+                    mime: r.get(1)?,
+                    width: r.get(2)?,
+                    height: r.get(3)?,
+                    byte_len: r.get(4)?,
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -72,18 +77,27 @@ impl<M> Db<M> {
 
     pub fn get_track_art(&self, track_id: i64) -> Result<Vec<TrackArt>> {
         let mut stmt = self.conn.prepare(
-            "SELECT art_id, picture_type, description, ordinal
+            "SELECT length(description), art_id, picture_type, description, ordinal
              FROM track_art WHERE track_id = ?1 ORDER BY ordinal",
         )?;
-        let rows = stmt.query_map(params![track_id], |r| {
-            Ok(TrackArt {
-                art_id: r.get(0)?,
-                picture_type: r.get(1)?,
-                description: r.get(2)?,
-                ordinal: r.get(3)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut rows = stmt.query(params![track_id])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            check_field_len(
+                "track_art",
+                "description",
+                r.get(0)?,
+                MAX_ART_DESCRIPTION_LEN,
+            )?;
+            out.push(TrackArt {
+                art_id: r.get(1)?,
+                picture_type: r.get(2)?,
+                description: r.get(3)?,
+                ordinal: r.get(4)?,
+            });
+            check_art_count(track_id, out.len())?;
+        }
+        Ok(out)
     }
 }
 
@@ -137,5 +151,157 @@ impl Db<ReadWrite> {
             [],
         )?;
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use crate::error::DbError;
+    use crate::models::{NewArt, TrackArt};
+    use crate::{Db, Format, NewTrack};
+
+    fn db_track_art() -> (Db, i64, i64) {
+        let db = Db::open_in_memory().unwrap();
+        let track = db
+            .upsert_track(&NewTrack {
+                backing_path: "/a.flac".into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
+            })
+            .unwrap();
+        let art = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![0u8],
+            })
+            .unwrap();
+        (db, track, art)
+    }
+
+    #[test]
+    fn get_art_meta_rejects_oversize_mime() {
+        let (db, _t, _art) = db_track_art();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        // art rows are immutable under the V5 `art_reject_content_update`
+        // trigger (which `ignore_check_constraints` does not disable), so plant
+        // the oversize-mime row with a fresh INSERT — the trigger guards only
+        // UPDATE — rather than mutating an existing row in place.
+        let mime = "x".repeat(256);
+        db.conn
+            .execute(
+                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+                 VALUES (?1, ?2, NULL, NULL, 1, X'00')",
+                rusqlite::params!["b".repeat(64), mime],
+            )
+            .unwrap();
+        let bad = db.conn.last_insert_rowid();
+        let err = db.get_art_meta(bad).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::FieldTooLarge {
+                    table: "art",
+                    field: "mime",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn get_track_art_rejects_oversize_description() {
+        let (db, track, art) = db_track_art();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        let desc = "d".repeat(1025);
+        db.set_track_art(
+            track,
+            &[TrackArt {
+                art_id: art,
+                picture_type: 3,
+                description: desc,
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        let err = db.get_track_art(track).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::FieldTooLarge {
+                    table: "track_art",
+                    field: "description",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn get_track_art_accepts_description_at_cap() {
+        let (db, track, art) = db_track_art();
+        let desc = "d".repeat(1024);
+        db.set_track_art(
+            track,
+            &[TrackArt {
+                art_id: art,
+                picture_type: 3,
+                description: desc,
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(db.get_track_art(track).unwrap()[0].description.len(), 1024);
+    }
+
+    #[test]
+    fn get_track_art_rejects_excess_rows() {
+        let (db, track, art) = db_track_art();
+        // 4097 track_art rows sharing one art_id -> TooManyArtRows. Raw INSERT
+        // (not set_track_art) keeps the fixture to a single planted blob; the
+        // PRIMARY KEY (track_id, ordinal) is satisfied by the distinct ordinals.
+        let tx = db.conn.unchecked_transaction().unwrap();
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+                 VALUES (?1, ?2, 3, '', ?3)",
+            )
+            .unwrap();
+        for i in 0..4097 {
+            stmt.execute(rusqlite::params![track, art, i]).unwrap();
+        }
+        drop(stmt);
+        tx.commit().unwrap();
+        let err = db.get_track_art(track).unwrap_err();
+        assert!(matches!(err, DbError::TooManyArtRows { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn get_track_art_accepts_rows_at_cap() {
+        let (db, track, art) = db_track_art();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+                 VALUES (?1, ?2, 3, '', ?3)",
+            )
+            .unwrap();
+        for i in 0..4096 {
+            stmt.execute(rusqlite::params![track, art, i]).unwrap();
+        }
+        drop(stmt);
+        tx.commit().unwrap();
+        assert_eq!(db.get_track_art(track).unwrap().len(), 4096);
     }
 }

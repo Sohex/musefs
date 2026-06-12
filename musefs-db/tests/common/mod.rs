@@ -9,7 +9,8 @@ pub fn new_track(path: &str) -> NewTrack {
         audio_offset: 100,
         audio_length: 1000,
         backing_size: 1100,
-        backing_mtime: 1_700_000_000,
+        backing_mtime_ns: 1_700_000_000_000_000_000,
+        backing_ctime_ns: 1_700_000_000_000_000_000,
     }
 }
 

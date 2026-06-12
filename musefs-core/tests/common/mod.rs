@@ -22,6 +22,20 @@ pub fn real_mtime(p: &std::path::Path) -> i64 {
         .cast_signed()
 }
 
+/// Return the mtime of `p` as nanoseconds since the Unix epoch.
+pub fn real_mtime_ns(p: &std::path::Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(p).unwrap();
+    meta.mtime() * 1_000_000_000 + meta.mtime_nsec()
+}
+
+/// Return the ctime of `p` as nanoseconds since the Unix epoch.
+pub fn real_ctime_ns(p: &std::path::Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(p).unwrap();
+    meta.ctime() * 1_000_000_000 + meta.ctime_nsec()
+}
+
 /// Write a simple FLAC (STREAMINFO + comment + audio) to `path`,
 /// returning (audio_offset, audio_length).
 pub fn write_flac(path: &Path, comments: &[&str], audio: &[u8]) -> (u64, u64) {

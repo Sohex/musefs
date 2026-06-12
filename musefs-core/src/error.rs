@@ -12,6 +12,8 @@ pub enum CoreError {
     },
     #[error(transparent)]
     Format(#[from] musefs_format::FormatError),
+    #[error(transparent)]
+    InvalidTemplate(#[from] crate::template::TemplateError),
     #[error("MP4 {box_kind} box is {size} bytes, exceeds the {cap}-byte metadata cap")]
     Mp4MetadataTooLarge {
         box_kind: &'static str,
@@ -34,6 +36,15 @@ pub enum CoreError {
         art_id: i64,
         value: u32,
     },
+    #[error("track {track_id} art {art_id} is {byte_len} bytes, exceeds the {cap}-byte art cap")]
+    ArtTooLarge {
+        track_id: i64,
+        art_id: i64,
+        byte_len: u64,
+        cap: u64,
+    },
+    #[error("front/header read of {requested} bytes exceeds the {cap}-byte serve cap")]
+    HeaderTooLarge { requested: u64, cap: u64 },
     #[error("track {0} not found")]
     TrackNotFound(i64),
     #[error("no such inode: {0}")]

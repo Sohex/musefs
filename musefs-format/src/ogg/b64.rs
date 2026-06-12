@@ -40,9 +40,16 @@ pub fn encode_b64_slice(raw: &[u8], skip: usize, take: usize) -> Vec<u8> {
     enc.as_bytes()[skip..skip + take].to_vec()
 }
 
+/// Total base64 output length for an image of `img_total` bytes, or `None` if it
+/// overflows `u64`. Only an adversarial `img_total` can overflow; every real
+/// image is far below this.
+pub fn b64_len_checked(img_total: u64) -> Option<u64> {
+    img_total.div_ceil(3).checked_mul(4)
+}
+
 /// Total base64 output length for an image of `img_total` bytes.
 pub fn b64_len(img_total: u64) -> u64 {
-    img_total.div_ceil(3) * 4
+    b64_len_checked(img_total).expect("base64 output length fits u64")
 }
 
 #[cfg(test)]
@@ -136,5 +143,21 @@ mod tests {
                 skip: 2
             }
         );
+    }
+
+    #[test]
+    fn b64_window_is_overflow_free_at_the_max_validated_boundary() {
+        // For any layout that passes RegionLayout::validate, an OggArtSlice
+        // satisfies offset + len <= b64_len(art_total) AND b64_len_checked(art_total)
+        // is Some. Under those bounds b64_window's internal +/* cannot overflow.
+        // Pin the worst case: the largest art_total whose b64_len still fits u64,
+        // reading the final 4 output chars. In debug, any intermediate overflow
+        // would panic here.
+        let art_total = u64::MAX / 4 * 3; // b64_len_checked(art_total) is Some
+        assert!(b64_len_checked(art_total).is_some());
+        let total = b64_len(art_total);
+        let w = b64_window(total - 4, 4, art_total);
+        assert!(w.in_start <= art_total);
+        assert!(w.in_len <= art_total);
     }
 }

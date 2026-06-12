@@ -12,6 +12,7 @@ use quick_cache::sync::Cache;
 
 use crate::error::{CoreError, Result};
 use crate::facade::Mode;
+use crate::freshness::BackingStamp;
 use crate::mapping::{tags_to_inputs, track_art_to_inputs};
 use crate::ogg_index::serve_ogg_window;
 
@@ -23,8 +24,7 @@ pub struct ResolvedFile {
     pub total_len: u64,
     pub content_version: i64,
     pub backing_path: PathBuf,
-    pub backing_size: u64,
-    pub backing_mtime_secs: i64,
+    pub stamp: BackingStamp,
     pub mtime_secs: i64,
     /// One-entry memo of the last patched Ogg page, so consecutive reads skip
     /// re-patching the page straddling a chunk boundary. Empty for non-Ogg files
@@ -70,15 +70,18 @@ pub const DEFAULT_CACHE_BUDGET: u64 = 64 * 1024 * 1024;
 /// exclusion in .cargo/mutants.toml (cargo-mutants does mutate const initializers).
 const CACHE_ESTIMATED_ITEMS: usize = (DEFAULT_CACHE_BUDGET / 4096) as usize;
 
-fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs().cast_signed())
-}
-
-fn read_front(path: &Path, n: u64) -> std::io::Result<Vec<u8>> {
+fn read_front(path: &Path, n: u64) -> crate::Result<Vec<u8>> {
     use std::io::Read;
+    // Fail closed before any allocation/open: a hostile DB row can request an
+    // arbitrary `audio_offset`, but no legitimately-scanned file has a front
+    // larger than the scanner's probe ceiling. Bounding `n` here also retires a
+    // 32-bit `usize_from` truncation footgun.
+    if n > crate::scan::MAX_PROBE_BYTES {
+        return Err(CoreError::HeaderTooLarge {
+            requested: n,
+            cap: crate::scan::MAX_PROBE_BYTES,
+        });
+    }
     crate::metrics::on_open();
     let mut f = std::fs::File::open(path)?;
     let mut buf = vec![0u8; usize_from(n)];
@@ -116,7 +119,7 @@ impl HeaderCache {
         // on a cache hit, because the audio region may have shifted.
         crate::metrics::on_stat();
         let meta = std::fs::metadata(&track.backing_path)?;
-        if meta.len() != track.backing_size || mtime_secs(&meta) != track.backing_mtime {
+        if BackingStamp::from_metadata(&meta) != BackingStamp::from_track(&track) {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
@@ -146,7 +149,11 @@ impl HeaderCache {
                     len: meta.len(),
                 }])
                 .map_err(musefs_format::FormatError::InvalidLayout)?;
-                (layout, meta.len(), track.backing_mtime)
+                (
+                    layout,
+                    meta.len(),
+                    BackingStamp::from_track(track).display_secs(),
+                )
             }
             Mode::Synthesis => {
                 // Guard the stored audio bounds before any cast/allocation: a negative
@@ -270,26 +277,29 @@ impl HeaderCache {
                             track.bounds.audio_offset(),
                         )?;
                         let header = musefs_format::ogg::read_metadata(&front)?;
-                        let art_images = crate::mapping::track_art_images(db, &art_inputs)?;
                         let arts: Vec<musefs_format::ogg::OggArt> = art_inputs
                             .iter()
-                            .zip(art_images.iter())
-                            .map(|(meta, image)| musefs_format::ogg::OggArt {
-                                meta,
-                                image: image.as_slice(),
-                            })
+                            .map(|meta| musefs_format::ogg::OggArt { meta })
                             .collect();
+                        let src = crate::mapping::DbArtSource(db);
                         musefs_format::ogg::synthesize_layout(
                             &header,
                             track.bounds.audio_offset(),
                             track.bounds.audio_length(),
                             &inputs,
                             &arts,
+                            &src,
                         )?
                     }
                 };
                 let total = layout.total_len();
-                (layout, total, track.backing_mtime.max(track.updated_at))
+                (
+                    layout,
+                    total,
+                    BackingStamp::from_track(track)
+                        .display_secs()
+                        .max(track.updated_at),
+                )
             }
         };
 
@@ -314,8 +324,7 @@ impl HeaderCache {
             total_len,
             content_version: track.content_version,
             backing_path: PathBuf::from(&track.backing_path),
-            backing_size: track.backing_size,
-            backing_mtime_secs: track.backing_mtime,
+            stamp: BackingStamp::from_track(track),
             mtime_secs: mtime_secs_val,
             last_page: Mutex::new(None),
             cache_bytes,
@@ -527,8 +536,11 @@ mod ogg_serve_tests {
             total_len: total,
             content_version: 0,
             backing_path: path.clone(),
-            backing_size: 0,
-            backing_mtime_secs: 0,
+            stamp: BackingStamp {
+                size: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            },
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 8,
@@ -569,6 +581,7 @@ mod resolve_ogg_tests {
     use musefs_db::{Db, Format, NewTrack, Tag};
     use musefs_format::ogg::page_test_support::lace_packet_pub;
     use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
 
     fn build_opus_file(path: &std::path::Path) -> (u64, u64) {
         let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
@@ -603,7 +616,8 @@ mod resolve_ogg_tests {
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
-                backing_mtime: mtime_secs(&meta),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap();
         db.replace_tags(track_id, &[Tag::new("title", "Telephasic Workshop", 0)])
@@ -643,7 +657,8 @@ mod resolve_ogg_tests {
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
-                backing_mtime: mtime_secs(&meta),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis);
@@ -700,7 +715,8 @@ mod resolve_ogg_tests {
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
-                backing_mtime: mtime_secs(&meta),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap();
         db.replace_tags(track_id, &[Tag::new("title", "Wave One", 0)])
@@ -739,7 +755,8 @@ mod resolve_ogg_tests {
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
-                backing_mtime: mtime_secs(&meta),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis);
@@ -804,8 +821,11 @@ mod ogg_art_serve_tests {
             total_len: total,
             content_version: 0,
             backing_path: std::path::PathBuf::from("/dev/null"),
-            backing_size: 0,
-            backing_mtime_secs: 0,
+            stamp: BackingStamp {
+                size: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            },
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
@@ -852,8 +872,11 @@ mod ogg_art_serve_tests {
             total_len: total,
             content_version: 0,
             backing_path: std::path::PathBuf::from("/dev/null"),
-            backing_size: 0,
-            backing_mtime_secs: 0,
+            stamp: BackingStamp {
+                size: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            },
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
@@ -868,6 +891,7 @@ mod ogg_art_serve_tests {
 mod cache_bound_tests {
     use super::*;
     use musefs_db::{Db, Format, NewTrack};
+    use std::os::unix::fs::MetadataExt;
 
     fn entry(content_version: i64, inline_len: usize) -> Arc<ResolvedFile> {
         Arc::new(ResolvedFile {
@@ -875,8 +899,11 @@ mod cache_bound_tests {
             total_len: inline_len as u64,
             content_version,
             backing_path: std::path::PathBuf::from("/nonexistent"),
-            backing_size: 0,
-            backing_mtime_secs: 0,
+            stamp: BackingStamp {
+                size: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            },
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: inline_len as u64,
@@ -898,7 +925,8 @@ mod cache_bound_tests {
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
-                backing_mtime: mtime_secs(&meta),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap();
         let cache = HeaderCache::new(Mode::Synthesis); // NOTE: not `mut` — resolve is &self now
@@ -926,7 +954,8 @@ mod cache_bound_tests {
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
-                backing_mtime: mtime_secs(&meta),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap()
         };
@@ -962,7 +991,8 @@ mod cache_bound_tests {
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
-                backing_mtime: mtime_secs(&meta),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap()
         };
@@ -994,7 +1024,8 @@ mod cache_bound_tests {
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
-                backing_mtime: mtime_secs(&meta),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap()
         };
@@ -1041,7 +1072,8 @@ mod cache_bound_tests {
                 audio_offset,
                 audio_length,
                 backing_size: meta.len(),
-                backing_mtime: mtime_secs(&meta),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap();
         (db, id)
@@ -1063,7 +1095,8 @@ mod cache_bound_tests {
             audio_offset: meta.len(),
             audio_length: 5,
             backing_size: meta.len(),
-            backing_mtime: mtime_secs(&meta),
+            backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
         });
         assert!(
             rejected.is_err(),
@@ -1209,6 +1242,7 @@ mod cache_bound_tests {
 mod binary_tag_serve_tests {
     use super::*;
     use musefs_db::{BinaryTag, NewTrack};
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn resolve_mp3_emits_binary_tag_in_synthesized_region() {
@@ -1243,13 +1277,8 @@ mod binary_tag_serve_tests {
                 audio_offset: bounds.audio_offset,
                 audio_length: bounds.audio_length,
                 backing_size: meta.len(),
-                backing_mtime: meta
-                    .modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    .cast_signed(),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             })
             .unwrap();
         db.set_binary_tags(
@@ -1281,7 +1310,8 @@ mod binary_tag_serve_tests {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.set_binary_tags(
@@ -1304,8 +1334,11 @@ mod binary_tag_serve_tests {
             total_len: 4,
             content_version: 0,
             backing_path: PathBuf::from("/x.mp3"),
-            backing_size: 0,
-            backing_mtime_secs: 0,
+            stamp: BackingStamp {
+                size: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            },
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
@@ -1314,5 +1347,119 @@ mod binary_tag_serve_tests {
         // No BackingAudio segment, so read_at opens no file.
         let got = read_at(&resolved, &db, 1, 2).unwrap();
         assert_eq!(got, vec![20, 30]);
+    }
+}
+
+#[cfg(test)]
+mod serve_cap_tests {
+    use super::*;
+    use musefs_db::{Db, Format, NewTrack};
+
+    const CAP: u64 = crate::scan::MAX_PROBE_BYTES;
+
+    /// A sparse backing file of `len` bytes (no real bytes written — `set_len`
+    /// only extends the file's logical size, which tmpfs keeps sparse).
+    fn sparse_file(dir: &std::path::Path, name: &str, len: u64) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(len).unwrap();
+        path
+    }
+
+    /// Insert a `tracks` row whose `audio_offset` exceeds the cap while still
+    /// satisfying both serve guards (`backing_size == meta.len()` and
+    /// `audio_offset + audio_length <= meta.len()`). Returns the track id.
+    /// Takes `&Db` (= `Db<ReadWrite>`) because `upsert_track` is defined on
+    /// `impl Db<ReadWrite>`, not the generic `impl<M> Db<M>`.
+    fn hostile_track(db: &Db, path: &std::path::Path, format: Format) -> i64 {
+        let meta = std::fs::metadata(path).unwrap();
+        let stamp = BackingStamp::from_metadata(&meta);
+        db.upsert_track(&NewTrack {
+            backing_path: path.to_string_lossy().into_owned(),
+            format,
+            audio_offset: CAP + 1,
+            audio_length: 1,
+            backing_size: meta.len(),
+            backing_mtime_ns: stamp.mtime_ns,
+            backing_ctime_ns: stamp.ctime_ns,
+        })
+        .unwrap()
+    }
+
+    /// Assert a resolve attempt fails closed with the cap error for `audio_offset`.
+    fn assert_capped(result: crate::Result<std::sync::Arc<ResolvedFile>>) {
+        match result {
+            Err(CoreError::HeaderTooLarge { requested, cap }) => {
+                assert_eq!(requested, CAP + 1);
+                assert_eq!(cap, CAP);
+            }
+            Err(other) => panic!("expected HeaderTooLarge, got {other:?}"),
+            Ok(_) => panic!("expected HeaderTooLarge, resolve unexpectedly succeeded"),
+        }
+    }
+
+    #[test]
+    fn wav_serve_caps_hostile_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "hostile.wav", CAP + 2);
+        let db = Db::open_in_memory().unwrap();
+        let track_id = hostile_track(&db, &path, Format::Wav);
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        assert_capped(cache.resolve(&db, track_id));
+    }
+
+    #[test]
+    fn ogg_serve_caps_hostile_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "hostile.opus", CAP + 2);
+        let db = Db::open_in_memory().unwrap();
+        let track_id = hostile_track(&db, &path, Format::Opus);
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        assert_capped(cache.resolve(&db, track_id));
+    }
+
+    #[test]
+    fn flac_legacy_serve_caps_hostile_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "hostile.flac", CAP + 2);
+        let db = Db::open_in_memory().unwrap();
+        // No structural-block rows inserted -> build() takes the legacy fallback
+        // branch (rows.is_empty()) that calls read_front.
+        let track_id = hostile_track(&db, &path, Format::Flac);
+        assert!(db.get_structural_blocks(track_id).unwrap().is_empty());
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        assert_capped(cache.resolve(&db, track_id));
+    }
+
+    #[test]
+    fn read_front_rejects_oversize_before_open() {
+        // Nonexistent path: if the cap check did NOT fire first, File::open would
+        // error and we'd get an Io error instead of HeaderTooLarge. So this also
+        // pins the fail-closed ordering (check precedes any open/allocation).
+        let err =
+            read_front(std::path::Path::new("/nonexistent/musefs/front"), CAP + 1).unwrap_err();
+        match err {
+            CoreError::HeaderTooLarge { requested, cap } => {
+                assert_eq!(requested, CAP + 1);
+                assert_eq!(cap, CAP);
+            }
+            other => panic!("expected HeaderTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_front_allows_exactly_cap() {
+        // Boundary: `n == CAP` must NOT be rejected — the check is `>`, not `>=`.
+        // With a nonexistent path the call still fails, but with an Io error from
+        // File::open, never HeaderTooLarge. This pins the boundary and kills the
+        // `> -> >=` mutant.
+        let err = read_front(std::path::Path::new("/nonexistent/musefs/front"), CAP).unwrap_err();
+        assert!(
+            matches!(err, CoreError::Io(_)),
+            "expected Io error at the cap boundary, got {err:?}"
+        );
     }
 }

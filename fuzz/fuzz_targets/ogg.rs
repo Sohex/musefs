@@ -32,33 +32,25 @@ fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
     let tags = arb_tags(&mut u).unwrap_or_default();
 
-    // Derive art metadata from the shared helper (so OGG exercises the same
-    // randomized width/height/data_len as every other format target), then
-    // generate each image's bytes independently. OGG is the one synthesis path
-    // carrying both a `data_len` field and a separate `image` slice, so their
-    // lengths must be free to disagree. Images stay non-empty: synthesize_layout
-    // documents that the bridge drops zero-length art at construction.
     let arts_meta = arb_arts(&mut u).unwrap_or_default();
+    // Streaming couples image length to data_len (production enforces
+    // `byte_len = length(data)`), so generate exactly data_len bytes per image.
     let images: Vec<Vec<u8>> = arts_meta
         .iter()
-        .map(|_| {
-            let len = u.int_in_range(1..=8192usize).unwrap_or(1);
-            u.bytes(len).map(<[u8]>::to_vec).unwrap_or_default()
+        .map(|m| {
+            let mut img = vec![0u8; m.data_len.get() as usize];
+            let _ = u.fill_buffer(&mut img);
+            img
         })
         .collect();
-    let arts: Vec<OggArt> = arts_meta
-        .iter()
-        .zip(images.iter())
-        .filter(|(_, image)| !image.is_empty())
-        .map(|(meta, image)| OggArt {
-            meta,
-            image: image.as_slice(),
-        })
-        .collect();
+    let src = ogg::MapArtSource::new(
+        arts_meta.iter().zip(images.iter()).map(|(m, img)| (m.art_id, img.clone())),
+    );
+    let arts: Vec<OggArt> = arts_meta.iter().map(|m| OggArt { meta: m }).collect();
 
-    if let Ok(layout) =
-        ogg::synthesize_layout(&header, scan.audio_offset, scan.audio_length, &tags, &arts)
-    {
+    if let Ok(layout) = ogg::synthesize_layout(
+        &header, scan.audio_offset, scan.audio_length, &tags, &arts, &src,
+    ) {
         assert_backing_covers_audio(scan.audio_offset, scan.audio_length, &layout);
     }
 });

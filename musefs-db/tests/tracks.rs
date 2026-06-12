@@ -53,24 +53,25 @@ fn get_missing_track_returns_none() {
 }
 
 #[test]
-fn rescan_does_not_reset_content_version() {
+fn rescan_with_changed_geometry_bumps_content_version() {
     let db = Db::open_in_memory().unwrap();
     let id = db.upsert_track(&new_track("/music/a.flac")).unwrap();
     db.replace_tags(id, &[Tag::new("title", "T", 0)]).unwrap();
     let cv_before = db.track_content_version(id).unwrap();
     assert!(cv_before > 0);
 
-    // Re-scan the same path with updated offsets; this must NOT reset the
-    // version counter, which tracks tag/art edits.
     let mut rescan = new_track("/music/a.flac");
     rescan.audio_offset = 100;
     rescan.audio_length = 900;
     db.upsert_track(&rescan).unwrap();
 
+    // Exactly +1 (not just ">") is deliberate: it asserts the `tracks_geometry_au`
+    // WHEN guard halts the trigger's own nested content_version UPDATE, so the
+    // recursion terminates after a single bump rather than running away.
     assert_eq!(
         db.track_content_version(id).unwrap(),
-        cv_before,
-        "re-scan must not reset content_version"
+        cv_before + 1,
+        "a geometry-changing rescan must bump content_version exactly once"
     );
 }
 
@@ -84,7 +85,8 @@ fn delete_track_cascades_tags_and_track_art() {
             audio_offset: 0,
             audio_length: 0,
             backing_size: 0,
-            backing_mtime: 0,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("artist", "A", 0)]).unwrap();
@@ -128,7 +130,8 @@ fn upsert_conflict_updates_all_mutable_columns() {
         audio_offset: 222,
         audio_length: 333,
         backing_size: 555,
-        backing_mtime: 555,
+        backing_mtime_ns: 555,
+        backing_ctime_ns: 666,
     };
     let id2 = db.upsert_track(&changed).unwrap();
     assert_eq!(id, id2, "conflict update must keep the same id");
@@ -138,7 +141,8 @@ fn upsert_conflict_updates_all_mutable_columns() {
     assert_eq!(t.bounds.audio_offset(), 222);
     assert_eq!(t.bounds.audio_length(), 333);
     assert_eq!(t.backing_size, 555);
-    assert_eq!(t.backing_mtime, 555);
+    assert_eq!(t.backing_mtime_ns, 555);
+    assert_eq!(t.backing_ctime_ns, 666);
 }
 
 #[test]
