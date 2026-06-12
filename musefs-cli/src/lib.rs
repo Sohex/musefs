@@ -109,6 +109,12 @@ pub struct MountArgs {
     /// Permission bits for directories, octal (e.g. 555). Defaults to 555.
     #[arg(long, env = "MUSEFS_DIR_MODE", value_name = "OCTAL", value_parser = parse_octal_mode)]
     pub dir_mode: Option<u16>,
+    /// Mount with `allow_other` + `default_permissions` so accounts other than
+    /// the mounting user can reach the mount and the presented owner/mode bits
+    /// are kernel-enforced. Implied by `--owner`/`--group`. Non-root mounts also
+    /// require `user_allow_other` in `/etc/fuse.conf`.
+    #[arg(long, env = "MUSEFS_ALLOW_OTHER")]
+    pub allow_other: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -249,6 +255,13 @@ fn write_bit_warning(flag: &str, mode: u16) -> Option<String> {
     })
 }
 
+/// Effective `allow_other`: the explicit flag, or implied by a presented
+/// owner/group (the cross-user use case is unreachable without it). Auto-enable
+/// wins over an explicit `--allow-other false` (only reachable via the env var).
+fn effective_allow_other(flag: bool, owner: Option<u32>, group: Option<u32>) -> bool {
+    flag || owner.is_some() || group.is_some()
+}
+
 /// Parse mount CLI flags into `MountConfig` and `FuseConfig`. Pure function —
 /// no DB access, no mounting. Exported for unit testing.
 pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseConfig) {
@@ -270,7 +283,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         gid: args.group.unwrap_or(defaults.gid),
         file_mode: args.file_mode.unwrap_or(defaults.file_mode),
         dir_mode: args.dir_mode.unwrap_or(defaults.dir_mode),
-        allow_other: args.owner.is_some() || args.group.is_some(),
+        allow_other: effective_allow_other(args.allow_other, args.owner, args.group),
     };
     (config, fuse_config)
 }
@@ -582,5 +595,33 @@ mod tests {
         };
         let (_config, fuse_config) = parse_mount_config(&args);
         assert!(!fuse_config.allow_other);
+    }
+
+    #[test]
+    fn effective_allow_other_combines_flag_and_owner_group() {
+        assert!(!effective_allow_other(false, None, None));
+        assert!(effective_allow_other(true, None, None));
+        // Auto-enable wins even when the flag is explicitly false (env path).
+        assert!(effective_allow_other(false, Some(0), None));
+        assert!(effective_allow_other(false, None, Some(0)));
+    }
+
+    #[test]
+    fn explicit_allow_other_flag_enables_it() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "musefs",
+            "mount",
+            "/mnt",
+            "--db",
+            "/tmp/x.db",
+            "--allow-other",
+        ])
+        .unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected Mount");
+        };
+        let (_config, fuse_config) = parse_mount_config(&args);
+        assert!(fuse_config.allow_other);
     }
 }
