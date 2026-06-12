@@ -440,6 +440,17 @@ In `musefs-cli/src/lib.rs`, in `struct MountArgs`, add after the `dir_mode` fiel
     pub allow_other: bool,
 ```
 
+Adding this field breaks the four **exhaustive** `MountArgs { … }` literals in the integration test file `musefs-cli/tests/cli.rs` (at lines 121, 153, 181, 230 — these build the struct field-by-field, not via argv). Each ends with `dir_mode: None,`; add `allow_other: false,` immediately after that line in all four. For example, the literal at ~line 121:
+
+```rust
+        file_mode: None,
+        dir_mode: None,
+        allow_other: false,
+    };
+```
+
+Apply the identical one-line addition to the literals at ~153, ~181, and ~230. (Without this the crate fails to compile and the pre-commit full-suite gate rejects the commit.)
+
 - [ ] **Step 4: Add the `effective_allow_other` helper and use it**
 
 In `musefs-cli/src/lib.rs`, add the helper near `parse_mount_config`:
@@ -470,7 +481,7 @@ Run: `cargo clippy --all-targets -- -D warnings && cargo fmt --all --check`
 Expected: clean.
 
 ```bash
-git add musefs-cli/src/lib.rs
+git add musefs-cli/src/lib.rs musefs-cli/tests/cli.rs
 git commit -m "feat(cli): explicit --allow-other flag with owner/group auto-enable (#294)"
 ```
 
@@ -547,15 +558,27 @@ explanatory error if it is missing; add the line to `/etc/fuse.conf`, or run
 musefs as root. (This is libfuse/system policy, not a musefs restriction.)
 ```
 
-- [ ] **Step 3: Verify the rendered changes read correctly**
+- [ ] **Step 3: Add `MUSEFS_ALLOW_OTHER` to the systemd conf example**
 
-Run: `git diff README.md`
-Expected: the AppArmor blockquote appears under **Mount**; the **Ownership and permissions** section shows the new intro, the 5-row table including `--allow-other`, the world-bits note, and the `user_allow_other` note. Confirm no stray duplicate of the old table remains.
+`contrib/systemd/musefs.conf.example` is the canonical env-var list the README points at. In its "Mount: ownership & permissions" block, after the `#MUSEFS_DIR_MODE=555` entry (currently ~line 59), add:
 
-- [ ] **Step 4: Commit**
+```ini
+# Mount with allow_other + default_permissions so accounts other than the
+# mounting user can reach the mount and the owner/mode bits are enforced.
+# Implied by MUSEFS_OWNER/MUSEFS_GROUP. Non-root mounts also need
+# 'user_allow_other' in /etc/fuse.conf. Default: false.
+#MUSEFS_ALLOW_OTHER=true
+```
+
+- [ ] **Step 4: Verify the rendered changes read correctly**
+
+Run: `git diff README.md contrib/systemd/musefs.conf.example`
+Expected: the AppArmor blockquote appears under **Mount**; the **Ownership and permissions** section shows the new intro, the 5-row table including `--allow-other`, the world-bits note, and the `user_allow_other` note (no stray duplicate of the old table); the systemd example gains the `#MUSEFS_ALLOW_OTHER=true` entry.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add README.md
+git add README.md contrib/systemd/musefs.conf.example
 git commit -m "docs: document AppArmor mountpoint restriction (#293) and allow_other ownership behaviour (#294)"
 ```
 

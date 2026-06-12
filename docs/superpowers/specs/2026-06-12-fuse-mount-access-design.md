@@ -131,10 +131,12 @@ fusermount3 (unlike `max_readahead`/`max_background`, which are negotiated at
 - **Struct-literal sites to update** (adding a field to `FuseConfig` breaks
   exhaustive literals): `FuseConfig::default` (lib.rs:~70) and the
   `parse_mount_config` literal (cli.rs:~264). The `keep_cache` test site uses
-  `..Default::default()` and is unaffected. The plan should grep for
-  `FuseConfig {` and `MountArgs {` literals to confirm no other exhaustive sites
-  exist (existing CLI tests construct `MountArgs` via argv parsing, not bare
-  literals, so they are non-breaking — verify).
+  `..Default::default()` and is unaffected. **Adding a field to `MountArgs` also
+  breaks the four exhaustive `MountArgs { … }` literals in the integration test
+  `musefs-cli/tests/cli.rs` (lines 121, 153, 181, 230)** — each must gain
+  `allow_other: false,`. (The in-`src` CLI tests build `MountArgs` via argv
+  parsing and are non-breaking.) The plan should grep `FuseConfig {` and
+  `MountArgs {` to confirm no further exhaustive sites exist.
 
 ## #293 + #294 — documentation
 
