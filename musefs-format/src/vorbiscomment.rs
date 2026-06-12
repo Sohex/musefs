@@ -15,9 +15,6 @@ pub fn is_valid_key(key: &str) -> bool {
     !key.is_empty() && key.bytes().all(|b| (0x20..=0x7D).contains(&b) && b != b'=')
 }
 
-/// Build a VorbisComment body: vendor string then count then `KEY=value` comments.
-/// Lengths are 32-bit little-endian. Known canonical keys are mapped to their
-/// Vorbis field name via the vocabulary; unknown keys are upper-cased.
 pub(crate) fn build(tags: &[TagInput]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(
@@ -26,12 +23,16 @@ pub(crate) fn build(tags: &[TagInput]) -> Result<Vec<u8>> {
             .to_le_bytes(),
     );
     out.extend_from_slice(VENDOR.as_bytes());
+    // Skip keys outside the Vorbis field-name grammar (e.g. an `=` key would shift
+    // the key/value boundary on re-parse). build() is the single enforcement point,
+    // so it stays total for any caller — including the fuzz harness.
+    let valid: Vec<&TagInput> = tags.iter().filter(|t| is_valid_key(&t.key)).collect();
     out.extend_from_slice(
-        &u32::try_from(tags.len())
+        &u32::try_from(valid.len())
             .map_err(|_| FormatError::TooLarge)?
             .to_le_bytes(),
     );
-    for t in tags {
+    for t in valid {
         let field = crate::tagmap::key_to_vorbis(&t.key)
             .map_or_else(|| t.key.to_ascii_uppercase(), str::to_string);
         let comment = format!("{field}={}", t.value);
@@ -89,6 +90,43 @@ pub fn parse(body: &[u8]) -> Result<Vec<(String, String)>> {
 mod tests {
     use super::*;
     use crate::input::TagInput;
+
+    #[test]
+    fn build_skips_keys_outside_vorbis_grammar() {
+        // The issue's case: an `a=b` key would otherwise synthesize `A=B=c` and
+        // shift the boundary on re-parse. Empty keys are also dropped. Valid keys
+        // keep their order, and the comment count reflects only survivors.
+        let tags = vec![
+            TagInput::new("artist", "Alice"),
+            TagInput::new("a=b", "c"),
+            TagInput::new("", "x"),
+            TagInput::new("title", "Song"),
+        ];
+        let body = build(&tags).unwrap();
+        let parsed = parse(&body).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("artist".to_string(), "Alice".to_string()),
+                ("title".to_string(), "Song".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_is_total_over_arbitrary_keys() {
+        // build() must remain total: it has no assert guarding key validity, so the
+        // fuzz harness can feed it arbitrary keys. It must never panic and must emit
+        // only valid comments.
+        let tags = vec![
+            TagInput::new("a=b=c", "v"),
+            TagInput::new("\u{0}\u{1}", "v"),
+            TagInput::new("ok", "v"),
+        ];
+        let body = build(&tags).unwrap();
+        let parsed = parse(&body).unwrap();
+        assert_eq!(parsed, vec![("OK".to_string(), "v".to_string())]);
+    }
 
     #[test]
     fn build_then_parse_round_trips() {
