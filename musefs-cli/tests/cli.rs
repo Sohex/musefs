@@ -309,3 +309,32 @@ fn fallback_without_equals_is_rejected() {
     .unwrap_err();
     assert!(err.to_string().contains("FIELD=VALUE"), "{err}");
 }
+
+#[test]
+fn mount_fails_on_missing_db_without_creating_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("missing.db");
+    let mount_dir = tempfile::tempdir().unwrap();
+
+    let cli = Cli::parse_from([
+        "musefs",
+        "mount",
+        mount_dir.path().to_str().unwrap(),
+        "--db",
+        db_path.to_str().unwrap(),
+    ]);
+    let args = match cli.command {
+        Command::Mount(args) => args,
+        Command::Scan { .. } => panic!("expected mount"),
+    };
+
+    let err = musefs_cli::run_mount(&args).unwrap_err();
+    assert!(
+        err.to_string().contains("does not exist"),
+        "expected a missing-db error, got: {err}"
+    );
+    assert!(
+        !db_path.exists(),
+        "mount must not create the database when it is absent"
+    );
+}
