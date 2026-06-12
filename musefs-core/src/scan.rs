@@ -36,11 +36,44 @@ pub(crate) const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 /// payloads (e.g. a GEOB embedding a multi-MB file) are logged-and-skipped.
 const MAX_BINARY_TAG_BYTES: usize = MAX_ART_BYTES;
 
+/// Outcome of probing one backing file. `Raced` means the file changed under us
+/// between the pre- and post-probe `fstat` — the probe may be torn, so nothing
+/// is committed for it (#276).
+#[derive(Debug)]
+enum ProbeOutcome {
+    Probed(Probed, BackingStamp),
+    Unsupported,
+    Raced,
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_S1_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn fire_after_s1() {
+    AFTER_S1_HOOK.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+#[cfg(test)]
+fn set_after_s1_hook(f: impl FnMut() + 'static) {
+    AFTER_S1_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+#[cfg(test)]
+fn clear_after_s1_hook() {
+    AFTER_S1_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanStats {
     pub scanned: u64,
     pub skipped: u64,
     pub failed: u64,
+    pub raced: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +82,7 @@ pub struct RevalidateStats {
     pub unchanged: u64,
     pub pruned: u64,
     pub failed: u64,
+    pub raced: u64,
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
@@ -156,6 +190,7 @@ fn dir_key(meta: &std::fs::Metadata) -> (u64, u64) {
 
 /// A backing file parsed into the fields a track row needs, plus its raw
 /// `(key, value)` tags to seed.
+#[derive(Debug)]
 pub(crate) struct Probed {
     format: Format,
     audio_offset: u64,
@@ -272,97 +307,114 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
     Ok(Some(buf))
 }
 
-/// Bounded probe of one backing file: open once, read a bounded window, dispatch
-/// per format, widening on `NeedMore`. Never reads the audio payload (M4A uses
-/// the seek reader; front-anchored formats read only the metadata extent).
-/// Returns `Ok(None)` for an unsupported/unparseable file (to be skipped).
+/// Bounded probe of one backing file: open once, fstat before and after the
+/// probe, and report `Raced` when the file moved mid-probe — so the stored
+/// stamp and the probed bytes provably share one inode held still across the
+/// probe. Never reads the audio payload (M4A uses the seek reader;
+/// front-anchored formats read only the metadata extent).
 ///
-/// Metrics note: `on_scan_read` counts the front-anchored prefix/widen/tail
-/// reads only. The M4A seek reader does its own positioned reads internally, so
-/// its bytes are not reflected in `SCAN_BYTES_READ` (only `on_scan_open` fires
-/// for M4A); its win shows up in wall time and peak RSS instead.
-fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Option<Probed>> {
+/// Returns `ProbeOutcome::Unsupported` for an unsupported/unparseable file (to
+/// be skipped) and `ProbeOutcome::Raced` if the file changed under us.
+fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
+    let s1 = BackingStamp::from_metadata(&file.metadata()?);
+    #[cfg(test)]
+    fire_after_s1();
+    let file_len = s1.size;
 
-    // M4A: seek reader, never touches mdat.
-    if has_ext(path, "m4a") || has_ext(path, "m4b") {
-        let mut f = &file;
-        let scan = match mp4::read_structure_from(&mut f, file_len) {
-            Ok(s) => s,
-            Err(e) => {
-                if matches!(e, mp4::Mp4ScanError::MetadataTooLarge { .. }) {
-                    log::warn!("skipping {}: {e}", path.display());
+    // ---- existing probe body, using file_len = s1.size ----
+    let probed: Option<Probed> = (|file_len: u64| -> std::io::Result<Option<Probed>> {
+        // M4A: seek reader, never touches mdat.
+        if has_ext(path, "m4a") || has_ext(path, "m4b") {
+            let mut f = &file;
+            let scan = match mp4::read_structure_from(&mut f, file_len) {
+                Ok(s) => s,
+                Err(e) => {
+                    if matches!(e, mp4::Mp4ScanError::MetadataTooLarge { .. }) {
+                        log::warn!("skipping {}: {e}", path.display());
+                    }
+                    return Ok(None);
                 }
-                return Ok(None);
-            }
+            };
+            return Ok(Some(Probed {
+                format: Format::M4a,
+                audio_offset: scan.mdat_payload_offset,
+                audio_length: scan.mdat_payload_len,
+                tags: mp4::read_tags(&scan.moov),
+                pictures: mp4::read_pictures(&scan.moov, MAX_ART_BYTES),
+                binary_tags: mp4::read_binary_tags(&scan.moov, MAX_BINARY_TAG_BYTES),
+                structural_blocks: Vec::new(),
+            }));
+        }
+
+        // Front-anchored formats: read a window, widen on NeedMore. Only the MP3
+        // arm of probe_prefix consumes the ID3v1 tail, and dispatch is by
+        // extension — so only .mp3 pays the tail read (#67).
+        let tail = if has_ext(path, "mp3") {
+            read_tail_128(&file, file_len)?
+        } else {
+            None
         };
-        return Ok(Some(Probed {
-            format: Format::M4a,
-            audio_offset: scan.mdat_payload_offset,
-            audio_length: scan.mdat_payload_len,
-            tags: mp4::read_tags(&scan.moov),
-            pictures: mp4::read_pictures(&scan.moov, MAX_ART_BYTES),
-            binary_tags: mp4::read_binary_tags(&scan.moov, MAX_BINARY_TAG_BYTES),
-            structural_blocks: Vec::new(),
-        }));
-    }
-
-    // Front-anchored formats: read a window, widen on NeedMore. Only the MP3
-    // arm of probe_prefix consumes the ID3v1 tail, and dispatch is by
-    // extension — so only .mp3 pays the tail read (#67).
-    let tail = if has_ext(path, "mp3") {
-        read_tail_128(&file, file_len)?
-    } else {
-        None
-    };
-    // Never read past the probe ceiling, however large the file or whatever a
-    // (possibly corrupt) header asks for via `NeedMore`.
-    let probe_cap = file_len.min(MAX_PROBE_BYTES);
-    let mut want = usize_from((window as u64).min(probe_cap));
-    let mut prefix = read_window(&file, want)?;
-    for _ in 0..MAX_WIDEN_RETRIES {
-        match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
-            Probe::Done(p) => return Ok(Some(p)),
-            Probe::Skip => return Ok(None),
-            Probe::NeedMore(up_to) => {
-                // Read everything we're willing to probe? Widening can't help.
-                if want as u64 >= probe_cap {
-                    break;
+        // Never read past the probe ceiling, however large the file or whatever a
+        // (possibly corrupt) header asks for via `NeedMore`.
+        let probe_cap = file_len.min(MAX_PROBE_BYTES);
+        let mut want = usize_from((window as u64).min(probe_cap));
+        let mut prefix = read_window(&file, want)?;
+        for _ in 0..MAX_WIDEN_RETRIES {
+            match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
+                Probe::Done(p) => return Ok(Some(p)),
+                Probe::Skip => return Ok(None),
+                Probe::NeedMore(up_to) => {
+                    // Read everything we're willing to probe? Widening can't help.
+                    if want as u64 >= probe_cap {
+                        break;
+                    }
+                    // Grow to at least `up_to` (capped at `probe_cap`), always making
+                    // progress (`+1`), then retry.
+                    want = usize_from(up_to.min(probe_cap))
+                        .max(want + 1)
+                        .min(usize_from(probe_cap));
+                    prefix = read_window(&file, want)?;
                 }
-                // Grow to at least `up_to` (capped at `probe_cap`), always making
-                // progress (`+1`), then retry.
-                want = usize_from(up_to.min(probe_cap))
-                    .max(want + 1)
-                    .min(usize_from(probe_cap));
-                prefix = read_window(&file, want)?;
             }
         }
+        // Fallback: full-buffer probe over the bytes we were willing to read.
+        if (prefix.len() as u64) < probe_cap {
+            prefix = read_window(&file, usize_from(probe_cap))?;
+        }
+        if let Some(p) = probe_full(path, &prefix) {
+            return Ok(Some(p));
+        }
+        // A WAV whose `data` payload runs past the probe ceiling fails the strict
+        // full-buffer parse (the payload isn't present to bound), yet its `fmt `/`data`
+        // headers sit at the front: trust the declared bounds and serve the audio,
+        // accepting the loss of any tag chunks trailing the payload.
+        if has_ext(path, "wav")
+            && file_len > MAX_PROBE_BYTES
+            && let Ok(bounds) = wav::locate_audio_at_ceiling(&prefix, file_len)
+        {
+            return Ok(Some(wav_probed(&prefix, &bounds)));
+        }
+        if file_len > MAX_PROBE_BYTES {
+            log::warn!(
+                "skipping {}: no parseable metadata within first {MAX_PROBE_BYTES} bytes",
+                path.display()
+            );
+        }
+        Ok(None)
+    })(file_len)?;
+    // ---- end of existing probe body ----
+
+    let s2 = BackingStamp::from_metadata(&file.metadata()?);
+    if s1 != s2 {
+        log::warn!("skipping {}: changed during probe", path.display());
+        return Ok(ProbeOutcome::Raced);
     }
-    // Fallback: full-buffer probe over the bytes we were willing to read.
-    if (prefix.len() as u64) < probe_cap {
-        prefix = read_window(&file, usize_from(probe_cap))?;
-    }
-    if let Some(p) = probe_full(path, &prefix) {
-        return Ok(Some(p));
-    }
-    // A WAV whose `data` payload runs past the probe ceiling fails the strict
-    // full-buffer parse (the payload isn't present to bound), yet its `fmt `/`data`
-    // headers sit at the front: trust the declared bounds and serve the audio,
-    // accepting the loss of any tag chunks trailing the payload.
-    if has_ext(path, "wav")
-        && file_len > MAX_PROBE_BYTES
-        && let Ok(bounds) = wav::locate_audio_at_ceiling(&prefix, file_len)
-    {
-        return Ok(Some(wav_probed(&prefix, &bounds)));
-    }
-    if file_len > MAX_PROBE_BYTES {
-        log::warn!(
-            "skipping {}: no parseable metadata within first {MAX_PROBE_BYTES} bytes",
-            path.display()
-        );
-    }
-    Ok(None)
+    Ok(match probed {
+        Some(p) => ProbeOutcome::Probed(p, s1),
+        None => ProbeOutcome::Unsupported,
+    })
 }
 
 /// Outcome of a single bounded dispatch attempt against the current `prefix`.
@@ -697,6 +749,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     let budget = Arc::new(ByteBudget::new(cap));
     let skipped = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
+    let raced = Arc::new(AtomicU64::new(0));
 
     // Work queue: a shared iterator behind a mutex (cheap; probing dominates).
     let work = Arc::new(std::sync::Mutex::new(files.into_iter()));
@@ -709,16 +762,13 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         let budget = Arc::clone(&budget);
         let skipped = Arc::clone(&skipped);
         let failed = Arc::clone(&failed);
+        let raced = Arc::clone(&raced);
         workers.push(std::thread::spawn(move || {
             loop {
                 let next = { work.lock().unwrap().next() };
                 let Some(path) = next else { break };
-                let Ok(meta) = std::fs::metadata(&path) else {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
-                match probe_file(&path, meta.len(), window) {
-                    Ok(Some(probed)) => {
+                match probe_file(&path, window) {
+                    Ok(ProbeOutcome::Probed(probed, stamp)) => {
                         let Ok(abs) = std::fs::canonicalize(&path) else {
                             failed.fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -727,7 +777,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                         budget.acquire(weight); // backpressure on in-flight art bytes
                         let unit = Unit {
                             abs_path: abs.to_string_lossy().into_owned(),
-                            stamp: BackingStamp::from_metadata(&meta),
+                            stamp,
                             probed,
                             weight,
                         };
@@ -736,8 +786,11 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                             break;
                         }
                     }
-                    Ok(None) => {
+                    Ok(ProbeOutcome::Unsupported) => {
                         skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(ProbeOutcome::Raced) => {
+                        raced.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => {
                         failed.fetch_add(1, Ordering::Relaxed);
@@ -826,6 +879,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         scanned,
         skipped: skipped.load(Ordering::Relaxed),
         failed: failed.load(Ordering::Relaxed),
+        raced: raced.load(Ordering::Relaxed),
     })
 }
 
@@ -845,6 +899,7 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
         scanned: 0,
         skipped: 0,
         failed: 0,
+        raced: 0,
     };
     for path in files {
         let bytes = std::fs::read(&path)?;
@@ -951,6 +1006,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         unchanged,
         pruned,
         failed: scan.failed + skip_failed,
+        raced: scan.raced,
     })
 }
 
@@ -1168,9 +1224,10 @@ mod scan_unit_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oversized_art.m4a");
         std::fs::write(&path, &bytes).unwrap();
-        let probed = probe_file(&path, bytes.len() as u64, 0)
-            .unwrap()
-            .expect("m4a should probe");
+        let probed = match probe_file(&path, 0).unwrap() {
+            ProbeOutcome::Probed(p, _) => p,
+            other => panic!("expected Probed, got {other:?}"),
+        };
         assert_eq!(probed.format, Format::M4a);
         assert!(
             probed.pictures.is_empty(),
@@ -1187,9 +1244,10 @@ mod scan_unit_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oversized_bin.m4a");
         std::fs::write(&path, &bytes).unwrap();
-        let probed = probe_file(&path, bytes.len() as u64, 0)
-            .unwrap()
-            .expect("m4a should probe");
+        let probed = match probe_file(&path, 0).unwrap() {
+            ProbeOutcome::Probed(p, _) => p,
+            other => panic!("expected Probed, got {other:?}"),
+        };
         assert_eq!(probed.format, Format::M4a);
         assert!(
             probed.binary_tags.is_empty(),
@@ -2131,7 +2189,10 @@ mod bounded_probe_tests {
         f.set_len(len).unwrap();
         drop(f);
 
-        assert!(probe_file(&path, len, WINDOW).unwrap().is_none());
+        assert!(matches!(
+            probe_file(&path, WINDOW).unwrap(),
+            ProbeOutcome::Unsupported
+        ));
     }
 
     #[test]
@@ -2171,11 +2232,46 @@ mod bounded_probe_tests {
         f.set_len(file_len).unwrap();
         drop(f);
 
-        let probed = probe_file(&path, file_len, WINDOW)
-            .unwrap()
-            .expect("oversize wav should probe");
+        let probed = match probe_file(&path, WINDOW).unwrap() {
+            ProbeOutcome::Probed(p, _) => p,
+            other => panic!("expected Probed, got {other:?}"),
+        };
         assert_eq!(probed.format, Format::Wav);
         assert_eq!(probed.audio_offset, audio_offset);
         assert_eq!(probed.audio_length, data_len);
+    }
+
+    #[test]
+    fn probe_file_reports_raced_on_mid_probe_mutation() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+
+        // Minimal valid WAV the probe accepts (fmt + tiny data).
+        let mut fmt = Vec::new();
+        for v in [1u16, 1, 0, 0, 0, 16] {
+            fmt.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut front = b"RIFF".to_vec();
+        front.extend_from_slice(&0u32.to_le_bytes());
+        front.extend_from_slice(b"WAVE");
+        front.extend_from_slice(b"fmt ");
+        front.extend_from_slice(&u32::try_from(fmt.len()).unwrap().to_le_bytes());
+        front.extend_from_slice(&fmt);
+        front.extend_from_slice(b"data");
+        front.extend_from_slice(&64u32.to_le_bytes());
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&front).unwrap();
+        f.set_len(front.len() as u64 + 64).unwrap();
+        drop(f);
+
+        let pc = path.clone();
+        set_after_s1_hook(move || {
+            let mut g = std::fs::OpenOptions::new().append(true).open(&pc).unwrap();
+            g.write_all(&[0u8; 4096]).unwrap(); // size moves -> S2 != S1
+        });
+        let out = probe_file(&path, WINDOW);
+        clear_after_s1_hook();
+        assert!(matches!(out, Ok(ProbeOutcome::Raced)), "got {out:?}");
     }
 }
