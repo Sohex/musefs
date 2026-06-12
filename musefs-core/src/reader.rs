@@ -1393,6 +1393,20 @@ mod serve_cap_tests {
     }
 
     #[test]
+    fn flac_legacy_serve_caps_hostile_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "hostile.flac", CAP + 2);
+        let db = Db::open_in_memory().unwrap();
+        // No structural-block rows inserted -> build() takes the legacy fallback
+        // branch (rows.is_empty()) that calls read_front.
+        let track_id = hostile_track(&db, &path, Format::Flac);
+        assert!(db.get_structural_blocks(track_id).unwrap().is_empty());
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        assert_capped(cache.resolve(&db, track_id));
+    }
+
+    #[test]
     fn read_front_rejects_oversize_before_open() {
         // Nonexistent path: if the cap check did NOT fire first, File::open would
         // error and we'd get an Io error instead of HeaderTooLarge. So this also
