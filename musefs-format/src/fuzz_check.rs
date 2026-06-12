@@ -250,6 +250,60 @@ pub mod fixtures {
         data
     }
 
+    /// Minimal Ogg **Vorbis**: 3 header packets (identification, comment, setup)
+    /// then one audio packet. `detect_codec` keys on the `\x01vorbis` magic of
+    /// packet 0; `read_header` reassembles exactly 3 Vorbis header packets. The
+    /// comment packet carries an empty (but valid, round-trippable) VorbisComment
+    /// body so synthesis can splice tags without erroring.
+    pub fn ogg_vorbis() -> Vec<u8> {
+        use crate::ogg::page_test_support::{build_header_pub, lace_packet_pub, vorbis_body_empty};
+        let mut id = b"\x01vorbis".to_vec();
+        id.extend_from_slice(&[0u8; 23]); // pad toward the 30-byte id-header shape
+        let mut comment = b"\x03vorbis".to_vec();
+        comment.extend_from_slice(&vorbis_body_empty());
+        let setup = b"\x05vorbis".to_vec();
+        let (mut data, pages) = build_header_pub(0x4321, &[&id, &comment, &setup]);
+        let (audio, _) = lace_packet_pub(0x4321, pages, false, 960, &[0u8; 120]);
+        data.extend_from_slice(&audio);
+        data
+    }
+
+    /// Minimal **OggFLAC**: mapping header packet 0
+    /// (`0x7F "FLAC" major minor count(2 BE) "fLaC" STREAMINFO`) plus one
+    /// following VORBIS_COMMENT metadata-block packet (`count = 1`), then one
+    /// audio packet. `detect_codec` keys on `\x7FFLAC`; `read_header` reads
+    /// `1 + count` header packets. Lengths are computed from the bodies so the
+    /// 24-bit metadata-block length is always self-consistent.
+    pub fn ogg_flac() -> Vec<u8> {
+        use crate::ogg::page_test_support::{build_header_pub, lace_packet_pub, vorbis_body_empty};
+
+        // STREAMINFO metadata block: header (type 0, not-last) + 24-bit len + body.
+        let mut streaminfo = vec![0x00u8, 0x00, 0x00, 0x22]; // len 34
+        streaminfo.extend_from_slice(&[0u8; 34]);
+
+        let mut p0 = Vec::new();
+        p0.push(0x7F);
+        p0.extend_from_slice(b"FLAC");
+        p0.push(1); // mapping major version
+        p0.push(0); // mapping minor version
+        p0.extend_from_slice(&1u16.to_be_bytes()); // count: 1 following packet
+        p0.extend_from_slice(b"fLaC");
+        p0.extend_from_slice(&streaminfo);
+
+        // Following packet: VORBIS_COMMENT block (type 4, last-metadata-block set).
+        let vc_body = vorbis_body_empty();
+        let mut p1 = Vec::new();
+        p1.push(0x84); // 0x80 last-flag | type 4
+        let len = u32::try_from(vc_body.len()).expect("empty vorbis body fits in u24");
+        p1.extend_from_slice(&len.to_be_bytes()[1..4]); // 24-bit big-endian length
+        p1.extend_from_slice(&vc_body);
+
+        let (mut data, pages) = build_header_pub(0x7777, &[&p0, &p1]);
+        let (audio, _) = lace_packet_pub(0x7777, pages, false, 960, &[0u8; 120]);
+        data.extend_from_slice(&audio);
+        data
+    }
+
     /// Minimal MP3 — a hand-crafted ID3v2.4 header (empty tag) followed by a
     /// minimal MPEG frame sync. `locate_audio` requires only `ID3` marker +
     /// syncsafe size + a valid `0xFF 0xE*` sync at the audio start; the "audio"
@@ -503,5 +557,23 @@ mod fixtures_tests {
     fn ogg_fixture_parses() {
         let f = fixtures::ogg_opus();
         crate::ogg::locate_audio(&f).unwrap();
+    }
+
+    #[test]
+    fn ogg_vorbis_fixture_is_recognized() {
+        let f = fixtures::ogg_vorbis();
+        let h = crate::ogg::read_header(&f).unwrap();
+        assert_eq!(h.codec, crate::ogg::Codec::Vorbis);
+        let scan = crate::ogg::locate_audio(&f).unwrap();
+        assert!(scan.audio_length > 0, "audio must be non-empty");
+    }
+
+    #[test]
+    fn ogg_flac_fixture_is_recognized() {
+        let f = fixtures::ogg_flac();
+        let h = crate::ogg::read_header(&f).unwrap();
+        assert_eq!(h.codec, crate::ogg::Codec::OggFlac);
+        let scan = crate::ogg::locate_audio(&f).unwrap();
+        assert!(scan.audio_length > 0, "audio must be non-empty");
     }
 }

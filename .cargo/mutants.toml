@@ -390,4 +390,14 @@ exclude_re = [
     # stands in for the `'` in `Cow<'_, str>`, which a TOML literal string can't hold.)
     'replace truncate_component -> Cow<._, str> with Cow::Borrowed\(""\)',
     'replace truncate_component -> Cow<._, str> with Cow::Owned\(""\.to_owned\(\)\)',
+
+    # Db::with_raw_conn is #[cfg(feature = "fuzzing")] — a test/fuzz-only raw
+    # rusqlite-connection escape hatch enabled solely by the out-of-workspace fuzz
+    # crate. The per-PR --in-diff gate runs cargo-mutants without that feature, so
+    # the body is cfg'd out and any mutation there is unobservable — reported
+    # MISSED yet unkillable in that config, the same class as the metrics counters
+    # in exclude_globs above. It has no serving/correctness role and is covered
+    # functionally by the fuzzing-gated accessor test in the same file.
+    # guard: count=1
+    'musefs-db/src/lib\.rs:\d+:\d+: replace Db<M>::with_raw_conn -> R with Default::default\(\)',
 ]

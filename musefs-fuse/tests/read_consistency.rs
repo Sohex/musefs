@@ -284,6 +284,25 @@ fn assert_refused(ret: i32, accepted: &[i32], what: &str) {
     );
 }
 
+/// Assert a libc *read* call (getxattr/listxattr) did not error as if it were a
+/// write: it either succeeds (`ret >= 0`) or fails with a non-mutation errno in
+/// `accepted`. Refusing a read on a read-only mount would itself be the bug.
+///
+/// Linux-gated to match its only call sites (the xattr probes), so the macOS /
+/// FreeBSD workspace build that compiles this `#[ignore]` test does not see it
+/// as dead code under `-D warnings`.
+#[cfg(target_os = "linux")]
+fn assert_read_safe(ret: isize, accepted: &[i32], what: &str) {
+    if ret >= 0 {
+        return;
+    }
+    let e = last_errno();
+    assert!(
+        accepted.contains(&e),
+        "{what}: errno {e} not in accepted read-safe set {accepted:?}"
+    );
+}
+
 #[test]
 #[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse --test read_consistency -- --ignored"]
 #[expect(
@@ -351,6 +370,109 @@ fn write_ops_are_refused_on_read_only_mount() {
                 &[libc::EROFS, libc::EPERM, libc::EACCES],
                 "utimes",
             );
+
+            // --- #306: additional mutating-syscall families ---
+            let renamed = cstr(&mountpoint.join("Alice").join("renamed.flac"));
+            let link_dst = cstr(&mountpoint.join("Alice").join("hardlink.flac"));
+            let sym_dst = cstr(&mountpoint.join("Alice").join("symlink.flac"));
+            let dir = cstr(&mountpoint.join("Alice"));
+
+            assert_refused(
+                libc::rename(existing.as_ptr(), renamed.as_ptr()),
+                &[libc::EROFS, libc::EPERM, libc::EACCES],
+                "rename",
+            );
+            assert_refused(
+                libc::rmdir(dir.as_ptr()),
+                &[libc::EROFS, libc::EPERM, libc::EACCES, libc::ENOTEMPTY],
+                "rmdir",
+            );
+            assert_refused(
+                libc::symlink(existing.as_ptr(), sym_dst.as_ptr()),
+                &[libc::EROFS, libc::EPERM, libc::EACCES],
+                "symlink",
+            );
+            assert_refused(
+                libc::chown(existing.as_ptr(), 0, 0),
+                &[libc::EROFS, libc::EPERM, libc::EACCES],
+                "chown",
+            );
+            assert_refused(
+                libc::lchown(existing.as_ptr(), 0, 0),
+                &[libc::EROFS, libc::EPERM, libc::EACCES],
+                "lchown",
+            );
+            // mknod a regular file (no privilege needed); ENOSYS tolerates a
+            // platform/FUSE build that does not implement the callback at all.
+            // EINVAL: FreeBSD's mknod(2) only creates special files and rejects
+            // S_IFREG at the syscall layer before the FUSE RO check — still a
+            // refusal (no node is created), which is all this test asserts.
+            assert_refused(
+                libc::mknod(new_file.as_ptr(), libc::S_IFREG | 0o644, 0),
+                &[
+                    libc::EROFS,
+                    libc::EPERM,
+                    libc::EACCES,
+                    libc::ENOSYS,
+                    libc::EINVAL,
+                ],
+                "mknod",
+            );
+            assert_refused(
+                libc::link(existing.as_ptr(), link_dst.as_ptr()),
+                &[libc::EROFS, libc::EPERM, libc::EACCES, libc::ENOSYS],
+                "link",
+            );
+
+            // xattr syscall signatures and names differ across platforms (Linux
+            // setxattr vs the BSD/macOS extattr_* family), so gate the probes to
+            // Linux: on macOS/FreeBSD the workspace build still compiles, and on
+            // FreeBSD (where this test *does* run, via fusefs) they are skipped
+            // rather than calling a syscall this code isn't written against.
+            #[cfg(target_os = "linux")]
+            {
+                let xval = [0u8; 4];
+                assert_refused(
+                    libc::setxattr(
+                        existing.as_ptr(),
+                        c"user.test".as_ptr(),
+                        xval.as_ptr().cast(),
+                        xval.len(),
+                        0,
+                    ),
+                    &[libc::EROFS, libc::EPERM, libc::EACCES, libc::ENOTSUP],
+                    "setxattr",
+                );
+                assert_refused(
+                    libc::removexattr(existing.as_ptr(), c"user.test".as_ptr()),
+                    &[
+                        libc::EROFS,
+                        libc::EPERM,
+                        libc::EACCES,
+                        libc::ENOTSUP,
+                        libc::ENODATA,
+                    ],
+                    "removexattr",
+                );
+
+                // Read probes: NOT mutations. Assert read-safety, never refusal.
+                let mut buf = [0u8; 256];
+                assert_read_safe(
+                    libc::getxattr(
+                        existing.as_ptr(),
+                        c"user.test".as_ptr(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                    ),
+                    &[libc::ENOTSUP, libc::ENODATA],
+                    "getxattr",
+                );
+                assert_read_safe(
+                    libc::listxattr(existing.as_ptr(), buf.as_mut_ptr().cast(), buf.len()),
+                    &[libc::ENOTSUP],
+                    "listxattr",
+                );
+            }
         }
     });
 }
