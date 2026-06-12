@@ -42,17 +42,29 @@ from the database, spliced in front of your original, untouched audio.
   [Picard plugin](contrib/picard/README.md), or
   [Lidarr integration](contrib/lidarr/README.md)) and the mounted view
   updates live — no remount, no rewrite, no re-rip anxiety.
-- **Lossless-by-construction experimentation.** Try a retag, a different
+- **Lossless-by-construction experimentation.** Change your tags, try a different
   organization scheme, new cover art — the originals are physically
-  read-only to the mount.
+  read-only to the mount. Backing up a current library is as easy as copying the db file.
+
+> [!NOTE]
+> This project was built with AI. The general workflow was to use the [superpowers](https://github.com/obra/superpowers) skills to provide a framework. Claude Opus was used to write plans and specs which were then implemented by another model, primarily MiMo v2.5.
+>
+> One of my goals in building this project was to "vibe code" something that was decisively not slop. I believe I've realized that objective and I hope that you take the project on its merits.
+>
+> If you disagree, please let me know! I'd love to know where I came up short so I can improve things. 
 
 ## Installing
 
 Three ways to get musefs: a [prebuilt binary](#prebuilt-binaries) (no
 toolchain needed), [building from source](#building-from-source), or a
 [container image](#container-images).
-Whichever you pick, mounting needs a FUSE-capable OS — see
+Whichever you pick, mounting needs a 64-bit FUSE-capable OS (Linux, FreeBSD, macOS) — see
 [Platform support](#platform-support).
+
+> [!IMPORTANT]
+> Linux and FreeBSD are E2E tested. I don't have anything running macOS to test on, if you run this on one let me know if it works, or especially if it doesn't!
+>
+> At present only AMD64 and AARCH64 are supported. If you'd like 32-bit support please open an issue.
 
 ### Prebuilt binaries
 
