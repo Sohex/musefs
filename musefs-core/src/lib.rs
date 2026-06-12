@@ -22,7 +22,7 @@ pub use scan::{
     RevalidateStats, ScanOptions, ScanStats, revalidate, revalidate_with, scan_directory,
     scan_directory_with,
 };
-pub use template::Template;
+pub use template::{Template, TemplateError};
 pub use tree::{Node, NodeKind, VirtualTree};
 
 #[cfg(test)]

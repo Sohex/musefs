@@ -2,6 +2,32 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::iter::Peekable;
 use std::str::Chars;
+use thiserror::Error;
+
+/// Max surviving segments a single `$!{}` path field may expand into. A hostile
+/// 256 KiB tag shaped `a/a/a/...` would otherwise build tens of thousands of
+/// directory levels (depth amplification across the DB trust boundary, #303).
+const MAX_PATH_FIELD_SEGMENTS: usize = 64;
+
+/// Max `[...]` section nesting depth accepted by [`Template::parse`]. Beyond this
+/// the parser rejects the template rather than recursing further (#304). Real
+/// templates nest 2–3 deep; 64 is generous headroom that still bounds the
+/// adversarial `[[[…` case.
+const MAX_SECTION_DEPTH: usize = 64;
+
+/// Why a template was rejected at parse time. Surfaced to the operator via
+/// [`crate::CoreError::InvalidTemplate`] when `Musefs::open` parses a bad
+/// `--template`.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum TemplateError {
+    /// `[...]` sections nested deeper than `limit`.
+    #[error("template nesting exceeds the maximum depth of {limit}")]
+    NestingTooDeep { limit: usize },
+    /// A literal run contains a control byte (`< 0x20`, includes NUL), which is
+    /// not a valid POSIX path-component byte.
+    #[error("template literal contains control byte {byte:#04x}")]
+    ControlByte { byte: u8 },
+}
 
 /// A parsed path template: literal runs, `$field` / `${field}` substitutions
 /// (with optional `${a|b}` fallback chains and `$!{field}` slash-preserving path
@@ -27,7 +53,9 @@ enum Part {
 }
 
 impl Template {
-    /// Parse a beets-style template. Infallible.
+    /// Parse a beets-style template. Returns `Err` for a template that cannot
+    /// produce valid path components: control/NUL bytes in literal text
+    /// (#275) or `[...]` nesting deeper than [`MAX_SECTION_DEPTH`] (#304).
     ///
     /// - `$field` / `${field}` substitute a tag field; `${a|b|c}` is a fallback
     ///   chain (first present wins). Names are matched case-insensitively.
@@ -38,17 +66,17 @@ impl Template {
     /// - A `$` not followed by a recognized form stays literal; an unterminated
     ///   `${`/`$!{` consumes the rest as the name; an unterminated `[` runs to
     ///   end of input.
-    pub fn parse(template: &str) -> Template {
+    pub fn parse(template: &str) -> Result<Template, TemplateError> {
         let mut chars = template.chars().peekable();
-        let parts = parse_parts(&mut chars, false);
-        Template { parts }
+        let parts = parse_parts(&mut chars, 0)?;
+        Ok(Template { parts })
     }
 
-    /// The set of field names this template references, across plain fields, `$!{}`
-    /// path fields, `|` fallback chains, and `[...]` sections. Names are already
-    /// ASCII-lowercased at parse time, matching `tags_to_fields`'s key folding, so a
-    /// key-filtered tag load (`Db::tags_grouped_for_keys`) fetches exactly what
-    /// rendering consumes.
+    /// The set of field names this template references, across plain fields,
+    /// `$!{}` path fields, `|` fallback chains, and `[...]` sections. Names
+    /// are already ASCII-lowercased at parse time, matching `tags_to_fields`'s
+    /// key folding, so a key-filtered tag load (`Db::tags_grouped_for_keys`)
+    /// fetches exactly what rendering consumes.
     pub fn referenced_fields(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         collect_field_names(&self.parts, &mut out);
@@ -72,20 +100,26 @@ impl Template {
     }
 }
 
-/// Parse parts until a closing `]` (when `in_section`) or end of input.
-fn parse_parts(chars: &mut Peekable<Chars>, in_section: bool) -> Vec<Part> {
+/// Parse parts until a closing `]` (when `depth > 0`) or end of input. `depth`
+/// is the current `[...]` nesting level (0 = top level).
+fn parse_parts(chars: &mut Peekable<Chars>, depth: usize) -> Result<Vec<Part>, TemplateError> {
     let mut parts = Vec::new();
     let mut literal = String::new();
     while let Some(&c) = chars.peek() {
         match c {
-            ']' if in_section => {
+            ']' if depth > 0 => {
                 chars.next(); // consume the closing ']'
                 break;
             }
             '[' => {
                 chars.next();
                 push_literal(&mut parts, &mut literal);
-                let inner = parse_parts(chars, true);
+                if depth + 1 > MAX_SECTION_DEPTH {
+                    return Err(TemplateError::NestingTooDeep {
+                        limit: MAX_SECTION_DEPTH,
+                    });
+                }
+                let inner = parse_parts(chars, depth + 1)?;
                 parts.push(Part::Section(inner));
             }
             '$' => {
@@ -129,13 +163,16 @@ fn parse_parts(chars: &mut Peekable<Chars>, in_section: bool) -> Vec<Part> {
                 }
             }
             _ => {
+                if (c as u32) < 0x20 {
+                    return Err(TemplateError::ControlByte { byte: c as u8 });
+                }
                 literal.push(c);
                 chars.next();
             }
         }
     }
     push_literal(&mut parts, &mut literal);
-    parts
+    Ok(parts)
 }
 
 fn push_literal(parts: &mut Vec<Part>, literal: &mut String) {
@@ -287,10 +324,16 @@ fn sanitize_into(out: &mut String, value: &str) {
 
 /// Split `value` on '/', drop empty / `.` / `..` segments, sanitize each
 /// surviving segment, and rejoin with '/'. Guarantees no empty, `.`, `..`, or
-/// leading/trailing-slash components reach the virtual tree.
+/// leading/trailing-slash components reach the virtual tree. Stops after
+/// `MAX_PATH_FIELD_SEGMENTS` surviving segments, bounding the depth a single
+/// hostile path-field value can amplify into (#303).
 fn sanitize_path(value: &str) -> String {
     let mut out = String::new();
+    let mut count = 0usize;
     for segment in value.split('/') {
+        if count == MAX_PATH_FIELD_SEGMENTS {
+            break;
+        }
         if segment.is_empty() || segment == "." || segment == ".." {
             continue;
         }
@@ -298,6 +341,7 @@ fn sanitize_path(value: &str) -> String {
             out.push('/');
         }
         sanitize_into(&mut out, segment);
+        count += 1;
     }
     out
 }
@@ -312,7 +356,8 @@ mod tests {
 
     #[test]
     fn referenced_fields_collects_plain_path_section_and_fallback_names() {
-        let t = Template::parse("$artist/$!{beets_path}/[$disc - ]${title|name}");
+        let t = Template::parse("$artist/$!{beets_path}/[$disc - ]${title|name}")
+            .expect("valid template");
         let f = t.referenced_fields();
         assert!(f.contains("artist"));
         assert!(f.contains("beets_path"));
@@ -321,5 +366,20 @@ mod tests {
         assert!(f.contains("name"));
         // No spurious entries from literals.
         assert_eq!(f.len(), 5);
+    }
+
+    #[test]
+    fn nesting_at_limit_parses_one_past_limit_rejected() {
+        let at_limit = "[".repeat(MAX_SECTION_DEPTH);
+        assert!(
+            Template::parse(&at_limit).is_ok(),
+            "{MAX_SECTION_DEPTH} deep parses"
+        );
+
+        let past_limit = "[".repeat(MAX_SECTION_DEPTH + 1);
+        assert!(matches!(
+            Template::parse(&past_limit),
+            Err(TemplateError::NestingTooDeep { limit }) if limit == MAX_SECTION_DEPTH
+        ));
     }
 }

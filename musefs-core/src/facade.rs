@@ -252,7 +252,7 @@ impl Musefs {
         // update, since the next poll would see both stamps as current.
         let last_data_version = db.data_version()?;
         let last_seq = db.changelog_since(i64::MAX)?.max_seq;
-        let template = Template::parse(&config.template);
+        let template = Template::parse(&config.template)?;
         let (tree, snapshot) = Self::build_full(&db, &template, &config, &mut alloc)?;
         let poll_interval = config.poll_interval;
         Ok(Musefs {
@@ -1526,8 +1526,12 @@ mod tests {
             case_insensitive: false,
         };
 
-        let (entries, snapshot) =
-            Musefs::render_entries(&db, &Template::parse(&cfg.template), &cfg).unwrap();
+        let (entries, snapshot) = Musefs::render_entries(
+            &db,
+            &Template::parse(&cfg.template).expect("valid template"),
+            &cfg,
+        )
+        .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, "Pix/Song.mp3");
         let id = entries[0].0;
@@ -1784,7 +1788,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
         };
-        let template = Template::parse(&config.template);
+        let template = Template::parse(&config.template).expect("valid template");
 
         let mut alloc = InodeAllocator::new();
         let (tree, _snapshot) = Musefs::build_full(&db, &template, &config, &mut alloc).unwrap();
@@ -1860,5 +1864,22 @@ mod tests {
             matches!(fs.getattr(file_inode), Err(CoreError::BackingChanged(_))),
             "getattr must degrade to BackingChanged after an on-disk backing change"
         );
+    }
+
+    #[test]
+    fn open_rejects_template_with_control_byte() {
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let config = MountConfig {
+            template: "a\0b/$title".to_string(),
+            fallbacks: std::collections::BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+        };
+        assert!(matches!(
+            Musefs::open(db, config),
+            Err(crate::CoreError::InvalidTemplate(_))
+        ));
     }
 }
