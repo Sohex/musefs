@@ -3,9 +3,16 @@
 
 use fuser::MountOption;
 
-/// Read-only mount options for `fs_name`, plus any per-OS additions.
-pub fn options(fs_name: &str) -> Vec<MountOption> {
+/// Read-only mount options for `fs_name`, plus any per-OS additions. With
+/// `allow_other`, also mount `allow_other` + `default_permissions` so an account
+/// other than the mounting user can reach the mount and the presented owner/mode
+/// bits are kernel-enforced.
+pub fn options(fs_name: &str, allow_other: bool) -> Vec<MountOption> {
     let mut opts = vec![MountOption::RO, MountOption::FSName(fs_name.to_string())];
+    if allow_other {
+        opts.push(MountOption::CUSTOM("allow_other".to_string()));
+        opts.push(MountOption::DefaultPermissions);
+    }
     extend_os_specific(&mut opts, fs_name);
     opts
 }
@@ -27,9 +34,23 @@ mod tests {
 
     #[test]
     fn options_are_always_read_only_and_named() {
-        let opts = options("musefs");
+        let opts = options("musefs", false);
         assert!(opts.contains(&MountOption::RO));
         assert!(opts.contains(&MountOption::FSName("musefs".to_string())));
+    }
+
+    #[test]
+    fn allow_other_adds_allow_other_and_default_permissions() {
+        let opts = options("musefs", true);
+        assert!(opts.contains(&MountOption::CUSTOM("allow_other".to_string())));
+        assert!(opts.contains(&MountOption::DefaultPermissions));
+    }
+
+    #[test]
+    fn no_allow_other_omits_allow_other_and_default_permissions() {
+        let opts = options("musefs", false);
+        assert!(!opts.contains(&MountOption::CUSTOM("allow_other".to_string())));
+        assert!(!opts.contains(&MountOption::DefaultPermissions));
     }
 }
 
@@ -39,7 +60,7 @@ mod macos_tests {
 
     #[test]
     fn macos_adds_volname_and_noappledouble() {
-        let opts = options("musefs");
+        let opts = options("musefs", false);
         assert!(opts.contains(&MountOption::CUSTOM("volname=musefs".to_string())));
         assert!(opts.contains(&MountOption::CUSTOM("noappledouble".to_string())));
     }

@@ -270,6 +270,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         gid: args.group.unwrap_or(defaults.gid),
         file_mode: args.file_mode.unwrap_or(defaults.file_mode),
         dir_mode: args.dir_mode.unwrap_or(defaults.dir_mode),
+        allow_other: args.owner.is_some() || args.group.is_some(),
     };
     (config, fuse_config)
 }
@@ -548,5 +549,38 @@ mod tests {
         assert_eq!(parse_group("1234").unwrap(), 1234);
         assert!(parse_group("").is_err());
         assert!(parse_group("definitely-no-such-group-xyzzy").is_err());
+    }
+
+    #[test]
+    fn owner_or_group_auto_enables_allow_other() {
+        use clap::Parser;
+        for arg in [["--owner", "0"], ["--group", "0"]] {
+            let cli = Cli::try_parse_from([
+                "musefs",
+                "mount",
+                "/mnt",
+                "--db",
+                "/tmp/x.db",
+                arg[0],
+                arg[1],
+            ])
+            .unwrap();
+            let Command::Mount(args) = cli.command else {
+                panic!("expected Mount");
+            };
+            let (_config, fuse_config) = parse_mount_config(&args);
+            assert!(fuse_config.allow_other, "{arg:?} should enable allow_other");
+        }
+    }
+
+    #[test]
+    fn allow_other_defaults_off_without_owner_group() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "mount", "/mnt", "--db", "/tmp/x.db"]).unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected Mount");
+        };
+        let (_config, fuse_config) = parse_mount_config(&args);
+        assert!(!fuse_config.allow_other);
     }
 }
