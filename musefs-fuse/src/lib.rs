@@ -5,7 +5,7 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -49,7 +49,7 @@ pub struct FuseConfig {
     pub max_readahead: u32,
     /// Max outstanding background (readahead/async) requests the kernel queues.
     /// Caps that class of work delivered to the pool; foreground reads are
-    /// bounded only by client concurrency, not by this.
+    /// bounded separately by `MAX_INFLIGHT_READS` (#308), not by this.
     pub max_background: u16,
     /// Keep the kernel page cache across opens (`FOPEN_KEEP_CACHE`). An external
     /// re-tag auto-invalidates the affected inode on refresh (`poll_refresh_notify`
@@ -179,6 +179,42 @@ impl Drop for PollPendingGuard<'_> {
     }
 }
 
+/// Cap on concurrently outstanding foreground reads (#308). Every FUSE `read`
+/// reserves a slot on the dispatch thread *before* enqueuing onto the unbounded
+/// pool queue; over the cap the read is rejected with `EAGAIN` rather than
+/// queued, so the queue cannot grow past the cap. 1024 is far above any
+/// legitimate read fan-in (a player reads sequentially; readahead is bounded by
+/// `max_background`), so it is an attack-only response, and queued job state is
+/// small, keeping the bound cheap.
+const MAX_INFLIGHT_READS: usize = 1024;
+
+/// Releases one `inflight_reads` slot when dropped — on worker completion, on the
+/// over-cap reject path, and on panic. Owns an `Arc<AtomicUsize>` (unlike the
+/// borrow-based `PollPendingGuard`) so it can move into the `'static` worker
+/// closure.
+struct ReadSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for ReadSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Reserve one in-flight-read slot (#308). Increments `inflight` and returns a
+/// guard if the post-increment count is within `cap`; otherwise the guard drops
+/// immediately (undoing the increment) and `None` is returned, so the caller
+/// replies `EAGAIN` without enqueuing. The counter is a pure count with no
+/// happens-before tie to other data, so `Relaxed` ordering suffices.
+fn reserve_read_slot(inflight: &Arc<AtomicUsize>, cap: usize) -> Option<ReadSlotGuard> {
+    let count = inflight.fetch_add(1, Ordering::Relaxed) + 1;
+    let guard = ReadSlotGuard(Arc::clone(inflight));
+    if count > cap {
+        None // guard drops here, undoing the increment
+    } else {
+        Some(guard)
+    }
+}
+
 /// A `fuser::Filesystem` that serves a `musefs_core::Musefs`. fuser dispatches
 /// on one thread; blocking ops (read/getattr/lookup-attr) are offloaded to a
 /// bounded worker pool and answered via the `Send` reply objects, so a slow
@@ -207,6 +243,10 @@ pub struct MusefsFs {
     dir_handles: Arc<Mutex<std::collections::HashMap<u64, Arc<Vec<(u64, FileType, String)>>>>>,
     /// Monotonic dir-handle id (starts at 1; 0 stays the stateless sentinel).
     dir_fh: Arc<AtomicU64>,
+    /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
+    /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
+    /// otherwise-unbounded pool queue (#308).
+    inflight_reads: Arc<AtomicUsize>,
 }
 
 impl MusefsFs {
@@ -232,6 +272,7 @@ impl MusefsFs {
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
             dir_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dir_fh: Arc::new(AtomicU64::new(1)),
+            inflight_reads: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -472,8 +513,18 @@ impl Filesystem for MusefsFs {
         if platform::spotlight::is_marker(ino.0) {
             return reply.data(&[]);
         }
+        // Reserve a slot on the dispatch thread before enqueuing; over the cap,
+        // reject with EAGAIN so the unbounded pool queue can't grow (#308).
+        let Some(slot) = reserve_read_slot(&self.inflight_reads, MAX_INFLIGHT_READS) else {
+            return reply.error(fuser::Errno::EAGAIN);
+        };
         let core = Arc::clone(&self.core);
         self.pool.execute(move || {
+            // `_slot` (named) holds the guard until the read completes or the
+            // worker panics, then releases it. Do NOT simplify to bare `_`: that
+            // drops the guard immediately, releasing the slot before the work
+            // runs and neutering the cap.
+            let _slot = slot;
             READ_BUF.with(|b| {
                 let mut buf = b.borrow_mut();
                 match core.read_into(
@@ -783,6 +834,56 @@ mod tests {
         assert!(
             handles.contains_key(&12),
             "the new handle fills the freed slot"
+        );
+    }
+
+    #[test]
+    fn reserve_read_slot_admits_up_to_cap() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let g1 = reserve_read_slot(&inflight, 2);
+        let g2 = reserve_read_slot(&inflight, 2);
+        assert!(g1.is_some() && g2.is_some(), "two reservations fit cap 2");
+        assert_eq!(inflight.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn reserve_read_slot_rejects_over_cap_and_releases() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let _g1 = reserve_read_slot(&inflight, 2);
+        let _g2 = reserve_read_slot(&inflight, 2);
+        let g3 = reserve_read_slot(&inflight, 2);
+        assert!(g3.is_none(), "third reservation exceeds cap 2");
+        assert_eq!(
+            inflight.load(Ordering::Relaxed),
+            2,
+            "a rejected reservation must release its own increment"
+        );
+    }
+
+    #[test]
+    fn read_slot_guard_releases_on_drop_and_panic() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        {
+            let _g = reserve_read_slot(&inflight, 4).expect("under cap");
+            assert_eq!(inflight.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(
+            inflight.load(Ordering::Relaxed),
+            0,
+            "guard releases on drop"
+        );
+
+        let inflight2 = Arc::new(AtomicUsize::new(0));
+        let i2 = Arc::clone(&inflight2);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = reserve_read_slot(&i2, 4).expect("under cap");
+            panic!("boom");
+        }));
+        assert!(r.is_err());
+        assert_eq!(
+            inflight2.load(Ordering::Relaxed),
+            0,
+            "guard releases its slot on unwind"
         );
     }
 }
