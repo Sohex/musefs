@@ -106,6 +106,10 @@ pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
         let is_last = (header & 0x80) != 0;
         let block_type = header & 0x7F;
         let len = u24_be(prefix[pos + 1], prefix[pos + 2], prefix[pos + 3]);
+        // Header-only validation: fail closed on a bad STREAMINFO header (wrong
+        // position/length, or a duplicate) before widening the probe to read a
+        // body that can never make the file valid.
+        check_streaminfo_position(index, block_type, len)?;
         let body_start = pos + 4;
         let body_end = body_start + len;
         if body_end > prefix.len() {
@@ -113,7 +117,6 @@ pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
                 up_to: body_end as u64,
             });
         }
-        check_streaminfo_position(index, block_type, len)?;
         match block_type {
             BLOCK_STREAMINFO | BLOCK_APPLICATION | BLOCK_SEEKTABLE | BLOCK_CUESHEET => {
                 preserved.push(MetadataBlock {
@@ -615,6 +618,18 @@ mod tests {
     }
 
     #[test]
+    fn bounded_fails_closed_on_bad_first_header_before_widening() {
+        // First block header declares STREAMINFO with a non-34 body length, and
+        // the body is absent from the prefix. The header alone is invalid, so we
+        // must reject with Malformed immediately rather than return NeedMore and
+        // drive the prober to widen toward a body that can't make the file valid.
+        let mut prefix = b"fLaC".to_vec();
+        prefix.push(BLOCK_STREAMINFO | 0x80); // last STREAMINFO
+        prefix.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // len = 0xFFFFFF, body absent
+        assert_eq!(read_metadata_bounded(&prefix), Err(FormatError::Malformed));
+    }
+
+    #[test]
     fn synthesize_layout_rejects_structural_without_streaminfo() {
         // Hostile DB rows: a SEEKTABLE but no STREAMINFO.
         let structural = [MetadataBlock {
@@ -936,13 +951,16 @@ mod tests {
     fn bounded_length_decodes_high_and_mid_bytes() {
         // Declare length 0x010100 (high byte 0x01, mid byte 0x01, low 0x00); correct
         // len = 65792. A decode that collapses the high or mid byte asks for a very
-        // different body.
+        // different body. The length-bearing block must NOT be the first one (the
+        // first must be a valid 34-byte STREAMINFO), so exercise it on a SEEKTABLE.
         // Use NeedMore: body is absent, so the correct parse asks for the full body.
-        let file = flac_with(&[raw_block(BLOCK_STREAMINFO, &[], true, Some(0x01_0100))]);
+        let b1 = raw_block(BLOCK_STREAMINFO, &[0u8; 34], false, None); // 4 + 34 = 38
+        let b2 = raw_block(BLOCK_SEEKTABLE, &[], true, Some(0x01_0100)); // declares len, body absent
+        let file = flac_with(&[b1, b2]);
         match read_metadata_bounded(&file).unwrap() {
             Extent::NeedMore { up_to } => {
-                // body_start = 4 + 4 = 8; up_to = body_end = 8 + 0x010100.
-                assert_eq!(up_to, 8 + 0x01_0100);
+                // body_start = 4 + 38 + 4 = 46; up_to = body_end = 46 + 0x010100.
+                assert_eq!(up_to, 46 + 0x01_0100);
             }
             other @ Extent::Complete(_) => panic!("expected NeedMore, got {other:?}"),
         }

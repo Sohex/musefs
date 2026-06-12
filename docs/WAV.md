@@ -84,14 +84,17 @@ The form covers bytes 8 through `8 + riff_size` and must encompass all
 top-level chunks (`fmt `, `data`, `LIST`, `id3 `, …). musefs enforces
 this at parse time:
 
-- `riff_wave_start` parses the RIFF size and returns `form_end = 8 +
-  riff_size`.
+- `riff_wave_start` parses the RIFF size and returns `form_end = 8 + riff_size`.
 - `locate_audio` and `locate_audio_at_ceiling` reject any file where
   `form_end` exceeds the physical file **or** where the `data` chunk
   payload extends past `form_end`.
 - Streaming or concatenated WAVs that write `riff_size = 0` or
-  `0xFFFFFFFF` are rejected (skipped from the virtual tree, never
-  modified). Allowing those sentinels is a deferred follow-up.
+  `0xFFFFFFFF` are rejected, but only incidentally: there is no explicit
+  sentinel check. `riff_size = 0` yields `form_end = 8`, which is smaller
+  than any file carrying a `data` payload, and `0xFFFFFFFF` yields a
+  `form_end` larger than any real file — both fall foul of the bounds
+  checks above. Detecting and honouring those sentinels explicitly is a
+  deferred follow-up.
 
 ## Quirks & invariants
 

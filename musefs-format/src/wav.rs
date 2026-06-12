@@ -74,21 +74,23 @@ pub fn locate_audio(buf: &[u8]) -> Result<WavBounds> {
         return Err(FormatError::Malformed);
     }
     let chunks = walk_chunks(buf);
-    let has_fmt = chunks.iter().any(|(id, _, _)| id == b"fmt ");
+    let fmt = chunks.iter().find(|(id, _, _)| id == b"fmt ");
     let data = chunks.iter().find(|(id, _, _)| id == b"data");
-    match (has_fmt, data) {
-        (true, Some(&(_, off, len))) => {
-            let data_end = (off as u64).saturating_add(len);
-            if data_end > buf.len() as u64 || data_end > form_end {
-                return Err(FormatError::Malformed);
-            }
-            Ok(WavBounds {
-                audio_offset: off as u64,
-                audio_length: len,
-            })
-        }
-        _ => Err(FormatError::NotWav),
+    let (Some(&(_, fmt_off, fmt_len)), Some(&(_, off, len))) = (fmt, data) else {
+        return Err(FormatError::NotWav);
+    };
+    // `fmt ` and `data` must both fall within the declared RIFF form; a chunk
+    // past `form_end` means the form does not describe the audio. (Trailing
+    // metadata chunks beyond `form_end` are still walked for best-effort tags.)
+    let fmt_end = (fmt_off as u64).saturating_add(fmt_len);
+    let data_end = (off as u64).saturating_add(len);
+    if data_end > buf.len() as u64 || data_end > form_end || fmt_end > form_end {
+        return Err(FormatError::Malformed);
     }
+    Ok(WavBounds {
+        audio_offset: off as u64,
+        audio_length: len,
+    })
 }
 
 /// Bounded twin of [`locate_audio`]. WAV metadata chunks can trail the `data`
@@ -115,21 +117,22 @@ pub fn locate_audio_at_ceiling(prefix: &[u8], file_len: u64) -> Result<WavBounds
         return Err(FormatError::Malformed);
     }
     let chunks = walk_chunks(prefix);
-    let has_fmt = chunks.iter().any(|(id, _, _)| id == b"fmt ");
+    let fmt = chunks.iter().find(|(id, _, _)| id == b"fmt ");
     let data = chunks.iter().find(|(id, _, _)| id == b"data");
-    match (has_fmt, data) {
-        (true, Some(&(_, off, len))) => {
-            let data_end = (off as u64).saturating_add(len);
-            if data_end > file_len || data_end > form_end {
-                return Err(FormatError::Malformed);
-            }
-            Ok(WavBounds {
-                audio_offset: off as u64,
-                audio_length: len,
-            })
-        }
-        _ => Err(FormatError::NotWav),
+    let (Some(&(_, fmt_off, fmt_len)), Some(&(_, off, len))) = (fmt, data) else {
+        return Err(FormatError::NotWav);
+    };
+    // `fmt ` and `data` must both fall within the declared RIFF form (mirrors
+    // [`locate_audio`]); the payload itself need not be present in `prefix`.
+    let fmt_end = (fmt_off as u64).saturating_add(fmt_len);
+    let data_end = (off as u64).saturating_add(len);
+    if data_end > file_len || data_end > form_end || fmt_end > form_end {
+        return Err(FormatError::Malformed);
     }
+    Ok(WavBounds {
+        audio_offset: off as u64,
+        audio_length: len,
+    })
 }
 
 /// Read the preserved structural chunks (`fmt `, optional `fact`) from the front
@@ -839,6 +842,27 @@ mod tests {
         let mut buf = wav(&[(b"fmt ", fmt_pcm()), (b"data", vec![0x11; 8])]);
         let file_len = buf.len() as u64;
         buf[4..8].copy_from_slice(&8u32.to_le_bytes()); // form_end = 16, before data
+        assert_eq!(
+            locate_audio_at_ceiling(&buf, file_len),
+            Err(FormatError::Malformed)
+        );
+    }
+
+    #[test]
+    fn locate_audio_rejects_fmt_outside_declared_form() {
+        // `data` first (in-form), then a `fmt ` chunk located past `form_end`. The
+        // declared form does not contain `fmt `, so reject even though the `data`
+        // payload fits the form. (data ends at 28; fmt spans 28..52.)
+        let mut buf = wav(&[(b"data", vec![0x11; 8]), (b"fmt ", fmt_pcm())]);
+        buf[4..8].copy_from_slice(&20u32.to_le_bytes()); // form_end = 28: covers data, not fmt
+        assert_eq!(locate_audio(&buf), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn locate_audio_at_ceiling_rejects_fmt_outside_declared_form() {
+        let mut buf = wav(&[(b"data", vec![0x11; 8]), (b"fmt ", fmt_pcm())]);
+        let file_len = buf.len() as u64;
+        buf[4..8].copy_from_slice(&20u32.to_le_bytes()); // form_end = 28: covers data, not fmt
         assert_eq!(
             locate_audio_at_ceiling(&buf, file_len),
             Err(FormatError::Malformed)
