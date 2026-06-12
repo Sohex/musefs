@@ -1547,13 +1547,20 @@ mod hardening_tests {
 
     #[test]
     fn collect_audio_ignores_symlink_to_non_file_target_when_following() {
+        use std::os::unix::ffi::OsStrExt;
+
         let dir = tempfile::tempdir().unwrap();
-        // A unix socket is neither a regular file nor a directory.
-        let sock = dir.path().join("sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // A FIFO is neither a regular file nor a directory, and mkfifo works in
+        // restricted sandboxes that deny Unix-socket bind (issue #277).
+        let fifo = dir.path().join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        #[expect(unsafe_code, reason = "libc::mkfifo FFI; no std equivalent")]
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
         // Name the link with a supported audio extension so the only thing
         // keeping it out of `out` is the resolved target's is_file() check.
-        std::os::unix::fs::symlink(&sock, dir.path().join("link.flac")).unwrap();
+        std::os::unix::fs::symlink(&fifo, dir.path().join("link.flac")).unwrap();
 
         let mut out = Vec::new();
         collect_audio(dir.path(), &mut out, true).unwrap();

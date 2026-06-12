@@ -915,6 +915,7 @@ dependencies = [
  "dashmap",
  "id3",
  "im",
+ "libc",
  "log",
  "metaflac",
  "musefs-db",
