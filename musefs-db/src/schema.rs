@@ -3,172 +3,21 @@ use rusqlite::{Connection, TransactionBehavior};
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE tracks (
-    id              INTEGER PRIMARY KEY,
-    backing_path    TEXT NOT NULL UNIQUE,
-    format          TEXT NOT NULL,
-    audio_offset    INTEGER NOT NULL,
-    audio_length    INTEGER NOT NULL,
-    backing_size    INTEGER NOT NULL,
-    backing_mtime   INTEGER NOT NULL,
-    content_version INTEGER NOT NULL DEFAULT 0,
-    updated_at      INTEGER NOT NULL
-);
-
-CREATE TABLE tags (
-    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    key      TEXT NOT NULL,
-    value    TEXT NOT NULL,
-    ordinal  INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (track_id, key, ordinal)
-);
-
-CREATE TABLE art (
-    id       INTEGER PRIMARY KEY,
-    sha256   TEXT NOT NULL UNIQUE,
-    mime     TEXT NOT NULL,
-    width    INTEGER,
-    height   INTEGER,
-    byte_len INTEGER NOT NULL,
-    data     BLOB NOT NULL
-);
-
-CREATE TABLE track_art (
-    track_id     INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    art_id       INTEGER NOT NULL REFERENCES art(id),
-    picture_type INTEGER NOT NULL DEFAULT 3,
-    description  TEXT NOT NULL DEFAULT '',
-    ordinal      INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (track_id, ordinal)
-);
-
-CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
-    UPDATE tracks SET content_version = content_version + 1,
-                      updated_at = CAST(strftime('%s','now') AS INTEGER)
-    WHERE id = NEW.track_id;
-END;
-CREATE TRIGGER tags_au AFTER UPDATE ON tags BEGIN
-    UPDATE tracks SET content_version = content_version + 1,
-                      updated_at = CAST(strftime('%s','now') AS INTEGER)
-    WHERE id = NEW.track_id;
-END;
-CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
-    UPDATE tracks SET content_version = content_version + 1,
-                      updated_at = CAST(strftime('%s','now') AS INTEGER)
-    WHERE id = OLD.track_id;
-END;
-
-CREATE TRIGGER track_art_ai AFTER INSERT ON track_art BEGIN
-    UPDATE tracks SET content_version = content_version + 1,
-                      updated_at = CAST(strftime('%s','now') AS INTEGER)
-    WHERE id = NEW.track_id;
-END;
-CREATE TRIGGER track_art_au AFTER UPDATE ON track_art BEGIN
-    UPDATE tracks SET content_version = content_version + 1,
-                      updated_at = CAST(strftime('%s','now') AS INTEGER)
-    WHERE id = NEW.track_id;
-END;
-CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
-    UPDATE tracks SET content_version = content_version + 1,
-                      updated_at = CAST(strftime('%s','now') AS INTEGER)
-    WHERE id = OLD.track_id;
-END;
-";
-
-const MIGRATION_V2: &str = r"
--- Binary tag payloads live alongside text tags. A row is binary iff
--- value_blob IS NOT NULL; binary rows store '' in value.
-ALTER TABLE tags ADD COLUMN value_blob BLOB;
-
--- Read-only, derived-from-file structural metadata (FLAC STREAMINFO/SEEKTABLE).
--- NOT part of the editable `tags` contract: external tools never touch it.
-CREATE TABLE structural_blocks (
-    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    kind     TEXT NOT NULL,
-    ordinal  INTEGER NOT NULL DEFAULT 0,
-    body     BLOB NOT NULL,
-    PRIMARY KEY (track_id, kind, ordinal)
-);
-";
-
-/// Ring capacity of the `track_changes` changelog. Must match the literal in
-/// MIGRATION_V3 (guarded by `changelog_cap_constant_matches_migration_sql`).
-#[allow(dead_code)]
-pub const CHANGELOG_CAP: i64 = 8192;
-
-const MIGRATION_V3: &str = r"
--- Bounded changelog ring for O(changed) refresh. Every metadata edit funnels
--- through an UPDATE on the tracks row (the V1 tags/track_art triggers), so
--- triggers on tracks alone capture all writers. Relies on SQLite nested
--- trigger activation (on by default; distinct from PRAGMA recursive_triggers).
-CREATE TABLE track_changes (
-    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
-    track_id INTEGER NOT NULL
-);
-
-CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
-    INSERT INTO track_changes (track_id) VALUES (NEW.id);
-END;
-CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
-    INSERT INTO track_changes (track_id) VALUES (NEW.id);
-END;
-CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
-    INSERT INTO track_changes (track_id) VALUES (OLD.id);
-END;
-
--- Self-pruning ring: writers maintain it; the mount's read-only connections
--- never need to. Deletes only from the old end, so retained seqs stay contiguous.
-CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
-    DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
-END;
-";
-
-// V4 adds CHECK constraints to the four editable/contract tables. SQLite
-// cannot ALTER ADD CONSTRAINT, so each table is rebuilt. Order is load-bearing:
-//   1. Stash every row into a TEMP table (TEMP tables carry no FK, so the
-//      drops below cannot cascade through them).
-//   2. DROP the four real tables. This is done with foreign_keys ON (the
-//      migrate() transaction cannot toggle the pragma), so dropping a parent
-//      would ON DELETE CASCADE its children — but the children are dropped
-//      first and their data already lives in the stash, so nothing is lost.
-//   3. CREATE the four tables WITH the CHECK constraints.
-//   4. Refill from the stash. The INSERT..SELECT copies enforce every new
-//      CHECK, so any pre-existing violating row aborts the migration.
-//   5. Recreate the triggers AFTER the refill. Dropping/renaming a table
-//      destroys triggers defined ON it: the V1 tags_ai/au/ad, the V1
-//      track_art_ai/au/ad, and the V3 tracks_changelog_ai/au/ad. Recreating
-//      them only after step 4 means the bulk refill of `tracks` does NOT fire
-//      tracks_changelog_ai and pump the self-pruning track_changes ring.
-//      track_changes_prune (ON track_changes) is NOT rebuilt. structural_blocks
-//      IS now rebuilt — its rows are stashed before the tracks DROP so they
-//      survive the cascade, then restored with the new CHECK constraints.
-const MIGRATION_V4: &str = r"
-CREATE TEMP TABLE _m4_tracks AS SELECT * FROM tracks;
-CREATE TEMP TABLE _m4_tags AS SELECT * FROM tags;
-CREATE TEMP TABLE _m4_art AS SELECT * FROM art;
-CREATE TEMP TABLE _m4_track_art AS SELECT * FROM track_art;
-CREATE TEMP TABLE _m4_structural AS SELECT * FROM structural_blocks;
-
-DROP TABLE track_art;
-DROP TABLE tags;
-DROP TABLE art;
-DROP TABLE structural_blocks;
-DROP TABLE tracks;
-
-CREATE TABLE tracks (
-    id              INTEGER PRIMARY KEY,
-    backing_path    TEXT NOT NULL UNIQUE,
-    format          TEXT NOT NULL,
-    audio_offset    INTEGER NOT NULL,
-    audio_length    INTEGER NOT NULL,
-    backing_size    INTEGER NOT NULL,
-    backing_mtime   INTEGER NOT NULL,
-    content_version INTEGER NOT NULL DEFAULT 0,
-    updated_at      INTEGER NOT NULL,
+    id               INTEGER PRIMARY KEY,
+    backing_path     TEXT NOT NULL UNIQUE,
+    format           TEXT NOT NULL,
+    audio_offset     INTEGER NOT NULL,
+    audio_length     INTEGER NOT NULL,
+    backing_size     INTEGER NOT NULL,
+    backing_mtime_ns INTEGER NOT NULL,
+    content_version  INTEGER NOT NULL DEFAULT 0,
+    updated_at       INTEGER NOT NULL,
+    backing_ctime_ns INTEGER NOT NULL DEFAULT 0 CHECK (backing_ctime_ns >= 0),
     CHECK (format IN ('flac','mp3','m4a','opus','vorbis','oggflac','wav')),
     CHECK (audio_offset >= 0),
     CHECK (audio_length >= 0),
     CHECK (backing_size >= 0),
-    CHECK (backing_mtime >= 0),
+    CHECK (backing_mtime_ns >= 0),
     CHECK (content_version >= 0),
     CHECK (updated_at >= 0),
     CHECK (audio_offset + audio_length <= backing_size)
@@ -218,6 +67,8 @@ CREATE TABLE track_art (
     CHECK (length(description) <= 1024)
 );
 
+-- Read-only, derived-from-file structural metadata (FLAC STREAMINFO/SEEKTABLE).
+-- NOT part of the editable `tags` contract: external tools never touch it.
 CREATE TABLE structural_blocks (
     track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
     kind     TEXT NOT NULL,
@@ -229,17 +80,18 @@ CREATE TABLE structural_blocks (
     CHECK (length(body) <= 16777215)
 );
 
-INSERT INTO tracks SELECT * FROM _m4_tracks;
-INSERT INTO art SELECT * FROM _m4_art;
-INSERT INTO tags SELECT * FROM _m4_tags;
-INSERT INTO track_art SELECT * FROM _m4_track_art;
-INSERT INTO structural_blocks SELECT * FROM _m4_structural;
+-- Bounded changelog ring for O(changed) refresh. Every metadata edit funnels
+-- through an UPDATE on the tracks row (the tags/track_art triggers), so
+-- triggers on tracks alone capture all writers. Relies on SQLite nested
+-- trigger activation (on by default; distinct from PRAGMA recursive_triggers).
+CREATE TABLE track_changes (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL
+);
 
-DROP TABLE _m4_track_art;
-DROP TABLE _m4_tags;
-DROP TABLE _m4_art;
-DROP TABLE _m4_structural;
-DROP TABLE _m4_tracks;
+-- Index the reverse art -> track_art edge so bulk orphan-GC and the art delete
+-- trigger below do not scan the whole join table per deleted row.
+CREATE INDEX track_art_art_id_idx ON track_art(art_id);
 
 CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
     UPDATE tracks SET content_version = content_version + 1,
@@ -282,20 +134,18 @@ END;
 CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (OLD.id);
 END;
-";
 
-const MIGRATION_V5: &str = r"
-ALTER TABLE tracks RENAME COLUMN backing_mtime TO backing_mtime_ns;
-ALTER TABLE tracks ADD COLUMN backing_ctime_ns INTEGER NOT NULL DEFAULT 0
-    CHECK (backing_ctime_ns >= 0);
-
+-- Self-pruning ring: writers maintain it; the mount's read-only connections
+-- never need to. Deletes only from the old end, so retained seqs stay contiguous.
+CREATE TRIGGER track_changes_prune AFTER INSERT ON track_changes BEGIN
+    DELETE FROM track_changes WHERE seq <= NEW.seq - 8192;
+END;
 
 -- art rows are content-addressed by sha256: once written, their content
 -- columns are immutable. A writer needing different bytes/metadata inserts a
 -- NEW row and relinks via track_art (which bumps content_version through the
--- V1 track_art triggers). This closes #271, where an in-place art edit changed
--- served bytes without bumping any referencing track. width/height use IS NOT
--- (NULL-safe) because they are nullable; the NOT NULL columns use <>.
+-- track_art triggers). width/height use IS NOT (NULL-safe) because they are
+-- nullable; the NOT NULL columns use <>.
 CREATE TRIGGER art_reject_content_update
 BEFORE UPDATE ON art
 WHEN NEW.data   <> OLD.data
@@ -308,12 +158,6 @@ BEGIN
     SELECT RAISE(ABORT,
         'art rows are immutable; insert a new content-addressed row and relink via track_art');
 END;
-
--- Index the reverse art -> track_art edge. track_art is keyed (track_id,
--- ordinal), so without this both the art_ad trigger below and SQLite's own
--- REFERENCES art(id) check on art deletes scan the whole join table per
--- deleted row, which makes bulk orphan-GC O(deletes * rows).
-CREATE INDEX track_art_art_id_idx ON track_art(art_id);
 
 -- Deleting an art row that still has track_art references (an orphan an
 -- external writer can produce with foreign_keys OFF) bumps every referencing
@@ -328,9 +172,9 @@ END;
 
 -- Scanner-owned geometry feeds the synthesized layout, but upsert_track does
 -- not touch content_version. Bump it whenever a geometry column actually
--- changes, making content_version a true superset of served-byte inputs
--- (#272). The WHEN guard is false on this trigger's own nested UPDATE (only
--- content_version changes), so the recursion terminates after exactly one bump.
+-- changes, making content_version a true superset of served-byte inputs. The
+-- WHEN guard is false on this trigger's own nested UPDATE (only content_version
+-- changes), so the recursion terminates after exactly one bump.
 CREATE TRIGGER tracks_geometry_au
 AFTER UPDATE ON tracks
 WHEN NEW.format        <> OLD.format
@@ -355,13 +199,12 @@ CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
 END;
 ";
 
-const MIGRATIONS: &[&str] = &[
-    MIGRATION_V1,
-    MIGRATION_V2,
-    MIGRATION_V3,
-    MIGRATION_V4,
-    MIGRATION_V5,
-];
+/// Ring capacity of the `track_changes` changelog. Must match the literal in
+/// MIGRATION_V1 (guarded by `changelog_cap_constant_matches_migration_sql`).
+#[allow(dead_code)]
+pub const CHANGELOG_CAP: i64 = 8192;
+
+const MIGRATIONS: &[&str] = &[MIGRATION_V1];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let latest = i64::try_from(MIGRATIONS.len()).expect("MIGRATIONS count must fit i64");
@@ -451,18 +294,17 @@ pub(crate) fn validate_identity(conn: &Connection) -> crate::Result<()> {
 }
 
 #[cfg(test)]
-mod migration_v2_tests {
+mod baseline_tests {
     use rusqlite::Connection;
 
     #[test]
-    fn v2_adds_value_blob_and_structural_blocks_and_is_idempotent() {
+    fn baseline_creates_value_blob_and_structural_blocks_and_is_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         super::migrate(&mut conn).unwrap();
-        // user_version reflects the number of migrations applied.
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 5);
+        assert_eq!(uv, 1);
 
         // value_blob exists on tags and defaults to NULL.
         conn.execute(
@@ -499,63 +341,37 @@ mod migration_v2_tests {
         let uv2: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv2, 5);
+        assert_eq!(uv2, 1);
+    }
+
+    /// The SQL literal and the exported constant must not drift.
+    #[test]
+    fn changelog_cap_constant_matches_migration_sql() {
+        assert!(super::MIGRATION_V1.contains(&format!("NEW.seq - {}", super::CHANGELOG_CAP)));
     }
 
     #[test]
-    fn v1_rows_survive_v2_migration_with_null_value_blob() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        // Apply ONLY V1, then stamp the version so migrate() resumes at V2.
-        conn.execute_batch(super::MIGRATIONS[0]).unwrap();
-        conn.pragma_update(None, "user_version", 1i64).unwrap();
-
-        // Insert under the V1 schema (no value_blob column exists yet).
-        conn.execute(
-            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
-             VALUES ('/legacy.flac','flac',10,20,30,0,0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','Legacy',0)",
-            [],
-        )
-        .unwrap();
-
-        // Upgrade V1 -> V2 -> V3.
-        super::migrate(&mut conn).unwrap();
-        let uv: i64 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(uv, 5);
-
-        // The pre-existing row survived unchanged, with value_blob defaulted NULL.
-        let (value, blob_is_null): (String, bool) = conn
-            .query_row(
-                "SELECT value, value_blob IS NULL FROM tags WHERE track_id=1 AND key='artist'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(value, "Legacy");
-        assert!(
-            blob_is_null,
-            "existing tag rows must default value_blob to NULL"
-        );
-
-        // The track row survived too.
-        let offset: i64 = conn
-            .query_row("SELECT audio_offset FROM tracks WHERE id=1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(offset, 10);
+    fn check_literals_match_limits_constants() {
+        use crate::limits::*;
+        let sql = super::MIGRATION_V1;
+        assert!(sql.contains(&format!("length(key) <= {MAX_TAG_KEY_LEN}")));
+        assert!(sql.contains(&format!("length(value) <= {MAX_TAG_VALUE_LEN}")));
+        assert!(sql.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
+        assert!(sql.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
+        assert!(sql.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
+        assert!(sql.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
+        assert!(sql.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));
+        let kinds = STRUCTURAL_KINDS
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(sql.contains(&format!("kind IN ({kinds})")));
     }
 }
 
 #[cfg(test)]
-mod migration_v3_tests {
+mod changelog_tests {
     use rusqlite::Connection;
 
     fn count_changes(conn: &Connection) -> i64 {
@@ -580,7 +396,7 @@ mod migration_v3_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 5);
+        assert_eq!(uv, 1);
 
         insert_track(&conn, "/a.flac"); // tracks AI -> 1 row
         assert_eq!(count_changes(&conn), 1);
@@ -660,38 +476,34 @@ mod migration_v3_tests {
     }
 
     #[test]
-    fn v2_db_upgrades_to_v3_preserving_rows() {
+    fn v4_metadata_edit_bumps_version_and_appends_one_changelog_row() {
         let mut conn = Connection::open_in_memory().unwrap();
-        // Apply V1+V2 only, stamp version 2, insert under the V2 schema.
-        conn.execute_batch(super::MIGRATIONS[0]).unwrap();
-        conn.execute_batch(super::MIGRATIONS[1]).unwrap();
-        conn.pragma_update(None, "user_version", 2i64).unwrap();
-        // V2 schema has `backing_mtime` (pre-rename); use it directly.
+        super::migrate(&mut conn).unwrap();
+        insert_track(&conn, "/a.flac");
+        let cv_before: i64 = conn
+            .query_row("SELECT content_version FROM tracks WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let changes_before = count_changes(&conn);
+
         conn.execute(
-            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
-             VALUES ('/legacy.flac','flac',0,1,1,0,0)",
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','A',0)",
             [],
         )
         .unwrap();
 
-        super::migrate(&mut conn).unwrap();
-        let uv: i64 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
+        let cv_after: i64 = conn
+            .query_row("SELECT content_version FROM tracks WHERE id=1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(uv, 5);
-        // Pre-migration rows produce no retroactive changelog entries...
-        assert_eq!(count_changes(&conn), 0);
-        // ...but post-migration edits do.
-        conn.execute("UPDATE tracks SET backing_mtime_ns = 9 WHERE id = 1", [])
-            .unwrap();
-        assert_eq!(count_changes(&conn), 2);
-    }
-
-    /// The SQL literal and the exported constant must not drift.
-    #[test]
-    fn changelog_cap_constant_matches_migration_sql() {
-        assert!(super::MIGRATIONS[2].contains(&format!("NEW.seq - {}", super::CHANGELOG_CAP)));
+        assert_eq!(cv_after, cv_before + 1, "content_version must bump by one");
+        assert_eq!(
+            count_changes(&conn),
+            changes_before + 1,
+            "exactly one changelog row from the edit (nested trigger)"
+        );
     }
 }
 
@@ -800,7 +612,7 @@ mod schema_py_tests {
 }
 
 #[cfg(test)]
-mod migration_v4_tests {
+mod constraint_tests {
     use rusqlite::Connection;
 
     /// A fresh, fully-migrated DB with foreign_keys ON — mirrors how
@@ -808,16 +620,6 @@ mod migration_v4_tests {
     fn fresh(conn: &mut Connection) {
         conn.pragma_update(None, "foreign_keys", true).unwrap();
         super::migrate(conn).unwrap();
-    }
-
-    fn insert_track_v3(conn: &Connection, path: &str) {
-        conn.execute(
-            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime, updated_at) \
-             VALUES (?1,'flac',0,1,1,0,0)",
-            [path],
-        )
-        .unwrap();
     }
 
     fn insert_track(conn: &Connection, path: &str) {
@@ -838,7 +640,7 @@ mod migration_v4_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 5);
+        assert_eq!(uv, 1);
 
         insert_track(&conn, "/a.flac");
         conn.execute(
@@ -875,74 +677,6 @@ mod migration_v4_tests {
             )
             .unwrap();
         assert_eq!(pic, 3);
-    }
-
-    /// The `tracks` rebuild drops the table while foreign_keys is ON, which
-    /// would cascade-delete `tags`/`track_art` if the rows were not stashed
-    /// first. Prove the children survive a fresh upgrade carrying real rows.
-    #[test]
-    fn v4_rebuild_preserves_fk_children() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "foreign_keys", true).unwrap();
-        // Apply V1+V2+V3 only, stamp version 3, insert under the V3 schema.
-        conn.execute_batch(super::MIGRATIONS[0]).unwrap();
-        conn.execute_batch(super::MIGRATIONS[1]).unwrap();
-        conn.execute_batch(super::MIGRATIONS[2]).unwrap();
-        conn.pragma_update(None, "user_version", 3i64).unwrap();
-
-        insert_track_v3(&conn, "/legacy.flac");
-        conn.execute(
-            "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?1,'image/png',1,X'00')",
-            [&"b".repeat(64)],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','Legacy',0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
-             VALUES (1,1,3,0)",
-            [],
-        )
-        .unwrap();
-
-        // Upgrade V3 -> V4.
-        super::migrate(&mut conn).unwrap();
-        let uv: i64 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(uv, 5);
-
-        // Children survived the parent rebuild (no cascade-delete).
-        let tags: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
-            .unwrap();
-        let track_art: i64 = conn
-            .query_row("SELECT COUNT(*) FROM track_art", [], |r| r.get(0))
-            .unwrap();
-        let art: i64 = conn
-            .query_row("SELECT COUNT(*) FROM art", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!((tags, track_art, art), (1, 1, 1));
-        assert_eq!(
-            Vec::<(i64, String, Option<String>)>::new(),
-            conn.prepare("PRAGMA foreign_key_check")
-                .unwrap()
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(3)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap(),
-            "no orphaned FK rows after rebuild"
-        );
-
-        // FK is still enforced after the rebuild: an orphan tag is rejected.
-        let orphan = conn.execute(
-            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (999,'x','y',0)",
-            [],
-        );
-        assert!(orphan.is_err(), "FK must still reject orphan child rows");
     }
 
     fn rejected(conn: &Connection, sql: &str) {
@@ -1253,62 +987,6 @@ mod migration_v4_tests {
         );
     }
 
-    fn count_changes(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM track_changes", [], |r| r.get(0))
-            .unwrap()
-    }
-
-    #[test]
-    fn v4_rebuild_does_not_pump_changelog_ring() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "foreign_keys", true).unwrap();
-        conn.execute_batch(super::MIGRATIONS[0]).unwrap();
-        conn.execute_batch(super::MIGRATIONS[1]).unwrap();
-        conn.execute_batch(super::MIGRATIONS[2]).unwrap();
-        conn.pragma_update(None, "user_version", 3i64).unwrap();
-        insert_track_v3(&conn, "/a.flac");
-        insert_track_v3(&conn, "/b.flac");
-        conn.execute("DELETE FROM track_changes", []).unwrap();
-
-        super::migrate(&mut conn).unwrap();
-        assert_eq!(
-            count_changes(&conn),
-            0,
-            "the V4 bulk refill must not fire tracks_changelog_ai"
-        );
-    }
-
-    #[test]
-    fn v4_metadata_edit_bumps_version_and_appends_one_changelog_row() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        fresh(&mut conn);
-        insert_track(&conn, "/a.flac");
-        let cv_before: i64 = conn
-            .query_row("SELECT content_version FROM tracks WHERE id=1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let changes_before = count_changes(&conn);
-
-        conn.execute(
-            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','A',0)",
-            [],
-        )
-        .unwrap();
-
-        let cv_after: i64 = conn
-            .query_row("SELECT content_version FROM tracks WHERE id=1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(cv_after, cv_before + 1, "content_version must bump by one");
-        assert_eq!(
-            count_changes(&conn),
-            changes_before + 1,
-            "exactly one changelog row from the edit (nested trigger)"
-        );
-    }
-
     #[test]
     fn v4_tags_rejects_oversize_key() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1421,58 +1099,7 @@ mod migration_v4_tests {
     }
 
     #[test]
-    fn v4_rebuild_preserves_structural_blocks() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "foreign_keys", true).unwrap();
-        conn.execute_batch(super::MIGRATIONS[0]).unwrap();
-        conn.execute_batch(super::MIGRATIONS[1]).unwrap();
-        conn.execute_batch(super::MIGRATIONS[2]).unwrap();
-        conn.pragma_update(None, "user_version", 3i64).unwrap();
-
-        insert_track_v3(&conn, "/legacy.flac");
-        conn.execute(
-            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) VALUES (1, 'STREAMINFO', 0, X'AABB')",
-            [],
-        )
-        .unwrap();
-
-        super::migrate(&mut conn).unwrap();
-
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM structural_blocks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 1, "structural_blocks must survive the V4 tracks rebuild");
-        let body: Vec<u8> = conn
-            .query_row(
-                "SELECT body FROM structural_blocks WHERE track_id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(body, vec![0xAA, 0xBB]);
-    }
-
-    #[test]
-    fn v4_check_literals_match_limits_constants() {
-        use crate::limits::*;
-        let v4 = super::MIGRATION_V4;
-        assert!(v4.contains(&format!("length(key) <= {MAX_TAG_KEY_LEN}")));
-        assert!(v4.contains(&format!("length(value) <= {MAX_TAG_VALUE_LEN}")));
-        assert!(v4.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
-        assert!(v4.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
-        assert!(v4.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
-        assert!(v4.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
-        assert!(v4.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));
-        let kinds = STRUCTURAL_KINDS
-            .iter()
-            .map(|k| format!("'{k}'"))
-            .collect::<Vec<_>>()
-            .join(",");
-        assert!(v4.contains(&format!("kind IN ({kinds})")));
-    }
-
-    #[test]
-    fn v4_recreates_all_destroyed_triggers() {
+    fn fresh_db_has_all_baseline_triggers() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
         let names: Vec<String> = conn
@@ -1493,12 +1120,18 @@ mod migration_v4_tests {
             "tracks_changelog_au",
             "tracks_changelog_ad",
             "track_changes_prune",
+            "art_reject_content_update",
+            "art_ad",
+            "tracks_geometry_au",
+            "structural_blocks_ai",
+            "structural_blocks_ad",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
-                "missing trigger after V4: {expected}"
+                "missing trigger on fresh DB: {expected}"
             );
         }
+        assert_eq!(names.len(), 15, "unexpected trigger count: {names:?}");
     }
 
     #[test]
@@ -1668,7 +1301,7 @@ mod identity_tests {
 }
 
 #[cfg(test)]
-mod migration_v5_tests {
+mod art_immutability_tests {
     use rusqlite::{Connection, params};
 
     /// A fresh, fully-migrated DB with `foreign_keys` OFF — that is what lets
@@ -1702,12 +1335,12 @@ mod migration_v5_tests {
     }
 
     #[test]
-    fn migration_reaches_user_version_5() {
+    fn migration_reaches_user_version_1() {
         let conn = migrated();
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 5);
+        assert_eq!(uv, 1);
     }
 
     #[test]

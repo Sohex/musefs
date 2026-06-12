@@ -132,7 +132,7 @@ that bite plugin authors:
 
 - **Write only `tags`, `art`, and `track_art`.** The scanner owns the structural
   columns of `tracks` and all of `structural_blocks`; never compute them — run
-  `musefs scan` (i.e. `run_scan`). V4 `CHECK` constraints reject malformed
+  `musefs scan` (i.e. `run_scan`). `CHECK` constraints reject malformed
   structural shapes at commit, so you cannot persist them anyway.
 - **Binary tags survive a sync.** `merge_tags` / `replace_tags` scope their
   deletes to text rows (`value_blob IS NULL`), so the write loop never wipes
@@ -141,7 +141,7 @@ that bite plugin authors:
   `CHECK` on the row).
 - **Content-address art** through `upsert_art` (sha256 de-dup) rather than
   inserting `art` rows by hand; `sync_files` does this for you.
-- **Art rows are immutable.** As of V5 a trigger rejects in-place updates of an
+- **Art rows are immutable.** A trigger rejects in-place updates of an
   `art` row's content columns (`data`, `sha256`, `mime`, `byte_len`, `width`,
   `height`). To change a track's art, insert a new content-addressed row via
   `upsert_art` and relink it via `replace_track_art`.

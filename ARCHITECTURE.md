@@ -111,46 +111,30 @@ represents the spliced bytes, so passthrough never applies.
 
 ## The SQLite store
 
-`musefs-db/src/schema.rs` defines the schema as an append-only list of
-migrations (`MIGRATIONS`); `user_version` records how many have been applied.
+`musefs-db/src/schema.rs` defines the schema as a single baseline migration
+(`MIGRATIONS`); `user_version` records the schema version (1).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
-- **V1** — the core tables: `tracks` (one row per backing file: path, format,
-  audio byte range, size/nanosecond-mtime/ctime stamps, `content_version`), `tags` (multi-value
-  key/value rows ordered by `ordinal`), `art` (content-addressed by sha256,
-  deduplicated image blobs), and `track_art` (per-track art links with
-  picture type and ordering). Deleting a track cascades to its `tags` and
-  `track_art` rows. Triggers bump the owning track's `content_version` and
-  `updated_at` on any `tags`/`track_art` insert/update/delete.
-- **V2** — binary tags and structural blocks: `tags.value_blob` (a row is
-  binary iff `value_blob IS NOT NULL`) and the `structural_blocks` table —
-  read-only, derived-from-file metadata (FLAC `STREAMINFO`/`SEEKTABLE`) that
-  is **not** part of the editable contract.
-- **V3** — the `track_changes` changelog: a bounded, self-pruning ring
-  (capacity 8192, `CHANGELOG_CAP`) fed by triggers on `tracks`. Every
-  metadata edit funnels through an `UPDATE` on the tracks row (the V1
-  triggers), so triggers on `tracks` alone capture all writers — this relies
-  on SQLite's nested trigger activation (on by default). Writers maintain the
-  ring via the pruning trigger; the mount's read-only connections never need
-  to.
-- **V4** — `CHECK` constraints on `tracks`, `tags`, `art`, and `track_art`
-  that move the contract invariants below from convention to commit-time
-  enforcement. SQLite cannot add a constraint in place, so V4 rebuilds the
-  four tables (stashing rows past the FK cascade) and recreates their
-  triggers after the bulk refill so the rebuild does not pump the
-  `track_changes` ring. A pre-existing violating row aborts the migration.
-- **V5** — freshness-superset triggers that make `content_version` cover every
-  DB-knowable input to synthesized bytes, not only tag/`track_art` edits:
-  `art_reject_content_update` (rejects in-place mutation of an `art` row's
-  content columns — art is content-addressed, so a changed image is a new row),
-  `art_ad` (bumps every track referencing a deleted `art` row, so an orphaned
-  reference rebuilds to a clean serve-time error rather than streaming stale
-  bytes), `tracks_geometry_au` (bumps when scanner-owned geometry — `format`,
-  audio bounds, backing size/nanosecond-mtime — changes; keys on
-  `backing_mtime_ns` only — `backing_ctime_ns` is pure freshness identity, not a
-  served-byte input), and `structural_blocks_ai`/`_ad`
-  (bump when FLAC structural blocks change).
+- The **baseline schema** (`MIGRATION_V1`): the core tables — `tracks` (one row
+  per backing file: path, format, audio byte range, size/nanosecond-mtime/ctime
+  stamps, `content_version`), `tags` (multi-value key/value rows ordered by
+  `ordinal`, with an optional `value_blob` for binary tags), `art`
+  (content-addressed, deduplicated image blobs), `track_art` (per-track art
+  links with picture type and ordering), and `structural_blocks` (read-only,
+  derived-from-file FLAC `STREAMINFO`/`SEEKTABLE` metadata, **not** part of the
+  editable contract). Deleting a track cascades to its `tags` and `track_art`
+  rows. Triggers bump the owning track's `content_version`/`updated_at` on any
+  `tags`/`track_art` edit; `CHECK` constraints enforce the contract invariants
+  below at commit time. A bounded, self-pruning `track_changes` ring (capacity
+  8192, `CHANGELOG_CAP`) fed by triggers on `tracks` gives O(changed) refresh —
+  every metadata edit funnels through an `UPDATE` on the tracks row, relying on
+  SQLite's nested trigger activation (on by default). Freshness-superset
+  triggers make `content_version` cover every DB-knowable input to synthesized
+  bytes: `art_reject_content_update` (art is content-addressed and immutable),
+  `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
+  a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
+  changes), and `structural_blocks_ai`/`_ad`.
 
 ### The external-writer contract
 
@@ -161,7 +145,7 @@ plugins under `contrib/` write tags and art here out-of-band.
 all of `structural_blocks`: those are derived from probing the file, and
 external tools must run `musefs scan` rather than compute them.
 
-**What the store enforces.** As of V4, SQLite `CHECK` constraints reject the
+**What the store enforces.** SQLite `CHECK` constraints reject the
 malformed *shapes* at commit, so an external writer cannot persist them:
 
 - an unknown `format` string, or a negative length/offset/size/version;
@@ -191,7 +175,7 @@ foreign_key_check`, rejecting anything that is not the canonical latest schema
 with a message telling the user to run `musefs scan`.
 
 **Art is immutable once written.** `art` rows are content-addressed by
-`sha256`; as of V5 a trigger rejects any in-place `UPDATE` of an art row's
+`sha256`; a trigger rejects any in-place `UPDATE` of an art row's
 content columns (`data`, `sha256`, `mime`, `byte_len`, `width`, `height`) with
 `RAISE(ABORT)` — a multi-row `UPDATE art` touching any content column aborts the
 whole statement. To change a track's art, insert a new content-addressed row
@@ -207,7 +191,7 @@ from the actual file's stat, or audio bounds that fit the stored
 `backing_size` but overrun the file once it has shrunk. musefs re-stats the
 backing file on every resolve and treats such rows as untrusted input,
 degrading to a controlled
-`BackingChanged`/layout error, never undefined behavior. The store's V4
+`BackingChanged`/layout error, never undefined behavior. The store's
 `CHECK` rejects art over `MAX_ART_BYTES` (16 MiB − 64 KiB) at write time;
 resolve also re-checks it (`ArtTooLarge`, all formats) to backstop a writer
 that disables check enforcement, and the scanner's ingest-time drop is
@@ -265,7 +249,7 @@ Two distinct counters drive correctness; they answer different questions.
 bytes change?"*. The DB triggers increment it on any input the database can see that changes
 synthesized bytes: tag and `track_art` edits, `art`-row deletes that orphan a
 reference, scanner-owned geometry changes (`format`, audio bounds, backing
-size/nanosecond-mtime), and FLAC structural-block changes (V5). It is
+size/nanosecond-mtime), and FLAC structural-block changes. It is
 therefore a superset key — the one input it cannot cover is an on-disk backing
 change with no DB write, which `resolve` (and, since #279, a size-cache
 `getattr` hit) catches by re-statting the backing file and degrading to
