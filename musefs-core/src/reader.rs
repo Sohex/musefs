@@ -1382,6 +1382,17 @@ mod serve_cap_tests {
     }
 
     #[test]
+    fn ogg_serve_caps_hostile_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "hostile.opus", CAP + 2);
+        let db = Db::open_in_memory().unwrap();
+        let track_id = hostile_track(&db, &path, Format::Opus);
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        assert_capped(cache.resolve(&db, track_id));
+    }
+
+    #[test]
     fn read_front_rejects_oversize_before_open() {
         // Nonexistent path: if the cap check did NOT fire first, File::open would
         // error and we'd get an Io error instead of HeaderTooLarge. So this also
