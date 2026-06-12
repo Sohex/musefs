@@ -226,7 +226,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_length: bounds.audio_length,
             tags: mp4::read_tags(bytes),
             pictures: mp4::read_pictures(bytes, MAX_ART_BYTES),
-            binary_tags: mp4::read_binary_tags(bytes),
+            binary_tags: mp4::read_binary_tags(bytes, MAX_BINARY_TAG_BYTES),
             structural_blocks: Vec::new(),
         })
     } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
@@ -308,7 +308,7 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
             audio_length: scan.mdat_payload_len,
             tags: mp4::read_tags(&scan.moov),
             pictures: mp4::read_pictures(&scan.moov, MAX_ART_BYTES),
-            binary_tags: mp4::read_binary_tags(&scan.moov),
+            binary_tags: mp4::read_binary_tags(&scan.moov, MAX_BINARY_TAG_BYTES),
             structural_blocks: Vec::new(),
         }));
     }
@@ -1178,6 +1178,25 @@ mod scan_unit_tests {
         assert!(
             probed.pictures.is_empty(),
             "oversized covr must be skipped at extraction, not materialized"
+        );
+    }
+
+    #[test]
+    fn probe_file_skips_oversized_mp4_binary_freeform() {
+        // A `----` value larger than MAX_BINARY_TAG_BYTES must be skipped at
+        // extraction by the real seek-path scanner, so it is absent from Probed.
+        let oversized = vec![0xABu8; MAX_BINARY_TAG_BYTES + 1];
+        let bytes = mp4_with_binary_freeform("com.serato.dj", "analysis", &oversized);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized_bin.m4a");
+        std::fs::write(&path, &bytes).unwrap();
+        let probed = probe_file(&path, bytes.len() as u64, 0)
+            .unwrap()
+            .expect("m4a should probe");
+        assert_eq!(probed.format, Format::M4a);
+        assert!(
+            probed.binary_tags.is_empty(),
+            "oversized binary freeform must be skipped at extraction, not materialized"
         );
     }
 }
