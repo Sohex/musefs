@@ -340,8 +340,10 @@ aborting the scan. The `root` argument is always followed regardless of the
 flag; only links encountered during recursion are gated.
 
 `revalidate` is the maintenance pass (`scan --revalidate`): re-probe only
-files whose size/mtime changed (skipping unchanged files **preserves
-external tag edits** in the DB), delete tracks under the scanned root whose
+files whose `(size, mtime_ns, ctime_ns)` freshness stamp changed — a
+ctime-only move (e.g. a forged-mtime in-place rewrite) is still re-probed
+(skipping unchanged files **preserves external tag edits** in the DB),
+delete tracks under the scanned root whose
 backing file is gone, and garbage-collect now-unreferenced art. Pruning is
 scoped to the scanned root, so revalidating one library root never removes
 tracks belonging to another. Because a track is keyed by its *canonical*
