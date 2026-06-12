@@ -467,7 +467,7 @@ fn oggflac_packets_with_art(
     block_packets.push(vec![PayloadChunk::Bytes(comment)]);
     for art in arts {
         let prefix = picture_prefix(art.meta)?;
-        let body_len = prefix.len() as u64 + art.meta.data_len.get();
+        let body_len = size::checked_add(prefix.len() as u64, art.meta.data_len.get())?;
         if body_len > crate::flac::MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
@@ -1274,6 +1274,35 @@ mod tests {
             codec: Codec::Vorbis,
             serial: 0,
             packets: vec![vec![], vec![], vec![]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let result = build_packets_with_art(&header, &[], &[art]);
+        let is_too_large = matches!(&result, Err(FormatError::TooLarge));
+        assert!(is_too_large, "expected Err(TooLarge) for near-u64::MAX art");
+    }
+
+    #[test]
+    fn near_u64_max_art_value_rejected_by_oggflac_build_packets() {
+        // The Ogg-FLAC art path builds a METADATA_BLOCK_PICTURE body as
+        // prefix + raw image. A hostile data_len near u64::MAX must fail closed
+        // with TooLarge, not panic (debug) / wrap (release). picture_prefix's u32
+        // length field already rejects it; the checked add keeps the body-length
+        // site self-defending regardless of that ordering.
+        let meta = crate::input::ArtInput {
+            art_id: 0,
+            mime: "image/jpeg".to_string(),
+            description: String::new(),
+            data_len: crate::input::BlobLen::new(u64::MAX).unwrap(),
+            picture_type: crate::input::PictureType::new(3).unwrap(),
+            width: 0,
+            height: 0,
+        };
+        let art = OggArt { meta: &meta };
+        let header = OggHeader {
+            codec: Codec::OggFlac,
+            serial: 0,
+            packets: vec![vec![0x7F]],
             header_pages: 1,
             audio_offset: 0,
         };
