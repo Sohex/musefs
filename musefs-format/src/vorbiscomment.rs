@@ -77,9 +77,13 @@ pub fn parse(body: &[u8]) -> Result<Vec<(String, String)>> {
         }
         let comment = std::str::from_utf8(&body[pos..end]).map_err(|_| FormatError::Malformed)?;
         if let Some((field, value)) = comment.split_once('=') {
-            let key = crate::tagmap::vorbis_to_key(field)
-                .map_or_else(|| field.to_string(), str::to_string);
-            out.push((key, value.to_string()));
+            // A comment whose field name is empty (e.g. "=value") is malformed and
+            // must not become an empty-key tag. The first-`=` split is preserved.
+            if !field.is_empty() {
+                let key = crate::tagmap::vorbis_to_key(field)
+                    .map_or_else(|| field.to_string(), str::to_string);
+                out.push((key, value.to_string()));
+            }
         }
         pos = end;
     }
@@ -182,5 +186,28 @@ mod tests {
         // keeps unknown verbatim.
         assert_eq!(parsed[0], ("albumartist".to_string(), "VA".to_string()));
         assert_eq!(parsed[1], ("CUSTOM_THING".to_string(), "x".to_string()));
+    }
+
+    fn body_with_one_comment(comment: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32::try_from(VENDOR.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(VENDOR.as_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        body.extend_from_slice(&u32::try_from(comment.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(comment.as_bytes());
+        body
+    }
+
+    #[test]
+    fn parse_skips_empty_field_name() {
+        // A "=value" comment has no field name; it must not become an empty-key tag.
+        assert!(parse(&body_with_one_comment("=value")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_splits_on_first_equals() {
+        // The exact boundary the issue is about: A=B=c -> key "A", value "B=c".
+        let parsed = parse(&body_with_one_comment("A=B=c")).unwrap();
+        assert_eq!(parsed, vec![("A".to_string(), "B=c".to_string())]);
     }
 }
