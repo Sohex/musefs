@@ -5,6 +5,7 @@ use crate::input::{
 };
 use crate::layout::{RegionLayout, Segment};
 use crate::probe::Extent;
+use crate::size;
 
 /// Where the MP3 audio frames begin and end (excluding any ID3v2 prefix and
 /// ID3v1 trailer). Unlike FLAC there is no preserved structural metadata: the
@@ -285,14 +286,14 @@ pub fn build_id3v2_segments(
                 let data = text_frame_data(values);
                 push_frame_header(&mut buf, id, data.len())?;
                 buf.extend_from_slice(&data);
-                frames_len += 10 + data.len() as u64;
+                frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
             }
             Some(crate::tagmap::Id3Slot::Txxx(desc)) => {
                 for value in values {
                     let data = txxx_frame_data(desc, value);
                     push_frame_header(&mut buf, b"TXXX", data.len())?;
                     buf.extend_from_slice(&data);
-                    frames_len += 10 + data.len() as u64;
+                    frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
                 }
             }
             Some(crate::tagmap::Id3Slot::Comment) => {
@@ -300,7 +301,7 @@ pub fn build_id3v2_segments(
                     let data = comm_like_frame_data(value);
                     push_frame_header(&mut buf, b"COMM", data.len())?;
                     buf.extend_from_slice(&data);
-                    frames_len += 10 + data.len() as u64;
+                    frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
                 }
             }
             Some(crate::tagmap::Id3Slot::Lyrics) => {
@@ -308,7 +309,7 @@ pub fn build_id3v2_segments(
                     let data = comm_like_frame_data(value);
                     push_frame_header(&mut buf, b"USLT", data.len())?;
                     buf.extend_from_slice(&data);
-                    frames_len += 10 + data.len() as u64;
+                    frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
                 }
             }
             None if is_id3_text_frame_id(key) => {
@@ -317,14 +318,14 @@ pub fn build_id3v2_segments(
                 let data = text_frame_data(values);
                 push_frame_header(&mut buf, &id, data.len())?;
                 buf.extend_from_slice(&data);
-                frames_len += 10 + data.len() as u64;
+                frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
             }
             None => {
                 for value in values {
                     let data = txxx_frame_data(key, value);
                     push_frame_header(&mut buf, b"TXXX", data.len())?;
                     buf.extend_from_slice(&data);
-                    frames_len += 10 + data.len() as u64;
+                    frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
                 }
             }
         }
@@ -335,13 +336,13 @@ pub fn build_id3v2_segments(
         let data = popm_frame_data(rating, popm_playcount);
         push_frame_header(&mut buf, b"POPM", data.len())?;
         buf.extend_from_slice(&data);
-        frames_len += 10 + data.len() as u64;
+        frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
     }
     if let Some(id) = &mbid {
         let data = ufid_frame_data(MUSICBRAINZ_UFID_OWNER, id.as_bytes());
         push_frame_header(&mut buf, b"UFID", data.len())?;
         buf.extend_from_slice(&data);
-        frames_len += 10 + data.len() as u64;
+        frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
     }
 
     // Opaque binary frames: header (inline) + streamed body (BinaryTag segment).
@@ -356,12 +357,12 @@ pub fn build_id3v2_segments(
             payload_id: bt.payload_id,
             len: bt.len,
         });
-        frames_len += 10 + bt.len.get();
+        frames_len = size::checked_add(frames_len, size::checked_add(10, bt.len.get())?)?;
     }
 
     for art in arts {
         let framing = apic_framing(art);
-        let data_len = framing.len() as u64 + art.data_len.get();
+        let data_len = size::checked_add(framing.len() as u64, art.data_len.get())?;
         push_frame_header(&mut buf, b"APIC", usize_from(data_len))?;
         buf.extend_from_slice(&framing);
         segments.push(Segment::Inline(std::mem::take(&mut buf)));
@@ -369,7 +370,7 @@ pub fn build_id3v2_segments(
             art_id: art.art_id,
             len: art.data_len,
         });
-        frames_len += 10 + data_len;
+        frames_len = size::checked_add(frames_len, size::checked_add(10, data_len)?)?;
     }
 
     if !buf.is_empty() {
@@ -392,7 +393,7 @@ pub fn build_id3v2_segments(
     header.extend_from_slice(&syncsafe(frames_len_ss));
     segments.insert(0, Segment::Inline(header));
 
-    Ok((segments, 10 + frames_len))
+    Ok((segments, size::checked_add(10, frames_len)?))
 }
 
 /// Build the synthesized region for an MP3: a fresh ID3v2.4 tag (text frames +
@@ -2089,6 +2090,25 @@ mod tests {
         assert!(
             !promoted.iter().any(|(k, v)| k == "rating" && v == "20"),
             "later rating must be dropped: {promoted:?}"
+        );
+    }
+
+    #[test]
+    fn build_id3v2_segments_checked_art_len_rejects_overflow() {
+        // A hostile art data_len near u64::MAX must fail closed with TooLarge at
+        // the checked add, not panic (debug) / wrap (release).
+        let mk = |data_len: u64| ArtInput {
+            art_id: 1,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: PictureType::new(3).unwrap(),
+            width: 0,
+            height: 0,
+            data_len: BlobLen::new(data_len).unwrap(),
+        };
+        assert_eq!(
+            build_id3v2_segments(&[], &[], &[mk(u64::MAX)]).err(),
+            Some(FormatError::TooLarge)
         );
     }
 
