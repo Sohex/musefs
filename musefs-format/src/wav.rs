@@ -832,6 +832,20 @@ mod tests {
     }
 
     #[test]
+    fn locate_audio_at_ceiling_rejects_form_end_before_data() {
+        // Ceiling path (over-budget file): the RIFF size declares a form ending
+        // before the data payload, while the data payload still fits inside the
+        // physical file. Must reject on the `data_end > form_end` clause.
+        let mut buf = wav(&[(b"fmt ", fmt_pcm()), (b"data", vec![0x11; 8])]);
+        let file_len = buf.len() as u64;
+        buf[4..8].copy_from_slice(&8u32.to_le_bytes()); // form_end = 16, before data
+        assert_eq!(
+            locate_audio_at_ceiling(&buf, file_len),
+            Err(FormatError::Malformed)
+        );
+    }
+
+    #[test]
     fn wav_read_binary_tags_extracts_id3_chunk_frames() {
         use id3::frame::{Content, Unknown};
         use id3::{Frame, Tag, TagLike, Version};

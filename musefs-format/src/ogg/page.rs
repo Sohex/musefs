@@ -586,6 +586,19 @@ mod tests {
     }
 
     #[test]
+    fn multipage_payload_cursor_advances_across_pages() {
+        // A >65 025-byte packet with DISTINCT bytes at every position: the second
+        // page must carry the *tail* of the packet, not a re-read from offset 0.
+        // Pins `payload_pos += page_payload` against a cursor stuck at 0 (a uniform
+        // payload, as in the other multi-page tests, can't observe this).
+        let packet: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let (bytes, pages) = lace_packet(2, 0, false, 0, &packet);
+        assert_eq!(pages, 2);
+        let pkts = read_packets(&bytes, 1).unwrap();
+        assert_eq!(pkts[0].data, packet);
+    }
+
+    #[test]
     fn patch_page_header_updates_seq_and_crc() {
         let packet = vec![0x42u8; 300];
         let (page, _) = lace_packet(0xCAFE, 10, false, 7, &packet);

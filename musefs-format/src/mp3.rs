@@ -24,16 +24,6 @@ fn synchsafe_decode(b: &[u8]) -> u32 {
         | u32::from(b[3] & 0x7F)
 }
 
-/// Validate a leading ID3v2 header and return the tag length (10-byte header +
-/// declared body, *excluding* any footer), or `None` when there is no ID3v2
-/// header at offset 0 or the buffer is shorter than a 10-byte header.
-///
-/// A present-but-malformed header — unsupported major version, or a synchsafe
-/// size byte with its high bit set — is `FormatError::Malformed`. This is the
-/// intersection of the checks `id3v2_alloc_safe` makes on the header, so the
-/// audio locator and the allocation guard agree on which headers are well-formed
-/// instead of the locator mask-decoding shapes the guard rejects. Footer and
-/// frame-flag handling stay with the callers.
 fn id3v2_header_len(data: &[u8]) -> Result<Option<usize>> {
     if data.len() < 10 || &data[0..3] != b"ID3" {
         return Ok(None);
@@ -41,7 +31,9 @@ fn id3v2_header_len(data: &[u8]) -> Result<Option<usize>> {
     if !matches!(data[3], 2..=4) {
         return Err(FormatError::Malformed);
     }
-    if data[6] | data[7] | data[8] | data[9] >= 0x80 {
+    // A well-formed synchsafe size has the high bit clear in every byte; reject
+    // if any size byte has it set (the id3 crate may not mask those bits).
+    if data[6..10].iter().any(|&b| b & 0x80 != 0) {
         return Err(FormatError::Malformed);
     }
     Ok(Some(10 + synchsafe_decode(&data[6..10]) as usize))
