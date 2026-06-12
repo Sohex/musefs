@@ -1,4 +1,4 @@
-from musefs_common import connect, realpath_key
+from musefs_common import SCAN_TIMEOUT_SECONDS, connect, realpath_key
 
 from musefs_lidarr.events import EventType, LidarrEvent
 from musefs_lidarr.import_link import LinkMode
@@ -92,10 +92,28 @@ def test_scan_if_enabled_calls_runner(tmp_path):
     scan_if_enabled(
         config=config,
         paths=["/music/a.flac"],
-        runner=lambda binary, db_path, targets: calls.append((binary, db_path, targets)),
+        runner=lambda binary, db_path, targets, *, timeout=None: calls.append(
+            (binary, db_path, targets)
+        ),
     )
 
     assert calls == [("musefs-dev", str(tmp_path / "m.db"), ["/music/a.flac"])]
+
+
+def test_scan_if_enabled_passes_shared_timeout(tmp_path):
+    captured = {}
+    config = SyncConfig(
+        db_path=str(tmp_path / "m.db"),
+        link_mode=LinkMode.SYMLINK,
+        autoscan=True,
+    )
+
+    def fake_runner(binary, db_path, targets, *, timeout=None):
+        captured["timeout"] = timeout
+
+    scan_if_enabled(config=config, paths=["/music/a.flac"], runner=fake_runner)
+
+    assert captured["timeout"] == SCAN_TIMEOUT_SECONDS == 120
 
 
 def test_sync_records_writes_tags(
@@ -229,7 +247,7 @@ def test_sync_event_with_payloads_scans_then_syncs(
     )
     calls = []
 
-    def fake_scan(binary, db_path_arg, targets):
+    def fake_scan(binary, db_path_arg, targets, *, timeout=None):
         calls.append(("scan", binary, db_path_arg, targets))
 
     def fake_prune(*, config, previous_paths):

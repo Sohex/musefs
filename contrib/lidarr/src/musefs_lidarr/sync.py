@@ -5,6 +5,7 @@ import sys
 from dataclasses import dataclass
 
 from musefs_common import (
+    SCAN_TIMEOUT_SECONDS,
     SyncStats,
     check_schema_version,
     connect,
@@ -69,7 +70,7 @@ def scan_if_enabled(*, config: SyncConfig, paths: list[str], runner=run_scan) ->
     """Run ``musefs scan`` over ``paths`` when autoscan is on and paths exist."""
     if not config.autoscan or not paths:
         return
-    runner(config.musefs_bin, config.db_path, paths)
+    runner(config.musefs_bin, config.db_path, paths, timeout=SCAN_TIMEOUT_SECONDS)
 
 
 def _log_skipped(skipped, *, warning_printer) -> None:
