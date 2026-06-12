@@ -43,11 +43,26 @@ today's unbounded growth).
 
 ### Part A — bound directory-handle snapshots (#307)
 
-`opendir` already inserts under the `dir_handles` mutex. Add a count check
-against the live map **before** insert: if `map.len() >= MAX_DIR_HANDLES`, reply
-`ENFILE` without inserting (and without consuming a `dir_fh` id). `releasedir`
-already removes entries, so the count is self-healing — `map.len()` is the
-gauge, no separate counter.
+The whole `opendir` body runs on the pool thread, and it already takes the
+`dir_handles` mutex to insert. Extend that single lock hold to cover the cap
+check and the id allocation, so concurrent `opendir` closures (up to `workers`
+in flight) cannot race the count past the cap: under the lock, if
+`map.len() >= MAX_DIR_HANDLES`, reply `ENFILE`; otherwise `dir_fh.fetch_add(1)`
+and insert. `releasedir` already removes entries under the same mutex, so the
+count is self-healing — `map.len()` is the gauge, no separate counter.
+
+Two structural points the implementer must preserve (the current code does the
+opposite of the first):
+
+- **The `dir_fh.fetch_add` moves *after* the cap check, inside the lock.** Today
+  it happens before the lock (`lib.rs:361`). Allocating the id only on the admit
+  path keeps a rejected open from consuming an id, and keeping it inside the lock
+  keeps check-and-insert atomic. (Monotonicity of `dir_fh` is preserved either
+  way; the only behavioural change is that a rejected open no longer burns an
+  id.)
+- **The check is a pool-thread check under the existing mutex**, not a
+  dispatch-thread check like Part B's read gate. An implementer who mirrors Part
+  B's synchronous-on-dispatch structure here would build the wrong thing.
 
 `ENFILE` is correct here: a failed `opendir` is the literal "too many open files
 in system" condition that every directory walker already handles, and — unlike a
@@ -72,25 +87,38 @@ mid-stream read error — it cannot corrupt a playback stream.
 - *Degenerate caveat.* A flat template (e.g. `$title`) places the entire library
   in one directory, so the widest listing ≈ total track count and the product
   grows with library size. That is a self-inflicted template choice; it is
-  documented as a known edge rather than designed around. (An aggregate
+  documented as a known edge rather than designed around. Even here the cap is a
+  *strict improvement*: it bounds the multiplier to a finite `1024`, where today
+  the multiplier is unbounded — just not down to a small constant. (An aggregate
   byte-budget would be the answer if this case ever became real; it was
   considered and discarded in favour of the simpler count cap.)
 
 ### Part B — bound foreground read work (#308)
 
-Add `inflight_reads: Arc<AtomicUsize>` to `MusefsFs`. In `read`:
+Add `inflight_reads: Arc<AtomicUsize>` to `MusefsFs`. The gate runs
+**synchronously on the dispatch thread, in `read`, before `pool.execute`** — this
+is the load-bearing fact, because rejecting before submission is what actually
+caps the queue. Only `core.read_into` and the guard's `fetch_sub` run on the
+worker. In `read`:
 
-1. `fetch_add(1, …)`; bind a drop-guard that `fetch_sub(1, …)` on drop, so the
-   count is released on worker completion **and** on panic.
+1. `fetch_add(1, …)` and bind a drop-guard that `fetch_sub(1, …)` on drop, so
+   the reservation is released on worker completion **and** on panic. The guard
+   *owns* an `Arc<AtomicUsize>` (it is moved into a `'static` pool closure on the
+   admit path), so it cannot reuse the borrow-based `PollPendingGuard`; it is a
+   sibling type of the same shape.
 2. If the post-increment count `> MAX_INFLIGHT_READS`, reply `EAGAIN` and return
-   immediately — no enqueue, no read-buffer allocation, the `ReplyData` is
-   consumed by the error reply, the guard drops.
+   immediately on the dispatch thread — no enqueue, no read-buffer allocation,
+   the `ReplyData` is consumed by the error reply, the guard drops here.
 3. Otherwise enqueue as today, **moving the guard into the closure** so it
    decrements when the worker finishes.
 
-The dispatch thread never blocks. The pool queue cannot grow past the cap
-because submission stops once the count is exceeded. Nothing blocking is added
-to the read path: an over-cap read is rejected, not queued and not run inline.
+Because the single fuser dispatch thread checks reads serially, there is no
+TOCTOU among reads. The invariant: at most `MAX_INFLIGHT_READS` guards are held
+simultaneously by admitted (queued-or-running) reads; a rejected read transiently
+observes `cap + 1` and immediately releases. The dispatch thread never blocks,
+the pool queue cannot grow past the cap because submission stops once the count
+is exceeded, and nothing blocking is added to the read path: an over-cap read is
+rejected, not queued and not run inline.
 
 **Errno: `EAGAIN`.** Because nothing blocks, an over-cap read must surface *some*
 errno. No errno makes a blocking `read()` retry transparently (only `EINTR`
@@ -110,7 +138,10 @@ Queued-but-not-running job state is small — a boxed closure plus the `ReplyDat
 well under 1 KB — so 1024 queued ≈ ~1 MB; the large per-read buffers (≤
 `MAX_RETAINED_READ_BUF` = 2 MiB) exist only for the ≤ `workers` jobs actually
 running. 1024 is far above any legitimate foreground-read burst and keeps the
-bound cheap.
+bound cheap. The cap is on *concurrently outstanding* reads, not on worker
+count: the kernel can hold many foreground FUSE read requests in flight at once
+(well above `workers`), and that fan-in — not the drain rate — is the queue's
+growth lever, which is exactly what the cap targets.
 
 ### Scope boundary for Part B
 
@@ -125,12 +156,17 @@ genuine queue-growth lever.
 Mirror the existing house pattern: one direct unit test of the decision logic
 per part, plus end-to-end coverage where feasible.
 
-- **Part A.** Extract the cap-and-insert decision into a pure helper (a function
-  over the handle map and the cap, returning whether a new handle may be
-  admitted). Unit-test that `len >= cap` rejects, that a sub-cap state admits,
-  and that removing a handle frees a slot. Optional `--ignored` FUSE e2e: open
-  `MAX_DIR_HANDLES + 1` directories and assert the final `opendir` returns
-  `ENFILE`.
+- **Part A.** Extract the *guarded admit* into a pure helper — a function over
+  `&mut HashMap<…>`, the `dir_fh` counter, the cap, and the freshly built
+  listing, that performs the whole atomic step the caller runs under the lock:
+  reject (return `None`) when `len >= cap`, otherwise allocate the id, insert,
+  and return `Some(fh)`. Testing the helper then exercises the real
+  check-and-insert, not just `len >= cap` arithmetic — so the unit test catches a
+  regression that admits past the cap, which a bare predicate would miss.
+  Unit-test that a sub-cap state admits and inserts, that `len == cap` rejects
+  without inserting or advancing the id, and that removing a handle frees a slot.
+  Optional `--ignored` FUSE e2e: open `MAX_DIR_HANDLES + 1` directories and
+  assert the final `opendir` returns `ENFILE`.
 - **Part B.** Extract the reserve decision (the atomic counter and cap, yielding
   enqueue-vs-reject) into a pure helper. Unit-test the boundary
   (`count == cap` admits, `count > cap` rejects) and that the drop-guard
@@ -141,8 +177,18 @@ per part, plus end-to-end coverage where feasible.
 
 Update the two existing in-code rationale comments to point at the new bounds:
 the `ThreadPool` "queue is unbounded" note in `MusefsFs::new` and the
-`max_background` field doc on `FuseConfig`. No user-facing documentation changes,
-since neither bound adds configuration surface.
+`max_background` field doc on `FuseConfig`. Add a rationale comment at each new
+cap site (the `opendir` check and the `read` gate), in the style of the existing
+`MAX_RETAINED_READ_BUF` comment. No user-facing documentation changes, since
+neither bound adds configuration surface.
+
+## Implementation sequencing
+
+The pre-commit hook runs the full workspace test suite, so each commit must be
+green. The extracted decision helpers and their unit tests can land green in one
+commit ahead of wiring the call sites, satisfying that constraint cleanly; a
+natural split is a Part-A commit and a Part-B commit, each self-contained and
+green.
 
 ## Out of scope
 
