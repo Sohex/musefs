@@ -1421,4 +1421,17 @@ mod serve_cap_tests {
             other => panic!("expected HeaderTooLarge, got {other:?}"),
         }
     }
+
+    #[test]
+    fn read_front_allows_exactly_cap() {
+        // Boundary: `n == CAP` must NOT be rejected — the check is `>`, not `>=`.
+        // With a nonexistent path the call still fails, but with an Io error from
+        // File::open, never HeaderTooLarge. This pins the boundary and kills the
+        // `> -> >=` mutant.
+        let err = read_front(std::path::Path::new("/nonexistent/musefs/front"), CAP).unwrap_err();
+        assert!(
+            matches!(err, CoreError::Io(_)),
+            "expected Io error at the cap boundary, got {err:?}"
+        );
+    }
 }
