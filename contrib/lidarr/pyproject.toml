@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lidarr-musefs"
-version = "0.1.0"
+version = "1.0.0"
 description = "Sync Lidarr metadata into the musefs SQLite store"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Conor Futro" }]
-dependencies = ["python-musefs>=0.1.0"]
+dependencies = ["python-musefs>=1.0.0"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

@@ -2,7 +2,7 @@ import musefs_common
 
 
 def test_version_is_package_semver_not_schema_version():
-    assert musefs_common.__version__ == "0.1.0"
+    assert musefs_common.__version__ == "1.0.0"
     assert musefs_common.__version__ != str(musefs_common.EXPECTED_USER_VERSION)
 
 

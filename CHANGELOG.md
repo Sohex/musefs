@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-12
+
+First stable release.
+
 ### Added
 
 - **Lidarr integration:** a new `contrib/lidarr/` package that drives

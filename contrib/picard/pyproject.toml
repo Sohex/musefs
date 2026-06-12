@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "musefs-picard"
-version = "0.1.0"
+version = "1.0.0"
 description = "Sync MusicBrainz Picard metadata into the musefs SQLite store"
 readme = "README.md"
 requires-python = ">=3.8"
