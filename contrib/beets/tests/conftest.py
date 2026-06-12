@@ -18,14 +18,20 @@ def db_path(tmp_path):
 
 
 def insert_track(
-    conn, backing_path, fmt="flac", audio_offset=0, audio_length=0, backing_size=0, backing_mtime=0
+    conn,
+    backing_path,
+    fmt="flac",
+    audio_offset=0,
+    audio_length=0,
+    backing_size=0,
+    backing_mtime_ns=0,
 ):
     """Insert a minimal track row (as `musefs scan` would) and return its id."""
     now = int(time.time())
     cur = conn.execute(
         "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
-        "backing_size, backing_mtime, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (backing_path, fmt, audio_offset, audio_length, backing_size, backing_mtime, now),
+        "backing_size, backing_mtime_ns, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (backing_path, fmt, audio_offset, audio_length, backing_size, backing_mtime_ns, now),
     )
     return cur.lastrowid
 
