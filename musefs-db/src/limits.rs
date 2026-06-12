@@ -1,6 +1,6 @@
 //! Size and identity caps enforced at the DB boundary (#267/#269/#278).
 //!
-//! The `CHECK` constraints in [`crate::schema`] (`MIGRATION_V4`) enforce these
+//! The `CHECK` constraints in [`crate::schema`] (`MIGRATION_V1`) enforce these
 //! at write time for honest writers; the reader guards in [`crate::tags`],
 //! [`crate::art`] and [`crate::structural`] re-enforce them at read time,
 //! because a crafted DB can carry the canonical schema yet smuggle a
