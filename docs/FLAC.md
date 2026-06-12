@@ -85,3 +85,7 @@ the streamed path.
   header length.
 - Block-body sizes are bounded at parse time (`MAX_BLOCK_BODY`); a crafted
   file cannot force a huge allocation.
+- The parser now rejects (at scan and synthesis) any FLAC whose metadata does
+  not begin with exactly one 34-byte STREAMINFO block; a crafted store
+  providing malformed structural rows fails synthesis with a controlled error
+  rather than emitting decoder-rejected output.

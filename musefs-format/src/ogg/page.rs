@@ -123,10 +123,10 @@ pub fn lace_packet(
 
         lace_pos += chunk;
         payload_pos += page_payload;
-        seq += 1;
+        seq = seq.wrapping_add(1);
         first = false;
     }
-    (out, seq - seq_start)
+    (out, seq.wrapping_sub(seq_start))
 }
 
 /// Lace a sequence of header packets onto fresh pages starting at sequence 0, with
@@ -583,6 +583,19 @@ mod tests {
         assert_eq!(pkts[1].data, big);
         assert_eq!(pkts[1].pages_through_end, 3);
         assert_eq!(pkts[1].end_offset, bytes.len());
+    }
+
+    #[test]
+    fn multipage_payload_cursor_advances_across_pages() {
+        // A >65 025-byte packet with DISTINCT bytes at every position: the second
+        // page must carry the *tail* of the packet, not a re-read from offset 0.
+        // Pins `payload_pos += page_payload` against a cursor stuck at 0 (a uniform
+        // payload, as in the other multi-page tests, can't observe this).
+        let packet: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let (bytes, pages) = lace_packet(2, 0, false, 0, &packet);
+        assert_eq!(pages, 2);
+        let pkts = read_packets(&bytes, 1).unwrap();
+        assert_eq!(pkts[0].data, packet);
     }
 
     #[test]

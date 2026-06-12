@@ -197,8 +197,8 @@ pub fn serve_ogg_window(
             h
         } else {
             let old_seq = u32::from_le_bytes(hdr_buf[18..22].try_into().unwrap());
-            let new_seq = u32::try_from(i64::from(old_seq) + seq_delta)
-                .map_err(|_| musefs_format::FormatError::Malformed)?;
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let new_seq = old_seq.wrapping_add(seq_delta as u32);
             patch_page_header_algebraic(&hdr_buf[..header_len], new_seq)?
         };
         if let Some(m) = memo {
@@ -838,5 +838,35 @@ mod tests {
             find_page_start(&backing, 0, data.len() as u64, None).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn serve_ogg_window_wraps_seq_past_u32_max() {
+        use musefs_format::ogg::{parse_page, patch_page_header};
+        // A single audio page whose sequence number is u32::MAX. With seq_delta = +1
+        // the patched sequence must wrap to 0, not fail the read.
+        let payload = vec![0x5Au8; 300];
+        let (page, _) = lace_packet_pub(0x1234, u32::MAX, false, 0, &payload);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrap.ogg");
+        let mut file = vec![0u8; 16];
+        file.extend_from_slice(&page);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&file)
+            .unwrap();
+
+        let ao = 16u64;
+        let alen = page.len() as u64;
+        let backing = std::fs::File::open(&path).unwrap();
+        let mut out = Vec::new();
+        serve_ogg_window(&backing, ao, alen, 1, 0, alen, &mut out, None).unwrap();
+
+        // The served region must be the page with its sequence wrapped (u32::MAX + 1 == 0):
+        // patched header followed by the original payload bytes.
+        let h = parse_page(&page, 0).unwrap();
+        let mut want = patch_page_header(&page[..h.total_len()], 0).unwrap();
+        want.extend_from_slice(&page[h.header_len..h.total_len()]);
+        assert_eq!(out, want);
     }
 }

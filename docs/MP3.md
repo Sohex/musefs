@@ -49,6 +49,11 @@ described here is shared with WAV's embedded `id3 ` chunk — see
 - **ID3v1 is not read.** A file whose only tag is ID3v1 scans with no tags
   (populate the DB via beets/Picard instead). A trailing ID3v1 tag is also
   excluded from the audio region, so the synthesized file does not carry it.
+- The audio locator validates the ID3v2 major version (2–4) and rejects
+  synchsafe size bytes with the high bit set, producing a controlled
+  `Malformed` error rather than mask-decoding an invalid offset. Tags using
+  unsynchronisation or an extended header still scan — their declared size
+  already covers the audio boundary.
 - Scan-time tag extraction is skipped entirely — by a deliberate
   denial-of-service guard, see below — for tags using unsynchronisation, an
   extended header, non-zero frame flags (compression/encryption), malformed

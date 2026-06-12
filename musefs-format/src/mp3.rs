@@ -24,6 +24,21 @@ fn synchsafe_decode(b: &[u8]) -> u32 {
         | u32::from(b[3] & 0x7F)
 }
 
+fn id3v2_header_len(data: &[u8]) -> Result<Option<usize>> {
+    if data.len() < 10 || &data[0..3] != b"ID3" {
+        return Ok(None);
+    }
+    if !matches!(data[3], 2..=4) {
+        return Err(FormatError::Malformed);
+    }
+    // A well-formed synchsafe size has the high bit clear in every byte; reject
+    // if any size byte has it set (the id3 crate may not mask those bits).
+    if data[6..10].iter().any(|&b| b & 0x80 != 0) {
+        return Err(FormatError::Malformed);
+    }
+    Ok(Some(10 + synchsafe_decode(&data[6..10]) as usize))
+}
+
 /// Locate the audio region: skip a leading ID3v2 tag (if present) and a trailing
 /// 128-byte ID3v1 tag (if present), then require an MPEG frame sync at the audio
 /// offset. The synthesized file re-prepends a fresh ID3v2 tag, so the original
@@ -32,10 +47,9 @@ pub fn locate_audio(data: &[u8]) -> Result<Mp3Bounds> {
     let len = data.len();
 
     let mut audio_offset = 0usize;
-    if len >= 10 && &data[0..3] == b"ID3" {
+    if let Some(base) = id3v2_header_len(data)? {
         let flags = data[5];
-        let body = synchsafe_decode(&data[6..10]) as usize;
-        let mut tag_len = 10 + body;
+        let mut tag_len = base;
         if flags & 0x10 != 0 {
             tag_len += 10; // ID3v2.4 footer
         }
@@ -76,10 +90,13 @@ pub fn locate_audio_bounded(
     tail: Option<&[u8; 128]>,
 ) -> Result<Extent<Mp3Bounds>> {
     let mut audio_offset = 0usize;
-    if prefix.len() >= 10 && &prefix[0..3] == b"ID3" {
+    if prefix.len() < 10 && file_len >= 10 {
+        // Not enough bytes even to read the ID3v2 header.
+        return Ok(Extent::NeedMore { up_to: 10 });
+    }
+    if let Some(base) = id3v2_header_len(prefix)? {
         let flags = prefix[5];
-        let body = synchsafe_decode(&prefix[6..10]) as usize;
-        let mut tag_len = 10 + body;
+        let mut tag_len = base;
         if flags & 0x10 != 0 {
             tag_len += 10; // ID3v2.4 footer
         }
@@ -87,9 +104,6 @@ pub fn locate_audio_bounded(
             return Err(FormatError::Malformed);
         }
         audio_offset = tag_len;
-    } else if prefix.len() < 10 && file_len >= 10 {
-        // Not enough bytes even to read the ID3v2 header.
-        return Ok(Extent::NeedMore { up_to: 10 });
     }
 
     // The audio start (plus its 2-byte frame sync) must fit in the file. Mirrors
@@ -431,34 +445,20 @@ fn id3v2_alloc_safe(data: &[u8]) -> bool {
     // extraction for ID3v1-only files (no leading ID3v2 header) is skipped;
     // ID3v1 is legacy/fixed-size and tags can be populated via the DB
     // (beets/picard) regardless.
-    if data.len() < 10 || &data[0..3] != b"ID3" {
+    let Ok(Some(tag_end)) = id3v2_header_len(data) else {
+        // Not an ID3v2 tag at offset 0, or a malformed header: skip parsing.
         return false;
-    }
-    let major = data[3];
-    if !matches!(major, 2..=4) {
-        return false;
-    }
+    };
     let flags = data[5];
     // Extended header (0x40) and unsynchronisation (0x80) complicate frame
     // bounds; skip rather than risk mis-validating.
     if flags & 0xC0 != 0 {
         return false;
     }
-    // A well-formed synchsafe integer has the high bit clear in every byte.  If
-    // any byte has the high bit set the field is malformed; the id3 crate may
-    // not mask those bits, producing a body size much larger than our
-    // spec-correct synchsafe decode and walking frames we have not validated.
-    // Reject such tags conservatively rather than risk mis-validating bounds.
-    if data[6] | data[7] | data[8] | data[9] >= 0x80 {
-        return false;
-    }
-    let body = synchsafe_decode(&data[6..10]) as usize;
-    let Some(tag_end) = 10usize.checked_add(body) else {
-        return false;
-    };
     if tag_end > data.len() {
         return false;
     }
+    let major = data[3];
     let header_len = if major == 2 { 6 } else { 10 };
     // Walk frames over the entire remaining buffer (not just [10, tag_end)):
     // the id3 crate does not consistently stop at the declared tag body and
@@ -2134,6 +2134,42 @@ mod tests {
                 panic!("mp3 bounded/full divergence: full={full:?} bounded={bounded:?}")
             }
         }
+    }
+
+    #[test]
+    fn locate_audio_rejects_high_bit_size_byte() {
+        // Malformed synchsafe size (last byte 0x80) that masks to body=0, with a valid
+        // frame sync at offset 10. Must reject rather than serve audio from offset 10.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ID3");
+        data.extend_from_slice(&[0x04, 0x00, 0x00]); // major, rev, flags
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x80]); // high bit set -> malformed
+        data.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]); // valid sync at offset 10
+        assert_eq!(locate_audio(&data), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn locate_audio_rejects_unsupported_major_version() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ID3");
+        data.extend_from_slice(&[0x05, 0x00, 0x00]); // major 5 (unsupported)
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        assert_eq!(locate_audio(&data), Err(FormatError::Malformed));
+    }
+
+    #[test]
+    fn locate_audio_bounded_rejects_high_bit_size_byte() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ID3");
+        data.extend_from_slice(&[0x04, 0x00, 0x00]);
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x80]);
+        data.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        let file_len = data.len() as u64;
+        assert_eq!(
+            locate_audio_bounded(&data, file_len, None),
+            Err(FormatError::Malformed)
+        );
     }
 
     #[test]

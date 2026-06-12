@@ -74,6 +74,19 @@ exclude_re = [
     # sibling helper stays IN scope: core uses it only for slice bounds, so its
     # constant-return mutants die by prompt panic (verified caught).
     'musefs-format/src/convert\.rs:\d+:\d+: replace usize_from -> usize',
+    # wav walk_chunks chunk-advance `8u64 + size + (size & 1)`, the `8u64 + size`
+    # operator (col 28): the SAME MACHINE-KILLER class as convert.rs above. `+`->`*`
+    # zeroes the advance when size==0 (`8 * 0 + 0`), and `+`->`-` zeroes it when
+    # size==8 (`8 - 8 + 0`) — both real inputs in the test corpus. A zero advance
+    # freezes `pos` (next == pos passes the `next <= ceiling` guard) while the loop
+    # `out.push`-es the same chunk every iteration: an unbounded allocation that OOMs
+    # the runner before cargo-mutants' timeout fires (observed killing the in-diff CI
+    # job). The advance's correctness is pinned functionally by
+    # walk_chunks_advances_past_each_payload — a wrong advance lands off the next
+    # header. The `size + (size & 1)` operator at :35 and the `& 1` at :43 cannot
+    # zero the advance (min 8) and stay IN scope (caught by that same test).
+    # guard: op="+" fn="walk_chunks" rows=2
+    'musefs-format/src/wav\.rs:58:28:',
     # dirty_min_flip_ancestors (add-side walk) `id < introducing_id(child)`: the
     # `<`->`<=` boundary is unreachable-different. Equality needs the walked id to
     # BE the subtree's introducing id, which only a moved-in id can satisfy (pure
@@ -333,15 +346,16 @@ exclude_re = [
     # description-anchored against `cargo fmt` line drift.
     'replace < with <= in read_segments_into',
 
-    # wav walk_chunks advance guard `next <= buf.len() as u64` -> `true`: forcing
-    # the guard true sets `pos = next` even when `next > buf.len()`, but the loop's
-    # `while pos + 8 <= buf.len()` test is then immediately false (next can't wrap —
+    # wav walk_chunks advance guard `next <= ceiling as u64` -> `true`: forcing
+    # the guard true sets `pos = next` even when `next > ceiling`, but the loop's
+    # `while pos + 8 <= ceiling` test is then immediately false (next can't wrap —
     # checked_add guards overflow and usize_from doesn't truncate on 64-bit), so the
     # walk ends on the next iteration with the IDENTICAL output Vec the original's
     # `break` produced (the chunk header was pushed before the advance). Equivalent;
     # the in-file note in wav.rs's test module documents the hand-apply confirmation.
+    # (`ceiling = min(form_end, buf.len())` clamps the walk to the declared RIFF form.)
     # The sole match guard in walk_chunks, so description-anchored.
-    'replace match guard next <= buf.len\(\) as u64 with true in walk_chunks',
+    'replace match guard next <= ceiling as u64 with true in walk_chunks',
 
     # fuzz_check fixtures::wav RIFF-size sum `4 + fmt_chunk.len() + data_chunk.len()`
     # `+`->`*`: the computed `riff_size` is written into the RIFF header's size field,

@@ -93,7 +93,9 @@ pages are walked forward with each header patched algebraically and payload
 bytes served by exact positioned reads. A one-page memo on the resolved file
 short-circuits the scan for sequential reads. A page walk that overruns the
 scanned audio bounds is a hard `Malformed` error — corrupt or misaligned
-data is refused, not served.
+data is refused, not served. Synthesized page sequence numbers wrap modulo
+2³² (matching Ogg's `u32` sequence field), so files whose audio pages have
+very high sequence numbers serve correctly rather than failing the read.
 
 ## CRC patching: the linear-CRC trick
 
