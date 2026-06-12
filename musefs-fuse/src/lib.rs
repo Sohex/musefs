@@ -126,6 +126,20 @@ fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
     errno(err)
 }
 
+/// One directory's readdir snapshot: `(child inode, entry type, name)` rows.
+/// Aliased so the handle-map signatures stay readable (and dodge
+/// `clippy::type_complexity`).
+type DirListing = Vec<(u64, FileType, String)>;
+
+/// Cap on concurrently-open directory handles (#307). Each `opendir` snapshots a
+/// full `DirListing`, so an unreleased handle pins memory ~ (entries × name
+/// length); the cap bounds the *number* of snapshots, not their inherent size (a
+/// single `ls` of the widest directory already allocates one). 1024 sits well
+/// above a heavy parallel indexer's concurrent-dir-handle count (~hundreds), so
+/// legitimate clients never hit it, while an over-cap `opendir` returns `ENFILE`
+/// — the directory-side analogue of the file-handle `HandleTableFull → ENFILE`.
+const MAX_DIR_HANDLES: usize = 1024;
+
 /// Build a directory's full readdir listing once. Shared by `opendir`
 /// (snapshotted per fh) and the `readdir` fallback for an unknown fh.
 fn build_dir_listing(core: &Musefs, ino: u64) -> Result<Vec<(u64, FileType, String)>, CoreError> {
@@ -133,6 +147,26 @@ fn build_dir_listing(core: &Musefs, ino: u64) -> Result<Vec<(u64, FileType, Stri
     let parent = core.parent(ino).unwrap_or(ino);
     let marker = platform::spotlight::marker_dir_entry(ino);
     Ok(assemble_dir_listing(ino, parent, entries, marker))
+}
+
+/// Admit a directory handle under the caller's `dir_handles` lock, enforcing
+/// `MAX_DIR_HANDLES` (#307). Returns the freshly allocated handle id on admit, or
+/// `None` when the table is at `cap` (the caller replies `ENFILE`). The id is
+/// drawn from `counter` only on the admit path, and the whole check-then-insert
+/// runs under the single lock the caller holds, so concurrent `opendir` closures
+/// cannot race the count past the cap and a rejected open burns no id.
+fn try_admit_dir_handle(
+    handles: &mut std::collections::HashMap<u64, Arc<DirListing>>,
+    counter: &AtomicU64,
+    cap: usize,
+    listing: DirListing,
+) -> Option<u64> {
+    if handles.len() >= cap {
+        return None;
+    }
+    let fh = counter.fetch_add(1, Ordering::Relaxed);
+    handles.insert(fh, Arc::new(listing));
+    Some(fh)
 }
 
 /// Clears the `fire_poll_refresh` single-flight gate when the poll task ends,
@@ -182,10 +216,12 @@ impl MusefsFs {
         let structure_only = core.mode() == musefs_core::Mode::StructureOnly;
         MusefsFs {
             core: Arc::new(core),
-            // `ThreadPool`'s queue is unbounded. `max_background` (set in `init`)
-            // caps the kernel's *background/readahead* requests, bounding that
-            // class of work; foreground reads are bounded only by client
-            // concurrency, so a wide parallel read storm can still queue jobs.
+            // `ThreadPool`'s queue is unbounded, so foreground reads are gated by
+            // `inflight_reads`/`MAX_INFLIGHT_READS` before submission (#308) and
+            // directory handles are capped at `MAX_DIR_HANDLES` (#307); both reject
+            // over-cap work rather than letting it grow process memory.
+            // `max_background` (set in `init`) separately caps the kernel's
+            // background/readahead requests.
             pool: ThreadPool::new(workers),
             uid: config.uid,
             gid: config.gid,
@@ -358,12 +394,18 @@ impl Filesystem for MusefsFs {
                 Ok(l) => l,
                 Err(e) => return reply.error(reply_errno("opendir", ino.0, &e)),
             };
-            let fh = counter.fetch_add(1, Ordering::Relaxed);
-            handles
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(fh, Arc::new(listing));
-            reply.opened(FileHandle(fh), FopenFlags::empty());
+            // Check + id allocation + insert under one lock hold, so concurrent
+            // opendir closures can't race the count past MAX_DIR_HANDLES (#307).
+            let admitted = {
+                let mut guard = handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                try_admit_dir_handle(&mut guard, &counter, MAX_DIR_HANDLES, listing)
+            };
+            match admitted {
+                Some(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+                None => reply.error(fuser::Errno::ENFILE),
+            }
         });
     }
 
@@ -689,6 +731,58 @@ mod tests {
         assert!(
             !fs.poll_pending.load(Ordering::SeqCst),
             "guard must clear the gate after the task finishes"
+        );
+    }
+
+    fn empty_dir_handles() -> std::collections::HashMap<u64, Arc<DirListing>> {
+        std::collections::HashMap::new()
+    }
+
+    #[test]
+    fn try_admit_dir_handle_admits_and_allocates_id_below_cap() {
+        let mut handles = empty_dir_handles();
+        let counter = AtomicU64::new(1); // matches the live `dir_fh` start
+        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        assert_eq!(
+            fh,
+            Some(1),
+            "first admit uses the pre-increment counter value"
+        );
+        assert_eq!(handles.len(), 1);
+        assert!(handles.contains_key(&1));
+        assert_eq!(counter.load(Ordering::Relaxed), 2, "id allocated on admit");
+    }
+
+    #[test]
+    fn try_admit_dir_handle_rejects_at_cap_without_inserting_or_advancing_id() {
+        let mut handles = empty_dir_handles();
+        handles.insert(10, Arc::new(Vec::new()));
+        handles.insert(11, Arc::new(Vec::new()));
+        let counter = AtomicU64::new(12);
+        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        assert_eq!(fh, None, "at cap must reject");
+        assert_eq!(handles.len(), 2, "must not insert on reject");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            12,
+            "must not burn a dir_fh id on reject"
+        );
+    }
+
+    #[test]
+    fn try_admit_dir_handle_frees_slot_after_removal() {
+        let mut handles = empty_dir_handles();
+        handles.insert(10, Arc::new(Vec::new()));
+        handles.insert(11, Arc::new(Vec::new()));
+        let counter = AtomicU64::new(12);
+        handles.remove(&10); // releasedir frees a slot
+        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        assert_eq!(fh, Some(12), "a freed slot admits again");
+        assert_eq!(handles.len(), 2);
+        assert!(!handles.contains_key(&10), "the freed handle stays gone");
+        assert!(
+            handles.contains_key(&12),
+            "the new handle fills the freed slot"
         );
     }
 }
