@@ -9,6 +9,10 @@ updates:
     schedule:
       interval: "weekly"
   - package-ecosystem: "pip"
+    directory: "/contrib/lidarr"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "pip"
     directory: "/contrib/python-musefs"
     schedule:
       interval: "weekly"
