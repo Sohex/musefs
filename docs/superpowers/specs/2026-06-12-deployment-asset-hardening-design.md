@@ -30,13 +30,20 @@ not face, while the riskiest ones can **break the FUSE mount** or impose
 user-visible friction. This spec keeps only directives that are *both* worth the
 risk and friction-free, and moves the rest to an explicit opt-in bucket.
 
-Two of the three issues also intersect an **in-flight PR** touching FUSE
-`allow_other` / `default_permissions`:
+The FUSE `allow_other` / `default_permissions` PR (**#339**, merged) has now
+landed and this branch is rebased on it. What shipped changes #319's rationale:
 
-- **#318 (mount unit)** and **#319 (`/etc/fuse.conf` + container)** are **parked**
-  until that PR lands, to avoid conflicting on the same surface.
-- **#317 (scanner)** is independent of `allow_other`/`default_permissions` and
-  can proceed on its own.
+- An explicit `--allow-other` flag (implied by `--owner`/`--group`) and a
+  `MUSEFS_ALLOW_OTHER` env var.
+- musefs now **pre-flight-checks `/etc/fuse.conf` for `user_allow_other`** and
+  fails with an explanatory error when a non-root `allow_other` mount lacks it
+  (`musefs-fuse/src/platform/mount.rs`).
+
+Consequence: switching the container to non-root (**#319**) makes the
+`user_allow_other` line in the image **required** to preserve the documented
+multi-container pod pattern (a non-root `--allow-other` mount now hard-fails the
+pre-flight without it), not the optional polish the earlier draft treated it as.
+All three issues are now unblocked.
 
 ## Guiding principle
 
@@ -53,7 +60,7 @@ friction and without risking the mount**. This yields three proportionate tiers:
    mount-capable / namespace / syscall-filter directives are **opt-in**, because
    they can trap the mount on kernels older than the dev box.
 3. **Container** — drop from root to a fixed unprivileged uid/gid 1000. Mostly a
-   docs change (volume ownership). Parked behind the `allow_other` PR.
+   docs change (volume ownership), plus the now-required `user_allow_other` line.
 
 ## Facts grounding the design
 
@@ -168,11 +175,12 @@ known-recent platform can uncomment them after confirming the mount still
 appears. We do not ship them on, because the dedi (kernel 7.0 / systemd 259) is
 not representative — "works here" does not generalize to Debian 12.
 
-### #319 — Dockerfiles: non-root uid 1000 (parked behind the `allow_other` PR)
+### #319 — Dockerfiles: non-root uid 1000
 
 Both images: create a `musefs` group+user at gid/uid **1000**, add
-`user_allow_other` to `/etc/fuse.conf` (so the multi-container pod pattern's
-`allow_other` still works without root), then `USER musefs`.
+`user_allow_other` to `/etc/fuse.conf` (now **required** for the non-root pod
+pattern — post-#339 musefs pre-flight-checks for it and hard-fails an
+`allow_other`/`--owner`/`--group` mount without it), then `USER musefs`.
 
 - **glibc / Debian:**
   `groupadd -g 1000 musefs && useradd -u 1000 -g 1000 -M -s /usr/sbin/nologin musefs`
@@ -190,29 +198,35 @@ change as much as an image change. Confirm no base image / compose default
 injects `NoNewPrivileges` (would block the setuid escalation the container
 relies on).
 
-**This issue is parked** until the in-flight `allow_other`/`default_permissions`
-PR lands, since both edit `/etc/fuse.conf` and the FUSE permission surface.
+A plain single-container mount read only by uid 1000 itself needs **no**
+`allow_other`; the `user_allow_other` line matters only for the
+cross-container / owner-presenting case, and is harmless when unused.
 
 ## Documentation updates
 
 - `contrib/systemd/README.md` — short "Hardening" note: the units ship
   sandboxed; no per-user path edits are required (the scanner uses
   `ProtectSystem=true`, not `strict`). Mention the opt-in mount-unit directives.
-- `README.md` Docker section — the image runs as uid 1000; the bind-mounted
-  store dir must be owned by / writable to 1000 (or pass `--user`). Update the
-  `docker run` example (`README.md:116-120`) and the pod example
-  (`README.md:142-149`) so uid-1000 guidance does not contradict their existing
-  `--security-opt apparmor=unconfined` lines. (Deferred with #319.)
+- `README.md` Docker section (post-#339 line numbers) — the image runs as uid
+  1000; the bind-mounted store dir must be owned by / writable to 1000 (or pass
+  `--user`). Update the `docker run` example (`README.md:116-120`) and the
+  "mount-visibility gotcha" pod example (`README.md:145-148`) so uid-1000
+  guidance does not contradict their `--security-opt apparmor=unconfined` lines.
+  Cross-reference the new "Non-root mounts need `user_allow_other`" note
+  (`README.md:297-302`) from the pod example, since the non-root image now
+  relies on the image-baked `user_allow_other` for that pattern.
 - Inline comments in each unit / Dockerfile justifying the non-obvious
   directives.
 
 ## Implementation ordering
 
-1. **#317 (scanner)** — independent of the `allow_other` PR; do this now. Single
-   live `scan --revalidate` validates it.
-2. **#318 (mount unit)** and **#319 (container)** — after the `allow_other` PR
-   lands. #318 is a single edit (no prune loop now that the risky directives are
-   opt-in/commented). #319 is image + docs.
+All three are unblocked (#339 is merged). Suggested order by ascending risk:
+
+1. **#317 (scanner)** — simplest; a single live `scan --revalidate` validates it.
+2. **#318 (mount unit)** — a single edit (no prune loop now that the risky
+   directives are opt-in/commented).
+3. **#319 (container)** — image + docs; exercise the non-root `allow_other` pod
+   path against the now-merged pre-flight check.
 
 **Rollback:** each asset's pre-hardening version is recoverable from git. The
 pre-commit cargo gate is **skipped** for these (docs/config-only paths) and the
@@ -228,16 +242,18 @@ is the manual live run; do not commit an untested directive set.
    the case the dropped `ReadWritePaths` would have broken. Confirm the scanner
    spawns no namespace-cloning helper (probe workers are plain threads, so
    `RestrictNamespaces` is safe).
-2. **#318 (post-PR):** install the unit; assert the mount is visible in the
-   session and a served file reads back correctly. `systemd-analyze` score is
-   *evidence, not a gate* — the mount unit intentionally scores higher than the
-   scanner. Spot-check that uncommenting one opt-in directive and restarting
-   still mounts, to document the opt-in path.
-3. **#319 (post-PR):** build **both** images; for each assert uid 1000 can open
+2. **#318:** install the unit; assert the mount is visible in the session and a
+   served file reads back correctly. `systemd-analyze` score is *evidence, not a
+   gate* — the mount unit intentionally scores higher than the scanner.
+   Spot-check that uncommenting one opt-in directive and restarting still mounts,
+   to document the opt-in path.
+3. **#319:** build **both** images; for each assert uid 1000 can open
    `/dev/fuse`, run `scan` + `mount` non-root with
-   `--cap-add SYS_ADMIN --device /dev/fuse`, and confirm the store write is
-   uid-1000-owned and `allow_other` works non-root (musl-specific regression
-   risk).
+   `--cap-add SYS_ADMIN --device /dev/fuse`. Confirm the store write is
+   uid-1000-owned, and that a non-root `--allow-other` (or `--owner`) mount
+   passes the merged `/etc/fuse.conf` pre-flight check thanks to the image-baked
+   `user_allow_other` — and fails cleanly if that line is removed (musl-specific
+   regression risk).
 
 ## Out of scope (YAGNI)
 
