@@ -114,8 +114,15 @@ ALTER TABLE tracks ADD COLUMN backing_ctime_ns INTEGER NOT NULL DEFAULT 0;
   on any pre-existing row mismatches the real file and forces a re-probe, which
   is correct).
 
-The schema string is the source of truth; regenerate the Python mirror
-(`MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py`) and re-vendor.
+The schema string is the source of truth; both Python mirrors embed the full
+migration SQL verbatim and must be regenerated and re-vendored:
+`MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py` rewrites
+`contrib/python-musefs/src/musefs_common/schema.py`, then
+`python contrib/python-musefs/vendor_to_picard.py` propagates it to
+`contrib/picard/musefs/_common/schema.py`. The `schema_py` gate test
+(`schema.rs:685`) is part of the green-commit set. `user_version` is unchanged
+(still 5), so the Picard `test_conftest_sanity.py` `== 5` assertion needs no
+bump.
 
 ### DB read/write plumbing
 
@@ -141,32 +148,68 @@ probes one descriptor:
 5. If `S1 != S2` (size, mtime_ns, or ctime_ns moved) the file changed under us
    mid-probe → return a "raced" outcome; commit nothing for this file.
 
-`probe_file` returns `Option<(Probed, BackingStamp)>`. The worker
-(`run_pipeline`, ~`scan.rs:716`) stores **that** stamp instead of the
-path-stat values, so the committed stamp and the probed bytes share one inode
-held still across the probe. The redundant pre-probe `std::fs::metadata(&path)`
-at `scan.rs:720` is removed: an `open` failure inside `probe_file` already
-returns `Err`, which the worker routes to the `failed` arm.
+**Signature and return.** `probe_file` currently is
+`fn probe_file(path, file_len, window) -> io::Result<Option<Probed>>`, where
+`file_len` is supplied by the caller from a separate path-stat. After the
+refactor it takes no `file_len` (it derives the probe ceiling from S1's `len`,
+including the `m4a` arm's `mp4::read_structure_from` at `scan.rs:296`) and must
+distinguish **three** outcomes that `Ok(None)` alone cannot: probed-ok,
+unsupported/skip, and raced. Use a small enum, e.g.
 
-Add a `raced` counter to `ScanStats` / `RevalidateStats` so mid-probe races are
-observable and assertable. (Logged at `warn`.)
+```rust
+enum ProbeOutcome { Probed(Probed, BackingStamp), Unsupported, Raced }
+fn probe_file(path: &Path, window: usize) -> io::Result<ProbeOutcome>
+```
 
-`Unit` (`scan.rs`), `ingest` (`scan.rs:507`), and `ingest_bulk`
-(`scan.rs:587`) carry and persist the three-integer stamp instead of
-`meta_len` / `meta_mtime`.
+so `Raced` is counted as `raced` (not folded into the existing `skipped`, which
+means "unsupported/unparseable", nor `failed`, which means an IO error). The
+worker (`run_pipeline`, ~`scan.rs:716`) stores the returned stamp, so the
+committed stamp and the probed bytes share one inode held still across the
+probe. The redundant pre-probe `std::fs::metadata(&path)` at `scan.rs:720` is
+removed: an `open` failure inside `probe_file` already returns `Err`, routed to
+the `failed` arm.
+
+Add a `raced` counter to `ScanStats` / `RevalidateStats`, logged at `warn`.
+
+The stamp must flow through the worker→writer channel and the two ingest paths
+without re-statting (a fresh `Metadata` would reopen the TOCTOU this closes):
+
+- `Unit` (`scan.rs:482`) replaces `meta_len`/`meta_mtime` with the three-integer
+  stamp; update its construction (`scan.rs:732`) and the writer destructure
+  (`scan.rs:768`).
+- `ingest_bulk` (`scan.rs:587`) replaces its `meta_len`/`meta_mtime` params.
+- `ingest` (`scan.rs:507`) **replaces** its `meta: &Metadata` param with the
+  `BackingStamp` (it must not re-`stat`).
 
 ### Serve-path validation
 
-Both compare sites switch to `BackingStamp`, re-stat, full three-field compare,
-`BackingChanged` on any mismatch:
+**Three** compare sites switch to `BackingStamp`, re-stat, full three-field
+compare, `BackingChanged` on any mismatch:
 
 - `HeaderCache::resolve` (`reader.rs:110`): re-stat on every resolve
   (`reader.rs:118`), compare `BackingStamp::from_metadata(&meta)` against the
   track's stored stamp (`reader.rs:119`).
 - `validate_opened_backing` (`facade.rs:115`): same, against the held
-  descriptor's `file.metadata()` on every read. `ResolvedFile`
-  (`reader.rs:~26`, fields `backing_size` / `backing_mtime_secs`) carries the
-  full stamp, captured at resolve time (`reader.rs:~314`).
+  descriptor's `file.metadata()` on every read. `ResolvedFile` (`reader.rs:~26`)
+  carries the full stamp, captured at resolve time (`reader.rs:~314`).
+- **`Musefs::getattr`'s size-cache hit** (`facade.rs:963`, added in #279): the
+  warm-attr path re-stats and compares a whole-second mtime against
+  `SizeEntry.backing_mtime_secs` (`facade.rs:90`). This is the one metadata
+  surface that can outrun a backing change, so it must use the full stamp too:
+  widen `SizeEntry` to carry `BackingStamp` and switch the compare at
+  `facade.rs:963`. (The single `metadata` call → one `on_stat` is unchanged, so
+  the `getattr_size_cache_hit_restats_backing` metrics assertion still holds.)
+
+**Displayed mtime is independent of the stamp and stays in whole seconds.**
+`ResolvedFile` holds a second, distinct field `mtime_secs` (`reader.rs:28`) —
+the synthesized file's *displayed* mtime surfaced to FUSE `getattr`, derived at
+`reader.rs:149` (`track.backing_mtime`) and `reader.rs:289`
+(`track.backing_mtime.max(track.updated_at)`). After the rename these sites read
+`backing_mtime_ns`, which is **nanoseconds**; they must convert to seconds
+(`backing_mtime_ns / 1_000_000_000`) before the `.max(updated_at)` (seconds) and
+before storing into `mtime_secs`. Leaving them unconverted would advertise a
+~10¹⁸-second mtime. `ResolvedFile::mtime_secs` and the `SizeEntry.mtime_secs`
+display field remain seconds; only the *freshness stamp* fields go to ns.
 
 ### Revalidate skip pass
 
@@ -174,7 +217,10 @@ The pre-dispatch skip check (`scan.rs:924-929`) compares the **full** stored
 stamp `(size, mtime_ns, ctime_ns)` against the candidate file; any difference
 forces a re-probe. This means a ctime-only change — e.g. an adversarial
 mtime-reset after an in-place rewrite — is no longer skipped as "unchanged".
-The existing `needs_backfill` FLAC-structural hook is unaffected.
+The `existing` map it reads from (`scan.rs:896`, currently
+`HashMap<String,(u64,i64,i64,Format)>` = `(size, mtime, id, format)`) must be
+widened to carry `backing_ctime_ns`, sourced from the `list_tracks()`
+projection. The existing `needs_backfill` FLAC-structural hook is unaffected.
 
 ### Deliberate non-changes
 
@@ -200,11 +246,22 @@ The existing `needs_backfill` FLAC-structural hook is unaffected.
   not is re-probed, not skipped.
 - **Serve-path per-read guard**: `validate_opened_backing` rejects a held
   handle after a same-size sub-second rewrite.
-- Schema mirror regenerated; full workspace suite green, including
-  `cargo test -p musefs-core --features metrics` (the stat/open-count
-  assertions: the extra scan-time `fstat` and the removed path-stat shift
-  scanner stat counts — update expectations) and the FUSE e2e tier where
+- **`getattr` size-cache guard** (C1): a warm-cache `getattr` after a same-size
+  sub-second/ctime-only rewrite yields `BackingChanged`, not stale attrs.
+- **Displayed mtime sanity** (C2): the FUSE-advertised mtime of a synthesized
+  file is a plausible whole-second value (≈ the backing file's mtime, not a
+  ~10¹⁸ nanosecond value), guarding the ns→s conversion at `reader.rs:149`/`:289`.
+- Schema mirrors regenerated; full workspace suite green, including
+  `cargo test -p musefs-core --features metrics` and the FUSE e2e tier where
   relevant.
+  - **Metrics note:** the scan path is instrumented only with
+    `on_scan_open`/`on_scan_read`; an `fstat` is neither, and the path-stat
+    being removed (`scan.rs:720`) was never counted — so **no scan metric
+    assertion changes**. Do *not* wire `on_stat` (a serve-path-only counter)
+    into the scanner. The real check is that serve-path stat counts stay exact
+    after the `getattr` size-cache change (C1): the hit path still issues one
+    `metadata` → one `on_stat`, so `s.stats` assertions (`tests/metrics.rs`,
+    e.g. `getattr_size_cache_hit_restats_backing`) are unchanged.
 - `cargo +nightly fuzz build` if any format-layer signature is touched (it is
   not expected to be).
 
@@ -223,11 +280,22 @@ The existing `needs_backfill` FLAC-structural hook is unaffected.
 
 | File | Change |
 | ---- | ------ |
-| `musefs-db/src/schema.rs` | V5 rename + add column; trigger + CHECK; Python mirror regen |
+| `musefs-db/src/schema.rs` | V5 rename + add column; trigger + CHECK |
 | `musefs-db/src/models.rs` | `Track`, `NewTrack` stamp fields |
-| `musefs-db/src/tracks.rs` | `track_select!`, `row_to_track`, `upsert_track`, bulk insert |
-| `musefs-core/src/reader.rs` | `BackingStamp`, `ResolvedFile`, `resolve` compare |
-| `musefs-core/src/facade.rs` | `validate_opened_backing` compare; drop dup `mtime_secs` |
-| `musefs-core/src/scan.rs` | `probe_file` fd-stat sandwich, `raced` counter, `Unit`/`ingest`/revalidate skip; drop dup `mtime_secs` |
+| `musefs-db/src/tracks.rs` | `track_select!`, `row_to_track`, `upsert_track`, bulk insert, `list_tracks` projection |
+| `musefs-core/src/reader.rs` | `BackingStamp`, `ResolvedFile` (stamp + seconds `mtime_secs`), `resolve` compare, displayed-mtime ns→s conversion (`:149`,`:289`) |
+| `musefs-core/src/facade.rs` | `validate_opened_backing` compare; `SizeEntry` stamp widening + `getattr` size-cache compare (`:963`); drop dup `mtime_secs` |
+| `musefs-core/src/scan.rs` | `probe_file` fd-stat sandwich + new signature/`ProbeOutcome`, `raced` counter, `Unit`/`ingest`/`ingest_bulk` stamp, revalidate `existing`-tuple + skip; drop dup `mtime_secs` |
+| `musefs-core/src/metrics.rs` + `tests/metrics.rs` | verify serve-path `s.stats` assertions unchanged; no scan-counter change |
 | `ARCHITECTURE.md` | freshness + contract docs |
-| Python schema mirror + vendored copy | regenerate |
+| `contrib/python-musefs/src/musefs_common/schema.py` | regenerate (`schema_py`) |
+| `contrib/picard/musefs/_common/schema.py` | re-vendor (`vendor_to_picard.py`) |
+
+**Commit sequencing** (the pre-commit hook runs the full workspace suite +
+`schema_py` gate, so each commit must be green). The column rename touches the
+db layer and all four core compare sites at once, so they land together:
+(1) schema V5 edit + both schema.py mirrors + `models.rs`/`tracks.rs` plumbing +
+the `reader.rs`/`facade.rs` field rename and ns→s display conversion (compiles
+and passes only as one unit); (2) scanner fd-stat sandwich + `raced`;
+(3) the new freshness tests; (4) ARCHITECTURE.md. Steps may merge if that keeps
+each commit green.
