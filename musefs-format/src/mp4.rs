@@ -9,6 +9,7 @@ use crate::input::{
     ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, PictureType, TagInput,
 };
 use crate::layout::{RegionLayout, Segment};
+use crate::size;
 use std::io::{self, Read, Seek, SeekFrom};
 
 const MAX_MP4_METADATA_BYTES: u64 = 256 * 1024 * 1024;
@@ -693,13 +694,15 @@ fn build_udta(
             payload_id: bt.payload_id,
             len: bt.len,
         });
-        streamed_total += bt.len.get();
+        streamed_total = size::checked_add(streamed_total, bt.len.get())?;
     }
 
     if !arts.is_empty() {
         // One covr atom; each art is its own `data` child (the iTunes
         // convention for multiple artworks).
-        let covr_size: u64 = 8 + arts.iter().map(|a| 16 + a.data_len.get()).sum::<u64>();
+        let covr_size: u64 = arts.iter().try_fold(8u64, |acc, a| {
+            size::checked_add(acc, size::checked_add(16, a.data_len.get())?)
+        })?;
         ilst_inline.extend_from_slice(
             &u32::try_from(covr_size)
                 .map_err(|_| FormatError::TooLarge)?
@@ -708,7 +711,7 @@ fn build_udta(
         ilst_inline.extend_from_slice(b"covr");
         for a in arts {
             let type_code: u32 = if a.mime == "image/png" { 14 } else { 13 };
-            let data_size = 8 + 8 + a.data_len.get(); // data header + type + locale + image
+            let data_size = size::checked_add(16, a.data_len.get())?; // data header + type + locale + image
             ilst_inline.extend_from_slice(
                 &u32::try_from(data_size)
                     .map_err(|_| FormatError::TooLarge)?
@@ -722,7 +725,7 @@ fn build_udta(
                 art_id: a.art_id,
                 len: a.data_len,
             });
-            streamed_total += a.data_len.get();
+            streamed_total = size::checked_add(streamed_total, a.data_len.get())?;
         }
     } else if !ilst_inline.is_empty() {
         ilst_segments.push(Segment::Inline(std::mem::take(&mut ilst_inline)));
@@ -745,11 +748,11 @@ fn build_udta(
     // Box sizes. Each enclosing box adds its 8-byte header to the inline content of
     // its child and carries `streamed_total` through unchanged (the streamed bytes
     // live at the deepest level, inside ilst).
-    let ilst_size = 8 + ilst_inline_len + streamed_total;
+    let ilst_size = size::checked_sum([8, ilst_inline_len, streamed_total])?;
     let meta_inline_len = 4 + hdlr.len() as u64 + 8 + ilst_inline_len; // [vf][hdlr][ilst hdr][ilst inline]
-    let meta_size = 8 + meta_inline_len + streamed_total;
+    let meta_size = size::checked_sum([8, meta_inline_len, streamed_total])?;
     let udta_inline_len = 8 + meta_inline_len; // [meta hdr][meta inline]
-    let udta_size = 8 + udta_inline_len + streamed_total;
+    let udta_size = size::checked_sum([8, udta_inline_len, streamed_total])?;
 
     // MP4 box sizes are 32-bit. udta encloses all inner boxes, so converting it
     // first bounds them all; refuse oversized metadata at the format boundary
@@ -849,12 +852,15 @@ pub fn synthesize_layout(
     let (udta_segments, _streamed_total) = build_udta(tags, binary_tags, &arts)?;
     let udta_total: u64 = udta_segments.iter().map(Segment::len).sum();
 
-    let new_moov_size = 8 + kept.len() as u64 + udta_total;
+    let new_moov_size = size::checked_sum([8, kept.len() as u64, udta_total])?;
     // MP4 box sizes are 32-bit; mirror build_udta's bound. The try_from below
     // (writing the size field) is the enforcing check.
     let new_moov_size_u32 = u32::try_from(new_moov_size).map_err(|_| FormatError::TooLarge)?;
-    let new_mdat_payload_pos =
-        scan.ftyp.len() as u64 + new_moov_size + scan.mdat_header.len() as u64;
+    let new_mdat_payload_pos = size::checked_sum([
+        scan.ftyp.len() as u64,
+        new_moov_size,
+        scan.mdat_header.len() as u64,
+    ])?;
     let delta = new_mdat_payload_pos.cast_signed() - scan.mdat_payload_offset.cast_signed();
 
     patch_chunk_offsets(&mut kept, delta)?;
@@ -2431,6 +2437,25 @@ mod tests {
         assert!(
             matches!(err, Mp4ScanError::Io(_)),
             "exact-cap box must pass the strict `>` guard (got {err:?})"
+        );
+    }
+
+    #[test]
+    fn build_udta_checked_art_len_rejects_overflow() {
+        // A hostile art data_len near u64::MAX must fail closed with TooLarge at
+        // the covr_size fold, not panic (debug) / wrap (release).
+        let mk = |data_len: u64| crate::input::ArtInput {
+            art_id: 1,
+            mime: "image/png".to_string(),
+            description: String::new(),
+            picture_type: PictureType::new(3).unwrap(),
+            width: 0,
+            height: 0,
+            data_len: BlobLen::new(data_len).unwrap(),
+        };
+        assert_eq!(
+            build_udta(&[], &[], &[mk(u64::MAX)]).err(),
+            Some(FormatError::TooLarge)
         );
     }
 }
