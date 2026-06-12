@@ -63,9 +63,21 @@ constructed `Template` *structurally cannot* exceed `MAX_SECTION_DEPTH`. Therefo
 need no per-consumer depth guards — the invariant is established at the single
 construction point.
 
-**Call sites:**
-- `facade.rs:255` — propagate with `?` (already in a `Result` fn).
-- `facade.rs:1530`, `facade.rs:1787` (tests) — `.unwrap()` / `.expect()`.
+**Call sites (blast radius — larger than first estimated).** `Template::parse`
+is `pub` and has 34 call sites workspace-wide:
+- `facade.rs:255` — the single **production** site; propagate with `?` (already a
+  `Result` fn).
+- `facade.rs:1530`, `facade.rs:1787` and one in-module `template.rs` test —
+  `.expect(...)`.
+- **30 calls in `musefs-core/tests/template.rs`** — every one breaks when the
+  signature becomes fallible. The pre-commit gate runs the full workspace test
+  suite, so all of these must compile (and stay green) in the same commit. To keep
+  the churn mechanical and readable, add a private test helper
+  `fn parse(t: &str) -> Template { Template::parse(t).expect("valid template") }`
+  in that test module and the in-module `tests`, and rewrite the existing
+  call sites to use it; only the new negative-path tests call `Template::parse`
+  directly to assert `Err`. The implementation plan must list this rename as an
+  explicit step, not leave it implicit.
 
 ### 2. #303 — path-field segment cap (contain)
 
@@ -81,6 +93,12 @@ construction point.
   amplifier across a trust boundary is the per-field DB value, which this cap
   contains directly. Adding a second cap at `insert_file` would be unused defense
   against a non-threat (YAGNI).
+- **The multiplier is bounded.** A template can interleave several `$!{}` path
+  fields and literal `/`s, so worst-case rendered depth is
+  `(path-field count × MAX_PATH_FIELD_SEGMENTS) + (literal-slash count)`. Both
+  multiplicands are properties of the now-validated template (operator config,
+  bounded by template length), not of hostile DB data — so the product stays
+  bounded by trusted input. That is precisely why the per-field cap suffices.
 
 ### 3. Constants
 
@@ -114,6 +132,15 @@ existing FUSE regression coverage):
     `MAX_PATH_FIELD_SEGMENTS` components.
   - Values at/under the cap are unaffected; `.`/`..`/empty segments still dropped;
     per-segment control sanitization unchanged.
+- **Existing proptest adaptation** (`render_never_panics_and_path_fields_stay_safe`,
+  `tests/template.rs:261`). Its `tmpl in ".{0,64}"` strategy generates control
+  bytes and `[` runs, which `Template::parse` now legitimately *rejects*. The
+  chained `Template::parse(&tmpl).render(...)` therefore breaks both at compile
+  time (`Result` has no `.render`) and semantically. Rewrite the property as: a
+  template either fails to parse **or** renders without panicking —
+  `if let Ok(t) = Template::parse(&tmpl) { let _ = t.render(...); }`. The fixed
+  `Template::parse("$!{p}")` half uses the test `parse` helper (`.expect`). The
+  path-field safety assertions are unchanged.
 - **Regression**
   - FUSE/`readdir` path names never contain NUL (covered by the now-enforced
     literal rejection plus existing field-value sanitization).
