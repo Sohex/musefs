@@ -206,6 +206,13 @@ impl HeaderCache {
                                     .collect();
                                 (structural, &binary_tag_inputs)
                             };
+                        for key in invalid_vorbis_keys(&inputs) {
+                            log::warn!(
+                                "track {}: dropping tag key {key:?} from Vorbis \
+                                 synthesis (not a valid field name)",
+                                track.id
+                            );
+                        }
                         flac::synthesize_layout(
                             &structural,
                             track.bounds.audio_offset(),
@@ -282,6 +289,13 @@ impl HeaderCache {
                             .map(|meta| musefs_format::ogg::OggArt { meta })
                             .collect();
                         let src = crate::mapping::DbArtSource(db);
+                        for key in invalid_vorbis_keys(&inputs) {
+                            log::warn!(
+                                "track {}: dropping tag key {key:?} from Vorbis \
+                                 synthesis (not a valid field name)",
+                                track.id
+                            );
+                        }
                         musefs_format::ogg::synthesize_layout(
                             &header,
                             track.bounds.audio_offset(),
@@ -357,6 +371,20 @@ pub fn read_at_into<M>(
     } else {
         read_segments_into(resolved, db, None, offset, size, out)
     }
+}
+
+/// The distinct user-defined keys in `inputs` that the Vorbis synthesis path
+/// drops because they are not valid field names. Pure and unit-tested; the
+/// caller logs them so a silently-dropped key is observable. Deduped so a
+/// multi-valued bad key warns once, not once per value.
+fn invalid_vorbis_keys(inputs: &[musefs_format::TagInput]) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    inputs
+        .iter()
+        .map(|t| t.key.as_str())
+        .filter(|k| !musefs_format::is_valid_vorbis_key(k))
+        .filter(|k| seen.insert(*k))
+        .collect()
 }
 
 /// Allocating form of `read_at_into` (tests and non-hot-path callers).
@@ -640,6 +668,63 @@ mod resolve_ogg_tests {
         assert!(
             tags.iter()
                 .any(|(k, v)| k == "title" && v == "Telephasic Workshop")
+        );
+    }
+
+    #[test]
+    fn invalid_vorbis_keys_reports_distinct_out_of_grammar_keys() {
+        use musefs_format::TagInput;
+        let inputs = vec![
+            TagInput::new("artist", "A"),
+            TagInput::new("a=b", "c"),
+            TagInput::new("a=b", "d"), // same bad key twice -> reported once
+            TagInput::new("title", "S"),
+        ];
+        // Only the out-of-grammar key, deduped; valid keys are not flagged.
+        assert_eq!(invalid_vorbis_keys(&inputs), vec!["a=b"]);
+    }
+
+    #[test]
+    fn synthesis_drops_invalid_vorbis_key_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("track.opus");
+        let (audio_offset, audio_length) = build_opus_file(&path);
+
+        let db = Db::open_in_memory().unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let track_id = db
+            .upsert_track(&NewTrack {
+                backing_path: path.to_string_lossy().into_owned(),
+                format: Format::Opus,
+                audio_offset,
+                audio_length,
+                backing_size: meta.len(),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+            })
+            .unwrap();
+        // `a=b` passes the DB floor but is not a valid Vorbis field name. Without the
+        // fix it would synthesize `A=B=c` and re-parse as key "A", value "B=c".
+        db.replace_tags(
+            track_id,
+            &[
+                Tag::new("artist", "Alice", 0),
+                Tag::new("a=b", "c", 0),
+                Tag::new("title", "Song", 0),
+            ],
+        )
+        .unwrap();
+
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let resolved = cache.resolve(&db, track_id).unwrap();
+        let out = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
+
+        let tags = musefs_format::ogg::read_tags(&out).unwrap();
+        assert!(tags.iter().any(|(k, v)| k == "artist" && v == "Alice"));
+        assert!(tags.iter().any(|(k, v)| k == "title" && v == "Song"));
+        assert!(
+            !tags.iter().any(|(k, _)| k == "A" || k.contains('=')),
+            "the a=b key must be dropped, not synthesized as A=B=c: {tags:?}"
         );
     }
 

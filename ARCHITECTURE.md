@@ -171,6 +171,14 @@ malformed *shapes* at commit, so an external writer cannot persist them:
   length;
 - a `picture_type` outside `0..=20`;
 - a `tags.key` over 256 chars or `tags.value` over 256 KiB;
+- `tags.key` must be non-empty and contain no ASCII control characters (a DB
+  `CHECK` enforces this, rejecting violating writes — with one blind spot: an
+  embedded NUL terminates SQLite's `length()`/`GLOB`, so a key like `a\0b` slips
+  the `CHECK`. The scanner's own floor drops it before insert, and the Vorbis
+  path rejects it on synthesis). Additionally, only keys within the Vorbis
+  field-name grammar (ASCII `0x20`–`0x7D`, excluding `=`) survive FLAC/Ogg
+  synthesis — others are dropped and logged. MP3/M4A custom keys may use the
+  wider set (e.g. `=`, `:`, spaces, non-ASCII).
 - a `value_blob` over `MAX_BINARY_TAG_BYTES`;
 - an `art.mime` over 255 chars or `byte_len` over `MAX_ART_BYTES`;
 - a `track_art.description` over 1 KiB;

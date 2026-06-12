@@ -556,6 +556,17 @@ fn payload_weight(p: &Probed) -> u64 {
     pictures + binary + structural
 }
 
+/// The universal `tags.key` floor, mirrored from the DB `CHECK` exactly: a key
+/// must be non-empty and contain no byte below 0x20 (the control chars the DB
+/// rejects via its GLOB range; NUL also fails here, the DB's documented blind
+/// spot). DEL (0x7F) and high/non-ASCII bytes are accepted, matching the DB.
+/// Distinct from the strict Vorbis `is_valid_key` (which also bars `=`, 0x7E,
+/// 0x7F, and non-ASCII) — applying that here would wrongly drop legal MP3/M4A
+/// custom keys containing `=`/`:`/space.
+fn key_passes_floor(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| b >= 0x20)
+}
+
 /// Upsert a track from a probed backing file: write the track row, replace its
 /// seeded tags, and ingest its embedded art (capped, deduped, clamped).
 fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
@@ -573,6 +584,9 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     let mut tags = Vec::new();
     let mut ordinals: HashMap<String, u64> = HashMap::new();
     for (key, value) in probed.tags {
+        if !key_passes_floor(&key) {
+            continue;
+        }
         let ord = ordinals.entry(key.clone()).or_insert(0);
         tags.push(Tag::new(&key, &value, *ord));
         *ord += 1;
@@ -656,6 +670,9 @@ fn ingest_bulk(
     let mut tags = Vec::new();
     let mut ordinals: HashMap<String, u64> = HashMap::new();
     for (key, value) in &probed.tags {
+        if !key_passes_floor(key) {
+            continue;
+        }
         let ord = ordinals.entry(key.clone()).or_insert(0);
         tags.push(Tag::new(key, value, *ord));
         *ord += 1;
@@ -1903,6 +1920,88 @@ mod hardening_tests {
         );
         assert_eq!(rows[0].key, "PRIV");
         assert_eq!(rows[0].byte_len, 3);
+    }
+
+    fn probed_with_text_tags(tags: &[(&str, &str)]) -> Probed {
+        Probed {
+            format: musefs_db::Format::Mp3,
+            audio_offset: 0,
+            audio_length: 0,
+            tags: tags
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            pictures: Vec::new(),
+            binary_tags: Vec::new(),
+            structural_blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ingest_skips_empty_and_control_char_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.mp3");
+        std::fs::write(&path, b"x").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let db = Db::open_in_memory().unwrap();
+
+        ingest(
+            &db,
+            &path.to_string_lossy(),
+            &meta,
+            probed_with_text_tags(&[
+                ("artist", "Alice"),
+                ("", "dropped"),        // empty key
+                ("a\u{7}b", "dropped"), // control char
+                ("a\u{0}b", "dropped"), // embedded NUL — DB CHECK can't see it, the floor can
+                ("a=b", "kept"),        // '=' is NOT a floor violation
+            ]),
+        )
+        .unwrap();
+
+        let tid = db.list_tracks().unwrap()[0].id;
+        let keys: Vec<String> = db
+            .get_tags(tid)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.key)
+            .collect();
+        // get_tags is ORDER BY key, ordinal: '=' (0x3D) sorts before 'a' (0x61).
+        assert_eq!(keys, vec!["a=b".to_string(), "artist".to_string()]);
+    }
+
+    #[test]
+    fn ingest_bulk_skips_empty_and_control_char_keys() {
+        let db = Db::open_in_memory().unwrap();
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            ingest_bulk(
+                &mut bw,
+                "/a.mp3",
+                BackingStamp {
+                    size: 1,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                },
+                probed_with_text_tags(&[
+                    ("artist", "Alice"),
+                    ("", "dropped"),
+                    ("a\u{7}b", "dropped"),
+                    ("a\u{0}b", "dropped"), // embedded NUL — floor drops it
+                    ("a=b", "kept"),
+                ]),
+            )
+            .unwrap();
+            bw.commit().unwrap();
+        }
+        let tid = db.list_tracks().unwrap()[0].id;
+        let keys: Vec<String> = db
+            .get_tags(tid)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.key)
+            .collect();
+        assert_eq!(keys, vec!["a=b".to_string(), "artist".to_string()]);
     }
 
     /// Probed with two structural blocks of the SAME kind, to make the per-kind

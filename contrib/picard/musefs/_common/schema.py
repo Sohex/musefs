@@ -165,6 +165,8 @@ CREATE TABLE tags (
     CHECK (ordinal >= 0),
     CHECK (value_blob IS NULL OR value = ''),
     CHECK (length(key) <= 256),
+    CHECK (length(key) >= 1
+           AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
     CHECK (length(value) <= 262144),
     CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
 );

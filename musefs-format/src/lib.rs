@@ -22,6 +22,7 @@ pub use input::{
 pub use layout::{LayoutError, RegionLayout, Segment};
 pub use ogg::{Codec, OggHeader, OggScan};
 pub use probe::Extent;
+pub use vorbiscomment::is_valid_key as is_valid_vorbis_key;
 
 // tagmap is pure &str→key mapping with no byte parsing and is already exercised
 // indirectly by the per-format fuzz targets (which pass arbitrary tag keys through
