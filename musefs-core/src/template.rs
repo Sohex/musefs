@@ -3,6 +3,11 @@ use std::collections::BTreeSet;
 use std::iter::Peekable;
 use std::str::Chars;
 
+/// Max surviving segments a single `$!{}` path field may expand into. A hostile
+/// 256 KiB tag shaped `a/a/a/...` would otherwise build tens of thousands of
+/// directory levels (depth amplification across the DB trust boundary, #303).
+const MAX_PATH_FIELD_SEGMENTS: usize = 64;
+
 /// A parsed path template: literal runs, `$field` / `${field}` substitutions
 /// (with optional `${a|b}` fallback chains and `$!{field}` slash-preserving path
 /// fields), and `[...]` conditional sections. Parse once per mount; `render`
@@ -285,19 +290,21 @@ fn sanitize_into(out: &mut String, value: &str) {
     }
 }
 
-/// Split `value` on '/', drop empty / `.` / `..` segments, sanitize each
-/// surviving segment, and rejoin with '/'. Guarantees no empty, `.`, `..`, or
-/// leading/trailing-slash components reach the virtual tree.
 fn sanitize_path(value: &str) -> String {
     let mut out = String::new();
+    let mut count = 0usize;
     for segment in value.split('/') {
         if segment.is_empty() || segment == "." || segment == ".." {
             continue;
+        }
+        if count == MAX_PATH_FIELD_SEGMENTS {
+            break;
         }
         if !out.is_empty() {
             out.push('/');
         }
         sanitize_into(&mut out, segment);
+        count += 1;
     }
     out
 }

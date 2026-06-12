@@ -296,3 +296,26 @@ fn path_field_neutralizes_traversal_values() {
         }
     }
 }
+
+#[test]
+fn path_field_segment_count_is_capped() {
+    // MAX_PATH_FIELD_SEGMENTS is a private const = 64 in template.rs. A hostile
+    // 256 KiB `a/a/a/...` tag would expand to tens of thousands of segments; the
+    // cap clamps the rendered path to at most 64 directory components.
+    let value = vec!["a"; 200].join("/");
+    let f = fields(&[("p", value.as_str())]);
+    let rendered = Template::parse("$!{p}").render(&f, &BTreeMap::new(), "Unknown", "flac");
+    let body = rendered.strip_suffix(".flac").expect("ext appended");
+    assert_eq!(
+        body.split('/').count(),
+        64,
+        "clamped to MAX_PATH_FIELD_SEGMENTS"
+    );
+}
+
+#[test]
+fn path_field_under_cap_is_unchanged() {
+    let f = fields(&[("p", "a/b/c")]);
+    let rendered = Template::parse("$!{p}").render(&f, &BTreeMap::new(), "Unknown", "flac");
+    assert_eq!(rendered, "a/b/c.flac");
+}
