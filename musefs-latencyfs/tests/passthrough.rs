@@ -73,7 +73,7 @@ fn write_fsync_rename_unlink_through_the_mount() {
     }
     assert_eq!(std::fs::read(&p).unwrap(), b"abcdef");
     assert!(mount.fsyncs() >= 1, "fsync should have been counted");
-    // The bytes landed in the backing dir, not a tmpfs overlay (true passthrough).
+    // The bytes landed in the backing dir, not a tmpfs overlay (writes forwarded).
     assert_eq!(
         std::fs::read(backing.path().join("data.bin")).unwrap(),
         b"abcdef"
@@ -86,7 +86,7 @@ fn write_fsync_rename_unlink_through_the_mount() {
     std::fs::remove_file(&q).unwrap();
     assert!(!q.exists());
 
-    // The backing dir reflects the changes (true passthrough).
+    // The backing dir reflects the changes (rename/unlink forwarded).
     assert!(!backing.path().join("data.bin").exists());
 }
 
@@ -97,7 +97,7 @@ fn mkdir_rmdir_and_statfs_through_the_mount() {
     let mount = LatencyMount::new(backing.path(), "ssd").unwrap();
     let mp = mount.path();
 
-    // mkdir then rmdir, each reflected in the backing dir (true passthrough).
+    // mkdir then rmdir, each reflected in the backing dir (forwarded to backing).
     std::fs::create_dir(mp.join("d")).unwrap();
     assert!(backing.path().join("d").is_dir());
     std::fs::remove_dir(mp.join("d")).unwrap();
