@@ -446,7 +446,7 @@ mod fixtures_tests {
         let f = fixtures::m4a_two_covers(&[9u8; 16]);
         let b = crate::mp4::locate_audio(&f).unwrap();
         assert_eq!(b.audio_length, 16);
-        let pics = crate::mp4::read_pictures(&f);
+        let pics = crate::mp4::read_pictures(&f, usize::MAX);
         assert_eq!(pics.len(), 2);
         assert_eq!(pics[0].mime, "image/jpeg");
         assert_eq!(pics[0].data, [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]);
