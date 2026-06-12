@@ -241,10 +241,27 @@ Example for the binary-tag test:
     );
 ```
 
+Also update the **integration** test `synthesize_errors_on_oversized_picture` in `musefs-format/tests/synthesize_art.rs` — it likewise passes `&[]` and expects `TooLarge`. The `valid_streaminfo()` unit-test helper is NOT visible from the `tests/` directory, so build the block inline with the idiom the other integration tests use (`MetadataBlock { block_type: 0, body: streaminfo_body() }`; `streaminfo_body()` is already imported from `common` and returns a valid 34-byte body). Add `MetadataBlock` to the file's import and pass the block:
+
+```rust
+// add to the existing import at the top of musefs-format/tests/synthesize_art.rs:
+use musefs_format::flac::{locate_audio, synthesize_layout, MetadataBlock};
+
+// in synthesize_errors_on_oversized_picture, replace the `&[]` first argument:
+    let streaminfo = [MetadataBlock { block_type: 0, body: streaminfo_body() }];
+    assert_eq!(
+        synthesize_layout(&streaminfo, 0, 0, &[], &[], &[art]),
+        Err(FormatError::TooLarge)
+    );
+```
+
 - [ ] **Step 9: Run the full format suite to verify green**
 
 Run: `cargo test -p musefs-format`
-Expected: PASS. (Integration tests in `roundtrip.rs`/`synthesize_art.rs`/`synthesize_tags.rs` build structural via `streaminfo_body()` — a valid 34-byte body — so they stay green. `proptest_flac.rs` feeds `synthesize_layout` only successful `locate_audio` output, also green.)
+Expected: PASS. Note the split among integration tests:
+- `roundtrip.rs` and `synthesize_tags.rs` build structural via `MetadataBlock { block_type: 0, body: streaminfo_body() }` (valid 34-byte STREAMINFO) and the `make_flac`/`locate_audio` round-trip, so they stay green untouched.
+- `synthesize_art.rs::synthesize_errors_on_oversized_picture` is the one that passed `&[]`; it was fixed in Step 8.
+- `proptest_flac.rs` feeds `synthesize_layout` only successful `locate_audio` output (a valid STREAMINFO-first fixture), so it stays green.
 
 - [ ] **Step 10: Update FLAC docs**
 
@@ -255,7 +272,7 @@ In `docs/FLAC.md`, add a sentence to the metadata/synthesis section: the parser 
 ```bash
 cd /home/cfutro/git/musefs/.worktrees/parser-strictness
 cargo fmt
-git add musefs-format/src/flac.rs docs/FLAC.md
+git add musefs-format/src/flac.rs musefs-format/tests/synthesize_art.rs docs/FLAC.md
 git commit -m "$(cat <<'EOF'
 fix(flac): validate STREAMINFO structure at scan and synthesis (#295)
 
@@ -668,9 +685,12 @@ fn serve_ogg_window_wraps_seq_past_u32_max() {
     let mut out = Vec::new();
     serve_ogg_window(&backing, ao, alen, 1, 0, alen, &mut out, None).unwrap();
 
-    // The served page header must carry the wrapped sequence (u32::MAX + 1 == 0).
-    let want = patch_page_header(&page[..parse_page(&page, 0).unwrap().total_len()], 0).unwrap();
-    assert_eq!(&out[..want.len()], &want[..]);
+    // The served region must be the page with its sequence wrapped (u32::MAX + 1 == 0):
+    // patched header followed by the original payload bytes.
+    let h = parse_page(&page, 0).unwrap();
+    let mut want = patch_page_header(&page[..h.total_len()], 0).unwrap();
+    want.extend_from_slice(&page[h.header_len..h.total_len()]);
+    assert_eq!(out, want);
 }
 ```
 
@@ -744,7 +764,7 @@ Expected: no warnings; fmt clean (check exit status directly).
 
 The fuzz crate is outside the workspace and uses format-layer APIs. No public signatures changed (`riff_wave_start` is private; `locate_audio`/`synthesize_layout` signatures are unchanged), but confirm:
 Run: `cargo +nightly fuzz build flac ; cargo +nightly fuzz build mp3 ; cargo +nightly fuzz build wav ; cargo +nightly fuzz build ogg`
-Expected: builds succeed. (If any target now exercises the stricter parser and a corpus seed is a malformed file the parser used to accept, that seed simply returns `Err` — not a build break.)
+Expected: builds succeed. (If any target now exercises the stricter parser and a corpus seed is a malformed file the parser used to accept, that seed simply returns `Err` — not a build break.) The FLAC fuzz target chains `locate_audio` → `synthesize_layout(&scan.preserved, …)`; because strict `locate_audio` now succeeds only for valid STREAMINFO-first input, `scan.preserved` always satisfies the new synthesis check, so the chain gains no new panic/assert path.
 
 - [ ] **Step 4: Confirm the four commits are present and the tree is clean**
 
