@@ -128,6 +128,24 @@ than FUSE mounting (mounting arbitrary filesystems, and more). It is unavoidable
 for an in-container FUSE mount, but it is another reason to prefer running musefs
 on the host, which needs no such capability.
 
+#### Runs as a non-root user
+
+The images run as a dedicated unprivileged user (default uid/gid 1000), not
+root — musefs mounts via the setuid `fusermount3` helper and needs no root of
+its own. Consequences for the commands above:
+
+- The bind-mounted **store** volume must be writable by that uid. Either
+  `chown 1000:1000 /path/to/store` on the host, or add `--user $(id -u):$(id -g)`
+  to run as your own uid. The **library** volume is mounted `:ro`, so its
+  ownership does not matter.
+- To bake an image whose user matches your host account (so no `chown` or
+  `--user` is needed), build from source with
+  `--build-arg MUSEFS_UID=$(id -u) --build-arg MUSEFS_GID=$(id -g)`.
+- The images include `user_allow_other` in `/etc/fuse.conf`, so a non-root
+  `--allow-other` / `--owner` / `--group` mount (used by the pod pattern below)
+  passes musefs's pre-flight check. See
+  [Ownership and permissions](#ownership-and-permissions).
+
 #### The mount-visibility gotcha (read this before sharing the mount)
 
 A FUSE mount made **inside** a container lives in that container's mount
@@ -306,7 +324,9 @@ world bits (e.g. `--file-mode 440 --dir-mode 550`) — only then does
 refuses an `allow_other` mount unless `/etc/fuse.conf` contains a line
 `user_allow_other`. musefs checks this before mounting and fails with an
 explanatory error if it is missing; add the line to `/etc/fuse.conf`, or run
-musefs as root. (This is libfuse/system policy, not a musefs restriction.)
+musefs as root. (This is libfuse/system policy, not a musefs restriction.) The
+published container images already include this line, so non-root `allow_other`
+mounts work out of the box there.
 
 ### Configuring with environment variables
 

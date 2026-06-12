@@ -6,9 +6,23 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends fuse3 \
  && rm -rf /var/lib/apt/lists/*
 
+# Run as a dedicated unprivileged user. musefs mounts via the setuid fusermount3
+# helper and needs no root. The uid/gid default to 1000 but are build-arg
+# configurable: build with `--build-arg MUSEFS_UID=$(id -u) --build-arg
+# MUSEFS_GID=$(id -g)` to match your host owner and skip the store chown.
+# A bind-mounted store volume must be writable by the chosen uid.
+# user_allow_other lets a non-root --allow-other / --owner mount pass musefs's
+# /etc/fuse.conf pre-flight check (needed for the multi-container pod pattern).
+ARG MUSEFS_UID=1000
+ARG MUSEFS_GID=1000
+RUN groupadd -g "${MUSEFS_GID}" musefs \
+ && useradd -u "${MUSEFS_UID}" -g "${MUSEFS_GID}" -M -s /usr/sbin/nologin musefs \
+ && echo 'user_allow_other' >> /etc/fuse.conf
+
 # TARGETARCH is auto-populated by buildx per platform (amd64 / arm64); the build
 # context root holds <arch>/musefs for each.
 ARG TARGETARCH
 COPY ${TARGETARCH}/musefs /usr/local/bin/musefs
 
+USER musefs
 ENTRYPOINT ["musefs"]
