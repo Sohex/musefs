@@ -77,8 +77,18 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .map_or(0, |d| d.as_secs().cast_signed())
 }
 
-fn read_front(path: &Path, n: u64) -> std::io::Result<Vec<u8>> {
+fn read_front(path: &Path, n: u64) -> crate::Result<Vec<u8>> {
     use std::io::Read;
+    // Fail closed before any allocation/open: a hostile DB row can request an
+    // arbitrary `audio_offset`, but no legitimately-scanned file has a front
+    // larger than the scanner's probe ceiling. Bounding `n` here also retires a
+    // 32-bit `usize_from` truncation footgun.
+    if n > crate::scan::MAX_PROBE_BYTES {
+        return Err(CoreError::HeaderTooLarge {
+            requested: n,
+            cap: crate::scan::MAX_PROBE_BYTES,
+        });
+    }
     crate::metrics::on_open();
     let mut f = std::fs::File::open(path)?;
     let mut buf = vec![0u8; usize_from(n)];
@@ -1311,5 +1321,28 @@ mod binary_tag_serve_tests {
         // No BackingAudio segment, so read_at opens no file.
         let got = read_at(&resolved, &db, 1, 2).unwrap();
         assert_eq!(got, vec![20, 30]);
+    }
+}
+
+#[cfg(test)]
+mod serve_cap_tests {
+    use super::*;
+
+    const CAP: u64 = crate::scan::MAX_PROBE_BYTES;
+
+    #[test]
+    fn read_front_rejects_oversize_before_open() {
+        // Nonexistent path: if the cap check did NOT fire first, File::open would
+        // error and we'd get an Io error instead of HeaderTooLarge. So this also
+        // pins the fail-closed ordering (check precedes any open/allocation).
+        let err =
+            read_front(std::path::Path::new("/nonexistent/musefs/front"), CAP + 1).unwrap_err();
+        match err {
+            CoreError::HeaderTooLarge { requested, cap } => {
+                assert_eq!(requested, CAP + 1);
+                assert_eq!(cap, CAP);
+            }
+            other => panic!("expected HeaderTooLarge, got {other:?}"),
+        }
     }
 }

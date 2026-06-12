@@ -105,6 +105,7 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::OrphanedArt { .. }
         | CoreError::ArtTooLarge { .. }
         | CoreError::InvalidPictureType { .. }
+        | CoreError::HeaderTooLarge { .. }
         | CoreError::Format(_) => fuser::Errno::EIO,
     }
 }
@@ -599,6 +600,14 @@ mod tests {
                 art_id: 2,
                 byte_len: 16_711_681,
                 cap: 16_711_680,
+            })
+            .code(),
+            libc::EIO
+        );
+        assert_eq!(
+            errno(&CoreError::HeaderTooLarge {
+                requested: 67_108_865,
+                cap: 67_108_864,
             })
             .code(),
             libc::EIO

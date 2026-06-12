@@ -41,6 +41,8 @@ pub enum CoreError {
         byte_len: u64,
         cap: u64,
     },
+    #[error("front/header read of {requested} bytes exceeds the {cap}-byte serve cap")]
+    HeaderTooLarge { requested: u64, cap: u64 },
     #[error("track {0} not found")]
     TrackNotFound(i64),
     #[error("no such inode: {0}")]

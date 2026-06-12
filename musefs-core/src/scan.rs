@@ -22,7 +22,7 @@ const MAX_WIDEN_RETRIES: usize = 8;
 /// rather than read whole into RAM. Guards against a multi-GB file misnamed with
 /// an audio extension, and against a corrupt header whose length field demands a
 /// giant `NeedMore` widen.
-const MAX_PROBE_BYTES: u64 = 64 << 20; // 64 MiB
+pub(crate) const MAX_PROBE_BYTES: u64 = 64 << 20; // 64 MiB
 
 /// The artwork-size ceiling. Enforced here at ingest (oversize scanned art is
 /// dropped) and at resolve in `mapping::track_art_to_inputs` (oversize art from
