@@ -331,27 +331,53 @@ fn revalidate_failed_carries_scan_failure() {
     );
 }
 
-// === Full-probe oracle counters (scan_directory_full_oracle, lines 858/864) ===
+// === Full-probe oracle counters (scan_directory_full_oracle) ===
 
-/// The full-file-probe oracle's `scanned`/`skipped` counters must reflect the
-/// corpus exactly. A directory with one valid FLAC and one extension-only
-/// `.flac` of garbage (collected by `is_supported_audio`, then rejected by
-/// `probe_full`) yields scanned == 1, skipped == 1. The `+=`→`-=` mutants
-/// underflow-panic from 0 and `+=`→`*=` pin the counter at 0, so both counters
-/// must be asserted nonzero and exact.
-// kills scan L858 `stats.skipped += 1` and L864 `stats.scanned += 1` `+=`→`-=`/`*=`
+/// The full-file-probe oracle's `scanned`/`failed`/`skipped` counters must
+/// reflect the corpus exactly: one valid FLAC (`scanned`), one extension-only
+/// `.flac` of garbage that `is_supported_audio` collects but `probe_full`
+/// rejects (`failed`), and one unsupported-extension file dropped at collection
+/// (`skipped`). Asserting all three nonzero-and-exact kills the `+=`→`-=`
+/// (underflow-panic from 0) and `+=`→`*=` (pinned at 0) mutants on the oracle's
+/// `stats.scanned += 1` / `stats.failed += 1` and on collection's `*skipped += 1`.
 #[test]
-fn oracle_counts_scanned_and_skipped_exactly() {
+fn oracle_counts_scanned_failed_and_skipped_exactly() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("good.flac"), flac_minimal(b"AUDIO-OK")).unwrap();
-    // Extension-only: `is_supported_audio` collects it, but `probe_full` returns
-    // None (no fLaC marker) → counted as skipped, not scanned.
+    // Extension-only: collected by `is_supported_audio`, rejected by `probe_full`.
     std::fs::write(dir.path().join("bad.flac"), b"not a flac at all").unwrap();
+    // Unsupported extension: dropped at collection → skipped.
+    std::fs::write(dir.path().join("notes.txt"), b"not audio").unwrap();
 
     let db = Db::open_in_memory().unwrap();
     let stats = scan_directory_full_oracle(&db, dir.path()).unwrap();
 
     assert_eq!(stats.scanned, 1, "exactly the one valid FLAC is scanned");
-    assert_eq!(stats.skipped, 1, "the garbage .flac is skipped");
+    assert_eq!(stats.failed, 1, "the garbage .flac is a failure");
+    assert_eq!(stats.skipped, 1, "the .txt is skipped at collection");
     assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
+
+/// Under follow, a symlink whose target has an unsupported extension counts as
+/// skipped, symmetric with a regular unsupported file. Covers the symlink-arm
+/// `*skipped += 1` site.
+#[test]
+fn follow_symlinks_counts_unsupported_symlink_target_as_skipped() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let txt = dir.path().join("notes.txt");
+    std::fs::write(&txt, b"hi").unwrap();
+    symlink(&txt, dir.path().join("link.txt")).unwrap();
+    std::fs::write(dir.path().join("song.flac"), flac_minimal(b"AUDIO")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 1);
+    // notes.txt (regular) + link.txt (symlink target) → both skipped.
+    assert_eq!(stats.skipped, 2);
 }
