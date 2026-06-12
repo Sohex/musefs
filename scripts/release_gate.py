@@ -20,27 +20,40 @@ class Decision(enum.Enum):
     FAIL = "fail"
 
 
-def latest_completed_by_name(runs, name):
+def latest_completed_by_name(runs, name, since=None):
     """Return the newest *completed* check-run with ``name``, or ``None``.
 
     The Checks API returns every run of a name (including re-runs); the gate
     only trusts the most recently completed one, sorted by ``completed_at``.
+
+    When ``since`` (an ISO-8601 timestamp) is given, runs that *started* before
+    it are discarded as stale: ``ci-ok``/``coverage-ok`` are late aggregator
+    jobs, so a release tag's fresh runs only appear minutes in. Filtering on
+    ``started_at`` keeps the gate from trusting a still-green main-branch run
+    from before the tag, which would let the release skip the tag-only legs.
     """
     completed = [
         r
         for r in runs
-        if r.get("name") == name and r.get("status") == "completed" and r.get("completed_at")
+        if r.get("name") == name
+        and r.get("status") == "completed"
+        and r.get("completed_at")
+        and (since is None or (r.get("started_at") or "") >= since)
     ]
     if not completed:
         return None
     return max(completed, key=lambda r: r["completed_at"])
 
 
-def decide(runs, names):
-    """Return a :class:`Decision` for the required check ``names``."""
+def decide(runs, names, since=None):
+    """Return a :class:`Decision` for the required check ``names``.
+
+    ``since`` is forwarded to :func:`latest_completed_by_name` to discard
+    pre-tag (stale) runs.
+    """
     saw_missing = False
     for name in names:
-        chosen = latest_completed_by_name(runs, name)
+        chosen = latest_completed_by_name(runs, name, since)
         if chosen is None:
             saw_missing = True
             continue
@@ -52,6 +65,12 @@ def decide(runs, names):
 def main(argv=None, stdin_text=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--names", nargs="+", required=True, help="required check-run names")
+    parser.add_argument(
+        "--since",
+        default=None,
+        help="ISO-8601 cutoff; ignore check-runs that started before it (stale "
+        "pre-tag runs). Pass the release run's run_started_at.",
+    )
     args = parser.parse_args(argv)
 
     text = stdin_text if stdin_text is not None else sys.stdin.read()
@@ -67,7 +86,7 @@ def main(argv=None, stdin_text=None):
     # mis-slurped gh payload can produce — must degrade to "wait", not raise.
     runs = (payload.get("check_runs") if isinstance(payload, dict) else None) or []
 
-    result = decide(runs, args.names)
+    result = decide(runs, args.names, args.since)
     if result is Decision.FAIL:
         print(f"::error::A required check did not succeed for this commit ({args.names}).")
         return 1
