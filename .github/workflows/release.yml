@@ -65,15 +65,17 @@ jobs:
           echo "Gating on check-runs started at/after ${SINCE} (the tag trigger)."
           deadline=$(( $(date +%s) + 45 * 60 ))   # 45 min covers the full matrix
           while :; do
-            # --slurp collects all pages into one JSON array; the jq filter then
-            # flattens every page's check_runs into a single {check_runs: [...]}
-            # object (plain --paginate would emit one object per page, which is
-            # not valid single-document JSON).
+            # --slurp collects all pages into one JSON array; a standalone jq
+            # then flattens every page's check_runs into a single
+            # {check_runs: [...]} object (plain --paginate would emit one object
+            # per page, which is not valid single-document JSON). gh forbids
+            # combining --slurp with its built-in -q/--jq, so the flatten runs as
+            # a separate jq process (preinstalled on ubuntu-latest).
             # `|| true`: tolerate a transient gh/API failure — release_gate.py
             # treats an empty/garbled checks.json as "wait", so the loop retries
             # rather than aborting the release on a single blip.
             gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
-              --paginate --slurp -q '{check_runs: [.[].check_runs[]]}' > checks.json || true
+              --paginate --slurp | jq '{check_runs: [.[].check_runs[]]}' > checks.json || true
             set +e
             python scripts/release_gate.py --names ci-ok coverage-ok --since "$SINCE" < checks.json
             rc=$?
