@@ -225,8 +225,8 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             audio_offset: bounds.audio_offset,
             audio_length: bounds.audio_length,
             tags: mp4::read_tags(bytes),
-            pictures: mp4::read_pictures(bytes),
-            binary_tags: mp4::read_binary_tags(bytes),
+            pictures: mp4::read_pictures(bytes, MAX_ART_BYTES),
+            binary_tags: mp4::read_binary_tags(bytes, MAX_BINARY_TAG_BYTES),
             structural_blocks: Vec::new(),
         })
     } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
@@ -307,8 +307,8 @@ fn probe_file(path: &Path, file_len: u64, window: usize) -> std::io::Result<Opti
             audio_offset: scan.mdat_payload_offset,
             audio_length: scan.mdat_payload_len,
             tags: mp4::read_tags(&scan.moov),
-            pictures: mp4::read_pictures(&scan.moov),
-            binary_tags: mp4::read_binary_tags(&scan.moov),
+            pictures: mp4::read_pictures(&scan.moov, MAX_ART_BYTES),
+            binary_tags: mp4::read_binary_tags(&scan.moov, MAX_BINARY_TAG_BYTES),
             structural_blocks: Vec::new(),
         }));
     }
@@ -1134,6 +1134,70 @@ mod scan_unit_tests {
         assert_eq!(bt.payload, vec![0x00, 0xAB, 0xCD]);
         let scan = mp4::read_structure(&bytes).unwrap();
         assert_eq!(probed.audio_offset, scan.mdat_payload_offset);
+    }
+
+    fn mp4_with_covr(type_code: u32, value: &[u8]) -> Vec<u8> {
+        fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut v = u32::try_from(8 + body.len())
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
+            v.extend_from_slice(kind);
+            v.extend_from_slice(body);
+            v
+        }
+        let mut hdlr_body = vec![0u8; 8];
+        hdlr_body.extend_from_slice(b"soun");
+        hdlr_body.extend_from_slice(&[0u8; 12]);
+        let trak = bx(b"trak", &bx(b"mdia", &bx(b"hdlr", &hdlr_body)));
+
+        let mut data_body = type_code.to_be_bytes().to_vec();
+        data_body.extend_from_slice(&0u32.to_be_bytes());
+        data_body.extend_from_slice(value);
+        let ilst = bx(b"ilst", &bx(b"covr", &bx(b"data", &data_body)));
+        let mut meta = 0u32.to_be_bytes().to_vec();
+        meta.extend(bx(b"hdlr", &[0u8; 25]));
+        meta.extend(ilst);
+        let udta = bx(b"udta", &bx(b"meta", &meta));
+
+        let moov = bx(b"moov", &[trak, udta].concat());
+        [bx(b"ftyp", b"M4A "), moov, bx(b"mdat", b"AUDIODATA")].concat()
+    }
+
+    #[test]
+    fn probe_file_skips_oversized_mp4_covr() {
+        let oversized = vec![0xFFu8; MAX_ART_BYTES + 1];
+        let bytes = mp4_with_covr(13, &oversized);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized_art.m4a");
+        std::fs::write(&path, &bytes).unwrap();
+        let probed = probe_file(&path, bytes.len() as u64, 0)
+            .unwrap()
+            .expect("m4a should probe");
+        assert_eq!(probed.format, Format::M4a);
+        assert!(
+            probed.pictures.is_empty(),
+            "oversized covr must be skipped at extraction, not materialized"
+        );
+    }
+
+    #[test]
+    fn probe_file_skips_oversized_mp4_binary_freeform() {
+        // A `----` value larger than MAX_BINARY_TAG_BYTES must be skipped at
+        // extraction by the real seek-path scanner, so it is absent from Probed.
+        let oversized = vec![0xABu8; MAX_BINARY_TAG_BYTES + 1];
+        let bytes = mp4_with_binary_freeform("com.serato.dj", "analysis", &oversized);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized_bin.m4a");
+        std::fs::write(&path, &bytes).unwrap();
+        let probed = probe_file(&path, bytes.len() as u64, 0)
+            .unwrap()
+            .expect("m4a should probe");
+        assert_eq!(probed.format, Format::M4a);
+        assert!(
+            probed.binary_tags.is_empty(),
+            "oversized binary freeform must be skipped at extraction, not materialized"
+        );
     }
 }
 

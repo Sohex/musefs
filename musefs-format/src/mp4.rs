@@ -433,7 +433,11 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
 /// seeds cover art from existing files, so a missing or garbled picture must simply be absent.
 /// Every `data` child of every `covr` atom yields one picture (the iTunes
 /// multiple-artwork convention); non-`data` children are skipped.
-pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
+///
+/// `max_art_bytes` caps each image body: a `data` payload whose image bytes
+/// (after the 8-byte `[type][locale]` header) exceed it is skipped before any
+/// copy, so an oversized `covr` in a large `moov` is never materialized.
+pub fn read_pictures(buf: &[u8], max_art_bytes: usize) -> Vec<EmbeddedPicture> {
     let Some((start, len)) = ilst_region(buf) else {
         return Vec::new();
     };
@@ -450,6 +454,9 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
             }
             let dp = data.payload(inner);
             if dp.len() < 8 {
+                continue;
+            }
+            if dp.len() - 8 > max_art_bytes {
                 continue;
             }
             let mime = match u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]) {
@@ -477,7 +484,11 @@ pub fn read_pictures(buf: &[u8]) -> Vec<EmbeddedPicture> {
 /// (type 1) are handled by `read_tags`, so the two paths never double-store.
 /// Lenient: malformed atoms are skipped. Only the first `data` sub-box is read
 /// (multi-value freeform is rare; mirrors `read_freeform`).
-pub fn read_binary_tags(buf: &[u8]) -> Vec<EmbeddedBinaryTag> {
+///
+/// `max_binary_tag_bytes` caps each value: a `data` payload whose value bytes
+/// (after the 8-byte `[type][locale]` header) exceed it is skipped before any
+/// copy, so an oversized `----` in a large `moov` is never materialized.
+pub fn read_binary_tags(buf: &[u8], max_binary_tag_bytes: usize) -> Vec<EmbeddedBinaryTag> {
     let Some((start, len)) = ilst_region(buf) else {
         return Vec::new();
     };
@@ -493,6 +504,9 @@ pub fn read_binary_tags(buf: &[u8]) -> Vec<EmbeddedBinaryTag> {
         };
         let dp = data.payload(inner);
         if dp.len() < 8 {
+            continue;
+        }
+        if dp.len() - 8 > max_binary_tag_bytes {
             continue;
         }
         // `data` body is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text,
@@ -1087,7 +1101,7 @@ mod tests {
     fn reads_cover_art() {
         let jpeg = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3];
         let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, &jpeg)), false);
-        let pics = read_pictures(&buf);
+        let pics = read_pictures(&buf, usize::MAX);
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].mime, "image/jpeg");
         assert_eq!(pics[0].data, jpeg);
@@ -1097,17 +1111,17 @@ mod tests {
     fn read_side_never_panics_on_garbage() {
         // Empty buffer.
         assert!(read_tags(&[]).is_empty());
-        assert!(read_pictures(&[]).is_empty());
+        assert!(read_pictures(&[], usize::MAX).is_empty());
 
         // Random non-MP4 bytes.
         let garbage = b"not an mp4 file at all............";
         assert!(read_tags(garbage).is_empty());
-        assert!(read_pictures(garbage).is_empty());
+        assert!(read_pictures(garbage, usize::MAX).is_empty());
 
         // Valid moov but no udta/meta/ilst.
         let no_ilst = mk_mp4(true, b"AUDIO", &[0]);
         assert!(read_tags(&no_ilst).is_empty());
-        assert!(read_pictures(&no_ilst).is_empty());
+        assert!(read_pictures(&no_ilst, usize::MAX).is_empty());
 
         // A meta FullBox whose payload is shorter than the 4 version/flags bytes it
         // needs: exercises the `udta.get(meta.payload_start()+4..meta.end())?` guard.
@@ -1117,7 +1131,7 @@ mod tests {
         let mdat = bx(b"mdat", b"AUDIO");
         let lying = [ftyp, moov, mdat].concat();
         assert!(read_tags(&lying).is_empty());
-        assert!(read_pictures(&lying).is_empty());
+        assert!(read_pictures(&lying, usize::MAX).is_empty());
     }
 
     #[test]
@@ -1830,7 +1844,7 @@ mod tests {
         // covr/data payload of exactly 8 bytes (type+locale, empty image) is the
         // boundary of `dp.len() < 8`; the (empty) picture must be read.
         let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, b"")), true);
-        let pics = read_pictures(&buf);
+        let pics = read_pictures(&buf, usize::MAX);
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].mime, "image/jpeg");
         assert!(pics[0].data.is_empty());
@@ -1842,7 +1856,7 @@ mod tests {
         // drops it to `_ => continue` and yields no picture.
         let png = [0x89, b'P', b'N', b'G', 1, 2, 3];
         let buf = mp4_with_ilst(&bx(b"covr", &data_atom(14, &png)), false);
-        let pics = read_pictures(&buf);
+        let pics = read_pictures(&buf, usize::MAX);
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].mime, "image/png");
         assert_eq!(pics[0].data, png);
@@ -1865,12 +1879,28 @@ mod tests {
             .concat(),
         );
         let buf = mp4_with_ilst(&covr, true);
-        let pics = read_pictures(&buf);
+        let pics = read_pictures(&buf, usize::MAX);
         assert_eq!(pics.len(), 2);
         assert_eq!(pics[0].mime, "image/jpeg");
         assert_eq!(pics[0].data, jpeg);
         assert_eq!(pics[1].mime, "image/png");
         assert_eq!(pics[1].data, png);
+    }
+
+    #[test]
+    fn read_pictures_skips_art_over_budget() {
+        let over = vec![0xFFu8; 5];
+        let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, &over)), true);
+        assert!(read_pictures(&buf, 4).is_empty());
+    }
+
+    #[test]
+    fn read_pictures_accepts_art_exactly_at_budget() {
+        let exact = vec![0xFFu8; 4];
+        let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, &exact)), true);
+        let pics = read_pictures(&buf, 4);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].data, exact);
     }
 
     #[test]
@@ -1882,7 +1912,7 @@ mod tests {
             &[bx(b"free", b"pad"), data_atom(14, &png)].concat(),
         );
         let buf = mp4_with_ilst(&covr, false);
-        let pics = read_pictures(&buf);
+        let pics = read_pictures(&buf, usize::MAX);
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].mime, "image/png");
         assert_eq!(pics[0].data, png);
@@ -2015,7 +2045,7 @@ mod tests {
             bx(b"mdat", b"A"),
         ]
         .concat();
-        let pics = read_pictures(&buf);
+        let pics = read_pictures(&buf, usize::MAX);
         assert_eq!(pics.len(), 2);
         assert_eq!(pics[0].mime, "image/jpeg");
         assert_eq!(pics[0].data.len(), 5);
@@ -2153,14 +2183,14 @@ mod tests {
         let text = freeform_atom_typed("com.apple.iTunes", "MOOD", 1, b"calm");
         let moov = moov_with_ilst(&[binary, text].concat());
 
-        let tags = read_binary_tags(&moov);
+        let tags = read_binary_tags(&moov, usize::MAX);
         assert_eq!(tags.len(), 1, "only the binary `----` is opaque");
         assert_eq!(tags[0].key, "----:com.serato.dj:analysis");
         assert_eq!(tags[0].payload, serato);
 
         // The text `----` is the text path's job, never opaque.
         assert!(
-            read_binary_tags(&moov)
+            read_binary_tags(&moov, usize::MAX)
                 .iter()
                 .all(|t| t.key != "----:com.apple.iTunes:MOOD")
         );
@@ -2192,10 +2222,30 @@ mod tests {
         let empty = freeform_atom_typed("com.serato.dj", "empty", 0, b"");
         let moov = moov_with_ilst(&[short, empty].concat());
 
-        let tags = read_binary_tags(&moov);
+        let tags = read_binary_tags(&moov, usize::MAX);
         assert_eq!(tags.len(), 1, "short data skipped, 8-byte data emitted");
         assert_eq!(tags[0].key, "----:com.serato.dj:empty");
         assert!(tags[0].payload.is_empty());
+    }
+
+    #[test]
+    fn read_binary_tags_skips_payload_over_budget() {
+        // A `----` value of 5 bytes with a budget of 4: skipped before any copy.
+        let over = vec![0xABu8; 5];
+        let atom = freeform_atom_typed("com.serato.dj", "analysis", 0, &over);
+        let moov = moov_with_ilst(&atom);
+        assert!(read_binary_tags(&moov, 4).is_empty());
+    }
+
+    #[test]
+    fn read_binary_tags_accepts_payload_exactly_at_budget() {
+        // Boundary: value length == budget is still extracted.
+        let exact = vec![0xABu8; 4];
+        let atom = freeform_atom_typed("com.serato.dj", "analysis", 0, &exact);
+        let moov = moov_with_ilst(&atom);
+        let tags = read_binary_tags(&moov, 4);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].payload, exact);
     }
 
     #[test]
@@ -2255,7 +2305,7 @@ mod tests {
         // `read_binary_tags` returns a bare Vec (no promotion for MP4) and emits the
         // raw `mean:name` key WITHOUT folding through the vocabulary — `com.serato.dj`
         // is not in any vocabulary entry, so the key is preserved verbatim.
-        let reparsed = read_binary_tags(&served);
+        let reparsed = read_binary_tags(&served, usize::MAX);
         assert_eq!(reparsed.len(), 1);
         assert_eq!(reparsed[0].key, "----:com.serato.dj:analysis");
         assert_eq!(reparsed[0].payload, payload);
