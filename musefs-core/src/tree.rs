@@ -24,27 +24,48 @@ pub enum RebuildError {
 /// Retired paths are dropped by `prune_retired` once they outnumber live ones,
 /// bounding the map at 2x the live tree between prunes; a path that returns
 /// after a prune gets a fresh inode rather than its old one.
+/// In case-insensitive mounts the key is case-folded, so a track keeps its
+/// inode when an unrelated deletion flips a merged directory's display casing
+/// (#305).
 #[derive(Debug, Clone)]
 pub struct InodeAllocator {
     paths: ImHashMap<String, u64>,
     next: u64,
+    fold_keys: bool,
 }
 
 impl InodeAllocator {
-    pub fn new() -> InodeAllocator {
+    pub fn new(case_insensitive: bool) -> InodeAllocator {
         let mut paths = ImHashMap::new();
         paths.insert(String::new(), VirtualTree::ROOT); // root path "" -> inode 1
-        InodeAllocator { paths, next: 2 }
+        InodeAllocator {
+            paths,
+            next: 2,
+            fold_keys: case_insensitive,
+        }
     }
+
+    /// Transform a path into its map key: case-folded when the mount is
+    /// case-insensitive (so a survivor keeps its inode when an unrelated deletion
+    /// flips a merged directory's display casing, #305), identity otherwise.
+    fn key<'a>(&self, path: &'a str) -> Cow<'a, str> {
+        if self.fold_keys {
+            Cow::Owned(fold(path))
+        } else {
+            Cow::Borrowed(path)
+        }
+    }
+
     /// The inode for `path` (the disambiguated path from root), reused if seen
     /// before, else freshly allocated.
     fn intern(&mut self, path: &str) -> u64 {
-        if let Some(&ino) = self.paths.get(path) {
+        let key = self.key(path);
+        if let Some(&ino) = self.paths.get(key.as_ref()) {
             return ino;
         }
         let ino = self.next;
         self.next += 1;
-        self.paths.insert(path.to_string(), ino);
+        self.paths.insert(key.into_owned(), ino);
         ino
     }
 
@@ -60,7 +81,7 @@ impl InodeAllocator {
         }
         let mut live = ImHashMap::new();
         for &ino in tree.nodes.keys() {
-            live.insert(tree.path_of(ino), ino);
+            live.insert(self.key(&tree.path_of(ino)).into_owned(), ino);
         }
         self.paths = live;
     }
@@ -105,7 +126,7 @@ impl VirtualTree {
     pub const ROOT: u64 = 1;
 
     pub fn build(entries: &[(i64, String)]) -> VirtualTree {
-        VirtualTree::build_with(entries, &mut InodeAllocator::new())
+        VirtualTree::build_with(entries, &mut InodeAllocator::new(false))
     }
 
     /// Case-sensitive build (the default everywhere except a folded mount).
@@ -903,7 +924,7 @@ mod tests {
 
     #[test]
     fn build_with_keeps_inodes_stable_across_rebuilds() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let t1 = VirtualTree::build_with(&[(10, "Alice/Song.flac".into())], &mut alloc);
         let alice1 = t1.lookup(VirtualTree::ROOT, "Alice").unwrap();
         let song1 = t1.lookup(alice1, "Song.flac").unwrap();
@@ -934,7 +955,7 @@ mod tests {
 
     #[test]
     fn build_with_does_not_recycle_a_vanished_inode() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let t1 = VirtualTree::build_with(&[(10, "Gone/X.flac".into())], &mut alloc);
         let gone = t1.lookup(VirtualTree::ROOT, "Gone").unwrap();
         let x = t1.lookup(gone, "X.flac").unwrap();
@@ -946,7 +967,7 @@ mod tests {
 
     #[test]
     fn prune_retired_bounds_map_under_churn() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         for generation in 0..100 {
             let entries = vec![(1, format!("Gen{generation}/a.flac"))];
             let tree = VirtualTree::build_with(&entries, &mut alloc);
@@ -962,7 +983,7 @@ mod tests {
 
     #[test]
     fn prune_retired_keeps_live_inodes_stable() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let tree = VirtualTree::build_with(&[(1, "Keep/song.flac".into())], &mut alloc);
         let keep_dir = tree.lookup(VirtualTree::ROOT, "Keep").unwrap();
         let keep_file = tree.lookup(keep_dir, "song.flac").unwrap();
@@ -982,7 +1003,7 @@ mod tests {
 
     #[test]
     fn pruned_path_reborn_gets_fresh_inode_never_recycled() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let t1 = VirtualTree::build_with(&[(1, "Gone/x.flac".into())], &mut alloc);
         let gone_dir = t1.lookup(VirtualTree::ROOT, "Gone").unwrap();
         let gone_file = t1.lookup(gone_dir, "x.flac").unwrap();
@@ -1011,7 +1032,7 @@ mod tests {
     fn prune_retired_waits_for_threshold() {
         // Drives the map to exactly 2x live nodes: prune must NOT fire at
         // equality (pins the `<=` boundary for the mutation gate).
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let t1 = VirtualTree::build_with(&[(1, "A/x.flac".into())], &mut alloc);
         let a_dir = t1.lookup(VirtualTree::ROOT, "A").unwrap();
         // paths: "", A, A/x.flac = 3
@@ -1074,7 +1095,7 @@ mod tests {
         // Two artist dirs differing only by case collapse into one; both titles
         // live under the first-seen casing.
         let entries = vec![(1i64, "Foo/A".to_string()), (2i64, "foo/B".to_string())];
-        let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(), true);
+        let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(true), true);
         let foo = tree.lookup(VirtualTree::ROOT, "Foo").expect("Foo dir");
         // Case-insensitive lookup resolves any casing to the same inode.
         assert_eq!(tree.lookup(VirtualTree::ROOT, "foo"), Some(foo));
@@ -1094,7 +1115,7 @@ mod tests {
             (1i64, "Dir/Song".to_string()),
             (2i64, "Dir/song".to_string()),
         ];
-        let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(), true);
+        let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(true), true);
         let dir = tree.lookup(VirtualTree::ROOT, "Dir").expect("Dir");
         let names: Vec<String> = tree.children(dir).unwrap().keys().cloned().collect();
         // First-seen "Song" keeps its name; "song" becomes "song (2)".
@@ -1108,7 +1129,7 @@ mod tests {
         // Control: with folding OFF, "Foo" and "foo" are distinct dirs and a
         // differently-cased query misses.
         let entries = vec![(1i64, "Foo/A".to_string()), (2i64, "foo/B".to_string())];
-        let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(), false);
+        let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(false), false);
         assert_eq!(tree.children(VirtualTree::ROOT).unwrap().len(), 2);
         assert_ne!(
             tree.lookup(VirtualTree::ROOT, "Foo"),
@@ -1125,16 +1146,63 @@ mod tests {
             (1i64, "Dir/Song".to_string()),
             (2i64, "Dir/Other".to_string()),
         ];
-        let mut tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(), true);
+        let mut tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(true), true);
         let dir = tree.lookup(VirtualTree::ROOT, "dir").expect("dir");
         assert!(tree.lookup(dir, "song").is_some());
 
-        tree.remove_track(1, &mut InodeAllocator::new());
+        tree.remove_track(1, &mut InodeAllocator::new(false));
 
         // The removed file no longer resolves (any casing); the sibling still does.
         assert_eq!(tree.lookup(dir, "song"), None);
         assert_eq!(tree.lookup(dir, "Song"), None);
         assert!(tree.lookup(dir, "other").is_some());
+    }
+
+    #[test]
+    fn folded_dir_recase_keeps_survivor_inode() {
+        // #305: track 1 seen first wins the merged directory's casing ("Foo");
+        // track 2 merges under it. Removing track 1 lets the next full rebuild
+        // re-derive the casing from track 2 alone, rendering "foo". Track 2's
+        // rendered path is unchanged, so its inode must be stable.
+        let mut alloc = InodeAllocator::new(true);
+        let entries = vec![(1i64, "Foo/A".to_string()), (2i64, "foo/B".to_string())];
+        let tree = VirtualTree::build_with_ci(&entries, &mut alloc, true);
+        let before = tree.inode_of_track(2).expect("track 2 inode");
+
+        let rebuilt = VirtualTree::build_with_ci(&[(2i64, "foo/B".to_string())], &mut alloc, true);
+        let after = rebuilt
+            .inode_of_track(2)
+            .expect("track 2 inode after rebuild");
+
+        assert_eq!(
+            before, after,
+            "survivor inode must survive a folded dir re-case"
+        );
+        // Scope is inode stability only: the directory legitimately re-cases to "foo".
+        assert!(rebuilt.lookup(VirtualTree::ROOT, "foo").is_some());
+    }
+
+    #[test]
+    fn folded_inode_key_keeps_disambiguated_siblings_distinct() {
+        // Guard that folding the key never collapses a legitimately-disambiguated
+        // pair: "Song" and "song" fold equal, so the second becomes "song (2)";
+        // their fold-keys ("dir/song" vs "dir/song (2)") differ, so do their inodes.
+        let mut alloc = InodeAllocator::new(true);
+        let entries = vec![
+            (1i64, "Dir/Song".to_string()),
+            (2i64, "Dir/song".to_string()),
+        ];
+        let tree = VirtualTree::build_with_ci(&entries, &mut alloc, true);
+        let a = tree.inode_of_track(1).expect("track 1 inode");
+        let b = tree.inode_of_track(2).expect("track 2 inode");
+        assert_ne!(
+            a, b,
+            "disambiguated folded siblings must not collapse to one inode"
+        );
+
+        let dir = tree.lookup(VirtualTree::ROOT, "Dir").expect("Dir");
+        assert_eq!(tree.lookup(dir, "Song"), Some(a));
+        assert_eq!(tree.lookup(dir, "song (2)"), Some(b));
     }
 
     #[test]
@@ -1167,7 +1235,7 @@ mod tests {
 
     #[test]
     fn children_by_rendered_updates_when_collision_member_removed() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(
             &[(10, "D/song.flac".into()), (20, "D/song.flac".into())],
             &mut alloc,
@@ -1183,7 +1251,7 @@ mod tests {
 
     #[test]
     fn children_by_rendered_updates_when_empty_dir_pruned() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(
             &[(10, "A/B/x.flac".into()), (20, "A/C/y.flac".into())],
             &mut alloc,
@@ -1223,7 +1291,7 @@ mod tests {
 
     #[test]
     fn introducing_id_is_min_descendant_track_id() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let t = VirtualTree::build_with(
             &[(30, "A/B/x.flac".into()), (10, "A/C/y.flac".into())],
             &mut alloc,
@@ -1234,7 +1302,7 @@ mod tests {
 
     #[test]
     fn remove_track_prunes_empty_ancestors_b() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(
             &[(10, "A/B/x.flac".into()), (20, "C/y.flac".into())],
             &mut alloc,
@@ -1247,7 +1315,7 @@ mod tests {
 
     #[test]
     fn remove_track_keeps_parent_with_surviving_sibling() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(
             &[(10, "A/x.flac".into()), (20, "A/y.flac".into())],
             &mut alloc,
@@ -1286,7 +1354,7 @@ mod tests {
     #[test]
     fn rebuild_subtree_reports_missing_rendered_path() {
         use std::collections::HashMap;
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut tree = VirtualTree::build_with(&[(10, "Alice/Song.flac".into())], &mut alloc);
         let dir = tree.lookup(VirtualTree::ROOT, "Alice").unwrap();
         let new_paths: HashMap<i64, TrackRenderState> = HashMap::new(); // omits track 10
@@ -1298,7 +1366,7 @@ mod tests {
 
     #[test]
     fn rebuild_subtree_reclaims_freed_base_name() {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(
             &[(10, "D/song.flac".into()), (20, "D/song.flac".into())],
             &mut alloc,
@@ -1322,7 +1390,7 @@ mod tests {
             (2, "P/X.flac/t.flac".to_string()),
         ];
         let reference = VirtualTree::build(&entries);
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         let p = t.lookup(VirtualTree::ROOT, "P").unwrap();
         let np: std::collections::HashMap<i64, TrackRenderState> =
@@ -1343,7 +1411,7 @@ mod tests {
             (9, "X.flac/b.flac".to_string()),
             (5, "X.flac".to_string()), // a FILE rendered "X.flac" in root
         ];
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         // Delete track 1 (the dir's min). Dir's introducing id rises to 9; file 5 (id 5 < 9)
         // should now claim base "X.flac" and the dir become "X.flac (2)".
@@ -1374,7 +1442,7 @@ mod tests {
         // Initial: file "X.flac" (id 2) claims the base name; dir "X.flac"
         // (introduced by id 5) is disambiguated to "X.flac (2)".
         let entries = vec![(2, "X.flac".to_string()), (5, "X.flac/a.flac".to_string())];
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         // ADD track 1 under the dir: its id (1) is now the dir's min (< file's 2), so a
         // full rebuild gives the DIR the base name and the file becomes "X.flac (2)".
@@ -1408,7 +1476,7 @@ mod tests {
             (2, "Old/b.flac".to_string()),
             (3, "New/c.flac".to_string()),
         ];
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         // Track 2 moves Old -> New.
         let mut new_entries = vec![
@@ -1436,7 +1504,7 @@ mod tests {
         // A `changed` id whose rendered path is identical (e.g. a tag edit that does
         // not affect the template) must leave structure untouched.
         let entries = vec![(1, "A/x.flac".to_string()), (2, "A/y.flac".to_string())];
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         let reference = VirtualTree::build(&entries);
         let new_paths: std::collections::HashMap<i64, TrackRenderState> =
@@ -1470,7 +1538,7 @@ mod tests {
         removed: &[i64],
         expected_rebuilds: usize,
     ) {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(before, &mut alloc);
         let mut after_sorted = after.to_vec();
         after_sorted.sort_by_key(|(id, _)| *id);
@@ -1635,7 +1703,7 @@ mod tests {
             (2, "P/Sub/u.flac".to_string()),
             (3, "P/keep.flac".to_string()),
         ];
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let mut t = VirtualTree::build_with(&entries, &mut alloc);
         let p = t.lookup(VirtualTree::ROOT, "P").unwrap();
         // Drop both tracks under Sub; rebuild P from the survivors only.

@@ -236,7 +236,7 @@ struct IncrementalOutcome {
 
 impl Musefs {
     pub fn open(db: Db, config: MountConfig) -> Result<Musefs> {
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(config.case_insensitive);
         // Capture both freshness stamps BEFORE the build: a write landing during
         // build_full then leaves data_version > stamp (the first poll triggers)
         // and seq > watermark (the changelog replays it) — at worst one redundant
@@ -1784,7 +1784,7 @@ mod tests {
         };
         let template = Template::parse(&config.template).expect("valid template");
 
-        let mut alloc = InodeAllocator::new();
+        let mut alloc = InodeAllocator::new(false);
         let (tree, _snapshot) = Musefs::build_full(&db, &template, &config, &mut alloc).unwrap();
 
         let root = VirtualTree::ROOT;
