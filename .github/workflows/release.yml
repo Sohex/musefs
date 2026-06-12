@@ -224,7 +224,7 @@ jobs:
           # unpacked into the repo root.
           mkdir -p bin
           tar -xzf dist/musefs-*-${{ matrix.triple }}.tar.gz -C bin
-          ./bin/musefs --version || true   # glibc/musl host may differ; real check is the smoke
+          ./bin/musefs --help || true   # glibc/musl host may differ; real check is the smoke
       - name: Smoke (host)
         if: matrix.mode == 'host'
         run: |
