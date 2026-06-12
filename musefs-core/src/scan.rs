@@ -8,7 +8,6 @@ use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, 
 use crate::byte_budget::ByteBudget;
 use crate::error::Result;
 use crate::freshness::BackingStamp;
-use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::sync_channel;
 
 const BATCH_FILES: usize = 256;
@@ -916,7 +915,7 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 }
 
 /// Re-validate an already-scanned library root: re-probe only files whose
-/// size/mtime changed since the last scan (skipping unchanged ones so external
+/// size/mtime/ctime changed since the last scan (skipping unchanged ones so external
 /// tag edits in the DB are preserved), then delete tracks **under `root`** whose
 /// backing file is gone (cascading tags/art links) and garbage-collect
 /// now-unreferenced art. `root` may be a single audio file (only that file is
@@ -940,15 +939,19 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     }
     db.apply_bulk_pragmas_self()?;
 
-    // Main-thread pre-dispatch skip pass: load existing (path -> size,mtime,id,format) once,
+    // Main-thread pre-dispatch skip pass: load existing (path -> stamp,id,format) once,
     // stat each candidate, keep only changed files. Workers stay DB-free.
-    let existing: HashMap<String, (u64, i64, i64, Format)> = db
+    let existing: HashMap<String, (crate::freshness::BackingStamp, i64, Format)> = db
         .list_tracks()?
         .into_iter()
         .map(|t| {
             (
-                t.backing_path,
-                (t.backing_size, t.backing_mtime_ns, t.id, t.format),
+                t.backing_path.clone(),
+                (
+                    crate::freshness::BackingStamp::from_track(&t),
+                    t.id,
+                    t.format,
+                ),
             )
         })
         .collect();
@@ -970,12 +973,9 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             continue;
         };
         let key = abs.to_string_lossy().into_owned();
-        if let Some(&(size, mtime, id, format)) = existing.get(&key) {
+        if let Some((stamp, id, format)) = existing.get(&key).copied() {
             let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
-            if size == meta.len()
-                && mtime == meta.mtime() * 1_000_000_000 + meta.mtime_nsec()
-                && !needs_backfill
-            {
+            if crate::freshness::BackingStamp::from_metadata(&meta) == stamp && !needs_backfill {
                 unchanged += 1;
                 continue;
             }
