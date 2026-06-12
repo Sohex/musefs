@@ -12,6 +12,7 @@ pub use page::{
 
 use crate::error::{FormatError, Result};
 use crate::probe::Extent;
+use crate::size;
 
 /// The codec carried inside an Ogg logical bitstream that we synthesize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,10 +345,15 @@ fn build_packets_with_art(
             // the image; any one of these alone may fit in u32 but the sum may not.
             for a in arts {
                 let prefix = picture_prefix(a.meta)?;
-                let b64_prefix_len = b64_len(prefix.len() as u64);
-                let value_len = METADATA_BLOCK_PICTURE_KEY.len() as u64
-                    + b64_prefix_len
-                    + b64_len(a.meta.data_len.get());
+                let b64_prefix_len =
+                    b64_len_checked(prefix.len() as u64).ok_or(FormatError::TooLarge)?;
+                let b64_image_len =
+                    b64_len_checked(a.meta.data_len.get()).ok_or(FormatError::TooLarge)?;
+                let value_len = size::checked_sum([
+                    METADATA_BLOCK_PICTURE_KEY.len() as u64,
+                    b64_prefix_len,
+                    b64_image_len,
+                ])?;
                 if value_len > u64::from(u32::MAX) {
                     return Err(FormatError::TooLarge);
                 }
@@ -395,9 +401,13 @@ fn comment_packet_chunks(
     for art in arts {
         let prefix = picture_prefix(art.meta)?;
         let b64_prefix = b64_encode(&prefix);
-        let value_len = METADATA_BLOCK_PICTURE_KEY.len()
-            + b64_prefix.len()
-            + crate::convert::usize_from(b64_len(art.meta.data_len.get()));
+        let b64_image_len =
+            b64_len_checked(art.meta.data_len.get()).ok_or(FormatError::TooLarge)?;
+        let value_len = size::checked_sum([
+            METADATA_BLOCK_PICTURE_KEY.len() as u64,
+            b64_prefix.len() as u64,
+            b64_image_len,
+        ])?;
         head.extend_from_slice(
             &u32::try_from(value_len)
                 .map_err(|_| FormatError::TooLarge)?
@@ -1243,6 +1253,33 @@ mod tests {
             accepted,
             "value_len exactly u32::MAX must be accepted by build_packets_with_art"
         );
+    }
+
+    #[test]
+    fn near_u64_max_art_value_rejected_by_build_packets() {
+        // data_len near u64::MAX makes b64_len(data_len) overflow u64; the builder
+        // must fail closed with TooLarge at the checked b64 length, not panic
+        // (debug) inside the pre-flight value_len computation.
+        let meta = crate::input::ArtInput {
+            art_id: 0,
+            mime: "image/jpeg".to_string(),
+            description: String::new(),
+            data_len: crate::input::BlobLen::new(u64::MAX).unwrap(),
+            picture_type: crate::input::PictureType::new(3).unwrap(),
+            width: 0,
+            height: 0,
+        };
+        let art = OggArt { meta: &meta };
+        let header = OggHeader {
+            codec: Codec::Vorbis,
+            serial: 0,
+            packets: vec![vec![], vec![], vec![]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let result = build_packets_with_art(&header, &[], &[art]);
+        let is_too_large = matches!(&result, Err(FormatError::TooLarge));
+        assert!(is_too_large, "expected Err(TooLarge) for near-u64::MAX art");
     }
 
     #[test]
