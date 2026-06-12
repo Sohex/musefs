@@ -71,7 +71,8 @@ casing affect the inode at all. Hence: fold the key.
 
 - Add a `fold_keys: bool` field.
 - `new(case_insensitive: bool)` sets `fold_keys` from its argument (was `new()`).
-- Add a private helper that applies the key transform:
+- Add a private helper that applies the key transform (`Cow` is already
+  imported at `tree.rs:2` — no new `use`):
 
   ```rust
   fn key<'a>(&self, path: &'a str) -> Cow<'a, str> {
@@ -102,10 +103,14 @@ threads both from the same `MountConfig`, so they cannot drift.
 
 ### 3. Call-site churn
 
-`InodeAllocator::new()` becomes `InodeAllocator::new(bool)` (~30 mechanical
-edits, almost all in `tree.rs` tests). The `build_with` helper passes `false`;
-`build_with_ci` test sites pass their own `case_insensitive` argument so the
-allocator's fold mode matches the tree under test.
+`InodeAllocator::new()` becomes `InodeAllocator::new(bool)` (~28 mechanical
+edits, almost all in `tree.rs` tests, plus the two `facade.rs` sites). Call
+sites that build case-sensitive trees construct `InodeAllocator::new(false)`;
+`build_with_ci` test sites construct the allocator with the same
+`case_insensitive` value they pass as the tree's fold flag, so the allocator's
+fold mode matches the tree under test. (`build_with` itself does not construct
+an allocator — it receives one and forwards `false` as the *tree's* fold flag;
+the bool originates at each call site.)
 
 ## Correctness
 
@@ -118,6 +123,13 @@ allocator's fold mode matches the tree under test.
 - **`prune_retired` semantics preserved.** Still keyed off live nodes, just
   under the folded key; the "retired inode is never reissued" guarantee and the
   `next` watermark are untouched.
+- **The incremental path is CI-unreachable, so it needs no change.**
+  `poll_refresh_notify` (`facade.rs`) forces case-insensitive mounts through
+  `force_full_rebuild` → `rebuild_full` → `build_with_ci`, so the fold-keyed
+  allocator is only ever driven by `build_with_ci` + `prune_retired`, never by
+  `apply_changes`/`rebuild_incremental` (including its `debug_assertions`
+  reference-tree divergence check, which clones `alloc` but is never entered in
+  CI mode). No incremental call site needs touching.
 
 ## Testing (TDD)
 
@@ -129,10 +141,16 @@ so the failing-first regression and its fix land in the same commit.
    track 2's inode. Drop track 1, rebuild from `[(2, "foo/B")]` with the same
    allocator, and assert track 2's inode is unchanged — while allowing the
    directory to now render `foo`.
-2. **Uniqueness guard.** A case-insensitive tree whose folded sibling paths
-   differ only by a disambiguation suffix still yields distinct inodes.
+2. **Uniqueness guard.** Build a case-insensitive tree from
+   `[(1, "Dir/Song"), (2, "Dir/song")]`, which disambiguates to `Song` and
+   `song (2)`. Assert the two tracks get distinct inodes *and* that their
+   fold-keys differ (`dir/song` vs `dir/song (2)`) — guarding that folding never
+   collapses a legitimately-disambiguated pair, not merely restating test #1.
 3. **Regression safety.** Existing `prune_retired_*` and `case_*` tests stay
    green (they pin the case-sensitive contract and folded lookup behavior).
 
-No documentation outside this spec needs updating; the change restores the
-already-documented stable-inode contract rather than altering it.
+The change restores the already-documented stable-inode contract rather than
+altering it, so no behavioral doc change is expected. The implementation plan
+must still grep `ARCHITECTURE.md` for any prose claiming inodes key on the
+*display* path specifically; if such a claim exists it gets a one-line
+correction (a doc touch, not a design change).
