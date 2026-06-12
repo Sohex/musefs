@@ -45,16 +45,24 @@ RIFF chunks, and Ogg pages share a theme but no structure, so a common
 
 ### Current state
 
-`parse_blocks` (`musefs-format/src/flac.rs:37`) and its bounded twin
-`read_metadata_bounded` (`:83`) walk metadata blocks until the first last-block
-flag, recording `STREAMINFO`/`APPLICATION`/`SEEKTABLE`/`CUESHEET` bodies. Neither
+(Code is referenced by function + file; the codebase moves and line numbers go
+stale, so they are omitted deliberately.)
+
+`parse_blocks` (`musefs-format/src/flac.rs`) and its bounded twin
+`read_metadata_bounded` walk metadata blocks until the first last-block flag,
+recording `STREAMINFO`/`APPLICATION`/`SEEKTABLE`/`CUESHEET` bodies. Neither
 enforces the FLAC structural rule that STREAMINFO is the first metadata block,
-appears exactly once, and has a 34-byte body. `synthesize_layout` (`:235`) sorts
-stored structural blocks by type and emits them before the regenerated
+appears exactly once, and has a 34-byte body. `synthesize_layout` sorts stored
+structural blocks by type (`sort_by_key(block_type)`; `BLOCK_STREAMINFO == 0`, so
+STREAMINFO sorts to index 0) and emits them before the regenerated
 VORBIS_COMMENT, assuming the rows describe a valid FLAC front — but neither
 scanner rows nor hostile DB rows are required to contain exactly one valid
-STREAMINFO. It is invoked with DB-loaded `&structural` at
-`musefs-core/src/reader.rs:208`.
+STREAMINFO.
+
+`synthesize_layout` is invoked from `musefs-core/src/reader.rs` (`HeaderCache::build`)
+with structural data from one of two sources: DB rows filtered through
+`flac::structural_block_type` (the crafted-DB surface), or — when no structural
+rows exist — a fallback re-read `flac::read_metadata(&front)?.preserved`.
 
 Two existing unit tests intentionally characterize the laxness:
 `parse_blocks_accepts_header_flush_with_end` (accepts a single empty STREAMINFO)
@@ -75,22 +83,39 @@ header+body may not yet be in the prefix — return `NeedMore { up_to }` as toda
 until enough bytes are present to validate, then apply the check.
 
 In `synthesize_layout`, reject any `structural` slice that does not contain
-exactly one STREAMINFO with a 34-byte body → `FormatError::Malformed`. After the
-existing `sort_by_key(block_type)`, STREAMINFO (type 0) sorts to index 0, so a
-valid slice always emits STREAMINFO first. (APPLICATION/CUESHEET continue to ride
-through `binary_tags`, not `structural`; SEEKTABLE remains allowed in
-`structural`.)
+exactly one STREAMINFO with a 34-byte body → `FormatError::Malformed`. This check
+runs **first**, before the existing `TooLarge` size guards (validate inputs
+before doing size arithmetic). APPLICATION/CUESHEET continue to ride through
+`binary_tags`, not `structural`; SEEKTABLE remains allowed in `structural`.
+
+Consequence of the fallback re-read: because `read_metadata` → `parse_blocks`
+now enforces the rule, a file scanned under the old lax rules with malformed
+STREAMINFO and *no* structural DB rows will fail at serve time via the
+`reader.rs` fallback (`Err(Malformed)` propagates out of `HeaderCache::build`).
+This is intended — serving decoder-rejected FLAC is worse than a controlled
+failure — and is distinct from the "no forced re-scan" out-of-scope item (that
+concerns the scanner, not this serve-time re-parse).
 
 ### Test churn
 
 - Flip `parse_blocks_accepts_header_flush_with_end` and
   `bounded_is_last_flag_continues_past_nonlast_block` to expect
   `FormatError::Malformed`.
-- Update synthesis unit/integration tests that pass empty or STREAMINFO-less
-  `structural` (e.g. the `synthesize_layout(&[], …)` boundary tests in
-  `flac.rs` tests, and any in `roundtrip.rs`/`synthesize_art.rs`/
-  `synthesize_tags.rs` that rely on the lax path) to pass a valid 34-byte
-  STREAMINFO block.
+- **Ordering hazard — these pass `&[]` (STREAMINFO-less) `structural` and expect
+  `TooLarge`; with the new check running first they now return `Malformed`, so
+  each must be updated to pass a valid 34-byte STREAMINFO block:**
+  - `flac.rs` unit tests `synthesize_layout_picture_block_size_boundary_is_inclusive`,
+    `synthesize_layout_vorbis_comment_block_size_boundary_is_inclusive`,
+    `synthesize_layout_binary_tag_block_size_boundary_is_inclusive`,
+    `synthesize_layout_checked_picture_len_rejects_overflow`.
+  - `synthesize_art.rs::synthesize_errors_on_oversized_picture`
+    (`synthesize_layout(&[], …, &[art])` expecting `TooLarge`).
+- `roundtrip.rs`/`synthesize_art.rs`/`synthesize_tags.rs` tests that build
+  structural via `streaminfo_body()` (a valid 34-byte body) already pass a valid
+  STREAMINFO and stay green — do not "fix" them.
+- `proptest_flac.rs` stays green: it feeds `synthesize_layout` only the output of
+  a successful `locate_audio` on `fixtures::flac()`, which emits a valid 34-byte
+  STREAMINFO first; the new `parse_blocks` rule accepts that fixture unchanged.
 
 ### New tests (from the audit)
 
@@ -106,20 +131,23 @@ through `binary_tags`, not `structural`; SEEKTABLE remains allowed in
 
 ### Current state
 
-`locate_audio` (`musefs-format/src/mp3.rs:26`) and `locate_audio_bounded` (`:66`)
-use a lightweight ID3v2 skip: they `synchsafe_decode` the size bytes (masking the
-high bit of each), honor the footer flag, and never validate the ID3 major
-version or reject high-bit size bytes. The stricter `id3v2_alloc_safe` (`:416`)
-rejects exactly those shapes. The divergence lets a malformed ID3-looking header
-(`ID3 04 00 00 00 00 00 80`) mask-decode to `audio_offset = 10`; if bytes 10–11
-satisfy the MPEG sync check the file scans as MP3 with an audio window starting
-inside malformed metadata.
+`locate_audio` and `locate_audio_bounded` (`musefs-format/src/mp3.rs`) use a
+lightweight ID3v2 skip: they `synchsafe_decode` the size bytes (masking the high
+bit of each), honor the footer flag, and never validate the ID3 major version or
+reject high-bit size bytes. The stricter `id3v2_alloc_safe` rejects exactly those
+shapes (its `data[6] | data[7] | data[8] | data[9] >= 0x80` guard). The
+divergence lets a malformed ID3-looking 10-byte header
+(`49 44 33 04 00 00 00 00 00 80` — `"ID3"`, version 4, flags 0, size bytes
+`00 00 00 80` with the high bit set in the last byte) mask-decode to
+`audio_offset = 10`; if bytes 10–11 satisfy the MPEG sync check (`0xff`,
+`0xfb`) the file scans as MP3 with an audio window starting inside malformed
+metadata.
 
 ### Change
 
-Extract a shared ID3v2 header validator used by `locate_audio`,
-`locate_audio_bounded`, and the header decode in `id3v2_alloc_safe`. Given the
-10-byte header it requires:
+Extract a shared ID3v2 header validator — the **intersection** of the three
+checks, *not* a wholesale extraction of `id3v2_alloc_safe`. Given the 10-byte
+header it requires:
 
 1. `ID3` magic.
 2. Major version in `2..=4`.
@@ -127,7 +155,10 @@ Extract a shared ID3v2 header validator used by `locate_audio`,
 
 On success it returns the decoded tag length (the locators add the 10-byte footer
 when the footer flag is set, as today); on violation the locators return
-`FormatError::Malformed`.
+`FormatError::Malformed`. `id3v2_alloc_safe` calls this helper for the header
+portion and keeps its additional, stricter checks layered on top
+(extended-header/unsync flag rejection, frame walking) — the plan must not push
+those flag checks down into the locator (see Decided, below).
 
 **Decided:** the locator does **not** reject unsynchronization or extended-header
 flags. The declared tag size already accounts for an extended header, and
@@ -149,10 +180,10 @@ intentional behavior; tags come from the DB).
 
 ### Current state
 
-`ogg::synthesize_layout` (`musefs-format/src/ogg/mod.rs:249`) computes
-`seq_delta = synth_header_pages − orig_header_pages`. At read time
-`serve_ogg_window` (`musefs-core/src/ogg_index.rs:134`) applies it with checked
-signed arithmetic:
+`ogg::synthesize_layout` (`musefs-format/src/ogg/mod.rs`) computes
+`seq_delta = i64::from(seq) - i64::from(header.header_pages)` (synthesized header
+page count minus original header page count). At read time `serve_ogg_window`
+(`musefs-core/src/ogg_index.rs`) applies it with checked signed arithmetic:
 
 ```rust
 let new_seq = u32::try_from(i64::from(old_seq) + seq_delta)
@@ -161,8 +192,8 @@ let new_seq = u32::try_from(i64::from(old_seq) + seq_delta)
 
 A valid-or-crafted file whose first audio pages have high sequence numbers reads
 fine until a positive `seq_delta` pushes a page over `u32::MAX`, at which point
-reads fail — a read-path availability bug. The local reference helper at
-`ogg_index.rs:430` already uses `wrapping_add`.
+reads fail — a read-path availability bug. The local reference helper
+(`new_reference_region`) already uses `wrapping_add`.
 
 ### Change
 
@@ -182,9 +213,13 @@ emitted header bytes. Document the wrap in `docs/OGG.md`.
 
 - First audio page `seq = u32::MAX` with `seq_delta = +1` wraps to `0` and reads
   succeed.
-- Corresponding low-sequence / negative-delta case wraps and reads succeed.
-- Boundary regression comparing `serve_ogg_window` output against a full-page
-  wrapping oracle.
+- Corresponding low-sequence / negative-delta case (e.g. `seq = 0`,
+  `seq_delta = -1` → wraps to `u32::MAX`) wraps and reads succeed.
+- A regression that specifically crosses the `u32::MAX` boundary and compares
+  `serve_ogg_window` output to a wrapping oracle. (The existing
+  `serve_ogg_window_whole_region_matches_reference` already compares against
+  `new_reference_region` for ordinary deltas; the new test must exercise the
+  *wrap*, not just any delta.)
 
 ---
 
@@ -192,20 +227,22 @@ emitted header bytes. Document the wrap in `docs/OGG.md`.
 
 ### Current state
 
-`riff_wave_start` (`musefs-format/src/wav.rs:21`) validates only the `RIFF`/`WAVE`
-magic and ignores the size field at bytes 4..8. `walk_chunks` (`:31`) walks to the
-physical buffer length, not the declared form end. `locate_audio` (`:67`) and
-`locate_audio_at_ceiling` (`:99`) accept the first in-bounds `data` chunk
-regardless of the declared form size. A crafted WAV can declare a form size that
-ends before `data`, or larger than the file, and still be ingested. The ceiling
-fixture documents this by writing a zero RIFF size (`// size field unused by the
-walk`).
+`riff_wave_start` (`musefs-format/src/wav.rs`) validates only the `RIFF`/`WAVE`
+magic and ignores the size field at bytes 4..8. `walk_chunks` walks to the
+physical buffer length, not the declared form end. `locate_audio` and
+`locate_audio_at_ceiling` accept the first in-bounds `data` chunk regardless of
+the declared form size. A crafted WAV can declare a form size that ends before
+`data`, or larger than the file, and still be ingested. The ceiling fixture
+documents this by writing a zero RIFF size (`// size field unused by the walk`).
 
 ### Change
 
 - `riff_wave_start` parses the RIFF size (`u32` LE at bytes 4..8) and exposes the
   declared `form_end = 8 + riff_size` to callers (e.g. return
-  `(start, form_end)`).
+  `(start, form_end)`). This signature change touches every caller —
+  `walk_chunks`, `locate_audio`, `locate_audio_at_ceiling`, and `read_structure`
+  (which currently calls `riff_wave_start(front)?` and discards the result; it
+  must be updated to compile even though it ignores `form_end`).
 - `walk_chunks` walks chunks only within `min(form_end, buf.len())`.
 - `locate_audio` (full file present): reject when `form_end > buf.len()` or when
   the `data` chunk's end exceeds `form_end` → `FormatError::Malformed`.
@@ -220,9 +257,11 @@ or concatenated WAVs that write `riff_size = 0` or `0xFFFFFFFF` as a placeholder
 These are rare in a curated music library — finished WAVs from CD rippers
 (EAC, dBpoweramp, XLD) and DAW exports patch the real size; the sentinel pattern
 comes from live capture to a pipe or files truncated mid-write, which rarely
-land in a library and are usually malformed when they do. Rejection is graceful
-(the file is skipped from the virtual tree, never touched; re-encoding fixes it).
-If a real user hits this, allowing the two sentinels is a trivial follow-up.
+land in a library and are usually malformed when they do. Rejection is graceful:
+the scanner calls `locate_audio(bytes).ok()?` (in `scan.rs`'s `detect` helpers),
+so an `Err(Malformed)` becomes "not recognized as WAV" → the file is skipped from
+the virtual tree, never touched; re-encoding fixes it. If a real user hits this,
+allowing the two sentinels is a trivial follow-up.
 
 ### New tests (from the audit)
 
