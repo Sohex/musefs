@@ -324,8 +324,10 @@ Inodes are **stable across rebuilds**: a persistent path→inode allocator
 (`InodeAllocator`) reuses an unchanged rendered path's inode and never
 recycles a retired one, so a descriptor held open across a refresh keeps
 resolving to the same node and a stale FUSE handle can never alias a
-different file. A path that vanished degrades to `ENOENT`, bounded by the
-entry/attr TTL. (Retired paths are pruned once they outnumber live ones,
+different file. On case-insensitive mounts the key is case-folded, so a
+survivor keeps its inode even when an unrelated deletion flips a merged
+directory's display casing (#305). A path that vanished degrades to
+`ENOENT`, bounded by the entry/attr TTL. (Retired paths are pruned once they outnumber live ones,
 bounding the allocator at twice the live tree; a path that returns after a
 prune gets a fresh inode.)
 
