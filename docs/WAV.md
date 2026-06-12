@@ -77,6 +77,22 @@ RIFF front, then serves the untouched payload:
 3. `BackingAudio` — the original `data` chunk payload, served verbatim by
    positioned reads.
 
+## RIFF form-size enforcement
+
+Every RIFF/WAVE file declares a form size at bytes 4..8 (`riff_size`).
+The form covers bytes 8 through `8 + riff_size` and must encompass all
+top-level chunks (`fmt `, `data`, `LIST`, `id3 `, …). musefs enforces
+this at parse time:
+
+- `riff_wave_start` parses the RIFF size and returns `form_end = 8 +
+  riff_size`.
+- `locate_audio` and `locate_audio_at_ceiling` reject any file where
+  `form_end` exceeds the physical file **or** where the `data` chunk
+  payload extends past `form_end`.
+- Streaming or concatenated WAVs that write `riff_size = 0` or
+  `0xFFFFFFFF` are rejected (skipped from the virtual tree, never
+  modified). Allowing those sentinels is a deferred follow-up.
+
 ## Quirks & invariants
 
 - A file must have both a `fmt ` chunk and a `data` chunk to scan; the

@@ -2331,8 +2331,9 @@ mod bounded_probe_tests {
         fmt.extend_from_slice(&16u16.to_le_bytes());
 
         let mut front = b"RIFF".to_vec();
-        // The RIFF size field is not validated by the chunk walk; placeholder.
-        front.extend_from_slice(&0u32.to_le_bytes());
+        // form: WAVE(4) + fmt chunk(24) + data header(8) + data payload
+        let riff_size = 36u32 + u32::try_from(data_len).unwrap();
+        front.extend_from_slice(&riff_size.to_le_bytes());
         front.extend_from_slice(b"WAVE");
         front.extend_from_slice(b"fmt ");
         front.extend_from_slice(&u32::try_from(fmt.len()).unwrap().to_le_bytes());
@@ -2368,7 +2369,9 @@ mod bounded_probe_tests {
             fmt.extend_from_slice(&v.to_le_bytes());
         }
         let mut front = b"RIFF".to_vec();
-        front.extend_from_slice(&0u32.to_le_bytes());
+        // form: WAVE(4) + fmt chunk(8+len) + data header(8) + data payload(64)
+        let riff_size = 4 + 8 + u32::try_from(fmt.len()).unwrap() + 8 + 64;
+        front.extend_from_slice(&riff_size.to_le_bytes());
         front.extend_from_slice(b"WAVE");
         front.extend_from_slice(b"fmt ");
         front.extend_from_slice(&u32::try_from(fmt.len()).unwrap().to_le_bytes());
