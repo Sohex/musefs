@@ -5,7 +5,7 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -49,7 +49,7 @@ pub struct FuseConfig {
     pub max_readahead: u32,
     /// Max outstanding background (readahead/async) requests the kernel queues.
     /// Caps that class of work delivered to the pool; foreground reads are
-    /// bounded only by client concurrency, not by this.
+    /// bounded separately by `MAX_INFLIGHT_READS` (#308), not by this.
     pub max_background: u16,
     /// Keep the kernel page cache across opens (`FOPEN_KEEP_CACHE`). An external
     /// re-tag auto-invalidates the affected inode on refresh (`poll_refresh_notify`
@@ -126,6 +126,20 @@ fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
     errno(err)
 }
 
+/// One directory's readdir snapshot: `(child inode, entry type, name)` rows.
+/// Aliased so the handle-map signatures stay readable (and dodge
+/// `clippy::type_complexity`).
+type DirListing = Vec<(u64, FileType, String)>;
+
+/// Cap on concurrently-open directory handles (#307). Each `opendir` snapshots a
+/// full `DirListing`, so an unreleased handle pins memory ~ (entries × name
+/// length); the cap bounds the *number* of snapshots, not their inherent size (a
+/// single `ls` of the widest directory already allocates one). 1024 sits well
+/// above a heavy parallel indexer's concurrent-dir-handle count (~hundreds), so
+/// legitimate clients never hit it, while an over-cap `opendir` returns `ENFILE`
+/// — the directory-side analogue of the file-handle `HandleTableFull → ENFILE`.
+const MAX_DIR_HANDLES: usize = 1024;
+
 /// Build a directory's full readdir listing once. Shared by `opendir`
 /// (snapshotted per fh) and the `readdir` fallback for an unknown fh.
 fn build_dir_listing(core: &Musefs, ino: u64) -> Result<Vec<(u64, FileType, String)>, CoreError> {
@@ -135,6 +149,26 @@ fn build_dir_listing(core: &Musefs, ino: u64) -> Result<Vec<(u64, FileType, Stri
     Ok(assemble_dir_listing(ino, parent, entries, marker))
 }
 
+/// Admit a directory handle under the caller's `dir_handles` lock, enforcing
+/// `MAX_DIR_HANDLES` (#307). Returns the freshly allocated handle id on admit, or
+/// `None` when the table is at `cap` (the caller replies `ENFILE`). The id is
+/// drawn from `counter` only on the admit path, and the whole check-then-insert
+/// runs under the single lock the caller holds, so concurrent `opendir` closures
+/// cannot race the count past the cap and a rejected open burns no id.
+fn try_admit_dir_handle(
+    handles: &mut std::collections::HashMap<u64, Arc<DirListing>>,
+    counter: &AtomicU64,
+    cap: usize,
+    listing: DirListing,
+) -> Option<u64> {
+    if handles.len() >= cap {
+        return None;
+    }
+    let fh = counter.fetch_add(1, Ordering::Relaxed);
+    handles.insert(fh, Arc::new(listing));
+    Some(fh)
+}
+
 /// Clears the `fire_poll_refresh` single-flight gate when the poll task ends,
 /// on every exit path including a panic in `poll_refresh_notify` (#89).
 struct PollPendingGuard<'a>(&'a AtomicBool);
@@ -142,6 +176,42 @@ struct PollPendingGuard<'a>(&'a AtomicBool);
 impl Drop for PollPendingGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Cap on concurrently outstanding foreground reads (#308). Every FUSE `read`
+/// reserves a slot on the dispatch thread *before* enqueuing onto the unbounded
+/// pool queue; over the cap the read is rejected with `EAGAIN` rather than
+/// queued, so the queue cannot grow past the cap. 1024 is far above any
+/// legitimate read fan-in (a player reads sequentially; readahead is bounded by
+/// `max_background`), so it is an attack-only response, and queued job state is
+/// small, keeping the bound cheap.
+const MAX_INFLIGHT_READS: usize = 1024;
+
+/// Releases one `inflight_reads` slot when dropped — on worker completion, on the
+/// over-cap reject path, and on panic. Owns an `Arc<AtomicUsize>` (unlike the
+/// borrow-based `PollPendingGuard`) so it can move into the `'static` worker
+/// closure.
+struct ReadSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for ReadSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Reserve one in-flight-read slot (#308). Increments `inflight` and returns a
+/// guard if the post-increment count is within `cap`; otherwise the guard drops
+/// immediately (undoing the increment) and `None` is returned, so the caller
+/// replies `EAGAIN` without enqueuing. The counter is a pure count with no
+/// happens-before tie to other data, so `Relaxed` ordering suffices.
+fn reserve_read_slot(inflight: &Arc<AtomicUsize>, cap: usize) -> Option<ReadSlotGuard> {
+    let count = inflight.fetch_add(1, Ordering::Relaxed) + 1;
+    let guard = ReadSlotGuard(Arc::clone(inflight));
+    if count > cap {
+        None // guard drops here, undoing the increment
+    } else {
+        Some(guard)
     }
 }
 
@@ -173,6 +243,10 @@ pub struct MusefsFs {
     dir_handles: Arc<Mutex<std::collections::HashMap<u64, Arc<Vec<(u64, FileType, String)>>>>>,
     /// Monotonic dir-handle id (starts at 1; 0 stays the stateless sentinel).
     dir_fh: Arc<AtomicU64>,
+    /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
+    /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
+    /// otherwise-unbounded pool queue (#308).
+    inflight_reads: Arc<AtomicUsize>,
 }
 
 impl MusefsFs {
@@ -182,10 +256,12 @@ impl MusefsFs {
         let structure_only = core.mode() == musefs_core::Mode::StructureOnly;
         MusefsFs {
             core: Arc::new(core),
-            // `ThreadPool`'s queue is unbounded. `max_background` (set in `init`)
-            // caps the kernel's *background/readahead* requests, bounding that
-            // class of work; foreground reads are bounded only by client
-            // concurrency, so a wide parallel read storm can still queue jobs.
+            // `ThreadPool`'s queue is unbounded, so foreground reads are gated by
+            // `inflight_reads`/`MAX_INFLIGHT_READS` before submission (#308) and
+            // directory handles are capped at `MAX_DIR_HANDLES` (#307); both reject
+            // over-cap work rather than letting it grow process memory.
+            // `max_background` (set in `init`) separately caps the kernel's
+            // background/readahead requests.
             pool: ThreadPool::new(workers),
             uid: config.uid,
             gid: config.gid,
@@ -196,6 +272,7 @@ impl MusefsFs {
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
             dir_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dir_fh: Arc::new(AtomicU64::new(1)),
+            inflight_reads: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -358,12 +435,18 @@ impl Filesystem for MusefsFs {
                 Ok(l) => l,
                 Err(e) => return reply.error(reply_errno("opendir", ino.0, &e)),
             };
-            let fh = counter.fetch_add(1, Ordering::Relaxed);
-            handles
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(fh, Arc::new(listing));
-            reply.opened(FileHandle(fh), FopenFlags::empty());
+            // Check + id allocation + insert under one lock hold, so concurrent
+            // opendir closures can't race the count past MAX_DIR_HANDLES (#307).
+            let admitted = {
+                let mut guard = handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                try_admit_dir_handle(&mut guard, &counter, MAX_DIR_HANDLES, listing)
+            };
+            match admitted {
+                Some(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+                None => reply.error(fuser::Errno::ENFILE),
+            }
         });
     }
 
@@ -430,8 +513,18 @@ impl Filesystem for MusefsFs {
         if platform::spotlight::is_marker(ino.0) {
             return reply.data(&[]);
         }
+        // Reserve a slot on the dispatch thread before enqueuing; over the cap,
+        // reject with EAGAIN so the unbounded pool queue can't grow (#308).
+        let Some(slot) = reserve_read_slot(&self.inflight_reads, MAX_INFLIGHT_READS) else {
+            return reply.error(fuser::Errno::EAGAIN);
+        };
         let core = Arc::clone(&self.core);
         self.pool.execute(move || {
+            // `_slot` (named) holds the guard until the read completes or the
+            // worker panics, then releases it. Do NOT simplify to bare `_`: that
+            // drops the guard immediately, releasing the slot before the work
+            // runs and neutering the cap.
+            let _slot = slot;
             READ_BUF.with(|b| {
                 let mut buf = b.borrow_mut();
                 match core.read_into(
@@ -689,6 +782,108 @@ mod tests {
         assert!(
             !fs.poll_pending.load(Ordering::SeqCst),
             "guard must clear the gate after the task finishes"
+        );
+    }
+
+    fn empty_dir_handles() -> std::collections::HashMap<u64, Arc<DirListing>> {
+        std::collections::HashMap::new()
+    }
+
+    #[test]
+    fn try_admit_dir_handle_admits_and_allocates_id_below_cap() {
+        let mut handles = empty_dir_handles();
+        let counter = AtomicU64::new(1); // matches the live `dir_fh` start
+        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        assert_eq!(
+            fh,
+            Some(1),
+            "first admit uses the pre-increment counter value"
+        );
+        assert_eq!(handles.len(), 1);
+        assert!(handles.contains_key(&1));
+        assert_eq!(counter.load(Ordering::Relaxed), 2, "id allocated on admit");
+    }
+
+    #[test]
+    fn try_admit_dir_handle_rejects_at_cap_without_inserting_or_advancing_id() {
+        let mut handles = empty_dir_handles();
+        handles.insert(10, Arc::new(Vec::new()));
+        handles.insert(11, Arc::new(Vec::new()));
+        let counter = AtomicU64::new(12);
+        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        assert_eq!(fh, None, "at cap must reject");
+        assert_eq!(handles.len(), 2, "must not insert on reject");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            12,
+            "must not burn a dir_fh id on reject"
+        );
+    }
+
+    #[test]
+    fn try_admit_dir_handle_frees_slot_after_removal() {
+        let mut handles = empty_dir_handles();
+        handles.insert(10, Arc::new(Vec::new()));
+        handles.insert(11, Arc::new(Vec::new()));
+        let counter = AtomicU64::new(12);
+        handles.remove(&10); // releasedir frees a slot
+        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        assert_eq!(fh, Some(12), "a freed slot admits again");
+        assert_eq!(handles.len(), 2);
+        assert!(!handles.contains_key(&10), "the freed handle stays gone");
+        assert!(
+            handles.contains_key(&12),
+            "the new handle fills the freed slot"
+        );
+    }
+
+    #[test]
+    fn reserve_read_slot_admits_up_to_cap() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let g1 = reserve_read_slot(&inflight, 2);
+        let g2 = reserve_read_slot(&inflight, 2);
+        assert!(g1.is_some() && g2.is_some(), "two reservations fit cap 2");
+        assert_eq!(inflight.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn reserve_read_slot_rejects_over_cap_and_releases() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let _g1 = reserve_read_slot(&inflight, 2);
+        let _g2 = reserve_read_slot(&inflight, 2);
+        let g3 = reserve_read_slot(&inflight, 2);
+        assert!(g3.is_none(), "third reservation exceeds cap 2");
+        assert_eq!(
+            inflight.load(Ordering::Relaxed),
+            2,
+            "a rejected reservation must release its own increment"
+        );
+    }
+
+    #[test]
+    fn read_slot_guard_releases_on_drop_and_panic() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        {
+            let _g = reserve_read_slot(&inflight, 4).expect("under cap");
+            assert_eq!(inflight.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(
+            inflight.load(Ordering::Relaxed),
+            0,
+            "guard releases on drop"
+        );
+
+        let inflight2 = Arc::new(AtomicUsize::new(0));
+        let i2 = Arc::clone(&inflight2);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = reserve_read_slot(&i2, 4).expect("under cap");
+            panic!("boom");
+        }));
+        assert!(r.is_err());
+        assert_eq!(
+            inflight2.load(Ordering::Relaxed),
+            0,
+            "guard releases its slot on unwind"
         );
     }
 }
