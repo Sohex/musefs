@@ -4,128 +4,71 @@
 
 **Goal:** Make `ScanStats` honest — `skipped` = unsupported-extension files (counted at collection), `failed` = supported-extension files that won't probe, `scanned` = distinct tracks — and stop double-counting a file reached via both a real path and a symlink under `--follow-symlinks`.
 
-**Architecture:** All changes are in `musefs-core/src/scan.rs` plus its two integration test files. #301 moves the `skipped` tally from the probe pipeline (where it actually counted parse failures) to the directory walk (where unsupported extensions are dropped), and reclassifies unparseable supported-extension files as `failed`. #302 adds a file-level `(dev, ino)` visited set beside the existing directory-cycle set, active only under follow, so duplicate canonical targets are dropped before dispatch.
+**Architecture:** All code changes are in `musefs-core/src/scan.rs` plus its two integration test files. #301 moves the `skipped` tally from the probe pipeline (where it actually counted parse failures) to the directory walk (where unsupported extensions are dropped), and reclassifies unparseable supported-extension files as `failed`. #302 adds a file-level `(dev, ino)` visited set beside the existing directory-cycle set, active only under follow, so duplicate canonical targets are dropped before dispatch.
 
-**Tech Stack:** Rust (workspace crate `musefs-core`), `cargo test`, `cargo clippy --all-targets -D warnings`, `cargo fmt`, `cargo mutants` (in-diff gate). Serena symbolic tools are the primary edit tools for `scan.rs` per the repo's `CLAUDE.md`.
+**Tech Stack:** Rust (`musefs-core`), `cargo test`, `cargo clippy --all-targets -D warnings`, `cargo fmt`, `cargo mutants` (anchor-drift guard + in-diff gate). Serena symbolic tools are the primary edit tools for `scan.rs` per the repo's `CLAUDE.md`.
 
 ---
 
-## Background the worker needs
+## Read this before starting
 
-Read [the design spec](../specs/2026-06-12-scan-counters-and-symlink-dedup-design.md) first. Key facts about the current code (`musefs-core/src/scan.rs`):
+1. **Read the spec:** [docs/superpowers/specs/2026-06-12-scan-counters-and-symlink-dedup-design.md](../specs/2026-06-12-scan-counters-and-symlink-dedup-design.md).
 
-- The directory walk is `collect_audio` → `collect_audio_inner` → `descend` (mutually recursive). It filters to supported *extensions* via `is_supported_audio`; non-audio files are silently dropped. A `HashSet<(dev, ino)>` (`dir_key`) guards directory-symlink cycles.
-- `probe_file` returns an `enum ProbeOutcome { Probed(..), Unsupported, Raced }`. `Unsupported` is produced when `probe_body` returns `None` — i.e. a **supported extension that would not parse** (collection already filtered out unsupported extensions, so `Unsupported` never means "wrong extension").
-- `run_pipeline` runs parallel probe workers feeding one writer thread. Workers map `Unsupported → skipped`, `Err(_)`/canonicalize-failure → `failed`, `Raced → raced`. The writer counts `scanned` once per drained unit.
-- `scan_directory_with`, `scan_directory_full_oracle` (a whole-file-probe oracle compared for equivalence against the bounded path), and `revalidate_with` all call `collect_audio`.
+2. **Line numbers in this plan are navigation hints, not edit coordinates.** Every code edit targets a *named symbol* via Serena (`replace_symbol_body`, `insert_after_symbol`); locate symbols by name, not by the cited line. The numbers were accurate at authoring but the file shifts as you edit it.
 
-**Pre-commit gate:** the hook runs `cargo fmt`, `cargo clippy -D warnings`, and the **full workspace test suite**. Every commit must be green — a commit with red tests is rejected. So each task below ends green.
+3. **The pre-commit hook is strict.** `.githooks/pre-commit` runs `cargo fmt`, `cargo clippy -D warnings`, the **full workspace test suite**, AND — whenever a `musefs-core/src/*.rs` file is staged and `cargo-mutants` is installed — a **mutant-anchor drift guard** (`scripts/check_mutant_anchors.py`). Every commit must satisfy all of them. A red test, a warning, or a drifted anchor rejects the commit.
 
-**A subtlety for #302 testing:** a symlink to an already-visited *directory* is already caught by the existing `dir_key` cycle guard, so "symlinked directory reaching the same file" mostly does not double-count today. The genuinely-buggy case is a **file** reachable via a real path and a symlink (same dir or different dir), because file symlinks bypass the directory guard. Tests below cover both, and a comment notes which path each exercises.
+4. **The mutant-anchor guard is the subtle one.** `.cargo/mutants.toml` excludes specific equivalent/unkillable mutants by exact `file:line:col`, each tagged with a `# guard: op="…" fn="…" rows=N` comment. The guard re-derives the live mutant list and checks each anchor still lands on exactly that operator in that function. **Any edit that shifts a line in `scan.rs` moves these anchors and trips the guard** — so each `scan.rs`-touching commit below re-anchors `.cargo/mutants.toml` in the *same* commit. The affected `scan.rs` anchors are at (authoring-time) lines 396, 403, 414, 419, 781, 872, 874, 882, 884, 994, 998, 1034. If `cargo-mutants` is not installed the local guard is skipped, but **CI enforces it regardless**, so re-anchor either way.
+
+### Re-anchor procedure (referenced by Task 1 and Task 2)
+
+Run after the code edits in a `scan.rs`-touching task, before committing:
+
+```bash
+# 1. Regenerate the live mutant list and run the guard.
+cargo mutants --no-config --list --json > /tmp/musefs-mutants.json
+python3 scripts/check_mutant_anchors.py --mutants-json /tmp/musefs-mutants.json
+```
+
+For each reported failure (`[mutants.toml:N] /…scan\.rs:LINE:COL:/ — … line likely shifted …`):
+- Read that entry's `# guard: op="OP" fn="FN" rows=R` comment in `.cargo/mutants.toml`.
+- Find the mutant's new coordinate in the plain list:
+
+```bash
+cargo mutants --no-config --list | grep -F 'in FN' | grep -F 'OP'
+```
+
+- Update the `musefs-core/src/scan\.rs:LINE:COL:` coordinate in `.cargo/mutants.toml` to the new `LINE:COL` (keep the rest of the regex, including any `replace + with -` description suffix).
+- Re-run the guard. Repeat until it prints `OK: N exclude_re entries validated against M mutants.`
+
+If a guard entry now matches **zero** mutants because the mutated expression was *removed* (not just moved), that exclusion is obsolete — delete the entry and its `# guard:` comment. (None of the planned edits remove an anchored expression — the removed `skipped` atomic is not anchored — but verify.)
 
 ---
 
 ## File map
 
-- **Modify** `musefs-core/src/scan.rs` — the enum, the walk (`collect_audio`/`collect_audio_inner`/`descend`), `run_pipeline`, `scan_directory_with`, `scan_directory_full_oracle`, and three in-module tests.
-- **Modify** `musefs-core/tests/scan_counters.rs` — update `oracle_counts_scanned_and_skipped_exactly` to the new contract and its mutation kill-anchor; add the #302 dedup tests.
-- **Modify** `ARCHITECTURE.md` and `CHANGELOG.md` — document the dedup and the operator-visible counter shift.
+- **Modify** `musefs-core/src/scan.rs` — the `ProbeOutcome` enum, the walk (`collect_audio`/`collect_audio_inner`/`descend`), a new `push_file` helper, `run_pipeline`, `scan_directory_with`, `scan_directory_full_oracle`, and three in-module tests.
+- **Modify** `musefs-core/tests/scan_counters.rs` — update `oracle_counts_scanned_and_skipped_exactly` to the new contract; add four symlink/skip tests.
+- **Modify** `.cargo/mutants.toml` — re-anchor drifted coordinates (Tasks 1 and 2).
+- **Modify** `ARCHITECTURE.md`, `CHANGELOG.md` — document the dedup and the operator-visible counter shift.
 
-No new files. No public API signature changes except `collect_audio` (private) gaining a `u64` return.
+No new files. No public API signature change except `collect_audio` (private) gaining a `u64` return.
 
----
+### A subtlety for #302 testing
 
-## Task 1a: Rename `ProbeOutcome::Unsupported` → `Unparseable` (pure rename, no behavior change)
-
-Mechanical rename to isolate the behavior change in Task 1b. After this task the variant still maps to `skipped`; all tests still pass.
-
-**Files:**
-- Modify: `musefs-core/src/scan.rs` (enum `ProbeOutcome` ~37-45; `probe_file` ~308-334; `run_pipeline` worker arm ~811; in-module test `oversize_unparseable_file_is_skipped_not_read_whole` ~2289-2310)
-
-- [ ] **Step 1: Rename the enum variant and tighten its doc**
-
-In `scan.rs`, replace the `ProbeOutcome` enum body (use Serena `replace_symbol_body` on `ProbeOutcome`):
-
-```rust
-/// Outcome of probing one backing file. `Unparseable` is a supported-extension
-/// file whose bytes did not parse (counted as a scan `failed`). `Raced` means
-/// the file changed under us between the pre- and post-probe `fstat` — the probe
-/// may be torn, so nothing is committed for it (#276).
-#[derive(Debug)]
-enum ProbeOutcome {
-    Probed(Probed, BackingStamp),
-    Unparseable,
-    Raced,
-}
-```
-
-- [ ] **Step 2: Update `probe_file` doc + construction**
-
-In `probe_file`, change the doc sentence and the `None` arm. The doc line currently reads "Returns `ProbeOutcome::Unsupported` for an unsupported/unparseable file (to be skipped)…"; replace with:
-
-```rust
-/// Returns `ProbeOutcome::Unparseable` for a supported-extension file that does
-/// not parse (counted as `failed`) and `ProbeOutcome::Raced` if the file
-/// changed under us.
-```
-
-And the match tail:
-
-```rust
-    Ok(match probed {
-        Some(p) => ProbeOutcome::Probed(p, s1),
-        None => ProbeOutcome::Unparseable,
-    })
-```
-
-- [ ] **Step 3: Update the `run_pipeline` worker arm (still maps to `skipped` for now)**
-
-In `run_pipeline`, the worker `match probe_file(...)` arm:
-
-```rust
-                    Ok(ProbeOutcome::Unparseable) => {
-                        skipped.fetch_add(1, Ordering::Relaxed);
-                    }
-```
-
-- [ ] **Step 4: Update the in-module test's variant reference**
-
-In `oversize_unparseable_file_is_skipped_not_read_whole`, change the `matches!` arm to `ProbeOutcome::Unparseable`:
-
-```rust
-        assert!(matches!(
-            probe_file(&path, WINDOW).unwrap(),
-            ProbeOutcome::Unparseable
-        ));
-```
-
-- [ ] **Step 5: Build, lint, test**
-
-Run: `cargo test -p musefs-core && cargo clippy -p musefs-core --all-targets`
-Expected: PASS, no warnings. (Pure rename — behavior unchanged.)
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add musefs-core/src/scan.rs
-git commit -m "refactor(scan): rename ProbeOutcome::Unsupported to Unparseable
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-```
+A symlink to an already-visited *directory* is already caught by the existing `dir_key` cycle guard, so "symlinked directory reaching the same file" mostly does not double-count today. The genuinely-buggy case is a **file** reachable via a real path and a symlink (same dir or a sibling dir), because file symlinks bypass the directory guard. The tests cover both; a comment notes which path each exercises.
 
 ---
 
-## Task 1b: Reclassify counters to the documented contract (#301)
+## Task 1: Reclassify scan counters to the documented contract (#301)
 
-Move `skipped` to the collection phase (unsupported extensions) and map `Unparseable → failed` in the pipeline and the oracle. This task flips behavior, so it updates the value-asserting tests in the same commit to stay green.
+Rename the probe outcome, move `skipped` to the collection phase (unsupported extensions), and map unparseable supported files to `failed` — across `run_pipeline`, both scan entry points, and the oracle. This flips behavior, so it updates the value-asserting tests and re-anchors `.cargo/mutants.toml` in the same commit.
 
-**Files:**
-- Modify: `musefs-core/src/scan.rs` (`collect_audio`, `collect_audio_inner`, `descend`, `run_pipeline`, `scan_directory_with`, `scan_directory_full_oracle`, in-module test `scan_directory_counts_scanned_and_skipped`)
-- Modify: `musefs-core/tests/scan_counters.rs` (`oracle_counts_scanned_and_skipped_exactly` + its kill-anchor)
+**Files:** `musefs-core/src/scan.rs`, `musefs-core/tests/scan_counters.rs`, `.cargo/mutants.toml`
 
 - [ ] **Step 1: Update the in-module counter test to the new contract (failing test)**
 
-In `scan.rs`'s `hardening_tests` module, replace `scan_directory_counts_scanned_and_skipped` (use Serena `replace_symbol_body` on `hardening_tests/scan_directory_counts_scanned_and_skipped`; **re-include the `#[test]` attribute** — `replace_symbol_body` drops leading attributes otherwise):
+In `scan.rs`'s `hardening_tests` module, replace `scan_directory_counts_scanned_and_skipped` (Serena `replace_symbol_body` on `hardening_tests/scan_directory_counts_scanned_and_skipped`; **re-include the `#[test]` attribute** — `replace_symbol_body` drops leading attributes):
 
 ```rust
     #[test]
@@ -155,7 +98,7 @@ In `scan.rs`'s `hardening_tests` module, replace `scan_directory_counts_scanned_
 
 - [ ] **Step 2: Update the oracle counter test (failing test)**
 
-In `musefs-core/tests/scan_counters.rs`, replace `oracle_counts_scanned_and_skipped_exactly` and the comment block immediately above it (the `// === Full-probe oracle counters …` divider, the doc comment, and the `// kills scan …` anchor) with:
+In `musefs-core/tests/scan_counters.rs`, replace `oracle_counts_scanned_and_skipped_exactly` and the comment block immediately above it (the `// === Full-probe oracle counters …` divider, the doc comment, and the `// kills scan L…` line). The replacement comment intentionally references the *expressions* (not scan.rs line numbers, which drift):
 
 ```rust
 // === Full-probe oracle counters (scan_directory_full_oracle) ===
@@ -164,9 +107,9 @@ In `musefs-core/tests/scan_counters.rs`, replace `oracle_counts_scanned_and_skip
 /// reflect the corpus exactly: one valid FLAC (`scanned`), one extension-only
 /// `.flac` of garbage that `is_supported_audio` collects but `probe_full`
 /// rejects (`failed`), and one unsupported-extension file dropped at collection
-/// (`skipped`). The `+=`→`-=` mutants underflow-panic from 0 and `+=`→`*=` pin
-/// the counter at 0, so all three must be asserted nonzero and exact.
-// kills scan L<scanned> `stats.scanned += 1` and L<failed> `stats.failed += 1` `+=`→`-=`/`*=`
+/// (`skipped`). Asserting all three nonzero-and-exact kills the `+=`→`-=`
+/// (underflow-panic from 0) and `+=`→`*=` (pinned at 0) mutants on the oracle's
+/// `stats.scanned += 1` / `stats.failed += 1` and on collection's `*skipped += 1`.
 #[test]
 fn oracle_counts_scanned_failed_and_skipped_exactly() {
     let dir = tempfile::tempdir().unwrap();
@@ -186,14 +129,61 @@ fn oracle_counts_scanned_failed_and_skipped_exactly() {
 }
 ```
 
-The `L<scanned>`/`L<failed>` placeholders in the kill-anchor are filled in during Step 11 once the oracle's final line numbers are known.
-
 - [ ] **Step 3: Run the two tests to verify they fail**
 
 Run: `cargo test -p musefs-core scan_directory_counts_scanned_failed_and_skipped oracle_counts_scanned_failed_and_skipped_exactly`
-Expected: FAIL — old code counts `bad.flac` as `skipped` (so `failed == 0`, `skipped` includes it) and does not count `notes.txt`.
+Expected: FAIL — old code counts `bad.flac` as `skipped` (so `failed == 0`) and does not count `notes.txt`.
 
-- [ ] **Step 4: Thread a `skipped` counter through the walk — `collect_audio`**
+- [ ] **Step 4: Rename the `ProbeOutcome` variant and tighten its doc**
+
+Replace the `ProbeOutcome` enum body (Serena `replace_symbol_body` on `ProbeOutcome`). Note `Unsupported` and `Unparseable` are both 11 chars, so the rename alone does not shift columns:
+
+```rust
+/// Outcome of probing one backing file. `Unparseable` is a supported-extension
+/// file whose bytes did not parse (counted as a scan `failed`). `Raced` means
+/// the file changed under us between the pre- and post-probe `fstat` — the probe
+/// may be torn, so nothing is committed for it (#276).
+#[derive(Debug)]
+enum ProbeOutcome {
+    Probed(Probed, BackingStamp),
+    Unparseable,
+    Raced,
+}
+```
+
+- [ ] **Step 5: Update `probe_file` doc + the `None` arm**
+
+In `probe_file`, change the doc sentence that mentions `Unsupported` and the match tail (Serena `replace_symbol_body` on `probe_file`, preserving the rest of its body):
+
+Doc sentence becomes:
+
+```rust
+/// Returns `ProbeOutcome::Unparseable` for a supported-extension file that does
+/// not parse (counted as `failed`) and `ProbeOutcome::Raced` if the file
+/// changed under us.
+```
+
+Match tail becomes:
+
+```rust
+    Ok(match probed {
+        Some(p) => ProbeOutcome::Probed(p, s1),
+        None => ProbeOutcome::Unparseable,
+    })
+```
+
+- [ ] **Step 6: Update the in-module probe test's variant reference**
+
+In `oversize_unparseable_file_is_skipped_not_read_whole` (Serena `replace_symbol_body`, re-include `#[test]`), change the `matches!` arm:
+
+```rust
+        assert!(matches!(
+            probe_file(&path, WINDOW).unwrap(),
+            ProbeOutcome::Unparseable
+        ));
+```
+
+- [ ] **Step 7: Thread a `skipped` counter through the walk — `collect_audio`**
 
 Replace `collect_audio` (Serena `replace_symbol_body`):
 
@@ -217,7 +207,7 @@ fn collect_audio(
 }
 ```
 
-- [ ] **Step 5: Count unsupported extensions in `collect_audio_inner`**
+- [ ] **Step 8: Count unsupported extensions in `collect_audio_inner`**
 
 Replace `collect_audio_inner` (Serena `replace_symbol_body`):
 
@@ -271,7 +261,7 @@ fn collect_audio_inner(
 }
 ```
 
-- [ ] **Step 6: Thread `skipped` through `descend`**
+- [ ] **Step 9: Thread `skipped` through `descend`**
 
 Replace `descend` (Serena `replace_symbol_body`):
 
@@ -301,13 +291,13 @@ fn descend(
 }
 ```
 
-- [ ] **Step 7: Map `Unparseable → failed` and drop the `skipped` atomic in `run_pipeline`**
+- [ ] **Step 10: Map `Unparseable → failed` and drop the `skipped` atomic in `run_pipeline`**
 
-Edit `run_pipeline` (Serena `replace_symbol_body`, or targeted `replace_content` for each spot). Make exactly these four changes:
+Edit `run_pipeline`. Make exactly these four changes (targeted `replace_content` per spot, or a full `replace_symbol_body`):
 
-1. Delete the declaration `let skipped = Arc::new(AtomicU64::new(0));`.
-2. Delete the per-worker clone line `let skipped = Arc::clone(&skipped);` (in the `for _ in 0..jobs` setup).
-3. Change the worker arm to:
+1. Delete the declaration line `let skipped = Arc::new(AtomicU64::new(0));`.
+2. Delete the per-worker clone line `let skipped = Arc::clone(&skipped);` (in the `for _ in 0..jobs` worker setup).
+3. Change the worker match arm to:
 
 ```rust
                     Ok(ProbeOutcome::Unparseable) => {
@@ -315,7 +305,7 @@ Edit `run_pipeline` (Serena `replace_symbol_body`, or targeted `replace_content`
                     }
 ```
 
-4. Change the final return to source `skipped` from nowhere (the caller fills it):
+4. Change the final return so `skipped` is sourced by the caller, not the pipeline:
 
 ```rust
     Ok(ScanStats {
@@ -326,9 +316,9 @@ Edit `run_pipeline` (Serena `replace_symbol_body`, or targeted `replace_content`
     })
 ```
 
-- [ ] **Step 8: Fill `skipped` from collection in `scan_directory_with`**
+- [ ] **Step 11: Fill `skipped` from collection in `scan_directory_with`**
 
-Replace `scan_directory_with` (Serena `replace_symbol_body`; keep the existing doc comment — re-include it in the body):
+Replace `scan_directory_with` (Serena `replace_symbol_body`; keep its doc comment — re-include it):
 
 ```rust
 /// Public entry: parallel-probe / single-writer scan of `root`.
@@ -359,7 +349,7 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
 }
 ```
 
-- [ ] **Step 9: Reclassify the oracle (`scan_directory_full_oracle`) in lockstep**
+- [ ] **Step 12: Reclassify the oracle (`scan_directory_full_oracle`) in lockstep**
 
 Replace `scan_directory_full_oracle` (Serena `replace_symbol_body`; re-include the `#[doc(hidden)]` attribute and doc comment):
 
@@ -400,43 +390,69 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 }
 ```
 
-Note: `revalidate_with` needs **no edit** — its `collect_audio(...)?;` statement already discards the now-`u64` return, and reclassifying `Unparseable → failed` flows through `run_pipeline` automatically.
+`revalidate_with` needs **no edit** — its `collect_audio(...)?;` statement already discards the now-`u64` return (no `#[must_use]`, so no clippy warning under `-D warnings`), and reclassifying `Unparseable → failed` flows through `run_pipeline` automatically.
 
-- [ ] **Step 10: Build, lint, run the full crate suite**
+- [ ] **Step 13: Add a test for the symlink-target `skipped` site (failing test)**
+
+There are now **two** `*skipped += 1` sites in `collect_audio_inner` (the regular-file arm and the symlink-to-file arm). The in-module test covers the regular arm; add a test in `musefs-core/tests/scan_counters.rs` covering the symlink arm so its mutant is killable:
+
+```rust
+/// Under follow, a symlink whose target has an unsupported extension counts as
+/// skipped, symmetric with a regular unsupported file. Covers the symlink-arm
+/// `*skipped += 1` site.
+#[test]
+fn follow_symlinks_counts_unsupported_symlink_target_as_skipped() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let txt = dir.path().join("notes.txt");
+    std::fs::write(&txt, b"hi").unwrap();
+    symlink(&txt, dir.path().join("link.txt")).unwrap();
+    std::fs::write(dir.path().join("song.flac"), flac_minimal(b"AUDIO")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 1);
+    // notes.txt (regular) + link.txt (symlink target) → both skipped.
+    assert_eq!(stats.skipped, 2);
+}
+```
+
+- [ ] **Step 14: Build, lint, run the full crate suite**
 
 Run: `cargo test -p musefs-core && cargo clippy -p musefs-core --all-targets`
-Expected: PASS, no warnings. The two tests from Steps 1-2 now pass; the tolerant `assert_eq!(stats.skipped + stats.failed, 1)` test (zero-byte `bad.flac`) still passes (now `failed == 1`).
+Expected: PASS, no warnings. The three new/updated tests pass; the tolerant `assert_eq!(stats.skipped + stats.failed, 1)` test (zero-byte `bad.flac`) still passes (now `failed == 1`); the single-file `skipped == 0` tests and the existing `collect_audio_*` walk tests (scan.rs, ~1455-1588) stay green — the `Result<u64>` change is transparent to their `.unwrap()`.
 
-- [ ] **Step 11: Refresh the oracle test's kill-anchor line numbers**
+- [ ] **Step 15: Re-anchor `.cargo/mutants.toml`**
 
-Find the oracle's counter lines and fill the `L<scanned>`/`L<failed>` placeholders left in Step 2:
+Follow the **Re-anchor procedure** above. Every `scan.rs` anchor shifted (collection grew above the probe-internal anchors at 396/403/414/419; `run_pipeline` lost 2 lines under its 781/872/874/882/884 anchors; the oracle/`scan_directory_with` growth pushed the `revalidate_with` anchors 994/998/1034 down). The removed `skipped` atomic is **not** anchored, so no exclusion becomes obsolete. Re-run the guard until `OK`.
 
-Run: `grep -n "stats.scanned += 1\|stats.failed += 1" musefs-core/src/scan.rs`
-Take the two line numbers inside `scan_directory_full_oracle` and edit the `// kills scan L<…>` comment in `scan_counters.rs` to the real numbers, e.g. `// kills scan L933 \`stats.scanned += 1\` and L928 \`stats.failed += 1\` …`.
-
-- [ ] **Step 12: Commit**
+- [ ] **Step 16: Commit**
 
 ```bash
-git add musefs-core/src/scan.rs musefs-core/tests/scan_counters.rs
+git add musefs-core/src/scan.rs musefs-core/tests/scan_counters.rs .cargo/mutants.toml
 git commit -m "fix(scan): count unsupported extensions as skipped, malformed as failed (#301)
 
 skipped now tallies unsupported-extension files at collection; a
 supported-extension file that will not parse counts as failed, matching the
-documented ScanStats contract. The full-probe oracle is reclassified in
-lockstep so the bounded-vs-full equivalence property holds.
+documented ScanStats contract. ProbeOutcome::Unsupported is renamed Unparseable
+and the full-probe oracle is reclassified in lockstep so the bounded-vs-full
+equivalence property holds. Mutant anchors re-coordinated for the line shifts.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
 
-## Task 2: Deduplicate canonical backing paths under `--follow-symlinks` (#302)
+## Task 2: Deduplicate canonical backing targets under `--follow-symlinks` (#302)
 
-Add a file-level `(dev, ino)` visited set so a file reached via both a real path and a symlink (or two symlink paths) is collected once. Active only when `follow_symlinks` is true; off-mode behavior (incl. hardlinks) is unchanged.
+Add a file-level `(dev, ino)` visited set so a file reached via both a real path and a symlink (or two symlink paths) is collected once. Active only when `follow_symlinks` is true; off-mode behavior (including hardlinks) is unchanged.
 
-**Files:**
-- Modify: `musefs-core/src/scan.rs` (`collect_audio`, `collect_audio_inner`, `descend`; new helper `push_file`)
-- Modify: `musefs-core/tests/scan_counters.rs` (new dedup tests)
+**Files:** `musefs-core/src/scan.rs`, `musefs-core/tests/scan_counters.rs`, `.cargo/mutants.toml`
 
 - [ ] **Step 1: Write the dedup tests (failing tests)**
 
@@ -495,8 +511,8 @@ fn follow_symlinks_dedups_file_across_directories() {
 }
 
 /// A symlinked directory pointing at an already-walked directory reaches the
-/// same file by two paths but ingests once. (This case is handled by the
-/// existing directory-cycle guard; the test locks in the combined behavior.)
+/// same file by two paths but ingests once. (Handled by the existing
+/// directory-cycle guard; this locks in the combined behavior.)
 #[test]
 fn follow_symlinks_dedups_via_symlinked_directory() {
     use std::os::unix::fs::symlink;
@@ -559,7 +575,7 @@ fn push_file(
 }
 ```
 
-- [ ] **Step 4: Thread `files_visited` and route file pushes through `push_file` in `collect_audio_inner`**
+- [ ] **Step 4: Route file pushes through `push_file` and thread `files_visited` in `collect_audio_inner`**
 
 Replace `collect_audio_inner` (Serena `replace_symbol_body`):
 
@@ -680,18 +696,22 @@ fn collect_audio(
 - [ ] **Step 7: Build, lint, run the full crate suite**
 
 Run: `cargo test -p musefs-core && cargo clippy -p musefs-core --all-targets`
-Expected: PASS, no warnings. All three #302 tests now pass.
+Expected: PASS, no warnings. All four #302-area tests pass.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Re-anchor `.cargo/mutants.toml`**
+
+Follow the **Re-anchor procedure**. `push_file` inserted after `dir_key` shifts every anchor below it; re-coordinate them. The new `push_file`/dedup code is covered by the dedup tests (a mutant that disables dedup makes `scanned == 2`, killed), so no new exclusions are expected — but if the final in-diff gate (Task 4) surfaces a survivor here, add a documented exclusion then.
+
+- [ ] **Step 9: Commit**
 
 ```bash
-git add musefs-core/src/scan.rs musefs-core/tests/scan_counters.rs
+git add musefs-core/src/scan.rs musefs-core/tests/scan_counters.rs .cargo/mutants.toml
 git commit -m "fix(scan): dedup canonical backing targets under --follow-symlinks (#302)
 
 A file-level (dev, ino) visited set, active only when following symlinks,
 collapses a real file and a symlink to it (or a file reached via two paths)
 into one collected candidate, so scanned counts distinct tracks. Off-mode
-behavior is unchanged.
+behavior is unchanged. Mutant anchors re-coordinated for the line shifts.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
@@ -700,9 +720,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ## Task 3: Documentation + release note
 
-**Files:**
-- Modify: `ARCHITECTURE.md` (`--follow-symlinks` paragraph in the scanning section, ~344-352)
-- Modify: `CHANGELOG.md` (`[Unreleased]` section)
+**Files:** `ARCHITECTURE.md`, `CHANGELOG.md` (no `scan.rs` → no anchor guard)
 
 - [ ] **Step 1: Document the dedup in ARCHITECTURE.md**
 
@@ -718,7 +736,7 @@ canonical track row twice.
 
 - [ ] **Step 2: Add a CHANGELOG entry**
 
-Under `## [Unreleased]`, add a `### Fixed` section (after the existing `### Added`):
+Under `## [Unreleased]`, add a `### Fixed` section after the existing `### Added`:
 
 ```markdown
 ### Fixed
@@ -744,46 +762,37 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 4: Full verification + mutation gate
-
-Confirm the whole workspace is green and the mutation kill-anchors did not silently rot.
+## Task 4: Full verification + in-diff mutation gate
 
 - [ ] **Step 1: Workspace fmt + clippy + tests**
 
 Run: `cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace`
-Expected: all PASS. This includes `musefs-core/tests/probe_equivalence.rs`, whose corpus (`common::corpus::generate`) is all valid audio of each format — no unsupported extensions or garbage — so it compares DB rows only and is unaffected by the counter reclassification; confirm it stays green. (Note per repo memory: the `rtk` hook may summarize `cargo test` output to `cargo test: N passed`; trust the exit code, not a grep for "test result".)
+Expected: all PASS. This includes `musefs-core/tests/probe_equivalence.rs`, whose corpus (`common::corpus::generate`) is all valid audio of each format — no unsupported extensions or garbage — so it compares DB rows only and is unaffected by the reclassification; confirm it stays green. (Per repo memory: the `rtk` hook may summarize `cargo test` to `cargo test: N passed`; trust the exit code, not a grep for "test result".)
 
 - [ ] **Step 2: metrics-feature tests (CI's `check` job runs these; local `--workspace` skips them)**
 
 Run: `cargo test -p musefs-core --features metrics`
-Expected: PASS. This scan change touches `collect_audio`/`run_pipeline` but not the getattr/read stat counters, so these should be unaffected — confirm rather than assume.
+Expected: PASS. This change touches `collect_audio`/`run_pipeline` but not the getattr/read stat counters; confirm rather than assume.
 
-- [ ] **Step 3: Audit every `// kills scan L…` anchor for line drift**
+- [ ] **Step 3: Confirm anchor guard is green on the final tree**
 
-Run: `grep -n "kills scan L" musefs-core/tests/scan_counters.rs`
-For each anchor, open the cited expression in `musefs-core/src/scan.rs` and confirm the line number still matches; fix any that drifted from the Task 1b/Task 2 edits. The anchors reference lines in `probe_file`, `run_pipeline`, and `scan_directory_full_oracle` — all of which moved.
+Run: `cargo mutants --no-config --list --json > /tmp/musefs-mutants.json && python3 scripts/check_mutant_anchors.py --mutants-json /tmp/musefs-mutants.json`
+Expected: `OK: N exclude_re entries validated against M mutants.` If any anchor still drifts, finish re-anchoring (the Tasks 1/2 re-anchor steps were incomplete).
 
-- [ ] **Step 4: Run the in-diff mutation gate**
+- [ ] **Step 4: Run the in-diff mutation gate over the branch diff**
 
-Per repo convention (memory: copy-mode OOMs on worktree targets; use in-place, serial):
+Per repo memory (copy-mode OOMs on worktree targets — use in-place, serial):
 
-Run: `cargo mutants --in-place -p musefs-core` (or the project's in-diff invocation `cargo mutants --in-diff <diff>` if scoped to the branch diff)
-Expected: no surviving or unviable mutants introduced by the diff. If a counter-arithmetic mutant survives, the corresponding assertion or kill-anchor needs tightening. Sanity-check that the diff fed to the gate is non-empty (an empty diff is a silent false pass).
-
-- [ ] **Step 5 (if any anchor changed): commit the anchor fixes**
-
-```bash
-git add musefs-core/tests/scan_counters.rs
-git commit -m "test(scan): refresh mutation kill-anchors after counter changes
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-```
+Run: `cargo mutants --in-place --in-diff <(git diff main...HEAD -- musefs-core/src/scan.rs) -j2`
+Expected: no surviving/missed mutants in the diff. Sanity-check the diff is non-empty before trusting a pass (an empty diff is a silent false pass). New killable sites to expect covered: oracle `stats.scanned += 1` / `stats.failed += 1` (oracle test), collection `*skipped += 1` ×2 (the `scan_directory_counts_*` and `follow_symlinks_counts_unsupported_symlink_target_*` tests), and the `push_file` dedup branch (the `follow_symlinks_dedups_*` tests). If a survivor appears, add a test that kills it (preferred) or a documented `exclude_re` with a `# guard:` tag in `.cargo/mutants.toml` — then re-run the anchor guard and amend the relevant commit.
 
 ---
 
 ## Self-review notes (for the executor)
 
-- **`replace_symbol_body` drops leading attributes/doc comments** — every replaced symbol in this plan re-includes its `#[test]` / `#[doc(hidden)]` / doc comment in the body. Do not strip them.
-- **Signatures change across Task 1b and Task 2** (`collect_audio` return type; `collect_audio_inner`/`descend` gain params). The code will not compile until *all* mutually-recursive callers in a task are updated — that is why each task builds only at its final "build + test" step, not between individual symbol edits.
-- **`revalidate_with` is intentionally untouched** — verify by `cargo test -p musefs-core revalidate` after Task 1b that its tests stay green.
-- **Type/name consistency check:** the variant is `ProbeOutcome::Unparseable` everywhere; the helper is `push_file`; the two visited sets are `visited` (directories) and `files_visited` (files); `collect_audio` returns `std::io::Result<u64>`.
+- **`replace_symbol_body` drops leading attributes/doc comments** — every replaced symbol re-includes its `#[test]` / `#[doc(hidden)]` / doc comment in the body. Do not strip them.
+- **Signatures change twice** (`collect_audio` return type and `*_inner`/`descend` params in Task 1; a second param added in Task 2). Mutually-recursive callers must all update together — the crate compiles only at each task's "build + test" step, not between individual symbol edits.
+- **Each `scan.rs` commit re-anchors `.cargo/mutants.toml`.** The pre-commit anchor guard (when cargo-mutants is installed) will otherwise reject the commit; CI rejects it regardless.
+- **`revalidate_with` is intentionally untouched** — verify with `cargo test -p musefs-core revalidate` after Task 1 that its tests stay green.
+- **The `// kills scan L…` comments in `scan_counters.rs` are descriptive only** — they are not the mutation gate (`.cargo/mutants.toml` is) and were already drifted in the baseline. The Task 1 rewrite replaces the oracle one with an expression-referencing comment so it stops chasing line numbers; do not reintroduce hard-coded scan.rs line numbers in test comments.
+- **Type/name consistency:** the variant is `ProbeOutcome::Unparseable` everywhere; the helper is `push_file`; the two visited sets are `visited` (directories) and `files_visited` (files); `collect_audio` returns `std::io::Result<u64>`.
