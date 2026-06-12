@@ -92,7 +92,7 @@ proptest! {
         let served = materialize(&layout, &file, &map);
 
         // Re-parse the served file: every input payload survives byte-identically.
-        let reparsed = mp4::read_binary_tags(&served);
+        let reparsed = mp4::read_binary_tags(&served, usize::MAX);
         prop_assert_eq!(reparsed.len(), inputs.len(), "binary tag count mismatch");
         for input in &inputs {
             let want = map.get(&input.payload_id).unwrap();

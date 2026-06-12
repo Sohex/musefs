@@ -26,12 +26,18 @@ const fn build_table() -> [u32; 256] {
 
 const TABLE: [u32; 256] = build_table();
 
-pub fn crc32(buf: &[u8]) -> u32 {
-    let mut crc: u32 = 0;
+/// Fold `buf` into a running CRC `state`. `crc32(x) == crc32_update(0, x)` and
+/// `crc32(a ++ b) == crc32_update(crc32_update(0, &a), &b)`, so a page CRC can be
+/// computed in bounded windows without assembling the whole page.
+pub(crate) fn crc32_update(mut state: u32, buf: &[u8]) -> u32 {
     for &b in buf {
-        crc = (crc << 8) ^ TABLE[(((crc >> 24) as u8) ^ b) as usize];
+        state = (state << 8) ^ TABLE[(((state >> 24) as u8) ^ b) as usize];
     }
-    crc
+    state
+}
+
+pub fn crc32(buf: &[u8]) -> u32 {
+    crc32_update(0, buf)
 }
 
 pub fn crc_shift_zeros(crc: u32, n: usize) -> u32 {
@@ -135,6 +141,16 @@ mod tests {
         assert_eq!(crc32(b"123456789"), reference(b"123456789"));
         let blob: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
         assert_eq!(crc32(&blob), reference(&blob));
+    }
+
+    #[test]
+    fn crc32_update_matches_oneshot_across_a_split() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        for split in [0usize, 1, 3, 255, 256, 700, 1000] {
+            let (a, b) = data.split_at(split);
+            let streamed = super::crc32_update(super::crc32_update(0, a), b);
+            assert_eq!(streamed, super::crc32(&data), "split at {split}");
+        }
     }
 
     #[test]

@@ -12,6 +12,13 @@ pub enum LayoutError {
     /// A backing-audio run's offset + length overflowed u64.
     #[error("backing-audio range offset + length overflowed u64")]
     BackingRangeOverflow,
+    /// An Ogg art slice's offset + length overflowed u64, or its base64 output
+    /// length (`b64_len(art_total)`) overflowed u64.
+    #[error("ogg art slice range (offset + length, or base64 output length) overflowed u64")]
+    OggArtSliceRangeOverflow,
+    /// An Ogg art slice names an output window past the end of its source art.
+    #[error("ogg art slice output window exceeds the source art length")]
+    OggArtSliceOutOfBounds,
 }
 
 /// One contiguous run of bytes in a synthesized virtual file.
@@ -155,6 +162,27 @@ impl RegionLayout {
                     .checked_add(*len)
                     .ok_or(LayoutError::BackingRangeOverflow)?;
             }
+            if let Segment::OggArtSlice {
+                offset,
+                len: slice_len,
+                base64,
+                art_total,
+                ..
+            } = seg
+            {
+                let permitted = if *base64 {
+                    crate::ogg::b64_len_checked(*art_total)
+                        .ok_or(LayoutError::OggArtSliceRangeOverflow)?
+                } else {
+                    *art_total
+                };
+                let end = offset
+                    .checked_add(slice_len.get())
+                    .ok_or(LayoutError::OggArtSliceRangeOverflow)?;
+                if end > permitted {
+                    return Err(LayoutError::OggArtSliceOutOfBounds);
+                }
+            }
             total = total.checked_add(len).ok_or(LayoutError::TotalOverflow)?;
         }
         Ok(())
@@ -164,6 +192,90 @@ impl RegionLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_rejects_raw_ogg_art_slice_past_source() {
+        let seg = Segment::OggArtSlice {
+            art_id: 1,
+            offset: 5,
+            len: BlobLen::new(10).unwrap(),
+            base64: false,
+            art_total: 12,
+        };
+        assert_eq!(
+            RegionLayout::new(vec![seg, Segment::BackingAudio { offset: 0, len: 1 }]).validate(),
+            Err(LayoutError::OggArtSliceOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_base64_ogg_art_slice_past_source() {
+        let seg = Segment::OggArtSlice {
+            art_id: 1,
+            offset: 2,
+            len: BlobLen::new(4).unwrap(),
+            base64: true,
+            art_total: 3,
+        };
+        assert_eq!(
+            RegionLayout::new(vec![seg, Segment::BackingAudio { offset: 0, len: 1 }]).validate(),
+            Err(LayoutError::OggArtSliceOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_ogg_art_slice_offset_len_overflow() {
+        let seg = Segment::OggArtSlice {
+            art_id: 1,
+            offset: u64::MAX,
+            len: BlobLen::new(1).unwrap(),
+            base64: false,
+            art_total: u64::MAX,
+        };
+        assert_eq!(
+            RegionLayout::new(vec![seg, Segment::BackingAudio { offset: 0, len: 1 }]).validate(),
+            Err(LayoutError::OggArtSliceRangeOverflow)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_base64_ogg_art_slice_when_b64_len_overflows() {
+        let seg = Segment::OggArtSlice {
+            art_id: 1,
+            offset: 0,
+            len: BlobLen::new(1).unwrap(),
+            base64: true,
+            art_total: u64::MAX,
+        };
+        assert_eq!(
+            RegionLayout::new(vec![seg, Segment::BackingAudio { offset: 0, len: 1 }]).validate(),
+            Err(LayoutError::OggArtSliceRangeOverflow)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_ogg_art_slice_at_source_boundary() {
+        let raw = Segment::OggArtSlice {
+            art_id: 1,
+            offset: 2,
+            len: BlobLen::new(10).unwrap(),
+            base64: false,
+            art_total: 12,
+        };
+        RegionLayout::new(vec![raw, Segment::BackingAudio { offset: 0, len: 1 }])
+            .validate()
+            .unwrap();
+        let b64 = Segment::OggArtSlice {
+            art_id: 1,
+            offset: 0,
+            len: BlobLen::new(4).unwrap(),
+            base64: true,
+            art_total: 3,
+        };
+        RegionLayout::new(vec![b64, Segment::BackingAudio { offset: 0, len: 1 }])
+            .validate()
+            .unwrap();
+    }
 
     #[test]
     fn binary_tag_segment_len_and_validate() {

@@ -158,7 +158,7 @@ fn handle_reuses_one_open_and_no_per_read_stat() {
 }
 
 #[test]
-fn getattr_size_cache_hit_skips_stat() {
+fn getattr_size_cache_hit_restats_backing() {
     let _guard = METRICS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -179,11 +179,14 @@ fn getattr_size_cache_hit_skips_stat() {
 
     let first = fs.getattr(file_inode).unwrap(); // miss → resolve → stat
     metrics::reset();
-    let second = fs.getattr(file_inode).unwrap(); // hit → size cache, no stat
+    let second = fs.getattr(file_inode).unwrap(); // hit → size from cache, re-stat for freshness
     let s = metrics::snapshot();
 
     assert_eq!(first.size, second.size);
-    assert_eq!(s.stats, 0, "a warm getattr must not stat the backing file");
+    assert_eq!(
+        s.stats, 1,
+        "a warm getattr re-stats the backing file to detect out-of-band changes (#279)"
+    );
 }
 
 #[test]
@@ -224,7 +227,8 @@ fn layout_cache_survives_unrelated_refresh() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db2.replace_tags(

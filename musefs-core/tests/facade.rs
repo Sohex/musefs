@@ -291,7 +291,8 @@ fn poll_refresh_picks_up_external_db_edits() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.replace_tags(
@@ -315,7 +316,8 @@ fn poll_refresh_picks_up_external_db_edits() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db2.replace_tags(
@@ -416,7 +418,8 @@ fn poll_refresh_keeps_unchanged_entries_and_prunes_vanished() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db2.replace_tags(
@@ -446,7 +449,8 @@ fn poll_refresh_debounces_within_interval() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.replace_tags(
@@ -469,7 +473,8 @@ fn poll_refresh_debounces_within_interval() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db2.replace_tags(
@@ -496,7 +501,8 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.replace_tags(
@@ -524,7 +530,8 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db2.replace_tags(
@@ -555,7 +562,8 @@ fn failed_refresh_retries_after_backoff_not_every_call() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.replace_tags(
@@ -579,7 +587,8 @@ fn failed_refresh_retries_after_backoff_not_every_call() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db2.replace_tags(
@@ -613,7 +622,8 @@ fn poll_refresh_single_flights_concurrent_callers() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.replace_tags(
@@ -636,7 +646,8 @@ fn poll_refresh_single_flights_concurrent_callers() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db2.replace_tags(
@@ -672,7 +683,8 @@ fn inode_is_stable_across_refresh() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.replace_tags(
@@ -697,7 +709,8 @@ fn inode_is_stable_across_refresh() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db2.replace_tags(
@@ -988,7 +1001,8 @@ fn refresh_picks_up_externally_added_track() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.replace_tags(
@@ -1008,7 +1022,8 @@ fn refresh_picks_up_externally_added_track() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db2.replace_tags(
@@ -1225,7 +1240,8 @@ fn forced_refresh_and_poll_refresh_never_publish_stale_tree() {
                 audio_offset: 0,
                 audio_length: 0,
                 backing_size: 0,
-                backing_mtime: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
             })
             .unwrap();
         db.replace_tags(
@@ -1280,4 +1296,47 @@ fn forced_refresh_and_poll_refresh_never_publish_stale_tree() {
             "track A{n} missing — a stale rebuild published an outdated tree"
         );
     }
+}
+
+// Template-agnostic: walk readdir from the root to the first non-dir entry.
+fn first_file_inode(fs: &Musefs) -> u64 {
+    fn walk(fs: &Musefs, inode: u64) -> Option<u64> {
+        for (name, child, is_dir) in fs.readdir(inode).unwrap() {
+            if name == "." || name == ".." {
+                continue;
+            }
+            if is_dir {
+                if let Some(f) = walk(fs, child) {
+                    return Some(f);
+                }
+            } else {
+                return Some(child);
+            }
+        }
+        None
+    }
+    walk(fs, VirtualTree::ROOT).expect("a file inode under root")
+}
+
+// getattr's warm size-cache hit must re-stat with the full stamp (#276/#279):
+// a same-size sub-second rewrite after the first getattr must surface
+// BackingChanged, not stale attrs.
+#[test]
+fn getattr_size_cache_rejects_subsecond_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("a.flac");
+    common::write_flac(&src, &["TITLE=T", "ARTIST=A"], &[0xAB; 4096]);
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+
+    let inode = first_file_inode(&fs);
+    fs.getattr(inode).unwrap(); // warm the size cache
+
+    let mut v = std::fs::read(&src).unwrap();
+    *v.last_mut().unwrap() ^= 0xFF; // same size, new mtime/ctime
+    std::fs::write(&src, v).unwrap();
+
+    let err = fs.getattr(inode).unwrap_err();
+    assert!(matches!(err, CoreError::BackingChanged(_)), "got {err:?}");
 }

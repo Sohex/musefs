@@ -15,7 +15,14 @@ proptest! {
         let header = ogg::read_metadata(&file).unwrap();
         let taginputs: Vec<TagInput> = tags.iter().map(|(k, v)| TagInput::new(k, v)).collect();
         if let Ok(layout) =
-            ogg::synthesize_layout(&header, scan.audio_offset, scan.audio_length, &taginputs, &[])
+            ogg::synthesize_layout(
+                &header,
+                scan.audio_offset,
+                scan.audio_length,
+                &taginputs,
+                &[],
+                &ogg::MapArtSource::default(),
+            )
         {
             assert_backing_covers_audio(scan.audio_offset, scan.audio_length, &layout);
         }

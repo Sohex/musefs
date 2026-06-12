@@ -1,5 +1,6 @@
 mod common;
 use common::write_flac;
+use musefs_core::freshness::BackingStamp;
 use musefs_core::{HeaderCache, Mode, read_at, read_at_with_file};
 use musefs_db::{Db, Format, NewTrack, Tag};
 
@@ -17,14 +18,8 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
             audio_offset,
             audio_length,
             backing_size: meta.len(),
-            backing_mtime: i64::try_from(
-                meta.modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            )
-            .unwrap(),
+            backing_mtime_ns: common::real_mtime_ns(&flac),
+            backing_ctime_ns: common::real_ctime_ns(&flac),
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", "Real", 0)])
@@ -125,8 +120,11 @@ fn read_at_streams_art_image_segments() {
         total_len,
         content_version: 0,
         backing_path: std::path::PathBuf::from("/unused"),
-        backing_size: 0,
-        backing_mtime_secs: 0,
+        stamp: BackingStamp {
+            size: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        },
         mtime_secs: 0,
         last_page: std::sync::Mutex::new(None),
         cache_bytes: 0,

@@ -1,14 +1,18 @@
+mod art_source;
 mod b64;
 mod crc;
 mod page;
 
-pub use b64::{B64Window, b64_len, b64_window, encode_b64_slice};
+pub use art_source::{ArtSource, MapArtSource};
+
+pub use b64::{B64Window, b64_len, b64_len_checked, b64_window, encode_b64_slice};
 pub use page::{
     PageHeader, parse_page, patch_page_header, patch_page_header_algebraic, verify_page_crc,
 };
 
 use crate::error::{FormatError, Result};
 use crate::probe::Extent;
+use crate::size;
 
 /// The codec carried inside an Ogg logical bitstream that we synthesize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,25 +247,21 @@ pub fn read_metadata_bounded(prefix: &[u8], file_len: u64) -> Result<Extent<OggH
 use crate::input::TagInput;
 use crate::layout::{RegionLayout, Segment};
 
-/// Assemble a synthesized layout: regenerated header pages (with embedded art as
-/// `OggArtSlice` runs) + one compact `OggAudio` segment renumbering the preserved
-/// audio pages. `arts` carries each embedded image's metadata + raw bytes (used
-/// transiently to compute page CRCs; not retained in the layout).
 pub fn synthesize_layout(
     header: &OggHeader,
     audio_offset: u64,
     audio_length: u64,
     tags: &[TagInput],
     arts: &[OggArt],
+    src: &dyn ArtSource,
 ) -> Result<RegionLayout> {
-    // All art inputs are non-zero-length (the bridge drops zero-length at construction).
     let arts: Vec<OggArt> = arts.to_vec();
     let packet_chunks = build_packets_with_art(header, tags, &arts)?;
     let mut segments: Vec<Segment> = Vec::new();
     let mut seq = 0u32;
     for (i, chunks) in packet_chunks.iter().enumerate() {
         let (segs, used) =
-            crate::ogg::page::lace_chunks_to_segments(header.serial, seq, i == 0, chunks);
+            crate::ogg::page::lace_chunks_to_segments(header.serial, seq, i == 0, chunks, src)?;
         segments.extend(segs);
         seq += used;
     }
@@ -316,11 +316,11 @@ fn picture_prefix(art: &crate::input::ArtInput) -> Result<Vec<u8>> {
 use crate::ogg::page::PayloadChunk;
 use base64::Engine;
 
-/// One image to embed: its metadata and raw bytes (read transiently at resolve).
+/// One image to embed: its metadata. Bytes are read from an `ArtSource` only to
+/// compute page CRCs at synthesis time; they are never retained in the layout.
 #[derive(Clone, Copy)]
 pub struct OggArt<'a> {
     pub meta: &'a crate::input::ArtInput,
-    pub image: &'a [u8],
 }
 
 fn b64_encode(bytes: &[u8]) -> Vec<u8> {
@@ -345,10 +345,15 @@ fn build_packets_with_art(
             // the image; any one of these alone may fit in u32 but the sum may not.
             for a in arts {
                 let prefix = picture_prefix(a.meta)?;
-                let b64_prefix_len = b64_len(prefix.len() as u64);
-                let value_len = METADATA_BLOCK_PICTURE_KEY.len() as u64
-                    + b64_prefix_len
-                    + b64_len(a.meta.data_len.get());
+                let b64_prefix_len =
+                    b64_len_checked(prefix.len() as u64).ok_or(FormatError::TooLarge)?;
+                let b64_image_len =
+                    b64_len_checked(a.meta.data_len.get()).ok_or(FormatError::TooLarge)?;
+                let value_len = size::checked_sum([
+                    METADATA_BLOCK_PICTURE_KEY.len() as u64,
+                    b64_prefix_len,
+                    b64_image_len,
+                ])?;
                 if value_len > u64::from(u32::MAX) {
                     return Err(FormatError::TooLarge);
                 }
@@ -396,9 +401,13 @@ fn comment_packet_chunks(
     for art in arts {
         let prefix = picture_prefix(art.meta)?;
         let b64_prefix = b64_encode(&prefix);
-        let value_len = METADATA_BLOCK_PICTURE_KEY.len()
-            + b64_prefix.len()
-            + crate::convert::usize_from(b64_len(art.meta.data_len.get()));
+        let b64_image_len =
+            b64_len_checked(art.meta.data_len.get()).ok_or(FormatError::TooLarge)?;
+        let value_len = size::checked_sum([
+            METADATA_BLOCK_PICTURE_KEY.len() as u64,
+            b64_prefix.len() as u64,
+            b64_image_len,
+        ])?;
         head.extend_from_slice(
             &u32::try_from(value_len)
                 .map_err(|_| FormatError::TooLarge)?
@@ -409,7 +418,6 @@ fn comment_packet_chunks(
         chunks.push(PayloadChunk::Bytes(std::mem::take(&mut head)));
         chunks.push(PayloadChunk::Art {
             art_id: art.meta.art_id,
-            out: b64_encode(art.image),
             base64: true,
             art_total: art.meta.data_len.get(),
         });
@@ -459,7 +467,7 @@ fn oggflac_packets_with_art(
     block_packets.push(vec![PayloadChunk::Bytes(comment)]);
     for art in arts {
         let prefix = picture_prefix(art.meta)?;
-        let body_len = prefix.len() as u64 + art.meta.data_len.get();
+        let body_len = size::checked_add(prefix.len() as u64, art.meta.data_len.get())?;
         if body_len > crate::flac::MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
         }
@@ -470,7 +478,6 @@ fn oggflac_packets_with_art(
             PayloadChunk::Bytes(blk),
             PayloadChunk::Art {
                 art_id: art.meta.art_id,
-                out: art.image.to_vec(),
                 base64: false,
                 art_total: art.meta.data_len.get(),
             },
@@ -621,6 +628,7 @@ mod tests {
             scan.audio_length,
             &[TagInput::new("album", "Geogaddi")],
             &[],
+            &MapArtSource::default(),
         )
         .unwrap();
 
@@ -660,8 +668,15 @@ mod tests {
             read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
 
         // Synthesis re-lays the Opus header into a known page count; record it.
-        let baseline =
-            synthesize_layout(&header, scan.audio_offset, scan.audio_length, &[], &[]).unwrap();
+        let baseline = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[],
+            &[],
+            &MapArtSource::default(),
+        )
+        .unwrap();
         let synth_pages = baseline
             .segments()
             .iter()
@@ -673,8 +688,15 @@ mod tests {
         // pages must be renumbered downward by exactly three.
         let original_pages = u32::try_from(synth_pages).unwrap() + 3;
         header.header_pages = original_pages;
-        let layout =
-            synthesize_layout(&header, scan.audio_offset, scan.audio_length, &[], &[]).unwrap();
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[],
+            &[],
+            &MapArtSource::default(),
+        )
+        .unwrap();
         let delta = layout
             .segments()
             .iter()
@@ -728,6 +750,7 @@ mod tests {
             scan.audio_length,
             &[TagInput::new("artist", "Autechre")],
             &[],
+            &MapArtSource::default(),
         )
         .unwrap();
 
@@ -860,6 +883,7 @@ mod tests {
             scan.audio_length,
             &[TagInput::new("title", "Kaini Industries")],
             &[],
+            &MapArtSource::default(),
         )
         .unwrap();
 
@@ -910,15 +934,14 @@ mod tests {
             height: 64,
             data_len: crate::input::BlobLen::new(image.len() as u64).unwrap(),
         };
+        let src = MapArtSource::new([(meta.art_id, image.clone())]);
         let layout = synthesize_layout(
             &header,
             scan.audio_offset,
             scan.audio_length,
             &[TagInput::new("title", "Cover")],
-            &[OggArt {
-                meta: &meta,
-                image: &image,
-            }],
+            &[OggArt { meta: &meta }],
+            &src,
         )
         .unwrap();
 
@@ -1019,15 +1042,14 @@ mod tests {
 
         let image: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         let meta = art_input(11, "image/png", image.len());
+        let src = MapArtSource::new([(meta.art_id, image.clone())]);
         let layout = synthesize_layout(
             &header,
             scan.audio_offset,
             scan.audio_length,
             &[TagInput::new("artist", "X")],
-            &[OggArt {
-                meta: &meta,
-                image: &image,
-            }],
+            &[OggArt { meta: &meta }],
+            &src,
         )
         .unwrap();
 
@@ -1050,15 +1072,14 @@ mod tests {
 
         let image: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         let meta = art_input(22, "image/png", image.len());
+        let src = MapArtSource::new([(meta.art_id, image.clone())]);
         let layout = synthesize_layout(
             &header,
             scan.audio_offset,
             scan.audio_length,
             &[TagInput::new("title", "Y")],
-            &[OggArt {
-                meta: &meta,
-                image: &image,
-            }],
+            &[OggArt { meta: &meta }],
+            &src,
         )
         .unwrap();
 
@@ -1068,6 +1089,52 @@ mod tests {
         let pics = read_pictures(&bytes).unwrap();
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].data, image);
+    }
+
+    #[test]
+    fn synthesize_oggflac_embeds_large_art_spanning_pages_round_trips() {
+        // A >64 KiB raw PICTURE block forces the art run across multiple pages,
+        // exercising the non-base64 streaming-CRC path at page boundaries (the
+        // base64 path is covered by the lacer test; this pins the raw path).
+        let mut data = oggflac_headers();
+        let (audio, _) = crate::ogg::page::lace_packet(77, 3, false, 4096, &[0u8; 64]);
+        data.extend_from_slice(&audio);
+        let scan = locate_audio(&data).unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
+
+        let image: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let meta = art_input(31, "image/png", image.len());
+        let src = MapArtSource::new([(meta.art_id, image.clone())]);
+        let layout = synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[TagInput::new("title", "Big")],
+            &[OggArt { meta: &meta }],
+            &src,
+        )
+        .unwrap();
+
+        // The art run must split across pages: more than one raw OggArtSlice.
+        let art_slices = layout
+            .segments()
+            .iter()
+            .filter(|s| matches!(s, Segment::OggArtSlice { base64: false, .. }))
+            .count();
+        assert!(
+            art_slices >= 2,
+            "expected the raw art to span multiple pages, got {art_slices} slice(s)"
+        );
+
+        let bytes = materialize_header(&layout, &[(31, &image)]);
+        let h = read_header(&bytes).unwrap();
+        assert_eq!(h.codec, Codec::OggFlac);
+        let pics = read_pictures(&bytes).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(
+            pics[0].data, image,
+            "large art must round-trip byte-for-byte"
+        );
     }
 
     #[test]
@@ -1082,21 +1149,17 @@ mod tests {
         let img_b: Vec<u8> = (0..1500u32).map(|i| ((i * 3) % 251) as u8).collect();
         let meta_a = art_input(1, "image/png", img_a.len());
         let meta_b = art_input(2, "image/jpeg", img_b.len());
+        let src = MapArtSource::new([
+            (meta_a.art_id, img_a.clone()),
+            (meta_b.art_id, img_b.clone()),
+        ]);
         let layout = synthesize_layout(
             &header,
             scan.audio_offset,
             scan.audio_length,
             &[TagInput::new("title", "Multi")],
-            &[
-                OggArt {
-                    meta: &meta_a,
-                    image: &img_a,
-                },
-                OggArt {
-                    meta: &meta_b,
-                    image: &img_b,
-                },
-            ],
+            &[OggArt { meta: &meta_a }, OggArt { meta: &meta_b }],
+            &src,
         )
         .unwrap();
 
@@ -1120,10 +1183,7 @@ mod tests {
             width: 0,
             height: 0,
         };
-        let art = OggArt {
-            meta: &meta,
-            image: &[],
-        };
+        let art = OggArt { meta: &meta };
         let header = OggHeader {
             codec: Codec::Vorbis,
             serial: 0,
@@ -1148,10 +1208,7 @@ mod tests {
             width: 0,
             height: 0,
         };
-        let art = OggArt {
-            meta: &meta,
-            image: &[],
-        };
+        let art = OggArt { meta: &meta };
         let header = OggHeader {
             codec: Codec::Vorbis,
             serial: 0,
@@ -1183,10 +1240,7 @@ mod tests {
             width: 0,
             height: 0,
         };
-        let art = OggArt {
-            meta: &meta,
-            image: &[],
-        };
+        let art = OggArt { meta: &meta };
         let header = OggHeader {
             codec: Codec::Vorbis,
             serial: 0,
@@ -1199,6 +1253,62 @@ mod tests {
             accepted,
             "value_len exactly u32::MAX must be accepted by build_packets_with_art"
         );
+    }
+
+    #[test]
+    fn near_u64_max_art_value_rejected_by_build_packets() {
+        // data_len near u64::MAX makes b64_len(data_len) overflow u64; the builder
+        // must fail closed with TooLarge at the checked b64 length, not panic
+        // (debug) inside the pre-flight value_len computation.
+        let meta = crate::input::ArtInput {
+            art_id: 0,
+            mime: "image/jpeg".to_string(),
+            description: String::new(),
+            data_len: crate::input::BlobLen::new(u64::MAX).unwrap(),
+            picture_type: crate::input::PictureType::new(3).unwrap(),
+            width: 0,
+            height: 0,
+        };
+        let art = OggArt { meta: &meta };
+        let header = OggHeader {
+            codec: Codec::Vorbis,
+            serial: 0,
+            packets: vec![vec![], vec![], vec![]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let result = build_packets_with_art(&header, &[], &[art]);
+        let is_too_large = matches!(&result, Err(FormatError::TooLarge));
+        assert!(is_too_large, "expected Err(TooLarge) for near-u64::MAX art");
+    }
+
+    #[test]
+    fn near_u64_max_art_value_rejected_by_oggflac_build_packets() {
+        // The Ogg-FLAC art path builds a METADATA_BLOCK_PICTURE body as
+        // prefix + raw image. A hostile data_len near u64::MAX must fail closed
+        // with TooLarge, not panic (debug) / wrap (release). picture_prefix's u32
+        // length field already rejects it; the checked add keeps the body-length
+        // site self-defending regardless of that ordering.
+        let meta = crate::input::ArtInput {
+            art_id: 0,
+            mime: "image/jpeg".to_string(),
+            description: String::new(),
+            data_len: crate::input::BlobLen::new(u64::MAX).unwrap(),
+            picture_type: crate::input::PictureType::new(3).unwrap(),
+            width: 0,
+            height: 0,
+        };
+        let art = OggArt { meta: &meta };
+        let header = OggHeader {
+            codec: Codec::OggFlac,
+            serial: 0,
+            packets: vec![vec![0x7F]],
+            header_pages: 1,
+            audio_offset: 0,
+        };
+        let result = build_packets_with_art(&header, &[], &[art]);
+        let is_too_large = matches!(&result, Err(FormatError::TooLarge));
+        assert!(is_too_large, "expected Err(TooLarge) for near-u64::MAX art");
     }
 
     #[test]
@@ -1317,17 +1427,11 @@ mod tests {
         };
         let framing_len = picture_prefix(&mk(1)).unwrap().len() as u64;
         let at_limit = mk(crate::flac::MAX_BLOCK_BODY - framing_len);
-        let arts = [OggArt {
-            meta: &at_limit,
-            image: &[],
-        }];
+        let arts = [OggArt { meta: &at_limit }];
         assert!(oggflac_packets_with_art(&header, &[], &arts).is_ok());
         // one byte over must still error, pinning the high side of the boundary.
         let over = mk(crate::flac::MAX_BLOCK_BODY - framing_len + 1);
-        let arts = [OggArt {
-            meta: &over,
-            image: &[],
-        }];
+        let arts = [OggArt { meta: &over }];
         assert!(matches!(
             oggflac_packets_with_art(&header, &[], &arts),
             Err(FormatError::TooLarge)
@@ -1398,6 +1502,63 @@ mod tests {
         let pad = declared - u32::try_from(art.description.len()).unwrap();
         assert!(pad <= 2, "pad must be 0..=2, got {pad}");
         assert_eq!(pad, 0, "base % 3 == 0 implies pad 0");
+    }
+
+    #[test]
+    fn synthesis_reads_art_in_page_bounded_windows() {
+        use std::cell::Cell;
+        struct Counting<'a> {
+            inner: MapArtSource,
+            max: &'a Cell<usize>,
+        }
+        impl ArtSource for Counting<'_> {
+            fn read_window(&self, art_id: i64, offset: u64, buf: &mut [u8]) -> crate::Result<()> {
+                self.max.set(self.max.get().max(buf.len()));
+                self.inner.read_window(art_id, offset, buf)
+            }
+        }
+
+        // Inline Opus fixture, mirroring synthesize_opus_emits_valid_header_and_audio_segment.
+        let mut data = opus_headers();
+        let scan = locate_audio({
+            let (audio, _) = crate::ogg::page::lace_packet(0x1234, 2, false, 960, &[0u8; 80]);
+            data.extend_from_slice(&audio);
+            &data
+        })
+        .unwrap();
+        let header = read_metadata(&data[..crate::convert::usize_from(scan.audio_offset)]).unwrap();
+
+        let image: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
+        let meta = crate::input::ArtInput {
+            art_id: 7,
+            mime: "image/jpeg".to_string(),
+            description: String::new(),
+            picture_type: crate::input::PictureType::new(3).unwrap(),
+            width: 0,
+            height: 0,
+            data_len: crate::input::BlobLen::new(image.len() as u64).unwrap(),
+        };
+        let max = Cell::new(0usize);
+        let src = Counting {
+            inner: MapArtSource::new([(7i64, image.clone())]),
+            max: &max,
+        };
+        synthesize_layout(
+            &header,
+            scan.audio_offset,
+            scan.audio_length,
+            &[],
+            &[OggArt { meta: &meta }],
+            &src,
+        )
+        .unwrap();
+        // One Ogg page's payload is at most 255*255 = 65025 bytes; raw windows are
+        // <= that. The 500 KB image is never read in a single call.
+        assert!(
+            max.get() > 0 && max.get() <= 65_025,
+            "max single read was {}",
+            max.get()
+        );
     }
 }
 

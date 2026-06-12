@@ -104,17 +104,16 @@ fn richer_m4a(mdat_payload: &[u8]) -> Vec<u8> {
 const COVR_JPEG: &[u8] = b"\xFF\xD8\xFF\xE0interop-jpeg-cover";
 const COVR_PNG: &[u8] = b"\x89PNG\r\n\x1a\ninterop-png-cover";
 
-fn real_mtime(p: &Path) -> i64 {
-    i64::try_from(
-        std::fs::metadata(p)
-            .unwrap()
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    )
-    .unwrap()
+fn real_mtime_ns(p: &Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(p).unwrap();
+    meta.mtime() * 1_000_000_000 + meta.mtime_nsec()
+}
+
+fn real_ctime_ns(p: &Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(p).unwrap();
+    meta.ctime() * 1_000_000_000 + meta.ctime_nsec()
 }
 
 #[derive(Debug)]
@@ -167,7 +166,8 @@ fn emit(
             audio_offset,
             audio_length,
             backing_size: std::fs::metadata(src).unwrap().len(),
-            backing_mtime: real_mtime(src),
+            backing_mtime_ns: real_mtime_ns(src),
+            backing_ctime_ns: real_ctime_ns(src),
         })
         .unwrap();
     db.replace_tags(
@@ -230,7 +230,8 @@ fn emit_binary(
             audio_offset,
             audio_length,
             backing_size: std::fs::metadata(src).unwrap().len(),
-            backing_mtime: real_mtime(src),
+            backing_mtime_ns: real_mtime_ns(src),
+            backing_ctime_ns: real_ctime_ns(src),
         })
         .unwrap();
     db.replace_tags(id, text).unwrap();

@@ -18,6 +18,8 @@ pub enum FormatError {
     InvalidLayout(#[from] crate::layout::LayoutError),
     #[error("producer invariant violated: {0}")]
     ProducerBug(&'static str),
+    #[error("failed to read art {art_id} bytes for synthesis")]
+    ArtRead { art_id: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, FormatError>;

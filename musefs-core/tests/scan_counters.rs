@@ -330,3 +330,28 @@ fn revalidate_failed_carries_scan_failure() {
         "failed must carry the re-probe scan failure (skip_failed == 0)"
     );
 }
+
+// === Full-probe oracle counters (scan_directory_full_oracle, lines 858/864) ===
+
+/// The full-file-probe oracle's `scanned`/`skipped` counters must reflect the
+/// corpus exactly. A directory with one valid FLAC and one extension-only
+/// `.flac` of garbage (collected by `is_supported_audio`, then rejected by
+/// `probe_full`) yields scanned == 1, skipped == 1. The `+=`→`-=` mutants
+/// underflow-panic from 0 and `+=`→`*=` pin the counter at 0, so both counters
+/// must be asserted nonzero and exact.
+// kills scan L858 `stats.skipped += 1` and L864 `stats.scanned += 1` `+=`→`-=`/`*=`
+#[test]
+fn oracle_counts_scanned_and_skipped_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("good.flac"), flac_minimal(b"AUDIO-OK")).unwrap();
+    // Extension-only: `is_supported_audio` collects it, but `probe_full` returns
+    // None (no fLaC marker) → counted as skipped, not scanned.
+    std::fs::write(dir.path().join("bad.flac"), b"not a flac at all").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory_full_oracle(&db, dir.path()).unwrap();
+
+    assert_eq!(stats.scanned, 1, "exactly the one valid FLAC is scanned");
+    assert_eq!(stats.skipped, 1, "the garbage .flac is skipped");
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
