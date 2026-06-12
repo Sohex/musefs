@@ -331,27 +331,203 @@ fn revalidate_failed_carries_scan_failure() {
     );
 }
 
-// === Full-probe oracle counters (scan_directory_full_oracle, lines 858/864) ===
+// === Full-probe oracle counters (scan_directory_full_oracle) ===
 
-/// The full-file-probe oracle's `scanned`/`skipped` counters must reflect the
-/// corpus exactly. A directory with one valid FLAC and one extension-only
-/// `.flac` of garbage (collected by `is_supported_audio`, then rejected by
-/// `probe_full`) yields scanned == 1, skipped == 1. The `+=`→`-=` mutants
-/// underflow-panic from 0 and `+=`→`*=` pin the counter at 0, so both counters
-/// must be asserted nonzero and exact.
-// kills scan L858 `stats.skipped += 1` and L864 `stats.scanned += 1` `+=`→`-=`/`*=`
+/// The full-file-probe oracle's `scanned`/`failed`/`skipped` counters must
+/// reflect the corpus exactly: one valid FLAC (`scanned`), one extension-only
+/// `.flac` of garbage that `is_supported_audio` collects but `probe_full`
+/// rejects (`failed`), and one unsupported-extension file dropped at collection
+/// (`skipped`). Asserting all three nonzero-and-exact kills the `+=`→`-=`
+/// (underflow-panic from 0) and `+=`→`*=` (pinned at 0) mutants on the oracle's
+/// `stats.scanned += 1` / `stats.failed += 1` and on collection's `*skipped += 1`.
 #[test]
-fn oracle_counts_scanned_and_skipped_exactly() {
+fn oracle_counts_scanned_failed_and_skipped_exactly() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("good.flac"), flac_minimal(b"AUDIO-OK")).unwrap();
-    // Extension-only: `is_supported_audio` collects it, but `probe_full` returns
-    // None (no fLaC marker) → counted as skipped, not scanned.
+    // Extension-only: collected by `is_supported_audio`, rejected by `probe_full`.
     std::fs::write(dir.path().join("bad.flac"), b"not a flac at all").unwrap();
+    // Unsupported extension: dropped at collection → skipped.
+    std::fs::write(dir.path().join("notes.txt"), b"not audio").unwrap();
 
     let db = Db::open_in_memory().unwrap();
     let stats = scan_directory_full_oracle(&db, dir.path()).unwrap();
 
     assert_eq!(stats.scanned, 1, "exactly the one valid FLAC is scanned");
-    assert_eq!(stats.skipped, 1, "the garbage .flac is skipped");
+    assert_eq!(stats.failed, 1, "the garbage .flac is a failure");
+    assert_eq!(stats.skipped, 1, "the .txt is skipped at collection");
+}
+
+// === Symlink dedup under --follow-symlinks (#302) ===
+
+/// A real file and a symlink to it in the same directory ingest once: file-level
+/// (dev, ino) dedup (the directory-cycle guard does not apply to file symlinks).
+#[test]
+fn follow_symlinks_dedups_file_and_sibling_symlink() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let song = dir.path().join("song.flac");
+    std::fs::write(&song, flac_minimal(b"AUDIO-SONG")).unwrap();
+    symlink(&song, dir.path().join("link.flac")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 1, "real file and its symlink ingest once");
+    assert_eq!(stats.skipped, 0);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
+
+/// The same file reached through two directory paths — one real, one a file
+/// symlink in a sibling directory — ingests once. Exercises cross-directory
+/// file-level dedup.
+#[test]
+fn follow_symlinks_dedups_file_across_directories() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let song = a.join("song.flac");
+    std::fs::write(&song, flac_minimal(b"AUDIO-SONG")).unwrap();
+    symlink(&song, b.join("alias.flac")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 1);
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
+
+/// A symlinked directory pointing at an already-walked directory reaches the
+/// same file by two paths but ingests once. (Handled by the existing
+/// directory-cycle guard; this locks in the combined behavior.)
+#[test]
+fn follow_symlinks_dedups_via_symlinked_directory() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("song.flac"), flac_minimal(b"AUDIO-SONG")).unwrap();
+    symlink(&real, dir.path().join("mirror")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 1);
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
+
+/// Under follow, a symlink whose target has an unsupported extension counts as
+/// skipped, symmetric with a regular unsupported file. Covers the symlink-arm
+/// `*skipped += 1` site.
+#[test]
+fn follow_symlinks_counts_unsupported_symlink_target_as_skipped() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let txt = dir.path().join("notes.txt");
+    std::fs::write(&txt, b"hi").unwrap();
+    symlink(&txt, dir.path().join("link.txt")).unwrap();
+    std::fs::write(dir.path().join("song.flac"), flac_minimal(b"AUDIO")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 1);
+    // notes.txt (regular) + link.txt (symlink target) → both skipped.
+    assert_eq!(stats.skipped, 2);
+}
+
+/// A single unsupported file passed directly as the scan root is counted as
+/// skipped (kills the `scan_directory_with` single-file-root `skipped += 1`
+/// mutants — `-=` underflow-panics from 0, `*=` pins at 0).
+#[test]
+fn scan_single_unsupported_file_root_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let txt = dir.path().join("notes.txt");
+    std::fs::write(&txt, b"hi").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, &txt).unwrap();
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.skipped, 1);
+}
+
+/// Same single-unsupported-file root, via the full-probe oracle (kills the
+/// oracle's single-file-root `skipped += 1` mutants).
+#[test]
+fn oracle_single_unsupported_file_root_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let txt = dir.path().join("notes.txt");
+    std::fs::write(&txt, b"hi").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory_full_oracle(&db, &txt).unwrap();
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.skipped, 1);
+}
+
+/// Under follow, an unsupported file inside a directory that is ALSO reached via
+/// a directory symlink is counted as skipped exactly once: the directory-cycle
+/// guard skips the symlinked re-entry. Unsupported files are not file-deduped,
+/// so a missing guard would double-count `skipped` (kills the `descend`
+/// `if !follow_symlinks` gate mutant). The symlink targets a sibling real dir,
+/// not a cycle, so the walk terminates.
+#[test]
+fn follow_symlinks_mirrored_dir_counts_unsupported_file_once() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("notes.txt"), b"not audio").unwrap();
+    symlink(&real, dir.path().join("mirror")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.skipped, 1, "notes.txt is skipped once, not twice");
+}
+
+/// Two hardlinks to the same inode collapse to a single track under follow: the
+/// `(dev, ino)` dedup keys on inode identity, so hardlinks dedup like symlinks.
+/// Locks in the documented #302 side effect.
+#[test]
+fn follow_symlinks_dedups_hardlinks_to_same_inode() {
+    let dir = tempfile::tempdir().unwrap();
+    let song = dir.path().join("song.flac");
+    std::fs::write(&song, flac_minimal(b"AUDIO-SONG")).unwrap();
+    std::fs::hard_link(&song, dir.path().join("link.flac")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    assert_eq!(
+        stats.scanned, 1,
+        "hardlinks to one inode ingest once under follow"
+    );
     assert_eq!(db.list_tracks().unwrap().len(), 1);
 }

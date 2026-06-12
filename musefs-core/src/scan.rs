@@ -35,13 +35,14 @@ pub(crate) const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 /// payloads (e.g. a GEOB embedding a multi-MB file) are logged-and-skipped.
 const MAX_BINARY_TAG_BYTES: usize = MAX_ART_BYTES;
 
-/// Outcome of probing one backing file. `Raced` means the file changed under us
-/// between the pre- and post-probe `fstat` — the probe may be torn, so nothing
-/// is committed for it (#276).
+/// Outcome of probing one backing file. `Unparseable` is a supported-extension
+/// file whose bytes did not parse (counted as a scan `failed`). `Raced` means
+/// the file changed under us between the pre- and post-probe `fstat` — the probe
+/// may be torn, so nothing is committed for it (#276).
 #[derive(Debug)]
 enum ProbeOutcome {
     Probed(Probed, BackingStamp),
-    Unsupported,
+    Unparseable,
     Raced,
 }
 
@@ -106,8 +107,10 @@ fn collect_audio(
     root: &Path,
     out: &mut Vec<PathBuf>,
     follow_symlinks: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     let mut visited = HashSet::new();
+    let mut files_visited = HashSet::new();
+    let mut skipped = 0u64;
     if follow_symlinks {
         // Seed with the root's identity so a symlink pointing back to it is
         // caught as a cycle on the first descent.
@@ -115,7 +118,15 @@ fn collect_audio(
             visited.insert(dir_key(&meta));
         }
     }
-    collect_audio_inner(root, out, follow_symlinks, &mut visited)
+    collect_audio_inner(
+        root,
+        out,
+        follow_symlinks,
+        &mut visited,
+        &mut files_visited,
+        &mut skipped,
+    )?;
+    Ok(skipped)
 }
 
 fn collect_audio_inner(
@@ -123,16 +134,20 @@ fn collect_audio_inner(
     out: &mut Vec<PathBuf>,
     follow_symlinks: bool,
     visited: &mut HashSet<(u64, u64)>,
+    files_visited: &mut HashSet<(u64, u64)>,
+    skipped: &mut u64,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
-            descend(&path, out, follow_symlinks, visited)?;
+            descend(&path, out, follow_symlinks, visited, files_visited, skipped)?;
         } else if ftype.is_file() {
             if is_supported_audio(&path) {
-                out.push(path);
+                push_file(&path, out, follow_symlinks, files_visited, None);
+            } else {
+                *skipped += 1;
             }
         } else if ftype.is_symlink() {
             if !follow_symlinks {
@@ -143,10 +158,14 @@ fn collect_audio_inner(
                 continue;
             }
             match std::fs::metadata(&path) {
-                Ok(meta) if meta.is_dir() => descend(&path, out, follow_symlinks, visited)?,
+                Ok(meta) if meta.is_dir() => {
+                    descend(&path, out, follow_symlinks, visited, files_visited, skipped)?;
+                }
                 Ok(meta) if meta.is_file() => {
                     if is_supported_audio(&path) {
-                        out.push(path);
+                        push_file(&path, out, follow_symlinks, files_visited, Some(&meta));
+                    } else {
+                        *skipped += 1;
                     }
                 }
                 Ok(_) => {}
@@ -164,9 +183,11 @@ fn descend(
     out: &mut Vec<PathBuf>,
     follow_symlinks: bool,
     visited: &mut HashSet<(u64, u64)>,
+    files_visited: &mut HashSet<(u64, u64)>,
+    skipped: &mut u64,
 ) -> std::io::Result<()> {
     if !follow_symlinks {
-        return collect_audio_inner(path, out, follow_symlinks, visited);
+        return collect_audio_inner(path, out, follow_symlinks, visited, files_visited, skipped);
     }
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -179,12 +200,42 @@ fn descend(
         log::warn!("skipping symlink cycle at {}", path.display());
         return Ok(());
     }
-    collect_audio_inner(path, out, follow_symlinks, visited)
+    collect_audio_inner(path, out, follow_symlinks, visited, files_visited, skipped)
 }
 
 fn dir_key(meta: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (meta.dev(), meta.ino())
+}
+
+/// Collect one supported-extension file into `out`, deduplicating by target
+/// identity when following symlinks so a real file and a symlink to it (or a
+/// file reached via two symlink paths) are ingested once. `known_meta` is the
+/// already-resolved target metadata when the caller has it (the symlink arm),
+/// avoiding a second `stat`. Dedup is best-effort: if the target cannot be
+/// `stat`ed we push it and let the probe pipeline count it rather than dropping
+/// it silently.
+fn push_file(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    follow_symlinks: bool,
+    files_visited: &mut HashSet<(u64, u64)>,
+    known_meta: Option<&std::fs::Metadata>,
+) {
+    if !follow_symlinks {
+        out.push(path.to_path_buf());
+        return;
+    }
+    let key = match known_meta {
+        Some(m) => Some(dir_key(m)),
+        None => std::fs::metadata(path).ok().map(|m| dir_key(&m)),
+    };
+    match key {
+        Some(k) if !files_visited.insert(k) => {
+            log::debug!("skipping duplicate backing target {}", path.display());
+        }
+        _ => out.push(path.to_path_buf()),
+    }
 }
 
 /// A backing file parsed into the fields a track row needs, plus its raw
@@ -312,8 +363,9 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
 /// probe. Never reads the audio payload (M4A uses the seek reader;
 /// front-anchored formats read only the metadata extent).
 ///
-/// Returns `ProbeOutcome::Unsupported` for an unsupported/unparseable file (to
-/// be skipped) and `ProbeOutcome::Raced` if the file changed under us.
+/// Returns `ProbeOutcome::Unparseable` for a supported-extension file that does
+/// not parse (counted as `failed`) and `ProbeOutcome::Raced` if the file
+/// changed under us.
 fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
@@ -330,7 +382,7 @@ fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
     }
     Ok(match probed {
         Some(p) => ProbeOutcome::Probed(p, s1),
-        None => ProbeOutcome::Unsupported,
+        None => ProbeOutcome::Unparseable,
     })
 }
 
@@ -739,20 +791,25 @@ fn ingest_bulk(
 /// Opus, Vorbis, FLAC-in-Ogg) under `root` (with audio bounds and validation
 /// stamps), seeding its tags from the file's existing metadata. `root` may be
 /// a single audio file (only that file is scanned) or a directory (walked
-/// recursively). Unsupported-format files increment `ScanStats::skipped`; files
-/// with a per-file I/O or parse error increment `ScanStats::failed` and do not
-/// abort the scan.
+/// recursively). Files whose extension is not a supported audio format
+/// increment `ScanStats::skipped`; supported-extension files with a per-file
+/// I/O or parse error increment `ScanStats::failed` and do not abort the scan.
 pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<ScanStats> {
     let mut files = Vec::new();
+    let mut skipped = 0u64;
     if root.is_file() {
         if is_supported_audio(root) {
             files.push(root.to_path_buf());
+        } else {
+            skipped += 1;
         }
     } else {
-        collect_audio(root, &mut files, opts.follow_symlinks)?;
+        skipped += collect_audio(root, &mut files, opts.follow_symlinks)?;
     }
     db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
-    let stats = run_pipeline(db, files, opts)?;
+    let mut stats = run_pipeline(db, files, opts)?;
+    // skipped is tallied during the walk, not the pipeline
+    stats.skipped = skipped;
     Ok(stats)
 }
 
@@ -772,7 +829,6 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     let window = opts.window;
     let cap = opts.batch_bytes;
     let budget = Arc::new(ByteBudget::new(cap));
-    let skipped = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
     let raced = Arc::new(AtomicU64::new(0));
 
@@ -785,7 +841,6 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         let work = Arc::clone(&work);
         let tx = tx.clone();
         let budget = Arc::clone(&budget);
-        let skipped = Arc::clone(&skipped);
         let failed = Arc::clone(&failed);
         let raced = Arc::clone(&raced);
         workers.push(std::thread::spawn(move || {
@@ -811,14 +866,11 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                             break;
                         }
                     }
-                    Ok(ProbeOutcome::Unsupported) => {
-                        skipped.fetch_add(1, Ordering::Relaxed);
+                    Ok(ProbeOutcome::Unparseable) | Err(_) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(ProbeOutcome::Raced) => {
                         raced.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        failed.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -902,7 +954,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
 
     Ok(ScanStats {
         scanned,
-        skipped: skipped.load(Ordering::Relaxed),
+        skipped: 0, // counted at walk time; filled in by scan_directory_with
         failed: failed.load(Ordering::Relaxed),
         raced: raced.load(Ordering::Relaxed),
     })
@@ -913,23 +965,26 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
 #[doc(hidden)]
 pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut files = Vec::new();
+    let mut skipped = 0u64;
     if root.is_file() {
         if is_supported_audio(root) {
             files.push(root.to_path_buf());
+        } else {
+            skipped += 1;
         }
     } else {
-        collect_audio(root, &mut files, false)?;
+        skipped += collect_audio(root, &mut files, false)?;
     }
     let mut stats = ScanStats {
         scanned: 0,
-        skipped: 0,
+        skipped,
         failed: 0,
         raced: 0,
     };
     for path in files {
         let bytes = std::fs::read(&path)?;
         let Some(probed) = probe_full(&path, &bytes) else {
-            stats.skipped += 1;
+            stats.failed += 1;
             continue;
         };
         let meta = std::fs::metadata(&path)?;
@@ -1710,7 +1765,7 @@ mod hardening_tests {
     }
 
     #[test]
-    fn scan_directory_counts_scanned_and_skipped() {
+    fn scan_directory_counts_scanned_failed_and_skipped() {
         let dir = tempfile::tempdir().unwrap();
         write_flac(
             &dir.path().join("ok1.flac"),
@@ -1722,10 +1777,14 @@ mod hardening_tests {
             &["ARTIST=A", "TITLE=T2"],
             None,
         );
+        // Supported extension, unparseable bytes → a scan failure.
         std::fs::write(dir.path().join("bad.flac"), b"garbage").unwrap();
+        // Unsupported extension → skipped at collection, never probed.
+        std::fs::write(dir.path().join("notes.txt"), b"hello").unwrap();
         let db = musefs_db::Db::open_in_memory().unwrap();
         let stats = crate::scan_directory(&db, dir.path()).unwrap();
         assert_eq!(stats.scanned, 2);
+        assert_eq!(stats.failed, 1);
         assert_eq!(stats.skipped, 1);
     }
 
@@ -2306,7 +2365,7 @@ mod bounded_probe_tests {
 
         assert!(matches!(
             probe_file(&path, WINDOW).unwrap(),
-            ProbeOutcome::Unsupported
+            ProbeOutcome::Unparseable
         ));
     }
 

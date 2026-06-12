@@ -345,7 +345,11 @@ Symlinks are **not followed by default**: a symlinked file or directory is
 logged (`RUST_LOG=info`/`warn`) and skipped, which keeps the walk immune to
 directory-symlink cycles. Passing `--follow-symlinks` resolves them — symlinked
 audio files and directories are scanned — guarded by a visited `(dev, ino)` set
-so symlink cycles terminate. Broken symlinks are logged and skipped without
+so symlink cycles terminate, and by a second file-level `(dev, ino)` set so a
+file reached via both a real path and a symlink is ingested once rather than
+upserting its canonical track row twice. Because that set keys on `(dev, ino)`,
+multiple hardlinks to the same inode are likewise collapsed to a single track
+under `--follow-symlinks`. Broken symlinks are logged and skipped without
 aborting the scan. The `root` argument is always followed regardless of the
 flag; only links encountered during recursion are gated.
 

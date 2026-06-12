@@ -48,6 +48,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `id3 ` chunk. Parsing is now gated on validated ID3v2 frame bounds and an
   ID3v2 tag at offset 0 (the `id3` reader scans forward). Found by the `mp3` and
   `wav` fuzz targets.
+- **Scan counters now match their documented contract:** `musefs scan` reports
+  every non-audio file (any unsupported or missing extension — `.jpg`, `.cue`,
+  `.log`, `.nfo`, cover art, etc.) as `skipped`, and supported-extension files
+  that fail to parse (e.g. a corrupt `.flac`) as `failed`. Previously malformed
+  files were miscounted as `skipped` and unsupported files were not counted at
+  all, so expect `skipped` to be larger than before on a real library (#301).
+- **Symlink scans no longer double-count:** with `--follow-symlinks`, a file
+  reached via both its real path and a symlink is ingested and counted once
+  instead of inflating `scanned`; multiple hardlinks to the same inode are
+  likewise collapsed to a single track (#302).
 
 ## [0.2.0] - 2026-05-27
 
