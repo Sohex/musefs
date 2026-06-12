@@ -403,9 +403,7 @@ fn probe_body(
         let scan = match mp4::read_structure_from(&mut f, file_len) {
             Ok(s) => s,
             Err(e) => {
-                if matches!(e, mp4::Mp4ScanError::MetadataTooLarge { .. }) {
-                    log::warn!("skipping {}: {e}", path.display());
-                }
+                log::warn!("skipping {}: {e}", path.display());
                 return Ok(None);
             }
         };
@@ -436,7 +434,10 @@ fn probe_body(
     for _ in 0..MAX_WIDEN_RETRIES {
         match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
             Probe::Done(p) => return Ok(Some(p)),
-            Probe::Skip => return Ok(None),
+            Probe::Skip => {
+                log::warn!("skipping {}: no parseable audio metadata", path.display());
+                return Ok(None);
+            }
             Probe::NeedMore(up_to) => {
                 // Read everything we're willing to probe? Widening can't help.
                 if want as u64 >= probe_cap {
@@ -473,6 +474,8 @@ fn probe_body(
             "skipping {}: no parseable metadata within first {MAX_PROBE_BYTES} bytes",
             path.display()
         );
+    } else {
+        log::warn!("skipping {}: no parseable audio metadata", path.display());
     }
     Ok(None)
 }
@@ -619,6 +622,53 @@ fn key_passes_floor(key: &str) -> bool {
     !key.is_empty() && key.bytes().all(|b| b >= 0x20)
 }
 
+/// Drops embedded pictures over [`MAX_ART_BYTES`], logging each so a cover that
+/// vanishes from the synthesized view is explained rather than silent (#284).
+/// Filtering here, before the caller enumerates, keeps stored art ordinals
+/// gap-free. Note: the mp4 `covr` path caps oversize art earlier, inside
+/// `mp4::read_pictures`, so those drops never reach this filter.
+fn accept_pictures(abs_path: &str, pictures: Vec<EmbeddedPicture>) -> Vec<EmbeddedPicture> {
+    pictures
+        .into_iter()
+        .filter(|p| {
+            if p.data.len() > MAX_ART_BYTES {
+                log::warn!(
+                    "{abs_path}: dropping embedded {} art ({} bytes), over the {MAX_ART_BYTES}-byte cap",
+                    p.mime,
+                    p.data.len(),
+                );
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Filters embedded binary tags to those worth storing, logging oversize drops
+/// (#284). Empty payloads carry nothing to serve, so they are dropped silently;
+/// payloads over [`MAX_BINARY_TAG_BYTES`] are a lossy drop and get a warning.
+fn accept_binary_tags(abs_path: &str, tags: Vec<EmbeddedBinaryTag>) -> Vec<musefs_db::BinaryTag> {
+    tags.into_iter()
+        .filter(|b| {
+            if b.payload.len() > MAX_BINARY_TAG_BYTES {
+                log::warn!(
+                    "{abs_path}: dropping binary tag {} ({} bytes), over the {MAX_BINARY_TAG_BYTES}-byte cap",
+                    b.key,
+                    b.payload.len(),
+                );
+                return false;
+            }
+            !b.payload.is_empty()
+        })
+        .enumerate()
+        .map(|(ordinal, b)| musefs_db::BinaryTag {
+            key: b.key,
+            payload: b.payload,
+            ordinal: ordinal as u64,
+        })
+        .collect()
+}
+
 /// Upsert a track from a probed backing file: write the track row, replace its
 /// seeded tags, and ingest its embedded art (capped, deduped, clamped).
 fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
@@ -645,17 +695,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     }
     db.replace_tags(track_id, &tags)?;
 
-    let binary_tags: Vec<musefs_db::BinaryTag> = probed
-        .binary_tags
-        .into_iter()
-        .filter(|b| !b.payload.is_empty() && b.payload.len() <= MAX_BINARY_TAG_BYTES)
-        .enumerate()
-        .map(|(ordinal, b)| musefs_db::BinaryTag {
-            key: b.key,
-            payload: b.payload,
-            ordinal: ordinal as u64,
-        })
-        .collect();
+    let binary_tags = accept_binary_tags(abs_path, probed.binary_tags);
     db.set_binary_tags(track_id, &binary_tags)?;
 
     let mut sb_ordinals: HashMap<String, u64> = HashMap::new();
@@ -676,13 +716,10 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
     db.set_structural_blocks(track_id, &structural_blocks)?;
 
     let mut track_arts = Vec::new();
-    // Filter before enumerating so skipped (oversized) art doesn't leave gaps
-    // in the stored ordinals.
-    let accepted = probed
-        .pictures
+    for (ordinal, pic) in accept_pictures(abs_path, probed.pictures)
         .into_iter()
-        .filter(|p| p.data.len() <= MAX_ART_BYTES);
-    for (ordinal, pic) in accepted.enumerate() {
+        .enumerate()
+    {
         let art_id = db.upsert_art(&NewArt {
             mime: pic.mime,
             width: (pic.width != 0).then_some(pic.width),
@@ -731,17 +768,7 @@ fn ingest_bulk(
     }
     bw.replace_tags(track_id, &tags)?;
 
-    let binary_tags: Vec<musefs_db::BinaryTag> = probed
-        .binary_tags
-        .into_iter()
-        .filter(|b| !b.payload.is_empty() && b.payload.len() <= MAX_BINARY_TAG_BYTES)
-        .enumerate()
-        .map(|(ordinal, b)| musefs_db::BinaryTag {
-            key: b.key,
-            payload: b.payload,
-            ordinal: ordinal as u64,
-        })
-        .collect();
+    let binary_tags = accept_binary_tags(abs_path, probed.binary_tags);
     bw.set_binary_tags(track_id, &binary_tags)?;
 
     let mut sb_ordinals: HashMap<String, u64> = HashMap::new();
@@ -762,11 +789,10 @@ fn ingest_bulk(
     bw.set_structural_blocks(track_id, &structural_blocks)?;
 
     let mut track_arts = Vec::new();
-    let accepted = probed
-        .pictures
+    for (ordinal, pic) in accept_pictures(abs_path, probed.pictures)
         .into_iter()
-        .filter(|p| p.data.len() <= MAX_ART_BYTES);
-    for (ordinal, pic) in accepted.enumerate() {
+        .enumerate()
+    {
         let art_id = bw.upsert_art(&NewArt {
             mime: pic.mime,
             width: (pic.width != 0).then_some(pic.width),
@@ -849,9 +875,13 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                 let Some(path) = next else { break };
                 match probe_file(&path, window) {
                     Ok(ProbeOutcome::Probed(probed, stamp)) => {
-                        let Ok(abs) = std::fs::canonicalize(&path) else {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            continue;
+                        let abs = match std::fs::canonicalize(&path) {
+                            Ok(abs) => abs,
+                            Err(e) => {
+                                log::warn!("skipping {}: {e}", path.display());
+                                failed.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                         };
                         let weight = payload_weight(&probed);
                         budget.acquire(weight); // backpressure on in-flight art bytes
@@ -866,7 +896,11 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                             break;
                         }
                     }
-                    Ok(ProbeOutcome::Unparseable) | Err(_) => {
+                    Ok(ProbeOutcome::Unparseable) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        log::warn!("skipping {}: {e}", path.display());
                         failed.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(ProbeOutcome::Raced) => {
@@ -1045,13 +1079,21 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     let mut skip_failed = 0u64;
     let mut changed: Vec<PathBuf> = Vec::new();
     for path in files {
-        let Ok(meta) = std::fs::metadata(&path) else {
-            skip_failed += 1;
-            continue;
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                log::warn!("skipping {}: {e}", path.display());
+                skip_failed += 1;
+                continue;
+            }
         };
-        let Ok(abs) = std::fs::canonicalize(&path) else {
-            skip_failed += 1;
-            continue;
+        let abs = match std::fs::canonicalize(&path) {
+            Ok(abs) => abs,
+            Err(e) => {
+                log::warn!("skipping {}: {e}", path.display());
+                skip_failed += 1;
+                continue;
+            }
         };
         let key = abs.to_string_lossy().into_owned();
         if let Some((stamp, id, format)) = existing.get(&key).copied() {
