@@ -9,6 +9,10 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
+# Make the in-repo python-musefs importable without a prior `pip install`, and
+# prepend it so the current checkout always wins over an installed/stale copy.
+export PYTHONPATH="$repo_root/contrib/python-musefs/src${PYTHONPATH:+:$PYTHONPATH}"
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 backing="$work/backing"; mkdir -p "$backing"
