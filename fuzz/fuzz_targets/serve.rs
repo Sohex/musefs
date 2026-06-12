@@ -285,12 +285,17 @@ fuzz_target!(|data: &[u8]| {
 
     // Splice-consistency invariants. A successfully-resolved layout is internally
     // consistent regardless of how its rows were planted, so whenever the read
-    // returns Ok these MUST hold and are asserted. The only hostile-path
-    // relaxation: a read may return Err (missing art row, stale binary-tag
-    // handle, bumped content_version) -> return/break, do not assert.
+    // returns Ok these MUST hold and are asserted. The only relaxation: when ANY
+    // hostile mutation was applied, a read may return Err -> return/break, do not
+    // assert. This must key on `hostile.is_some()`, NOT `hostile_post`: resolve
+    // trusts the DB geometry for Ogg (it defers page parsing to read time), so a
+    // pre-resolve geometry corruption (variant 0) can survive resolve and surface
+    // as a clean Err(Format(Malformed)) at read time — that is the production code
+    // correctly rejecting hostile state, not a clean-path failure. Only a
+    // genuinely clean input (hostile == None) must read without error.
     let whole = match read_at_with_file(&resolved, &db, &file, 0, total) {
         Ok(w) => w,
-        Err(_) if hostile_post => return,
+        Err(_) if hostile.is_some() => return,
         Err(e) => panic!("clean-path whole read failed: {e:?}"),
     };
     assert_eq!(whole.len() as u64, total, "whole read length != total_len");
@@ -312,7 +317,7 @@ fuzz_target!(|data: &[u8]| {
         };
         let got = match read_at_with_file(&resolved, &db, &file, offset, size) {
             Ok(g) => g,
-            Err(_) if hostile_post => break,
+            Err(_) if hostile.is_some() => break,
             Err(e) => panic!("clean-path window read failed: {e:?}"),
         };
         // Mirror read_segments_into's clamp: served = [min(offset,total), min(offset+size,total)).
