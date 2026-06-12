@@ -608,6 +608,10 @@ fn new_session(
     fs_name: &str,
     allow_other: bool,
 ) -> std::io::Result<Session<MusefsFs>> {
+    // Validate the allow_other environment before taking the mount lock: the
+    // /etc/fuse.conf read is unrelated to the fusermount3 handshake the lock
+    // serializes, so it must not extend that critical section.
+    platform::mount::check_allow_other(allow_other)?;
     // Recover from a poisoned lock: it guards only ordering, so a prior panic
     // during a mount leaves no inconsistent state to protect against.
     let _guard = MOUNT_SETUP
