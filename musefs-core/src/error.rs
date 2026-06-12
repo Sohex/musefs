@@ -12,6 +12,8 @@ pub enum CoreError {
     },
     #[error(transparent)]
     Format(#[from] musefs_format::FormatError),
+    #[error(transparent)]
+    InvalidTemplate(#[from] crate::template::TemplateError),
     #[error("MP4 {box_kind} box is {size} bytes, exceeds the {cap}-byte metadata cap")]
     Mp4MetadataTooLarge {
         box_kind: &'static str,

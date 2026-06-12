@@ -106,7 +106,8 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::ArtTooLarge { .. }
         | CoreError::InvalidPictureType { .. }
         | CoreError::HeaderTooLarge { .. }
-        | CoreError::Format(_) => fuser::Errno::EIO,
+        | CoreError::Format(_)
+        | CoreError::InvalidTemplate(_) => fuser::Errno::EIO,
     }
 }
 
