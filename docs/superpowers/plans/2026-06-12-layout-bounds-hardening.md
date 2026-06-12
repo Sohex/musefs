@@ -15,7 +15,7 @@
 ## File Structure
 
 - **Create** `musefs-format/src/size.rs` — `pub(crate)` checked aggregate-size helpers (`checked_add`, `checked_sum`) returning `FormatError::TooLarge`. One responsibility: overflow-safe size arithmetic for builders.
-- **Modify** `musefs-format/src/lib.rs` — register `mod size;`.
+- **Modify** `musefs-format/src/lib.rs` — register `mod size;` (between `pub mod probe;` at line 9 and `mod tagmap;` at line 10).
 - **Modify** `musefs-format/src/ogg/b64.rs` — add `b64_len_checked`; make `b64_len` delegate; add a reader-safety boundary test.
 - **Modify** `musefs-format/src/ogg/mod.rs` — re-export `b64_len_checked`; switch the two VorbisComment picture `value_len` computations to checked helpers; add an overflow test.
 - **Modify** `musefs-format/src/layout.rs` — two new `LayoutError` variants; `OggArtSlice` case in `validate`; Part A tests.
@@ -437,19 +437,21 @@ use crate::size;
 
 - [ ] **Step 4: Convert the accumulation sites**
 
-Replace **every** occurrence (6 of them) of:
+This accumulator line appears **8 times** at three different indentation levels (text/id3-text paths at 16 spaces; the TXXX/COMMENT/USLT/fallback-TXXX `for value in values` loops at 20 spaces; and the **POPM and UFID** accumulators at 8 spaces). Use a **`replace_all`** keyed on the substring **starting at `frames_len`** (no leading whitespace in the match), so each line's existing indentation is left untouched and all 8 sites — including POPM/UFID — are converted in one operation. Do not key on an indented copy (it would match only the sites at that one indent level), and do not edit site-by-site (you may miss POPM/UFID).
 
-```rust
-                frames_len += 10 + data.len() as u64;
+Replace this substring (exactly, no leading spaces):
+
+```
+frames_len += 10 + data.len() as u64;
 ```
 
 with:
 
-```rust
-                frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
+```
+frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
 ```
 
-(`data` is a freshly built `Vec`, so `10 + data.len()` cannot itself overflow; only the running `frames_len` accumulation is the DB-derived aggregate.)
+After the replace, confirm with `grep -c "frames_len += 10 + data.len() as u64;" musefs-format/src/mp3.rs` returning `0`. (`data` is a freshly built `Vec`, so `10 + data.len()` cannot itself overflow; only the running `frames_len` accumulation is the DB-derived aggregate.)
 
 Replace the binary-tag site:
 
@@ -690,7 +692,7 @@ git commit -m "fix(format): checked box-size aggregates in mp4 synthesis (#274)"
 ## Task 6: wav — checked aggregate for the RIFF size
 
 **Files:**
-- Modify: `musefs-format/src/wav.rs` — imports, the `synthesize` RIFF-size block (`:275-276`)
+- Modify: `musefs-format/src/wav.rs` — imports, the `synthesize_layout` RIFF-size block (`:275-276`)
 
 - [ ] **Step 1: Add the `size` import**
 
