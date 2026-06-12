@@ -320,90 +320,8 @@ fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
     let s1 = BackingStamp::from_metadata(&file.metadata()?);
     #[cfg(test)]
     fire_after_s1();
-    let file_len = s1.size;
 
-    // ---- existing probe body, using file_len = s1.size ----
-    let probed: Option<Probed> = (|file_len: u64| -> std::io::Result<Option<Probed>> {
-        // M4A: seek reader, never touches mdat.
-        if has_ext(path, "m4a") || has_ext(path, "m4b") {
-            let mut f = &file;
-            let scan = match mp4::read_structure_from(&mut f, file_len) {
-                Ok(s) => s,
-                Err(e) => {
-                    if matches!(e, mp4::Mp4ScanError::MetadataTooLarge { .. }) {
-                        log::warn!("skipping {}: {e}", path.display());
-                    }
-                    return Ok(None);
-                }
-            };
-            return Ok(Some(Probed {
-                format: Format::M4a,
-                audio_offset: scan.mdat_payload_offset,
-                audio_length: scan.mdat_payload_len,
-                tags: mp4::read_tags(&scan.moov),
-                pictures: mp4::read_pictures(&scan.moov, MAX_ART_BYTES),
-                binary_tags: mp4::read_binary_tags(&scan.moov, MAX_BINARY_TAG_BYTES),
-                structural_blocks: Vec::new(),
-            }));
-        }
-
-        // Front-anchored formats: read a window, widen on NeedMore. Only the MP3
-        // arm of probe_prefix consumes the ID3v1 tail, and dispatch is by
-        // extension — so only .mp3 pays the tail read (#67).
-        let tail = if has_ext(path, "mp3") {
-            read_tail_128(&file, file_len)?
-        } else {
-            None
-        };
-        // Never read past the probe ceiling, however large the file or whatever a
-        // (possibly corrupt) header asks for via `NeedMore`.
-        let probe_cap = file_len.min(MAX_PROBE_BYTES);
-        let mut want = usize_from((window as u64).min(probe_cap));
-        let mut prefix = read_window(&file, want)?;
-        for _ in 0..MAX_WIDEN_RETRIES {
-            match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
-                Probe::Done(p) => return Ok(Some(p)),
-                Probe::Skip => return Ok(None),
-                Probe::NeedMore(up_to) => {
-                    // Read everything we're willing to probe? Widening can't help.
-                    if want as u64 >= probe_cap {
-                        break;
-                    }
-                    // Grow to at least `up_to` (capped at `probe_cap`), always making
-                    // progress (`+1`), then retry.
-                    want = usize_from(up_to.min(probe_cap))
-                        .max(want + 1)
-                        .min(usize_from(probe_cap));
-                    prefix = read_window(&file, want)?;
-                }
-            }
-        }
-        // Fallback: full-buffer probe over the bytes we were willing to read.
-        if (prefix.len() as u64) < probe_cap {
-            prefix = read_window(&file, usize_from(probe_cap))?;
-        }
-        if let Some(p) = probe_full(path, &prefix) {
-            return Ok(Some(p));
-        }
-        // A WAV whose `data` payload runs past the probe ceiling fails the strict
-        // full-buffer parse (the payload isn't present to bound), yet its `fmt `/`data`
-        // headers sit at the front: trust the declared bounds and serve the audio,
-        // accepting the loss of any tag chunks trailing the payload.
-        if has_ext(path, "wav")
-            && file_len > MAX_PROBE_BYTES
-            && let Ok(bounds) = wav::locate_audio_at_ceiling(&prefix, file_len)
-        {
-            return Ok(Some(wav_probed(&prefix, &bounds)));
-        }
-        if file_len > MAX_PROBE_BYTES {
-            log::warn!(
-                "skipping {}: no parseable metadata within first {MAX_PROBE_BYTES} bytes",
-                path.display()
-            );
-        }
-        Ok(None)
-    })(file_len)?;
-    // ---- end of existing probe body ----
+    let probed = probe_body(path, &file, s1.size, window)?;
 
     let s2 = BackingStamp::from_metadata(&file.metadata()?);
     if s1 != s2 {
@@ -414,6 +332,97 @@ fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
         Some(p) => ProbeOutcome::Probed(p, s1),
         None => ProbeOutcome::Unsupported,
     })
+}
+
+/// The per-format metadata dispatch for one already-opened backing file, over
+/// its first `file_len` bytes. Split out of `probe_file` so the fstat-sandwich
+/// wrapper stays legible. Never reads the audio payload (M4A uses the seek
+/// reader; front-anchored formats read only the metadata extent). Returns
+/// `Ok(None)` for an unsupported/unparseable file.
+fn probe_body(
+    path: &Path,
+    file: &std::fs::File,
+    file_len: u64,
+    window: usize,
+) -> std::io::Result<Option<Probed>> {
+    // M4A: seek reader, never touches mdat.
+    if has_ext(path, "m4a") || has_ext(path, "m4b") {
+        let mut f = file;
+        let scan = match mp4::read_structure_from(&mut f, file_len) {
+            Ok(s) => s,
+            Err(e) => {
+                if matches!(e, mp4::Mp4ScanError::MetadataTooLarge { .. }) {
+                    log::warn!("skipping {}: {e}", path.display());
+                }
+                return Ok(None);
+            }
+        };
+        return Ok(Some(Probed {
+            format: Format::M4a,
+            audio_offset: scan.mdat_payload_offset,
+            audio_length: scan.mdat_payload_len,
+            tags: mp4::read_tags(&scan.moov),
+            pictures: mp4::read_pictures(&scan.moov, MAX_ART_BYTES),
+            binary_tags: mp4::read_binary_tags(&scan.moov, MAX_BINARY_TAG_BYTES),
+            structural_blocks: Vec::new(),
+        }));
+    }
+
+    // Front-anchored formats: read a window, widen on NeedMore. Only the MP3
+    // arm of probe_prefix consumes the ID3v1 tail, and dispatch is by
+    // extension — so only .mp3 pays the tail read (#67).
+    let tail = if has_ext(path, "mp3") {
+        read_tail_128(file, file_len)?
+    } else {
+        None
+    };
+    // Never read past the probe ceiling, however large the file or whatever a
+    // (possibly corrupt) header asks for via `NeedMore`.
+    let probe_cap = file_len.min(MAX_PROBE_BYTES);
+    let mut want = usize_from((window as u64).min(probe_cap));
+    let mut prefix = read_window(file, want)?;
+    for _ in 0..MAX_WIDEN_RETRIES {
+        match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
+            Probe::Done(p) => return Ok(Some(p)),
+            Probe::Skip => return Ok(None),
+            Probe::NeedMore(up_to) => {
+                // Read everything we're willing to probe? Widening can't help.
+                if want as u64 >= probe_cap {
+                    break;
+                }
+                // Grow to at least `up_to` (capped at `probe_cap`), always making
+                // progress (`+1`), then retry.
+                want = usize_from(up_to.min(probe_cap))
+                    .max(want + 1)
+                    .min(usize_from(probe_cap));
+                prefix = read_window(file, want)?;
+            }
+        }
+    }
+    // Fallback: full-buffer probe over the bytes we were willing to read.
+    if (prefix.len() as u64) < probe_cap {
+        prefix = read_window(file, usize_from(probe_cap))?;
+    }
+    if let Some(p) = probe_full(path, &prefix) {
+        return Ok(Some(p));
+    }
+    // A WAV whose `data` payload runs past the probe ceiling fails the strict
+    // full-buffer parse (the payload isn't present to bound), yet its `fmt `/`data`
+    // headers sit at the front: trust the declared bounds and serve the audio,
+    // accepting the loss of any tag chunks trailing the payload.
+    if has_ext(path, "wav")
+        && file_len > MAX_PROBE_BYTES
+        && let Ok(bounds) = wav::locate_audio_at_ceiling(&prefix, file_len)
+    {
+        return Ok(Some(wav_probed(&prefix, &bounds)));
+    }
+    if file_len > MAX_PROBE_BYTES {
+        log::warn!(
+            "skipping {}: no parseable metadata within first {MAX_PROBE_BYTES} bytes",
+            path.display()
+        );
+    }
+    Ok(None)
 }
 
 /// Outcome of a single bounded dispatch attempt against the current `prefix`.

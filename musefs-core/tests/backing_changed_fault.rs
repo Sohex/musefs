@@ -50,7 +50,6 @@ fn shrinking_the_backing_file_after_scan_yields_backing_changed() {
 // a fast test) changed only the sub-second mtime + ctime. The old whole-second
 // guard would have passed it; the ns stamp must reject it.
 #[test]
-#[allow(clippy::cast_possible_truncation)]
 fn same_size_subsecond_rewrite_yields_backing_changed() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("a.flac");
@@ -75,7 +74,7 @@ fn same_size_subsecond_rewrite_yields_backing_changed() {
     // Rewrite the same number of bytes in place: size identical, mtime/ctime move.
     std::fs::write(&src, {
         let mut v = std::fs::read(&src).unwrap();
-        v[audio_offset as usize] ^= 0xFF;
+        v[usize::try_from(audio_offset).unwrap()] ^= 0xFF;
         v
     })
     .unwrap();
@@ -89,7 +88,6 @@ fn same_size_subsecond_rewrite_yields_backing_changed() {
 // Adversary rewrites in place, then forges mtime back to the stored value.
 // mtime_ns now matches; only ctime (un-forgeable) caught the change.
 #[test]
-#[allow(clippy::cast_possible_truncation)]
 fn forged_mtime_is_caught_by_ctime() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("a.flac");
@@ -114,7 +112,7 @@ fn forged_mtime_is_caught_by_ctime() {
 
     // In-place same-size rewrite, then reset mtime back to the scanned instant.
     let mut v = std::fs::read(&src).unwrap();
-    v[audio_offset as usize] ^= 0xFF;
+    v[usize::try_from(audio_offset).unwrap()] ^= 0xFF;
     std::fs::write(&src, v).unwrap();
     let f = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
     f.set_times(std::fs::FileTimes::new().set_modified(original_modified))
