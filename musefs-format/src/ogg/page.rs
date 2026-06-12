@@ -123,10 +123,10 @@ pub fn lace_packet(
 
         lace_pos += chunk;
         payload_pos += page_payload;
-        seq += 1;
+        seq = seq.wrapping_add(1);
         first = false;
     }
-    (out, seq - seq_start)
+    (out, seq.wrapping_sub(seq_start))
 }
 
 /// Lace a sequence of header packets onto fresh pages starting at sequence 0, with
