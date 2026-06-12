@@ -7,6 +7,14 @@ use crate::input::TagInput;
 
 pub(crate) const VENDOR: &str = "musefs";
 
+/// True if `key` is a legal VorbisComment field name: one or more characters in
+/// ASCII 0x20..=0x7D, excluding 0x3D (`=`). This is the Vorbis spec grammar and
+/// matches what mutagen/TagLib enforce when writing. Non-ASCII, control chars,
+/// `=`, and the empty string are all rejected.
+pub fn is_valid_key(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| (0x20..=0x7D).contains(&b) && b != b'=')
+}
+
 /// Build a VorbisComment body: vendor string then count then `KEY=value` comments.
 /// Lengths are 32-bit little-endian. Known canonical keys are mapped to their
 /// Vorbis field name via the vocabulary; unknown keys are upper-cased.
@@ -106,6 +114,22 @@ mod tests {
         body.extend_from_slice(&0u32.to_le_bytes()); // vendor_len = 0
         body.extend_from_slice(&u32::MAX.to_le_bytes()); // count ~= 4 billion; cap prevents OOM
         assert!(parse(&body).is_err());
+    }
+
+    #[test]
+    fn is_valid_key_enforces_vorbis_grammar() {
+        // Legal: one-or-more ASCII 0x20..=0x7D, excluding '=' (0x3D).
+        assert!(is_valid_key("title"));
+        assert!(is_valid_key("CUSTOM_THING"));
+        assert!(is_valid_key("}")); // 0x7D, upper bound
+        assert!(is_valid_key(" ")); // 0x20, lower bound
+        // Illegal.
+        assert!(!is_valid_key("")); // empty
+        assert!(!is_valid_key("a=b")); // contains '='
+        assert!(!is_valid_key("a\u{1f}b")); // control char 0x1F
+        assert!(!is_valid_key("a\u{7f}b")); // DEL 0x7F
+        assert!(!is_valid_key("a~b")); // 0x7E, just past upper bound
+        assert!(!is_valid_key("género")); // non-ASCII high bytes
     }
 
     #[test]
