@@ -117,7 +117,7 @@ The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
 - **V1** — the core tables: `tracks` (one row per backing file: path, format,
-  audio byte range, size/mtime stamps, `content_version`), `tags` (multi-value
+  audio byte range, size/nanosecond-mtime/ctime stamps, `content_version`), `tags` (multi-value
   key/value rows ordered by `ordinal`), `art` (content-addressed by sha256,
   deduplicated image blobs), and `track_art` (per-track art links with
   picture type and ordering). Deleting a track cascades to its `tags` and
@@ -147,7 +147,9 @@ plugins under `contrib/` write tags and art here out-of-band.
   `art_ad` (bumps every track referencing a deleted `art` row, so an orphaned
   reference rebuilds to a clean serve-time error rather than streaming stale
   bytes), `tracks_geometry_au` (bumps when scanner-owned geometry — `format`,
-  audio bounds, backing size/mtime — changes), and `structural_blocks_ai`/`_ad`
+  audio bounds, backing size/nanosecond-mtime — changes; keys on
+  `backing_mtime_ns` only — `backing_ctime_ns` is pure freshness identity, not a
+  served-byte input), and `structural_blocks_ai`/`_ad`
   (bump when FLAC structural blocks change).
 
 ### The external-writer contract
@@ -155,9 +157,9 @@ plugins under `contrib/` write tags and art here out-of-band.
 **Ownership.** External tools get full read/write on `tags`, `art`, and
 `track_art`. The scanner owns the structural columns of `tracks` (`id`,
 `backing_path`, `format`, `audio_offset`, `audio_length`, `backing_size`,
-`backing_mtime`, `content_version`, `updated_at`) and all of
-`structural_blocks`: those are derived from probing the file, and external
-tools must run `musefs scan` rather than compute them.
+`backing_mtime_ns`, `backing_ctime_ns`, `content_version`, `updated_at`) and
+all of `structural_blocks`: those are derived from probing the file, and
+external tools must run `musefs scan` rather than compute them.
 
 **What the store enforces.** As of V4, SQLite `CHECK` constraints reject the
 malformed *shapes* at commit, so an external writer cannot persist them:
@@ -192,10 +194,11 @@ a clean `EIO` on the now-orphaned reference instead of stale bytes.
 
 **What musefs defends at serve time.** CHECKs cannot catch a scanner-owned
 field mutated to a *well-formed* value that no longer matches the real file
-on disk: `backing_size` or `backing_mtime` that drift from the actual file's
-stat, or audio bounds that fit the stored `backing_size` but overrun the file
-once it has shrunk. musefs re-stats the backing file on every resolve and
-treats such rows as untrusted input, degrading to a controlled
+on disk: `backing_size` or `backing_mtime_ns`/`backing_ctime_ns` that drift
+from the actual file's stat, or audio bounds that fit the stored
+`backing_size` but overrun the file once it has shrunk. musefs re-stats the
+backing file on every resolve and treats such rows as untrusted input,
+degrading to a controlled
 `BackingChanged`/layout error, never undefined behavior. The store's V4
 `CHECK` rejects art over `MAX_ART_BYTES` (16 MiB − 64 KiB) at write time;
 resolve also re-checks it (`ArtTooLarge`, all formats) to backstop a writer
@@ -254,18 +257,22 @@ Two distinct counters drive correctness; they answer different questions.
 bytes change?"*. The DB triggers increment it on any input the database can see that changes
 synthesized bytes: tag and `track_art` edits, `art`-row deletes that orphan a
 reference, scanner-owned geometry changes (`format`, audio bounds, backing
-size/mtime), and FLAC structural-block changes (V5). It is therefore a
-superset key — the one input it cannot cover is an on-disk backing change with
-no DB write, which `resolve` (and, since #279, a size-cache `getattr` hit)
-catches by re-statting the backing file and degrading to `BackingChanged`.
-The `HeaderCache` (`reader.rs`) — a byte-budgeted concurrent cache (64 MiB
+size/nanosecond-mtime), and FLAC structural-block changes (V5). It is
+therefore a superset key — the one input it cannot cover is an on-disk backing
+change with no DB write, which `resolve` (and, since #279, a size-cache
+`getattr` hit) catches by re-statting the backing file and degrading to
+`BackingChanged`. The scanner stamps the backing file's `(size, mtime_ns,
+ctime_ns)` tuple from the **probed file descriptor** using a pre/post `fstat`
+sandwich: if the file's metadata changes between the two stats, the entry is
+dropped. `ctime` defeats an mtime-forging writer (e.g. `touch -m`). The
+`HeaderCache` (`reader.rs`) — a byte-budgeted concurrent cache (64 MiB
 default) of resolved layouts — keys each entry on it: a hit with a stale
 `content_version` rebuilds the layout. Independently of the cache, **every**
 resolve re-stats the backing file and errors with `BackingChanged` if its
-size or mtime drifted from the scanned values, so a silently replaced backing
-file is never spliced at stale offsets. The per-handle read path re-stats the
-held descriptor on every read too, so this guarantee holds on the hot path and
-not only through `resolve()`.
+size, mtime, or ctime drifted from the scanned values, so a silently replaced
+backing file is never spliced at stale offsets. The per-handle read path
+re-stats the held descriptor on every read too, so this guarantee holds on the
+hot path and not only through `resolve()`.
 
 **`data_version`** (`PRAGMA data_version`, whole-DB) answers *"did anyone
 commit anything?"*. `Musefs::poll_refresh` compares it to the last seen
