@@ -120,10 +120,12 @@ would compile, pass every format-layer test, and silently reintroduce the bug
 So add a core-level test that proves the skip happens *before* `ingest*:
 
 - Build an MP4 buffer with a `covr` (and a `----`) payload larger than the cap,
-  probe it via `probe_full`, and assert the oversized payload is **absent from
-  `Probed.pictures` / `Probed.binary_tags`** — i.e. it was skipped at extraction,
-  not merely filtered later by `ingest`. Model this on the existing
-  `probe_full_surfaces_mp4_binary_freeform` test (`scan.rs:1119`).
+  probe it via `probe_file` (the seek path that loads the up-to-256 MiB `moov`
+  via `read_structure_from` — the actual exposure in #297), and assert the
+  oversized payload is **absent from `Probed.pictures` / `Probed.binary_tags`**
+  — i.e. it was skipped at extraction, not merely filtered later by `ingest`.
+  The test buffers need a single `soun` track to pass `validate_moov`; model the
+  `covr` builder on the existing `mp4_with_binary_freeform` test helper.
 
 The existing `ingest` oversize-filter tests in `scan.rs` are unaffected: they
 construct `Probed` directly, so they continue to exercise the backstop filter
