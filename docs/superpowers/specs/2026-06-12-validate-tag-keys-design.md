@@ -67,8 +67,9 @@ format layer remains a pure leaf.
     empty/control-char keys before `replace_tags`: `scan.rs:575` (iterates
     `probed.tags` by value) and `scan.rs:658` (iterates `&probed.tags` by
     reference). Both call one shared predicate — `key_passes_floor(&str) ->
-    bool` (non-empty, no control char) — which mirrors the DB `CHECK`, so a scan
-    never trips it. This is the **universal** floor, distinct from the strict
+    bool` (non-empty, no byte below 0x20) — which mirrors the DB `CHECK` exactly
+    (DEL 0x7F and high/non-ASCII bytes pass both), so a scan never trips it. This
+    is the **universal** floor, distinct from the strict
     `vorbiscomment::is_valid_key`: applying the Vorbis predicate here would
     wrongly drop legal MP3/M4A keys containing `=`/`:`/space.
 
@@ -158,8 +159,8 @@ Ripples:
 - **`is_valid_key` unit table:** boundary bytes `0x1F`/`0x20`/`0x3D`/`0x7D`/
   `0x7E`, empty string, a non-ASCII key.
 - **`build` totality:** `build` over arbitrary keys (including `a=b`, empty,
-  control char) never panics and emits only valid comments — the property the
-  fuzz harness relies on now that the old `debug_assert` is gone.
+  control char) never panics and emits only valid comments — the totality the
+  fuzz harness relies on (`build` has no assert guarding key validity).
 - **DB:** an external `replace_tags` with a control-char key (and with an empty
   key) returns a constraint error and rolls back the whole transaction (inserts
   are row-by-row, `tags.rs:177`) — documenting *why* the scanner floor exists; a
