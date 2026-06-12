@@ -34,6 +34,14 @@ pub enum DbError {
         count: usize,
         max: usize,
     },
+    #[error(
+        "track {track_id} has {count} track_art rows, exceeds the {max}-row cap (crafted or corrupt DB)"
+    )]
+    TooManyArtRows {
+        track_id: i64,
+        count: usize,
+        max: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -73,6 +81,22 @@ pub(crate) fn check_tag_count(track_id: i64, count: usize) -> Result<()> {
     Ok(())
 }
 
+/// Reject a track whose materialized `track_art` row count exceeds the per-track
+/// cap. There is a single art reader (`get_track_art`), so this helper is not
+/// about sharing across callers the way `check_tag_count` is; it exists for
+/// fidelity with that pattern and to keep the single `>` comparison as one
+/// mutation-gate target.
+pub(crate) fn check_art_count(track_id: i64, count: usize) -> Result<()> {
+    if count > crate::limits::MAX_ART_ROWS_PER_TRACK {
+        return Err(DbError::TooManyArtRows {
+            track_id,
+            count,
+            max: crate::limits::MAX_ART_ROWS_PER_TRACK,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod guard_helper_tests {
     use super::check_field_len;
@@ -92,5 +116,14 @@ mod guard_helper_tests {
         // Pins the single `>` site so a `>`→`>=`/`==` mutant cannot survive.
         assert!(super::check_tag_count(1, MAX_TAGS_PER_TRACK).is_ok());
         assert!(super::check_tag_count(1, MAX_TAGS_PER_TRACK + 1).is_err());
+    }
+
+    #[test]
+    fn art_count_accepts_at_cap_rejects_above() {
+        use crate::limits::MAX_ART_ROWS_PER_TRACK;
+        // Boundary is inclusive: exactly the cap is accepted, one over rejected.
+        // Pins the single `>` site so a `>`→`>=`/`==` mutant cannot survive.
+        assert!(super::check_art_count(1, MAX_ART_ROWS_PER_TRACK).is_ok());
+        assert!(super::check_art_count(1, MAX_ART_ROWS_PER_TRACK + 1).is_err());
     }
 }
