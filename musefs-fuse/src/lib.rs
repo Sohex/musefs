@@ -63,6 +63,11 @@ pub struct FuseConfig {
     pub file_mode: u16,
     /// Permission bits for directories (bare mode word, no type bits).
     pub dir_mode: u16,
+    /// Mount with `allow_other` + `default_permissions`: accounts other than the
+    /// mounting user can reach the mount and the kernel enforces the presented
+    /// owner/mode bits. Non-root mounts also require `user_allow_other` in
+    /// `/etc/fuse.conf` (validated at mount time).
+    pub allow_other: bool,
 }
 
 impl Default for FuseConfig {
@@ -76,6 +81,7 @@ impl Default for FuseConfig {
             gid: rustix::process::getgid().as_raw(),
             file_mode: 0o444,
             dir_mode: 0o555,
+            allow_other: false,
         }
     }
 }
@@ -579,9 +585,9 @@ impl Filesystem for MusefsFs {
 }
 
 /// Read-only mount options tagged with the filesystem name, plus per-OS extras.
-fn mount_config(fs_name: &str) -> Config {
+fn mount_config(fs_name: &str, allow_other: bool) -> Config {
     let mut cfg = Config::default();
-    cfg.mount_options = platform::mount::options(fs_name);
+    cfg.mount_options = platform::mount::options(fs_name, allow_other);
     cfg
 }
 
@@ -600,13 +606,18 @@ fn new_session(
     fs: MusefsFs,
     mountpoint: &Path,
     fs_name: &str,
+    allow_other: bool,
 ) -> std::io::Result<Session<MusefsFs>> {
+    // Validate the allow_other environment before taking the mount lock: the
+    // /etc/fuse.conf read is unrelated to the fusermount3 handshake the lock
+    // serializes, so it must not extend that critical section.
+    platform::mount::check_allow_other(allow_other)?;
     // Recover from a poisoned lock: it guards only ordering, so a prior panic
     // during a mount leaves no inconsistent state to protect against.
     let _guard = MOUNT_SETUP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Session::new(fs, mountpoint, &mount_config(fs_name))
+    Session::new(fs, mountpoint, &mount_config(fs_name, allow_other))
 }
 
 /// Mount `core` at `mountpoint` with default fuse tuning, blocking until unmounted.
@@ -621,9 +632,10 @@ pub fn mount_with(
     fs_name: &str,
     config: FuseConfig,
 ) -> std::io::Result<()> {
+    let allow_other = config.allow_other;
     let fs = MusefsFs::new(core, config);
     let cell = fs.notifier_cell();
-    let session = new_session(fs, mountpoint, fs_name)?;
+    let session = new_session(fs, mountpoint, fs_name, allow_other)?;
     let _ = cell.set(session.notifier());
     let bg = session.spawn()?;
     bg.join()
@@ -641,9 +653,10 @@ pub fn spawn_with(
     fs_name: &str,
     config: FuseConfig,
 ) -> std::io::Result<BackgroundSession> {
+    let allow_other = config.allow_other;
     let fs = MusefsFs::new(core, config);
     let cell = fs.notifier_cell();
-    let session = new_session(fs, mountpoint, fs_name)?;
+    let session = new_session(fs, mountpoint, fs_name, allow_other)?;
     // Set the notifier BEFORE `spawn()` starts the dispatch thread, so the first
     // request can't observe an empty cell. `session.notifier()` and the spawned
     // session's notifier clone the same channel sender, so they're equivalent.

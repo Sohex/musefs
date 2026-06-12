@@ -200,6 +200,19 @@ musefs mount /path/to/mountpoint --db library.db \
 `mount` blocks until the filesystem is unmounted (`fusermount -u`, or
 Ctrl-C).
 
+> **Mounting at an arbitrary path may be denied by AppArmor.** On distros that
+> ship an AppArmor profile for `fusermount3` (Ubuntu 24.04+ / libfuse ≥ 3.17),
+> unprivileged FUSE mounts are only allowed when the mountpoint is under a
+> whitelisted prefix — the shipped profile permits `$HOME/**`, `/mnt`, `/media`,
+> `/tmp`, `/cvmfs`, `$XDG_RUNTIME_DIR`, plus flatpak dirs. Mounting elsewhere
+> (e.g. a data volume at `/data/...`) fails with `fusermount3: mount failed:
+> Permission denied`, and the kernel audit log shows
+> `apparmor="DENIED" operation="mount" … profile="fusermount3"`. The mountpoint's
+> own ownership is irrelevant — AppArmor rejects the `mount()` syscall first. Fix
+> it by mounting under a permitted prefix, or by whitelisting your prefix in
+> `/etc/apparmor.d/local/fusermount3` (the shipped profile ends with
+> `include if exists <local/fusermount3>`).
+
 Two modes:
 
 - **`synthesis`** (default) — files carry metadata freshly generated from
@@ -259,16 +272,33 @@ for the methodology and numbers).
 ### Ownership and permissions
 
 By default the mount presents the launching process's uid/gid and read-only
-permission bits (`555` dirs, `444` files). Override them to present a specific
-owner — e.g. a media-server service account — without running musefs as that
-user.
+permission bits (`555` dirs, `444` files), and is reachable only by the user who
+performed the mount (and root).
+
+To present a different owner — e.g. a media-server service account — and let that
+account actually reach the mount, pass `--owner`/`--group` (or `--allow-other`).
+Either makes musefs mount with `allow_other` and `default_permissions`: other
+users can traverse the mount, and the kernel enforces the presented owner/mode
+bits instead of ignoring them.
 
 | Flag | Default | What it does |
 | ---- | ------- | ------------ |
-| `--owner <NAME\|UID>` | process uid | User presented as the owner of every entry. Accepts a username or a numeric uid. |
-| `--group <NAME\|GID>` | process gid | Group presented for every entry. Accepts a group name or a numeric gid. |
+| `--owner <NAME\|UID>` | process uid | User presented as the owner of every entry. Accepts a username or a numeric uid. Implies `--allow-other`. |
+| `--group <NAME\|GID>` | process gid | Group presented for every entry. Accepts a group name or a numeric gid. Implies `--allow-other`. |
+| `--allow-other` | off | Mount with `allow_other` + `default_permissions` so accounts other than the mounting user can reach the mount and the owner/mode bits are enforced. Implied by `--owner`/`--group`. |
 | `--file-mode <OCTAL>` | `444` | Permission bits for regular files, in octal. The mount is read-only, so write bits are advertised but writes still fail with `EROFS`. |
 | `--dir-mode <OCTAL>` | `555` | Permission bits for directories, in octal. |
+
+The default `444`/`555` bits are world-readable, so any account can read once
+`allow_other` is on. To restrict the mount to the presented owner/group, drop the
+world bits (e.g. `--file-mode 440 --dir-mode 550`) — only then does
+`--owner`/`--group` gate access rather than merely label it.
+
+**Non-root mounts need `user_allow_other`.** When you are not root, libfuse
+refuses an `allow_other` mount unless `/etc/fuse.conf` contains a line
+`user_allow_other`. musefs checks this before mounting and fails with an
+explanatory error if it is missing; add the line to `/etc/fuse.conf`, or run
+musefs as root. (This is libfuse/system policy, not a musefs restriction.)
 
 ### Configuring with environment variables
 
