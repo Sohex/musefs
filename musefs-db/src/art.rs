@@ -131,14 +131,16 @@ impl<M> Db<M> {
                 description: r.get(3)?,
                 ordinal: r.get(4)?,
             };
-            // A NULL `mime` means the LEFT JOIN found no `art` row (orphaned
-            // link); `mime` is NOT NULL in the schema, so it is a reliable
-            // presence sentinel.
-            let meta = match r.get::<_, Option<String>>(6)? {
-                Some(mime) => {
-                    check_field_len("art", "mime", r.get(5)?, MAX_ART_MIME_LEN)?;
+            // A NULL `length(a.mime)` means the LEFT JOIN found no `art` row
+            // (orphaned link); `mime` is NOT NULL in the schema, so the length
+            // column is a reliable presence sentinel — and checking it lets us
+            // reject an over-cap mime before the string is ever materialized
+            // (the allocation-free guarantee, spec N13).
+            let meta = match r.get::<_, Option<i64>>(5)? {
+                Some(mime_len) => {
+                    check_field_len("art", "mime", mime_len, MAX_ART_MIME_LEN)?;
                     Some(ArtMeta {
-                        mime,
+                        mime: r.get(6)?,
                         width: r.get(7)?,
                         height: r.get(8)?,
                         byte_len: r.get(9)?,
