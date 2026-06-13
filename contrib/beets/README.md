@@ -17,20 +17,26 @@ a re-tagged view of your library without rewriting any audio.
 
 ## Install
 
-Whichever path you choose below, the plugin needs the shared `python-musefs`
-library as a **runtime dependency**. It's unpublished and lives in this repo,
-so install it from the working tree first:
-
 ```bash
-pip install -e contrib/python-musefs
+pip install beets-musefs
 ```
+
+This pulls in the shared [`python-musefs`](../python-musefs/README.md) runtime
+library from PyPI automatically — both packages are published, so no
+working-tree install is needed.
 
 ### Use via pluginpath (no package install)
 
 The plugin itself doesn't need to be installed — point beets at the plugin's
-`beetsplug` directory and it loads at runtime. beets adds `pluginpath` entries
-directly to the `beetsplug` package path, so it must be the `beetsplug` dir
-itself (not its parent). In your beets `config.yaml`:
+`beetsplug` directory and it loads at runtime. It still needs the shared
+`python-musefs` runtime library importable, so install that first:
+
+```bash
+pip install python-musefs
+```
+
+beets adds `pluginpath` entries directly to the `beetsplug` package path, so it
+must be the `beetsplug` dir itself (not its parent). In your beets `config.yaml`:
 
 ```yaml
 pluginpath: /path/to/musefs/contrib/beets/beetsplug
@@ -45,13 +51,14 @@ musefs:
   #   comments: comment
 ```
 
-### Development / test install
+### Development install (from a checkout)
 
-To run the test suite — or if you'd rather install the plugin as a package
-than wire up `pluginpath` — install it editable instead:
+To hack on the plugin or run the test suite against your working tree, install
+both packages editable from the repo so imports resolve to the local source:
 
 ```bash
-pip install -e "contrib/beets[test]"
+pip install -e contrib/python-musefs       # shared library
+pip install -e "contrib/beets[test]"       # plugin + test deps
 ```
 
 ## Workflow (test drive)
@@ -125,7 +132,7 @@ The tests live under `tests/` and use a local virtualenv with beets + pytest.
 cd contrib/beets
 uv venv                                   # create .venv (once)
 source .venv/bin/activate
-uv pip install -e ../python-musefs        # shared library (unpublished; install first)
+uv pip install -e ../python-musefs        # shared library (editable, from the working tree)
 uv pip install -r requirements.txt        # beets + pytest
 
 python -m pytest                          # unit + integration (no Rust binary)

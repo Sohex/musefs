@@ -39,8 +39,9 @@ Lidarr's `PATH`:
 pip install lidarr-musefs
 ```
 
-Or, from this repository (the working-tree library first — it is the local
-source of the `python-musefs` dependency):
+This pulls in the shared [`python-musefs`](../python-musefs/README.md) dependency
+from PyPI automatically. To install from a checkout instead (e.g. for
+development), install both editable so imports resolve to the local source:
 
 ```bash
 pip install -e contrib/python-musefs
@@ -165,7 +166,7 @@ complete per-track metadata.
 ```bash
 cd contrib/lidarr
 python -m venv .venv && source .venv/bin/activate
-pip install -e ../python-musefs    # shared library (unpublished in-tree; install first)
+pip install -e ../python-musefs    # shared library (editable, from the working tree)
 pip install -e ".[test]"
 
 python -m pytest                   # unit + integration (no Rust binary)
