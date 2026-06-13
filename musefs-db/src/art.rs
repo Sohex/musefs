@@ -40,9 +40,9 @@ impl<M> Db<M> {
     /// Art row metadata without loading the image blob — used to build synthesis
     /// inputs at resolve time without materializing art in memory.
     pub fn get_art_meta(&self, id: i64) -> Result<Option<ArtMeta>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT length(mime), mime, width, height, byte_len FROM art WHERE id = ?1")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT length(mime), mime, width, height, byte_len FROM art WHERE id = ?1",
+        )?;
         let mut rows = stmt.query(params![id])?;
         match rows.next()? {
             Some(r) => {
@@ -76,7 +76,7 @@ impl<M> Db<M> {
     }
 
     pub fn get_track_art(&self, track_id: i64) -> Result<Vec<TrackArt>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT length(description), art_id, picture_type, description, ordinal
              FROM track_art WHERE track_id = ?1 ORDER BY ordinal",
         )?;
@@ -95,6 +95,60 @@ impl<M> Db<M> {
                 description: r.get(3)?,
                 ordinal: r.get(4)?,
             });
+            check_art_count(track_id, out.len())?;
+        }
+        Ok(out)
+    }
+
+    /// A track's `track_art` links joined with their `art` row metadata (no
+    /// image blob), in one query — collapses the former N+1 (`get_track_art`
+    /// plus one `get_art_meta` per row) on the resolve hot path. The `art` side
+    /// is `None` for an orphaned link: SQLite FK enforcement is per-connection,
+    /// so an external writer can leave a `track_art` row dangling, and the
+    /// caller surfaces that rather than silently dropping the art.
+    pub fn get_track_art_with_meta(
+        &self,
+        track_id: i64,
+    ) -> Result<Vec<(TrackArt, Option<ArtMeta>)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT length(ta.description), ta.art_id, ta.picture_type, ta.description, ta.ordinal, \
+             length(a.mime), a.mime, a.width, a.height, a.byte_len \
+             FROM track_art ta LEFT JOIN art a ON a.id = ta.art_id \
+             WHERE ta.track_id = ?1 ORDER BY ta.ordinal",
+        )?;
+        let mut rows = stmt.query(params![track_id])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            check_field_len(
+                "track_art",
+                "description",
+                r.get(0)?,
+                MAX_ART_DESCRIPTION_LEN,
+            )?;
+            let track_art = TrackArt {
+                art_id: r.get(1)?,
+                picture_type: r.get(2)?,
+                description: r.get(3)?,
+                ordinal: r.get(4)?,
+            };
+            // A NULL `length(a.mime)` means the LEFT JOIN found no `art` row
+            // (orphaned link); `mime` is NOT NULL in the schema, so the length
+            // column is a reliable presence sentinel — and checking it lets us
+            // reject an over-cap mime before the string is ever materialized
+            // (the allocation-free guarantee, spec N13).
+            let meta = match r.get::<_, Option<i64>>(5)? {
+                Some(mime_len) => {
+                    check_field_len("art", "mime", mime_len, MAX_ART_MIME_LEN)?;
+                    Some(ArtMeta {
+                        mime: r.get(6)?,
+                        width: r.get(7)?,
+                        height: r.get(8)?,
+                        byte_len: r.get(9)?,
+                    })
+                }
+                None => None,
+            };
+            out.push((track_art, meta));
             check_art_count(track_id, out.len())?;
         }
         Ok(out)

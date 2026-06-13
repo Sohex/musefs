@@ -16,7 +16,7 @@ fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
 
 impl<M> Db<M> {
     pub fn get_tags(&self, track_id: i64) -> Result<Vec<Tag>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT length(key), length(value), key, value, ordinal FROM tags \
              WHERE track_id = ?1 AND value_blob IS NULL ORDER BY key, ordinal",
         )?;

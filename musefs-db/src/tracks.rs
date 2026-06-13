@@ -88,6 +88,21 @@ impl<M> Db<M> {
         )?)
     }
 
+    /// The two columns `getattr` needs to validate cached attrs — the freshness
+    /// stamp (`content_version`) and the path to re-stat (`backing_path`) —
+    /// without materializing a full `Track` (no `format` parse, no
+    /// `TrackBounds`) on the hottest metadata op. `None` if the id is unknown.
+    pub fn track_version_and_path(&self, id: i64) -> Result<Option<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT content_version, backing_path FROM tracks WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(r) => Ok(Some((r.get(0)?, r.get(1)?))),
+            None => Ok(None),
+        }
+    }
+
     /// Begin a deferred (read) transaction: subsequent reads on this connection see
     /// a single consistent snapshot until `end_read`. Used to make a binary-tag
     /// read's content_version check and its blob reads mutually consistent.

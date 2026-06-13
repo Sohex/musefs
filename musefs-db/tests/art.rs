@@ -48,6 +48,35 @@ fn set_and_get_track_art() {
 }
 
 #[test]
+fn get_track_art_with_meta_joins_the_art_row() {
+    let db = Db::open_in_memory().unwrap();
+    let track = db.upsert_track(&new_track("/m/a.flac")).unwrap();
+    let art_id = db.upsert_art(&jpeg(vec![1, 2, 3])).unwrap();
+
+    db.set_track_art(
+        track,
+        &[TrackArt {
+            art_id,
+            picture_type: 3,
+            description: "front".to_string(),
+            ordinal: 0,
+        }],
+    )
+    .unwrap();
+
+    let got = db.get_track_art_with_meta(track).unwrap();
+    assert_eq!(got.len(), 1);
+    let (ta, meta) = &got[0];
+    assert_eq!(ta.art_id, art_id);
+    assert_eq!(ta.picture_type, 3);
+    assert_eq!(ta.description, "front");
+    assert_eq!(ta.ordinal, 0);
+    let meta = meta.as_ref().expect("joined art metadata must be present");
+    assert_eq!(meta.mime, "image/jpeg");
+    assert_eq!(meta.byte_len, 3);
+}
+
+#[test]
 fn linking_art_bumps_content_version() {
     let db = Db::open_in_memory().unwrap();
     let track = db.upsert_track(&new_track("/m/a.flac")).unwrap();

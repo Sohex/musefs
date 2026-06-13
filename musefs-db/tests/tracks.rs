@@ -1,5 +1,5 @@
 mod common;
-use common::new_track;
+use common::{jpeg, new_track};
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
 
 #[test]
@@ -19,6 +19,36 @@ fn insert_then_get_by_id_and_path() {
         .unwrap()
         .expect("track by path");
     assert_eq!(by_path.id, id);
+}
+
+#[test]
+fn track_version_and_path_returns_stamp_and_path() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.upsert_track(&new_track("/music/a.flac")).unwrap();
+    // Link art so content_version is bumped off its 0 default, pinning the
+    // returned stamp to a real, non-default value.
+    let art_id = db.upsert_art(&jpeg(vec![1, 2, 3])).unwrap();
+    db.set_track_art(
+        id,
+        &[TrackArt {
+            art_id,
+            picture_type: 3,
+            description: String::new(),
+            ordinal: 0,
+        }],
+    )
+    .unwrap();
+
+    let cv = db.track_content_version(id).unwrap();
+    assert!(
+        cv > 0,
+        "linking art must bump content_version above the default"
+    );
+    assert_eq!(
+        db.track_version_and_path(id).unwrap(),
+        Some((cv, "/music/a.flac".to_string())),
+    );
+    assert!(db.track_version_and_path(999_999).unwrap().is_none());
 }
 
 #[test]
