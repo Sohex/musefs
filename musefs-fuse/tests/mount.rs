@@ -249,3 +249,63 @@ fn large_directory_lists_fully_across_paginated_readdir() {
     drop(session);
     drop(backing);
 }
+
+#[test]
+#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse -- --ignored"]
+fn statfs_reports_nonzero_capacity(/* #368 */) {
+    let backing = tempfile::tempdir().unwrap();
+    let flac = make_flac(&["ARTIST=Alice", "TITLE=Song"], &[0xAB; 64]);
+    std::fs::write(backing.path().join("a.flac"), &flac).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, backing.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+
+    let mountpoint = tempfile::tempdir().unwrap();
+    let session = musefs_fuse::spawn(fs, mountpoint.path(), "musefs-statfs").unwrap();
+
+    // `df` over the mount must not see a 0-byte filesystem.
+    let stat = rustix::fs::statvfs(mountpoint.path()).unwrap();
+    assert!(stat.f_blocks > 0, "total blocks must be non-zero");
+    assert!(stat.f_bavail > 0, "available blocks must be non-zero");
+
+    drop(session);
+    drop(backing);
+}
+
+#[test]
+#[cfg(target_os = "linux")] // xattr probing semantics are Linux-specific here
+#[ignore = "requires /dev/fuse; run with: cargo test -p musefs-fuse -- --ignored"]
+fn xattr_ops_reply_enotsup_quietly(/* #364 */) {
+    let backing = tempfile::tempdir().unwrap();
+    let flac = make_flac(&["ARTIST=Alice", "TITLE=Song"], &[0xAB; 64]);
+    std::fs::write(backing.path().join("a.flac"), &flac).unwrap();
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, backing.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+
+    let mountpoint = tempfile::tempdir().unwrap();
+    let session = musefs_fuse::spawn(fs, mountpoint.path(), "musefs-xattr").unwrap();
+
+    let song = mountpoint.path().join("Alice").join("Song.flac");
+    let mut buf = [0u8; 64];
+
+    // getxattr a missing attribute → ENOTSUP (same caller-visible result as the
+    // suppressed default, without the per-probe `[Not Implemented]` warn).
+    let err = rustix::fs::getxattr(&song, "user.test", &mut buf).unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        libc::ENOTSUP,
+        "getxattr should be ENOTSUP"
+    );
+
+    // listxattr likewise.
+    let err = rustix::fs::listxattr(&song, &mut buf).unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        libc::ENOTSUP,
+        "listxattr should be ENOTSUP"
+    );
+
+    drop(session);
+    drop(backing);
+}
