@@ -165,6 +165,9 @@ pub struct Musefs {
     /// incremental change diff and the `on_changed` cache-invalidation callbacks.
     snapshot: Mutex<HashMap<i64, TrackRenderState>>,
     force_rebuild_error: AtomicBool,
+    /// Forces the poll `data_version` read to fail, so a test can exercise the
+    /// read-error backoff stamp without a really-broken poll connection (#369).
+    force_poll_read_error: AtomicBool,
     force_apply_fail: AtomicBool,
     /// Forces the next N binary-tag `content_version` guard checks in
     /// `read_into` to report a stale layout, simulating a writer committing to
@@ -266,6 +269,7 @@ impl Musefs {
             inodes: Mutex::new(alloc),
             snapshot: Mutex::new(snapshot),
             force_rebuild_error: AtomicBool::new(false),
+            force_poll_read_error: AtomicBool::new(false),
             force_apply_fail: AtomicBool::new(false),
             #[cfg(test)]
             force_version_mismatch: AtomicU64::new(0),
@@ -416,10 +420,26 @@ impl Musefs {
         let new_seq = self
             .pool
             .with_poll(|db| Ok(db.changelog_since(i64::MAX)?.max_seq))?;
+        // Consume the rebuild request before touching VFS state: a re-poison that
+        // re-raises `needs_rebuild` while the rebuild below runs then survives for
+        // the next poll instead of being clobbered by a trailing unconditional clear
+        // (#369). On success we never clear again, so a concurrent re-raise persists.
+        let was_set = self.needs_rebuild.swap(false, Ordering::AcqRel);
         let old_tree = self.tree.load_full();
         let old_snapshot =
             crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot").clone();
-        let new_snapshot = self.rebuild_full()?;
+        let new_snapshot = match self.rebuild_full() {
+            Ok(v) => v,
+            Err(err) => {
+                // Rebuild failed: re-arm the request we consumed so the next poll
+                // retries. Only restore when we were the one that cleared it — a
+                // concurrent re-raise has already set the flag and must not be undone.
+                if was_set {
+                    self.needs_rebuild.store(true, Ordering::Release);
+                }
+                return Err(err);
+            }
+        };
         let new_tree = self.tree.load();
         let live = new_tree.track_ids();
         self.cache.retain(&live);
@@ -435,7 +455,6 @@ impl Musefs {
         self.last_seq.store(new_seq, Ordering::Release);
         self.last_data_version.store(version, Ordering::Release);
         self.refresh_gen.fetch_add(1, Ordering::AcqRel);
-        self.needs_rebuild.store(false, Ordering::Release);
         self.stamp_successful_poll();
         Ok(true)
     }
@@ -662,7 +681,25 @@ impl Musefs {
         {
             return Ok(false);
         }
-        let version = self.pool.with_poll(|db| Ok(db.data_version()?))?;
+        // Stamp the failure on a broken data_version read too: it propagates before
+        // the `refreshing` CAS, so without this stamp a persistently broken poll
+        // connection re-dispatches a fast-failing poll on every metadata op, never
+        // arming the backoff the rebuild-error paths below rely on (#369).
+        let version_read = if self.force_poll_read_error.load(Ordering::Acquire) {
+            Err(CoreError::BackingChanged(
+                "forced poll-read failure".to_string(),
+            ))
+        } else {
+            self.pool.with_poll(|db| Ok(db.data_version()?))
+        };
+        let version = match version_read {
+            Ok(v) => v,
+            Err(err) => {
+                *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh") =
+                    Some(std::time::Instant::now());
+                return Err(err);
+            }
+        };
         if version == self.last_data_version.load(Ordering::Acquire) {
             self.stamp_successful_poll();
             return Ok(false);
@@ -840,6 +877,11 @@ impl Musefs {
     #[doc(hidden)]
     pub fn force_rebuild_errors_for_test(&self, fail: bool) {
         self.force_rebuild_error.store(fail, Ordering::Release);
+    }
+
+    #[doc(hidden)]
+    pub fn force_poll_read_errors_for_test(&self, fail: bool) {
+        self.force_poll_read_error.store(fail, Ordering::Release);
     }
 
     #[doc(hidden)]
@@ -1594,6 +1636,103 @@ mod tests {
         assert!(
             !fs.poll_refresh().unwrap(),
             "forced rebuild must stamp data_version (next poll is a no-op)"
+        );
+    }
+
+    #[test]
+    fn failed_forced_rebuild_keeps_needs_rebuild_set() {
+        // A forced rebuild that fails must re-arm the request it consumed up front,
+        // so the next poll retries instead of leaving the poisoned VFS state only
+        // re-validated by a data_version change a quiescent DB may never produce (#369).
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::ZERO);
+        fs.mark_needs_rebuild_for_test();
+        fs.force_rebuild_errors_for_test(true);
+        assert!(
+            fs.poll_refresh().is_err(),
+            "forced rebuild propagates the rebuild error"
+        );
+        assert!(
+            fs.needs_rebuild_is_set_for_test(),
+            "a failed forced rebuild must leave needs_rebuild set for retry"
+        );
+    }
+
+    #[test]
+    fn failed_case_insensitive_rebuild_does_not_arm_needs_rebuild() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        // The case-insensitive poll path also routes through force_full_rebuild, but
+        // with needs_rebuild unset. A rebuild failure there must NOT raise the flag:
+        // only a request we actually consumed is re-armed, so a transient error
+        // can't pin the bypass-backoff rebuild branch into a busy retry (#369).
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: true,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+
+        // Bump data_version so the poll enters the version-changed (case-insensitive)
+        // rebuild branch instead of short-circuiting as a no-op.
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            let track_id = db.list_tracks().unwrap().into_iter().next().unwrap().id;
+            db.replace_tags(track_id, &[musefs_db::Tag::new("comment", "hi", 0)])
+                .unwrap();
+        }
+        assert!(
+            !fs.needs_rebuild_is_set_for_test(),
+            "precondition: needs_rebuild is unset"
+        );
+        fs.force_rebuild_errors_for_test(true);
+        assert!(fs.poll_refresh().is_err(), "rebuild error propagates");
+        assert!(
+            !fs.needs_rebuild_is_set_for_test(),
+            "a failed rebuild with no pending request must not raise needs_rebuild"
+        );
+    }
+
+    #[test]
+    fn poll_read_error_arms_backoff() {
+        // A failing data_version read propagates before the `refreshing` CAS; it must
+        // still stamp the failed-refresh time so the existing backoff gate suppresses
+        // an immediate re-dispatch on the next metadata op (#369).
+        let (_d, fs) = fs_with_poll_interval(std::time::Duration::from_hours(1));
+        fs.expire_poll_debounce_for_test(); // past the debounce so the read is reached
+        fs.force_poll_read_errors_for_test(true);
+        assert!(
+            fs.poll_refresh().is_err(),
+            "a broken poll read propagates the error"
+        );
+        fs.force_poll_read_errors_for_test(false);
+        assert!(
+            !fs.poll_due(),
+            "the read error must arm the retry backoff, suppressing an immediate re-poll"
+        );
+        fs.expire_refresh_backoff_for_test();
+        assert!(
+            fs.poll_due(),
+            "past the backoff window the poll is due again"
         );
     }
 
