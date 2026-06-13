@@ -18,7 +18,7 @@ impl<M> Db<M> {
     /// FLAC track has not been (re)scanned under V2 — callers fall back to a
     /// front read in that case.
     pub fn get_structural_blocks(&self, track_id: i64) -> Result<Vec<StructuralBlock>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT kind, ordinal, length(body), body FROM structural_blocks \
              WHERE track_id = ?1 ORDER BY kind, ordinal",
         )?;

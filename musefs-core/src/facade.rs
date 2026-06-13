@@ -979,14 +979,15 @@ impl Musefs {
         };
         let (size, mtime_secs) = self.pool.with(|db| {
             // Cheap, indexed: the current content_version drives lazy invalidation.
-            let track = db
-                .get_track(track_id)?
+            // Only the two columns the validation needs — no full-row materialization.
+            let (content_version, backing_path) = db
+                .track_version_and_path(track_id)?
                 .ok_or(CoreError::TrackNotFound(track_id))?;
             // `.map(|e| *e)` copies the SizeEntry (Copy) so the shard Ref drops
             // before the miss-path insert below — same key → same shard, and
             // holding the Ref across the re-lock would deadlock.
             if let Some(e) = self.size_cache.get(&track_id).map(|e| *e)
-                && e.content_version == track.content_version
+                && e.content_version == content_version
             {
                 // Hit: re-stat the backing file (no synthesis) and compare to
                 // the stamp the cached attrs were built from. An on-disk change
@@ -994,9 +995,9 @@ impl Musefs {
                 // getattr advertise stale attrs — the one metadata surface that
                 // could outrun a backing change (read/open already re-stat).
                 crate::metrics::on_stat();
-                let meta = std::fs::metadata(&track.backing_path)?;
+                let meta = std::fs::metadata(&backing_path)?;
                 if BackingStamp::from_metadata(&meta) != e.stamp {
-                    return Err(CoreError::BackingChanged(track.backing_path.clone()));
+                    return Err(CoreError::BackingChanged(backing_path));
                 }
                 return Ok((e.total_len, e.mtime_secs));
             }
@@ -1005,7 +1006,7 @@ impl Musefs {
             self.size_cache.insert(
                 track_id,
                 SizeEntry {
-                    content_version: track.content_version,
+                    content_version,
                     total_len: resolved.total_len,
                     mtime_secs: resolved.mtime_secs,
                     stamp: resolved.stamp,

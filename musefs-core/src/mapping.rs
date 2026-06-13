@@ -36,12 +36,12 @@ pub(crate) fn tags_to_fields(tags: &[Tag]) -> BTreeMap<String, &str> {
 /// the bytes are streamed at read time.
 pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<ArtInput>> {
     let mut inputs = Vec::new();
-    for ta in db.get_track_art(track_id)? {
+    for (ta, meta) in db.get_track_art_with_meta(track_id)? {
         // `track_art.art_id` is a foreign key into `art`, but SQLite FK
         // enforcement is per-connection and external writers can disable it or
         // import a partial DB. A missing `art` row is a contract violation we
         // surface (the read fails) rather than silently dropping the art.
-        let Some(meta) = db.get_art_meta(ta.art_id)? else {
+        let Some(meta) = meta else {
             return Err(crate::error::CoreError::OrphanedArt {
                 track_id,
                 art_id: ta.art_id,
