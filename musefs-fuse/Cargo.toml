@@ -23,6 +23,7 @@ fuser = { version = "0.17", features = ["macos-no-mount"] }
 
 [dev-dependencies]
 tempfile = "3"
+rustix = { version = "1", features = ["fs"] }
 metaflac = "0.2"
 musefs-db = { path = "../musefs-db" }
 musefs-format = { path = "../musefs-format" }

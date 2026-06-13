@@ -15,7 +15,7 @@ use crate::convert::{assemble_dir_listing, to_file_attr};
 use fuser::{
     BackgroundSession, Config, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, Request, Session,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request, Session,
 };
 use musefs_core::CoreError;
 use musefs_core::Fh;
@@ -93,6 +93,33 @@ fn open_flags(keep_cache: bool) -> FopenFlags {
     } else {
         FopenFlags::empty()
     }
+}
+
+/// Synthetic `statfs` reply values (#368). musefs is a read-only passthrough
+/// with no single backing volume to mirror (backing files are per-track and may
+/// span devices), so we advertise a large, fully-free synthetic capacity rather
+/// than fuser's default all-zero reply — which makes `df` report a 0-byte
+/// filesystem and can make capacity-checking importers (Lidarr et al.) refuse to
+/// operate. Returns the `ReplyStatfs::statfs` argument tuple:
+/// `(blocks, bfree, bavail, files, ffree, bsize, namelen, frsize)`.
+fn statfs_params() -> (u64, u64, u64, u64, u64, u32, u32, u32) {
+    const BSIZE: u32 = 512;
+    const NAMELEN: u32 = 255;
+    // 1 TiB advertised capacity, reported entirely free — read-only, so nothing
+    // is "used" in a writable sense, and 1 TiB clears typical free-space checks.
+    const CAPACITY_BYTES: u64 = 1 << 40;
+    const TOTAL_INODES: u64 = 1 << 32;
+    let blocks = CAPACITY_BYTES / u64::from(BSIZE);
+    (
+        blocks,
+        blocks,
+        blocks,
+        TOTAL_INODES,
+        TOTAL_INODES,
+        BSIZE,
+        NAMELEN,
+        BSIZE,
+    )
 }
 
 /// Map a core error onto a POSIX errno for the FUSE reply. `Io` errors carry the
@@ -537,6 +564,51 @@ impl Filesystem for MusefsFs {
         reply.ok();
     }
 
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let (blocks, bfree, bavail, files, ffree, bsize, namelen, frsize) = statfs_params();
+        reply.statfs(blocks, bfree, bavail, files, ffree, bsize, namelen, frsize);
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        // Read-only filesystem with no extended attributes. Reply ENOTSUP
+        // explicitly so fuser's default doesn't log a `[Not Implemented]` warn on
+        // every probe (#364); callers see the same "Operation not supported"
+        // result the default's ENOSYS already collapses to.
+        reply.error(fuser::Errno::ENOTSUP);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
+        // See `getxattr`: no xattrs, reply ENOTSUP quietly to suppress the warn.
+        reply.error(fuser::Errno::ENOTSUP);
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        // Read-only: setting an xattr is unsupported. Replied explicitly for
+        // symmetry with get/listxattr so no `[Not Implemented]` warn is logged.
+        reply.error(fuser::Errno::ENOTSUP);
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        // Read-only: removing an xattr is unsupported. See `setxattr`.
+        reply.error(fuser::Errno::ENOTSUP);
+    }
+
     fn read(
         &self,
         _req: &Request,
@@ -797,6 +869,24 @@ mod tests {
     fn open_flags_sets_keep_cache_bit_only_when_enabled() {
         assert_eq!(open_flags(false), FopenFlags::empty());
         assert_eq!(open_flags(true), FopenFlags::FOPEN_KEEP_CACHE);
+    }
+
+    #[test]
+    fn statfs_params_reports_nonzero_capacity_with_ample_free() {
+        let (blocks, bfree, bavail, files, ffree, bsize, namelen, frsize) = statfs_params();
+        // The whole point of #368: a non-zero total so capacity-checking
+        // clients (Lidarr et al.) don't read the mount as a full/empty 0-byte fs.
+        assert!(blocks > 0, "blocks must be non-zero");
+        assert!(bavail > 0 && bfree > 0, "must advertise free space");
+        assert!(
+            bavail <= blocks && bfree <= blocks,
+            "free cannot exceed total"
+        );
+        assert!(ffree <= files, "free inodes cannot exceed total");
+        // bsize/namelen were already fine in fuser's default; keep them.
+        assert_eq!(bsize, 512);
+        assert_eq!(frsize, 512);
+        assert_eq!(namelen, 255);
     }
 
     fn test_fs() -> (tempfile::TempDir, MusefsFs) {

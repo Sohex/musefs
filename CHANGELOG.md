@@ -9,6 +9,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`statfs` reply:** the mount now reports a non-zero synthetic capacity with
+  ample free space instead of fuser's all-zero default, so `df` no longer shows a
+  0-byte filesystem and capacity-checking importers (Lidarr et al.) don't balk
+  (#368).
+
+### Fixed
+
+- **xattr log noise:** `getxattr`/`listxattr`/`setxattr`/`removexattr` now reply
+  `ENOTSUP` explicitly (read-only filesystem, no extended attributes) instead of
+  falling through to fuser's default, which logged a `[Not Implemented]` warn on
+  every xattr probe (`ls -l`, indexers, backup tools). The caller-visible result
+  is unchanged (#364).
+
 ## [1.0.0] - 2026-06-12
 
 First stable release.
