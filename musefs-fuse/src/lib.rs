@@ -132,6 +132,32 @@ fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
     errno(err)
 }
 
+/// Run a read's synthesis under a panic boundary so a residual parser panic —
+/// one the format-layer alloc guards (`id3v2_alloc_safe` and friends) don't
+/// catch — becomes an `EIO` reply instead of unwinding the pool worker. fuser's
+/// reply objects send nothing when dropped, so an unwound worker leaves the
+/// kernel waiting forever and the read syscall hangs at 0% CPU with no error
+/// logged (#359). A `CoreError` maps to its errno via [`reply_errno`]; a caught
+/// panic is logged and mapped to `EIO`.
+fn read_outcome<F>(ino: u64, work: F) -> Result<(), fuser::Errno>
+where
+    F: FnOnce() -> Result<(), CoreError> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(work) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(reply_errno("read", ino, &e)),
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic>");
+            log::error!("read({ino}) worker panicked in synthesis: {msg}; replying EIO");
+            Err(fuser::Errno::EIO)
+        }
+    }
+}
+
 /// One directory's readdir snapshot: `(child inode, entry type, name)` rows.
 /// Aliased so the handle-map signatures stay readable (and dodge
 /// `clippy::type_complexity`).
@@ -533,15 +559,24 @@ impl Filesystem for MusefsFs {
             let _slot = slot;
             READ_BUF.with(|b| {
                 let mut buf = b.borrow_mut();
-                match core.read_into(
+                // `reply` lives outside the panic boundary so a residual parser
+                // panic in `read_into` still gets answered (EIO) instead of
+                // unwinding the worker with no reply and hanging the read (#359).
+                let outcome = read_outcome(
                     ino.0,
-                    NonZeroU64::new(fh.0).map(Fh::from),
-                    offset,
-                    u64::from(size),
-                    &mut buf,
-                ) {
+                    std::panic::AssertUnwindSafe(|| {
+                        core.read_into(
+                            ino.0,
+                            NonZeroU64::new(fh.0).map(Fh::from),
+                            offset,
+                            u64::from(size),
+                            &mut buf,
+                        )
+                    }),
+                );
+                match outcome {
                     Ok(()) => reply.data(&buf),
-                    Err(e) => reply.error(reply_errno("read", ino.0, &e)),
+                    Err(e) => reply.error(e),
                 }
                 if buf.capacity() > MAX_RETAINED_READ_BUF {
                     buf.shrink_to(MAX_RETAINED_READ_BUF);
@@ -719,6 +754,24 @@ mod tests {
             .code(),
             libc::EIO
         );
+    }
+
+    #[test]
+    fn read_outcome_passes_through_ok() {
+        let r = read_outcome(7, || Ok(()));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn read_outcome_maps_core_error_to_errno() {
+        let r = read_outcome(7, || Err(CoreError::NoEntry(7)));
+        assert_eq!(r.unwrap_err().code(), libc::ENOENT);
+    }
+
+    #[test]
+    fn read_outcome_catches_panic_as_eio() {
+        let r = read_outcome(7, || panic!("parser exploded"));
+        assert_eq!(r.unwrap_err().code(), libc::EIO);
     }
 
     #[test]
