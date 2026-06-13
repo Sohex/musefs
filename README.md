@@ -45,6 +45,10 @@ from the database, spliced in front of your original, untouched audio.
 - **Lossless-by-construction experimentation.** Change your tags, try a different
   organization scheme, new cover art — the originals are physically
   read-only to the mount. Backing up a current library is as easy as copying the db file.
+- **Hash-stable by construction.** The mount never rewrites a byte, so each
+  backing file's checksum is exactly what it was the day it arrived — anything
+  verified by hash keeps verifying, and anything you're seeding keeps seeding,
+  however aggressively you retag and reorganize the view on top.
 
 > [!NOTE]
 > This project was built with AI. The general workflow was to use the [superpowers](https://github.com/obra/superpowers) skills to provide a framework. Claude Opus was used to write plans and specs which were then implemented by another model, primarily MiMo v2.5.
