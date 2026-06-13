@@ -9,8 +9,9 @@
 #   - leave optional settings COMMENTED. A bare `KEY=` means "set to empty",
 #     which is treated as a value and breaks path/boolean settings.
 #
-# Booleans accept (case-insensitive): true/false, yes/no, on/off, 1/0.
-# Any other value is a hard error that stops the unit from starting.
+# Booleans accept only the literal lowercase `true` or `false`. Any other
+# value (including 1/0, yes/no, on/off, or capitalised True/False) is a hard
+# error that stops the unit from starting.
 
 # --- Required ---------------------------------------------------------------
 
