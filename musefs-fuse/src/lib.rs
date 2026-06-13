@@ -202,10 +202,13 @@ fn try_admit_dir_handle(
 }
 
 /// Clears the `fire_poll_refresh` single-flight gate when the poll task ends,
-/// on every exit path including a panic in `poll_refresh_notify` (#89).
-struct PollPendingGuard<'a>(&'a AtomicBool);
+/// on every exit path including a panic in `poll_refresh_notify` (#89). Owns an
+/// `Arc<AtomicBool>` so the guard is built before `ThreadPool::execute` and moved
+/// into the worker closure: if a dead pool drops the job without running it,
+/// dropping the closure still drops the guard and clears the gate (#369).
+struct PollPendingGuard(Arc<AtomicBool>);
 
-impl Drop for PollPendingGuard<'_> {
+impl Drop for PollPendingGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
@@ -221,9 +224,8 @@ impl Drop for PollPendingGuard<'_> {
 const MAX_INFLIGHT_READS: usize = 1024;
 
 /// Releases one `inflight_reads` slot when dropped — on worker completion, on the
-/// over-cap reject path, and on panic. Owns an `Arc<AtomicUsize>` (unlike the
-/// borrow-based `PollPendingGuard`) so it can move into the `'static` worker
-/// closure.
+/// over-cap reject path, and on panic. Owns an `Arc<AtomicUsize>` (like
+/// `PollPendingGuard`) so it can move into the `'static` worker closure.
 struct ReadSlotGuard(Arc<AtomicUsize>);
 
 impl Drop for ReadSlotGuard {
@@ -328,12 +330,16 @@ impl MusefsFs {
         {
             return; // a poll task is already queued/running
         }
+        // Build the gate guard before enqueuing and move it into the closure: if
+        // `execute` ever fails to run the job (a dead worker pool), dropping the
+        // un-run closure drops the guard and clears `poll_pending`, so the gate
+        // can't stick `true` forever and silently disable refresh (#369).
+        let guard = PollPendingGuard(Arc::clone(&self.poll_pending));
         let core = Arc::clone(&self.core);
-        let pending = Arc::clone(&self.poll_pending);
         if self.config.keep_cache {
             let notifier = Arc::clone(&self.notifier);
             self.pool.execute(move || {
-                let _guard = PollPendingGuard(&pending);
+                let _guard = guard;
                 if let Err(e) = core.poll_refresh_notify(|ino| {
                     if let Some(n) = notifier.get()
                         && let Err(inval_err) = n.inval_inode(INodeNo(ino), 0, 0)
@@ -346,7 +352,7 @@ impl MusefsFs {
             });
         } else {
             self.pool.execute(move || {
-                let _guard = PollPendingGuard(&pending);
+                let _guard = guard;
                 if let Err(e) = core.poll_refresh() {
                     log::warn!("poll_refresh failed: {e}");
                 }
@@ -813,15 +819,27 @@ mod tests {
     #[test]
     fn poll_pending_guard_clears_flag_on_panic() {
         let flag = Arc::new(AtomicBool::new(true));
-        let f = Arc::clone(&flag);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _g = PollPendingGuard(&f);
+            let _g = PollPendingGuard(Arc::clone(&flag));
             panic!("boom");
         }));
         assert!(r.is_err());
         assert!(
             !flag.load(Ordering::SeqCst),
             "guard must clear the flag on unwind"
+        );
+    }
+
+    #[test]
+    fn poll_pending_guard_clears_flag_when_dropped_unrun() {
+        // Models a dead pool dropping the poll job without running it: the guard
+        // is built before `execute`, so dropping the un-run closure still clears
+        // the gate rather than sticking it `true` forever (#369).
+        let flag = Arc::new(AtomicBool::new(true));
+        drop(PollPendingGuard(Arc::clone(&flag)));
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "guard must clear the flag when dropped without running"
         );
     }
 
