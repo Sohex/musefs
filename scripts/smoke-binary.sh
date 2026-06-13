@@ -19,7 +19,7 @@ trap cleanup EXIT
 echo "smoke: musefs = $MUSEFS"
 
 # Validate the binary actually runs before doing any FUSE work.
-if ! "$MUSEFS" scan --help >/dev/null 2>&1; then
+if ! "$MUSEFS" --version >/dev/null 2>&1; then
   echo "FAIL: $MUSEFS did not run"; exit 1
 fi
 
