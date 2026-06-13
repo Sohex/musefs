@@ -37,7 +37,7 @@ pub struct BulkWriter<'c> {
 
 impl BulkWriter<'_> {
     pub fn upsert_track(&mut self, t: &NewTrack) -> Result<i64> {
-        self.tx.execute(
+        Ok(self.tx.query_row(
             "INSERT INTO tracks
                 (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns, backing_ctime_ns, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CAST(strftime('%s','now') AS INTEGER))
@@ -46,12 +46,9 @@ impl BulkWriter<'_> {
                 audio_length=excluded.audio_length, backing_size=excluded.backing_size,
                 backing_mtime_ns=excluded.backing_mtime_ns,
                 backing_ctime_ns=excluded.backing_ctime_ns,
-                updated_at=CAST(strftime('%s','now') AS INTEGER)",
+                updated_at=CAST(strftime('%s','now') AS INTEGER)
+             RETURNING id",
             params![t.backing_path, t.format.as_str(), t.audio_offset, t.audio_length, t.backing_size, t.backing_mtime_ns, t.backing_ctime_ns],
-        )?;
-        Ok(self.tx.query_row(
-            "SELECT id FROM tracks WHERE backing_path = ?1",
-            params![t.backing_path],
             |r| r.get(0),
         )?)
     }
@@ -75,7 +72,7 @@ impl BulkWriter<'_> {
             "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL",
             params![track_id],
         )?;
-        let mut stmt = self.tx.prepare(
+        let mut stmt = self.tx.prepare_cached(
             "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
              VALUES (?1, ?2, '', ?3, ?4)",
         )?;
@@ -94,7 +91,7 @@ impl BulkWriter<'_> {
             "DELETE FROM structural_blocks WHERE track_id = ?1",
             params![track_id],
         )?;
-        let mut stmt = self.tx.prepare(
+        let mut stmt = self.tx.prepare_cached(
             "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
              VALUES (?1, ?2, ?3, ?4)",
         )?;
