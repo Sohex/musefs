@@ -185,7 +185,9 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
         }
         Codec::OggFlac => {
             for pkt in header.packets.iter().skip(1) {
-                if !pkt.is_empty() && (pkt[0] & 0x7F) == 6 {
+                // `pkt.len() >= 4` guards the `&pkt[4..]` slice: the packet length is
+                // attacker-controlled, so a 1-3 byte type-6 packet must not panic.
+                if pkt.len() >= 4 && (pkt[0] & 0x7F) == 6 {
                     // Strip the 4-byte FLAC metadata block header.
                     out.push(crate::flac::parse_picture_block(&pkt[4..])?);
                 }
@@ -813,6 +815,33 @@ mod tests {
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].mime, "image/png");
         assert_eq!(pics[0].data, b"PNG");
+    }
+
+    #[test]
+    fn read_pictures_oggflac_short_picture_packet_does_not_panic() {
+        // Crafted OggFLAC: a structurally-valid mapping header declaring one
+        // following packet, where that packet is a 1-byte type-6 (PICTURE) block —
+        // too short for the 4-byte FLAC metadata block header. The `&pkt[4..]`
+        // slice must not panic (issue #365).
+        let mut mapping = vec![0x7F];
+        mapping.extend_from_slice(b"FLAC");
+        mapping.push(1);
+        mapping.push(0);
+        mapping.extend_from_slice(&1u16.to_be_bytes()); // one following packet
+        mapping.extend_from_slice(b"fLaC");
+        let mut streaminfo = Vec::new();
+        crate::flac::push_block_header(&mut streaminfo, 0, 34, false).unwrap();
+        streaminfo.extend(std::iter::repeat_n(0u8, 34));
+        mapping.extend_from_slice(&streaminfo);
+
+        // One lacing byte yields this 1-byte packet: block type 6, no body.
+        let short_picture = vec![0x06u8];
+
+        let (data, _) = crate::ogg::page::build_header(77, &[&mapping, &short_picture]);
+
+        // Sanity: the header parses, so we actually reach the picture loop.
+        assert_eq!(read_header(&data).unwrap().codec, Codec::OggFlac);
+        assert!(read_pictures(&data).unwrap().is_empty());
     }
 
     fn oggflac_headers() -> Vec<u8> {
