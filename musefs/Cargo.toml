@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [features]
 default = ["jemalloc"]
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "tikv-jemalloc-ctl/stats"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "tikv-jemalloc-ctl/stats", "dep:log"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -23,6 +23,7 @@ env_logger = "0.11"
 musefs-cli = { path = "../musefs-cli", version = "1.0.0" }
 tikv-jemallocator = { version = "0.7", optional = true }
 tikv-jemalloc-ctl = { version = "0.7", optional = true }
+log = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

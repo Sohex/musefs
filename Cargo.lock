@@ -891,6 +891,7 @@ version = "1.0.0"
 dependencies = [
  "clap",
  "env_logger",
+ "log",
  "musefs-cli",
  "rustix",
  "tempfile",
