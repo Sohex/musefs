@@ -63,7 +63,7 @@ run_variant() {
     mountpoint -q "$MOUNT" && break
     sleep 0.1
   done
-  trap 'kill "$mpid" 2>/dev/null; kill "${pids[@]:-}" 2>/dev/null; [ -n "${rpid:-}" ] && kill "$rpid" 2>/dev/null; fusermount3 -u "$MOUNT" 2>/dev/null; rm -f "${stop:-}"' EXIT INT TERM
+  trap 'kill "${mpid:-}" 2>/dev/null; kill "${pids[@]:-}" 2>/dev/null; [ -n "${rpid:-}" ] && kill "$rpid" 2>/dev/null; fusermount3 -u "$MOUNT" 2>/dev/null; rm -f "${stop:-}"' EXIT INT TERM
   local targets=()
   mapfile -t targets < <(find "$MOUNT" -type f | head -n "$FILES")
   if [ "${#targets[@]}" -eq 0 ]; then
