@@ -318,3 +318,58 @@ fn bracket_escapes_and_slashes_still_parse() {
     );
     assert_eq!(path, "[X]/a/b.flac");
 }
+
+#[test]
+fn checked_render_returns_path_when_all_top_level_fields_present() {
+    let f = fields(&[("albumartist", "AC"), ("album", "LP"), ("title", "Song")]);
+    assert_eq!(
+        parse("$albumartist/$album/$title").render_checked(&f, &BTreeMap::new(), "flac"),
+        Some("AC/LP/Song.flac".to_string())
+    );
+}
+
+#[test]
+fn checked_render_returns_none_when_top_level_field_missing() {
+    let f = fields(&[("album", "LP"), ("title", "Song")]);
+    assert_eq!(
+        parse("$albumartist/$album/$title").render_checked(&f, &BTreeMap::new(), "flac"),
+        None
+    );
+}
+
+#[test]
+fn checked_render_ignores_missing_fields_inside_sections() {
+    let f = fields(&[("album", "LP")]);
+    assert_eq!(
+        parse("$album[ - CD $disc]").render_checked(&f, &BTreeMap::new(), "flac"),
+        Some("LP.flac".to_string())
+    );
+}
+
+#[test]
+fn checked_render_counts_fallback_chain_as_present() {
+    let f = fields(&[("artist", "Beck"), ("title", "Loser")]);
+    assert_eq!(
+        parse("${albumartist|artist}/$title").render_checked(&f, &BTreeMap::new(), "flac"),
+        Some("Beck/Loser.flac".to_string())
+    );
+}
+
+#[test]
+fn checked_render_counts_per_field_fallback_as_present() {
+    let f = fields(&[("title", "Loser")]);
+    let fb = owned(&[("albumartist", "VA")]);
+    assert_eq!(
+        parse("$albumartist/$title").render_checked(&f, &fb, "flac"),
+        Some("VA/Loser.flac".to_string())
+    );
+}
+
+#[test]
+fn checked_render_path_field_all_segments_dropped_is_none() {
+    let f = fields(&[("p", "..")]);
+    assert_eq!(
+        parse("$!{p}").render_checked(&f, &BTreeMap::new(), "flac"),
+        None
+    );
+}

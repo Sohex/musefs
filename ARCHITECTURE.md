@@ -339,7 +339,11 @@ mapping from rendered paths. Paths come from beets-style templates
 (`template.rs`): `$field` / `${field}` substitutions (with `${a|b}` fallback
 chains) over the track's tag fields, each resolving through per-field fallbacks
 and then a global `default_fallback`; `[...]` conditional sections suppress
-their literals when every field they reference is empty. Plain values are
+their literals when every field they reference is empty. With `skip_on_missing`
+set (CLI `--skip-on-missing`), an unresolved *top-level* field instead drops the
+track from the mount: `render_one` returns `None`, so the track enters neither
+the snapshot nor the tree, and the incremental refresh path reclassifies a track
+that loses (or regains) such a field as a removal (or addition). Plain values are
 sanitized to a single path component ('/' and control characters become '_',
 components equal to `.` or `..` are dropped, and any component is truncated to
 255 bytes on a UTF-8 boundary so it stays within NAME_MAX),
