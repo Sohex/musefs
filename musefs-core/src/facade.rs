@@ -1123,10 +1123,7 @@ impl Musefs {
         let cap = self.readahead_pool.per_stream_cap();
         let (starts, window) = {
             let mut ra = h.readahead.lock().unwrap();
-            // Start at the cached frontier, not the read cursor: a window-filling
-            // miss leaves next_expected mid-window, so dispatching from it would
-            // re-request the bytes just pulled synchronously.
-            let start = ra.frontier(ra.next_expected());
+            let start = ra.next_expected();
             let window = ra.window();
             let depth = crate::readahead::prefetch_depth(cap, window);
             let ring = usize::try_from(depth).unwrap_or(4) + 1;

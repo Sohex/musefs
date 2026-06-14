@@ -58,15 +58,17 @@ gen_corpus() { # $1=backing-dir $2=size_mib $3=streams
   # a compressing backing fs can't collapse it into a cached extent. `cp -n` makes
   # reruns reuse the copy.
   if [ -n "${MUSEFS_BENCH_CORPUS_SRC:-}" ]; then
-    # Already populated (a prior run)? Skip the rescan of the (large) source tree.
-    # `-print -quit` stops at the first match (no pipe, so pipefail-safe) and we
-    # check every copied extension, not just flac/mp3.
-    if [ -n "$(find "$1" -maxdepth 1 -type f \
+    local n=$(( $3 + 1 ))
+    # Already populated by a prior run with at least as many streams? Skip the
+    # rescan of the (large) source tree. Count via `-printf '.' | wc -c` (wc
+    # consumes all input, so no early pipe close under pipefail) across every
+    # copied extension, and require >= streams+1 distinct files so a rerun after
+    # a SMALLER bench still tops up the corpus.
+    if [ "$(find "$1" -maxdepth 1 -type f \
       \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.ogg' \) \
-      -print -quit 2>/dev/null)" ]; then
+      -printf '.' 2>/dev/null | wc -c)" -ge "$n" ]; then
       return 0
     fi
-    local n=$(( $3 + 1 ))
     # Optional size cap (MiB): pick the biggest real tracks UNDER it. High-RTT NFS
     # rows need a normal ~50 MiB track (a 1 GiB file would take ~15 min/sample);
     # local rows leave it unset to get one large file for a long, stable read.
