@@ -228,3 +228,116 @@ fn scan_help_lists_env_vars() {
     assert!(stdout.contains("MUSEFS_DB"), "stdout: {stdout}");
     assert!(stdout.contains("MUSEFS_JOBS"), "stdout: {stdout}");
 }
+
+// #370: the SetTrue bools parse the full boolish set from env (case-insensitive
+// true/false, t/f, yes/no, y/n, on/off, 1/0), not just literal `true`/`false`.
+// Each accepted value gets past clap parsing (exit != 2) and reaches the mount
+// runtime's missing-db guard.
+#[test]
+fn boolish_boolean_env_values_are_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = unopenable_db(dir.path(), "env.db");
+    for val in ["1", "0", "yes", "no", "on", "off", "t", "f", "TRUE", "Off"] {
+        let out = musefs()
+            .arg("mount")
+            .arg(dir.path())
+            .arg("--db")
+            .arg(&db)
+            .env("MUSEFS_KEEP_CACHE", val)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "MUSEFS_KEEP_CACHE={val} should parse, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("database does not exist"),
+            "MUSEFS_KEEP_CACHE={val} should reach the missing-db guard, stderr: {stderr}"
+        );
+    }
+}
+
+// #370: a boolish MUSEFS_REVALIDATE actually flips scan into its revalidate
+// pass (observable on stdout), proving the parsed bool reaches run_scan — not
+// merely that parsing succeeds.
+#[test]
+fn boolish_revalidate_env_selects_the_revalidate_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("library");
+    std::fs::create_dir(&target).unwrap();
+    let db = dir.path().join("reval.db");
+
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .env("MUSEFS_DB", &db)
+        .env("MUSEFS_REVALIDATE", "on")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("revalidated"), "stdout: {stdout}");
+
+    // Default (no env) takes the full-ingest path.
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .env("MUSEFS_DB", &db)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("scanned"), "stdout: {stdout}");
+}
+
+// #370: a boolish MUSEFS_QUIET (1/0) is honoured — `1` suppresses the summary,
+// `0` keeps it. The bare-`bool` parser would reject `0` outright, so this only
+// passes once BoolishValueParser is attached.
+#[test]
+fn boolish_quiet_env_toggles_the_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("library");
+    std::fs::create_dir(&target).unwrap();
+    let db = dir.path().join("quiet.db");
+
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .env("MUSEFS_DB", &db)
+        .env("MUSEFS_QUIET", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "MUSEFS_QUIET=1 should suppress the summary, stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .env("MUSEFS_DB", &db)
+        .env("MUSEFS_QUIET", "0")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("scanned"),
+        "MUSEFS_QUIET=0 should keep the summary, stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

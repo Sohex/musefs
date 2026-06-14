@@ -31,6 +31,8 @@ impl From<CliMode> for musefs_core::Mode {
 #[derive(Parser, Debug)]
 #[command(
     name = "musefs",
+    version,
+    propagate_version = true,
     about = "Read-only re-tagging FUSE view of a music library"
 )]
 pub struct Cli {
@@ -86,13 +88,13 @@ pub struct MountArgs {
     /// Keep the kernel page cache across opens. External re-tags auto-invalidate
     /// the affected inodes on refresh, so cached bytes are dropped when content
     /// changes.
-    #[arg(long, env = "MUSEFS_KEEP_CACHE")]
+    #[arg(long, env = "MUSEFS_KEEP_CACHE", value_parser = clap::builder::BoolishValueParser::new())]
     pub keep_cache: bool,
     /// Compare filenames case-insensitively: case-variant directories merge and
     /// case-variant files are disambiguated. Defaults to true on macOS (whose
     /// volumes are usually case-insensitive), false on Linux/FreeBSD. Override
     /// with `--case-insensitive false` (e.g. a case-sensitive APFS volume).
-    #[arg(long, env = "MUSEFS_CASE_INSENSITIVE", default_value_t = cfg!(target_os = "macos"), action = clap::ArgAction::Set)]
+    #[arg(long, env = "MUSEFS_CASE_INSENSITIVE", default_value_t = cfg!(target_os = "macos"), action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
     pub case_insensitive: bool,
     /// Owning user for every entry: a username or numeric uid. Defaults to the
     /// launching process's uid.
@@ -113,7 +115,7 @@ pub struct MountArgs {
     /// the mounting user can reach the mount and the presented owner/mode bits
     /// are kernel-enforced. Implied by `--owner`/`--group`. Non-root mounts also
     /// require `user_allow_other` in `/etc/fuse.conf`.
-    #[arg(long, env = "MUSEFS_ALLOW_OTHER")]
+    #[arg(long, env = "MUSEFS_ALLOW_OTHER", value_parser = clap::builder::BoolishValueParser::new())]
     pub allow_other: bool,
 }
 
@@ -130,18 +132,18 @@ pub enum Command {
         db: PathBuf,
         /// Re-validate: skip unchanged files, prune tracks whose backing file is
         /// gone, and garbage-collect orphaned art.
-        #[arg(long, env = "MUSEFS_REVALIDATE")]
+        #[arg(long, env = "MUSEFS_REVALIDATE", value_parser = clap::builder::BoolishValueParser::new())]
         revalidate: bool,
         /// Probe worker threads (0 = available parallelism). 1 = sequential.
         #[arg(long, env = "MUSEFS_JOBS", default_value_t = 0)]
         jobs: usize,
         /// Follow symlinks while walking directories. Off by default: symlinked
         /// files and directories are logged and skipped.
-        #[arg(long, env = "MUSEFS_FOLLOW_SYMLINKS")]
+        #[arg(long, env = "MUSEFS_FOLLOW_SYMLINKS", value_parser = clap::builder::BoolishValueParser::new())]
         follow_symlinks: bool,
         /// Suppress the per-target summary on stdout (failures still surface via
         /// the `log` facade on stderr; raise detail with `RUST_LOG=info`).
-        #[arg(long, short, env = "MUSEFS_QUIET")]
+        #[arg(long, short, env = "MUSEFS_QUIET", value_parser = clap::builder::BoolishValueParser::new())]
         quiet: bool,
     },
     /// Mount a read-only FUSE view of the store.
@@ -466,7 +468,17 @@ mod tests {
     #[test]
     fn case_insensitive_is_overridable() {
         use clap::Parser;
-        for (val, want) in [("true", true), ("false", false)] {
+        // The boolish set (1/0, yes/no, on/off, t/f) parses, not just true/false.
+        for (val, want) in [
+            ("true", true),
+            ("false", false),
+            ("1", true),
+            ("0", false),
+            ("yes", true),
+            ("no", false),
+            ("on", true),
+            ("off", false),
+        ] {
             let cli = Cli::try_parse_from([
                 "musefs",
                 "mount",
