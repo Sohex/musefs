@@ -345,6 +345,26 @@ impl HeaderCache {
             has_binary_tag,
         }))
     }
+    /// Current number of cached resolved-file entries.
+    pub fn entry_count(&self) -> u64 {
+        self.cache.len() as u64
+    }
+    /// Current resident inline-byte weight.
+    pub fn weight_bytes(&self) -> u64 {
+        self.cache.weight()
+    }
+    /// Configured resident-byte budget.
+    pub fn budget_bytes(&self) -> u64 {
+        self.cache.capacity()
+    }
+    /// Raw key-hit count (NOT content-version-validated hits — see telemetry docs).
+    pub fn raw_hits(&self) -> u64 {
+        self.cache.hits()
+    }
+    /// Raw key-miss count.
+    pub fn raw_misses(&self) -> u64 {
+        self.cache.misses()
+    }
 }
 
 /// Read `size` bytes at virtual `offset` into `out` (appended), opening the
@@ -978,6 +998,53 @@ mod cache_bound_tests {
     use super::*;
     use musefs_db::{Db, Format, NewTrack};
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn header_cache_exposes_budget_and_starts_empty() {
+        let c = HeaderCache::with_budget(Mode::Synthesis, 1234);
+        assert_eq!(c.entry_count(), 0);
+        assert_eq!(c.weight_bytes(), 0);
+        assert!(
+            c.budget_bytes() >= 1234,
+            "budget must be at least the requested amount"
+        );
+    }
+
+    #[test]
+    fn header_cache_counts_entries_weight_hits_and_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mut ids = Vec::new();
+        for name in ["a.flac", "b.flac"] {
+            let path = dir.path().join(name);
+            let (audio_offset, audio_length) = write_flac_local(&path);
+            let meta = std::fs::metadata(&path).unwrap();
+            ids.push(
+                db.upsert_track(&NewTrack {
+                    backing_path: path.to_string_lossy().into_owned(),
+                    format: Format::Flac,
+                    audio_offset,
+                    audio_length,
+                    backing_size: meta.len(),
+                    backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                    backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                })
+                .unwrap(),
+            );
+        }
+        let cache = HeaderCache::new(Mode::Synthesis);
+        for id in &ids {
+            cache.resolve(&db, *id).unwrap(); // miss → build + insert
+            cache.resolve(&db, *id).unwrap(); // hit (content_version unchanged)
+        }
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.raw_hits(), 2);
+        assert_eq!(cache.raw_misses(), 2);
+        assert!(
+            cache.weight_bytes() > 0,
+            "synthesis entries carry inline header bytes"
+        );
+    }
 
     fn entry(content_version: i64, inline_len: usize) -> Arc<ResolvedFile> {
         Arc::new(ResolvedFile {

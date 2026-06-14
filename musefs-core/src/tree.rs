@@ -85,6 +85,11 @@ impl InodeAllocator {
         }
         self.paths = live;
     }
+
+    /// Number of interned paths (telemetry: inode-allocator footprint, #394).
+    pub fn interned_path_count(&self) -> usize {
+        self.paths.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +413,11 @@ impl VirtualTree {
                 NodeKind::Dir => None,
             })
             .collect()
+    }
+
+    /// Number of live inodes (telemetry: virtual-tree footprint, #394).
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
@@ -941,6 +951,19 @@ mod tests {
         assert_eq!(song1, song2);
         let bob2 = t2.lookup(VirtualTree::ROOT, "Bob").unwrap();
         assert!(bob2 != alice2 && bob2 != song2);
+    }
+
+    #[test]
+    fn node_count_and_interned_path_count_track_tree_size() {
+        let mut alloc = InodeAllocator::new(false);
+        let tree = VirtualTree::build_with(
+            &[(10, "Alice/Song.flac".into()), (20, "Bob/Tune.flac".into())],
+            &mut alloc,
+        );
+        // root + Alice + Alice/Song.flac + Bob + Bob/Tune.flac
+        assert_eq!(tree.node_count(), 5);
+        // interned: "" (root) + the four component paths above
+        assert_eq!(alloc.interned_path_count(), 5);
     }
 
     #[test]

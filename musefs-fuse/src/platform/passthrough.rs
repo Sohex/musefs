@@ -45,6 +45,18 @@ mod imp {
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&fh);
         }
+
+        /// Telemetry: `(sticky-disabled, live backing registrations)`. The map
+        /// length is read under its lock (scrapes are rare). `#394`.
+        #[allow(clippy::unnecessary_wraps)]
+        pub fn telemetry(&self) -> Option<(bool, u64)> {
+            let active = self
+                .backing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len() as u64;
+            Some((self.disabled.load(Ordering::Relaxed), active))
+        }
     }
 
     /// Reply to `open`: try kernel passthrough, else serve through the daemon.
@@ -119,6 +131,12 @@ mod imp {
         // Mirrors the Linux signature (which uses `self`); the stub doesn't.
         #[allow(clippy::unused_self)]
         pub fn remove(&self, _fh: u64) {}
+
+        /// No passthrough off Linux; telemetry is absent.
+        #[allow(clippy::unused_self)]
+        pub fn telemetry(&self) -> Option<(bool, u64)> {
+            None
+        }
     }
 
     /// Always serve through the daemon - no passthrough on this OS.

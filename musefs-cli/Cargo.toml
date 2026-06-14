@@ -20,5 +20,8 @@ uzers = "0.12"
 [dev-dependencies]
 tempfile = "3"
 
+[features]
+metrics = ["musefs-fuse/metrics"]
+
 [lints]
 workspace = true

@@ -405,6 +405,37 @@ effect (see [BENCHMARKS.md](BENCHMARKS.md#storage-tunables) for the methodology 
 | `--max-background` | `64` | Max outstanding background (read-ahead/async) requests the kernel keeps in flight. Does **not** bound foreground reads (those scale with client concurrency), so it has little effect on read throughput; left for completeness. |
 | `--case-insensitive <true\|false>` | OS default | Compare filenames case-insensitively. Case-variant directories merge into one (first-seen casing wins) and case-variant files get a numeric suffix (e.g. `Song (2)`). Defaults to `true` on macOS and `false` on Linux/FreeBSD; case-insensitive mounts refresh via a full rebuild rather than the incremental fast path. |
 
+### Metrics
+
+`musefs mount` optionally exposes runtime telemetry through a synthetic
+`.musefs-metrics/` directory at the mount root:
+
+```bash
+musefs mount /mnt/music --db library.db --expose-metrics   # or: MUSEFS_EXPOSE_METRICS=1
+cat /mnt/music/.musefs-metrics/metrics
+```
+
+```text
+# HELP musefs_uptime_seconds Seconds since the mount started.
+# TYPE musefs_uptime_seconds gauge
+musefs_uptime_seconds 60
+# HELP musefs_handles_open Open file handles in the core slab.
+# TYPE musefs_handles_open gauge
+musefs_handles_open 3
+# HELP musefs_cache_header_hits_total Raw header-cache key hits; a hit may still trigger a content-version rebuild.
+# TYPE musefs_cache_header_hits_total counter
+musefs_cache_header_hits_total 100
+```
+
+`--expose-metrics` (default off) is a **runtime** flag that gates the virtual
+file; it is unrelated to the compile-time `metrics` cargo feature, which adds
+syscall counters (opens, preads, etc.) to the output. The jemalloc allocator
+stats require a build with the `jemalloc` feature, which is the default.
+
+The `metrics` file advertises `st_size == 0` (like `/proc`), so use an
+EOF-aware reader — `cat`, `head -c`, or the Prometheus textfile collector —
+not a stat-and-`read`-by-size approach.
+
 ### Ownership and permissions
 
 By default the mount presents the launching process's uid/gid and read-only
@@ -460,7 +491,7 @@ underscores (e.g. `--poll-interval-ms` → `MUSEFS_POLL_INTERVAL_MS`, the
 `mount` mountpoint → `MUSEFS_MOUNTPOINT`). An explicit flag always overrides
 its env var, which overrides the default. Boolean flags (`MUSEFS_KEEP_CACHE`,
 `MUSEFS_REVALIDATE`, `MUSEFS_FOLLOW_SYMLINKS`, `MUSEFS_QUIET`,
-`MUSEFS_ALLOW_OTHER`, `MUSEFS_CASE_INSENSITIVE`) accept a case-insensitive
+`MUSEFS_ALLOW_OTHER`, `MUSEFS_CASE_INSENSITIVE`, `MUSEFS_EXPOSE_METRICS`) accept a case-insensitive
 boolish value — `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0` — and reject
 anything else. The repeatable `--fallback` and the
 `scan` targets are command-line only. See

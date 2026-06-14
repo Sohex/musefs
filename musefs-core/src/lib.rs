@@ -12,6 +12,7 @@ mod readahead;
 mod reader;
 mod refresh_diff;
 mod scan;
+mod telemetry;
 mod template;
 mod tree;
 
@@ -25,6 +26,9 @@ pub use scan::scan_directory_full_oracle;
 pub use scan::{
     RevalidateStats, ScanOptions, ScanStats, revalidate, revalidate_with, scan_directory,
     scan_directory_with,
+};
+pub use telemetry::{
+    AllocatorStats, CoreTelemetry, FuseTelemetry, PassthroughTelemetry, render_prometheus,
 };
 pub use template::{Template, TemplateError};
 pub use tree::{Node, NodeKind, VirtualTree};
