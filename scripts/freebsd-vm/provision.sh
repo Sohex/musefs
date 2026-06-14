@@ -17,7 +17,10 @@ cd "$ROOT"
 # flac-in-ogg fixtures — both shell out to `ffmpeg` and SILENTLY SKIP if it is
 # absent (a vacuous pass). The default FreeBSD `ffmpeg` package ships the
 # needed decoders/encoders (flac, opus, vorbis, aac, mp3, pcm/wav).
-pkg install -y git ffmpeg rustup-init
+# gmake is REQUIRED to build the bundled jemalloc: the `musefs` binary's default
+# `jemalloc` feature pulls tikv-jemalloc-sys, whose build.rs invokes `gmake` (not
+# base `make`) on BSD hosts — without it the build panics with os error 2.
+pkg install -y git ffmpeg gmake rustup-init
 
 # Install the current stable toolchain (cargo + rustc) into ~/.cargo. run-e2e.sh
 # puts ~/.cargo/bin on PATH. `-y` makes it non-interactive / idempotent.
