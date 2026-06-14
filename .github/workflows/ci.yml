@@ -423,6 +423,10 @@ jobs:
       - uses: vmactions/freebsd-vm@a6de9343ef5747433d9c25784c90e84998b9d69a
         with:
           usesh: true
+          # Pass/fail e2e gate — we keep no build artifacts, so skip the rsync
+          # sync-back of the large target/ tree, which has filled the host
+          # runner's disk ("No space left on device") at the end of a green run.
+          copyback: false
           prepare: sh scripts/freebsd-vm/provision.sh
           run: sh scripts/freebsd-vm/run-e2e.sh
 
