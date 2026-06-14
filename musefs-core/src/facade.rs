@@ -1369,13 +1369,11 @@ impl Musefs {
 
     /// Snapshot the core-owned telemetry for the `.musefs-metrics` surface (#394).
     /// Cheap: atomic loads plus three length reads (the `inodes` mutex is taken
-    /// briefly; poison is recovered like every other lock site).
+    /// briefly; a poisoned lock flags `needs_rebuild` via `lock_or_flag`, the same
+    /// self-heal contract as every other VFS-state lock site).
     pub fn telemetry(&self) -> crate::telemetry::CoreTelemetry {
         let tree_nodes = self.tree.load().node_count() as u64;
-        let inode_paths = self
-            .inodes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let inode_paths = crate::lock::lock_or_flag(&self.inodes, &self.needs_rebuild, "inodes")
             .interned_path_count() as u64;
         crate::telemetry::CoreTelemetry {
             handles_open: self.handles_open.load(Ordering::Relaxed) as u64,

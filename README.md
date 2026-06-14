@@ -491,7 +491,7 @@ underscores (e.g. `--poll-interval-ms` → `MUSEFS_POLL_INTERVAL_MS`, the
 `mount` mountpoint → `MUSEFS_MOUNTPOINT`). An explicit flag always overrides
 its env var, which overrides the default. Boolean flags (`MUSEFS_KEEP_CACHE`,
 `MUSEFS_REVALIDATE`, `MUSEFS_FOLLOW_SYMLINKS`, `MUSEFS_QUIET`,
-`MUSEFS_ALLOW_OTHER`, `MUSEFS_CASE_INSENSITIVE`) accept a case-insensitive
+`MUSEFS_ALLOW_OTHER`, `MUSEFS_CASE_INSENSITIVE`, `MUSEFS_EXPOSE_METRICS`) accept a case-insensitive
 boolish value — `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0` — and reject
 anything else. The repeatable `--fallback` and the
 `scan` targets are command-line only. See
