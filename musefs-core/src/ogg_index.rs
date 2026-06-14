@@ -145,7 +145,7 @@ fn page_crc_ok(backing: &std::fs::File, page_start: u64) -> Result<bool> {
 /// enforced, as a hard error in both debug and release builds.
 #[allow(clippy::too_many_arguments)] // serve geometry + memo; bundling adds no clarity
 pub fn serve_ogg_window(
-    backing: &std::fs::File,
+    backing: &crate::readahead::BackingReader,
     audio_offset: u64,
     audio_length: u64,
     seq_delta: i64,
@@ -159,7 +159,7 @@ pub fn serve_ogg_window(
     }
     let audio_end = audio_offset + audio_length;
     let abs_rstart = audio_offset + rstart;
-    let mut pos = find_page_start(backing, audio_offset, abs_rstart, memo)?;
+    let mut pos = find_page_start(backing.file(), audio_offset, abs_rstart, memo)?;
 
     while pos < audio_end {
         let page_rel = pos - audio_offset;
@@ -170,7 +170,7 @@ pub fn serve_ogg_window(
         // Clamped to the declared audio region end.
         let read_len = MAX_OGG_HEADER_BYTES.min(usize_from(audio_end - pos));
         let mut hdr_buf = vec![0u8; read_len];
-        read_counted(backing, &mut hdr_buf, pos)?;
+        backing.read_exact_at(&mut hdr_buf, pos)?;
         if hdr_buf.len() < 27 {
             return Err(musefs_format::FormatError::Malformed.into());
         }
@@ -227,7 +227,7 @@ pub fn serve_ogg_window(
             let n = usize_from(pe - ps);
             let start = out.len();
             out.resize(start + n, 0);
-            read_counted(backing, &mut out[start..], pos + header_len as u64 + within)?;
+            backing.read_exact_at(&mut out[start..], pos + header_len as u64 + within)?;
         }
 
         pos += (header_len + payload_len) as u64;
@@ -248,6 +248,27 @@ mod tests {
     use super::*;
     use musefs_format::ogg::page_test_support::lace_packet_pub;
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    struct TestBr {
+        pool: crate::readahead::ReadAheadPool,
+        buf: Arc<Mutex<crate::readahead::ReadAhead>>,
+    }
+    impl TestBr {
+        fn new() -> Self {
+            TestBr {
+                pool: crate::readahead::ReadAheadPool::new(0),
+                buf: Arc::new(Mutex::new(crate::readahead::ReadAhead::new(0))),
+            }
+        }
+        fn reader<'a>(
+            &'a self,
+            f: &'a std::fs::File,
+            len: u64,
+        ) -> crate::readahead::BackingReader<'a> {
+            crate::readahead::BackingReader::new(f, &self.buf, &self.pool, 0, len)
+        }
+    }
 
     /// CRC-32/Ogg: poly 0x04C11DB7, init 0, no reflection, no xorout. Independent
     /// of musefs-format::ogg::crc (different table, from the `crc` crate).
@@ -354,8 +375,10 @@ mod tests {
             .unwrap();
 
         let backing = std::fs::File::open(&path).unwrap();
+        let test_br = TestBr::new();
+        let br = test_br.reader(&backing, u64::MAX);
         let mut audio = Vec::new();
-        serve_ogg_window(&backing, ao, alen, delta, 0, alen, &mut audio, None).unwrap();
+        serve_ogg_window(&br, ao, alen, delta, 0, alen, &mut audio, None).unwrap();
 
         let mut full = hdr_bytes;
         full.extend_from_slice(&audio);
@@ -445,8 +468,10 @@ mod tests {
 
     fn new_serve_range(path: &std::path::Path, ao: u64, alen: u64, a: u64, b: u64) -> Vec<u8> {
         let backing = std::fs::File::open(path).unwrap();
+        let test_br = TestBr::new();
+        let br = test_br.reader(&backing, u64::MAX);
         let mut out = Vec::new();
-        serve_ogg_window(&backing, ao, alen, 2, a, b, &mut out, None).unwrap();
+        serve_ogg_window(&br, ao, alen, 2, a, b, &mut out, None).unwrap();
         out
     }
 
@@ -635,17 +660,10 @@ mod tests {
             .unwrap();
         let audio_length = bytes.len() as u64 - 5;
         let backing = std::fs::File::open(&path).unwrap();
+        let test_br = TestBr::new();
+        let br = test_br.reader(&backing, u64::MAX);
         let mut out = Vec::new();
-        let r = serve_ogg_window(
-            &backing,
-            0,
-            audio_length,
-            0,
-            0,
-            audio_length,
-            &mut out,
-            None,
-        );
+        let r = serve_ogg_window(&br, 0, audio_length, 0, 0, audio_length, &mut out, None);
         assert!(r.is_err(), "misaligned audio_length must error");
     }
 
@@ -658,13 +676,15 @@ mod tests {
         let (_d, path, ao, alen) = new_serve_fixture();
         let want = new_reference_region(&path, ao, alen);
         let backing = std::fs::File::open(&path).unwrap();
+        let test_br = TestBr::new();
+        let br = test_br.reader(&backing, u64::MAX);
         let memo: LastPageMemo = std::sync::Mutex::new(None);
         let mut out = Vec::new();
         let mut off = 0u64;
         let chunk = 20_000u64;
         while off < alen {
             let end = (off + chunk).min(alen);
-            serve_ogg_window(&backing, ao, alen, 2, off, end, &mut out, Some(&memo)).unwrap();
+            serve_ogg_window(&br, ao, alen, 2, off, end, &mut out, Some(&memo)).unwrap();
             off = end;
         }
         assert_eq!(out, want, "memo-served bytes must match the reference");
@@ -789,10 +809,12 @@ mod tests {
             .write_all(&data)
             .unwrap();
         let backing = std::fs::File::open(&path).unwrap();
+        let test_br = TestBr::new();
+        let br = test_br.reader(&backing, u64::MAX);
         let alen = data.len() as u64;
         let mut out = Vec::new();
         // seq_delta 0 → patched headers equal the originals, so output == input.
-        serve_ogg_window(&backing, 0, alen, 0, 0, alen, &mut out, None).unwrap();
+        serve_ogg_window(&br, 0, alen, 0, 0, alen, &mut out, None).unwrap();
         assert_eq!(out, data);
     }
 
@@ -859,8 +881,10 @@ mod tests {
         let ao = 16u64;
         let alen = page.len() as u64;
         let backing = std::fs::File::open(&path).unwrap();
+        let test_br = TestBr::new();
+        let br = test_br.reader(&backing, u64::MAX);
         let mut out = Vec::new();
-        serve_ogg_window(&backing, ao, alen, 1, 0, alen, &mut out, None).unwrap();
+        serve_ogg_window(&br, ao, alen, 1, 0, alen, &mut out, None).unwrap();
 
         // The served region must be the page with its sequence wrapped (u32::MAX + 1 == 0):
         // patched header followed by the original payload bytes.

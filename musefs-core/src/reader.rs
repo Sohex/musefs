@@ -452,11 +452,9 @@ fn read_segments_into<M>(
                     seq_delta,
                     len,
                 } => {
-                    let f = backing
-                        .expect("ogg-audio segment requires an open backing reader")
-                        .file();
+                    let br = backing.expect("ogg-audio segment requires an open backing reader");
                     serve_ogg_window(
-                        f,
+                        br,
                         *ao,
                         *len,
                         *seq_delta,
