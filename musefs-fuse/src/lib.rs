@@ -101,6 +101,40 @@ fn open_flags(keep_cache: bool) -> FopenFlags {
     }
 }
 
+/// jemalloc allocator stats, or `None` when not built with the `jemalloc`
+/// feature (or when the ctls fail — best-effort, never panics). #394.
+#[cfg(feature = "jemalloc")]
+#[allow(dead_code)]
+fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().ok()?;
+    Some(musefs_core::AllocatorStats {
+        allocated: stats::allocated::read().ok()? as u64,
+        resident: stats::resident::read().ok()? as u64,
+        active: stats::active::read().ok()? as u64,
+        retained: stats::retained::read().ok()? as u64,
+    })
+}
+
+#[cfg(not(feature = "jemalloc"))]
+#[allow(dead_code)]
+fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
+    None
+}
+
+/// Serve-path syscall counters, present only on a `metrics`-feature build.
+#[cfg(feature = "metrics")]
+#[allow(dead_code)]
+fn syscall_snapshot() -> Option<musefs_core::metrics::Snapshot> {
+    Some(musefs_core::metrics::snapshot())
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)]
+fn syscall_snapshot() -> Option<musefs_core::metrics::Snapshot> {
+    None
+}
+
 /// Synthetic `statfs` reply values (#368). musefs is a read-only passthrough
 /// with no single backing volume to mirror (backing files are per-track and may
 /// span devices), so we advertise a large, fully-free synthetic capacity rather
@@ -405,6 +439,36 @@ impl MusefsFs {
                 }
             });
         }
+    }
+
+    /// Assemble and render the `.musefs-metrics/metrics` body (#394). Best-effort:
+    /// every source is an atomic load, a brief lock, or a fallible probe mapped to
+    /// `None`/0; nothing here can panic the daemon or perturb a read.
+    #[allow(dead_code)]
+    fn render_metrics(&self) -> Vec<u8> {
+        let core = self.core.telemetry();
+        let dir_handles = self
+            .dir_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len() as u64;
+        let fuse = musefs_core::FuseTelemetry {
+            uptime_seconds: self.mount_time.elapsed().map_or(0, |d| d.as_secs()),
+            reads_inflight: self.inflight_reads.load(Ordering::Relaxed) as u64,
+            reads_inflight_max: MAX_INFLIGHT_READS as u64,
+            dir_handles,
+            dir_handles_max: MAX_DIR_HANDLES as u64,
+            pool_workers: self.pool.max_count() as u64,
+            pool_active: self.pool.active_count() as u64,
+            pool_queued: self.pool.queued_count() as u64,
+            passthrough: self
+                .passthrough
+                .telemetry()
+                .map(|(disabled, active)| musefs_core::PassthroughTelemetry { disabled, active }),
+        };
+        let alloc = allocator_stats();
+        let syscalls = syscall_snapshot();
+        musefs_core::render_prometheus(&core, &fuse, alloc.as_ref(), syscalls.as_ref()).into_bytes()
     }
 }
 
