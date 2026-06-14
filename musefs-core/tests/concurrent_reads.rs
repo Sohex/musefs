@@ -5,9 +5,9 @@
 //! asserts on bytes) so it can gate CI and run under AddressSanitizer.
 mod common;
 
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 
-use musefs_core::{HeaderCache, Mode, read_at_with_file};
+use musefs_core::{BackingReader, HeaderCache, Mode, ReadAhead, ReadAheadPool, read_at_with_file};
 use musefs_db::Db;
 
 /// Build a file-backed store with `n` FLAC tracks (each a real backing file),
@@ -54,7 +54,10 @@ fn read_full(db_path: &std::path::Path, cache: &HeaderCache, id: i64) -> Vec<u8>
     let db = Db::open_readonly(db_path).unwrap();
     let resolved = cache.resolve(&db, id).unwrap();
     let file = std::fs::File::open(&resolved.backing_path).unwrap();
-    read_at_with_file(&resolved, &db, &file, 0, resolved.total_len).unwrap()
+    let pool = ReadAheadPool::new(0);
+    let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
+    let br = BackingReader::new(&file, &buf, &pool, 0, resolved.total_len);
+    read_at_with_file(&resolved, &db, &br, 0, resolved.total_len).unwrap()
 }
 
 #[test]

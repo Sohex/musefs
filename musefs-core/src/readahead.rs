@@ -195,6 +195,7 @@ impl ReadAhead {
     }
 
     /// Bytes currently held (charged against the global budget).
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
         self.bytes.len() as u64
     }
@@ -305,6 +306,10 @@ impl<'a> BackingReader<'a> {
 
     pub fn fills(&self) -> u64 {
         self.fills.get()
+    }
+
+    pub fn file(&self) -> &std::fs::File {
+        self.file
     }
 
     pub fn read_exact_at(&self, dst: &mut [u8], abs_offset: u64) -> std::io::Result<()> {

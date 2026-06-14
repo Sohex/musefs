@@ -367,7 +367,11 @@ pub fn read_at_into<M>(
     if needs_file {
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
-        read_segments_into(resolved, db, Some(&file), offset, size, out)
+        let pool = crate::readahead::ReadAheadPool::new(0);
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(crate::readahead::ReadAhead::new(0)));
+        let backing_len = resolved.stamp.size;
+        let br = crate::readahead::BackingReader::new(&file, &buf, &pool, 0, backing_len);
+        read_segments_into(resolved, db, Some(&br), offset, size, out)
     } else {
         read_segments_into(resolved, db, None, offset, size, out)
     }
@@ -394,13 +398,13 @@ pub fn read_at<M>(resolved: &ResolvedFile, db: &Db<M>, offset: u64, size: u64) -
     Ok(out)
 }
 
-/// The single segment-splicing loop. `file` is `Some` whenever the layout has a
+/// The single segment-splicing loop. `backing` is `Some` whenever the layout has a
 /// `BackingAudio`/`OggAudio` segment (guaranteed by `read_at`/`read_at_with_file`);
 /// the backing arms treat `None` as a contract violation.
 fn read_segments_into<M>(
     resolved: &ResolvedFile,
     db: &Db<M>,
-    file: Option<&std::fs::File>,
+    backing: Option<&crate::readahead::BackingReader>,
     offset: u64,
     size: u64,
     out: &mut Vec<u8>,
@@ -426,16 +430,10 @@ fn read_segments_into<M>(
                     out.extend_from_slice(&bytes[w..w + n]);
                 }
                 Segment::BackingAudio { offset: bo, .. } => {
-                    let f = file.expect("backing segment requires an open backing file");
-                    // Finding #15 (ESTALE, untested by design): on an NFS-backed mount a stale file
-                    // handle surfaces here as a raw io::Error from the positioned read (or as
-                    // BackingChanged from the size/mtime re-validation) and is propagated verbatim
-                    // through the FUSE layer. There is no test-framework support to inject NFS ESTALE,
-                    // so this path is documented rather than covered.
+                    let br = backing.expect("backing segment requires an open backing reader");
                     let start = out.len();
                     out.resize(start + n, 0);
-                    crate::metrics::backing_read_exact_at(f, &mut out[start..], bo + within)?;
-                    crate::metrics::on_pread(n as u64);
+                    br.read_exact_at(&mut out[start..], bo + within)?;
                 }
                 Segment::ArtImage { art_id, .. } => {
                     let start = out.len();
@@ -454,7 +452,9 @@ fn read_segments_into<M>(
                     seq_delta,
                     len,
                 } => {
-                    let f = file.expect("ogg-audio segment requires an open backing file");
+                    let f = backing
+                        .expect("ogg-audio segment requires an open backing reader")
+                        .file();
                     serve_ogg_window(
                         f,
                         *ao,
@@ -474,7 +474,6 @@ fn read_segments_into<M>(
                     ..
                 } => {
                     if *base64 {
-                        // Output base64 chars [offset+within, +n) of base64(image).
                         let w =
                             musefs_format::ogg::b64_window(*offset + within, n as u64, *art_total);
                         let raw = db.read_art_chunk(*art_id, w.in_start, usize_from(w.in_len))?;
@@ -483,7 +482,6 @@ fn read_segments_into<M>(
                             &raw, w.skip, n,
                         ));
                     } else {
-                        // Raw image bytes (OggFLAC PICTURE block).
                         let start = out.len();
                         out.resize(start + n, 0);
                         db.read_art_chunk_into(*art_id, *offset + within, &mut out[start..])?;
@@ -500,28 +498,28 @@ fn read_segments_into<M>(
     Ok(())
 }
 
-/// Serve into `out` from an already-open backing `file` (per-handle path).
+/// Serve into `out` from an already-open backing reader (per-handle path).
 pub fn read_at_with_file_into<M>(
     resolved: &ResolvedFile,
     db: &Db<M>,
-    file: &std::fs::File,
+    backing: &crate::readahead::BackingReader,
     offset: u64,
     size: u64,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    read_segments_into(resolved, db, Some(file), offset, size, out)
+    read_segments_into(resolved, db, Some(backing), offset, size, out)
 }
 
 /// Allocating form of `read_at_with_file_into`.
 pub fn read_at_with_file<M>(
     resolved: &ResolvedFile,
     db: &Db<M>,
-    file: &std::fs::File,
+    backing: &crate::readahead::BackingReader,
     offset: u64,
     size: u64,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    read_at_with_file_into(resolved, db, file, offset, size, &mut out)?;
+    read_at_with_file_into(resolved, db, backing, offset, size, &mut out)?;
     Ok(out)
 }
 
@@ -751,7 +749,10 @@ mod resolve_ogg_tests {
 
         let via_open = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
         let file = std::fs::File::open(&resolved.backing_path).unwrap();
-        let via_file = read_at_with_file(&resolved, &db, &file, 0, resolved.total_len).unwrap();
+        let pool = crate::readahead::ReadAheadPool::new(0);
+        let buf = Arc::new(Mutex::new(crate::readahead::ReadAhead::new(0)));
+        let br = crate::readahead::BackingReader::new(&file, &buf, &pool, 0, meta.len());
+        let via_file = read_at_with_file(&resolved, &db, &br, 0, resolved.total_len).unwrap();
         assert_eq!(via_open, via_file);
     }
 
@@ -1546,5 +1547,119 @@ mod serve_cap_tests {
             matches!(err, CoreError::Io(_)),
             "expected Io error at the cap boundary, got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod readahead_differential_tests {
+    use super::*;
+    use crate::readahead::{BackingReader, ReadAhead, ReadAheadPool};
+    use std::sync::{Arc, Mutex};
+
+    fn pcm_fixture() -> (musefs_db::Db, Arc<ResolvedFile>, std::fs::File) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wav");
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fmt ");
+        body.extend_from_slice(&16u32.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&44100u32.to_le_bytes());
+        body.extend_from_slice(&88200u32.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&16u16.to_le_bytes());
+        let audio_data: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&u32::try_from(audio_data.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(&audio_data);
+        let mut riff = b"RIFF".to_vec();
+        riff.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+        riff.extend_from_slice(b"WAVE");
+        riff.extend_from_slice(&body);
+        let audio_offset = (riff.len() - audio_data.len()) as u64;
+        std::fs::write(&path, &riff).unwrap();
+
+        let db = musefs_db::Db::open_in_memory().unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let track_id = db
+            .upsert_track(&musefs_db::NewTrack {
+                backing_path: path.to_string_lossy().into_owned(),
+                format: musefs_db::Format::Wav,
+                audio_offset,
+                audio_length: audio_data.len() as u64,
+                backing_size: meta.len(),
+                backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+            })
+            .unwrap();
+        let cache = HeaderCache::new(Mode::Synthesis);
+        let resolved = cache.resolve(&db, track_id).unwrap();
+        let file = std::fs::File::open(&resolved.backing_path).unwrap();
+        (db, resolved, file)
+    }
+
+    fn oracle_read(
+        resolved: &ResolvedFile,
+        file: &std::fs::File,
+        offset: u64,
+        size: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        if offset >= resolved.total_len || size == 0 {
+            return Ok(());
+        }
+        let end = offset.saturating_add(size).min(resolved.total_len);
+        out.reserve(usize_from(end - offset));
+        let mut seg_start = 0u64;
+        for seg in resolved.layout.segments() {
+            let seg_len = seg.len();
+            let seg_end = seg_start + seg_len;
+            let ov_start = offset.max(seg_start);
+            let ov_end = end.min(seg_end);
+            if ov_start < ov_end {
+                let within = ov_start - seg_start;
+                let n = usize_from(ov_end - ov_start);
+                match seg {
+                    Segment::Inline(bytes) => {
+                        let w = usize_from(within);
+                        out.extend_from_slice(&bytes[w..w + n]);
+                    }
+                    Segment::BackingAudio { offset: bo, .. } => {
+                        let start = out.len();
+                        out.resize(start + n, 0);
+                        use std::os::unix::fs::FileExt;
+                        file.read_exact_at(&mut out[start..], bo + within)?;
+                    }
+                    _ => panic!("unexpected segment in PCM fixture"),
+                }
+            }
+            seg_start = seg_end;
+            if seg_start >= end {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pcm_bytes_identical_through_backing_reader() {
+        let (db, resolved, file) = pcm_fixture();
+        let pool = ReadAheadPool::new(0);
+        let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
+        let br = BackingReader::new(&file, &buf, &pool, 0, resolved.stamp.size);
+        let total = resolved.total_len;
+        for &size in &[1u64, 7, 4096, 65536, 262_144] {
+            let mut off = 0;
+            while off < total {
+                let n = size.min(total - off);
+                let mut via = Vec::new();
+                read_segments_into(&resolved, &db, Some(&br), off, n, &mut via).unwrap();
+                let mut direct = Vec::new();
+                oracle_read(&resolved, &file, off, n, &mut direct).unwrap();
+                assert_eq!(via, direct, "mismatch at off={off} size={size}");
+                off += n;
+            }
+        }
     }
 }

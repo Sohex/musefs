@@ -71,6 +71,8 @@ struct Handle {
     resolved: arc_swap::ArcSwap<ResolvedFile>,
     generation: AtomicU64,
     file: std::fs::File,
+    backing_pool: crate::readahead::ReadAheadPool,
+    backing_buf: Arc<Mutex<crate::readahead::ReadAhead>>,
 }
 
 /// An owned view of an open handle's backing fd, for FUSE passthrough
@@ -1103,13 +1105,27 @@ impl Musefs {
                                 {
                                     return Ok(None); // stale layout — retry after re-resolve
                                 }
-                                read_at_with_file_into(r, db, &h.file, offset, size, out)?;
+                                let br = crate::readahead::BackingReader::new(
+                                    &h.file,
+                                    &h.backing_buf,
+                                    &h.backing_pool,
+                                    0,
+                                    r.stamp.size,
+                                );
+                                read_at_with_file_into(r, db, &br, offset, size, out)?;
                                 Ok(Some(()))
                             })();
                             let _ = db.end_read(); // always release the snapshot
                             res
                         } else {
-                            read_at_with_file_into(r, db, &h.file, offset, size, out)?;
+                            let br = crate::readahead::BackingReader::new(
+                                &h.file,
+                                &h.backing_buf,
+                                &h.backing_pool,
+                                0,
+                                r.stamp.size,
+                            );
+                            read_at_with_file_into(r, db, &br, offset, size, out)?;
                             Ok(Some(()))
                         }
                     })?;
@@ -1181,11 +1197,18 @@ impl Musefs {
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
         validate_opened_backing(&file, &resolved)?;
+        let backing_pool =
+            crate::readahead::ReadAheadPool::new(crate::readahead::DEFAULT_READAHEAD_BUDGET);
+        let backing_buf = Arc::new(Mutex::new(crate::readahead::ReadAhead::new(
+            backing_pool.per_stream_cap(),
+        )));
         fh_from_key(self.handles.insert(Arc::new(Handle {
             track_id,
             resolved: arc_swap::ArcSwap::from(resolved),
             generation: AtomicU64::new(generation),
             file,
+            backing_pool,
+            backing_buf,
         })))
     }
 

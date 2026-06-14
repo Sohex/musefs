@@ -3,8 +3,9 @@
 //! for an independent reader (mutagen) to verify. Mirrors `interop_emit.rs` but
 //! sources rows from an EXISTING DB (scan + python-musefs writes) rather than
 //! building one in-process.
-use musefs_core::{HeaderCache, Mode, read_at_with_file};
+use musefs_core::{BackingReader, HeaderCache, Mode, ReadAhead, ReadAheadPool, read_at_with_file};
 use musefs_db::Db;
+use std::sync::{Arc, Mutex};
 
 #[test]
 #[ignore = "contract emitter; run with MUSEFS_DB + MUSEFS_INTEROP_DIR set (see scripts/contract-roundtrip.sh)"]
@@ -23,7 +24,10 @@ fn emit_contract_fixtures() {
     for track in tracks {
         let resolved = cache.resolve(&db, track.id).expect("resolve track");
         let file = std::fs::File::open(&resolved.backing_path).expect("open backing file");
-        let bytes = read_at_with_file(&resolved, &db, &file, 0, resolved.total_len)
+        let pool = ReadAheadPool::new(0);
+        let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
+        let br = BackingReader::new(&file, &buf, &pool, 0, resolved.total_len);
+        let bytes = read_at_with_file(&resolved, &db, &br, 0, resolved.total_len)
             .expect("synthesize served bytes");
         // Name the output by track id + the backing file's extension, so the
         // independent reader can pick the right parser.
