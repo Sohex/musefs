@@ -10,7 +10,7 @@
 
 use std::time::SystemTime;
 
-use fuser::{FileAttr, FileType, INodeNo};
+use fuser::{FileAttr, FileType};
 
 /// Mount root inode (fuser's FUSE root id).
 const ROOT_INO: u64 = 1;
@@ -44,46 +44,28 @@ pub fn metrics_lookup(parent: u64, name: &str) -> Option<u64> {
 
 /// Attributes for the synthetic directory (read-only, size 0, nlink 2).
 pub fn dir_attr(uid: u32, gid: u32, dir_mode: u16, mtime: SystemTime) -> FileAttr {
-    FileAttr {
-        ino: INodeNo(METRICS_DIR_INO),
-        size: 0,
-        blocks: 0,
-        atime: mtime,
-        mtime,
-        ctime: mtime,
-        crtime: mtime,
-        kind: FileType::Directory,
-        perm: dir_mode,
-        nlink: 2,
+    crate::convert::make_attr(
+        METRICS_DIR_INO,
+        0,
+        (FileType::Directory, dir_mode, 2),
         uid,
         gid,
-        rdev: 0,
-        blksize: 512,
-        flags: 0,
-    }
+        mtime,
+    )
 }
 
 /// Attributes for the synthetic `metrics` file. Size 0 (`/proc`-style): the
 /// content is served at read time via `FOPEN_DIRECT_IO`, so the kernel reads to
 /// EOF rather than trusting `st_size`.
 pub fn file_attr(uid: u32, gid: u32, file_mode: u16, mtime: SystemTime) -> FileAttr {
-    FileAttr {
-        ino: INodeNo(METRICS_FILE_INO),
-        size: 0,
-        blocks: 0,
-        atime: mtime,
-        mtime,
-        ctime: mtime,
-        crtime: mtime,
-        kind: FileType::RegularFile,
-        perm: file_mode,
-        nlink: 1,
+    crate::convert::make_attr(
+        METRICS_FILE_INO,
+        0,
+        (FileType::RegularFile, file_mode, 1),
         uid,
         gid,
-        rdev: 0,
-        blksize: 512,
-        flags: 0,
-    }
+        mtime,
+    )
 }
 
 /// The readdir entry to append when listing the root (only the root).

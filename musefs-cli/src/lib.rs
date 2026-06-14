@@ -247,27 +247,27 @@ fn parse_fallback(s: &str) -> Result<(String, String), String> {
     Ok((field.to_string(), value.to_string()))
 }
 
+/// Resolve a `--owner`/`--group` value: an all-numeric string is taken as a raw
+/// id (never a name, matching `chown`); otherwise `lookup` resolves it by name,
+/// with `noun` naming the entity in the not-found error.
+fn parse_id(s: &str, lookup: impl FnOnce(&str) -> Option<u32>, noun: &str) -> Result<u32, String> {
+    if let Ok(id) = s.parse::<u32>() {
+        return Ok(id);
+    }
+    lookup(s).ok_or_else(|| format!("no such {noun}: {s}"))
+}
+
 /// Resolve `--owner`: a numeric uid is used directly; anything else is looked
 /// up as a username. An all-numeric string is always treated as an id (never a
 /// name), matching `chown`.
 fn parse_owner(s: &str) -> Result<u32, String> {
-    if let Ok(uid) = s.parse::<u32>() {
-        return Ok(uid);
-    }
-    uzers::get_user_by_name(s)
-        .map(|u| u.uid())
-        .ok_or_else(|| format!("no such user: {s}"))
+    parse_id(s, |n| uzers::get_user_by_name(n).map(|u| u.uid()), "user")
 }
 
 /// Resolve `--group`: a numeric gid is used directly; anything else is looked
 /// up as a group name.
 fn parse_group(s: &str) -> Result<u32, String> {
-    if let Ok(gid) = s.parse::<u32>() {
-        return Ok(gid);
-    }
-    uzers::get_group_by_name(s)
-        .map(|g| g.gid())
-        .ok_or_else(|| format!("no such group: {s}"))
+    parse_id(s, |n| uzers::get_group_by_name(n).map(|g| g.gid()), "group")
 }
 
 /// Parse a bare octal permission word (e.g. `644`, `0755`) — NOT decimal, and

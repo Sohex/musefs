@@ -221,6 +221,13 @@ fn attr_from_meta(ino: u64, m: &std::fs::Metadata) -> FileAttr {
     }
 }
 
+/// Map a `std::io::Error` onto the errno for a FUSE reply, defaulting to `EIO`
+/// when the error carries no raw OS errno. Local to this bench harness, mirroring
+/// `musefs-fuse`'s `errno` without taking a dependency on the production crate.
+fn io_errno(e: &std::io::Error) -> fuser::Errno {
+    fuser::Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
 /// The passthrough filesystem. Root inode (1) maps to the backing root.
 ///
 /// Invariant: mounted with single-threaded FUSE dispatch (`Config::default()`,
@@ -318,9 +325,7 @@ impl fuser::Filesystem for PassthroughFs {
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) => {
-                return reply.error(fuser::Errno::from_i32(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                ));
+                return reply.error(io_errno(&e));
             }
         };
         for ent in rd.flatten() {
@@ -363,9 +368,7 @@ impl fuser::Filesystem for PassthroughFs {
             Err(_) => match File::open(&p) {
                 Ok(f) => f,
                 Err(e) => {
-                    return reply.error(fuser::Errno::from_i32(
-                        e.raw_os_error().unwrap_or(libc::EIO),
-                    ));
+                    return reply.error(io_errno(&e));
                 }
             },
         };
@@ -399,9 +402,7 @@ impl fuser::Filesystem for PassthroughFs {
         match file.read_at(&mut buf, offset) {
             Ok(n) => reply.data(&buf[..n]),
             Err(e) => {
-                reply.error(fuser::Errno::from_i32(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                ));
+                reply.error(io_errno(&e));
             }
         }
     }
@@ -484,17 +485,13 @@ impl fuser::Filesystem for PassthroughFs {
         {
             Ok(f) => f,
             Err(e) => {
-                return reply.error(fuser::Errno::from_i32(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                ));
+                return reply.error(io_errno(&e));
             }
         };
         let m = match file.metadata() {
             Ok(m) => m,
             Err(e) => {
-                return reply.error(fuser::Errno::from_i32(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                ));
+                return reply.error(io_errno(&e));
             }
         };
         let ino = self.inodes.lock().unwrap().intern(child);
@@ -531,9 +528,7 @@ impl fuser::Filesystem for PassthroughFs {
         match file.write_at(data, offset) {
             Ok(n) => reply.written(u32::try_from(n).unwrap_or(u32::MAX)),
             Err(e) => {
-                reply.error(fuser::Errno::from_i32(
-                    e.raw_os_error().unwrap_or(libc::EIO),
-                ));
+                reply.error(io_errno(&e));
             }
         }
     }
@@ -559,9 +554,7 @@ impl fuser::Filesystem for PassthroughFs {
         };
         match r {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(fuser::Errno::from_i32(
-                e.raw_os_error().unwrap_or(libc::EIO),
-            )),
+            Err(e) => reply.error(io_errno(&e)),
         }
     }
 
@@ -611,15 +604,11 @@ impl fuser::Filesystem for PassthroughFs {
                 .open(&p)
                 .and_then(|f| f.set_len(sz))
         {
-            return reply.error(fuser::Errno::from_i32(
-                e.raw_os_error().unwrap_or(libc::EIO),
-            ));
+            return reply.error(io_errno(&e));
         }
         match std::fs::symlink_metadata(&p) {
             Ok(m) => reply.attr(&TTL, &attr_from_meta(ino.0, &m)),
-            Err(e) => reply.error(fuser::Errno::from_i32(
-                e.raw_os_error().unwrap_or(libc::EIO),
-            )),
+            Err(e) => reply.error(io_errno(&e)),
         }
     }
 
@@ -634,9 +623,7 @@ impl fuser::Filesystem for PassthroughFs {
                 self.inodes.lock().unwrap().forget_path(&child);
                 reply.ok();
             }
-            Err(e) => reply.error(fuser::Errno::from_i32(
-                e.raw_os_error().unwrap_or(libc::EIO),
-            )),
+            Err(e) => reply.error(io_errno(&e)),
         }
     }
 
@@ -661,9 +648,7 @@ impl fuser::Filesystem for PassthroughFs {
                 self.inodes.lock().unwrap().rename(&from, to);
                 reply.ok();
             }
-            Err(e) => reply.error(fuser::Errno::from_i32(
-                e.raw_os_error().unwrap_or(libc::EIO),
-            )),
+            Err(e) => reply.error(io_errno(&e)),
         }
     }
 
@@ -686,9 +671,7 @@ impl fuser::Filesystem for PassthroughFs {
                 let ino = self.inodes.lock().unwrap().intern(child);
                 reply.entry(&TTL, &attr_from_meta(ino, &m), Generation(0));
             }
-            Err(e) => reply.error(fuser::Errno::from_i32(
-                e.raw_os_error().unwrap_or(libc::EIO),
-            )),
+            Err(e) => reply.error(io_errno(&e)),
         }
     }
 
@@ -703,9 +686,7 @@ impl fuser::Filesystem for PassthroughFs {
                 self.inodes.lock().unwrap().forget_path(&child);
                 reply.ok();
             }
-            Err(e) => reply.error(fuser::Errno::from_i32(
-                e.raw_os_error().unwrap_or(libc::EIO),
-            )),
+            Err(e) => reply.error(io_errno(&e)),
         }
     }
 }
