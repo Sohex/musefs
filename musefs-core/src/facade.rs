@@ -1298,6 +1298,18 @@ impl Musefs {
         self.handles.remove(key);
     }
 
+    /// Test accessor: are the Phase-2 prefetch worker threads running?
+    #[cfg(test)]
+    pub(crate) fn prefetch_workers_active(&self) -> bool {
+        self.prefetch.is_some()
+    }
+
+    /// Test accessor: bytes currently charged against the read-ahead budget.
+    #[cfg(test)]
+    pub(crate) fn pool_charged(&self) -> u64 {
+        self.readahead_pool.charged_for_test()
+    }
+
     /// The backing fd behind `fh`, for kernel passthrough registration. `Some`
     /// only in StructureOnly mode, where the served bytes ARE the backing file;
     /// in Synthesis mode the bytes are spliced, so no single fd represents
@@ -1427,6 +1439,81 @@ mod tests {
             "handle did not re-resolve: {len_before} -> {len_after}"
         );
         fs.release_handle(fh);
+    }
+
+    #[test]
+    fn prefetch_workers_created_only_with_budget_and_flag() {
+        use std::collections::BTreeMap;
+        let mk = |budget: u64, prefetch: bool| {
+            let cfg = MountConfig {
+                template: "$artist/$title".to_string(),
+                fallbacks: BTreeMap::new(),
+                default_fallback: "Unknown".to_string(),
+                mode: Mode::Synthesis,
+                poll_interval: std::time::Duration::ZERO,
+                case_insensitive: false,
+                read_ahead_budget: budget,
+                read_ahead_prefetch: prefetch,
+            };
+            Musefs::open(musefs_db::Db::open_in_memory().unwrap(), cfg).unwrap()
+        };
+        assert!(
+            !mk(64 << 20, false).prefetch_workers_active(),
+            "default is Phase-1 amplification only"
+        );
+        assert!(mk(64 << 20, true).prefetch_workers_active(), "flag opts in");
+        assert!(
+            !mk(0, true).prefetch_workers_active(),
+            "budget 0 disables read-ahead entirely"
+        );
+        assert!(!mk(0, false).prefetch_workers_active());
+    }
+
+    #[test]
+    fn read_then_release_does_not_leak_budget() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+        let fh = fs.open_handle(file_inode).unwrap();
+        assert!(
+            !fs.read(file_inode, Some(fh), 0, 1 << 20)
+                .unwrap()
+                .is_empty()
+        );
+        // The read registers the stream and charges its window; release must
+        // deregister and uncharge it. A registration that does not fire on the
+        // first read leaks the charge (the buffer is never in the pool to free).
+        fs.release_handle(fh);
+        assert_eq!(fs.pool_charged(), 0, "release leaked the read-ahead charge");
     }
 
     /// The safety property the transactional `content_version` guard exists to

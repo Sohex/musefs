@@ -13,9 +13,6 @@ pub const WINDOW_FLOOR: u64 = 512 * 1024;
 /// Absolute per-stream window cap, independent of the global budget.
 pub const WINDOW_ABS_CAP: u64 = 8 * 1024 * 1024;
 
-/// Default global read-ahead budget when the operator passes no flag (64 MiB,
-/// mirroring `reader::DEFAULT_CACHE_BUDGET`). `0` disables read-ahead entirely.
-pub const DEFAULT_READAHEAD_BUDGET: u64 = 64 * 1024 * 1024;
 /// No single stream may hold more than `budget / PER_STREAM_DIVISOR`.
 const PER_STREAM_DIVISOR: u64 = 4;
 
@@ -145,13 +142,6 @@ impl ReadAheadPool {
     #[cfg(test)]
     pub fn charged_for_test(&self) -> u64 {
         self.charged.load(O::Relaxed)
-    }
-
-    /// Uncharge `bytes` directly (window cleared on invalidation/release).
-    pub fn uncharge(&self, bytes: u64) {
-        if bytes > 0 {
-            self.charged.fetch_sub(bytes, O::Relaxed);
-        }
     }
 
     /// Find and clear the coldest registered buffer other than `except`, using
@@ -1267,5 +1257,183 @@ mod concurrency_tests {
                 });
             }
         });
+    }
+}
+
+/// Focused unit tests that pin the read-ahead pool/buffer arithmetic and
+/// accounting against the mutation gate (#255): each asserts an EXACT observable
+/// (charged bytes, grant size, window size, fill/epoch counts) rather than a
+/// loose range, so an operator/return mutation flips the assertion.
+#[cfg(test)]
+mod mutation_guard_tests {
+    use super::*;
+    use std::sync::atomic::Ordering as AO;
+    use std::sync::{Arc, Mutex};
+
+    #[expect(clippy::unnecessary_wraps)]
+    fn fillb(b: &mut [u8], _o: u64) -> io::Result<()> {
+        b.fill(7);
+        Ok(())
+    }
+
+    #[expect(clippy::cast_possible_truncation)]
+    fn bk_temp(len: usize) -> (tempfile::TempDir, std::fs::File) {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bk.bin");
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        (dir, std::fs::File::open(&path).unwrap())
+    }
+
+    #[test]
+    fn next_expected_equals_consumed_tail() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        let mut dst = vec![0u8; 4096];
+        ra.read_into(&mut dst, 1000, 8 << 20, fillb).unwrap();
+        assert_eq!(ra.next_expected(), 1000 + 4096); // miss path: off + len
+        let mut d2 = vec![0u8; 100];
+        ra.read_into(&mut d2, 5096, 8 << 20, fillb).unwrap();
+        assert_eq!(ra.next_expected(), 5096 + 100); // hit path: off + len
+    }
+
+    #[test]
+    fn window_doubles_on_sequential_miss_and_floors_on_seek() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        let blen = 16 << 20;
+        #[expect(clippy::cast_possible_truncation)]
+        let mut dst = vec![0u8; WINDOW_FLOOR as usize];
+        ra.read_into(&mut dst, 0, blen, fillb).unwrap();
+        assert_eq!(ra.window(), WINDOW_FLOOR); // first miss
+        ra.read_into(&mut dst, WINDOW_FLOOR, blen, fillb).unwrap();
+        assert_eq!(ra.window(), WINDOW_FLOOR * 2); // sequential miss doubles
+        ra.read_into(&mut dst, 12 << 20, blen, fillb).unwrap();
+        assert_eq!(ra.window(), WINDOW_FLOOR); // seek resets to floor
+    }
+
+    #[test]
+    fn set_cap_clamps_window_down_only() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.set_cap(WINDOW_FLOOR / 2);
+        assert_eq!(ra.window(), WINDOW_FLOOR / 2); // window > cap → clamped
+        ra.set_cap(WINDOW_ABS_CAP);
+        assert_eq!(ra.window(), WINDOW_FLOOR / 2); // window < cap → untouched
+    }
+
+    #[test]
+    fn reconcile_charges_growth_and_uncharges_shrink() {
+        let pool = ReadAheadPool::new(64 << 20);
+        pool.reconcile(0, 1000);
+        assert_eq!(pool.charged_for_test(), 1000);
+        pool.reconcile(1000, 250); // shrink must uncharge by old-new
+        assert_eq!(pool.charged_for_test(), 250);
+        pool.reconcile(250, 250); // equal: no change
+        assert_eq!(pool.charged_for_test(), 250);
+    }
+
+    #[test]
+    fn has_room_for_zero_need_is_false_when_disabled() {
+        assert!(!ReadAheadPool::new(0).has_room_for(0)); // budget==0 guard
+        let p = ReadAheadPool::new(1 << 20);
+        p.reconcile(0, 1 << 20);
+        assert!(!p.has_room_for(1));
+    }
+
+    #[test]
+    fn permitted_window_need_is_relative_to_old_len() {
+        let pool = ReadAheadPool::new(2 << 20); // cap 512K
+        let cap = pool.per_stream_cap();
+        let b1 = Arc::new(Mutex::new(ReadAhead::new(cap)));
+        pool.register(1, Arc::clone(&b1));
+        pool.reconcile(0, cap); // stream 1 holds one cap; budget still has room
+        // need = cap - cap/2 fits in the free budget → full grant. If need used
+        // `cap + cap/2` it would exceed free room and clamp below cap.
+        assert_eq!(pool.permitted_window(2, cap / 2, cap), cap);
+    }
+
+    #[test]
+    fn permitted_window_clamps_to_room_when_nothing_evictable() {
+        let pool = ReadAheadPool::new(WINDOW_FLOOR); // budget==cap==floor
+        let cap = pool.per_stream_cap();
+        let locked = Arc::new(Mutex::new(ReadAhead::new(cap)));
+        pool.register(1, Arc::clone(&locked));
+        pool.reconcile(0, cap); // budget full
+        let _held = locked.lock().unwrap(); // un-evictable
+        // room == 0, nothing evictable → grant == old_len + room == old_len.
+        assert_eq!(pool.permitted_window(2, 1000, cap), 1000);
+    }
+
+    #[test]
+    #[expect(clippy::cast_possible_truncation)]
+    fn touch_keeps_a_stream_off_the_eviction_block() {
+        let pool = ReadAheadPool::new(2 << 20); // cap 512K, holds 4 streams
+        let cap = pool.per_stream_cap();
+        let mk = |key: usize| {
+            let arc = Arc::new(Mutex::new(ReadAhead::new(cap)));
+            let mut d = vec![0u8; cap as usize];
+            let (o, n) = arc
+                .lock()
+                .unwrap()
+                .read_into(&mut d, 0, cap * 4, fillb)
+                .unwrap();
+            pool.register(key, Arc::clone(&arc));
+            pool.reconcile(o, n);
+            arc
+        };
+        let s1 = mk(1);
+        let s2 = mk(2);
+        let _s3 = mk(3);
+        let _s4 = mk(4); // budget full (4×cap)
+        pool.touch(1); // stream 1 now most-recent → stream 2 is coldest
+        let hot = Arc::new(Mutex::new(ReadAhead::new(cap)));
+        pool.register(5, Arc::clone(&hot));
+        pool.permitted_window(5, 0, cap); // must evict the coldest OTHER (stream 2)
+        assert_eq!(s2.lock().unwrap().len(), 0, "coldest stream evicted");
+        assert!(s1.lock().unwrap().len() > 0, "touched stream survives");
+    }
+
+    #[test]
+    fn fills_count_is_exact() {
+        let (_d, file) = bk_temp(256 * 1024);
+        let mut d = vec![0u8; 4096];
+        // Disabled pool: every read is one physical fill.
+        let pool0 = ReadAheadPool::new(0);
+        let buf0 = Arc::new(Mutex::new(ReadAhead::new(0)));
+        let ep0 = std::sync::atomic::AtomicU64::new(0);
+        let br0 = BackingReader::new(&file, &buf0, &pool0, 0, 256 * 1024, &ep0);
+        br0.read_exact_at(&mut d, 0).unwrap();
+        br0.read_exact_at(&mut d, 100_000).unwrap();
+        assert_eq!(br0.fills(), 2);
+        // Enabled pool: a cold read is one amplified fill; the next sequential
+        // read hits the window and adds no fill.
+        let pool = ReadAheadPool::new(64 << 20);
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        pool.register(1, Arc::clone(&buf));
+        let ep = std::sync::atomic::AtomicU64::new(0);
+        let br = BackingReader::new(&file, &buf, &pool, 1, 256 * 1024, &ep);
+        br.read_exact_at(&mut d, 0).unwrap();
+        assert_eq!(br.fills(), 1);
+        br.read_exact_at(&mut d, 4096).unwrap();
+        assert_eq!(br.fills(), 1);
+    }
+
+    #[test]
+    fn epoch_bumps_on_seek_not_on_sequential() {
+        let (_d, file) = bk_temp(1 << 20);
+        let pool = ReadAheadPool::new(64 << 20);
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        pool.register(1, Arc::clone(&buf));
+        let ep = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let br = BackingReader::new(&file, &buf, &pool, 1, 1 << 20, &ep);
+        let mut d = vec![0u8; 4096];
+        br.read_exact_at(&mut d, 0).unwrap(); // first read: a "seek" off MAX
+        let base = ep.load(AO::Relaxed);
+        br.read_exact_at(&mut d, 4096).unwrap(); // sequential hit
+        assert_eq!(ep.load(AO::Relaxed), base, "sequential must not bump epoch");
+        br.read_exact_at(&mut d, 900_000).unwrap(); // genuine seek (miss, off != next)
+        assert_eq!(ep.load(AO::Relaxed), base + 1, "seek bumps epoch");
     }
 }

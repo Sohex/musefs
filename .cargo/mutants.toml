@@ -435,4 +435,37 @@ exclude_re = [
     # functionally by the fuzzing-gated accessor test in the same file.
     # guard: count=1
     'musefs-db/src/lib\.rs:\d+:\d+: replace Db<M>::with_raw_conn -> R with Default::default\(\)',
+
+    # --- #255 backing read-ahead pool: hang-class + boundary-equivalent ---
+    # The read-ahead pool is a transparent cache: these mutants change cache
+    # accounting/eviction internals, never the bytes served (the byte-differential
+    # tests guarantee correctness). They split into two unkillable classes.
+    #
+    # Hang-class (TIMEOUT-only, never a clean kill — these CANCEL the in-diff CI
+    # job, the SP3 non-terminating-loop precedent): `per_stream_cap` returning 0
+    # (or inverting its `budget == 0` guard so every live pool reports cap 0) caps
+    # every window at 0, and `evict_one_coldest` reporting `Some`/widening its
+    # `freed > 0` guard claims progress it didn't make — either way the
+    # evict-until-room loop in `permitted_window` spins forever. Each is the sole
+    # such site in its fn, so operator+function-anchored (line-agnostic).
+    'replace ReadAheadPool::per_stream_cap -> u64 with 0',
+    'replace == with != in ReadAheadPool::per_stream_cap',
+    'replace ReadAheadPool::evict_one_coldest -> Option<u64> with Some\(0\)',
+    'replace ReadAheadPool::evict_one_coldest -> Option<u64> with Some\(1\)',
+    'replace > with (==|>=) in ReadAheadPool::evict_one_coldest',
+    #
+    # Boundary-equivalent guards: at the `==` boundary both branches do the same
+    # no-op (`fetch_sub(0)`, `add(0)`, or `window = cap`), so charged total and
+    # served bytes are identical. The NON-boundary mutations of these same
+    # operators (e.g. `> with ==`/`< with >`) ARE caught by the reconcile-accounting,
+    # read-then-release-leak, and set_cap-clamp tests. Sole site per fn.
+    'replace > with >= in ReadAheadPool::deregister',
+    'replace > with >= in ReadAheadPool::reconcile',
+    'replace < with <= in ReadAheadPool::reconcile',
+    'replace > with >= in ReadAhead::set_cap',
+    #
+    # Phase-2 prefetch ring size (`depth + 1`), off by default and best-effort: a
+    # wrong ring size only changes how many speculative windows are retained, never
+    # the served bytes. Sole `+` in serve_backing.
+    'replace \+ with (-|\*) in Musefs::serve_backing',
 ]
