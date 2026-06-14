@@ -8,6 +8,8 @@ use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, 
 use crate::byte_budget::ByteBudget;
 use crate::error::Result;
 use crate::freshness::BackingStamp;
+use std::fmt;
+use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 
 const BATCH_FILES: usize = 256;
@@ -66,6 +68,49 @@ fn set_after_s1_hook(f: impl FnMut() + 'static) {
 #[cfg(test)]
 fn clear_after_s1_hook() {
     AFTER_S1_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+/// A progress event emitted during a scan or revalidate. Borrows the current
+/// path to avoid a per-file allocation in the writer; the saved allocation is
+/// negligible next to the existing per-file `to_string_lossy` + DB write, so do
+/// not contort the API to preserve the borrow.
+#[derive(Debug, Clone, Copy)]
+pub enum ScanProgress<'a> {
+    /// A supported-audio file was found during the walk; `found` is the running
+    /// count of collected files.
+    Discovered { found: u64 },
+    /// The walk (and, for revalidate, the skip-unchanged pass) finished;
+    /// `total` files will be ingested and tracked by the determinate bar.
+    Walked { total: u64 },
+    /// A file was committed. `done` runs 1..=total; `path` is its absolute path.
+    Ingested {
+        done: u64,
+        total: u64,
+        path: &'a str,
+    },
+}
+
+/// UI-agnostic progress callback for [`ScanOptions`]. Invoked only from the
+/// caller's thread (the walk and the single writer), never from probe workers.
+/// The `Send + Sync` bound is not required by today's code; it is deliberate
+/// future-proofing and free here (`indicatif::ProgressBar` is `Send + Sync`).
+#[derive(Clone)]
+pub struct ProgressSink(Arc<dyn for<'a> Fn(ScanProgress<'a>) + Send + Sync>);
+
+impl ProgressSink {
+    pub fn new(f: impl for<'a> Fn(ScanProgress<'a>) + Send + Sync + 'static) -> Self {
+        ProgressSink(Arc::new(f))
+    }
+
+    fn emit(&self, ev: ScanProgress<'_>) {
+        (self.0)(ev);
+    }
+}
+
+impl fmt::Debug for ProgressSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProgressSink")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,15 +195,20 @@ fn collect_audio(
     out: &mut Vec<PathBuf>,
     follow_symlinks: bool,
 ) -> std::io::Result<SkipTally> {
+    collect_audio_with(root, out, follow_symlinks, None)
+}
+
+fn collect_audio_with(
+    root: &Path,
+    out: &mut Vec<PathBuf>,
+    follow_symlinks: bool,
+    progress: Option<&ProgressSink>,
+) -> std::io::Result<SkipTally> {
     let mut visited = HashSet::new();
     let mut files_visited = HashSet::new();
     let mut tally = SkipTally::default();
-    if follow_symlinks {
-        // Seed with the root's identity so a symlink pointing back to it is
-        // caught as a cycle on the first descent.
-        if let Ok(meta) = std::fs::metadata(root) {
-            visited.insert(dir_key(&meta));
-        }
+    if follow_symlinks && let Ok(meta) = std::fs::metadata(root) {
+        visited.insert(dir_key(&meta));
     }
     collect_audio_inner(
         root,
@@ -167,6 +217,7 @@ fn collect_audio(
         &mut visited,
         &mut files_visited,
         &mut tally,
+        progress,
     )?;
     Ok(tally)
 }
@@ -178,16 +229,25 @@ fn collect_audio_inner(
     visited: &mut HashSet<(u64, u64)>,
     files_visited: &mut HashSet<(u64, u64)>,
     tally: &mut SkipTally,
+    progress: Option<&ProgressSink>,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
-            descend(&path, out, follow_symlinks, visited, files_visited, tally)?;
+            descend(
+                &path,
+                out,
+                follow_symlinks,
+                visited,
+                files_visited,
+                tally,
+                progress,
+            )?;
         } else if ftype.is_file() {
             if is_supported_audio(&path) {
-                push_file(&path, out, follow_symlinks, files_visited, None);
+                push_file(&path, out, follow_symlinks, files_visited, None, progress);
             } else {
                 tally.record(&path);
             }
@@ -201,11 +261,26 @@ fn collect_audio_inner(
             }
             match std::fs::metadata(&path) {
                 Ok(meta) if meta.is_dir() => {
-                    descend(&path, out, follow_symlinks, visited, files_visited, tally)?;
+                    descend(
+                        &path,
+                        out,
+                        follow_symlinks,
+                        visited,
+                        files_visited,
+                        tally,
+                        progress,
+                    )?;
                 }
                 Ok(meta) if meta.is_file() => {
                     if is_supported_audio(&path) {
-                        push_file(&path, out, follow_symlinks, files_visited, Some(&meta));
+                        push_file(
+                            &path,
+                            out,
+                            follow_symlinks,
+                            files_visited,
+                            Some(&meta),
+                            progress,
+                        );
                     } else {
                         tally.record(&path);
                     }
@@ -227,9 +302,18 @@ fn descend(
     visited: &mut HashSet<(u64, u64)>,
     files_visited: &mut HashSet<(u64, u64)>,
     tally: &mut SkipTally,
+    progress: Option<&ProgressSink>,
 ) -> std::io::Result<()> {
     if !follow_symlinks {
-        return collect_audio_inner(path, out, follow_symlinks, visited, files_visited, tally);
+        return collect_audio_inner(
+            path,
+            out,
+            follow_symlinks,
+            visited,
+            files_visited,
+            tally,
+            progress,
+        );
     }
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -242,7 +326,15 @@ fn descend(
         log::warn!("skipping symlink cycle at {}", path.display());
         return Ok(());
     }
-    collect_audio_inner(path, out, follow_symlinks, visited, files_visited, tally)
+    collect_audio_inner(
+        path,
+        out,
+        follow_symlinks,
+        visited,
+        files_visited,
+        tally,
+        progress,
+    )
 }
 
 fn dir_key(meta: &std::fs::Metadata) -> (u64, u64) {
@@ -263,9 +355,15 @@ fn push_file(
     follow_symlinks: bool,
     files_visited: &mut HashSet<(u64, u64)>,
     known_meta: Option<&std::fs::Metadata>,
+    progress: Option<&ProgressSink>,
 ) {
     if !follow_symlinks {
         out.push(path.to_path_buf());
+        if let Some(p) = progress {
+            p.emit(ScanProgress::Discovered {
+                found: out.len() as u64,
+            });
+        }
         return;
     }
     let key = match known_meta {
@@ -276,7 +374,14 @@ fn push_file(
         Some(k) if !files_visited.insert(k) => {
             log::debug!("skipping duplicate backing target {}", path.display());
         }
-        _ => out.push(path.to_path_buf()),
+        _ => {
+            out.push(path.to_path_buf());
+            if let Some(p) = progress {
+                p.emit(ScanProgress::Discovered {
+                    found: out.len() as u64,
+                });
+            }
+        }
     }
 }
 
@@ -617,6 +722,8 @@ pub struct ScanOptions {
     /// Follow symlinks during collection. Off by default: symlinks are logged
     /// and skipped, which keeps the walk immune to directory-symlink cycles.
     pub follow_symlinks: bool,
+    /// Optional progress callback. `None` (the default) disables reporting.
+    pub progress: Option<ProgressSink>,
 }
 
 impl Default for ScanOptions {
@@ -626,6 +733,7 @@ impl Default for ScanOptions {
             window: WINDOW,
             batch_bytes: BATCH_BYTES,
             follow_symlinks: false,
+            progress: None,
         }
     }
 }
@@ -906,7 +1014,17 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
             tally.record(root);
         }
     } else {
-        tally = collect_audio(root, &mut files, opts.follow_symlinks)?;
+        tally = collect_audio_with(
+            root,
+            &mut files,
+            opts.follow_symlinks,
+            opts.progress.as_ref(),
+        )?;
+    }
+    if let Some(p) = &opts.progress {
+        p.emit(ScanProgress::Walked {
+            total: files.len() as u64,
+        });
     }
     db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
     let mut stats = run_pipeline(db, files, opts)?;
@@ -929,10 +1047,11 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
 /// single writer (this thread) in batched transactions. Per-file errors are
 /// counted, not fatal.
 fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<ScanStats> {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     let jobs = effective_jobs(opts.jobs);
+    let total = files.len() as u64;
+    let progress = opts.progress.as_ref();
     let window = opts.window;
     let cap = opts.batch_bytes;
     let budget = Arc::new(ByteBudget::new(cap));
@@ -1015,6 +1134,13 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
             weights.push(weight);
             ingest_bulk(&mut bw, &abs_path, stamp, probed)?;
             *scanned += 1;
+            if let Some(p) = progress {
+                p.emit(ScanProgress::Ingested {
+                    done: *scanned,
+                    total,
+                    path: &abs_path,
+                });
+            }
         }
         bw.commit()?;
         for w in weights {
@@ -1131,7 +1257,12 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             files.push(root.to_path_buf());
         }
     } else {
-        collect_audio(root, &mut files, opts.follow_symlinks)?;
+        collect_audio_with(
+            root,
+            &mut files,
+            opts.follow_symlinks,
+            opts.progress.as_ref(),
+        )?;
     }
     db.apply_bulk_pragmas_self()?;
 
@@ -1185,6 +1316,12 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             }
         }
         changed.push(path);
+    }
+
+    if let Some(p) = &opts.progress {
+        p.emit(ScanProgress::Walked {
+            total: changed.len() as u64,
+        });
     }
 
     let scan = run_pipeline(db, changed, opts)?;
@@ -1456,6 +1593,61 @@ mod scan_unit_tests {
         assert!(
             probed.binary_tags.is_empty(),
             "oversized binary freeform must be skipped at extraction, not materialized"
+        );
+    }
+
+    #[test]
+    fn scan_options_debug_includes_progress_sink() {
+        let opts = ScanOptions {
+            progress: Some(ProgressSink::new(|_| {})),
+            ..Default::default()
+        };
+        assert!(format!("{opts:?}").contains("ProgressSink"));
+    }
+
+    #[test]
+    fn scan_emits_discovered_walked_ingested_events() {
+        use std::sync::Mutex;
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            let mut bytes = b"fLaC".to_vec();
+            bytes.push(0x80);
+            bytes.extend_from_slice(&[0, 0, 34]);
+            bytes.extend(std::iter::repeat_n(0u8, 34));
+            bytes.extend_from_slice(format!("AUDIO-{i}").as_bytes());
+            std::fs::write(dir.path().join(format!("t{i}.flac")), &bytes).unwrap();
+        }
+
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&events);
+        let sink = ProgressSink::new(move |ev| {
+            let line = match ev {
+                ScanProgress::Discovered { found } => format!("disc:{found}"),
+                ScanProgress::Walked { total } => format!("walk:{total}"),
+                ScanProgress::Ingested { done, total, .. } => format!("ing:{done}/{total}"),
+            };
+            recorder.lock().unwrap().push(line);
+        });
+
+        let db = Db::open_in_memory().unwrap();
+        let opts = ScanOptions {
+            jobs: 1,
+            progress: Some(sink),
+            ..Default::default()
+        };
+        let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+        assert_eq!(stats.scanned, 5);
+
+        let ev = events.lock().unwrap();
+        // Discovery climbs to the full count.
+        assert!(ev.iter().any(|e| e == "disc:5"), "events: {ev:?}");
+        // Walk reports the total to ingest.
+        assert!(ev.contains(&"walk:5".to_string()), "events: {ev:?}");
+        // Ingest reports each committed file, done strictly 1..=total.
+        let ing: Vec<&String> = ev.iter().filter(|e| e.starts_with("ing:")).collect();
+        assert_eq!(
+            ing,
+            vec!["ing:1/5", "ing:2/5", "ing:3/5", "ing:4/5", "ing:5/5"],
         );
     }
 }
