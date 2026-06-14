@@ -43,6 +43,10 @@ layouts plug into, see [ARCHITECTURE.md](../ARCHITECTURE.md#the-segment-model).
   other type codes are skipped. MP4 has no picture-type or description
   fields: scanned art becomes "front cover" with an empty description, and
   any non-PNG stored art is emitted with the JPEG type code.
+- A `covr` image or binary `----` value larger than its size cap is skipped
+  at scan time — before the image is materialized out of a potentially large
+  `moov` — and logged (a `warn` line on stderr) so the lossy drop is explained
+  rather than silent.
 
 ## How synthesis works
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use musefs_db::convert::usize_from;
@@ -76,6 +76,48 @@ pub struct ScanStats {
     pub raced: u64,
 }
 
+/// Per-extension tally of files skipped during the directory walk because their
+/// extension is not a supported audio format. Backs the end-of-scan summary log
+/// line (#341) that breaks the single `skipped` count down by extension, so an
+/// operator can tell expected sidecars (cover art, `.cue`, `.log`, `.nfo`) from
+/// genuinely unexpected files. Not part of `ScanStats`: the breakdown is
+/// log-only and does not affect the CLI summary.
+#[derive(Debug, Default)]
+struct SkipTally {
+    total: u64,
+    by_ext: BTreeMap<String, u64>,
+}
+
+impl SkipTally {
+    /// Record one skipped file, bucketed by its lowercased extension
+    /// (`<none>` when the file has no extension or a non-UTF-8 one).
+    fn record(&mut self, path: &Path) {
+        self.total += 1;
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map_or_else(|| "<none>".to_string(), str::to_ascii_lowercase);
+        *self.by_ext.entry(ext).or_insert(0) += 1;
+    }
+
+    /// The end-of-scan summary line, e.g. `skipped 42: jpg=20, cue=10, log=8,
+    /// <none>=4` — buckets ordered by descending count, ties broken by extension
+    /// name. `None` when nothing was skipped, so there is no line to emit.
+    fn summary(&self) -> Option<String> {
+        if self.total == 0 {
+            return None;
+        }
+        let mut buckets: Vec<(&String, &u64)> = self.by_ext.iter().collect();
+        buckets.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let breakdown = buckets
+            .iter()
+            .map(|(ext, n)| format!("{ext}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("skipped {}: {breakdown}", self.total))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevalidateStats {
     pub updated: u64,
@@ -107,10 +149,10 @@ fn collect_audio(
     root: &Path,
     out: &mut Vec<PathBuf>,
     follow_symlinks: bool,
-) -> std::io::Result<u64> {
+) -> std::io::Result<SkipTally> {
     let mut visited = HashSet::new();
     let mut files_visited = HashSet::new();
-    let mut skipped = 0u64;
+    let mut tally = SkipTally::default();
     if follow_symlinks {
         // Seed with the root's identity so a symlink pointing back to it is
         // caught as a cycle on the first descent.
@@ -124,9 +166,9 @@ fn collect_audio(
         follow_symlinks,
         &mut visited,
         &mut files_visited,
-        &mut skipped,
+        &mut tally,
     )?;
-    Ok(skipped)
+    Ok(tally)
 }
 
 fn collect_audio_inner(
@@ -135,19 +177,19 @@ fn collect_audio_inner(
     follow_symlinks: bool,
     visited: &mut HashSet<(u64, u64)>,
     files_visited: &mut HashSet<(u64, u64)>,
-    skipped: &mut u64,
+    tally: &mut SkipTally,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
         let ftype = entry.file_type()?;
         if ftype.is_dir() {
-            descend(&path, out, follow_symlinks, visited, files_visited, skipped)?;
+            descend(&path, out, follow_symlinks, visited, files_visited, tally)?;
         } else if ftype.is_file() {
             if is_supported_audio(&path) {
                 push_file(&path, out, follow_symlinks, files_visited, None);
             } else {
-                *skipped += 1;
+                tally.record(&path);
             }
         } else if ftype.is_symlink() {
             if !follow_symlinks {
@@ -159,13 +201,13 @@ fn collect_audio_inner(
             }
             match std::fs::metadata(&path) {
                 Ok(meta) if meta.is_dir() => {
-                    descend(&path, out, follow_symlinks, visited, files_visited, skipped)?;
+                    descend(&path, out, follow_symlinks, visited, files_visited, tally)?;
                 }
                 Ok(meta) if meta.is_file() => {
                     if is_supported_audio(&path) {
                         push_file(&path, out, follow_symlinks, files_visited, Some(&meta));
                     } else {
-                        *skipped += 1;
+                        tally.record(&path);
                     }
                 }
                 Ok(_) => {}
@@ -184,10 +226,10 @@ fn descend(
     follow_symlinks: bool,
     visited: &mut HashSet<(u64, u64)>,
     files_visited: &mut HashSet<(u64, u64)>,
-    skipped: &mut u64,
+    tally: &mut SkipTally,
 ) -> std::io::Result<()> {
     if !follow_symlinks {
-        return collect_audio_inner(path, out, follow_symlinks, visited, files_visited, skipped);
+        return collect_audio_inner(path, out, follow_symlinks, visited, files_visited, tally);
     }
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -200,7 +242,7 @@ fn descend(
         log::warn!("skipping symlink cycle at {}", path.display());
         return Ok(());
     }
-    collect_audio_inner(path, out, follow_symlinks, visited, files_visited, skipped)
+    collect_audio_inner(path, out, follow_symlinks, visited, files_visited, tally)
 }
 
 fn dir_key(meta: &std::fs::Metadata) -> (u64, u64) {
@@ -300,13 +342,16 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
         })
     } else if has_ext(path, "m4a") || has_ext(path, "m4b") {
         let bounds = mp4::locate_audio(bytes).ok()?;
+        let (pictures, art_drops) = mp4::read_pictures_reporting(bytes, MAX_ART_BYTES);
+        let (binary_tags, bin_drops) = mp4::read_binary_tags_reporting(bytes, MAX_BINARY_TAG_BYTES);
+        log_mp4_oversize_drops(path, &art_drops, &bin_drops);
         Some(Probed {
             format: Format::M4a,
             audio_offset: bounds.audio_offset,
             audio_length: bounds.audio_length,
             tags: mp4::read_tags(bytes),
-            pictures: mp4::read_pictures(bytes, MAX_ART_BYTES),
-            binary_tags: mp4::read_binary_tags(bytes, MAX_BINARY_TAG_BYTES),
+            pictures,
+            binary_tags,
             structural_blocks: Vec::new(),
         })
     } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
@@ -407,13 +452,17 @@ fn probe_body(
                 return Ok(None);
             }
         };
+        let (pictures, art_drops) = mp4::read_pictures_reporting(&scan.moov, MAX_ART_BYTES);
+        let (binary_tags, bin_drops) =
+            mp4::read_binary_tags_reporting(&scan.moov, MAX_BINARY_TAG_BYTES);
+        log_mp4_oversize_drops(path, &art_drops, &bin_drops);
         return Ok(Some(Probed {
             format: Format::M4a,
             audio_offset: scan.mdat_payload_offset,
             audio_length: scan.mdat_payload_len,
             tags: mp4::read_tags(&scan.moov),
-            pictures: mp4::read_pictures(&scan.moov, MAX_ART_BYTES),
-            binary_tags: mp4::read_binary_tags(&scan.moov, MAX_BINARY_TAG_BYTES),
+            pictures,
+            binary_tags,
             structural_blocks: Vec::new(),
         }));
     }
@@ -669,6 +718,31 @@ fn accept_binary_tags(abs_path: &str, tags: Vec<EmbeddedBinaryTag>) -> Vec<musef
         .collect()
 }
 
+/// Logs each oversized mp4 `covr` image / binary `----` value that the format
+/// layer skipped before materialization (#343). These drops happen inside
+/// `mp4::read_pictures` / `mp4::read_binary_tags` — earlier than the `accept_*`
+/// ingest filters that log the lossy drops for the other formats (#284), and
+/// deliberately so, to avoid building a large image out of a large `moov` — so
+/// they are surfaced here at probe time, mirroring the `accept_*` message shape.
+fn log_mp4_oversize_drops(path: &Path, art: &[mp4::OversizeDrop], binary: &[mp4::OversizeDrop]) {
+    for d in art {
+        log::warn!(
+            "{}: dropping embedded {} art ({} bytes), over the {MAX_ART_BYTES}-byte cap",
+            path.display(),
+            d.descriptor,
+            d.bytes,
+        );
+    }
+    for d in binary {
+        log::warn!(
+            "{}: dropping binary tag {} ({} bytes), over the {MAX_BINARY_TAG_BYTES}-byte cap",
+            path.display(),
+            d.descriptor,
+            d.bytes,
+        );
+    }
+}
+
 /// Upsert a track from a probed backing file: write the track row, replace its
 /// seeded tags, and ingest its embedded art (capped, deduped, clamped).
 fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
@@ -818,24 +892,31 @@ fn ingest_bulk(
 /// stamps), seeding its tags from the file's existing metadata. `root` may be
 /// a single audio file (only that file is scanned) or a directory (walked
 /// recursively). Files whose extension is not a supported audio format
-/// increment `ScanStats::skipped`; supported-extension files with a per-file
-/// I/O or parse error increment `ScanStats::failed` and do not abort the scan.
+/// increment `ScanStats::skipped` and are tallied by extension for the
+/// end-of-scan summary log line (#341); supported-extension files with a
+/// per-file I/O or parse error increment `ScanStats::failed` and do not abort
+/// the scan.
 pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<ScanStats> {
     let mut files = Vec::new();
-    let mut skipped = 0u64;
+    let mut tally = SkipTally::default();
     if root.is_file() {
         if is_supported_audio(root) {
             files.push(root.to_path_buf());
         } else {
-            skipped += 1;
+            tally.record(root);
         }
     } else {
-        skipped += collect_audio(root, &mut files, opts.follow_symlinks)?;
+        tally = collect_audio(root, &mut files, opts.follow_symlinks)?;
     }
     db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
     let mut stats = run_pipeline(db, files, opts)?;
     // skipped is tallied during the walk, not the pipeline
-    stats.skipped = skipped;
+    stats.skipped = tally.total;
+    // Per-extension breakdown of the skip count, so a large `skipped` is
+    // diagnosable (#341). Log-only: never folded into `stats`/the CLI summary.
+    if let Some(summary) = tally.summary() {
+        log::info!("{summary}");
+    }
     Ok(stats)
 }
 
@@ -1007,7 +1088,7 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
             skipped += 1;
         }
     } else {
-        skipped += collect_audio(root, &mut files, false)?;
+        skipped += collect_audio(root, &mut files, false)?.total;
     }
     let mut stats = ScanStats {
         scanned: 0,
@@ -1828,6 +1909,50 @@ mod hardening_tests {
         assert_eq!(stats.scanned, 2);
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.skipped, 1);
+    }
+
+    #[test]
+    fn skip_tally_summary_orders_by_descending_count() {
+        let mut tally = super::SkipTally::default();
+        for _ in 0..20 {
+            tally.record(std::path::Path::new("art/cover.jpg"));
+        }
+        for _ in 0..10 {
+            tally.record(std::path::Path::new("disc.cue"));
+        }
+        for _ in 0..8 {
+            tally.record(std::path::Path::new("rip.log"));
+        }
+        for _ in 0..4 {
+            tally.record(std::path::Path::new("README"));
+        }
+        assert_eq!(tally.total, 42);
+        assert_eq!(
+            tally.summary().unwrap(),
+            "skipped 42: jpg=20, cue=10, log=8, <none>=4"
+        );
+    }
+
+    #[test]
+    fn skip_tally_lowercases_extension_and_buckets_extensionless() {
+        let mut tally = super::SkipTally::default();
+        tally.record(std::path::Path::new("a.JPG"));
+        tally.record(std::path::Path::new("b.jpg"));
+        tally.record(std::path::Path::new("noext"));
+        assert_eq!(tally.summary().unwrap(), "skipped 3: jpg=2, <none>=1");
+    }
+
+    #[test]
+    fn skip_tally_ties_break_by_extension_name() {
+        let mut tally = super::SkipTally::default();
+        tally.record(std::path::Path::new("a.nfo"));
+        tally.record(std::path::Path::new("b.cue"));
+        assert_eq!(tally.summary().unwrap(), "skipped 2: cue=1, nfo=1");
+    }
+
+    #[test]
+    fn skip_tally_empty_has_no_summary() {
+        assert!(super::SkipTally::default().summary().is_none());
     }
 
     #[test]

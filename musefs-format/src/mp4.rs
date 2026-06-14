@@ -430,20 +430,33 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     out
 }
 
-/// Lenient: returns empty / skips any malformed atom and never errors — this only
-/// seeds cover art from existing files, so a missing or garbled picture must simply be absent.
-/// Every `data` child of every `covr` atom yields one picture (the iTunes
-/// multiple-artwork convention); non-`data` children are skipped.
-///
-/// `max_art_bytes` caps each image body: a `data` payload whose image bytes
-/// (after the 8-byte `[type][locale]` header) exceed it is skipped before any
-/// copy, so an oversized `covr` in a large `moov` is never materialized.
-pub fn read_pictures(buf: &[u8], max_art_bytes: usize) -> Vec<EmbeddedPicture> {
+/// An embedded `covr` image or binary `----` payload that a reader skipped
+/// because it exceeded the caller's size cap. Carries only a descriptor and the
+/// payload's byte size — never the bytes themselves — so the caller can log the
+/// lossy drop (the format layer has no logging facade) without materializing the
+/// oversized item out of a potentially large `moov` (#343).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OversizeDrop {
+    /// Cover-art MIME type, or the binary tag's `----:<mean>:<name>` key.
+    pub descriptor: String,
+    /// Size of the dropped payload body in bytes (after the 8-byte `data` header).
+    pub bytes: usize,
+}
+
+/// Like [`read_pictures`], but also returns the oversized `covr` images skipped
+/// over `max_art_bytes`, so the caller can log each lossy drop. The size check
+/// still happens before any copy — an oversized image is described, never
+/// materialized. See [`OversizeDrop`].
+pub fn read_pictures_reporting(
+    buf: &[u8],
+    max_art_bytes: usize,
+) -> (Vec<EmbeddedPicture>, Vec<OversizeDrop>) {
     let Some((start, len)) = ilst_region(buf) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let ilst = &buf[start..start + len];
     let mut out = Vec::new();
+    let mut dropped = Vec::new();
     for atom in child_boxes(ilst).unwrap_or_default() {
         if &atom.kind != b"covr" {
             continue;
@@ -457,14 +470,18 @@ pub fn read_pictures(buf: &[u8], max_art_bytes: usize) -> Vec<EmbeddedPicture> {
             if dp.len() < 8 {
                 continue;
             }
-            if dp.len() - 8 > max_art_bytes {
-                continue;
-            }
             let mime = match u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]) {
                 13 => "image/jpeg",
                 14 => "image/png",
                 _ => continue,
             };
+            if dp.len() - 8 > max_art_bytes {
+                dropped.push(OversizeDrop {
+                    descriptor: mime.to_string(),
+                    bytes: dp.len() - 8,
+                });
+                continue;
+            }
             out.push(EmbeddedPicture {
                 mime: mime.to_string(),
                 picture_type: PictureType::new(3).expect("3 is in range"),
@@ -475,26 +492,36 @@ pub fn read_pictures(buf: &[u8], max_art_bytes: usize) -> Vec<EmbeddedPicture> {
             });
         }
     }
-    out
+    (out, dropped)
 }
 
-/// Extract opaque (non-text) MP4 `----` freeform atoms for binary-tag passthrough.
-/// One `EmbeddedBinaryTag` per `----` atom whose first `data` sub-box is
-/// binary-typed (type code != 1): key `----:<mean>:<name>`, payload the `data`
-/// value bytes (after the 8-byte `[type][locale]` header). Text freeform atoms
-/// (type 1) are handled by `read_tags`, so the two paths never double-store.
-/// Lenient: malformed atoms are skipped. Only the first `data` sub-box is read
-/// (multi-value freeform is rare; mirrors `read_freeform`).
+/// Lenient: returns empty / skips any malformed atom and never errors — this only
+/// seeds cover art from existing files, so a missing or garbled picture must simply be absent.
+/// Every `data` child of every `covr` atom yields one picture (the iTunes
+/// multiple-artwork convention); non-`data` children are skipped.
 ///
-/// `max_binary_tag_bytes` caps each value: a `data` payload whose value bytes
+/// `max_art_bytes` caps each image body: a `data` payload whose image bytes
 /// (after the 8-byte `[type][locale]` header) exceed it is skipped before any
-/// copy, so an oversized `----` in a large `moov` is never materialized.
-pub fn read_binary_tags(buf: &[u8], max_binary_tag_bytes: usize) -> Vec<EmbeddedBinaryTag> {
+/// copy, so an oversized `covr` in a large `moov` is never materialized. Use
+/// [`read_pictures_reporting`] to also recover the oversized drops for logging.
+pub fn read_pictures(buf: &[u8], max_art_bytes: usize) -> Vec<EmbeddedPicture> {
+    read_pictures_reporting(buf, max_art_bytes).0
+}
+
+/// Like [`read_binary_tags`], but also returns the oversized `----` values
+/// skipped over `max_binary_tag_bytes`, so the caller can log each lossy drop.
+/// The size check still happens before any copy — an oversized value is
+/// described, never materialized. See [`OversizeDrop`].
+pub fn read_binary_tags_reporting(
+    buf: &[u8],
+    max_binary_tag_bytes: usize,
+) -> (Vec<EmbeddedBinaryTag>, Vec<OversizeDrop>) {
     let Some((start, len)) = ilst_region(buf) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let ilst = &buf[start..start + len];
     let mut out = Vec::new();
+    let mut dropped = Vec::new();
     for atom in child_boxes(ilst).unwrap_or_default() {
         if &atom.kind != b"----" {
             continue;
@@ -505,9 +532,6 @@ pub fn read_binary_tags(buf: &[u8], max_binary_tag_bytes: usize) -> Vec<Embedded
         };
         let dp = data.payload(inner);
         if dp.len() < 8 {
-            continue;
-        }
-        if dp.len() - 8 > max_binary_tag_bytes {
             continue;
         }
         // `data` body is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text,
@@ -536,12 +560,36 @@ pub fn read_binary_tags(buf: &[u8], max_binary_tag_bytes: usize) -> Vec<Embedded
                     "com.apple.iTunes"
                 }
             });
+        let key = format!("----:{mean}:{name}");
+        if dp.len() - 8 > max_binary_tag_bytes {
+            dropped.push(OversizeDrop {
+                descriptor: key,
+                bytes: dp.len() - 8,
+            });
+            continue;
+        }
         out.push(EmbeddedBinaryTag {
-            key: format!("----:{mean}:{name}"),
+            key,
             payload: dp[8..].to_vec(),
         });
     }
-    out
+    (out, dropped)
+}
+
+/// Extract opaque (non-text) MP4 `----` freeform atoms for binary-tag passthrough.
+/// One `EmbeddedBinaryTag` per `----` atom whose first `data` sub-box is
+/// binary-typed (type code != 1): key `----:<mean>:<name>`, payload the `data`
+/// value bytes (after the 8-byte `[type][locale]` header). Text freeform atoms
+/// (type 1) are handled by `read_tags`, so the two paths never double-store.
+/// Lenient: malformed atoms are skipped. Only the first `data` sub-box is read
+/// (multi-value freeform is rare; mirrors `read_freeform`).
+///
+/// `max_binary_tag_bytes` caps each value: a `data` payload whose value bytes
+/// (after the 8-byte `[type][locale]` header) exceed it is skipped before any
+/// copy, so an oversized `----` in a large `moov` is never materialized. Use
+/// [`read_binary_tags_reporting`] to also recover the oversized drops for logging.
+pub fn read_binary_tags(buf: &[u8], max_binary_tag_bytes: usize) -> Vec<EmbeddedBinaryTag> {
+    read_binary_tags_reporting(buf, max_binary_tag_bytes).0
 }
 
 fn boxed(kind: &[u8; 4], payload: &[u8]) -> Result<Vec<u8>> {
@@ -1911,6 +1959,28 @@ mod tests {
     }
 
     #[test]
+    fn read_pictures_reporting_reports_oversize_drop() {
+        // The image body (5 bytes) exceeds the 4-byte cap: skipped from the
+        // pictures, but reported as a drop with its MIME and exact byte size.
+        let over = vec![0xFFu8; 5];
+        let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, &over)), true);
+        let (pics, dropped) = read_pictures_reporting(&buf, 4);
+        assert!(pics.is_empty());
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].descriptor, "image/jpeg");
+        assert_eq!(dropped[0].bytes, over.len());
+    }
+
+    #[test]
+    fn read_pictures_reporting_no_drops_when_within_budget() {
+        let exact = vec![0xFFu8; 4];
+        let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, &exact)), true);
+        let (pics, dropped) = read_pictures_reporting(&buf, 4);
+        assert_eq!(pics.len(), 1);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
     fn read_pictures_skips_non_data_children_of_covr() {
         // A non-`data` child inside covr (rare but legal) is silently skipped.
         let png = [0x89, b'P', b'N', b'G'];
@@ -2253,6 +2323,32 @@ mod tests {
         let tags = read_binary_tags(&moov, 4);
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].payload, exact);
+    }
+
+    #[test]
+    fn read_binary_tags_reporting_reports_oversize_drop() {
+        // A 5-byte value over the 4-byte cap: skipped from the tags, but reported
+        // as a drop with its `----:<mean>:<name>` key and exact byte size.
+        let over = vec![0xABu8; 5];
+        let atom = freeform_atom_typed("com.serato.dj", "analysis", 0, &over);
+        let moov = moov_with_ilst(&atom);
+        let (tags, dropped) = read_binary_tags_reporting(&moov, 4);
+        assert!(tags.is_empty());
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].descriptor, "----:com.serato.dj:analysis");
+        assert_eq!(dropped[0].bytes, over.len());
+    }
+
+    #[test]
+    fn read_binary_tags_reporting_skips_oversize_text_without_reporting() {
+        // An oversized *text* (type 1) freeform is the text path's job, never a
+        // binary-tag drop — it must not be reported here.
+        let over = vec![b'x'; 5];
+        let atom = freeform_atom_typed("com.apple.iTunes", "MOOD", 1, &over);
+        let moov = moov_with_ilst(&atom);
+        let (tags, dropped) = read_binary_tags_reporting(&moov, 4);
+        assert!(tags.is_empty());
+        assert!(dropped.is_empty());
     }
 
     #[test]
