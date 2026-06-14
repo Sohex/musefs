@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# HexDisplay is the RustCrypto-recommended way to hex-format a digest since
+# sha2 0.11 swapped GenericArray (LowerHex) for hybrid_array::Array (no fmt).
+base16ct = "0.2"
 # fallible_uint enables the checked FromSql/ToSql impls for u64/usize, which
 # validate non-negative row columns at the boundary (the cast-convention spec).
 rusqlite = { version = "0.40", features = ["bundled", "blob", "fallible_uint"] }
