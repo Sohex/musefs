@@ -167,7 +167,10 @@ mutation gate can reach the densest new arithmetic (the integration test cannot)
 ```rust
 /// Returns the milestone percent (a multiple of `STEP`, or 100) that `done`
 /// newly reaches versus `prev_done`, else `None`. `total == 0` → `None`.
-fn next_milestone(prev_done: u64, done: u64, total: u64) -> Option<u8>;
+/// Implementation note: the return is `Option<u64>` (not `u8`) so the percent
+/// stays in `u64` end-to-end, avoiding a narrowing cast under the workspace's
+/// `cast_possible_truncation` lint.
+fn next_milestone(prev_done: u64, done: u64, total: u64) -> Option<u64>;
 ```
 
 Progress always renders on **stderr**, leaving stdout clean for the summary
@@ -186,6 +189,11 @@ wraps each target in an `Instant`, builds the sink once, passes it via
   `Walked { total: 1 }`, no discovery ticks.
 - Failures / races: tracked in the summary as today; they do not advance the
   bar, which `finish_and_clear`s regardless of final position.
+- Multiple targets: one renderer is shared across the target loop, with a
+  per-target reset that rewinds the TTY bar to the discovery spinner (and clears
+  the non-TTY milestone watermark) at the start of each target, so target N does
+  not inherit target N-1's finished determinate bar. The bar is finished once,
+  after the last target.
 
 ## Tests
 
@@ -219,17 +227,27 @@ mutants):
   when the last step is smaller than 5%.
 - `total == 1` (`done` 0→1) returns `Some(100)`.
 
-### CLI integration (`musefs-cli/tests/scan.rs`, `assert_cmd` — runs non-TTY)
+### CLI integration (`musefs-cli/tests/scan.rs` — in-process, runs non-TTY)
 
-`assert_cmd` pipes streams, so `is_terminal()` is false: these exercise only the
-non-TTY line printer. The fixture must hold **≥ 20 supported files** so at least
-one intermediate milestone is guaranteed in addition to the final line.
+The existing harness calls `run_scan` **in-process** (no `assert_cmd` subprocess)
+and asserts on the resulting DB. Under `cargo test`, stderr is captured, so
+`is_terminal()` is false — the non-TTY `Plain` printer path runs. In-process
+stderr text cannot be captured without a new dev-dep, so these are **smoke
+tests** that progress wiring does not break ingest; the milestone-line *decision*
+is covered by the `next_milestone` unit tests above, and the actual rendered
+output is covered by the manual TTY check. The fixture holds **≥ 20 supported
+files** so the `Plain` path crosses at least one intermediate milestone at run
+time.
 
-- A non-quiet scan emits the final `ingested {total}/{total} (100%)` line (and at
-  least one intermediate milestone) on stderr, and the summary with ` in …`
-  elapsed on stdout.
-- `--quiet` emits neither progress nor summary.
-- A revalidate run emits the same milestone lines and an elapsed summary.
+- A non-quiet scan over ≥20 files ingests all rows (exercises the `Plain` printer
+  without asserting its text).
+- `--quiet` ingests identically with the sink disabled.
+- A revalidate pass ingests/preserves all rows.
+
+> The spec originally proposed `assert_cmd` + asserting the printed stderr line;
+> that is intentionally dropped because the real harness is in-process. Asserting
+> printed output would require adding `assert_cmd` (subprocess) — out of scope for
+> v1.
 
 ### Manual TTY verification (no automated coverage)
 
