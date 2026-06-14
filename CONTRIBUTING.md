@@ -345,6 +345,11 @@ Sharp edges:
   the mutant there is still genuinely equivalent** (a reformat can change
   surrounding logic, not just line numbers). A `count`/`rows` mismatch means a
   sibling appeared or disappeared — investigate before bumping the number.
+  Pure `cargo fmt`/line-shift drift can be repaired automatically with
+  `python3 scripts/check_mutant_anchors.py --fix`, which re-points each
+  `file:line:col` anchor to its current coordinates by operator+function and
+  refuses to guess when a site was added or removed; always eyeball the
+  resulting diff before committing.
   Every new `file:line:col` exclusion needs a `# guard:` tag (the guard rejects
   an untagged one), and `exclude_re` patterns must stay within the
   Rust-regex/Python-`re` shared subset the guard allows (`\. \d + | ^ ( ) *`,
