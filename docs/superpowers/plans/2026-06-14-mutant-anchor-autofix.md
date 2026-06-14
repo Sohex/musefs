@@ -4,7 +4,7 @@
 
 **Goal:** Add a `--fix` flag to `scripts/check_mutant_anchors.py` that rewrites drifted `file:line:col` anchors in `.cargo/mutants.toml` in place, deriving each entry's current coordinates from the live cargo-mutants list and refusing to guess when a mapping is ambiguous.
 
-**Architecture:** Pure functions layered on the existing parser: `_candidate_mutants` resolves an entry's current sites by `op`+`fn` (coordinates wildcarded out of its regex); `compute_rewrites` groups same-resolving "sibling" entries and maps them positionally by source order, flagging structural/zero-candidate cases instead of rewriting them; `apply_rewrites` does a byte-preserving line-level coordinate swap; `run_fix` applies, re-parses from disk, and re-validates via the existing `check()`. The pre-commit hook and CI stay read-only and merely point at `--fix`.
+**Architecture:** Pure functions layered on the existing parser: `_candidate_mutants` resolves an entry's current sites by `op`+`fn` (coordinates wildcarded out of its regex); `compute_rewrites` groups same-resolving "sibling" entries and maps them positionally by source order, leaving non-derivable cases for manual fix instead of rewriting them; `run_fix` re-derives the set of entries that *currently* fail `check()` and gates unfixable-entry reporting on it (so a valid but non-unique-op/fn anchor on a clean tree is a silent no-op), then applies the rewrites, re-parses from disk, and re-validates. `apply_rewrites` does a byte-preserving line-level coordinate swap. The pre-commit hook and CI stay read-only and merely point at `--fix`.
 
 **Tech Stack:** Python 3 stdlib (`re`, `argparse`, `dataclasses`, `collections.Counter`), pytest. No new dependencies.
 
@@ -362,7 +362,7 @@ def test_compute_rewrites_structural_count_mismatch():
     ]
     rewrites, skips, skipped = g.compute_rewrites(entries, muts)
     assert rewrites == [] and skipped == {4}
-    assert "structural change" in skips[0]
+    assert "can't auto-derive" in skips[0]
 
 
 def test_compute_rewrites_rows_mismatch_skips_group():
@@ -377,7 +377,7 @@ def test_compute_rewrites_rows_mismatch_skips_group():
     muts = [_m("musefs-core/src/scan.rs:1045:29: replace += with -= in run_pipeline")]
     rewrites, skips, skipped = g.compute_rewrites(entries, muts)
     assert rewrites == [] and skipped == {4}
-    assert "structural change" in skips[0]
+    assert "can't auto-derive" in skips[0]
 
 
 def test_compute_rewrites_ignores_desc_and_tagless():
@@ -453,8 +453,8 @@ def compute_rewrites(
                 skip_notes.append(
                     _fmt(
                         e,
-                        f"op/fn resolves to {len(sites)} site(s) but {len(group)} anchor(s) "
-                        "reference it — structural change, re-anchor manually",
+                        f"op/fn resolves to {len(sites)} live site(s), {len(group)} anchor(s) "
+                        "pin it — can't auto-derive the coordinate, re-anchor manually",
                     )
                 )
                 skipped.add(e.toml_line)
@@ -637,6 +637,57 @@ def test_main_fix_no_op_when_clean(tmp_path, capsys):
     assert rc == 0
     assert toml.read_text() == _FIX_TOML
     assert "no coordinates needed re-anchoring" in capsys.readouterr().out
+
+
+# A line:col anchor exists precisely because op+fn is NOT unique in the function
+# (several same-op/fn sites, only one excluded). On a clean tree such an entry is
+# valid and --fix must leave it silent — never re-derive its coordinate from the
+# tag (impossible) and false-flag it. Regression for the #345 review finding.
+_NONUNIQUE_TOML = (
+    "exclude_re = [\n"
+    '    # guard: op="+" fn="walk" rows=1\n'
+    "    'musefs-format/src/wav\\.rs:58:28:',\n"
+    "]\n"
+)
+
+
+def test_main_fix_clean_nonunique_op_fn_is_noop(tmp_path, capsys):
+    toml = _write_toml(tmp_path, _NONUNIQUE_TOML)
+    muts = _write_muts(
+        tmp_path,
+        [
+            "musefs-format/src/wav.rs:58:28: replace + with - in walk",  # excluded site (valid)
+            "musefs-format/src/wav.rs:60:10: replace + with - in walk",  # killable sibling
+            "musefs-format/src/wav.rs:62:14: replace + with - in walk",
+        ],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert toml.read_text() == _NONUNIQUE_TOML
+    assert "auto-derive" not in out and "manual attention" not in out
+
+
+def test_main_fix_drifted_nonunique_reports_manual(tmp_path, capsys):
+    body = (
+        "exclude_re = [\n"
+        '    # guard: op="+" fn="walk" rows=1\n'
+        "    'musefs-format/src/wav\\.rs:58:28:',\n"  # stale: no live mutant at 58:28
+        "]\n"
+    )
+    toml = _write_toml(tmp_path, body)
+    muts = _write_muts(
+        tmp_path,
+        [
+            "musefs-format/src/wav.rs:70:28: replace + with - in walk",
+            "musefs-format/src/wav.rs:72:10: replace + with - in walk",
+        ],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "auto-derive" in out
+    assert toml.read_text() == body  # ambiguous → not rewritten
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -646,17 +697,42 @@ Expected: FAIL — `--fix` is an unrecognized argument (argparse `SystemExit`), 
 
 - [ ] **Step 3: Implement `run_fix` and wire `--fix`**
 
-Add `run_fix` after `apply_rewrites`:
+First add a small helper after `_fmt` (used to map `check()`/skip-note strings
+back to the toml line they refer to):
 
 ```python
-def run_fix(toml_path: Path, entries: list[Entry], mutants: list[Mutant]) -> int:
+_FAIL_LINE_RE = re.compile(r"^\[mutants\.toml:(\d+)\]")
+
+
+def _failing_lines(failures: list[str]) -> set[int]:
+    """Extract the toml line numbers a list of `_fmt` failure strings refers to."""
+    return {int(m.group(1)) for f in failures if (m := _FAIL_LINE_RE.match(f))}
+```
+
+Then add `run_fix` after `apply_rewrites`. The **failure gate** is the key
+correctness point: a `file:line:col` anchor's `op`+`fn` resolves to *every*
+same-operator site in its function (that non-uniqueness is why it is pinned by
+coordinate), so `compute_rewrites` will mark most valid anchors "can't
+auto-derive". Reporting those on a clean tree would fail a valid config — so we
+only surface an unfixable entry when it **actually fails `check()` now**:
+
+```python
+def run_fix(
+    toml_path: Path, entries: list[Entry], globs: list[str], mutants: list[Mutant]
+) -> int:
     """Re-anchor drifted linecol coordinates in ``toml_path``, then re-validate.
 
     Exactly one rewrite pass followed by one validation pass — no fixpoint. Entries
-    that could not be safely re-anchored (structural / deleted) are reported with
-    their dedicated wording; re-validation handles the rest (desc drift, untagged).
+    that could not be safely re-anchored are reported with their dedicated wording
+    *only when they actually fail validation now* — an op/fn that resolves to many
+    sites is normal for a line:col anchor (that non-uniqueness is why it is pinned by
+    coordinate), so a currently-valid such entry is left silent rather than false-
+    flagged. Re-validation handles the rest (desc drift, untagged).
     """
+    failing = _failing_lines(check(entries, mutants, globs))
     rewrites, skip_notes, skipped = compute_rewrites(entries, mutants)
+    skip_notes = [n for n in skip_notes if _failing_lines([n]) <= failing]
+    skipped &= failing
     if rewrites:
         toml_path.write_text(apply_rewrites(toml_path.read_text(), rewrites))
         for rw in rewrites:
@@ -705,7 +781,7 @@ with:
 ```python
     if args.fix:
         try:
-            return run_fix(args.toml, entries, mutants)
+            return run_fix(args.toml, entries, globs, mutants)
         except OSError as ex:
             print(f"error: failed to rewrite {args.toml}: {ex}", file=sys.stderr)
             return 1
@@ -716,7 +792,7 @@ with:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest scripts/test_check_mutant_anchors.py -k main_fix -v`
-Expected: PASS (4 passed).
+Expected: PASS (6 passed).
 
 - [ ] **Step 5: Run the full script test suite to confirm no regressions**
 

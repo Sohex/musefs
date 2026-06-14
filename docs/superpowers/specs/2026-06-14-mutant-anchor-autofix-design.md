@@ -82,16 +82,44 @@ Entries that resolve to the **identical candidate-site set** are siblings (e.g.
   site holds exactly `rows` matching mutants, then rewrite. Positional-by-source-
   order is safe because `cargo fmt` and ordinary edits preserve textual order;
   it correctly handles partial shifts within a group (only some sites moved).
-- If counts differ, or a mapped site's mutant count ≠ `rows`: this is a
-  **structural change, not a shift** (a site was added/removed, or the operator
-  count changed). Leave the whole group untouched and report it.
+- If counts differ, or a mapped site's mutant count ≠ `rows`: the coordinate
+  **cannot be auto-derived** — leave the whole group untouched and (subject to
+  the failure gate below) report it.
 
-The **zero-candidate** case (the entry's op/fn now matches *no* live site) is a
-distinct sub-case of "counts differ": the code was deleted, not moved, so a
-re-anchor is impossible. Report it with deletion-oriented wording — `matches no
-live mutant — code removed? delete this exclude_re entry` — rather than the
-generic "re-anchor" note, mirroring `_check_desc`'s "delete a dead rule"
-guidance.
+#### Why op/fn alone is not enough — the covering-set requirement
+
+A `file:line:col` anchor exists *precisely because* its `op`+`fn` is **not
+unique in the function** (that non-uniqueness is the documented reason it is
+pinned by coordinate rather than description). So an entry's `op`+`fn` typically
+resolves to **every** same-operator site in the function, not the one the anchor
+pins — e.g. `wav.rs:58:28` (`op="+" fn="walk_chunks"`) resolves to 9 live `+`
+sites; only one is excluded. The guard tag was designed to **validate a known
+coordinate**, not to **derive** one, and the literal coordinate (the only
+disambiguator) is exactly what wildcarding throws away.
+
+Positional re-derivation therefore only works for a **covering set**: a group
+where *every* same-`op`/`fn` site is anchored, so `#anchors == #sites` and the
+bijection is unambiguous (the `run_pipeline` `>=` cluster is one). When an anchor
+pins one of many sites (`#anchors < #sites`), the coordinate is unrecoverable
+from the tag — `--fix` must decline, never guess.
+
+The **zero-candidate** case (the entry's op/fn matches *no* live site) is the
+deleted-code variant: report it with deletion-oriented wording — `matches no
+live mutant — code removed? delete this exclude_re entry` — mirroring
+`_check_desc`'s "delete a dead rule" guidance.
+
+#### The failure gate (only report what actually broke)
+
+Because a non-covering anchor is the *normal* shape of a line:col entry, naively
+reporting every group that fails to map would fail a **clean, valid config**.
+So `--fix` first computes the set of entries that **currently fail `check()`**
+and only emits a skip-note / counts a group as a problem when at least one of its
+entries is in that failing set. A currently-valid non-covering anchor (its
+literal coordinate still matches) is left **silent** — `--fix` is not
+responsible for it until it actually drifts. This makes `--fix` on an unshifted
+tree a true no-op (exit 0), and surfaces a genuinely-drifted ambiguous anchor
+honestly as `can't auto-derive the coordinate, re-anchor manually` rather than
+mislabelling it a "structural change".
 
 Grouping by candidate-site set (rather than by raw `op`+`fn` strings) is what
 lets repl-suffixed and bare-prefix entries share one code path: two entries are
@@ -143,19 +171,28 @@ though `_NAME_RE`'s file group (`[^:]+`) is in principle permissive.
 - Flow under `--fix` — exactly one rewrite pass followed by one validation pass,
   no fixpoint iteration:
   1. load entries + mutants,
-  2. compute rewrites (per the rules above),
-  3. write the rewritten toml,
-  4. print the rewrite summary (ascending `toml_line`),
-  5. **re-read and re-parse the rewritten toml from disk**
+  2. compute the **currently-failing** set: `_failing_lines(check(entries,
+     mutants, globs))` (the toml line numbers `check()` flags *before* any
+     rewrite),
+  3. compute rewrites (per the rules above), then **filter** the unfixable
+     skip-notes / skipped-line set down to entries in the failing set (the
+     failure gate — a valid non-covering anchor produces a skip-note that is
+     dropped here),
+  4. write the rewritten toml,
+  5. print the rewrite summary (ascending `toml_line`),
+  6. **re-read and re-parse the rewritten toml from disk**
      (`parse_toml_entries(args.toml.read_text())`) and run `check()` on those
      fresh entries — never the pre-rewrite in-memory `entries`, whose regex and
-     `toml_line` are now stale,
-  6. exit `0` only if that validation is clean.
-- Remaining failures after a fix (desc-count drift, structural `linecol`
-  groups, zero-candidate deleted-code entries, tagless entries) are printed
-  exactly as `check()` reports them, plus the per-case note from the rules above
-  ("left untouched — needs manual re-anchor", or the deletion-oriented wording
-  for zero-candidate). Exit is non-zero whenever any entry still fails.
+     `toml_line` are now stale; the gated skipped-line set suppresses `check()`'s
+     generic message for entries already reported with better wording,
+  7. exit `0` only if no skip-notes remain and that validation is clean.
+- Remaining failures after a fix (desc-count drift, genuinely-drifted ambiguous
+  `linecol` anchors, zero-candidate deleted-code entries, tagless entries) are
+  printed with the per-case note from the rules above (`can't auto-derive the
+  coordinate, re-anchor manually`, or the deletion-oriented wording for
+  zero-candidate) plus any other `check()` failures. Exit is non-zero whenever
+  any entry still fails. A clean, unshifted tree produces no skip-notes and exits
+  `0`.
 
 ### Hook / CI integration
 
@@ -174,14 +211,18 @@ temporary toml:
 - single unambiguous remap (op/fn unique in file);
 - multi-site sibling group remap (the `>=` case);
 - repl-suffixed entry remap (`replace \+ with -`);
-- structural-change group (site count changed) → untouched, reported, non-zero
-  exit;
+- non-covering group (anchor count ≠ site count) → `can't auto-derive` note,
+  reported only when failing;
+- **valid non-unique-op/fn anchor on a clean tree → `--fix` is a silent no-op,
+  exit 0** (the failure-gate regression test for the #345 review finding);
+- drifted non-unique anchor → reported `can't auto-derive`, not rewritten,
+  non-zero exit;
 - zero-candidate / deleted-code entry → untouched, reported with the deletion-
   oriented message, non-zero exit;
 - tagless / incomplete-guard `linecol` entry → skipped by `--fix`, surfaced by
   re-validation;
 - desc entries are never rewritten;
-- partial-fix: one group remapped while another (structural) is reported;
+- partial-fix: one group remapped while another (deleted) is reported;
 - idempotence: a second `--fix` produces no changes;
 - non-coordinate bytes (comments, guard tags, formatting) are preserved exactly,
   and a remapped entry's `op=`/`fn=`/`rows=` guard tag is byte-identical after
