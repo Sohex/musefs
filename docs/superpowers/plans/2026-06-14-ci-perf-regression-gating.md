@@ -86,17 +86,15 @@ fn collect_file_inodes(fs: &Musefs, dir: u64, out: &mut Vec<u64>) {
     }
 }
 
-/// Generate a single-format corpus (audio-only, fixed seed/size), scan + mount,
+/// Generate a single-format AUDIO-ONLY corpus (fixed seed/size), scan + mount,
 /// and return (fs, first-file-inode, tempdir-guard).
-fn mount_one(fmt: Format, bytes_per_track: usize, art_bytes_per_track: usize)
-    -> (Musefs, u64, tempfile::TempDir)
-{
+fn mount_one(fmt: Format, bytes_per_track: usize) -> (Musefs, u64, tempfile::TempDir) {
     let base = tempfile::tempdir().unwrap();
     let params = CorpusParams {
         albums: 1,
         tracks_per_album: 1,
         bytes_per_track,
-        art_bytes_per_track,
+        art_bytes_per_track: 0,
         format_mix: vec![fmt],
         seed: 42,
     };
@@ -123,25 +121,26 @@ fn read_whole(fs: &Musefs, inode: u64) {
 }
 ```
 
-- [ ] **Step 2: Add the sequential-read golden test (audio read exactly once, no art/tags)**
+- [ ] **Step 2: Add the format-agnostic invariant test (audio-only emits no art/tag chunks)**
+
+These two are computable a-priori (the corpus is audio-only with `art_bytes=0`,
+and the non-FLAC corpus carries no embedded art/tags), so they are green
+immediately — no characterization. The exact `pread_bytes`/`preads` (which differ
+per format — MP3 prepends sync bytes, M4A wraps audio in an `mdat` box) are pinned
+in Task 1.2.
 
 ```rust
-/// Whole-file sequential read of an audio-only file: the audio payload is read
-/// exactly once (no slurp / no over-read), and no art or binary-tag chunks are
-/// emitted. `pread_bytes` is the load-bearing slurp guard.
+/// A whole-file sequential read of an audio-only file must emit zero art and
+/// zero binary-tag chunks (guards against accidental art/tag re-emission on the
+/// hot read path). Per-format byte/pread goldens live in Task 1.2.
 #[test]
-fn sequential_read_audio_read_exactly_once() {
+fn audio_only_read_emits_no_art_or_tag_chunks() {
     let _g = METRICS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for &fmt in ALL_FORMATS {
-        let (fs, inode, _dir) = mount_one(fmt, AUDIO_BYTES as usize, 0);
+        let (fs, inode, _dir) = mount_one(fmt, AUDIO_BYTES as usize);
         metrics::reset();
         read_whole(&fs, inode);
         let s = metrics::snapshot();
-        assert_eq!(
-            s.pread_bytes, AUDIO_BYTES,
-            "{}: audio body must be read exactly once (slurp/over-read guard)",
-            format_token(fmt),
-        );
         assert_eq!(s.art_chunks, 0, "{}: audio-only must emit no art chunks", format_token(fmt));
         assert_eq!(
             s.binary_tag_chunks, 0,
@@ -153,14 +152,14 @@ fn sequential_read_audio_read_exactly_once() {
 
 - [ ] **Step 3: Run the test, expect PASS**
 
-Run: `cargo test -p musefs-core --features metrics --test perf_counters sequential_read_audio_read_exactly_once -- --nocapture`
-Expected: PASS. (If `pread_bytes` differs for a format, that is a real finding — investigate before adjusting; the audio payload is read once by construction.)
+Run: `cargo test -p musefs-core --features metrics --test perf_counters audio_only_read_emits_no_art_or_tag_chunks -- --nocapture`
+Expected: PASS. (If a format emits art/tag chunks for an audio-only file, that is a real finding — investigate before adjusting.)
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add musefs-core/tests/perf_counters.rs
-git commit -m "test(core): golden sequential-read counters per format (#211)"
+git commit -m "test(core): scaffold perf counters + no-art/tag read invariant (#211)"
 ```
 
 ### Task 1.2: freeze per-format `preads` + seek goldens (characterization)
@@ -173,19 +172,26 @@ format-specific; observe them once and pin them as constants.
 
 - [ ] **Step 1: Add a per-format expected-constants table and the seek fixture, using sentinel `0`s to be filled in Step 3**
 
+`pread_bytes` is per-format because the corpus generator frames audio differently
+(MP3 prepends `0xFF 0xFB`; M4A wraps the payload in an `mdat` box; FLAC/OGG/WAV
+append it verbatim). So the audio-read-once guard is a pinned per-format
+`seq_pread_bytes`, not a single `AUDIO_BYTES` constant.
+
 ```rust
-/// Frozen per-format goldens. `(seq_preads, seek_preads, seek_pread_bytes)`.
-/// seek = one 128 KiB read near EOF; it must touch a BOUNDED window, never the
-/// whole file/index. Filled by the characterization run in Step 3 — a change
-/// here means real read-path work changed; update in the same PR.
-fn goldens(fmt: Format) -> (u64, u64, u64) {
+/// Frozen per-format read goldens:
+/// `(seq_preads, seq_pread_bytes, seek_preads, seek_pread_bytes)`.
+/// seq = whole-file sequential read (audio read exactly once).
+/// seek = one 128 KiB read near EOF — must touch a BOUNDED window, never the
+/// whole file/index. Filled by the characterization run in Step 3; a change here
+/// means real read-path work changed — update in the same PR.
+fn goldens(fmt: Format) -> (u64, u64, u64, u64) {
     match fmt {
-        Format::Flac => (0, 0, 0),
-        Format::Mp3 => (0, 0, 0),
-        Format::M4aMoovFirst => (0, 0, 0),
-        Format::M4aMoovLast => (0, 0, 0),
-        Format::Ogg => (0, 0, 0),
-        Format::Wav => (0, 0, 0),
+        Format::Flac => (0, 0, 0, 0),
+        Format::Mp3 => (0, 0, 0, 0),
+        Format::M4aMoovFirst => (0, 0, 0, 0),
+        Format::M4aMoovLast => (0, 0, 0, 0),
+        Format::Ogg => (0, 0, 0, 0),
+        Format::Wav => (0, 0, 0, 0),
     }
 }
 
@@ -195,16 +201,22 @@ const SEEK_OFF: u64 = 3_500_000;
 fn read_preads_and_seek_match_goldens() {
     let _g = METRICS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for &fmt in ALL_FORMATS {
-        let (exp_seq_preads, exp_seek_preads, exp_seek_bytes) = goldens(fmt);
+        let (exp_seq_preads, exp_seq_bytes, exp_seek_preads, exp_seek_bytes) = goldens(fmt);
 
-        let (fs, inode, _dir) = mount_one(fmt, AUDIO_BYTES as usize, 0);
+        let (fs, inode, _dir) = mount_one(fmt, AUDIO_BYTES as usize);
         metrics::reset();
         read_whole(&fs, inode);
         let seq = metrics::snapshot();
         assert_eq!(seq.preads, exp_seq_preads, "{}: sequential preads", format_token(fmt));
+        assert_eq!(seq.pread_bytes, exp_seq_bytes, "{}: sequential pread_bytes (audio read once)", format_token(fmt));
+        // Format-agnostic slurp guard, independent of the frozen number.
+        assert!(
+            seq.pread_bytes < AUDIO_BYTES * 2,
+            "{}: sequential read {} bytes — looks like a double-read/slurp", format_token(fmt), seq.pread_bytes,
+        );
 
         // Fresh mount → cold cache → single deep read.
-        let (fs2, inode2, _dir2) = mount_one(fmt, AUDIO_BYTES as usize, 0);
+        let (fs2, inode2, _dir2) = mount_one(fmt, AUDIO_BYTES as usize);
         metrics::reset();
         let _ = fs2.read(inode2, None, SEEK_OFF, CHUNK).unwrap();
         let seek = metrics::snapshot();
@@ -224,20 +236,20 @@ fn read_preads_and_seek_match_goldens() {
 - [ ] **Step 2: Run the test to characterize — it will FAIL and print actual vs expected**
 
 Run: `cargo test -p musefs-core --features metrics --test perf_counters read_preads_and_seek_match_goldens -- --nocapture`
-Expected: FAIL. Each panic line prints the actual value, e.g. `flac: sequential preads ... left: 33, right: 0`. Record the actual `seq.preads`, `seek.preads`, and `seek.pread_bytes` for every format.
+Expected: FAIL. Each panic line prints the actual value, e.g. `flac: sequential preads ... left: 33, right: 0`. Record the actual `seq.preads`, `seq.pread_bytes`, `seek.preads`, and `seek.pread_bytes` for every format. (Sanity-check each `seq.pread_bytes` ≈ 4 MiB and each `seek.pread_bytes` ≪ 1 MiB before pinning — a value near the whole file size means a real over-read, not a golden to freeze.)
 
 - [ ] **Step 3: Replace the sentinel `0`s in `goldens()` with the observed values**
 
-Edit `goldens()` so each arm holds the `(seq_preads, seek_preads, seek_pread_bytes)` triple you recorded. Example shape (your numbers will differ):
+Edit `goldens()` so each arm holds the `(seq_preads, seq_pread_bytes, seek_preads, seek_pread_bytes)` tuple you recorded. Example shape (your numbers will differ):
 
 ```rust
-        Format::Flac => (33, 1, 131072),
+        Format::Flac => (33, 4_194_304, 1, 131_072),
 ```
 
 - [ ] **Step 4: Re-run, expect PASS**
 
 Run: `cargo test -p musefs-core --features metrics --test perf_counters read_preads_and_seek_match_goldens -- --nocapture`
-Expected: PASS for all six formats. Confirm every `seek_pread_bytes` is well under `AUDIO_BYTES/4` (the bounded-window invariant).
+Expected: PASS for all six formats. Confirm every `seek_pread_bytes` is well under `AUDIO_BYTES/4` (the bounded-window invariant) and every `seq_pread_bytes` is under `AUDIO_BYTES*2` (the slurp guard).
 
 - [ ] **Step 5: Commit**
 
@@ -336,10 +348,14 @@ Expected: exits 0 (anchors valid before the edit).
 Insert immediately before the final closing `}` of `mod tests` (after `dot_and_dotdot_plain_components_are_dropped`):
 
 ```rust
-    /// Builds a many-album library, re-tags ONE track (renaming its leaf within
-    /// its own album dir), and asserts `apply_changes` rebuilds exactly one
-    /// subtree — *regardless of library size*. A reintroduced full reconstruction
-    /// would rebuild every album dir, so the count would scale with size.
+    /// Builds a many-album library and re-tags ONE track (renaming its leaf
+    /// within its own album dir, no rendered-name collision). The
+    /// `apply_changes` rebuild-subtree count for such a change is 0 — it is
+    /// handled by remove+insert — and must stay 0 *regardless of library size*.
+    /// A regression that over-dirties (rebuilding album subtrees on every change)
+    /// would make the count scale with album count, tripping this gate. (This
+    /// guards `apply_changes`'s O(changed) contract; it does NOT guard the
+    /// facade's choice to call `apply_changes` vs a full `build_with`.)
     fn library(albums: usize) -> Vec<(i64, String)> {
         let mut e = Vec::new();
         for a in 0..albums {
@@ -371,12 +387,16 @@ Insert immediately before the final closing `}` of `mod tests` (after `dot_and_d
 
     #[test]
     fn apply_changes_rebuild_count_is_size_invariant() {
+        // Characterized: a collision-free single re-tag dirties nothing, at any
+        // size. Pinned exactly so ANY change (a constant shift to 1, or scaling
+        // with album count) trips the gate.
+        const EXPECTED_REBUILDS: usize = 0;
         let small = rebuilds_for_one_retag(43); // 129 tracks
         let large = rebuilds_for_one_retag(683); // 2049 tracks
-        assert_eq!(small, 1, "one re-tag must rebuild exactly its own album dir");
+        assert_eq!(small, EXPECTED_REBUILDS, "small-library rebuild count");
         assert_eq!(
-            small, large,
-            "rebuild count must not grow with library size (O(changed), not O(N))",
+            large, EXPECTED_REBUILDS,
+            "large-library rebuild count must not scale with size (O(changed), not O(N))",
         );
     }
 ```
@@ -384,7 +404,7 @@ Insert immediately before the final closing `}` of `mod tests` (after `dot_and_d
 - [ ] **Step 3: Run the new test, expect PASS**
 
 Run: `cargo test -p musefs-core apply_changes_rebuild_count_is_size_invariant -- --nocapture`
-Expected: PASS. (If `small != 1`, the re-tag is touching more than its dir — investigate; do not loosen the assertion to match.)
+Expected: PASS — the count is 0 at both sizes (verified against the current tree). If it is nonzero, the re-tag is tripping a collision path; switch the changed leaf to a guaranteed-unique name (it must not collide with any sibling) rather than loosening the assertion.
 
 - [ ] **Step 4: Re-check mutants anchors are still valid**
 
@@ -796,5 +816,11 @@ git commit -m "docs: point BENCHMARKS.md at the release snapshot artifact (#211)
 
 - **Spec coverage:** Lane 1 read goldens → 1.1/1.2; ingest slurp guard → 1.3; refresh O(changed) via existing `apply_changes` return (no new counter) → 1.4; fsync==0 explicitly release-only → 3.1 (ci-tier `bench_ingest`) + noted in docs. Lane 2 path filter/job/script/fork-fallback/pin → 2.1–2.4. Lane 3 record-only artifact + ci tier → 3.1–3.3.
 - **No production code in PR1** — every asserted counter already exists; the only `tree.rs` change is an appended test (mutants anchors re-checked in 1.4).
-- **Characterization steps** (1.2, 1.3) discover format-specific exact constants via a shown command + a shown edit, not a vague "TODO" — the load-bearing invariants (`pread_bytes == AUDIO_BYTES`, bounded-seek/slurp upper bounds) are asserted independently of the frozen numbers.
+- **Characterization steps** (1.2, 1.3) discover format-specific exact constants via a shown command + a shown edit, not a vague "TODO" — the load-bearing invariants (bounded-seek `< AUDIO_BYTES/4`, slurp `< AUDIO_BYTES*2`) are asserted independently of the frozen numbers.
 - **Pins** (`critcmp` version, sticky-comment commit SHA, `upload-artifact` SHA) are resolved by the explicit commands in 2.3/3.2, honoring the commit-not-tag pin rule.
+
+**Spec-plan-reviewer pass 2 — corrections applied (all verified against the live code):**
+- **Refresh count is 0, not 1** (probed: `clean_rename small=0 large=0`). Task 1.4 now pins `EXPECTED_REBUILDS = 0` exactly at both sizes — a collision-free single re-tag is handled by remove+insert and rebuilds nothing; the gate trips on any scaling or constant shift. (A `== 1` assertion would have been red at its own commit, which the pre-commit hook rejects.)
+- **`pread_bytes` is per-format** (MP3 prepends sync bytes, M4A wraps audio in `mdat`), so Task 1.1 no longer asserts `pread_bytes == AUDIO_BYTES` for all formats; the exact per-format `seq_pread_bytes` is pinned in Task 1.2's `goldens()`.
+- **No dead code in `perf_counters.rs`**: dropped `mount_one`'s unused `art_bytes` param (the spec's exact-art-chunk golden is already covered relationally by `flac_art_serve_increments_art_chunks` in `metrics.rs`); every helper/const in the new file is used, so `clippy --all-targets -D warnings` stays green.
+- **Verified-OK by the reviewer (no change needed):** all PR1 APIs compile against real signatures; cross-binary metrics global state is per-process (no flake); no PR1 commit boundary is red after the 1.4 fix; PR2/PR3 workflow wiring (`ci-ok` excludes `perf-ab`, `release.yml` tag trigger + `github.ref_name`, fork context expression, `critcmp --list`) is correct.
