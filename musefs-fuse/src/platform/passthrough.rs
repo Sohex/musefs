@@ -45,6 +45,20 @@ mod imp {
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&fh);
         }
+
+        /// Telemetry: `(sticky-disabled, live backing registrations)`. The map
+        /// length is read under its lock (scrapes are rare). `#394`.
+        // `allow`: consumed in Task 6's `render_metrics`, which is itself only
+        // reachable after Task 7 wires dispatch. REMOVED in Task 7 Step 11.
+        #[allow(dead_code, clippy::unnecessary_wraps)]
+        pub fn telemetry(&self) -> Option<(bool, u64)> {
+            let active = self
+                .backing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len() as u64;
+            Some((self.disabled.load(Ordering::Relaxed), active))
+        }
     }
 
     /// Reply to `open`: try kernel passthrough, else serve through the daemon.
@@ -119,6 +133,13 @@ mod imp {
         // Mirrors the Linux signature (which uses `self`); the stub doesn't.
         #[allow(clippy::unused_self)]
         pub fn remove(&self, _fh: u64) {}
+
+        /// No passthrough off Linux; telemetry is absent.
+        // See the Linux arm: REMOVE the `dead_code` allow in Task 7 Step 11.
+        #[allow(clippy::unused_self, dead_code)]
+        pub fn telemetry(&self) -> Option<(bool, u64)> {
+            None
+        }
     }
 
     /// Always serve through the daemon - no passthrough on this OS.
