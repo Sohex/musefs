@@ -371,6 +371,12 @@ read/ingest/refresh work must update the golden numbers in the same PR. They run
 on every non-doc PR via CI's `check` job. Constant-factor (wall-clock) changes
 are surfaced separately by the warn-only `perf-ab` job (below).
 
+The `perf-ab` job runs only when `musefs-core/src/**` or `musefs-format/src/**`
+change. It benches the base and PR commits back-to-back on one runner and posts a
+`critcmp` delta as a sticky PR comment. It is **warn-only** and not a required
+check — GH runner noise makes wall-clock unfit for hard gating. Reproduce locally
+with `scripts/perf-ab.sh <base-sha> out.md`.
+
 ### Concurrency + sanitizers
 
 Concurrent-reader coverage exists at two levels:
