@@ -78,6 +78,7 @@ fn config(mode: Mode) -> MountConfig {
         poll_interval: std::time::Duration::ZERO,
         case_insensitive: false,
         read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
     }
 }
 

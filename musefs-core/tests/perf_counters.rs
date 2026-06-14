@@ -26,6 +26,7 @@ fn config() -> MountConfig {
         // detect synthesis-path regressions; read amplification would collapse
         // and mask them. Read-ahead's own effects are covered in readahead.rs.
         read_ahead_budget: 0,
+        read_ahead_prefetch: false,
     }
 }
 

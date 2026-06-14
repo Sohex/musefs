@@ -46,6 +46,10 @@ pub struct MountConfig {
     pub case_insensitive: bool,
     /// Global read-ahead RAM envelope in bytes. `0` disables read-ahead.
     pub read_ahead_budget: u64,
+    /// Enable Phase-2 background prefetch threads. Off by default: Phase-1 read
+    /// amplification carries the entire measured read-ahead win (#255); the
+    /// prefetch threads add overhead without benefit on the backends tested.
+    pub read_ahead_prefetch: bool,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -251,6 +255,7 @@ impl Musefs {
         let (tree, snapshot) = Self::build_full(&db, &template, &config, &mut alloc)?;
         let poll_interval = config.poll_interval;
         let read_ahead_budget = config.read_ahead_budget;
+        let read_ahead_prefetch = config.read_ahead_prefetch;
         Ok(Musefs {
             cache: HeaderCache::new(config.mode),
             last_data_version: AtomicI64::new(last_data_version),
@@ -261,7 +266,11 @@ impl Musefs {
             template,
             handles: sharded_slab::Slab::new(),
             readahead_pool: Arc::new(crate::readahead::ReadAheadPool::new(read_ahead_budget)),
-            prefetch: if read_ahead_budget > 0 {
+            // Phase 2 (background prefetch threads) runs only when read-ahead is
+            // on AND explicitly opted in. Off by default: Phase-1 amplification
+            // carries the whole win, and the threads add ~10% overhead without
+            // benefit on the backends benchmarked (#255).
+            prefetch: if read_ahead_budget > 0 && read_ahead_prefetch {
                 Some(crate::readahead::PrefetchWorkers::new(2))
             } else {
                 None
@@ -1386,6 +1395,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1479,6 +1489,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1594,6 +1605,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1658,6 +1670,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
 
         let (entries, snapshot) = Musefs::render_entries(
@@ -1702,6 +1715,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1791,6 +1805,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: true,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1848,6 +1863,7 @@ mod tests {
             poll_interval: interval,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
         (dir, fs)
@@ -1916,6 +1932,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
 
         // StructureOnly: exposed, and the fd refers to the backing inode.
@@ -2025,6 +2042,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let template = Template::parse(&config.template).expect("valid template");
 
@@ -2073,6 +2091,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -2116,6 +2135,7 @@ mod tests {
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         assert!(matches!(
             Musefs::open(db, config),

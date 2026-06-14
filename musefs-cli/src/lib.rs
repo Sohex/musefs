@@ -43,6 +43,7 @@ pub struct Cli {
 /// Flags for `musefs mount`, grouped so the mount plumbing passes one value
 /// instead of ten ordering-fragile positional parameters.
 #[derive(clap::Args, Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI toggles, not a state machine
 pub struct MountArgs {
     /// Empty directory to mount at.
     #[arg(env = "MUSEFS_MOUNTPOINT")]
@@ -83,8 +84,13 @@ pub struct MountArgs {
     #[arg(long, env = "MUSEFS_MAX_READAHEAD_KIB", default_value_t = 512)]
     pub max_readahead_kib: u32,
     /// Global read-ahead RAM budget (MiB) shared across all active streams. 0 disables.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, env = "MUSEFS_READ_AHEAD_BUDGET_MIB", default_value_t = 64)]
     pub read_ahead_budget_mib: u32,
+    /// Enable Phase-2 background prefetch threads (advanced). Off by default:
+    /// read amplification alone carries the read-ahead win; the threads add
+    /// overhead without benefit on tested backends (NFS, SSD). See BENCHMARKS.md.
+    #[arg(long, env = "MUSEFS_READ_AHEAD_PREFETCH", default_value_t = false)]
+    pub read_ahead_prefetch: bool,
     /// Max outstanding background (readahead/async) requests the kernel queues.
     #[arg(long, env = "MUSEFS_MAX_BACKGROUND", default_value_t = 64)]
     pub max_background: u16,
@@ -278,6 +284,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),
         case_insensitive: args.case_insensitive,
         read_ahead_budget: u64::from(args.read_ahead_budget_mib).saturating_mul(1024 * 1024),
+        read_ahead_prefetch: args.read_ahead_prefetch,
     };
     let defaults = musefs_fuse::FuseConfig::default();
     let fuse_config = musefs_fuse::FuseConfig {
@@ -375,6 +382,29 @@ mod tests {
         };
         let (config, _) = parse_mount_config(&args);
         assert_eq!(config.read_ahead_budget, 0);
+    }
+
+    #[test]
+    fn read_ahead_prefetch_defaults_off_and_opts_in() {
+        use clap::Parser;
+        let base = ["musefs", "mount", "/mnt", "--db", "/tmp/x.db"];
+        let off = Cli::try_parse_from(base).unwrap();
+        let Command::Mount(args) = off.command else {
+            panic!("expected Mount");
+        };
+        assert!(
+            !parse_mount_config(&args).0.read_ahead_prefetch,
+            "Phase-2 prefetch must default off"
+        );
+
+        let on = Cli::try_parse_from(base.iter().chain(["--read-ahead-prefetch"].iter())).unwrap();
+        let Command::Mount(args) = on.command else {
+            panic!("expected Mount");
+        };
+        assert!(
+            parse_mount_config(&args).0.read_ahead_prefetch,
+            "flag opts in"
+        );
     }
 
     #[test]

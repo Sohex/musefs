@@ -24,6 +24,7 @@ fn config() -> MountConfig {
         poll_interval: Duration::ZERO,
         case_insensitive: false,
         read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
     }
 }
 
@@ -31,6 +32,7 @@ fn config_ci() -> MountConfig {
     MountConfig {
         case_insensitive: true,
         read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
         ..config()
     }
 }
