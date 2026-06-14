@@ -986,6 +986,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "threadpool",
+ "tikv-jemalloc-ctl",
 ]
 
 [[package]]

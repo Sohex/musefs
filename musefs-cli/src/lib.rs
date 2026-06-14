@@ -126,6 +126,12 @@ pub struct MountArgs {
     /// require `user_allow_other` in `/etc/fuse.conf`.
     #[arg(long, env = "MUSEFS_ALLOW_OTHER", value_parser = clap::builder::BoolishValueParser::new())]
     pub allow_other: bool,
+    /// Expose a `/proc`-style `.musefs-metrics/metrics` file at the mount root
+    /// for live observability (handles, read/dir-handle queues, caches, tree,
+    /// allocator). Off by default. Distinct from the compile-time `metrics`
+    /// cargo feature, which adds the syscall counters.
+    #[arg(long, env = "MUSEFS_EXPOSE_METRICS", value_parser = clap::builder::BoolishValueParser::new())]
+    pub expose_metrics: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -297,7 +303,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         file_mode: args.file_mode.unwrap_or(defaults.file_mode),
         dir_mode: args.dir_mode.unwrap_or(defaults.dir_mode),
         allow_other: effective_allow_other(args.allow_other, args.owner, args.group),
-        expose_metrics: false,
+        expose_metrics: args.expose_metrics,
     };
     (config, fuse_config)
 }
@@ -509,6 +515,7 @@ mod tests {
             "64",
             "--max-background",
             "32",
+            "--expose-metrics",
         ])
         .unwrap();
         let Command::Mount(args) = cli.command else {
@@ -527,6 +534,7 @@ mod tests {
         // KiB → bytes.
         assert_eq!(fuse_config.max_readahead, 64 * 1024);
         assert_eq!(fuse_config.max_background, 32);
+        assert!(fuse_config.expose_metrics);
     }
 
     #[test]
@@ -682,6 +690,17 @@ mod tests {
         };
         let (_config, fuse_config) = parse_mount_config(&args);
         assert!(!fuse_config.allow_other);
+    }
+
+    #[test]
+    fn expose_metrics_defaults_off() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "mount", "/mnt", "--db", "/tmp/x.db"]).unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected Mount")
+        };
+        let (_c, fuse_config) = parse_mount_config(&args);
+        assert!(!fuse_config.expose_metrics);
     }
 
     #[test]
