@@ -50,6 +50,10 @@ pub struct MountConfig {
     /// amplification carries the entire measured read-ahead win (#255); the
     /// prefetch threads add overhead without benefit on the backends tested.
     pub read_ahead_prefetch: bool,
+    /// Drop a track from the mount when a top-level template field is unresolved,
+    /// instead of substituting `default_fallback`. Per-field fallback chains and
+    /// `[...]` sections are unaffected. Set by the CLI (`--skip-on-missing`).
+    pub skip_on_missing: bool,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -325,19 +329,25 @@ impl Musefs {
 
     /// Render a single track's path from its tags + format. The one place
     /// `Template::render` is called, shared by full and incremental rebuilds.
+    /// Returns `None` when `skip_on_missing` is set and a top-level template
+    /// field is unresolved — the caller drops the track from the mount.
     fn render_one(
         template: &Template,
         config: &MountConfig,
         format: musefs_db::Format,
         tags: &[musefs_db::Tag],
-    ) -> String {
+    ) -> Option<String> {
         let fields = tags_to_fields(tags);
-        template.render(
-            &fields,
-            &config.fallbacks,
-            &config.default_fallback,
-            format.as_str(),
-        )
+        if config.skip_on_missing {
+            template.render_checked(&fields, &config.fallbacks, format.as_str())
+        } else {
+            Some(template.render(
+                &fields,
+                &config.fallbacks,
+                &config.default_fallback,
+                format.as_str(),
+            ))
+        }
     }
 
     /// DB read + path render with no allocator: the lock-free phase shared by
@@ -350,6 +360,9 @@ impl Musefs {
     /// (#188): the build path's insertion order decides which member of a colliding
     /// path keeps the bare name, and that must match the incremental path's min-id
     /// rule regardless of the source query's ordering.
+    ///
+    /// Tracks that `render_one` drops (`skip_on_missing` + an unresolved top-level
+    /// field) enter neither `entries` nor the snapshot, so they never materialize.
     #[allow(clippy::type_complexity)]
     fn render_entries<M>(
         db: &Db<M>,
@@ -364,7 +377,9 @@ impl Musefs {
         let mut snapshot = HashMap::with_capacity(tracks.len());
         for t in &tracks {
             let tags = tags_by_track.remove(&t.id).unwrap_or_default();
-            let path = Self::render_one(template, config, t.format, &tags);
+            let Some(path) = Self::render_one(template, config, t.format, &tags) else {
+                continue;
+            };
             snapshot.insert(
                 t.id,
                 TrackRenderState {
@@ -544,7 +559,7 @@ impl Musefs {
                 .filter_map(|id| snap.get(id).map(|s| (*id, s.clone())))
                 .collect()
         };
-        let change = partition_changelog(&prev_states, &log.changed_ids, &keys);
+        let mut change = partition_changelog(&prev_states, &log.changed_ids, &keys);
 
         // Phase 3 (DB, no VFS locks): render changed ∪ added.
         let mut to_render: Vec<i64> = change.changed.clone();
@@ -557,20 +572,39 @@ impl Musefs {
             let mut tags_by_track = self.pool.with(|db| Ok(db.tags_for_tracks(&to_render)?))?;
             to_render
                 .iter()
-                .map(|&id| {
+                .filter_map(|&id| {
                     let (cv, fmt) = key_of[&id];
                     let tags = tags_by_track.remove(&id).unwrap_or_default();
-                    (
-                        id,
-                        TrackRenderState {
-                            content_version: cv,
-                            format: fmt,
-                            path: Self::render_one(&self.template, &self.config, fmt, &tags),
-                        },
-                    )
+                    Self::render_one(&self.template, &self.config, fmt, &tags).map(|path| {
+                        (
+                            id,
+                            TrackRenderState {
+                                content_version: cv,
+                                format: fmt,
+                                path,
+                            },
+                        )
+                    })
                 })
                 .collect()
         };
+
+        // Reconcile `skip_on_missing` drops: a `changed`/`added` id that rendered
+        // nothing (`render_one` -> None) produced no `new_states` entry. A changed
+        // id was materialized before, so it becomes a removal; an added id never
+        // was, so it just disappears from the change set. Keeps the change set and
+        // `new_states` agreeing for `apply_changes` and the snapshot mutation below.
+        let mut vanished = Vec::new();
+        change.changed.retain(|id| {
+            if new_states.contains_key(id) {
+                true
+            } else {
+                vanished.push(*id);
+                false
+            }
+        });
+        change.added.retain(|id| new_states.contains_key(id));
+        change.removed.extend(vanished);
 
         // Phase 4 (snapshot + inodes locks, pure CPU): mutate in place, apply delta.
         let mut snap = crate::lock::lock_or_flag(&self.snapshot, &self.needs_rebuild, "snapshot");
@@ -1474,6 +1508,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1520,6 +1555,7 @@ mod tests {
                 case_insensitive: false,
                 read_ahead_budget: budget,
                 read_ahead_prefetch: prefetch,
+                skip_on_missing: false,
             };
             Musefs::open(musefs_db::Db::open_in_memory().unwrap(), cfg).unwrap()
         };
@@ -1565,6 +1601,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
         let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
@@ -1612,6 +1649,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
         let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
@@ -1694,6 +1732,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1810,6 +1849,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1875,6 +1915,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
 
         let (entries, snapshot) = Musefs::render_entries(
@@ -1888,6 +1929,54 @@ mod tests {
         let id = entries[0].0;
         assert_eq!(snapshot[&id].path, "Pix/Song.mp3");
         assert!(snapshot[&id].content_version >= 1);
+    }
+
+    #[test]
+    fn render_entries_skips_tracks_missing_top_level_field_when_enabled() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str, artist: Option<&str>, title: &str| {
+            let mut tag = id3::Tag::new();
+            if let Some(a) = artist {
+                tag.set_artist(a);
+            }
+            tag.set_title(title);
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join(name), &bytes).unwrap();
+        };
+        mk("full.mp3", Some("Pix"), "Song");
+        mk("partial.mp3", None, "Lonely");
+
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
+            skip_on_missing: true,
+        };
+
+        let (entries, snapshot) = Musefs::render_entries(
+            &db,
+            &Template::parse(&cfg.template).expect("valid template"),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1, "the artist-less track must be skipped");
+        assert_eq!(entries[0].1, "Pix/Song.mp3");
+        let id = entries[0].0;
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot.contains_key(&id));
     }
 
     #[test]
@@ -1920,6 +2009,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -2010,6 +2100,7 @@ mod tests {
             case_insensitive: true,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -2068,6 +2159,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
         (dir, fs)
@@ -2137,6 +2229,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
 
         // StructureOnly: exposed, and the fd refers to the backing inode.
@@ -2247,6 +2340,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let template = Template::parse(&config.template).expect("valid template");
 
@@ -2296,6 +2390,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -2340,6 +2435,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         assert!(matches!(
             Musefs::open(db, config),
@@ -2377,6 +2473,7 @@ mod tests {
             case_insensitive: false,
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
+            skip_on_missing: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
         let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");

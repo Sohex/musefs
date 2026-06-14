@@ -138,6 +138,7 @@ fn parse_mount_config_defaults_are_sensible() {
         allow_other: false,
         read_ahead_budget_mib: 64,
         read_ahead_prefetch: false,
+        skip_on_missing: false,
         expose_metrics: false,
     };
     let (config, fuse_config) = parse_mount_config(&args);
@@ -174,6 +175,7 @@ fn parse_mount_config_keep_cache_sets_flag() {
         allow_other: false,
         read_ahead_budget_mib: 64,
         read_ahead_prefetch: false,
+        skip_on_missing: false,
         expose_metrics: false,
     };
     let (config, fuse_config) = parse_mount_config(&args);
@@ -206,6 +208,7 @@ fn parse_mount_config_saturating_readahead() {
         allow_other: false,
         read_ahead_budget_mib: 64,
         read_ahead_prefetch: false,
+        skip_on_missing: false,
         expose_metrics: false,
     };
     let (_, fuse_config) = parse_mount_config(&args);
@@ -262,6 +265,7 @@ fn parse_mount_config_populates_per_field_fallbacks() {
         allow_other: false,
         read_ahead_budget_mib: 64,
         read_ahead_prefetch: false,
+        skip_on_missing: false,
         expose_metrics: false,
     };
     let (config, _) = parse_mount_config(&args);

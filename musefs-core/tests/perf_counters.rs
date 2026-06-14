@@ -27,6 +27,7 @@ fn config() -> MountConfig {
         // and mask them. Read-ahead's own effects are covered in readahead.rs.
         read_ahead_budget: 0,
         read_ahead_prefetch: false,
+        skip_on_missing: false,
     }
 }
 
