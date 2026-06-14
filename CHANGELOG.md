@@ -11,6 +11,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Runtime telemetry (`.musefs-metrics`):** an opt-in `--expose-metrics` flag
+  (env `MUSEFS_EXPOSE_METRICS`) surfaces a synthetic `.musefs-metrics` file at
+  the mount root rendering Prometheus-format counters — getattr/read/open
+  activity, backing read-ahead behavior, and (when built with jemalloc)
+  allocator stats. Off by default; the file is absent unless enabled. See the
+  README [Metrics](README.md#metrics) section (#394).
+- **Scan progress indicator:** `scan` and `scan --revalidate` render a live
+  progress bar (indicatif) with an elapsed-time summary on an interactive
+  terminal, falling back to periodic `ingested N/M (P%)` log lines when output
+  is non-interactive. A new `--quiet`/`-q` flag suppresses it (#406).
+- **`--skip-on-missing` template flag:** an opt-in `--skip-on-missing` (env
+  `MUSEFS_SKIP_ON_MISSING`) drops a track from the mount when a top-level
+  template field stays unresolved, instead of substituting `--default-fallback`.
+  Per-field `--fallback` chains and `[...]` optional sections are unaffected (a
+  field resolved via its fallback counts as present). The motivating case is
+  `--template '$!{beets_path}' --skip-on-missing`, which hides tracks beets left
+  without a `beets_path` rather than collapsing them into an `Unknown` bucket
+  (#408).
+- **`--read-ahead-prefetch` flag:** opt-in background prefetch threads layered on
+  top of read amplification, default off — benchmarks found amplification alone
+  delivers the entire read-ahead win, while the threads add ~10% overhead with no
+  measured benefit. Enable only when profiling a backend where a single large
+  read does not self-pipeline (#255).
 - **riscv64 release platform:** prebuilt `riscv64gc-unknown-linux-{gnu,musl}`
   binaries and `linux/riscv64` Docker images now ship with each tagged release.
   Container bases bumped to current stable: glibc Debian bookworm → trixie
