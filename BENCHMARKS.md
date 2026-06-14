@@ -762,3 +762,29 @@ consistent across HDD and NFS. This is the only tunable worth changing for slow 
   latency is never hidden by prefetch. The real lever for slow backing would be a
   **concurrent backing-prefetch pipeline in the daemon** (issue several `BackingAudio`
   reads ahead in parallel), an architectural change tracked separately.
+
+---
+
+## Global allocator — steady-state RSS (#360)
+
+Long-lived high-churn FUSE load fragments glibc malloc, growing daemon RSS over
+days without a true leak. The `musefs` binary now defaults to the jemalloc
+global allocator with a background purge thread. Measured with
+`scripts/rss-churn-bench.sh` (Linux; median `VmRSS` over the flattened tail —
+steady state, not peak).
+
+**Parameters:** WORKERS=8 (nproc), FILES=500, CYCLES=200, WARMUP=20, no
+REFRESH_CMD. DB = a freshly-scanned 4427-track store on tmpfs (`/tmp`); backing
+audio on `/data` (HDD). Concurrent `cat`-to-`/dev/null` churn drives the
+open/read/release handle-table and read-synthesis allocation path.
+
+| Allocator      | Steady-state RSS      |
+| -------------- | --------------------- |
+| system malloc  | ~74.7 MiB (76496 kiB) |
+| jemalloc       | ~28.7 MiB (29368 kiB) |
+
+**Decision: SHIP jemalloc.** Steady-state RSS is ~62% lower (jemalloc ≤ system
+malloc, the §4 ship rule). Under identical churn glibc retained ~46 MiB of dirty
+pages that jemalloc's decay + background purge return to the OS — the #360
+fragmentation failure mode, reproduced and fixed. The gap is far outside
+run-to-run noise, so no within-noise tie-break was needed.
