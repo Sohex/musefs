@@ -347,3 +347,48 @@ def test_wildcard_coords_replaces_only_first_linecol():
 def test_entry_coords_parses_line_col():
     assert g._entry_coords(r"musefs-core/src/scan\.rs:1041:32:") == (1041, 32)
     assert g._entry_coords(r"musefs-core/src/scan\.rs:1212:29: replace \+ with -") == (1212, 29)
+
+
+def test_candidate_mutants_bare_prefix_filters_by_op_fn():
+    entry = g.Entry(
+        r"musefs-core/src/scan\.rs:277:30:",
+        1,
+        g.Tag(op="<", fn="probe_file", fn_present=True, rows=1),
+    )
+    muts = [
+        _m("musefs-core/src/scan.rs:300:30: replace < with == in probe_file"),
+        _m("musefs-core/src/scan.rs:305:10: replace + with - in probe_file"),  # wrong op
+        _m("musefs-core/src/scan.rs:310:10: replace < with == in other_fn"),  # wrong fn
+    ]
+    got = g._candidate_mutants(entry, muts)
+    assert [m.site for m in got] == [("musefs-core/src/scan.rs", 300, 30)]
+
+
+def test_candidate_mutants_repl_suffix_narrows():
+    entry = g.Entry(
+        r"musefs-core/src/scan\.rs:1212:29: replace \+ with -",
+        1,
+        g.Tag(op="+", fn="revalidate_with", fn_present=True, rows=1),
+    )
+    muts = [
+        _m("musefs-core/src/scan.rs:1220:29: replace + with - in revalidate_with"),
+        _m("musefs-core/src/scan.rs:1220:29: replace + with * in revalidate_with"),
+        # ^ suffix mismatch — different repl
+    ]
+    got = g._candidate_mutants(entry, muts)
+    assert [m.repl for m in got] == ["-"]
+
+
+def test_candidate_mutants_empty_fn_matches_free_function():
+    entry = g.Entry(
+        r"musefs-core/src/reader\.rs:71:60: replace / with [%*]",
+        1,
+        g.Tag(op="/", fn="", fn_present=True, rows=2),
+    )
+    muts = [
+        _m("musefs-core/src/reader.rs:80:60: replace / with %"),
+        _m("musefs-core/src/reader.rs:80:60: replace / with *"),
+    ]
+    got = g._candidate_mutants(entry, muts)
+    assert {m.site for m in got} == {("musefs-core/src/reader.rs", 80, 60)}
+    assert len(got) == 2

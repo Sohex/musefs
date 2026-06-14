@@ -90,6 +90,20 @@ _COORD_RE = re.compile(r":([0-9]+):([0-9]+):")
 _ALLOWED_ESCAPES = set(".d+|^()*")
 
 
+def _candidate_mutants(entry: Entry, mutants: list[Mutant]) -> list[Mutant]:
+    """Live mutants a linecol entry's op/fn currently resolve to, ignoring its stale coords.
+
+    The entry's regex is matched with its coordinates wildcarded — preserving any
+    ``replace \\+ with -`` repl suffix that narrows the match — and the result is
+    further filtered by the guard tag's ``op`` and ``fn`` (``fn=""`` → free function,
+    matched as ``fn is None``). Mirrors the predicate ``_check_linecol`` validates with.
+    """
+    t = entry.tag
+    wild = re.compile(_wildcard_coords(entry.regex))
+    expected_fn = None if t.fn == "" else t.fn
+    return [m for m in mutants if wild.search(m.name) and m.op == t.op and m.fn == expected_fn]
+
+
 def classify(regex: str) -> str:
     return "linecol" if _LITERAL_LINECOL.search(regex) else "desc"
 
