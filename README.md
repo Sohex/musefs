@@ -293,6 +293,12 @@ symlinks are logged and skipped). `--quiet`
 (`-q`) suppresses the per-target summary for scripting; scan failures still
 surface on stderr (raise detail with `RUST_LOG=info`).
 
+`scan` and `scan --revalidate` show a live progress indicator: on an interactive
+terminal, a discovery spinner followed by a determinate bar (position, percent,
+ETA, current file); on a non-interactive stderr (piped or logged), throttled
+`ingested N/M (P%)` lines. `--quiet` (`-q`) suppresses the progress indicator
+and the per-target summary. Each summary line ends with the elapsed time.
+
 The per-target summary reads `scanned N: … skipped X, failed Y`. `skipped`
 counts every file that isn't a supported audio format — cover art, `.cue` /
 `.log` / `.nfo` sidecars, and anything else non-audio — so a large `skipped`

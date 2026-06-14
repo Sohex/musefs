@@ -24,8 +24,8 @@ pub use readahead::{BackingReader, ReadAhead, ReadAheadPool};
 pub use reader::{HeaderCache, ResolvedFile, read_at, read_at_with_file};
 pub use scan::scan_directory_full_oracle;
 pub use scan::{
-    RevalidateStats, ScanOptions, ScanStats, revalidate, revalidate_with, scan_directory,
-    scan_directory_with,
+    ProgressSink, RevalidateStats, ScanOptions, ScanProgress, ScanStats, revalidate,
+    revalidate_with, scan_directory, scan_directory_with,
 };
 pub use telemetry::{
     AllocatorStats, CoreTelemetry, FuseTelemetry, PassthroughTelemetry, render_prometheus,
