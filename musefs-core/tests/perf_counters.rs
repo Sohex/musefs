@@ -98,3 +98,79 @@ fn audio_only_read_emits_no_art_or_tag_chunks() {
         );
     }
 }
+
+/// Frozen per-format read goldens:
+/// `(seq_preads, seq_pread_bytes, seek_preads, seek_pread_bytes)`.
+/// seq = whole-file sequential read (audio read exactly once).
+/// seek = one 128 KiB read near EOF — must touch a BOUNDED window, never the
+/// whole file/index. Filled by the characterization run in Step 3; a change here
+/// means real read-path work changed — update in the same PR.
+fn goldens(fmt: Format) -> (u64, u64, u64, u64) {
+    match fmt {
+        Format::Mp3 => (33, 4_194_306, 1, 131_072),
+        Format::Ogg => (194, 4_221_658, 9, 262_250),
+        Format::Flac | Format::M4aMoovFirst | Format::M4aMoovLast | Format::Wav => {
+            (33, 4_194_304, 1, 131_072)
+        }
+    }
+}
+
+const SEEK_OFF: u64 = 3_500_000;
+
+#[test]
+fn read_preads_and_seek_match_goldens() {
+    let _g = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for &fmt in ALL_FORMATS {
+        let (exp_seq_preads, exp_seq_bytes, exp_seek_preads, exp_seek_bytes) = goldens(fmt);
+
+        let (fs, inode, _dir) = mount_one(fmt, AUDIO_BYTES_USIZE);
+        metrics::reset();
+        read_whole(&fs, inode);
+        let seq = metrics::snapshot();
+        assert_eq!(
+            seq.preads,
+            exp_seq_preads,
+            "{}: sequential preads",
+            format_token(fmt)
+        );
+        assert_eq!(
+            seq.pread_bytes,
+            exp_seq_bytes,
+            "{}: sequential pread_bytes (audio read once)",
+            format_token(fmt)
+        );
+        // Format-agnostic slurp guard, independent of the frozen number.
+        assert!(
+            seq.pread_bytes < AUDIO_BYTES_USIZE as u64 * 2,
+            "{}: sequential read {} bytes — looks like a double-read/slurp",
+            format_token(fmt),
+            seq.pread_bytes,
+        );
+
+        // Fresh mount → cold cache → single deep read.
+        let (fs2, inode2, _dir2) = mount_one(fmt, AUDIO_BYTES_USIZE);
+        metrics::reset();
+        let _ = fs2.read(inode2, None, SEEK_OFF, CHUNK).unwrap();
+        let seek = metrics::snapshot();
+        assert_eq!(
+            seek.preads,
+            exp_seek_preads,
+            "{}: seek preads",
+            format_token(fmt)
+        );
+        assert_eq!(
+            seek.pread_bytes,
+            exp_seek_bytes,
+            "{}: seek must read a bounded window, not the whole file/index",
+            format_token(fmt),
+        );
+        assert!(
+            seek.pread_bytes < AUDIO_BYTES_USIZE as u64 / 4,
+            "{}: seek read {} bytes — not a bounded window",
+            format_token(fmt),
+            seek.pread_bytes,
+        );
+    }
+}
