@@ -146,6 +146,10 @@ jobs:
             zig_target: x86_64-unknown-linux-musl
           - triple: aarch64-unknown-linux-musl
             zig_target: aarch64-unknown-linux-musl
+          - triple: riscv64gc-unknown-linux-gnu
+            zig_target: riscv64gc-unknown-linux-gnu.2.27
+          - triple: riscv64gc-unknown-linux-musl
+            zig_target: riscv64gc-unknown-linux-musl
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
