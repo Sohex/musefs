@@ -287,7 +287,8 @@ fuzz_target!(|data: &[u8]| {
     let file = std::fs::File::open(&resolved.backing_path).expect("backing file opens");
     let pool = ReadAheadPool::new(0);
     let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
-    let br = BackingReader::new(&file, &buf, &pool, 0, total, &std::sync::atomic::AtomicU64::new(0));
+    let epoch = std::sync::atomic::AtomicU64::new(0);
+    let br = BackingReader::new(&file, &buf, &pool, 0, total, &epoch);
 
     // Splice-consistency invariants. A successfully-resolved layout is internally
     // consistent regardless of how its rows were planted, so whenever the read
