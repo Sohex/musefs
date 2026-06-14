@@ -104,25 +104,47 @@ it:
   sequential access — so the thousands of handles a scanner opens-and-stats cost
   zero read-ahead RAM. Freed on `release`.
 - The no-handle fallback path (`read_at_into`, one-shot open) keeps doing plain
-  preads. It is the uncommon path with no persistent state to read ahead into.
+  preads. The FUSE `read` op always carries the fh issued by `open`, so a normal
+  sequential stream (player, `cat`, scanner) always resolves to a `Handle` and
+  gets read-ahead. The fallback in `read_into` is reached only when `fh` is
+  `None` or names a handle absent from the slab — a pathological case no normal
+  stream produces — so excluding it costs the headline numbers nothing.
+
+### `BackingReader` ownership
+
+`BackingReader` is constructed per `read_into` call and lives only for that call.
+It borrows the `Handle`'s backing fd and a reference to the global budget, and
+holds the per-handle `Mutex<Buffer>` guard. `read_exact_at` takes `&self` with
+the window/budget mutation behind that mutex (interior mutability) — no `&mut`
+threading through the splice loop. Phase 1's large refill `pread` runs on the
+foreground worker, which already holds an `MAX_INFLIGHT_READS` slot, so Phase 1
+adds no new slot pressure.
 
 ## Mechanism: sequential detection & adaptive window
 
-Per handle:
+Per handle, track `next_expected_offset` (the backing offset just past the last
+served read) and `window` (current size, between a floor and a cap — see Memory
+bounding). Each `read_exact_at(buf, abs_offset)` resolves via this decision
+table:
 
-- Track `next_expected_offset` (the backing offset just past the last served
-  read).
-- A `read_exact_at` whose start `== next_expected_offset` (or lands inside the
-  current window) is **sequential** → grow the window (e.g. double, capped by the
-  stream's budget share). Successive misses fetch ever-larger chunks; this is
-  what self-tunes HDD (stays small) vs 200 ms NFS (ramps to MBs).
-- A read landing outside the window is a **seek** → reset: shrink the window to
-  the floor and refill at the new offset, returning the reclaimed bytes to the
-  budget.
+| condition                                              | classification  | action                                                                       |
+| ------------------------------------------------------ | --------------- | ---------------------------------------------------------------------------- |
+| requested range ⊆ current window                       | **hit**         | memcpy from window, no syscall                                               |
+| range ⊄ window **and** `abs_offset == next_expected`   | **seq. miss**   | grow `window` (geometric, capped), refill at `abs_offset`, serve             |
+| range ⊄ window **and** `abs_offset != next_expected`   | **seek**        | shrink `window` to floor, free old bytes, refill at `abs_offset`, serve      |
+
+After serving, set `next_expected = abs_offset + len`. "Grow" is geometric
+(double, capped); successive sequential misses fetch ever-larger chunks, which is
+what self-tunes HDD (stays small) vs 200 ms NFS (ramps to MBs). On seek the old
+window's bytes are freed immediately (returned to the budget), not retained.
 
 For the Ogg page-walk, a page's header and payload preads are adjacent and the
 walk proceeds forward, so once the window covers a page both reads hit and the
-stream stays "sequential" under the same detector.
+stream stays sequential under the same detector. `serve_ogg_window` issues
+several `read_exact_at` calls per request (header + payload per page); each
+re-locks the per-handle buffer mutex, which is correct (intra-request re-locking
+is uncontended for a single stream) but changes the per-request pread count the
+`metrics`-feature tests assert — see Testing.
 
 ## Memory bounding
 
@@ -130,19 +152,40 @@ Hybrid: lazy per-handle buffers drawing from one global byte budget with
 eviction.
 
 - **Global budget:** a single process-wide cap on total buffered bytes, separate
-  from the `HeaderCache` budget. Each handle's window growth is charged against
-  it. N concurrent streams share the budget — 100 streams each get smaller
-  windows than 2 streams do, which is the correct graceful degradation (aggregate
-  RAM stays fixed).
-- **Eviction:** when the budget is exhausted and a stream needs to grow/refill,
-  reclaim from the coldest buffer(s) — least-recently-served handles give back
-  their window first. A reclaimed handle simply re-misses and re-fetches
-  (correctness unaffected). Because only *actively streaming* handles hold
-  buffers, the set to scan for an eviction victim is small (bounded by concurrent
-  streams, not total opens); a guarded last-served scan over that set suffices —
-  no `quick_cache` (its keys are content, not live handles).
+  from the `HeaderCache` budget, held as an `AtomicU64` charged/uncharged with
+  `fetch_add`/`fetch_sub`. No lock on the per-read hot path.
+- **Window floor / cap / growth.** Floor = one FUSE chunk-class size (e.g.
+  512 KiB) so a fresh or just-seeked stream still does useful read-ahead. Growth
+  = geometric doubling per sequential miss. Per-stream cap = `min(absolute_cap,
+  budget / DIVISOR)` (e.g. `DIVISOR = 4`), so no single stream can monopolize the
+  envelope. The division across N active streams is **emergent, not a static
+  partition**: each stream grows greedily toward its cap; the global atomic
+  budget is the hard ceiling, and LRU eviction (below) reclaims from colder
+  streams when a hotter one needs to grow. Under sustained N-stream load this
+  settles toward roughly equal shares without any explicit `budget / N`
+  computation. Final constants are benchmark-chosen in the plan; the policy
+  (floor, geometric growth, per-stream cap, global hard ceiling, LRU balancing)
+  is fixed here.
+- **Eviction + lock order (deadlock-free by construction).** When charging the
+  budget would exceed the cap, the growing stream runs eviction: it scans a small
+  guarded **active-stream registry** (live streaming-handle keys + last-served
+  counter — bounded by concurrent streams, not total opens), picks the coldest,
+  and reclaims it by `try_lock`-ing that victim's per-handle buffer mutex. The
+  strict rules that make this deadlock-free:
+  1. The budget is a lock-free atomic — never a held lock.
+  2. The registry lock is a leaf: victim keys are copied out and it is released
+     before touching any buffer mutex.
+  3. Eviction **never blocks** on a victim's buffer mutex — it `try_lock`s and
+     skips a victim that is mid-read, moving to the next-coldest. So no thread
+     ever holds buffer-mutex-A while waiting on buffer-mutex-B or the registry.
+  If nothing reclaimable is found (all candidates busy), the grower simply does
+  not grow this round and serves at the current window — graceful degradation,
+  never a stall. A reclaimed handle re-misses and re-fetches (correctness
+  unaffected). `quick_cache` is not used (its keys are content, not live
+  handles).
 - **Free on close / seek-shrink:** `release` returns the buffer to the budget; a
-  detected seek shrinks the window rather than holding the high-water mark.
+  detected seek shrinks the window and frees the old bytes rather than holding
+  the high-water mark.
 
 ### Configuration
 
@@ -168,7 +211,10 @@ validation.
 
 1. **Audio invariant.** The buffer stores backing bytes verbatim and serves them
    verbatim — never transformed. Ogg header *patching* happens on top of the raw
-   bytes after the read (unchanged), so caching raw bytes does not touch it.
+   bytes after the read (unchanged), so caching raw bytes does not touch it. The
+   existing one-entry `LastPageMemo` in `serve_ogg_window` (which caches a
+   *patched header*) is orthogonal to and independent of the new buffer (which
+   caches *raw backing bytes*); they cache different things and do not interact.
 2. **Retag/refresh survives the buffer for free.** A retag changes DB metadata —
    the synthesized segments (`Inline`/`ArtImage`/`BinaryTag`) and the virtual
    layout — but not the backing audio bytes nor their absolute offset in the
@@ -177,16 +223,42 @@ validation.
    nonetheless **dropped on any handle generation bump** (refills are cheap; this
    makes buffer validity trivially track the invariants the facade already
    enforces). A tight retag loop thrashes the buffer harmlessly; retags are rare
-   vs reads.
-3. **Per-read re-stat guard preserved.** Every FUSE read still runs
-   `validate_opened_backing` in `read_into` before any byte — buffered or freshly
-   pread — reaches the kernel. A buffered byte is handed out only if the fd still
-   validates at serve time, so staleness exposure is no wider than today's
-   documented size/mtime guarantee (Finding #15, ESTALE). On validation failure →
-   `BackingChanged`, buffer dropped.
+   vs reads. The generation bump, a seek, and `release` all advance **one
+   per-handle epoch**; any in-flight Phase-2 prefetch checks the epoch before
+   storing and discards a fill made against a stale one (§"Phase 2"). So seek,
+   release, and refresh are unified under a single invalidation signal rather
+   than two mechanisms.
+3. **Per-read re-stat guard preserved; the buffer is bound to `resolved.stamp`.**
+   `validate_opened_backing` compares the fd's live `BackingStamp` against
+   `resolved.stamp` (the stamp captured at resolve time) on every `read_into`
+   call, *before* the splice descends, and is terminal (`BackingChanged`) on
+   drift. The buffer is bound to that same `resolved`: it can only have been
+   filled through this fd, and it is **dropped on any generation bump** (§2),
+   which is the only event that swaps `resolved` (and thus `resolved.stamp`).
+   Therefore a buffered byte is served only when the current read's validate
+   passes — i.e. the fd's stamp still equals the stamp under which those bytes
+   were filled. No separate fill-time stamp is needed; `resolved.stamp` *is* the
+   fill-time stamp.
+   - **Detectable rewrite (size or mtime changes):** the next read's
+     `validate_opened_backing` mismatches `resolved.stamp` → `BackingChanged`
+     terminal; the buffer is never consulted. Identical behavior with or without
+     read-ahead.
+   - **Undetectable rewrite (same size *and* same mtime in place):** validate
+     passes either way. Without read-ahead a hit-region read preads post-rewrite
+     bytes; with read-ahead it may serve pre-rewrite buffered bytes. Both are real
+     backing bytes never modified by musefs; this same-size+same-mtime in-place
+     case is already outside the guarantee (Finding #15, ESTALE; the
+     external-writer contract requires content changes to bump `content_version`
+     rather than silently rewrite). Read-ahead's exposure is therefore the same
+     *kind* and bound by the same precondition as today's — not wider.
 4. **No interaction with the `begin_read` / `content_version` snapshot.** That
    machinery guards DB-sourced segments (`BinaryTag`); read-ahead caches only
-   backing bytes and sits outside that path.
+   backing bytes and sits outside that path. **Invariant (constrains the Phase-2
+   worker):** prefetch workers touch *only* the backing fd via positioned reads —
+   never the `Db`, the connection pool, or any WAL snapshot. A foreground read
+   may hold an open `db.begin_read()` snapshot while a background prefetch runs;
+   keeping prefetch `Db`-free means it cannot open a second snapshot, contend the
+   `PerThread` pool, or perturb `content_version` checks.
 5. **Concurrency.** The buffer is `Mutex`-guarded and per-handle. A single
    sequential stream never contends; concurrent/random reads on the same fh
    serialize on the buffer mutex only, with no cross-handle effect.
@@ -209,10 +281,13 @@ validation.
   queue, #308). Prefetch gets its own small concurrency bound so it can never
   starve foreground reads.
 - **Cancellation without killing preads:** a blocking `pread` cannot be
-  interrupted, so we do not try. Each handle carries an epoch; a seek or
-  `release` bumps it; a prefetch job checks the epoch before storing its result
-  and discards stale fills. The abandoned `pread` completes and its bytes are
-  dropped.
+  interrupted, so we do not try. Each handle carries the single epoch from
+  Correctness §2 — a seek, `release`, **or a refresh-generation bump** advances
+  it. A prefetch job reads the epoch when dispatched and re-checks it under the
+  buffer mutex before storing; if it changed, the fill is discarded. The
+  abandoned `pread` completes and its bytes are dropped. This is what makes an
+  in-flight prefetch against a layout that was just re-resolved (generation bump)
+  safe to throw away.
 - **Adaptive depth:** the window-growth signal also drives how many windows ahead
   to prefetch, bounded by the stream's budget share. High-RTT NFS ramps depth up;
   HDD stays shallow. No knob beyond the budget ceiling.
@@ -222,8 +297,12 @@ validation.
 - **Differential correctness (keystone).** For both PCM and Ogg fixtures, bytes
   served through the read-ahead path must be byte-for-byte identical to direct
   preads, across sequential and random access, arbitrary offset/size splits, and
-  buffer eviction. Reuses the existing `ogg_serve_tests` / serve fixtures in
-  `reader.rs`.
+  buffer eviction. The test injects a deliberately tiny budget via the
+  `with_budget` seam so eviction is *forced* mid-stream (a default-sized budget
+  would silently never exercise the eviction path). Includes a seek that lands
+  *partially* back inside a just-freed window region, to catch off-by-one in the
+  shrink/refill offset math. Reuses the existing `ogg_serve_tests` / serve
+  fixtures in `reader.rs`.
 - **Unit.** hit/miss; window grow-on-sequential; reset-on-seek; eviction reclaims
   coldest; drop-on-generation-bump; drop-on-validation-failure.
 - **Concurrency.** multi-thread reads of one handle (the existing TSan CI job
