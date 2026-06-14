@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,6 +103,73 @@ def _candidate_mutants(entry: Entry, mutants: list[Mutant]) -> list[Mutant]:
     wild = re.compile(_wildcard_coords(entry.regex))
     expected_fn = None if t.fn == "" else t.fn
     return [m for m in mutants if wild.search(m.name) and m.op == t.op and m.fn == expected_fn]
+
+
+def compute_rewrites(
+    entries: list[Entry], mutants: list[Mutant]
+) -> tuple[list[Rewrite], list[str], set[int]]:
+    """Plan coordinate rewrites for drifted complete-tag linecol entries.
+
+    Returns (rewrites, skip_notes, skipped_lines). Entries are grouped by the
+    identical set of sites their op/fn resolves to; siblings in a group are mapped
+    to those sites positionally by source order (which fmt/edits preserve). A group
+    whose anchor count differs from its site count, or any of whose sites holds a
+    number of mutants other than the anchor's ``rows``, is a structural change — it
+    is left untouched and reported, never guessed. An entry resolving to no site is
+    deleted code, reported with deletion-oriented wording.
+    """
+    targets = [
+        e
+        for e in entries
+        if classify(e.regex) == "linecol"
+        and e.tag is not None
+        and e.tag.op is not None
+        and e.tag.fn_present
+        and e.tag.rows is not None
+    ]
+
+    rewrites: list[Rewrite] = []
+    skip_notes: list[str] = []
+    skipped: set[int] = set()
+
+    groups: dict[tuple, list[Entry]] = {}
+    matched_by_line: dict[int, list[Mutant]] = {}
+    for e in targets:
+        ms = _candidate_mutants(e, mutants)
+        matched_by_line[e.toml_line] = ms
+        sites = tuple(sorted({m.site for m in ms}))
+        if not sites:
+            skip_notes.append(
+                _fmt(e, "matches no live mutant — code removed? delete this exclude_re entry")
+            )
+            skipped.add(e.toml_line)
+            continue
+        groups.setdefault(sites, []).append(e)
+
+    for sites, group in groups.items():
+        group = sorted(group, key=lambda e: _entry_coords(e.regex))
+        counts = Counter(m.site for m in matched_by_line[group[0].toml_line])
+        mappable = len(group) == len(sites) and all(
+            counts[sites[i]] == group[i].tag.rows for i in range(len(group))
+        )
+        if not mappable:
+            for e in group:
+                skip_notes.append(
+                    _fmt(
+                        e,
+                        f"op/fn resolves to {len(sites)} site(s) but {len(group)} anchor(s) "
+                        "reference it — structural change, re-anchor manually",
+                    )
+                )
+                skipped.add(e.toml_line)
+            continue
+        for e, site in zip(group, sites):
+            _, line, col = site
+            if (line, col) != _entry_coords(e.regex):
+                rewrites.append(Rewrite(e, line, col))
+
+    rewrites.sort(key=lambda r: r.entry.toml_line)
+    return rewrites, skip_notes, skipped
 
 
 def classify(regex: str) -> str:

@@ -392,3 +392,149 @@ def test_candidate_mutants_empty_fn_matches_free_function():
     got = g._candidate_mutants(entry, muts)
     assert {m.site for m in got} == {("musefs-core/src/reader.rs", 80, 60)}
     assert len(got) == 2
+
+
+def test_compute_rewrites_simple_shift():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:277:30:",
+            3,
+            g.Tag(op="<", fn="probe_file", fn_present=True, rows=1),
+        )
+    ]
+    muts = [_m("musefs-core/src/scan.rs:300:30: replace < with == in probe_file")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert skips == [] and skipped == set()
+    assert len(rewrites) == 1
+    assert (rewrites[0].entry.toml_line, rewrites[0].line, rewrites[0].col) == (3, 300, 30)
+
+
+def test_compute_rewrites_no_drift_is_noop():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:277:30:",
+            3,
+            g.Tag(op="<", fn="probe_file", fn_present=True, rows=1),
+        )
+    ]
+    muts = [_m("musefs-core/src/scan.rs:277:30: replace < with == in probe_file")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skips == [] and skipped == set()
+
+
+def test_compute_rewrites_multisite_positional():
+    # two >= anchors in run_pipeline, both shifted down 2 lines; map low->low, high->high
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1041:32:",
+            5,
+            g.Tag(op=">=", fn="run_pipeline", fn_present=True, rows=1),
+        ),
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1051:40:",
+            9,
+            g.Tag(op=">=", fn="run_pipeline", fn_present=True, rows=1),
+        ),
+    ]
+    muts = [
+        _m("musefs-core/src/scan.rs:1043:32: replace >= with > in run_pipeline"),
+        _m("musefs-core/src/scan.rs:1053:40: replace >= with > in run_pipeline"),
+    ]
+    rewrites, skips, _ = g.compute_rewrites(entries, muts)
+    assert skips == []
+    assert {(r.entry.toml_line, r.line, r.col) for r in rewrites} == {
+        (5, 1043, 32),
+        (9, 1053, 40),
+    }
+
+
+def test_compute_rewrites_repl_suffixed():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1212:29: replace \+ with -",
+            3,
+            g.Tag(op="+", fn="revalidate_with", fn_present=True, rows=1),
+        )
+    ]
+    muts = [
+        _m("musefs-core/src/scan.rs:1220:29: replace + with - in revalidate_with"),
+        _m("musefs-core/src/scan.rs:1220:29: replace + with * in revalidate_with"),
+    ]
+    rewrites, skips, _ = g.compute_rewrites(entries, muts)
+    assert skips == []
+    assert len(rewrites) == 1 and (rewrites[0].line, rewrites[0].col) == (1220, 29)
+
+
+def test_compute_rewrites_rows_two_site():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1039:29:",
+            3,
+            g.Tag(op="+=", fn="run_pipeline", fn_present=True, rows=2),
+        )
+    ]
+    muts = [
+        _m("musefs-core/src/scan.rs:1045:29: replace += with -= in run_pipeline"),
+        _m("musefs-core/src/scan.rs:1045:29: replace += with *= in run_pipeline"),
+    ]
+    rewrites, skips, _ = g.compute_rewrites(entries, muts)
+    assert skips == []
+    assert len(rewrites) == 1 and (rewrites[0].line, rewrites[0].col) == (1045, 29)
+
+
+def test_compute_rewrites_zero_candidate_reports_deletion():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:277:30:",
+            4,
+            g.Tag(op="<", fn="probe_file", fn_present=True, rows=1),
+        )
+    ]
+    muts = [_m("musefs-core/src/scan.rs:500:10: replace + with - in other_fn")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skipped == {4}
+    assert len(skips) == 1 and "delete this exclude_re entry" in skips[0]
+
+
+def test_compute_rewrites_structural_count_mismatch():
+    # one anchor, op/fn now resolves to two sites -> refuse the whole group
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1041:32:",
+            4,
+            g.Tag(op=">=", fn="run_pipeline", fn_present=True, rows=1),
+        )
+    ]
+    muts = [
+        _m("musefs-core/src/scan.rs:1043:32: replace >= with > in run_pipeline"),
+        _m("musefs-core/src/scan.rs:1099:10: replace >= with > in run_pipeline"),
+    ]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skipped == {4}
+    assert "structural change" in skips[0]
+
+
+def test_compute_rewrites_rows_mismatch_skips_group():
+    # equinumerous (1 anchor, 1 site) but the site holds 1 mutant while rows=2
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1039:29:",
+            4,
+            g.Tag(op="+=", fn="run_pipeline", fn_present=True, rows=2),
+        )
+    ]
+    muts = [_m("musefs-core/src/scan.rs:1045:29: replace += with -= in run_pipeline")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skipped == {4}
+    assert "structural change" in skips[0]
+
+
+def test_compute_rewrites_ignores_desc_and_tagless():
+    entries = [
+        g.Entry(r"replace \| with \^ in synchsafe_decode", 3, g.Tag(count=3)),
+        g.Entry(r"musefs-core/src/scan\.rs:277:30:", 5, None),
+        g.Entry(r"musefs-core/src/scan\.rs:277:30:", 7, g.Tag(op="<")),
+    ]
+    muts = [_m("musefs-core/src/scan.rs:277:30: replace < with == in probe_file")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skips == [] and skipped == set()
