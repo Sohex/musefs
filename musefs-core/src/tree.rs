@@ -954,6 +954,19 @@ mod tests {
     }
 
     #[test]
+    fn node_count_and_interned_path_count_track_tree_size() {
+        let mut alloc = InodeAllocator::new(false);
+        let tree = VirtualTree::build_with(
+            &[(10, "Alice/Song.flac".into()), (20, "Bob/Tune.flac".into())],
+            &mut alloc,
+        );
+        // root + Alice + Alice/Song.flac + Bob + Bob/Tune.flac
+        assert_eq!(tree.node_count(), 5);
+        // interned: "" (root) + the four component paths above
+        assert_eq!(alloc.interned_path_count(), 5);
+    }
+
+    #[test]
     fn inode_of_track_maps_file_nodes() {
         let t = VirtualTree::build(&[(10, "Alice/Song.flac".into()), (20, "Bob/Tune.flac".into())]);
         let alice = t.lookup(VirtualTree::ROOT, "Alice").unwrap();

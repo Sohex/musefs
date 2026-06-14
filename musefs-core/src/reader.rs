@@ -1010,6 +1010,42 @@ mod cache_bound_tests {
         );
     }
 
+    #[test]
+    fn header_cache_counts_entries_weight_hits_and_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mut ids = Vec::new();
+        for name in ["a.flac", "b.flac"] {
+            let path = dir.path().join(name);
+            let (audio_offset, audio_length) = write_flac_local(&path);
+            let meta = std::fs::metadata(&path).unwrap();
+            ids.push(
+                db.upsert_track(&NewTrack {
+                    backing_path: path.to_string_lossy().into_owned(),
+                    format: Format::Flac,
+                    audio_offset,
+                    audio_length,
+                    backing_size: meta.len(),
+                    backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                    backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                })
+                .unwrap(),
+            );
+        }
+        let cache = HeaderCache::new(Mode::Synthesis);
+        for id in &ids {
+            cache.resolve(&db, *id).unwrap(); // miss → build + insert
+            cache.resolve(&db, *id).unwrap(); // hit (content_version unchanged)
+        }
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.raw_hits(), 2);
+        assert_eq!(cache.raw_misses(), 2);
+        assert!(
+            cache.weight_bytes() > 0,
+            "synthesis entries carry inline header bytes"
+        );
+    }
+
     fn entry(content_version: i64, inline_len: usize) -> Arc<ResolvedFile> {
         Arc::new(ResolvedFile {
             layout: RegionLayout::new_unchecked(vec![Segment::Inline(vec![0u8; inline_len])]),
