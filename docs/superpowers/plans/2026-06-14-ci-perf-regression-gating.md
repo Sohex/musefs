@@ -4,7 +4,7 @@
 
 **Goal:** Give musefs CI a regression signal for the read/serve, ingest, and refresh paths without flaky wall-clock gating.
 
-**Architecture:** Three independently-shippable PRs. PR1 is a hard, zero-flake gate of deterministic work *counters* (reusing the existing `metrics` feature — no production code). PR2 adds a warn-only same-runner A/B wall-clock job that runs only when read/synthesis `src` changes. PR3 records a full bench snapshot at release time as an artifact.
+**Delivery:** A **single PR**, landed as a series of commits grouped into three parts. Part 1 is a hard, zero-flake gate of deterministic work *counters* (reusing the existing `metrics` feature — no production code). Part 2 adds a warn-only same-runner A/B wall-clock job that runs only when read/synthesis `src` changes. Part 3 records a full bench snapshot at release time as an artifact. (The spec's "Sequencing" section sketches these as three PRs; per the user they ship as one PR / one commit series. Because the PR touches `musefs-core/src/**`, the Part-2 `perf-ab` job self-validates on this very PR.)
 
 **Tech Stack:** Rust, `cargo test --features metrics`, criterion (`read_throughput` bench), `critcmp`, GitHub Actions, bash.
 
@@ -14,11 +14,11 @@
 
 ## File structure
 
-| File | PR | Responsibility |
-| ---- | -- | -------------- |
+| File | Part | Responsibility |
+| ---- | ---- | -------------- |
 | `musefs-core/tests/perf_counters.rs` | 1 | New `--features metrics` test module: per-format golden read counters + ingest slurp-window counters. |
 | `musefs-core/src/tree.rs` | 1 | One new unit test appended to the existing `#[cfg(test)] mod` asserting `apply_changes` rebuild count is size-invariant. |
-| `CONTRIBUTING.md`, `BENCHMARKS.md` | 1 | Document the counter gate + (PR2) the A/B job. |
+| `CONTRIBUTING.md`, `BENCHMARKS.md` | 1 | Document the counter gate + (Part 2) the A/B job. |
 | `scripts/perf-ab.sh` | 2 | Same-runner base-vs-PR criterion A/B + critcmp; emits a markdown table. |
 | `.github/workflows/ci.yml` | 2 | New `perf` output on the `changes` job; new `perf-ab` job. |
 | `scripts/perf-release-bench.sh` | 3 | Run the full read bench + `ci`-tier ingest/refresh benches, capture output. |
@@ -33,11 +33,12 @@
 
 ---
 
-# PR 1 — Lane 1: deterministic counter gate (no production code)
+# Part 1 — Lane 1: deterministic counter gate (no production code)
 
 Runs in the existing `check` job's "Core metrics-feature tests" step
-(`cargo test -p musefs-core --features metrics`) — no workflow change. Must land
-green (the pre-commit hook runs the full workspace suite).
+(`cargo test -p musefs-core --features metrics`) — no workflow change. Every
+commit must be green (the pre-commit hook runs the full workspace suite, so a red
+commit is rejected).
 
 ### Task 1.1: read-counter module scaffold + sequential-read goldens
 
@@ -479,11 +480,12 @@ git add CONTRIBUTING.md BENCHMARKS.md
 git commit -m "docs: document the perf counter gate + CI gating lanes (#211)"
 ```
 
-PR1 is complete: open it, confirm the `check` job is green.
+Part 1 complete — the counter gate is in place; the metrics-feature `check` leg
+stays green. Continue committing on the same branch.
 
 ---
 
-# PR 2 — Lane 2: same-runner A/B wall-clock (warn-only)
+# Part 2 — Lane 2: same-runner A/B wall-clock (warn-only)
 
 ### Task 2.1: `perf` path-filter output on the `changes` job
 
@@ -654,18 +656,19 @@ Expected: `perf-ab` appears only as its own job — never in the `needs:` list o
 Run: `yamllint .github/workflows/ci.yml`
 Expected: clean.
 
-- [ ] **Step 4: Commit and push the PR; verify behavior on the PR itself**
+- [ ] **Step 4: Commit; the job self-validates on this PR**
 
 ```bash
 git add .github/workflows/ci.yml
 git commit -m "ci: warn-only same-runner read A/B job (#211)"
 ```
 
-Because this PR touches `.github/workflows/` (not `musefs-*/src/`), `perf=false`,
-so `perf-ab` will be **skipped** on its own PR — expected. Validate it by either
-(a) a follow-up trivial `musefs-core/src/` no-op PR, or (b) temporarily widening
-the `perf` filter on a scratch branch. Confirm the comment posts and the job is
-green/non-required.
+Because this single PR also contains the Part 1 `musefs-core/src/**` changes, the
+`changes` job sets `perf=true`, so `perf-ab` **runs on this PR** (GitHub uses the
+PR branch's workflow file for same-repo `pull_request` events). It benches base
+(`main`) vs HEAD — read logic is unchanged, so expect a no-regression table.
+Confirm: the sticky comment posts, and the job is green and **not** a required
+check (does not block merge).
 
 ### Task 2.4: document the A/B job
 
@@ -693,7 +696,7 @@ git commit -m "docs: document the perf-ab warn-only job (#211)"
 
 ---
 
-# PR 3 — Lane 3: release full-bench record
+# Part 3 — Lane 3: release full-bench record
 
 ### Task 3.1: the release bench script
 
@@ -810,12 +813,24 @@ git add BENCHMARKS.md
 git commit -m "docs: point BENCHMARKS.md at the release snapshot artifact (#211)"
 ```
 
+### Finish: open the single PR
+
+- [ ] **Step 1: Verify the whole suite is green (the pre-commit hook already ran it per commit, but confirm the metrics leg explicitly)**
+
+Run: `cargo test -p musefs-core --features metrics && cargo test --workspace`
+Expected: PASS.
+
+- [ ] **Step 2: Open ONE PR for the full commit series**
+
+Run: `gh pr create --base main --title "ci: performance-regression gating for the read path (#211)" --body "<summary of the three lanes; closes #211>"`
+Expected: a single PR containing all Part 1–3 commits. Confirm on the PR that the `check` job (counter gate) is green and the `perf-ab` job ran, posted its comment, and is non-blocking.
+
 ---
 
 ## Self-review notes (resolved during authoring)
 
 - **Spec coverage:** Lane 1 read goldens → 1.1/1.2; ingest slurp guard → 1.3; refresh O(changed) via existing `apply_changes` return (no new counter) → 1.4; fsync==0 explicitly release-only → 3.1 (ci-tier `bench_ingest`) + noted in docs. Lane 2 path filter/job/script/fork-fallback/pin → 2.1–2.4. Lane 3 record-only artifact + ci tier → 3.1–3.3.
-- **No production code in PR1** — every asserted counter already exists; the only `tree.rs` change is an appended test (mutants anchors re-checked in 1.4).
+- **No production code in Part 1** — every asserted counter already exists; the only `tree.rs` change is an appended test (mutants anchors re-checked in 1.4).
 - **Characterization steps** (1.2, 1.3) discover format-specific exact constants via a shown command + a shown edit, not a vague "TODO" — the load-bearing invariants (bounded-seek `< AUDIO_BYTES/4`, slurp `< AUDIO_BYTES*2`) are asserted independently of the frozen numbers.
 - **Pins** (`critcmp` version, sticky-comment commit SHA, `upload-artifact` SHA) are resolved by the explicit commands in 2.3/3.2, honoring the commit-not-tag pin rule.
 
@@ -823,4 +838,4 @@ git commit -m "docs: point BENCHMARKS.md at the release snapshot artifact (#211)
 - **Refresh count is 0, not 1** (probed: `clean_rename small=0 large=0`). Task 1.4 now pins `EXPECTED_REBUILDS = 0` exactly at both sizes — a collision-free single re-tag is handled by remove+insert and rebuilds nothing; the gate trips on any scaling or constant shift. (A `== 1` assertion would have been red at its own commit, which the pre-commit hook rejects.)
 - **`pread_bytes` is per-format** (MP3 prepends sync bytes, M4A wraps audio in `mdat`), so Task 1.1 no longer asserts `pread_bytes == AUDIO_BYTES` for all formats; the exact per-format `seq_pread_bytes` is pinned in Task 1.2's `goldens()`.
 - **No dead code in `perf_counters.rs`**: dropped `mount_one`'s unused `art_bytes` param (the spec's exact-art-chunk golden is already covered relationally by `flac_art_serve_increments_art_chunks` in `metrics.rs`); every helper/const in the new file is used, so `clippy --all-targets -D warnings` stays green.
-- **Verified-OK by the reviewer (no change needed):** all PR1 APIs compile against real signatures; cross-binary metrics global state is per-process (no flake); no PR1 commit boundary is red after the 1.4 fix; PR2/PR3 workflow wiring (`ci-ok` excludes `perf-ab`, `release.yml` tag trigger + `github.ref_name`, fork context expression, `critcmp --list`) is correct.
+- **Verified-OK by the reviewer (no change needed):** all Part 1 APIs compile against real signatures; cross-binary metrics global state is per-process (no flake); no Part 1 commit boundary is red after the 1.4 fix; Part 2/3 workflow wiring (`ci-ok` excludes `perf-ab`, `release.yml` tag trigger + `github.ref_name`, fork context expression, `critcmp --list`) is correct.
