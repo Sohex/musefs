@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64 as Epoch, Ordering as O};
 use std::sync::{Arc, Mutex};
 
 /// Floor window size: a fresh or just-seeked stream still reads this much ahead.
@@ -32,20 +32,20 @@ pub struct ReadAheadPool {
     /// Total RAM envelope; `0` means read-ahead is disabled.
     budget: u64,
     /// Currently charged bytes (sum of registered buffers' lengths).
-    charged: AtomicU64,
+    charged: Epoch,
     /// Active streaming handles keyed by slab key. Only sequential streams register.
     streams: Mutex<HashMap<usize, StreamEntry>>,
     /// Monotonic source for `last_served` stamps (LRU ordering).
-    clock: AtomicU64,
+    clock: Epoch,
 }
 
 impl ReadAheadPool {
     pub fn new(budget: u64) -> Self {
         ReadAheadPool {
             budget,
-            charged: AtomicU64::new(0),
+            charged: Epoch::new(0),
             streams: Mutex::new(HashMap::new()),
-            clock: AtomicU64::new(0),
+            clock: Epoch::new(0),
         }
     }
 
@@ -63,7 +63,7 @@ impl ReadAheadPool {
 
     /// Lazily register a handle's buffer once sequential access is detected.
     pub fn register(&self, key: usize, buf: Arc<Mutex<ReadAhead>>) {
-        let last_served = self.clock.fetch_add(1, Ordering::Relaxed);
+        let last_served = self.clock.fetch_add(1, O::Relaxed);
         self.streams
             .lock()
             .unwrap()
@@ -80,13 +80,13 @@ impl ReadAheadPool {
             }
         };
         if freed > 0 {
-            self.charged.fetch_sub(freed, Ordering::Relaxed);
+            self.charged.fetch_sub(freed, O::Relaxed);
         }
     }
 
     /// Mark `key` as most-recently-served (LRU bump). No-op if unregistered.
     pub fn touch(&self, key: usize) {
-        let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
+        let stamp = self.clock.fetch_add(1, O::Relaxed);
         if let Some(e) = self.streams.lock().unwrap().get_mut(&key) {
             e.last_served = stamp;
         }
@@ -104,7 +104,7 @@ impl ReadAheadPool {
         let desired = desired.min(self.per_stream_cap()).max(old_len);
         let need = desired - old_len;
         loop {
-            let cur = self.charged.load(Ordering::Relaxed);
+            let cur = self.charged.load(O::Relaxed);
             let room = self.budget.saturating_sub(cur);
             if room >= need {
                 return desired;
@@ -124,16 +124,16 @@ impl ReadAheadPool {
     /// Keeps the invariant `charged == Σ(registered buffers' bytes.len())`.
     pub fn reconcile(&self, old_len: u64, new_len: u64) {
         if new_len > old_len {
-            self.charged.fetch_add(new_len - old_len, Ordering::Relaxed);
+            self.charged.fetch_add(new_len - old_len, O::Relaxed);
         } else if new_len < old_len {
-            self.charged.fetch_sub(old_len - new_len, Ordering::Relaxed);
+            self.charged.fetch_sub(old_len - new_len, O::Relaxed);
         }
     }
 
     /// Uncharge `bytes` directly (window cleared on invalidation/release).
     pub fn uncharge(&self, bytes: u64) {
         if bytes > 0 {
-            self.charged.fetch_sub(bytes, Ordering::Relaxed);
+            self.charged.fetch_sub(bytes, O::Relaxed);
         }
     }
 
@@ -155,7 +155,7 @@ impl ReadAheadPool {
             if let Ok(mut ra) = buf.try_lock() {
                 let freed = ra.clear();
                 if freed > 0 {
-                    self.charged.fetch_sub(freed, Ordering::Relaxed);
+                    self.charged.fetch_sub(freed, O::Relaxed);
                     return Some(freed);
                 }
             }
@@ -164,53 +164,47 @@ impl ReadAheadPool {
     }
 }
 
-/// A single contiguous read-ahead window over a backing file, keyed by absolute
-/// backing-file offset. NOT thread-safe; the caller wraps it in a `Mutex` (one
-/// per open handle). Caches raw backing bytes only — never synthesized output —
-/// so it is immune to retag and orthogonal to the DB snapshot path.
-pub struct ReadAhead {
-    /// Absolute backing offset of `bytes[0]`. Meaningless when `bytes` is empty.
-    win_start: u64,
-    /// Buffered raw backing bytes covering `[win_start, win_start + bytes.len())`.
+struct Window {
+    start: u64,
     bytes: Vec<u8>,
-    /// Backing offset just past the last served read — the sequential predictor.
-    /// `u64::MAX` until the first read, so the first read is always a (seek) miss.
+}
+
+pub struct ReadAhead {
+    windows: Vec<Window>,
     next_expected: u64,
-    /// Current target window size; grows geometrically on a sequential miss,
-    /// resets to the floor on a seek. Bounded by `cap`.
     window: u64,
-    /// Per-stream window cap (set from the budget: `min(WINDOW_ABS_CAP, budget/N)`).
     cap: u64,
+    max_windows: usize,
 }
 
 impl ReadAhead {
     pub fn new(cap: u64) -> Self {
         ReadAhead {
-            win_start: 0,
-            bytes: Vec::new(),
+            windows: Vec::new(),
             next_expected: u64::MAX,
             window: WINDOW_FLOOR,
             cap,
+            max_windows: 1,
         }
     }
-
-    /// Bytes currently held (charged against the global budget).
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> u64 {
-        self.bytes.len() as u64
+    pub fn set_max_windows(&mut self, n: usize) {
+        self.max_windows = n.max(1);
+    }
+    pub fn next_expected(&self) -> u64 {
+        self.next_expected
     }
 
-    /// Drop the buffered bytes (eviction / invalidation). Returns bytes freed.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> u64 {
+        self.windows.iter().map(|w| w.bytes.len() as u64).sum()
+    }
     pub fn clear(&mut self) -> u64 {
-        let freed = self.bytes.len() as u64;
-        self.bytes = Vec::new();
+        let freed = self.len();
+        self.windows.clear();
         self.window = WINDOW_FLOOR.min(self.cap);
         self.next_expected = u64::MAX;
         freed
     }
-
-    /// Update the per-stream cap (when the budget share changes). No floor — see
-    /// `new`: a sub-floor cap must shrink the window, not be silently raised.
     pub fn set_cap(&mut self, cap: u64) {
         self.cap = cap;
         if self.window > self.cap {
@@ -218,21 +212,46 @@ impl ReadAhead {
         }
     }
 
-    fn covers(&self, off: u64, len: usize) -> bool {
+    pub fn covers(&self, off: u64, len: usize) -> bool {
         let end = off.saturating_add(len as u64);
-        !self.bytes.is_empty()
-            && off >= self.win_start
-            && end <= self.win_start + self.bytes.len() as u64
+        self.windows
+            .iter()
+            .any(|w| off >= w.start && end <= w.start + w.bytes.len() as u64)
     }
 
-    /// Serve `[off, off+dst.len())` into `dst`. On a hit, memcpy from the window.
-    /// On a miss, `fill(window_buf, start)` does ONE positioned read of up to
-    /// `window` bytes (clamped to `backing_len`) starting at `off`. `backing_len`
-    /// is the backing file size; the caller guarantees `off+dst.len() <=
-    /// backing_len` (the splice loop already clamps the request).
-    ///
-    /// Returns `(old_len, new_len)` of `self.bytes` so the caller can reconcile
-    /// the global budget. A hit returns `(n, n)` (no change).
+    fn window_containing(&self, off: u64, len: usize) -> Option<&Window> {
+        let end = off.saturating_add(len as u64);
+        self.windows
+            .iter()
+            .find(|w| off >= w.start && end <= w.start + w.bytes.len() as u64)
+    }
+
+    fn insert_window(&mut self, w: Window) {
+        if let Some(slot) = self.windows.iter_mut().find(|x| x.start == w.start) {
+            *slot = w;
+        } else {
+            self.windows.push(w);
+        }
+        self.windows.sort_by_key(|x| x.start);
+        while self.windows.len() > self.max_windows {
+            let frontier = self.next_expected;
+            let idx = self
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| w.start + w.bytes.len() as u64 <= frontier)
+                .min_by_key(|(_, w)| w.start)
+                .map_or(0, |(i, _)| i);
+            self.windows.remove(idx);
+        }
+    }
+
+    pub fn store_window(&mut self, start: u64, bytes: Vec<u8>) -> (u64, u64) {
+        let old = self.len();
+        self.insert_window(Window { start, bytes });
+        (old, self.len())
+    }
+
     pub fn read_into(
         &mut self,
         dst: &mut [u8],
@@ -242,17 +261,18 @@ impl ReadAhead {
     ) -> io::Result<(u64, u64)> {
         let len = dst.len();
         if len == 0 {
-            return Ok((self.bytes.len() as u64, self.bytes.len() as u64));
-        }
-        if self.covers(off, len) {
-            #[expect(clippy::cast_possible_truncation)]
-            let lo = (off - self.win_start) as usize;
-            dst.copy_from_slice(&self.bytes[lo..lo + len]);
-            self.next_expected = off + len as u64;
-            let n = self.bytes.len() as u64;
+            let n = self.len();
             return Ok((n, n));
         }
-        let old_len = self.bytes.len() as u64;
+        if let Some(w) = self.window_containing(off, len) {
+            #[expect(clippy::cast_possible_truncation)]
+            let lo = (off - w.start) as usize;
+            dst.copy_from_slice(&w.bytes[lo..lo + len]);
+            self.next_expected = off + len as u64;
+            let n = self.len();
+            return Ok((n, n));
+        }
+        let old = self.len();
         if off == self.next_expected {
             self.window = self.window.saturating_mul(2).min(self.cap);
         } else {
@@ -268,11 +288,28 @@ impl ReadAhead {
         let mut buf = vec![0u8; want as usize];
         fill(&mut buf, off)?;
         dst.copy_from_slice(&buf[..len]);
-        self.win_start = off;
-        self.bytes = buf;
+        self.insert_window(Window {
+            start: off,
+            bytes: buf,
+        });
         self.next_expected = off + len as u64;
-        Ok((old_len, self.bytes.len() as u64))
+        Ok((old, self.len()))
     }
+}
+
+pub fn try_store_prefetch(
+    buf: &Arc<Mutex<ReadAhead>>,
+    epoch: &Epoch,
+    dispatched_epoch: u64,
+    start: u64,
+    bytes: Vec<u8>,
+) -> bool {
+    let mut ra = buf.lock().unwrap();
+    if epoch.load(O::Acquire) != dispatched_epoch {
+        return false;
+    }
+    ra.store_window(start, bytes);
+    true
 }
 
 use std::cell::Cell;
@@ -603,5 +640,92 @@ mod eviction_tests {
                 assert_eq!(a, b, "read-ahead byte mismatch at {off}+{len}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    #[test]
+    fn default_ring_holds_one_window_like_phase1() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        let data = (0..2 * 1024 * 1024u64)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>();
+        let blen = data.len() as u64;
+        let mut dst = vec![0u8; 4096];
+        ra.read_into(&mut dst, 0, blen, |b, o| {
+            #[expect(clippy::cast_possible_truncation)]
+            let o = o as usize;
+            b.copy_from_slice(&data[o..][..b.len()]);
+            Ok(())
+        })
+        .unwrap();
+        ra.read_into(&mut dst, 1_000_000, blen, |b, o| {
+            #[expect(clippy::cast_possible_truncation)]
+            let o = o as usize;
+            b.copy_from_slice(&data[o..][..b.len()]);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            !ra.covers(0, 4096),
+            "single-window ring evicts the old window"
+        );
+        assert!(ra.covers(1_000_000, 4096));
+    }
+
+    #[test]
+    fn ring_of_two_keeps_current_and_prefetched_window() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.set_max_windows(2);
+        ra.store_window(1024 * 1024, vec![9u8; 512 * 1024]);
+        let mut dst = vec![0u8; 4096];
+        ra.read_into(&mut dst, 0, 4 * 1024 * 1024, |b, _| {
+            b.fill(1u8);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ra.covers(0, 4096), "current window present");
+        assert!(
+            ra.covers(1024 * 1024, 4096),
+            "prefetched window NOT clobbered"
+        );
+    }
+
+    #[test]
+    fn len_sums_all_windows_and_clear_drops_all() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.set_max_windows(3);
+        ra.store_window(0, vec![0u8; 100]);
+        ra.store_window(1000, vec![0u8; 200]);
+        assert_eq!(ra.len(), 300);
+        assert_eq!(ra.clear(), 300);
+        assert_eq!(ra.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod prefetch_store_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn store_with_stale_epoch_is_discarded() {
+        let ra = Arc::new(Mutex::new(ReadAhead::new(WINDOW_ABS_CAP)));
+        let epoch = AtomicU64::new(0);
+        epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(!try_store_prefetch(&ra, &epoch, 0, 0, vec![1, 2, 3]));
+        assert_eq!(ra.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn store_with_current_epoch_is_accepted() {
+        let ra = Arc::new(Mutex::new(ReadAhead::new(WINDOW_ABS_CAP)));
+        ra.lock().unwrap().set_max_windows(2);
+        let epoch = AtomicU64::new(5);
+        assert!(try_store_prefetch(&ra, &epoch, 5, 1000, vec![0u8; 4096]));
+        assert!(ra.lock().unwrap().covers(1000, 4096));
     }
 }
