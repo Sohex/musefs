@@ -139,9 +139,16 @@ impl ReadAheadPool {
         self.budget > 0 && self.budget.saturating_sub(self.charged.load(O::Relaxed)) >= need
     }
 
-    #[cfg(test)]
-    pub fn charged_for_test(&self) -> u64 {
+    /// Bytes currently held across all registered read-ahead buffers (telemetry
+    /// `musefs_readahead_charged_bytes`; #394).
+    pub fn charged(&self) -> u64 {
         self.charged.load(O::Relaxed)
+    }
+
+    /// Total read-ahead RAM envelope; `0` when read-ahead is disabled (telemetry
+    /// `musefs_readahead_budget_bytes`; #394).
+    pub fn budget(&self) -> u64 {
+        self.budget
     }
 
     /// Find and clear the coldest registered buffer other than `except`, using
@@ -954,7 +961,14 @@ mod prefetch_store_tests {
         ));
         assert!(ra.lock().unwrap().covers(1000, 4096));
         // The stored window is charged against the global budget.
-        assert_eq!(pool.charged_for_test(), 4096);
+        assert_eq!(pool.charged(), 4096);
+    }
+
+    #[test]
+    fn pool_reports_its_budget() {
+        assert_eq!(ReadAheadPool::new(64 * 1024).budget(), 64 * 1024);
+        assert_eq!(ReadAheadPool::new(0).budget(), 0);
+        assert_eq!(ReadAheadPool::new(0).charged(), 0);
     }
 
     /// Regression: a prefetched window must charge the budget so that the
@@ -989,9 +1003,9 @@ mod prefetch_store_tests {
             cap,
             vec![2u8; cap as usize]
         ));
-        assert_eq!(pool.charged_for_test(), 2 * cap);
+        assert_eq!(pool.charged(), 2 * cap);
         pool.deregister(1);
-        assert_eq!(pool.charged_for_test(), 0, "release must not underflow");
+        assert_eq!(pool.charged(), 0, "release must not underflow");
         // A fresh stream still gets its full grant — read-ahead is not disabled.
         let hot = Arc::new(Mutex::new(ReadAhead::new(cap)));
         pool.register(2, Arc::clone(&hot));
@@ -1329,11 +1343,11 @@ mod mutation_guard_tests {
     fn reconcile_charges_growth_and_uncharges_shrink() {
         let pool = ReadAheadPool::new(64 << 20);
         pool.reconcile(0, 1000);
-        assert_eq!(pool.charged_for_test(), 1000);
+        assert_eq!(pool.charged(), 1000);
         pool.reconcile(1000, 250); // shrink must uncharge by old-new
-        assert_eq!(pool.charged_for_test(), 250);
+        assert_eq!(pool.charged(), 250);
         pool.reconcile(250, 250); // equal: no change
-        assert_eq!(pool.charged_for_test(), 250);
+        assert_eq!(pool.charged(), 250);
     }
 
     #[test]

@@ -125,6 +125,10 @@ fn metrics_surface_e2e() {
             text.contains("musefs_reads_inflight_max 1024"),
             "metrics must contain musefs_reads_inflight_max 1024"
         );
+        assert!(
+            text.contains("musefs_readahead_budget_bytes 67108864"),
+            "metrics must report the read-ahead budget (64 MiB) from MountConfig"
+        );
     }
 
     // --- Assertion 2: open a track, hold it, metrics shows handles_open >= 1 ---

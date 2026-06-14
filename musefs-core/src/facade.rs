@@ -1347,7 +1347,7 @@ impl Musefs {
     /// Test accessor: bytes currently charged against the read-ahead budget.
     #[cfg(test)]
     pub(crate) fn pool_charged(&self) -> u64 {
-        self.readahead_pool.charged_for_test()
+        self.readahead_pool.charged()
     }
 
     /// The backing fd behind `fh`, for kernel passthrough registration. `Some`
@@ -1385,6 +1385,8 @@ impl Musefs {
             cache_header_hits: self.cache.raw_hits(),
             cache_header_misses: self.cache.raw_misses(),
             cache_size_entries: self.size_cache.len() as u64,
+            readahead_budget_bytes: self.readahead_pool.budget(),
+            readahead_charged_bytes: self.readahead_pool.charged(),
             tree_nodes,
             inode_paths,
             refresh_generation: self.refresh_gen.load(Ordering::Acquire),

@@ -17,6 +17,8 @@ pub struct CoreTelemetry {
     pub cache_header_hits: u64,
     pub cache_header_misses: u64,
     pub cache_size_entries: u64,
+    pub readahead_budget_bytes: u64,
+    pub readahead_charged_bytes: u64,
     pub tree_nodes: u64,
     pub inode_paths: u64,
     pub refresh_generation: u64,
@@ -175,6 +177,19 @@ pub fn render_prometheus(
 
     gauge(
         &mut out,
+        "musefs_readahead_budget_bytes",
+        "Backing read-ahead RAM budget (0 when read-ahead is off).",
+        core.readahead_budget_bytes,
+    );
+    gauge(
+        &mut out,
+        "musefs_readahead_charged_bytes",
+        "Bytes currently held across all read-ahead buffers.",
+        core.readahead_charged_bytes,
+    );
+
+    gauge(
+        &mut out,
         "musefs_tree_nodes",
         "Live virtual-tree inodes.",
         core.tree_nodes,
@@ -302,6 +317,18 @@ pub fn render_prometheus(
             "Scan-path bytes read.",
             s.scan_bytes_read,
         );
+        counter(
+            &mut out,
+            "musefs_readahead_hits_total",
+            "Reads served wholly from a read-ahead buffer (no backing pread).",
+            s.readahead_hits,
+        );
+        counter(
+            &mut out,
+            "musefs_readahead_misses_total",
+            "Reads that missed the read-ahead buffer and hit the backing file.",
+            s.readahead_misses,
+        );
     }
 
     out.push('\n');
@@ -321,6 +348,8 @@ mod tests {
             cache_header_hits: 100,
             cache_header_misses: 5,
             cache_size_entries: 9,
+            readahead_budget_bytes: 67_108_864,
+            readahead_charged_bytes: 8192,
             tree_nodes: 42,
             inode_paths: 50,
             refresh_generation: 2,
@@ -353,6 +382,8 @@ mod tests {
         assert!(out.contains("musefs_reads_inflight 1\n"));
         assert!(out.contains("musefs_reads_inflight_max 1024\n"));
         assert!(out.contains("musefs_pool_queued 0\n"));
+        assert!(out.contains("musefs_readahead_budget_bytes 67108864\n"));
+        assert!(out.contains("musefs_readahead_charged_bytes 8192\n"));
         assert!(out.contains("musefs_tree_nodes 42\n"));
         // counter type for hit/miss
         assert!(out.contains(
@@ -397,6 +428,8 @@ mod tests {
         let s = crate::metrics::Snapshot {
             opens: 11,
             preads: 22,
+            readahead_hits: 33,
+            readahead_misses: 44,
             ..crate::metrics::Snapshot::default()
         };
         let out = render_prometheus(&sample_core(), &sample_fuse(), None, Some(&s));
@@ -404,6 +437,10 @@ mod tests {
             "# TYPE musefs_backing_opens_total counter\nmusefs_backing_opens_total 11\n"
         ));
         assert!(out.contains("musefs_backing_preads_total 22\n"));
+        assert!(out.contains(
+            "# TYPE musefs_readahead_hits_total counter\nmusefs_readahead_hits_total 33\n"
+        ));
+        assert!(out.contains("musefs_readahead_misses_total 44\n"));
     }
 
     #[test]
