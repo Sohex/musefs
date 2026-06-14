@@ -40,6 +40,16 @@ MUSEFS_DB=/home/youruser/.local/share/musefs/library.db
 #MUSEFS_ATTR_TTL_MS=1000
 # Kernel read-ahead window (KiB); clamped to the kernel maximum at mount.
 #MUSEFS_MAX_READAHEAD_KIB=512
+# Backing read-ahead RAM budget (MiB), shared across all active streams. This is
+# the single most effective tuning for slow/high-latency backing (NFS, remote):
+# one large backing read lets the client pipeline its RPCs and hide latency
+# (~5-6x single-stream over a 200 ms-RTT NFS mount). Neutral on local disk.
+# 0 disables read-ahead. Default: 64.
+#MUSEFS_READ_AHEAD_BUDGET_MIB=64
+# Enable Phase-2 background prefetch threads (advanced). Off by default: read
+# amplification alone carries the read-ahead win, and the threads add overhead
+# without benefit on tested backends (NFS, SSD). Default: false.
+#MUSEFS_READ_AHEAD_PREFETCH=false
 # Max outstanding background (readahead/async) requests the kernel queues.
 #MUSEFS_MAX_BACKGROUND=64
 # Keep the kernel page cache across opens.
