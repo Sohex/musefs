@@ -110,6 +110,13 @@ cargo install --git https://github.com/Sohex/musefs musefs
 
 The same `fuse3` runtime requirement as the prebuilt binaries applies.
 
+The binary uses **jemalloc** as its global allocator by default (it bounds
+resident memory for the long-lived mount daemon under heavy concurrent reads).
+Distribution packagers or anyone debugging memory with valgrind/heaptrack can
+build against the system allocator instead with
+`cargo build -p musefs --no-default-features` (or `cargo install musefs
+--no-default-features`).
+
 ### Container images
 
 Each tagged release also publishes multi-arch images to the GitHub Container

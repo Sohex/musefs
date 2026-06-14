@@ -80,6 +80,11 @@ cargo clippy --all-targets               # lint (policy: see below)
 cargo fmt                                # format
 ```
 
+The `musefs` binary enables the default-on `jemalloc` feature (jemalloc global
+allocator + background purge thread). Build the system-allocator variant with
+`cargo build -p musefs --no-default-features` — used for the RSS comparison
+(`scripts/rss-churn-bench.sh`) and by packagers that forbid vendored C libs.
+
 The FUSE end-to-end tests perform real mounts and are `#[ignore]`d:
 
 ```bash
@@ -576,6 +581,19 @@ and is the source of truth; this checklist is the human side.
    `ci-ok` and `coverage-ok` to be green on the tagged commit** before anything
    builds or publishes — a red tree blocks the release automatically.
 3. `CARGO_REGISTRY_TOKEN` is present in repo secrets.
+4. Smoke-build every cross target so `jemalloc-sys` is known to compile under
+   zig before tagging (the release matrix builds with the `jemalloc` feature on):
+
+   ```bash
+   for t in x86_64-unknown-linux-gnu.2.17 aarch64-unknown-linux-gnu.2.17 \
+            x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+     cargo zigbuild --release -p musefs --target "$t"
+   done
+   ```
+
+   If a target cannot build `jemalloc-sys`, add `--no-default-features` to that
+   matrix entry in `release.yml` **and** its matching Docker image, rather than
+   blocking the release.
 
 **Version bump (do this in one commit before tagging).**
 
