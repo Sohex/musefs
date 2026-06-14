@@ -64,6 +64,13 @@ run_variant() {
     sleep 0.1
   done
   trap 'kill "${mpid:-}" 2>/dev/null; kill "${pids[@]:-}" 2>/dev/null; [ -n "${rpid:-}" ] && kill "$rpid" 2>/dev/null; fusermount3 -u "$MOUNT" 2>/dev/null; rm -f "${stop:-}"' EXIT INT TERM
+  # Confirm the mount actually came up: a failed mount would leave $MOUNT as a
+  # plain host dir, so find/cat below would silently churn host files instead of
+  # the synthesized FS and the RSS numbers would be garbage.
+  if ! mountpoint -q "$MOUNT"; then
+    echo "mount did not come up at $MOUNT" >&2
+    return 1
+  fi
   local targets=()
   mapfile -t targets < <(find "$MOUNT" -type f | head -n "$FILES")
   if [ "${#targets[@]}" -eq 0 ]; then
