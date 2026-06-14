@@ -26,7 +26,7 @@ tempfile = "3"
 rustix = { version = "1", features = ["fs"] }
 metaflac = "0.2"
 musefs-db = { path = "../musefs-db" }
-musefs-format = { path = "../musefs-format" }
+musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
 ogg = "0.9"
 sha2 = "0.11"
 memmap2 = "0.9"

@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use musefs_core::{MountConfig, Musefs, scan_directory};
+use musefs_core::{Musefs, scan_directory};
 use sha2::{Digest, Sha256};
+
+mod common;
+use common::{config, walk_tree};
 
 #[derive(Clone, Copy)]
 struct PlaybackCase {
@@ -13,20 +15,6 @@ struct PlaybackCase {
     artist: &'static str,
     freq: u32,
     codec_args: &'static [&'static str],
-}
-
-fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: musefs_core::Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-    }
 }
 
 fn playback_cases() -> Vec<PlaybackCase> {
@@ -157,21 +145,6 @@ fn mounted_path(mountpoint: &Path, case: PlaybackCase) -> PathBuf {
     mountpoint
         .join(case.artist)
         .join(format!("{}.{}", case.title, case.served_ext))
-}
-
-fn walk_tree(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                out.extend(walk_tree(&p));
-            } else {
-                out.push(p);
-            }
-        }
-    }
-    out
 }
 
 #[test]

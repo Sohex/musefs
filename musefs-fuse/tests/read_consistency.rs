@@ -5,72 +5,17 @@
 //! fidelity, and that every mutating op is refused on the read-only mount.
 //! See docs/superpowers/specs/2026-06-10-mount-read-consistency-design.md.
 
-use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use base64::Engine as _;
-use musefs_core::{MountConfig, Musefs, scan_directory};
+use musefs_core::{Musefs, scan_directory};
 
-// --- minimal proven FLAC fixture (mirrors musefs-fuse/tests/mount.rs) ---
-
-fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.push((if is_last { 0x80 } else { 0 }) | (block_type & 0x7F));
-    let len = body.len();
-    out.push(u8::try_from((len >> 16) & 0xFF).unwrap());
-    out.push(u8::try_from((len >> 8) & 0xFF).unwrap());
-    out.push(u8::try_from(len & 0xFF).unwrap());
-    out.extend_from_slice(body);
-    out
-}
-
-fn streaminfo_body() -> Vec<u8> {
-    let mut b = vec![
-        0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0xC4, 0x42, 0xF0, 0x00,
-        0x00, 0x00, 0x00,
-    ];
-    b.extend_from_slice(&[0u8; 16]);
-    b
-}
-
-fn vorbis_comment_body(vendor: &str, comments: &[&str]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&u32::try_from(vendor.len()).unwrap().to_le_bytes());
-    out.extend_from_slice(vendor.as_bytes());
-    out.extend_from_slice(&u32::try_from(comments.len()).unwrap().to_le_bytes());
-    for c in comments {
-        out.extend_from_slice(&u32::try_from(c.len()).unwrap().to_le_bytes());
-        out.extend_from_slice(c.as_bytes());
-    }
-    out
-}
-
-fn make_flac(comments: &[&str], audio: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"fLaC");
-    out.extend_from_slice(&flac_block(0, &streaminfo_body(), false));
-    out.extend_from_slice(&flac_block(4, &vorbis_comment_body("orig", comments), true));
-    out.extend_from_slice(audio);
-    out
-}
-
-fn config() -> MountConfig {
-    MountConfig {
-        template: "$artist/$title".to_string(),
-        fallbacks: BTreeMap::new(),
-        default_fallback: "Unknown".to_string(),
-        mode: musefs_core::Mode::Synthesis,
-        poll_interval: std::time::Duration::ZERO,
-        case_insensitive: false,
-        read_ahead_budget: 64 * 1024 * 1024,
-        read_ahead_prefetch: false,
-        skip_on_missing: false,
-    }
-}
+mod common;
+use common::{COVER_PNG, config, flac_picture_block, make_flac, walk_tree};
 
 /// A deterministic backing-audio payload of `n` bytes. Distinct per-offset
 /// values make any splice/offset mismatch visible in the oracle compare.
@@ -551,37 +496,6 @@ fn sweep_cases() -> &'static [SweepCase] {
     ]
 }
 
-/// A valid 4x4 PNG cover image. ffmpeg 8's PNG decoder rejects malformed chunks,
-/// so this must be a real, decodable image.
-const COVER_PNG: &[u8] = &[
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x02, 0x00, 0x00, 0x00, 0x26, 0x93, 0x09,
-    0x29, 0x00, 0x00, 0x00, 0x09, 0x70, 0x48, 0x59, 0x73, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-    0x01, 0x00, 0x4F, 0x25, 0xC4, 0xD6, 0x00, 0x00, 0x00, 0x14, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C,
-    0x63, 0x64, 0x60, 0xF8, 0xC7, 0x00, 0x03, 0x2C, 0x0C, 0x48, 0x00, 0x37, 0x07, 0x00, 0x32, 0x3E,
-    0x01, 0x0C, 0x1C, 0xDB, 0xAF, 0x41, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
-    0x60, 0x82,
-];
-
-/// Build a FLAC METADATA PICTURE block body (the same structure used verbatim in a
-/// FLAC `PICTURE` block and, base64-encoded, in a Vorbis `METADATA_BLOCK_PICTURE`
-/// tag): picture type, MIME, description, dimensions, then the image. Big-endian.
-fn flac_picture_block(png: &[u8]) -> Vec<u8> {
-    let mime: &[u8] = b"image/png";
-    let mut out = Vec::new();
-    out.extend_from_slice(&3u32.to_be_bytes()); // type: front cover
-    out.extend_from_slice(&u32::try_from(mime.len()).unwrap().to_be_bytes());
-    out.extend_from_slice(mime);
-    out.extend_from_slice(&0u32.to_be_bytes()); // description length (empty)
-    out.extend_from_slice(&4u32.to_be_bytes()); // width
-    out.extend_from_slice(&4u32.to_be_bytes()); // height
-    out.extend_from_slice(&24u32.to_be_bytes()); // color depth
-    out.extend_from_slice(&0u32.to_be_bytes()); // colors used (0 = non-indexed)
-    out.extend_from_slice(&u32::try_from(png.len()).unwrap().to_be_bytes());
-    out.extend_from_slice(png);
-    out
-}
-
 /// Number of embedded pictures in `path`, via musefs's own readers, for the
 /// formats whose art the sweep verifies (FLAC and the Ogg family). `None` for
 /// formats without a reader used here (mp3/m4a/wav).
@@ -641,22 +555,6 @@ fn make_sweep_fixture(dir: &Path, case: &SweepCase) -> bool {
 
     cmd.arg(&out).stdout(Stdio::null()).stderr(Stdio::null());
     cmd.status().is_ok_and(|s| s.success()) && out.exists()
-}
-
-/// All regular files under `dir`, recursively.
-fn walk_tree(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                out.extend(walk_tree(&p));
-            } else {
-                out.push(p);
-            }
-        }
-    }
-    out
 }
 
 #[test]
