@@ -76,3 +76,39 @@ def test_merge_preserves_binary_tags(db_path):
         assert text_tags(conn, tid)["comment"] == ["text"]
     finally:
         conn.close()
+
+
+def test_merge_replaces_case_variant_scan_key(db_path):
+    """A scan seeds an unmapped Vorbis key in the file's native (upper) case;
+    the plugin's lowercase canonical key must replace it, not coexist (#407)."""
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, "/m/e.flac")
+        # Scanner-seeded row, native FLAC Vorbis case (uppercase).
+        replace_tags(conn, tid, [("LABEL", "New Friends")])
+        # Plugin sync writes the canonical lowercase key for the same field.
+        merge_tags(conn, tid, [("label", "New Friends")], delete_keys=[])
+        conn.commit()
+        rows = conn.execute(
+            "SELECT key, value FROM tags WHERE track_id=? AND value_blob IS NULL", (tid,)
+        ).fetchall()
+        # Exactly one row survives (no LABEL/label duplicate that renders twice).
+        assert rows == [("label", "New Friends")]
+    finally:
+        conn.close()
+
+
+def test_merge_delete_keys_clears_case_variant(db_path):
+    """delete_keys must also clear a scan-seeded case variant of the named key."""
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, "/m/f.flac")
+        replace_tags(conn, tid, [("LABEL", "Old")])
+        merge_tags(conn, tid, [], delete_keys=["label"])
+        conn.commit()
+        rows = conn.execute(
+            "SELECT key FROM tags WHERE track_id=? AND value_blob IS NULL", (tid,)
+        ).fetchall()
+        assert rows == []
+    finally:
+        conn.close()

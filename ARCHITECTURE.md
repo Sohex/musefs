@@ -251,7 +251,11 @@ out of band (the beets plugin uses a beets flexattr; the store is not the
 place for plugin state). musefs renders tags outside its native VOCAB
 (`musefs-format/src/tagmap.rs`) by passthrough (Vorbis uppercased, mp3
 `TXXX`, mp4 freeform), so such tags appear but are not guaranteed
-byte-identical to a given tagger's own per-format encoding.
+byte-identical to a given tagger's own per-format encoding. A merge matches
+the keys it manages **case-insensitively**, so a writer's canonical
+(lowercase) key replaces a scan-seeded row stored under the backing file's
+native case (e.g. Vorbis `LABEL`) instead of coexisting with it — Vorbis keys
+render case-insensitively, so two such rows would otherwise duplicate.
 
 **Path layout offload.** External tools can also offload path layout
 entirely: a plugin evaluates its own (arbitrarily complex) path logic, writes
