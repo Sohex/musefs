@@ -208,8 +208,19 @@ const MIGRATIONS: &[&str] = &[MIGRATION_V1];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let latest = i64::try_from(MIGRATIONS.len()).expect("MIGRATIONS count must fit i64");
+    let current = conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))?;
+    // A store at a user_version past anything this binary knows about was written
+    // by a newer (or third-party) tool that bumped the schema. Refuse it loudly
+    // rather than treating it as already-migrated and silently misreading the
+    // external-writer contract.
+    if current > latest {
+        return Err(crate::error::DbError::StoreTooNew {
+            found: current,
+            supported: latest,
+        });
+    }
     // Fast path: already at the latest version, no transaction needed.
-    if conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))? >= latest {
+    if current >= latest {
         return Ok(());
     }
     // Use an IMMEDIATE transaction so the write lock is acquired up front. The

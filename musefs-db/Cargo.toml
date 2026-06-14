@@ -25,6 +25,9 @@ mutants = []
 fuzzing = []
 
 [dev-dependencies]
+# Used to plant a future `user_version` on a file-backed store, exercising the
+# "store is newer than this binary" guard the public API cannot otherwise reach.
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 
 [lints]
