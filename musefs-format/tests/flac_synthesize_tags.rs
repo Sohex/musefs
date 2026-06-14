@@ -2,21 +2,13 @@ mod common;
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use common::{make_flac, resolve_layout, streaminfo_body, vorbis_comment_body};
+use common::{flac_fixture, resolve_layout};
 use musefs_format::flac::{locate_audio, synthesize_layout};
 use musefs_format::{Segment, TagInput};
 
-fn fixture() -> (Vec<u8>, Vec<u8>) {
-    let si = streaminfo_body();
-    let vc = vorbis_comment_body("oldvendor", &["TITLE=Old"]);
-    let audio = vec![0xAB; 64];
-    let file = make_flac(&[(0, si), (4, vc)], &audio);
-    (file, audio)
-}
-
 #[test]
 fn measured_lengths_match_assembled_bytes() {
-    let (file, audio) = fixture();
+    let (file, audio) = flac_fixture(0xAB, 64);
     let scan = locate_audio(&file).unwrap();
 
     let tags = vec![
@@ -47,7 +39,7 @@ fn measured_lengths_match_assembled_bytes() {
 
 #[test]
 fn metaflac_reads_synthesized_vorbis_comments_and_preserves_streaminfo() {
-    let (file, _audio) = fixture();
+    let (file, _audio) = flac_fixture(0xAB, 64);
     let scan = locate_audio(&file).unwrap();
 
     let tags = vec![
@@ -85,7 +77,7 @@ fn metaflac_reads_synthesized_vorbis_comments_and_preserves_streaminfo() {
 
 #[test]
 fn vorbis_comment_block_is_the_last_metadata_block_when_no_art() {
-    let (file, _audio) = fixture();
+    let (file, _audio) = flac_fixture(0xAB, 64);
     let scan = locate_audio(&file).unwrap();
     let layout = synthesize_layout(
         &scan.preserved,

@@ -1,36 +1,12 @@
+mod common;
+
+use std::collections::HashMap;
 use std::io::Cursor;
 
+use common::{fmt_pcm_16bit_mono, resolve_layout};
 use id3::TagLike;
 use musefs_format::wav::{WavScan, synthesize_layout};
-use musefs_format::{ArtInput, BlobLen, PictureType, RegionLayout, Segment, TagInput};
-
-fn fmt_pcm_16bit_mono() -> Vec<u8> {
-    let mut f = Vec::new();
-    f.extend_from_slice(&1u16.to_le_bytes());
-    f.extend_from_slice(&1u16.to_le_bytes());
-    f.extend_from_slice(&44_100u32.to_le_bytes());
-    f.extend_from_slice(&88_200u32.to_le_bytes());
-    f.extend_from_slice(&2u16.to_le_bytes());
-    f.extend_from_slice(&16u16.to_le_bytes());
-    f
-}
-
-/// Flatten a layout, substituting `audio` for the backing-audio segment and the
-/// matching bytes for each `ArtImage` segment.
-fn assemble(layout: &RegionLayout, audio: &[u8], arts: &[(i64, &[u8])]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for seg in layout.segments() {
-        match seg {
-            Segment::Inline(b) => out.extend_from_slice(b),
-            Segment::BackingAudio { .. } => out.extend_from_slice(audio),
-            Segment::ArtImage { art_id, .. } => {
-                out.extend_from_slice(arts.iter().find(|(id, _)| id == art_id).unwrap().1);
-            }
-            other => unreachable!("unexpected segment in WAV layout: {other:?}"),
-        }
-    }
-    out
-}
+use musefs_format::{ArtInput, BlobLen, PictureType, Segment, TagInput};
 
 #[test]
 fn synthesizes_valid_riff_and_preserves_audio() {
@@ -47,7 +23,7 @@ fn synthesizes_valid_riff_and_preserves_audio() {
     ];
 
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &[]).unwrap();
-    let bytes = assemble(&layout, &audio, &[]);
+    let bytes = resolve_layout(&layout, &audio, &HashMap::new(), &HashMap::new());
 
     // total_len equals the bytes actually produced (generate-and-measure).
     assert_eq!(bytes.len() as u64, layout.total_len());
@@ -98,7 +74,12 @@ fn embeds_full_fidelity_id3_tag_with_art() {
             .any(|s| matches!(s, Segment::ArtImage { art_id: 9, len, .. } if len.get() == 120))
     );
 
-    let bytes = assemble(&layout, &audio, &[(9, &art_bytes)]);
+    let bytes = resolve_layout(
+        &layout,
+        &audio,
+        &HashMap::from([(9i64, art_bytes.clone())]),
+        &HashMap::new(),
+    );
 
     // Locate and parse the embedded `id3 ` chunk with the id3 crate.
     let pos = find_chunk(&bytes, b"id3 ").expect("an id3 chunk");
@@ -124,7 +105,7 @@ fn emits_native_info_chunk_for_mapped_tags() {
         TagInput::new("artist", "Bob"),
     ];
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &tags, &[], &[]).unwrap();
-    let bytes = assemble(&layout, &audio, &[]);
+    let bytes = resolve_layout(&layout, &audio, &HashMap::new(), &HashMap::new());
 
     let (off, len) = find_chunk(&bytes, b"LIST").expect("a LIST chunk");
     let body = &bytes[off..off + len];
@@ -144,7 +125,7 @@ fn pads_odd_data_payload_to_word_boundary() {
         fact: None,
     };
     let layout = synthesize_layout(&scan, 0, audio.len() as u64, &[], &[], &[]).unwrap();
-    let bytes = assemble(&layout, &audio, &[]);
+    let bytes = resolve_layout(&layout, &audio, &HashMap::new(), &HashMap::new());
     // File length is even and total_len accounts for the pad byte.
     assert_eq!(bytes.len() % 2, 0);
     assert_eq!(bytes.len() as u64, layout.total_len());

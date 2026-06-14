@@ -46,3 +46,44 @@ pub fn resolve_layout(
     }
     out
 }
+
+/// A minimal FLAC file (STREAMINFO + VORBIS_COMMENT) with `len` bytes of audio
+/// filled with `fill`. Returns the file and the raw audio payload.
+pub fn flac_fixture(fill: u8, len: usize) -> (Vec<u8>, Vec<u8>) {
+    let si = streaminfo_body();
+    let vc = vorbis_comment_body("oldvendor", &["TITLE=Old"]);
+    let audio = vec![fill; len];
+    let file = make_flac(&[(0, si), (4, vc)], &audio);
+    (file, audio)
+}
+
+/// A 16-byte PCM `fmt ` payload: mono, 44.1 kHz, 16-bit.
+pub fn fmt_pcm_16bit_mono() -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&1u16.to_le_bytes()); // wFormatTag = PCM
+    f.extend_from_slice(&1u16.to_le_bytes()); // channels
+    f.extend_from_slice(&44_100u32.to_le_bytes()); // sample rate
+    f.extend_from_slice(&88_200u32.to_le_bytes()); // byte rate
+    f.extend_from_slice(&2u16.to_le_bytes()); // block align
+    f.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    f
+}
+
+/// Build a minimal valid `RIFF/WAVE` file from a list of `(fourcc, payload)` chunks.
+pub fn build_wav(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (id, payload) in chunks {
+        body.extend_from_slice(*id);
+        body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            body.push(0x00);
+        }
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(&body);
+    out
+}

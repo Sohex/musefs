@@ -1,8 +1,10 @@
 #![cfg(feature = "fuzzing")]
+
+mod common;
+
+use common::resolve_layout;
 use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
-use musefs_format::{
-    ArtInput, BinaryTagInput, BlobLen, PictureType, RegionLayout, Segment, TagInput, mp4,
-};
+use musefs_format::{ArtInput, BinaryTagInput, BlobLen, PictureType, TagInput, mp4};
 use proptest::prelude::*;
 
 proptest! {
@@ -72,24 +74,7 @@ proptest! {
 
         // Materialize the served file: inline verbatim, BinaryTag from the map,
         // BackingAudio from the original fixture.
-        fn materialize(layout: &RegionLayout, original: &[u8], map: &HashMap<i64, Vec<u8>>) -> Vec<u8> {
-            let mut out = Vec::new();
-            for seg in layout.segments() {
-                match seg {
-                    Segment::Inline(b) => out.extend_from_slice(b),
-                    Segment::BinaryTag { payload_id, .. } => {
-                        out.extend_from_slice(map.get(payload_id).unwrap());
-                    }
-                    Segment::BackingAudio { offset, len } => {
-                        let s = usize::try_from(*offset).unwrap();
-                        out.extend_from_slice(&original[s..s + usize::try_from(*len).unwrap()]);
-                    }
-                    other => panic!("unexpected segment: {other:?}"),
-                }
-            }
-            out
-        }
-        let served = materialize(&layout, &file, &map);
+        let served = resolve_layout(&layout, &file, &HashMap::new(), &map);
 
         // Re-parse the served file: every input payload survives byte-identically.
         let reparsed = mp4::read_binary_tags(&served, usize::MAX);

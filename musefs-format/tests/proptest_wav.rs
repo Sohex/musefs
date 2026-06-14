@@ -1,6 +1,10 @@
 #![cfg(feature = "fuzzing")]
+
+mod common;
+
+use common::{fmt_pcm_16bit_mono, resolve_layout};
 use musefs_format::fuzz_check::{assert_backing_covers_audio, fixtures};
-use musefs_format::{ArtInput, BinaryTagInput, BlobLen, RegionLayout, Segment, TagInput, wav};
+use musefs_format::{ArtInput, BinaryTagInput, BlobLen, TagInput, wav};
 use proptest::prelude::*;
 
 proptest! {
@@ -29,18 +33,6 @@ proptest! {
     }
 }
 
-/// A 16-bit mono PCM `fmt ` body (matches musefs-format/tests/wav_synthesize.rs).
-fn fmt_pcm_16bit_mono() -> Vec<u8> {
-    let mut f = Vec::new();
-    f.extend_from_slice(&1u16.to_le_bytes()); // audio_format = PCM
-    f.extend_from_slice(&1u16.to_le_bytes()); // channels = 1
-    f.extend_from_slice(&44_100u32.to_le_bytes());
-    f.extend_from_slice(&88_200u32.to_le_bytes());
-    f.extend_from_slice(&2u16.to_le_bytes());
-    f.extend_from_slice(&16u16.to_le_bytes());
-    f
-}
-
 /// Wrap raw ID3v2 tag bytes + PCM audio into a minimal RIFF/WAVE file carrying an
 /// `id3 ` chunk, so `wav::read_binary_tags` has a real chunk to extract.
 fn wav_with_id3(id3: &[u8], audio: &[u8]) -> Vec<u8> {
@@ -62,30 +54,6 @@ fn wav_with_id3(id3: &[u8], audio: &[u8]) -> Vec<u8> {
     out.extend_from_slice(b"RIFF");
     out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&body);
-    out
-}
-
-/// Flatten a layout: inline verbatim, BinaryTag from `map`, BackingAudio from `audio`.
-fn materialize_wav(
-    layout: &RegionLayout,
-    audio: &[u8],
-    map: &std::collections::HashMap<i64, Vec<u8>>,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    for seg in layout.segments() {
-        match seg {
-            Segment::Inline(b) => out.extend_from_slice(b),
-            Segment::BinaryTag { payload_id, .. } => {
-                out.extend_from_slice(map.get(payload_id).unwrap());
-            }
-            Segment::BackingAudio { offset, len } => {
-                let s = usize::try_from(*offset).unwrap();
-                out.extend_from_slice(&audio[s..s + usize::try_from(*len).unwrap()]);
-            }
-            Segment::ArtImage { .. } => panic!("no art in this fixture"),
-            other => panic!("unexpected segment in WAV layout: {other:?}"),
-        }
-    }
     out
 }
 
@@ -176,7 +144,7 @@ proptest! {
         // Synthesize a fresh WAV and re-parse.
         let scan = wav::WavScan { fmt: fmt_pcm_16bit_mono(), fact: None };
         let layout = wav::synthesize_layout(&scan, 0, audio.len() as u64, &text, &inputs, &[]).unwrap();
-        let served = materialize_wav(&layout, &audio, &map);
+        let served = resolve_layout(&layout, &audio, &HashMap::new(), &map);
         let (opaque2, promoted2) = wav::read_binary_tags(&served);
 
         // Opaque payloads survive byte-identically.
