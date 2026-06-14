@@ -22,6 +22,10 @@ fn config() -> MountConfig {
         mode: Mode::Synthesis,
         poll_interval: std::time::Duration::ZERO,
         case_insensitive: false,
+        // Read-ahead off: these goldens are exact per-format pread counts that
+        // detect synthesis-path regressions; read amplification would collapse
+        // and mask them. Read-ahead's own effects are covered in readahead.rs.
+        read_ahead_budget: 0,
     }
 }
 
