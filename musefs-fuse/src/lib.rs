@@ -236,6 +236,12 @@ type DirListing = Vec<(u64, FileType, String)>;
 /// — the directory-side analogue of the file-handle `HandleTableFull → ENFILE`.
 const MAX_DIR_HANDLES: usize = 1024;
 
+/// Cap on concurrently-open `.musefs-metrics/metrics` handles (#394). Each `open`
+/// pins one rendered snapshot until `release`; the cap bounds the map the same way
+/// `MAX_DIR_HANDLES` bounds dir snapshots, so a client that opens the file without
+/// closing cannot grow it without bound. An over-cap `open` returns `ENFILE`.
+const MAX_METRICS_HANDLES: usize = 1024;
+
 /// Build a directory's full readdir listing once. Shared by `opendir`
 /// (snapshotted per fh) and the `readdir` fallback for an unknown fh. When
 /// `expose_metrics` is on, the synthetic `.musefs-metrics` entry is appended to
@@ -596,11 +602,18 @@ impl Filesystem for MusefsFs {
         }
         if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_FILE_INO {
             let body = Arc::new(self.render_metrics());
-            let fh = self.metrics_fh.fetch_add(1, Ordering::Relaxed);
-            self.metrics_handles
+            let mut handles = self
+                .metrics_handles
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(fh, body);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Check + id + insert under one lock hold: concurrent opens can't race
+            // the count past the cap, and a rejected open burns no id (#394).
+            if handles.len() >= MAX_METRICS_HANDLES {
+                return reply.error(fuser::Errno::ENFILE);
+            }
+            let fh = self.metrics_fh.fetch_add(1, Ordering::Relaxed);
+            handles.insert(fh, body);
+            drop(handles);
             // DIRECT_IO (no NONSEEKABLE): size-0 stat means the kernel reads to
             // EOF, and absolute-offset slicing in `read` supports pread/re-reads.
             return reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);

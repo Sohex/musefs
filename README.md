@@ -413,10 +413,18 @@ effect (see [BENCHMARKS.md](BENCHMARKS.md#storage-tunables) for the methodology 
 ```bash
 musefs mount /mnt/music --db library.db --expose-metrics   # or: MUSEFS_EXPOSE_METRICS=1
 cat /mnt/music/.musefs-metrics/metrics
-# musefs_uptime_seconds 60
-# musefs_handles_open 3
-# musefs_cache_header_hits_total 100
-# musefs_pool_active 1
+```
+
+```text
+# HELP musefs_uptime_seconds Seconds since the mount started.
+# TYPE musefs_uptime_seconds gauge
+musefs_uptime_seconds 60
+# HELP musefs_handles_open Open file handles in the core slab.
+# TYPE musefs_handles_open gauge
+musefs_handles_open 3
+# HELP musefs_cache_header_hits_total Raw header-cache key hits; a hit may still trigger a content-version rebuild.
+# TYPE musefs_cache_header_hits_total counter
+musefs_cache_header_hits_total 100
 ```
 
 `--expose-metrics` (default off) is a **runtime** flag that gates the virtual
