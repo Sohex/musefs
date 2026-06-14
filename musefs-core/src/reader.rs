@@ -1660,4 +1660,45 @@ mod readahead_differential_tests {
             }
         }
     }
+
+    #[test]
+    fn pcm_bytes_identical_under_forced_eviction() {
+        let (db, resolved, file) = pcm_fixture();
+        let pool = ReadAheadPool::new(1024 * 1024);
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        pool.register(1, Arc::clone(&buf));
+        let br = BackingReader::new(&file, &buf, &pool, 1, resolved.stamp.size);
+        let total = resolved.total_len;
+        let mut off = 0;
+        while off < total {
+            let n = 65536u64.min(total - off);
+            let mut via = Vec::new();
+            read_segments_into(&resolved, &db, Some(&br), off, n, &mut via).unwrap();
+            let mut direct = Vec::new();
+            oracle_read(&resolved, &file, off, n, &mut direct).unwrap();
+            assert_eq!(via, direct, "eviction mismatch at {off}");
+            off += n;
+        }
+    }
+
+    #[test]
+    fn partial_overlap_seek_serves_correct_bytes() {
+        let (db, resolved, file) = pcm_fixture();
+        let pool = ReadAheadPool::new(64 * 1024 * 1024);
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        pool.register(1, Arc::clone(&buf));
+        let br = BackingReader::new(&file, &buf, &pool, 1, resolved.stamp.size);
+        let seq = [(0u64, 600u64), (590, 50), (10, 4096), (12, 4096)];
+        for &(off, n) in &seq {
+            let n = n.min(resolved.total_len.saturating_sub(off));
+            if n == 0 {
+                continue;
+            }
+            let mut via = Vec::new();
+            read_segments_into(&resolved, &db, Some(&br), off, n, &mut via).unwrap();
+            let mut direct = Vec::new();
+            oracle_read(&resolved, &file, off, n, &mut direct).unwrap();
+            assert_eq!(via, direct, "partial-seek mismatch at {off}+{n}");
+        }
+    }
 }
