@@ -138,18 +138,16 @@ fn read_preads_and_seek_match_goldens() {
         assert_eq!(
             seq.pread_bytes,
             exp_seq_bytes,
-            "{}: sequential pread_bytes (audio read once)",
+            "{}: sequential pread_bytes",
             format_token(fmt)
         );
-        // Format-agnostic slurp guard, independent of the frozen number.
         assert!(
             seq.pread_bytes < AUDIO_BYTES_USIZE as u64 * 2,
-            "{}: sequential read {} bytes — looks like a double-read/slurp",
+            "{}: sequential read {} bytes — slurp?",
             format_token(fmt),
-            seq.pread_bytes,
+            seq.pread_bytes
         );
 
-        // Fresh mount → cold cache → single deep read.
         let (fs2, inode2, _dir2) = mount_one(fmt, AUDIO_BYTES_USIZE);
         metrics::reset();
         let _ = fs2.read(inode2, None, SEEK_OFF, CHUNK).unwrap();
@@ -163,14 +161,14 @@ fn read_preads_and_seek_match_goldens() {
         assert_eq!(
             seek.pread_bytes,
             exp_seek_bytes,
-            "{}: seek must read a bounded window, not the whole file/index",
-            format_token(fmt),
+            "{}: seek pread_bytes",
+            format_token(fmt)
         );
         assert!(
             seek.pread_bytes < AUDIO_BYTES_USIZE as u64 / 4,
-            "{}: seek read {} bytes — not a bounded window",
+            "{}: seek read {} bytes — not bounded",
             format_token(fmt),
-            seek.pread_bytes,
+            seek.pread_bytes
         );
     }
 }
