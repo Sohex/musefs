@@ -15,9 +15,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ample free space instead of fuser's all-zero default, so `df` no longer shows a
   0-byte filesystem and capacity-checking importers (Lidarr et al.) don't balk
   (#368).
+- **Per-extension skip breakdown:** at end of scan, a summary line breaks the
+  `skipped` count down by lowercased extension (e.g. `skipped 42: jpg=20,
+  cue=10, log=8, <none>=4`), logged at `warn` so it shows by default, so a large
+  skip count is diagnosable — expected sidecars versus genuinely unexpected
+  files. Log-only; the `ScanStats` struct and CLI summary are unchanged (#341).
 
 ### Fixed
 
+- **Silent mp4 oversize drops:** oversized embedded `covr` cover art and binary
+  freeform (`----`) values in `.m4a`/`.m4b` files are skipped in the format layer
+  before materialization (to avoid building a large image out of a large `moov`),
+  which previously dropped them with nothing in the logs. The scan now emits a
+  `warn` line for each, matching the logging the other formats already had (#343,
+  follow-up to #284).
 - **xattr log noise:** `getxattr`/`listxattr`/`setxattr`/`removexattr` now reply
   `ENOTSUP` explicitly (read-only filesystem, no extended attributes) instead of
   falling through to fuser's default, which logged a `[Not Implemented]` warn on

@@ -284,8 +284,11 @@ The per-target summary reads `scanned N: … skipped X, failed Y`. `skipped`
 counts every file that isn't a supported audio format — cover art, `.cue` /
 `.log` / `.nfo` sidecars, and anything else non-audio — so a large `skipped`
 number (hundreds or thousands on a big library) is expected, not an error.
-`failed` is the one to watch: those are audio files musefs recognised by
-extension but could not parse. Format dispatch is by **extension only** —
+A per-extension breakdown of the skip count is logged at end of scan (e.g.
+`skipped 42: jpg=20, cue=10, log=8, <none>=4`), so you can tell expected
+sidecars from anything genuinely unexpected. `failed` is the one
+to watch: those are audio files musefs recognised by extension but could not
+parse. Format dispatch is by **extension only** —
 there is no content sniffing and no fallback to another parser, so a file
 whose contents don't match its extension (e.g. a FLAC named `.mp3`) is handed
 to the wrong parser, fails, and is counted here rather than retried. Renaming
