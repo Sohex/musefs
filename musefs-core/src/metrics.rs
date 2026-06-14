@@ -323,12 +323,15 @@ mod tests {
         on_pread(100);
         on_art_chunk();
         on_binary_tag_chunk();
+        on_readahead_miss();
         let s = snapshot();
         assert_eq!(s.opens, 2);
         assert_eq!(s.preads, 1);
         assert_eq!(s.pread_bytes, 100);
         assert_eq!(s.art_chunks, 1);
         assert_eq!(s.binary_tag_chunks, 1);
+        assert_eq!(s.readahead_misses, 1);
+        assert_eq!(s.readahead_hits, 0);
         reset();
         assert_eq!(snapshot(), Snapshot::default());
     }
