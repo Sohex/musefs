@@ -468,4 +468,22 @@ exclude_re = [
     # wrong ring size only changes how many speculative windows are retained, never
     # the served bytes. Sole `+` in serve_backing.
     'replace \+ with (-|\*) in Musefs::serve_backing',
+    #
+    # More hang-class (TIMEOUT-only, CANCEL the in-diff job): `len() -> 1` /
+    # `clear() -> 1` force a constant resident size, so `evict_one_coldest` keeps
+    # reporting a non-zero freed amount it never actually freed and
+    # `permitted_window`'s evict loop never terminates. The `-> 0` variants ARE
+    # caught (the len/clear-sum test). Sole returns.
+    'replace ReadAhead::len -> u64 with 1',
+    'replace ReadAhead::clear -> u64 with 1',
+    # insert_window eviction-filter arithmetic `w.start + w.bytes.len() <= frontier`,
+    # `+`->`*`: only changes WHICH cached window is dropped in a contrived spanning
+    # case, never the served bytes (the byte-differential tests pin those) — cache
+    # eviction policy, not correctness. The `<=`->`>` at the same site IS caught by
+    # the ring-trim test. Sole `+` in insert_window.
+    'replace \+ with \* in ReadAhead::insert_window',
+    # PrefetchWorkers::request -> (): drops the speculative job instead of queuing
+    # it. Phase-2 is opt-in and best-effort — a dropped prefetch just means a later
+    # synchronous fill, identical served bytes. Sole site.
+    'replace PrefetchWorkers::request with \(\)',
 ]

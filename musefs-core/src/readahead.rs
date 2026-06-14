@@ -366,8 +366,10 @@ pub fn plan_prefetch(
         .saturating_add(depth.saturating_mul(window))
         .min(backing_len);
     let mut s = prefetched_upto;
-    if s < start || s > horizon {
-        s = start; // seek / fell behind: dispatch from the current position
+    // Outside [start, horizon] means a seek (reader moved before the watermark)
+    // or the watermark ran past the horizon: dispatch from the current position.
+    if !(start..=horizon).contains(&s) {
+        s = start;
     }
     let mut starts = Vec::new();
     while s < horizon {
@@ -1344,26 +1346,29 @@ mod mutation_guard_tests {
 
     #[test]
     fn permitted_window_need_is_relative_to_old_len() {
-        let pool = ReadAheadPool::new(2 << 20); // cap 512K
+        // budget 2 MiB → cap 512K. Charge all but one cap (nothing registered, so
+        // nothing is evictable), leaving room == cap. A stream at old_len = cap/4
+        // asks for cap: need = cap − cap/4 = 384K ≤ room → full grant. If `need`
+        // were `cap + cap/4` (640K > room) it would fall through to the clamp and
+        // return old_len + room (640K) instead.
+        let pool = ReadAheadPool::new(2 << 20);
         let cap = pool.per_stream_cap();
-        let b1 = Arc::new(Mutex::new(ReadAhead::new(cap)));
-        pool.register(1, Arc::clone(&b1));
-        pool.reconcile(0, cap); // stream 1 holds one cap; budget still has room
-        // need = cap - cap/2 fits in the free budget → full grant. If need used
-        // `cap + cap/2` it would exceed free room and clamp below cap.
-        assert_eq!(pool.permitted_window(2, cap / 2, cap), cap);
+        pool.reconcile(0, (2 << 20) - cap); // room == cap
+        assert_eq!(pool.permitted_window(2, cap / 4, cap), cap);
     }
 
     #[test]
     fn permitted_window_clamps_to_room_when_nothing_evictable() {
-        let pool = ReadAheadPool::new(WINDOW_FLOOR); // budget==cap==floor
+        // budget 2 MiB → cap 512K. Charge to leave room == 256K. A stream at
+        // old_len = 128K asks for cap: need = 384K > room, nothing evictable, so
+        // the grant clamps to old_len + room = 384K. `old_len − room` underflows.
+        let pool = ReadAheadPool::new(2 << 20);
         let cap = pool.per_stream_cap();
-        let locked = Arc::new(Mutex::new(ReadAhead::new(cap)));
-        pool.register(1, Arc::clone(&locked));
-        pool.reconcile(0, cap); // budget full
-        let _held = locked.lock().unwrap(); // un-evictable
-        // room == 0, nothing evictable → grant == old_len + room == old_len.
-        assert_eq!(pool.permitted_window(2, 1000, cap), 1000);
+        pool.reconcile(0, (2 << 20) - 256 * 1024); // room == 256K
+        assert_eq!(
+            pool.permitted_window(2, 128 * 1024, cap),
+            128 * 1024 + 256 * 1024
+        );
     }
 
     #[test]
@@ -1435,5 +1440,46 @@ mod mutation_guard_tests {
         assert_eq!(ep.load(AO::Relaxed), base, "sequential must not bump epoch");
         br.read_exact_at(&mut d, 900_000).unwrap(); // genuine seek (miss, off != next)
         assert_eq!(ep.load(AO::Relaxed), base + 1, "seek bumps epoch");
+    }
+
+    #[test]
+    fn ring_trim_evicts_window_fully_behind_the_reader() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.set_max_windows(2);
+        ra.store_window(0, vec![0u8; 1000]); // [0, 1000)
+        ra.store_window(1000, vec![0u8; 1000]); // [1000, 2000)
+        // Advance the reader to 2000 so both windows are fully behind it.
+        let mut dst = vec![0u8; 10];
+        ra.read_into(&mut dst, 1990, 1 << 20, fillb).unwrap(); // hit → next_expected = 2000
+        // A third window forces a trim: the victim is the fully-behind window with
+        // the smallest start ([0,1000)) — NOT the just-stored ahead window. The
+        // `<=` filter (`start+len <= frontier`) selects which windows are behind.
+        ra.store_window(2000, vec![0u8; 1000]); // [2000, 3000)
+        assert!(!ra.covers(0, 10), "fully-behind window evicted");
+        assert!(ra.covers(1000, 10), "nearer behind window kept");
+        assert!(ra.covers(2000, 10), "just-stored ahead window kept");
+    }
+
+    #[test]
+    fn plan_prefetch_no_jobs_when_watermark_at_horizon() {
+        // Watermark already at the horizon (start + depth*window): nothing new to
+        // dispatch. The `s > horizon` reset guard must NOT fire at s == horizon
+        // (`>=` would reset to start and re-queue the whole horizon).
+        let win = WINDOW_FLOOR;
+        let depth = 4;
+        let start = 10 * win;
+        let horizon = start + depth * win;
+        let (starts, upto) = plan_prefetch(horizon, start, win, depth, 100 << 20);
+        assert!(starts.is_empty(), "caught up to horizon → no jobs");
+        assert_eq!(upto, horizon);
+    }
+
+    #[test]
+    fn plan_prefetch_window_zero_leaves_watermark_unchanged() {
+        // window == 0 short-circuits via the `||` early-out, returning the
+        // watermark UNCHANGED. With `&&` it would fall through and return `start`.
+        let (starts, upto) = plan_prefetch(500, 1000, 0, 4, 1 << 20);
+        assert!(starts.is_empty());
+        assert_eq!(upto, 500);
     }
 }

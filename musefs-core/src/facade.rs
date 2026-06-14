@@ -1544,6 +1544,57 @@ mod tests {
         assert_eq!(fs.pool_charged(), 0, "release leaked the read-ahead charge");
     }
 
+    #[test]
+    fn two_handles_get_distinct_pool_keys() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+        // Two handles on the same inode hold DISTINCT read-ahead buffers, so their
+        // pool keys (buffer addresses) must differ. A constant pool_key collides
+        // both onto one registry entry: the second registration overwrites the
+        // first, so only one of the two charges is freed on release — a leak.
+        let fh1 = fs.open_handle(inode).unwrap();
+        let fh2 = fs.open_handle(inode).unwrap();
+        assert!(!fs.read(inode, Some(fh1), 0, 1 << 20).unwrap().is_empty());
+        assert!(!fs.read(inode, Some(fh2), 0, 1 << 20).unwrap().is_empty());
+        fs.release_handle(fh1);
+        fs.release_handle(fh2);
+        assert_eq!(
+            fs.pool_charged(),
+            0,
+            "distinct keys must each free their charge"
+        );
+    }
+
     /// The safety property the transactional `content_version` guard exists to
     /// protect: a handle holding a `Segment::BinaryTag { payload_id }` must never
     /// serve the bytes of a *different* row that later reused that rowid under the
