@@ -127,6 +127,26 @@ silently. Freshness for a passthrough handle is open-time-only — it is a
 plain POSIX fd onto the backing file. In `Synthesis` mode no single fd
 represents the spliced bytes, so passthrough never applies.
 
+## Synthetic telemetry namespace
+
+When `--expose-metrics` is on, the root directory gains a synthetic
+`.musefs-metrics/` entry backed by reserved inodes at `u64::MAX - 1` (dir) and
+`u64::MAX - 2` (file) — the same "top of the u64 space" trick the Spotlight
+marker uses, since `InodeAllocator` starts at 2 and only increments. The
+directory and file are disjoint from the macOS Spotlight marker at `u64::MAX`.
+
+The metrics file is `/proc`-style: it advertises `st_size == 0` and is served
+via `FOPEN_DIRECT_IO`, so readers must read to EOF rather than trusting the
+stated size. Content is rendered at `open` time from a snapshot of
+`CoreTelemetry` (header/size caches, virtual-tree footprint, refresh health),
+`FuseTelemetry` (uptime, read/dir-handle gates, worker pool, passthrough
+state), and optional jemalloc/syscall counters — see
+[`musefs-core/src/telemetry.rs`](musefs-core/src/telemetry.rs) for the full
+metric list. This namespace deliberately bypasses the virtual tree
+(`VirtualTree`) and the `RegionLayout` / segment model: it is injected into
+root-directory `readdir` and resolved by direct inode checks, so the cardinal
+audio path is untouched.
+
 ## The SQLite store
 
 `musefs-db/src/schema.rs` defines the schema as a single baseline migration
