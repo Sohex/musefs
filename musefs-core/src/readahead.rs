@@ -1116,4 +1116,94 @@ mod concurrency_tests {
             }
         });
     }
+
+    /// Stress the Phase-2 surface single-stream tests miss: worker-side
+    /// `run_job` (store + budget `reconcile`) racing reads, while a second
+    /// contended stream forces cross-buffer `try_lock` eviction — all hammering
+    /// the shared `charged` budget. Asserts byte-correctness; run under TSan for
+    /// race detection.
+    #[test]
+    #[expect(clippy::cast_possible_truncation)]
+    fn workers_and_eviction_race_reads_without_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.bin");
+        let data: Vec<u8> = (0u64..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let backing_len = data.len() as u64;
+
+        // Small budget: the worker's has_room_for gate bites and stream 2's
+        // misses must evict stream 1 to make room.
+        let pool = Arc::new(ReadAheadPool::new(2 * 1024 * 1024));
+        let window = pool.per_stream_cap();
+        let buf1 = Arc::new(Mutex::new(ReadAhead::new(window)));
+        buf1.lock().unwrap().set_max_windows(4);
+        let buf2 = Arc::new(Mutex::new(ReadAhead::new(window)));
+        let epoch1 = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let epoch2 = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        pool.register(1, Arc::clone(&buf1));
+        pool.register(2, Arc::clone(&buf2));
+
+        std::thread::scope(|s| {
+            // Stream 1: one sequential reader (epoch stays stable, so the
+            // prefetched windows actually store + reconcile).
+            {
+                let (file, buf1, pool, epoch1, data) = (&file, &buf1, &pool, &epoch1, &data);
+                s.spawn(move || {
+                    let br = BackingReader::new(file, buf1, pool, 1, backing_len, epoch1);
+                    let mut off = 0u64;
+                    while off < backing_len {
+                        let len = (64 * 1024).min((backing_len - off) as usize);
+                        let mut got = vec![0u8; len];
+                        br.read_exact_at(&mut got, off).unwrap();
+                        assert_eq!(got, data[off as usize..off as usize + len]);
+                        off += len as u64;
+                    }
+                });
+            }
+            // Two prefetchers driving real `run_job` (store + reconcile) for
+            // stream 1, concurrent with its reader.
+            for _ in 0..2 {
+                let (file, buf1, pool, epoch1) = (&file, &buf1, &pool, &epoch1);
+                s.spawn(move || {
+                    for _ in 0..4 {
+                        let mut start = 0u64;
+                        while start < backing_len {
+                            PrefetchWorkers::run_job(PrefetchJob {
+                                file: Arc::clone(file),
+                                buf: Arc::clone(buf1),
+                                pool: Arc::clone(pool),
+                                epoch: Arc::clone(epoch1),
+                                dispatched_epoch: epoch1.load(std::sync::atomic::Ordering::Acquire),
+                                start,
+                                len: window,
+                                backing_len,
+                            });
+                            start += window;
+                        }
+                    }
+                });
+            }
+            // Stream 2: random-offset readers → misses → permitted_window →
+            // cross-buffer eviction of stream 1 (try_lock), churning `charged`.
+            for tid in 0..4u64 {
+                let (file, buf2, pool, epoch2, data) = (&file, &buf2, &pool, &epoch2, &data);
+                s.spawn(move || {
+                    let br = BackingReader::new(file, buf2, pool, 2, backing_len, epoch2);
+                    let mut rng: u64 = tid * 7919 + 1;
+                    for _ in 0..300 {
+                        rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        let off = rng % backing_len.saturating_sub(4096).max(1);
+                        let len = 4096usize.min((backing_len - off) as usize);
+                        let mut got = vec![0u8; len];
+                        br.read_exact_at(&mut got, off).unwrap();
+                        assert_eq!(got, data[off as usize..off as usize + len]);
+                    }
+                });
+            }
+        });
+    }
 }
