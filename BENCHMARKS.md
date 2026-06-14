@@ -758,10 +758,74 @@ consistent across HDD and NFS. This is the only tunable worth changing for slow 
   (`max_readahead`, `max_background`, and by extension a per-medium combination of them)
   show no benefit; `max_readahead` ≥2048 KiB actively hurts on HDD. The only justified
   change — enable `--keep-cache` on HDD/NFS — does not need an abstraction.
-- **Latent finding (future work):** single-stream reads are serialized, so per-read
-  latency is never hidden by prefetch. The real lever for slow backing would be a
-  **concurrent backing-prefetch pipeline in the daemon** (issue several `BackingAudio`
-  reads ahead in parallel), an architectural change tracked separately.
+- **Single-stream latency hiding — addressed in #255 (next section).** The serialized
+  read path measured above (512 MiB ÷ 256 KiB × RTT) is exactly what backing read-ahead
+  now fixes.
+
+---
+
+## Backing read-ahead (#255)
+
+Each `--max-readahead-kib` row above exposed the real bottleneck: a single stream is
+served one ≤256 KiB FUSE chunk at a time, each paying the full backing RTT, so a
+200 ms-RTT NFS mount tops out at ~1.3 MB/s regardless of the *kernel* read-ahead window.
+The fix is **read amplification in the daemon** — `BackingReader` coalesces a stream's
+small reads into one large positioned `pread` (geometric window growth, global RAM budget
+with LRU eviction), so the backing client can pipeline/parallelize the RPCs behind one
+syscall. A background-prefetch-threads layer ("Phase 2") was also built but is **off by
+default** (see below).
+
+### Methodology
+
+Two harnesses. **Real kernel mount** (`benches/storage_tunables_bench.sh`): a real reader
+(`dd`) over a real FUSE mount, cold (`drop_caches`) each sample, median of 3. Local backing
+on a btrfs HDD; NFS via a loopback **NFSv4.2** export plus `tc netem` for RTT. **The corpus
+is real FLAC** (`MUSEFS_BENCH_CORPUS_SRC`) — a `/dev/zero` corpus on a compressing fs
+(btrfs `compress=zstd`) collapses to a cached extent and never touches the platter, which
+silently inverts the HDD numbers; real already-compressed audio is incompressible.
+**In-process** (`musefs-core/tests/bench_ingest.rs::bench_read_under_latency`): the core read
+path over `musefs-latencyfs` (per-op injected latency), isolating the daemon from the kernel
+FUSE layer. `off` = `--read-ahead-budget-mib 0`; `phase1` = the default (amplification only);
+`phase1+2` = `--read-ahead-prefetch`.
+
+### Single-stream cold throughput (MB/s)
+
+| backing | off | **phase 1 (default)** | phase 1+2 | passthrough |
+|--------:|----:|----------------------:|----------:|------------:|
+| local HDD (btrfs, real FLAC) | ~60 | ~62 | ~60 | ~58 |
+| NFS, tmpfs-backed, 200 ms RTT | 1.2 | **7.4** | 6.8 | 9.8 |
+
+On NFS read-ahead is a **~6× single-stream win** (1.2 → 7.4 MB/s, 75 % of the kernel-passthrough
+ceiling). On a real local HDD all four configs sit within run-to-run noise (~±15 %) — read-ahead
+is **neutral**, not a regression. (An earlier `/dev/zero` corpus showed a spurious −35 %; it was
+the zstd-compression artifact above, not read-ahead.)
+
+### Concurrent streams (8 × distinct tracks, aggregate MB/s, NFS 200 ms RTT)
+
+| off | **phase 1 (default)** | phase 1+2 | passthrough |
+|----:|----------------------:|----------:|------------:|
+| 1.6 | **13.6** | 12.1 | 16.3 |
+
+### In-process, per-op latency (16 MiB Ogg whole read; wall ms / backing preads)
+
+| profile | off | phase 1 (default) |
+|--------:|----:|------------------:|
+| ssd (80 µs/op) | 45 ms / 774 preads | **26 ms / 32 preads** |
+| nfs-ssd (600 µs/op) | 138 ms / 774 | **112 ms / 32** |
+
+Amplification collapses 774 backing round-trips to 32; the win scales with per-op latency and
+is already material at SSD speeds (1.7×).
+
+### Phase 2 is off by default
+
+Background prefetch threads (Phase 2) **never beat amplification alone** and cost a consistent
+~10 %: single-stream NFS 6.8 vs 7.4, concurrent NFS 12.1 vs 13.6, neutral on HDD. A single large
+`pread` already lets the NFS client pipeline its RPCs, so the threads add coordination overhead
+without overlap to exploit. Phase 2 is therefore opt-in (`--read-ahead-prefetch`), retained for
+hypothetical backends where one large read does not self-pipeline.
+
+**Defaults:** read-ahead on at `--read-ahead-budget-mib 64`, Phase-1 amplification only. Set
+`0` to disable on local-disk-only setups (no benefit there, though no harm either).
 
 ---
 
