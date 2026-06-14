@@ -541,6 +541,38 @@ def test_compute_rewrites_ignores_desc_and_tagless():
     assert rewrites == [] and skips == [] and skipped == set()
 
 
+def test_compute_rewrites_skips_malformed_regex():
+    # A linecol regex can be malformed (unbalanced group); compute_rewrites must not
+    # raise — check() reports it gracefully in the re-validation pass instead.
+    entries = [g.Entry(r"foo\.rs:10:5:(", 3, g.Tag(op="+", fn="x", fn_present=True, rows=1))]
+    muts = [_m("foo.rs:10:5: replace + with - in x")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skips == [] and skipped == set()
+
+
+def test_compute_rewrites_mixed_narrowing_group_uses_per_entry_rows():
+    # A bare anchor (rows=2) and a repl-narrowed anchor (rows=1) resolve to the SAME
+    # two sites. The rows check must use each entry's own match set, not the first
+    # entry's — otherwise the narrowed entry is falsely judged unmappable.
+    entries = [
+        g.Entry(r"foo\.rs:10:5:", 3, g.Tag(op="+", fn="foo", fn_present=True, rows=2)),
+        g.Entry(
+            r"foo\.rs:20:5: replace \+ with -",
+            5,
+            g.Tag(op="+", fn="foo", fn_present=True, rows=1),
+        ),
+    ]
+    muts = [  # both sites shifted +100
+        _m("foo.rs:110:5: replace + with - in foo"),
+        _m("foo.rs:110:5: replace + with * in foo"),
+        _m("foo.rs:120:5: replace + with - in foo"),
+        _m("foo.rs:120:5: replace + with * in foo"),
+    ]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert skips == [] and skipped == set()
+    assert {(r.entry.toml_line, r.line, r.col) for r in rewrites} == {(3, 110, 5), (5, 120, 5)}
+
+
 def test_apply_rewrites_byte_preserving():
     toml = (
         "exclude_re = [\n"

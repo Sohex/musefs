@@ -135,7 +135,10 @@ def compute_rewrites(
     groups: dict[tuple, list[Entry]] = {}
     matched_by_line: dict[int, list[Mutant]] = {}
     for e in targets:
-        ms = _candidate_mutants(e, mutants)
+        try:
+            ms = _candidate_mutants(e, mutants)
+        except re.error:
+            continue  # malformed regex; check() reports it gracefully in re-validation
         matched_by_line[e.toml_line] = ms
         sites = tuple(sorted({m.site for m in ms}))
         if not sites:
@@ -148,9 +151,9 @@ def compute_rewrites(
 
     for sites, group in groups.items():
         group = sorted(group, key=lambda e: _entry_coords(e.regex))
-        counts = Counter(m.site for m in matched_by_line[group[0].toml_line])
+        counts = {e.toml_line: Counter(m.site for m in matched_by_line[e.toml_line]) for e in group}
         mappable = len(group) == len(sites) and all(
-            counts[sites[i]] == group[i].tag.rows for i in range(len(group))
+            counts[e.toml_line][site] == e.tag.rows for e, site in zip(group, sites)
         )
         if not mappable:
             for e in group:
