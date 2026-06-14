@@ -1144,15 +1144,19 @@ let key = fh.slab_key();
 if !h.registered.swap(true, Ordering::AcqRel) {
     self.readahead_pool.register(key, Arc::clone(&h.readahead));
 }
-let backing_len = r.stamp.size; // backing file size from the validated stamp (u64 field)
+let backing_len = r.stamp.size; // BackingStamp.size is a public u64 field (freshness.rs:16)
 let br = crate::readahead::BackingReader::new(
     &h.file, &h.readahead, &self.readahead_pool, key, backing_len,
 );
 read_at_with_file_into(r, db, &br, offset, size, out)?;
 ```
    (Adjust `read_at_with_file_into`'s signature use: it now takes `&BackingReader`
-   per Task 5/6.) Determine the correct `backing_len` accessor on `BackingStamp`;
-   if it stores size as a field use `r.stamp.size` / add a `size()` getter.
+   per Task 5/6.) `r.stamp.size` is the right accessor — `BackingStamp`
+   (`musefs-core/src/freshness.rs`) exposes `size: u64` as a public field; no
+   getter needed.
+   > Forward reference: Task 13 adds an `epoch` argument to `BackingReader::new`;
+   > this exact call site is migrated to `BackingReader::new(&h.file, &h.readahead,
+   > &self.readahead_pool, &h.epoch, key, backing_len)` there. Leave it 5-arg here.
 
 5. On the generation-bump path in `read_into` (where `h.generation.store(cur, ...)`
    happens after a re-resolve), drop the buffer and bump the epoch:
