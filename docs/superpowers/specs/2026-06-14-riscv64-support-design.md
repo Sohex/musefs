@@ -147,7 +147,7 @@ QEMU step). Add a single new `mode: emulated` with two `include` rows carrying
 | triple | mode | platform | image | pkg install |
 | --- | --- | --- | --- | --- |
 | `riscv64gc-unknown-linux-gnu` | `emulated` | `linux/riscv64` | `debian:trixie-slim` | `apt-get update && apt-get install -y fuse3 ffmpeg` |
-| `riscv64gc-unknown-linux-musl` | `emulated` | `linux/riscv64` | `alpine:3.20` | `apk add --no-cache fuse3 ffmpeg` |
+| `riscv64gc-unknown-linux-musl` | `emulated` | `linux/riscv64` | `alpine:3.23` | `apk add --no-cache fuse3 ffmpeg` |
 
 Concrete edits:
 
@@ -189,18 +189,21 @@ manifest** — riscv64 became an official Debian architecture only in Debian 13
 (decided 2026-06-14): bump the glibc base to **`debian:trixie-slim` for all
 arches** — trixie is current Debian stable, so this is a routine base bump that
 keeps a single shared base across amd64/arm64/riscv64. `docker/Dockerfile.musl`
-(`alpine:3.20`) is **unchanged** — Alpine publishes riscv64 from 3.20 on.
+is bumped `alpine:3.20` → **`alpine:3.23`** (Alpine has riscv64 from 3.20 on, but
+3.20 reached end-of-support on 2026-04-01; 3.23 is supported through 2027-11 and
+is the better-baked current stable). Both base bumps now feed Dependabot: a
+`docker` ecosystem on `/docker` is added (numeric `alpine:3.x` gets auto-bump
+PRs; the debian codename tag is not version-comparable and stays manual).
 
 Spike-verified: a riscv64 glibc binary mounts FUSE and serves a valid FLAC under
-`debian:trixie-slim` emulation; the riscv64 musl binary does the same on
-`alpine:3.20`.
+`debian:trixie-slim` emulation; the riscv64 musl binary does the same on Alpine.
 
 The current `images` job stages exactly two arches by literal calls. Four
 concrete edits:
 
 - Bump `docker/Dockerfile.glibc` from `FROM debian:bookworm-slim` to `FROM
-  debian:trixie-slim` (the riscv64-availability fix above; the only Dockerfile
-  change).
+  debian:trixie-slim` (the riscv64-availability fix above), and
+  `docker/Dockerfile.musl` from `alpine:3.20` to `alpine:3.23` (EOL bump).
 - Add a `riscv64_triple` value to each matrix variant (glibc:
   `riscv64gc-unknown-linux-gnu`, musl: `riscv64gc-unknown-linux-musl`).
 - Add a third `download-artifact` step (mirroring the amd64/arm64 ones,

@@ -32,3 +32,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+  # Tracks the FROM base images in docker/Dockerfile.{glibc,musl}. Numeric tags
+  # (alpine:3.x) get version-bump PRs; the debian codename tag (trixie-slim) is
+  # not version-comparable, so it stays manual unless digest-pinned.
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"

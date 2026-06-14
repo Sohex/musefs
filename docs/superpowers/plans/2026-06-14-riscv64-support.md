@@ -28,7 +28,9 @@
 - **Modify:** `README.md` — "Prebuilt binaries" table only.
 - **Modify:** `CHANGELOG.md` — one `### Added` bullet under `## [Unreleased]`.
 - **Modify:** `docker/Dockerfile.glibc` — bump `FROM debian:bookworm-slim` → `FROM debian:trixie-slim`. Debian bookworm (12) publishes no riscv64 manifest; riscv64 is official only from Debian 13 (trixie). The `COPY ${TARGETARCH}/musefs` is arch-generic, but the base image is not — bumped for all arches (decided 2026-06-14).
-- **No change:** `docker/Dockerfile.musl` (`alpine:3.20` already has riscv64), `scripts/smoke-binary.sh`, `scripts/container_tags.py`, all crate source.
+- **Modify:** `docker/Dockerfile.musl` — bump `alpine:3.20` → `alpine:3.23`. 3.20 is EOL (2026-04-01); 3.23 is supported through 2027-11. (3.20 had riscv64; the bump is for EOL, not arch.)
+- **Modify:** `.github/dependabot.yml` — add a `docker` ecosystem on `/docker` so the base images get update PRs.
+- **No change:** `scripts/smoke-binary.sh`, `scripts/container_tags.py`, all crate source.
 
 ---
 
@@ -267,7 +269,7 @@ In the `smoke` job's `strategy.matrix.include`, after the `aarch64-unknown-linux
             runner: ubuntu-latest
             mode: emulated
             platform: linux/riscv64
-            image: alpine:3.20
+            image: alpine:3.23
             pkg: apk add --no-cache fuse3 ffmpeg >/dev/null
 ```
 
@@ -353,23 +355,18 @@ The `COPY ${TARGETARCH}/musefs` is arch-generic, but `docker/Dockerfile.glibc`'s
 
 **Files:**
 - Modify: `docker/Dockerfile.glibc` (base image bump)
+- Modify: `docker/Dockerfile.musl` (base image bump)
 - Modify: `.github/workflows/release.yml:244-360` (the `images` job: `matrix`, a new download step, the stage run step, and the manifest `platforms`)
 
-- [ ] **Step 0: Bump the glibc base image to trixie**
+- [ ] **Step 0: Bump the base images**
 
-In `docker/Dockerfile.glibc`, change line 2:
+In `docker/Dockerfile.glibc`, change line 2 `FROM debian:bookworm-slim` →
+`FROM debian:trixie-slim`. Debian bookworm (12) has no `linux/riscv64` manifest;
+trixie (13) does and is current Debian stable.
 
-```dockerfile
-FROM debian:bookworm-slim
-```
-
-to:
-
-```dockerfile
-FROM debian:trixie-slim
-```
-
-Debian bookworm (12) has no `linux/riscv64` manifest; trixie (13) does, and trixie is current Debian stable, so this bumps the shared base for all three arches. `docker/Dockerfile.musl` (`alpine:3.20`) is unchanged — Alpine has riscv64 from 3.20.
+In `docker/Dockerfile.musl`, change line 2 `FROM alpine:3.20` →
+`FROM alpine:3.23`. 3.20 hit end-of-support 2026-04-01; 3.23 (supported through
+2027-11) is the better-baked current stable and has riscv64.
 
 - [ ] **Step 1: Add `riscv64_triple` to each matrix variant**
 
@@ -439,14 +436,14 @@ Expected: `images riscv64 wiring OK`
 - [ ] **Step 7: Commit**
 
 ```bash
-git add docker/Dockerfile.glibc .github/workflows/release.yml
+git add docker/Dockerfile.glibc docker/Dockerfile.musl .github/workflows/release.yml
 git commit -m "$(cat <<'EOF'
 ci(release): publish linux/riscv64 Docker images
 
 Stage the riscv64 binary into the build context and add linux/riscv64
 to both the glibc and musl multi-arch manifests. Bump Dockerfile.glibc
-from bookworm to trixie: bookworm has no riscv64 manifest, trixie does
-(and is current stable). Dockerfile.musl (alpine:3.20) already has it.
+bookworm -> trixie (bookworm has no riscv64 manifest) and Dockerfile.musl
+alpine:3.20 -> 3.23 (3.20 is EOL).
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
