@@ -67,7 +67,25 @@ def parse_mutant(name: str) -> Mutant:
     )
 
 
+def _wildcard_coords(regex: str) -> str:
+    """Replace an entry regex's literal ``:line:col:`` with a ``:\\d+:\\d+:`` wildcard.
+
+    Uses a function replacement, not a literal one: a string replacement of
+    ``":\\d+:\\d+:"`` would have its ``\\d`` parsed as a replacement-template escape
+    and raise ``re.PatternError: bad escape \\d``.
+    """
+    return _LITERAL_LINECOL.sub(lambda _: r":\d+:\d+:", regex, count=1)
+
+
+def _entry_coords(regex: str) -> tuple[int, int]:
+    """Parse the (line, col) a linecol entry currently anchors on."""
+    m = _COORD_RE.search(regex)
+    assert m is not None  # caller guarantees classify(regex) == "linecol"
+    return int(m.group(1)), int(m.group(2))
+
+
 _LITERAL_LINECOL = re.compile(r":[0-9]+:[0-9]+:")
+_COORD_RE = re.compile(r":([0-9]+):([0-9]+):")
 
 _ALLOWED_ESCAPES = set(".d+|^()*")
 
@@ -141,6 +159,13 @@ class Entry:
     regex: str
     toml_line: int
     tag: Tag | None
+
+
+@dataclass
+class Rewrite:
+    entry: Entry
+    line: int
+    col: int
 
 
 def _unquote_toml_string(s: str) -> str:

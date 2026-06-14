@@ -323,3 +323,27 @@ def test_load_mutants_from_json():
 def test_load_mutants_empty_is_error():
     with pytest.raises(ValueError):
         g.load_mutants("[]")
+
+
+def test_wildcard_coords_bare_prefix():
+    assert g._wildcard_coords(r"musefs-core/src/scan\.rs:1041:32:") == (
+        r"musefs-core/src/scan\.rs:\d+:\d+:"
+    )
+
+
+def test_wildcard_coords_preserves_repl_suffix():
+    assert g._wildcard_coords(r"musefs-core/src/scan\.rs:1212:29: replace \+ with -") == (
+        r"musefs-core/src/scan\.rs:\d+:\d+: replace \+ with -"
+    )
+
+
+def test_wildcard_coords_replaces_only_first_linecol():
+    # the suffix's own digits must survive untouched
+    assert g._wildcard_coords(r"foo/bar\.rs:10:20: replace 1 with 2") == (
+        r"foo/bar\.rs:\d+:\d+: replace 1 with 2"
+    )
+
+
+def test_entry_coords_parses_line_col():
+    assert g._entry_coords(r"musefs-core/src/scan\.rs:1041:32:") == (1041, 32)
+    assert g._entry_coords(r"musefs-core/src/scan\.rs:1212:29: replace \+ with -") == (1212, 29)
