@@ -206,6 +206,22 @@ impl ReadAhead {
         self.window
     }
 
+    /// First backing offset at or after `from` that is NOT resident — i.e. the
+    /// end of the contiguous run of cached windows covering `from`. Prefetch
+    /// starts here (not at the read cursor) so it never re-requests bytes a
+    /// window-filling miss already pulled in synchronously.
+    pub fn frontier(&self, from: u64) -> u64 {
+        let mut f = from;
+        while let Some(w) = self
+            .windows
+            .iter()
+            .find(|w| w.start <= f && f < w.start + w.bytes.len() as u64)
+        {
+            f = w.start + w.bytes.len() as u64;
+        }
+        f
+    }
+
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
         self.windows.iter().map(|w| w.bytes.len() as u64).sum()

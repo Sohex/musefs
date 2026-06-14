@@ -72,6 +72,29 @@ struct Handle {
     /// Absolute backing offset through which prefetch jobs were already
     /// dispatched, so a sequential stream does not re-request buffered windows.
     prefetched_upto: AtomicU64,
+    /// Shared so the read-ahead pool registration is cleaned up on the handle's
+    /// FINAL drop, not eagerly in `release_handle`. A read that races a release
+    /// holds an `Arc<Handle>` clone, so the buffer (and its budget charge) stays
+    /// alive until that read finishes; deregistering here, keyed by the buffer's
+    /// address, then frees exactly that stream's charge with no leak or reuse.
+    pool: Arc<crate::readahead::ReadAheadPool>,
+}
+
+impl Handle {
+    /// Stable pool key for this handle's read-ahead buffer: its heap address,
+    /// unique for the buffer's lifetime (the handle holds the `Arc`, so the
+    /// address can't be reused while still registered).
+    fn pool_key(&self) -> usize {
+        Arc::as_ptr(&self.readahead) as usize
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // Runs when the last Arc<Handle> drops — after any in-flight read that
+        // re-registered the buffer post-release — so the budget never leaks.
+        self.pool.deregister(self.pool_key());
+    }
 }
 
 /// An owned view of an open handle's backing fd, for FUSE passthrough
@@ -1059,17 +1082,18 @@ impl Musefs {
     /// then (when Phase-2 prefetch is enabled and the stream is sequential)
     /// enqueue depth-adaptive next-window jobs. Shared by the binary-tag
     /// (snapshotted) and plain read branches of `read_into`.
-    #[expect(clippy::too_many_arguments)] // mirrors the read offset/size/out plumbing
     fn serve_backing<M>(
         &self,
         h: &Handle,
-        key: usize,
         db: &musefs_db::Db<M>,
         r: &ResolvedFile,
         offset: u64,
         size: u64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
+        // Keyed by the buffer address (not the slab key) so the handle's Drop can
+        // deregister it after a racing release; see Handle::pool_key / Drop.
+        let key = h.pool_key();
         if !h.registered.swap(true, Ordering::AcqRel) {
             self.readahead_pool.register(key, Arc::clone(&h.readahead));
         }
@@ -1099,7 +1123,10 @@ impl Musefs {
         let cap = self.readahead_pool.per_stream_cap();
         let (starts, window) = {
             let mut ra = h.readahead.lock().unwrap();
-            let start = ra.next_expected();
+            // Start at the cached frontier, not the read cursor: a window-filling
+            // miss leaves next_expected mid-window, so dispatching from it would
+            // re-request the bytes just pulled synchronously.
+            let start = ra.frontier(ra.next_expected());
             let window = ra.window();
             let depth = crate::readahead::prefetch_depth(cap, window);
             let ring = usize::try_from(depth).unwrap_or(4) + 1;
@@ -1196,13 +1223,13 @@ impl Musefs {
                                 {
                                     return Ok(None); // stale layout — retry after re-resolve
                                 }
-                                self.serve_backing(&h, fh.slab_key(), db, r, offset, size, out)?;
+                                self.serve_backing(&h, db, r, offset, size, out)?;
                                 Ok(Some(()))
                             })();
                             let _ = db.end_read(); // always release the snapshot
                             res
                         } else {
-                            self.serve_backing(&h, fh.slab_key(), db, r, offset, size, out)?;
+                            self.serve_backing(&h, db, r, offset, size, out)?;
                             Ok(Some(()))
                         }
                     })?;
@@ -1285,6 +1312,7 @@ impl Musefs {
             registered: AtomicBool::new(false),
             epoch: Arc::new(AtomicU64::new(0)),
             prefetched_upto: AtomicU64::new(0),
+            pool: Arc::clone(&self.readahead_pool),
         })))
     }
 
@@ -1294,7 +1322,10 @@ impl Musefs {
         if let Some(h) = self.handles.get(key) {
             h.epoch.fetch_add(1, Ordering::AcqRel);
         }
-        self.readahead_pool.deregister(key);
+        // Pool deregistration is the handle's Drop responsibility, not done here:
+        // a read racing this release still holds an Arc<Handle>, so eagerly
+        // deregistering would drop the entry before that read's charge lands,
+        // leaking it. Drop runs once the last reference (the in-flight read) goes.
         self.handles.remove(key);
     }
 
