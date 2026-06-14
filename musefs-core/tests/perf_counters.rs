@@ -9,8 +9,8 @@ use std::sync::Mutex;
 /// The `metrics` counters are global statics; serialize every measured region.
 static METRICS_LOCK: Mutex<()> = Mutex::new(());
 
-/// Audio payload size for every read golden (4 MiB, matching `read_throughput`).
-const AUDIO_BYTES: u64 = 4 * 1024 * 1024;
+/// `AUDIO_BYTES` as `usize` for `CorpusParams::bytes_per_track`.
+const AUDIO_BYTES_USIZE: usize = 4 * 1024 * 1024;
 /// 128 KiB read chunk (matching `read_throughput`).
 const CHUNK: u64 = 128 * 1024;
 
@@ -80,7 +80,7 @@ fn audio_only_read_emits_no_art_or_tag_chunks() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for &fmt in ALL_FORMATS {
-        let (fs, inode, _dir) = mount_one(fmt, AUDIO_BYTES as usize);
+        let (fs, inode, _dir) = mount_one(fmt, AUDIO_BYTES_USIZE);
         metrics::reset();
         read_whole(&fs, inode);
         let s = metrics::snapshot();
