@@ -25,6 +25,7 @@ fn config() -> MountConfig {
         case_insensitive: false,
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
+        skip_on_missing: false,
     }
 }
 
@@ -33,6 +34,14 @@ fn config_ci() -> MountConfig {
         case_insensitive: true,
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
+        skip_on_missing: false,
+        ..config()
+    }
+}
+
+fn config_skip() -> MountConfig {
+    MountConfig {
+        skip_on_missing: true,
         ..config()
     }
 }
@@ -95,6 +104,58 @@ fn incremental_refresh_matches_full_rebuild_over_edits() {
         tree_fingerprint(&reference).keys().collect::<Vec<_>>(),
         "incremental and full-rebuild paths must match"
     );
+}
+
+#[test]
+fn incremental_skip_on_missing_matches_full_rebuild_over_key_loss_and_gain() {
+    let target = small_corpus(4);
+    let db_path = target.db_path.clone();
+    let corpus = target.corpus_dir.clone();
+
+    let db = Db::open(&db_path).unwrap();
+    scan_directory(&db, &corpus).unwrap();
+    let fs = Musefs::open(Db::open(&db_path).unwrap(), config_skip()).unwrap();
+
+    let writer = Db::open(&db_path).unwrap();
+    let ids: Vec<i64> = writer.list_tracks().unwrap().iter().map(|t| t.id).collect();
+
+    let full = |label: &str, fs: &Musefs| {
+        let reference = Musefs::open(Db::open(&db_path).unwrap(), config_skip()).unwrap();
+        let inc = tree_fingerprint(fs);
+        assert_eq!(
+            inc.keys().collect::<Vec<_>>(),
+            tree_fingerprint(&reference).keys().collect::<Vec<_>>(),
+            "{label}: incremental must match full rebuild"
+        );
+        inc.len()
+    };
+
+    assert_eq!(full("baseline", &fs), 4);
+
+    // Key loss: drop TITLE (a top-level template field) from ids[0]. Full rebuild
+    // skips it, so the incremental path must drop it too.
+    writer
+        .replace_tags(
+            ids[0],
+            &[Tag::new("ARTIST", "Zed", 0), Tag::new("ALBUM", "Al", 0)],
+        )
+        .unwrap();
+    fs.poll_refresh().unwrap();
+    assert_eq!(full("key loss", &fs), 3);
+
+    // Key gain: restore TITLE; the track must reappear.
+    writer
+        .replace_tags(
+            ids[0],
+            &[
+                Tag::new("ARTIST", "Zed", 0),
+                Tag::new("ALBUM", "Al", 0),
+                Tag::new("TITLE", "Back", 0),
+            ],
+        )
+        .unwrap();
+    fs.poll_refresh().unwrap();
+    assert_eq!(full("key gain", &fs), 4);
 }
 
 #[test]

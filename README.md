@@ -379,6 +379,13 @@ any tag key in the store works):
   fallback** from `--fallback FIELD=VALUE` (repeatable, e.g. `--fallback
   albumartist='Unknown Artist'`), then `--default-fallback`. Per-field
   fallbacks let one field default differently from the rest.
+- `--skip-on-missing` — drop a track from the mount entirely when a **top-level**
+  template field stays unresolved, instead of substituting `--default-fallback`.
+  Per-field `--fallback` chains and `[ … ]` sections are unaffected (a field
+  resolved via its fallback counts as present, and section fields stay optional).
+  Handy when an external tool tags only some tracks, e.g.
+  `--template '$!{beets_path}' --skip-on-missing` hides tracks beets left without
+  a `beets_path` (such as deduplicated albums).
 - `[ … ]` — **conditional section**: the bracketed text is emitted only when at
   least one field inside it is present. So `$album[ - CD $disc]` yields
   `Album - CD 2`, or just `Album` on a single-disc release. Write `$[` / `$]`

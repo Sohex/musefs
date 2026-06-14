@@ -26,6 +26,10 @@ MUSEFS_DB=/home/youruser/.local/share/musefs/library.db
 #MUSEFS_TEMPLATE=$albumartist/$album/$title
 # Value substituted for any missing template field.
 #MUSEFS_DEFAULT_FALLBACK=Unknown
+# Drop tracks missing a top-level template field instead of substituting
+# MUSEFS_DEFAULT_FALLBACK (per-field fallbacks and [ ... ] sections still apply).
+# Useful with e.g. MUSEFS_TEMPLATE=$!{beets_path} to hide untagged tracks.
+#MUSEFS_SKIP_ON_MISSING=false
 # How file contents are served: synthesis or structure-only.
 #MUSEFS_MODE=synthesis
 # Compare filenames case-insensitively. Default: false on Linux/FreeBSD,

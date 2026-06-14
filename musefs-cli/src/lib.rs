@@ -74,6 +74,12 @@ pub struct MountArgs {
     /// albumartist="Unknown Artist" --fallback genre=Misc`.
     #[arg(long = "fallback", value_name = "FIELD=VALUE", value_parser = parse_fallback)]
     pub fallbacks: Vec<(String, String)>,
+    /// Drop tracks whose path is missing a top-level template field instead of
+    /// substituting `--default-fallback` (per-field `--fallback` chains and
+    /// `[...]` sections still apply). Useful when an external writer only tags a
+    /// subset of tracks, e.g. skipping tracks beets left without a `beets_path`.
+    #[arg(long, env = "MUSEFS_SKIP_ON_MISSING", default_value_t = false)]
+    pub skip_on_missing: bool,
     /// How file contents are served.
     #[arg(long, value_enum, env = "MUSEFS_MODE", default_value_t = CliMode::Synthesis)]
     pub mode: CliMode,
@@ -303,6 +309,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         case_insensitive: args.case_insensitive,
         read_ahead_budget: u64::from(args.read_ahead_budget_mib).saturating_mul(1024 * 1024),
         read_ahead_prefetch: args.read_ahead_prefetch,
+        skip_on_missing: args.skip_on_missing,
     };
     let defaults = musefs_fuse::FuseConfig::default();
     let fuse_config = musefs_fuse::FuseConfig {
@@ -424,6 +431,26 @@ mod tests {
             parse_mount_config(&args).0.read_ahead_prefetch,
             "flag opts in"
         );
+    }
+
+    #[test]
+    fn skip_on_missing_defaults_off_and_opts_in() {
+        use clap::Parser;
+        let base = ["musefs", "mount", "/mnt", "--db", "/tmp/x.db"];
+        let off = Cli::try_parse_from(base).unwrap();
+        let Command::Mount(args) = off.command else {
+            panic!("expected Mount");
+        };
+        assert!(
+            !parse_mount_config(&args).0.skip_on_missing,
+            "skip-on-missing must default off"
+        );
+
+        let on = Cli::try_parse_from(base.iter().chain(["--skip-on-missing"].iter())).unwrap();
+        let Command::Mount(args) = on.command else {
+            panic!("expected Mount");
+        };
+        assert!(parse_mount_config(&args).0.skip_on_missing, "flag opts in");
     }
 
     #[test]

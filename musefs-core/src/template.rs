@@ -93,10 +93,30 @@ impl Template {
         default_fallback: &str,
         ext: &str,
     ) -> String {
-        let (mut out, _) = render_parts(&self.parts, fields, fallbacks, default_fallback, false);
+        let (mut out, _, _) = render_parts(&self.parts, fields, fallbacks, default_fallback, false);
         out.push('.');
         out.push_str(ext);
         out
+    }
+
+    /// Like [`render`](Self::render), but returns `None` when any *top-level*
+    /// (non-section) field is unresolved — the caller's signal to skip the track
+    /// rather than substitute `default_fallback`. Per-field fallback chains and
+    /// `[...]` sections behave exactly as in `render`; only the top-level default
+    /// substitution is replaced by the skip. Backs `--skip-on-missing`.
+    pub fn render_checked(
+        &self,
+        fields: &BTreeMap<String, &str>,
+        fallbacks: &BTreeMap<String, String>,
+        ext: &str,
+    ) -> Option<String> {
+        let (mut out, _, top_complete) = render_parts(&self.parts, fields, fallbacks, "", false);
+        if !top_complete {
+            return None;
+        }
+        out.push('.');
+        out.push_str(ext);
+        Some(out)
     }
 }
 
@@ -221,18 +241,21 @@ fn collect_field_names(parts: &[Part], out: &mut BTreeSet<String>) {
     }
 }
 
-/// Render `parts`, returning the text and whether at least one referenced field
-/// was present. `in_section` gates `default_fallback`: it is substituted only at
-/// the top level (outside any `[...]`).
+/// Render `parts`, returning the text, whether at least one referenced field
+/// was present, and whether every *top-level* field resolved (no
+/// `default_fallback` substitution was needed). `in_section` gates
+/// `default_fallback`: it is substituted only at the top level (outside any
+/// `[...]`), and only a top-level miss clears `top_complete`.
 fn render_parts(
     parts: &[Part],
     fields: &BTreeMap<String, &str>,
     fallbacks: &BTreeMap<String, String>,
     default_fallback: &str,
     in_section: bool,
-) -> (String, bool) {
+) -> (String, bool, bool) {
     let mut out = String::new();
     let mut any_present = false;
+    let mut top_complete = true;
     for part in parts {
         match part {
             Part::Literal(lit) => out.push_str(lit),
@@ -242,6 +265,7 @@ fn render_parts(
                     any_present = true;
                 } else if !in_section {
                     sanitize_into(&mut out, default_fallback);
+                    top_complete = false;
                 }
             }
             Part::Field { names, raw: true } => {
@@ -250,10 +274,11 @@ fn render_parts(
                     any_present = true;
                 } else if !in_section {
                     sanitize_into(&mut out, default_fallback);
+                    top_complete = false;
                 }
             }
             Part::Section(inner) => {
-                let (text, present) =
+                let (text, present, _) =
                     render_parts(inner, fields, fallbacks, default_fallback, true);
                 if present {
                     out.push_str(&text);
@@ -262,7 +287,7 @@ fn render_parts(
             }
         }
     }
-    (out, any_present)
+    (out, any_present, top_complete)
 }
 
 /// First candidate with a non-empty value, checked against `fields` then
