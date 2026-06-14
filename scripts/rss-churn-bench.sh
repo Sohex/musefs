@@ -42,10 +42,13 @@ build_variants() {
 
 # stdin: one integer per line -> median of the last 25% of lines.
 median_tail() {
-  local n tail_start
+  local n keep tail_start
   mapfile -t vals
   n="${#vals[@]}"
-  tail_start=$(( n - n / 4 ))
+  [ "$n" -eq 0 ] && return 0
+  keep=$(( n / 4 ))
+  [ "$keep" -lt 1 ] && keep=1
+  tail_start=$(( n - keep ))
   printf '%s\n' "${vals[@]:tail_start}" | sort -n | awk '
     { a[NR] = $1 }
     END { if (NR % 2) print a[(NR + 1) / 2]; else print (a[NR / 2] + a[NR / 2 + 1]) / 2 }'
@@ -60,7 +63,7 @@ run_variant() {
     mountpoint -q "$MOUNT" && break
     sleep 0.1
   done
-  trap 'kill "$mpid" 2>/dev/null; kill "${pids[@]}" 2>/dev/null; [ -n "${rpid:-}" ] && kill "$rpid" 2>/dev/null; fusermount3 -u "$MOUNT" 2>/dev/null; rm -f "$stop"' EXIT INT TERM
+  trap 'kill "$mpid" 2>/dev/null; kill "${pids[@]:-}" 2>/dev/null; [ -n "${rpid:-}" ] && kill "$rpid" 2>/dev/null; fusermount3 -u "$MOUNT" 2>/dev/null; rm -f "${stop:-}"' EXIT INT TERM
   local targets=()
   mapfile -t targets < <(find "$MOUNT" -type f | head -n "$FILES")
   if [ "${#targets[@]}" -eq 0 ]; then
