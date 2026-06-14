@@ -4,7 +4,7 @@
 
 use std::time::SystemTime;
 
-use fuser::{FileAttr, FileType, INodeNo};
+use fuser::{FileAttr, FileType};
 
 /// Mount root inode (fuser's FUSE root id). The marker is a child of the root.
 #[cfg(target_os = "macos")]
@@ -23,23 +23,14 @@ pub const MARKER_INO: u64 = u64::MAX;
 /// The marker's attributes: a zero-byte, read-only regular file owned by the
 /// mount, all timestamps set to `mtime` (matching synthetic-node stamping).
 pub fn marker_attr(uid: u32, gid: u32, file_mode: u16, mtime: SystemTime) -> FileAttr {
-    FileAttr {
-        ino: INodeNo(MARKER_INO),
-        size: 0,
-        blocks: 0,
-        atime: mtime,
-        mtime,
-        ctime: mtime,
-        crtime: mtime,
-        kind: FileType::RegularFile,
-        perm: file_mode,
-        nlink: 1,
+    crate::convert::make_attr(
+        MARKER_INO,
+        0,
+        (FileType::RegularFile, file_mode, 1),
         uid,
         gid,
-        rdev: 0,
-        blksize: 512,
-        flags: 0,
-    }
+        mtime,
+    )
 }
 
 /// Marker inode if `(parent, name)` addresses it; `None` otherwise (always `None`
@@ -80,6 +71,8 @@ pub fn marker_dir_entry(_dir_ino: u64) -> Option<(u64, FileType, String)> {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use fuser::INodeNo;
 
     use super::*;
 

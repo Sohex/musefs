@@ -13,6 +13,37 @@ use std::time::{Duration, SystemTime};
 use fuser::{FileAttr, FileType, INodeNo};
 use musefs_core::Attr;
 
+/// Build a `FileAttr` from the fields that actually vary between musefs's nodes,
+/// applying the conventions shared by all of them: every timestamp set to
+/// `mtime`, `blocks` derived from `size`, and the fixed `rdev = 0` /
+/// `blksize = 512` / `flags = 0`.
+pub(crate) fn make_attr(
+    ino: u64,
+    size: u64,
+    (kind, perm, nlink): (FileType, u16, u32),
+    uid: u32,
+    gid: u32,
+    mtime: SystemTime,
+) -> FileAttr {
+    FileAttr {
+        ino: INodeNo(ino),
+        size,
+        blocks: size.div_ceil(512),
+        atime: mtime,
+        mtime,
+        ctime: mtime,
+        crtime: mtime,
+        kind,
+        perm,
+        nlink,
+        uid,
+        gid,
+        rdev: 0,
+        blksize: 512,
+        flags: 0,
+    }
+}
+
 /// Translate a core `Attr` into a `fuser::FileAttr`. Permission bits come from
 /// `dir_mode`/`file_mode` (the mount is read-only, so these are advertised but
 /// inert for writes). A zero `mtime_secs` (e.g. synthetic directories) falls
@@ -33,28 +64,12 @@ pub(crate) fn to_file_attr(
     } else {
         fallback_mtime
     };
-    let (kind, perm, nlink) = if attr.is_dir {
+    let node = if attr.is_dir {
         (FileType::Directory, dir_mode, 2)
     } else {
         (FileType::RegularFile, file_mode, 1)
     };
-    FileAttr {
-        ino: INodeNo(attr.inode),
-        size: attr.size,
-        blocks: attr.size.div_ceil(512),
-        atime: mtime,
-        mtime,
-        ctime: mtime,
-        crtime: mtime,
-        kind,
-        perm,
-        nlink,
-        uid,
-        gid,
-        rdev: 0,
-        blksize: 512,
-        flags: 0,
-    }
+    make_attr(attr.inode, attr.size, node, uid, gid, mtime)
 }
 
 /// Assemble a directory's readdir listing: `.`, `..`, the children, then the
