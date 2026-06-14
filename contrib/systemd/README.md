@@ -55,6 +55,21 @@ sandboxing is possible. The two units differ sharply:
 
 ## Notes
 
+- **The store must exist before the mount starts.** `musefs mount` never
+  creates the DB — it requires a populated store and exits non-zero otherwise,
+  so a mount unit that starts before anything has scanned hard-fails and (with
+  `Restart=on-failure`) crash-loops. Seed the store with an initial
+  `musefs scan` before `enable --now musefs.service`. If you generate the store
+  from another unit, order this one after it with a drop-in
+  (`systemctl --user edit musefs`):
+
+  ```ini
+  [Unit]
+  After=musefs-initial-scan.service
+  Requires=musefs-initial-scan.service
+  ```
+
+  (The `musefs-scan.timer` is a periodic *re-scan*, not the initial seed.)
 - **Binary location.** The `--user` manager does not inherit your shell's
   `PATH`. The units set `PATH` for a `cargo install` binary in `~/.cargo/bin`;
   if musefs is elsewhere, edit the `Environment=PATH=` line (or make

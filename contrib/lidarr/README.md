@@ -116,6 +116,34 @@ runs the doctor preflight first (skip with `--skip-lidarr-preflight`), then
 queries all Lidarr artists and syncs their known track files into the musefs
 DB.
 
+## Migrating an existing Lidarr library
+
+The forward path above (new import → import script symlink → sync) works
+cleanly on a fresh import. Re-homing a **pre-existing** Lidarr library onto the
+musefs symlink tree runs into several Lidarr behaviors; this is the working
+order (observed on Lidarr v1, lsio image). None of it is a musefs bug — these
+are Lidarr quirks an integrator only hits here.
+
+1. **Reassign the artists to the new (musefs) root folder.**
+2. **Clear the stale trackfile records before re-importing.** If the artists'
+   existing trackfiles still reference the *old* root, re-import fails with
+   `NotParentException` (`/old/root/... is not a child of /new/root`) —
+   Lidarr's `RemoveExistingTrackFiles` chokes computing the relative path.
+   Delete the stale trackfile records first.
+   - **The empty-root deletion guard:** Lidarr blocks trackfile deletion while
+     the new root folder is empty ("Artist's root folder is empty", a
+     mass-deletion safety guard) — a chicken-and-egg with the symlinks not
+     existing yet. Drop a placeholder file in the root until the first symlinks
+     land, then remove it.
+   - **Batch the bulk delete:** `DELETE /api/v1/trackfile/bulk` returns 500 on
+     large batches (~200 ids); send ~25 ids per call.
+3. **Re-import.** The import script creates the destination symlinks.
+4. **Backfill the store:** `musefs-lidarr-sync --all`.
+
+Point `musefs scan` at the **backing directory, not the symlink tree.** The
+default (`--follow-symlinks` off) is exactly right here: the store should key
+off the real files, while Lidarr's symlink tree is just its own tracking view.
+
 ## Doctor
 
 To verify your Lidarr settings are musefs-safe:
@@ -133,6 +161,15 @@ The doctor checks Lidarr's API for:
 If `MUSEFS_LIDARR_URL` and `MUSEFS_LIDARR_API_KEY` are not configured, `doctor`
 and sync fail because the integration cannot verify safe settings or build
 complete per-track metadata.
+
+`--doctor` is a **runtime / post-deploy** check, not an offline one: it makes a
+live Lidarr API call, so it needs `MUSEFS_LIDARR_URL` + `MUSEFS_LIDARR_API_KEY`
+and a reachable Lidarr instance. Run it after deployment, not at container
+**build** time — offline it fails with connection-refused even when the
+toolchain itself is wired up correctly. There is no offline "are the binary and
+plugins installed/wired" check; to confirm installation at build time, test that
+the `musefs-lidarr-import` / `musefs-lidarr-sync` scripts and the `musefs`
+binary are importable/on `PATH`.
 
 ## Smoke test
 

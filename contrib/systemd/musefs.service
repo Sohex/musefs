@@ -10,6 +10,11 @@ EnvironmentFile=-%h/.config/musefs/musefs.conf
 # replace ExecStart with an absolute path) to match where musefs is installed.
 Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin
 ExecStart=musefs mount
+# Passing --template here? systemd expands `$word` in ExecStart as a (usually
+# undefined, hence empty) environment variable, so a bare `$albumartist/...`
+# reaches musefs garbled and the mount aborts (rc 2). Double the `$` so systemd
+# passes the literal template through:
+#ExecStart=musefs mount %h/mnt/music --db %h/.local/share/musefs/library.db --template '$$albumartist/$$album/$$title'
 # musefs unmounts cleanly on SIGTERM (systemd's default stop signal), so no
 # ExecStop is required. Uncomment as a fallback if a mount is ever left behind:
 #ExecStop=-fusermount3 -u ${MUSEFS_MOUNTPOINT}

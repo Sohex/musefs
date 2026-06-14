@@ -81,6 +81,12 @@ Each tagged release attaches static/portable Linux binaries for four targets:
 | `x86_64-unknown-linux-musl`  | musl | Fully static — runs on Alpine / scratch containers. |
 | `aarch64-unknown-linux-musl` | musl | Fully static, ARM64. |
 
+The `*-musl` build is statically linked, so it runs on **any** Linux host of
+that architecture regardless of libc — glibc distros (Debian/Ubuntu/Fedora)
+included, not just Alpine/musl. For mixed or containerized deployments it is the
+simplest choice: one binary you can drop onto a glibc host and an Alpine image
+alike.
+
 Download the tarball for your target from the
 [latest release](https://github.com/Sohex/musefs/releases/latest), verify it,
 and extract:
@@ -319,6 +325,14 @@ musefs mount /path/to/mountpoint --db library.db \
 `mount` blocks until the filesystem is unmounted (`fusermount -u`, or
 Ctrl-C).
 
+> **`mount` never creates the store** — unlike `scan`, it requires a populated
+> DB to already exist and exits non-zero otherwise. Interactively this is
+> invisible (the `scan` → `mount` quick start always seeds it first), but it
+> bites automation: a `mount` started at boot before anything has scanned
+> hard-fails (and crash-loops under `Restart=`). Seed the store with an initial
+> `scan`, or order the mount after it — see
+> [`contrib/systemd`](contrib/systemd/README.md).
+
 > **Mounting at an arbitrary path may be denied by AppArmor.** On distros that
 > ship an AppArmor profile for `fusermount3` (Ubuntu 24.04+ / libfuse ≥ 3.17),
 > unprivileged FUSE mounts are only allowed when the mountpoint is under a
@@ -420,6 +434,20 @@ explanatory error if it is missing; add the line to `/etc/fuse.conf`, or run
 musefs as root. (This is libfuse/system policy, not a musefs restriction.) The
 published container images already include this line, so non-root `allow_other`
 mounts work out of the box there.
+
+**`--allow-other` grants other users — but not root.** A FUSE mount made with
+`allow_other` (not `allow_root`) is reachable by other unprivileged users, yet
+**root specifically cannot traverse or stat it** when it is owned by another
+user. This surprises root-run tooling (Ansible, boot scripts):
+
+- `mountpoint -q <mnt>` / `stat <mnt>` run as root report it as *not a
+  mountpoint* — they try to stat *through* the mount and get EACCES. Detect the
+  mount from root with `findmnt <mnt>` or `/proc/mounts` instead, which read the
+  mount table rather than the filesystem.
+- Don't have root manage the mountpoint **directory** while it is mounted: a
+  root task that re-asserts the directory (e.g. Ansible `file: state=directory`)
+  fails with EACCES/EEXIST on every run after the first. Create the directory
+  before mounting, or run such tasks as the mounting user.
 
 ### Configuring with environment variables
 
