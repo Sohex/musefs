@@ -3,6 +3,7 @@
 //! whose `mdat` audio payload is served verbatim. Strict: anything outside the
 //! supported shape (single audio track, one `mdat`, non-fragmented) is rejected.
 
+use crate::bytes::{read_u32_be, read_u64_be};
 use crate::convert::usize_from;
 use crate::error::{FormatError, Result};
 use crate::input::{
@@ -13,16 +14,6 @@ use crate::size;
 use std::io::{self, Read, Seek, SeekFrom};
 
 const MAX_MP4_METADATA_BYTES: u64 = 256 * 1024 * 1024;
-
-fn be_u32(b: &[u8], pos: usize) -> Result<u32> {
-    let s = b.get(pos..pos + 4).ok_or(FormatError::Malformed)?;
-    Ok(u32::from_be_bytes(s.try_into().unwrap()))
-}
-
-fn be_u64(b: &[u8], pos: usize) -> Result<u64> {
-    let s = b.get(pos..pos + 8).ok_or(FormatError::Malformed)?;
-    Ok(u64::from_be_bytes(s.try_into().unwrap()))
-}
 
 /// A located box header within some buffer. `start` is relative to that buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,14 +58,14 @@ pub struct BoxHeader {
 /// largesize). `remaining` is the byte count from this box's start to EOF, used
 /// to resolve a `size == 0` ("extends to end") box.
 pub fn box_header(hdr: &[u8], remaining: u64) -> Result<BoxHeader> {
-    let size32 = u64::from(be_u32(hdr, 0)?);
+    let size32 = u64::from(read_u32_be(hdr, 0)?);
     let kind: [u8; 4] = hdr
         .get(4..8)
         .ok_or(FormatError::Malformed)?
         .try_into()
         .unwrap();
     let (header_len, total_len) = match size32 {
-        1 => (16u64, be_u64(hdr, 8)?),
+        1 => (16u64, read_u64_be(hdr, 8)?),
         0 => (8u64, remaining),
         n => (8u64, n),
     };
@@ -106,14 +97,14 @@ pub enum Mp4ScanError {
 }
 
 fn read_box(buf: &[u8], pos: usize) -> Result<BoxRef> {
-    let size32 = u64::from(be_u32(buf, pos)?);
+    let size32 = u64::from(read_u32_be(buf, pos)?);
     let kind: [u8; 4] = buf
         .get(pos + 4..pos + 8)
         .ok_or(FormatError::Malformed)?
         .try_into()
         .unwrap();
     let (header_len, total) = match size32 {
-        1 => (16usize, be_u64(buf, pos + 8)?),
+        1 => (16usize, read_u64_be(buf, pos + 8)?),
         0 => (8usize, (buf.len() - pos) as u64),
         n => (8usize, n),
     };
@@ -600,13 +591,20 @@ fn boxed(kind: &[u8; 4], payload: &[u8]) -> Result<Vec<u8>> {
     Ok(v)
 }
 
+/// Build a UTF-8 `data` sub-box: a `1u32` type tag (UTF-8), a `0u32` locale, then
+/// the value bytes, wrapped as a `data` box. Shared by `text_atom` and
+/// `freeform_atom`, whose value lists emit one of these per value.
+fn utf8_data_box(value: &str) -> Result<Vec<u8>> {
+    let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
+    data.extend_from_slice(&0u32.to_be_bytes()); // locale
+    data.extend_from_slice(value.as_bytes());
+    boxed(b"data", &data)
+}
+
 fn text_atom(kind: &[u8; 4], values: &[&str]) -> Result<Vec<u8>> {
     let mut inner = Vec::new();
     for v in values {
-        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
-        data.extend_from_slice(&0u32.to_be_bytes()); // locale
-        data.extend_from_slice(v.as_bytes());
-        inner.extend(boxed(b"data", &data)?);
+        inner.extend(utf8_data_box(v)?);
     }
     boxed(kind, &inner)
 }
@@ -638,10 +636,7 @@ fn freeform_atom(mean: &str, name: &str, values: &[&str]) -> Result<Vec<u8>> {
     name_body.extend_from_slice(name.as_bytes());
     inner.extend(boxed(b"name", &name_body)?);
     for v in values {
-        let mut data = 1u32.to_be_bytes().to_vec(); // type 1 = UTF-8
-        data.extend_from_slice(&0u32.to_be_bytes()); // locale
-        data.extend_from_slice(v.as_bytes());
-        inner.extend(boxed(b"data", &data)?);
+        inner.extend(utf8_data_box(v)?);
     }
     boxed(b"----", &inner)
 }
@@ -854,18 +849,18 @@ fn patch_chunk_offsets(kept: &mut [u8], delta: i64) -> Result<()> {
         },
     };
     let (start, len) = range;
-    let count = be_u32(kept, start + 4)? as usize;
+    let count = read_u32_be(kept, start + 4)? as usize;
     for i in 0..count {
         let pos = start + 8 + i * entry;
         if pos + entry > start + len {
             return Err(FormatError::Malformed);
         }
         if entry == 4 {
-            let v = i64::from(be_u32(kept, pos)?) + delta;
+            let v = i64::from(read_u32_be(kept, pos)?) + delta;
             let new_val = u32::try_from(v).map_err(|_| FormatError::TooLarge)?;
             kept[pos..pos + 4].copy_from_slice(&new_val.to_be_bytes());
         } else {
-            let v = be_u64(kept, pos)?.cast_signed() + delta;
+            let v = read_u64_be(kept, pos)?.cast_signed() + delta;
             if v < 0 {
                 return Err(FormatError::Malformed);
             }

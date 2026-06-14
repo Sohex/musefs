@@ -1,3 +1,4 @@
+mod bytes;
 mod convert;
 mod error;
 pub mod flac;

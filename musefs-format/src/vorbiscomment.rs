@@ -2,6 +2,7 @@
 //! Ogg codecs' comment packets. This is the body only: it never includes the
 //! Vorbis framing bit or any codec-specific magic.
 
+use crate::bytes::read_u32_le;
 use crate::error::{FormatError, Result};
 use crate::input::TagInput;
 
@@ -44,18 +45,6 @@ pub(crate) fn build(tags: &[TagInput]) -> Result<Vec<u8>> {
         out.extend_from_slice(comment.as_bytes());
     }
     Ok(out)
-}
-
-fn read_u32_le(data: &[u8], pos: usize) -> Result<u32> {
-    if pos + 4 > data.len() {
-        return Err(FormatError::Malformed);
-    }
-    Ok(u32::from_le_bytes([
-        data[pos],
-        data[pos + 1],
-        data[pos + 2],
-        data[pos + 3],
-    ]))
 }
 
 /// Parse a VorbisComment body into `(key, value)` pairs in order. Comments

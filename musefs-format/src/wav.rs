@@ -1,3 +1,4 @@
+use crate::bytes::read_u32_le;
 use crate::error::{FormatError, Result};
 use crate::input::{BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture};
 use crate::probe::Extent;
@@ -26,7 +27,8 @@ fn riff_wave_start(buf: &[u8]) -> Result<(usize, u64)> {
     if buf.len() < 12 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
         return Err(FormatError::NotWav);
     }
-    let riff_size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let riff_size =
+        read_u32_le(buf, 4).expect("RIFF size field within the validated 12-byte header");
     Ok((12, 8 + u64::from(riff_size)))
 }
 
@@ -47,12 +49,9 @@ fn walk_chunks(buf: &[u8]) -> Vec<([u8; 4], usize, u64)> {
     while pos + 8 <= ceiling {
         let mut id = [0u8; 4];
         id.copy_from_slice(&buf[pos..pos + 4]);
-        let size = u64::from(u32::from_le_bytes([
-            buf[pos + 4],
-            buf[pos + 5],
-            buf[pos + 6],
-            buf[pos + 7],
-        ]));
+        let size = u64::from(
+            read_u32_le(buf, pos + 4).expect("chunk size field within the loop-guarded bounds"),
+        );
         let payload_offset = pos + 8;
         out.push((id, payload_offset, size));
         let advance = 8u64 + size + (size & 1); // word-align: pad odd payloads
@@ -338,7 +337,8 @@ fn read_info_tags(body: &[u8]) -> Vec<(String, String)> {
     while pos + 8 <= body.len() {
         let mut id = [0u8; 4];
         id.copy_from_slice(&body[pos..pos + 4]);
-        let size = u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]])
+        let size = read_u32_le(body, pos + 4)
+            .expect("subchunk size field within the loop-guarded bounds")
             as usize;
         let val_start = pos + 8;
         let val_end = val_start.saturating_add(size).min(body.len());
