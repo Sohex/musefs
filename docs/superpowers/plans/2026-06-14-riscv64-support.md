@@ -137,7 +137,13 @@ Expected: both finish `Finished release`. Two distinct failure modes to recogniz
      ```bash
      JEMALLOC_SYS_WITH_LG_PAGE=12 cargo zigbuild --release -p musefs --target riscv64gc-unknown-linux-gnu.2.27
      ```
-     If this fixes it, the release `build` step must export `JEMALLOC_SYS_WITH_LG_PAGE=12` for the riscv64 legs — add it as a conditional `env` on the "Build" step (`.github/workflows/release.yml:172-173`), gated to the riscv64 triples, and note it in this commit.
+     If this fixes it, the release `build` job must export `JEMALLOC_SYS_WITH_LG_PAGE=12` for the riscv64 legs only. Add a guarded step **before** the "Build" step (`.github/workflows/release.yml:172-173`) — do **not** use a step-level `env:` with a matrix expression, because an empty-string value on the non-riscv64 legs would still be *set* and break jemalloc's `configure`. A `$GITHUB_ENV` write under an `if:` sets the var on the riscv64 legs and leaves it entirely unset elsewhere:
+     ```yaml
+      - name: Pin jemalloc page size for riscv64
+        if: contains(matrix.triple, 'riscv64')
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=12" >> "$GITHUB_ENV"
+     ```
+     Note this in the commit.
   2. If jemalloc still won't cross-compile, drop it for riscv64 only:
      ```bash
      cargo zigbuild --release -p musefs --no-default-features --target riscv64gc-unknown-linux-gnu.2.27
@@ -184,6 +190,8 @@ docker run --rm --privileged tonistiigi/binfmt --install riscv64
 ```
 
 Expected: JSON output listing `riscv64` among the installed emulators. (Skip if your host already has `qemu-riscv64` binfmt registered; verify with `cat /proc/sys/fs/binfmt_misc/qemu-riscv64` → `enabled`.)
+
+Note: this spike registers binfmt via `tonistiigi/binfmt` directly, whereas the CI leg (Task 4) uses `docker/setup-qemu-action` — which wraps the same `tonistiigi/binfmt` image, so they are functionally equivalent. A spike pass is strong but not identical-path evidence; the CI leg's `continue-on-error` is the backstop if the action-based registration behaves differently.
 
 - [ ] **Step 2: Stage the binary the way the smoke job will see it**
 
@@ -293,6 +301,10 @@ After the "Smoke (Alpine container)" step (`.github/workflows/release.yml:234-24
 ```yaml
             sh -c '${{ matrix.pkg }} && ./bin/musefs --version'
 ```
+
+**Quoting constraint:** `${{ matrix.pkg }}` is a *text substitution* into a single-quoted `sh -c '...'` before the shell runs. The two `pkg` values defined in Step 2 contain `&&` and `>` (fine) but **no single quotes** (required). Never put a `'` in a `pkg` value — it would terminate the quote and allow matrix data to inject shell. Keep `pkg` to plain `&&`-joined package-install commands.
+
+**`set -euo pipefail` scope:** the `pipefail` in this step's `run:` block is the *runner's bash* (GitHub's default shell). The work inside the container runs under the image's `sh` (busybox on Alpine), and `smoke-binary.sh` sets its own `set -eu` (verified `scripts/smoke-binary.sh:10`); the outer `pipefail` does not propagate into the container, and nothing here relies on it doing so.
 
 - [ ] **Step 5: Lint the workflow**
 
@@ -423,10 +435,24 @@ EOF
 ## Task 6: Documentation
 
 **Files:**
-- Modify: `README.md:75-82` (the "Prebuilt binaries" table)
+- Modify: `README.md:71` (stale "only AMD64 and AARCH64" note) + `README.md:75-82` (the "Prebuilt binaries" table)
 - Modify: `CHANGELOG.md:11-13` (the `## [Unreleased]` → `### Added` list)
 
-- [ ] **Step 1: Update the README prebuilt-binaries table**
+- [ ] **Step 1a: Fix the stale architecture note**
+
+In `README.md`, the IMPORTANT callout at `README.md:71` reads:
+
+```markdown
+> At present only AMD64 and AARCH64 are supported. If you'd like 32-bit support please open an issue.
+```
+
+Adding riscv64 binaries makes this contradictory. Change it to:
+
+```markdown
+> At present AMD64, AARCH64, and RISC-V 64 are supported. If you'd like 32-bit support please open an issue.
+```
+
+- [ ] **Step 1b: Update the README prebuilt-binaries table**
 
 In `README.md`, change the lead-in line (`README.md:75`):
 

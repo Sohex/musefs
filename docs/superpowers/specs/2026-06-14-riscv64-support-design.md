@@ -89,7 +89,11 @@ cargo-zigbuild that means `zig cc` cross-compiling jemalloc for `riscv64gc`.
   build; (2) worst case, build the riscv64 target with `--no-default-features`,
   dropping jemalloc for that arch only — the binary falls back to the system
   allocator and loses the jemalloc allocator-stats telemetry on riscv64, with no
-  other behavioral change.
+  other behavioral change. Mount support is unaffected: the `jemalloc` feature's
+  `dep:musefs-fuse` is a *direct* dep only so `main.rs` can install the allocator
+  probe; `musefs-fuse` stays linked transitively via `musefs-cli`'s non-optional
+  dependency, so a `--no-default-features` binary still mounts (verified with
+  `cargo tree -p musefs --no-default-features`).
 
 ## Changes
 
@@ -153,8 +157,12 @@ Concrete edits:
   install> && sh scripts/smoke-binary.sh ./bin/musefs'`. This is a **new** step,
   not a reuse of the existing alpine step (that step takes no `--platform`).
 - The existing `host`/`alpine` steps and their `if:` guards are unchanged.
-- Mark the emulated legs **`continue-on-error: true`** (per-leg, not job-level).
-  Rationale: `images`, `publish`, and `release-assets` all `needs: smoke`, so a
+- Mark the emulated legs **`continue-on-error`**, scoped to those legs only via
+  a matrix-keyed expression at the job level (`continue-on-error: ${{
+  matrix.mode == 'emulated' }}`) — each matrix leg is a separate job instance,
+  so this is per-leg in effect. Do **not** make the whole job unconditionally
+  `continue-on-error`. Rationale: `images`, `publish`, and `release-assets` all
+  `needs: smoke`, so a
   *hard* emulated-smoke failure would otherwise block the image push, the
   crates.io publish, and the GitHub release upload. `fail-fast: false` only
   stops sibling legs from cancelling — it does not stop a failed leg from
