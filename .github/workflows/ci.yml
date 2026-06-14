@@ -25,6 +25,7 @@ jobs:
       src: ${{ steps.filter.outputs.src }}
       fuse: ${{ steps.filter.outputs.fuse }}
       lidarr: ${{ steps.filter.outputs.lidarr }}
+      perf: ${{ steps.filter.outputs.perf }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
@@ -48,6 +49,7 @@ jobs:
             echo "src=true" >> "$GITHUB_OUTPUT"
             echo "fuse=true" >> "$GITHUB_OUTPUT"
             echo "lidarr=true" >> "$GITHUB_OUTPUT"
+            echo "perf=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed="$(git diff --name-only "$base...HEAD")"
@@ -74,6 +76,14 @@ jobs:
             echo "lidarr=true" >> "$GITHUB_OUTPUT"
           else
             echo "lidarr=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Read/synthesis surface only: the A/B wall-clock job is expensive
+          # (builds criterion twice), so gate it to changes that can actually
+          # move read latency. tests/ and benches/ are excluded by the anchors.
+          if printf '%s\n' "$changed" | grep -qE '^(musefs-core/src/|musefs-format/src/)'; then
+            echo "perf=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "perf=false" >> "$GITHUB_OUTPUT"
           fi
 
   check:
