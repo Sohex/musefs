@@ -171,3 +171,11 @@ fn sustained_mixed_load_does_not_deadlock_or_corrupt() {
         h.join().unwrap();
     }
 }
+
+// `CoreError` must be `Send` so it can cross the thread boundary in the
+// concurrent serve path exercised above.
+#[test]
+fn core_error_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<musefs_core::CoreError>();
+}

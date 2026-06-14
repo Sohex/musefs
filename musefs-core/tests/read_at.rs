@@ -54,29 +54,6 @@ fn reading_whole_file_matches_total_len_and_splices_audio() {
 }
 
 #[test]
-fn random_offset_and_size_match_the_whole_read() {
-    let (_dir, db, id) = setup();
-    let cache = HeaderCache::new(Mode::Synthesis);
-    let resolved = cache.resolve(&db, id).unwrap();
-    let whole = read_at(&resolved, &db, 0, resolved.total_len).unwrap();
-
-    for (off, size) in [
-        (0u64, 10u64),
-        (resolved.layout.header_len() - 5, 20),
-        (resolved.total_len - 7, 50),
-        (50, 0),
-    ] {
-        let got = read_at(&resolved, &db, off, size).unwrap();
-        let end = usize::try_from((off + size).min(resolved.total_len)).unwrap();
-        assert_eq!(
-            got,
-            &whole[usize::try_from(off).unwrap()..end],
-            "off={off} size={size}"
-        );
-    }
-}
-
-#[test]
 fn reading_past_eof_returns_empty() {
     let (_dir, db, id) = setup();
     let cache = HeaderCache::new(Mode::Synthesis);

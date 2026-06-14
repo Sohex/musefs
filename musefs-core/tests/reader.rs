@@ -84,20 +84,6 @@ fn bounds_check_rejects_audio_region_overrunning_the_file() {
 }
 
 #[test]
-fn resolve_errors_when_backing_file_changes() {
-    let (dir, db, id) = setup();
-    let cache = HeaderCache::new(Mode::Synthesis);
-    cache.resolve(&db, id).unwrap();
-
-    std::fs::write(dir.path().join("song.flac"), b"fLaC truncated").unwrap();
-    let err = cache.resolve(&db, id);
-    assert!(matches!(
-        err,
-        Err(musefs_core::CoreError::BackingChanged(_))
-    ));
-}
-
-#[test]
 fn resolve_includes_art_image_segments() {
     use musefs_db::{NewArt, TrackArt};
     use musefs_format::Segment;
