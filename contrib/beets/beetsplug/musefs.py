@@ -137,7 +137,28 @@ class MusefsPlugin(BeetsPlugin):
             # environmental failure (locked DB, vanished file, wedged scan); those
             # degrade to a warning. An unexpected exception still propagates so a
             # real bug surfaces instead of hiding behind a one-line warning.
-            self._log.warning("musefs: {}", exc)
+            if self._is_permission_error(exc):
+                # A persistent setup failure (read-only DB / permission denied)
+                # would otherwise be a silent no-op: beets hides plugin WARNINGs
+                # at default verbosity, so the user gets no sign the sync did
+                # nothing. Surface it via ui.print_ — but still don't abort.
+                ui.print_(
+                    f"musefs: cannot write {db_path} (read-only/permission denied) "
+                    f"— metadata not synced"
+                )
+            else:
+                self._log.warning("musefs: {}", exc)
+
+    @staticmethod
+    def _is_permission_error(exc):
+        """True if ``exc`` is a persistent permission/read-only DB failure (worth
+        surfacing loudly), as opposed to a transient lock or a vanished file."""
+        if isinstance(exc, PermissionError):
+            return True
+        if isinstance(exc, sqlite3.OperationalError):
+            msg = str(exc).lower()
+            return "readonly database" in msg or "unable to open database file" in msg
+        return False
 
     # --- helpers ---------------------------------------------------------
 

@@ -35,10 +35,18 @@ def _plugin(monkeypatch, *, sync_raises=None):
     return plugin
 
 
+def _capture_prints(monkeypatch):
+    prints = []
+    monkeypatch.setattr(musefs_mod.ui, "print_", lambda *a: prints.append(a))
+    return prints
+
+
 def test_reconcile_swallows_db_error_as_warning(monkeypatch):
     plugin = _plugin(monkeypatch, sync_raises=sqlite3.OperationalError("database is locked"))
+    prints = _capture_prints(monkeypatch)
     plugin._reconcile_pending()  # must NOT raise
     assert len(plugin._log.warnings) == 1
+    assert prints == []  # transient failures stay quiet
 
 
 def test_reconcile_swallows_os_error_as_warning(monkeypatch):
@@ -51,6 +59,41 @@ def test_reconcile_propagates_unexpected_error(monkeypatch):
     plugin = _plugin(monkeypatch, sync_raises=ValueError("a real bug"))
     with pytest.raises(ValueError):
         plugin._reconcile_pending()
+
+
+def test_reconcile_surfaces_readonly_db_loudly(monkeypatch):
+    plugin = _plugin(
+        monkeypatch,
+        sync_raises=sqlite3.OperationalError("attempt to write a readonly database"),
+    )
+    prints = _capture_prints(monkeypatch)
+    plugin._reconcile_pending()  # still must NOT raise
+    assert plugin._log.warnings == []  # not buried in a default-hidden warning
+    assert len(prints) == 1
+    msg = prints[0][0]
+    assert "/db.sqlite" in msg and "not synced" in msg
+
+
+def test_reconcile_surfaces_unwritable_dir_loudly(monkeypatch):
+    # A non-writable DB directory surfaces as SQLite "unable to open database
+    # file" when it tries to create the -wal/-shm files — also persistent.
+    plugin = _plugin(
+        monkeypatch,
+        sync_raises=sqlite3.OperationalError("unable to open database file"),
+    )
+    prints = _capture_prints(monkeypatch)
+    plugin._reconcile_pending()
+    assert plugin._log.warnings == []
+    assert len(prints) == 1
+
+
+def test_reconcile_surfaces_permission_error_loudly(monkeypatch):
+    plugin = _plugin(monkeypatch, sync_raises=PermissionError(13, "Permission denied"))
+    prints = _capture_prints(monkeypatch)
+    plugin._reconcile_pending()
+    assert plugin._log.warnings == []
+    assert len(prints) == 1
+    assert "/db.sqlite" in prints[0][0]
 
 
 def test_run_scan_passes_shared_timeout(monkeypatch):

@@ -86,6 +86,35 @@ left behind at the old one. A metadata-only `beet modify` (no `-w`) doesn't fire
 a hook — re-run `beet musefs`. With `autoscan: no`, run `musefs scan` yourself
 first; the hooks then skip gracefully if the DB is missing.
 
+## Never writing to your backing audio files
+
+If your backing files must stay byte-for-byte untouched — you're seeding them as
+a torrent, the library is immutable, or you simply want beets to drive the musefs
+view without ever rewriting a tag — configure beets to never write to disk:
+
+```yaml
+import:
+    copy: no
+    move: no
+    write: no
+```
+
+`write: no` is enough on its own: every stock beets plugin gates its file writes
+on `import.write`. The musefs plugin reads canonical metadata from the **beets
+database**, not from the files, and `musefs scan` ingests/synthesizes embedded
+art itself — so `write: no` loses nothing in the musefs view.
+
+A few plugins ignore that gate or are redundant in this mode:
+
+- **scrub** — deletes all tags from files directly via mutagen, *ignoring*
+  `import.write`; its auto-import hook would wipe tags from your backing files.
+  Don't enable it.
+- **embedart** — embeds cover art into the audio files. Redundant: musefs already
+  presents embedded art in the virtual files (scan ingestion plus the plugin's
+  overlay of the album's `artpath`).
+- **zero** — only acts during a file write, so it is inert with `write: no`
+  (nothing to do, but nothing to worry about either).
+
 ## Notes
 
 - **Field coverage:** every tag beets writes to a file (its `_media_tag_fields`)
