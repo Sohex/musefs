@@ -73,6 +73,14 @@ MUSEFS_DB=/home/youruser/.local/share/musefs/library.db
 # 'user_allow_other' in /etc/fuse.conf. Default: false.
 #MUSEFS_ALLOW_OTHER=true
 
+# --- Mount: observability ---------------------------------------------------
+
+# Expose a /proc-style metrics file at <mountpoint>/.musefs-metrics/metrics
+# (Prometheus text format: handles, read/dir-handle queues, caches, read-ahead,
+# tree footprint, allocator). Off by default. Distinct from the compile-time
+# `metrics` cargo feature, which adds backing-syscall counters. Default: false.
+#MUSEFS_EXPOSE_METRICS=true
+
 # --- Scan -------------------------------------------------------------------
 # (scan targets are set in musefs-scan.service, not here.)
 
