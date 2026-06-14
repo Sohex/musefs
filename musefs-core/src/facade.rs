@@ -57,25 +57,13 @@ pub struct Attr {
     pub mtime_secs: i64,
 }
 
-/// An open file handle: the resolved layout, the track it belongs to, the
-/// generation at which `resolved` was last validated, and a backing fd opened
-/// once at `open`.
-///
-/// A handle survives `poll_refresh`, but is **not** a frozen snapshot: when the
-/// global `refresh_gen` advances (a refresh applied changes), the next `read`
-/// re-resolves the track (a cheap `content_version`-keyed cache hit when the
-/// track is unchanged) and swaps in the fresh layout. This keeps a re-tagged
-/// file's handle consistent with the size the kernel sees via getattr, and
-/// prevents a stale `Segment::BinaryTag { payload_id }` from serving reused-rowid
-/// bytes after a re-tag.
 struct Handle {
     track_id: i64,
     resolved: arc_swap::ArcSwap<ResolvedFile>,
     generation: AtomicU64,
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
     readahead: Arc<Mutex<crate::readahead::ReadAhead>>,
     registered: AtomicBool,
-    #[expect(dead_code)]
     epoch: Arc<AtomicU64>,
 }
 
@@ -151,6 +139,7 @@ pub struct Musefs {
     refresh_gen: AtomicU64,
     handles: sharded_slab::Slab<Arc<Handle>>,
     readahead_pool: Arc<crate::readahead::ReadAheadPool>,
+    prefetch: Option<crate::readahead::PrefetchWorkers>,
     /// `SizeEntry` keyed by track id. Tiny entries, effectively unbounded; serves
     /// getattr/lookup without a backing stat or full synthesis. Self-invalidates on
     /// a content_version change.
@@ -269,6 +258,11 @@ impl Musefs {
             template,
             handles: sharded_slab::Slab::new(),
             readahead_pool: Arc::new(crate::readahead::ReadAheadPool::new(read_ahead_budget)),
+            prefetch: if read_ahead_budget > 0 {
+                Some(crate::readahead::PrefetchWorkers::new(2))
+            } else {
+                None
+            },
             size_cache: dashmap::DashMap::new(),
             last_poll: Mutex::new(std::time::Instant::now()),
             last_failed_refresh: Mutex::new(None),
@@ -1115,6 +1109,9 @@ impl Musefs {
                                 let key = fh.slab_key();
                                 if !h.registered.swap(true, Ordering::AcqRel) {
                                     self.readahead_pool.register(key, Arc::clone(&h.readahead));
+                                    if self.readahead_pool.enabled() {
+                                        h.readahead.lock().unwrap().set_max_windows(2);
+                                    }
                                 }
                                 let backing_len = r.stamp.size;
                                 let br = crate::readahead::BackingReader::new(
@@ -1123,8 +1120,26 @@ impl Musefs {
                                     &self.readahead_pool,
                                     key,
                                     backing_len,
+                                    &h.epoch,
                                 );
                                 read_at_with_file_into(r, db, &br, offset, size, out)?;
+                                if let Some(pf) = &self.prefetch {
+                                    let (start, len) = {
+                                        let ra = h.readahead.lock().unwrap();
+                                        (ra.next_expected(), self.readahead_pool.per_stream_cap())
+                                    };
+                                    if start < backing_len {
+                                        pf.request(crate::readahead::PrefetchJob {
+                                            file: Arc::clone(&h.file),
+                                            buf: Arc::clone(&h.readahead),
+                                            epoch: Arc::clone(&h.epoch),
+                                            dispatched_epoch: h.epoch.load(Ordering::Acquire),
+                                            start,
+                                            len,
+                                            backing_len,
+                                        });
+                                    }
+                                }
                                 Ok(Some(()))
                             })();
                             let _ = db.end_read(); // always release the snapshot
@@ -1133,6 +1148,9 @@ impl Musefs {
                             let key = fh.slab_key();
                             if !h.registered.swap(true, Ordering::AcqRel) {
                                 self.readahead_pool.register(key, Arc::clone(&h.readahead));
+                                if self.readahead_pool.enabled() {
+                                    h.readahead.lock().unwrap().set_max_windows(2);
+                                }
                             }
                             let backing_len = r.stamp.size;
                             let br = crate::readahead::BackingReader::new(
@@ -1141,8 +1159,26 @@ impl Musefs {
                                 &self.readahead_pool,
                                 key,
                                 backing_len,
+                                &h.epoch,
                             );
                             read_at_with_file_into(r, db, &br, offset, size, out)?;
+                            if let Some(pf) = &self.prefetch {
+                                let (start, len) = {
+                                    let ra = h.readahead.lock().unwrap();
+                                    (ra.next_expected(), self.readahead_pool.per_stream_cap())
+                                };
+                                if start < backing_len {
+                                    pf.request(crate::readahead::PrefetchJob {
+                                        file: Arc::clone(&h.file),
+                                        buf: Arc::clone(&h.readahead),
+                                        epoch: Arc::clone(&h.epoch),
+                                        dispatched_epoch: h.epoch.load(Ordering::Acquire),
+                                        start,
+                                        len,
+                                        backing_len,
+                                    });
+                                }
+                            }
                             Ok(Some(()))
                         }
                     })?;
@@ -1212,7 +1248,7 @@ impl Musefs {
         let generation = self.refresh_gen.load(Ordering::Acquire);
         let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
         crate::metrics::on_open();
-        let file = std::fs::File::open(&resolved.backing_path)?;
+        let file = Arc::new(std::fs::File::open(&resolved.backing_path)?);
         validate_opened_backing(&file, &resolved)?;
         fh_from_key(self.handles.insert(Arc::new(Handle {
             track_id,
@@ -1230,6 +1266,9 @@ impl Musefs {
     /// Drop an open handle (closes its backing fd when the last reference goes).
     pub fn release_handle(&self, fh: Fh) {
         let key = fh.slab_key();
+        if let Some(h) = self.handles.get(key) {
+            h.epoch.fetch_add(1, Ordering::AcqRel);
+        }
         self.readahead_pool.deregister(key);
         self.handles.remove(key);
     }

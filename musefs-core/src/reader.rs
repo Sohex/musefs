@@ -370,7 +370,8 @@ pub fn read_at_into<M>(
         let pool = crate::readahead::ReadAheadPool::new(0);
         let buf = std::sync::Arc::new(std::sync::Mutex::new(crate::readahead::ReadAhead::new(0)));
         let backing_len = resolved.stamp.size;
-        let br = crate::readahead::BackingReader::new(&file, &buf, &pool, 0, backing_len);
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let br = crate::readahead::BackingReader::new(&file, &buf, &pool, 0, backing_len, &epoch);
         read_segments_into(resolved, db, Some(&br), offset, size, out)
     } else {
         read_segments_into(resolved, db, None, offset, size, out)
@@ -749,7 +750,8 @@ mod resolve_ogg_tests {
         let file = std::fs::File::open(&resolved.backing_path).unwrap();
         let pool = crate::readahead::ReadAheadPool::new(0);
         let buf = Arc::new(Mutex::new(crate::readahead::ReadAhead::new(0)));
-        let br = crate::readahead::BackingReader::new(&file, &buf, &pool, 0, meta.len());
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let br = crate::readahead::BackingReader::new(&file, &buf, &pool, 0, meta.len(), &epoch);
         let via_file = read_at_with_file(&resolved, &db, &br, 0, resolved.total_len).unwrap();
         assert_eq!(via_open, via_file);
     }
@@ -1645,7 +1647,8 @@ mod readahead_differential_tests {
         let (db, resolved, file) = pcm_fixture();
         let pool = ReadAheadPool::new(0);
         let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
-        let br = BackingReader::new(&file, &buf, &pool, 0, resolved.stamp.size);
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let br = BackingReader::new(&file, &buf, &pool, 0, resolved.stamp.size, &epoch);
         let total = resolved.total_len;
         for &size in &[1u64, 7, 4096, 65536, 262_144] {
             let mut off = 0;
@@ -1667,7 +1670,8 @@ mod readahead_differential_tests {
         let pool = ReadAheadPool::new(1024 * 1024);
         let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
         pool.register(1, Arc::clone(&buf));
-        let br = BackingReader::new(&file, &buf, &pool, 1, resolved.stamp.size);
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let br = BackingReader::new(&file, &buf, &pool, 1, resolved.stamp.size, &epoch);
         let total = resolved.total_len;
         let mut off = 0;
         while off < total {
@@ -1687,7 +1691,8 @@ mod readahead_differential_tests {
         let pool = ReadAheadPool::new(64 * 1024 * 1024);
         let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
         pool.register(1, Arc::clone(&buf));
-        let br = BackingReader::new(&file, &buf, &pool, 1, resolved.stamp.size);
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let br = BackingReader::new(&file, &buf, &pool, 1, resolved.stamp.size, &epoch);
         let seq = [(0u64, 600u64), (590, 50), (10, 4096), (12, 4096)];
         for &(off, n) in &seq {
             let n = n.min(resolved.total_len.saturating_sub(off));

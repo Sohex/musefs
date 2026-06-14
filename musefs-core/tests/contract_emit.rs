@@ -26,7 +26,8 @@ fn emit_contract_fixtures() {
         let file = std::fs::File::open(&resolved.backing_path).expect("open backing file");
         let pool = ReadAheadPool::new(0);
         let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
-        let br = BackingReader::new(&file, &buf, &pool, 0, resolved.total_len);
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let br = BackingReader::new(&file, &buf, &pool, 0, resolved.total_len, &epoch);
         let bytes = read_at_with_file(&resolved, &db, &br, 0, resolved.total_len)
             .expect("synthesize served bytes");
         // Name the output by track id + the backing file's extension, so the

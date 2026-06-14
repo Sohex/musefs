@@ -253,12 +253,14 @@ mod tests {
     struct TestBr {
         pool: crate::readahead::ReadAheadPool,
         buf: Arc<Mutex<crate::readahead::ReadAhead>>,
+        epoch: std::sync::atomic::AtomicU64,
     }
     impl TestBr {
         fn new() -> Self {
             TestBr {
                 pool: crate::readahead::ReadAheadPool::new(0),
                 buf: Arc::new(Mutex::new(crate::readahead::ReadAhead::new(0))),
+                epoch: std::sync::atomic::AtomicU64::new(0),
             }
         }
         fn reader<'a>(
@@ -266,7 +268,7 @@ mod tests {
             f: &'a std::fs::File,
             len: u64,
         ) -> crate::readahead::BackingReader<'a> {
-            crate::readahead::BackingReader::new(f, &self.buf, &self.pool, 0, len)
+            crate::readahead::BackingReader::new(f, &self.buf, &self.pool, 0, len, &self.epoch)
         }
     }
 

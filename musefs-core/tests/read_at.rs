@@ -167,7 +167,8 @@ fn read_at_with_file_out_of_range_and_zero_size_return_empty() {
     let file = std::fs::File::open(&resolved.backing_path).unwrap();
     let pool = ReadAheadPool::new(0);
     let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
-    let br = BackingReader::new(&file, &buf, &pool, 0, resolved.total_len);
+    let epoch = std::sync::atomic::AtomicU64::new(0);
+    let br = BackingReader::new(&file, &buf, &pool, 0, resolved.total_len, &epoch);
 
     // The per-handle path has no outer guard: read_segments_into itself must
     // bail on offset > total_len (its window arithmetic would underflow).

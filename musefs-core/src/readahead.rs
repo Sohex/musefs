@@ -313,6 +313,70 @@ pub fn try_store_prefetch(
 }
 
 use std::cell::Cell;
+use std::sync::mpsc;
+
+pub struct PrefetchJob {
+    pub file: Arc<std::fs::File>,
+    pub buf: Arc<Mutex<ReadAhead>>,
+    pub epoch: Arc<std::sync::atomic::AtomicU64>,
+    pub dispatched_epoch: u64,
+    pub start: u64,
+    pub len: u64,
+    pub backing_len: u64,
+}
+
+pub struct PrefetchWorkers {
+    tx: mpsc::SyncSender<PrefetchJob>,
+    #[cfg(test)]
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl PrefetchWorkers {
+    pub fn new(threads: usize) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<PrefetchJob>(threads * 4);
+        let rx = Arc::new(Mutex::new(rx));
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let rx = Arc::clone(&rx);
+            let h = std::thread::spawn(move || {
+                while let Ok(job) = {
+                    let g = rx.lock().unwrap();
+                    g.recv()
+                } {
+                    Self::run_job(job);
+                }
+            });
+            handles.push(h);
+        }
+        PrefetchWorkers {
+            tx,
+            #[cfg(test)]
+            handles,
+        }
+    }
+
+    #[expect(clippy::needless_pass_by_value)]
+    pub fn run_job(job: PrefetchJob) {
+        use std::os::unix::fs::FileExt;
+        if job.epoch.load(std::sync::atomic::Ordering::Acquire) != job.dispatched_epoch {
+            return;
+        }
+        let want = job.len.min(job.backing_len.saturating_sub(job.start));
+        if want == 0 {
+            return;
+        }
+        #[expect(clippy::cast_possible_truncation)]
+        let mut bytes = vec![0u8; want as usize];
+        if job.file.read_exact_at(&mut bytes, job.start).is_err() {
+            return;
+        }
+        let _ = try_store_prefetch(&job.buf, &job.epoch, job.dispatched_epoch, job.start, bytes);
+    }
+
+    pub fn request(&self, job: PrefetchJob) {
+        let _ = self.tx.try_send(job);
+    }
+}
 
 pub struct BackingReader<'a> {
     file: &'a std::fs::File,
@@ -321,6 +385,7 @@ pub struct BackingReader<'a> {
     key: usize,
     backing_len: u64,
     fills: Cell<u64>,
+    epoch: &'a std::sync::atomic::AtomicU64,
 }
 
 impl<'a> BackingReader<'a> {
@@ -330,6 +395,7 @@ impl<'a> BackingReader<'a> {
         pool: &'a ReadAheadPool,
         key: usize,
         backing_len: u64,
+        epoch: &'a std::sync::atomic::AtomicU64,
     ) -> Self {
         BackingReader {
             file,
@@ -338,6 +404,7 @@ impl<'a> BackingReader<'a> {
             key,
             backing_len,
             fills: Cell::new(0),
+            epoch,
         }
     }
 
@@ -361,6 +428,9 @@ impl<'a> BackingReader<'a> {
             crate::metrics::on_readahead_hit();
         } else {
             crate::metrics::on_readahead_miss();
+            if abs_offset != ra.next_expected() {
+                self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
             let cap = self
                 .pool
                 .permitted_window(self.key, ra.len(), self.pool.per_stream_cap());
@@ -606,7 +676,8 @@ mod eviction_tests {
             let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
             pool.register(1, Arc::clone(&buf));
             let backing_len = data.len() as u64;
-            let br = BackingReader::new(&file, &buf, &pool, 1, backing_len);
+            let epoch = std::sync::atomic::AtomicU64::new(0);
+            let br = BackingReader::new(&file, &buf, &pool, 1, backing_len, &epoch);
             let mut out = vec![0u8; 64 * 1024];
             #[expect(clippy::cast_possible_truncation)]
             for chunk in 0..16u64 {
@@ -626,7 +697,8 @@ mod eviction_tests {
             let pool = ReadAheadPool::new(64 * 1024 * 1024);
             let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
             pool.register(1, Arc::clone(&buf));
-            let br = BackingReader::new(&file, &buf, &pool, 1, data.len() as u64);
+            let epoch = std::sync::atomic::AtomicU64::new(0);
+            let br = BackingReader::new(&file, &buf, &pool, 1, data.len() as u64, &epoch);
             for &(off, len) in &[
                 (0u64, 100usize),
                 (1_000_000, 4096),
@@ -727,5 +799,49 @@ mod prefetch_store_tests {
         let epoch = AtomicU64::new(5);
         assert!(try_store_prefetch(&ra, &epoch, 5, 1000, vec![0u8; 4096]));
         assert!(ra.lock().unwrap().covers(1000, 4096));
+    }
+}
+
+#[cfg(test)]
+mod prefetch_worker_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn prefetch_fills_next_window_for_a_sequential_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.bin");
+        let data: Vec<u8> = (0u64..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+
+        let pool = Arc::new(ReadAheadPool::new(64 * 1024 * 1024));
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        pool.register(1, Arc::clone(&buf));
+
+        PrefetchWorkers::run_job(PrefetchJob {
+            file: Arc::clone(&file),
+            buf: Arc::clone(&buf),
+            epoch: Arc::clone(&epoch),
+            dispatched_epoch: 0,
+            start: 1024 * 1024,
+            len: 1024 * 1024,
+            backing_len: data.len() as u64,
+        });
+        let mut out = vec![0u8; 4096];
+        let mut ra = buf.lock().unwrap();
+        let mut fills = 0;
+        ra.read_into(&mut out, 1024 * 1024, data.len() as u64, |_, _| {
+            fills += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fills, 0, "prefetched window should serve without a pread");
+        assert_eq!(out, data[1024 * 1024..1024 * 1024 + 4096]);
     }
 }
