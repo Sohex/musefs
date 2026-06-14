@@ -300,9 +300,23 @@ pub struct MusefsFs {
     /// `opendir`. A paginated `readdir` clones the `Arc` under the lock and
     /// serves it lock-free, so building the listing is O(N) per `ls`, not per
     /// `readdir` call (#176).
+    ///
+    /// All three lock sites recover a poisoned mutex via `into_inner` rather than
+    /// propagating (#194). Every op under the lock is a `HashMap` insert/remove
+    /// (plus `Arc::new`, whose only failure mode — allocation — aborts the process
+    /// rather than unwinding, so it can't poison), and a `HashMap` mutation cannot
+    /// leave a partially-observable map across a single lock acquisition. So even a
+    /// poisoning panic can't tear a later `readdir`'s view; recovery is deliberate.
     #[allow(clippy::type_complexity)]
     dir_handles: Arc<Mutex<std::collections::HashMap<u64, Arc<Vec<(u64, FileType, String)>>>>>,
     /// Monotonic dir-handle id (starts at 1; 0 stays the stateless sentinel).
+    ///
+    /// Unlike the file slab's generation-encoded keys (`facade.rs`, ABA-safe by
+    /// construction), this is a bare never-recycled counter — sufficient precisely
+    /// *because* it never recycles: an id is handed out once and never reused, so a
+    /// stale or duplicate `releasedir` can only `remove` an id that names no live
+    /// handle, never evict a different open dir (#192). A 64-bit monotonic counter
+    /// cannot wrap within any real process lifetime.
     dir_fh: Arc<AtomicU64>,
     /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
@@ -486,6 +500,12 @@ impl Filesystem for MusefsFs {
                 Ok(fh) => fh,
                 Err(e) => return reply.error(reply_errno("open", ino.0, &e)),
             };
+            // Ordering invariant (#193): `open_handle` inserts the handle into the
+            // slab and returns `fh` *before* we reply here, and the kernel won't
+            // issue `release` for an fh until it has received this open reply — so
+            // the handle is always registered before any `release` can find it.
+            // Keep the slab insert ahead of this reply: replying first to shave open
+            // latency would let a `release` race a not-yet-registered handle.
             platform::passthrough::reply_open(&passthrough, &core, fh, reply, flags);
         });
     }
