@@ -55,6 +55,34 @@ fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
     })
 }
 
+/// Upsert a track by `backing_path`, returning its id (via `RETURNING`, so the
+/// insert and id-read are one statement). Runs on `conn` so `Db<ReadWrite>` and
+/// `BulkWriter` share one body.
+pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Result<i64> {
+    Ok(conn.query_row(
+        "INSERT INTO tracks
+            (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns, backing_ctime_ns, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CAST(strftime('%s','now') AS INTEGER))
+         ON CONFLICT(backing_path) DO UPDATE SET
+            format=excluded.format, audio_offset=excluded.audio_offset,
+            audio_length=excluded.audio_length, backing_size=excluded.backing_size,
+            backing_mtime_ns=excluded.backing_mtime_ns,
+            backing_ctime_ns=excluded.backing_ctime_ns,
+            updated_at=CAST(strftime('%s','now') AS INTEGER)
+         RETURNING id",
+        params![
+            t.backing_path,
+            t.format.as_str(),
+            t.audio_offset,
+            t.audio_length,
+            t.backing_size,
+            t.backing_mtime_ns,
+            t.backing_ctime_ns,
+        ],
+        |r| r.get(0),
+    )?)
+}
+
 /// One read of the changelog ring past `last_seq`: the distinct changed track
 /// ids (ascending) plus the table's retained seq bounds (0/0 when empty). The
 /// caller derives gap detection from `min_seq` (see musefs-core's refresh).
@@ -93,14 +121,12 @@ impl<M> Db<M> {
     /// without materializing a full `Track` (no `format` parse, no
     /// `TrackBounds`) on the hottest metadata op. `None` if the id is unknown.
     pub fn track_version_and_path(&self, id: i64) -> Result<Option<(i64, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT content_version, backing_path FROM tracks WHERE id = ?1")?;
-        let mut rows = stmt.query(params![id])?;
-        match rows.next()? {
-            Some(r) => Ok(Some((r.get(0)?, r.get(1)?))),
-            None => Ok(None),
-        }
+        crate::query_optional(
+            &self.conn,
+            "SELECT content_version, backing_path FROM tracks WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
     }
 
     /// Begin a deferred (read) transaction: subsequent reads on this connection see
@@ -118,12 +144,7 @@ impl<M> Db<M> {
     }
 
     fn query_optional_track(&self, sql: &str, p: impl rusqlite::Params) -> Result<Option<Track>> {
-        let mut stmt = self.conn.prepare_cached(sql)?;
-        let mut rows = stmt.query(p)?;
-        match rows.next()? {
-            Some(r) => Ok(Some(row_to_track(r)?)),
-            None => Ok(None),
-        }
+        crate::query_optional(&self.conn, sql, p, |r| Ok(row_to_track(r)?))
     }
 
     /// Cheap render-key identity scan for incremental refresh: `(id, content_version,
@@ -176,60 +197,35 @@ impl<M> Db<M> {
     /// Render keys for a specific id set (the changelog ids); ids no longer in
     /// `tracks` are simply absent from the result. Chunked like `tags_for_tracks`.
     pub fn render_keys_for(&self, ids: &[i64]) -> Result<Vec<(i64, i64, Format)>> {
-        const CHUNK: usize = 900;
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(CHUNK) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT id, content_version, format FROM tracks \
-                 WHERE id IN ({placeholders}) ORDER BY id"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let params = rusqlite::params_from_iter(chunk.iter());
-            let rows = stmt.query_map(params, |r| {
-                let fmt: String = r.get(2)?;
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    parse_format_col(&fmt)?,
-                ))
-            })?;
-            out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
-        }
+        crate::query_in_chunks(
+            &self.conn,
+            ids,
+            |ph| {
+                format!(
+                    "SELECT id, content_version, format FROM tracks \
+                     WHERE id IN ({ph}) ORDER BY id"
+                )
+            },
+            |rows| {
+                while let Some(r) = rows.next()? {
+                    let fmt: String = r.get(2)?;
+                    out.push((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        parse_format_col(&fmt)?,
+                    ));
+                }
+                Ok(())
+            },
+        )?;
         Ok(out)
     }
 }
 
 impl Db<ReadWrite> {
     pub fn upsert_track(&self, t: &NewTrack) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO tracks
-                (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns, backing_ctime_ns, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CAST(strftime('%s','now') AS INTEGER))
-             ON CONFLICT(backing_path) DO UPDATE SET
-                format        = excluded.format,
-                audio_offset  = excluded.audio_offset,
-                audio_length  = excluded.audio_length,
-                backing_size  = excluded.backing_size,
-                backing_mtime_ns = excluded.backing_mtime_ns,
-                backing_ctime_ns = excluded.backing_ctime_ns,
-                updated_at    = CAST(strftime('%s','now') AS INTEGER)",
-            params![
-                t.backing_path,
-                t.format.as_str(),
-                t.audio_offset,
-                t.audio_length,
-                t.backing_size,
-                t.backing_mtime_ns,
-                t.backing_ctime_ns,
-            ],
-        )?;
-        let id = self.conn.query_row(
-            "SELECT id FROM tracks WHERE backing_path = ?1",
-            params![t.backing_path],
-            |r| r.get(0),
-        )?;
-        Ok(id)
+        upsert_track_in(&self.conn, t)
     }
 
     /// Delete a track row. Foreign keys cascade to its `tags` and `track_art`

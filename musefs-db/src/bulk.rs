@@ -1,7 +1,10 @@
-use crate::art::sha256_hex;
+use crate::art::{set_track_art_in, upsert_art_in};
 use crate::models::{BinaryTag, NewArt, NewTrack, StructuralBlock, Tag, TrackArt};
+use crate::structural::set_structural_blocks_in;
+use crate::tags::{replace_tags_in, set_binary_tags_in};
+use crate::tracks::upsert_track_in;
 use crate::{Db, ReadWrite, Result};
-use rusqlite::{Transaction, params};
+use rusqlite::Transaction;
 
 impl Db<ReadWrite> {
     /// Apply the bulk-write pragmas to an open connection. WAL is left untouched
@@ -28,58 +31,26 @@ impl Db<ReadWrite> {
     }
 }
 
-/// A batch of track writes held in one transaction. Mirrors `Db::upsert_track` /
-/// `replace_tags` / `upsert_art` / `set_track_art`, but executes on a single
-/// caller-held transaction so a whole batch commits with one fsync.
+/// A batch of track writes held in one transaction. Each method delegates to the
+/// shared per-row writer helper (`upsert_track_in` / `replace_tags_in` /
+/// `set_binary_tags_in` / `set_structural_blocks_in` / `upsert_art_in` /
+/// `set_track_art_in`) that also backs the `Db<ReadWrite>` writers, but runs it
+/// on a single caller-held transaction so a whole batch commits with one fsync.
 pub struct BulkWriter<'c> {
     tx: Transaction<'c>,
 }
 
 impl BulkWriter<'_> {
     pub fn upsert_track(&mut self, t: &NewTrack) -> Result<i64> {
-        Ok(self.tx.query_row(
-            "INSERT INTO tracks
-                (backing_path, format, audio_offset, audio_length, backing_size, backing_mtime_ns, backing_ctime_ns, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CAST(strftime('%s','now') AS INTEGER))
-             ON CONFLICT(backing_path) DO UPDATE SET
-                format=excluded.format, audio_offset=excluded.audio_offset,
-                audio_length=excluded.audio_length, backing_size=excluded.backing_size,
-                backing_mtime_ns=excluded.backing_mtime_ns,
-                backing_ctime_ns=excluded.backing_ctime_ns,
-                updated_at=CAST(strftime('%s','now') AS INTEGER)
-             RETURNING id",
-            params![t.backing_path, t.format.as_str(), t.audio_offset, t.audio_length, t.backing_size, t.backing_mtime_ns, t.backing_ctime_ns],
-            |r| r.get(0),
-        )?)
+        upsert_track_in(&self.tx, t)
     }
 
     pub fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> Result<()> {
-        self.tx.execute(
-            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NULL",
-            params![track_id],
-        )?;
-        let mut stmt = self.tx.prepare_cached(
-            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for t in tags {
-            stmt.execute(params![track_id, t.key, t.value, t.ordinal])?;
-        }
-        Ok(())
+        replace_tags_in(&self.tx, track_id, tags)
     }
 
     pub fn set_binary_tags(&mut self, track_id: i64, tags: &[BinaryTag]) -> Result<()> {
-        self.tx.execute(
-            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL",
-            params![track_id],
-        )?;
-        let mut stmt = self.tx.prepare_cached(
-            "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
-             VALUES (?1, ?2, '', ?3, ?4)",
-        )?;
-        for t in tags {
-            stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
-        }
-        Ok(())
+        set_binary_tags_in(&self.tx, track_id, tags)
     }
 
     pub fn set_structural_blocks(
@@ -87,53 +58,15 @@ impl BulkWriter<'_> {
         track_id: i64,
         blocks: &[StructuralBlock],
     ) -> Result<()> {
-        self.tx.execute(
-            "DELETE FROM structural_blocks WHERE track_id = ?1",
-            params![track_id],
-        )?;
-        let mut stmt = self.tx.prepare_cached(
-            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
-             VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for b in blocks {
-            stmt.execute(params![track_id, b.kind, b.ordinal, b.body])?;
-        }
-        Ok(())
+        set_structural_blocks_in(&self.tx, track_id, blocks)
     }
 
     pub fn upsert_art(&mut self, a: &NewArt) -> Result<i64> {
-        let sha = sha256_hex(&a.data);
-        self.tx.execute(
-            "INSERT INTO art (sha256, mime, width, height, byte_len, data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(sha256) DO NOTHING",
-            params![sha, a.mime, a.width, a.height, a.data.len() as u64, a.data],
-        )?;
-        Ok(self
-            .tx
-            .query_row("SELECT id FROM art WHERE sha256 = ?1", params![sha], |r| {
-                r.get(0)
-            })?)
+        upsert_art_in(&self.tx, a)
     }
 
     pub fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> Result<()> {
-        self.tx.execute(
-            "DELETE FROM track_art WHERE track_id = ?1",
-            params![track_id],
-        )?;
-        let mut stmt = self.tx.prepare_cached(
-            "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for it in items {
-            stmt.execute(params![
-                track_id,
-                it.art_id,
-                it.picture_type,
-                it.description,
-                it.ordinal
-            ])?;
-        }
-        Ok(())
+        set_track_art_in(&self.tx, track_id, items)
     }
 
     pub fn commit(self) -> Result<()> {
@@ -215,15 +148,6 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM track_art", [], |r| r.get(0))
             .unwrap();
         assert_eq!(track_art_count, 3);
-    }
-
-    #[test]
-    fn sha256_hex_matches_known_digest() {
-        // NIST sample vector: sha256("abc").
-        assert_eq!(
-            super::sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 
     #[test]

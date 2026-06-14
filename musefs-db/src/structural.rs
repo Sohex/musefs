@@ -56,23 +56,32 @@ impl<M> Db<M> {
     }
 }
 
+/// Replace a track's structural blocks. Runs on `conn` so `Db<ReadWrite>` (own
+/// transaction) and `BulkWriter` (caller-held transaction) share one body.
+pub(crate) fn set_structural_blocks_in(
+    conn: &rusqlite::Connection,
+    track_id: i64,
+    blocks: &[StructuralBlock],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM structural_blocks WHERE track_id = ?1",
+        params![track_id],
+    )?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for b in blocks {
+        stmt.execute(params![track_id, b.kind, b.ordinal, b.body])?;
+    }
+    Ok(())
+}
+
 impl Db<ReadWrite> {
     /// Replace the track's structural blocks (FLAC STREAMINFO/SEEKTABLE).
     pub fn set_structural_blocks(&self, track_id: i64, blocks: &[StructuralBlock]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM structural_blocks WHERE track_id = ?1",
-            params![track_id],
-        )?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for b in blocks {
-                stmt.execute(params![track_id, b.kind, b.ordinal, b.body])?;
-            }
-        }
+        set_structural_blocks_in(&tx, track_id, blocks)?;
         tx.commit()?;
         Ok(())
     }
