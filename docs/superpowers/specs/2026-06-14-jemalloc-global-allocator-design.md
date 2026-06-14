@@ -62,12 +62,14 @@ default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [dependencies]
-tikv-jemallocator = { version = "0.6", optional = true }
-tikv-jemalloc-ctl = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
+tikv-jemalloc-ctl = { version = "0.7", optional = true }
 ```
 
-(`background_threads_runtime_support` is on by default in `tikv-jemallocator`;
-the plan pins exact versions.) The opt-out for packagers, memory-debuggers, and
+(`background_threads_runtime_support` is on by default via `tikv-jemalloc-sys`,
+so enabling the background thread at runtime needs no extra cargo feature; the
+plan pins exact versions and updates `Cargo.lock`.) The opt-out for packagers,
+memory-debuggers, and
 A/B benchmarking is `cargo build -p musefs --no-default-features`. A cargo
 feature is a build-time toggle, so end users running a prebuilt release binary
 are unaffected — only source builds can flip it, which is precisely who the
@@ -134,7 +136,10 @@ cross-cutting logic in `musefs-core`" layering rule.
   - Smoke-build all four targets locally with `cargo zigbuild --release -p
     musefs --target <zig_target>` before relying on the release.
   - If any target cannot build `jemalloc-sys`, set `--no-default-features` for
-    that matrix entry (and document it) rather than blocking the release.
+    that matrix entry (and document it) rather than blocking the release. The
+    Docker image variants consume the same triples, so a dropped target must
+    propagate to its matching image — otherwise the tarball and container for one
+    arch would ship different allocators.
 - **Mutants — no re-anchoring.** `mutants.toml` anchors live in `musefs-core` /
   `musefs-format` source, which this change does not touch.
 
@@ -149,16 +154,40 @@ backed by a committed, runnable harness:
      default build (jemalloc).
   2. Mounts each variant under `$HOME` (AppArmor permits FUSE there) against the
      test music corpus, with `/data`-backed files as needed.
-  3. Drives a churn loop: repeated open/read/release across many files plus
-     periodic refresh, to exercise the `im`-tree alloc/free bursts, the
-     `sharded_slab` handle-table churn, and the per-worker read path.
-  4. Samples `VmRSS` from `/proc/<pid>/status` over N cycles and reports
-     steady-state RSS for each variant.
+  3. Drives a **concurrent** churn loop — cross-thread alloc-here/free-there is
+     the exact mechanism jemalloc must win on, so a single-threaded loop would
+     show a false null. The script pins, as configurable parameters with stated
+     defaults:
+     - **Concurrency:** `WORKERS` reader threads (default = number of cores),
+       each independently opening/reading/releasing across the file set, so
+       allocations and frees land on different threads.
+     - **File set:** `FILES` distinct tracks (default ≥ 500) read end-to-end so
+       the read path, header cache, and handle table all churn.
+     - **Refresh cadence:** trigger a tree refresh every `REFRESH_SECS` (default
+       30 s) to exercise the `im`-tree alloc/free bursts.
+     - **Duration:** `CYCLES` churn cycles (default ≥ 200) after a discarded
+       `WARMUP` cycles (default 20).
+  4. Samples `VmRSS` from `/proc/<pid>/status` once per cycle and reports
+     **steady-state** RSS per variant: the median `VmRSS` over the last 25 % of
+     cycles, after warmup, once the curve has flattened (max-vs-median over that
+     window within a few percent). This is distinct from the *peak* RSS already
+     reported elsewhere in `BENCHMARKS.md`.
+- **Decision rule (the actual gate):** ship jemalloc only if its steady-state
+  RSS is **≤** the system-malloc baseline. If the two are within run-to-run
+  noise, record both and make an explicit ship/no-ship call in the spec/PR
+  rather than assuming a win. A jemalloc result meaningfully *worse* than
+  baseline blocks the change pending investigation.
 - **Record:** add a new allocator/RSS section to `BENCHMARKS.md` with the
-  methodology and measured numbers (system malloc vs jemalloc).
+  methodology, the parameters used, and the measured numbers (system malloc vs
+  jemalloc) plus the resulting decision.
 - **CI's role** is only to confirm the binary builds/links and all tests pass
   under jemalloc — already covered by `cargo test --workspace` and
-  `cargo test -p musefs -- --ignored`. CI does not run the RSS bench.
+  `cargo test -p musefs -- --ignored` (the latter spawns the real
+  default-feature binary, so it exercises jemalloc end-to-end). CI does not run
+  the RSS bench. The cross-built release targets get their first jemalloc
+  *runtime* exercise from the existing release smoke (`scripts/smoke-binary.sh`
+  on host + the Alpine/musl container smoke in `release.yml`), so a jemalloc
+  init failure under musl/aarch64 surfaces there, not in `cargo test`.
 
 ### 5. Documentation
 
@@ -187,6 +216,9 @@ backed by a committed, runnable harness:
    the default (jemalloc) build; the ASan/TSan jobs are unchanged.
 4. All four release targets build with `jemalloc-sys` under `cargo-zigbuild`
    (or are documented as `--no-default-features`).
-5. `scripts/rss-churn-bench.sh` runs and `BENCHMARKS.md` records the system
-   malloc vs jemalloc steady-state RSS comparison.
+5. `scripts/rss-churn-bench.sh` runs the concurrent churn workload and
+   `BENCHMARKS.md` records the system malloc vs jemalloc **steady-state** RSS
+   comparison (median over the flattened tail, not peak), together with the
+   explicit ship decision per the §4 rule — jemalloc steady-state RSS must be
+   ≤ baseline (or, if within noise, an explicit recorded call).
 6. `README.md` and `CONTRIBUTING.md` document the allocator and the opt-out.
