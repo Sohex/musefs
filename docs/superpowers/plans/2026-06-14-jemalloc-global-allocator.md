@@ -39,7 +39,7 @@ Insert a `[features]` block immediately after the `[[bin]]` block (before `[depe
 ```toml
 [features]
 default = ["jemalloc"]
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "tikv-jemalloc-ctl/stats"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -49,7 +49,7 @@ tikv-jemallocator = { version = "0.7", optional = true }
 tikv-jemalloc-ctl = { version = "0.7", optional = true }
 ```
 
-(jemalloc's stats and `background_threads_runtime_support` are on by default via `tikv-jemalloc-sys`; no extra cargo feature is required.)
+(`background_threads_runtime_support` is on by default via `tikv-jemalloc-sys`, so the background thread needs no extra feature. The `stats` module of `tikv-jemalloc-ctl` is **not** a default feature, though — the `tikv-jemalloc-ctl/stats` entry above turns it on so `stats::allocated::read()` in the Step 2 test compiles. `epoch::advance()` and `background_thread` are ungated and need no feature.)
 
 - [ ] **Step 2: Write the failing test in `musefs/src/main.rs`**
 
@@ -127,7 +127,7 @@ git commit -m "feat(musefs): jemalloc global allocator behind default-on feature
 In `musefs/Cargo.toml`, extend the feature and add the dep:
 
 ```toml
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:log"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "tikv-jemalloc-ctl/stats", "dep:log"]
 ```
 
 ```toml
@@ -279,8 +279,7 @@ run_variant() {
   mkdir -p "$MOUNT"
   "$bin" mount "$DB" "$MOUNT" &
   local mpid=$!
-  local i
-  for i in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     mountpoint -q "$MOUNT" && break
     sleep 0.1
   done
@@ -295,7 +294,7 @@ run_variant() {
   stop="$(mktemp)"
   rm -f "$stop"
   local pids=()
-  for i in $(seq 1 "$WORKERS"); do
+  for _ in $(seq 1 "$WORKERS"); do
     (
       while [ ! -e "$stop" ]; do
         for f in "${targets[@]}"; do
@@ -318,7 +317,7 @@ run_variant() {
     rpid=$!
   fi
   local samples=()
-  for i in $(seq 1 "$CYCLES"); do
+  for _ in $(seq 1 "$CYCLES"); do
     sleep 1
     samples+=("$(awk '/^VmRSS:/ { print $2 }' "/proc/$mpid/status" 2>/dev/null || echo 0)")
   done
@@ -556,10 +555,11 @@ Add a per-entry flag in the matrix (add `no_default: true` to the failing
         run: cargo zigbuild --release -p musefs --target ${{ matrix.zig_target }} ${{ matrix.no_default && '--no-default-features' || '' }}
 ```
 
-Then apply the same `--no-default-features` to that arch's Docker image build
-(`docker/Dockerfile` / `docker/Dockerfile.musl` cargo invocation) so the tarball
-and container for that arch ship the same allocator. Document the dropped target
-in `CONTRIBUTING.md` under the release section.
+No Docker edit is needed: the image variants `COPY` the prebuilt binary emitted
+by this same `build` job (they do not invoke cargo), so the build-step flag
+propagates to that arch's container automatically — the tarball and image stay
+in sync for free. Just document the dropped target in `CONTRIBUTING.md` under the
+release section.
 
 - [ ] **Step 4: If all four built, no workflow change is needed**
 
@@ -569,7 +569,7 @@ cleanly, so the conditional fallback was not triggered.
 - [ ] **Step 5: Commit (only if Step 3 changed files)**
 
 ```bash
-git add .github/workflows/release.yml docker/ CONTRIBUTING.md
+git add .github/workflows/release.yml CONTRIBUTING.md
 git commit -m "ci(release): opt the <triple> target out of jemalloc (jemalloc-sys cross-build) (#360)"
 ```
 
