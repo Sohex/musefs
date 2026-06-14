@@ -150,9 +150,14 @@ def merge_tags(conn, track_id, managed_pairs, delete_keys):
         for key, value in managed_pairs:
             by_key.setdefault(key, []).append(value)
 
+        # Case-fold the key match: a scan seeds an unmapped tag in the file's
+        # native case (e.g. Vorbis ``LABEL``) while the plugin canonicalises to
+        # lowercase (``label``). Vorbis keys render case-insensitively, so an
+        # exact-case delete would leave the scan row and render a duplicate (#407).
         for key in set(by_key) | set(delete_keys or ()):
             conn.execute(
-                "DELETE FROM tags WHERE track_id = ? AND key = ? AND value_blob IS NULL",
+                "DELETE FROM tags WHERE track_id = ? AND lower(key) = lower(?) "
+                "AND value_blob IS NULL",
                 (track_id, key),
             )
 
