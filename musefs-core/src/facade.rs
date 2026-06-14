@@ -71,8 +71,10 @@ struct Handle {
     resolved: arc_swap::ArcSwap<ResolvedFile>,
     generation: AtomicU64,
     file: std::fs::File,
-    backing_pool: crate::readahead::ReadAheadPool,
-    backing_buf: Arc<Mutex<crate::readahead::ReadAhead>>,
+    readahead: Arc<Mutex<crate::readahead::ReadAhead>>,
+    registered: AtomicBool,
+    #[expect(dead_code)]
+    epoch: Arc<AtomicU64>,
 }
 
 /// An owned view of an open handle's backing fd, for FUSE passthrough
@@ -146,6 +148,7 @@ pub struct Musefs {
     /// a layout that was invalidated by a refresh the kernel did not yet see.
     refresh_gen: AtomicU64,
     handles: sharded_slab::Slab<Arc<Handle>>,
+    readahead_pool: Arc<crate::readahead::ReadAheadPool>,
     /// `SizeEntry` keyed by track id. Tiny entries, effectively unbounded; serves
     /// getattr/lookup without a backing stat or full synthesis. Self-invalidates on
     /// a content_version change.
@@ -262,6 +265,9 @@ impl Musefs {
             config,
             template,
             handles: sharded_slab::Slab::new(),
+            readahead_pool: Arc::new(crate::readahead::ReadAheadPool::new(
+                crate::readahead::DEFAULT_READAHEAD_BUDGET,
+            )),
             size_cache: dashmap::DashMap::new(),
             last_poll: Mutex::new(std::time::Instant::now()),
             last_failed_refresh: Mutex::new(None),
@@ -1105,12 +1111,17 @@ impl Musefs {
                                 {
                                     return Ok(None); // stale layout — retry after re-resolve
                                 }
+                                let key = fh.slab_key();
+                                if !h.registered.swap(true, Ordering::AcqRel) {
+                                    self.readahead_pool.register(key, Arc::clone(&h.readahead));
+                                }
+                                let backing_len = r.stamp.size;
                                 let br = crate::readahead::BackingReader::new(
                                     &h.file,
-                                    &h.backing_buf,
-                                    &h.backing_pool,
-                                    0,
-                                    r.stamp.size,
+                                    &h.readahead,
+                                    &self.readahead_pool,
+                                    key,
+                                    backing_len,
                                 );
                                 read_at_with_file_into(r, db, &br, offset, size, out)?;
                                 Ok(Some(()))
@@ -1118,12 +1129,17 @@ impl Musefs {
                             let _ = db.end_read(); // always release the snapshot
                             res
                         } else {
+                            let key = fh.slab_key();
+                            if !h.registered.swap(true, Ordering::AcqRel) {
+                                self.readahead_pool.register(key, Arc::clone(&h.readahead));
+                            }
+                            let backing_len = r.stamp.size;
                             let br = crate::readahead::BackingReader::new(
                                 &h.file,
-                                &h.backing_buf,
-                                &h.backing_pool,
-                                0,
-                                r.stamp.size,
+                                &h.readahead,
+                                &self.readahead_pool,
+                                key,
+                                backing_len,
                             );
                             read_at_with_file_into(r, db, &br, offset, size, out)?;
                             Ok(Some(()))
@@ -1197,24 +1213,24 @@ impl Musefs {
         crate::metrics::on_open();
         let file = std::fs::File::open(&resolved.backing_path)?;
         validate_opened_backing(&file, &resolved)?;
-        let backing_pool =
-            crate::readahead::ReadAheadPool::new(crate::readahead::DEFAULT_READAHEAD_BUDGET);
-        let backing_buf = Arc::new(Mutex::new(crate::readahead::ReadAhead::new(
-            backing_pool.per_stream_cap(),
-        )));
         fh_from_key(self.handles.insert(Arc::new(Handle {
             track_id,
             resolved: arc_swap::ArcSwap::from(resolved),
             generation: AtomicU64::new(generation),
             file,
-            backing_pool,
-            backing_buf,
+            readahead: Arc::new(Mutex::new(crate::readahead::ReadAhead::new(
+                self.readahead_pool.per_stream_cap(),
+            ))),
+            registered: AtomicBool::new(false),
+            epoch: Arc::new(AtomicU64::new(0)),
         })))
     }
 
     /// Drop an open handle (closes its backing fd when the last reference goes).
     pub fn release_handle(&self, fh: Fh) {
-        self.handles.remove(fh.slab_key());
+        let key = fh.slab_key();
+        self.readahead_pool.deregister(key);
+        self.handles.remove(key);
     }
 
     /// The backing fd behind `fh`, for kernel passthrough registration. `Some`
