@@ -108,7 +108,6 @@ impl<M> musefs_format::ogg::ArtSource for DbArtSource<'_, M> {
 /// Map a track's binary tag rows to `BinaryTagInput`s for synthesis. Never reads
 /// the payload bytes — only `(rowid, key, byte_len)`; the bytes stream at read
 /// time. Ordered by (key, ordinal), matching `get_binary_tags`.
-#[allow(dead_code)] // wired into the reader resolve arms in Task 2.9
 pub(crate) fn binary_tags_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<BinaryTagInput>> {
     Ok(db
         .get_binary_tags(track_id)?
