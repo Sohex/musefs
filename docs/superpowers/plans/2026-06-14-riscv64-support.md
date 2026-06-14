@@ -4,7 +4,7 @@
 
 **Goal:** Ship `riscv64gc` (glibc + musl) as a first-class musefs release platform — prebuilt tarballs, multi-arch Docker images, and an emulated FUSE smoke test — with no crate source changes.
 
-**Architecture:** All changes live in `.github/workflows/release.yml` and docs. The release `build` job cross-compiles via `cargo-zigbuild`; zig is bumped to 0.14 (0.13 cannot emit riscv64 glibc). A new emulated smoke leg runs the binary under `docker run --platform linux/riscv64` (QEMU user-mode: guest syscalls hit the real host kernel, so FUSE mounts), gated `continue-on-error` so emulation flakiness never blocks the release. The `images` job gains a third staged arch; the Dockerfiles are already `${TARGETARCH}`-generic.
+**Architecture:** All changes live in `.github/workflows/release.yml` and docs. The release `build` job cross-compiles via `cargo-zigbuild`; zig is bumped to 0.14 (0.13 cannot emit riscv64 glibc). A new emulated smoke leg runs the binary under `docker run --platform linux/riscv64` (QEMU user-mode: guest syscalls hit the real host kernel, so FUSE mounts), gated `continue-on-error` so emulation flakiness never blocks the release. The `images` job gains a third staged arch; the `COPY` is `${TARGETARCH}`-generic, but `Dockerfile.glibc`'s base bumps bookworm→trixie (bookworm has no riscv64 manifest).
 
 **Tech Stack:** GitHub Actions, `cargo-zigbuild` + zig, `rustup` cross targets, `docker buildx` + QEMU `binfmt`, the existing `scripts/smoke-binary.sh`.
 
@@ -27,7 +27,8 @@
 - **Modify:** `.github/workflows/release.yml` — the only workflow touched. Four jobs change: `build` (zig bump + 2 matrix rows), `smoke` (emulated leg + QEMU step + `continue-on-error`), `images` (third staged arch + platform). `gate`, `publish`, `release-assets`, `benchmarks` are untouched (verified arch-generic).
 - **Modify:** `README.md` — "Prebuilt binaries" table only.
 - **Modify:** `CHANGELOG.md` — one `### Added` bullet under `## [Unreleased]`.
-- **No change:** `docker/Dockerfile.glibc`, `docker/Dockerfile.musl` (already `${TARGETARCH}`), `scripts/smoke-binary.sh`, `scripts/container_tags.py`, all crate source.
+- **Modify:** `docker/Dockerfile.glibc` — bump `FROM debian:bookworm-slim` → `FROM debian:trixie-slim`. Debian bookworm (12) publishes no riscv64 manifest; riscv64 is official only from Debian 13 (trixie). The `COPY ${TARGETARCH}/musefs` is arch-generic, but the base image is not — bumped for all arches (decided 2026-06-14).
+- **No change:** `docker/Dockerfile.musl` (`alpine:3.20` already has riscv64), `scripts/smoke-binary.sh`, `scripts/container_tags.py`, all crate source.
 
 ---
 
@@ -201,24 +202,28 @@ The smoke job extracts the tarball into `./bin/musefs`. Mirror that with the Tas
 mkdir -p bin && cp target/riscv64gc-unknown-linux-gnu/release/musefs bin/musefs
 ```
 
-- [ ] **Step 3: Run the real smoke under emulation (glibc)**
+- [x] **Step 3: Run the real smoke under emulation**
 
 ```bash
 docker run --rm --platform linux/riscv64 \
   --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
   -v "$PWD":/w -w /w \
-  debian:bookworm-slim \
+  debian:trixie-slim \
   sh -c 'apt-get update >/dev/null && apt-get install -y --no-install-recommends fuse3 ffmpeg >/dev/null && sh scripts/smoke-binary.sh ./bin/musefs'
 ```
 
-Expected (success): the script prints `smoke: read <N> bytes ... (fLaC OK)` and `smoke: SIGTERM unmounted cleanly — PASS`, exit 0. It will be slow (ffmpeg under emulation — allow several minutes).
+Expected (success): the script prints `smoke: read <N> bytes ... (fLaC OK)` and `smoke: SIGTERM unmounted cleanly — PASS`, exit 0. Slow (ffmpeg under emulation — allow several minutes).
 
-- [ ] **Step 4: Record the outcome and decide Task 4's shape**
+**Executed 2026-06-14 (results):**
+- **musl, host-level (no container):** the host already has `qemu-riscv64` binfmt registered with the `F` (fix_binary) flag, so the *statically-linked* musl riscv64 binary runs directly under emulation. `sh scripts/smoke-binary.sh target/riscv64gc-unknown-linux-musl/release/musefs` → **PASS** (`read 12173 bytes ... fLaC OK`, `SIGTERM unmounted cleanly`). The smoke mounts under `/tmp`, which AppArmor permits.
+- **glibc, container (`debian:trixie-slim`):** the dynamically-linked glibc binary loads and runs in the trixie riscv64 rootfs under emulation — `./bin/musefs --version` → `musefs 1.0.0`, `--help` OK, and `fusermount3` is present at `/usr/bin/fusermount3`. The *full* ffmpeg-based smoke was not completed locally: this box's Docker needs `--network host` for container DNS, and ffmpeg's dependency install under riscv64 emulation exceeds 10 min (timed out at 600s) — both are local-environment issues, not riscv64 or CI issues. The mount itself is already proven libc-agnostically by the musl host run.
+- **Base-image blocker found:** `debian:bookworm-slim` has **no riscv64 manifest** (`no matching manifest for linux/riscv64`); only `debian:trixie-slim`+ do. The command and Task 4/5 use `debian:trixie-slim`. `alpine:3.20` already has riscv64.
 
-- **If the smoke PASSES:** Task 4 wires the full `scripts/smoke-binary.sh` run (the default). Proceed.
-- **If the mount fails** (e.g. `fusermount3` errors, `/dev/fuse` unusable, or it hangs past the 30s loops): Task 4 uses the **`--version`-only fallback** instead. Note which, and why, in the Task 4 commit body.
+- [x] **Step 4: Record the outcome and decide Task 4's shape**
 
-Either way the binaries and images still ship; this only decides how much the emulated leg asserts.
+- **musl emulated smoke PASSES** and the **glibc binary runs in trixie under emulation** → the FUSE-under-QEMU mechanism is sound, so Task 4 wires the **full `scripts/smoke-binary.sh` run** (not the `--version`-only fallback).
+- **CI note:** installing `ffmpeg` inside a riscv64-emulated container is slow (10+ min observed locally). The emulated smoke leg is `continue-on-error`, so this does not block the release, but expect that leg to run long.
+- The base-image finding fed back into the spec/plan: `docker/Dockerfile.glibc` bumps to `debian:trixie-slim` (Task 5), and the glibc smoke leg uses `debian:trixie-slim` (Task 4).
 
 - [ ] **Step 5: Clean up the spike artifacts**
 
@@ -256,7 +261,7 @@ In the `smoke` job's `strategy.matrix.include`, after the `aarch64-unknown-linux
             runner: ubuntu-latest
             mode: emulated
             platform: linux/riscv64
-            image: debian:bookworm-slim
+            image: debian:trixie-slim
             pkg: apt-get update >/dev/null && apt-get install -y --no-install-recommends fuse3 ffmpeg >/dev/null
           - triple: riscv64gc-unknown-linux-musl
             runner: ubuntu-latest
@@ -344,10 +349,27 @@ EOF
 
 ## Task 5: Add riscv64 to the multi-arch Docker images
 
-The Dockerfiles already `COPY ${TARGETARCH}/musefs`, so they need no change. Stage a third arch and add it to the manifest platform list.
+The `COPY ${TARGETARCH}/musefs` is arch-generic, but `docker/Dockerfile.glibc`'s base must move off bookworm (no riscv64 manifest) to trixie. Bump the base, stage a third arch, and add it to the manifest platform list.
 
 **Files:**
+- Modify: `docker/Dockerfile.glibc` (base image bump)
 - Modify: `.github/workflows/release.yml:244-360` (the `images` job: `matrix`, a new download step, the stage run step, and the manifest `platforms`)
+
+- [ ] **Step 0: Bump the glibc base image to trixie**
+
+In `docker/Dockerfile.glibc`, change line 2:
+
+```dockerfile
+FROM debian:bookworm-slim
+```
+
+to:
+
+```dockerfile
+FROM debian:trixie-slim
+```
+
+Debian bookworm (12) has no `linux/riscv64` manifest; trixie (13) does, and trixie is current Debian stable, so this bumps the shared base for all three arches. `docker/Dockerfile.musl` (`alpine:3.20`) is unchanged — Alpine has riscv64 from 3.20.
 
 - [ ] **Step 1: Add `riscv64_triple` to each matrix variant**
 
@@ -417,13 +439,14 @@ Expected: `images riscv64 wiring OK`
 - [ ] **Step 7: Commit**
 
 ```bash
-git add .github/workflows/release.yml
+git add docker/Dockerfile.glibc .github/workflows/release.yml
 git commit -m "$(cat <<'EOF'
 ci(release): publish linux/riscv64 Docker images
 
 Stage the riscv64 binary into the build context and add linux/riscv64
-to both the glibc and musl multi-arch manifests. Dockerfiles are
-already ${TARGETARCH}-generic, so no Dockerfile change.
+to both the glibc and musl multi-arch manifests. Bump Dockerfile.glibc
+from bookworm to trixie: bookworm has no riscv64 manifest, trixie does
+(and is current stable). Dockerfile.musl (alpine:3.20) already has it.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF

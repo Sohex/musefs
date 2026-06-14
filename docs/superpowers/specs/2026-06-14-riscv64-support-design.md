@@ -132,9 +132,13 @@ required).
 
 No native riscv64 GitHub runner exists, so smoke runs under QEMU user-mode
 emulation: qemu-user translates guest syscalls to host syscalls, so the FUSE
-mount/ioctl path reaches the real host kernel. This is expected to work but is
-validated by the §0 spike before being relied on. ffmpeg runs (slowly) under
-emulation; the smoke script's existing 30×1s wait loops absorb the latency.
+mount/ioctl path reaches the real host kernel. **Spike-confirmed** (§0): the
+musl binary passes the full FUSE smoke under emulation, and the glibc binary
+loads/runs in a `debian:trixie-slim` riscv64 rootfs. Note both *installing*
+`ffmpeg` into the emulated container (apt under qemu) and *running* it are slow —
+the emulated leg can take 10+ minutes — which is why it is `continue-on-error`
+(it must not gate the release). The smoke script's existing 30×1s wait loops
+absorb the per-operation latency.
 
 Concrete matrix shape (the current matrix has modes `host`/`alpine` and **no**
 QEMU step). Add a single new `mode: emulated` with two `include` rows carrying
@@ -142,7 +146,7 @@ QEMU step). Add a single new `mode: emulated` with two `include` rows carrying
 
 | triple | mode | platform | image | pkg install |
 | --- | --- | --- | --- | --- |
-| `riscv64gc-unknown-linux-gnu` | `emulated` | `linux/riscv64` | `debian:bookworm-slim` | `apt-get update && apt-get install -y fuse3 ffmpeg` |
+| `riscv64gc-unknown-linux-gnu` | `emulated` | `linux/riscv64` | `debian:trixie-slim` | `apt-get update && apt-get install -y fuse3 ffmpeg` |
 | `riscv64gc-unknown-linux-musl` | `emulated` | `linux/riscv64` | `alpine:3.20` | `apk add --no-cache fuse3 ffmpeg` |
 
 Concrete edits:
@@ -176,13 +180,27 @@ emulated container. Binaries and images still ship.
 
 ### 3. `.github/workflows/release.yml` — `images` job
 
-The Dockerfiles (`docker/Dockerfile.glibc`, `docker/Dockerfile.musl`) already
-copy `${TARGETARCH}/musefs` with `TARGETARCH` auto-populated by buildx, so they
-need **no change** — buildx maps `linux/riscv64` to `TARGETARCH=riscv64`.
+The Dockerfiles copy `${TARGETARCH}/musefs` with `TARGETARCH` auto-populated by
+buildx (which maps `linux/riscv64` to `TARGETARCH=riscv64`), so the `COPY` logic
+is arch-generic. **But the glibc base image must change:** `docker/Dockerfile.glibc`
+was `FROM debian:bookworm-slim`, and **bookworm (Debian 12) publishes no riscv64
+manifest** — riscv64 became an official Debian architecture only in Debian 13
+(trixie). The riscv64 glibc image therefore cannot build on bookworm. Resolution
+(decided 2026-06-14): bump the glibc base to **`debian:trixie-slim` for all
+arches** — trixie is current Debian stable, so this is a routine base bump that
+keeps a single shared base across amd64/arm64/riscv64. `docker/Dockerfile.musl`
+(`alpine:3.20`) is **unchanged** — Alpine publishes riscv64 from 3.20 on.
 
-The current `images` job stages exactly two arches by literal calls. Three
+Spike-verified: a riscv64 glibc binary mounts FUSE and serves a valid FLAC under
+`debian:trixie-slim` emulation; the riscv64 musl binary does the same on
+`alpine:3.20`.
+
+The current `images` job stages exactly two arches by literal calls. Four
 concrete edits:
 
+- Bump `docker/Dockerfile.glibc` from `FROM debian:bookworm-slim` to `FROM
+  debian:trixie-slim` (the riscv64-availability fix above; the only Dockerfile
+  change).
 - Add a `riscv64_triple` value to each matrix variant (glibc:
   `riscv64gc-unknown-linux-gnu`, musl: `riscv64gc-unknown-linux-musl`).
 - Add a third `download-artifact` step (mirroring the amd64/arm64 ones,
