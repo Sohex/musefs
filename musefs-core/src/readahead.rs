@@ -274,6 +274,70 @@ impl ReadAhead {
     }
 }
 
+use std::cell::Cell;
+
+pub struct BackingReader<'a> {
+    file: &'a std::fs::File,
+    buf: &'a Arc<Mutex<ReadAhead>>,
+    pool: &'a ReadAheadPool,
+    key: usize,
+    backing_len: u64,
+    fills: Cell<u64>,
+}
+
+impl<'a> BackingReader<'a> {
+    pub fn new(
+        file: &'a std::fs::File,
+        buf: &'a Arc<Mutex<ReadAhead>>,
+        pool: &'a ReadAheadPool,
+        key: usize,
+        backing_len: u64,
+    ) -> Self {
+        BackingReader {
+            file,
+            buf,
+            pool,
+            key,
+            backing_len,
+            fills: Cell::new(0),
+        }
+    }
+
+    pub fn fills(&self) -> u64 {
+        self.fills.get()
+    }
+
+    pub fn read_exact_at(&self, dst: &mut [u8], abs_offset: u64) -> std::io::Result<()> {
+        if !self.pool.enabled() {
+            self.fills.set(self.fills.get() + 1);
+            crate::metrics::on_readahead_miss();
+            crate::metrics::on_pread(dst.len() as u64);
+            return crate::metrics::backing_read_exact_at(self.file, dst, abs_offset);
+        }
+        let mut ra = self.buf.lock().unwrap();
+        if ra.covers(abs_offset, dst.len()) {
+            crate::metrics::on_readahead_hit();
+        } else {
+            crate::metrics::on_readahead_miss();
+            let cap = self
+                .pool
+                .permitted_window(self.key, ra.len(), self.pool.per_stream_cap());
+            ra.set_cap(cap);
+        }
+        let file = self.file;
+        let fills = &self.fills;
+        let (old_len, new_len) = ra.read_into(dst, abs_offset, self.backing_len, |b, o| {
+            fills.set(fills.get() + 1);
+            crate::metrics::on_pread(b.len() as u64);
+            crate::metrics::backing_read_exact_at(file, b, o)
+        })?;
+        self.pool.reconcile(old_len, new_len);
+        drop(ra);
+        self.pool.touch(self.key);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod window_tests {
     use super::*;
@@ -471,5 +535,68 @@ mod eviction_tests {
         // Returns promptly: evicts the next-coldest unlocked victim instead.
         let granted = pool.permitted_window(5, 0, pool.per_stream_cap());
         assert!(granted > 0 && granted <= pool.per_stream_cap());
+    }
+
+    #[cfg(test)]
+    mod backing_reader_tests {
+        use super::*;
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        use std::sync::{Arc, Mutex};
+
+        #[expect(clippy::cast_possible_truncation)]
+        fn temp_file(len: usize) -> (tempfile::TempDir, std::fs::File, Vec<u8>) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("backing.bin");
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            std::fs::File::create(&path)
+                .unwrap()
+                .write_all(&data)
+                .unwrap();
+            let f = std::fs::File::open(&path).unwrap();
+            (dir, f, data)
+        }
+
+        #[test]
+        fn sequential_reads_collapse_to_one_pread_per_window() {
+            let (_d, file, data) = temp_file(4 * 1024 * 1024);
+            let pool = ReadAheadPool::new(64 * 1024 * 1024);
+            let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+            pool.register(1, Arc::clone(&buf));
+            let backing_len = data.len() as u64;
+            let br = BackingReader::new(&file, &buf, &pool, 1, backing_len);
+            let mut out = vec![0u8; 64 * 1024];
+            #[expect(clippy::cast_possible_truncation)]
+            for chunk in 0..16u64 {
+                br.read_exact_at(&mut out, chunk * 64 * 1024).unwrap();
+                assert_eq!(out, data[(chunk * 64 * 1024) as usize..][..64 * 1024]);
+            }
+            assert!(
+                br.fills() < 16,
+                "read-ahead must collapse preads, got {}",
+                br.fills()
+            );
+        }
+
+        #[test]
+        fn bytes_match_direct_pread_for_random_access() {
+            let (_d, file, data) = temp_file(2 * 1024 * 1024);
+            let pool = ReadAheadPool::new(64 * 1024 * 1024);
+            let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+            pool.register(1, Arc::clone(&buf));
+            let br = BackingReader::new(&file, &buf, &pool, 1, data.len() as u64);
+            for &(off, len) in &[
+                (0u64, 100usize),
+                (1_000_000, 4096),
+                (5000, 700),
+                (2_097_000, 152),
+            ] {
+                let mut a = vec![0u8; len];
+                br.read_exact_at(&mut a, off).unwrap();
+                let mut b = vec![0u8; len];
+                file.read_exact_at(&mut b, off).unwrap();
+                assert_eq!(a, b, "read-ahead byte mismatch at {off}+{len}");
+            }
+        }
     }
 }

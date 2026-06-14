@@ -38,6 +38,8 @@ mod imp {
     static SCAN_OPENS: AtomicU64 = AtomicU64::new(0);
     static SCAN_PREADS: AtomicU64 = AtomicU64::new(0);
     static SCAN_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+    static READAHEAD_HITS: AtomicU64 = AtomicU64::new(0);
+    static READAHEAD_MISSES: AtomicU64 = AtomicU64::new(0);
     static PREAD_FAULT: OnceLock<Option<Duration>> = OnceLock::new();
 
     // Backing-read fault seam (test-only; process-global so it reaches the FUSE
@@ -183,6 +185,14 @@ mod imp {
         SCAN_BYTES_READ.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    pub fn on_readahead_hit() {
+        READAHEAD_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn on_readahead_miss() {
+        READAHEAD_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct Snapshot {
         pub opens: u64,
@@ -194,6 +204,8 @@ mod imp {
         pub scan_opens: u64,
         pub scan_preads: u64,
         pub scan_bytes_read: u64,
+        pub readahead_hits: u64,
+        pub readahead_misses: u64,
     }
 
     pub fn snapshot() -> Snapshot {
@@ -207,6 +219,8 @@ mod imp {
             scan_opens: SCAN_OPENS.load(Ordering::Relaxed),
             scan_preads: SCAN_PREADS.load(Ordering::Relaxed),
             scan_bytes_read: SCAN_BYTES_READ.load(Ordering::Relaxed),
+            readahead_hits: READAHEAD_HITS.load(Ordering::Relaxed),
+            readahead_misses: READAHEAD_MISSES.load(Ordering::Relaxed),
         }
     }
 
@@ -220,6 +234,8 @@ mod imp {
         SCAN_OPENS.store(0, Ordering::Relaxed);
         SCAN_PREADS.store(0, Ordering::Relaxed);
         SCAN_BYTES_READ.store(0, Ordering::Relaxed);
+        READAHEAD_HITS.store(0, Ordering::Relaxed);
+        READAHEAD_MISSES.store(0, Ordering::Relaxed);
     }
 }
 
@@ -236,6 +252,8 @@ mod imp {
         pub scan_opens: u64,
         pub scan_preads: u64,
         pub scan_bytes_read: u64,
+        pub readahead_hits: u64,
+        pub readahead_misses: u64,
     }
 
     #[inline(always)]
@@ -263,6 +281,10 @@ mod imp {
     pub fn on_scan_open() {}
     #[inline(always)]
     pub fn on_scan_read(_bytes: u64) {}
+    #[inline(always)]
+    pub fn on_readahead_hit() {}
+    #[inline(always)]
+    pub fn on_readahead_miss() {}
     #[inline(always)]
     pub fn snapshot() -> Snapshot {
         Snapshot::default()
