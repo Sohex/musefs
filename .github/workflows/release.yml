@@ -156,7 +156,7 @@ jobs:
           key: ${{ matrix.triple }}
       - name: Install Zig and cargo-zigbuild
         env:
-          ZIG_VERSION: "0.13.0"
+          ZIG_VERSION: "0.14.0"
           CARGO_ZIGBUILD_VERSION: "0.22.3"
         run: |
           set -euo pipefail
