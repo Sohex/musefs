@@ -345,6 +345,26 @@ impl HeaderCache {
             has_binary_tag,
         }))
     }
+    /// Current number of cached resolved-file entries.
+    pub fn entry_count(&self) -> u64 {
+        self.cache.len() as u64
+    }
+    /// Current resident inline-byte weight.
+    pub fn weight_bytes(&self) -> u64 {
+        self.cache.weight()
+    }
+    /// Configured resident-byte budget.
+    pub fn budget_bytes(&self) -> u64 {
+        self.cache.capacity()
+    }
+    /// Raw key-hit count (NOT content-version-validated hits — see telemetry docs).
+    pub fn raw_hits(&self) -> u64 {
+        self.cache.hits()
+    }
+    /// Raw key-miss count.
+    pub fn raw_misses(&self) -> u64 {
+        self.cache.misses()
+    }
 }
 
 /// Read `size` bytes at virtual `offset` into `out` (appended), opening the
@@ -978,6 +998,17 @@ mod cache_bound_tests {
     use super::*;
     use musefs_db::{Db, Format, NewTrack};
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn header_cache_exposes_budget_and_starts_empty() {
+        let c = HeaderCache::with_budget(Mode::Synthesis, 1234);
+        assert_eq!(c.entry_count(), 0);
+        assert_eq!(c.weight_bytes(), 0);
+        assert!(
+            c.budget_bytes() >= 1234,
+            "budget must be at least the requested amount"
+        );
+    }
 
     fn entry(content_version: i64, inline_len: usize) -> Arc<ResolvedFile> {
         Arc::new(ResolvedFile {

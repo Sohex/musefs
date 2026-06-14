@@ -170,6 +170,11 @@ pub struct Musefs {
     handles: sharded_slab::Slab<Arc<Handle>>,
     readahead_pool: Arc<crate::readahead::ReadAheadPool>,
     prefetch: Option<crate::readahead::PrefetchWorkers>,
+
+    /// Live count of entries in `handles` (telemetry: `sharded_slab` has no O(1)
+    /// `len()`). Incremented only on a successful slab insert, decremented only on
+    /// a successful remove, so it tracks slab occupancy exactly (#394).
+    handles_open: std::sync::atomic::AtomicUsize,
     /// `SizeEntry` keyed by track id. Tiny entries, effectively unbounded; serves
     /// getattr/lookup without a backing stat or full synthesis. Self-invalidates on
     /// a content_version change.
@@ -298,6 +303,7 @@ impl Musefs {
             } else {
                 None
             },
+            handles_open: std::sync::atomic::AtomicUsize::new(0),
             size_cache: dashmap::DashMap::new(),
             last_poll: Mutex::new(std::time::Instant::now()),
             last_failed_refresh: Mutex::new(None),
@@ -1298,7 +1304,7 @@ impl Musefs {
         crate::metrics::on_open();
         let file = Arc::new(std::fs::File::open(&resolved.backing_path)?);
         validate_opened_backing(&file, &resolved)?;
-        fh_from_key(self.handles.insert(Arc::new(Handle {
+        let key = self.handles.insert(Arc::new(Handle {
             track_id,
             resolved: arc_swap::ArcSwap::from(resolved),
             generation: AtomicU64::new(generation),
@@ -1310,7 +1316,11 @@ impl Musefs {
             epoch: Arc::new(AtomicU64::new(0)),
             prefetched_upto: AtomicU64::new(0),
             pool: Arc::clone(&self.readahead_pool),
-        })))
+        }));
+        if key.is_some() {
+            self.handles_open.fetch_add(1, Ordering::Relaxed);
+        }
+        fh_from_key(key)
     }
 
     /// Drop an open handle (closes its backing fd when the last reference goes).
@@ -1323,7 +1333,9 @@ impl Musefs {
         // a read racing this release still holds an Arc<Handle>, so eagerly
         // deregistering would drop the entry before that read's charge lands,
         // leaking it. Drop runs once the last reference (the in-flight read) goes.
-        self.handles.remove(key);
+        if self.handles.remove(key) {
+            self.handles_open.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Test accessor: are the Phase-2 prefetch worker threads running?
@@ -1353,6 +1365,32 @@ impl Musefs {
     /// The mount's serving mode (how file contents are produced).
     pub fn mode(&self) -> Mode {
         self.config.mode
+    }
+
+    /// Snapshot the core-owned telemetry for the `.musefs-metrics` surface (#394).
+    /// Cheap: atomic loads plus three length reads (the `inodes` mutex is taken
+    /// briefly; poison is recovered like every other lock site).
+    pub fn telemetry(&self) -> crate::telemetry::CoreTelemetry {
+        let tree_nodes = self.tree.load().node_count() as u64;
+        let inode_paths = self
+            .inodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .interned_path_count() as u64;
+        crate::telemetry::CoreTelemetry {
+            handles_open: self.handles_open.load(Ordering::Relaxed) as u64,
+            cache_header_entries: self.cache.entry_count(),
+            cache_header_bytes: self.cache.weight_bytes(),
+            cache_header_bytes_max: self.cache.budget_bytes(),
+            cache_header_hits: self.cache.raw_hits(),
+            cache_header_misses: self.cache.raw_misses(),
+            cache_size_entries: self.size_cache.len() as u64,
+            tree_nodes,
+            inode_paths,
+            refresh_generation: self.refresh_gen.load(Ordering::Acquire),
+            refresh_gap_fallbacks: self.gap_fallbacks.load(Ordering::Relaxed),
+            refresh_needs_rebuild: self.needs_rebuild.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -2307,5 +2345,47 @@ mod tests {
             Musefs::open(db, config),
             Err(crate::CoreError::InvalidTemplate(_))
         ));
+    }
+
+    #[test]
+    fn telemetry_counts_open_handles() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+
+        let base = fs.telemetry().handles_open;
+        let fh = fs.open_handle(file_inode).unwrap();
+        assert_eq!(fs.telemetry().handles_open, base + 1);
+        fs.release_handle(fh);
+        assert_eq!(fs.telemetry().handles_open, base);
     }
 }

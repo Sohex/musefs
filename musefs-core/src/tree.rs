@@ -85,6 +85,11 @@ impl InodeAllocator {
         }
         self.paths = live;
     }
+
+    /// Number of interned paths (telemetry: inode-allocator footprint, #394).
+    pub fn interned_path_count(&self) -> usize {
+        self.paths.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +413,11 @@ impl VirtualTree {
                 NodeKind::Dir => None,
             })
             .collect()
+    }
+
+    /// Number of live inodes (telemetry: virtual-tree footprint, #394).
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Inodes of `dir`'s direct children whose pre-disambiguation name is `rendered`.
