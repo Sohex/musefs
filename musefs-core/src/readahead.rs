@@ -410,3 +410,66 @@ mod pool_budget_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Build a buffer holding exactly `bytes` real backing bytes and register it
+    /// with the pool, charging the pool for those bytes (mirrors what a real miss
+    /// does via permitted_window + reconcile). `bytes` must be >= WINDOW_FLOOR for
+    /// the stored window to equal `bytes`.
+    fn register_filled(pool: &ReadAheadPool, key: usize, bytes: usize) -> Arc<Mutex<ReadAhead>> {
+        let arc = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        let data = vec![7u8; bytes * 2];
+        let mut dst = vec![0u8; bytes];
+        let (old, new) = arc
+            .lock()
+            .unwrap()
+            .read_into(&mut dst, 0, (bytes * 2) as u64, |b, _| {
+                b.copy_from_slice(&data[..b.len()]);
+                Ok(())
+            })
+            .unwrap();
+        pool.register(key, Arc::clone(&arc));
+        pool.reconcile(old, new);
+        arc
+    }
+
+    #[test]
+    fn permitted_window_evicts_coldest_other_stream_under_pressure() {
+        // Budget 4 MiB, per-stream cap 1 MiB. Fill the budget with four 1 MiB
+        // streams (registered keys 1..4, so key 1 is coldest), then a fifth stream
+        // wants to grow → must evict the coldest (key 1).
+        let pool = ReadAheadPool::new(4 * 1024 * 1024);
+        let mib = 1024 * 1024usize;
+        let cold = register_filled(&pool, 1, mib);
+        register_filled(&pool, 2, mib);
+        register_filled(&pool, 3, mib);
+        register_filled(&pool, 4, mib);
+        // Budget is now full (4 x 1 MiB). A fresh hot stream wants 1 MiB.
+        let hot = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        pool.register(5, Arc::clone(&hot));
+        let granted = pool.permitted_window(5, 0, pool.per_stream_cap());
+        assert_eq!(granted, mib as u64, "eviction frees room for the full cap");
+        assert_eq!(cold.lock().unwrap().len(), 0, "coldest stream was evicted");
+    }
+
+    #[test]
+    fn locked_victim_is_skipped_not_blocked() {
+        let pool = ReadAheadPool::new(4 * 1024 * 1024);
+        let mib = 1024 * 1024;
+        let victim = register_filled(&pool, 1, mib);
+        register_filled(&pool, 2, mib);
+        register_filled(&pool, 3, mib);
+        register_filled(&pool, 4, mib);
+        // Hold the coldest victim's lock: eviction must skip it (try_lock), not hang.
+        let _held = victim.lock().unwrap();
+        let hot = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        pool.register(5, Arc::clone(&hot));
+        // Returns promptly: evicts the next-coldest unlocked victim instead.
+        let granted = pool.permitted_window(5, 0, pool.per_stream_cap());
+        assert!(granted > 0 && granted <= pool.per_stream_cap());
+    }
+}
