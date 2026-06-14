@@ -65,6 +65,7 @@ struct Handle {
     readahead: Arc<Mutex<crate::readahead::ReadAhead>>,
     registered: AtomicBool,
     epoch: Arc<AtomicU64>,
+    depth: std::sync::atomic::AtomicU32,
 }
 
 /// An owned view of an open handle's backing fd, for FUSE passthrough
@@ -1075,6 +1076,7 @@ impl Musefs {
                         }
                         h.resolved.store(fresh);
                         h.generation.store(cur, Ordering::Release);
+                        h.depth.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
                     let resolved = h.resolved.load();
                     let r: &ResolvedFile = &resolved;
@@ -1124,20 +1126,39 @@ impl Musefs {
                                 );
                                 read_at_with_file_into(r, db, &br, offset, size, out)?;
                                 if let Some(pf) = &self.prefetch {
-                                    let (start, len) = {
+                                    let (start, window_size) = {
                                         let ra = h.readahead.lock().unwrap();
                                         (ra.next_expected(), self.readahead_pool.per_stream_cap())
                                     };
                                     if start < backing_len {
-                                        pf.request(crate::readahead::PrefetchJob {
-                                            file: Arc::clone(&h.file),
-                                            buf: Arc::clone(&h.readahead),
-                                            epoch: Arc::clone(&h.epoch),
-                                            dispatched_epoch: h.epoch.load(Ordering::Acquire),
-                                            start,
-                                            len,
-                                            backing_len,
-                                        });
+                                        let depth = h
+                                            .depth
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
+                                        let max_depth =
+                                            ((window_size / window_size.max(1)).clamp(1, 4)) as u32;
+                                        let depth = depth.min(max_depth);
+                                        h.readahead
+                                            .lock()
+                                            .unwrap()
+                                            .set_max_windows((depth as usize) + 1);
+                                        let cur_epoch =
+                                            h.epoch.load(std::sync::atomic::Ordering::Acquire);
+                                        for i in 0..depth {
+                                            let start = start + u64::from(i) * window_size;
+                                            if start >= backing_len {
+                                                break;
+                                            }
+                                            pf.request(crate::readahead::PrefetchJob {
+                                                file: Arc::clone(&h.file),
+                                                buf: Arc::clone(&h.readahead),
+                                                epoch: Arc::clone(&h.epoch),
+                                                dispatched_epoch: cur_epoch,
+                                                start,
+                                                len: window_size,
+                                                backing_len,
+                                            });
+                                        }
                                     }
                                 }
                                 Ok(Some(()))
@@ -1163,20 +1184,38 @@ impl Musefs {
                             );
                             read_at_with_file_into(r, db, &br, offset, size, out)?;
                             if let Some(pf) = &self.prefetch {
-                                let (start, len) = {
+                                let (start, window_size) = {
                                     let ra = h.readahead.lock().unwrap();
                                     (ra.next_expected(), self.readahead_pool.per_stream_cap())
                                 };
                                 if start < backing_len {
-                                    pf.request(crate::readahead::PrefetchJob {
-                                        file: Arc::clone(&h.file),
-                                        buf: Arc::clone(&h.readahead),
-                                        epoch: Arc::clone(&h.epoch),
-                                        dispatched_epoch: h.epoch.load(Ordering::Acquire),
-                                        start,
-                                        len,
-                                        backing_len,
-                                    });
+                                    let depth =
+                                        h.depth.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
+                                    let max_depth =
+                                        ((window_size / window_size.max(1)).clamp(1, 4)) as u32;
+                                    let depth = depth.min(max_depth);
+                                    h.readahead
+                                        .lock()
+                                        .unwrap()
+                                        .set_max_windows((depth as usize) + 1);
+                                    let cur_epoch =
+                                        h.epoch.load(std::sync::atomic::Ordering::Acquire);
+                                    for i in 0..depth {
+                                        let start = start + u64::from(i) * window_size;
+                                        if start >= backing_len {
+                                            break;
+                                        }
+                                        pf.request(crate::readahead::PrefetchJob {
+                                            file: Arc::clone(&h.file),
+                                            buf: Arc::clone(&h.readahead),
+                                            epoch: Arc::clone(&h.epoch),
+                                            dispatched_epoch: cur_epoch,
+                                            start,
+                                            len: window_size,
+                                            backing_len,
+                                        });
+                                    }
                                 }
                             }
                             Ok(Some(()))
@@ -1190,6 +1229,7 @@ impl Musefs {
                     h.resolved.store(fresh);
                     h.generation
                         .store(self.refresh_gen.load(Ordering::Acquire), Ordering::Release);
+                    h.depth.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Pathological constant re-tagging raced every attempt; surface a
                 // retryable error rather than risk wrong bytes.
@@ -1260,6 +1300,7 @@ impl Musefs {
             ))),
             registered: AtomicBool::new(false),
             epoch: Arc::new(AtomicU64::new(0)),
+            depth: std::sync::atomic::AtomicU32::new(0),
         })))
     }
 
