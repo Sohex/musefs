@@ -360,6 +360,23 @@ Sharp edges:
   Rust-regex/Python-`re` shared subset the guard allows (`\. \d + | ^ ( ) *`,
   no inline `(?...)` groups).
 
+### Performance regression gating
+
+`cargo test -p musefs-core --features metrics` includes
+`tests/perf_counters.rs`: golden assertions on deterministic work counters
+(`preads`, `pread_bytes`, `scan_bytes_read`, art/binary-tag chunks) for the
+read/serve and ingest paths, plus a `tree.rs` unit test pinning the refresh
+rebuild count as size-invariant. These are a hard gate — a legitimate change to
+read/ingest/refresh work must update the golden numbers in the same PR. They run
+on every non-doc PR via CI's `check` job. Constant-factor (wall-clock) changes
+are surfaced separately by the warn-only `perf-ab` job (below).
+
+The `perf-ab` job runs only when `musefs-core/src/**` or `musefs-format/src/**`
+change. It benches the base and PR commits back-to-back on one runner and posts a
+`critcmp` delta as a sticky PR comment. It is **warn-only** and not a required
+check — GH runner noise makes wall-clock unfit for hard gating. Reproduce locally
+with `scripts/perf-ab.sh <base-sha> out.md`.
+
 ### Concurrency + sanitizers
 
 Concurrent-reader coverage exists at two levels:

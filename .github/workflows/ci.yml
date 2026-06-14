@@ -25,6 +25,7 @@ jobs:
       src: ${{ steps.filter.outputs.src }}
       fuse: ${{ steps.filter.outputs.fuse }}
       lidarr: ${{ steps.filter.outputs.lidarr }}
+      perf: ${{ steps.filter.outputs.perf }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
@@ -48,6 +49,7 @@ jobs:
             echo "src=true" >> "$GITHUB_OUTPUT"
             echo "fuse=true" >> "$GITHUB_OUTPUT"
             echo "lidarr=true" >> "$GITHUB_OUTPUT"
+            echo "perf=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed="$(git diff --name-only "$base...HEAD")"
@@ -74,6 +76,14 @@ jobs:
             echo "lidarr=true" >> "$GITHUB_OUTPUT"
           else
             echo "lidarr=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Read/synthesis surface only: the A/B wall-clock job is expensive
+          # (builds criterion twice), so gate it to changes that can actually
+          # move read latency. tests/ and benches/ are excluded by the anchors.
+          if printf '%s\n' "$changed" | grep -qE '^(musefs-core/src/|musefs-format/src/)'; then
+            echo "perf=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "perf=false" >> "$GITHUB_OUTPUT"
           fi
 
   check:
@@ -413,6 +423,10 @@ jobs:
       - uses: vmactions/freebsd-vm@a6de9343ef5747433d9c25784c90e84998b9d69a
         with:
           usesh: true
+          # Pass/fail e2e gate — we keep no build artifacts, so skip the rsync
+          # sync-back of the large target/ tree, which has filled the host
+          # runner's disk ("No space left on device") at the end of a green run.
+          copyback: false
           prepare: sh scripts/freebsd-vm/provision.sh
           run: sh scripts/freebsd-vm/run-e2e.sh
 
@@ -420,6 +434,37 @@ jobs:
     needs: changes
     if: needs.changes.outputs.lidarr == 'true'
     uses: ./.github/workflows/lidarr-smoke.yml
+
+  perf-ab:
+    name: Read A/B (warn-only)
+    needs: changes
+    # PR-only: on push/tag events `pull_request.base.sha` is empty, so the A/B
+    # script has no base to bench against. The job is informational anyway.
+    if: needs.changes.outputs.perf == 'true' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install libfuse3
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Install critcmp
+        run: cargo install critcmp --locked --version 0.1.8
+      - name: Run A/B
+        run: scripts/perf-ab.sh "${{ github.event.pull_request.base.sha }}" "$RUNNER_TEMP/perf-ab.md"
+      - name: Comment (same-repo PRs)
+        if: github.event.pull_request.head.repo.fork == false
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405
+        with:
+          header: perf-ab
+          path: ${{ runner.temp }}/perf-ab.md
+      - name: Job summary (fallback / forks)
+        if: always()
+        run: cat "$RUNNER_TEMP/perf-ab.md" >> "$GITHUB_STEP_SUMMARY"
 
   # Single required status check for branch protection. Always runs (even when
   # the heavy jobs were skipped on a docs-only change) so the check is always

@@ -1912,4 +1912,55 @@ mod tests {
         assert!(t.lookup(VirtualTree::ROOT, "Song.flac").is_some());
         assert!(t.lookup(VirtualTree::ROOT, "Tune.flac").is_some());
     }
+
+    /// Builds a many-album library and re-tags ONE track (renaming its leaf
+    /// within its own album dir, no rendered-name collision). The
+    /// `apply_changes` rebuild-subtree count for such a change is 0 — it is
+    /// handled by remove+insert — and must stay 0 *regardless of library size*.
+    /// A regression that over-dirties (rebuilding album subtrees on every change)
+    /// would make the count scale with album count, tripping this gate. (This
+    /// guards `apply_changes`'s O(changed) contract; it does NOT guard the
+    /// facade's choice to call `apply_changes` vs a full `build_with`.)
+    fn library(albums: usize) -> Vec<(i64, String)> {
+        let mut e = Vec::new();
+        for a in 0..albums {
+            for t in 0..3 {
+                let id = i64::try_from(a * 3 + t).unwrap();
+                e.push((id, format!("Album{a:04}/t{t}.flac")));
+            }
+        }
+        e
+    }
+
+    fn rebuilds_for_one_retag(albums: usize) -> usize {
+        let entries = library(albums);
+        let mut alloc = InodeAllocator::new(false);
+        let mut t = VirtualTree::build_with(&entries, &mut alloc);
+        // Re-tag track id 1 (Album0000/t1.flac) → renamed leaf in the SAME dir.
+        let changed_id: i64 = 1;
+        let mut new_entries = entries.clone();
+        for (id, path) in &mut new_entries {
+            if *id == changed_id {
+                *path = "Album0000/renamed.flac".to_string();
+            }
+        }
+        let new_paths: std::collections::HashMap<i64, TrackRenderState> = new_entries
+            .iter()
+            .map(|&(id, ref p)| (id, trs(p)))
+            .collect();
+        t.apply_changes(&new_paths, &[changed_id], &[], &[], &mut alloc)
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_changes_rebuild_count_is_size_invariant() {
+        const EXPECTED_REBUILDS: usize = 0;
+        let small = rebuilds_for_one_retag(43); // 129 tracks
+        let large = rebuilds_for_one_retag(683); // 2049 tracks
+        assert_eq!(small, EXPECTED_REBUILDS, "small-library rebuild count");
+        assert_eq!(
+            large, EXPECTED_REBUILDS,
+            "large-library rebuild count must not scale with size (O(changed), not O(N))",
+        );
+    }
 }

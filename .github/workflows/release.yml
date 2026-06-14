@@ -385,3 +385,23 @@ jobs:
               --notes "Prebuilt binaries for ${GITHUB_REF_NAME}. Verify with: sha256sum -c <file>.sha256"
           fi
           gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --clobber
+
+  benchmarks:
+    name: Benchmark snapshot
+    runs-on: ubuntu-latest
+    continue-on-error: true # record-only; never blocks a release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - name: Install libfuse3
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Run benchmarks
+        run: scripts/perf-release-bench.sh "$RUNNER_TEMP/bench-snapshot.txt"
+      - name: Upload snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: benchmark-snapshot-${{ github.ref_name }}
+          path: ${{ runner.temp }}/bench-snapshot.txt
