@@ -91,3 +91,4 @@ doc = false
 bench = false
 
 [workspace]
+resolver = "3"

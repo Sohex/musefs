@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["musefs-db", "musefs-format", "musefs-core", "musefs-fuse", "musefs-cli", "musefs", "musefs-latencyfs"]
 exclude = ["fuzz"]
 
