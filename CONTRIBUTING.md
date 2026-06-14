@@ -592,8 +592,9 @@ and is the source of truth; this checklist is the human side.
    ```
 
    If a target cannot build `jemalloc-sys`, add `--no-default-features` to that
-   matrix entry in `release.yml` **and** its matching Docker image, rather than
-   blocking the release.
+   matrix entry's `cargo zigbuild` in `release.yml`, rather than blocking the
+   release. The Docker images `COPY` the binary this step produces (they don't
+   run cargo), so the matching container inherits the opt-out automatically.
 
 **Version bump (do this in one commit before tagging).**
 
