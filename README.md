@@ -285,7 +285,12 @@ counts every file that isn't a supported audio format — cover art, `.cue` /
 `.log` / `.nfo` sidecars, and anything else non-audio — so a large `skipped`
 number (hundreds or thousands on a big library) is expected, not an error.
 `failed` is the one to watch: those are audio files musefs recognised by
-extension but could not parse.
+extension but could not parse. Format dispatch is by **extension only** —
+there is no content sniffing and no fallback to another parser, so a file
+whose contents don't match its extension (e.g. a FLAC named `.mp3`) is handed
+to the wrong parser, fails, and is counted here rather than retried. Renaming
+files across formats makes them vanish from the mount; fix the extension and
+rescan.
 
 `--revalidate` is the maintenance pass: it skips unchanged files —
 **preserving any tag edits you made in the store** — prunes tracks whose

@@ -47,6 +47,17 @@ Verified by `musefs-format/tests/proptest_ogg.rs` (crate feature `fuzzing`),
   upper-cased on synthesis.
 - Ogg carries no binary-tag slot: only text comments and pictures exist, so
   there is nothing else to preserve.
+- **Embedded picture descriptions are right-padded with up to two trailing
+  spaces.** The FLAC PICTURE block body is built with its description padded so
+  the body length is a multiple of 3 (`picture_prefix`,
+  `musefs-format/src/ogg/mod.rs`), which is what makes
+  `base64(prefix ++ image) == base64(prefix) ++ base64(image)` and lets the
+  image's base64 be served as an independent, incrementally-streamable
+  substring (the [art split](#how-synthesis-works) above). Padding the
+  description is the safe place to do it — the MIME type must stay a valid
+  type. So a synthesized picture's description can differ from the original by
+  up to two trailing spaces; this applies to Opus/Vorbis and OggFLAC alike,
+  since both build the block body the same way.
 
 ## How synthesis works
 
