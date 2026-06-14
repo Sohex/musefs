@@ -104,7 +104,6 @@ fn open_flags(keep_cache: bool) -> FopenFlags {
 /// jemalloc allocator stats, or `None` when not built with the `jemalloc`
 /// feature (or when the ctls fail — best-effort, never panics). #394.
 #[cfg(feature = "jemalloc")]
-#[allow(dead_code)]
 fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
     use tikv_jemalloc_ctl::{epoch, stats};
     epoch::advance().ok()?;
@@ -117,20 +116,18 @@ fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
 }
 
 #[cfg(not(feature = "jemalloc"))]
-#[allow(dead_code)]
 fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
     None
 }
 
 /// Serve-path syscall counters, present only on a `metrics`-feature build.
 #[cfg(feature = "metrics")]
-#[allow(dead_code)]
+#[allow(clippy::unnecessary_wraps)]
 fn syscall_snapshot() -> Option<musefs_core::metrics::Snapshot> {
     Some(musefs_core::metrics::snapshot())
 }
 
 #[cfg(not(feature = "metrics"))]
-#[allow(dead_code)]
 fn syscall_snapshot() -> Option<musefs_core::metrics::Snapshot> {
     None
 }
@@ -240,12 +237,22 @@ type DirListing = Vec<(u64, FileType, String)>;
 const MAX_DIR_HANDLES: usize = 1024;
 
 /// Build a directory's full readdir listing once. Shared by `opendir`
-/// (snapshotted per fh) and the `readdir` fallback for an unknown fh.
-fn build_dir_listing(core: &Musefs, ino: u64) -> Result<Vec<(u64, FileType, String)>, CoreError> {
+/// (snapshotted per fh) and the `readdir` fallback for an unknown fh. When
+/// `expose_metrics` is on, the synthetic `.musefs-metrics` entry is appended to
+/// the root listing (append-without-dedup, matching the Spotlight marker; #394).
+fn build_dir_listing(
+    core: &Musefs,
+    ino: u64,
+    expose_metrics: bool,
+) -> Result<Vec<(u64, FileType, String)>, CoreError> {
     let entries = core.readdir(ino)?;
     let parent = core.parent(ino).unwrap_or(ino);
     let marker = platform::spotlight::marker_dir_entry(ino);
-    Ok(assemble_dir_listing(ino, parent, entries, marker))
+    let mut listing = assemble_dir_listing(ino, parent, entries, marker);
+    if expose_metrics && let Some(entry) = metrics_dir::root_dir_entry(ino) {
+        listing.push(entry);
+    }
+    Ok(listing)
 }
 
 /// Admit a directory handle under the caller's `dir_handles` lock, enforcing
@@ -362,6 +369,12 @@ pub struct MusefsFs {
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
     /// otherwise-unbounded pool queue (#308).
     inflight_reads: Arc<AtomicUsize>,
+    /// Per-open rendered `.musefs-metrics/metrics` buffers, keyed by the fh handed
+    /// out at `open` (#394). Each open snapshots once; reads slice it by absolute
+    /// offset; `release` drops it. Empty/untouched unless `expose_metrics` is on.
+    metrics_handles: Arc<Mutex<std::collections::HashMap<u64, Arc<Vec<u8>>>>>,
+    /// Monotonic fh source for `metrics_handles` (starts at 1; never 0).
+    metrics_fh: Arc<AtomicU64>,
 }
 
 impl MusefsFs {
@@ -388,6 +401,8 @@ impl MusefsFs {
             dir_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dir_fh: Arc::new(AtomicU64::new(1)),
             inflight_reads: Arc::new(AtomicUsize::new(0)),
+            metrics_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            metrics_fh: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -444,7 +459,6 @@ impl MusefsFs {
     /// Assemble and render the `.musefs-metrics/metrics` body (#394). Best-effort:
     /// every source is an atomic load, a brief lock, or a fallible probe mapped to
     /// `None`/0; nothing here can panic the daemon or perturb a read.
-    #[allow(dead_code)]
     fn render_metrics(&self) -> Vec<u8> {
         let core = self.core.telemetry();
         let dir_handles = self
@@ -506,6 +520,16 @@ impl Filesystem for MusefsFs {
             );
             return reply.entry(&self.config.ttl, &attr, Generation(0));
         }
+        if self.config.expose_metrics
+            && let Some(mino) = metrics_dir::metrics_lookup(parent.0, name)
+        {
+            let attr = if mino == metrics_dir::METRICS_DIR_INO {
+                metrics_dir::dir_attr(self.uid, self.gid, self.config.dir_mode, self.mount_time)
+            } else {
+                metrics_dir::file_attr(self.uid, self.gid, self.config.file_mode, self.mount_time)
+            };
+            return reply.entry(&self.config.ttl, &attr, Generation(0));
+        }
         // Inode resolution is an in-memory tree read; the attr (which may touch
         // the DB/disk) is computed on the worker pool.
         let Some(child) = self.core.lookup(parent.0, name) else {
@@ -541,6 +565,14 @@ impl Filesystem for MusefsFs {
             );
             return reply.attr(&self.config.ttl, &attr);
         }
+        if self.config.expose_metrics && metrics_dir::is_metrics_ino(ino.0) {
+            let attr = if ino.0 == metrics_dir::METRICS_DIR_INO {
+                metrics_dir::dir_attr(self.uid, self.gid, self.config.dir_mode, self.mount_time)
+            } else {
+                metrics_dir::file_attr(self.uid, self.gid, self.config.file_mode, self.mount_time)
+            };
+            return reply.attr(&self.config.ttl, &attr);
+        }
         let core = Arc::clone(&self.core);
         let (uid, gid, fm, dm, mt, ttl) = (
             self.uid,
@@ -562,6 +594,17 @@ impl Filesystem for MusefsFs {
             // NonZeroU64 guard) and `read` short-circuits on `is_marker`.
             return reply.opened(FileHandle(0), open_flags(false));
         }
+        if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_FILE_INO {
+            let body = Arc::new(self.render_metrics());
+            let fh = self.metrics_fh.fetch_add(1, Ordering::Relaxed);
+            self.metrics_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(fh, body);
+            // DIRECT_IO (no NONSEEKABLE): size-0 stat means the kernel reads to
+            // EOF, and absolute-offset slicing in `read` supports pread/re-reads.
+            return reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+        }
         let core = Arc::clone(&self.core);
         let flags = open_flags(self.config.keep_cache);
         let passthrough = self.passthrough.clone();
@@ -582,16 +625,20 @@ impl Filesystem for MusefsFs {
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         self.fire_poll_refresh();
+        if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
+            // Stateless: readdir(METRICS_DIR_INO) serves an inline listing and
+            // never consults dir_handles, so this fh burns no MAX_DIR_HANDLES slot.
+            return reply.opened(FileHandle(0), FopenFlags::empty());
+        }
         let core = Arc::clone(&self.core);
         let handles = Arc::clone(&self.dir_handles);
         let counter = Arc::clone(&self.dir_fh);
+        let expose_metrics = self.config.expose_metrics;
         self.pool.execute(move || {
-            let listing = match build_dir_listing(&core, ino.0) {
+            let listing = match build_dir_listing(&core, ino.0, expose_metrics) {
                 Ok(l) => l,
                 Err(e) => return reply.error(reply_errno("opendir", ino.0, &e)),
             };
-            // Check + id allocation + insert under one lock hold, so concurrent
-            // opendir closures can't race the count past MAX_DIR_HANDLES (#307).
             let admitted = {
                 let mut guard = handles
                     .lock()
@@ -608,17 +655,22 @@ impl Filesystem for MusefsFs {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_FILE_INO {
+            self.metrics_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&fh.0);
+            return reply.ok();
+        }
         // Cheap (a backing-map remove + a slab remove); no need to offload to the pool.
         if let Some(fh) = NonZeroU64::new(fh.0) {
-            // Drops the backing registration (fires the close ioctl on Linux);
-            // a no-op for plain handles and on non-Linux.
             self.passthrough.remove(fh.get());
             self.core.release_handle(Fh::from(fh));
         }
@@ -713,6 +765,22 @@ impl Filesystem for MusefsFs {
         if platform::spotlight::is_marker(ino.0) {
             return reply.data(&[]);
         }
+        if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_FILE_INO {
+            let body = self
+                .metrics_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&fh.0)
+                .map(Arc::clone);
+            let Some(body) = body else {
+                return reply.data(&[]); // unknown fh → EOF
+            };
+            let start = usize_from(offset).min(body.len());
+            let end = start
+                .saturating_add(usize_from(u64::from(size)))
+                .min(body.len());
+            return reply.data(&body[start..end]);
+        }
         // Reserve a slot on the dispatch thread before enqueuing; over the cap,
         // reject with EAGAIN so the unbounded pool queue can't grow (#308).
         let Some(slot) = reserve_read_slot(&self.inflight_reads, MAX_INFLIGHT_READS) else {
@@ -762,6 +830,15 @@ impl Filesystem for MusefsFs {
         mut reply: ReplyDirectory,
     ) {
         self.fire_poll_refresh();
+        if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
+            let listing = metrics_dir::dir_listing();
+            for (i, (child, kind, name)) in listing.iter().enumerate().skip(usize_from(offset)) {
+                if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
+                    break;
+                }
+            }
+            return reply.ok();
+        }
         let snapshot = self
             .dir_handles
             .lock()
@@ -772,7 +849,7 @@ impl Filesystem for MusefsFs {
         let listing = match snapshot {
             Some(l) => l,
             // Unknown fh (e.g. fh 0): build once inline so we never regress.
-            None => match build_dir_listing(&self.core, ino.0) {
+            None => match build_dir_listing(&self.core, ino.0, self.config.expose_metrics) {
                 Ok(l) => Arc::new(l),
                 Err(e) => return reply.error(reply_errno("readdir", ino.0, &e)),
             },

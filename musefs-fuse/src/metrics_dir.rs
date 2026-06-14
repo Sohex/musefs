@@ -8,11 +8,6 @@
 //! so the top band is unreachable in practice (a fixed mid-range constant would
 //! NOT be safe). They are disjoint from the macOS marker (`u64::MAX`).
 
-// These items are consumed by the FUSE dispatch in Task 7; until then the
-// lib-target build sees them as unused. This allow keeps the intermediate
-// commit green under `clippy -D warnings`. REMOVED in Task 7 once wired.
-#![allow(dead_code)]
-
 use std::time::SystemTime;
 
 use fuser::{FileAttr, FileType, INodeNo};

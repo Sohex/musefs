@@ -48,9 +48,7 @@ mod imp {
 
         /// Telemetry: `(sticky-disabled, live backing registrations)`. The map
         /// length is read under its lock (scrapes are rare). `#394`.
-        // `allow`: consumed in Task 6's `render_metrics`, which is itself only
-        // reachable after Task 7 wires dispatch. REMOVED in Task 7 Step 11.
-        #[allow(dead_code, clippy::unnecessary_wraps)]
+        #[allow(clippy::unnecessary_wraps)]
         pub fn telemetry(&self) -> Option<(bool, u64)> {
             let active = self
                 .backing
@@ -135,8 +133,7 @@ mod imp {
         pub fn remove(&self, _fh: u64) {}
 
         /// No passthrough off Linux; telemetry is absent.
-        // See the Linux arm: REMOVE the `dead_code` allow in Task 7 Step 11.
-        #[allow(clippy::unused_self, dead_code)]
+        #[allow(clippy::unused_self)]
         pub fn telemetry(&self) -> Option<(bool, u64)> {
             None
         }
