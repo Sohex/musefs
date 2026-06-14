@@ -1,11 +1,14 @@
 #![no_main]
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
-use musefs_core::{HeaderCache, Mode, read_at_with_file};
+use musefs_core::{
+    BackingReader, HeaderCache, Mode, ReadAhead, ReadAheadPool, read_at_with_file,
+};
 use musefs_db::{BinaryTag, Db, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_fuzz::{MAX_INPUT, arb_arts, arb_tags};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
+use std::sync::{Arc, Mutex};
 
 /// Build a one-track in-memory DB over `backing` written to a temp file, and
 /// return (tempdir, db, track_id). Returns None on any setup error.
@@ -282,6 +285,9 @@ fuzz_target!(|data: &[u8]| {
 
     let total = resolved.total_len;
     let file = std::fs::File::open(&resolved.backing_path).expect("backing file opens");
+    let pool = ReadAheadPool::new(0);
+    let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
+    let br = BackingReader::new(&file, &buf, &pool, 0, total);
 
     // Splice-consistency invariants. A successfully-resolved layout is internally
     // consistent regardless of how its rows were planted, so whenever the read
@@ -293,7 +299,7 @@ fuzz_target!(|data: &[u8]| {
     // as a clean Err(Format(Malformed)) at read time — that is the production code
     // correctly rejecting hostile state, not a clean-path failure. Only a
     // genuinely clean input (hostile == None) must read without error.
-    let whole = match read_at_with_file(&resolved, &db, &file, 0, total) {
+    let whole = match read_at_with_file(&resolved, &db, &br, 0, total) {
         Ok(w) => w,
         Err(_) if hostile.is_some() => return,
         Err(e) => panic!("clean-path whole read failed: {e:?}"),
@@ -315,7 +321,7 @@ fuzz_target!(|data: &[u8]| {
             Ok(v) => v,
             Err(_) => break,
         };
-        let got = match read_at_with_file(&resolved, &db, &file, offset, size) {
+        let got = match read_at_with_file(&resolved, &db, &br, offset, size) {
             Ok(g) => g,
             Err(_) if hostile.is_some() => break,
             Err(e) => panic!("clean-path window read failed: {e:?}"),
