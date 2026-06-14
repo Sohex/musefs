@@ -14,6 +14,38 @@ fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
     Ok(())
 }
 
+/// Columns the grouped tag readers project: `track_id` followed by the five
+/// columns `read_tag_row` consumes. Kept in lockstep with `read_tag_row`'s
+/// offset arithmetic.
+const GROUPED_TAG_COLS: &str = "track_id, length(key), length(value), key, value, ordinal";
+
+/// Read one text-tag row laid out as `length(key), length(value), key, value,
+/// ordinal` starting at column `base`; length-guards the row before its strings
+/// are materialized (spec N13).
+fn read_tag_row(r: &rusqlite::Row, base: usize) -> Result<Tag> {
+    check_tag_lengths(r.get(base)?, r.get(base + 1)?)?;
+    Ok(Tag {
+        key: r.get(base + 2)?,
+        value: r.get(base + 3)?,
+        ordinal: r.get(base + 4)?,
+    })
+}
+
+/// Drain grouped tag rows (`GROUPED_TAG_COLS`: `track_id` then `read_tag_row`'s
+/// five columns at base 1) into `out`, enforcing the per-track count cap.
+fn collect_grouped_tags(
+    rows: &mut rusqlite::Rows,
+    out: &mut std::collections::HashMap<i64, Vec<Tag>>,
+) -> Result<()> {
+    while let Some(r) = rows.next()? {
+        let track_id: i64 = r.get(0)?;
+        let entry = out.entry(track_id).or_default();
+        entry.push(read_tag_row(r, 1)?);
+        check_tag_count(track_id, entry.len())?;
+    }
+    Ok(())
+}
+
 impl<M> Db<M> {
     pub fn get_tags(&self, track_id: i64) -> Result<Vec<Tag>> {
         let mut stmt = self.conn.prepare_cached(
@@ -23,12 +55,7 @@ impl<M> Db<M> {
         let mut rows = stmt.query(params![track_id])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            check_tag_lengths(r.get(0)?, r.get(1)?)?;
-            out.push(Tag {
-                key: r.get(2)?,
-                value: r.get(3)?,
-                ordinal: r.get(4)?,
-            });
+            out.push(read_tag_row(r, 0)?);
             check_tag_count(track_id, out.len())?;
         }
         Ok(out)
@@ -38,51 +65,31 @@ impl<M> Db<M> {
         &self,
         track_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
-        const CHUNK: usize = 900;
-        let mut out: std::collections::HashMap<i64, Vec<Tag>> = std::collections::HashMap::new();
-        for chunk in track_ids.chunks(CHUNK) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT track_id, length(key), length(value), key, value, ordinal FROM tags \
-                 WHERE track_id IN ({placeholders}) AND value_blob IS NULL \
-                 ORDER BY track_id, key, ordinal"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let params = rusqlite::params_from_iter(chunk.iter());
-            let mut rows = stmt.query(params)?;
-            while let Some(r) = rows.next()? {
-                let track_id: i64 = r.get(0)?;
-                check_tag_lengths(r.get(1)?, r.get(2)?)?;
-                let entry = out.entry(track_id).or_default();
-                entry.push(Tag {
-                    key: r.get(3)?,
-                    value: r.get(4)?,
-                    ordinal: r.get(5)?,
-                });
-                check_tag_count(track_id, entry.len())?;
-            }
-        }
+        let mut out = std::collections::HashMap::new();
+        crate::query_in_chunks(
+            &self.conn,
+            track_ids,
+            |ph| {
+                format!(
+                    "SELECT {GROUPED_TAG_COLS} FROM tags \
+                     WHERE track_id IN ({ph}) AND value_blob IS NULL \
+                     ORDER BY track_id, key, ordinal"
+                )
+            },
+            |rows| collect_grouped_tags(rows, &mut out),
+        )?;
         Ok(out)
     }
 
     pub fn tags_grouped(&self) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT track_id, length(key), length(value), key, value, ordinal FROM tags \
-             WHERE value_blob IS NULL ORDER BY track_id, key, ordinal",
-        )?;
+        let sql = format!(
+            "SELECT {GROUPED_TAG_COLS} FROM tags \
+             WHERE value_blob IS NULL ORDER BY track_id, key, ordinal"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
-        let mut out: std::collections::HashMap<i64, Vec<Tag>> = std::collections::HashMap::new();
-        while let Some(r) = rows.next()? {
-            let track_id: i64 = r.get(0)?;
-            check_tag_lengths(r.get(1)?, r.get(2)?)?;
-            let entry = out.entry(track_id).or_default();
-            entry.push(Tag {
-                key: r.get(3)?,
-                value: r.get(4)?,
-                ordinal: r.get(5)?,
-            });
-            check_tag_count(track_id, entry.len())?;
-        }
+        let mut out = std::collections::HashMap::new();
+        collect_grouped_tags(&mut rows, &mut out)?;
         Ok(out)
     }
 
@@ -90,31 +97,20 @@ impl<M> Db<M> {
         &self,
         keys: &[&str],
     ) -> Result<std::collections::HashMap<i64, Vec<Tag>>> {
-        const CHUNK: usize = 900;
-        let mut out: std::collections::HashMap<i64, Vec<Tag>> = std::collections::HashMap::new();
-        for chunk in keys.chunks(CHUNK) {
-            let lowered: Vec<String> = chunk.iter().map(|k| k.to_ascii_lowercase()).collect();
-            let placeholders = vec!["?"; lowered.len()].join(",");
-            let sql = format!(
-                "SELECT track_id, length(key), length(value), key, value, ordinal FROM tags \
-                 WHERE value_blob IS NULL AND lower(key) IN ({placeholders}) \
-                 ORDER BY track_id, key, ordinal"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let params = rusqlite::params_from_iter(lowered.iter());
-            let mut rows = stmt.query(params)?;
-            while let Some(r) = rows.next()? {
-                let track_id: i64 = r.get(0)?;
-                check_tag_lengths(r.get(1)?, r.get(2)?)?;
-                let entry = out.entry(track_id).or_default();
-                entry.push(Tag {
-                    key: r.get(3)?,
-                    value: r.get(4)?,
-                    ordinal: r.get(5)?,
-                });
-                check_tag_count(track_id, entry.len())?;
-            }
-        }
+        let lowered: Vec<String> = keys.iter().map(|k| k.to_ascii_lowercase()).collect();
+        let mut out = std::collections::HashMap::new();
+        crate::query_in_chunks(
+            &self.conn,
+            &lowered,
+            |ph| {
+                format!(
+                    "SELECT {GROUPED_TAG_COLS} FROM tags \
+                     WHERE value_blob IS NULL AND lower(key) IN ({ph}) \
+                     ORDER BY track_id, key, ordinal"
+                )
+            },
+            |rows| collect_grouped_tags(rows, &mut out),
+        )?;
         Ok(out)
     }
 
@@ -173,21 +169,53 @@ impl<M> Db<M> {
     }
 }
 
+/// Replace a track's text-tag rows (`value_blob IS NULL`); binary rows are
+/// untouched. Runs on `conn` so both `Db<ReadWrite>` (own transaction) and
+/// `BulkWriter` (caller-held transaction) share one implementation.
+pub(crate) fn replace_tags_in(
+    conn: &rusqlite::Connection,
+    track_id: i64,
+    tags: &[Tag],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NULL",
+        params![track_id],
+    )?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for t in tags {
+        stmt.execute(params![track_id, t.key, t.value, t.ordinal])?;
+    }
+    Ok(())
+}
+
+/// Replace a track's binary-tag rows (`value_blob IS NOT NULL`); text rows are
+/// untouched. Binary rows store `''` in `value`. See `replace_tags_in` for the
+/// shared-`conn` rationale.
+pub(crate) fn set_binary_tags_in(
+    conn: &rusqlite::Connection,
+    track_id: i64,
+    tags: &[BinaryTag],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL",
+        params![track_id],
+    )?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
+         VALUES (?1, ?2, '', ?3, ?4)",
+    )?;
+    for t in tags {
+        stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
+    }
+    Ok(())
+}
+
 impl Db<ReadWrite> {
     pub fn replace_tags(&self, track_id: i64, tags: &[Tag]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NULL",
-            params![track_id],
-        )?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for t in tags {
-                stmt.execute(params![track_id, t.key, t.value, t.ordinal])?;
-            }
-        }
+        replace_tags_in(&tx, track_id, tags)?;
         tx.commit()?;
         Ok(())
     }
@@ -196,19 +224,7 @@ impl Db<ReadWrite> {
     /// (managed by `replace_tags`) are untouched. Binary rows store '' in `value`.
     pub fn set_binary_tags(&self, track_id: i64, tags: &[BinaryTag]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM tags WHERE track_id = ?1 AND value_blob IS NOT NULL",
-            params![track_id],
-        )?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
-                 VALUES (?1, ?2, '', ?3, ?4)",
-            )?;
-            for t in tags {
-                stmt.execute(params![track_id, t.key, t.payload, t.ordinal])?;
-            }
-        }
+        set_binary_tags_in(&tx, track_id, tags)?;
         tx.commit()?;
         Ok(())
     }

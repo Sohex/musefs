@@ -11,43 +11,41 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
 
 impl<M> Db<M> {
     pub fn get_art(&self, id: i64) -> Result<Option<Art>> {
-        let mut stmt = self.conn.prepare(
+        crate::query_optional(
+            &self.conn,
             "SELECT id, sha256, mime, width, height, byte_len, data FROM art WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query(params![id])?;
-        match rows.next()? {
-            Some(r) => Ok(Some(Art {
-                id: r.get(0)?,
-                sha256: r.get(1)?,
-                mime: r.get(2)?,
-                width: r.get(3)?,
-                height: r.get(4)?,
-                byte_len: r.get(5)?,
-                data: r.get(6)?,
-            })),
-            None => Ok(None),
-        }
+            params![id],
+            |r| {
+                Ok(Art {
+                    id: r.get(0)?,
+                    sha256: r.get(1)?,
+                    mime: r.get(2)?,
+                    width: r.get(3)?,
+                    height: r.get(4)?,
+                    byte_len: r.get(5)?,
+                    data: r.get(6)?,
+                })
+            },
+        )
     }
 
     /// Art row metadata without loading the image blob — used to build synthesis
     /// inputs at resolve time without materializing art in memory.
     pub fn get_art_meta(&self, id: i64) -> Result<Option<ArtMeta>> {
-        let mut stmt = self.conn.prepare_cached(
+        crate::query_optional(
+            &self.conn,
             "SELECT length(mime), mime, width, height, byte_len FROM art WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query(params![id])?;
-        match rows.next()? {
-            Some(r) => {
+            params![id],
+            |r| {
                 check_field_len("art", "mime", r.get(0)?, MAX_ART_MIME_LEN)?;
-                Ok(Some(ArtMeta {
+                Ok(ArtMeta {
                     mime: r.get(1)?,
                     width: r.get(2)?,
                     height: r.get(3)?,
                     byte_len: r.get(4)?,
-                }))
-            }
-            None => Ok(None),
-        }
+                })
+            },
+        )
     }
 
     /// Stream art-blob bytes at `offset` directly into `buf` via SQLite incremental
@@ -147,44 +145,57 @@ impl<M> Db<M> {
     }
 }
 
+/// Insert `a` (deduplicated by content sha256) and return its `art` id. Runs on
+/// `conn` so `Db<ReadWrite>` and `BulkWriter` share one body.
+pub(crate) fn upsert_art_in(conn: &rusqlite::Connection, a: &NewArt) -> Result<i64> {
+    let sha = sha256_hex(&a.data);
+    conn.execute(
+        "INSERT INTO art (sha256, mime, width, height, byte_len, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(sha256) DO NOTHING",
+        params![sha, a.mime, a.width, a.height, a.data.len() as u64, a.data],
+    )?;
+    Ok(
+        conn.query_row("SELECT id FROM art WHERE sha256 = ?1", params![sha], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
+/// Replace a track's `track_art` links. Runs on `conn` so `Db<ReadWrite>` (own
+/// transaction) and `BulkWriter` (caller-held transaction) share one body.
+pub(crate) fn set_track_art_in(
+    conn: &rusqlite::Connection,
+    track_id: i64,
+    items: &[TrackArt],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM track_art WHERE track_id = ?1",
+        params![track_id],
+    )?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for it in items {
+        stmt.execute(params![
+            track_id,
+            it.art_id,
+            it.picture_type,
+            it.description,
+            it.ordinal
+        ])?;
+    }
+    Ok(())
+}
+
 impl Db<ReadWrite> {
     pub fn upsert_art(&self, a: &NewArt) -> Result<i64> {
-        let sha = sha256_hex(&a.data);
-        self.conn.execute(
-            "INSERT INTO art (sha256, mime, width, height, byte_len, data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(sha256) DO NOTHING",
-            params![sha, a.mime, a.width, a.height, a.data.len() as u64, a.data],
-        )?;
-        let id =
-            self.conn
-                .query_row("SELECT id FROM art WHERE sha256 = ?1", params![sha], |r| {
-                    r.get(0)
-                })?;
-        Ok(id)
+        upsert_art_in(&self.conn, a)
     }
 
     pub fn set_track_art(&self, track_id: i64, items: &[TrackArt]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM track_art WHERE track_id = ?1",
-            params![track_id],
-        )?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            for it in items {
-                stmt.execute(params![
-                    track_id,
-                    it.art_id,
-                    it.picture_type,
-                    it.description,
-                    it.ordinal
-                ])?;
-            }
-        }
+        set_track_art_in(&tx, track_id, items)?;
         tx.commit()?;
         Ok(())
     }
@@ -349,5 +360,14 @@ mod guard_tests {
         drop(stmt);
         tx.commit().unwrap();
         assert_eq!(db.get_track_art(track).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_digest() {
+        // NIST sample vector: sha256("abc").
+        assert_eq!(
+            super::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

@@ -22,6 +22,45 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Run a single-row query, mapping the row with `map` if present. The shared
+/// shape behind every `Result<Option<T>>` point read (`get_art`,
+/// `track_version_and_path`, the `Track` readers, …): prepare-cached, step once,
+/// map-or-`None`.
+pub(crate) fn query_optional<T>(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    map: impl FnOnce(&rusqlite::Row) -> Result<T>,
+) -> Result<Option<T>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let mut rows = stmt.query(params)?;
+    match rows.next()? {
+        Some(r) => Ok(Some(map(r)?)),
+        None => Ok(None),
+    }
+}
+
+/// Run an `IN (?,?,…)` query over `items` split into chunks within SQLite's bound
+/// variable limit. `make_sql` receives the comma-joined placeholder list for the
+/// chunk; `consume` drains the resulting rows (a chunk's items bind positionally
+/// in order).
+pub(crate) fn query_in_chunks<T: rusqlite::ToSql>(
+    conn: &Connection,
+    items: &[T],
+    make_sql: impl Fn(&str) -> String,
+    mut consume: impl FnMut(&mut rusqlite::Rows) -> Result<()>,
+) -> Result<()> {
+    const CHUNK: usize = 900;
+    for chunk in items.chunks(CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = make_sql(&placeholders);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
+        consume(&mut rows)?;
+    }
+    Ok(())
+}
+
 /// Type-state markers for [`Db`]: the connection's write capability, at the
 /// type level. Write APIs exist only on `Db<ReadWrite>`.
 #[derive(Debug)]
