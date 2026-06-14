@@ -82,6 +82,9 @@ in three lanes:
 The fsync-storm (403→0) signal needs a real FUSE mount and lives only in the
 release lane / the `#[ignore]` `bench_scan_under_latency`, not the per-PR gate.
 
+The release artifact is named `benchmark-snapshot-<tag>`; download it from the
+tag's workflow run and fold the numbers into the per-pass tables here.
+
 ## Methodology
 
 ### Machine
