@@ -659,7 +659,7 @@ fn quiet_scan_still_ingests_all_files() {
     let db_path = db_dir.path().join("musefs.db");
 
     // quiet = true: sink is None; ingest must be identical.
-    run_scan(&db_path, &[backing.path().to_path_buf()], true, 0, false, false).unwrap();
+    run_scan(&db_path, &[backing.path().to_path_buf()], false, 0, false, true).unwrap();
 
     let db = musefs_db::Db::open(&db_path).unwrap();
     assert_eq!(db.list_tracks().unwrap().len(), 20);

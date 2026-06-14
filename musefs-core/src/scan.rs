@@ -1124,6 +1124,10 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         // Budget weights are released only after commit, and ingest_bulk consumes
         // the Probed — capture each unit's weight before the move (#68).
         let mut weights = Vec::with_capacity(batch.len());
+        // `Ingested` reports committed files, so buffer the paths and emit only
+        // after `bw.commit()` succeeds — a failed commit aborts the scan without
+        // having advanced the progress bar past unpersisted files.
+        let mut committed: Vec<String> = Vec::new();
         for Unit {
             abs_path,
             stamp,
@@ -1133,6 +1137,10 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         {
             weights.push(weight);
             ingest_bulk(&mut bw, &abs_path, stamp, probed)?;
+            committed.push(abs_path);
+        }
+        bw.commit()?;
+        for abs_path in committed {
             *scanned += 1;
             if let Some(p) = progress {
                 p.emit(ScanProgress::Ingested {
@@ -1142,7 +1150,6 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                 });
             }
         }
-        bw.commit()?;
         for w in weights {
             budget.release(w);
         }
