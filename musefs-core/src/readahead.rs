@@ -348,6 +348,42 @@ pub fn prefetch_depth(cap: u64, window: u64) -> u64 {
     (cap / window.max(1)).clamp(1, 4)
 }
 
+/// Plan which next-windows to enqueue, deduplicating against `prefetched_upto`
+/// (the offset through which jobs were already dispatched for this stream).
+///
+/// Anchoring dispatch to the moving `next_expected` made every read re-request
+/// the same forward windows at shifted offsets — a pile of overlapping preads.
+/// Instead we fetch contiguous `window`-sized blocks from the watermark up to
+/// the horizon (`start + depth*window`), so a sequential reader enqueues only
+/// the freshly-exposed tail (≈ one window per window consumed). A seek — the
+/// reader landing before the watermark, or the watermark sitting beyond the new
+/// horizon — restarts dispatch from `start`. Returns the window-aligned start
+/// offsets and the new watermark.
+pub fn plan_prefetch(
+    prefetched_upto: u64,
+    start: u64,
+    window: u64,
+    depth: u64,
+    backing_len: u64,
+) -> (Vec<u64>, u64) {
+    if window == 0 || start >= backing_len {
+        return (Vec::new(), prefetched_upto);
+    }
+    let horizon = start
+        .saturating_add(depth.saturating_mul(window))
+        .min(backing_len);
+    let mut s = prefetched_upto;
+    if s < start || s > horizon {
+        s = start; // seek / fell behind: dispatch from the current position
+    }
+    let mut starts = Vec::new();
+    while s < horizon {
+        starts.push(s);
+        s += window;
+    }
+    (starts, s.min(backing_len))
+}
+
 use std::cell::Cell;
 use std::sync::mpsc;
 
@@ -836,6 +872,48 @@ mod ring_tests {
         for w in [WINDOW_FLOOR, 1 << 20, 2 << 20, 4 << 20, cap] {
             assert!(prefetch_depth(cap, w) * w <= cap, "overshoot at window {w}");
         }
+    }
+
+    /// A sequential stream must not re-request windows it already dispatched:
+    /// after the initial fan-out, each subsequent read enqueues only the newly
+    /// exposed tail (no overlapping preads).
+    #[test]
+    fn plan_prefetch_dedups_sequential_dispatch() {
+        let win = WINDOW_FLOOR;
+        let cap = 8 * 1024 * 1024;
+        let depth = prefetch_depth(cap, win); // 4
+        let blen = 100 * 1024 * 1024;
+        // First read ends at `win`; fan out `depth` windows ahead.
+        let (s1, w1) = plan_prefetch(0, win, win, depth, blen);
+        assert_eq!(s1, vec![win, 2 * win, 3 * win, 4 * win]);
+        assert_eq!(w1, 5 * win);
+        // Reader advanced ~half a window. The already-requested windows are
+        // skipped — only the single newly-exposed window is enqueued.
+        let start2 = win + win / 2;
+        let (s2, w2) = plan_prefetch(w1, start2, win, depth, blen);
+        assert_eq!(s2, vec![5 * win], "must not re-dispatch buffered windows");
+        assert_eq!(w2, 6 * win);
+    }
+
+    #[test]
+    fn plan_prefetch_seek_resets_watermark() {
+        let win = WINDOW_FLOOR;
+        let depth = 4;
+        let blen = 100 * 1024 * 1024;
+        let (_s, w) = plan_prefetch(0, 10 * win, win, depth, blen);
+        // Seek backward, well before the watermark: dispatch restarts at `start`.
+        let (s2, w2) = plan_prefetch(w, 2 * win, win, depth, blen);
+        assert_eq!(s2.first(), Some(&(2 * win)));
+        assert_eq!(w2, 6 * win);
+    }
+
+    #[test]
+    fn plan_prefetch_clamps_to_backing_len() {
+        let win = WINDOW_FLOOR;
+        let blen = 3 * win + 100;
+        let (s, w) = plan_prefetch(0, win, win, 4, blen);
+        assert!(s.iter().all(|&x| x < blen), "no job starts past EOF");
+        assert!(w <= blen, "watermark clamped to EOF");
     }
 
     #[test]

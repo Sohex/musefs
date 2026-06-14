@@ -65,6 +65,9 @@ struct Handle {
     readahead: Arc<Mutex<crate::readahead::ReadAhead>>,
     registered: AtomicBool,
     epoch: Arc<AtomicU64>,
+    /// Absolute backing offset through which prefetch jobs were already
+    /// dispatched, so a sequential stream does not re-request buffered windows.
+    prefetched_upto: AtomicU64,
 }
 
 /// An owned view of an open handle's backing fd, for FUSE passthrough
@@ -1079,24 +1082,34 @@ impl Musefs {
         // The window grows geometrically while sequential, so `cap / window`
         // windows of the current size sum to about `cap`; clamp the thread
         // fan-out to a small bound. A seek resets `window` to the floor, which
-        // raises depth again — no separate ramp counter is needed.
-        let (start, window) = {
-            let ra = h.readahead.lock().unwrap();
-            (ra.next_expected(), ra.window())
+        // raises depth again — no separate ramp counter is needed. `plan_prefetch`
+        // deduplicates against the per-handle watermark so a sequential stream
+        // enqueues only the freshly-exposed tail rather than re-requesting
+        // already-buffered windows. The watermark read/update sits under the
+        // buffer lock that also serialises concurrent reads of this handle.
+        let cap = self.readahead_pool.per_stream_cap();
+        let (starts, window) = {
+            let mut ra = h.readahead.lock().unwrap();
+            let start = ra.next_expected();
+            let window = ra.window();
+            let depth = crate::readahead::prefetch_depth(cap, window);
+            let ring = usize::try_from(depth).unwrap_or(4) + 1;
+            ra.set_max_windows(ring);
+            let (starts, upto) = crate::readahead::plan_prefetch(
+                h.prefetched_upto.load(Ordering::Relaxed),
+                start,
+                window,
+                depth,
+                backing_len,
+            );
+            h.prefetched_upto.store(upto, Ordering::Relaxed);
+            (starts, window)
         };
-        if window == 0 || start >= backing_len {
+        if starts.is_empty() {
             return Ok(());
         }
-        let cap = self.readahead_pool.per_stream_cap();
-        let depth = crate::readahead::prefetch_depth(cap, window);
-        let ring = usize::try_from(depth).unwrap_or(4) + 1;
-        h.readahead.lock().unwrap().set_max_windows(ring);
         let dispatched_epoch = h.epoch.load(Ordering::Acquire);
-        for i in 0..depth {
-            let s = start + i * window;
-            if s >= backing_len {
-                break;
-            }
+        for s in starts {
             pf.request(crate::readahead::PrefetchJob {
                 file: Arc::clone(&h.file),
                 buf: Arc::clone(&h.readahead),
@@ -1262,6 +1275,7 @@ impl Musefs {
             ))),
             registered: AtomicBool::new(false),
             epoch: Arc::new(AtomicU64::new(0)),
+            prefetched_upto: AtomicU64::new(0),
         })))
     }
 
