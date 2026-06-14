@@ -915,7 +915,7 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
     // Per-extension breakdown of the skip count, so a large `skipped` is
     // diagnosable (#341). Log-only: never folded into `stats`/the CLI summary.
     if let Some(summary) = tally.summary() {
-        log::info!("{summary}");
+        log::warn!("{summary}");
     }
     Ok(stats)
 }
