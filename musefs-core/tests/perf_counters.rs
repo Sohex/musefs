@@ -172,3 +172,41 @@ fn read_preads_and_seek_match_goldens() {
         );
     }
 }
+
+/// Ingest of files LARGER than the ~1 MiB bounded metadata window: the scanner
+/// reads only a bounded prefix, never the whole file. A reintroduced slurp shows
+/// up as `scan_bytes_read` jumping toward `tracks * 2 MiB`. Counts frozen below.
+#[test]
+fn ingest_reads_bounded_prefix_not_whole_file() {
+    let _g = METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    const TRACKS: usize = 3;
+    const BYTES_PER_TRACK: usize = 2 * 1024 * 1024; // > 1 MiB scan window
+    let (exp_opens, exp_preads, exp_bytes): (u64, u64, u64) = (3, 3, 3_145_728);
+
+    let base = tempfile::tempdir().unwrap();
+    let params = CorpusParams {
+        albums: 1,
+        tracks_per_album: TRACKS,
+        bytes_per_track: BYTES_PER_TRACK,
+        art_bytes_per_track: 0,
+        format_mix: vec![Format::Flac],
+        seed: 42,
+    };
+    let target = prepare_format(&params, base.path(), Format::Flac);
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    metrics::reset();
+    scan_directory(&db, &target.corpus_dir).unwrap();
+    let s = metrics::snapshot();
+
+    assert_eq!(s.scan_opens, exp_opens, "scan_opens");
+    assert_eq!(s.scan_preads, exp_preads, "scan_preads");
+    assert_eq!(s.scan_bytes_read, exp_bytes, "scan_bytes_read");
+    // Hard upper bound independent of the frozen number: must be far below a slurp.
+    assert!(
+        s.scan_bytes_read < (TRACKS as u64) * BYTES_PER_TRACK as u64,
+        "scan read {} bytes — looks like a whole-file slurp",
+        s.scan_bytes_read,
+    );
+}
