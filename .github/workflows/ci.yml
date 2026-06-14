@@ -65,9 +65,12 @@ jobs:
             echo "src=false" >> "$GITHUB_OUTPUT"
           fi
           # The FreeBSD VM e2e is far too slow for every PR: run it only when the
-          # FUSE/mount surface or its harness changes. Release tags run it
-          # unconditionally (gated in the job's `if`, not here).
-          if printf '%s\n' "$changed" | grep -qE '^(musefs-fuse/|scripts/freebsd-vm/|\.github/workflows/ci\.yml$)'; then
+          # FUSE/mount surface or its harness changes. The `musefs/` binary crate
+          # and `Cargo.lock` are included too: allocator/dependency changes there
+          # (e.g. the jemalloc global allocator) can break the FreeBSD build
+          # without touching the FUSE surface. Release tags run it unconditionally
+          # (gated in the job's `if`, not here).
+          if printf '%s\n' "$changed" | grep -qE '^(musefs/|musefs-fuse/|scripts/freebsd-vm/|Cargo\.lock$|\.github/workflows/ci\.yml$)'; then
             echo "fuse=true" >> "$GITHUB_OUTPUT"
           else
             echo "fuse=false" >> "$GITHUB_OUTPUT"
