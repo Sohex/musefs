@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -568,3 +569,82 @@ def test_apply_rewrites_preserves_repl_suffix():
 def test_apply_rewrites_empty_is_identity():
     toml = "exclude_re = [\n    'musefs-core/src/scan\\.rs:1041:32:',\n]\n"
     assert g.apply_rewrites(toml, []) == toml
+
+
+def _write_toml(tmp_path, body: str):
+    p = tmp_path / "mutants.toml"
+    p.write_text(body)
+    return p
+
+
+def _write_muts(tmp_path, names: list[str]):
+    p = tmp_path / "muts.json"
+    p.write_text(json.dumps([{"name": n} for n in names]))
+    return p
+
+
+_FIX_TOML = (
+    "exclude_re = [\n"
+    '    # guard: op="<" fn="probe_file" rows=1\n'
+    "    'musefs-core/src/scan\\.rs:277:30:',\n"
+    "]\n"
+)
+
+
+def test_main_fix_rewrites_and_passes(tmp_path, capsys):
+    toml = _write_toml(tmp_path, _FIX_TOML)
+    muts = _write_muts(
+        tmp_path,
+        ["musefs-core/src/scan.rs:300:30: replace < with == in probe_file"],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    assert rc == 0
+    assert "scan\\.rs:300:30:" in toml.read_text()
+    assert "scan\\.rs:277:30:" not in toml.read_text()
+    assert "re-anchored" in capsys.readouterr().out
+
+
+def test_main_fix_idempotent(tmp_path):
+    toml = _write_toml(tmp_path, _FIX_TOML)
+    muts = _write_muts(
+        tmp_path,
+        ["musefs-core/src/scan.rs:300:30: replace < with == in probe_file"],
+    )
+    assert g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)]) == 0
+    after_first = toml.read_text()
+    assert g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)]) == 0
+    assert toml.read_text() == after_first
+
+
+def test_main_fix_partial_reports_and_exits_nonzero(tmp_path, capsys):
+    # first entry is fixable; second resolves to no live mutant (deleted code)
+    body = (
+        "exclude_re = [\n"
+        '    # guard: op="<" fn="probe_file" rows=1\n'
+        "    'musefs-core/src/scan\\.rs:277:30:',\n"
+        '    # guard: op=">" fn="gone" rows=1\n'
+        "    'musefs-core/src/scan\\.rs:900:10:',\n"
+        "]\n"
+    )
+    toml = _write_toml(tmp_path, body)
+    muts = _write_muts(
+        tmp_path,
+        ["musefs-core/src/scan.rs:300:30: replace < with == in probe_file"],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "scan\\.rs:300:30:" in toml.read_text()  # the fixable one was still applied
+    assert "delete this exclude_re entry" in out
+
+
+def test_main_fix_no_op_when_clean(tmp_path, capsys):
+    toml = _write_toml(tmp_path, _FIX_TOML)
+    muts = _write_muts(
+        tmp_path,
+        ["musefs-core/src/scan.rs:277:30: replace < with == in probe_file"],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    assert rc == 0
+    assert toml.read_text() == _FIX_TOML
+    assert "no coordinates needed re-anchoring" in capsys.readouterr().out

@@ -188,6 +188,41 @@ def apply_rewrites(toml_text: str, rewrites: list[Rewrite]) -> str:
     return "".join(lines)
 
 
+def run_fix(toml_path: Path, entries: list[Entry], mutants: list[Mutant]) -> int:
+    """Re-anchor drifted linecol coordinates in ``toml_path``, then re-validate.
+
+    Exactly one rewrite pass followed by one validation pass — no fixpoint. Entries
+    that could not be safely re-anchored (structural / deleted) are reported with
+    their dedicated wording; re-validation handles the rest (desc drift, untagged).
+    """
+    rewrites, skip_notes, skipped = compute_rewrites(entries, mutants)
+    if rewrites:
+        toml_path.write_text(apply_rewrites(toml_path.read_text(), rewrites))
+        for rw in rewrites:
+            old_line, old_col = _entry_coords(rw.entry.regex)
+            print(
+                f"re-anchored [mutants.toml:{rw.entry.toml_line}] "
+                f":{old_line}:{old_col}: -> :{rw.line}:{rw.col}:"
+            )
+    else:
+        print("no coordinates needed re-anchoring.")
+
+    fresh_entries, fresh_globs = parse_toml_entries(toml_path.read_text())
+    remaining = [
+        f
+        for f in check(fresh_entries, mutants, fresh_globs)
+        if not any(f"[mutants.toml:{ln}]" in f for ln in skipped)
+    ]
+    problems = skip_notes + remaining
+    if problems:
+        print(f"\n{len(problems)} entry(ies) still need manual attention:\n")
+        for p in problems:
+            print(f"  {p}")
+        return 1
+    print(f"OK: {len(fresh_entries)} exclude_re entries validated against {len(mutants)} mutants.")
+    return 0
+
+
 def classify(regex: str) -> str:
     return "linecol" if _LITERAL_LINECOL.search(regex) else "desc"
 
@@ -425,6 +460,11 @@ def main(argv: list[str] | None = None) -> int:
         default=Path(".cargo/mutants.toml"),
         help="path to mutants.toml (default: .cargo/mutants.toml)",
     )
+    ap.add_argument(
+        "--fix",
+        action="store_true",
+        help="rewrite drifted file:line:col anchors in --toml in place, then re-validate",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -434,6 +474,13 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError, ValueError, KeyError) as ex:
         print(f"error: failed to load toml/mutants: {ex}", file=sys.stderr)
         return 1
+
+    if args.fix:
+        try:
+            return run_fix(args.toml, entries, mutants)
+        except OSError as ex:
+            print(f"error: failed to rewrite {args.toml}: {ex}", file=sys.stderr)
+            return 1
 
     failures = check(entries, mutants, globs)
     if failures:
