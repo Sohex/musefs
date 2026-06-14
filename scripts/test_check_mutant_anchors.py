@@ -512,7 +512,7 @@ def test_compute_rewrites_structural_count_mismatch():
     ]
     rewrites, skips, skipped = g.compute_rewrites(entries, muts)
     assert rewrites == [] and skipped == {4}
-    assert "structural change" in skips[0]
+    assert "can't auto-derive" in skips[0]
 
 
 def test_compute_rewrites_rows_mismatch_skips_group():
@@ -527,7 +527,7 @@ def test_compute_rewrites_rows_mismatch_skips_group():
     muts = [_m("musefs-core/src/scan.rs:1045:29: replace += with -= in run_pipeline")]
     rewrites, skips, skipped = g.compute_rewrites(entries, muts)
     assert rewrites == [] and skipped == {4}
-    assert "structural change" in skips[0]
+    assert "can't auto-derive" in skips[0]
 
 
 def test_compute_rewrites_ignores_desc_and_tagless():
@@ -648,3 +648,54 @@ def test_main_fix_no_op_when_clean(tmp_path, capsys):
     assert rc == 0
     assert toml.read_text() == _FIX_TOML
     assert "no coordinates needed re-anchoring" in capsys.readouterr().out
+
+
+# A line:col anchor exists precisely because op+fn is NOT unique in the function
+# (several same-op/fn sites, only one excluded). On a clean tree such an entry is
+# valid and --fix must leave it silent — never re-derive its coordinate from the
+# tag (impossible) and false-flag it. Regression for the #345 review finding.
+_NONUNIQUE_TOML = (
+    "exclude_re = [\n"
+    '    # guard: op="+" fn="walk" rows=1\n'
+    "    'musefs-format/src/wav\\.rs:58:28:',\n"
+    "]\n"
+)
+
+
+def test_main_fix_clean_nonunique_op_fn_is_noop(tmp_path, capsys):
+    toml = _write_toml(tmp_path, _NONUNIQUE_TOML)
+    muts = _write_muts(
+        tmp_path,
+        [
+            "musefs-format/src/wav.rs:58:28: replace + with - in walk",  # the excluded site (valid)
+            "musefs-format/src/wav.rs:60:10: replace + with - in walk",  # killable sibling
+            "musefs-format/src/wav.rs:62:14: replace + with - in walk",
+        ],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert toml.read_text() == _NONUNIQUE_TOML
+    assert "auto-derive" not in out and "manual attention" not in out
+
+
+def test_main_fix_drifted_nonunique_reports_manual(tmp_path, capsys):
+    body = (
+        "exclude_re = [\n"
+        '    # guard: op="+" fn="walk" rows=1\n'
+        "    'musefs-format/src/wav\\.rs:58:28:',\n"  # stale: no live mutant at 58:28
+        "]\n"
+    )
+    toml = _write_toml(tmp_path, body)
+    muts = _write_muts(
+        tmp_path,
+        [
+            "musefs-format/src/wav.rs:70:28: replace + with - in walk",
+            "musefs-format/src/wav.rs:72:10: replace + with - in walk",
+        ],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "auto-derive" in out
+    assert toml.read_text() == body  # ambiguous → not rewritten

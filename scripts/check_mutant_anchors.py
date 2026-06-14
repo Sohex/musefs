@@ -157,8 +157,8 @@ def compute_rewrites(
                 skip_notes.append(
                     _fmt(
                         e,
-                        f"op/fn resolves to {len(sites)} site(s) but {len(group)} anchor(s) "
-                        "reference it — structural change, re-anchor manually",
+                        f"op/fn resolves to {len(sites)} live site(s), {len(group)} anchor(s) "
+                        "pin it — can't auto-derive the coordinate, re-anchor manually",
                     )
                 )
                 skipped.add(e.toml_line)
@@ -188,14 +188,20 @@ def apply_rewrites(toml_text: str, rewrites: list[Rewrite]) -> str:
     return "".join(lines)
 
 
-def run_fix(toml_path: Path, entries: list[Entry], mutants: list[Mutant]) -> int:
+def run_fix(toml_path: Path, entries: list[Entry], globs: list[str], mutants: list[Mutant]) -> int:
     """Re-anchor drifted linecol coordinates in ``toml_path``, then re-validate.
 
     Exactly one rewrite pass followed by one validation pass — no fixpoint. Entries
-    that could not be safely re-anchored (structural / deleted) are reported with
-    their dedicated wording; re-validation handles the rest (desc drift, untagged).
+    that could not be safely re-anchored are reported with their dedicated wording
+    *only when they actually fail validation now* — an op/fn that resolves to many
+    sites is normal for a line:col anchor (that non-uniqueness is why it is pinned by
+    coordinate), so a currently-valid such entry is left silent rather than false-
+    flagged. Re-validation handles the rest (desc drift, untagged).
     """
+    failing = _failing_lines(check(entries, mutants, globs))
     rewrites, skip_notes, skipped = compute_rewrites(entries, mutants)
+    skip_notes = [n for n in skip_notes if _failing_lines([n]) <= failing]
+    skipped &= failing
     if rewrites:
         toml_path.write_text(apply_rewrites(toml_path.read_text(), rewrites))
         for rw in rewrites:
@@ -358,6 +364,14 @@ def _fmt(entry: Entry, msg: str) -> str:
     return f"[mutants.toml:{entry.toml_line}] /{entry.regex}/ — {msg}"
 
 
+_FAIL_LINE_RE = re.compile(r"^\[mutants\.toml:(\d+)\]")
+
+
+def _failing_lines(failures: list[str]) -> set[int]:
+    """Extract the toml line numbers a list of `_fmt` failure strings refers to."""
+    return {int(m.group(1)) for f in failures if (m := _FAIL_LINE_RE.match(f))}
+
+
 def _check_linecol(entry: Entry, matched: list[Mutant]) -> list[str]:
     t = entry.tag
     if t is None or t.op is None or not t.fn_present or t.rows is None:
@@ -477,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.fix:
         try:
-            return run_fix(args.toml, entries, mutants)
+            return run_fix(args.toml, entries, globs, mutants)
         except OSError as ex:
             print(f"error: failed to rewrite {args.toml}: {ex}", file=sys.stderr)
             return 1
