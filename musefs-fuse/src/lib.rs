@@ -920,6 +920,7 @@ mod tests {
             // Zero interval => poll_due() is always true, isolating the gate.
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();

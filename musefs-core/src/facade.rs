@@ -44,6 +44,8 @@ pub struct MountConfig {
     /// Compare filenames case-insensitively (dirs merge, files disambiguate).
     /// Set by the CLI (`--case-insensitive`), default true on macOS.
     pub case_insensitive: bool,
+    /// Global read-ahead RAM envelope in bytes. `0` disables read-ahead.
+    pub read_ahead_budget: u64,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -256,6 +258,7 @@ impl Musefs {
         let template = Template::parse(&config.template)?;
         let (tree, snapshot) = Self::build_full(&db, &template, &config, &mut alloc)?;
         let poll_interval = config.poll_interval;
+        let read_ahead_budget = config.read_ahead_budget;
         Ok(Musefs {
             cache: HeaderCache::new(config.mode),
             last_data_version: AtomicI64::new(last_data_version),
@@ -265,9 +268,7 @@ impl Musefs {
             config,
             template,
             handles: sharded_slab::Slab::new(),
-            readahead_pool: Arc::new(crate::readahead::ReadAheadPool::new(
-                crate::readahead::DEFAULT_READAHEAD_BUDGET,
-            )),
+            readahead_pool: Arc::new(crate::readahead::ReadAheadPool::new(read_ahead_budget)),
             size_cache: dashmap::DashMap::new(),
             last_poll: Mutex::new(std::time::Instant::now()),
             last_failed_refresh: Mutex::new(None),
@@ -1329,6 +1330,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1421,6 +1423,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1535,6 +1538,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1598,6 +1602,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
 
         let (entries, snapshot) = Musefs::render_entries(
@@ -1641,6 +1646,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1729,6 +1735,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: true,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1785,6 +1792,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: interval,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         let fs = Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
         (dir, fs)
@@ -1852,6 +1860,7 @@ mod tests {
             mode,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
 
         // StructureOnly: exposed, and the fd refers to the backing inode.
@@ -1960,6 +1969,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         let template = Template::parse(&config.template).expect("valid template");
 
@@ -2007,6 +2017,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -2049,6 +2060,7 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
         };
         assert!(matches!(
             Musefs::open(db, config),

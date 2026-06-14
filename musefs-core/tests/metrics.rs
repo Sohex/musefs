@@ -22,6 +22,7 @@ fn config() -> MountConfig {
         mode: musefs_core::Mode::Synthesis,
         poll_interval: std::time::Duration::ZERO,
         case_insensitive: false,
+        read_ahead_budget: 64 * 1024 * 1024,
     }
 }
 

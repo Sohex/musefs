@@ -82,6 +82,9 @@ pub struct MountArgs {
     /// streaming; clamped to the kernel maximum at mount.
     #[arg(long, env = "MUSEFS_MAX_READAHEAD_KIB", default_value_t = 512)]
     pub max_readahead_kib: u32,
+    /// Global read-ahead RAM budget (MiB) shared across all active streams. 0 disables.
+    #[arg(long, default_value_t = 64)]
+    pub read_ahead_budget_mib: u32,
     /// Max outstanding background (readahead/async) requests the kernel queues.
     #[arg(long, env = "MUSEFS_MAX_BACKGROUND", default_value_t = 64)]
     pub max_background: u16,
@@ -274,6 +277,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         mode: args.mode.into(),
         poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),
         case_insensitive: args.case_insensitive,
+        read_ahead_budget: u64::from(args.read_ahead_budget_mib).saturating_mul(1024 * 1024),
     };
     let defaults = musefs_fuse::FuseConfig::default();
     let fuse_config = musefs_fuse::FuseConfig {
@@ -332,6 +336,46 @@ pub fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_ahead_budget_flag_maps_to_mount_config() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "musefs",
+            "mount",
+            "/mnt",
+            "--db",
+            "/tmp/x.db",
+            "--read-ahead-budget-mib",
+            "128",
+        ])
+        .unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected Mount");
+        };
+        let (config, _) = parse_mount_config(&args);
+        assert_eq!(config.read_ahead_budget, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn read_ahead_budget_zero_disables() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "musefs",
+            "mount",
+            "/mnt",
+            "--db",
+            "/tmp/x.db",
+            "--read-ahead-budget-mib",
+            "0",
+        ])
+        .unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected Mount");
+        };
+        let (config, _) = parse_mount_config(&args);
+        assert_eq!(config.read_ahead_budget, 0);
+    }
 
     #[test]
     fn scan_command_parses_jobs_flag() {
