@@ -20,6 +20,34 @@ fn migration_is_idempotent_across_reopen() {
     assert_eq!(db2.user_version().unwrap(), 1);
 }
 
+#[test]
+fn opening_a_store_newer_than_the_binary_fails_loudly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("musefs.db");
+
+    // Create a normal store, then simulate a future/third-party tool bumping the
+    // schema past what this binary knows about (the issue's "V2" scenario).
+    Db::open(&path).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+    }
+
+    // Reopening must refuse the store instead of silently treating it as
+    // already-migrated and risking a misread of the external-writer contract.
+    let err = Db::open(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            musefs_db::DbError::StoreTooNew {
+                found: 2,
+                supported: 1
+            }
+        ),
+        "expected StoreTooNew {{ found: 2, supported: 1 }}, got {err:?}"
+    );
+}
+
 #[cfg(feature = "mutants")]
 #[test]
 fn default_db_is_unmigrated_version_zero() {

@@ -17,6 +17,11 @@ pub enum DbError {
          regenerate the store by running `musefs scan` against the library"
     )]
     SchemaMismatch { object: String },
+    #[error(
+        "store schema version {found} is newer than this musefs build supports \
+         (max {supported}); upgrade musefs to read this store"
+    )]
+    StoreTooNew { found: i64, supported: i64 },
     #[error("{table}.{field} length {len} exceeds the {max} cap (crafted or corrupt DB)")]
     FieldTooLarge {
         table: &'static str,

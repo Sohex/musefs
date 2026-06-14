@@ -172,7 +172,11 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 **Schema identity.** On open, musefs also validates schema identity: a
 `sqlite_master` comparison against a freshly-migrated reference plus `PRAGMA
 foreign_key_check`, rejecting anything that is not the canonical latest schema
-with a message telling the user to run `musefs scan`.
+with a message telling the user to run `musefs scan`. A store whose
+`user_version` is *newer* than this binary's latest migration (a future or
+third-party tool bumped the schema) is refused up front with a distinct
+"store is newer than this binary" error rather than silently treated as
+already-migrated — an older binary must not risk misreading a newer contract.
 
 **Art is immutable once written.** `art` rows are content-addressed by
 `sha256`; a trigger rejects any in-place `UPDATE` of an art row's
