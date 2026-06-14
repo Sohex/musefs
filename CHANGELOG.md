@@ -11,6 +11,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **riscv64 release platform:** prebuilt `riscv64gc-unknown-linux-{gnu,musl}`
+  binaries and `linux/riscv64` Docker images now ship with each tagged release.
+  The glibc container base moves from Debian bookworm to trixie (bookworm has no
+  riscv64 image).
 - **`statfs` reply:** the mount now reports a non-zero synthetic capacity with
   ample free space instead of fuser's all-zero default, so `df` no longer shows a
   0-byte filesystem and capacity-checking importers (Lidarr et al.) don't balk
