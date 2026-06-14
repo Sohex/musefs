@@ -86,7 +86,7 @@ exclude_re = [
     # header. The `size + (size & 1)` operator at :35 and the `& 1` at :43 cannot
     # zero the advance (min 8) and stay IN scope (caught by that same test).
     # guard: op="+" fn="walk_chunks" rows=2
-    'musefs-format/src/wav\.rs:58:28:',
+    'musefs-format/src/wav\.rs:57:28:',
     # dirty_min_flip_ancestors (add-side walk) `id < introducing_id(child)`: the
     # `<`->`<=` boundary is unreachable-different. Equality needs the walked id to
     # BE the subtree's introducing id, which only a moved-in id can satisfy (pure

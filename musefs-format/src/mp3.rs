@@ -24,6 +24,20 @@ fn synchsafe_decode(b: &[u8]) -> u32 {
         | u32::from(b[3] & 0x7F)
 }
 
+/// Decode an ID3v2 frame's 4-byte size field. ID3v2.4 sizes are syncsafe (a 28-bit
+/// value with the high bit of each byte cleared); v2.3 and earlier use a plain
+/// big-endian `u32`. `major_version` is the tag header's version byte (ID3v2
+/// offset 3). The write path emits v2.4 syncsafe sizes via [`syncsafe`]; keeping
+/// the version-dependent rule named here keeps read decode and write encode from
+/// silently drifting apart.
+fn decode_frame_size(major_version: u8, raw: &[u8]) -> u32 {
+    if major_version == 3 {
+        u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
+    } else {
+        synchsafe_decode(raw)
+    }
+}
+
 fn id3v2_header_len(data: &[u8]) -> Result<Option<usize>> {
     if data.len() < 10 || &data[0..3] != b"ID3" {
         return Ok(None);
@@ -611,12 +625,7 @@ pub fn read_binary_tags(data: &[u8]) -> (Vec<EmbeddedBinaryTag>, Vec<(String, St
             break;
         }
         let id = &data[pos..pos + 4];
-        let size = if data[3] == 3 {
-            u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                as usize
-        } else {
-            synchsafe_decode(&data[pos + 4..pos + 8]) as usize
-        };
+        let size = decode_frame_size(data[3], &data[pos + 4..pos + 8]) as usize;
         let body_start = pos + 10;
         if body_start + size > tag_end {
             break;

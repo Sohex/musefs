@@ -282,37 +282,16 @@ pub fn synthesize_layout(
 /// This makes `base64(prefix ++ image) == base64(prefix) ++ base64(image)`, so the
 /// image's base64 is an independent substring that can be served incrementally.
 /// The declared data-length field is the true image length (`art.data_len`).
+///
+/// The actual byte layout is shared with the plain FLAC write path via
+/// [`crate::flac::picture_body_framing`]; only the description padding is unique here.
 fn picture_prefix(art: &crate::input::ArtInput) -> Result<Vec<u8>> {
     // Unpadded prefix length = 4(type)+4(mimelen)+mime +4(desclen)+desc
     //   +4(w)+4(h)+4(depth)+4(colors)+4(datalen) = 32 + mime + desc.
     let base = 32 + art.mime.len() + art.description.len();
     let pad = (3 - base % 3) % 3;
     let description = format!("{}{}", art.description, " ".repeat(pad));
-
-    let mut out = Vec::new();
-    out.extend_from_slice(&art.picture_type.get().to_be_bytes());
-    out.extend_from_slice(
-        &u32::try_from(art.mime.len())
-            .map_err(|_| FormatError::TooLarge)?
-            .to_be_bytes(),
-    );
-    out.extend_from_slice(art.mime.as_bytes());
-    out.extend_from_slice(
-        &u32::try_from(description.len())
-            .map_err(|_| FormatError::TooLarge)?
-            .to_be_bytes(),
-    );
-    out.extend_from_slice(description.as_bytes());
-    out.extend_from_slice(&art.width.to_be_bytes());
-    out.extend_from_slice(&art.height.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes()); // depth
-    out.extend_from_slice(&0u32.to_be_bytes()); // colors
-    out.extend_from_slice(
-        &u32::try_from(art.data_len.get())
-            .map_err(|_| FormatError::TooLarge)?
-            .to_be_bytes(),
-    ); // image data length
-    Ok(out)
+    crate::flac::picture_body_framing(art, &description)
 }
 
 use crate::ogg::page::PayloadChunk;

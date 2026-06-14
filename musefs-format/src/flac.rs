@@ -1,3 +1,4 @@
+use crate::bytes::read_u32_be;
 use crate::error::{FormatError, Result};
 use crate::probe::Extent;
 use crate::size;
@@ -35,44 +36,124 @@ pub struct FlacMeta {
     pub preserved: Vec<MetadataBlock>,
 }
 
-fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
-    if data.len() < 4 || &data[0..4] != FLAC_MARKER {
-        return Err(FormatError::NotFlac);
-    }
-    let mut pos = 4usize;
-    let mut index = 0usize;
-    let mut preserved = Vec::new();
-    loop {
-        if pos + 4 > data.len() {
-            return Err(FormatError::Malformed);
+/// Decoded header fields of one FLAC metadata block.
+struct BlockHead {
+    /// 0-based position of this block in the metadata sequence.
+    index: usize,
+    /// The 7-bit block type (`BLOCK_*`).
+    block_type: u8,
+    /// Declared body length in bytes.
+    len: usize,
+}
+
+/// One step of a metadata-block walk produced by [`BlockWalker::next_block`].
+enum BlockStep<'a> {
+    /// A complete block: its decoded header plus an in-bounds view of its body.
+    Ready(BlockHead, &'a [u8]),
+    /// The header decoded but its declared body runs past the data. `up_to` is the
+    /// byte index just past the body — what a bounded reader must widen the window
+    /// to before retrying.
+    Truncated(BlockHead, u64),
+    /// Fewer than the 4 header bytes remain. `up_to` is `pos + 4`.
+    NeedHeader(u64),
+}
+
+/// Walks the metadata blocks of a FLAC stream after the `fLaC` marker, decoding
+/// one block header per [`BlockWalker::next_block`] call. This centralizes the
+/// marker check, header decode, 24-bit length, and body-bounds arithmetic shared
+/// by the four metadata readers; each caller supplies its own short-body policy
+/// (`Malformed` vs `NeedMore`), STREAMINFO validation, and per-block action.
+struct BlockWalker<'a> {
+    data: &'a [u8],
+    pos: usize,
+    index: usize,
+    done: bool,
+}
+
+impl<'a> BlockWalker<'a> {
+    /// Validate the `fLaC` marker and position at the first metadata block.
+    fn new(data: &'a [u8]) -> Result<Self> {
+        if data.len() < 4 || &data[0..4] != FLAC_MARKER {
+            return Err(FormatError::NotFlac);
         }
-        let header = data[pos];
+        Ok(Self {
+            data,
+            pos: 4,
+            index: 0,
+            done: false,
+        })
+    }
+
+    /// Byte offset just past the last fully-walked block. Once the walk has
+    /// completed (the `is_last` block was returned as `Ready`), this is the
+    /// audio offset.
+    fn audio_offset(&self) -> u64 {
+        self.pos as u64
+    }
+
+    /// Decode the next block header, or `None` once the last block has been
+    /// returned or a short/truncated read has been reported.
+    fn next_block(&mut self) -> Option<BlockStep<'a>> {
+        if self.done {
+            return None;
+        }
+        if self.pos + 4 > self.data.len() {
+            // Need at least the 4-byte block header.
+            self.done = true;
+            return Some(BlockStep::NeedHeader((self.pos + 4) as u64));
+        }
+        let header = self.data[self.pos];
         let is_last = (header & 0x80) != 0;
         let block_type = header & 0x7F;
-        let len = u24_be(data[pos + 1], data[pos + 2], data[pos + 3]);
-        let body_start = pos + 4;
+        let len = u24_be(
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        );
+        let head = BlockHead {
+            index: self.index,
+            block_type,
+            len,
+        };
+        let body_start = self.pos + 4;
         let body_end = body_start + len;
-        if body_end > data.len() {
-            return Err(FormatError::Malformed);
+        if body_end > self.data.len() {
+            self.done = true;
+            return Some(BlockStep::Truncated(head, body_end as u64));
         }
-        check_streaminfo_position(index, block_type, len)?;
-        match block_type {
-            BLOCK_STREAMINFO | BLOCK_APPLICATION | BLOCK_SEEKTABLE | BLOCK_CUESHEET => {
-                preserved.push(MetadataBlock {
-                    block_type,
-                    body: data[body_start..body_end].to_vec(),
-                });
-            }
-            _ => {}
-        }
-        pos = body_end;
-        index += 1;
+        self.pos = body_end;
+        self.index += 1;
         if is_last {
-            break;
+            self.done = true;
+        }
+        Some(BlockStep::Ready(head, &self.data[body_start..body_end]))
+    }
+}
+
+fn parse_blocks(data: &[u8]) -> Result<FlacMeta> {
+    let mut walker = BlockWalker::new(data)?;
+    let mut preserved = Vec::new();
+    while let Some(step) = walker.next_block() {
+        match step {
+            BlockStep::Ready(head, body) => {
+                check_streaminfo_position(head.index, head.block_type, head.len)?;
+                if matches!(
+                    head.block_type,
+                    BLOCK_STREAMINFO | BLOCK_APPLICATION | BLOCK_SEEKTABLE | BLOCK_CUESHEET
+                ) {
+                    preserved.push(MetadataBlock {
+                        block_type: head.block_type,
+                        body: body.to_vec(),
+                    });
+                }
+            }
+            BlockStep::Truncated(..) | BlockStep::NeedHeader(_) => {
+                return Err(FormatError::Malformed);
+            }
         }
     }
     Ok(FlacMeta {
-        audio_offset: pos as u64,
+        audio_offset: walker.audio_offset(),
         preserved,
     })
 }
@@ -89,51 +170,36 @@ pub fn read_metadata(data: &[u8]) -> Result<FlacMeta> {
 /// body runs past the prefix, return `NeedMore { up_to }` with the exact end of
 /// that block — the caller widens the window and retries. Otherwise `Complete`.
 pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
-    if prefix.len() < 4 || &prefix[0..4] != FLAC_MARKER {
-        return Err(FormatError::NotFlac);
-    }
-    let mut pos = 4usize;
-    let mut index = 0usize;
+    let mut walker = BlockWalker::new(prefix)?;
     let mut preserved = Vec::new();
-    loop {
-        if pos + 4 > prefix.len() {
-            // Need at least the 4-byte block header.
-            return Ok(Extent::NeedMore {
-                up_to: (pos + 4) as u64,
-            });
-        }
-        let header = prefix[pos];
-        let is_last = (header & 0x80) != 0;
-        let block_type = header & 0x7F;
-        let len = u24_be(prefix[pos + 1], prefix[pos + 2], prefix[pos + 3]);
-        // Header-only validation: fail closed on a bad STREAMINFO header (wrong
-        // position/length, or a duplicate) before widening the probe to read a
-        // body that can never make the file valid.
-        check_streaminfo_position(index, block_type, len)?;
-        let body_start = pos + 4;
-        let body_end = body_start + len;
-        if body_end > prefix.len() {
-            return Ok(Extent::NeedMore {
-                up_to: body_end as u64,
-            });
-        }
-        match block_type {
-            BLOCK_STREAMINFO | BLOCK_APPLICATION | BLOCK_SEEKTABLE | BLOCK_CUESHEET => {
-                preserved.push(MetadataBlock {
-                    block_type,
-                    body: prefix[body_start..body_end].to_vec(),
-                });
+    while let Some(step) = walker.next_block() {
+        match step {
+            BlockStep::Ready(head, body) => {
+                check_streaminfo_position(head.index, head.block_type, head.len)?;
+                if matches!(
+                    head.block_type,
+                    BLOCK_STREAMINFO | BLOCK_APPLICATION | BLOCK_SEEKTABLE | BLOCK_CUESHEET
+                ) {
+                    preserved.push(MetadataBlock {
+                        block_type: head.block_type,
+                        body: body.to_vec(),
+                    });
+                }
             }
-            _ => {}
-        }
-        pos = body_end;
-        index += 1;
-        if is_last {
-            break;
+            BlockStep::Truncated(head, up_to) => {
+                // Header-only validation: fail closed on a bad STREAMINFO header
+                // (wrong position/length, or a duplicate) before widening the probe
+                // to read a body that can never make the file valid.
+                check_streaminfo_position(head.index, head.block_type, head.len)?;
+                return Ok(Extent::NeedMore { up_to });
+            }
+            BlockStep::NeedHeader(up_to) => {
+                return Ok(Extent::NeedMore { up_to });
+            }
         }
     }
     Ok(Extent::Complete(FlacMeta {
-        audio_offset: pos as u64,
+        audio_offset: walker.audio_offset(),
         preserved,
     }))
 }
@@ -235,7 +301,12 @@ pub fn split_preserved(
     (structural, binary)
 }
 
-fn picture_body_framing(art: &ArtInput) -> Result<Vec<u8>> {
+/// Serialize a FLAC PICTURE block *body* for `art`: type, mime, description,
+/// dimensions, depth+colors placeholders, and the declared image-data length.
+/// The image bytes themselves are not appended. `description` is taken as a
+/// parameter (rather than `art.description`) so the OGG path can pass a
+/// space-padded variant for incremental base64 — see [`crate::ogg`].
+pub(crate) fn picture_body_framing(art: &ArtInput, description: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&art.picture_type.get().to_be_bytes());
     out.extend_from_slice(
@@ -245,11 +316,11 @@ fn picture_body_framing(art: &ArtInput) -> Result<Vec<u8>> {
     );
     out.extend_from_slice(art.mime.as_bytes());
     out.extend_from_slice(
-        &u32::try_from(art.description.len())
+        &u32::try_from(description.len())
             .map_err(|_| FormatError::TooLarge)?
             .to_be_bytes(),
     );
-    out.extend_from_slice(art.description.as_bytes());
+    out.extend_from_slice(description.as_bytes());
     out.extend_from_slice(&art.width.to_be_bytes());
     out.extend_from_slice(&art.height.to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes()); // color depth (unknown)
@@ -338,7 +409,7 @@ pub fn synthesize_layout(
     }
 
     for art in arts {
-        let framing = picture_body_framing(art)?;
+        let framing = picture_body_framing(art, &art.description)?;
         let body_len = size::checked_add(framing.len() as u64, art.data_len.get())?;
         if body_len > MAX_BLOCK_BODY {
             return Err(FormatError::TooLarge);
@@ -373,29 +444,17 @@ pub fn synthesize_layout(
 /// `(FIELD, value)` pairs in order. Comments without a `=` are skipped. Returns
 /// an empty vec if there is no comment block. Used by the scanner to seed tags.
 pub fn read_vorbis_comments(data: &[u8]) -> Result<Vec<(String, String)>> {
-    if data.len() < 4 || &data[0..4] != FLAC_MARKER {
-        return Err(FormatError::NotFlac);
-    }
-    let mut pos = 4usize;
-    loop {
-        if pos + 4 > data.len() {
-            return Err(FormatError::Malformed);
-        }
-        let header = data[pos];
-        let is_last = (header & 0x80) != 0;
-        let block_type = header & 0x7F;
-        let len = u24_be(data[pos + 1], data[pos + 2], data[pos + 3]);
-        let body_start = pos + 4;
-        let body_end = body_start + len;
-        if body_end > data.len() {
-            return Err(FormatError::Malformed);
-        }
-        if block_type == BLOCK_VORBIS_COMMENT {
-            return crate::vorbiscomment::parse(&data[body_start..body_end]);
-        }
-        pos = body_end;
-        if is_last {
-            break;
+    let mut walker = BlockWalker::new(data)?;
+    while let Some(step) = walker.next_block() {
+        match step {
+            BlockStep::Ready(head, body) => {
+                if head.block_type == BLOCK_VORBIS_COMMENT {
+                    return crate::vorbiscomment::parse(body);
+                }
+            }
+            BlockStep::Truncated(..) | BlockStep::NeedHeader(_) => {
+                return Err(FormatError::Malformed);
+            }
         }
     }
     Ok(Vec::new())
@@ -404,18 +463,6 @@ pub fn read_vorbis_comments(data: &[u8]) -> Result<Vec<(String, String)>> {
 /// Assemble a 24-bit big-endian block length from its three raw bytes.
 fn u24_be(b0: u8, b1: u8, b2: u8) -> usize {
     u32::from_be_bytes([0, b0, b1, b2]) as usize
-}
-
-pub(crate) fn read_u32_be(data: &[u8], pos: usize) -> Result<u32> {
-    if pos + 4 > data.len() {
-        return Err(FormatError::Malformed);
-    }
-    Ok(u32::from_be_bytes([
-        data[pos],
-        data[pos + 1],
-        data[pos + 2],
-        data[pos + 3],
-    ]))
 }
 
 pub(crate) fn parse_picture_block(body: &[u8]) -> Result<EmbeddedPicture> {
@@ -465,30 +512,18 @@ pub(crate) fn parse_picture_block(body: &[u8]) -> Result<EmbeddedPicture> {
 /// Extract all PICTURE blocks from a complete FLAC file as embedded pictures, for
 /// scan-time art ingestion. Returns an empty vec if there are none.
 pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
-    if data.len() < 4 || &data[0..4] != FLAC_MARKER {
-        return Err(FormatError::NotFlac);
-    }
-    let mut pos = 4usize;
+    let mut walker = BlockWalker::new(data)?;
     let mut out = Vec::new();
-    loop {
-        if pos + 4 > data.len() {
-            return Err(FormatError::Malformed);
-        }
-        let header = data[pos];
-        let is_last = (header & 0x80) != 0;
-        let block_type = header & 0x7F;
-        let len = u24_be(data[pos + 1], data[pos + 2], data[pos + 3]);
-        let body_start = pos + 4;
-        let body_end = body_start + len;
-        if body_end > data.len() {
-            return Err(FormatError::Malformed);
-        }
-        if block_type == BLOCK_PICTURE {
-            out.push(parse_picture_block(&data[body_start..body_end])?);
-        }
-        pos = body_end;
-        if is_last {
-            break;
+    while let Some(step) = walker.next_block() {
+        match step {
+            BlockStep::Ready(head, body) => {
+                if head.block_type == BLOCK_PICTURE {
+                    out.push(parse_picture_block(body)?);
+                }
+            }
+            BlockStep::Truncated(..) | BlockStep::NeedHeader(_) => {
+                return Err(FormatError::Malformed);
+            }
         }
     }
     Ok(out)
@@ -1075,7 +1110,8 @@ mod tests {
         // Derive the exact framing length from production rather than hardcoding it
         // (it is independent of the data_len *value* — that field is always 4 bytes).
         // This keeps the boundary correct regardless of the framing's field count.
-        let framing_len = picture_body_framing(&mk(1)).unwrap().len() as u64;
+        let art = mk(1);
+        let framing_len = picture_body_framing(&art, &art.description).unwrap().len() as u64;
         let at_limit = 0x00FF_FFFF - framing_len; // body_len == 0x00FF_FFFF exactly
         // original `>` accepts the inclusive boundary; the `>=` mutant rejects it.
         // (data_len is only a count; no large allocation occurs.)
