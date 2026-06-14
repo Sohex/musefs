@@ -132,8 +132,8 @@ Registry:
 
 | Image | libc | Platforms |
 | --- | --- | --- |
-| `ghcr.io/sohex/musefs:<version>`, `ghcr.io/sohex/musefs:latest` | glibc | amd64, arm64 |
-| `ghcr.io/sohex/musefs:<version>-musl`, `ghcr.io/sohex/musefs:musl` | musl | amd64, arm64 |
+| `ghcr.io/sohex/musefs:<version>`, `ghcr.io/sohex/musefs:latest` | glibc | amd64, arm64, riscv64 |
+| `ghcr.io/sohex/musefs:<version>-musl`, `ghcr.io/sohex/musefs:musl` | musl | amd64, arm64, riscv64 |
 
 `docker pull` selects the CPU architecture automatically. Use the `-musl` /
 `:musl` tags when slotting musefs into an Alpine-based stack; the default

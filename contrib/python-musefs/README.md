@@ -109,6 +109,11 @@ rest. The store does not remember which keys you manage — **you** track your
 managed-key set out of band (the contract is explicit that the store is not the
 place for plugin state).
 
+Merge-mode key matching is **case-insensitive** (`lower(key) = lower(?)`): Vorbis
+keys render case-insensitively, so a scan that seeds a tag in the file's native
+case (e.g. `LABEL`) is correctly replaced when your plugin canonicalizes to
+lowercase (`label`), rather than leaving the original row behind as a duplicate.
+
 When the user removes a tag in the host, merge mode needs to delete the
 now-orphaned store row. The beets plugin solves this with an **accumulating
 managed-key set** (the `musefs_managed` pattern), worth copying:

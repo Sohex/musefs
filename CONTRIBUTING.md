@@ -128,8 +128,8 @@ truth — CI and local runs invoke the same scripts, so they can't drift:
 **CI.** The `freebsd` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
 runs these in a `vmactions/freebsd-vm` VM. It is expensive (a full in-VM build),
 so it does **not** run on every PR — only when the FUSE/mount surface or its
-harness changed (`musefs-fuse/`, `scripts/freebsd-vm/`, `ci.yml`) or on a release
-tag (`v*`).
+harness changed (`musefs/`, `musefs-fuse/`, `scripts/freebsd-vm/`, `Cargo.lock`,
+`ci.yml`) or on a release tag (`v*`).
 
 **Local run (one command):**
 
