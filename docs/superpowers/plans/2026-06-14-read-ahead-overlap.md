@@ -185,7 +185,11 @@ impl ReadAhead {
             bytes: Vec::new(),
             next_expected: u64::MAX,
             window: WINDOW_FLOOR,
-            cap: cap.max(WINDOW_FLOOR),
+            // Do NOT floor the cap here: when the pool grants a sub-floor budget
+            // share, forcing the cap up to WINDOW_FLOOR would let the window grow
+            // past the grant and push `charged` over `budget`. A small cap simply
+            // means small windows.
+            cap,
         }
     }
 
@@ -203,9 +207,10 @@ impl ReadAhead {
         freed
     }
 
-    /// Update the per-stream cap (when the active-stream count changes the share).
+    /// Update the per-stream cap (when the budget share changes). No floor — see
+    /// `new`: a sub-floor cap must shrink the window, not be silently raised.
     pub fn set_cap(&mut self, cap: u64) {
-        self.cap = cap.max(WINDOW_FLOOR);
+        self.cap = cap;
         if self.window > self.cap {
             self.window = self.cap;
         }
@@ -245,14 +250,23 @@ impl ReadAhead {
             return Ok((n, n));
         }
         let old_len = self.bytes.len() as u64;
-        // Sequential miss grows; a seek resets to floor.
+        // Sequential miss grows; a seek resets to floor (both clamped by cap).
         if off == self.next_expected {
             self.window = self.window.saturating_mul(2).min(self.cap);
         } else {
             self.window = WINDOW_FLOOR.min(self.cap);
         }
-        // The window must at least cover the request, and never overrun EOF.
-        let want = self.window.max(len as u64).min(backing_len - off);
+        // The window must cover at least the request, must not exceed the cap
+        // (except by the bounded amount needed to satisfy a request larger than
+        // the cap), and must never overrun EOF. For a valid backing segment
+        // `off + len <= backing_len` always holds; `saturating_sub` is a defensive
+        // guard against a malformed caller rather than an expected branch.
+        debug_assert!(off < backing_len && off + len as u64 <= backing_len);
+        let want = self
+            .window
+            .max(len as u64)
+            .min(self.cap.max(len as u64))
+            .min(backing_len.saturating_sub(off));
         let mut buf = vec![0u8; want as usize];
         fill(&mut buf, off)?;
         dst.copy_from_slice(&buf[..len]);
@@ -449,13 +463,20 @@ impl ReadAheadPool {
     /// Charge the budget by the ACTUAL window-size change `(old_len → new_len)`.
     /// Keeps the invariant `charged == Σ(registered buffers' bytes.len())`.
     /// `new < old` (shrink/clear) uncharges. A no-op when `old == new` (hit).
+    ///
+    /// Hard ceiling caveat: `charged` can transiently exceed `budget` only by the
+    /// bounded amount a single request forces beyond the per-stream cap (a request
+    /// larger than the cap must still be served from one window). That overshoot
+    /// is at most `Σ(in-flight request sizes)` — at most one FUSE chunk (~256 KiB)
+    /// or one Ogg payload per active reader — never the unbounded read-ahead
+    /// region, which `permitted_window` strictly bounds. No assertion here: a
+    /// blanket bound would either be wrong (too tight) or vacuous (too loose).
     pub fn reconcile(&self, old_len: u64, new_len: u64) {
         if new_len > old_len {
             self.charged.fetch_add(new_len - old_len, Ordering::Relaxed);
         } else if new_len < old_len {
             self.charged.fetch_sub(old_len - new_len, Ordering::Relaxed);
         }
-        debug_assert!(self.charged.load(Ordering::Relaxed) <= self.budget.max(1) * 2);
     }
 
     /// Uncharge `bytes` directly (window cleared on invalidation/release).
@@ -722,8 +743,10 @@ impl<'a> BackingReader<'a> {
         // ceiling holds. A hit changes nothing and skips eviction entirely.
         if !ra.covers(abs_offset, dst.len()) {
             crate::metrics::on_readahead_miss();
+            // Use the grant verbatim — do NOT raise it to WINDOW_FLOOR, or a
+            // sub-floor budget share would over-grow the window past `budget`.
             let cap = self.pool.permitted_window(self.key, ra.len(), self.pool.per_stream_cap());
-            ra.set_cap(cap.max(WINDOW_FLOOR));
+            ra.set_cap(cap);
         } else {
             crate::metrics::on_readahead_hit();
         }
@@ -866,14 +889,15 @@ let start = out.len();
 out.resize(start + n, 0);
 br.read_exact_at(&mut out[start..], bo + within)?;
 ```
-3. In the `Segment::OggAudio { .. }` arm, temporarily keep it compiling by
-   obtaining the raw file from the reader for now — Task 6 routes it properly.
-   Add an accessor to `BackingReader`:
+3. Add a permanent `file()` accessor to `BackingReader` (Task 6 uses it for the
+   Ogg raw-fd scan path; it is not temporary):
 ```rust
 // in readahead.rs, impl BackingReader
 pub fn file(&self) -> &std::fs::File { self.file }
 ```
-   and in the Ogg arm change `let f = file.expect(...)` → `let f = backing.expect("...").file();` (Task 6 replaces this).
+   In the `Segment::OggAudio { .. }` arm, keep it compiling against the *unchanged*
+   `serve_ogg_window(&File, ...)` signature for now by passing `backing.expect(..).file()`:
+   change `let f = file.expect(...)` → `let f = backing.expect("ogg-audio segment requires an open backing reader").file();`. Task 6 changes `serve_ogg_window` to take `&BackingReader` and updates this call site to pass `br` directly.
 4. Update callers `read_at_with_file_into` and `read_at_into` to build a
    `BackingReader`. For the non-handle `read_at_into` fallback (one-shot open, no
    persistent buffer) construct a throwaway pool-less reader:
@@ -882,12 +906,15 @@ pub fn file(&self) -> &std::fs::File { self.file }
 let pool = crate::readahead::ReadAheadPool::new(0); // disabled → plain preads
 let buf = std::sync::Arc::new(std::sync::Mutex::new(
     crate::readahead::ReadAhead::new(0)));
-let br = crate::readahead::BackingReader::new(&file, &buf, &pool, 0, resolved.total_len);
+// backing_len MUST be the backing file size, not the virtual total_len: the
+// reader clamps the window by `backing_len - off` where off is a BACKING offset.
+let backing_len = file.metadata()?.len();
+let br = crate::readahead::BackingReader::new(&file, &buf, &pool, 0, backing_len);
 read_segments_into(resolved, db, Some(&br), offset, size, out)
 ```
-   (`backing_len` for the fallback can be `resolved` audio bound; `total_len` is a
-   safe upper clamp because the splice never requests past it. If a stricter file
-   length is needed, `file.metadata()?.len()`.)
+   (The pool is disabled here, so `BackingReader` takes its plain-pread path and
+   never touches the window; `backing_len` is still passed for signature
+   uniformity and is correct regardless.)
 5. Make `read_at_with_file_into` / `read_at_with_file` take `&BackingReader`
    instead of `&std::fs::File` (callers in `facade.rs` updated in Task 7). Keep
    their bodies delegating to `read_segments_into(..., Some(br), ...)`.
@@ -953,36 +980,38 @@ builders):
 Run: `cargo test -p musefs-core readahead_differential_tests::ogg_bytes_identical_through_backing_reader 2>&1 | tail -20`
 Expected: PASS already (the temp `.file()` accessor serves correct bytes) — but it bypasses the read-ahead window. The point of this task is to route Ogg's preads through the buffer so they also benefit and are covered. Proceed to change the signatures.
 
-- [ ] **Step 3: Thread `&BackingReader` through `ogg_index.rs`**
+- [ ] **Step 3: Route only the forward serving walk through `BackingReader`**
 
-Change these signatures from `backing: &std::fs::File` / `f: &std::fs::File` to
-`backing: &crate::readahead::BackingReader`:
-- `serve_ogg_window`
-- `find_page_start`
-- `read_counted`
-- `page_crc_ok` (and any other `read_counted` caller)
+**Why selective:** `serve_ogg_window` (`ogg_index.rs`) has TWO kinds of backing
+read. The forward page-walk reads (the header read at `pos`, line ~173, and the
+payload read at `pos + header_len + within`, line ~230) are exact and sequential
+— the hot path that benefits from read-ahead. But `find_page_start`'s backward
+scan and `page_crc_ok` use a short-read-tolerant `read_at` (returning a count,
+tolerating EOF) to *locate* a page during a seek — they cannot route through the
+exact-or-error `read_exact_at` shim, and they are the cold scan path. So:
 
-Change `read_counted` body to route through the shim and drop its own
-`on_pread` (the shim's fill closure counts physical preads — Task 4):
-```rust
-fn read_counted(
-    backing: &crate::readahead::BackingReader,
-    buf: &mut [u8],
-    offset: u64,
-) -> std::io::Result<()> {
-    // The BackingReader's fill closure increments `preads`; do not double-count.
-    backing.read_exact_at(buf, offset)
-}
-```
-**Counting model (already established in Task 4):** `preads` counts *physical*
-backing preads, incremented only inside `BackingReader`'s fill closure (and its
-disabled-pool path). Neither the PCM `BackingAudio` arm nor `read_counted` calls
-`on_pread`. Verify no stray `crate::metrics::on_pread(` remains in `reader.rs` or
-`ogg_index.rs`:
+- `serve_ogg_window`: change its `backing: &std::fs::File` param to
+  `backing: &crate::readahead::BackingReader`. Replace its two forward-walk
+  `read_counted(backing, ...)` calls with `backing.read_exact_at(...)` directly
+  (these now flow through the window). Where it calls
+  `find_page_start(backing, ...)`, pass the raw fd via `backing.file()` instead
+  (Step 4 makes `file()` a permanent accessor).
+- `find_page_start`, `page_crc_ok`, `read_counted`: leave their signatures on
+  `&std::fs::File` and their bodies (and their own `on_pread`) UNCHANGED — the
+  scan path stays raw.
+
+**Counting model:** `on_pread` counts every *physical* positioned backing read,
+wherever it happens — inside `BackingReader`'s fill closure (serve hot path,
+deduplicated by the window) AND inside `read_counted`/`page_crc_ok` (cold scan
+path, always physical). This is consistent: a sequential serve does fewer
+physical preads (window hits), while seek-time page location still counts its
+real preads. Do NOT remove `on_pread` from `ogg_index.rs`'s scan helpers — only
+the PCM `BackingAudio` arm dropped its `on_pread` (Task 5), because that read now
+goes through the shim. Verify only the PCM arm changed:
 ```bash
-grep -rn "on_pread" musefs-core/src/reader.rs musefs-core/src/ogg_index.rs
+grep -n "on_pread" musefs-core/src/ogg_index.rs   # expect: read_counted + page_crc_ok still present
+grep -n "on_pread" musefs-core/src/reader.rs       # expect: no matches (PCM arm dropped it)
 ```
-Expected: no matches (all counting now lives in `readahead.rs`).
 
 - [ ] **Step 4: Update the `OggAudio` arm call site in `reader.rs`**
 
@@ -992,8 +1021,8 @@ Segment::OggAudio { offset: ao, seq_delta, len } => {
     serve_ogg_window(br, *ao, *len, *seq_delta, within, within + n as u64, &mut *out, Some(&resolved.last_page))?;
 }
 ```
-Remove the temporary `.file()` accessor usage. You may keep `BackingReader::file()`
-only if Phase 2 needs it; otherwise delete it to avoid a dead-code warning.
+Keep `BackingReader::file()` permanently — `serve_ogg_window` passes it to
+`find_page_start` for the raw-fd scan path (Step 3). It is not dead code.
 
 - [ ] **Step 5: Run the full differential suite + crate tests**
 
@@ -1045,9 +1074,8 @@ mod readahead_handle_tests {
 }
 ```
 
-> If `metrics::reset()` does not exist, add it under the `metrics` feature (a
-> helper that zeroes the static counters) — it is needed for deterministic count
-> assertions and mirrors the existing test usage pattern.
+> `metrics::reset()` already exists (`metrics.rs:213`, both feature cfgs); Task 8
+> extends it to also zero the new read-ahead counters. Use it as-is here.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1071,8 +1099,10 @@ struct Handle {
     /// Whether this handle is registered in the pool's active-stream registry.
     registered: AtomicBool,
     /// Bumped on a refresh-generation change, a seek, or release; an in-flight
-    /// Phase-2 prefetch checks it before storing (see spec §"Phase 2").
-    epoch: AtomicU64,
+    /// Phase-2 prefetch checks it before storing (see spec §"Phase 2"). `Arc` so a
+    /// prefetch job can share it (Task 13); a plain `AtomicU64` would not be
+    /// shareable into the worker. Bumped in-place via deref.
+    epoch: Arc<AtomicU64>,
 }
 ```
 
@@ -1099,7 +1129,7 @@ fh_from_key(self.handles.insert(Arc::new(Handle {
         self.readahead_pool.per_stream_cap(),
     ))),
     registered: AtomicBool::new(false),
-    epoch: AtomicU64::new(0),
+    epoch: Arc::new(AtomicU64::new(0)),
 })))
 ```
 
@@ -1195,17 +1225,30 @@ fn readahead_counts_physical_preads_not_logical_reads() {
 }
 ```
 
-- [ ] **Step 3: Fix the pre-existing exact-count assertions**
+- [ ] **Step 3: Audit and reconcile the pre-existing exact-count assertions**
 
-Find every test that asserts `s.preads == N` on a read path:
+The exact-count assertions in this crate are few — enumerate them and confirm
+each:
 ```bash
-grep -rn "preads, " musefs-core/src | grep assert
+grep -rn "\.preads\|\.opens\|scan_preads" musefs-core/src --include=*.rs | grep assert
 ```
-Re-derive the expected counts under read-ahead semantics (`preads` is now
-*physical* backing preads; a sequential second read is a hit, not a pread). For
-single-read tests the count is unchanged (first read always misses → 1 pread).
-For multi-sequential-read tests, lower the expected count and add a
-`readahead_hits`/`readahead_misses` assertion. Update each.
+As of writing, the only matches are in `musefs-core/src/metrics.rs`:
+- `metrics.rs:305` `assert_eq!(s.opens, 2);` and `:306` `assert_eq!(s.preads, 1);`
+  — this is a **single-read** scenario. Under read-ahead the first (only) read is
+  always a miss → exactly 1 physical pread, and `opens` is unchanged. **These
+  assertions stay as-is.** Add `assert_eq!(s.readahead_misses, 1)` and
+  `assert_eq!(s.readahead_hits, 0)` alongside to lock the new semantics.
+- `metrics.rs:323` `assert_eq!(s.scan_preads, 2);` — the **scan** path
+  (`on_scan_*`), which does NOT route through `BackingReader`. Unchanged; leave it.
+
+Also check the FUSE passthrough e2e (`musefs-fuse`), which `metrics.rs:22` notes
+"asserts exactly this" for `on_pread`: it runs in StructureOnly/passthrough mode
+where the kernel serves audio bytes and `read_into` is never called, so read-ahead
+does not touch it. Confirm by reading the test; expect no change needed.
+
+If `grep` surfaces any assertion not in this list (added since), apply the rule:
+single-read → unchanged; multi-sequential-read → lower `preads` and assert
+`readahead_hits`/`misses`.
 
 - [ ] **Step 4: Run the metrics-feature suite**
 
@@ -1360,7 +1403,7 @@ Add to `readahead_differential_tests`:
 
 Run: `cargo test -p musefs-core readahead_differential_tests 2>&1 | tail -20`
 Expected: PASS. If `pcm_bytes_identical_under_forced_eviction` fails, the bug is
-in budget reconciliation (`acquire`/`uncharge`) or `covers()` after a `clear()`;
+in budget reconciliation (`permitted_window`/`reconcile`) or `covers()` after a `clear()`;
 fix in `readahead.rs` until green.
 
 - [ ] **Step 3: Commit**
@@ -1414,70 +1457,241 @@ git commit -m "chore(core): Phase 1 read-ahead verification fixups (#255)"
 
 ## PHASE 2 — parallel prefetch
 
-### Task 12: Generalize the window to a prefetch ring + epoch-checked store
+### Task 12: Refactor `ReadAhead` to a bounded window ring
+
+**Why:** Phase 2 must fill window *K+1* while the kernel still reads window *K*.
+The Phase-1 single-window model can't hold both: a prefetch that overwrote the
+single window would clobber the bytes being served and *regress* sequential
+throughput. This task refactors `ReadAhead` from one `(win_start, bytes)` window
+to a small bounded set of windows. `max_windows` defaults to **1**, so all
+Phase-1 behavior and tests are preserved unchanged; Phase 2 raises it (Task 14).
 
 **Files:**
 - Modify: `musefs-core/src/readahead.rs`
 
 - [ ] **Step 1: Write the failing tests**
 
-Add a `prefetch_tests` module:
+Add a `ring_tests` module:
 ```rust
 #[cfg(test)]
-mod prefetch_tests {
+mod ring_tests {
+    use super::*;
+
+    #[test]
+    fn default_ring_holds_one_window_like_phase1() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP); // max_windows defaults to 1
+        let data: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let blen = data.len() as u64;
+        let mut dst = vec![0u8; 4096];
+        // Fill window A at offset 0, then a far read evicts it (only 1 window).
+        ra.read_into(&mut dst, 0, blen, |b, o| { b.copy_from_slice(&data[o as usize..][..b.len()]); Ok(()) }).unwrap();
+        ra.read_into(&mut dst, 1_000_000, blen, |b, o| { b.copy_from_slice(&data[o as usize..][..b.len()]); Ok(()) }).unwrap();
+        assert!(!ra.covers(0, 4096), "single-window ring evicts the old window");
+        assert!(ra.covers(1_000_000, 4096));
+    }
+
+    #[test]
+    fn ring_of_two_keeps_current_and_prefetched_window() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.set_max_windows(2);
+        // Store a prefetched window ahead WITHOUT serving a read there.
+        ra.store_window(1024 * 1024, vec![9u8; 512 * 1024]);
+        // Fill the current window via a normal read at 0.
+        let data = vec![1u8; 4096];
+        ra.read_into(&mut vec![0u8; 4096], 0, 4 * 1024 * 1024, |b, _| { b.copy_from_slice(&data[..b.len()]); Ok(()) }).unwrap();
+        // BOTH windows coexist: the just-read one and the prefetched-ahead one.
+        assert!(ra.covers(0, 4096), "current window present");
+        assert!(ra.covers(1024 * 1024, 4096), "prefetched window NOT clobbered");
+    }
+
+    #[test]
+    fn len_sums_all_windows_and_clear_drops_all() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.set_max_windows(3);
+        ra.store_window(0, vec![0u8; 100]);
+        ra.store_window(1000, vec![0u8; 200]);
+        assert_eq!(ra.len(), 300);
+        assert_eq!(ra.clear(), 300);
+        assert_eq!(ra.len(), 0);
+    }
+}
+```
+Also add the epoch-checked store seam tests (carried over from the prior design):
+```rust
+#[cfg(test)]
+mod prefetch_store_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn store_with_stale_epoch_is_discarded() {
         let ra = Arc::new(Mutex::new(ReadAhead::new(WINDOW_ABS_CAP)));
-        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        // Dispatch a prefetch at epoch 0.
-        let dispatched = epoch.load(std::sync::atomic::Ordering::Acquire);
-        // A seek/refresh bumps the epoch.
-        epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        // Storing the prefetched window must be rejected.
-        let stored = try_store_prefetch(&ra, &epoch, dispatched, 0, vec![1, 2, 3]);
-        assert!(!stored, "stale-epoch prefetch must be discarded");
+        let epoch = AtomicU64::new(0);
+        let dispatched = 0;
+        epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel); // seek/refresh
+        assert!(!try_store_prefetch(&ra, &epoch, dispatched, 0, vec![1, 2, 3]));
         assert_eq!(ra.lock().unwrap().len(), 0);
     }
 
     #[test]
     fn store_with_current_epoch_is_accepted() {
         let ra = Arc::new(Mutex::new(ReadAhead::new(WINDOW_ABS_CAP)));
-        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(5));
-        let stored = try_store_prefetch(&ra, &epoch, 5, 1000, vec![0u8; 4096]);
-        assert!(stored);
+        ra.lock().unwrap().set_max_windows(2);
+        let epoch = AtomicU64::new(5);
+        assert!(try_store_prefetch(&ra, &epoch, 5, 1000, vec![0u8; 4096]));
+        assert!(ra.lock().unwrap().covers(1000, 4096));
     }
 }
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p musefs-core readahead::prefetch_tests 2>&1 | tail -20`
-Expected: FAIL — `try_store_prefetch` and the prefetch-store path undefined.
+Run: `cargo test -p musefs-core readahead::ring_tests readahead::prefetch_store_tests 2>&1 | tail -20`
+Expected: FAIL — `set_max_windows` / `store_window` / `try_store_prefetch` / the
+multi-window representation do not exist.
 
-- [ ] **Step 3: Implement the prefetch-store seam + a `store_window` on `ReadAhead`**
+- [ ] **Step 3: Refactor `ReadAhead` to a window ring**
 
-Add to `ReadAhead`:
+Replace the single-window fields with a bounded, sorted, non-overlapping set:
 ```rust
-/// Adopt an externally prefetched window (Phase 2). Replaces the current window
-/// with `[start, start+bytes.len())`. Does not touch `next_expected` (the
-/// foreground reader owns the sequential predictor). Returns the byte delta
-/// `(old_len, new_len)` for budget reconciliation.
-pub fn store_window(&mut self, start: u64, bytes: Vec<u8>) -> (u64, u64) {
-    let old = self.bytes.len() as u64;
-    self.win_start = start;
-    self.bytes = bytes;
-    (old, self.bytes.len() as u64)
+struct Window {
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+pub struct ReadAhead {
+    /// Cached windows, sorted by `start`, non-overlapping. Bounded by `max_windows`.
+    windows: Vec<Window>,
+    next_expected: u64,
+    window: u64,
+    cap: u64,
+    /// Ring capacity: 1 in Phase 1 (single window), `depth + 1` in Phase 2.
+    max_windows: usize,
 }
 ```
-Add a free function:
+Rewrite the methods so external behavior is identical when `max_windows == 1`:
+```rust
+impl ReadAhead {
+    pub fn new(cap: u64) -> Self {
+        ReadAhead { windows: Vec::new(), next_expected: u64::MAX, window: WINDOW_FLOOR, cap, max_windows: 1 }
+    }
+    pub fn set_max_windows(&mut self, n: usize) { self.max_windows = n.max(1); }
+    pub fn next_expected(&self) -> u64 { self.next_expected }
+
+    pub fn len(&self) -> u64 {
+        self.windows.iter().map(|w| w.bytes.len() as u64).sum()
+    }
+    pub fn clear(&mut self) -> u64 {
+        let freed = self.len();
+        self.windows.clear();
+        self.window = WINDOW_FLOOR.min(self.cap.max(1));
+        self.next_expected = u64::MAX;
+        freed
+    }
+    pub fn set_cap(&mut self, cap: u64) {
+        self.cap = cap;
+        if self.window > self.cap { self.window = self.cap; }
+    }
+
+    /// True if some window fully contains `[off, off+len)`.
+    pub fn covers(&self, off: u64, len: usize) -> bool {
+        let end = off.saturating_add(len as u64);
+        self.windows.iter().any(|w| {
+            off >= w.start && end <= w.start + w.bytes.len() as u64
+        })
+    }
+
+    fn window_containing(&self, off: u64, len: usize) -> Option<&Window> {
+        let end = off.saturating_add(len as u64);
+        self.windows.iter().find(|w| off >= w.start && end <= w.start + w.bytes.len() as u64)
+    }
+
+    /// Insert a window, keeping `windows` sorted and bounded. When at capacity,
+    /// evict the window whose start is furthest *behind* `next_expected` (the one
+    /// the sequential stream has most likely passed). Returns bytes freed by any
+    /// eviction (for budget reconciliation by the caller; `store_window` returns
+    /// the net delta itself).
+    fn insert_window(&mut self, w: Window) {
+        // Replace an existing window with the same start (idempotent prefetch).
+        if let Some(slot) = self.windows.iter_mut().find(|x| x.start == w.start) {
+            *slot = w;
+        } else {
+            self.windows.push(w);
+        }
+        self.windows.sort_by_key(|x| x.start);
+        while self.windows.len() > self.max_windows {
+            let frontier = self.next_expected;
+            // Prefer evicting a window the reader has fully passed (its end is at or
+            // behind the frontier); among those, the smallest-start (oldest). If
+            // none are behind (all are ahead — e.g. freshly prefetched), evict the
+            // smallest-start window (index 0, since `windows` is sorted by start).
+            // This keeps the windows just ahead of the reader, never clobbering a
+            // window still to be read.
+            let idx = self
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| w.start + w.bytes.len() as u64 <= frontier)
+                .min_by_key(|(_, w)| w.start)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.windows.remove(idx);
+        }
+    }
+
+    /// Adopt an externally prefetched window (Phase 2) WITHOUT disturbing existing
+    /// windows or `next_expected`. Returns `(old_total, new_total)` for budget
+    /// reconciliation.
+    pub fn store_window(&mut self, start: u64, bytes: Vec<u8>) -> (u64, u64) {
+        let old = self.len();
+        self.insert_window(Window { start, bytes });
+        (old, self.len())
+    }
+
+    pub fn read_into(
+        &mut self,
+        dst: &mut [u8],
+        off: u64,
+        backing_len: u64,
+        mut fill: impl FnMut(&mut [u8], u64) -> io::Result<()>,
+    ) -> io::Result<(u64, u64)> {
+        let len = dst.len();
+        if len == 0 {
+            let n = self.len();
+            return Ok((n, n));
+        }
+        if let Some(w) = self.window_containing(off, len) {
+            let lo = (off - w.start) as usize;
+            dst.copy_from_slice(&w.bytes[lo..lo + len]);
+            self.next_expected = off + len as u64;
+            let n = self.len();
+            return Ok((n, n));
+        }
+        let old = self.len();
+        if off == self.next_expected {
+            self.window = self.window.saturating_mul(2).min(self.cap);
+        } else {
+            self.window = WINDOW_FLOOR.min(self.cap);
+        }
+        debug_assert!(off < backing_len && off + len as u64 <= backing_len);
+        let want = self.window.max(len as u64).min(self.cap.max(len as u64)).min(backing_len.saturating_sub(off));
+        let mut buf = vec![0u8; want as usize];
+        fill(&mut buf, off)?;
+        dst.copy_from_slice(&buf[..len]);
+        self.insert_window(Window { start: off, bytes: buf });
+        self.next_expected = off + len as u64;
+        Ok((old, self.len()))
+    }
+}
+```
+Add the epoch-checked store seam:
 ```rust
 use std::sync::atomic::{AtomicU64 as Epoch, Ordering as O};
 
-/// Store a prefetched window only if `dispatched_epoch` still matches `epoch`
-/// (no seek/refresh/release happened since dispatch). Returns whether stored.
+/// Store a prefetched window into `buf` only if `dispatched_epoch` still matches
+/// `epoch` (no seek/refresh/release since dispatch). Returns whether stored. The
+/// caller reconciles the budget with the returned delta on success.
 pub fn try_store_prefetch(
     buf: &Arc<Mutex<ReadAhead>>,
     epoch: &Epoch,
@@ -1494,17 +1708,23 @@ pub fn try_store_prefetch(
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+> This refactor touches every `ReadAhead` method, so re-run the EARLIER unit tests
+> (`window_tests`, `backing_reader_tests`, the differentials) — they must all stay
+> green because `max_windows` defaults to 1. If `first_read_misses_then_sequential_reads_hit`
+> or the differentials break, the single-window-equivalence is wrong; fix
+> `insert_window`'s eviction until they pass.
 
-Run: `cargo test -p musefs-core readahead::prefetch_tests 2>&1 | tail -20`
-Expected: PASS.
+- [ ] **Step 4: Run to verify pass (new + all prior readahead tests)**
+
+Run: `cargo test -p musefs-core readahead 2>&1 | tail -30`
+Expected: PASS — ring tests, store tests, AND all Phase-1 readahead tests.
 
 - [ ] **Step 5: Re-anchor + commit**
 
 ```bash
 python3 scripts/check_mutant_anchors.py --fix 2>/dev/null || true
 git add musefs-core/src/readahead.rs .cargo/mutants.toml
-git commit -m "feat(core): epoch-checked prefetch window store seam (#255)"
+git commit -m "refactor(core): ReadAhead window ring (non-clobbering prefetch) (#255)"
 ```
 
 ---
@@ -1535,13 +1755,12 @@ mod prefetch_worker_tests {
         let file = Arc::new(std::fs::File::open(&path).unwrap());
 
         let pool = Arc::new(ReadAheadPool::new(64 * 1024 * 1024));
-        let prefetch = PrefetchWorkers::new(2);
         let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         pool.register(1, Arc::clone(&buf));
 
-        // Foreground reads window 0; request a prefetch of window 1.
-        prefetch.request(PrefetchJob {
+        // Run the prefetch of window 1 synchronously (deterministic; no threads).
+        PrefetchWorkers::run_job(PrefetchJob {
             file: Arc::clone(&file),
             buf: Arc::clone(&buf),
             epoch: Arc::clone(&epoch),
@@ -1550,11 +1769,9 @@ mod prefetch_worker_tests {
             len: 1024 * 1024,
             backing_len: data.len() as u64,
         });
-        prefetch.drain_for_test();
-        // The window now holds [1 MiB, 2 MiB).
+        // The window now holds [1 MiB, 2 MiB) and serves without a fill closure call.
         let mut out = vec![0u8; 4096];
         let mut ra = buf.lock().unwrap();
-        // covers() true → served without a fill closure call.
         let mut fills = 0;
         ra.read_into(&mut out, 1024 * 1024, data.len() as u64, |_, _| { fills += 1; Ok(()) }).unwrap();
         assert_eq!(fills, 0, "prefetched window should serve without a pread");
@@ -1562,6 +1779,9 @@ mod prefetch_worker_tests {
     }
 }
 ```
+> `run_job` must be callable as an associated fn (`PrefetchWorkers::run_job(job)`)
+> — it already is in Step 3. Make it `pub(crate)` or `#[cfg(test)] pub` so the test
+> can call it.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1642,41 +1862,125 @@ impl PrefetchWorkers {
         let _ = self.tx.try_send(job);
     }
 
+    /// Test-only: run any queued jobs synchronously and deterministically (no
+    /// sleep). The production path uses the background threads via `request`.
     #[cfg(test)]
-    pub fn drain_for_test(&self) {
-        // Give workers a moment; jobs are tiny. For determinism, run synchronously
-        // instead in the test build:
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    pub fn run_pending_for_test(&self, rx_jobs: Vec<PrefetchJob>) {
+        for job in rx_jobs {
+            Self::run_job(job);
+        }
     }
 }
 ```
 
-> If the 50 ms sleep is too flaky for CI, make `run_job` callable directly and
-> have the test call `PrefetchWorkers::run_job(job)` synchronously instead of
-> `request` + `drain_for_test`. Prefer the synchronous form for the unit test.
+> Use the synchronous form in unit tests: build `PrefetchJob`s and call
+> `PrefetchWorkers::run_job(job)` directly — do NOT rely on thread timing. The
+> background threads exist for production; the test asserts the *logic* (window
+> filled, epoch honored), not the scheduler. The `prefetch_fills_next_window...`
+> test in Step 1 should call `PrefetchWorkers::run_job(job)` directly rather than
+> `request` + a sleep; update it to do so.
 
-- [ ] **Step 4: Trigger prefetch from `BackingReader` on a serving advance**
+- [ ] **Step 4: Make the backing fd shareable and add the prefetch worker to `Musefs`**
 
-In `facade.rs` `read_into`, after a successful `read_at_with_file_into`, if the
-pool is enabled and the read was sequential, enqueue a prefetch of the next
-window. Add a `Musefs` field `prefetch: crate::readahead::PrefetchWorkers`
-(initialize in `open` with e.g. `PrefetchWorkers::new(2)` only when budget > 0;
-when disabled, skip requests). Build the job from `h.file` (wrap the fd in an
-`Arc` once at `open` — change `Handle.file` to `Arc<std::fs::File>`), `h.readahead`,
-`h.epoch`, the current epoch value, the next window `start = next_expected`, and
-`len = per_stream_cap`. Gate the request on the buffer reporting a recent
-sequential serve (expose `ReadAhead::next_expected()` and only prefetch when the
-just-served read ended at the window tail).
+Prefetch jobs need an owned fd reference, so change `Handle.file` from
+`std::fs::File` to `Arc<std::fs::File>`. Update the call sites:
+- `open_handle`: `file: Arc::new(file)`.
+- `validate_opened_backing(&h.file, ...)` → `validate_opened_backing(&h.file, ...)`
+  still works via `Arc` deref, but make the param `&std::fs::File` and pass
+  `&h.file` (Arc derefs); confirm `passthrough_fd`'s `AsFd` impl uses `&*self.0.file`.
+- `BackingReader::new(&h.file, ...)` → `BackingReader::new(&h.file, ...)` (Arc
+  derefs to `&File` at the call; `BackingReader` keeps borrowing `&File`).
 
-> Keep this trigger minimal: a single next-window prefetch per serving read is the
-> depth-1 pipeline. Task 14 makes the depth adaptive.
+Add a `Musefs` field `prefetch: Option<crate::readahead::PrefetchWorkers>`,
+initialized in `open` to `Some(PrefetchWorkers::new(2))` when
+`config.read_ahead_budget > 0`, else `None`.
 
-- [ ] **Step 5: Bump epoch on seek + release (Phase-2 cancellation)**
+- [ ] **Step 5: Move seek detection + epoch bump into `BackingReader` (NOT the facade)**
 
-In `read_into`, detect a seek at the facade level too (compare the incoming
-`offset`'s backing offset to the buffer's `next_expected`); on a seek and on
-`release_handle`, `h.epoch.fetch_add(1, ...)` so any in-flight prefetch is
-discarded. (The generation-bump epoch bump from Task 7 already covers refresh.)
+The `offset` the facade's `read_into` receives is the *virtual* file offset; the
+sequential predictor works in *backing* offsets, so seek detection MUST live where
+the backing offset is known — inside `BackingReader::read_exact_at`, not the
+facade. Add an epoch reference to `BackingReader`:
+```rust
+pub struct BackingReader<'a> {
+    file: &'a std::fs::File,
+    buf: &'a Arc<Mutex<ReadAhead>>,
+    pool: &'a ReadAheadPool,
+    epoch: &'a std::sync::atomic::AtomicU64,
+    key: usize,
+    backing_len: u64,
+    fills: Cell<u64>,
+}
+```
+`new` takes `epoch: &'a AtomicU64` as a new param. In `read_exact_at`, on a miss,
+detect a seek by comparing the backing `abs_offset` to the buffer's
+`next_expected` BEFORE filling, and bump the epoch so in-flight prefetch for the
+abandoned position is discarded:
+```rust
+if !ra.covers(abs_offset, dst.len()) {
+    crate::metrics::on_readahead_miss();
+    if abs_offset != ra.next_expected() {
+        // Seek: invalidate outstanding prefetch (Phase-2 cancellation).
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    let cap = self.pool.permitted_window(self.key, ra.len(), self.pool.per_stream_cap());
+    ra.set_cap(cap);
+} else {
+    crate::metrics::on_readahead_hit();
+}
+```
+**Update every `BackingReader::new` call site to pass an epoch** (this is the
+signature change the refactor requires):
+- `readahead.rs` unit tests (`backing_reader_tests`) and `reader.rs`
+  `readahead_differential_tests`: pass `&std::sync::atomic::AtomicU64::new(0)`.
+- `read_at_into` fallback (Task 5): pass `&std::sync::atomic::AtomicU64::new(0)`
+  (disabled pool never bumps it).
+- `facade.rs` `read_into` per-handle path: pass `&h.epoch`.
+
+Also bump the epoch in `release_handle` before deregistering:
+```rust
+pub fn release_handle(&self, fh: Fh) {
+    let key = fh.slab_key();
+    if let Some(h) = self.handles.get(key) {
+        h.epoch.fetch_add(1, Ordering::AcqRel); // cancel outstanding prefetch
+    }
+    self.readahead_pool.deregister(key);
+    self.handles.remove(key);
+}
+```
+(The refresh-generation bump from Task 7 already advances the epoch; seek is now
+covered here; release is covered above — the three invalidation signals are
+unified, per the spec.)
+
+- [ ] **Step 5b: Wire the prefetch trigger**
+
+When the pool is enabled, set the buffer's ring capacity once on first sequential
+use: `h.readahead.lock().unwrap().set_max_windows(2)` (depth-1 pipeline; Task 14
+makes it adaptive). After a successful per-handle `read_at_with_file_into`, if
+`self.prefetch` is `Some` and the just-served read was sequential (the buffer's
+`next_expected` advanced to the window tail), enqueue ONE next-window job:
+```rust
+if let Some(pf) = &self.prefetch {
+    let (start, len) = {
+        let ra = h.readahead.lock().unwrap();
+        (ra.next_expected(), self.readahead_pool.per_stream_cap())
+    };
+    if start < backing_len {
+        pf.request(crate::readahead::PrefetchJob {
+            file: Arc::clone(&h.file),
+            buf: Arc::clone(&h.readahead),
+            epoch: Arc::clone(&h.epoch),
+            dispatched_epoch: h.epoch.load(Ordering::Acquire),
+            start,
+            len,
+            backing_len,
+        });
+    }
+}
+```
+> `Handle.epoch` is already `Arc<AtomicU64>` (Task 7), so `Arc::clone(&h.epoch)`
+> shares it into the job while `&h.epoch` deref-coerces to the `&AtomicU64` that
+> `BackingReader::new` takes — no further type change needed.
 
 - [ ] **Step 6: Run the suite**
 
@@ -1714,11 +2018,20 @@ fake/instrumented prefetch sink:
 
 - [ ] **Step 2: Implement adaptive depth**
 
-Track a per-handle `depth` (in `ReadAhead` or a sibling atomic) that increments
-while sequential and resets on seek, capped so `depth * window <=
-per_stream_cap`. On each serving advance, enqueue up to `depth` next-window
-prefetch jobs (offsets `next_expected, next_expected+window, ...`), each with the
-current epoch.
+Track a per-handle `depth` that increments on each sequential serve and resets to
+1 on a seek (a seek is already detected in `BackingReader::read_exact_at` — have
+it also reset depth, or recompute depth in the facade from whether `next_expected`
+advanced contiguously). Cap depth so `depth * window <= per_stream_cap` (i.e.
+`depth = (per_stream_cap / window).max(1)`, clamped to a small absolute max like
+4 to bound thread fan-out). On each serving advance:
+1. Size the ring to hold the in-flight windows: `h.readahead.lock().unwrap().set_max_windows(depth + 1)`.
+2. Enqueue up to `depth` next-window jobs at offsets `next_expected,
+   next_expected + window, …`, each carrying the current `h.epoch` snapshot, each
+   skipped if `start >= backing_len`.
+
+Because the ring (Task 12) holds `depth + 1` windows, these prefetched windows
+accumulate ahead of the reader instead of clobbering the current one — this is the
+behavior the single-window design could not provide.
 
 - [ ] **Step 3: Run + commit**
 
@@ -1845,11 +2158,12 @@ git commit -m "docs: backing read-ahead architecture, Ogg, and CLI flag (#255)"
   No extra fstat needed.
 - **Budget accounting is the subtle part.** The invariant: `pool.charged` ==
   Σ(registered buffers' `bytes.len()`). Every path that changes a buffer's length
-  (`acquire` grow, `clear` on eviction/invalidation, `store_window` in Phase 2,
-  seek-shrink) must reconcile via `acquire`/`uncharge`. Task 10's forced-eviction
-  differential and a debug assertion (`charged <= budget`) are the safety net —
-  consider adding `debug_assert!(self.charged.load(Relaxed) <= self.budget)` after
-  each `acquire` return.
+  (window grow via `permitted_window` + `reconcile`, `clear` on
+  eviction/invalidation which uncharges inline, `store_window` in Phase 2,
+  seek-shrink) must keep `charged` in sync. Task 10's forced-eviction differential
+  is the safety net. Do NOT add a `charged <= budget` assertion — see `reconcile`:
+  a request larger than the per-stream cap legitimately overshoots by a bounded
+  amount, so that assertion would false-positive.
 - **`Handle.file` becomes `Arc<std::fs::File>` in Task 13** (prefetch jobs need an
   owned fd reference). Make that change in Task 13 and update `open_handle`,
   `validate_opened_backing` call sites (`&h.file` → `&*h.file`), and
