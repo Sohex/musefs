@@ -210,7 +210,23 @@ jobs:
           - triple: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             mode: alpine
+          - triple: riscv64gc-unknown-linux-gnu
+            runner: ubuntu-latest
+            mode: emulated
+            platform: linux/riscv64
+            image: debian:trixie-slim
+            pkg: apt-get update >/dev/null && apt-get install -y --no-install-recommends fuse3 ffmpeg >/dev/null
+          - triple: riscv64gc-unknown-linux-musl
+            runner: ubuntu-latest
+            mode: emulated
+            platform: linux/riscv64
+            image: alpine:3.20
+            pkg: apk add --no-cache fuse3 ffmpeg >/dev/null
     runs-on: ${{ matrix.runner }}
+    # Emulated (riscv64) legs run under QEMU and are slow/flaky; keep them
+    # non-blocking so they can't gate images/publish/release-assets (all of
+    # which `needs: smoke`). The native host/alpine legs stay hard-gating.
+    continue-on-error: ${{ matrix.mode == 'emulated' }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
@@ -229,6 +245,9 @@ jobs:
           mkdir -p bin
           tar -xzf dist/musefs-*-${{ matrix.triple }}.tar.gz -C bin
           ./bin/musefs --version || true   # glibc/musl host may differ; real check is the smoke
+      - name: Set up QEMU (emulated arch)
+        if: matrix.mode == 'emulated'
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3
       - name: Smoke (host)
         if: matrix.mode == 'host'
         run: |
@@ -244,6 +263,15 @@ jobs:
             -v "$PWD":/w -w /w \
             alpine:3.20 \
             sh -c 'apk add --no-cache fuse3 ffmpeg >/dev/null && sh scripts/smoke-binary.sh ./bin/musefs'
+      - name: Smoke (emulated container)
+        if: matrix.mode == 'emulated'
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            -v "$PWD":/w -w /w \
+            ${{ matrix.image }} \
+            sh -c '${{ matrix.pkg }} && sh scripts/smoke-binary.sh ./bin/musefs'
 
   images:
     needs: smoke
