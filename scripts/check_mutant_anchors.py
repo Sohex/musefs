@@ -172,6 +172,22 @@ def compute_rewrites(
     return rewrites, skip_notes, skipped
 
 
+def apply_rewrites(toml_text: str, rewrites: list[Rewrite]) -> str:
+    """Return ``toml_text`` with each rewrite's ``:line:col:`` swapped in place.
+
+    Only the entry's own source line is touched; the new coordinates are an
+    f-string (no backslash, so a literal replacement is safe here, unlike the
+    wildcard in ``_wildcard_coords``). Quote char, comma, indentation, and the
+    guard-tag comment above are byte-preserved.
+    """
+    lines = toml_text.splitlines(keepends=True)
+    for rw in rewrites:
+        new_regex = _LITERAL_LINECOL.sub(f":{rw.line}:{rw.col}:", rw.entry.regex, count=1)
+        idx = rw.entry.toml_line - 1
+        lines[idx] = lines[idx].replace(rw.entry.regex, new_regex, 1)
+    return "".join(lines)
+
+
 def classify(regex: str) -> str:
     return "linecol" if _LITERAL_LINECOL.search(regex) else "desc"
 

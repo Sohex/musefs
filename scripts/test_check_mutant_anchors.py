@@ -538,3 +538,33 @@ def test_compute_rewrites_ignores_desc_and_tagless():
     muts = [_m("musefs-core/src/scan.rs:277:30: replace < with == in probe_file")]
     rewrites, skips, skipped = g.compute_rewrites(entries, muts)
     assert rewrites == [] and skips == [] and skipped == set()
+
+
+def test_apply_rewrites_byte_preserving():
+    toml = (
+        "exclude_re = [\n"
+        '    # guard: op=">=" fn="run_pipeline" rows=1\n'
+        "    'musefs-core/src/scan\\.rs:1041:32:',\n"
+        "]\n"
+    )
+    entries, _ = g.parse_toml_entries(toml)
+    out = g.apply_rewrites(toml, [g.Rewrite(entries[0], 1043, 32)])
+    assert "scan\\.rs:1043:32:" in out
+    assert "scan\\.rs:1041:32:" not in out
+    # guard tag and overall structure untouched
+    assert 'op=">=" fn="run_pipeline" rows=1' in out
+    assert out.count("\n") == toml.count("\n")
+    # only the coordinate digits changed
+    assert out == toml.replace(":1041:32:", ":1043:32:")
+
+
+def test_apply_rewrites_preserves_repl_suffix():
+    toml = "exclude_re = [\n    'musefs-core/src/scan\\.rs:1212:29: replace \\+ with -',\n]\n"
+    entries, _ = g.parse_toml_entries(toml)
+    out = g.apply_rewrites(toml, [g.Rewrite(entries[0], 1220, 29)])
+    assert "scan\\.rs:1220:29: replace \\+ with -" in out
+
+
+def test_apply_rewrites_empty_is_identity():
+    toml = "exclude_re = [\n    'musefs-core/src/scan\\.rs:1041:32:',\n]\n"
+    assert g.apply_rewrites(toml, []) == toml
