@@ -130,6 +130,20 @@ impl ReadAheadPool {
         }
     }
 
+    /// Best-effort check that `need` bytes of *free* (uncharged) budget exist.
+    /// Speculative prefetch uses this rather than evicting live streams: under
+    /// memory pressure it simply declines to prefetch. Racy by design — the
+    /// caller still `reconcile`s the actual stored delta, so the
+    /// `charged == Σ bytes` invariant holds regardless; this only bounds overshoot.
+    pub fn has_room_for(&self, need: u64) -> bool {
+        self.budget > 0 && self.budget.saturating_sub(self.charged.load(O::Relaxed)) >= need
+    }
+
+    #[cfg(test)]
+    pub fn charged_for_test(&self) -> u64 {
+        self.charged.load(O::Relaxed)
+    }
+
     /// Uncharge `bytes` directly (window cleared on invalidation/release).
     pub fn uncharge(&self, bytes: u64) {
         if bytes > 0 {
@@ -192,6 +206,11 @@ impl ReadAhead {
     }
     pub fn next_expected(&self) -> u64 {
         self.next_expected
+    }
+    /// The current adaptive window size (grows geometrically on sequential
+    /// access, resets to the floor on seek). Drives prefetch depth.
+    pub fn window(&self) -> u64 {
+        self.window
     }
 
     #[allow(clippy::len_without_is_empty)]
@@ -297,7 +316,12 @@ impl ReadAhead {
     }
 }
 
+/// Store a prefetched window into `buf` iff the handle's epoch is unchanged, and
+/// charge the global budget by the resulting size delta so the
+/// `charged == Σ(registered buffers' bytes.len())` invariant is preserved. A
+/// stale epoch (seek/release/refresh since dispatch) drops the window untouched.
 pub fn try_store_prefetch(
+    pool: &ReadAheadPool,
     buf: &Arc<Mutex<ReadAhead>>,
     epoch: &Epoch,
     dispatched_epoch: u64,
@@ -308,8 +332,20 @@ pub fn try_store_prefetch(
     if epoch.load(O::Acquire) != dispatched_epoch {
         return false;
     }
-    ra.store_window(start, bytes);
+    let (old, new) = ra.store_window(start, bytes);
+    drop(ra);
+    pool.reconcile(old, new);
     true
+}
+
+/// How many `window`-sized next-windows to keep in flight for a sequential
+/// stream: enough that their combined size is about one per-stream budget share
+/// (`cap`), clamped to a small thread fan-out. Decreases as the adaptive window
+/// grows toward `cap` (fewer, larger chunks) and rises again after a seek resets
+/// the window to the floor. Always ≥ 1 and never `cap / cap == 1` regardless of
+/// `window`.
+pub fn prefetch_depth(cap: u64, window: u64) -> u64 {
+    (cap / window.max(1)).clamp(1, 4)
 }
 
 use std::cell::Cell;
@@ -318,6 +354,7 @@ use std::sync::mpsc;
 pub struct PrefetchJob {
     pub file: Arc<std::fs::File>,
     pub buf: Arc<Mutex<ReadAhead>>,
+    pub pool: Arc<ReadAheadPool>,
     pub epoch: Arc<std::sync::atomic::AtomicU64>,
     pub dispatched_epoch: u64,
     pub start: u64,
@@ -365,12 +402,24 @@ impl PrefetchWorkers {
         if want == 0 {
             return;
         }
+        // Speculative: only prefetch into free budget, never evicting a live
+        // stream. Under pressure we skip rather than thrash real reads.
+        if !job.pool.has_room_for(want) {
+            return;
+        }
         #[expect(clippy::cast_possible_truncation)]
         let mut bytes = vec![0u8; want as usize];
         if job.file.read_exact_at(&mut bytes, job.start).is_err() {
             return;
         }
-        let _ = try_store_prefetch(&job.buf, &job.epoch, job.dispatched_epoch, job.start, bytes);
+        let _ = try_store_prefetch(
+            &job.pool,
+            &job.buf,
+            &job.epoch,
+            job.dispatched_epoch,
+            job.start,
+            bytes,
+        );
     }
 
     pub fn request(&self, job: PrefetchJob) {
@@ -766,6 +815,29 @@ mod ring_tests {
         );
     }
 
+    /// Regression for the `cap / cap == 1` tautology: depth must track the live
+    /// adaptive window, fanning out when the window is small and collapsing to 1
+    /// as it grows to `cap` — and the in-flight prefetch (`depth * window`) must
+    /// stay within one per-stream budget share.
+    #[test]
+    fn prefetch_depth_tracks_window_and_bounds_inflight() {
+        let cap = 8 * 1024 * 1024;
+        // Fresh / just-seeked: floor-sized window → fan out (16 → clamp 4),
+        // NOT 1 (which the old cap/cap formula always produced).
+        assert_eq!(prefetch_depth(cap, WINDOW_FLOOR), 4);
+        assert_eq!(prefetch_depth(cap, 2 * 1024 * 1024), 4);
+        assert_eq!(prefetch_depth(cap, 4 * 1024 * 1024), 2);
+        // Window grown to the cap → a single next-window suffices.
+        assert_eq!(prefetch_depth(cap, cap), 1);
+        // Degenerate inputs never panic or return 0.
+        assert_eq!(prefetch_depth(cap, 0), 4);
+        assert_eq!(prefetch_depth(cap, cap * 2), 1);
+        // In-flight bytes stay within one budget share across the growth curve.
+        for w in [WINDOW_FLOOR, 1 << 20, 2 << 20, 4 << 20, cap] {
+            assert!(prefetch_depth(cap, w) * w <= cap, "overshoot at window {w}");
+        }
+    }
+
     #[test]
     fn len_sums_all_windows_and_clear_drops_all() {
         let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
@@ -785,20 +857,82 @@ mod prefetch_store_tests {
 
     #[test]
     fn store_with_stale_epoch_is_discarded() {
+        let pool = ReadAheadPool::new(64 * 1024 * 1024);
         let ra = Arc::new(Mutex::new(ReadAhead::new(WINDOW_ABS_CAP)));
         let epoch = AtomicU64::new(0);
         epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        assert!(!try_store_prefetch(&ra, &epoch, 0, 0, vec![1, 2, 3]));
+        assert!(!try_store_prefetch(&pool, &ra, &epoch, 0, 0, vec![1, 2, 3]));
         assert_eq!(ra.lock().unwrap().len(), 0);
     }
 
     #[test]
-    fn store_with_current_epoch_is_accepted() {
+    fn store_with_current_epoch_is_accepted_and_charges_budget() {
+        let pool = ReadAheadPool::new(64 * 1024 * 1024);
         let ra = Arc::new(Mutex::new(ReadAhead::new(WINDOW_ABS_CAP)));
         ra.lock().unwrap().set_max_windows(2);
         let epoch = AtomicU64::new(5);
-        assert!(try_store_prefetch(&ra, &epoch, 5, 1000, vec![0u8; 4096]));
+        assert!(try_store_prefetch(
+            &pool,
+            &ra,
+            &epoch,
+            5,
+            1000,
+            vec![0u8; 4096]
+        ));
         assert!(ra.lock().unwrap().covers(1000, 4096));
+        // The stored window is charged against the global budget.
+        assert_eq!(pool.charged_for_test(), 4096);
+    }
+
+    /// Regression: a prefetched window must charge the budget so that the
+    /// subsequent uncharge on eviction/release cannot drive `charged` negative
+    /// (an underflow that silently disabled read-ahead process-wide).
+    #[test]
+    #[expect(clippy::cast_possible_truncation)]
+    fn prefetch_charge_survives_release_without_underflow() {
+        let pool = ReadAheadPool::new(2 * 1024 * 1024); // per-stream cap 512K
+        let cap = pool.per_stream_cap();
+        let buf = Arc::new(Mutex::new(ReadAhead::new(cap)));
+        buf.lock().unwrap().set_max_windows(2);
+        pool.register(1, Arc::clone(&buf));
+        // Sync read fills + charges one cap-sized window at offset 0.
+        let mut dst = vec![0u8; cap as usize];
+        let (o, n) = buf
+            .lock()
+            .unwrap()
+            .read_into(&mut dst, 0, 8 * 1024 * 1024, |b, _| {
+                b.fill(1);
+                Ok(())
+            })
+            .unwrap();
+        pool.reconcile(o, n);
+        // Prefetch a second cap-sized window — now charged via try_store_prefetch.
+        let epoch = Epoch::new(0);
+        assert!(try_store_prefetch(
+            &pool,
+            &buf,
+            &epoch,
+            0,
+            cap,
+            vec![2u8; cap as usize]
+        ));
+        assert_eq!(pool.charged_for_test(), 2 * cap);
+        pool.deregister(1);
+        assert_eq!(pool.charged_for_test(), 0, "release must not underflow");
+        // A fresh stream still gets its full grant — read-ahead is not disabled.
+        let hot = Arc::new(Mutex::new(ReadAhead::new(cap)));
+        pool.register(2, Arc::clone(&hot));
+        assert_eq!(pool.permitted_window(2, 0, cap), cap);
+    }
+
+    /// Under budget pressure, prefetch declines (no free room) rather than
+    /// evicting a live stream or overshooting the budget.
+    #[test]
+    fn prefetch_declines_when_budget_full() {
+        let pool = ReadAheadPool::new(1024 * 1024);
+        assert!(pool.has_room_for(512 * 1024));
+        pool.reconcile(0, 1024 * 1024); // fill the budget
+        assert!(!pool.has_room_for(1));
     }
 }
 
@@ -827,6 +961,7 @@ mod prefetch_worker_tests {
         PrefetchWorkers::run_job(PrefetchJob {
             file: Arc::clone(&file),
             buf: Arc::clone(&buf),
+            pool: Arc::clone(&pool),
             epoch: Arc::clone(&epoch),
             dispatched_epoch: 0,
             start: 1024 * 1024,
