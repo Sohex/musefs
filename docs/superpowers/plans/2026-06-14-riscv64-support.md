@@ -17,6 +17,7 @@
 - **This is YAML + docs work, not Rust.** There are no unit tests to add — verification is local cross-compilation, `yamllint`, an emulated-mount spike, and structural inspection of the workflow.
 - **Pre-commit cost:** the pre-commit hook skips the cargo gate only for *docs-only* commits (every staged path under `docs/` or a `*.md`). The `release.yml` commits in Tasks 1, 2, 4, 5 are **not** docs-only, so each runs the **full workspace test suite** (slow, but expected — let it run; do not `--no-verify`). It also runs `yamllint` over the edited workflow. The Task 6 docs commit skips the cargo gate.
 - **No libfuse for cross-builds:** the `build` job does not install `libfuse3-dev`, and musefs links no libfuse on Linux (mount execs `fusermount3` at runtime; passthrough uses `rustix`). So `cargo zigbuild` cross-compiles without any target FUSE libraries.
+- **jemalloc is the riskiest dependency:** `musefs` enables `jemalloc` by default, so the release binaries compile the vendored jemalloc C library (`tikv-jemalloc-sys 0.7.1+5.3.1`) from source per target via `zig cc`. riscv64 jemalloc runs fine at runtime (4 KB pages), but cross-compiling the C is the most likely break. Task 2, Step 3 verifies it and documents the `JEMALLOC_SYS_WITH_LG_PAGE=12` → `--no-default-features` fallback ladder. If a fallback is taken, the workflow's "Build" step must carry the corresponding `env`/flag for the riscv64 legs.
 - **Toolchain prereqs for local verification** (your dedicated machine, per setup): zig **0.14.0** on `PATH` and a `cargo-zigbuild` that supports it. Install zig 0.14.0 from `https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz`; install/confirm cargo-zigbuild with `cargo install cargo-zigbuild` (or use the pinned `0.22.3`). Docker (or podman with the same flags) is required for the Task 3 spike.
 
 ---
@@ -118,7 +119,9 @@ Keep alignment with the existing entries (two-space list indent under `include:`
 Run: `yamllint .github/workflows/release.yml`
 Expected: clean exit.
 
-- [ ] **Step 3: Cross-compile both riscv64 targets locally**
+- [ ] **Step 3: Cross-compile both riscv64 targets locally (this links jemalloc)**
+
+`musefs` enables `jemalloc` as a **default feature**, so a plain `cargo zigbuild -p musefs` (no `--no-default-features`) compiles the vendored jemalloc C library (`tikv-jemalloc-sys 0.7.1+5.3.1`) from source via `zig cc` for riscv64. This is the single most likely failure point of the whole effort, so it is verified here, with default features, exactly as the release job builds it:
 
 ```bash
 rustup target add riscv64gc-unknown-linux-gnu riscv64gc-unknown-linux-musl
@@ -126,7 +129,22 @@ cargo zigbuild --release -p musefs --target riscv64gc-unknown-linux-gnu.2.27
 cargo zigbuild --release -p musefs --target riscv64gc-unknown-linux-musl
 ```
 
-Expected: both finish `Finished release`. The glibc one is the real test of Task 1's zig bump + the `.2.27` floor — if it fails with a glibc-version or "unknown target" error, recheck the zig version (Step 3 of Task 1) and the `.2.27` suffix. Confirm the artifacts exist:
+Expected: both finish `Finished release`. Two distinct failure modes to recognize:
+
+- **glibc-version / "unknown target" error** → recheck the zig version (Task 1, Step 3) and the `.2.27` suffix.
+- **jemalloc build failure** (errors from `jemalloc-sys`'s `build.rs`, `configure`, or `make`; or a page-size assertion). Apply the fallback ladder in order:
+  1. Re-run the failing target with the page size pinned to riscv64's 4 KB:
+     ```bash
+     JEMALLOC_SYS_WITH_LG_PAGE=12 cargo zigbuild --release -p musefs --target riscv64gc-unknown-linux-gnu.2.27
+     ```
+     If this fixes it, the release `build` step must export `JEMALLOC_SYS_WITH_LG_PAGE=12` for the riscv64 legs — add it as a conditional `env` on the "Build" step (`.github/workflows/release.yml:172-173`), gated to the riscv64 triples, and note it in this commit.
+  2. If jemalloc still won't cross-compile, drop it for riscv64 only:
+     ```bash
+     cargo zigbuild --release -p musefs --no-default-features --target riscv64gc-unknown-linux-gnu.2.27
+     ```
+     This falls back to the system allocator and loses jemalloc allocator-stats telemetry on riscv64 (no other behavior change). If taken, the release `build` step's `cargo zigbuild` command needs `--no-default-features` for the riscv64 legs only — and the spec's Gotcha 3 fallback became the chosen path, so say so in the commit body.
+
+Confirm the artifacts exist:
 
 ```bash
 file target/riscv64gc-unknown-linux-gnu/release/musefs
@@ -482,6 +500,6 @@ Expected: clean exit.
 
 ## Self-review notes (author)
 
-- **Spec coverage:** zig bump (§Gotcha 1 → Task 1), `.2.27` floor + build matrix (§Gotcha 2, §1 → Task 2), emulated-mount spike (§0 → Task 3), emulated smoke + `continue-on-error` (§2 → Task 4), images staging/platforms (§3 → Task 5), publish/release-assets no-change (§4 → confirmed in File Structure / Final verification, no task needed), docs (§5 → Task 6). All spec sections map to a task.
+- **Spec coverage:** zig bump (§Gotcha 1 → Task 1), `.2.27` floor + build matrix (§Gotcha 2, §1 → Task 2), jemalloc cross-compile + fallback ladder (§Gotcha 3 → Task 2 Step 3 + implementer notes), emulated-mount spike (§0 → Task 3), emulated smoke + `continue-on-error` (§2 → Task 4), images staging/platforms (§3 → Task 5), publish/release-assets no-change (§4 → confirmed in File Structure / Final verification, no task needed), docs (§5 → Task 6). All spec sections map to a task.
 - **No placeholders:** every code/YAML step shows the exact text and a line anchor; commands have expected output.
 - **Consistency:** matrix field names (`triple`, `zig_target`, `mode`, `platform`, `image`, `pkg`, `riscv64_triple`) are used identically across Tasks 2/4/5; the `stage` helper name matches the existing `release.yml` function.

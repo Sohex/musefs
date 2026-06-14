@@ -25,6 +25,9 @@ Rust targets used (both Tier 2 with `std`):
 - `riscv64gc-unknown-linux-gnu`
 - `riscv64gc-unknown-linux-musl`
 
+No *Rust* source changes are needed. The one non-source caveat is the vendored
+jemalloc C library, which is compiled per target — see Gotcha 3.
+
 ## Two toolchain gotchas (the load-bearing details)
 
 ### Gotcha 1 — zig must be bumped to 0.14.0
@@ -61,6 +64,32 @@ riscv64gc-unknown-linux-gnu.2.27
 (~2.28+) — it is the lowest floor riscv64 supports, chosen for maximum distro
 reach. Keep the explicit `.2.27` suffix; do not "tidy" it away. The musl target
 carries no version suffix, matching the existing musl entries.
+
+### Gotcha 3 — jemalloc is a default-on C dependency, compiled per target
+
+The `musefs` binary enables `jemalloc` as a **default feature**
+(`default = ["jemalloc"]`), installing `tikv-jemallocator` as its
+`#[global_allocator]`. The release build runs `cargo zigbuild --release -p
+musefs` with no `--no-default-features`, so **the riscv64 binaries link
+jemalloc**. `tikv-jemalloc-sys 0.7.1+5.3.1` vendors jemalloc 5.3.1 and compiles
+it from C source at build time (autotools `./configure && make`) — under
+cargo-zigbuild that means `zig cc` cross-compiling jemalloc for `riscv64gc`.
+
+- **Runtime is not a concern.** jemalloc 5.3.x supports riscv64 Linux, which
+  uses 4 KB pages (`LG_PAGE=12`, same as x86_64) — it avoids the variable
+  page-size issue that complicates aarch64.
+- **The build is the risk**, and it is the single most likely failure point of
+  this whole effort. It is de-risked by the fact that the existing musl release
+  targets already link jemalloc via the same cargo-zigbuild toolchain — so the
+  jemalloc + musl + zigbuild combination is already proven; riscv64 is the only
+  new variable. The local cross-compile (Task 2 / Testing) exercises it with
+  default features, so a failure surfaces before any tag.
+- **Fallbacks, in order:** (1) if jemalloc's `configure` misdetects the page
+  size during cross-compile, set `JEMALLOC_SYS_WITH_LG_PAGE=12` for the riscv64
+  build; (2) worst case, build the riscv64 target with `--no-default-features`,
+  dropping jemalloc for that arch only — the binary falls back to the system
+  allocator and loses the jemalloc allocator-stats telemetry on riscv64, with no
+  other behavioral change.
 
 ## Changes
 
@@ -235,3 +264,10 @@ against zig 0.14 (Testing section) before the change lands.
 mounting working under qemu-user (§0). Mitigated by proving it in a spike first
 and by the `--version`-only fallback, which keeps binaries and images shipping
 regardless.
+
+**jemalloc cross-compile (highest-likelihood failure).** jemalloc ships by
+default and is compiled from C per target (Gotcha 3); `zig cc` cross-compiling
+it for riscv64gc is the most probable break. Mitigated by the existing musl
+targets already proving jemalloc + zigbuild, by the local cross-compile catching
+it pre-tag, and by the `JEMALLOC_SYS_WITH_LG_PAGE=12` → `--no-default-features`
+fallback ladder.
