@@ -101,23 +101,30 @@ fn open_flags(keep_cache: bool) -> FopenFlags {
     }
 }
 
-/// jemalloc allocator stats, or `None` when not built with the `jemalloc`
-/// feature (or when the ctls fail — best-effort, never panics). #394.
-#[cfg(feature = "jemalloc")]
-fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
-    use tikv_jemalloc_ctl::{epoch, stats};
-    epoch::advance().ok()?;
-    Some(musefs_core::AllocatorStats {
-        allocated: stats::allocated::read().ok()? as u64,
-        resident: stats::resident::read().ok()? as u64,
-        active: stats::active::read().ok()? as u64,
-        retained: stats::retained::read().ok()? as u64,
-    })
+pub use musefs_core::AllocatorStats;
+
+/// A process-wide allocator-stats probe, installed by [`set_alloc_probe`].
+///
+/// The probe lives in the final binary, not here: reading jemalloc stats means
+/// linking `tikv-jemalloc-ctl` (and the vendored jemalloc C lib), and only the
+/// binary that installs `tikv-jemallocator` as its `#[global_allocator]` can do
+/// that coherently. Linking it into this library would, via workspace feature
+/// unification, pull a second jemalloc into every `cargo test --workspace`
+/// binary — which segfaults on FreeBSD (base libc *is* jemalloc). So the binary
+/// injects a probe and this layer stays allocator-agnostic (#394).
+pub type AllocProbe = fn() -> Option<AllocatorStats>;
+
+static ALLOC_PROBE: OnceLock<AllocProbe> = OnceLock::new();
+
+/// Install the allocator-stats probe (call once at startup, before mounting).
+/// Later calls are ignored. Without it, `.musefs-metrics` omits the alloc block.
+pub fn set_alloc_probe(probe: AllocProbe) {
+    let _ = ALLOC_PROBE.set(probe);
 }
 
-#[cfg(not(feature = "jemalloc"))]
-fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
-    None
+/// Run the installed allocator probe, or `None` if none was installed.
+fn allocator_stats() -> Option<AllocatorStats> {
+    ALLOC_PROBE.get().and_then(|probe| probe())
 }
 
 /// Serve-path syscall counters, present only on a `metrics`-feature build.

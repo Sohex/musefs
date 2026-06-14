@@ -16,13 +16,33 @@ fn enable_jemalloc_background_thread() {
     }
 }
 
+/// Allocator-stats probe for the `.musefs-metrics` surface (#394). Lives here
+/// because reading jemalloc stats requires linking `tikv-jemalloc-ctl`, and only
+/// this binary installs jemalloc as the `#[global_allocator]`; `musefs-fuse`
+/// stays allocator-agnostic and receives this via `set_alloc_probe`. Best-effort:
+/// any ctl failure maps to `None` rather than panicking.
+#[cfg(feature = "jemalloc")]
+fn jemalloc_stats() -> Option<musefs_fuse::AllocatorStats> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().ok()?;
+    Some(musefs_fuse::AllocatorStats {
+        allocated: stats::allocated::read().ok()? as u64,
+        resident: stats::resident::read().ok()? as u64,
+        active: stats::active::read().ok()? as u64,
+        retained: stats::retained::read().ok()? as u64,
+    })
+}
+
 fn main() {
     // The library crates report serve-path failures through the `log` facade;
     // without a sink they vanish. Default to `warn` so they surface on stderr,
     // overridable via RUST_LOG.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     #[cfg(feature = "jemalloc")]
-    enable_jemalloc_background_thread();
+    {
+        enable_jemalloc_background_thread();
+        musefs_fuse::set_alloc_probe(jemalloc_stats);
+    }
     if let Err(e) = run(Cli::parse()) {
         eprintln!("musefs: {e:#}");
         std::process::exit(1);

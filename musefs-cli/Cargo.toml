@@ -21,7 +21,6 @@ uzers = "0.12"
 tempfile = "3"
 
 [features]
-jemalloc = ["musefs-fuse/jemalloc"]
 metrics = ["musefs-fuse/metrics"]
 
 [lints]

@@ -8,7 +8,6 @@ repository.workspace = true
 
 [features]
 metrics = ["musefs-core/metrics"]
-jemalloc = ["dep:tikv-jemalloc-ctl", "tikv-jemalloc-ctl/stats"]
 
 [dependencies]
 # Pure-rust fusermount3 mount path; never enable `libfuse` (static musl can't link it).
@@ -18,7 +17,6 @@ log = "0.4"
 rustix = { version = "1", features = ["process"] }
 musefs-core = { path = "../musefs-core", version = "1.0.0" }
 threadpool = "1"
-tikv-jemalloc-ctl = { version = "0.7", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fuser = { version = "0.17", features = ["macos-no-mount"] }

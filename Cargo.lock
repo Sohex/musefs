@@ -892,6 +892,7 @@ dependencies = [
  "env_logger",
  "log",
  "musefs-cli",
+ "musefs-fuse",
  "rustix",
  "tempfile",
  "tikv-jemalloc-ctl",
@@ -986,7 +987,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "threadpool",
- "tikv-jemalloc-ctl",
 ]
 
 [[package]]
