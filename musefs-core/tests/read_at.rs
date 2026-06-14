@@ -1,8 +1,11 @@
 mod common;
 use common::write_flac;
 use musefs_core::freshness::BackingStamp;
-use musefs_core::{HeaderCache, Mode, read_at, read_at_with_file};
+use musefs_core::{
+    BackingReader, HeaderCache, Mode, ReadAhead, ReadAheadPool, read_at, read_at_with_file,
+};
 use musefs_db::{Db, Format, NewTrack, Tag};
+use std::sync::{Arc, Mutex};
 
 fn setup() -> (tempfile::TempDir, Db, i64) {
     let dir = tempfile::tempdir().unwrap();
@@ -162,6 +165,10 @@ fn read_at_with_file_out_of_range_and_zero_size_return_empty() {
     let cache = HeaderCache::new(Mode::Synthesis);
     let resolved = cache.resolve(&db, id).unwrap();
     let file = std::fs::File::open(&resolved.backing_path).unwrap();
+    let pool = ReadAheadPool::new(0);
+    let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
+    let epoch = std::sync::atomic::AtomicU64::new(0);
+    let br = BackingReader::new(&file, &buf, &pool, 0, resolved.total_len, &epoch);
 
     // The per-handle path has no outer guard: read_segments_into itself must
     // bail on offset > total_len (its window arithmetic would underflow).
@@ -171,7 +178,7 @@ fn read_at_with_file_out_of_range_and_zero_size_return_empty() {
         (10, 0),
     ] {
         assert!(
-            read_at_with_file(&resolved, &db, &file, off, size)
+            read_at_with_file(&resolved, &db, &br, off, size)
                 .unwrap()
                 .is_empty()
         );

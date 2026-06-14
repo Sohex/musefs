@@ -388,17 +388,20 @@ default template is `$albumartist/$album/$title`.
 
 ### Tuning
 
-The defaults are sensible for most setups. On slow backing storage (HDD, NFS) the one
-flag worth changing is `--keep-cache`; the read-ahead / background knobs have little
-measurable effect on musefs (see [BENCHMARKS.md](BENCHMARKS.md#storage-tunables)
-for the methodology and numbers).
+The defaults are sensible for most setups. On slow or high-latency backing (NFS, remote,
+HDD), the two flags worth knowing are `--read-ahead-budget-mib` — the daemon-level backing
+read-ahead that hides per-read latency, the single biggest win for NFS/remote — and
+`--keep-cache`. The *kernel*-level read-ahead / background knobs have little measurable
+effect (see [BENCHMARKS.md](BENCHMARKS.md#storage-tunables) for the methodology and numbers).
 
 | Flag | Default | What it does |
 | ---- | ------- | ------------ |
 | `--poll-interval-ms` | `1000` | Debounce window for detecting external DB edits. |
+| `--read-ahead-budget-mib` | `64` | Per-mount RAM budget (MiB) for **backing read-ahead**: the daemon coalesces a stream's small FUSE reads into one large positioned read, so the backing client can pipeline/parallelize them. **The biggest lever for slow/high-latency backing** — ~5–6× single-stream throughput over a 200 ms-RTT NFS mount; neutral on local disk. Shared across all active streams with LRU eviction; `0` disables it. |
+| `--read-ahead-prefetch` | disabled | Advanced: add background prefetch threads on top of read amplification. Off by default — benchmarks found amplification alone delivers the entire read-ahead win, while the threads add ~10% overhead with no measured benefit. Enable only when profiling a backend where a single large read does not self-pipeline. |
 | `--keep-cache` | disabled | Keep the kernel page cache across opens. **Worth enabling on HDD/NFS:** repeat opens of a file are then served from cache instead of re-read over slow storage (~3× faster reopen in our benches). External re-tags auto-invalidate the affected files, so cached bytes never go stale. |
 | `--attr-ttl-ms` | `1000` | How long the kernel may trust cached entry/attr lookups. Higher cuts `lookup`/`getattr` traffic — useful for metadata-heavy clients (library scanners) over high-latency backing — but bounds how fast external edits become visible. |
-| `--max-readahead-kib` | `512` | Kernel read-ahead window (clamped to the kernel maximum). In practice this does **not** speed up musefs streaming: reads reach the daemon in fixed FUSE-sized chunks and a single stream is served serially, so a larger window doesn't reduce per-read latency. On HDD, values well above the default can even hurt. Leave at the default unless your own profiling shows otherwise. |
+| `--max-readahead-kib` | `512` | *Kernel* read-ahead window (clamped to the kernel maximum). Distinct from `--read-ahead-budget-mib` (the daemon-level read-ahead, which is the effective one): this kernel knob does **not** speed up musefs streaming, since reads reach the daemon in fixed FUSE-sized chunks regardless. On HDD, values well above the default can even hurt. Leave at the default unless your own profiling shows otherwise. |
 | `--max-background` | `64` | Max outstanding background (read-ahead/async) requests the kernel keeps in flight. Does **not** bound foreground reads (those scale with client concurrency), so it has little effect on read throughput; left for completeness. |
 | `--case-insensitive <true\|false>` | OS default | Compare filenames case-insensitively. Case-variant directories merge into one (first-seen casing wins) and case-variant files get a numeric suffix (e.g. `Song (2)`). Defaults to `true` on macOS and `false` on Linux/FreeBSD; case-insensitive mounts refresh via a full rebuild rather than the incremental fast path. |
 

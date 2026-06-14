@@ -56,6 +56,8 @@ fn mount_config() -> MountConfig {
         mode: musefs_core::Mode::Synthesis,
         poll_interval: Duration::ZERO,
         case_insensitive: false,
+        read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
     }
 }
 

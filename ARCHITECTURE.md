@@ -80,6 +80,24 @@ binary tags are flagged (`RegionLayout::has_binary_tag`) so the reader can
 wrap those reads in a transactional `content_version` guard — a concurrent
 retag cannot interleave bytes from two generations of a tag.
 
+### Backing read-ahead
+
+Every backing read — `BackingAudio` splices and the `serve_ogg_window` page walk
+alike — flows through a single `BackingReader::read_exact_at`
+(`musefs-core/src/readahead.rs`). It caches *raw backing-file bytes keyed by
+absolute backing offset* in a per-handle adaptive window: a sequential miss reads
+one large `pread` (geometric growth up to a per-stream cap) instead of the
+≤256 KiB FUSE chunk, so a high-latency backing client (NFS, remote) can pipeline
+the RPCs behind one syscall; a seek resets the window to the floor. All handles
+draw from one process-wide RAM budget (`--read-ahead-budget-mib`, default 64) with
+deadlock-free `try_lock` LRU eviction. Keying on the absolute backing offset (not
+the synthesized output) makes the cache retag-immune, and serving still flows
+through the per-read `validate_opened_backing` re-stat, so the cardinal
+audio-bytes invariant and freshness semantics are untouched. An optional Phase-2
+background-prefetch layer (`--read-ahead-prefetch`) exists but is off by default —
+read amplification carries the whole win (see
+[BENCHMARKS.md](BENCHMARKS.md#backing-read-ahead-255)).
+
 How each format builds its layout differs enough to warrant its own document:
 [FLAC](docs/FLAC.md), [MP3](docs/MP3.md), [M4A](docs/M4A.md),
 [Ogg](docs/OGG.md), [WAV](docs/WAV.md).

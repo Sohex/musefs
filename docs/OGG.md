@@ -108,6 +108,17 @@ data is refused, not served. Synthesized page sequence numbers wrap modulo
 2³² (matching Ogg's `u32` sequence field), so files whose audio pages have
 very high sequence numbers serve correctly rather than failing the read.
 
+The forward page-walk reads (`serve_ogg_window`) flow through the shared backing
+read-ahead buffer (`BackingReader`, see
+[ARCHITECTURE.md](../ARCHITECTURE.md#backing-read-ahead)) just like PCM
+`BackingAudio` reads, so a sequential Ogg stream amortizes backing latency the
+same way. The read-ahead cache holds *raw backing bytes keyed by absolute
+offset*, so it is orthogonal to header patching: the algebraic CRC/sequence
+rewrite happens on the bytes after they are read, and the cache never sees a
+patched page. (The backward `find_page_start` scan and its CRC check stay on the
+raw fd — they are short, non-sequential probes that the forward-streaming window
+would not help.)
+
 ## CRC patching: the linear-CRC trick
 
 This is the neatest thing in the Ogg path. Every Ogg page carries a CRC-32 over

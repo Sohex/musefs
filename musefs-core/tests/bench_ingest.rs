@@ -183,6 +183,15 @@ fn bench_read_under_latency() {
         return;
     };
     let tier = std::env::var("MUSEFS_BENCH_TIER").unwrap_or_else(|_| "ci".into());
+    // Sweep the read-ahead budget off (0) vs on (default 64 MiB) to isolate the
+    // backing read-ahead win at each latency profile.
+    let ra_mib: u64 = std::env::var("MUSEFS_BENCH_READAHEAD_MIB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    // Opt into Phase-2 prefetch threads (off by default) for the bench sweep.
+    let ra_prefetch = std::env::var("MUSEFS_READ_AHEAD_PREFETCH")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"));
 
     let cfg = || MountConfig {
         template: "$artist/$album/$title".to_string(),
@@ -191,6 +200,8 @@ fn bench_read_under_latency() {
         mode: Mode::Synthesis,
         poll_interval: std::time::Duration::ZERO,
         case_insensitive: false,
+        read_ahead_budget: ra_mib.saturating_mul(1024 * 1024),
+        read_ahead_prefetch: ra_prefetch,
     };
     fn first_inode(fs: &Musefs, dir: u64) -> Option<u64> {
         for (_, ino, is_dir) in fs.readdir(dir).unwrap() {
@@ -221,13 +232,17 @@ fn bench_read_under_latency() {
         let fs = Musefs::open(db, cfg()).unwrap();
         let inode = first_inode(&fs, VirtualTree::ROOT).expect("an ogg inode");
         let size = fs.getattr(inode).unwrap().size;
+        // Read through a real handle: `None` would take the fallback path (a
+        // fresh disabled-pool reader), bypassing the per-handle read-ahead this
+        // bench measures. Open outside the timed region so only reads are timed.
+        let fh = fs.open_handle(inode).unwrap();
 
         metrics::reset();
         let t0 = Instant::now();
         if whole {
             let mut off = 0u64;
             while off < size {
-                let got = fs.read(inode, None, off, 128 * 1024).unwrap();
+                let got = fs.read(inode, Some(fh), off, 128 * 1024).unwrap();
                 if got.is_empty() {
                     break;
                 }
@@ -235,17 +250,21 @@ fn bench_read_under_latency() {
             }
         } else {
             let off = (size * 7 / 8).min(size.saturating_sub(128 * 1024));
-            let _ = fs.read(inode, None, off, 128 * 1024).unwrap();
+            let _ = fs.read(inode, Some(fh), off, 128 * 1024).unwrap();
         }
         let ms = t0.elapsed().as_millis();
         let s = metrics::snapshot();
+        fs.release_handle(fh);
         println!(
             "{}",
             RunReport {
                 label: label.into(),
                 format: "ogg".into(),
                 tier: tier.clone(),
-                storage: profile.clone(),
+                storage: format!(
+                    "{profile}/ra{ra_mib}/pf{}",
+                    if ra_prefetch { "on" } else { "off" }
+                ),
                 wall_ms: ms,
                 opens: s.opens,
                 preads: s.preads,

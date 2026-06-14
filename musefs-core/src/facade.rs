@@ -44,6 +44,12 @@ pub struct MountConfig {
     /// Compare filenames case-insensitively (dirs merge, files disambiguate).
     /// Set by the CLI (`--case-insensitive`), default true on macOS.
     pub case_insensitive: bool,
+    /// Global read-ahead RAM envelope in bytes. `0` disables read-ahead.
+    pub read_ahead_budget: u64,
+    /// Enable Phase-2 background prefetch threads. Off by default: Phase-1 read
+    /// amplification carries the entire measured read-ahead win (#255); the
+    /// prefetch threads add overhead without benefit on the backends tested.
+    pub read_ahead_prefetch: bool,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -55,22 +61,40 @@ pub struct Attr {
     pub mtime_secs: i64,
 }
 
-/// An open file handle: the resolved layout, the track it belongs to, the
-/// generation at which `resolved` was last validated, and a backing fd opened
-/// once at `open`.
-///
-/// A handle survives `poll_refresh`, but is **not** a frozen snapshot: when the
-/// global `refresh_gen` advances (a refresh applied changes), the next `read`
-/// re-resolves the track (a cheap `content_version`-keyed cache hit when the
-/// track is unchanged) and swaps in the fresh layout. This keeps a re-tagged
-/// file's handle consistent with the size the kernel sees via getattr, and
-/// prevents a stale `Segment::BinaryTag { payload_id }` from serving reused-rowid
-/// bytes after a re-tag.
 struct Handle {
     track_id: i64,
     resolved: arc_swap::ArcSwap<ResolvedFile>,
     generation: AtomicU64,
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
+    readahead: Arc<Mutex<crate::readahead::ReadAhead>>,
+    registered: AtomicBool,
+    epoch: Arc<AtomicU64>,
+    /// Absolute backing offset through which prefetch jobs were already
+    /// dispatched, so a sequential stream does not re-request buffered windows.
+    prefetched_upto: AtomicU64,
+    /// Shared so the read-ahead pool registration is cleaned up on the handle's
+    /// FINAL drop, not eagerly in `release_handle`. A read that races a release
+    /// holds an `Arc<Handle>` clone, so the buffer (and its budget charge) stays
+    /// alive until that read finishes; deregistering here, keyed by the buffer's
+    /// address, then frees exactly that stream's charge with no leak or reuse.
+    pool: Arc<crate::readahead::ReadAheadPool>,
+}
+
+impl Handle {
+    /// Stable pool key for this handle's read-ahead buffer: its heap address,
+    /// unique for the buffer's lifetime (the handle holds the `Arc`, so the
+    /// address can't be reused while still registered).
+    fn pool_key(&self) -> usize {
+        Arc::as_ptr(&self.readahead) as usize
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // Runs when the last Arc<Handle> drops — after any in-flight read that
+        // re-registered the buffer post-release — so the budget never leaks.
+        self.pool.deregister(self.pool_key());
+    }
 }
 
 /// An owned view of an open handle's backing fd, for FUSE passthrough
@@ -144,6 +168,8 @@ pub struct Musefs {
     /// a layout that was invalidated by a refresh the kernel did not yet see.
     refresh_gen: AtomicU64,
     handles: sharded_slab::Slab<Arc<Handle>>,
+    readahead_pool: Arc<crate::readahead::ReadAheadPool>,
+    prefetch: Option<crate::readahead::PrefetchWorkers>,
     /// `SizeEntry` keyed by track id. Tiny entries, effectively unbounded; serves
     /// getattr/lookup without a backing stat or full synthesis. Self-invalidates on
     /// a content_version change.
@@ -251,6 +277,8 @@ impl Musefs {
         let template = Template::parse(&config.template)?;
         let (tree, snapshot) = Self::build_full(&db, &template, &config, &mut alloc)?;
         let poll_interval = config.poll_interval;
+        let read_ahead_budget = config.read_ahead_budget;
+        let read_ahead_prefetch = config.read_ahead_prefetch;
         Ok(Musefs {
             cache: HeaderCache::new(config.mode),
             last_data_version: AtomicI64::new(last_data_version),
@@ -260,6 +288,16 @@ impl Musefs {
             config,
             template,
             handles: sharded_slab::Slab::new(),
+            readahead_pool: Arc::new(crate::readahead::ReadAheadPool::new(read_ahead_budget)),
+            // Phase 2 (background prefetch threads) runs only when read-ahead is
+            // on AND explicitly opted in. Off by default: Phase-1 amplification
+            // carries the whole win, and the threads add ~10% overhead without
+            // benefit on the backends benchmarked (#255).
+            prefetch: if read_ahead_budget > 0 && read_ahead_prefetch {
+                Some(crate::readahead::PrefetchWorkers::new(2))
+            } else {
+                None
+            },
             size_cache: dashmap::DashMap::new(),
             last_poll: Mutex::new(std::time::Instant::now()),
             last_failed_refresh: Mutex::new(None),
@@ -1040,6 +1078,85 @@ impl Musefs {
 
     /// Serve a read into `out` (cleared first). The FUSE layer passes a reused
     /// per-worker buffer so the hot path allocates nothing per read (#70).
+    /// Serve `[offset, offset+size)` through the per-handle read-ahead buffer,
+    /// then (when Phase-2 prefetch is enabled and the stream is sequential)
+    /// enqueue depth-adaptive next-window jobs. Shared by the binary-tag
+    /// (snapshotted) and plain read branches of `read_into`.
+    fn serve_backing<M>(
+        &self,
+        h: &Handle,
+        db: &musefs_db::Db<M>,
+        r: &ResolvedFile,
+        offset: u64,
+        size: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        // Keyed by the buffer address (not the slab key) so the handle's Drop can
+        // deregister it after a racing release; see Handle::pool_key / Drop.
+        let key = h.pool_key();
+        if !h.registered.swap(true, Ordering::AcqRel) {
+            self.readahead_pool.register(key, Arc::clone(&h.readahead));
+        }
+        let backing_len = r.stamp.size;
+        let br = crate::readahead::BackingReader::new(
+            &h.file,
+            &h.readahead,
+            &self.readahead_pool,
+            key,
+            backing_len,
+            &h.epoch,
+        );
+        read_at_with_file_into(r, db, &br, offset, size, out)?;
+
+        let Some(pf) = &self.prefetch else {
+            return Ok(());
+        };
+        // Adaptive depth: keep roughly one per-stream budget share in flight.
+        // The window grows geometrically while sequential, so `cap / window`
+        // windows of the current size sum to about `cap`; clamp the thread
+        // fan-out to a small bound. A seek resets `window` to the floor, which
+        // raises depth again — no separate ramp counter is needed. `plan_prefetch`
+        // deduplicates against the per-handle watermark so a sequential stream
+        // enqueues only the freshly-exposed tail rather than re-requesting
+        // already-buffered windows. The watermark read/update sits under the
+        // buffer lock that also serialises concurrent reads of this handle.
+        let cap = self.readahead_pool.per_stream_cap();
+        let (starts, window) = {
+            let mut ra = h.readahead.lock().unwrap();
+            let start = ra.next_expected();
+            let window = ra.window();
+            let depth = crate::readahead::prefetch_depth(cap, window);
+            let ring = usize::try_from(depth).unwrap_or(4) + 1;
+            ra.set_max_windows(ring);
+            let (starts, upto) = crate::readahead::plan_prefetch(
+                h.prefetched_upto.load(Ordering::Relaxed),
+                start,
+                window,
+                depth,
+                backing_len,
+            );
+            h.prefetched_upto.store(upto, Ordering::Relaxed);
+            (starts, window)
+        };
+        if starts.is_empty() {
+            return Ok(());
+        }
+        let dispatched_epoch = h.epoch.load(Ordering::Acquire);
+        for s in starts {
+            pf.request(crate::readahead::PrefetchJob {
+                file: Arc::clone(&h.file),
+                buf: Arc::clone(&h.readahead),
+                pool: Arc::clone(&self.readahead_pool),
+                epoch: Arc::clone(&h.epoch),
+                dispatched_epoch,
+                start: s,
+                len: window,
+                backing_len,
+            });
+        }
+        Ok(())
+    }
+
     pub fn read_into(
         &self,
         inode: u64,
@@ -1103,13 +1220,13 @@ impl Musefs {
                                 {
                                     return Ok(None); // stale layout — retry after re-resolve
                                 }
-                                read_at_with_file_into(r, db, &h.file, offset, size, out)?;
+                                self.serve_backing(&h, db, r, offset, size, out)?;
                                 Ok(Some(()))
                             })();
                             let _ = db.end_read(); // always release the snapshot
                             res
                         } else {
-                            read_at_with_file_into(r, db, &h.file, offset, size, out)?;
+                            self.serve_backing(&h, db, r, offset, size, out)?;
                             Ok(Some(()))
                         }
                     })?;
@@ -1179,19 +1296,46 @@ impl Musefs {
         let generation = self.refresh_gen.load(Ordering::Acquire);
         let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
         crate::metrics::on_open();
-        let file = std::fs::File::open(&resolved.backing_path)?;
+        let file = Arc::new(std::fs::File::open(&resolved.backing_path)?);
         validate_opened_backing(&file, &resolved)?;
         fh_from_key(self.handles.insert(Arc::new(Handle {
             track_id,
             resolved: arc_swap::ArcSwap::from(resolved),
             generation: AtomicU64::new(generation),
             file,
+            readahead: Arc::new(Mutex::new(crate::readahead::ReadAhead::new(
+                self.readahead_pool.per_stream_cap(),
+            ))),
+            registered: AtomicBool::new(false),
+            epoch: Arc::new(AtomicU64::new(0)),
+            prefetched_upto: AtomicU64::new(0),
+            pool: Arc::clone(&self.readahead_pool),
         })))
     }
 
     /// Drop an open handle (closes its backing fd when the last reference goes).
     pub fn release_handle(&self, fh: Fh) {
-        self.handles.remove(fh.slab_key());
+        let key = fh.slab_key();
+        if let Some(h) = self.handles.get(key) {
+            h.epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        // Pool deregistration is the handle's Drop responsibility, not done here:
+        // a read racing this release still holds an Arc<Handle>, so eagerly
+        // deregistering would drop the entry before that read's charge lands,
+        // leaking it. Drop runs once the last reference (the in-flight read) goes.
+        self.handles.remove(key);
+    }
+
+    /// Test accessor: are the Phase-2 prefetch worker threads running?
+    #[cfg(test)]
+    pub(crate) fn prefetch_workers_active(&self) -> bool {
+        self.prefetch.is_some()
+    }
+
+    /// Test accessor: bytes currently charged against the read-ahead budget.
+    #[cfg(test)]
+    pub(crate) fn pool_charged(&self) -> u64 {
+        self.readahead_pool.charged_for_test()
     }
 
     /// The backing fd behind `fh`, for kernel passthrough registration. `Some`
@@ -1290,6 +1434,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1321,6 +1467,132 @@ mod tests {
             "handle did not re-resolve: {len_before} -> {len_after}"
         );
         fs.release_handle(fh);
+    }
+
+    #[test]
+    fn prefetch_workers_created_only_with_budget_and_flag() {
+        use std::collections::BTreeMap;
+        let mk = |budget: u64, prefetch: bool| {
+            let cfg = MountConfig {
+                template: "$artist/$title".to_string(),
+                fallbacks: BTreeMap::new(),
+                default_fallback: "Unknown".to_string(),
+                mode: Mode::Synthesis,
+                poll_interval: std::time::Duration::ZERO,
+                case_insensitive: false,
+                read_ahead_budget: budget,
+                read_ahead_prefetch: prefetch,
+            };
+            Musefs::open(musefs_db::Db::open_in_memory().unwrap(), cfg).unwrap()
+        };
+        assert!(
+            !mk(64 << 20, false).prefetch_workers_active(),
+            "default is Phase-1 amplification only"
+        );
+        assert!(mk(64 << 20, true).prefetch_workers_active(), "flag opts in");
+        assert!(
+            !mk(0, true).prefetch_workers_active(),
+            "budget 0 disables read-ahead entirely"
+        );
+        assert!(!mk(0, false).prefetch_workers_active());
+    }
+
+    #[test]
+    fn read_then_release_does_not_leak_budget() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+        let fh = fs.open_handle(file_inode).unwrap();
+        assert!(
+            !fs.read(file_inode, Some(fh), 0, 1 << 20)
+                .unwrap()
+                .is_empty()
+        );
+        // The read registers the stream and charges its window; release must
+        // deregister and uncharge it. A registration that does not fire on the
+        // first read leaks the charge (the buffer is never in the pool to free).
+        fs.release_handle(fh);
+        assert_eq!(fs.pool_charged(), 0, "release leaked the read-ahead charge");
+    }
+
+    #[test]
+    fn two_handles_get_distinct_pool_keys() {
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+        // Two handles on the same inode hold DISTINCT read-ahead buffers, so their
+        // pool keys (buffer addresses) must differ. A constant pool_key collides
+        // both onto one registry entry: the second registration overwrites the
+        // first, so only one of the two charges is freed on release — a leak.
+        let fh1 = fs.open_handle(inode).unwrap();
+        let fh2 = fs.open_handle(inode).unwrap();
+        assert!(!fs.read(inode, Some(fh1), 0, 1 << 20).unwrap().is_empty());
+        assert!(!fs.read(inode, Some(fh2), 0, 1 << 20).unwrap().is_empty());
+        fs.release_handle(fh1);
+        fs.release_handle(fh2);
+        assert_eq!(
+            fs.pool_charged(),
+            0,
+            "distinct keys must each free their charge"
+        );
     }
 
     /// The safety property the transactional `content_version` guard exists to
@@ -1382,6 +1654,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1496,6 +1770,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1559,6 +1835,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
 
         let (entries, snapshot) = Musefs::render_entries(
@@ -1602,6 +1880,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1690,6 +1970,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: true,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1746,6 +2028,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: interval,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
         (dir, fs)
@@ -1813,6 +2097,8 @@ mod tests {
             mode,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
 
         // StructureOnly: exposed, and the fd refers to the backing inode.
@@ -1921,6 +2207,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let template = Template::parse(&config.template).expect("valid template");
 
@@ -1968,6 +2256,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -2010,6 +2300,8 @@ mod tests {
             mode: Mode::Synthesis,
             poll_interval: std::time::Duration::ZERO,
             case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
         };
         assert!(matches!(
             Musefs::open(db, config),

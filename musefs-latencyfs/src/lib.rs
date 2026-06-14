@@ -60,7 +60,8 @@ fn nap(d: Duration) {
     }
 }
 
-/// Per-operation injected latency. `ssd` is all-zero (≈ no injection).
+/// Per-operation injected latency. Unknown profiles are all-zero (≈ no
+/// injection); `ssd` models local NVMe-class latency, not zero.
 #[derive(Clone, Copy, Default)]
 pub struct Latency {
     pub open: Duration,
@@ -72,9 +73,19 @@ pub struct Latency {
 }
 
 impl Latency {
-    /// Named profiles. Unknown / "ssd" => zero.
+    /// Named profiles. Unknown => zero (pure passthrough, no injection).
     pub fn profile(name: &str) -> Latency {
         match name {
+            // Local NVMe-class: ~80µs queue-depth-1 random read. A zero "ssd"
+            // would measure only the bench's own FUSE overhead, not SSD latency.
+            "ssd" => Latency {
+                open: us(80),
+                stat: us(40),
+                read: us(80),
+                write: us(80),
+                fsync: us(300),
+                other: us(40),
+            },
             "hdd" => Latency {
                 open: ms(8),
                 stat: ms(8),
@@ -768,8 +779,8 @@ mod tests {
     }
 
     #[test]
-    fn profile_ssd_and_unknown_are_zero() {
-        for name in ["ssd", "", "garbage"] {
+    fn profile_unknown_is_zero() {
+        for name in ["", "garbage"] {
             let l = Latency::profile(name);
             assert_eq!(l.open, Duration::ZERO);
             assert_eq!(l.stat, Duration::ZERO);
@@ -778,6 +789,17 @@ mod tests {
             assert_eq!(l.fsync, Duration::ZERO);
             assert_eq!(l.other, Duration::ZERO);
         }
+    }
+
+    #[test]
+    fn profile_ssd_values() {
+        let l = Latency::profile("ssd");
+        assert_eq!(l.open, micros(80));
+        assert_eq!(l.stat, micros(40));
+        assert_eq!(l.read, micros(80));
+        assert_eq!(l.write, micros(80));
+        assert_eq!(l.fsync, micros(300));
+        assert_eq!(l.other, micros(40));
     }
 
     // Assert against literal `Duration`s rather than ms()/us(), so a mutation

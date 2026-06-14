@@ -17,7 +17,7 @@ fn nonzero_profile_is_slower_than_ssd() {
     let backing = tempfile::tempdir().unwrap();
     std::fs::write(backing.path().join("f.bin"), vec![0u8; 64 * 1024]).unwrap();
 
-    // ssd (~0) baseline.
+    // ssd (local NVMe-class, ~80µs/op) baseline.
     let fast = LatencyMount::new(backing.path(), "ssd").unwrap();
     let t0 = Instant::now();
     for _ in 0..20 {
