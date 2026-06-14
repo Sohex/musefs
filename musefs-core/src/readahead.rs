@@ -3,12 +3,166 @@
 //! every backing read flows through. See
 //! `docs/superpowers/specs/2026-06-14-read-ahead-overlap-design.md`.
 
+use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Floor window size: a fresh or just-seeked stream still reads this much ahead.
 pub const WINDOW_FLOOR: u64 = 512 * 1024;
 /// Absolute per-stream window cap, independent of the global budget.
 pub const WINDOW_ABS_CAP: u64 = 8 * 1024 * 1024;
+
+/// Default global read-ahead budget when the operator passes no flag (64 MiB,
+/// mirroring `reader::DEFAULT_CACHE_BUDGET`). `0` disables read-ahead entirely.
+pub const DEFAULT_READAHEAD_BUDGET: u64 = 64 * 1024 * 1024;
+/// No single stream may hold more than `budget / PER_STREAM_DIVISOR`.
+const PER_STREAM_DIVISOR: u64 = 4;
+
+struct StreamEntry {
+    buf: Arc<Mutex<ReadAhead>>,
+    last_served: u64,
+}
+
+/// The process-wide read-ahead allocator: one byte budget shared by all active
+/// streams, with `try_lock` LRU eviction. Deadlock-free by construction — the
+/// budget is a lock-free atomic, the registry lock is a leaf (released before any
+/// buffer mutex), and eviction never blocks on a buffer mutex (`try_lock` + skip).
+pub struct ReadAheadPool {
+    /// Total RAM envelope; `0` means read-ahead is disabled.
+    budget: u64,
+    /// Currently charged bytes (sum of registered buffers' lengths).
+    charged: AtomicU64,
+    /// Active streaming handles keyed by slab key. Only sequential streams register.
+    streams: Mutex<HashMap<usize, StreamEntry>>,
+    /// Monotonic source for `last_served` stamps (LRU ordering).
+    clock: AtomicU64,
+}
+
+impl ReadAheadPool {
+    pub fn new(budget: u64) -> Self {
+        ReadAheadPool {
+            budget,
+            charged: AtomicU64::new(0),
+            streams: Mutex::new(HashMap::new()),
+            clock: AtomicU64::new(0),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.budget > 0
+    }
+
+    /// Per-stream window cap derived from the budget.
+    pub fn per_stream_cap(&self) -> u64 {
+        if self.budget == 0 {
+            return 0;
+        }
+        (self.budget / PER_STREAM_DIVISOR).clamp(WINDOW_FLOOR, WINDOW_ABS_CAP)
+    }
+
+    /// Lazily register a handle's buffer once sequential access is detected.
+    pub fn register(&self, key: usize, buf: Arc<Mutex<ReadAhead>>) {
+        let last_served = self.clock.fetch_add(1, Ordering::Relaxed);
+        self.streams
+            .lock()
+            .unwrap()
+            .insert(key, StreamEntry { buf, last_served });
+    }
+
+    /// Deregister on release; returns the bytes to uncharge.
+    pub fn deregister(&self, key: usize) {
+        let freed = {
+            let mut g = self.streams.lock().unwrap();
+            match g.remove(&key) {
+                Some(e) => e.buf.lock().unwrap().len(),
+                None => 0,
+            }
+        };
+        if freed > 0 {
+            self.charged.fetch_sub(freed, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark `key` as most-recently-served (LRU bump). No-op if unregistered.
+    pub fn touch(&self, key: usize) {
+        let stamp = self.clock.fetch_add(1, Ordering::Relaxed);
+        if let Some(e) = self.streams.lock().unwrap().get_mut(&key) {
+            e.last_served = stamp;
+        }
+    }
+
+    /// Decide the largest window (≤ `desired`, ≤ per-stream cap) a stream may grow
+    /// to right now, given a current size of `old_len`. Evicts colder OTHER
+    /// streams as needed to make room for the `(window - old_len)` delta, but does
+    /// NOT charge — charging happens in `reconcile` against the ACTUAL bytes read.
+    /// Never blocks on a buffer mutex (`try_lock` + skip). Call only on a miss.
+    pub fn permitted_window(&self, key: usize, old_len: u64, desired: u64) -> u64 {
+        if self.budget == 0 {
+            return 0;
+        }
+        let desired = desired.min(self.per_stream_cap()).max(old_len);
+        let need = desired - old_len;
+        loop {
+            let cur = self.charged.load(Ordering::Relaxed);
+            let room = self.budget.saturating_sub(cur);
+            if room >= need {
+                return desired;
+            }
+            // Try to evict the coldest OTHER stream to free room.
+            match self.evict_one_coldest(key) {
+                Some(_) => {}
+                None => {
+                    // Nothing evictable: permit only what fits now.
+                    return old_len + room;
+                }
+            }
+        }
+    }
+
+    /// Charge the budget by the ACTUAL window-size change `(old_len → new_len)`.
+    /// Keeps the invariant `charged == Σ(registered buffers' bytes.len())`.
+    pub fn reconcile(&self, old_len: u64, new_len: u64) {
+        if new_len > old_len {
+            self.charged.fetch_add(new_len - old_len, Ordering::Relaxed);
+        } else if new_len < old_len {
+            self.charged.fetch_sub(old_len - new_len, Ordering::Relaxed);
+        }
+    }
+
+    /// Uncharge `bytes` directly (window cleared on invalidation/release).
+    pub fn uncharge(&self, bytes: u64) {
+        if bytes > 0 {
+            self.charged.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Find and clear the coldest registered buffer other than `except`, using
+    /// `try_lock` so eviction never blocks on an in-progress read. Returns the
+    /// freed byte count, or `None` if nothing was evictable this pass.
+    fn evict_one_coldest(&self, except: usize) -> Option<u64> {
+        let candidates: Vec<(usize, u64, Arc<Mutex<ReadAhead>>)> = {
+            let g = self.streams.lock().unwrap();
+            let mut v: Vec<_> = g
+                .iter()
+                .filter(|(k, _)| **k != except)
+                .map(|(k, e)| (*k, e.last_served, Arc::clone(&e.buf)))
+                .collect();
+            v.sort_by_key(|(_, ls, _)| *ls); // coldest (smallest stamp) first
+            v
+        };
+        for (_, _, buf) in candidates {
+            if let Ok(mut ra) = buf.try_lock() {
+                let freed = ra.clear();
+                if freed > 0 {
+                    self.charged.fetch_sub(freed, Ordering::Relaxed);
+                    return Some(freed);
+                }
+            }
+        }
+        None
+    }
+}
 
 /// A single contiguous read-ahead window over a backing file, keyed by absolute
 /// backing-file offset. NOT thread-safe; the caller wraps it in a `Mutex` (one
@@ -214,6 +368,45 @@ mod window_tests {
         assert!(
             off + len as u64 <= 700 * 1024,
             "fill must not read past EOF"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pool_budget_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn disabled_pool_grants_nothing_and_reports_disabled() {
+        let pool = ReadAheadPool::new(0);
+        assert!(!pool.enabled());
+        assert_eq!(pool.per_stream_cap(), 0);
+    }
+
+    #[test]
+    fn per_stream_cap_is_budget_over_divisor_capped_by_abs() {
+        // 16 MiB budget / 4 = 4 MiB, below the 8 MiB abs cap.
+        let pool = ReadAheadPool::new(16 * 1024 * 1024);
+        assert_eq!(pool.per_stream_cap(), 4 * 1024 * 1024);
+        // Huge budget → abs cap wins.
+        let big = ReadAheadPool::new(1024 * 1024 * 1024);
+        assert_eq!(big.per_stream_cap(), WINDOW_ABS_CAP);
+    }
+
+    #[test]
+    fn permitted_window_grants_up_to_budget_then_clamps() {
+        let pool = ReadAheadPool::new(4 * 1024 * 1024);
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        pool.register(1, Arc::clone(&buf));
+        // Grow from 0 → 1 MiB: permitted fully, then charge the actual delta.
+        assert_eq!(pool.permitted_window(1, 0, 1024 * 1024), 1024 * 1024);
+        pool.reconcile(0, 1024 * 1024);
+        // charged is now 1 MiB; the per-stream cap is budget/4 = 1 MiB, so a
+        // request for 8 MiB is first capped to 1 MiB (== old_len) → no growth.
+        assert_eq!(
+            pool.permitted_window(1, 1024 * 1024, 8 * 1024 * 1024),
+            1024 * 1024
         );
     }
 }
