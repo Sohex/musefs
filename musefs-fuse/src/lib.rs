@@ -24,6 +24,7 @@ use musefs_core::convert::usize_from;
 use std::num::NonZeroU64;
 
 mod convert;
+mod metrics_dir;
 mod platform;
 
 /// Per-worker read scratch buffer: each threadpool worker reuses one Vec across
