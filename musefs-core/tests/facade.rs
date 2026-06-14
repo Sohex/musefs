@@ -1057,9 +1057,11 @@ fn open_handle_returns_distinct_ids_and_rejects_dirs() {
     assert!(matches!(fs.open_handle(artist), Err(CoreError::IsDir(_))));
 }
 
-#[test]
-fn read_through_handle_errors_after_backing_grows_in_place() {
-    use std::io::Write;
+/// Scaffold shared by the in-place backing-change tests: scan one FLAC, open a
+/// handle, warm the per-handle fast path, apply `mutate` to the backing file, then
+/// assert the next read through the held handle reports `BackingChanged` (drift
+/// detected on the held fd, not served silently).
+fn assert_backing_change_detected_through_handle(mutate: impl FnOnce(&std::path::Path)) {
     let dir = tempfile::tempdir().unwrap();
     let db = scanned_db(dir.path());
     let fs = Musefs::open(db, config()).unwrap();
@@ -1068,69 +1070,47 @@ fn read_through_handle_errors_after_backing_grows_in_place() {
     let size = fs.getattr(file_inode).unwrap().size;
 
     let fh = fs.open_handle(file_inode).unwrap();
-    // Warm the per-handle fast path.
     let warm = fs.read(file_inode, Some(fh), 0, size).unwrap();
     assert_eq!(warm.len() as u64, size);
 
-    // In-place grow (same inode), no DB change.
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(dir.path().join("a.flac"))
-            .unwrap();
-        f.write_all(&[0u8; 64]).unwrap();
-    }
+    mutate(&dir.path().join("a.flac"));
 
-    // Size drift must be detected on the held fd, not served silently.
     let err = fs.read(file_inode, Some(fh), 0, size).unwrap_err();
     assert!(matches!(err, CoreError::BackingChanged(_)), "got {err:?}");
+}
+
+#[test]
+fn read_through_handle_errors_after_backing_grows_in_place() {
+    use std::io::Write;
+    // In-place grow (same inode), no DB change.
+    assert_backing_change_detected_through_handle(|path| {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(&[0u8; 64]).unwrap();
+    });
 }
 
 #[test]
 fn read_through_handle_errors_after_backing_truncated_in_place() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = scanned_db(dir.path());
-    let fs = Musefs::open(db, config()).unwrap();
-    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
-    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
-    let size = fs.getattr(file_inode).unwrap().size;
-
-    let fh = fs.open_handle(file_inode).unwrap();
-    fs.read(file_inode, Some(fh), 0, size).unwrap(); // warm
-
     // Truncate in place (same inode): std::fs::write create+truncates the path.
-    std::fs::write(dir.path().join("a.flac"), [0xCDu8; 8]).unwrap();
-
-    let err = fs.read(file_inode, Some(fh), 0, size).unwrap_err();
-    assert!(matches!(err, CoreError::BackingChanged(_)), "got {err:?}");
+    assert_backing_change_detected_through_handle(|path| {
+        std::fs::write(path, [0xCDu8; 8]).unwrap();
+    });
 }
 
 #[test]
 fn read_through_handle_errors_after_same_length_rewrite_with_new_mtime() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("a.flac");
-    let db = scanned_db(dir.path());
-    let fs = Musefs::open(db, config()).unwrap();
-    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
-    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
-    let size = fs.getattr(file_inode).unwrap().size;
-
-    let fh = fs.open_handle(file_inode).unwrap();
-    fs.read(file_inode, Some(fh), 0, size).unwrap(); // warm
-
-    // Same-length in-place rewrite (same inode), then a distinct mtime second.
-    let original_len = std::fs::read(&path).unwrap().len();
-    std::fs::write(&path, vec![0xEEu8; original_len]).unwrap();
-    // mtime_secs is whole-second; the rewrite above lands in the scan's second,
-    // so set a deterministic, distinct timestamp. (Year ~2001 — well clear of
-    // the scan second regardless of wall clock.)
-    let distinct = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
-    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-    f.set_times(std::fs::FileTimes::new().set_modified(distinct))
-        .unwrap();
-
-    let err = fs.read(file_inode, Some(fh), 0, size).unwrap_err();
-    assert!(matches!(err, CoreError::BackingChanged(_)), "got {err:?}");
+    assert_backing_change_detected_through_handle(|path| {
+        // Same-length in-place rewrite (same inode), then a distinct mtime second.
+        // mtime_secs is whole-second; the rewrite lands in the scan's second, so
+        // set a deterministic, distinct timestamp (year ~2001 — well clear of the
+        // scan second regardless of wall clock).
+        let original_len = std::fs::read(path).unwrap().len();
+        std::fs::write(path, vec![0xEEu8; original_len]).unwrap();
+        let distinct = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(distinct))
+            .unwrap();
+    });
 }
 
 #[test]
