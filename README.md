@@ -68,11 +68,11 @@ Whichever you pick, mounting needs a 64-bit FUSE-capable OS (Linux, FreeBSD, mac
 > [!IMPORTANT]
 > Linux and FreeBSD are E2E tested. I don't have anything running macOS to test on, if you run this on one let me know if it works, or especially if it doesn't!
 >
-> At present only AMD64 and AARCH64 are supported. If you'd like 32-bit support please open an issue.
+> At present AMD64, AARCH64, and RISC-V 64 are supported. If you'd like 32-bit support please open an issue.
 
 ### Prebuilt binaries
 
-Each tagged release attaches static/portable Linux binaries for four targets:
+Each tagged release attaches static/portable Linux binaries for six targets:
 
 | Target | libc | Notes |
 | --- | --- | --- |
@@ -80,6 +80,8 @@ Each tagged release attaches static/portable Linux binaries for four targets:
 | `aarch64-unknown-linux-gnu` | glibc | glibc 2.17 floor, ARM64. |
 | `x86_64-unknown-linux-musl`  | musl | Fully static — runs on Alpine / scratch containers. |
 | `aarch64-unknown-linux-musl` | musl | Fully static, ARM64. |
+| `riscv64gc-unknown-linux-gnu` | glibc | glibc 2.27 floor, RISC-V 64. |
+| `riscv64gc-unknown-linux-musl` | musl | Fully static, RISC-V 64. |
 
 The `*-musl` build is statically linked, so it runs on **any** Linux host of
 that architecture regardless of libc — glibc distros (Debian/Ubuntu/Fedora)
