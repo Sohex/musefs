@@ -845,3 +845,62 @@ mod prefetch_worker_tests {
         assert_eq!(out, data[1024 * 1024..1024 * 1024 + 4096]);
     }
 }
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::FileExt;
+    use std::sync::Arc;
+
+    #[test]
+    fn concurrent_reads_same_handle_match_oracle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.bin");
+        #[expect(clippy::cast_sign_loss)]
+        let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+
+        let pool = Arc::new(ReadAheadPool::new(64 * 1024 * 1024));
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        pool.register(1, Arc::clone(&buf));
+
+        let backing_len = data.len() as u64;
+        let num_threads: u64 = 8;
+        let reads_per_thread = 200;
+
+        std::thread::scope(|s| {
+            for tid in 0..num_threads {
+                let file = Arc::clone(&file);
+                let buf = Arc::clone(&buf);
+                let pool = Arc::clone(&pool);
+                let epoch = Arc::clone(&epoch);
+                s.spawn(move || {
+                    let br = BackingReader::new(&file, &buf, &pool, 1, backing_len, &epoch);
+                    let mut rng_state: u64 = tid * 7919;
+                    for _ in 0..reads_per_thread {
+                        rng_state = rng_state
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1);
+                        let off = rng_state % (backing_len.saturating_sub(4096).max(1));
+                        #[expect(clippy::cast_possible_truncation)]
+                        let len = 4096usize.min((backing_len - off) as usize);
+                        let mut got = vec![0u8; len];
+                        br.read_exact_at(&mut got, off).unwrap();
+                        let mut expected = vec![0u8; len];
+                        file.read_exact_at(&mut expected, off).unwrap();
+                        assert_eq!(
+                            got, expected,
+                            "mismatch at off={off} len={len} from thread {tid}"
+                        );
+                    }
+                });
+            }
+        });
+    }
+}
