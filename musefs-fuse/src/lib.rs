@@ -69,6 +69,10 @@ pub struct FuseConfig {
     /// owner/mode bits. Non-root mounts also require `user_allow_other` in
     /// `/etc/fuse.conf` (validated at mount time).
     pub allow_other: bool,
+    /// Expose the `/proc`-style `.musefs-metrics/` telemetry namespace at the
+    /// mount root (#394). Default off; named distinctly from the compile-time
+    /// `metrics` cargo feature (which gates the syscall counters).
+    pub expose_metrics: bool,
 }
 
 impl Default for FuseConfig {
@@ -83,6 +87,7 @@ impl Default for FuseConfig {
             file_mode: 0o444,
             dir_mode: 0o555,
             allow_other: false,
+            expose_metrics: false,
         }
     }
 }

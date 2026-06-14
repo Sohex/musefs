@@ -297,6 +297,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         file_mode: args.file_mode.unwrap_or(defaults.file_mode),
         dir_mode: args.dir_mode.unwrap_or(defaults.dir_mode),
         allow_other: effective_allow_other(args.allow_other, args.owner, args.group),
+        expose_metrics: false,
     };
     (config, fuse_config)
 }
