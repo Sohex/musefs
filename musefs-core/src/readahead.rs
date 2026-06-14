@@ -70,14 +70,17 @@ impl ReadAheadPool {
             .insert(key, StreamEntry { buf, last_served });
     }
 
-    /// Deregister on release; returns the bytes to uncharge.
+    /// Deregister on release; returns the bytes to uncharge. Drops the `streams`
+    /// lock BEFORE locking the buffer: a concurrent read holds its buffer mutex
+    /// and then blocking-acquires `streams` (via `permitted_window`), so holding
+    /// `streams` while locking the buffer here would invert that order and
+    /// deadlock. Keeping `streams` a leaf (released before any buffer mutex)
+    /// preserves the pool's deadlock-free invariant.
     pub fn deregister(&self, key: usize) {
-        let freed = {
-            let mut g = self.streams.lock().unwrap();
-            match g.remove(&key) {
-                Some(e) => e.buf.lock().unwrap().len(),
-                None => 0,
-            }
+        let entry = self.streams.lock().unwrap().remove(&key);
+        let freed = match entry {
+            Some(e) => e.buf.lock().unwrap().len(),
+            None => 0,
         };
         if freed > 0 {
             self.charged.fetch_sub(freed, O::Relaxed);
@@ -1201,6 +1204,65 @@ mod concurrency_tests {
                         let mut got = vec![0u8; len];
                         br.read_exact_at(&mut got, off).unwrap();
                         assert_eq!(got, data[off as usize..off as usize + len]);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Regression for the deregister deadlock: `deregister` takes `streams` then
+    /// the buffer mutex, while a read holds the buffer mutex then blocking-locks
+    /// `streams` via `permitted_window` → eviction. Racing them on the same key
+    /// would deadlock if `deregister` held `streams` across the buffer lock.
+    /// Asserts bytes stay correct and the run completes; the tsan job's
+    /// deadlock detector flags a regression even without an actual hang.
+    #[test]
+    #[expect(clippy::cast_possible_truncation)]
+    fn deregister_races_reads_without_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dereg.bin");
+        let data: Vec<u8> = (0u64..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        let backing_len = data.len() as u64;
+
+        // Small budget so reads miss and run permitted_window → eviction, which
+        // blocking-locks `streams` while the read holds the buffer mutex.
+        let pool = Arc::new(ReadAheadPool::new(1024 * 1024));
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        pool.register(1, Arc::clone(&buf));
+        // A second registered stream gives eviction a candidate to walk.
+        let buf2 = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        pool.register(2, Arc::clone(&buf2));
+
+        std::thread::scope(|s| {
+            for tid in 0..4u64 {
+                let (file, buf, pool, epoch, data) = (&file, &buf, &pool, &epoch, &data);
+                s.spawn(move || {
+                    let br = BackingReader::new(file, buf, pool, 1, backing_len, epoch);
+                    let mut rng = tid * 7919 + 1;
+                    for _ in 0..300 {
+                        rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        let off = rng % backing_len.saturating_sub(4096).max(1);
+                        let len = 4096usize.min((backing_len - off) as usize);
+                        let mut got = vec![0u8; len];
+                        br.read_exact_at(&mut got, off).unwrap();
+                        assert_eq!(got, data[off as usize..off as usize + len]);
+                    }
+                });
+            }
+            // Churn registration of the SAME key the readers use — the path that
+            // takes `streams` and then the buffer mutex.
+            {
+                let (pool, buf) = (&pool, &buf);
+                s.spawn(move || {
+                    for _ in 0..2000 {
+                        pool.deregister(1);
+                        pool.register(1, Arc::clone(buf));
                     }
                 });
             }
