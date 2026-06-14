@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Same-runner A/B wall-clock comparison of the read_throughput criterion bench.
 # Benches the base ref and HEAD back-to-back on ONE machine (robust to
-# runner-to-runner variance), then diffs with critcmp. Warn-only: always exits 0.
+# runner-to-runner variance), then diffs with critcmp. The job that invokes this
+# is informational (excluded from the ci-ok gate); a build/bench failure here
+# surfaces as a red job rather than being swallowed.
 #
 # Usage: scripts/perf-ab.sh <base-sha> <out-markdown-file>
 # Requires: cargo, critcmp on PATH. Run from the repo root with a clean tree.

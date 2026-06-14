@@ -434,7 +434,9 @@ jobs:
   perf-ab:
     name: Read A/B (warn-only)
     needs: changes
-    if: needs.changes.outputs.perf == 'true'
+    # PR-only: on push/tag events `pull_request.base.sha` is empty, so the A/B
+    # script has no base to bench against. The job is informational anyway.
+    if: needs.changes.outputs.perf == 'true' && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
