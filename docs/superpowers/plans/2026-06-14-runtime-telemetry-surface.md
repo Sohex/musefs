@@ -256,7 +256,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register the module.** Edit `musefs-core/src/lib.rs`: add `mod telemetry;` in the module list (alphabetically, after `mod template;` / before `mod tree;`) and append to the `pub use` block:
+- [ ] **Step 2: Register the module.** Edit `musefs-core/src/lib.rs`: add `mod telemetry;` in the module list (alphabetically, after `mod template;` / before `mod tree;`) and insert into the `pub use` block **between the `scan::{…}` and `template::{…}` lines** (keeping the block alphabetical by module):
 
 ```rust
 pub use telemetry::{
@@ -422,12 +422,42 @@ In `release_handle`, replace the body:
     }
 ```
 
-Add a test in the `facade.rs` test module:
+Add this **self-contained** test to the `facade.rs` test module — it mirrors the exact fixture pattern of the existing `open_handle_reresolves_after_content_version_bump` test (`facade.rs:1265`), which builds a real backing mp3 that `open_handle`'s `File::open` + `validate_opened_backing` require (an in-memory fixture won't satisfy them):
 
 ```rust
     #[test]
     fn telemetry_counts_open_handles() {
-        let (fs, file_inode) = telemetry_test_fixture(); // see note below
+        use crate::scan::scan_directory;
+        use id3::TagLike;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tag = id3::Tag::new();
+            tag.set_artist("Pix");
+            tag.set_title("Song");
+            let mut bytes = Vec::new();
+            tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+            bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+            std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+        }
+        let db_path = dir.path().join("m.db");
+        {
+            let db = musefs_db::Db::open(&db_path).unwrap();
+            scan_directory(&db, dir.path()).unwrap();
+        }
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+        };
+        let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+        let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+        let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+
         let base = fs.telemetry().handles_open;
         let fh = fs.open_handle(file_inode).unwrap();
         assert_eq!(fs.telemetry().handles_open, base + 1);
@@ -435,8 +465,6 @@ Add a test in the `facade.rs` test module:
         assert_eq!(fs.telemetry().handles_open, base);
     }
 ```
-
-Note: reuse whatever existing helper builds a `Musefs` + a file inode in `facade.rs` tests (e.g. the fixture used by `getattr_size_cache_hit_detects_backing_change` near `facade.rs:1942`). Name the test's fixture call to match the existing helper; do **not** introduce a new fixture if one exists.
 
 - [ ] **Step 6: Re-anchor mutants (tree.rs was edited).**
 
@@ -479,6 +507,11 @@ Mirrors `platform/spotlight.rs`: reserved inodes, `lookup`, attr builders, dir e
 //! rationale: `InodeAllocator` starts at 2 and only increments with no ceiling,
 //! so the top band is unreachable in practice (a fixed mid-range constant would
 //! NOT be safe). They are disjoint from the macOS marker (`u64::MAX`).
+
+// These items are consumed by the FUSE dispatch in Task 7; until then the
+// lib-target build sees them as unused. This allow keeps the intermediate
+// commit green under `clippy -D warnings`. REMOVED in Task 7 once wired.
+#![allow(dead_code)]
 
 use std::time::SystemTime;
 
@@ -620,7 +653,7 @@ mod metrics_dir;
 - [ ] **Step 3: Test + lint.**
 
 Run: `cargo test -p musefs-fuse metrics_dir` then `cargo clippy -p musefs-fuse --all-targets -- -D warnings`
-Expected: PASS / clean. (clippy may warn unused functions until Task 7 wires them; if so, the commit at Step 4 is still fine because the test references each — but if clippy `-D warnings` flags `dead_code`, add `#[allow(dead_code)]` on the module temporarily and REMOVE it in Task 7. Prefer to land Tasks 3+7 close together.)
+Expected: PASS / clean. The module-level `#![allow(dead_code)]` (Step 1) makes this deterministic — without it, the lib-target build flags every `pub fn` as unused until Task 7. The allow is removed in Task 7 Step 11.
 
 - [ ] **Step 4: Commit.**
 
@@ -688,6 +721,9 @@ One method on both cfg arms: `Some((disabled, active))` on Linux, `None` on the 
 ```rust
         /// Telemetry: `(sticky-disabled, live backing registrations)`. The map
         /// length is read under its lock (scrapes are rare). `#394`.
+        // `allow`: consumed in Task 6's `render_metrics`, which is itself only
+        // reachable after Task 7 wires dispatch. REMOVED in Task 7 Step 11.
+        #[allow(dead_code)]
         pub fn telemetry(&self) -> Option<(bool, u64)> {
             let active = self
                 .backing
@@ -702,7 +738,8 @@ One method on both cfg arms: `Some((disabled, active))` on Linux, `None` on the 
 
 ```rust
         /// No passthrough off Linux; telemetry is absent.
-        #[allow(clippy::unused_self)]
+        // See the Linux arm: REMOVE the `dead_code` allow in Task 7 Step 11.
+        #[allow(clippy::unused_self, dead_code)]
         pub fn telemetry(&self) -> Option<(bool, u64)> {
             None
         }
@@ -713,7 +750,7 @@ One method on both cfg arms: `Some((disabled, active))` on Linux, `None` on the 
 - [ ] **Step 4: Build + lint.**
 
 Run: `cargo build -p musefs-fuse` then `cargo clippy -p musefs-fuse --all-targets -- -D warnings`
-Expected: clean (the method is used in Task 6/7; if `dead_code` fires under `-D warnings`, proceed — it's consumed two tasks later; land close together, or temporarily `#[allow(dead_code)]` and remove in Task 7).
+Expected: clean — the `#[allow(dead_code)]` added on both arms (Steps 1–2) makes this deterministic; it is removed in Task 7 Step 11.
 
 - [ ] **Step 5: Commit.**
 
@@ -748,10 +785,13 @@ tikv-jemalloc-ctl = { version = "0.7", optional = true }
 
 - [ ] **Step 2: Add the probe helpers + gather method.** In `musefs-fuse/src/lib.rs`, add these free functions near the top-level helpers (e.g. after `open_flags`):
 
+All three helpers + `render_metrics` below are consumed by the dispatch in Task 7; the `#[allow(dead_code)]` keeps this commit green under `clippy -D warnings` and is removed in Task 7 Step 11.
+
 ```rust
 /// jemalloc allocator stats, or `None` when not built with the `jemalloc`
 /// feature (or when the ctls fail — best-effort, never panics). #394.
 #[cfg(feature = "jemalloc")]
+#[allow(dead_code)]
 fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
     use tikv_jemalloc_ctl::{epoch, stats};
     epoch::advance().ok()?;
@@ -764,17 +804,20 @@ fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
 }
 
 #[cfg(not(feature = "jemalloc"))]
+#[allow(dead_code)]
 fn allocator_stats() -> Option<musefs_core::AllocatorStats> {
     None
 }
 
 /// Serve-path syscall counters, present only on a `metrics`-feature build.
 #[cfg(feature = "metrics")]
+#[allow(dead_code)]
 fn syscall_snapshot() -> Option<musefs_core::metrics::Snapshot> {
     Some(musefs_core::metrics::snapshot())
 }
 
 #[cfg(not(feature = "metrics"))]
+#[allow(dead_code)]
 fn syscall_snapshot() -> Option<musefs_core::metrics::Snapshot> {
     None
 }
@@ -786,6 +829,8 @@ Add the gather method inside `impl MusefsFs` (near `fire_poll_refresh`):
     /// Assemble and render the `.musefs-metrics/metrics` body (#394). Best-effort:
     /// every source is an atomic load, a brief lock, or a fallible probe mapped to
     /// `None`/0; nothing here can panic the daemon or perturb a read.
+    // `allow`: reachable only after Task 7 wires `open`. REMOVED in Task 7 Step 11.
+    #[allow(dead_code)]
     fn render_metrics(&self) -> Vec<u8> {
         let core = self.core.telemetry();
         let dir_handles = self
@@ -826,7 +871,7 @@ Expected: all clean. (The `jemalloc` build compiles the ctl calls; they're only 
 - [ ] **Step 4: Lint.**
 
 Run: `cargo clippy -p musefs-fuse --all-targets -- -D warnings`
-Expected: clean. (`render_metrics` is unused until Task 7; if `-D warnings` flags it, land Task 7 in the same session — do not add a permanent `#[allow]`.)
+Expected: clean — the `#[allow(dead_code)]` on `render_metrics` and the two probe helpers makes this deterministic. All of these allows are removed in Task 7 Step 11.
 
 - [ ] **Step 5: Commit.**
 
@@ -1037,24 +1082,12 @@ And change the fallback line inside `readdir`:
 Run: `grep -n "build_dir_listing(" musefs-fuse/src/lib.rs`
 Expected: every call passes three args.
 
-- [ ] **Step 11: Add a dispatch unit test (no real mount needed for `render_metrics` shape).** In the `lib.rs` test module, add:
+- [ ] **Step 11: Remove the now-unnecessary dead-code allows.** All the items they covered are now reachable through `open`/`read`/`release`/`opendir`/`readdir`/`lookup`/`getattr`. Delete:
+  - the module-level `#![allow(dead_code)]` at the top of `musefs-fuse/src/metrics_dir.rs` (Task 3);
+  - the `#[allow(dead_code)]` on both `PassthroughState::telemetry()` arms (Task 5) — leave the non-Linux arm's `#[allow(clippy::unused_self)]`;
+  - the `#[allow(dead_code)]` on `render_metrics`, `allocator_stats`, and `syscall_snapshot` (Task 6).
 
-```rust
-    #[test]
-    fn build_dir_listing_appends_metrics_entry_only_when_exposed() {
-        // Uses the existing test core builder in this module; if the helper is
-        // named differently, match it. Builds a Musefs over a tiny fixture DB.
-        let (_dir, core) = test_core(); // <-- match existing helper name
-        let without = build_dir_listing(&core, 1, false).unwrap();
-        assert!(!without.iter().any(|(_, _, n)| n == metrics_dir::METRICS_DIR_NAME));
-        let with = build_dir_listing(&core, 1, true).unwrap();
-        assert!(with.iter().any(|(ino, _, n)| {
-            *ino == metrics_dir::METRICS_DIR_INO && n == metrics_dir::METRICS_DIR_NAME
-        }));
-    }
-```
-
-If no in-module `Musefs` builder exists, skip this test and rely on the e2e (Task 10) — do not invent a heavyweight fixture. Remove any temporary `#[allow(dead_code)]` added in Tasks 3/5/6.
+  (The root-readdir append behavior is verified by the Task 10 e2e assertion #5; no fragile in-module `Musefs` fixture is introduced here, because `build_dir_listing` needs a `&Musefs` that the `MusefsFs`-returning `test_fs()` helper does not expose.)
 
 - [ ] **Step 12: Test + lint (all combos).**
 
@@ -1062,15 +1095,16 @@ Run:
 ```bash
 cargo test -p musefs-fuse
 cargo test -p musefs-fuse --features metrics
+cargo clippy -p musefs-fuse --all-targets -- -D warnings
 cargo clippy -p musefs-fuse --all-targets --features metrics -- -D warnings
 cargo clippy -p musefs-fuse --all-targets --features jemalloc -- -D warnings
 ```
-Expected: PASS / clean.
+Expected: PASS / clean (the no-feature clippy confirms the dead-code allows were correctly removed in Step 11).
 
-- [ ] **Step 13: Commit.**
+- [ ] **Step 13: Commit.** (Step 11 also edited `metrics_dir.rs` and `passthrough.rs` — stage them too.)
 
 ```bash
-git add musefs-fuse/src/lib.rs
+git add musefs-fuse/src/lib.rs musefs-fuse/src/metrics_dir.rs musefs-fuse/src/platform/passthrough.rs
 git commit -m "feat(fuse): wire .musefs-metrics into FUSE dispatch (#394)"
 ```
 
@@ -1135,7 +1169,7 @@ git commit -m "build: forward jemalloc feature to musefs-fuse for the allocator 
         expose_metrics: args.expose_metrics,
 ```
 
-- [ ] **Step 3: Extend the CLI test.** In `mount_args_parse_into_configs`, add `"--expose-metrics", "true",` to the args array and assert:
+- [ ] **Step 3: Extend the CLI test.** The `#[arg]` above (matching `allow_other`/`keep_cache`, no `action = Set`) makes this a **bare `SetTrue` flag** — clap takes **no value**. Passing `"--expose-metrics", "true"` would make clap treat `"true"` as an unexpected positional and panic the parse. So add the **bare** `"--expose-metrics",` to the `mount_args_parse_into_configs` args array (NOT `"--expose-metrics", "true"`) and assert:
 
 ```rust
         assert!(fuse_config.expose_metrics);
