@@ -130,3 +130,86 @@ fn scan_fails_fast_on_a_bad_target() {
     );
     assert!(result.is_err());
 }
+
+fn write_n_flacs(dir: &std::path::Path, n: usize) {
+    for i in 0..n {
+        let title = format!("TITLE=T{i}");
+        std::fs::write(
+            dir.join(format!("t{i:02}.flac")),
+            make_flac(&[title.as_str()], &[0xAB; 32]),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn scan_with_progress_ingests_all_files() {
+    let backing = tempfile::tempdir().unwrap();
+    write_n_flacs(backing.path(), 20);
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("musefs.db");
+
+    run_scan(
+        &db_path,
+        &[backing.path().to_path_buf()],
+        false,
+        0,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let db = musefs_db::Db::open(&db_path).unwrap();
+    assert_eq!(db.list_tracks().unwrap().len(), 20);
+}
+
+#[test]
+fn quiet_scan_still_ingests_all_files() {
+    let backing = tempfile::tempdir().unwrap();
+    write_n_flacs(backing.path(), 20);
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("musefs.db");
+
+    run_scan(
+        &db_path,
+        &[backing.path().to_path_buf()],
+        false,
+        0,
+        false,
+        true,
+    )
+    .unwrap();
+
+    let db = musefs_db::Db::open(&db_path).unwrap();
+    assert_eq!(db.list_tracks().unwrap().len(), 20);
+}
+
+#[test]
+fn revalidate_with_progress_reports_unchanged() {
+    let backing = tempfile::tempdir().unwrap();
+    write_n_flacs(backing.path(), 20);
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("musefs.db");
+
+    run_scan(
+        &db_path,
+        &[backing.path().to_path_buf()],
+        false,
+        0,
+        false,
+        false,
+    )
+    .unwrap();
+    run_scan(
+        &db_path,
+        &[backing.path().to_path_buf()],
+        true,
+        0,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let db = musefs_db::Db::open(&db_path).unwrap();
+    assert_eq!(db.list_tracks().unwrap().len(), 20);
+}

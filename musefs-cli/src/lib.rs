@@ -2,12 +2,17 @@
 //! SQLite store) and `mount` (serve a read-only FUSE view of that store).
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use indicatif::HumanDuration;
 use musefs_core::{MountConfig, Musefs};
 use musefs_db::Db;
 
+use crate::progress::ScanReporter;
+
+mod progress;
 mod signal;
 
 /// Mount content mode (CLI surface for `musefs_core::Mode`).
@@ -181,23 +186,28 @@ pub fn run_scan(
 ) -> Result<()> {
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
+    let reporter = ScanReporter::new(quiet);
     let opts = musefs_core::ScanOptions {
         jobs,
         follow_symlinks,
+        progress: reporter.sink(),
         ..Default::default()
     };
     for target in targets {
+        reporter.start_target();
+        let start = Instant::now();
         if revalidate {
             let stats = musefs_core::revalidate_with(&db, target, &opts)
                 .with_context(|| format!("revalidating {}", target.display()))?;
             if !quiet {
                 println!(
-                    "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed",
+                    "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed in {}",
                     target.display(),
                     stats.updated,
                     stats.unchanged,
                     stats.pruned,
-                    stats.failed
+                    stats.failed,
+                    HumanDuration(start.elapsed()),
                 );
             }
         } else {
@@ -205,15 +215,17 @@ pub fn run_scan(
                 .with_context(|| format!("scanning {}", target.display()))?;
             if !quiet {
                 println!(
-                    "scanned {}: {} file(s), skipped {}, failed {}",
+                    "scanned {}: {} file(s), skipped {}, failed {} in {}",
                     target.display(),
                     stats.scanned,
                     stats.skipped,
-                    stats.failed
+                    stats.failed,
+                    HumanDuration(start.elapsed()),
                 );
             }
         }
     }
+    reporter.finish();
     Ok(())
 }
 
