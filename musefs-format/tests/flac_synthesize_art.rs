@@ -2,17 +2,9 @@ mod common;
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use common::{make_flac, resolve_layout, streaminfo_body, vorbis_comment_body};
+use common::{flac_fixture, resolve_layout, streaminfo_body};
 use musefs_format::flac::{MetadataBlock, locate_audio, synthesize_layout};
 use musefs_format::{ArtInput, BlobLen, PictureType, Segment, TagInput};
-
-fn fixture() -> (Vec<u8>, Vec<u8>) {
-    let si = streaminfo_body();
-    let vc = vorbis_comment_body("oldvendor", &["TITLE=Old"]);
-    let audio = vec![0xCD; 80];
-    let file = make_flac(&[(0, si), (4, vc)], &audio);
-    (file, audio)
-}
 
 fn cover(art_id: i64, data_len: u64) -> ArtInput {
     ArtInput {
@@ -28,7 +20,7 @@ fn cover(art_id: i64, data_len: u64) -> ArtInput {
 
 #[test]
 fn art_becomes_an_artimage_segment_and_lengths_are_exact() {
-    let (file, audio) = fixture();
+    let (file, audio) = flac_fixture(0xCD, 80);
     let scan = locate_audio(&file).unwrap();
 
     let image = vec![0x77u8; 1234];
@@ -69,7 +61,7 @@ fn art_becomes_an_artimage_segment_and_lengths_are_exact() {
 
 #[test]
 fn metaflac_reads_synthesized_picture() {
-    let (file, _audio) = fixture();
+    let (file, _audio) = flac_fixture(0xCD, 80);
     let scan = locate_audio(&file).unwrap();
 
     let image = vec![0x77u8; 1234];
@@ -126,7 +118,7 @@ fn synthesize_errors_on_oversized_picture() {
 fn multiple_valid_art_keeps_block_framing_valid() {
     // Guards the `is_last` flag: with only valid art, the final PICTURE block
     // carries its last-block bit. metaflac parsing the whole chain validates that.
-    let (file, _audio) = fixture();
+    let (file, _audio) = flac_fixture(0xCD, 80);
     let scan = locate_audio(&file).unwrap();
     let image = vec![0x55u8; 64];
     let real = cover(2, image.len() as u64);

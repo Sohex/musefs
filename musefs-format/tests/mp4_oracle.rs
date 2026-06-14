@@ -3,27 +3,12 @@
 //! samples read through OUR patched chunk offsets are byte-identical to the
 //! originals — proving the offset surgery.
 
-use musefs_format::{ArtInput, BlobLen, PictureType, RegionLayout, Segment, TagInput, mp4};
-use std::io::Cursor;
+mod common;
 
-fn materialize(layout: &RegionLayout, backing: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for seg in layout.segments() {
-        match seg {
-            Segment::Inline(b) => out.extend_from_slice(b),
-            Segment::BackingAudio { offset, len } => {
-                let s = usize::try_from(*offset).unwrap();
-                let e = usize::try_from(*offset + *len).unwrap();
-                out.extend_from_slice(&backing[s..e]);
-            }
-            Segment::ArtImage { .. } => unreachable!("no art in this fixture"),
-            Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
-            Segment::OggArtSlice { .. } => unreachable!("OggArtSlice only in ogg synthesis"),
-            Segment::BinaryTag { .. } => unreachable!("no binary tags in this fixture"),
-        }
-    }
-    out
-}
+use common::resolve_layout;
+use musefs_format::{ArtInput, BlobLen, PictureType, TagInput, mp4};
+use std::collections::HashMap;
+use std::io::Cursor;
 
 fn samples(bytes: &[u8]) -> Vec<Vec<u8>> {
     // `::mp4` is the external oracle crate; `mp4` (no leading `::`) is our own module.
@@ -55,7 +40,7 @@ fn synthesized_m4a_decodes_via_independent_parser() {
         &[],
     )
     .unwrap();
-    let synth = materialize(&layout, &original);
+    let synth = resolve_layout(&layout, &original, &HashMap::new(), &HashMap::new());
 
     // Independent parser reads samples through OUR patched offsets; must match.
     // Guard against a vacuous `[] == []` pass if a fixture/parser change ever

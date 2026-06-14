@@ -1,35 +1,8 @@
+mod common;
+
+use common::{build_wav, fmt_pcm_16bit_mono};
 use id3::{TagLike, Version};
 use musefs_format::wav::{read_pictures, read_tags};
-
-fn fmt_pcm_16bit_mono() -> Vec<u8> {
-    let mut f = Vec::new();
-    f.extend_from_slice(&1u16.to_le_bytes());
-    f.extend_from_slice(&1u16.to_le_bytes());
-    f.extend_from_slice(&44_100u32.to_le_bytes());
-    f.extend_from_slice(&88_200u32.to_le_bytes());
-    f.extend_from_slice(&2u16.to_le_bytes());
-    f.extend_from_slice(&16u16.to_le_bytes());
-    f
-}
-
-/// Build a RIFF/WAVE file from `(fourcc, payload)` chunks in order.
-fn build_wav(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
-    let mut body = Vec::new();
-    for (id, payload) in chunks {
-        body.extend_from_slice(*id);
-        body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
-        body.extend_from_slice(payload);
-        if payload.len() % 2 == 1 {
-            body.push(0x00);
-        }
-    }
-    let mut out = Vec::new();
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(&body);
-    out
-}
 
 /// An `INFO` payload (FourCC + NUL-terminated, word-aligned subchunk values).
 fn info_payload(pairs: &[(&[u8; 4], &str)]) -> Vec<u8> {

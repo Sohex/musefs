@@ -1,28 +1,12 @@
+mod common;
+
+use std::collections::HashMap;
 use std::io::Cursor;
 
+use common::resolve_layout;
 use id3::TagLike;
 use musefs_format::mp3::synthesize_layout;
-use musefs_format::{ArtInput, BlobLen, PictureType, RegionLayout, Segment, TagInput};
-
-/// Flatten a layout into a byte buffer, substituting `audio` for the backing-audio
-/// segment and the matching bytes for each `ArtImage` segment.
-fn assemble(layout: &RegionLayout, audio: &[u8], arts: &[(i64, &[u8])]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for seg in layout.segments() {
-        match seg {
-            Segment::Inline(b) => out.extend_from_slice(b),
-            Segment::BackingAudio { .. } => out.extend_from_slice(audio),
-            Segment::ArtImage { art_id, .. } => {
-                let bytes = arts.iter().find(|(id, _)| id == art_id).unwrap().1;
-                out.extend_from_slice(bytes);
-            }
-            Segment::OggAudio { .. } => unreachable!("no Ogg audio in this fixture"),
-            Segment::OggArtSlice { .. } => unreachable!("OggArtSlice only in ogg synthesis"),
-            Segment::BinaryTag { .. } => unreachable!("no binary tags in this fixture"),
-        }
-    }
-    out
-}
+use musefs_format::{ArtInput, BlobLen, PictureType, Segment, TagInput};
 
 /// Decode the 28-bit syncsafe ID3v2 tag-size field from the 10-byte header.
 fn header_size_field(bytes: &[u8]) -> u64 {
@@ -43,7 +27,7 @@ fn synthesizes_id3v24_text_frames_and_preserves_audio() {
     let layout = synthesize_layout(0, audio.len() as u64, &tags, &[], &[]).unwrap();
 
     // total_len must equal the bytes actually produced (generate-and-measure).
-    let bytes = assemble(&layout, &audio, &[]);
+    let bytes = resolve_layout(&layout, &audio, &HashMap::new(), &HashMap::new());
     assert_eq!(bytes.len() as u64, layout.total_len());
 
     // Independent oracle: the id3 crate parses our synthesized tag.
@@ -80,7 +64,12 @@ fn synthesizes_apic_with_streamed_image_bytes() {
             .any(|s| matches!(s, Segment::ArtImage { art_id: 7, len, .. } if len.get() == 200))
     );
 
-    let bytes = assemble(&layout, &audio, &[(7, &art_bytes)]);
+    let bytes = resolve_layout(
+        &layout,
+        &audio,
+        &HashMap::from([(7i64, art_bytes.clone())]),
+        &HashMap::new(),
+    );
     assert_eq!(bytes.len() as u64, layout.total_len());
 
     let tag = id3::Tag::read_from2(Cursor::new(&bytes)).unwrap();
@@ -108,7 +97,12 @@ fn embedded_size_field_matches_the_frame_region() {
         data_len: BlobLen::new(art_bytes.len() as u64).unwrap(),
     }];
     let layout = synthesize_layout(0, audio.len() as u64, &tags, &[], &arts).unwrap();
-    let bytes = assemble(&layout, &audio, &[(1, &art_bytes)]);
+    let bytes = resolve_layout(
+        &layout,
+        &audio,
+        &HashMap::from([(1i64, art_bytes.clone())]),
+        &HashMap::new(),
+    );
 
     // Verify the 10-byte ID3v2.4 header magic and version/flags.
     assert_eq!(&bytes[0..3], b"ID3");
@@ -139,7 +133,7 @@ fn empty_tag_when_no_tags_or_art() {
         Segment::BackingAudio { .. }
     ));
 
-    let bytes = assemble(&layout, &audio, &[]);
+    let bytes = resolve_layout(&layout, &audio, &HashMap::new(), &HashMap::new());
 
     // The 10-byte ID3v2.4 header must be well-formed with size == 0.
     assert_eq!(&bytes[0..3], b"ID3");
@@ -159,7 +153,7 @@ fn unknown_key_becomes_txxx() {
     let audio = [0xFFu8, 0xFB, 0, 0];
     let tags = vec![TagInput::new("mood", "calm")];
     let layout = synthesize_layout(0, audio.len() as u64, &tags, &[], &[]).unwrap();
-    let bytes = assemble(&layout, &audio, &[]);
+    let bytes = resolve_layout(&layout, &audio, &HashMap::new(), &HashMap::new());
 
     let tag = id3::Tag::read_from2(Cursor::new(&bytes)).unwrap();
     let txxx = tag
@@ -177,7 +171,7 @@ fn multi_value_text_frame_round_trips() {
         TagInput::new("artist", "Bob"),
     ];
     let layout = synthesize_layout(0, audio.len() as u64, &tags, &[], &[]).unwrap();
-    let bytes = assemble(&layout, &audio, &[]);
+    let bytes = resolve_layout(&layout, &audio, &HashMap::new(), &HashMap::new());
 
     let tag = id3::Tag::read_from2(Cursor::new(&bytes)).unwrap();
     // TPE1 frame carries both values NUL-joined; split and assert both survive.
@@ -232,7 +226,12 @@ fn multiple_art_frames_keep_order() {
         .collect();
     assert_eq!(art_segs, vec![1, 2]);
 
-    let bytes = assemble(&layout, &audio, &[(1, &art1), (2, &art2)]);
+    let bytes = resolve_layout(
+        &layout,
+        &audio,
+        &HashMap::from([(1i64, art1.clone()), (2i64, art2.clone())]),
+        &HashMap::new(),
+    );
     let tag = id3::Tag::read_from2(Cursor::new(&bytes)).unwrap();
 
     let pics: Vec<_> = tag.pictures().collect();
