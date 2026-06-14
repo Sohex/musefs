@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -323,3 +324,410 @@ def test_load_mutants_from_json():
 def test_load_mutants_empty_is_error():
     with pytest.raises(ValueError):
         g.load_mutants("[]")
+
+
+def test_wildcard_coords_bare_prefix():
+    assert g._wildcard_coords(r"musefs-core/src/scan\.rs:1041:32:") == (
+        r"musefs-core/src/scan\.rs:\d+:\d+:"
+    )
+
+
+def test_wildcard_coords_preserves_repl_suffix():
+    assert g._wildcard_coords(r"musefs-core/src/scan\.rs:1212:29: replace \+ with -") == (
+        r"musefs-core/src/scan\.rs:\d+:\d+: replace \+ with -"
+    )
+
+
+def test_wildcard_coords_replaces_only_first_linecol():
+    # the suffix's own digits must survive untouched
+    assert g._wildcard_coords(r"foo/bar\.rs:10:20: replace 1 with 2") == (
+        r"foo/bar\.rs:\d+:\d+: replace 1 with 2"
+    )
+
+
+def test_entry_coords_parses_line_col():
+    assert g._entry_coords(r"musefs-core/src/scan\.rs:1041:32:") == (1041, 32)
+    assert g._entry_coords(r"musefs-core/src/scan\.rs:1212:29: replace \+ with -") == (1212, 29)
+
+
+def test_candidate_mutants_bare_prefix_filters_by_op_fn():
+    entry = g.Entry(
+        r"musefs-core/src/scan\.rs:277:30:",
+        1,
+        g.Tag(op="<", fn="probe_file", fn_present=True, rows=1),
+    )
+    muts = [
+        _m("musefs-core/src/scan.rs:300:30: replace < with == in probe_file"),
+        _m("musefs-core/src/scan.rs:305:10: replace + with - in probe_file"),  # wrong op
+        _m("musefs-core/src/scan.rs:310:10: replace < with == in other_fn"),  # wrong fn
+    ]
+    got = g._candidate_mutants(entry, muts)
+    assert [m.site for m in got] == [("musefs-core/src/scan.rs", 300, 30)]
+
+
+def test_candidate_mutants_repl_suffix_narrows():
+    entry = g.Entry(
+        r"musefs-core/src/scan\.rs:1212:29: replace \+ with -",
+        1,
+        g.Tag(op="+", fn="revalidate_with", fn_present=True, rows=1),
+    )
+    muts = [
+        _m("musefs-core/src/scan.rs:1220:29: replace + with - in revalidate_with"),
+        _m("musefs-core/src/scan.rs:1220:29: replace + with * in revalidate_with"),
+        # ^ suffix mismatch — different repl
+    ]
+    got = g._candidate_mutants(entry, muts)
+    assert [m.repl for m in got] == ["-"]
+
+
+def test_candidate_mutants_empty_fn_matches_free_function():
+    entry = g.Entry(
+        r"musefs-core/src/reader\.rs:71:60: replace / with [%*]",
+        1,
+        g.Tag(op="/", fn="", fn_present=True, rows=2),
+    )
+    muts = [
+        _m("musefs-core/src/reader.rs:80:60: replace / with %"),
+        _m("musefs-core/src/reader.rs:80:60: replace / with *"),
+    ]
+    got = g._candidate_mutants(entry, muts)
+    assert {m.site for m in got} == {("musefs-core/src/reader.rs", 80, 60)}
+    assert len(got) == 2
+
+
+def test_compute_rewrites_simple_shift():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:277:30:",
+            3,
+            g.Tag(op="<", fn="probe_file", fn_present=True, rows=1),
+        )
+    ]
+    muts = [_m("musefs-core/src/scan.rs:300:30: replace < with == in probe_file")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert skips == [] and skipped == set()
+    assert len(rewrites) == 1
+    assert (rewrites[0].entry.toml_line, rewrites[0].line, rewrites[0].col) == (3, 300, 30)
+
+
+def test_compute_rewrites_no_drift_is_noop():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:277:30:",
+            3,
+            g.Tag(op="<", fn="probe_file", fn_present=True, rows=1),
+        )
+    ]
+    muts = [_m("musefs-core/src/scan.rs:277:30: replace < with == in probe_file")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skips == [] and skipped == set()
+
+
+def test_compute_rewrites_multisite_positional():
+    # two >= anchors in run_pipeline, both shifted down 2 lines; map low->low, high->high
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1041:32:",
+            5,
+            g.Tag(op=">=", fn="run_pipeline", fn_present=True, rows=1),
+        ),
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1051:40:",
+            9,
+            g.Tag(op=">=", fn="run_pipeline", fn_present=True, rows=1),
+        ),
+    ]
+    muts = [
+        _m("musefs-core/src/scan.rs:1043:32: replace >= with > in run_pipeline"),
+        _m("musefs-core/src/scan.rs:1053:40: replace >= with > in run_pipeline"),
+    ]
+    rewrites, skips, _ = g.compute_rewrites(entries, muts)
+    assert skips == []
+    assert {(r.entry.toml_line, r.line, r.col) for r in rewrites} == {
+        (5, 1043, 32),
+        (9, 1053, 40),
+    }
+
+
+def test_compute_rewrites_repl_suffixed():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1212:29: replace \+ with -",
+            3,
+            g.Tag(op="+", fn="revalidate_with", fn_present=True, rows=1),
+        )
+    ]
+    muts = [
+        _m("musefs-core/src/scan.rs:1220:29: replace + with - in revalidate_with"),
+        _m("musefs-core/src/scan.rs:1220:29: replace + with * in revalidate_with"),
+    ]
+    rewrites, skips, _ = g.compute_rewrites(entries, muts)
+    assert skips == []
+    assert len(rewrites) == 1 and (rewrites[0].line, rewrites[0].col) == (1220, 29)
+
+
+def test_compute_rewrites_rows_two_site():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1039:29:",
+            3,
+            g.Tag(op="+=", fn="run_pipeline", fn_present=True, rows=2),
+        )
+    ]
+    muts = [
+        _m("musefs-core/src/scan.rs:1045:29: replace += with -= in run_pipeline"),
+        _m("musefs-core/src/scan.rs:1045:29: replace += with *= in run_pipeline"),
+    ]
+    rewrites, skips, _ = g.compute_rewrites(entries, muts)
+    assert skips == []
+    assert len(rewrites) == 1 and (rewrites[0].line, rewrites[0].col) == (1045, 29)
+
+
+def test_compute_rewrites_zero_candidate_reports_deletion():
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:277:30:",
+            4,
+            g.Tag(op="<", fn="probe_file", fn_present=True, rows=1),
+        )
+    ]
+    muts = [_m("musefs-core/src/scan.rs:500:10: replace + with - in other_fn")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skipped == {4}
+    assert len(skips) == 1 and "delete this exclude_re entry" in skips[0]
+
+
+def test_compute_rewrites_structural_count_mismatch():
+    # one anchor, op/fn now resolves to two sites -> refuse the whole group
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1041:32:",
+            4,
+            g.Tag(op=">=", fn="run_pipeline", fn_present=True, rows=1),
+        )
+    ]
+    muts = [
+        _m("musefs-core/src/scan.rs:1043:32: replace >= with > in run_pipeline"),
+        _m("musefs-core/src/scan.rs:1099:10: replace >= with > in run_pipeline"),
+    ]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skipped == {4}
+    assert "can't auto-derive" in skips[0]
+
+
+def test_compute_rewrites_rows_mismatch_skips_group():
+    # equinumerous (1 anchor, 1 site) but the site holds 1 mutant while rows=2
+    entries = [
+        g.Entry(
+            r"musefs-core/src/scan\.rs:1039:29:",
+            4,
+            g.Tag(op="+=", fn="run_pipeline", fn_present=True, rows=2),
+        )
+    ]
+    muts = [_m("musefs-core/src/scan.rs:1045:29: replace += with -= in run_pipeline")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skipped == {4}
+    assert "can't auto-derive" in skips[0]
+
+
+def test_compute_rewrites_ignores_desc_and_tagless():
+    entries = [
+        g.Entry(r"replace \| with \^ in synchsafe_decode", 3, g.Tag(count=3)),
+        g.Entry(r"musefs-core/src/scan\.rs:277:30:", 5, None),
+        g.Entry(r"musefs-core/src/scan\.rs:277:30:", 7, g.Tag(op="<")),
+    ]
+    muts = [_m("musefs-core/src/scan.rs:277:30: replace < with == in probe_file")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skips == [] and skipped == set()
+
+
+def test_compute_rewrites_skips_malformed_regex():
+    # A linecol regex can be malformed (unbalanced group); compute_rewrites must not
+    # raise — check() reports it gracefully in the re-validation pass instead.
+    entries = [g.Entry(r"foo\.rs:10:5:(", 3, g.Tag(op="+", fn="x", fn_present=True, rows=1))]
+    muts = [_m("foo.rs:10:5: replace + with - in x")]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert rewrites == [] and skips == [] and skipped == set()
+
+
+def test_compute_rewrites_mixed_narrowing_group_uses_per_entry_rows():
+    # A bare anchor (rows=2) and a repl-narrowed anchor (rows=1) resolve to the SAME
+    # two sites. The rows check must use each entry's own match set, not the first
+    # entry's — otherwise the narrowed entry is falsely judged unmappable.
+    entries = [
+        g.Entry(r"foo\.rs:10:5:", 3, g.Tag(op="+", fn="foo", fn_present=True, rows=2)),
+        g.Entry(
+            r"foo\.rs:20:5: replace \+ with -",
+            5,
+            g.Tag(op="+", fn="foo", fn_present=True, rows=1),
+        ),
+    ]
+    muts = [  # both sites shifted +100
+        _m("foo.rs:110:5: replace + with - in foo"),
+        _m("foo.rs:110:5: replace + with * in foo"),
+        _m("foo.rs:120:5: replace + with - in foo"),
+        _m("foo.rs:120:5: replace + with * in foo"),
+    ]
+    rewrites, skips, skipped = g.compute_rewrites(entries, muts)
+    assert skips == [] and skipped == set()
+    assert {(r.entry.toml_line, r.line, r.col) for r in rewrites} == {(3, 110, 5), (5, 120, 5)}
+
+
+def test_apply_rewrites_byte_preserving():
+    toml = (
+        "exclude_re = [\n"
+        '    # guard: op=">=" fn="run_pipeline" rows=1\n'
+        "    'musefs-core/src/scan\\.rs:1041:32:',\n"
+        "]\n"
+    )
+    entries, _ = g.parse_toml_entries(toml)
+    out = g.apply_rewrites(toml, [g.Rewrite(entries[0], 1043, 32)])
+    assert "scan\\.rs:1043:32:" in out
+    assert "scan\\.rs:1041:32:" not in out
+    # guard tag and overall structure untouched
+    assert 'op=">=" fn="run_pipeline" rows=1' in out
+    assert out.count("\n") == toml.count("\n")
+    # only the coordinate digits changed
+    assert out == toml.replace(":1041:32:", ":1043:32:")
+
+
+def test_apply_rewrites_preserves_repl_suffix():
+    toml = "exclude_re = [\n    'musefs-core/src/scan\\.rs:1212:29: replace \\+ with -',\n]\n"
+    entries, _ = g.parse_toml_entries(toml)
+    out = g.apply_rewrites(toml, [g.Rewrite(entries[0], 1220, 29)])
+    assert "scan\\.rs:1220:29: replace \\+ with -" in out
+
+
+def test_apply_rewrites_empty_is_identity():
+    toml = "exclude_re = [\n    'musefs-core/src/scan\\.rs:1041:32:',\n]\n"
+    assert g.apply_rewrites(toml, []) == toml
+
+
+def _write_toml(tmp_path, body: str):
+    p = tmp_path / "mutants.toml"
+    p.write_text(body)
+    return p
+
+
+def _write_muts(tmp_path, names: list[str]):
+    p = tmp_path / "muts.json"
+    p.write_text(json.dumps([{"name": n} for n in names]))
+    return p
+
+
+_FIX_TOML = (
+    "exclude_re = [\n"
+    '    # guard: op="<" fn="probe_file" rows=1\n'
+    "    'musefs-core/src/scan\\.rs:277:30:',\n"
+    "]\n"
+)
+
+
+def test_main_fix_rewrites_and_passes(tmp_path, capsys):
+    toml = _write_toml(tmp_path, _FIX_TOML)
+    muts = _write_muts(
+        tmp_path,
+        ["musefs-core/src/scan.rs:300:30: replace < with == in probe_file"],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    assert rc == 0
+    assert "scan\\.rs:300:30:" in toml.read_text()
+    assert "scan\\.rs:277:30:" not in toml.read_text()
+    assert "re-anchored" in capsys.readouterr().out
+
+
+def test_main_fix_idempotent(tmp_path):
+    toml = _write_toml(tmp_path, _FIX_TOML)
+    muts = _write_muts(
+        tmp_path,
+        ["musefs-core/src/scan.rs:300:30: replace < with == in probe_file"],
+    )
+    assert g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)]) == 0
+    after_first = toml.read_text()
+    assert g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)]) == 0
+    assert toml.read_text() == after_first
+
+
+def test_main_fix_partial_reports_and_exits_nonzero(tmp_path, capsys):
+    # first entry is fixable; second resolves to no live mutant (deleted code)
+    body = (
+        "exclude_re = [\n"
+        '    # guard: op="<" fn="probe_file" rows=1\n'
+        "    'musefs-core/src/scan\\.rs:277:30:',\n"
+        '    # guard: op=">" fn="gone" rows=1\n'
+        "    'musefs-core/src/scan\\.rs:900:10:',\n"
+        "]\n"
+    )
+    toml = _write_toml(tmp_path, body)
+    muts = _write_muts(
+        tmp_path,
+        ["musefs-core/src/scan.rs:300:30: replace < with == in probe_file"],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "scan\\.rs:300:30:" in toml.read_text()  # the fixable one was still applied
+    assert "delete this exclude_re entry" in out
+
+
+def test_main_fix_no_op_when_clean(tmp_path, capsys):
+    toml = _write_toml(tmp_path, _FIX_TOML)
+    muts = _write_muts(
+        tmp_path,
+        ["musefs-core/src/scan.rs:277:30: replace < with == in probe_file"],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    assert rc == 0
+    assert toml.read_text() == _FIX_TOML
+    assert "no coordinates needed re-anchoring" in capsys.readouterr().out
+
+
+# A line:col anchor exists precisely because op+fn is NOT unique in the function
+# (several same-op/fn sites, only one excluded). On a clean tree such an entry is
+# valid and --fix must leave it silent — never re-derive its coordinate from the
+# tag (impossible) and false-flag it. Regression for the #345 review finding.
+_NONUNIQUE_TOML = (
+    "exclude_re = [\n"
+    '    # guard: op="+" fn="walk" rows=1\n'
+    "    'musefs-format/src/wav\\.rs:58:28:',\n"
+    "]\n"
+)
+
+
+def test_main_fix_clean_nonunique_op_fn_is_noop(tmp_path, capsys):
+    toml = _write_toml(tmp_path, _NONUNIQUE_TOML)
+    muts = _write_muts(
+        tmp_path,
+        [
+            "musefs-format/src/wav.rs:58:28: replace + with - in walk",  # the excluded site (valid)
+            "musefs-format/src/wav.rs:60:10: replace + with - in walk",  # killable sibling
+            "musefs-format/src/wav.rs:62:14: replace + with - in walk",
+        ],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert toml.read_text() == _NONUNIQUE_TOML
+    assert "auto-derive" not in out and "manual attention" not in out
+
+
+def test_main_fix_drifted_nonunique_reports_manual(tmp_path, capsys):
+    body = (
+        "exclude_re = [\n"
+        '    # guard: op="+" fn="walk" rows=1\n'
+        "    'musefs-format/src/wav\\.rs:58:28:',\n"  # stale: no live mutant at 58:28
+        "]\n"
+    )
+    toml = _write_toml(tmp_path, body)
+    muts = _write_muts(
+        tmp_path,
+        [
+            "musefs-format/src/wav.rs:70:28: replace + with - in walk",
+            "musefs-format/src/wav.rs:72:10: replace + with - in walk",
+        ],
+    )
+    rc = g.main(["--fix", "--toml", str(toml), "--mutants-json", str(muts)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "auto-derive" in out
+    assert toml.read_text() == body  # ambiguous → not rewritten

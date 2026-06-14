@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,9 +68,168 @@ def parse_mutant(name: str) -> Mutant:
     )
 
 
+def _wildcard_coords(regex: str) -> str:
+    """Replace an entry regex's literal ``:line:col:`` with a ``:\\d+:\\d+:`` wildcard.
+
+    Uses a function replacement, not a literal one: a string replacement of
+    ``":\\d+:\\d+:"`` would have its ``\\d`` parsed as a replacement-template escape
+    and raise ``re.PatternError: bad escape \\d``.
+    """
+    return _LITERAL_LINECOL.sub(lambda _: r":\d+:\d+:", regex, count=1)
+
+
+def _entry_coords(regex: str) -> tuple[int, int]:
+    """Parse the (line, col) a linecol entry currently anchors on."""
+    m = _COORD_RE.search(regex)
+    assert m is not None  # caller guarantees classify(regex) == "linecol"
+    return int(m.group(1)), int(m.group(2))
+
+
 _LITERAL_LINECOL = re.compile(r":[0-9]+:[0-9]+:")
+_COORD_RE = re.compile(r":([0-9]+):([0-9]+):")
 
 _ALLOWED_ESCAPES = set(".d+|^()*")
+
+
+def _candidate_mutants(entry: Entry, mutants: list[Mutant]) -> list[Mutant]:
+    """Live mutants a linecol entry's op/fn currently resolve to, ignoring its stale coords.
+
+    The entry's regex is matched with its coordinates wildcarded — preserving any
+    ``replace \\+ with -`` repl suffix that narrows the match — and the result is
+    further filtered by the guard tag's ``op`` and ``fn`` (``fn=""`` → free function,
+    matched as ``fn is None``). Mirrors the predicate ``_check_linecol`` validates with.
+    """
+    t = entry.tag
+    wild = re.compile(_wildcard_coords(entry.regex))
+    expected_fn = None if t.fn == "" else t.fn
+    return [m for m in mutants if wild.search(m.name) and m.op == t.op and m.fn == expected_fn]
+
+
+def compute_rewrites(
+    entries: list[Entry], mutants: list[Mutant]
+) -> tuple[list[Rewrite], list[str], set[int]]:
+    """Plan coordinate rewrites for drifted complete-tag linecol entries.
+
+    Returns (rewrites, skip_notes, skipped_lines). Entries are grouped by the
+    identical set of sites their op/fn resolves to; siblings in a group are mapped
+    to those sites positionally by source order (which fmt/edits preserve). A group
+    whose anchor count differs from its site count, or any of whose sites holds a
+    number of mutants other than the anchor's ``rows``, is a structural change — it
+    is left untouched and reported, never guessed. An entry resolving to no site is
+    deleted code, reported with deletion-oriented wording.
+    """
+    targets = [
+        e
+        for e in entries
+        if classify(e.regex) == "linecol"
+        and e.tag is not None
+        and e.tag.op is not None
+        and e.tag.fn_present
+        and e.tag.rows is not None
+    ]
+
+    rewrites: list[Rewrite] = []
+    skip_notes: list[str] = []
+    skipped: set[int] = set()
+
+    groups: dict[tuple, list[Entry]] = {}
+    matched_by_line: dict[int, list[Mutant]] = {}
+    for e in targets:
+        try:
+            ms = _candidate_mutants(e, mutants)
+        except re.error:
+            continue  # malformed regex; check() reports it gracefully in re-validation
+        matched_by_line[e.toml_line] = ms
+        sites = tuple(sorted({m.site for m in ms}))
+        if not sites:
+            skip_notes.append(
+                _fmt(e, "matches no live mutant — code removed? delete this exclude_re entry")
+            )
+            skipped.add(e.toml_line)
+            continue
+        groups.setdefault(sites, []).append(e)
+
+    for sites, group in groups.items():
+        group = sorted(group, key=lambda e: _entry_coords(e.regex))
+        counts = {e.toml_line: Counter(m.site for m in matched_by_line[e.toml_line]) for e in group}
+        mappable = len(group) == len(sites) and all(
+            counts[e.toml_line][site] == e.tag.rows for e, site in zip(group, sites)
+        )
+        if not mappable:
+            for e in group:
+                skip_notes.append(
+                    _fmt(
+                        e,
+                        f"op/fn resolves to {len(sites)} live site(s), {len(group)} anchor(s) "
+                        "pin it — can't auto-derive the coordinate, re-anchor manually",
+                    )
+                )
+                skipped.add(e.toml_line)
+            continue
+        for e, site in zip(group, sites):
+            _, line, col = site
+            if (line, col) != _entry_coords(e.regex):
+                rewrites.append(Rewrite(e, line, col))
+
+    rewrites.sort(key=lambda r: r.entry.toml_line)
+    return rewrites, skip_notes, skipped
+
+
+def apply_rewrites(toml_text: str, rewrites: list[Rewrite]) -> str:
+    """Return ``toml_text`` with each rewrite's ``:line:col:`` swapped in place.
+
+    Only the entry's own source line is touched; the new coordinates are an
+    f-string (no backslash, so a literal replacement is safe here, unlike the
+    wildcard in ``_wildcard_coords``). Quote char, comma, indentation, and the
+    guard-tag comment above are byte-preserved.
+    """
+    lines = toml_text.splitlines(keepends=True)
+    for rw in rewrites:
+        new_regex = _LITERAL_LINECOL.sub(f":{rw.line}:{rw.col}:", rw.entry.regex, count=1)
+        idx = rw.entry.toml_line - 1
+        lines[idx] = lines[idx].replace(rw.entry.regex, new_regex, 1)
+    return "".join(lines)
+
+
+def run_fix(toml_path: Path, entries: list[Entry], globs: list[str], mutants: list[Mutant]) -> int:
+    """Re-anchor drifted linecol coordinates in ``toml_path``, then re-validate.
+
+    Exactly one rewrite pass followed by one validation pass — no fixpoint. Entries
+    that could not be safely re-anchored are reported with their dedicated wording
+    *only when they actually fail validation now* — an op/fn that resolves to many
+    sites is normal for a line:col anchor (that non-uniqueness is why it is pinned by
+    coordinate), so a currently-valid such entry is left silent rather than false-
+    flagged. Re-validation handles the rest (desc drift, untagged).
+    """
+    failing = _failing_lines(check(entries, mutants, globs))
+    rewrites, skip_notes, skipped = compute_rewrites(entries, mutants)
+    skip_notes = [n for n in skip_notes if _failing_lines([n]) <= failing]
+    skipped &= failing
+    if rewrites:
+        toml_path.write_text(apply_rewrites(toml_path.read_text(), rewrites))
+        for rw in rewrites:
+            old_line, old_col = _entry_coords(rw.entry.regex)
+            print(
+                f"re-anchored [mutants.toml:{rw.entry.toml_line}] "
+                f":{old_line}:{old_col}: -> :{rw.line}:{rw.col}:"
+            )
+    else:
+        print("no coordinates needed re-anchoring.")
+
+    fresh_entries, fresh_globs = parse_toml_entries(toml_path.read_text())
+    remaining = [
+        f
+        for f in check(fresh_entries, mutants, fresh_globs)
+        if not any(f"[mutants.toml:{ln}]" in f for ln in skipped)
+    ]
+    problems = skip_notes + remaining
+    if problems:
+        print(f"\n{len(problems)} entry(ies) still need manual attention:\n")
+        for p in problems:
+            print(f"  {p}")
+        return 1
+    print(f"OK: {len(fresh_entries)} exclude_re entries validated against {len(mutants)} mutants.")
+    return 0
 
 
 def classify(regex: str) -> str:
@@ -143,6 +303,13 @@ class Entry:
     tag: Tag | None
 
 
+@dataclass
+class Rewrite:
+    entry: Entry
+    line: int
+    col: int
+
+
 def _unquote_toml_string(s: str) -> str:
     s = s.rstrip(",").strip()
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
@@ -198,6 +365,14 @@ def _glob_match(glob: str, file: str) -> bool:
 
 def _fmt(entry: Entry, msg: str) -> str:
     return f"[mutants.toml:{entry.toml_line}] /{entry.regex}/ — {msg}"
+
+
+_FAIL_LINE_RE = re.compile(r"^\[mutants\.toml:(\d+)\]")
+
+
+def _failing_lines(failures: list[str]) -> set[int]:
+    """Extract the toml line numbers a list of `_fmt` failure strings refers to."""
+    return {int(m.group(1)) for f in failures if (m := _FAIL_LINE_RE.match(f))}
 
 
 def _check_linecol(entry: Entry, matched: list[Mutant]) -> list[str]:
@@ -302,6 +477,11 @@ def main(argv: list[str] | None = None) -> int:
         default=Path(".cargo/mutants.toml"),
         help="path to mutants.toml (default: .cargo/mutants.toml)",
     )
+    ap.add_argument(
+        "--fix",
+        action="store_true",
+        help="rewrite drifted file:line:col anchors in --toml in place, then re-validate",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -311,6 +491,13 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError, ValueError, KeyError) as ex:
         print(f"error: failed to load toml/mutants: {ex}", file=sys.stderr)
         return 1
+
+    if args.fix:
+        try:
+            return run_fix(args.toml, entries, globs, mutants)
+        except OSError as ex:
+            print(f"error: failed to rewrite {args.toml}: {ex}", file=sys.stderr)
+            return 1
 
     failures = check(entries, mutants, globs)
     if failures:
