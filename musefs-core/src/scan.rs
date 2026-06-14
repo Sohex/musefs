@@ -851,16 +851,103 @@ fn log_mp4_oversize_drops(path: &Path, art: &[mp4::OversizeDrop], binary: &[mp4:
     }
 }
 
-/// Upsert a track from a probed backing file: write the track row, replace its
-/// seeded tags, and ingest its embedded art (capped, deduped, clamped).
-fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
-    let stamp = BackingStamp::from_metadata(meta);
-    let track_id = db.upsert_track(&NewTrack {
+/// The write surface `ingest_into` drives: satisfied by both a direct `&Db`
+/// (its methods take `&self`) and a batched `&mut BulkWriter` (`&mut self`), so
+/// the upsert body lives in exactly one place. Each method delegates through the
+/// concrete type path (`Db::`/`BulkWriter::`), which names the inherent method
+/// unambiguously so the same-named trait method can't recurse into itself.
+trait TrackSink {
+    fn upsert_track(&mut self, t: &NewTrack) -> musefs_db::Result<i64>;
+    fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> musefs_db::Result<()>;
+    fn set_binary_tags(
+        &mut self,
+        track_id: i64,
+        tags: &[musefs_db::BinaryTag],
+    ) -> musefs_db::Result<()>;
+    fn set_structural_blocks(
+        &mut self,
+        track_id: i64,
+        blocks: &[musefs_db::StructuralBlock],
+    ) -> musefs_db::Result<()>;
+    fn upsert_art(&mut self, a: &NewArt) -> musefs_db::Result<i64>;
+    fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()>;
+}
+
+impl TrackSink for &Db {
+    fn upsert_track(&mut self, t: &NewTrack) -> musefs_db::Result<i64> {
+        Db::upsert_track(self, t)
+    }
+    fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> musefs_db::Result<()> {
+        Db::replace_tags(self, track_id, tags)
+    }
+    fn set_binary_tags(
+        &mut self,
+        track_id: i64,
+        tags: &[musefs_db::BinaryTag],
+    ) -> musefs_db::Result<()> {
+        Db::set_binary_tags(self, track_id, tags)
+    }
+    fn set_structural_blocks(
+        &mut self,
+        track_id: i64,
+        blocks: &[musefs_db::StructuralBlock],
+    ) -> musefs_db::Result<()> {
+        Db::set_structural_blocks(self, track_id, blocks)
+    }
+    fn upsert_art(&mut self, a: &NewArt) -> musefs_db::Result<i64> {
+        Db::upsert_art(self, a)
+    }
+    fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()> {
+        Db::set_track_art(self, track_id, items)
+    }
+}
+
+impl TrackSink for &mut musefs_db::BulkWriter<'_> {
+    fn upsert_track(&mut self, t: &NewTrack) -> musefs_db::Result<i64> {
+        musefs_db::BulkWriter::upsert_track(self, t)
+    }
+    fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> musefs_db::Result<()> {
+        musefs_db::BulkWriter::replace_tags(self, track_id, tags)
+    }
+    fn set_binary_tags(
+        &mut self,
+        track_id: i64,
+        tags: &[musefs_db::BinaryTag],
+    ) -> musefs_db::Result<()> {
+        musefs_db::BulkWriter::set_binary_tags(self, track_id, tags)
+    }
+    fn set_structural_blocks(
+        &mut self,
+        track_id: i64,
+        blocks: &[musefs_db::StructuralBlock],
+    ) -> musefs_db::Result<()> {
+        musefs_db::BulkWriter::set_structural_blocks(self, track_id, blocks)
+    }
+    fn upsert_art(&mut self, a: &NewArt) -> musefs_db::Result<i64> {
+        musefs_db::BulkWriter::upsert_art(self, a)
+    }
+    fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()> {
+        musefs_db::BulkWriter::set_track_art(self, track_id, items)
+    }
+}
+
+/// Upsert a track from a probed backing file into `w`: write the track row,
+/// replace its seeded tags, and ingest its embedded art (capped, deduped,
+/// clamped). The single source of the ingest body shared by `ingest` (direct
+/// `&Db`) and `ingest_bulk` (batched `BulkWriter`). Takes `probed` by value so
+/// picture/binary-tag/structural-block bytes are moved, not cloned (#68).
+fn ingest_into(
+    mut w: impl TrackSink,
+    abs_path: &str,
+    stamp: BackingStamp,
+    probed: Probed,
+) -> Result<()> {
+    let track_id = w.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
         format: probed.format,
         audio_offset: probed.audio_offset,
         audio_length: probed.audio_length,
-        backing_size: meta.len(),
+        backing_size: stamp.size,
         backing_mtime_ns: stamp.mtime_ns,
         backing_ctime_ns: stamp.ctime_ns,
     })?;
@@ -875,10 +962,10 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
         tags.push(Tag::new(&key, &value, *ord));
         *ord += 1;
     }
-    db.replace_tags(track_id, &tags)?;
+    w.replace_tags(track_id, &tags)?;
 
     let binary_tags = accept_binary_tags(abs_path, probed.binary_tags);
-    db.set_binary_tags(track_id, &binary_tags)?;
+    w.set_binary_tags(track_id, &binary_tags)?;
 
     let mut sb_ordinals: HashMap<String, u64> = HashMap::new();
     let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
@@ -895,14 +982,14 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
             sb
         })
         .collect();
-    db.set_structural_blocks(track_id, &structural_blocks)?;
+    w.set_structural_blocks(track_id, &structural_blocks)?;
 
     let mut track_arts = Vec::new();
     for (ordinal, pic) in accept_pictures(abs_path, probed.pictures)
         .into_iter()
         .enumerate()
     {
-        let art_id = db.upsert_art(&NewArt {
+        let art_id = w.upsert_art(&NewArt {
             mime: pic.mime,
             width: (pic.width != 0).then_some(pic.width),
             height: (pic.height != 0).then_some(pic.height),
@@ -916,81 +1003,25 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
             ordinal: ordinal as u64,
         });
     }
-    db.set_track_art(track_id, &track_arts)?;
+    w.set_track_art(track_id, &track_arts)?;
     Ok(())
 }
 
-/// Like `ingest`, but writes through a batch `BulkWriter`. Takes `probed` by
-/// value so picture/binary-tag/structural-block bytes are moved, not cloned (#68).
+/// Upsert a track from a probed backing file through a direct `&Db`. Thin
+/// wrapper over [`ingest_into`]; the `oracle`/non-bulk scan path.
+fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
+    ingest_into(db, abs_path, BackingStamp::from_metadata(meta), probed)
+}
+
+/// Like [`ingest`], but writes through a batch `BulkWriter`. Thin wrapper over
+/// [`ingest_into`]; the `stamp` is captured once by the caller's `fstat`.
 fn ingest_bulk(
     bw: &mut musefs_db::BulkWriter<'_>,
     abs_path: &str,
     stamp: BackingStamp,
     probed: Probed,
 ) -> Result<()> {
-    let track_id = bw.upsert_track(&NewTrack {
-        backing_path: abs_path.to_string(),
-        format: probed.format,
-        audio_offset: probed.audio_offset,
-        audio_length: probed.audio_length,
-        backing_size: stamp.size,
-        backing_mtime_ns: stamp.mtime_ns,
-        backing_ctime_ns: stamp.ctime_ns,
-    })?;
-
-    let mut tags = Vec::new();
-    let mut ordinals: HashMap<String, u64> = HashMap::new();
-    for (key, value) in &probed.tags {
-        if !key_passes_floor(key) {
-            continue;
-        }
-        let ord = ordinals.entry(key.clone()).or_insert(0);
-        tags.push(Tag::new(key, value, *ord));
-        *ord += 1;
-    }
-    bw.replace_tags(track_id, &tags)?;
-
-    let binary_tags = accept_binary_tags(abs_path, probed.binary_tags);
-    bw.set_binary_tags(track_id, &binary_tags)?;
-
-    let mut sb_ordinals: HashMap<String, u64> = HashMap::new();
-    let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
-        .structural_blocks
-        .into_iter()
-        .map(|(kind, body)| {
-            let ord = sb_ordinals.entry(kind.clone()).or_insert(0);
-            let sb = musefs_db::StructuralBlock {
-                kind,
-                ordinal: *ord,
-                body,
-            };
-            *ord += 1;
-            sb
-        })
-        .collect();
-    bw.set_structural_blocks(track_id, &structural_blocks)?;
-
-    let mut track_arts = Vec::new();
-    for (ordinal, pic) in accept_pictures(abs_path, probed.pictures)
-        .into_iter()
-        .enumerate()
-    {
-        let art_id = bw.upsert_art(&NewArt {
-            mime: pic.mime,
-            width: (pic.width != 0).then_some(pic.width),
-            height: (pic.height != 0).then_some(pic.height),
-            data: pic.data,
-        })?;
-        let picture_type = pic.picture_type.get();
-        track_arts.push(TrackArt {
-            art_id,
-            picture_type,
-            description: pic.description,
-            ordinal: ordinal as u64,
-        });
-    }
-    bw.set_track_art(track_id, &track_arts)?;
-    Ok(())
+    ingest_into(bw, abs_path, stamp, probed)
 }
 
 /// Public entry: parallel-probe / single-writer scan of `root`.

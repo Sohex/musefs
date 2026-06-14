@@ -690,30 +690,41 @@ impl Musefs {
     // the read guard before the `insert`; `retain` is never called while a `Ref`
     // is held), so it imposes no problematic lock ordering / no cross-lock cycle.
 
-    /// Cheap, synchronous "is a `data_version` poll worth dispatching?" predicate
-    /// for the FUSE dispatch thread to gate `fire_poll_refresh` on, so a
-    /// metadata-op storm doesn't flood the worker pool with no-op poll tasks (#89).
-    /// Mirrors the early-return gates in `poll_refresh_notify` — keep the two in
-    /// sync. Advisory only: no DB access, no `data_version` read, no rebuild. A
-    /// stale `true` costs at most one task the inner gate short-circuits, and
-    /// `needs_rebuild` is checked first so a self-heal is never debounced away.
-    pub fn poll_due(&self) -> bool {
-        if self.needs_rebuild.load(Ordering::Acquire) {
-            return true;
-        }
+    /// The shared debounce/backoff gate: `true` when a `data_version` poll
+    /// should be skipped because the poll interval hasn't elapsed since the last
+    /// poll, or the retry backoff hasn't elapsed since the last failed refresh.
+    /// The single source for both `poll_due` (the advisory dispatch-thread
+    /// pre-check) and `poll_refresh_notify` (the authoritative gate), so the two
+    /// can't drift out of sync (#89). Advisory-cheap: lock + `Instant::elapsed`,
+    /// no DB access.
+    fn poll_debounced(&self) -> bool {
         if !self.poll_interval.is_zero()
             && crate::lock::lock_recover(&self.last_poll, "last_poll").elapsed()
                 < self.poll_interval
         {
-            return false;
+            return true;
         }
         if let Some(last_failed) =
             *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh")
             && last_failed.elapsed() < self.refresh_retry_backoff
         {
-            return false;
+            return true;
         }
-        true
+        false
+    }
+
+    /// Cheap, synchronous "is a `data_version` poll worth dispatching?" predicate
+    /// for the FUSE dispatch thread to gate `fire_poll_refresh` on, so a
+    /// metadata-op storm doesn't flood the worker pool with no-op poll tasks (#89).
+    /// Shares the `poll_debounced` gate with `poll_refresh_notify`. Advisory only:
+    /// no DB access, no `data_version` read, no rebuild. A stale `true` costs at
+    /// most one task the inner gate short-circuits, and `needs_rebuild` is checked
+    /// first so a self-heal is never debounced away.
+    pub fn poll_due(&self) -> bool {
+        if self.needs_rebuild.load(Ordering::Acquire) {
+            return true;
+        }
+        !self.poll_debounced()
     }
 
     /// See `poll_refresh_notify`; this is the no-callback form.
@@ -730,8 +741,8 @@ impl Musefs {
     /// Single-flighted: if a rebuild is already in progress, concurrent callers
     /// return `Ok(false)` immediately.
     pub fn poll_refresh_notify(&self, mut on_changed: impl FnMut(u64)) -> Result<bool> {
-        // These early-return gates are mirrored by the cheap `poll_due` pre-check
-        // the FUSE layer runs on the dispatch thread (#89); keep the two in sync.
+        // The debounce / backoff gate is shared with the cheap `poll_due`
+        // pre-check the FUSE layer runs on the dispatch thread (#89).
         // A poisoned VFS-state lock scheduled a full rebuild: do it now,
         // bypassing the debounce / backoff / data_version gates (#96).
         if self.needs_rebuild.load(Ordering::Acquire) {
@@ -747,16 +758,7 @@ impl Musefs {
             return self.force_full_rebuild(&mut on_changed);
         }
 
-        if !self.poll_interval.is_zero()
-            && crate::lock::lock_recover(&self.last_poll, "last_poll").elapsed()
-                < self.poll_interval
-        {
-            return Ok(false);
-        }
-        if let Some(last_failed) =
-            *crate::lock::lock_recover(&self.last_failed_refresh, "last_failed_refresh")
-            && last_failed.elapsed() < self.refresh_retry_backoff
-        {
+        if self.poll_debounced() {
             return Ok(false);
         }
         // Stamp the failure on a broken data_version read too: it propagates before
@@ -1291,16 +1293,7 @@ impl Musefs {
             }
         }
         // Fallback (no prior open, or unknown handle): resolve by inode and open.
-        let track_id = {
-            let tree = self.tree.load();
-            match tree.node(inode) {
-                None => return Err(CoreError::NoEntry(inode)),
-                Some(node) => match &node.kind {
-                    NodeKind::Dir => return Err(CoreError::IsDir(inode)),
-                    NodeKind::File { track_id } => *track_id,
-                },
-            }
-        };
+        let track_id = self.track_id_for(inode)?;
         self.pool.with(|db| {
             let resolved = self.cache.resolve(db, track_id)?;
             read_at_into(&resolved, db, offset, size, out)
@@ -1314,20 +1307,26 @@ impl Musefs {
         Ok(out)
     }
 
+    /// Resolve a file `inode` to its `track_id` for the read/open fast paths,
+    /// erroring on an unknown inode (`NoEntry`) or a directory (`IsDir`). The
+    /// `read_into` fallback and `open_handle` share this; `getattr` deliberately
+    /// diverges (it returns an attr for directories rather than erroring).
+    fn track_id_for(&self, inode: u64) -> Result<i64> {
+        let tree = self.tree.load();
+        match tree.node(inode) {
+            None => Err(CoreError::NoEntry(inode)),
+            Some(node) => match &node.kind {
+                NodeKind::Dir => Err(CoreError::IsDir(inode)),
+                NodeKind::File { track_id } => Ok(*track_id),
+            },
+        }
+    }
+
     /// Open a file handle: resolve + validate the layout and open the backing fd
     /// once, store it, and return a handle. Subsequent `read`s with this handle
     /// reuse the fd (no per-read open/stat).
     pub fn open_handle(&self, inode: u64) -> Result<Fh> {
-        let track_id = {
-            let tree = self.tree.load();
-            match tree.node(inode) {
-                None => return Err(CoreError::NoEntry(inode)),
-                Some(node) => match &node.kind {
-                    NodeKind::Dir => return Err(CoreError::IsDir(inode)),
-                    NodeKind::File { track_id } => *track_id,
-                },
-            }
-        };
+        let track_id = self.track_id_for(inode)?;
         // Snapshot the generation BEFORE resolving: if a refresh lands during the
         // resolve, stamping the post-refresh gen onto this (pre-refresh) layout
         // would make the first read skip re-resolution and serve stale bytes. With

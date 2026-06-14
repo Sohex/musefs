@@ -21,6 +21,43 @@
 //! served via kernel passthrough never reach userspace and are invisible to
 //! `on_pread` — by design (the passthrough e2e test asserts exactly this).
 
+/// Single source of the counter list: `public Snapshot field => backing static`.
+/// The `Snapshot` struct below and the metrics-on statics / `snapshot()` /
+/// `reset()` are all generated from this one list (the x-macro / callback
+/// pattern), so adding a counter is a one-line edit here instead of four edits
+/// scattered across both `imp` modules.
+macro_rules! for_each_counter {
+    ($cb:ident) => {
+        $cb! {
+            opens => OPENS,
+            stats => STATS,
+            preads => PREADS,
+            pread_bytes => PREAD_BYTES,
+            art_chunks => ART_CHUNKS,
+            binary_tag_chunks => BINARY_TAG_CHUNKS,
+            scan_opens => SCAN_OPENS,
+            scan_preads => SCAN_PREADS,
+            scan_bytes_read => SCAN_BYTES_READ,
+            readahead_hits => READAHEAD_HITS,
+            readahead_misses => READAHEAD_MISSES,
+        }
+    };
+}
+
+macro_rules! decl_snapshot {
+    ($($field:ident => $stat:ident),* $(,)?) => {
+        /// Counter totals sampled by `snapshot`; zeroable by `reset`. Generated
+        /// from `for_each_counter!` so the fields stay in lockstep with the
+        /// backing statics. Present (and `Default`) even without the `metrics`
+        /// feature so consumers compile unconditionally.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        pub struct Snapshot {
+            $(pub $field: u64,)*
+        }
+    };
+}
+for_each_counter!(decl_snapshot);
+
 pub use imp::*;
 
 #[cfg(feature = "metrics")]
@@ -29,17 +66,25 @@ mod imp {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
-    static OPENS: AtomicU64 = AtomicU64::new(0);
-    static STATS: AtomicU64 = AtomicU64::new(0);
-    static PREADS: AtomicU64 = AtomicU64::new(0);
-    static PREAD_BYTES: AtomicU64 = AtomicU64::new(0);
-    static ART_CHUNKS: AtomicU64 = AtomicU64::new(0);
-    static BINARY_TAG_CHUNKS: AtomicU64 = AtomicU64::new(0);
-    static SCAN_OPENS: AtomicU64 = AtomicU64::new(0);
-    static SCAN_PREADS: AtomicU64 = AtomicU64::new(0);
-    static SCAN_BYTES_READ: AtomicU64 = AtomicU64::new(0);
-    static READAHEAD_HITS: AtomicU64 = AtomicU64::new(0);
-    static READAHEAD_MISSES: AtomicU64 = AtomicU64::new(0);
+    // The counter statics, `snapshot()`, and `reset()` are all generated from the
+    // one `for_each_counter!` list (see the top of the file) so they can't drift.
+    macro_rules! decl_counters {
+        ($($field:ident => $stat:ident),* $(,)?) => {
+            $(static $stat: AtomicU64 = AtomicU64::new(0);)*
+
+            pub fn snapshot() -> super::Snapshot {
+                super::Snapshot {
+                    $($field: $stat.load(Ordering::Relaxed),)*
+                }
+            }
+
+            pub fn reset() {
+                $($stat.store(0, Ordering::Relaxed);)*
+            }
+        };
+    }
+    for_each_counter!(decl_counters);
+
     static PREAD_FAULT: OnceLock<Option<Duration>> = OnceLock::new();
 
     // Backing-read fault seam (test-only; process-global so it reaches the FUSE
@@ -192,70 +237,10 @@ mod imp {
     pub fn on_readahead_miss() {
         READAHEAD_MISSES.fetch_add(1, Ordering::Relaxed);
     }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct Snapshot {
-        pub opens: u64,
-        pub stats: u64,
-        pub preads: u64,
-        pub pread_bytes: u64,
-        pub art_chunks: u64,
-        pub binary_tag_chunks: u64,
-        pub scan_opens: u64,
-        pub scan_preads: u64,
-        pub scan_bytes_read: u64,
-        pub readahead_hits: u64,
-        pub readahead_misses: u64,
-    }
-
-    pub fn snapshot() -> Snapshot {
-        Snapshot {
-            opens: OPENS.load(Ordering::Relaxed),
-            stats: STATS.load(Ordering::Relaxed),
-            preads: PREADS.load(Ordering::Relaxed),
-            pread_bytes: PREAD_BYTES.load(Ordering::Relaxed),
-            art_chunks: ART_CHUNKS.load(Ordering::Relaxed),
-            binary_tag_chunks: BINARY_TAG_CHUNKS.load(Ordering::Relaxed),
-            scan_opens: SCAN_OPENS.load(Ordering::Relaxed),
-            scan_preads: SCAN_PREADS.load(Ordering::Relaxed),
-            scan_bytes_read: SCAN_BYTES_READ.load(Ordering::Relaxed),
-            readahead_hits: READAHEAD_HITS.load(Ordering::Relaxed),
-            readahead_misses: READAHEAD_MISSES.load(Ordering::Relaxed),
-        }
-    }
-
-    pub fn reset() {
-        OPENS.store(0, Ordering::Relaxed);
-        STATS.store(0, Ordering::Relaxed);
-        PREADS.store(0, Ordering::Relaxed);
-        PREAD_BYTES.store(0, Ordering::Relaxed);
-        ART_CHUNKS.store(0, Ordering::Relaxed);
-        BINARY_TAG_CHUNKS.store(0, Ordering::Relaxed);
-        SCAN_OPENS.store(0, Ordering::Relaxed);
-        SCAN_PREADS.store(0, Ordering::Relaxed);
-        SCAN_BYTES_READ.store(0, Ordering::Relaxed);
-        READAHEAD_HITS.store(0, Ordering::Relaxed);
-        READAHEAD_MISSES.store(0, Ordering::Relaxed);
-    }
 }
 
 #[cfg(not(feature = "metrics"))]
 mod imp {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct Snapshot {
-        pub opens: u64,
-        pub stats: u64,
-        pub preads: u64,
-        pub pread_bytes: u64,
-        pub art_chunks: u64,
-        pub binary_tag_chunks: u64,
-        pub scan_opens: u64,
-        pub scan_preads: u64,
-        pub scan_bytes_read: u64,
-        pub readahead_hits: u64,
-        pub readahead_misses: u64,
-    }
-
     #[inline(always)]
     pub fn on_open() {}
     #[inline(always)]
@@ -286,8 +271,8 @@ mod imp {
     #[inline(always)]
     pub fn on_readahead_miss() {}
     #[inline(always)]
-    pub fn snapshot() -> Snapshot {
-        Snapshot::default()
+    pub fn snapshot() -> super::Snapshot {
+        super::Snapshot::default()
     }
     #[inline(always)]
     pub fn reset() {}

@@ -147,7 +147,7 @@ exclude_re = [
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:1063:46:',
+    'musefs-core/src/scan\.rs:1094:46:',
     # run_pipeline flush cadence (batch_bytes accounting + the
     # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
     # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on
@@ -160,21 +160,21 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:1172:29:',
+    'musefs-core/src/scan\.rs:1203:29:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1174:32:',
+    'musefs-core/src/scan\.rs:1205:32:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1174:47:',
+    'musefs-core/src/scan\.rs:1205:47:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1174:62:',
+    'musefs-core/src/scan\.rs:1205:62:',
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:1182:37:',
+    'musefs-core/src/scan\.rs:1213:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1184:40:',
+    'musefs-core/src/scan\.rs:1215:40:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1184:55:',
+    'musefs-core/src/scan\.rs:1215:55:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1184:70:',
+    'musefs-core/src/scan\.rs:1215:70:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
@@ -182,11 +182,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:1305:29:',
+    'musefs-core/src/scan\.rs:1336:29:',
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:1313:29:',
+    'musefs-core/src/scan\.rs:1344:29:',
     # guard: op="+" fn="revalidate_with" rows=1
-    'musefs-core/src/scan\.rs:1356:29: replace \+ with -',
+    'musefs-core/src/scan\.rs:1387:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
@@ -318,22 +318,19 @@ exclude_re = [
     # guard: op="<" fn="serve_ogg_window" rows=1
     'musefs-core/src/ogg_index\.rs:225:15: replace < with <= in serve_ogg_window',
 
-    # Phase 4 poll_due (#89) — equivalent `<`->`<=` on the two wall-clock gates
-    # (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <
-    # refresh_retry_backoff`). The operators differ only when `Instant::elapsed()`
-    # equals the bound at the exact nanosecond it is sampled — a measure-zero
-    # boundary no deterministic test can construct: the `*_for_test` hooks backdate
-    # the stamp by exactly the bound, but time advances before the comparison runs,
-    # so elapsed() is already strictly greater under both operators. The same
-    # measure-zero class applies to the mirrored gates in `poll_refresh_notify`
-    # (both `<` gates there) — covered by the sibling entry below; it surfaced
-    # once the edition-2024 let-chain reformat pulled the refresh_retry_backoff
-    # gate into a diff. The `<`->`>`/`==` variants ARE caught and stay in scope;
-    # anchored on operator+function since both `<` in each fn are this class.
+    # Phase 4 poll debounce (#89) — equivalent `<`->`<=` on the two wall-clock
+    # gates (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <
+    # refresh_retry_backoff`), now shared by `poll_due` (advisory pre-check) and
+    # `poll_refresh_notify` (authoritative) via the `poll_debounced` helper. The
+    # operators differ only when `Instant::elapsed()` equals the bound at the exact
+    # nanosecond it is sampled — a measure-zero boundary no deterministic test can
+    # construct: the `*_for_test` hooks backdate the stamp by exactly the bound, but
+    # time advances before the comparison runs, so elapsed() is already strictly
+    # greater under both operators. The `<`->`>`/`==` variants ARE caught and stay
+    # in scope; anchored on operator+function since both `<` in the fn are this
+    # class.
     # guard: count=2
-    'musefs-core/src/facade\.rs:\d+:\d+: replace < with <= in Musefs::poll_due',
-    # guard: count=2
-    'replace < with <= in Musefs::poll_refresh_notify',
+    'replace < with <= in Musefs::poll_debounced',
 
     # CACHE_ESTIMATED_ITEMS const arithmetic — equivalent mutant. This is the
     # `estimated_items_capacity` hint passed to Cache::with_weighter; it sizes
