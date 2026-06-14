@@ -57,7 +57,7 @@ fn read_full(db_path: &std::path::Path, cache: &HeaderCache, id: i64) -> Vec<u8>
     let pool = ReadAheadPool::new(0);
     let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
     let epoch = std::sync::atomic::AtomicU64::new(0);
-    let br = BackingReader::new(&file, &buf, &pool, 0, resolved.total_len, &epoch);
+    let br = BackingReader::new(&file, &buf, &pool, 0, resolved.stamp.size, &epoch);
     read_at_with_file(&resolved, &db, &br, 0, resolved.total_len).unwrap()
 }
 

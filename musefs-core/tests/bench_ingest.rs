@@ -200,7 +200,7 @@ fn bench_read_under_latency() {
         mode: Mode::Synthesis,
         poll_interval: std::time::Duration::ZERO,
         case_insensitive: false,
-        read_ahead_budget: ra_mib * 1024 * 1024,
+        read_ahead_budget: ra_mib.saturating_mul(1024 * 1024),
         read_ahead_prefetch: ra_prefetch,
     };
     fn first_inode(fs: &Musefs, dir: u64) -> Option<u64> {
@@ -261,7 +261,10 @@ fn bench_read_under_latency() {
                 label: label.into(),
                 format: "ogg".into(),
                 tier: tier.clone(),
-                storage: format!("{profile}/ra{ra_mib}"),
+                storage: format!(
+                    "{profile}/ra{ra_mib}/pf{}",
+                    if ra_prefetch { "on" } else { "off" }
+                ),
                 wall_ms: ms,
                 opens: s.opens,
                 preads: s.preads,

@@ -288,7 +288,8 @@ fuzz_target!(|data: &[u8]| {
     let pool = ReadAheadPool::new(0);
     let buf = Arc::new(Mutex::new(ReadAhead::new(0)));
     let epoch = std::sync::atomic::AtomicU64::new(0);
-    let br = BackingReader::new(&file, &buf, &pool, 0, total, &epoch);
+    // backing_len is the raw backing-file length, not the synthesized total_len.
+    let br = BackingReader::new(&file, &buf, &pool, 0, resolved.stamp.size, &epoch);
 
     // Splice-consistency invariants. A successfully-resolved layout is internally
     // consistent regardless of how its rows were planted, so whenever the read

@@ -59,7 +59,11 @@ gen_corpus() { # $1=backing-dir $2=size_mib $3=streams
   # reruns reuse the copy.
   if [ -n "${MUSEFS_BENCH_CORPUS_SRC:-}" ]; then
     # Already populated (a prior run)? Skip the rescan of the (large) source tree.
-    if find "$1" -maxdepth 1 -type f \( -iname '*.flac' -o -iname '*.mp3' \) 2>/dev/null | grep -q .; then
+    # `-print -quit` stops at the first match (no pipe, so pipefail-safe) and we
+    # check every copied extension, not just flac/mp3.
+    if [ -n "$(find "$1" -maxdepth 1 -type f \
+      \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.ogg' \) \
+      -print -quit 2>/dev/null)" ]; then
       return 0
     fi
     local n=$(( $3 + 1 ))
