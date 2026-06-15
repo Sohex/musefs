@@ -151,6 +151,20 @@ def track_ids_by_tag(conn, key, value):
     return [track_id for (track_id,) in rows]
 
 
+def delete_tracks(conn, track_ids):
+    """Unconditionally delete the given track rows; return the count actually
+    deleted (an already-gone id contributes 0).
+
+    The intent-based delete: unlike ``prune_missing`` it does not check on-disk
+    existence. ``tags`` and ``track_art`` rows cascade away via the schema's
+    ``ON DELETE CASCADE`` (``connect`` enables ``foreign_keys = ON``).
+    """
+    deleted = 0
+    for track_id in track_ids:
+        deleted += conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,)).rowcount
+    return deleted
+
+
 def tags_for_track(conn, track_id):
     """Read back a track's tag rows as an ordered ``list[TagRow]`` (by key, then
     ordinal). Includes both plugin-owned text tags (``value_blob is None``) and

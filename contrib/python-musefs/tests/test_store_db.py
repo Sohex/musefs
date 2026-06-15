@@ -206,3 +206,63 @@ def test_track_ids_by_tag_ignores_binary_tags(db_path):
         assert track_ids_by_tag(conn, "cover", "") == []
     finally:
         conn.close()
+
+
+def test_delete_tracks_removes_rows_and_cascades(db_path):
+    from musefs_common import (
+        delete_tracks,
+        replace_track_art,
+        tags_for_track,
+        track_id_for_path,
+        upsert_art,
+    )
+    from musefs_common.store import replace_tags
+
+    conn = connect(db_path)
+    try:
+        a = insert_track(conn, "/m/a.flac")
+        b = insert_track(conn, "/m/b.flac")
+        replace_tags(conn, a, [("artist", "Alice"), ("genre", "Rock")])
+        # An art row referencing the track, to prove the cascade reaches track_art.
+        # Use the public helpers so the inserts match the real art/track_art schema
+        # (content-addressed sha256 + byte_len + data; track_art references art_id).
+        art_id = upsert_art(conn, b"coverbytes", "image/jpeg")
+        replace_track_art(conn, a, [(art_id, 3, "")])
+        conn.commit()
+
+        deleted = delete_tracks(conn, [a])
+        conn.commit()
+
+        assert deleted == 1
+        assert track_id_for_path(conn, "/m/a.flac") is None
+        assert tags_for_track(conn, a) == []  # tags cascaded
+        assert (
+            conn.execute("SELECT COUNT(*) FROM track_art WHERE track_id=?", (a,)).fetchone()[0] == 0
+        )
+        assert track_id_for_path(conn, "/m/b.flac") == b  # untouched
+    finally:
+        conn.close()
+
+
+def test_delete_tracks_counts_only_rows_actually_deleted(db_path):
+    from musefs_common import delete_tracks
+
+    conn = connect(db_path)
+    try:
+        a = insert_track(conn, "/m/a.flac")
+        conn.commit()
+        # 999 is not a real id, so it contributes 0 to the count.
+        assert delete_tracks(conn, [a, 999]) == 1
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_delete_tracks_empty_input(db_path):
+    from musefs_common import delete_tracks
+
+    conn = connect(db_path)
+    try:
+        assert delete_tracks(conn, []) == 0
+    finally:
+        conn.close()
