@@ -5,10 +5,7 @@ All notable changes to this project are documented here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 > The `contrib/` Python packages have their own decoupled version and changelog:
-> see [contrib/CHANGELOG.md](contrib/CHANGELOG.md).
-
-> The full, detailed changelog (including internal changes) lives in the
-> documentation site: <https://sohex.github.io/musefs/changelog.html>.
+> see [contrib/CHANGELOG.md](https://sohex.github.io/musefs/integrations/overview.html#contrib-changelog).
 
 ## [Unreleased]
 
@@ -19,7 +16,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the mount root rendering Prometheus-format counters — getattr/read/open
   activity, backing read-ahead behavior, and (when built with jemalloc)
   allocator stats. Off by default; the file is absent unless enabled. See the
-  README [Metrics](README.md#metrics) section (#394).
+  README [Metrics](https://sohex.github.io/musefs/guide/tuning.html#metrics) section (#394).
 - **Scan progress indicator:** `scan` and `scan --revalidate` render a live
   progress bar (indicatif) with an elapsed-time summary on an interactive
   terminal, falling back to periodic `ingested N/M (P%)` log lines when output
@@ -80,20 +77,26 @@ First stable release.
   are enforced; `--owner`/`--group` imply `--allow-other`. A non-root
   `allow_other` mount is pre-flight checked against `/etc/fuse.conf`
   `user_allow_other` and fails early with guidance if it is missing. See the
-  README [Ownership and permissions](README.md#ownership-and-permissions)
+  README [Ownership and permissions](https://sohex.github.io/musefs/guide/configuration.html#ownership-and-permissions)
   section (#293, #294).
 - **Hardened deployment assets:** the container image runs as a dedicated
   unprivileged user with a build-arg-configurable UID/GID, and the
   `musefs-scan.service` systemd unit ships a strong sandbox (the FUSE-mounting
   `musefs.service` deliberately cannot be sandboxed). See
-  [contrib/systemd/README.md](contrib/systemd/README.md#hardening)
+  [contrib/systemd/README.md](https://sohex.github.io/musefs/integrations/systemd.html#hardening)
   (#317, #318, #319).
 - **crates.io distribution:** the `musefs` binary is published to crates.io as of
   this release and installable with `cargo install musefs`. A new thin `musefs` wrapper crate
   owns the binary (`musefs-cli` is now a library crate), and a tag-triggered
   release workflow publishes all crates in dependency order.
-
-(Internal changes: fuzzing & property test infrastructure. See the full changelog for details.)
+- **Fuzzing & property tests:** coverage-guided `cargo-fuzz` targets for every
+  format parser (FLAC, MP3, MP4, Ogg, WAV), the byte-level primitives (Ogg
+  page parsing, base64 windowing, VorbisComment), and the serve path — the
+  latter drives the full synthesis pipeline over hostile DB rows and binary tags
+  via a fuzzing-gated `Db::with_raw_conn`. Plus `proptest` invariants —
+  panic-freedom, the byte-identical audio guarantee, and tag round-trip — an
+  end-to-end read-fidelity property, and a `mutagen` interop test asserting an
+  independent reader sees the tags we synthesize.
 
 ### Changed
 
@@ -179,7 +182,7 @@ First public release.
 
 - Read-only mount; tag edits happen out-of-band against the SQLite store and are
   picked up automatically (`PRAGMA data_version` polling). See the README
-  [Supported formats](README.md#supported-formats) section and the per-format
+  [Supported formats](https://sohex.github.io/musefs/formats/overview.html#supported-formats) section and the per-format
   docs (`docs/{FLAC,MP3,M4A,OGG,WAV}.md`) for round-trip limitations.
 
 ## [0.1.0]
@@ -187,3 +190,8 @@ First public release.
 - Initial MVP (FLAC and MP3 synthesis, virtual tree with beets-style templates,
   `synthesis` / `structure-only` mount modes, auto-refresh, `scan` /
   `scan --revalidate`). Never published publicly; superseded by 0.2.0.
+
+[Unreleased]: https://github.com/Sohex/musefs/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/Sohex/musefs/releases/tag/v1.0.0
+[0.2.0]: https://github.com/Sohex/musefs/releases/tag/v0.2.0
+[0.1.0]: https://github.com/Sohex/musefs/releases/tag/v0.1.0
