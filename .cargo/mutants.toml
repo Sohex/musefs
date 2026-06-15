@@ -483,4 +483,20 @@ exclude_re = [
     # it. Phase-2 is opt-in and best-effort — a dropped prefetch just means a later
     # synchronous fill, identical served bytes. Sole site.
     'replace PrefetchWorkers::request with \(\)',
+    #
+    # musefs-core facade refresh single-flight guard (#444/#445 module split moved
+    # this into facade/refresh.rs, which put it in the in-diff gate's scope for the
+    # first time). RefreshGuard::drop resets the `refreshing` flag; replacing its
+    # body with () leaves `refreshing` stuck `true` after the first rebuild, so
+    # `refresh_for_test` — which UNIQUELY blocks until it owns the gate (spins on
+    # `compare_exchange`) rather than bailing like the production poll path — spins
+    # forever and hangs the test binary. TIMEOUT-only, and it CANCELS the in-diff job,
+    # the same hang-class as the InodeAllocator / dirty_min_flip_ancestors / read-ahead
+    # exclusions above. The reset's correctness is still pinned functionally:
+    # facade.rs's `failed_refresh_retries_after_backoff_not_every_call` asserts
+    # `poll_refresh` surfaces the read error, which the stuck gate makes impossible
+    # (the CAS bails first) — that assertion does fail under the mutation, it just
+    # can't be observed before the sibling stress test hangs the binary. Sole site.
+    # guard: count=1
+    'replace <impl Drop for RefreshGuard.*::drop with \(\)',
 ]
