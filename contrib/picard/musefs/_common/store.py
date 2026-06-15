@@ -113,7 +113,10 @@ def track_ids_for_paths(conn, keys):
     ``{key: id}`` dict that omits keys with no matching track row. The IN-list is
     chunked under SQLite's host-parameter cap so arbitrarily large lookups work
     (the bulk counterpart to ``track_id_for_path``)."""
-    keys = list(keys)
+    # Deduplicate while preserving first-seen order: a key repeated across chunk
+    # boundaries would re-fetch its row in a later chunk and trip the duplicate
+    # guard below even on a conformant DB.
+    keys = list(dict.fromkeys(keys))
     out = {}
     for start in range(0, len(keys), _MAX_SQL_VARS):
         chunk = keys[start : start + _MAX_SQL_VARS]

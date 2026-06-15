@@ -55,7 +55,7 @@ def make_handler():
             # strip the /api/v0.4 prefix Lidarr's base URL carries
             route = path.split("/api/v0.4/", 1)[-1] if "/api/v0.4/" in path else path.lstrip("/")
             if route == "cover.jpg":
-                self._send_bytes(COVER_PNG, "image/jpeg")
+                self._send_bytes(COVER_PNG, "image/png")
             elif route.startswith("artist/"):
                 self._send(artist)
             elif route.startswith("album/"):

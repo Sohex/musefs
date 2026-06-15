@@ -166,12 +166,27 @@ impl ReadAheadPool {
                 .collect()
         };
         candidates.sort_by_key(|(_, ls, _)| *ls); // coldest (smallest stamp) first
-        for (_, _, buf) in candidates {
+        for (key, _, buf) in candidates {
             if let Ok(mut ra) = buf.try_lock() {
                 let freed = ra.clear();
+                drop(ra);
                 if freed > 0 {
-                    self.charged.fetch_sub(freed, O::Relaxed);
-                    return Some(freed);
+                    // The snapshot may name a stream that `deregister` removed
+                    // after we collected it; `deregister` already uncharged that
+                    // buffer's bytes, so subtracting again here would wrap
+                    // `charged`. Only uncharge while the stream is still the one
+                    // we cleared. (clear() left the buffer empty, so a racing
+                    // deregister now reads len 0 and uncharges nothing.)
+                    let still_registered = self
+                        .streams
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .is_some_and(|e| Arc::ptr_eq(&e.buf, &buf));
+                    if still_registered {
+                        self.charged.fetch_sub(freed, O::Relaxed);
+                        return Some(freed);
+                    }
                 }
             }
         }
