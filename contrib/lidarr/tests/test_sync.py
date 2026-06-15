@@ -204,6 +204,37 @@ def test_sync_records_logs_mapping_skipped_path(db_path, sample_track_file, caps
     assert "no matching Lidarr track file" in captured.err
 
 
+def test_sync_records_logs_invalid_record(
+    db_path, make_track, sample_track_file, sample_track, sample_album, sample_artist, capsys
+):
+    key = realpath_key(sample_track_file["path"])
+    make_track(key)
+    bad_track = {**sample_track, "title": "x" * 262145}  # over the value-length CHECK
+    event = LidarrEvent(
+        event_type=EventType.ALBUM_DOWNLOAD,
+        raw_type="AlbumDownload",
+        paths=[sample_track_file["path"]],
+        artist_id=10,
+        album_id=20,
+    )
+    config = SyncConfig(db_path=db_path, link_mode=LinkMode.SYMLINK, autoscan=False)
+
+    stats = sync_records(
+        config=config,
+        event=event,
+        track_files=[sample_track_file],
+        tracks=[bad_track],
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
+    )
+
+    assert stats.synced == 0
+    assert stats.skipped_invalid == 1
+    captured = capsys.readouterr()
+    assert key in captured.err
+    assert "invalid" in captured.err.lower()
+
+
 def test_symlink_rename_does_not_prune_previous_placeholder(
     db_path, make_track, sample_track_file, tmp_path
 ):

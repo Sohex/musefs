@@ -187,8 +187,11 @@ Everything in `__all__`, imported from the top-level `musefs_common` package.
   accumulate into a caller-seeded instance.
 - `sync_one(conn, record, stats, *, dry_run=False, merge=False)` — sync a single
   record into a caller-supplied `SyncStats`.
-- `SyncStats` — `synced` / `skipped` / `art_linked` / `skipped_art` counters,
-  plus `.summary()`.
+- `SyncStats` — `synced` / `skipped` / `art_linked` / `skipped_art` /
+  `skipped_invalid` counters, plus `.summary()`. A record whose tags or art
+  violate a store CHECK constraint is rolled back and skipped (not raised),
+  bumping `skipped_invalid` and appending `(record.key, message)` to the
+  `invalid` list — one malformed record never aborts the batch.
 
 **Lower-level store helpers** (called for you by `sync_files`; use directly only
 for a custom write loop)
@@ -205,6 +208,16 @@ for a custom write loop)
   extension.
 - `prune_missing(conn, track_ids=None)` → count — delete tracks whose backing
   file no longer exists (every track, or just `track_ids`).
+
+**Reading**
+
+- `track_ids_for_paths(conn, keys)` → `{key: id}` — bulk `backing_path` → track
+  id; keys with no matching row are omitted. Chunked under SQLite's parameter
+  cap, so arbitrarily large lookups are safe (the bulk `track_id_for_path`).
+- `tags_for_track(conn, track_id)` → `[TagRow, …]` ordered by key then ordinal,
+  covering both plugin-owned text tags and scanner-written binary tags.
+- `TagRow(key, value, value_blob)` — one read-back tag row. Text tags have
+  `value_blob is None`; binary tags have `value == ""` and `value_blob` bytes.
 
 **Constants**
 
