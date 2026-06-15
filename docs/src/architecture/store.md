@@ -143,7 +143,7 @@ for plugin authors, including a generated copy of the schema
 test — see [CONTRIBUTING](../contributing/setup.md)). Its tag/art replace operations
 each wrap their `DELETE`+`INSERT` in a SQLite savepoint, so they are
 individually atomic and the "caller owns the transaction" guarantee holds even
-on an autocommit connection. The [Lidarr integration](../../../contrib/lidarr/README.md)
+on an autocommit connection. The [Lidarr integration](../integrations/lidarr.md)
 uses the same shared library from a Custom Script workflow. Its Lidarr
 destination tree is only a tracking aid, made of symlinks by default; musefs
 remains the consumer-facing filesystem.
