@@ -116,8 +116,9 @@ assert_bytes_unchanged(before, {p: sha256_file(p) for p in files})
 print("bytes unchanged: OK")
 PY
 
-# Store received tags (>= 2 tracks; loud-fails a vacuous 0-record pass).
-python3 "$HERE/store_assert.py" --db "$MUSEFS_DB" --min-records 2
+# Store received tags AND the album cover for both tracks (loud-fails a vacuous
+# 0-record pass).
+python3 "$HERE/store_assert.py" --db "$MUSEFS_DB" --min-records 2 --min-art 2
 
 # Served mount carries the tags.
 "$MUSEFS" mount "$WORK/mnt" --db "$MUSEFS_DB" &
@@ -133,6 +134,16 @@ from lidarr_smoke_lib import parse_ffprobe_tags
 tags = parse_ffprobe_tags(open(sys.argv[1]).read())
 assert tags.get("artist") == "Alice", f"served file artist tag wrong: {tags}"
 print("served tags: OK")
+PY
+
+# Served mount carries the embedded cover (Lidarr's art spliced into the view).
+ffprobe -hide_banner -loglevel error -show_streams -of json "$SERVED" > "$WORK/streams.json"
+python3 - "$WORK/streams.json" <<'PY'
+import sys
+sys.path.insert(0, "scripts")
+from lidarr_smoke_lib import has_attached_picture
+assert has_attached_picture(open(sys.argv[1]).read()), "served file has no embedded cover art"
+print("served art: OK")
 PY
 
 echo "lidarr-smoke: PASS"
