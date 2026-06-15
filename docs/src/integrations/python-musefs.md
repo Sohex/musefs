@@ -132,7 +132,7 @@ the reference implementation.
 ### Store invariants you must respect
 
 The full external-writer contract is in
-[ARCHITECTURE.md](../architecture/store.md#the-external-writer-contract). The rules
+[the external-writer contract](../architecture/store.md#the-external-writer-contract). The rules
 that bite plugin authors:
 
 - **Write only `tags`, `art`, and `track_art`.** The scanner owns the structural

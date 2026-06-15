@@ -10,7 +10,7 @@ In the SQLite store (`--db`). Edit it with the
 [beets](../integrations/beets.md) or [Picard](../integrations/picard.md)
 plugins, the [Lidarr](../integrations/lidarr.md) integration, or with plain
 SQL — the schema is a documented, stable contract
-(see [ARCHITECTURE.md](../architecture/store.md#the-sqlite-store)).
+(see [the SQLite store](../architecture/store.md#the-sqlite-store)).
 
 **Do edits show up without remounting?**
 Yes. The mount polls the database (debounced) and picks up external commits

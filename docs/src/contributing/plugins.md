@@ -3,7 +3,7 @@
 ## Python plugins (contrib)
 
 The four packages share one drift-guarded contract; see
-[ARCHITECTURE.md](../architecture/tree-scanning.md#the-contrib-ecosystem) for the layout and
+[the contrib ecosystem](../architecture/tree-scanning.md#the-contrib-ecosystem) for the layout and
 each README for plugin-specific setup.
 
 ```bash

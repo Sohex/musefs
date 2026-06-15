@@ -51,7 +51,7 @@ through the per-read `validate_opened_backing` re-stat, so the cardinal
 audio-bytes invariant and freshness semantics are untouched. An optional Phase-2
 background-prefetch layer (`--read-ahead-prefetch`) exists but is off by default —
 read amplification carries the whole win (see
-[BENCHMARKS.md](../benchmarks.md#backing-read-ahead-255)).
+[the backing read-ahead benchmarks](../benchmarks.md#backing-read-ahead-255)).
 
 How each format builds its layout differs enough to warrant its own document:
 [FLAC](../formats/flac.md), [MP3](../formats/mp3.md), [M4A](../formats/m4a.md),

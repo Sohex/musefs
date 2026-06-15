@@ -29,7 +29,7 @@
   `rustix` for syscalls) over hand-rolled FFI.
 - **Layering.** Keep `musefs-fuse`, `musefs-cli`, and the `musefs` binary
   thin; cross-cutting logic belongs in `musefs-core`
-  (see [ARCHITECTURE.md](../architecture/overview.md#crate-layout)).
+  (see [the crate layout](../architecture/overview.md#crate-layout)).
 - **Hidden API consumers.** `benches/` directories and each crate's
   `tests/` are compiled only by `--all-targets`: after an API change,
   compile-check with `cargo clippy --all-targets`, not `cargo build`.

@@ -3,7 +3,7 @@
 Every optimization pass re-measured **apples-to-apples on one box** as a
 PR-isolated before/after pair, plus a cumulative `16caba4`→`main` summary. This
 file is **performance only** — correctness gates (byte-identical proptests, FUSE
-e2e, in-diff mutation) live in CI and [CONTRIBUTING.md](contributing/setup.md), not
+e2e, in-diff mutation) live in CI and [the contributor guide](contributing/setup.md), not
 here.
 
 Read it in three layers:
