@@ -361,3 +361,33 @@ fn checksum_tier_defaults_to_fingerprint() {
     assert_eq!(ScanOptions::default().checksum, ChecksumTier::Fingerprint);
     assert_eq!(ScanOptions::default().strictness, MatchStrictness::Auto);
 }
+
+#[test]
+fn fingerprint_changes_with_picture_description() {
+    let pic = |desc: &str| EmbeddedPicture {
+        mime: "image/jpeg".into(),
+        picture_type: PictureType::new(3).unwrap(),
+        description: desc.into(),
+        width: 10,
+        height: 10,
+        data: vec![1, 2, 3],
+    };
+    let base = Probed {
+        format: Format::Flac,
+        audio_offset: 8,
+        audio_length: 100,
+        tags: Vec::new(),
+        pictures: vec![pic("front")],
+        binary_tags: Vec::new(),
+        structural_blocks: Vec::new(),
+    };
+    let other = Probed {
+        pictures: vec![pic("back")],
+        ..clone_probed(&base)
+    };
+    assert_ne!(
+        fingerprint_of(&base),
+        fingerprint_of(&other),
+        "picture description change => fp change"
+    );
+}
