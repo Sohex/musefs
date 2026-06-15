@@ -655,6 +655,27 @@ mod checksum_tests {
         assert!(db.get_track_by_path("/old.flac").unwrap().is_none());
     }
 
+    // Direct coverage of the BulkWriter read accessors used by ingest_unit's
+    // retarget path: a mutated empty/None return makes these asserts fail. Kills
+    // bulk.rs `tracks_by_fingerprint -> Ok(vec![])` and `get_track_by_path -> Ok(None)`.
+    #[test]
+    fn bulk_writer_reads_back_fingerprint_and_path() {
+        let db = Db::open_in_memory().unwrap();
+        let fp = "f".repeat(64);
+        let mut bw = db.bulk_writer().unwrap();
+        let id = bw.upsert_track(&new_track("/x.flac")).unwrap();
+        bw.set_track_checksums(id, Some(&fp), None).unwrap();
+
+        let by_fp = bw.tracks_by_fingerprint(&fp).unwrap();
+        assert_eq!(by_fp.len(), 1, "fingerprint match must be returned");
+        assert_eq!(by_fp[0].id, id);
+
+        let by_path = bw.get_track_by_path("/x.flac").unwrap();
+        assert_eq!(by_path.map(|t| t.id), Some(id), "path lookup must hit");
+
+        bw.commit().unwrap();
+    }
+
     #[test]
     fn bulk_writer_retarget_and_checksums_match_db() {
         let db = Db::open_in_memory().unwrap();
