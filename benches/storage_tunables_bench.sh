@@ -8,24 +8,37 @@
 # synthesis: structure-only triggers kernel passthrough when privileged and bypasses
 # the daemon read path entirely.
 #
-# Usage (run as root; reads drop the page cache between samples):
-#   storage_tunables_bench.sh local <backing-dir> [size_mib] [streams]
-#   storage_tunables_bench.sh nfs   <export-dir>  <netem_ms_per_way> [size_mib] [streams]
+# Usage (reads drop the page cache between samples — needs root or passwordless sudo):
+#   storage_tunables_bench.sh local      <backing-dir> [size_mib] [streams]
+#   storage_tunables_bench.sh nfs        <export-dir>  <netem_ms_per_way> [size_mib] [streams]
+#   storage_tunables_bench.sh window-cap <backing-dir> [size_mib] [streams]
 #
-#   local: <backing-dir> is a real disk (e.g. an HDD) holding the corpus.
-#   nfs:   <export-dir> is exported via loopback NFSv4 and `tc netem` adds
-#          <netem_ms_per_way> per packet (~2x that as RPC RTT). Backing it on tmpfs
-#          isolates the RPC tax; on HDD adds real seeks. Needs nfs-kernel-server + tc.
+#   local:      <backing-dir> is a real disk (e.g. an HDD) holding the corpus.
+#   nfs:        <export-dir> is exported via loopback NFSv4 and `tc netem` adds
+#               <netem_ms_per_way> per packet (~2x that as RPC RTT). Backing it on tmpfs
+#               isolates the RPC tax; on HDD adds real seeks. Needs nfs-kernel-server + tc.
+#   window-cap: sweeps the daemon-internal read-amplification window cap
+#               (WINDOW_ABS_CAP) on real backing (issue #433). Builds one release
+#               binary per value in $WINDOW_CAP_MIB (default "1 2 4 8 16"), patching
+#               the const in place and restoring it after each build. Run this mode
+#               as the *normal user* (it rebuilds via cargo); it uses `sudo` only to
+#               drop the page cache. Point MUSEFS_BENCH_CORPUS_SRC at a real audio tree.
 set -euo pipefail
 
-MODE="${1:?usage: $0 local|nfs <dir> ...}"
-BIN="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/target/release/musefs"
-[ -x "$BIN" ] || { echo "build first: cargo build --release -p musefs" >&2; exit 1; }
+MODE="${1:?usage: $0 local|nfs|window-cap <dir> ...}"
+ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+BIN="$ROOT/target/release/musefs"
+RA="$ROOT/musefs-core/src/readahead.rs"
+# window-cap (issue #433) builds its own per-cap-value binaries; the other modes
+# need a prebuilt release binary.
+[ "$MODE" = window-cap ] || [ -x "$BIN" ] || { echo "build first: cargo build --release -p musefs" >&2; exit 1; }
 
 NFSMNT=/tmp/sp-nfsmnt
 MMNT=/tmp/sp-musefs-mnt
 DB=/tmp/sp-tunables.db
 MP=""; NETEM=0; NFS_EXP=""
+# Internal read-amplification window caps to sweep (WINDOW_ABS_CAP, MiB).
+CAP_MIB="${WINDOW_CAP_MIB:-1 2 4 8 16}"
 
 cleanup() {
   [ -n "$MP" ] && kill "$MP" 2>/dev/null || true
@@ -36,6 +49,9 @@ cleanup() {
     mountpoint -q "$NFSMNT" && umount -l "$NFSMNT" 2>/dev/null || true
     exportfs -u localhost:"$NFS_EXP" 2>/dev/null || true
   fi
+  # window-cap patches WINDOW_ABS_CAP in-place to build each variant; always
+  # restore the source so an interrupt can't leave the tree modified.
+  [ -n "${RA:-}" ] && git -C "$ROOT" checkout -- "$RA" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -82,7 +98,10 @@ gen_corpus() { # $1=backing-dir $2=size_mib $3=streams
       -printf '%s\t%p\n' 2>/dev/null | awk -v m="$maxb" -F'\t' 'm==0 || $1<=m' |
       sort -rn | head -n "$n" | cut -f2-) || true
     while IFS= read -r f; do
-      [ -n "$f" ] && { cp -n "$f" "$1/" 2>/dev/null || true; }
+      # --reflink=auto: on a CoW fs (btrfs/xfs) this shares extents with the
+      # source instead of copying bytes, but the data still lives on the same
+      # platter, so cold reads hit real backing. Falls back to a full copy off-CoW.
+      [ -n "$f" ] && { cp --reflink=auto -n "$f" "$1/" 2>/dev/null || true; }
     done <<< "$list"
     return 0
   fi
@@ -105,11 +124,20 @@ case "$MODE" in
     mount -t nfs -o vers=4.2 localhost:"$NFS_EXP" "$NFSMNT"
     SCANDIR="$NFSMNT/backing"
     echo "nfs export=$NFS_EXP ($(stat -f -c %T "$NFS_EXP"))  netem=${NETEM_MS}ms/way  size=${SIZE}MiB  streams=$STREAMS" ;;
+  window-cap)
+    BACKING="${2:?need backing dir}"; SIZE="${3:-512}"; STREAMS="${4:-8}"
+    gen_corpus "$BACKING/backing" "$SIZE" "$STREAMS"
+    SCANDIR="$BACKING/backing"
+    echo "window-cap backing=$BACKING ($(stat -f -c %T "$BACKING"))  size=${SIZE}MiB  streams=$STREAMS  caps=[$CAP_MIB]MiB" ;;
   *) echo "unknown mode: $MODE" >&2; exit 2 ;;
 esac
 
 mkdir -p "$MMNT"
-rm -f "$DB"; "$BIN" scan "$SCANDIR" --db "$DB" >/dev/null   # scan before adding netem
+# window-cap scans inside its own section (after building a binary); the scan is
+# independent of the read-ahead window so any variant binary produces the same DB.
+if [ "$MODE" != window-cap ]; then
+  rm -f "$DB"; "$BIN" scan "$SCANDIR" --db "$DB" >/dev/null   # scan before adding netem
+fi
 if [ "$MODE" = nfs ]; then tc qdisc add dev lo root netem delay "${NETEM_MS}ms"; NETEM=1; fi
 
 # shellcheck disable=SC2016  # '$title' is a musefs output-template literal, not a shell var
@@ -117,7 +145,16 @@ mount_mode() { local m="$1"; shift; "$BIN" mount "$MMNT" --db "$DB" --mode "$m" 
   local f=""; for _ in $(seq 1 60); do f=$(find "$MMNT" -type f 2>/dev/null|head -1); [ -n "$f" ] && break; sleep 0.25; done; }
 mount_m() { mount_mode synthesis "$@"; }
 umount_m() { kill "$MP" 2>/dev/null||true; for _ in $(seq 1 20); do kill -0 "$MP" 2>/dev/null||break; sleep 0.25; done; MP=""; }
-drop() { sync; echo 3 > /proc/sys/vm/drop_caches; }
+drop() { sync; if [ "$(id -u)" -eq 0 ]; then echo 3 > /proc/sys/vm/drop_caches
+  else sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'; fi; }
+# Build a musefs release binary with WINDOW_ABS_CAP patched to $1 MiB, restore the
+# source, and stash the binary at a per-cap path (echoed). #433.
+build_cap() { local c="$1" out="/tmp/sp-musefs-cap${1}mib"
+  git -C "$ROOT" checkout -- "$RA"
+  sed -i -E "s|(pub const WINDOW_ABS_CAP: u64 =).*;|\1 ${c} * 1024 * 1024;|" "$RA"
+  ( cd "$ROOT" && cargo build --release -p musefs -q )
+  git -C "$ROOT" checkout -- "$RA"
+  cp "$BIN" "$out"; echo "$out"; }
 biggest() { find "$MMNT" -type f -printf '%s\t%p\n'|sort -rn|head -1|cut -f2-; }
 secs() { dd if="$1" of=/dev/null bs=1M 2>&1|tail -1|awk '{for(i=1;i<=NF;i++) if($i=="copied,") print $(i+1)}'; }
 cold_mbps() { local v; v="$(biggest)"; local o
@@ -125,6 +162,9 @@ cold_mbps() { local v; v="$(biggest)"; local o
     dd if="$v" of=/dev/null bs=1M 2>&1|tail -1|awk '{b=$1}{for(i=1;i<=NF;i++) if($i=="copied,")s=$(i+1)}END{if(s>0)printf "%.1f\n",b/1e6/s}'
   done|sort -n|sed -n 2p); echo "${o:-0}"; }
 
+# The kernel/mount-knob sweeps below are the #256 investigation; window-cap (#433)
+# runs its own section instead — the cap is a daemon-internal const, not a knob.
+if [ "$MODE" != window-cap ]; then
 echo "## read_ahead_budget (cold single-stream MB/s; issue #255)"
 printf '%-24s %10s\n' config MBps
 # off (ra=0) vs the default Phase-1 read amplification (ra=64, prefetch off).
@@ -159,3 +199,38 @@ for kc in false true; do
   c=$(secs "$v"); r=$(secs "$v"); umount_m
   printf '%-16s %10s %10s\n' "$kc" "$c" "$r"
 done
+fi  # end non-window-cap sweeps
+
+if [ "$MODE" = window-cap ]; then
+  # Sweep the daemon-internal read-amplification window cap (WINDOW_ABS_CAP) on
+  # real spinning media (#433). Each cap value is its own release build; the
+  # source is patched in place and restored after every build (and on exit).
+  echo "## window_cap build (one release binary per cap value)"
+  declare -A CAPBIN; SCANBIN=""
+  for c in $CAP_MIB; do
+    printf '  building cap=%s MiB ... ' "$c" >&2
+    CAPBIN[$c]="$(build_cap "$c")"; [ -z "$SCANBIN" ] && SCANBIN="${CAPBIN[$c]}"
+    echo "ok" >&2
+  done
+  rm -f "$DB"; "$SCANBIN" scan "$SCANDIR" --db "$DB" >/dev/null
+
+  echo "## window_cap (cold single-stream MB/s; default mount = amplification on, prefetch off)"
+  printf '%-12s %10s\n' cap_MiB MBps
+  for c in $CAP_MIB; do
+    BIN="${CAPBIN[$c]}"; mount_m
+    printf '%-12s %10s\n' "$c" "$(cold_mbps)"; umount_m
+  done
+
+  if [ "$STREAMS" -gt 0 ]; then
+    echo "## window_cap ($STREAMS concurrent cold streams, aggregate wall s)"
+    printf '%-12s %10s\n' cap_MiB wall_s
+    for c in $CAP_MIB; do
+      BIN="${CAPBIN[$c]}"; mount_m
+      mapfile -t files < <(find "$MMNT" -type f ! -path "$(biggest)")
+      drop; t0=$(date +%s.%N); pids=()
+      for f in "${files[@]:0:$STREAMS}"; do dd if="$f" of=/dev/null bs=1M 2>/dev/null & pids+=("$!"); done
+      wait "${pids[@]}"; t1=$(date +%s.%N); umount_m
+      printf '%-12s %10s\n' "$c" "$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f",b-a}')"
+    done
+  fi
+fi
