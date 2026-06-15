@@ -120,7 +120,7 @@ pub struct MountArgs {
     pub read_ahead_budget_mib: u32,
     /// Enable Phase-2 background prefetch threads (advanced). Off by default:
     /// read amplification alone carries the read-ahead win; the threads add
-    /// overhead without benefit on tested backends (NFS, SSD). See BENCHMARKS.md.
+    /// overhead without benefit on tested backends (NFS, SSD). See the benchmarks docs: https://sohex.github.io/musefs/benchmarks.html
     #[arg(long, env = "MUSEFS_READ_AHEAD_PREFETCH", default_value_t = false)]
     pub read_ahead_prefetch: bool,
     /// Max outstanding background (readahead/async) requests the kernel queues.

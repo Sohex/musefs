@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Storage-tunables bench: measures whether --max-readahead-kib / --max-background /
 # --keep-cache actually help musefs on slow backing storage. Backs the discussion in
-# BENCHMARKS.md (#storage-tunables). Negative result: only --keep-cache helps.
+# the benchmarks docs (https://sohex.github.io/musefs/benchmarks.html#storage-tunables). Negative result: only --keep-cache helps.
 #
 # These knobs are kernel<->FUSE parameters, so they only matter through a REAL kernel
 # mount with a real reader (not the in-process Criterion benches). Mode MUST be

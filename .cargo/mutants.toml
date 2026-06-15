@@ -58,7 +58,7 @@ exclude_globs = [
 # it (`op=`/`fn=`/`rows=` for file:line:col anchors, `count=` for multi-site
 # description anchors). scripts/check_mutant_anchors.py re-validates them against
 # the live mutant set in CI so a `cargo fmt` line shift can't silently re-point an
-# anchor onto a killable mutant. See CONTRIBUTING.md "Mutation testing" before
+# anchor onto a killable mutant. See the "Mutation testing" section at https://sohex.github.io/musefs/contributing/testing.html#mutation-testing before
 # editing; run the guard locally after any change here.
 exclude_re = [
     # musefs-format's sanctioned u64->usize helper: replacing its body with a

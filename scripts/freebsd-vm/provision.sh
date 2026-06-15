@@ -2,7 +2,7 @@
 # Provision a FreeBSD host/VM to build and run musefs FUSE e2e tests.
 # Run as root, from the repo root. Used by BOTH the CI `freebsd` job
 # (vmactions/freebsd-vm) and local runs (run-local.sh); see the FreeBSD e2e
-# section in CONTRIBUTING.md. Keep CI and local identical by editing only this file.
+# section in the docs (https://sohex.github.io/musefs/contributing/setup.html#freebsd-e2e). Keep CI and local identical by editing only this file.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
