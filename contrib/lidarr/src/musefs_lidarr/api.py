@@ -8,6 +8,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from musefs_common import MAX_ART_BYTES
+
 from .errors import ConfigError, LidarrApiError
 
 # Lidarr custom scripts are fire-and-forget: a transient API error or a restart
@@ -91,10 +93,15 @@ class LidarrClient:
 
         ``url`` is the server-relative path from an album's ``images`` entry
         (e.g. ``/MediaCover/Albums/20/cover.jpg``); an absolute ``remoteUrl`` is
-        used as-is. Retries transient failures like :meth:`get_json`.
+        used as-is. The API key is sent only for server-local paths — absolute
+        URLs point at third-party hosts (coverartarchive.org, etc.) and must not
+        carry the Lidarr key. The body is capped at ``MAX_ART_BYTES`` so a
+        third-party host cannot make us buffer an unbounded image. Retries
+        transient failures like :meth:`get_json`.
         """
-        full = url if url.startswith(("http://", "https://")) else f"{self._base}{url}"
-        return self._request(full)
+        if url.startswith(("http://", "https://")):
+            return self._request(url, send_key=False, max_bytes=MAX_ART_BYTES)
+        return self._request(f"{self._base}{url}", max_bytes=MAX_ART_BYTES)
 
     def _url(self, path: str, params: dict[str, object] | None = None) -> str:
         query = ""
@@ -104,31 +111,64 @@ class LidarrClient:
                 query = "?" + urlencode(clean, doseq=True)
         return f"{self._base}{path}{query}"
 
-    def _request(self, url: str) -> bytes:
-        """GET ``url`` with the API key, returning the raw response body.
+    def _request(self, url: str, *, send_key: bool = True, max_bytes: int | None = None) -> bytes:
+        """GET ``url``, returning the raw response body.
+
+        The ``X-Api-Key`` header is sent only when ``send_key`` is true, so an
+        absolute third-party URL never carries the Lidarr key. When ``max_bytes``
+        is set, a response whose declared or actual length exceeds it fails with
+        ``LidarrApiError`` rather than being buffered in full.
 
         Retries up to ``self._retries`` attempts with exponential backoff on
         transient failures (network errors, timeouts, and the 5xx/429/408 HTTP
-        statuses); non-transient HTTP errors fail fast.
+        statuses); non-transient HTTP errors fail fast. Every failing path raises
+        ``LidarrApiError``.
         """
-        request = Request(url, headers={"X-Api-Key": self._api_key})
+        headers = {"X-Api-Key": self._api_key} if send_key else {}
+        request = Request(url, headers=headers)
+        last_exc: Exception | None = None
+        message = "Lidarr API request failed"
         for attempt in range(self._retries):
-            last = attempt + 1 == self._retries
             try:
                 with self._opener(request, timeout=self._timeout) as response:
-                    return response.read()
+                    return self._read_capped(response, max_bytes)
             except HTTPError as exc:
-                if last or exc.code not in _RETRYABLE_STATUS:
-                    raise LidarrApiError(
-                        f"Lidarr API request failed with HTTP {exc.code}; "
-                        f"api_key={redacted(self._api_key)}"
-                    ) from exc
+                message = (
+                    f"Lidarr API request failed with HTTP {exc.code}; "
+                    f"api_key={redacted(self._api_key)}"
+                )
+                if exc.code not in _RETRYABLE_STATUS:
+                    raise LidarrApiError(message) from exc
+                last_exc = exc
             except (URLError, TimeoutError) as exc:
-                if last:
-                    reason = getattr(exc, "reason", exc)
-                    raise LidarrApiError(f"Lidarr API request failed: {reason}") from exc
-            self._sleep(_RETRY_BACKOFF_BASE * (2**attempt))
-        raise AssertionError("unreachable")  # pragma: no cover
+                last_exc = exc
+                message = f"Lidarr API request failed: {getattr(exc, 'reason', exc)}"
+            if attempt + 1 < self._retries:
+                self._sleep(_RETRY_BACKOFF_BASE * (2**attempt))
+        raise LidarrApiError(message) from last_exc
+
+    def _read_capped(self, response, max_bytes: int | None) -> bytes:
+        """Read ``response`` body, rejecting one larger than ``max_bytes``.
+
+        A declared ``Content-Length`` over the cap fails before any body is read;
+        otherwise at most ``max_bytes + 1`` bytes are buffered to detect overrun.
+        """
+        if max_bytes is None:
+            return response.read()
+        declared = response.headers.get("Content-Length")
+        if declared is not None:
+            try:
+                declared_len = int(declared)
+            except ValueError:
+                declared_len = None
+            if declared_len is not None and declared_len > max_bytes:
+                raise LidarrApiError(
+                    f"Lidarr cover art exceeds {max_bytes} bytes (Content-Length {declared_len})"
+                )
+        body = response.read(max_bytes + 1)
+        if len(body) > max_bytes:
+            raise LidarrApiError(f"Lidarr cover art exceeds {max_bytes} bytes")
+        return body
 
     def media_management_config(self):
         """Return Lidarr's media-management config."""

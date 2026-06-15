@@ -2,6 +2,7 @@ import json
 from urllib.error import HTTPError, URLError
 
 import pytest
+from musefs_common import MAX_ART_BYTES
 
 from musefs_lidarr.api import (
     LidarrClient,
@@ -100,8 +101,9 @@ def test_config_requires_url_and_key_together():
 
 
 class RawResponse:
-    def __init__(self, payload: bytes):
+    def __init__(self, payload: bytes, headers: dict | None = None):
         self.payload = payload
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -109,8 +111,18 @@ class RawResponse:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def read(self):
-        return self.payload
+    def read(self, amount=None):
+        return self.payload if amount is None else self.payload[:amount]
+
+
+class _CountingResponse(RawResponse):
+    def __init__(self, payload: bytes, reads: list, headers: dict | None = None):
+        super().__init__(payload, headers)
+        self._reads = reads
+
+    def read(self, amount=None):
+        self._reads.append(amount)
+        return super().read(amount)
 
 
 def _flaky_opener(failures):
@@ -203,3 +215,72 @@ def test_media_cover_fetches_raw_bytes_with_api_key():
     assert data == b"\xff\xd8\xff\xe0jpegdata"
     assert captured["url"] == "http://lidarr.local/MediaCover/Albums/20/cover.jpg?lastModified=1"
     assert captured["headers"]["X-api-key"] == "secret"
+
+
+def test_media_cover_absolute_url_omits_api_key():
+    captured = {}
+
+    def opener(request, timeout):
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.header_items())
+        return RawResponse(b"\xff\xd8\xff\xe0jpegdata")
+
+    client = LidarrClient(
+        LidarrConfig(url="http://lidarr.local/", api_key="secret"), opener=opener
+    )
+
+    data = client.media_cover("https://coverartarchive.org/release/abc/front.jpg")
+
+    assert data == b"\xff\xd8\xff\xe0jpegdata"
+    assert captured["url"] == "https://coverartarchive.org/release/abc/front.jpg"
+    assert "X-api-key" not in captured["headers"]
+
+
+def test_media_cover_rejects_oversized_body():
+    def opener(request, timeout):
+        return RawResponse(b"x" * (MAX_ART_BYTES + 1))
+
+    client = LidarrClient(LidarrConfig(url="http://lidarr.local", api_key="secret"), opener=opener)
+
+    with pytest.raises(LidarrApiError, match="exceeds"):
+        client.media_cover("/MediaCover/Albums/1/cover.jpg")
+
+
+def test_media_cover_rejects_oversized_content_length():
+    reads = []
+
+    def opener(request, timeout):
+        return _CountingResponse(b"x", reads, headers={"Content-Length": str(MAX_ART_BYTES + 1)})
+
+    client = LidarrClient(LidarrConfig(url="http://lidarr.local", api_key="secret"), opener=opener)
+
+    with pytest.raises(LidarrApiError, match="Content-Length"):
+        client.media_cover("/MediaCover/Albums/1/cover.jpg")
+    assert reads == []
+
+
+def test_media_cover_accepts_body_at_cap():
+    data = b"y" * MAX_ART_BYTES
+
+    def opener(request, timeout):
+        return RawResponse(data, headers={"Content-Length": str(MAX_ART_BYTES)})
+
+    client = LidarrClient(LidarrConfig(url="http://lidarr.local", api_key="secret"), opener=opener)
+
+    assert client.media_cover("/MediaCover/Albums/1/cover.jpg") == data
+
+
+def test_request_exhausts_retries_raising_api_error_not_assertion():
+    err = HTTPError("http://lidarr.local/api/v1/album/1", 503, "Service Unavailable", None, None)
+    opener, calls = _flaky_opener([err, err, err])
+    client = LidarrClient(
+        LidarrConfig(url="http://lidarr.local", api_key="secret"),
+        opener=opener,
+        retries=3,
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(LidarrApiError) as exc:
+        client.get_json("/api/v1/album/1")
+    assert len(calls) == 3
+    assert "503" in str(exc.value)
