@@ -15,9 +15,9 @@ use std::sync::mpsc::sync_channel;
 const BATCH_FILES: usize = 256;
 const BATCH_BYTES: u64 = 64 << 20; // 64 MiB
 
-/// Initial bounded-read window. Covers typical metadata + cover art; a larger
-/// metadata region triggers a `NeedMore` widen.
-const WINDOW: usize = 1 << 20; // 1 MiB
+/// Initial bounded-read window. Sized to cover most files' metadata in one read;
+/// larger metadata (e.g. embedded cover art) triggers a precise `NeedMore` widen.
+const WINDOW: usize = 1 << 16; // 64 KiB
 /// Cap on widen iterations before falling back to a full-buffer read.
 const MAX_WIDEN_RETRIES: usize = 8;
 /// Hard ceiling on bytes read to probe one file. Real audio metadata fits far
