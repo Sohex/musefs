@@ -25,3 +25,7 @@
 - [Conventions & adding a format](contributing/conventions.md)
 - [Python plugins](contributing/plugins.md)
 - [Releasing](contributing/releasing.md)
+
+# Reference
+
+- [Benchmarks](benchmarks.md)

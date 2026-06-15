@@ -41,6 +41,6 @@ buffers, so a slow backing read never stalls the FUSE dispatch thread).
 
 The workspace also carries `musefs-latencyfs`, a dev/bench-only crate
 (`publish = false`): a latency-injecting passthrough FUSE filesystem used by
-the [BENCHMARKS.md](../../../BENCHMARKS.md) harness to simulate slow backing stores. It
+the [BENCHMARKS.md](../benchmarks.md) harness to simulate slow backing stores. It
 is not part of the shipping dependency graph (core uses it only as a
 dev-dependency).
