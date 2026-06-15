@@ -31,7 +31,7 @@ class MusefsPlugin(BeetsPlugin):
             "fields": {},
             "bin": "musefs",  # musefs executable (PATH name or full path)
             "autoscan": True,  # run `musefs scan` automatically before syncing
-            "write_path": True,  # emit a beets_path tag for ${beets_path} mounts
+            "write_path": True,  # emit a beets_path tag for $!{beets_path} mounts
             "restore_backing": False,  # on delete, let the backing tag value reappear
         })
         # beets has no file-move event, and `after_write` fires *before* a move
