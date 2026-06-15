@@ -84,9 +84,11 @@ them outright — intent-based, race-free, API-free, no schema change.
 `AlbumDeleteMessage`/`ArtistDeleteMessage` expose a `DeletedFiles` bool — the
 "also delete the files from disk" checkbox in Lidarr's delete dialog
 (`true` = "Album removed and all files were deleted", `false` = "Album removed,
-files were not deleted"). In musefs's topology the "files" are Lidarr's own symlink
-entries, never the backing directory, so the prune decision ("Lidarr stopped
-tracking this album/artist → drop the rows") is identical either way. We ignore it.
+files were not deleted"). It is emitted as `Lidarr_Artist_DeletedFiles` for
+**both** events (there is no `Lidarr_Album_DeletedFiles`). In musefs's topology the
+"files" are Lidarr's own symlink entries, never the backing directory, so the prune
+decision ("Lidarr stopped tracking this album/artist → drop the rows") is identical
+either way. We ignore it.
 
 ## Design
 
@@ -95,17 +97,24 @@ tracking this album/artist → drop the rows") is identical either way. We ignor
 Two additions to `musefs_common/store.py`, mirroring `prune_missing`'s style, and
 the intent-based counterpart to it:
 
-- `track_ids_by_tag(conn, key, value)` — return the track-ids whose text tag
-  `(key, value)` matches (e.g. `("musicbrainz_albumid", mbid)`). Matches
-  plugin-owned text rows (`value_blob IS NULL`).
+- `track_ids_by_tag(conn, key, value)` — return a `list[int]` (possibly empty,
+  order unspecified) of track-ids whose text tag `(key, value)` matches (e.g.
+  `("musicbrainz_albumid", mbid)`). Scoped to plugin-owned text rows
+  (`value_blob IS NULL`).
 - `delete_tracks(conn, track_ids)` — unconditional `DELETE FROM tracks WHERE id = ?`
-  per id; returns the count. Relies on the same FK `ON DELETE CASCADE` that
-  `prune_missing` already depends on, so tags and art rows are removed with the
-  track.
+  per id; returns the count of rows **actually deleted** (sum of per-statement
+  `rowcount`, so an already-gone id contributes 0). Relies on the same FK
+  `ON DELETE CASCADE` that `prune_missing` already depends on (and the
+  `foreign_keys = ON` pragma `connect()` sets), so tags and art rows are removed
+  with the track.
 
-Both are exported from `musefs_common/__init__.py` and re-vendored into the
-`contrib/picard/musefs/_common/` and lidarr trees per the existing vendoring flow.
-The `python-musefs` public-API test is updated for the two new names.
+Both are exported from `musefs_common/__init__.py`. Lidarr picks up the new
+exports through its `python-musefs` pip dependency (it does not vendor). Picard
+**does** vendor `musefs_common`, so the byte-identical drift gate
+(`vendor_to_picard.py` / `test_vendor_sync.py`) requires re-running
+`vendor_to_picard.py` and committing the regenerated Picard `store.py` /
+`__init__.py` even though Picard does not call the new functions. The
+`python-musefs` public-API test is updated for the two new names.
 
 ### 2. Lidarr — intent-based prune by MBID
 
@@ -113,34 +122,52 @@ The `python-musefs` public-API test is updated for the two new names.
   `ALBUM_DELETED = "AlbumDeleted"` to `EventType`. `parse_event` extracts
   `Lidarr_Album_MBId` / `Lidarr_Artist_MBId` into new `LidarrEvent` fields
   (`album_mbid`, `artist_mbid`).
-- **`sync.py`**: add `prune_deleted(*, config, event) -> int` that opens the DB and
-  deletes tracks by identity:
+- **`sync.py`**: add `prune_deleted(*, config: SyncConfig, event) -> int` that
+  opens the DB (`config.db_path`) and deletes tracks by identity:
   - `AlbumDeleted` → `delete_tracks(conn, track_ids_by_tag(conn, "musicbrainz_albumid", event.album_mbid))`
   - `ArtistDeleted` → `delete_tracks(conn, track_ids_by_tag(conn, "musicbrainz_artistid", event.artist_mbid))`
 
-  Commit/rollback like `sync_rename_prune`.
+  Commit/rollback like `sync_rename_prune`. It needs only `SyncConfig` (the
+  DB path) — never `LidarrConfig`/`client_factory`.
 - **`cli_sync.py`**: dispatch the two new event types to `prune_deleted` **before**
   the `config.enabled` / doctor-preflight / API block — deletion is a purely local
-  DB operation needing neither the Lidarr API nor a scan. Print a summary
+  DB operation needing neither the Lidarr API nor a scan. `config_from_env(env)`
+  (which raises `ConfigError` if `MUSEFS_DB` is unset) is called for delete events
+  **inside the existing `try`** so the error maps to the exit-1 path; no
+  `LidarrClient` is ever constructed. Print a summary
   (`musefs-lidarr-sync: pruned N rows`).
-- **No-MBID events**: a delete event with an empty/missing MBID cannot be mapped.
-  Log it to stderr (`… delete event carried no MusicBrainz id; cannot prune,
-  leaving rows for the next scan/reconcile`) and exit 0 — never fail Lidarr's hook.
-  These rows linger until a manual rescan/reconcile; accepted (rare for
-  Lidarr-managed libraries).
+- **No-MBID events**: a delete event with an empty/missing MBID (`album_mbid` /
+  `artist_mbid` parsed as `None`) cannot be mapped. Log it to stderr (`… delete
+  event carried no MusicBrainz id; cannot prune, leaving rows for the next
+  scan/reconcile`), open no DB connection, and return exit 0 — never fail
+  Lidarr's hook. These rows linger until a manual rescan/reconcile; accepted (rare
+  for Lidarr-managed libraries).
+- **Release-group granularity (accepted limitation)**: Lidarr models an "album" as
+  a MusicBrainz **release group** and `Lidarr_Album_MBId` is its release-group id;
+  the sync stores that same value in `musicbrainz_albumid`. So the album-delete
+  prune removes every stored row carrying that release-group id. Within one Lidarr
+  instance this is exact (Lidarr keys albums uniquely by `ForeignAlbumId`, so one
+  id ↔ one album's track files). The only over-prune risk is a **mixed store**
+  where non-Lidarr rows happen to carry the same `musicbrainz_albumid` value;
+  accepted as a limitation (rare; the backing bytes are untouched and the rows
+  rebuild on the next scan/sync). We do not store the numeric Lidarr album id, so
+  tighter scoping is out of scope here.
 
 ### 3. beets — existence-based prune on removal
 
 - **`__init__`**: register `item_removed` and `album_removed` listeners.
-- Handlers append the removed item(s) to a new `_pending_removed` list, kept
-  separate from `_pending` — removed items must **not** be scanned or synced, only
-  pruned.
-- **`_reconcile_pending`**: run when *either* `_pending` or `_pending_removed` is
-  non-empty. Written items still go through scan + sync; the existing
-  existence-based `prune_missing` step covers both moved-away backing files and
-  removed items. Because beets deletes files synchronously within the command, the
-  on-disk state is final by `cli_exit`: `remove -d` → row pruned; `remove` (file
-  kept) → row retained.
+- The handlers set a new `_saw_removal` flag (they do **not** feed the prune).
+  Their job is solely to make `_reconcile_pending` run on a removals-only command;
+  removed items are deliberately not scanned or synced.
+- **`_reconcile_pending`**: change the early-return guard to run when `_pending`
+  is non-empty **or** `_saw_removal` is set. The prune step is the **existing
+  unscoped** `prune_missing(db_path)` (full-DB existence sweep, `items=None`) —
+  it already covers removed-and-deleted files *and* moved-away backing files in
+  one pass, so the removed items themselves never need to be threaded into the
+  prune. Written items (from `_pending`) still go through scan + sync as today.
+  Because beets deletes files synchronously within the command, the on-disk state
+  is final by `cli_exit`: `remove -d` → row pruned; `remove` (file kept) → row
+  retained.
 - Stays best-effort: a passive `cli_exit` hook never aborts the beets command
   (existing warning / `print_` degradation preserved).
 
@@ -159,15 +186,19 @@ No change.
 
 ## Testing
 
-- **Store** (`python-musefs/tests`): `track_ids_by_tag` matches the right rows and
-  ignores binary tags; `delete_tracks` removes the track and cascades to its tags
-  and art; public-API test updated for the two new exports.
+- **Store** (`python-musefs/tests`): `track_ids_by_tag` matches the right rows
+  (set comparison, order unspecified) and ignores binary tags; `delete_tracks`
+  removes the track and cascades to its tags and art, and returns the count of
+  rows actually deleted (0 for an already-gone id); public-API test updated for
+  the two new exports.
 - **Lidarr**: `events.py` parse tests for `ArtistDeleted`/`AlbumDeleted` (MBID
-  extraction, including the empty-MBID case); `prune_deleted` integration test —
-  album delete prunes only that album's rows, artist delete prunes all the
-  artist's rows, and **the backing files are left on disk**; missing-MBID → skip;
-  a `cli_sync` dispatch test asserting **no API client is constructed** for delete
-  events.
+  extraction, including the empty/missing-MBID → `None` case); `prune_deleted`
+  integration test — album delete prunes the rows whose `musicbrainz_albumid`
+  matches and leaves a different album's rows intact, artist delete prunes all the
+  artist's rows, and **the backing files are left on disk** in every case;
+  no-MBID delete event → returns exit 0, prints the caveat to stderr, and opens
+  **no DB connection**; a `cli_sync` dispatch test asserting **no `LidarrClient`
+  is constructed** for delete events.
 - **beets**: `item_removed` with file deleted → pruned; `item_removed` without
   delete (file present) → retained; a removal-only command (no writes) still
   triggers the reconcile/prune.
@@ -193,3 +224,6 @@ beets venv and the vendored-tree re-vendor step apply).
 - Any `musefs-core`/scan or schema change.
 - Recovering deletions for Lidarr releases with no MusicBrainz id (left to a
   manual rescan/reconcile).
+- Release-scoped (vs release-group-scoped) Lidarr album deletion, and avoiding
+  over-prune in a mixed store sharing `musicbrainz_albumid` values — would require
+  storing the numeric Lidarr album id.
