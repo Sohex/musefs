@@ -318,6 +318,22 @@ fn scan_directory_counts_scanned_failed_and_skipped() {
 }
 
 #[test]
+fn probe_file_caught_isolates_parser_panic_as_failed() {
+    // A residual parser panic — one the format-layer alloc guards don't catch —
+    // must drop just that file (counted as failed), not unwind the scan worker
+    // thread and silently truncate the rest of the library (#425). Mirrors the
+    // read path's `read_outcome` panic boundary (#359). The after-S1 hook stands
+    // in for a parser that panics partway through the probe.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boom.flac");
+    write_flac(&path, &["ARTIST=A", "TITLE=T"], None);
+    set_after_s1_hook(|| panic!("parser exploded"));
+    let out = probe_file_caught(&path, WINDOW);
+    clear_after_s1_hook();
+    assert!(matches!(out, Ok(ProbeOutcome::Unparseable)), "got {out:?}");
+}
+
+#[test]
 fn skip_tally_summary_orders_by_descending_count() {
     let mut tally = super::SkipTally::default();
     for _ in 0..20 {
