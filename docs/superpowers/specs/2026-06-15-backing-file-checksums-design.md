@@ -59,39 +59,49 @@ editable tag contract and external tools never write them.
 
 ### Fingerprint — cheap candidate filter
 
-A hash over a **fixed, content-only region** of the backing file: the first
-`FP_HEAD` bytes and the last `FP_TAIL` bytes, folded together with the file
-`size`. `FP_HEAD`/`FP_TAIL` are constants (exact sizes a plan/bench detail —
-start around 64 KiB head / 4 KiB tail); for a file smaller than
-`FP_HEAD + FP_TAIL` the whole file is hashed.
+A hash over the **probe's parsed output** — the `Probed` result the scan already
+produces for every file (format, `audio_offset`/`audio_length`, the ordered tag
+set, and the embedded art / binary-tag / structural-block payloads). Computed at
+**zero extra I/O**: the data is already parsed in memory by the time it reaches
+the writer, so this reuses the existing probe machinery rather than adding a
+near-duplicate fixed-region read path.
 
-The region is deliberately defined independently of the probe's read, **not** as
-"the bytes the probe happened to read." The probe window is adaptive (it widens
-on `NeedMore`, varies with `--window`, and M4A reads `moov` via a seek reader
-rather than a front window — `probe_body`, `scan.rs:564`), so a probe-derived
-hash would be neither content-deterministic across scans nor uniform across
-formats, and cross-scan matching would break. A fixed head+tail+size region
-sidesteps all of that.
+The probe's *read* is adaptive (the window widens on `NeedMore`, varies with
+`--window`, and M4A reads `moov` via a seek reader rather than a front window —
+`probe_body`, `scan.rs:564`), but its *parsed result* is **deterministic per
+file**: the same file always parses to the same `Probed` (widening converges to
+the same parseable extent, capped at the constant `MAX_PROBE_BYTES`, independent
+of `--window`). Hashing the parsed output — not the raw read buffer — is
+therefore content-stable across scans and uniform across formats. (Hashing the
+raw adaptive buffer would *not* be deterministic; that distinction is the whole
+reason to hash the output.)
 
-The fingerprint is therefore a small **bounded extra read** (head bytes usually
-overlap what the probe already pulled, so the page cache is warm; the tail is the
-only reliably-new read). It is near-free but not literally zero — which is
-exactly what the with/without-fingerprint benchmark measures.
+Large embedded payloads (art, binary tags) are folded in by their **digest**
+(length + content hash) rather than their raw bytes, so the fingerprint stays
+cheap even for a file carrying a 16 MB cover — it never re-hashes multi-megabyte
+blobs per file.
+
+**Excluded: every `BackingStamp` field — `mtime_ns`, `ctime_ns`, and `size`.**
+`ctime` bumps on a rename, so it changes on the very move we are trying to
+survive; `mtime` changes on any in-place retag; both would defeat move-matching.
+`size` is content-stable but redundant — `audio_length` is already in the parsed
+output and gives the same length-based discrimination. The fingerprint is thus
+defined purely from content the probe parsed.
 
 Its role is to cheaply answer "which orphaned row might this new file be?"
-without reading whole files. A pure `mv` preserves the probe region byte-for-byte
-and the size is unchanged, so a moved file's fingerprint matches its old row's
-stored fingerprint. This means **the fingerprint alone already recovers the
-common move** — and since the vanished original cannot be re-read, a fingerprint
-match is in fact the only thing available when no full hash was pre-computed.
+without reading whole files. A pure `mv` leaves the parsed `Probed` identical, so
+a moved file's fingerprint matches its old row's stored fingerprint. This means
+**the fingerprint alone already recovers the common move** — and since the
+vanished original cannot be re-read, a fingerprint match is in fact the only
+thing available when no full hash was pre-computed.
 
-The fingerprint is **not collision-proof**: the probe region is dominated by
-metadata (headers, tags, embedded art), which is the least content-unique and
-most mutable part of a file, so two tracks with near-identical tags and the same
-cover can collide. Folding `size` into it makes that rare (such files almost
-always differ in size), and collisions are harmless under the two-tier design
-below: a fingerprint collision costs at most one extra full-hash confirmation,
-never a wrong retarget.
+The fingerprint is **not collision-proof**: it is derived from parsed metadata
+plus `audio_length`, and (for FLAC) the STREAMINFO structural block, which embeds
+an MD5 of the decoded audio — near-perfect identity. For non-FLAC formats no raw
+audio is sampled, so two tracks with identical tags, identical cover, and the
+same `audio_length` could in principle collide. `audio_length` makes that rare,
+and collisions are harmless under the two-tier design below: a fingerprint
+collision costs at most one extra full-hash confirmation, never a wrong retarget.
 
 The fingerprint hash function starts as **SHA-256** (the same primitive as the
 full hash and `art.sha256`), to keep the first implementation single-primitive.
@@ -101,9 +111,11 @@ hash (the fingerprint is a filter, not an integrity guarantee, so it does not
 need to be cryptographic). This is a hash-choice decision made from numbers, not
 up front.
 
-Changing `FP_HEAD`/`FP_TAIL` (or the fold) invalidates stored fingerprints, so
-they are versioned implicitly with the migration/scan logic. Regenerating them is
-cheap — bounded head+tail reads per file, not a whole-library read.
+Because the fingerprint is derived from the probe's parsed output, changing the
+probe/parse logic or the canonical encoding invalidates stored fingerprints (the
+"regen if the ingest mechanism changes" cost, accepted up front). Regenerating
+them is cheap — a metadata-only reprobe (bounded reads), not a whole-library
+read.
 
 ### Full hash — authoritative arbiter
 
@@ -123,7 +135,7 @@ paranoid case (a crafted file matching a fingerprint but carrying junk audio).
 A new migration adds two nullable columns to `tracks` and bumps `user_version`:
 
 ```sql
-ALTER TABLE tracks ADD COLUMN fingerprint  TEXT;  -- cheap probe-region + size hash
+ALTER TABLE tracks ADD COLUMN fingerprint  TEXT;  -- cheap hash of the probe's parsed output
 ALTER TABLE tracks ADD COLUMN content_hash TEXT;  -- SHA-256 of the whole file, 64-char hex
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 ```
@@ -161,10 +173,10 @@ preserves any existing `content_hash`. (`ingest_into`'s upsert,
 re-ingest.) On a retarget the content is unchanged, so the moved row keeps its
 `content_hash` and its `fingerprint` is identical to the matched value anyway.
 
-**Default tier is `fingerprint`, pending a benchmark** confirming the
-probe-region hash adds negligible overhead to a scan (corpus backed on tmpfs per
-the bench harness). If the overhead is non-negligible, the default stays `none`
-and `fingerprint` is opt-in. Either way `none` remains available.
+**Default tier is `fingerprint`, pending a benchmark** confirming that hashing
+the probe's parsed output adds negligible overhead to a scan (corpus backed on
+tmpfs per the bench harness). If the overhead is non-negligible, the default
+stays `none` and `fingerprint` is opt-in. Either way `none` remains available.
 
 ## Re-identification on `scan`
 
@@ -288,9 +300,10 @@ pass:
 - Schema migration round-trip and `user_version` (the existing `schema` test
   tiers); Python schema-mirror regeneration.
 - Fingerprint stability and determinism: identical bytes at a different path
-  produce the same fingerprint regardless of `--window`/format; a change confined
-  to the head or tail region changes it; a small file (< `FP_HEAD + FP_TAIL`)
-  hashes the whole file and still round-trips.
+  produce the same fingerprint; **the same file scanned at two different
+  `--window` values produces the same fingerprint** (parsed-output determinism);
+  a metadata edit the probe parses changes it; `mtime`/`ctime`/`size` changes
+  alone (e.g. `touch`) do not.
 - Refind matrix on `scan`: pure move (retarget, tags/art preserved, `id`
   stable); copy with original still present (fresh insert, original untouched);
   ambiguous multi-candidate (fresh insert + warning); no match (fresh insert);
