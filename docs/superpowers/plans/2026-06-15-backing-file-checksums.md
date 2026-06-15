@@ -68,6 +68,8 @@
 - Re-vendor: `contrib/picard/musefs/_common/schema.py`, `contrib/picard/musefs/_common/constants.py`
 - Modify: `contrib/picard/tests/test_conftest_sanity.py:8`, `contrib/python-musefs/tests/test_constants.py:5`
 
+> **Note:** Some `tracks.rs` comments mention "V4"/"V5" (e.g. `tracks.rs:243` "As of V5…"), but the live schema is a single squashed `MIGRATION_V1` at `user_version = 1`. Trust the actual `MIGRATIONS` array and `user_version` pragma, not those in-code version numbers. This migration takes the store from 1 → 2.
+
 - [ ] **Step 1: Add a failing test for user_version == 2**
 
 In `musefs-db/src/schema.rs`, inside the existing `mod baseline_tests` (near the `baseline_creates_...` test), add via `insert_after_symbol` on the `baseline_creates_value_blob_and_structural_blocks_and_is_idempotent` test:
@@ -310,9 +312,10 @@ Expected: FAIL to compile — `Track` has no `fingerprint`/`content_hash`, and t
 
 - [ ] **Step 3: Add fields to the `Track` read model**
 
-In `musefs-db/src/models.rs`, edit the `Track` struct (use `replace_symbol_body` on `Track`) to append two fields after `updated_at`:
+In `musefs-db/src/models.rs`, append two fields to the `Track` struct after `updated_at`. **Do NOT use `replace_symbol_body`** — it drops the leading attributes, and `Track` has a load-bearing `#[cfg_attr(feature = "mutants", derive(Default))]` above its derive that the mutation-gate build needs (`Option<String>` is `Default`, so the derive still works once both fields are present). Use a targeted `replace_content`/Edit that preserves both attribute lines, so the result is exactly:
 
 ```rust
+#[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: i64,
@@ -347,15 +350,15 @@ macro_rules! track_select {
 }
 ```
 
-Edit `row_to_track` (use `find_symbol` + `replace_symbol_body`) to read the two new columns. Append after the `updated_at` field read; the new columns are indices 10 and 11 (0-based) in the SELECT order above:
+Edit `row_to_track` (`tracks.rs:31-55`) to read the two new columns. It reads columns **by name** (`r.get("backing_path")`, etc.), not by index, so add two name-based reads to the `Ok(Track { ... })` literal after `updated_at`:
 
 ```rust
-        // ... existing field reads through updated_at (index 9) ...
-        fingerprint: row.get(10)?,
-        content_hash: row.get(11)?,
+        updated_at: r.get("updated_at")?,
+        fingerprint: r.get("fingerprint")?,
+        content_hash: r.get("content_hash")?,
 ```
 
-(Match the existing `row_to_track` construction style exactly — it builds a `Track { ... }`; add the two fields to that literal in the same positions.)
+(`Option<String>` reads a NULL column as `None`. Keep the rest of the literal unchanged.)
 
 - [ ] **Step 5: Add the three methods to `Db<ReadWrite>`**
 
@@ -508,7 +511,23 @@ pub(crate) fn set_track_checksums_in(
 }
 ```
 
-And the `Db` method becomes `pub fn set_track_checksums(&self, ...) -> Result<()> { set_track_checksums_in(&self.conn, id, fingerprint, content_hash) }`. Do the same `*_in` split for `tracks_by_fingerprint`, `retarget_track`, and `get_track_by_path` (the latter currently inlines `query_optional_track`; extract a `get_track_by_path_in(conn, path)` that runs the `track_select!("WHERE backing_path = ?1")` query).
+And the `Db` method becomes `pub fn set_track_checksums(&self, ...) -> Result<()> { set_track_checksums_in(&self.conn, id, fingerprint, content_hash) }`. Do the same `*_in` split for `tracks_by_fingerprint`, `retarget_track`, and `get_track_by_path`. `Db::get_track_by_path` (`tracks.rs:101-103`) goes through the private `query_optional_track` helper, which wraps `crate::query_optional(&self.conn, sql, params, row_to_track)` — and `crate::query_optional` already takes `&Connection`. So extract:
+
+```rust
+pub(crate) fn get_track_by_path_in(
+    conn: &rusqlite::Connection,
+    path: &str,
+) -> Result<Option<Track>> {
+    crate::query_optional(
+        conn,
+        track_select!("WHERE backing_path = ?1"),
+        params![path],
+        row_to_track,
+    )
+}
+```
+
+and have both `Db::get_track_by_path` and `BulkWriter::get_track_by_path` delegate to it. (Confirm `crate::query_optional`'s exact arg order against the live `query_optional_track` call site before finalizing.)
 
 - [ ] **Step 8: Add a BulkWriter parity test**
 
@@ -533,7 +552,7 @@ Add to `checksum_tests` in `tracks.rs`:
     }
 ```
 
-(Check the exact `BulkWriter` construction/commit API — `find_symbol` for how existing tests build a `BulkWriter` from `Db`; adjust `db.bulk_writer()`/`bw.commit()` to the real names.)
+(`db.bulk_writer()` and `bw.commit()` are the real method names — `bulk.rs:27` and `:72` — so no adjustment needed.)
 
 - [ ] **Step 9: Run, format, commit**
 
@@ -567,7 +586,7 @@ base16ct = "1.0"
 
 - [ ] **Step 2: Write failing unit tests for the helpers + enum defaults**
 
-In `musefs-core/src/scan.rs`, inside `mod scan_unit_tests` (use `find_symbol` to locate it), add:
+The unit tests go in `musefs-core/src/scan/scan_unit_tests.rs` (the external test module declared `mod scan_unit_tests;` in `scan.rs`, **not** an inline module). It's a child module of `scan`, so it can construct `Probed` with its private fields and call the `pub(crate)` helpers. Match that file's existing import style (`use super::*;` or per-item `use`). Add:
 
 ```rust
     #[test]
@@ -912,9 +931,35 @@ fn ingest_into(
 }
 ```
 
-- [ ] **Step 6: Update `ingest`/`ingest_bulk` call sites**
+- [ ] **Step 6: Keep the thin wrappers compiling, and persist checksums in the `flush` closure**
 
-`ingest_bulk` and `ingest` consume a `Unit`/probed and call `ingest_into`. Update them to pass `unit.fingerprint.as_deref()` and `unit.content_hash.as_deref()`. Find both call sites (`find_referencing_symbols` on `ingest_into`) and add the two args. For the direct `ingest` path (single `&Db`, used by tests), compute the checksums the same way if it doesn't go through a `Unit` — check its body; if `ingest` is only a thin wrapper used in tests, pass `None, None` or compute via tier as appropriate. (The production path is `run_pipeline` → `ingest_bulk`.)
+`ingest_into` now takes two extra args. Its two thin-wrapper callers — `ingest_bulk` (`scan.rs:1041-1050`) and `ingest` (`scan.rs:1038`, the single-`&Db` oracle/test path) — carry no per-unit checksums and are also called directly by `scan/hardening_tests.rs` (lines 550/574/652/682/739/788/812) and the oracle (`scan.rs:1313`), so leave **their** signatures unchanged and have them pass `None, None`:
+
+```rust
+fn ingest_bulk(bw: &mut musefs_db::BulkWriter<'_>, abs_path: &str, stamp: BackingStamp, probed: Probed) -> Result<()> {
+    ingest_into(bw, abs_path, stamp, probed, None, None)
+}
+```
+(and the same `None, None` in `ingest`'s `ingest_into(...)` call). This keeps the hardening tests compiling without edits.
+
+The **production path is the `flush` closure inside `run_pipeline`** (`scan.rs:1192-1231`), which is where the batch is iterated and where the worker-computed checksums live (on each `Unit`). `ingest_bulk` is *not* a batch loop — do not edit it for this. Change `flush`'s drain loop from destructuring `Unit { abs_path, stamp, probed, weight }` + `ingest_bulk(...)` to iterating whole units and calling `ingest_into` with their checksums (the `Unit` now has extra fields, so the old exhaustive destructure won't compile anyway):
+
+```rust
+        for unit in batch.drain(..) {
+            weights.push(unit.weight);
+            committed.push(unit.abs_path.clone());
+            ingest_into(
+                &mut bw,
+                &unit.abs_path,
+                unit.stamp,
+                unit.probed,
+                unit.fingerprint.as_deref(),
+                unit.content_hash.as_deref(),
+            )?;
+        }
+```
+
+(`committed.push(unit.abs_path.clone())` and `weights.push(unit.weight)` run before `unit` is moved into `ingest_into`. Task C replaces this `ingest_into(...)` call with `ingest_unit(...)`.)
 
 - [ ] **Step 7: Run the test**
 
@@ -1046,11 +1091,9 @@ Add to `scan.rs` (near `ingest_into`, via `insert_after_symbol`):
 ```rust
 /// Decide how to ingest one probed unit: retarget a relocated row when a unique
 /// fingerprint match exists whose backing file is gone, otherwise ingest fresh.
-fn ingest_unit(
-    mut w: impl TrackSink,
-    unit: Unit,
-    strictness: MatchStrictness,
-) -> Result<()> {
+/// The strict/auto confirm hash, if computed here, is persisted on the retarget
+/// (so a fingerprint-tier strict move doesn't re-read the file next scan).
+fn ingest_unit(mut w: impl TrackSink, unit: Unit, strictness: MatchStrictness) -> Result<()> {
     // Known path => ordinary upsert (re-scan of an in-place file).
     if w.track_exists_at(&unit.abs_path)? {
         return ingest_into(
@@ -1064,25 +1107,45 @@ fn ingest_unit(
             .into_iter()
             .filter(|t| !std::path::Path::new(&t.backing_path).exists())
             .collect();
-        match candidates.len() {
-            1 => {
-                let cand = &candidates[0];
-                if confirm_match(cand, &unit, strictness)? && !w.track_exists_at(&unit.abs_path)? {
-                    w.retarget_track(
-                        cand.id, &unit.abs_path, unit.stamp,
-                        unit.probed.audio_offset, unit.probed.audio_length,
-                        unit.fingerprint.as_deref(), unit.content_hash.as_deref(),
-                    )?;
-                    return Ok(());
-                }
+        if candidates.len() == 1 {
+            let cand = &candidates[0];
+            // Does this strictness need a full-hash confirm against this candidate?
+            let needs_full = match strictness {
+                MatchStrictness::Fast => false,
+                MatchStrictness::Auto => cand.content_hash.is_some(),
+                MatchStrictness::Strict => true,
+            };
+            // The new file's full hash: worker-computed if present, else read now
+            // (the file is present — it's the move destination). `full_file_hash`
+            // returns io::Result, which `?` converts into the crate `Result` via
+            // `CoreError::Io(#[from] io::Error)`.
+            let new_hash: Option<String> = match (&unit.content_hash, needs_full) {
+                (Some(h), _) => Some(h.clone()),
+                (None, true) => Some(full_file_hash(std::path::Path::new(&unit.abs_path))?),
+                (None, false) => None,
+            };
+            let confirmed = match strictness {
+                MatchStrictness::Fast => true,
+                MatchStrictness::Auto | MatchStrictness::Strict => match &cand.content_hash {
+                    // Strict with no stored hash => refuse; Auto with none => fingerprint is enough.
+                    None => matches!(strictness, MatchStrictness::Auto),
+                    Some(stored) => new_hash.as_deref() == Some(stored.as_str()),
+                },
+            };
+            if confirmed && !w.track_exists_at(&unit.abs_path)? {
+                w.retarget_track(
+                    cand.id, &unit.abs_path, unit.stamp,
+                    unit.probed.audio_offset, unit.probed.audio_length,
+                    unit.fingerprint.as_deref(), new_hash.as_deref(),
+                )?;
+                return Ok(());
             }
-            n if n > 1 => {
-                log::warn!(
-                    "ambiguous fingerprint match for {} ({n} missing candidates); inserting fresh",
-                    unit.abs_path
-                );
-            }
-            _ => {}
+        } else if candidates.len() > 1 {
+            log::warn!(
+                "ambiguous fingerprint match for {} ({} missing candidates); inserting fresh",
+                unit.abs_path,
+                candidates.len(),
+            );
         }
     }
     ingest_into(
@@ -1090,42 +1153,23 @@ fn ingest_unit(
         unit.fingerprint.as_deref(), unit.content_hash.as_deref(),
     )
 }
-
-/// Confirm a fingerprint match per the strictness policy. May read the new
-/// file's bytes (only on an actual refind candidate) to compute its full hash.
-fn confirm_match(
-    candidate: &musefs_db::Track,
-    unit: &Unit,
-    strictness: MatchStrictness,
-) -> Result<bool> {
-    match strictness {
-        MatchStrictness::Fast => Ok(true),
-        MatchStrictness::Auto => match &candidate.content_hash {
-            None => Ok(true),
-            Some(stored) => Ok(new_file_hash(unit)? .as_deref() == Some(stored.as_str())),
-        },
-        MatchStrictness::Strict => match &candidate.content_hash {
-            None => Ok(false),
-            Some(stored) => Ok(new_file_hash(unit)?.as_deref() == Some(stored.as_str())),
-        },
-    }
-}
-
-/// The new file's full hash: reuse the worker-computed one if present, else read
-/// the file now (the file is present — it's the move destination).
-fn new_file_hash(unit: &Unit) -> Result<Option<String>> {
-    if unit.content_hash.is_some() {
-        return Ok(unit.content_hash.clone());
-    }
-    Ok(Some(full_file_hash(std::path::Path::new(&unit.abs_path))?))
-}
 ```
 
-(`full_file_hash` returns `io::Result`; ensure `Result` here is the crate scan `Result` with a `From<io::Error>` — check how `revalidate_with` converts `std::fs` errors; it uses `?` on `std::fs::canonicalize`, so the crate error already converts from `io::Error`. If `confirm_match`'s `?` on `full_file_hash` doesn't convert, wrap with `.map_err(...)` to the crate error.)
+(`candidates` is an owned `Vec`, so `cand`'s borrow doesn't conflict with the later `&mut w` calls; `cand.id` is `Copy`. The confirmation hash is computed at most once and reused for both the compare and the persisted `new_hash` — addressing the spec's "strict full-hashes the new file regardless of tier" without discarding the result.)
 
-- [ ] **Step 5: Route the writer through `ingest_unit`**
+- [ ] **Step 5: Route the `flush` closure through `ingest_unit`**
 
-In `run_pipeline`, the writer's `flush` currently hands a batch to `ingest_bulk`. Change the per-unit ingest so each `Unit` goes through `ingest_unit(&mut bulk_writer, unit, strictness)` instead of the direct `ingest_into`/`ingest_bulk` body. Capture `let strictness = opts.strictness;` near the top of `run_pipeline`. Inspect `ingest_bulk` (it iterates the batch calling `ingest_into`); replace its inner `ingest_into(...)` call with `ingest_unit(&mut *w, unit, strictness)`, threading `strictness` into `ingest_bulk`'s signature. Keep the bulk transaction wrapper unchanged so all units in a batch share one transaction (and `track_exists_at`/`tracks_by_fingerprint` see prior retargets within the batch — the within-scan double-claim guard).
+The production batch loop is the `flush` closure in `run_pipeline` (`scan.rs:1192-1231`) — **not** `ingest_bulk`. Capture `let strictness = opts.strictness;` before the closure (alongside the other captured locals). Then change the drain-loop body added in Task B2 Step 6 from the direct `ingest_into(...)` call to:
+
+```rust
+        for unit in batch.drain(..) {
+            weights.push(unit.weight);
+            committed.push(unit.abs_path.clone());
+            ingest_unit(&mut bw, unit, strictness)?;
+        }
+```
+
+The closure already builds one `BulkWriter` (`bw`) per batch and all units run on it, so a retarget in one unit is visible to `track_exists_at`/`tracks_by_fingerprint` for later units in the same batch (the within-scan double-claim guard). Leave `ingest_bulk`/`ingest` as the `None, None` wrappers the hardening tests use.
 
 - [ ] **Step 6: Run the refind tests**
 
