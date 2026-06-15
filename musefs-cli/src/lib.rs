@@ -105,10 +105,11 @@ pub struct MountArgs {
     /// Max outstanding background (readahead/async) requests the kernel queues.
     #[arg(long, env = "MUSEFS_MAX_BACKGROUND", default_value_t = 64)]
     pub max_background: u16,
-    /// Keep the kernel page cache across opens. External re-tags auto-invalidate
-    /// the affected inodes on refresh, so cached bytes are dropped when content
-    /// changes.
-    #[arg(long, env = "MUSEFS_KEEP_CACHE", value_parser = clap::builder::BoolishValueParser::new())]
+    /// Keep the kernel page cache across opens. On by default: it is the one
+    /// measured storage win (~3× faster repeat-open on HDD/NFS, #432). External
+    /// re-tags auto-invalidate the affected inodes on refresh, so cached bytes
+    /// are dropped when content changes. Disable with `--keep-cache false`.
+    #[arg(long, env = "MUSEFS_KEEP_CACHE", default_value_t = true, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub keep_cache: bool,
     /// Compare filenames case-insensitively: case-variant directories merge and
     /// case-variant files are disambiguated. Defaults to true on macOS (whose
@@ -565,7 +566,8 @@ mod tests {
         assert_eq!(config.template, "$albumartist/$album/$title");
         assert_eq!(config.default_fallback, "Unknown");
         assert_eq!(config.mode, musefs_core::Mode::Synthesis);
-        assert!(!fuse_config.keep_cache);
+        // #432: keep-cache defaults on when the flag is absent.
+        assert!(fuse_config.keep_cache);
         assert_eq!(config.case_insensitive, cfg!(target_os = "macos"));
         // ms → Duration.
         assert_eq!(config.poll_interval, std::time::Duration::from_millis(250));
@@ -574,6 +576,27 @@ mod tests {
         assert_eq!(fuse_config.max_readahead, 64 * 1024);
         assert_eq!(fuse_config.max_background, 32);
         assert!(fuse_config.expose_metrics);
+    }
+
+    #[test]
+    fn keep_cache_flag_forms() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["musefs", "mount", "/mnt/muse", "--db", "/tmp/x.db"];
+            argv.extend_from_slice(extra);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Command::Mount(args) = cli.command else {
+                panic!("expected Mount");
+            };
+            parse_mount_config(&args).1.keep_cache
+        };
+        // Absent → default on (#432).
+        assert!(parse(&[]));
+        // Bare flag stays a backward-compatible "on".
+        assert!(parse(&["--keep-cache"]));
+        // Explicit value opts out / in.
+        assert!(!parse(&["--keep-cache", "false"]));
+        assert!(parse(&["--keep-cache", "true"]));
     }
 
     #[test]

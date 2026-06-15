@@ -750,7 +750,9 @@ Cold read then immediate reopen (no cache drop between); `reopen_s` is the signa
 With `--keep-cache` the kernel retains the page cache across opens, so a re-opened file
 is served from RAM instead of re-fetched over slow storage — **~3× faster reopen**,
 consistent across HDD and NFS. This is the only tunable worth changing for slow backing
-(relevant for players/scanners that re-open files), and it needs no preset.
+(relevant for players/scanners that re-open files), and it needs no preset. **It is on by
+default as of #432** (inode invalidation on retag keeps it consistent); disable with
+`--keep-cache false` on memory-constrained hosts.
 
 ### Conclusions
 

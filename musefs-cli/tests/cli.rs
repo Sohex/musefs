@@ -59,7 +59,7 @@ fn parses_mode_and_revalidate_flags() {
             assert_eq!(args.attr_ttl_ms, 1000); // default
             assert_eq!(args.max_readahead_kib, 512); // default
             assert_eq!(args.max_background, 64); // default
-            assert!(!args.keep_cache); // default off
+            assert!(args.keep_cache); // #432: default on
         }
         Command::Scan { .. } => panic!("expected mount"),
     }
