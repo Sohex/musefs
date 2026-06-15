@@ -852,7 +852,8 @@ impl Filesystem for MusefsFs {
         self.fire_poll_refresh();
         if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
             let listing = metrics_dir::dir_listing();
-            for (i, (child, kind, name)) in listing.iter().enumerate().skip(usize_from(offset)) {
+            let start = usize_from(offset).min(listing.len());
+            for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
                 if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
                     break;
                 }
@@ -874,7 +875,10 @@ impl Filesystem for MusefsFs {
                 Err(e) => return reply.error(reply_errno("readdir", ino.0, &e)),
             },
         };
-        for (i, (child, kind, name)) in listing.iter().enumerate().skip(usize_from(offset)) {
+        // Slice from `offset` directly so paginated calls don't re-walk the
+        // skipped prefix; full enumeration stays O(n), not O(n^2) (#442).
+        let start = usize_from(offset).min(listing.len());
+        for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
             // The stored offset is the index of the *next* entry to return.
             if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
                 break;
