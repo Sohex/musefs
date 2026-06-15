@@ -179,7 +179,7 @@ fn read_preads_and_seek_match_goldens() {
     }
 }
 
-/// Ingest of files LARGER than the ~1 MiB bounded metadata window: the scanner
+/// Ingest of files LARGER than the ~64 KiB bounded metadata window: the scanner
 /// reads only a bounded prefix, never the whole file. A reintroduced slurp shows
 /// up as `scan_bytes_read` jumping toward `tracks * 2 MiB`. Counts frozen below.
 #[test]
@@ -188,8 +188,8 @@ fn ingest_reads_bounded_prefix_not_whole_file() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     const TRACKS: usize = 3;
-    const BYTES_PER_TRACK: usize = 2 * 1024 * 1024; // > 1 MiB scan window
-    let (exp_opens, exp_preads, exp_bytes): (u64, u64, u64) = (3, 3, 3_145_728);
+    const BYTES_PER_TRACK: usize = 2 * 1024 * 1024; // > 64 KiB scan window
+    let (exp_opens, exp_preads, exp_bytes): (u64, u64, u64) = (3, 3, 196_608); // 3 × 64 KiB
 
     let base = tempfile::tempdir().unwrap();
     let params = CorpusParams {
@@ -210,7 +210,7 @@ fn ingest_reads_bounded_prefix_not_whole_file() {
     assert_eq!(s.scan_preads, exp_preads, "scan_preads");
     assert_eq!(s.scan_bytes_read, exp_bytes, "scan_bytes_read");
     // Hard upper bound independent of the frozen number: a slurp reads the whole
-    // 2 MiB/track (6 MiB total); the bounded prefix is ~1 MiB/track (3 MiB). Sit
+    // 2 MiB/track (6 MiB total); the bounded prefix is 64 KiB/track (192 KiB). Sit
     // the bound between them so any drift toward a slurp trips even if the golden
     // is updated.
     assert!(

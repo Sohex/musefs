@@ -420,7 +420,7 @@ fn oggflac_raw_art_serve_increments_art_chunks() {
 }
 
 /// #67: only .mp3 consumes the ID3v1 tail; non-MP3 formats must not pay the
-/// 128-byte tail read. A 300-byte FLAC (< the 1 MiB window) probes in exactly
+/// 128-byte tail read. A 300-byte FLAC (< the 64 KiB window) probes in exactly
 /// one positioned read of exactly the file's length.
 #[test]
 fn scan_reads_no_id3v1_tail_for_flac() {
@@ -480,7 +480,7 @@ fn scan_still_reads_id3v1_tail_for_mp3() {
     metrics::reset();
     scan_directory(&db, &target.corpus_dir).unwrap();
     let s = metrics::snapshot();
-    // Corpus tracks are far below the default 1 MiB scan window (this test must
+    // Corpus tracks are far below the default 64 KiB scan window (this test must
     // keep the default ScanOptions::window): one prefix read + the tail. read_tail_128
     // always reads 128 bytes when file_len >= 128, trailer present or not, so
     // the +128 assertion is robust.
