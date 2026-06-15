@@ -120,6 +120,14 @@ def track_ids_for_paths(conn, keys):
             chunk,
         )
         for backing_path, track_id in rows:
+            if backing_path in out:
+                # backing_path is UNIQUE in the schema, so a duplicate means a
+                # non-conformant DB; collapsing it would silently hide a track
+                # from prune (#478). Fail loudly instead.
+                raise ValueError(
+                    f"duplicate backing_path {backing_path!r} in tracks "
+                    f"(ids {out[backing_path]} and {track_id})"
+                )
             out[backing_path] = track_id
     return out
 

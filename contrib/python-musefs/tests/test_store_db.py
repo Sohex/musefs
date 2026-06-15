@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 from conftest import insert_track
 
@@ -147,5 +149,22 @@ def test_track_ids_for_paths_chunks_past_variable_limit(db_path):
         expected = {path: insert_track(conn, path) for path in paths}
         conn.commit()
         assert track_ids_for_paths(conn, paths) == expected
+    finally:
+        conn.close()
+
+
+def test_track_ids_for_paths_raises_on_duplicate_backing_path():
+    from musefs_common import track_ids_for_paths
+
+    # backing_path is UNIQUE in the real schema, so the {key: id} dict can never
+    # collapse against a conformant DB. Guard against a non-conformant one anyway:
+    # silently dropping a duplicate row would hide a track from prune (#478).
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE tracks (id INTEGER PRIMARY KEY, backing_path TEXT)")
+        conn.execute("INSERT INTO tracks (id, backing_path) VALUES (1, '/m/a.flac')")
+        conn.execute("INSERT INTO tracks (id, backing_path) VALUES (2, '/m/a.flac')")
+        with pytest.raises(ValueError):
+            track_ids_for_paths(conn, ["/m/a.flac"])
     finally:
         conn.close()
