@@ -3,7 +3,7 @@
 Issue: [#464](https://github.com/Sohex/musefs/issues/464)
 Related: [#422](https://github.com/Sohex/musefs/issues/422) (deferred — second pass)
 Date: 2026-06-15
-Status: design approved, reviewer pass applied, pending user spec review
+Status: implemented
 
 ## Problem
 

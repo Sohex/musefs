@@ -320,6 +320,44 @@ rescan.
 **preserving any tag edits you made in the store** — prunes tracks whose
 backing file is gone, and garbage-collects orphaned art.
 
+#### Content checksums and move re-identification
+
+`--checksum=none|fingerprint|full` (env `MUSEFS_CHECKSUM`, default
+`fingerprint`) controls what content checksums `scan` computes and stores.
+
+- **`none`** — no checksums (legacy behavior).
+- **`fingerprint`** — compute a cheap fingerprint for each file, derived from
+  the probe's parsed output (tags, audio bounds, embedded art). This is the
+  default: it rides the existing probe at essentially no extra I/O cost and
+  is sufficient for routine move detection.
+- **`full`** — fingerprint plus an eager full-file SHA-256. Use this when you
+  want collision-proof retargeting or a forensic content identity for every
+  file.
+
+Two flags govern how a fingerprint match is confirmed before retargeting a
+moved file:
+
+- **`--fast`** (env `MUSEFS_FAST`) — fingerprint match is always sufficient;
+  never reads the full file even when a stored `content_hash` exists.
+- **`--strict`** (env `MUSEFS_STRICT`) — require a full-hash match; if the
+  matched candidate has no stored `content_hash`, refuse the retarget and
+  insert a fresh row instead. The default (neither flag) auto-escalates:
+  full-hash the new file when the candidate already has a `content_hash`,
+  and trust the fingerprint alone when it does not.
+
+`--fast` and `--strict` are mutually exclusive.
+
+**Move re-identification workflow.** After moving or reorganizing your backing
+library, run a normal `musefs scan` on the new locations. For each file not
+already in the store, the scanner looks up rows whose fingerprint matches and
+whose old path is gone, and retargets the unique match in place — its `id`,
+tags, and art are preserved. Move recovery only applies to rows that were
+fingerprinted before the move (rows scanned under `--checksum=none` have no
+fingerprint and cannot be retargeted until a later fingerprint-tier pass).
+Run `scan` after a move and ideally **before** any `revalidate` — `revalidate`
+still prunes tracks whose backing file is gone, so it will remove un-retargeted
+rows if run first.
+
 ### Mount
 
 ```bash
