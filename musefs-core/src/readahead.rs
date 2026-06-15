@@ -1551,4 +1551,48 @@ mod mutation_guard_tests {
         assert!(starts.is_empty());
         assert_eq!(upto, 500);
     }
+
+    #[test]
+    fn cached_len_replaces_same_start_window() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.store_window(100, vec![0u8; 1000]);
+        assert_eq!(ra.len(), 1000);
+        // Re-storing at the same start must subtract the old window's bytes and
+        // add the new ones — not sum them, scale either, or leave the count
+        // stale. A single window of 2500 bytes remains.
+        ra.store_window(100, vec![0u8; 2500]);
+        assert_eq!(ra.len(), 2500);
+    }
+
+    #[test]
+    fn cached_len_drops_evicted_window_bytes() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.set_max_windows(2);
+        ra.store_window(0, vec![0u8; 1000]);
+        ra.store_window(1000, vec![0u8; 1000]);
+        assert_eq!(ra.len(), 2000);
+        let mut dst = vec![0u8; 10];
+        ra.read_into(&mut dst, 1990, 1 << 20, fillb).unwrap(); // hit → next_expected = 2000
+        // The third window trims one fully-behind window; len() must drop exactly
+        // the evicted window's bytes (3000 stored − 1000 evicted == 2000).
+        ra.store_window(2000, vec![0u8; 1000]);
+        assert_eq!(ra.len(), 2000);
+    }
+
+    #[test]
+    fn prefetch_plan_reports_captured_frontier_and_window() {
+        let (_d, file) = bk_temp(256 * 1024);
+        let pool = ReadAheadPool::new(64 << 20);
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        pool.register(1, Arc::clone(&buf));
+        let ep = std::sync::atomic::AtomicU64::new(0);
+        let br =
+            BackingReader::new(&file, &buf, &pool, 1, 256 * 1024, &ep).with_prefetch_planning();
+        let mut d = vec![0u8; 4096];
+        br.read_exact_at(&mut d, 0).unwrap();
+        // The read above captured the post-read frontier (off + len) and the
+        // first-miss window (the floor); `prefetch_plan` must return those exact
+        // values, not a constant placeholder.
+        assert_eq!(br.prefetch_plan(), (4096, WINDOW_FLOOR));
+    }
 }
