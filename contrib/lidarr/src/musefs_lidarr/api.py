@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .errors import ConfigError, LidarrApiError
+
+# Lidarr custom scripts are fire-and-forget: a transient API error or a restart
+# mid-import otherwise silently loses the sync, so retry these with backoff.
+_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+_RETRY_BACKOFF_BASE = 0.5
 
 
 def redacted(value: str | None) -> str:
@@ -52,37 +58,77 @@ class PreflightResult:
 class LidarrClient:
     """Minimal read-only client for the Lidarr v1 REST API."""
 
-    def __init__(self, config: LidarrConfig, *, opener=urlopen, timeout: int = 15):
+    def __init__(
+        self,
+        config: LidarrConfig,
+        *,
+        opener=urlopen,
+        timeout: int = 15,
+        retries: int = 3,
+        sleep=time.sleep,
+    ):
         if not config.url or not config.api_key:
             raise ConfigError("Lidarr API configuration is required")
         self._base = config.url.rstrip("/")
         self._api_key = config.api_key
         self._opener = opener
         self._timeout = timeout
+        self._retries = max(1, retries)
+        self._sleep = sleep
 
     def get_json(self, path: str, params: dict[str, object] | None = None):
         """GET ``path`` with optional query params; return parsed JSON.
 
         Raises ``LidarrApiError`` on HTTP, network, or JSON-decode failure.
         """
+        try:
+            return json.loads(self._request(self._url(path, params)).decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise LidarrApiError("Lidarr API returned invalid JSON") from exc
+
+    def media_cover(self, url: str) -> bytes:
+        """Fetch raw cover-art bytes for a Lidarr image ``url``.
+
+        ``url`` is the server-relative path from an album's ``images`` entry
+        (e.g. ``/MediaCover/Albums/20/cover.jpg``); an absolute ``remoteUrl`` is
+        used as-is. Retries transient failures like :meth:`get_json`.
+        """
+        full = url if url.startswith(("http://", "https://")) else f"{self._base}{url}"
+        return self._request(full)
+
+    def _url(self, path: str, params: dict[str, object] | None = None) -> str:
         query = ""
         if params:
             clean = {k: v for k, v in params.items() if v is not None}
             if clean:
                 query = "?" + urlencode(clean, doseq=True)
-        url = f"{self._base}{path}{query}"
+        return f"{self._base}{path}{query}"
+
+    def _request(self, url: str) -> bytes:
+        """GET ``url`` with the API key, returning the raw response body.
+
+        Retries up to ``self._retries`` attempts with exponential backoff on
+        transient failures (network errors, timeouts, and the 5xx/429/408 HTTP
+        statuses); non-transient HTTP errors fail fast.
+        """
         request = Request(url, headers={"X-Api-Key": self._api_key})
-        try:
-            with self._opener(request, timeout=self._timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            raise LidarrApiError(
-                f"Lidarr API request failed with HTTP {exc.code}; api_key={redacted(self._api_key)}"
-            ) from exc
-        except URLError as exc:
-            raise LidarrApiError(f"Lidarr API request failed: {exc.reason}") from exc
-        except json.JSONDecodeError as exc:
-            raise LidarrApiError("Lidarr API returned invalid JSON") from exc
+        for attempt in range(self._retries):
+            last = attempt + 1 == self._retries
+            try:
+                with self._opener(request, timeout=self._timeout) as response:
+                    return response.read()
+            except HTTPError as exc:
+                if last or exc.code not in _RETRYABLE_STATUS:
+                    raise LidarrApiError(
+                        f"Lidarr API request failed with HTTP {exc.code}; "
+                        f"api_key={redacted(self._api_key)}"
+                    ) from exc
+            except (URLError, TimeoutError) as exc:
+                if last:
+                    reason = getattr(exc, "reason", exc)
+                    raise LidarrApiError(f"Lidarr API request failed: {reason}") from exc
+            self._sleep(_RETRY_BACKOFF_BASE * (2**attempt))
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def media_management_config(self):
         """Return Lidarr's media-management config."""
