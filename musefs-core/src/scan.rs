@@ -536,6 +536,32 @@ fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
     })
 }
 
+/// Run [`probe_file`] under a panic boundary so a residual parser panic — one
+/// the format-layer alloc guards (`id3v2_alloc_safe` and friends) don't catch —
+/// drops just that file instead of unwinding the scan worker thread. An unwound
+/// worker would skip its `failed.fetch_add`, and a crafted directory could kill
+/// every worker, closing the channel so the writer reports success while
+/// silently truncating the rest of the library (#425). A caught panic is logged
+/// and folded into `ProbeOutcome::Unparseable`, which the worker already counts
+/// as `failed`. Mirrors the read path's `read_outcome` boundary (#359).
+fn probe_file_caught(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe_file(path, window))) {
+        Ok(res) => res,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic>");
+            log::error!(
+                "scan worker panicked probing {}: {msg}; counting as failed",
+                path.display()
+            );
+            Ok(ProbeOutcome::Unparseable)
+        }
+    }
+}
+
 /// The per-format metadata dispatch for one already-opened backing file, over
 /// its first `file_len` bytes. Split out of `probe_file` so the fstat-sandwich
 /// wrapper stays legible. Never reads the audio payload (M4A uses the seek
@@ -1104,7 +1130,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
             loop {
                 let next = { work.lock().unwrap().next() };
                 let Some(path) = next else { break };
-                match probe_file(&path, window) {
+                match probe_file_caught(&path, window) {
                     Ok(ProbeOutcome::Probed(probed, stamp)) => {
                         let abs = match std::fs::canonicalize(&path) {
                             Ok(abs) => abs,
