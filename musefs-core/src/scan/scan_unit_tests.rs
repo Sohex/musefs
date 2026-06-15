@@ -362,6 +362,133 @@ fn checksum_tier_defaults_to_fingerprint() {
     assert_eq!(ScanOptions::default().strictness, MatchStrictness::Auto);
 }
 
+// --- ingest_unit through the `&Db` TrackSink path ---
+
+fn empty_probed() -> Probed {
+    Probed {
+        format: Format::Flac,
+        audio_offset: 0,
+        audio_length: 0,
+        tags: Vec::new(),
+        pictures: Vec::new(),
+        binary_tags: Vec::new(),
+        structural_blocks: Vec::new(),
+    }
+}
+
+fn unit_with(abs_path: &str, fingerprint: Option<String>) -> Unit {
+    Unit {
+        abs_path: abs_path.to_string(),
+        stamp: BackingStamp {
+            size: 10,
+            mtime_ns: 1,
+            ctime_ns: 2,
+        },
+        probed: empty_probed(),
+        weight: 0,
+        fingerprint,
+        content_hash: None,
+    }
+}
+
+// Exercises the `&Db: TrackSink` ingest path: a fresh insert must persist the
+// unit's fingerprint via `Db::set_track_checksums` (kills the `&Db`
+// `set_track_checksums -> Ok(())` mutant — without the write the row's
+// fingerprint stays NULL).
+#[test]
+fn ingest_unit_db_path_sets_checksums_on_fresh_insert() {
+    let db = Db::open_in_memory().unwrap();
+    let fp = "a".repeat(64);
+    let unit = unit_with("/brand/new.flac", Some(fp.clone()));
+    ingest_unit(&db, unit, MatchStrictness::Auto).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].fingerprint.as_deref(), Some(fp.as_str()));
+}
+
+// Exercises the `&Db` retarget path: an orphan (backing file gone) with a unique
+// fingerprint match must be retargeted in place, not duplicated. Auto with a
+// candidate that has no content_hash needs no full-file read, so neither path
+// need exist on disk except the orphan's, which must NOT (so it passes the
+// copy-vs-move filter). Kills `&Db track_exists_at -> Ok(true)`,
+// `tracks_by_fingerprint -> Ok(vec![])`, and `retarget_track -> Ok(())`.
+#[test]
+fn ingest_unit_db_path_retargets_orphan() {
+    let db = Db::open_in_memory().unwrap();
+    let fp = "b".repeat(64);
+    let orphan = "/gone/missing-orphan.flac";
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: orphan.to_string(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 10,
+            backing_size: 10,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
+        })
+        .unwrap();
+    db.set_track_checksums(id, Some(&fp), None).unwrap();
+
+    let new_path = "/moved/here.flac";
+    let unit = unit_with(new_path, Some(fp.clone()));
+    ingest_unit(&db, unit, MatchStrictness::Auto).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1, "orphan retargeted, not duplicated");
+    assert_eq!(tracks[0].id, id, "retarget keeps the id");
+    assert_eq!(tracks[0].backing_path, new_path);
+}
+
+// A candidate whose backing path can't be statted with a NON-NotFound error
+// must NOT be treated as a missing move source — it stays a real (present-or-
+// inaccessible) row, so the new unit inserts fresh instead of stealing its id.
+// Kills the copy-vs-move filter's match-guard `... == NotFound with true` mutant
+// (which would treat every stat error, not just NotFound, as missing).
+#[test]
+fn ingest_unit_db_path_skips_unstatable_candidate() {
+    let db = Db::open_in_memory().unwrap();
+    let fp = "c".repeat(64);
+    // backing_path has a regular file as a path component, so metadata() returns
+    // a non-NotFound error (ENOTDIR / NotADirectory), not NotFound.
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("not_a_dir");
+    std::fs::write(&blocker, b"x").unwrap();
+    let bad_path = blocker.join("under_a_file.flac");
+    let bad_path = bad_path.to_string_lossy().into_owned();
+    // Sanity: the candidate path is unstatable for a reason other than NotFound.
+    let kind = std::fs::metadata(&bad_path).unwrap_err().kind();
+    assert_ne!(
+        kind,
+        std::io::ErrorKind::NotFound,
+        "must be a non-NotFound error"
+    );
+
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: bad_path,
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 10,
+            backing_size: 10,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
+        })
+        .unwrap();
+    db.set_track_checksums(id, Some(&fp), None).unwrap();
+
+    let unit = unit_with("/fresh/new.flac", Some(fp));
+    ingest_unit(&db, unit, MatchStrictness::Auto).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(
+        tracks.len(),
+        2,
+        "unstatable candidate must not be retargeted"
+    );
+}
+
 #[test]
 fn fingerprint_changes_with_picture_description() {
     let pic = |desc: &str| EmbeddedPicture {

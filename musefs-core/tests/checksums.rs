@@ -237,6 +237,95 @@ fn revalidate_backfills_fingerprint_on_unchanged_files() {
 }
 
 #[test]
+fn revalidate_full_backfills_content_hash_on_fingerprint_tier_row() {
+    let dir = tempfile::tempdir().unwrap();
+    write_a_flac(dir.path(), "a.flac", &[0xAB; 64]);
+    let db = Db::open_in_memory().unwrap();
+    // Seed at the fingerprint tier: fingerprint set, content_hash NULL.
+    scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 1,
+            checksum: ChecksumTier::Fingerprint,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let seeded = &db.list_tracks().unwrap()[0];
+    assert!(seeded.fingerprint.is_some(), "fingerprint seeded");
+    assert!(seeded.content_hash.is_none(), "content_hash not yet set");
+
+    // Revalidate at the Full tier WITHOUT touching the file: the
+    // `!has_fingerprint || !has_content_hash` gate must re-process the row to
+    // backfill content_hash (kills the `||`->`&&` and the two `delete !` mutants
+    // — any of which would leave the fp-present/ch-absent track skipped).
+    let stats = revalidate_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 1,
+            checksum: ChecksumTier::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(stats.updated, 1, "the fp-only row must be re-processed");
+    assert!(
+        db.list_tracks().unwrap()[0].content_hash.is_some(),
+        "content_hash backfilled at Full tier"
+    );
+}
+
+#[test]
+fn revalidate_full_reprocesses_row_missing_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    write_a_flac(dir.path(), "a.flac", &[0xAB; 64]);
+    let db = Db::open_in_memory().unwrap();
+    // Seed with no checksums, then force a row that has a content_hash but NO
+    // fingerprint — the case that exercises the Full arm's `!has_fingerprint`
+    // half of `!has_fingerprint || !has_content_hash`.
+    scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 1,
+            checksum: ChecksumTier::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    db.set_track_checksums(id, None, Some(&"d".repeat(64)))
+        .unwrap();
+    let seeded = &db.list_tracks().unwrap()[0];
+    assert!(seeded.fingerprint.is_none(), "fingerprint absent");
+    assert!(seeded.content_hash.is_some(), "content_hash present");
+
+    // Full tier must re-process the row to backfill the missing fingerprint
+    // (kills the Full-arm `delete !` on `!has_fingerprint` — dropping it would
+    // leave this row skipped because content_hash is already present).
+    let stats = revalidate_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 1,
+            checksum: ChecksumTier::Full,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        stats.updated, 1,
+        "row missing a fingerprint must be re-processed"
+    );
+    assert!(
+        db.list_tracks().unwrap()[0].fingerprint.is_some(),
+        "backfilled"
+    );
+}
+
+#[test]
 fn two_new_files_matching_one_orphan_retarget_one_insert_one() {
     let dir = tempfile::tempdir().unwrap();
     // Scan a single file so it gets a DB row.

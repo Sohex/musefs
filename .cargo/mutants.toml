@@ -147,7 +147,7 @@ exclude_re = [
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:1352:46:',
+    'musefs-core/src/scan\.rs:1371:46:',
     # run_pipeline flush cadence (batch_bytes accounting + the
     # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
     # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on
@@ -160,21 +160,21 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:1483:29:',
+    'musefs-core/src/scan\.rs:1502:29:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1485:32:',
+    'musefs-core/src/scan\.rs:1504:32:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1485:47:',
+    'musefs-core/src/scan\.rs:1504:47:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1485:62:',
+    'musefs-core/src/scan\.rs:1504:62:',
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:1493:37:',
+    'musefs-core/src/scan\.rs:1512:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1495:40:',
+    'musefs-core/src/scan\.rs:1514:40:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1495:55:',
+    'musefs-core/src/scan\.rs:1514:55:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1495:70:',
+    'musefs-core/src/scan\.rs:1514:70:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
@@ -182,11 +182,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:1623:29:',
+    'musefs-core/src/scan\.rs:1642:29:',
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:1632:33:',
+    'musefs-core/src/scan\.rs:1651:33:',
     # guard: op="+" fn="revalidate_with" rows=1
-    'musefs-core/src/scan\.rs:1687:29: replace \+ with -',
+    'musefs-core/src/scan\.rs:1706:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
@@ -502,4 +502,46 @@ exclude_re = [
     # can't be observed before the sibling stress test hangs the binary. Sole site.
     # guard: count=1
     'replace <impl Drop for RefreshGuard.*::drop with \(\)',
+
+    # #464 backing-file checksums — ingest_unit retarget path equivalents.
+    #
+    # TrackSink::track_exists_at -> Ok(false), for BOTH the &Db and the
+    # &mut BulkWriter impls: equivalent. ingest_unit calls track_exists_at twice and
+    # both are pure optimization/defense. The known-path short-circuit (the function's
+    # first `if`) only avoids the fingerprint lookup on an in-place re-scan; forced
+    # false, that re-scan just takes the refind path and falls through to the IDENTICAL
+    # upsert (its own row is filtered out by the copy-vs-move metadata filter, since its
+    # path still exists). The destination-occupied guard (`!w.track_exists_at` in the
+    # retarget `if`) only fires on a contrived input where the move destination already
+    # has a row; forced false there it would attempt a retarget onto an occupied path,
+    # which can only ever error on the UNIQUE(backing_path) constraint — never corrupt
+    # state. Neither is reachable as a corrupting divergence from a correctness test.
+    # The `Ok(true)` siblings at these sites stay IN scope (killed by
+    # ingest_unit_db_path_retargets_orphan / the retarget integration tests).
+    # guard: count=1
+    'replace <impl TrackSink for &Db>::track_exists_at -> musefs_db::Result<bool> with Ok\(false\)',
+    # guard: count=1
+    'replace <impl TrackSink for &mut musefs_db::BulkWriter<._>>::track_exists_at -> musefs_db::Result<bool> with Ok\(false\)',
+    #
+    # ingest_unit log-only branches: both gate ONLY a `log::warn!` with no effect on
+    # persisted state, and the suite has no log-capture harness (same class as the
+    # probe_body oversize-diag warn and log_mp4_oversize_drops above).
+    #
+    # `candidates.len() > 1` ambiguity warn: every operator variant only changes
+    # whether the warn fires; the fresh-insert fall-through is identical (the `== 1`
+    # retarget arm above already handled the unique-candidate case). Sole `>` in
+    # ingest_unit, so description-anchored against `cargo fmt` line drift.
+    # guard: count=1
+    'replace > with (==|<|>=) in ingest_unit',
+    # `if !confirmed` warn `delete !`: dropping the `!` only flips whether the warn
+    # fires; the subsequent fresh-insert path is unchanged. This `delete !` shares its
+    # description with the KILLABLE `!w.track_exists_at(...)` delete (caught by
+    # ingest_unit_db_path_retargets_orphan), so a plain description anchor would mask
+    # that sibling. Pinned by COLUMN (`:\d+:16:`) instead — line-drift-tolerant like
+    # the hang-class `:\d+:\d+:` entries, but column-specific so only the log-only
+    # delete at col 16 is suppressed; the killable one at col 29 stays IN scope. The
+    # `:\d+:16:` form is classified as a description (count) anchor, not a line:col
+    # anchor (the literal-coord detector needs `:digits:digits:`), so count=1 applies.
+    # guard: count=1
+    'musefs-core/src/scan\.rs:\d+:16: delete ! in ingest_unit',
 ]

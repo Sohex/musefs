@@ -1182,7 +1182,17 @@ fn ingest_unit(mut w: impl TrackSink, unit: Unit, strictness: MatchStrictness) -
         let candidates: Vec<musefs_db::Track> = w
             .tracks_by_fingerprint(fp)?
             .into_iter()
-            .filter(|t| !std::path::Path::new(&t.backing_path).exists())
+            .filter(|t| match std::fs::metadata(&t.backing_path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Ok(_) => false,
+                Err(e) => {
+                    log::warn!(
+                        "skipping retarget candidate {}: cannot stat backing path ({e})",
+                        t.backing_path
+                    );
+                    false
+                }
+            })
             .collect();
         if candidates.len() == 1 {
             let cand = &candidates[0];
@@ -1192,12 +1202,21 @@ fn ingest_unit(mut w: impl TrackSink, unit: Unit, strictness: MatchStrictness) -
                 MatchStrictness::Auto | MatchStrictness::Strict => cand.content_hash.is_some(),
             };
             // The new file's full hash: worker-computed if present, else read now
-            // (the file is present — it's the move destination). `full_file_hash`
-            // returns io::Result, which `?` converts into the crate `Result` via
-            // `CoreError::Io(#[from] io::Error)`.
+            // (the file is present — it's the move destination). A read error here
+            // must not abort the whole scan — log it and fall through with `None`,
+            // which fails the confirm and inserts this unit fresh.
             let new_hash: Option<String> = match (&unit.content_hash, needs_full) {
                 (Some(h), _) => Some(h.clone()),
-                (None, true) => Some(full_file_hash(std::path::Path::new(&unit.abs_path))?),
+                (None, true) => match full_file_hash(std::path::Path::new(&unit.abs_path)) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        log::warn!(
+                            "hash confirm failed for {}: {e}; inserting fresh",
+                            unit.abs_path
+                        );
+                        None
+                    }
+                },
                 (None, false) => None,
             };
             let confirmed = match strictness {
