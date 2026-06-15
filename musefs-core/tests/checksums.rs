@@ -133,3 +133,66 @@ fn strict_refuses_when_candidate_has_no_content_hash() {
             .any(|t| t.id != id && t.backing_path.ends_with("new.flac"))
     );
 }
+
+#[test]
+fn fast_retargets_despite_content_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_a_flac(dir.path(), "a.flac", &[0xAA; 64]);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Fast)).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+
+    // Delete A; create B with the same tags + same length but different bytes:
+    // same fingerprint, different content_hash.
+    std::fs::remove_file(&a).unwrap();
+    write_a_flac(dir.path(), "b.flac", &[0xBB; 64]);
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Fast)).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1, "Fast retargets despite content mismatch");
+    assert_eq!(tracks[0].id, id, "retarget keeps the id");
+    assert!(tracks[0].backing_path.ends_with("b.flac"));
+}
+
+#[test]
+fn auto_rejects_forged_fingerprint_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_a_flac(dir.path(), "a.flac", &[0xAA; 64]);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+
+    // Delete A; create B with the same fingerprint but different content.
+    std::fs::remove_file(&a).unwrap();
+    write_a_flac(dir.path(), "b.flac", &[0xBB; 64]);
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
+
+    // A carries a content_hash (Full seed) => Auto full-hashes B, mismatch => fresh insert.
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 2, "Auto refuses a forged fingerprint match");
+    let b = tracks
+        .iter()
+        .find(|t| t.backing_path.ends_with("b.flac"))
+        .expect("b.flac inserted fresh");
+    assert_ne!(b.id, id, "fresh insert gets a new id");
+}
+
+#[test]
+fn ambiguous_fingerprint_match_inserts_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two files with identical content + tags => they share a fingerprint.
+    let a1 = write_a_flac(dir.path(), "a1.flac", &[0xAA; 64]);
+    let a2 = write_a_flac(dir.path(), "a2.flac", &[0xAA; 64]);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
+
+    // Delete both; create b.flac with the same content => matches TWO missing candidates.
+    std::fs::remove_file(&a1).unwrap();
+    std::fs::remove_file(&a2).unwrap();
+    write_a_flac(dir.path(), "b.flac", &[0xAA; 64]);
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 3, "ambiguous match inserts fresh");
+    assert!(tracks.iter().any(|t| t.backing_path.ends_with("b.flac")));
+}
