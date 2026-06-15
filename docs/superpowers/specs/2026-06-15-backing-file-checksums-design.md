@@ -76,16 +76,19 @@ therefore content-stable across scans and uniform across formats. (Hashing the
 raw adaptive buffer would *not* be deterministic; that distinction is the whole
 reason to hash the output.)
 
-The fingerprint is computed in the **parallel probe worker**, straight from the
-in-memory `Probed` (the raw payload bytes are already in hand there), not on the
-single writer. So folding the art / binary-tag / structural-block payloads into
-the hash is parallelized CPU work, gated to new/changed files — never a
-writer-side cost. Art is *also* SHA-256'd independently at ingest by
-`upsert_art_in` (`art.rs:147`) for content-dedup; rather than thread that
-writer-side digest back out to the worker (coupling fingerprinting to the art
-path), the worker simply hashes the bytes it already holds. A second pass over a
-cover — parallel and gated, and typically sub-MB — is negligible and keeps the
-two paths decoupled.
+The fingerprint is a **single hash over the canonical serialization of the
+parsed `Probed`** (format, audio bounds, ordered tag set, and the art /
+binary-tag / structural payload bytes), computed in the **parallel probe worker**
+from the data already in memory — not on the single writer. There is no separate
+per-payload digest step: hashing a payload to make a digest and then hashing the
+digest would still pay the cost of hashing the payload, so the worker just
+streams the raw bytes into the one fingerprint hash in a single pass. This is
+parallelized CPU work gated to new/changed files, so even a file with a large
+embedded cover stays cheap and the single writer is untouched. (Art is
+independently SHA-256'd at ingest by `upsert_art_in`, `art.rs:147`, for dedup,
+but that digest lives on the writer and is not reused here — one extra parallel
+hash of bytes the worker already holds is worth keeping fingerprinting decoupled
+from the art path.)
 
 **Excluded: every `BackingStamp` field — `mtime_ns`, `ctime_ns`, and `size`.**
 `ctime` bumps on a rename, so it changes on the very move we are trying to
