@@ -155,16 +155,17 @@ impl ReadAheadPool {
     /// `try_lock` so eviction never blocks on an in-progress read. Returns the
     /// freed byte count, or `None` if nothing was evictable this pass.
     fn evict_one_coldest(&self, except: usize) -> Option<u64> {
-        let candidates: Vec<(usize, u64, Arc<Mutex<ReadAhead>>)> = {
+        // Snapshot the candidates under the `streams` lock, then sort by warmth
+        // *after* releasing it — the ordering work no longer blocks registration
+        // or deregistration of other streams.
+        let mut candidates: Vec<(usize, u64, Arc<Mutex<ReadAhead>>)> = {
             let g = self.streams.lock().unwrap();
-            let mut v: Vec<_> = g
-                .iter()
+            g.iter()
                 .filter(|(k, _)| **k != except)
                 .map(|(k, e)| (*k, e.last_served, Arc::clone(&e.buf)))
-                .collect();
-            v.sort_by_key(|(_, ls, _)| *ls); // coldest (smallest stamp) first
-            v
+                .collect()
         };
+        candidates.sort_by_key(|(_, ls, _)| *ls); // coldest (smallest stamp) first
         for (_, _, buf) in candidates {
             if let Ok(mut ra) = buf.try_lock() {
                 let freed = ra.clear();
@@ -185,6 +186,10 @@ struct Window {
 
 pub struct ReadAhead {
     windows: Vec<Window>,
+    /// Running sum of `windows[*].bytes.len()`, maintained on every insert,
+    /// eviction and clear so `len()` is O(1) on the read hot path instead of
+    /// re-summing every window under the per-handle lock.
+    cached_bytes: u64,
     next_expected: u64,
     window: u64,
     cap: u64,
@@ -195,6 +200,7 @@ impl ReadAhead {
     pub fn new(cap: u64) -> Self {
         ReadAhead {
             windows: Vec::new(),
+            cached_bytes: 0,
             next_expected: u64::MAX,
             window: WINDOW_FLOOR,
             cap,
@@ -215,11 +221,12 @@ impl ReadAhead {
 
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
-        self.windows.iter().map(|w| w.bytes.len() as u64).sum()
+        self.cached_bytes
     }
     pub fn clear(&mut self) -> u64 {
-        let freed = self.len();
+        let freed = self.cached_bytes;
         self.windows.clear();
+        self.cached_bytes = 0;
         self.window = WINDOW_FLOOR.min(self.cap);
         self.next_expected = u64::MAX;
         freed
@@ -246,21 +253,33 @@ impl ReadAhead {
     }
 
     fn insert_window(&mut self, w: Window) {
-        if let Some(slot) = self.windows.iter_mut().find(|x| x.start == w.start) {
-            *slot = w;
-        } else {
-            self.windows.push(w);
+        let w_bytes = w.bytes.len() as u64;
+        // `windows` is kept sorted by `start`, so storing a window is a binary
+        // search + positional insert rather than a full re-sort on every miss
+        // and every completed prefetch.
+        match self.windows.binary_search_by_key(&w.start, |x| x.start) {
+            Ok(i) => {
+                self.cached_bytes -= self.windows[i].bytes.len() as u64;
+                self.cached_bytes += w_bytes;
+                self.windows[i] = w;
+            }
+            Err(i) => {
+                self.cached_bytes += w_bytes;
+                self.windows.insert(i, w);
+            }
         }
-        self.windows.sort_by_key(|x| x.start);
         while self.windows.len() > self.max_windows {
             let frontier = self.next_expected;
+            // Sorted by `start`, so the first window lying fully behind the read
+            // frontier is also the lowest-start such window — the victim the
+            // previous min-by-start scan picked. Fall back to the oldest (index
+            // 0) when nothing is fully consumed yet.
             let idx = self
                 .windows
                 .iter()
-                .enumerate()
-                .filter(|(_, w)| w.start + w.bytes.len() as u64 <= frontier)
-                .min_by_key(|(_, w)| w.start)
-                .map_or(0, |(i, _)| i);
+                .position(|w| w.start + w.bytes.len() as u64 <= frontier)
+                .unwrap_or(0);
+            self.cached_bytes -= self.windows[idx].bytes.len() as u64;
             self.windows.remove(idx);
         }
     }
@@ -473,6 +492,12 @@ pub struct BackingReader<'a> {
     backing_len: u64,
     fills: Cell<u64>,
     epoch: &'a std::sync::atomic::AtomicU64,
+    /// When set, each backing read sizes the eviction ring and stashes the
+    /// post-read frontier/window below, so the caller can plan prefetch without
+    /// re-acquiring the per-handle lock (#429). Off by default.
+    prefetch: bool,
+    planned_next_expected: Cell<u64>,
+    planned_window: Cell<u64>,
 }
 
 impl<'a> BackingReader<'a> {
@@ -492,7 +517,27 @@ impl<'a> BackingReader<'a> {
             backing_len,
             fills: Cell::new(0),
             epoch,
+            prefetch: false,
+            planned_next_expected: Cell::new(u64::MAX),
+            planned_window: Cell::new(0),
         }
+    }
+
+    /// Opt into prefetch-plan capture: every backing read sizes the eviction
+    /// ring and records the post-read `next_expected`/`window` under the read
+    /// lock, so the caller reads them via [`Self::prefetch_plan`] without a
+    /// second lock acquisition (#429).
+    #[must_use]
+    pub fn with_prefetch_planning(mut self) -> Self {
+        self.prefetch = true;
+        self
+    }
+
+    /// The `(next_expected, window)` captured by the most recent backing read,
+    /// or `(u64::MAX, 0)` if no backing read occurred. Only meaningful when
+    /// constructed via [`Self::with_prefetch_planning`].
+    pub fn prefetch_plan(&self) -> (u64, u64) {
+        (self.planned_next_expected.get(), self.planned_window.get())
     }
 
     pub fn fills(&self) -> u64 {
@@ -530,6 +575,16 @@ impl<'a> BackingReader<'a> {
             crate::metrics::on_pread(b.len() as u64);
             crate::metrics::backing_read_exact_at(file, b, o)
         })?;
+        if self.prefetch {
+            // Size the eviction ring and capture the post-read frontier/window
+            // under the lock we already hold, so the caller plans prefetch
+            // without re-locking this per-handle mutex (#429).
+            let window = ra.window();
+            let depth = prefetch_depth(self.pool.per_stream_cap(), window);
+            ra.set_max_windows(usize::try_from(depth).unwrap_or(4) + 1);
+            self.planned_next_expected.set(ra.next_expected());
+            self.planned_window.set(window);
+        }
         self.pool.reconcile(old_len, new_len);
         drop(ra);
         self.pool.touch(self.key);
