@@ -1,0 +1,10 @@
+# cargo-audit / rustsec-audit-check configuration.
+
+[advisories]
+# RUSTSEC-2024-0436: `paste` is unmaintained. This is an unmaintained advisory,
+# not a vulnerability. `paste` is a transitive, compile-time-only dependency
+# (paste -> tikv-jemalloc-ctl -> the musefs binary's jemalloc allocator); it is
+# a proc-macro with fully determined input and output and no runtime or security
+# surface. Upstream has declined to remove it on those grounds and recommends
+# downstream consumers allow-list the advisory: tikv/jemallocator#123.
+ignore = ["RUSTSEC-2024-0436"]
