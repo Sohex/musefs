@@ -12,12 +12,12 @@
 //! lifetime, not the thread's. Each pool has its own map, so multiple mounts
 //! (or test DBs) on the same thread don't collide.
 
-use std::collections::{HashMap, hash_map::Entry};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::ThreadId;
 
-use parking_lot::{Mutex, ReentrantMutex};
+use dashmap::DashMap;
+use parking_lot::ReentrantMutex;
 
 use musefs_db::{Db, ReadOnly};
 
@@ -29,18 +29,20 @@ use crate::error::{CoreError, Result};
 ///
 /// The `poll`/`conns` asymmetry is deliberate. `poll` is uniquely owned (the
 /// `Box` only keeps the variant small) because `with_poll` locks it in place
-/// and takes no other lock. `conns` values are `Arc`-wrapped so `with` can
-/// clone a handle and release the map guard *before* running the caller's
-/// closure — holding the (non-reentrant) map guard across it would deadlock
-/// nested `with`. The inner `ReentrantMutex` is never contended (only its
-/// owning thread locks it) but is load-bearing for the type system: `Db` is
-/// `Send + !Sync`, so the mutex wrapper is what keeps the map field, and
-/// therefore `DbPool`, `Send + Sync`.
+/// and takes no other lock. `conns` is a `DashMap`, so `with` never
+/// serializes concurrent reads on a single map lock — a steady-state hit
+/// takes only a shard read lock. Values are `Arc`-wrapped so `with` can clone
+/// a handle and release the shard guard *before* running the caller's closure
+/// — holding a (non-reentrant) shard guard across it would deadlock a nested
+/// `with` whose thread hashes to the same shard. The inner `ReentrantMutex` is
+/// never contended (only its owning thread locks it) but is load-bearing for
+/// the type system: `Db` is `Send + !Sync`, so the mutex wrapper is what keeps
+/// the map values, and therefore `DbPool`, `Send + Sync`.
 pub enum DbPool {
     PerThread {
         path: PathBuf,
         poll: Box<ReentrantMutex<Db<ReadOnly>>>,
-        conns: Mutex<HashMap<ThreadId, Arc<ReentrantMutex<Db<ReadOnly>>>>>,
+        conns: DashMap<ThreadId, Arc<ReentrantMutex<Db<ReadOnly>>>>,
     },
     Shared(Arc<ReentrantMutex<Db<ReadOnly>>>),
 }
@@ -56,7 +58,7 @@ impl DbPool {
             Some(p) => Ok(DbPool::PerThread {
                 path: p.to_path_buf(),
                 poll: Box::new(ReentrantMutex::new(db)),
-                conns: Mutex::new(HashMap::new()),
+                conns: DashMap::new(),
             }),
             None => Ok(DbPool::Shared(Arc::new(ReentrantMutex::new(db)))),
         }
@@ -81,17 +83,23 @@ impl DbPool {
         match self {
             DbPool::PerThread { path, conns, .. } => {
                 let tid = std::thread::current().id();
-                let db = {
-                    let mut map = conns.lock();
-                    match map.entry(tid) {
-                        Entry::Occupied(entry) => Arc::clone(entry.get()),
-                        Entry::Vacant(entry) => {
+                // Clone the handle and release every DashMap shard guard before
+                // running `f`: holding a shard guard across the closure would
+                // deadlock a nested `with` whose thread hashes to the same shard.
+                // The steady-state hit takes only a shard *read* lock (`get`), so
+                // concurrent reads never serialize on a single global lock.
+                let db = if let Some(existing) = conns.get(&tid) {
+                    Arc::clone(existing.value())
+                } else {
+                    match conns.entry(tid) {
+                        dashmap::Entry::Occupied(entry) => Arc::clone(entry.get()),
+                        dashmap::Entry::Vacant(entry) => {
                             let db =
                                 Db::open_readonly(path).map_err(|source| CoreError::DbOpen {
                                     path: path.clone(),
                                     source,
                                 })?;
-                            Arc::clone(entry.insert(Arc::new(ReentrantMutex::new(db))))
+                            Arc::clone(&entry.insert(Arc::new(ReentrantMutex::new(db))))
                         }
                     }
                 };
@@ -263,7 +271,7 @@ mod tests {
             poll: Box::new(ReentrantMutex::new(
                 Db::open_in_memory().unwrap().into_read_only(),
             )),
-            conns: Mutex::new(HashMap::new()),
+            conns: DashMap::new(),
         };
         let msg = pool.with(|_db| Ok(())).unwrap_err().to_string();
         assert!(

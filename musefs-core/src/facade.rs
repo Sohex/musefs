@@ -405,7 +405,7 @@ impl Musefs {
             self.readahead_pool.register(key, Arc::clone(&h.readahead));
         }
         let backing_len = r.stamp.size;
-        let br = crate::readahead::BackingReader::new(
+        let mut br = crate::readahead::BackingReader::new(
             &h.file,
             &h.readahead,
             &self.readahead_pool,
@@ -413,6 +413,12 @@ impl Musefs {
             backing_len,
             &h.epoch,
         );
+        // Only capture prefetch-planning inputs (and size the eviction ring)
+        // when Phase-2 prefetch is on; otherwise the ring must stay at the
+        // single Phase-1 window.
+        if self.prefetch.is_some() {
+            br = br.with_prefetch_planning();
+        }
         read_at_with_file_into(r, db, &br, offset, size, out)?;
 
         let Some(pf) = &self.prefetch else {
@@ -425,26 +431,21 @@ impl Musefs {
         // raises depth again — no separate ramp counter is needed. `plan_prefetch`
         // deduplicates against the per-handle watermark so a sequential stream
         // enqueues only the freshly-exposed tail rather than re-requesting
-        // already-buffered windows. The watermark read/update sits under the
-        // buffer lock that also serialises concurrent reads of this handle.
+        // already-buffered windows. The backing read above already sized the
+        // eviction ring and captured the post-read frontier/window under the
+        // per-handle lock (see `BackingReader::with_prefetch_planning`), so this
+        // planning runs without re-locking that mutex (#429).
         let cap = self.readahead_pool.per_stream_cap();
-        let (starts, window) = {
-            let mut ra = h.readahead.lock().unwrap();
-            let start = ra.next_expected();
-            let window = ra.window();
-            let depth = crate::readahead::prefetch_depth(cap, window);
-            let ring = usize::try_from(depth).unwrap_or(4) + 1;
-            ra.set_max_windows(ring);
-            let (starts, upto) = crate::readahead::plan_prefetch(
-                h.prefetched_upto.load(Ordering::Relaxed),
-                start,
-                window,
-                depth,
-                backing_len,
-            );
-            h.prefetched_upto.store(upto, Ordering::Relaxed);
-            (starts, window)
-        };
+        let (start, window) = br.prefetch_plan();
+        let depth = crate::readahead::prefetch_depth(cap, window);
+        let (starts, upto) = crate::readahead::plan_prefetch(
+            h.prefetched_upto.load(Ordering::Relaxed),
+            start,
+            window,
+            depth,
+            backing_len,
+        );
+        h.prefetched_upto.store(upto, Ordering::Relaxed);
         if starts.is_empty() {
             return Ok(());
         }

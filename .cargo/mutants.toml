@@ -463,8 +463,11 @@ exclude_re = [
     #
     # Phase-2 prefetch ring size (`depth + 1`), off by default and best-effort: a
     # wrong ring size only changes how many speculative windows are retained, never
-    # the served bytes. Sole `+` in serve_backing.
-    'replace \+ with (-|\*) in Musefs::serve_backing',
+    # the served bytes. #429 moved it from serve_backing into read_exact_at (sizing
+    # the ring under the read lock); the fn's other two `+` are the observable fills
+    # counters and stay killable, so this one is pinned by coordinate, not by fn.
+    # guard: op="+" fn="BackingReader<'a>::read_exact_at" rows=2
+    'musefs-core/src/readahead\.rs:584:68:',
     #
     # More hang-class (TIMEOUT-only, CANCEL the in-diff job): `len() -> 1` /
     # `clear() -> 1` force a constant resident size, so `evict_one_coldest` keeps
