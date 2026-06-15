@@ -50,6 +50,9 @@ RENAME = {
     "mb_releasegroupid": "musicbrainz_releasegroupid",
     "mb_releasetrackid": "musicbrainz_releasetrackid",
     "mb_workid": "musicbrainz_workid",
+    "artist_sort": "artistsort",
+    "albumartist_sort": "albumartistsort",
+    "comp": "compilation",
 }
 
 # plural beets list field -> the singular beets field it collapses onto. The
@@ -82,7 +85,7 @@ _DROP_IF_ZERO = {
     "discnumber",
     "tracktotal",
     "disctotal",
-    "comp",
+    "compilation",
     "bpm",
     "original_year",
     "original_month",
