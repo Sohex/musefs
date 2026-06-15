@@ -164,7 +164,7 @@ language = "en"
 [output.html]
 site-url = "/musefs/"
 git-repository-url = "https://github.com/Sohex/musefs"
-edit-url-template = "https://github.com/Sohex/musefs/edit/main/docs/{path}"
+edit-url-template = "https://github.com/Sohex/musefs/edit/main/docs/src/{path}"
 default-theme = "navy"
 
 [output.linkcheck]
