@@ -54,8 +54,8 @@ read amplification carries the whole win (see
 [BENCHMARKS.md](../../../BENCHMARKS.md#backing-read-ahead-255)).
 
 How each format builds its layout differs enough to warrant its own document:
-[FLAC](../../../docs/FLAC.md), [MP3](../../../docs/MP3.md), [M4A](../../../docs/M4A.md),
-[Ogg](../../../docs/OGG.md), [WAV](../../../docs/WAV.md).
+[FLAC](../formats/flac.md), [MP3](../formats/mp3.md), [M4A](../formats/m4a.md),
+[Ogg](../formats/ogg.md), [WAV](../formats/wav.md).
 
 ## Mount modes
 
