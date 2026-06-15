@@ -146,10 +146,23 @@ A new migration adds two nullable columns to `tracks` and bumps `user_version`:
 ```sql
 ALTER TABLE tracks ADD COLUMN fingerprint  TEXT;  -- cheap hash of the probe's parsed output
 ALTER TABLE tracks ADD COLUMN content_hash TEXT;  -- SHA-256 of the whole file, 64-char hex
-CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
+CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);  -- NON-unique (see below)
 ```
 
-`content_hash` carries a `length(content_hash) = 64` check (nullable). The
+**Neither column is UNIQUE, and the index is non-unique — by design.**
+Duplicate-content tracks (the same album in two locations, or genuine duplicate
+files) legitimately share a fingerprint *and* a content_hash. A UNIQUE constraint
+would make ingesting the second copy fail and abort the scan batch. Correctness
+comes from the refind logic (a *unique missing* candidate plus confirmation) and
+the ambiguity guard — not from DB uniqueness. This is also why
+`tracks_by_fingerprint` returns a `Vec`, not an `Option`.
+
+`content_hash` carries a `length(content_hash) = 64` check (nullable) — SHA-256
+is fixed for the full hash. The `fingerprint` column gets an analogous length
+check **once its hash function is locked** (the with/without benchmark may swap
+SHA-256 for a faster non-crypto hash with a different hex width); since the whole
+feature ships on one unreleased branch, that check is added to this same V2
+migration after the benchmark settles, not in a follow-up migration. The
 `fingerprint` index backs the refind lookup.
 
 Migration chores per repo conventions:

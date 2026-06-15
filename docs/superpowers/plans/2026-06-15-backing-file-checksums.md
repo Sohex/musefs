@@ -115,6 +115,15 @@ In `musefs-db/src/schema.rs`, insert a new const immediately after the `MIGRATIO
 
 ```rust
 const MIGRATION_V2: &str = r"
+-- fingerprint/content_hash are scanner-owned content identities. Neither is
+-- UNIQUE and the index is NON-unique BY DESIGN: duplicate-content tracks (same
+-- album in two places, genuine dupes) legitimately share both values, and a
+-- UNIQUE constraint would abort the scan batch on the second copy. Correctness
+-- comes from the refind logic (unique-missing candidate + confirmation), not
+-- from DB uniqueness. A length CHECK on fingerprint is added here once the hash
+-- function is locked by the benchmark (Task E2) — different hash, different hex
+-- width — and the whole feature is one unreleased branch, so we amend this same
+-- migration rather than adding a follow-up.
 ALTER TABLE tracks ADD COLUMN fingerprint  TEXT;
 ALTER TABLE tracks ADD COLUMN content_hash TEXT
     CHECK (content_hash IS NULL OR length(content_hash) = 64);
@@ -1405,11 +1414,34 @@ criterion_main!(benches);
 Run: `cargo bench -p musefs-core --bench fingerprint_overhead`
 Expected: completes, prints both tiers' times. Record the delta in `BENCHMARKS.md` (per the project's bench-logging convention) and use it to confirm/deny the `fingerprint` default in a follow-up note.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Lock the hash and add the fingerprint length CHECK**
+
+The benchmark now settles the fingerprint hash function:
+- **If the SHA-256 overhead is negligible (expected):** keep SHA-256 and `fingerprint` is 64-char hex. Add a length CHECK to `MIGRATION_V2` in `musefs-db/src/schema.rs` (amend the same migration — the branch is unreleased), so it reads:
+
+  ```sql
+  ALTER TABLE tracks ADD COLUMN fingerprint  TEXT
+      CHECK (fingerprint IS NULL OR length(fingerprint) = 64);
+  ```
+
+- **If a faster non-crypto hash is chosen instead:** swap `fingerprint_of`'s hasher in `musefs-core/src/scan.rs`, then set the CHECK to that hash's hex width.
+
+After editing the migration, regenerate + re-vendor the Python mirror exactly as in Task A1 Step 5 (`MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py` then `python3 contrib/python-musefs/vendor_to_picard.py`), and confirm the default tier (keep `ChecksumTier::Fingerprint` unless the benchmark says otherwise — if it doesn't, change the `Default` impl in `scan.rs` and the CLI `default_value_t` to `None`).
+
+Run: `cargo test -p musefs-db && cargo test -p musefs-core`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+If Step 4 changed `fingerprint_of` (hash swap) or any other `musefs-core/src/*.rs`, run the re-anchor procedure from Critical Constraints §2 first and `git add .cargo/mutants.toml`. (If only `schema.rs` + the Python mirror changed, no re-anchor is needed.)
 
 ```bash
-git add musefs-core/benches/fingerprint_overhead.rs musefs-core/Cargo.toml BENCHMARKS.md
-git commit -m "bench(musefs-core): scan fingerprint-tier overhead (#464)"
+git add musefs-core/benches/fingerprint_overhead.rs musefs-core/Cargo.toml BENCHMARKS.md \
+        musefs-db/src/schema.rs \
+        contrib/python-musefs/src/musefs_common/schema.py \
+        contrib/picard/musefs/_common/schema.py
+# add musefs-core/src/scan.rs and .cargo/mutants.toml too if the hash was swapped
+git commit -m "bench(musefs-core): scan fingerprint overhead; lock hash + length CHECK (#464)"
 ```
 
 ---
