@@ -141,8 +141,9 @@ names.
 
 ### 3. Numeric drop-if-zero
 
-For these **output** keys, drop a value that parses to integer 0 (reusing
-`_to_int`), so Picard's "0" placeholders don't leak as tags:
+For these **output** keys, drop any value that parses to numeric zero (a
+float-aware check, so both `"0"` and `"0.0"` drop), so Picard's "0"
+placeholders don't leak as tags:
 
 ```
 {tracknumber, discnumber, tracktotal, disctotal, compilation, bpm}

@@ -72,8 +72,16 @@ fn find_page_start(
     if let Some(m) = memo {
         let guard = crate::lock::lock_or_clear(m, "ogg last-page memo");
         if let Some((rel, total_len, _)) = guard.as_ref() {
-            let start = audio_offset + *rel;
-            if start <= abs_target && abs_target < start + *total_len {
+            // `audio_offset` is DB-derived and semi-trusted, so fail closed on
+            // the offset arithmetic rather than wrap/panic (matching the bound
+            // serve_ogg_window applies on the same value).
+            let start = audio_offset
+                .checked_add(*rel)
+                .ok_or(musefs_format::FormatError::Malformed)?;
+            let end = start
+                .checked_add(*total_len)
+                .ok_or(musefs_format::FormatError::Malformed)?;
+            if start <= abs_target && abs_target < end {
                 return Ok(start);
             }
         }

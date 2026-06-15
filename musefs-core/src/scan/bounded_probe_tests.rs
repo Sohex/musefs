@@ -251,12 +251,21 @@ fn probe_file_reports_raced_on_mid_probe_mutation() {
     f.set_len(front.len() as u64 + 64).unwrap();
     drop(f);
 
+    // Clear the shared hook even if `probe_file` panics, so a failure here can't
+    // contaminate sibling tests that observe the global hook.
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            clear_after_s1_hook();
+        }
+    }
+
     let pc = path.clone();
     set_after_s1_hook(move || {
         let mut g = std::fs::OpenOptions::new().append(true).open(&pc).unwrap();
         g.write_all(&[0u8; 4096]).unwrap(); // size moves -> S2 != S1
     });
+    let _guard = HookGuard;
     let out = probe_file(&path, WINDOW);
-    clear_after_s1_hook();
     assert!(matches!(out, Ok(ProbeOutcome::Raced)), "got {out:?}");
 }

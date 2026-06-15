@@ -270,7 +270,7 @@ exclude_re = [
     # output is byte-identical either way. (`+`->`-` underflows and is caught.) Pinned
     # by line:col — one of several `+` in this fn; the others ARE caught.
     # guard: op="+" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:248:41: replace \+ with \* in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:256:41: replace \+ with \* in serve_ogg_window',
 
     # SP4 crc_shift_zeros — equivalent mutants inherent to the loop/matrix hybrid.
     # crc_shift_zeros has two code paths (a per-step loop and a GF(2) matrix-power)
@@ -314,9 +314,9 @@ exclude_re = [
     # were reported TIMEOUT under the parallel gate's load, not as a real hang. Pinned
     # by line:col — several `<` in this fn (the loop/length guards) ARE caught.
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:227:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:235:15: replace < with <= in serve_ogg_window',
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:236:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:244:15: replace < with <= in serve_ogg_window',
 
     # Phase 4 poll debounce (#89) — equivalent `<`->`<=` on the two wall-clock
     # gates (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <
@@ -467,7 +467,7 @@ exclude_re = [
     # the ring under the read lock); the fn's other two `+` are the observable fills
     # counters and stay killable, so this one is pinned by coordinate, not by fn.
     # guard: op="+" fn="BackingReader<'a>::read_exact_at" rows=2
-    'musefs-core/src/readahead\.rs:591:68:',
+    'musefs-core/src/readahead\.rs:606:68:',
     #
     # More hang-class (TIMEOUT-only, CANCEL the in-diff job): `len() -> 1` /
     # `clear() -> 1` force a constant resident size, so `evict_one_coldest` keeps

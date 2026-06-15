@@ -38,6 +38,7 @@ _TAG_FIELDS = (
     "artist_sort",
     "artists_sort",
     "albumartist_sort",
+    "albumartists_sort",
     "bitrate",
     "length",
     "format",  # file facts: present on item, NOT tag fields
@@ -128,6 +129,8 @@ def test_sort_fields_renamed_to_on_disk_keys():
     # plural twin collapses to the singular attr, then renames to on-disk key
     pairs = map_fields(item(artists_sort=["A", "B"]))
     assert [v for k, v in pairs if k == "artistsort"] == ["A", "B"]
+    pairs = map_fields(item(albumartists_sort=["A", "B"]))
+    assert [v for k, v in pairs if k == "albumartistsort"] == ["A", "B"]
 
 
 def test_file_facts_excluded():

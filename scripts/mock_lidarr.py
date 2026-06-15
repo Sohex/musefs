@@ -65,7 +65,7 @@ def make_handler(fixture):
             if path in fixture:
                 value = fixture[path]
                 if isinstance(value, (bytes, bytearray)):
-                    body, ctype = bytes(value), "image/jpeg"
+                    body, ctype = bytes(value), "image/png"
                 else:
                     body, ctype = json.dumps(value).encode(), "application/json"
                 self.send_response(200)
