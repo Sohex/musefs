@@ -829,6 +829,47 @@ hypothetical backends where one large read does not self-pipeline.
 **Defaults:** read-ahead on at `--read-ahead-budget-mib 64`, Phase-1 amplification only. Set
 `0` to disable on local-disk-only setups (no benefit there, though no harm either).
 
+### Internal window cap on HDD (#433)
+
+The amplification window doubles per sequential read up to `WINDOW_ABS_CAP` (8 MiB,
+`musefs-core/src/readahead.rs`). The #256 sweep above measured the *kernel* `max_readahead`
+knob — where ≥2048 KiB hurts on HDD — but never this daemon-internal cap, so #433 asked whether
+8 MiB is too large for spinning media.
+
+**Methodology.** `WINDOW_ABS_CAP` is a compile-time const, so the sweep builds one release binary
+per value (`benches/storage_tunables_bench.sh window-cap`, which patches the const in place and
+restores it after each build). Cold (`drop_caches`) single-stream reads of the same ~270 MiB real
+FLAC, synthesis mount, default flags (amplification on, prefetch off), real backing on a btrfs
+HDD (`/data`, 4389-track corpus). Reproduce:
+
+```sh
+WINDOW_CAP_MIB="1 2 4 8 16" MUSEFS_BENCH_CORPUS_SRC=<music-tree> MUSEFS_BENCH_CORPUS_MAX_MIB=300 \
+  benches/storage_tunables_bench.sh window-cap <hdd-backing-dir>
+```
+
+**Result: no measurable cap effect — the medium's noise dominates.** Median MB/s (and the
+within-cap min–max over 7 cold samples) overlap across every cap, and the apparent ordering is an
+artifact of *measurement order*, not the cap: throughput drifts down through each run, so whatever
+runs first looks fastest. Sweeping the caps in the reverse order reverses the "trend".
+
+| cap (MiB) | ascending sweep, median (min–max) | descending sweep, median |
+|----------:|----------------------------------:|-------------------------:|
+| 1  | 104 (65–132) | 46 |
+| 2  | 85 (54–142)  | 58 |
+| 4  | 83 (51–104)  | 61 |
+| 8  | 61 (54–72)   | 61 |
+| 16 | 68 (54–94)   | 86 |
+
+The current default (8 MiB) lands at ~61 MB/s in both orderings; the first-measured cap is fastest
+in both (104 for cap 1 ascending, 86 for cap 16 descending). The within-cap spread (≈50–140 MB/s)
+dwarfs every between-cap median gap. This corroborates the #256 finding that backing read-ahead is
+neutral on local HDD.
+
+**Decision: keep 8 MiB, no runtime knob.** There is no HDD gain to capture, and the cap exists for
+the proven case — the ~6× single-stream amplification win on high-RTT NFS/remote, where coalescing
+into one large `pread` lets the client pipeline RPCs. Lowering the cap to chase an unmeasurable HDD
+effect would regress that win.
+
 ---
 
 ## Global allocator — steady-state RSS (#360)
