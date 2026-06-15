@@ -29,3 +29,4 @@
 # Reference
 
 - [Benchmarks](benchmarks.md)
+- [Changelog](changelog.md)
