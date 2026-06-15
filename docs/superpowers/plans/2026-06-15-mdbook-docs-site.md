@@ -276,12 +276,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@<sha>  # v4
+      - uses: actions/checkout@<sha>  # v4 — use the repo-standard checkout SHA from ci.yml
+        with:
+          persist-credentials: false
       - name: Install mdbook + mdbook-linkcheck
         run: |
           mkdir -p "$HOME/.local/bin"
-          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
-          curl -sSL "https://github.com/Michael-F-Bryan/mdbook-linkcheck/releases/download/v${MDBOOK_LINKCHECK_VERSION}/mdbook-linkcheck.x86_64-unknown-linux-gnu.zip" -o /tmp/linkcheck.zip
+          curl -fsSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
+          curl -fsSL "https://github.com/Michael-F-Bryan/mdbook-linkcheck/releases/download/v${MDBOOK_LINKCHECK_VERSION}/mdbook-linkcheck.x86_64-unknown-linux-gnu.zip" -o /tmp/linkcheck.zip
           unzip -o -d "$HOME/.local/bin" /tmp/linkcheck.zip
           chmod +x "$HOME/.local/bin/mdbook" "$HOME/.local/bin/mdbook-linkcheck"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
