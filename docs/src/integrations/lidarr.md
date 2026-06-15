@@ -207,7 +207,7 @@ binary are importable/on `PATH`.
 - **CI coverage:** a fast smoke (real Lidarr exec path + mocked API) gates PRs,
   and a full real-instance download-client import e2e gates the Python
   releases — see
-  [CONTRIBUTING.md](../contributing/plugins.md#python-plugins-contrib).
+  [the Python plugins guide](../contributing/plugins.md#python-plugins-contrib).
 
 ## Tests
 

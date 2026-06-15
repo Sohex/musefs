@@ -2,9 +2,9 @@
 
 How musefs scans and synthesizes MP3 files (`.mp3`) and their ID3v2 metadata.
 For the segment model these layouts plug into, see
-[ARCHITECTURE.md](../architecture/serving.md#the-segment-model). The ID3v2 builder
+[the segment model](../architecture/serving.md#the-segment-model). The ID3v2 builder
 described here is shared with WAV's embedded `id3 ` chunk — see
-[WAV.md](wav.md).
+[WAV](wav.md).
 
 ## What round-trips
 

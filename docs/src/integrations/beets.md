@@ -142,7 +142,7 @@ A few plugins ignore that gate or are redundant in this mode:
   separators) to mirror your beets layout, including layouts musefs's own template
   engine can't express. Set `write_path: no` in the `musefs:` config to skip it.
   Do not add an extension in a template that consumes `beets_path`. See the
-  computed-tag workflow in [ARCHITECTURE.md](../architecture/overview.md).
+  computed-tag workflow in [the architecture overview](../architecture/overview.md).
 - **Moves & on-disk deletes:** every sync (the command and the end-of-command
   reconcile) prunes track rows whose backing file is gone from disk, so
   renames/moves don't leave stale entries. Caveat: a file that's merely offline

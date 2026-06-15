@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format is based on
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 > The `contrib/` Python packages have their own decoupled version and changelog:
-> see [contrib/CHANGELOG.md](integrations/overview.md#contrib-changelog).
+> see [the contrib changelog](integrations/overview.md#contrib-changelog).
 
 ## [Unreleased]
 
@@ -83,7 +83,7 @@ First stable release.
   unprivileged user with a build-arg-configurable UID/GID, and the
   `musefs-scan.service` systemd unit ships a strong sandbox (the FUSE-mounting
   `musefs.service` deliberately cannot be sandboxed). See
-  [contrib/systemd/README.md](integrations/systemd.md#hardening)
+  [the systemd hardening notes](integrations/systemd.md#hardening)
   (#317, #318, #319).
 - **crates.io distribution:** the `musefs` binary is published to crates.io as of
   this release and installable with `cargo install musefs`. A new thin `musefs` wrapper crate

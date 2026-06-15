@@ -1,9 +1,9 @@
 # FLAC
 
 How musefs scans and synthesizes native FLAC files (`.flac`). FLAC inside an
-Ogg container is a different beast — see [OGG.md](ogg.md). For the segment
+Ogg container is a different beast — see [Ogg](ogg.md). For the segment
 model these layouts plug into, see
-[ARCHITECTURE.md](../architecture/serving.md#the-segment-model).
+[the segment model](../architecture/serving.md#the-segment-model).
 
 ## What round-trips
 

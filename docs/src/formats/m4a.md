@@ -3,7 +3,7 @@
 How musefs scans and synthesizes MP4-container audio (`.m4a`, `.m4b`). Only
 unfragmented files with exactly one track, and that track audio (`soun`), are
 accepted; anything else is skipped at scan time. For the segment model these
-layouts plug into, see [ARCHITECTURE.md](../architecture/serving.md#the-segment-model).
+layouts plug into, see [the segment model](../architecture/serving.md#the-segment-model).
 
 ## What round-trips
 

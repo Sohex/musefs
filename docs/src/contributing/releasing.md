@@ -145,7 +145,7 @@ Lidarr e2e gate) is also run.
   changes skip the expensive jobs at the *job* level — the aggregators still
   report.
 - Benchmark results, when a change warrants them, are recorded in
-  [BENCHMARKS.md](../benchmarks.md).
+  [Benchmarks](../benchmarks.md).
 
 ### Before you push
 

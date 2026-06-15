@@ -1,7 +1,7 @@
 # Getting set up
 
 The working manual for building, testing, and landing a change. For what the
-pieces *are*, read [ARCHITECTURE.md](../architecture/overview.md) first; for per-format
+pieces *are*, read [the architecture overview](../architecture/overview.md) first; for per-format
 behavior, the docs under [`docs/`](../formats/overview.md).
 
 Map of this document:

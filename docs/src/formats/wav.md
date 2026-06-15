@@ -4,8 +4,8 @@ How musefs scans and synthesizes RIFF/WAVE files (`.wav`). WAV has no single
 native tag standard, so musefs writes metadata twice: a broad-compatibility
 `LIST`/`INFO` chunk and a full-fidelity embedded `id3 ` chunk. For the
 segment model these layouts plug into, see
-[ARCHITECTURE.md](../architecture/serving.md#the-segment-model). The ID3v2 tag inside
-the `id3 ` chunk is built by the same code as MP3's — [MP3.md](mp3.md)'s
+[the segment model](../architecture/serving.md#the-segment-model). The ID3v2 tag inside
+the `id3 ` chunk is built by the same code as MP3's — [MP3](mp3.md)'s
 round-trip and lossy-edge rules apply to it wholesale.
 
 ## What round-trips
@@ -40,7 +40,7 @@ precedence** and INFO filling gaps; only chunk headers are walked — the
 - All of MP3's ID3 lossy edges apply to the `id3 ` chunk: ID3v2.4-only
   output, `COMM`/`USLT` language/description reset, `POPM` owner dropped,
   ID3v1 ignored, the OOM-guard skips (the authoritative list lives in
-  [MP3.md](mp3.md#lossy-edges)).
+  [MP3's lossy edges](mp3.md#lossy-edges)).
 - **Tags trailing a very large `data` payload are not seen.** When the `data`
   payload pushes any `LIST`/`INFO` or `id3 ` chunk beyond the scan probe
   ceiling (64 MiB), the file is still ingested — the `data` chunk header gives

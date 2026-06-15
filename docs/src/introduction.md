@@ -38,5 +38,5 @@ HDD/SSD/NFS, and the parsers are continuously fuzzed. beets, Picard, and
 Lidarr plugins ship in [`contrib/`](integrations/overview.md). See the
 [CHANGELOG](changelog.md) for history.
 
-Deeper reading: [ARCHITECTURE.md](architecture/overview.md) for how it works,
-[CONTRIBUTING.md](contributing/setup.md) for the development workflow.
+Deeper reading: [the architecture reference](architecture/overview.md) for how it works,
+[the contributor guide](contributing/setup.md) for the development workflow.

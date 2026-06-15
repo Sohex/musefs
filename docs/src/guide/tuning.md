@@ -6,7 +6,7 @@ The defaults are sensible for most setups, including the two measured storage wi
 daemon-level backing read-ahead (`--read-ahead-budget-mib`, the single biggest win for
 NFS/remote) and keeping the kernel page cache across opens (`--keep-cache`, on by default,
 ~3× faster reopen on HDD/NFS). The *kernel*-level read-ahead / background knobs have little
-measurable effect (see [BENCHMARKS.md](../benchmarks.md#storage-tunables) for the methodology
+measurable effect (see [the storage-tunables benchmarks](../benchmarks.md#storage-tunables) for the methodology
 and numbers).
 
 | Flag | Default | What it does |
