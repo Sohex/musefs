@@ -135,6 +135,22 @@ def track_ids_for_paths(conn, keys):
     return out
 
 
+def track_ids_by_tag(conn, key, value):
+    """Return a list of track ids whose plugin-owned text tag ``(key, value)``
+    matches (order unspecified, possibly empty).
+
+    Scoped to text rows (``value_blob IS NULL``); scanner-written binary tags
+    never match. The intent-based counterpart to ``prune_missing``'s
+    existence-based scoping: used to map a source's "I deleted this album/artist"
+    signal back to the rows it tagged.
+    """
+    rows = conn.execute(
+        "SELECT track_id FROM tags WHERE key = ? AND value = ? AND value_blob IS NULL",
+        (key, value),
+    )
+    return [track_id for (track_id,) in rows]
+
+
 def tags_for_track(conn, track_id):
     """Read back a track's tag rows as an ordered ``list[TagRow]`` (by key, then
     ordinal). Includes both plugin-owned text tags (``value_blob is None``) and

@@ -168,3 +168,41 @@ def test_track_ids_for_paths_raises_on_duplicate_backing_path():
             track_ids_for_paths(conn, ["/m/a.flac"])
     finally:
         conn.close()
+
+
+def test_track_ids_by_tag_matches_text_rows(db_path):
+    from musefs_common import track_ids_by_tag
+    from musefs_common.store import replace_tags
+
+    conn = connect(db_path)
+    try:
+        a = insert_track(conn, "/m/a.flac")
+        b = insert_track(conn, "/m/b.flac")
+        c = insert_track(conn, "/m/c.flac")
+        replace_tags(conn, a, [("musicbrainz_albumid", "rg-1")])
+        replace_tags(conn, b, [("musicbrainz_albumid", "rg-1")])
+        replace_tags(conn, c, [("musicbrainz_albumid", "rg-2")])
+        conn.commit()
+        assert set(track_ids_by_tag(conn, "musicbrainz_albumid", "rg-1")) == {a, b}
+        assert track_ids_by_tag(conn, "musicbrainz_albumid", "rg-2") == [c]
+        assert track_ids_by_tag(conn, "musicbrainz_albumid", "nope") == []
+    finally:
+        conn.close()
+
+
+def test_track_ids_by_tag_ignores_binary_tags(db_path):
+    from musefs_common import track_ids_by_tag
+
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, "/m/a.flac")
+        # A scanner-written binary tag (value_blob NOT NULL) must never match.
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal, value_blob) "
+            "VALUES (?, 'cover', '', 0, ?)",
+            (tid, b"\x00\x01"),
+        )
+        conn.commit()
+        assert track_ids_by_tag(conn, "cover", "") == []
+    finally:
+        conn.close()
