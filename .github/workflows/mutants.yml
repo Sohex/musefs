@@ -60,10 +60,18 @@ jobs:
             echo "harness=false" >> "$GITHUB_OUTPUT"
           fi
 
-  in-diff:
-    # Per-PR: mutate only the lines changed in this PR. Fast gate.
+  in-diff-plan:
+    # Per-PR: validate the exclusion anchors, then size the in-diff campaign.
+    # A large refactor can change hundreds of lines, and the serial in-diff gate
+    # is ~one `cargo test` per mutant — so when the diff carries more than 50
+    # mutants we fan them out: this job lists them, sets n = ceil(count / 50),
+    # and emits a matrix of `i/n` shards the `in-diff` job runs in parallel
+    # (n == 1 for <=50, i.e. a single runner identical to the unsharded gate).
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    outputs:
+      has_mutants: ${{ steps.plan.outputs.has_mutants }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
@@ -83,17 +91,71 @@ jobs:
         run: |
           cargo mutants --no-config --list --json > mutants-list.json
           python3 scripts/check_mutant_anchors.py --mutants-json mutants-list.json
+      - name: Plan in-diff shards
+        id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git diff "$BASE_SHA...HEAD" -- '*.rs' > mutants.diff
+          echo "Changed Rust lines:"; wc -l mutants.diff
+          if [ ! -s mutants.diff ]; then
+            echo "No in-scope Rust changes; nothing to mutate."
+            echo "has_mutants=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Count the mutants this PR will run, honouring the SAME config +
+          # exclude the shard jobs apply, so `--shard i/n` partitions exactly
+          # this set (--list is parse-only; no build, no tests).
+          count="$(cargo mutants --in-diff mutants.diff --exclude 'musefs-latencyfs/**' --list | wc -l)"
+          echo "in-diff mutants: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "has_mutants=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          matrix="$(python3 -c 'import json,math,sys; n=max(1,math.ceil(int(sys.argv[1])/50)); print(json.dumps([{"shard":f"{i}/{n}","name":str(i)} for i in range(n)],separators=(",",":")))' "$count")"
+          echo "shards: $matrix"
+          echo "has_mutants=true" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  in-diff:
+    # Per-PR: mutate only the lines changed in this PR, fanned across the shards
+    # `in-diff-plan` sized. Each shard is a disjoint slice of the in-diff mutants
+    # (cargo-mutants randomizes order *within* a shard only, so coverage is whole
+    # and deterministic). Skipped entirely when the diff yields no mutants.
+    needs: in-diff-plan
+    if: github.event_name == 'pull_request' && needs.in-diff-plan.outputs.has_mutants == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.in-diff-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+          # Full history so the merge base for the three-dot diff is present;
+          # a shallow clone often lacks it and `git diff base...HEAD` then fails.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Install cargo-mutants
+        # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
+        # known-good version is 27.0.0 (documented in scripts/mutants.sh).
+        run: cargo install cargo-mutants
       - name: Build the merge-base diff
+        # Rebuilt here (not shared from in-diff-plan) so each shard is a
+        # self-contained job; `BASE_SHA...HEAD` is identical across jobs, so the
+        # mutant set — and therefore each `--shard i/n` slice — matches the plan.
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           git diff "$BASE_SHA...HEAD" -- '*.rs' > mutants.diff
           echo "Changed Rust lines:"; wc -l mutants.diff
-      - name: Mutate changed lines
+      - name: Mutate changed lines (shard ${{ matrix.shard }})
         run: |
-          if [ ! -s mutants.diff ]; then
-            echo "No in-scope Rust changes; nothing to mutate."; exit 0
-          fi
           # This fast gate runs the default `cargo test` (no libfuse, no
           # `--ignored`), so it can't exercise musefs-latencyfs — every mutant
           # there would falsely survive. That crate is mutation-tested in the
@@ -106,14 +168,15 @@ jobs:
           # so the parent must already exist (same gotcha as scripts/mutants.sh).
           mkdir -p mutants-out
           cargo mutants --in-diff mutants.diff -j1 --exclude 'musefs-latencyfs/**' \
-            --output mutants-out/in-diff
+            --shard "${{ matrix.shard }}" --output mutants-out/in-diff
       - name: Upload survivor report
         # `always()` so the report uploads even when the gate fails on a survivor
         # (the failing run is exactly when the survivor list is wanted).
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: mutants-in-diff
+          # Per-shard artifact names (a slash in matrix.shard is illegal here).
+          name: mutants-in-diff-${{ matrix.name }}
           path: mutants-out/in-diff
           if-no-files-found: warn
 
