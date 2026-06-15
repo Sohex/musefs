@@ -10,7 +10,8 @@ macro_rules! track_select {
     ($tail:literal) => {
         concat!(
             "SELECT id, backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime_ns, backing_ctime_ns, content_version, updated_at \
+             backing_size, backing_mtime_ns, backing_ctime_ns, content_version, updated_at, \
+             fingerprint, content_hash \
              FROM tracks ",
             $tail
         )
@@ -52,6 +53,8 @@ fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
         backing_ctime_ns: r.get("backing_ctime_ns")?,
         content_version: r.get("content_version")?,
         updated_at: r.get("updated_at")?,
+        fingerprint: r.get("fingerprint")?,
+        content_hash: r.get("content_hash")?,
     })
 }
 
@@ -83,6 +86,83 @@ pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Resu
     )?)
 }
 
+pub(crate) fn get_track_by_path_in(
+    conn: &rusqlite::Connection,
+    path: &str,
+) -> Result<Option<Track>> {
+    crate::query_optional(
+        conn,
+        track_select!("WHERE backing_path = ?1"),
+        params![path],
+        |r| Ok(row_to_track(r)?),
+    )
+}
+
+pub(crate) fn tracks_by_fingerprint_in(
+    conn: &rusqlite::Connection,
+    fp: &str,
+) -> Result<Vec<Track>> {
+    let mut stmt = conn.prepare_cached(track_select!("WHERE fingerprint = ?1 ORDER BY id"))?;
+    let rows = stmt.query_map(params![fp], row_to_track)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(crate) fn set_track_checksums_in(
+    conn: &rusqlite::Connection,
+    id: i64,
+    fingerprint: Option<&str>,
+    content_hash: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE tracks SET
+            fingerprint  = COALESCE(?2, fingerprint),
+            content_hash = COALESCE(?3, content_hash)
+         WHERE id = ?1",
+        params![id, fingerprint, content_hash],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn retarget_track_in(
+    conn: &rusqlite::Connection,
+    id: i64,
+    new_backing_path: &str,
+    backing_size: u64,
+    backing_mtime_ns: i64,
+    backing_ctime_ns: i64,
+    audio_offset: u64,
+    audio_length: u64,
+    fingerprint: Option<&str>,
+    content_hash: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE tracks SET
+            backing_path     = ?2,
+            backing_size     = ?3,
+            backing_mtime_ns = ?4,
+            backing_ctime_ns = ?5,
+            audio_offset     = ?6,
+            audio_length     = ?7,
+            fingerprint      = COALESCE(?8, fingerprint),
+            content_hash     = COALESCE(?9, content_hash),
+            updated_at       = CAST(strftime('%s','now') AS INTEGER)
+         WHERE id = ?1",
+        params![
+            id,
+            new_backing_path,
+            backing_size,
+            backing_mtime_ns,
+            backing_ctime_ns,
+            audio_offset,
+            audio_length,
+            fingerprint,
+            content_hash,
+        ],
+    )?;
+    Ok(())
+}
+
 /// One read of the changelog ring past `last_seq`: the distinct changed track
 /// ids (ascending) plus the table's retained seq bounds (0/0 when empty). The
 /// caller derives gap detection from `min_seq` (see musefs-core's refresh).
@@ -99,7 +179,7 @@ impl<M> Db<M> {
     }
 
     pub fn get_track_by_path(&self, path: &str) -> Result<Option<Track>> {
-        self.query_optional_track(track_select!("WHERE backing_path = ?1"), params![path])
+        get_track_by_path_in(&self.conn, path)
     }
 
     pub fn list_tracks(&self) -> Result<Vec<Track>> {
@@ -234,6 +314,57 @@ impl Db<ReadWrite> {
         self.conn
             .execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// All tracks whose stored fingerprint equals `fp` (rows with NULL
+    /// fingerprint never match). Used by the scan refind to find move candidates.
+    pub fn tracks_by_fingerprint(&self, fp: &str) -> Result<Vec<Track>> {
+        tracks_by_fingerprint_in(&self.conn, fp)
+    }
+
+    /// Set the scanner-owned checksums for a track. A `None` argument leaves the
+    /// existing column value intact (COALESCE), so a lower-tier pass never clears
+    /// a higher tier's value.
+    pub fn set_track_checksums(
+        &self,
+        id: i64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> Result<()> {
+        set_track_checksums_in(&self.conn, id, fingerprint, content_hash)
+    }
+
+    /// Point an existing track at a relocated backing file: update its path,
+    /// validation stamp, and audio bounds in place, preserving its `id` (and
+    /// thus its tags/art/structural blocks). Checksum args COALESCE like
+    /// `set_track_checksums`. `updated_at` is refreshed; `content_version` is
+    /// left to the geometry trigger (it bumps only if `backing_mtime_ns`
+    /// actually changed — a pure move preserves mtime, so no bump).
+    #[allow(clippy::too_many_arguments)]
+    pub fn retarget_track(
+        &self,
+        id: i64,
+        new_backing_path: &str,
+        backing_size: u64,
+        backing_mtime_ns: i64,
+        backing_ctime_ns: i64,
+        audio_offset: u64,
+        audio_length: u64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> Result<()> {
+        retarget_track_in(
+            &self.conn,
+            id,
+            new_backing_path,
+            backing_size,
+            backing_mtime_ns,
+            backing_ctime_ns,
+            audio_offset,
+            audio_length,
+            fingerprint,
+            content_hash,
+        )
     }
 
     /// Test-only: force a track's format column directly (no rescan), bumping
@@ -425,5 +556,112 @@ mod render_key_tests {
         reader.end_read().unwrap();
         // After the snapshot ends, the reader sees the new version.
         assert_eq!(reader.track_content_version(id).unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    use crate::{Db, NewTrack, models::Format};
+
+    fn new_track(path: &str) -> NewTrack {
+        NewTrack {
+            backing_path: path.to_string(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 10,
+            backing_size: 10,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
+        }
+    }
+
+    #[test]
+    fn set_and_read_back_checksums() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.set_track_checksums(id, Some("fp1"), Some(&"d".repeat(64)))
+            .unwrap();
+        let t = db.get_track(id).unwrap().unwrap();
+        assert_eq!(t.fingerprint.as_deref(), Some("fp1"));
+        assert_eq!(t.content_hash.as_deref(), Some(&"d".repeat(64)[..]));
+    }
+
+    #[test]
+    fn set_checksums_none_does_not_clobber_existing() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.set_track_checksums(id, Some("fp1"), Some(&"d".repeat(64)))
+            .unwrap();
+        // A later lower-tier pass passes None and must preserve both.
+        db.set_track_checksums(id, None, None).unwrap();
+        let t = db.get_track(id).unwrap().unwrap();
+        assert_eq!(t.fingerprint.as_deref(), Some("fp1"));
+        assert_eq!(t.content_hash.as_deref(), Some(&"d".repeat(64)[..]));
+    }
+
+    #[test]
+    fn tracks_by_fingerprint_returns_matches() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let b = db.upsert_track(&new_track("/b.flac")).unwrap();
+        db.set_track_checksums(a, Some("shared"), None).unwrap();
+        db.set_track_checksums(b, Some("shared"), None).unwrap();
+        db.upsert_track(&new_track("/c.flac")).unwrap(); // fingerprint NULL
+        let mut ids: Vec<i64> = db
+            .tracks_by_fingerprint("shared")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![a, b]);
+        assert!(db.tracks_by_fingerprint("nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn retarget_updates_path_stamp_and_bounds_keeping_id() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_track(&new_track("/old.flac")).unwrap();
+        db.set_track_checksums(id, Some("fp"), None).unwrap();
+        db.retarget_track(
+            id,
+            "/new.flac",
+            99,
+            1234,
+            5678,
+            42,
+            50,
+            None,
+            Some(&"e".repeat(64)),
+        )
+        .unwrap();
+        let t = db.get_track(id).unwrap().unwrap();
+        assert_eq!(t.id, id);
+        assert_eq!(t.backing_path, "/new.flac");
+        assert_eq!(t.backing_size, 99);
+        assert_eq!(t.backing_mtime_ns, 1234);
+        assert_eq!(t.backing_ctime_ns, 5678);
+        assert_eq!(t.bounds.audio_offset(), 42);
+        assert_eq!(t.bounds.audio_length(), 50);
+        assert_eq!(t.fingerprint.as_deref(), Some("fp")); // None arg preserves
+        assert_eq!(t.content_hash.as_deref(), Some(&"e".repeat(64)[..]));
+        assert!(db.get_track_by_path("/old.flac").unwrap().is_none());
+    }
+
+    #[test]
+    fn bulk_writer_retarget_and_checksums_match_db() {
+        let db = Db::open_in_memory().unwrap();
+        let id = {
+            let mut bw = db.bulk_writer().unwrap();
+            let id = bw.upsert_track(&new_track("/old.flac")).unwrap();
+            bw.set_track_checksums(id, Some("fp"), None).unwrap();
+            bw.retarget_track(id, "/new.flac", 10, 1, 2, 0, 10, None, None)
+                .unwrap();
+            bw.commit().unwrap();
+            id
+        };
+        let t = db.get_track(id).unwrap().unwrap();
+        assert_eq!(t.backing_path, "/new.flac");
+        assert_eq!(t.fingerprint.as_deref(), Some("fp"));
     }
 }
