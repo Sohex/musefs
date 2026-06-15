@@ -76,10 +76,16 @@ therefore content-stable across scans and uniform across formats. (Hashing the
 raw adaptive buffer would *not* be deterministic; that distinction is the whole
 reason to hash the output.)
 
-Large embedded payloads (art, binary tags) are folded in by their **digest**
-(length + content hash) rather than their raw bytes, so the fingerprint stays
-cheap even for a file carrying a 16 MB cover — it never re-hashes multi-megabyte
-blobs per file.
+The fingerprint is computed in the **parallel probe worker**, straight from the
+in-memory `Probed` (the raw payload bytes are already in hand there), not on the
+single writer. So folding the art / binary-tag / structural-block payloads into
+the hash is parallelized CPU work, gated to new/changed files — never a
+writer-side cost. Art is *also* SHA-256'd independently at ingest by
+`upsert_art_in` (`art.rs:147`) for content-dedup; rather than thread that
+writer-side digest back out to the worker (coupling fingerprinting to the art
+path), the worker simply hashes the bytes it already holds. A second pass over a
+cover — parallel and gated, and typically sub-MB — is negligible and keeps the
+two paths decoupled.
 
 **Excluded: every `BackingStamp` field — `mtime_ns`, `ctime_ns`, and `size`.**
 `ctime` bumps on a rename, so it changes on the very move we are trying to
