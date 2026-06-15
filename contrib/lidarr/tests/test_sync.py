@@ -500,3 +500,75 @@ def test_collect_album_art_logs_and_skips_fetch_failure(sample_album, sample_art
 
     assert result == {}
     assert "album 20" in capsys.readouterr().err
+
+
+def test_prune_deleted_album_removes_matching_rows(db_path, tmp_path):
+    from musefs_common import connect
+    from musefs_common.store import replace_tags
+    from musefs_lidarr.events import EventType, LidarrEvent
+    from musefs_lidarr.import_link import LinkMode
+    from musefs_lidarr.sync import SyncConfig, prune_deleted
+
+    backing = tmp_path / "a.flac"
+    backing.write_bytes(b"audio")  # backing file stays on disk
+
+    conn = connect(db_path)
+    try:
+        a = conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
+            "backing_size, backing_mtime_ns, updated_at) VALUES (?, 'flac', 0, 0, 0, 0, 0)",
+            (str(backing),),
+        ).lastrowid
+        b = conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
+            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/b.flac', 'flac', 0, 0, 0, 0, 0)",
+        ).lastrowid
+        replace_tags(conn, a, [("musicbrainz_albumid", "rg-1")])
+        replace_tags(conn, b, [("musicbrainz_albumid", "rg-2")])
+        conn.commit()
+    finally:
+        conn.close()
+
+    config = SyncConfig(db_path=db_path, link_mode=LinkMode.SYMLINK)
+    event = LidarrEvent(
+        event_type=EventType.ALBUM_DELETED, raw_type="AlbumDeleted", album_mbid="rg-1"
+    )
+    pruned = prune_deleted(config=config, event=event)
+
+    assert pruned == 1
+    assert backing.exists()  # invariant: backing bytes untouched
+    conn = connect(db_path)
+    try:
+        ids = {row[0] for row in conn.execute("SELECT id FROM tracks")}
+        assert ids == {b}
+    finally:
+        conn.close()
+
+
+def test_prune_deleted_artist_removes_all_artist_rows(db_path):
+    from musefs_common import connect
+    from musefs_common.store import replace_tags
+    from musefs_lidarr.events import EventType, LidarrEvent
+    from musefs_lidarr.import_link import LinkMode
+    from musefs_lidarr.sync import SyncConfig, prune_deleted
+
+    conn = connect(db_path)
+    try:
+        ids = []
+        for i, art in enumerate(["art-1", "art-1", "art-2"]):
+            tid = conn.execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
+                "backing_size, backing_mtime_ns, updated_at) VALUES (?, 'flac', 0, 0, 0, 0, 0)",
+                (f"/m/{i}.flac",),
+            ).lastrowid
+            replace_tags(conn, tid, [("musicbrainz_artistid", art)])
+            ids.append(tid)
+        conn.commit()
+    finally:
+        conn.close()
+
+    config = SyncConfig(db_path=db_path, link_mode=LinkMode.SYMLINK)
+    event = LidarrEvent(
+        event_type=EventType.ARTIST_DELETED, raw_type="ArtistDeleted", artist_mbid="art-1"
+    )
+    assert prune_deleted(config=config, event=event) == 2
