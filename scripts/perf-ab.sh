@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Same-runner A/B wall-clock comparison of the read_throughput criterion bench.
 # Benches the base ref and HEAD back-to-back on ONE machine (robust to
-# runner-to-runner variance), then diffs with critcmp. The job that invokes this
-# is informational (excluded from the ci-ok gate); a build/bench failure here
-# surfaces as a red job rather than being swallowed.
+# runner-to-runner variance), then diffs with critcmp. This is the local-dev /
+# single-machine entry point; CI instead splits the two bench runs across
+# separate runners (perf-bench-one.sh) for wall-clock and joins them with the
+# same perf-ab-compare.sh. The A/B job is informational (excluded from the ci-ok
+# gate); a build/bench failure surfaces as a red job rather than being swallowed.
 #
 # Usage: scripts/perf-ab.sh <base-sha> <out-markdown-file>
 # Requires: cargo, critcmp on PATH. Run from the repo root with a clean tree.
@@ -11,42 +13,14 @@ set -euo pipefail
 
 BASE_SHA="${1:?base sha required}"
 OUT="${2:?output markdown path required}"
-BENCH=(cargo bench -p musefs-core --bench read_throughput --)
+here="$(dirname "$0")"
 
 head_sha="$(git rev-parse HEAD)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
 
-run_baseline() {
-  local name="$1"
-  "${BENCH[@]}" --save-baseline "$name" >/dev/null 2>&1
-}
+"$here/perf-bench-one.sh" "$BASE_SHA" base "$tmp/base.json"
+"$here/perf-bench-one.sh" "$head_sha" pr "$tmp/pr.json"
 
-echo "Benching base ($BASE_SHA)…" >&2
-git checkout --quiet --detach "$BASE_SHA"
-run_baseline base
-
-echo "Benching head ($head_sha)…" >&2
-git checkout --quiet --detach "$head_sha"
-run_baseline pr
-
-{
-  echo "### Read-path A/B (same-runner, warn-only)"
-  echo
-  echo "Base \`${BASE_SHA:0:12}\` vs PR \`${head_sha:0:12}\`. Wall-clock on a"
-  echo "shared GH runner — treat <10% moves as noise."
-  echo
-  base_n="$(critcmp --list 2>/dev/null | grep -c '^base' || true)"
-  pr_n="$(critcmp --list 2>/dev/null | grep -c '^pr' || true)"
-  common="$(critcmp base pr 2>/dev/null | tail -n +2 | grep -c . || true)"
-  if [ "$common" -eq 0 ]; then
-    echo "> ⚠️ No comparable benchmarks (benchmark IDs differ between base and PR"
-    echo "> — a harness/bench rename?). Nothing to compare."
-  else
-    echo '```'
-    critcmp base pr
-    echo '```'
-    echo
-    echo "_base benches: ${base_n}, pr benches: ${pr_n}, compared: ${common}._"
-  fi
-} > "$OUT"
-
-echo "Wrote $OUT" >&2
+"$here/perf-ab-compare.sh" "$tmp/base.json" "$tmp/pr.json" "$BASE_SHA" "$head_sha" "$OUT" \
+  "Benched back-to-back on one machine. Treat <10% moves as noise."
