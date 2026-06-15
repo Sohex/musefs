@@ -9,12 +9,20 @@ monitor the artist with no network dependency. Lidarr is pointed here via its
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "metadata")
+
+# A minimal valid 1x1 PNG. album.json's cover image Url points back here so the
+# real Lidarr downloads it locally (network-free), then musefs-lidarr-sync writes
+# it into the store as the served file's cover art.
+COVER_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
 
 
 def _load(name):
@@ -35,11 +43,20 @@ def make_handler():
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_bytes(self, data, ctype):
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self):  # noqa: N802
             path = urlparse(self.path).path
             # strip the /api/v0.4 prefix Lidarr's base URL carries
             route = path.split("/api/v0.4/", 1)[-1] if "/api/v0.4/" in path else path.lstrip("/")
-            if route.startswith("artist/"):
+            if route == "cover.jpg":
+                self._send_bytes(COVER_PNG, "image/jpeg")
+            elif route.startswith("artist/"):
                 self._send(artist)
             elif route.startswith("album/"):
                 self._send(album)

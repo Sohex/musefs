@@ -50,6 +50,19 @@ def parse_ffprobe_tags(ffprobe_json: str) -> dict[str, str]:
     return {str(k).lower(): str(v) for k, v in tags.items()}
 
 
+def has_attached_picture(ffprobe_streams_json: str) -> bool:
+    """True if ``ffprobe -show_streams -of json`` reports embedded cover art.
+
+    Cover art rides as a video stream flagged ``disposition.attached_pic`` (FLAC
+    METADATA_BLOCK_PICTURE, ID3 APIC, etc.).
+    """
+    data = json.loads(ffprobe_streams_json)
+    for stream in data.get("streams", []):
+        if stream.get("disposition", {}).get("attached_pic"):
+            return True
+    return False
+
+
 def sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:

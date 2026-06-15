@@ -17,8 +17,8 @@
  "images": [
   {
    "CoverType": "Cover",
-   "Url": "https://images.lidarr.audio/cache/https://coverartarchive.org/release/59d2fc91-8a6a-45da-9e12-51b01d2a50d7/37224917897-1200.jpg",
-   "remoteUrl": "https://coverartarchive.org/release/59d2fc91-8a6a-45da-9e12-51b01d2a50d7/37224917897-1200.jpg"
+   "Url": "http://host.containers.internal:9701/cover.jpg",
+   "remoteUrl": "http://host.containers.internal:9701/cover.jpg"
   }
  ],
  "Releases": [

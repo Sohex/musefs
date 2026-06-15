@@ -128,6 +128,14 @@ vals=[r[0] for r in c.execute("SELECT value FROM tags WHERE key='artist'")]
 print("  [ok] store artist tags:", vals)
 assert "Komiku" in vals, vals
 PY
+# store got the album cover (the sync fetched Lidarr's MediaCover art)
+python3 - "$W/store/store.db" <<'PY' || fail "store carries no album art"
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1])
+n=c.execute("SELECT COUNT(*) FROM track_art").fetchone()[0]
+print("  [ok] store track_art rows:", n)
+assert n>=1, n
+PY
 SHA_AFTER="$(sha256sum "$BACKING" | awk '{print $1}')"
 [ "$SHA_BEFORE" = "$SHA_AFTER" ] || fail "backing audio bytes changed"
 echo "  [ok] backing bytes unchanged"
@@ -154,5 +162,14 @@ assert aa=="Komiku", f"served albumartist={aa!r} (expected Komiku, supplied by L
 assert (t.get("date") or "").startswith("2020-05-03"), f"served date={t.get('date')!r} (expected Lidarr's 2020-05-03)"
 print("  [ok] served file carries Lidarr-supplied metadata absent from the backing file:")
 print("       artist=%r albumartist=%r date=%r title=%r" % (t.get("artist"), aa, t.get("date"), t.get("title")))
+PY
+# served file carries the embedded cover (Lidarr's art spliced into the view);
+# the backing file has none, so an attached_pic stream must be musefs-generated.
+ffprobe -hide_banner -loglevel error -show_streams -of json "$SERVED" > "$W/served-streams.json"
+python3 - "$W/served-streams.json" <<'PY' || fail "served file has no embedded cover art"
+import json,sys
+streams=json.load(open(sys.argv[1])).get("streams",[])
+assert any(s.get("disposition",{}).get("attached_pic") for s in streams), "no attached_pic stream"
+print("  [ok] served file carries embedded cover art")
 PY
 echo "lidarr-e2e: PASS"
