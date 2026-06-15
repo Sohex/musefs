@@ -956,6 +956,7 @@ name = "musefs-core"
 version = "1.0.0"
 dependencies = [
  "arc-swap",
+ "base16ct",
  "base64",
  "crc",
  "criterion",
@@ -975,6 +976,7 @@ dependencies = [
  "proptest",
  "quick_cache",
  "rusqlite",
+ "sha2",
  "sharded-slab",
  "tempfile",
  "thiserror 2.0.18",
