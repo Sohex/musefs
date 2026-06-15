@@ -113,7 +113,10 @@ jobs:
             echo "has_mutants=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          matrix="$(python3 -c 'import json,math,sys; n=max(1,math.ceil(int(sys.argv[1])/50)); print(json.dumps([{"shard":f"{i}/{n}","name":str(i)} for i in range(n)],separators=(",",":")))' "$count")"
+          # `shard` is cargo-mutants' 0-indexed `i/n` arg; `label`/`name` are the
+          # human-facing 1-indexed forms (so the job list reads "1/n".."n/n", not
+          # "0/n".."(n-1)/n", and the artifact suffix carries no illegal slash).
+          matrix="$(python3 -c 'import json,math,sys; n=max(1,math.ceil(int(sys.argv[1])/50)); print(json.dumps([{"shard":f"{i}/{n}","label":f"{i+1}/{n}","name":f"{i+1}-of-{n}"} for i in range(n)],separators=(",",":")))' "$count")"
           echo "shards: $matrix"
           echo "has_mutants=true" >> "$GITHUB_OUTPUT"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -123,6 +126,7 @@ jobs:
     # `in-diff-plan` sized. Each shard is a disjoint slice of the in-diff mutants
     # (cargo-mutants randomizes order *within* a shard only, so coverage is whole
     # and deterministic). Skipped entirely when the diff yields no mutants.
+    name: in-diff (shard ${{ matrix.label }})
     needs: in-diff-plan
     if: github.event_name == 'pull_request' && needs.in-diff-plan.outputs.has_mutants == 'true'
     runs-on: ubuntu-latest
@@ -154,7 +158,7 @@ jobs:
         run: |
           git diff "$BASE_SHA...HEAD" -- '*.rs' > mutants.diff
           echo "Changed Rust lines:"; wc -l mutants.diff
-      - name: Mutate changed lines (shard ${{ matrix.shard }})
+      - name: Mutate changed lines (shard ${{ matrix.label }})
         run: |
           # This fast gate runs the default `cargo test` (no libfuse, no
           # `--ignored`), so it can't exercise musefs-latencyfs — every mutant
@@ -175,7 +179,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          # Per-shard artifact names (a slash in matrix.shard is illegal here).
+          # Per-shard artifact names; matrix.name is the slash-free "k-of-n" form
+          # (a slash, as in the shard arg, is illegal in an artifact name).
           name: mutants-in-diff-${{ matrix.name }}
           path: mutants-out/in-diff
           if-no-files-found: warn
