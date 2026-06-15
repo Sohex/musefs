@@ -1104,7 +1104,7 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
 /// single writer (this thread) in batched transactions. Per-file errors are
 /// counted, not fatal.
 fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<ScanStats> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     let jobs = effective_jobs(opts.jobs);
     let total = files.len() as u64;
@@ -1115,24 +1115,27 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     let failed = Arc::new(AtomicU64::new(0));
     let raced = Arc::new(AtomicU64::new(0));
 
-    // Work queue: a shared iterator behind a mutex (cheap; probing dominates).
-    let work = Arc::new(std::sync::Mutex::new(files.into_iter()));
+    // Work queue: a shared slice with an atomic cursor — each worker claims the
+    // next index with a single relaxed `fetch_add`, no per-file lock contention.
+    let files = Arc::new(files);
+    let cursor = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = sync_channel::<Unit>(jobs * 2);
 
     let mut workers = Vec::with_capacity(jobs);
     for _ in 0..jobs {
-        let work = Arc::clone(&work);
+        let files = Arc::clone(&files);
+        let cursor = Arc::clone(&cursor);
         let tx = tx.clone();
         let budget = Arc::clone(&budget);
         let failed = Arc::clone(&failed);
         let raced = Arc::clone(&raced);
         workers.push(std::thread::spawn(move || {
             loop {
-                let next = { work.lock().unwrap().next() };
-                let Some(path) = next else { break };
-                match probe_file_caught(&path, window) {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(path) = files.get(i) else { break };
+                match probe_file_caught(path, window) {
                     Ok(ProbeOutcome::Probed(probed, stamp)) => {
-                        let abs = match std::fs::canonicalize(&path) {
+                        let abs = match std::fs::canonicalize(path) {
                             Ok(abs) => abs,
                             Err(e) => {
                                 log::warn!("skipping {}: {e}", path.display());
