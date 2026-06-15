@@ -3,6 +3,7 @@
 #
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 
 from .constants import MAX_ART_BYTES
@@ -45,11 +46,14 @@ class SyncStats:
     skipped: int = 0  # path had no matching track row
     art_linked: int = 0
     skipped_art: int = 0  # art over the size cap (or, in the beets adapter, unreadable)
+    skipped_invalid: int = 0  # record violated a store CHECK constraint
+    invalid: list = field(default_factory=list)  # (record key, sqlite error message)
 
     def summary(self):
         return (
             f"synced={self.synced} skipped={self.skipped} "
-            f"art_linked={self.art_linked} skipped_art={self.skipped_art}"
+            f"art_linked={self.art_linked} skipped_art={self.skipped_art} "
+            f"skipped_invalid={self.skipped_invalid}"
         )
 
 
@@ -61,7 +65,13 @@ def sync_one(conn, record, stats, *, dry_run=False, merge=False):
     scanner-written binary tags survive. Art is replaced when at least one image is
     within ``MAX_ART_BYTES``; each over-cap image bumps ``skipped_art``, and if
     every provided image is over cap any scan-seeded ``track_art`` is left
-    untouched."""
+    untouched.
+
+    A record whose tags or art violate a store CHECK constraint (key/value/mime
+    length, ``picture_type`` range, control chars, ...) is rolled back through its
+    own savepoint and skipped -- it bumps ``skipped_invalid`` and appends
+    ``(record.key, message)`` to ``invalid`` rather than aborting the whole batch
+    with an opaque commit-time ``IntegrityError`` (#420)."""
     track_id = track_id_for_path(conn, record.key)
     if track_id is None:
         stats.skipped += 1
@@ -76,17 +86,22 @@ def sync_one(conn, record, stats, *, dry_run=False, merge=False):
     will_link_art = bool(kept)
 
     if not dry_run:
-        with _savepoint(conn, "musefs_sync_one"):
-            if merge:
-                merge_tags(conn, track_id, record.pairs, record.delete_keys or [])
-            else:
-                replace_tags(conn, track_id, record.pairs)
-            if will_link_art:
-                arts = [
-                    (upsert_art(conn, img.data, img.mime), img.picture_type, img.description)
-                    for img in kept
-                ]
-                replace_track_art(conn, track_id, arts)
+        try:
+            with _savepoint(conn, "musefs_sync_one"):
+                if merge:
+                    merge_tags(conn, track_id, record.pairs, record.delete_keys or [])
+                else:
+                    replace_tags(conn, track_id, record.pairs)
+                if will_link_art:
+                    arts = [
+                        (upsert_art(conn, img.data, img.mime), img.picture_type, img.description)
+                        for img in kept
+                    ]
+                    replace_track_art(conn, track_id, arts)
+        except sqlite3.IntegrityError as err:
+            stats.skipped_invalid += 1
+            stats.invalid.append((record.key, str(err)))
+            return
 
     if will_link_art:
         stats.art_linked += 1

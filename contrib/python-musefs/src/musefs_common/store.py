@@ -2,9 +2,26 @@ import contextlib
 import hashlib
 import os
 import sqlite3
+from dataclasses import dataclass
 
 from .constants import EXPECTED_USER_VERSION
 from .errors import SchemaMismatch
+
+# SQLite caps a statement's host parameters (SQLITE_MAX_VARIABLE_NUMBER: 999 on
+# the <3.32 floor). Chunk bulk IN-lists below it so large lookups never trip it.
+_MAX_SQL_VARS = 900
+
+
+@dataclass(frozen=True)
+class TagRow:
+    """One tag row read back from the store: the key, the text value, and the
+    raw ``value_blob``. Plugin-owned text tags have ``value_blob is None``;
+    scanner-written binary tags have ``value == ""`` and ``value_blob`` bytes."""
+
+    key: str
+    value: str
+    value_blob: object = None  # bytes | None
+
 
 # sqlite3.LEGACY_TRANSACTION_CONTROL is 3.12+; it is == -1. Use getattr so this
 # module still imports on the 3.8 floor (where the constant does not exist).
@@ -86,6 +103,36 @@ def track_id_for_path(conn, key):
     """Return the track id whose backing_path equals ``key``, or None."""
     row = conn.execute("SELECT id FROM tracks WHERE backing_path = ?", (key,)).fetchone()
     return row[0] if row else None
+
+
+def track_ids_for_paths(conn, keys):
+    """Resolve many ``backing_path`` keys to track ids in one pass, returning a
+    ``{key: id}`` dict that omits keys with no matching track row. The IN-list is
+    chunked under SQLite's host-parameter cap so arbitrarily large lookups work
+    (the bulk counterpart to ``track_id_for_path``)."""
+    keys = list(keys)
+    out = {}
+    for start in range(0, len(keys), _MAX_SQL_VARS):
+        chunk = keys[start : start + _MAX_SQL_VARS]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT backing_path, id FROM tracks WHERE backing_path IN ({placeholders})",
+            chunk,
+        )
+        for backing_path, track_id in rows:
+            out[backing_path] = track_id
+    return out
+
+
+def tags_for_track(conn, track_id):
+    """Read back a track's tag rows as an ordered ``list[TagRow]`` (by key, then
+    ordinal). Includes both plugin-owned text tags (``value_blob is None``) and
+    scanner-written binary tags (``value == ""``, ``value_blob`` bytes)."""
+    rows = conn.execute(
+        "SELECT key, value, value_blob FROM tags WHERE track_id = ? ORDER BY key, ordinal",
+        (track_id,),
+    )
+    return [TagRow(key, value, value_blob) for key, value, value_blob in rows]
 
 
 def prune_missing(conn, track_ids=None):

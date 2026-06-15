@@ -199,8 +199,8 @@ def test_art_deduped_across_records(db_path):
 
 
 def test_summary_format():
-    s = SyncStats(synced=3, skipped=1, art_linked=2, skipped_art=1)
-    assert s.summary() == "synced=3 skipped=1 art_linked=2 skipped_art=1"
+    s = SyncStats(synced=3, skipped=1, art_linked=2, skipped_art=1, skipped_invalid=4)
+    assert s.summary() == "synced=3 skipped=1 art_linked=2 skipped_art=1 skipped_invalid=4"
 
 
 def test_sync_one_multiple_images_written_in_order(db_path):
@@ -312,5 +312,77 @@ def test_sync_files_default_is_full_replace(db_path):
         tags = text_tags(conn, tid)
         assert tags["artist"] == ["New"]
         assert "comment" not in tags  # full replace wiped it
+    finally:
+        conn.close()
+
+
+def test_sync_one_skips_record_with_invalid_tag_key(db_path):
+    """A tag key with a control char violates the store CHECK; the record is
+    skipped and recorded, not raised (#420)."""
+    conn, tid = _seed(db_path)
+    try:
+        stats = SyncStats()
+        sync_one(conn, Record(key="/m/a.flac", pairs=[("ti\x01tle", "T")]), stats)
+        conn.commit()
+        assert stats.synced == 0
+        assert stats.skipped_invalid == 1
+        assert len(stats.invalid) == 1
+        key, reason = stats.invalid[0]
+        assert key == "/m/a.flac"
+        assert "CHECK" in reason
+        assert conn.execute("SELECT COUNT(*) FROM tags WHERE track_id=?", (tid,)).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_sync_one_skips_record_with_invalid_art_rolls_back_tags(db_path):
+    """An out-of-range picture_type aborts the art INSERT; the whole record's
+    write (tags included) rolls back and the record is skipped, not raised."""
+    conn, tid = _seed(db_path)
+    try:
+        stats = SyncStats()
+        sync_one(
+            conn,
+            Record(
+                key="/m/a.flac",
+                pairs=[("title", "T")],
+                art=[ArtImage(JPEG, "image/jpeg", picture_type=99)],
+            ),
+            stats,
+        )
+        conn.commit()
+        assert stats.synced == 0
+        assert stats.art_linked == 0
+        assert stats.skipped_invalid == 1
+        assert conn.execute("SELECT COUNT(*) FROM tags WHERE track_id=?", (tid,)).fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM track_art WHERE track_id=?", (tid,)).fetchone()[0]
+            == 0
+        )
+    finally:
+        conn.close()
+
+
+def test_invalid_record_mid_batch_does_not_abort_others(db_path):
+    conn = connect(db_path)
+    try:
+        a = insert_track(conn, "/m/a.flac")
+        b = insert_track(conn, "/m/b.flac")
+        conn.commit()
+        records = [
+            Record(key="/m/a.flac", pairs=[("title", "T")]),
+            Record(key="/m/b.flac", pairs=[("ti\x01tle", "T")]),  # invalid key
+        ]
+        stats = sync_files(conn, records)
+        conn.commit()
+        assert stats.synced == 1
+        assert stats.skipped_invalid == 1
+        assert (
+            conn.execute(
+                "SELECT value FROM tags WHERE track_id=? AND key='title'", (a,)
+            ).fetchone()[0]
+            == "T"
+        )
+        assert conn.execute("SELECT COUNT(*) FROM tags WHERE track_id=?", (b,)).fetchone()[0] == 0
     finally:
         conn.close()

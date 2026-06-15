@@ -14,6 +14,7 @@ from .errors import ScanError, SchemaMismatch
 from .paths import realpath_key
 from .scan import run_scan
 from .store import (
+    TagRow,
     check_schema_version,
     connect,
     merge_tags,
@@ -21,7 +22,9 @@ from .store import (
     replace_tags,
     replace_track_art,
     sniff_mime,
+    tags_for_track,
     track_id_for_path,
+    track_ids_for_paths,
     upsert_art,
 )
 from .sync import ArtImage, Record, SyncStats, sync_files, sync_one
@@ -39,6 +42,9 @@ __all__ = [
     "connect",
     "check_schema_version",
     "track_id_for_path",
+    "track_ids_for_paths",
+    "tags_for_track",
+    "TagRow",
     "prune_missing",
     "merge_tags",
     "replace_tags",
