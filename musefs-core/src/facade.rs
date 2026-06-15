@@ -450,16 +450,21 @@ impl Musefs {
             return Ok(());
         }
         let dispatched_epoch = h.epoch.load(Ordering::Acquire);
+        // All windows in this dispatch share one context, so each job bumps a
+        // single refcount instead of re-cloning four Arcs per window (#431).
+        let ctx = Arc::new(crate::readahead::PrefetchContext {
+            file: Arc::clone(&h.file),
+            buf: Arc::clone(&h.readahead),
+            pool: Arc::clone(&self.readahead_pool),
+            epoch: Arc::clone(&h.epoch),
+            dispatched_epoch,
+            len: window,
+            backing_len,
+        });
         for s in starts {
             pf.request(crate::readahead::PrefetchJob {
-                file: Arc::clone(&h.file),
-                buf: Arc::clone(&h.readahead),
-                pool: Arc::clone(&self.readahead_pool),
-                epoch: Arc::clone(&h.epoch),
-                dispatched_epoch,
+                ctx: Arc::clone(&ctx),
                 start: s,
-                len: window,
-                backing_len,
             });
         }
         Ok(())
