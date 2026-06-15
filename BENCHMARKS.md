@@ -73,9 +73,10 @@ in three lanes:
 1. **Counter gate (every non-doc PR, hard).** `perf_counters.rs` +
    `tree.rs` golden work-counter assertions under `--features metrics`. Catches
    algorithmic regressions (extra copy, whole-file slurp, O(N) tree rebuild).
-2. **A/B wall-clock (warn-only, core `src` PRs).** The `perf-ab` job benches the
-   base and PR commits back-to-back on one runner and posts a `critcmp` delta as
-   a PR comment. Never blocks.
+2. **A/B wall-clock (warn-only, core `src` PRs).** The `perf-bench` matrix job
+   benches the base and PR commits in parallel on separate runners; the `perf-ab`
+   job then diffs the two exported baselines and posts a `critcmp` delta as a PR
+   comment. Never blocks.
 3. **Release record.** The `benchmarks` job runs the full bench suite at the
    `ci` tier on a tag and uploads the numbers as an artifact for curation here.
 

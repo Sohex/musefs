@@ -376,11 +376,13 @@ read/ingest/refresh work must update the golden numbers in the same PR. They run
 on every non-doc PR via CI's `check` job. Constant-factor (wall-clock) changes
 are surfaced separately by the warn-only `perf-ab` job (below).
 
-The `perf-ab` job runs only when `musefs-core/src/**` or `musefs-format/src/**`
-change. It benches the base and PR commits back-to-back on one runner and posts a
-`critcmp` delta as a sticky PR comment. It is **warn-only** and not a required
-check — GH runner noise makes wall-clock unfit for hard gating. Reproduce locally
-with `scripts/perf-ab.sh <base-sha> out.md`.
+The A/B benchmark runs only when `musefs-core/src/**` or `musefs-format/src/**`
+change. The `perf-bench` matrix job benches the base and PR commits in parallel
+on separate runners (one ref each), then the `perf-ab` job downloads both
+exported baselines and posts a `critcmp` delta as a sticky PR comment. It is
+**warn-only** and not a required check — GH runner noise (now including
+cross-runner variance) makes wall-clock unfit for hard gating. Reproduce locally
+on one machine with `scripts/perf-ab.sh <base-sha> out.md`.
 
 ### Concurrency + sanitizers
 
