@@ -439,6 +439,15 @@ fn ingest_unit_db_path_retargets_orphan() {
     assert_eq!(tracks.len(), 1, "orphan retargeted, not duplicated");
     assert_eq!(tracks[0].id, id, "retarget keeps the id");
     assert_eq!(tracks[0].backing_path, new_path);
+    // Retarget must refresh the stamp + audio bounds too, not just the path — the
+    // orphan was inserted with mtime/ctime 0 and audio_length 10, so a path-only
+    // regression would leave these stale.
+    assert_eq!(tracks[0].backing_size, 10);
+    assert_eq!(tracks[0].backing_mtime_ns, 1);
+    assert_eq!(tracks[0].backing_ctime_ns, 2);
+    assert_eq!(tracks[0].bounds.audio_offset(), 0);
+    assert_eq!(tracks[0].bounds.audio_length(), 0);
+    assert_eq!(tracks[0].fingerprint.as_deref(), Some(fp.as_str()));
 }
 
 // A candidate whose backing path can't be statted with a NON-NotFound error
