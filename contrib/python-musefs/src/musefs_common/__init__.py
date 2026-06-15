@@ -21,6 +21,7 @@ from .store import (
     sniff_mime,
     tags_for_track,
     track_id_for_path,
+    track_ids_by_tag,
     track_ids_for_paths,
     upsert_art,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "check_schema_version",
     "track_id_for_path",
     "track_ids_for_paths",
+    "track_ids_by_tag",
     "tags_for_track",
     "TagRow",
     "prune_missing",
