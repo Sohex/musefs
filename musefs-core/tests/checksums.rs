@@ -196,3 +196,42 @@ fn ambiguous_fingerprint_match_inserts_fresh() {
     assert_eq!(tracks.len(), 3, "ambiguous match inserts fresh");
     assert!(tracks.iter().any(|t| t.backing_path.ends_with("b.flac")));
 }
+
+use musefs_core::revalidate_with;
+
+#[test]
+fn revalidate_backfills_fingerprint_on_unchanged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    write_a_flac(dir.path(), "a.flac", &[0xAB; 64]);
+    let db = Db::open_in_memory().unwrap();
+    // Initial scan with no checksums.
+    scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 1,
+            checksum: ChecksumTier::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(db.list_tracks().unwrap()[0].fingerprint.is_none());
+
+    // Revalidate at the fingerprint tier: the file is unchanged but missing the
+    // fingerprint, so it must be re-processed (backfilled), not skipped.
+    let stats = revalidate_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 1,
+            checksum: ChecksumTier::Fingerprint,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        db.list_tracks().unwrap()[0].fingerprint.is_some(),
+        "backfilled"
+    );
+    assert_eq!(stats.updated, 1);
+}
