@@ -49,6 +49,12 @@ fn read_counted(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Resu
 /// the scan rejects it and continues. This makes page location deterministic —
 /// the byte-identical guarantee holds unconditionally, not just probabilistically.
 ///
+/// This per-seek cost — one bounded backward `pread` (≤ `MAX_OGG_PAGE_BYTES`) plus
+/// a byte scan and a full-page CRC per OggS candidate — is paid only on
+/// non-sequential reads; sequential playback rides the memo fast path below. It is
+/// accepted as-is (#437) rather than reintroducing the page index this stateless
+/// design deliberately removed.
+///
 /// Fast path: if `memo` holds a page whose `[start, start+total_len)` region
 /// contains `abs_target`, return that start directly — skipping both the backward
 /// scan and the full-page CRC guard. That page was already located within this
@@ -157,10 +163,20 @@ pub fn serve_ogg_window(
     if rstart >= rend {
         return Ok(());
     }
-    let audio_end = audio_offset + audio_length;
-    let abs_rstart = audio_offset + rstart;
+    // `audio_offset` is DB-derived and semi-trusted (a buggy or hostile store
+    // writer can set it arbitrarily), so fail closed on the offset arithmetic
+    // rather than wrap (release) or panic (debug) — mirroring read_front's
+    // pre-allocation bound on the header path.
+    let audio_end = audio_offset
+        .checked_add(audio_length)
+        .ok_or(musefs_format::FormatError::Malformed)?;
+    let abs_rstart = audio_offset
+        .checked_add(rstart)
+        .ok_or(musefs_format::FormatError::Malformed)?;
     let mut pos = find_page_start(backing.file(), audio_offset, abs_rstart, memo)?;
 
+    // Reused across pages — refilled per page, never exceeds MAX_OGG_HEADER_BYTES.
+    let mut hdr_buf: Vec<u8> = Vec::new();
     while pos < audio_end {
         let page_rel = pos - audio_offset;
         if page_rel >= rend {
@@ -169,7 +185,7 @@ pub fn serve_ogg_window(
         // One pread for the full header (27 + up to 255 seg-table bytes).
         // Clamped to the declared audio region end.
         let read_len = MAX_OGG_HEADER_BYTES.min(usize_from(audio_end - pos));
-        let mut hdr_buf = vec![0u8; read_len];
+        hdr_buf.resize(read_len, 0);
         backing.read_exact_at(&mut hdr_buf, pos)?;
         if hdr_buf.len() < 27 {
             return Err(musefs_format::FormatError::Malformed.into());
@@ -201,11 +217,6 @@ pub fn serve_ogg_window(
             let new_seq = old_seq.wrapping_add(seq_delta as u32);
             patch_page_header_algebraic(&hdr_buf[..header_len], new_seq)?
         };
-        if let Some(m) = memo {
-            let total_len = (header_len + payload_len) as u64;
-            *crate::lock::lock_or_clear(m, "ogg last-page memo") =
-                Some((page_rel, total_len, patched_hdr.clone()));
-        }
 
         let hdr_end = page_rel + header_len as u64;
         let page_end = hdr_end + payload_len as u64;
@@ -228,6 +239,15 @@ pub fn serve_ogg_window(
             let start = out.len();
             out.resize(start + n, 0);
             backing.read_exact_at(&mut out[start..], pos + header_len as u64 + within)?;
+        }
+
+        // Record this page in the memo (the patched header is moved in, not
+        // cloned). Written before the integrity guard so the last good page is
+        // memoized for the next serve even when a later page overruns the region.
+        if let Some(m) = memo {
+            let total_len = (header_len + payload_len) as u64;
+            *crate::lock::lock_or_clear(m, "ogg last-page memo") =
+                Some((page_rel, total_len, patched_hdr));
         }
 
         pos += (header_len + payload_len) as u64;
@@ -667,6 +687,36 @@ mod tests {
         let mut out = Vec::new();
         let r = serve_ogg_window(&br, 0, audio_length, 0, 0, audio_length, &mut out, None);
         assert!(r.is_err(), "misaligned audio_length must error");
+    }
+
+    #[test]
+    fn serve_ogg_window_rejects_overflowing_audio_offset() {
+        // A buggy or hostile DB row can store an `audio_offset` near u64::MAX. The
+        // serve path must fail closed (Malformed) on the offset arithmetic rather
+        // than wrap (release) or panic (debug), mirroring read_front's
+        // pre-allocation bound on the header path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.ogg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"OggS")
+            .unwrap();
+        let backing = std::fs::File::open(&path).unwrap();
+        let test_br = TestBr::new();
+        let br = test_br.reader(&backing, u64::MAX);
+
+        // audio_offset + audio_length overflows u64.
+        let mut out = Vec::new();
+        let r = serve_ogg_window(&br, u64::MAX, 10, 0, 0, 5, &mut out, None);
+        assert!(
+            r.is_err(),
+            "overflowing audio_offset + audio_length must error"
+        );
+
+        // audio_offset + rstart overflows u64 (audio_end stays in range).
+        let mut out2 = Vec::new();
+        let r2 = serve_ogg_window(&br, u64::MAX - 1, 1, 0, 5, 10, &mut out2, None);
+        assert!(r2.is_err(), "overflowing audio_offset + rstart must error");
     }
 
     #[test]
