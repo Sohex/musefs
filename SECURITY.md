@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Security fixes target the latest release (see [CHANGELOG.md](CHANGELOG.md));
+Security fixes target the latest release (see [CHANGELOG.md](https://sohex.github.io/musefs/changelog.html));
 there are no maintained backport branches.
 
 ## Reporting a vulnerability
@@ -25,9 +25,9 @@ panics reachable from file contents, unbounded allocation, and hangs.
 Parser denial-of-service findings are real vulnerabilities here, not mere
 robustness bugs: several (a VorbisComment pre-allocation OOM, an MP4
 box-bounds overflow, an ID3v2 allocation bomb) have been found by the
-project's fuzz targets and fixed — see [CHANGELOG.md](CHANGELOG.md).
+project's fuzz targets and fixed — see [CHANGELOG.md](https://sohex.github.io/musefs/changelog.html).
 Those fuzz and property suites run continuously
-([CONTRIBUTING.md](CONTRIBUTING.md#test-tiers-beyond-cargo-test)); a fuzz
+([CONTRIBUTING.md](https://sohex.github.io/musefs/contributing/testing.html#test-tiers-beyond-cargo-test)); a fuzz
 reproducer is the ideal report attachment.
 
 Also in scope: anything that lets a crafted *database* (the mount trusts its
