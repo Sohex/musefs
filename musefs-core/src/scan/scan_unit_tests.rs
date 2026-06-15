@@ -11,7 +11,7 @@ use std::io::Write;
 fn scan_options_defaults() {
     let d = ScanOptions::default();
     assert_eq!(d.jobs, 0, "jobs default = use available parallelism");
-    assert_eq!(d.window, 1_048_576, "window default = 1 MiB");
+    assert_eq!(d.window, 65_536, "window default = 64 KiB");
     assert_eq!(d.batch_bytes, 67_108_864, "batch_bytes default = 64 MiB");
 }
 
