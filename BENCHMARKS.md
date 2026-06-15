@@ -896,3 +896,27 @@ malloc, the §4 ship rule). Under identical churn glibc retained ~46 MiB of dirt
 pages that jemalloc's decay + background purge return to the OS — the #360
 fragmentation failure mode, reproduced and fixed. The gap is far outside
 run-to-run noise, so no within-noise tie-break was needed.
+
+---
+
+## Scan fingerprint overhead (#464)
+
+**Bench:** `cargo bench -p musefs-core --bench fingerprint_overhead`
+**Corpus:** 200 minimal FLAC files (~200 B metadata + 4 KiB audio) in `tempfile::tempdir()` (TMPDIR =
+tmpfs/RAM). Single-threaded scan (`jobs: 1`). Criterion, 20 samples.
+
+| Tier | Median (ms) | µs/file |
+|------|------------:|--------:|
+| `None` | 47.0 | 235 |
+| `Fingerprint` | 107.6 | 538 |
+
+**Delta:** +60.6 ms / 200 files = **+303 µs/file overhead (+129%)**.
+
+**Interpretation:** The 129% overhead on this synthetic RAM-backed bench exceeds the plan's ≤15%
+threshold. The overhead is dominated by the extra `UPDATE tracks SET fingerprint = …` SQLite
+execution per file inside the batch transaction — not by SHA-256 hashing cost (SHA-256 of a few
+hundred bytes is sub-microsecond). On a real HDD-backed library the probe I/O (tens-of-ms per file)
+is the bottleneck, making both the hash and the DB write negligible. See plan Task E2 step 3 decision
+note: the decision to keep SHA-256 and add the length CHECK was escalated to the controller because
+the raw percentage exceeded the stated threshold, even though the absolute overhead (303 µs/file) is
+operationally negligible at disk I/O rates.
