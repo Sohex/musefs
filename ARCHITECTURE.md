@@ -184,6 +184,23 @@ plugins under `contrib/` write tags and art here out-of-band.
 all of `structural_blocks`: those are derived from probing the file, and
 external tools must run `musefs scan` rather than compute them.
 
+`tracks.fingerprint` and `tracks.content_hash` are also scanner-owned,
+read-only-derived columns — like `structural_blocks`, they are never part of
+the editable tag contract and external tools never write them.
+`fingerprint` is a SHA-256 over the probe's parsed output (deterministic per
+file, excludes filesystem stamps such as `mtime`/`ctime`), computed in the
+parallel probe worker at zero extra I/O. `content_hash` is a full-file
+SHA-256, stored as 64-char hex; it is computed only at the `full` checksum
+tier (`--checksum=full`), which requires an eager whole-file read. Neither
+column is `UNIQUE` by design — duplicate-content tracks legitimately share
+both values. On a normal `scan`, when a probed file's path is not yet in the
+store and its fingerprint matches exactly one orphaned row (a row whose
+`backing_path` no longer exists on disk), the scanner retargets that row to
+the new path in place, preserving its `id`, tags, and art rather than
+orphaning them. This is how musefs recovers from a backing-library move or
+reorganization: run `musefs scan` after moving files, and existing store rows
+follow their backing files to the new locations.
+
 **What the store enforces.** SQLite `CHECK` constraints reject the
 malformed *shapes* at commit, so an external writer cannot persist them:
 
