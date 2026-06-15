@@ -83,6 +83,9 @@ class FakeMetadata:
     def getall(self, key):
         return self._tags.get(key, [])
 
+    def rawitems(self):
+        return self._tags.items()
+
 
 @pytest.fixture
 def fake_metadata():
