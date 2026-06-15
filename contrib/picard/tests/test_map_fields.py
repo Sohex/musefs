@@ -106,6 +106,8 @@ def test_movement_swap(fake_metadata):
     d = dict(map_fields(fake_metadata(movement="Allegro", movementnumber="1")))
     assert d["movementname"] == "Allegro"
     assert d["movement"] == "1"
+    z = dict(map_fields(fake_metadata(movementnumber="0")))
+    assert "movement" not in z
 
 
 def test_totals_renamed_and_zero_dropped(fake_metadata):
