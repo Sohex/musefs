@@ -235,3 +235,34 @@ fn revalidate_backfills_fingerprint_on_unchanged_files() {
     );
     assert_eq!(stats.updated, 1);
 }
+
+#[test]
+fn two_new_files_matching_one_orphan_retarget_one_insert_one() {
+    let dir = tempfile::tempdir().unwrap();
+    // Scan a single file so it gets a DB row.
+    let a = write_a_flac(dir.path(), "a.flac", &[0xAA; 64]);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
+    let id_a = db.list_tracks().unwrap()[0].id;
+
+    // Delete a.flac, then create two new files with the identical content
+    // (same tags, same audio) so both share a.flac's fingerprint + content_hash.
+    std::fs::remove_file(&a).unwrap();
+    write_a_flac(dir.path(), "b.flac", &[0xAA; 64]);
+    write_a_flac(dir.path(), "c.flac", &[0xAA; 64]);
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    // Exactly 2 rows: the orphan was retargeted by one new file, the other was
+    // inserted fresh — no double-claim, no third row.
+    assert_eq!(tracks.len(), 2, "one retarget + one fresh insert = 2 rows");
+    let retargeted: Vec<_> = tracks.iter().filter(|t| t.id == id_a).collect();
+    assert_eq!(retargeted.len(), 1, "exactly one row keeps id_a");
+    // Both b.flac and c.flac must appear across the two rows.
+    let paths: Vec<_> = tracks.iter().map(|t| t.backing_path.as_str()).collect();
+    assert!(paths.iter().any(|p| p.ends_with("b.flac")));
+    assert!(paths.iter().any(|p| p.ends_with("c.flac")));
+    // The non-retargeted row has a new id.
+    let fresh: Vec<_> = tracks.iter().filter(|t| t.id != id_a).collect();
+    assert_eq!(fresh.len(), 1, "exactly one fresh row");
+}
