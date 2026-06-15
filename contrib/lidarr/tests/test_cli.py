@@ -245,3 +245,69 @@ def test_sync_cli_all_runs_manual_backfill(
     assert calls[0]["event"].raw_type == "ManualAll"
     assert calls[0]["event"].paths == [sample_track_file["path"]]
     assert "doctor ok" in capsys.readouterr().out
+
+
+def test_sync_cli_album_deleted_prunes_without_api(tmp_path, capsys):
+    import sqlite3
+
+    from musefs_common import connect
+    from musefs_common.schema import SCHEMA_SQL
+    from musefs_common.store import replace_tags
+    from musefs_lidarr.cli_sync import run
+
+    db = tmp_path / "musefs.db"
+    raw = sqlite3.connect(str(db))
+    raw.executescript(SCHEMA_SQL)
+    raw.commit()
+    raw.close()
+
+    conn = connect(str(db))
+    try:
+        tid = conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
+            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/a.flac', 'flac', 0, 0, 0, 0, 0)"
+        ).lastrowid
+        replace_tags(conn, tid, [("musicbrainz_albumid", "rg-1")])
+        conn.commit()
+    finally:
+        conn.close()
+
+    def boom(_config):
+        raise AssertionError("delete events must not construct a Lidarr client")
+
+    rc = run(
+        [],
+        {
+            "Lidarr_EventType": "AlbumDeleted",
+            "Lidarr_Album_MBId": "rg-1",
+            "MUSEFS_DB": str(db),
+        },
+        client_factory=boom,
+    )
+
+    assert rc == 0
+    assert "pruned 1 rows" in capsys.readouterr().out
+    conn = connect(str(db))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_sync_cli_delete_without_mbid_is_skipped(tmp_path, capsys):
+    from musefs_lidarr.cli_sync import run
+
+    def boom(_config):
+        raise AssertionError("must not construct a client")
+
+    rc = run(
+        [],
+        {"Lidarr_EventType": "AlbumDeleted", "MUSEFS_DB": str(tmp_path / "musefs.db")},
+        client_factory=boom,
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "no MusicBrainz id" in captured.err
+    # No DB was created/opened — the skip happens before any connection.
+    assert not (tmp_path / "musefs.db").exists()
