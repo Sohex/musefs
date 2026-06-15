@@ -82,6 +82,7 @@ def run(
                 tracks=payloads.tracks,
                 albums_by_id=payloads.albums_by_id,
                 artists_by_id=payloads.artists_by_id,
+                art_by_album_id=payloads.art_by_album_id,
             )
             print(f"musefs-lidarr-sync: {stats.summary()}")
             return 0
@@ -120,6 +121,7 @@ def run(
             tracks=payloads.tracks,
             albums_by_id=payloads.albums_by_id,
             artists_by_id=payloads.artists_by_id,
+            art_by_album_id=payloads.art_by_album_id,
         )
         print(f"musefs-lidarr-sync: {stats.summary()}")
         return 0

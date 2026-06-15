@@ -1,8 +1,14 @@
 import pytest
-from musefs_common import realpath_key
+from musefs_common import ArtImage, realpath_key
 
 from musefs_lidarr.errors import MappingError
-from musefs_lidarr.mapping import SkippedPath, build_pairs, match_track_file, records_for_paths
+from musefs_lidarr.mapping import (
+    SkippedPath,
+    _album_cover_url,
+    build_pairs,
+    match_track_file,
+    records_for_paths,
+)
 
 
 def test_build_pairs_maps_core_tags(sample_artist, sample_album, sample_track):
@@ -135,3 +141,57 @@ def test_records_for_paths_returns_reason_for_missing_linked_tracks(
             reason="multi-track metadata unavailable",
         )
     ]
+
+
+def test_album_cover_url_prefers_cover_type():
+    album = {
+        "images": [
+            {"coverType": "fanart", "url": "/MediaCover/Albums/20/fanart.jpg"},
+            {"coverType": "cover", "url": "/MediaCover/Albums/20/cover.jpg"},
+        ]
+    }
+
+    assert _album_cover_url(album) == "/MediaCover/Albums/20/cover.jpg"
+
+
+def test_album_cover_url_falls_back_to_first_image():
+    album = {"images": [{"coverType": "poster", "remoteUrl": "http://img/poster.jpg"}]}
+
+    assert _album_cover_url(album) == "http://img/poster.jpg"
+
+
+def test_album_cover_url_none_when_no_images():
+    assert _album_cover_url({"images": []}) is None
+    assert _album_cover_url({}) is None
+
+
+def test_records_for_paths_attaches_album_art(
+    sample_artist, sample_album, sample_track, sample_track_file
+):
+    art = ArtImage(data=b"\xff\xd8\xffjpeg", mime="image/jpeg")
+
+    records, skipped = records_for_paths(
+        paths=[sample_track_file["path"]],
+        track_files=[sample_track_file],
+        tracks=[sample_track],
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
+        art_by_album_id={20: art},
+    )
+
+    assert records[0].art == [art]
+
+
+def test_records_for_paths_no_art_when_album_missing_from_map(
+    sample_artist, sample_album, sample_track, sample_track_file
+):
+    records, _ = records_for_paths(
+        paths=[sample_track_file["path"]],
+        track_files=[sample_track_file],
+        tracks=[sample_track],
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
+        art_by_album_id={},
+    )
+
+    assert records[0].art is None

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
-from musefs_common import Record, realpath_key
+from musefs_common import ArtImage, Record, realpath_key
 
 from .errors import MappingError
 
@@ -82,6 +82,26 @@ def _tracks_by_file(tracks: list[dict]) -> dict[int, list[dict]]:
     return grouped
 
 
+def _album_cover_url(album: dict) -> str | None:
+    """Return the album's cover-art image URL, or None.
+
+    Prefers the image whose ``coverType`` is ``cover``; otherwise falls back to
+    the first image that carries a usable ``url``/``remoteUrl``.
+    """
+    fallback = None
+    for image in album.get("images") or []:
+        if not isinstance(image, dict):
+            continue
+        url = image.get("url") or image.get("remoteUrl")
+        if not url:
+            continue
+        if str(image.get("coverType") or "").lower() == "cover":
+            return url
+        if fallback is None:
+            fallback = url
+    return fallback
+
+
 def records_for_paths(
     *,
     paths: list[str],
@@ -89,12 +109,15 @@ def records_for_paths(
     tracks: list[dict],
     albums_by_id: dict[int, dict],
     artists_by_id: dict[int, dict],
+    art_by_album_id: dict[int, ArtImage] | None = None,
 ) -> tuple[list[Record], list[SkippedPath]]:
     """Build a store ``Record`` per path; return (records, skipped).
 
     A path is skipped when no track file matches it or its track/album/artist
-    metadata is unavailable.
+    metadata is unavailable. When ``art_by_album_id`` maps the file's album id to
+    an ``ArtImage``, that cover is attached to the record.
     """
+    art_by_album_id = art_by_album_id or {}
     tracks_by_file = _tracks_by_file(tracks)
     records = []
     skipped = []
@@ -116,5 +139,6 @@ def records_for_paths(
         pairs = []
         for track in linked:
             pairs.extend(build_pairs(track=track, album=album, artist=artist))
-        records.append(Record(key=key, pairs=pairs, art=None))
+        art = art_by_album_id.get(int(track_file["albumId"]))
+        records.append(Record(key=key, pairs=pairs, art=[art] if art else None))
     return records, skipped
