@@ -33,6 +33,27 @@ impl From<CliMode> for musefs_core::Mode {
     }
 }
 
+/// CLI surface for `musefs_core::ChecksumTier`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChecksumMode {
+    /// No checksums.
+    None,
+    /// Cheap fingerprint only (default).
+    Fingerprint,
+    /// Fingerprint plus full-file SHA-256.
+    Full,
+}
+
+impl From<ChecksumMode> for musefs_core::ChecksumTier {
+    fn from(m: ChecksumMode) -> musefs_core::ChecksumTier {
+        match m {
+            ChecksumMode::None => musefs_core::ChecksumTier::None,
+            ChecksumMode::Fingerprint => musefs_core::ChecksumTier::Fingerprint,
+            ChecksumMode::Full => musefs_core::ChecksumTier::Full,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "musefs",
@@ -172,6 +193,15 @@ pub enum Command {
         /// the `log` facade on stderr; raise detail with `RUST_LOG=info`).
         #[arg(long, short, env = "MUSEFS_QUIET", value_parser = clap::builder::BoolishValueParser::new())]
         quiet: bool,
+        /// Which content checksums to compute and store (none|fingerprint|full).
+        #[arg(long, value_enum, env = "MUSEFS_CHECKSUM", default_value_t = ChecksumMode::Fingerprint)]
+        checksum: ChecksumMode,
+        /// Confirm a move only by fingerprint, never reading the full file.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        fast: bool,
+        /// Require a full-hash match to retarget a moved file.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        strict: bool,
     },
     /// Mount a read-only FUSE view of the store.
     Mount(MountArgs),
@@ -183,6 +213,7 @@ pub enum Command {
 /// ingest. With `quiet`, suppress the per-target summary on stdout. Fails fast:
 /// the first failing target aborts the batch; targets already scanned stay
 /// committed (ingest is an idempotent upsert).
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub fn run_scan(
     db_path: &Path,
     targets: &[PathBuf],
@@ -190,7 +221,16 @@ pub fn run_scan(
     jobs: usize,
     follow_symlinks: bool,
     quiet: bool,
+    checksum: ChecksumMode,
+    fast: bool,
+    strict: bool,
 ) -> Result<()> {
+    let strictness = match (fast, strict) {
+        (true, true) => anyhow::bail!("--fast and --strict are mutually exclusive"),
+        (true, false) => musefs_core::MatchStrictness::Fast,
+        (false, true) => musefs_core::MatchStrictness::Strict,
+        (false, false) => musefs_core::MatchStrictness::Auto,
+    };
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let reporter = ScanReporter::new(quiet);
@@ -198,6 +238,8 @@ pub fn run_scan(
         jobs,
         follow_symlinks,
         progress: reporter.sink(),
+        checksum: checksum.into(),
+        strictness,
         ..Default::default()
     };
     for target in targets {
@@ -362,7 +404,20 @@ pub fn run(cli: Cli) -> Result<()> {
             jobs,
             follow_symlinks,
             quiet,
-        } => run_scan(&db, &targets, revalidate, jobs, follow_symlinks, quiet),
+            checksum,
+            fast,
+            strict,
+        } => run_scan(
+            &db,
+            &targets,
+            revalidate,
+            jobs,
+            follow_symlinks,
+            quiet,
+            checksum,
+            fast,
+            strict,
+        ),
         Command::Mount(args) => run_mount(&args),
     }
 }

@@ -150,6 +150,31 @@ fn scan_succeeds_and_ingests_through_the_binary() {
 }
 
 #[test]
+fn scan_with_checksum_full_exits_zero() {
+    let (_dir, target, db) = library_with_one_flac();
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .arg("--db")
+        .arg(&db)
+        .arg("--checksum")
+        .arg("full")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "scan --checksum full should exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(db.exists(), "scan should create the DB at --db");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 file(s)"),
+        "expected one ingested file in the summary, stdout: {stdout}"
+    );
+}
+
+#[test]
 fn scan_with_revalidate_flag_runs_the_revalidate_pass() {
     let (_dir, target, db) = library_with_one_flac();
     // Seed the store first so revalidate has something to re-check.
@@ -416,6 +441,7 @@ fn scan_help_lists_env_vars() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("MUSEFS_DB"), "stdout: {stdout}");
     assert!(stdout.contains("MUSEFS_JOBS"), "stdout: {stdout}");
+    assert!(stdout.contains("MUSEFS_CHECKSUM"), "stdout: {stdout}");
 }
 
 // #370: the SetTrue bools parse the full boolish set from env (case-insensitive
