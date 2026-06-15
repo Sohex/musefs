@@ -11,6 +11,7 @@ from .sync import (
     collect_all_payloads,
     collect_event_payloads,
     config_from_env,
+    prune_deleted,
     sync_event_with_payloads,
 )
 
@@ -99,6 +100,24 @@ def run(
                 "musefs-lidarr-sync: TrackRetag fires after Lidarr writes tags; skipping",
                 file=sys.stderr,
             )
+            return 0
+
+        if event.event_type in (EventType.ALBUM_DELETED, EventType.ARTIST_DELETED):
+            mbid = (
+                event.album_mbid
+                if event.event_type is EventType.ALBUM_DELETED
+                else event.artist_mbid
+            )
+            if not mbid:
+                print(
+                    "musefs-lidarr-sync: delete event carried no MusicBrainz id; "
+                    "cannot prune, leaving rows for the next scan/reconcile",
+                    file=sys.stderr,
+                )
+                return 0
+            sync_config = config_from_env(env)
+            pruned = prune_deleted(config=sync_config, event=event)
+            print(f"musefs-lidarr-sync: pruned {pruned} rows")
             return 0
 
         config = LidarrConfig.from_env(env)
