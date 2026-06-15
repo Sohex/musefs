@@ -134,6 +134,8 @@ pub struct Track {
     pub backing_ctime_ns: i64,
     pub content_version: i64,
     pub updated_at: i64,
+    pub fingerprint: Option<String>,
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]

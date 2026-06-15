@@ -1,8 +1,11 @@
 use crate::art::{set_track_art_in, upsert_art_in};
-use crate::models::{BinaryTag, NewArt, NewTrack, StructuralBlock, Tag, TrackArt};
+use crate::models::{BinaryTag, NewArt, NewTrack, StructuralBlock, Tag, Track, TrackArt};
 use crate::structural::set_structural_blocks_in;
 use crate::tags::{replace_tags_in, set_binary_tags_in};
-use crate::tracks::upsert_track_in;
+use crate::tracks::{
+    get_track_by_path_in, retarget_track_in, set_track_checksums_in, tracks_by_fingerprint_in,
+    upsert_track_in,
+};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::Transaction;
 
@@ -43,6 +46,50 @@ pub struct BulkWriter<'c> {
 impl BulkWriter<'_> {
     pub fn upsert_track(&mut self, t: &NewTrack) -> Result<i64> {
         upsert_track_in(&self.tx, t)
+    }
+
+    pub fn tracks_by_fingerprint(&self, fp: &str) -> Result<Vec<Track>> {
+        tracks_by_fingerprint_in(&self.tx, fp)
+    }
+
+    pub fn set_track_checksums(
+        &self,
+        id: i64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> Result<()> {
+        set_track_checksums_in(&self.tx, id, fingerprint, content_hash)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn retarget_track(
+        &self,
+        id: i64,
+        new_backing_path: &str,
+        backing_size: u64,
+        backing_mtime_ns: i64,
+        backing_ctime_ns: i64,
+        audio_offset: u64,
+        audio_length: u64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> Result<()> {
+        retarget_track_in(
+            &self.tx,
+            id,
+            new_backing_path,
+            backing_size,
+            backing_mtime_ns,
+            backing_ctime_ns,
+            audio_offset,
+            audio_length,
+            fingerprint,
+            content_hash,
+        )
+    }
+
+    pub fn get_track_by_path(&self, path: &str) -> Result<Option<Track>> {
+        get_track_by_path_in(&self.tx, path)
     }
 
     pub fn replace_tags(&mut self, track_id: i64, tags: &[Tag]) -> Result<()> {
