@@ -134,6 +134,31 @@ fn collect_audio_skips_broken_symlink_when_following() {
 }
 
 #[test]
+fn scan_stores_canonical_path_through_symlinked_root() {
+    // Scanning through a directory symlink must still store the canonical,
+    // symlink-resolved backing path, so a later revalidate — which keys on the
+    // canonical path — matches it rather than re-probing or pruning (#440).
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    write_flac(&real.join("t.flac"), &["ARTIST=A", "TITLE=T"], None);
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    crate::scan_directory(&db, &link).unwrap();
+
+    let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+    let expected = std::fs::canonicalize(real.join("t.flac")).unwrap();
+    assert_eq!(std::path::Path::new(&track.backing_path), expected);
+
+    let stats = crate::revalidate(&db, &link).unwrap();
+    assert_eq!(stats.unchanged, 1, "canonical key must match on revalidate");
+    assert_eq!(stats.updated, 0);
+    assert_eq!(stats.pruned, 0);
+}
+
+#[test]
 fn collect_audio_does_not_follow_symlinks_by_default() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("real.flac"), b"x").unwrap();

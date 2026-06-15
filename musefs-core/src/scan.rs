@@ -1062,6 +1062,11 @@ fn ingest_bulk(
 /// per-file I/O or parse error increment `ScanStats::failed` and do not abort
 /// the scan.
 pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<ScanStats> {
+    // Canonicalize the root once. With symlinks unfollowed (the default) every
+    // path the walk yields is then already absolute and symlink-free — i.e.
+    // canonical — so the workers need not canonicalize each probed file (#440).
+    let canon = std::fs::canonicalize(root)?;
+    let root = canon.as_path();
     let mut files = Vec::new();
     let mut tally = SkipTally::default();
     if root.is_file() {
@@ -1110,6 +1115,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     let total = files.len() as u64;
     let progress = opts.progress.as_ref();
     let window = opts.window;
+    let follow_symlinks = opts.follow_symlinks;
     let cap = opts.batch_bytes;
     let budget = Arc::new(ByteBudget::new(cap));
     let failed = Arc::new(AtomicU64::new(0));
@@ -1135,18 +1141,25 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                 let Some(path) = files.get(i) else { break };
                 match probe_file_caught(path, window) {
                     Ok(ProbeOutcome::Probed(probed, stamp)) => {
-                        let abs = match std::fs::canonicalize(path) {
-                            Ok(abs) => abs,
-                            Err(e) => {
-                                log::warn!("skipping {}: {e}", path.display());
-                                failed.fetch_add(1, Ordering::Relaxed);
-                                continue;
+                        // No-follow paths are canonical by construction (the root
+                        // was canonicalized up front); only the opt-in symlink walk
+                        // can yield a path with a symlink component to resolve (#440).
+                        let abs_path = if follow_symlinks {
+                            match std::fs::canonicalize(path) {
+                                Ok(abs) => abs.to_string_lossy().into_owned(),
+                                Err(e) => {
+                                    log::warn!("skipping {}: {e}", path.display());
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
                             }
+                        } else {
+                            path.to_string_lossy().into_owned()
                         };
                         let weight = payload_weight(&probed);
                         budget.acquire(weight); // backpressure on in-flight art bytes
                         let unit = Unit {
-                            abs_path: abs.to_string_lossy().into_owned(),
+                            abs_path,
                             stamp,
                             probed,
                             weight,
@@ -1318,6 +1331,10 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 /// candidate during the skip pass is counted in `failed` (and the file is left
 /// for the next revalidation) rather than re-probed or pruned.
 pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<RevalidateStats> {
+    // Canonicalize once; see scan_directory_with (#440). The prune pass below reuses
+    // this canonical root for its `starts_with` scope check.
+    let canon = std::fs::canonicalize(root)?;
+    let root = canon.as_path();
     let mut files = Vec::new();
     if root.is_file() {
         if is_supported_audio(root) {
@@ -1366,15 +1383,18 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
                 continue;
             }
         };
-        let abs = match std::fs::canonicalize(&path) {
-            Ok(abs) => abs,
-            Err(e) => {
-                log::warn!("skipping {}: {e}", path.display());
-                skip_failed += 1;
-                continue;
+        let key = if opts.follow_symlinks {
+            match std::fs::canonicalize(&path) {
+                Ok(abs) => abs.to_string_lossy().into_owned(),
+                Err(e) => {
+                    log::warn!("skipping {}: {e}", path.display());
+                    skip_failed += 1;
+                    continue;
+                }
             }
+        } else {
+            path.to_string_lossy().into_owned()
         };
-        let key = abs.to_string_lossy().into_owned();
         if let Some((stamp, id, format)) = existing.get(&key).copied() {
             let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
             if crate::freshness::BackingStamp::from_metadata(&meta) == stamp && !needs_backfill {
@@ -1394,10 +1414,10 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     let scan = run_pipeline(db, changed, opts)?;
 
     // Prune + GC on the writer connection (single-threaded), unchanged from before.
-    let canon_root = std::fs::canonicalize(root)?;
+    let canon_root = root;
     let mut pruned = 0u64;
     for track in db.list_tracks()? {
-        if !Path::new(&track.backing_path).starts_with(&canon_root) {
+        if !Path::new(&track.backing_path).starts_with(canon_root) {
             continue;
         }
         if let Err(e) = std::fs::metadata(&track.backing_path)
