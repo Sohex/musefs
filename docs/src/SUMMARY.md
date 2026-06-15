@@ -2,6 +2,17 @@
 
 [Introduction](introduction.md)
 
+# User Guide
+
+- [Quick start](guide/quick-start.md)
+- [Installation](guide/installation.md)
+- [Running in containers](guide/containers.md)
+- [Scanning](guide/scanning.md)
+- [Mounting & path templates](guide/mounting.md)
+- [Tuning & metrics](guide/tuning.md)
+- [Ownership, permissions & config](guide/configuration.md)
+- [FAQ](guide/faq.md)
+
 # Formats
 
 - [Overview](formats/overview.md)
