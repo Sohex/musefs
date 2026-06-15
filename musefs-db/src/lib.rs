@@ -51,10 +51,17 @@ pub(crate) fn query_in_chunks<T: rusqlite::ToSql>(
     mut consume: impl FnMut(&mut rusqlite::Rows) -> Result<()>,
 ) -> Result<()> {
     const CHUNK: usize = 900;
+    // Full chunks share one placeholder list (and thus one cached statement);
+    // only the trailing partial chunk allocates its own.
+    let mut full_placeholders: Option<String> = None;
     for chunk in items.chunks(CHUNK) {
-        let placeholders = vec!["?"; chunk.len()].join(",");
-        let sql = make_sql(&placeholders);
-        let mut stmt = conn.prepare(&sql)?;
+        let sql = if chunk.len() == CHUNK {
+            let ph = full_placeholders.get_or_insert_with(|| vec!["?"; CHUNK].join(","));
+            make_sql(ph)
+        } else {
+            make_sql(&vec!["?"; chunk.len()].join(","))
+        };
+        let mut stmt = conn.prepare_cached(&sql)?;
         let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
         consume(&mut rows)?;
     }
