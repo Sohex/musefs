@@ -112,6 +112,33 @@ fn parses_mode_and_revalidate_flags() {
     }
 }
 
+#[test]
+fn scan_parses_checksum_and_strictness_flags() {
+    let cli = Cli::parse_from([
+        "musefs",
+        "scan",
+        "/lib",
+        "--db",
+        "/tmp/m.db",
+        "--checksum",
+        "full",
+        "--strict",
+    ]);
+    match cli.command {
+        Command::Scan {
+            checksum,
+            strict,
+            fast,
+            ..
+        } => {
+            assert_eq!(checksum, musefs_cli::ChecksumMode::Full);
+            assert!(strict);
+            assert!(!fast);
+        }
+        Command::Mount(..) => panic!("expected scan"),
+    }
+}
+
 use musefs_cli::parse_mount_config;
 use musefs_core::Mode;
 use std::time::Duration;
