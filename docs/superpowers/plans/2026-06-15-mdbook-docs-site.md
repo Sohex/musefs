@@ -114,7 +114,7 @@ docs/
 | ---- | ----------------------------------------------------- |
 | `architecture/overview.md` | Design overview (`#design-overview`), Crate layout (`#crate-layout`) |
 | `architecture/serving.md` | The segment model (`#the-segment-model`), Backing read-ahead (`#backing-read-ahead`), Mount modes (`#mount-modes`), Synthetic telemetry namespace (`#synthetic-telemetry-namespace`) |
-| `architecture/store.md` | The SQLite store (`#the-sqlite-store`), The external-writer contract (`#the-external-writer-contract`) |
+| `architecture/store.md` (H1 `# The store & external-writer contract`, to avoid a duplicate-title stack) | The SQLite store (`#the-sqlite-store`), The external-writer contract (`#the-external-writer-contract`) |
 | `architecture/tree-scanning.md` | Freshness: two version counters (`#freshness-two-version-counters`), Virtual tree (`#virtual-tree`), Scanning (`#scanning`), The contrib ecosystem (`#the-contrib-ecosystem`) |
 
 **Contributing page split:**

@@ -1,4 +1,4 @@
-# The SQLite store
+# The store & external-writer contract
 
 ## The SQLite store
 
