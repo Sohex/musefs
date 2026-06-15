@@ -140,7 +140,7 @@ misbehaving writer cannot inject traversal or empty components into the tree.
 **The shared Python library.** `contrib/python-musefs/` encodes this contract
 for plugin authors, including a generated copy of the schema
 (`musefs_common/schema.py`, regenerated from `schema.rs` by a drift-guarded
-test — see [CONTRIBUTING](../../../CONTRIBUTING.md)). Its tag/art replace operations
+test — see [CONTRIBUTING](../contributing/setup.md)). Its tag/art replace operations
 each wrap their `DELETE`+`INSERT` in a SQLite savepoint, so they are
 individually atomic and the "caller owns the transaction" guarantee holds even
 on an autocommit connection. The [Lidarr integration](../../../contrib/lidarr/README.md)
@@ -149,7 +149,7 @@ destination tree is only a tracking aid, made of symlinks by default; musefs
 remains the consumer-facing filesystem.
 
 CI proves this contract end to end in the `contract` job (see
-[CONTRIBUTING](../../../CONTRIBUTING.md)): a Python writer's tags/art, layered on a
+[CONTRIBUTING](../contributing/setup.md)): a Python writer's tags/art, layered on a
 scanned track, are synthesized by the Rust serve path and read back by an
 independent reader.
 

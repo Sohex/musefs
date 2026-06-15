@@ -126,5 +126,5 @@ content-addressing, the `musefs scan` shell-out); the
 [Lidarr integration](../../../contrib/lidarr/README.md) (a Custom Script workflow)
 build host-specific tag mapping on top of it. Each one's README covers its own
 setup and behavior;
-[CONTRIBUTING](../../../CONTRIBUTING.md) covers their test suites and the
+[CONTRIBUTING](../contributing/setup.md) covers their test suites and the
 generated-schema/vendoring mechanics.

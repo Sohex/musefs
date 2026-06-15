@@ -47,7 +47,7 @@ cargo fmt
 | Topic | Document |
 | ----- | -------- |
 | Architecture: crate layout, segment model, store schema/contract, freshness, virtual tree, scanning | [Architecture](docs/src/architecture/overview.md) |
-| Dev workflow: full test tiers (fuzzing, interop, mutation gate), conventions (errors, integer casts), adding a format, contrib test suites | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Dev workflow: full test tiers (fuzzing, interop, mutation gate), conventions (errors, integer casts), adding a format, contrib test suites | [Contributing](docs/src/contributing/setup.md) |
 | Per-format synthesis behavior and lossy edges | [Formats](docs/src/formats/overview.md) |
 | External-writer store contract | [architecture/store.md](docs/src/architecture/store.md#the-external-writer-contract) |
 | Usage / CLI flags | [README.md](README.md) |
@@ -65,11 +65,11 @@ Consult these before exploring by hand; they are kept current.
   when their tool is absent.
 - The `fuzz/` crate is outside the workspace: format-layer API changes can
   break it silently — `cargo +nightly fuzz build` to check
-  ([CONTRIBUTING.md](CONTRIBUTING.md#coverage-guided-fuzzing)).
+  ([contributing/testing.md](docs/src/contributing/testing.md#coverage-guided-fuzzing)).
 - After any `musefs-db` schema change, regenerate the Python mirror:
   `MUSEFS_REGEN_SCHEMA_PY=1 cargo test -p musefs-db schema_py`, then
-  re-vendor ([CONTRIBUTING.md](CONTRIBUTING.md#python-plugins-contrib)).
+  re-vendor ([contributing/plugins.md](docs/src/contributing/plugins.md#python-plugins-contrib)).
 - Contrib Python suites have environment gotchas (beets needs a venv;
   real-Picard tests silently skip without an importable Picard) — see
-  [CONTRIBUTING.md](CONTRIBUTING.md#python-plugins-contrib) before touching
+  [contributing/plugins.md](docs/src/contributing/plugins.md#python-plugins-contrib) before touching
   `contrib/`.
