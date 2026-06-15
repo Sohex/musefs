@@ -148,6 +148,9 @@ A few plugins ignore that gate or are redundant in this mode:
   don't leave stale entries. Caveat: a file that's merely offline at sync time
   (e.g. an unmounted network share) is also pruned — sync while the library is
   available.
+- **Removals prune the store.** `beet remove -d` deletes the backing file, so the
+  store row is pruned at the end of the command. A bare `beet remove` (which keeps
+  the file on disk) leaves the row in place — musefs can still serve those bytes.
 - **Orphaned art:** replacing art can orphan old blobs; `musefs scan --revalidate`
   garbage-collects them.
 - **Schema version:** the plugin refuses to run if the DB's `user_version` differs
