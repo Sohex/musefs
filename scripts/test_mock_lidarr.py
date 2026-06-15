@@ -53,3 +53,18 @@ def test_fixture_album_and_artist_have_required_fields():
     assert fx["/api/v1/album/34"]["title"] == "Demo"
     assert fx["/api/v1/artist/7"]["artistName"] == "Alice"
     assert fx["/api/v1/artist/7"]["id"] == 7
+
+
+def test_fixture_album_carries_cover_image_pointing_at_served_bytes():
+    fx = build_fixture(
+        album_id=34,
+        artist_id=7,
+        artist_name="Alice",
+        album_title="Demo",
+        tracks=[(100, "/m/01.flac", "One", 1)],
+    )
+    images = fx["/api/v1/album/34"]["images"]
+    cover = next(i for i in images if i["coverType"] == "cover")
+    body = fx[cover["url"]]
+    assert isinstance(body, (bytes, bytearray))
+    assert bytes(body[:8]) == b"\x89PNG\r\n\x1a\n"

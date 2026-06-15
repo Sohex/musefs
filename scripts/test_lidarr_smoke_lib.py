@@ -3,6 +3,7 @@ from lidarr_smoke_lib import (
     assert_bytes_unchanged,
     build_album_download_env,
     build_import_env,
+    has_attached_picture,
     parse_ffprobe_tags,
     sha256_file,
 )
@@ -59,3 +60,16 @@ def test_assert_bytes_unchanged_passes_when_equal():
 def test_assert_bytes_unchanged_raises_on_change():
     with pytest.raises(AssertionError, match="a.flac"):
         assert_bytes_unchanged({"a.flac": "x"}, {"a.flac": "y"})
+
+
+def test_has_attached_picture_true_for_attached_pic_stream():
+    payload = (
+        '{"streams": [{"codec_type": "audio"}, '
+        '{"codec_type": "video", "disposition": {"attached_pic": 1}}]}'
+    )
+    assert has_attached_picture(payload) is True
+
+
+def test_has_attached_picture_false_without_attached_pic():
+    payload = '{"streams": [{"codec_type": "audio"}]}'
+    assert has_attached_picture(payload) is False
