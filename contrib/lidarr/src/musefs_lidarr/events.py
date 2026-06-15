@@ -12,6 +12,8 @@ class EventType(Enum):
     ALBUM_DOWNLOAD = "AlbumDownload"
     RENAME = "Rename"
     TRACK_RETAG = "TrackRetag"
+    ARTIST_DELETED = "ArtistDeleted"
+    ALBUM_DELETED = "AlbumDeleted"
     UNSUPPORTED = "Unsupported"
 
 
@@ -23,6 +25,8 @@ class LidarrEvent:
     previous_paths: list[str] = field(default_factory=list)
     artist_id: int | None = None
     album_id: int | None = None
+    album_mbid: str | None = None
+    artist_mbid: str | None = None
 
 
 def split_paths(value: str | None) -> list[str]:
@@ -40,6 +44,13 @@ def _int_or_none(value: str | None) -> int | None:
         return None
 
 
+def _text_or_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
 def parse_event(environ: dict[str, str] | None = None) -> LidarrEvent:
     env = os.environ if environ is None else environ
     raw = lidarr_get(env, "Lidarr_EventType", "")
@@ -52,6 +63,10 @@ def parse_event(environ: dict[str, str] | None = None) -> LidarrEvent:
         event_type = EventType.RENAME
     elif raw == EventType.TRACK_RETAG.value:
         event_type = EventType.TRACK_RETAG
+    elif raw == EventType.ARTIST_DELETED.value:
+        event_type = EventType.ARTIST_DELETED
+    elif raw == EventType.ALBUM_DELETED.value:
+        event_type = EventType.ALBUM_DELETED
     else:
         event_type = EventType.UNSUPPORTED
 
@@ -70,4 +85,6 @@ def parse_event(environ: dict[str, str] | None = None) -> LidarrEvent:
         previous_paths=previous_paths,
         artist_id=_int_or_none(lidarr_get(env, "Lidarr_Artist_Id")),
         album_id=_int_or_none(lidarr_get(env, "Lidarr_Album_Id")),
+        album_mbid=_text_or_none(lidarr_get(env, "Lidarr_Album_MBId")),
+        artist_mbid=_text_or_none(lidarr_get(env, "Lidarr_Artist_MBId")),
     )

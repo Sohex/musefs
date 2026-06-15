@@ -130,3 +130,59 @@ def test_parse_event_ignores_invalid_integer_ids():
 
     assert event.artist_id is None
     assert event.album_id is None
+
+
+def test_parse_album_deleted_event():
+    event = parse_event(
+        {
+            "Lidarr_EventType": "AlbumDeleted",
+            "Lidarr_Artist_Id": "12",
+            "Lidarr_Album_Id": "34",
+            "Lidarr_Album_MBId": "rg-mbid",
+            "Lidarr_Artist_MBId": "artist-mbid",
+            "Lidarr_Artist_DeletedFiles": "True",
+        }
+    )
+
+    assert event.event_type == EventType.ALBUM_DELETED
+    assert event.raw_type == "AlbumDeleted"
+    assert event.album_mbid == "rg-mbid"
+    assert event.artist_mbid == "artist-mbid"
+
+
+def test_parse_artist_deleted_event():
+    event = parse_event(
+        {
+            "Lidarr_EventType": "ArtistDeleted",
+            "Lidarr_Artist_Id": "12",
+            "Lidarr_Artist_MBId": "artist-mbid",
+            "Lidarr_Artist_DeletedFiles": "False",
+        }
+    )
+
+    assert event.event_type == EventType.ARTIST_DELETED
+    assert event.raw_type == "ArtistDeleted"
+    assert event.artist_mbid == "artist-mbid"
+    assert event.album_mbid is None
+
+
+def test_parse_delete_event_with_missing_mbid():
+    event = parse_event({"Lidarr_EventType": "AlbumDeleted", "Lidarr_Artist_Id": "12"})
+
+    assert event.event_type == EventType.ALBUM_DELETED
+    assert event.album_mbid is None
+    assert event.artist_mbid is None
+
+
+def test_parse_album_deleted_event_with_lowercase_keys():
+    event = parse_event(
+        {
+            "lidarr_eventtype": "AlbumDeleted",
+            "lidarr_album_mbid": "rg-mbid",
+            "lidarr_artist_mbid": "artist-mbid",
+        }
+    )
+
+    assert event.event_type == EventType.ALBUM_DELETED
+    assert event.album_mbid == "rg-mbid"
+    assert event.artist_mbid == "artist-mbid"
