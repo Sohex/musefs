@@ -1188,8 +1188,7 @@ fn ingest_unit(mut w: impl TrackSink, unit: Unit, strictness: MatchStrictness) -
             // Does this strictness need a full-hash confirm against this candidate?
             let needs_full = match strictness {
                 MatchStrictness::Fast => false,
-                MatchStrictness::Auto => cand.content_hash.is_some(),
-                MatchStrictness::Strict => true,
+                MatchStrictness::Auto | MatchStrictness::Strict => cand.content_hash.is_some(),
             };
             // The new file's full hash: worker-computed if present, else read now
             // (the file is present — it's the move destination). `full_file_hash`
@@ -1219,6 +1218,13 @@ fn ingest_unit(mut w: impl TrackSink, unit: Unit, strictness: MatchStrictness) -
                     new_hash.as_deref(),
                 )?;
                 return Ok(());
+            }
+            if !confirmed {
+                log::warn!(
+                    "fingerprint match for {} not confirmed (strictness {:?}); inserting fresh",
+                    unit.abs_path,
+                    strictness,
+                );
             }
         } else if candidates.len() > 1 {
             log::warn!(
