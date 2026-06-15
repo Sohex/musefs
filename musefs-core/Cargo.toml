@@ -43,5 +43,9 @@ base64 = "0.22"
 name = "read_throughput"
 harness = false
 
+[[bench]]
+name = "fingerprint_overhead"
+harness = false
+
 [lints]
 workspace = true
