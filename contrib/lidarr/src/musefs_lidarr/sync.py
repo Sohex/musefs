@@ -6,21 +6,23 @@ from dataclasses import dataclass
 
 from musefs_common import (
     SCAN_TIMEOUT_SECONDS,
+    ArtImage,
     SyncStats,
     check_schema_version,
     connect,
     prune_missing,
     realpath_key,
     run_scan,
+    sniff_mime,
     sync_files,
     track_id_for_path,
     track_ids_for_paths,
 )
 
-from .errors import ConfigError
+from .errors import ConfigError, LidarrApiError
 from .events import LidarrEvent
 from .import_link import LinkMode, parse_link_mode
-from .mapping import records_for_paths
+from .mapping import _album_cover_url, records_for_paths
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class EventPayloads:
     tracks: list[dict]
     albums_by_id: dict[int, dict]
     artists_by_id: dict[int, dict]
+    art_by_album_id: dict[int, ArtImage]
 
 
 def _env_bool(value: str | None, *, default: bool) -> bool:
@@ -90,6 +93,30 @@ def _log_invalid(invalid, *, warning_printer) -> None:
         )
 
 
+def _collect_album_art(client, albums_by_id, *, warning_printer=print) -> dict[int, ArtImage]:
+    """Fetch each album's cover art via ``client``; return ``{album_id: ArtImage}``.
+
+    Albums with no cover image are skipped silently. A failed fetch is logged and
+    skipped rather than aborting the sync (Lidarr custom scripts are
+    fire-and-forget, so a partial sync beats none).
+    """
+    art_by_album_id: dict[int, ArtImage] = {}
+    for album_id, album in albums_by_id.items():
+        url = _album_cover_url(album)
+        if not url:
+            continue
+        try:
+            data = client.media_cover(url)
+        except LidarrApiError as exc:
+            warning_printer(
+                f"musefs-lidarr-sync: art fetch failed for album {album_id}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        art_by_album_id[album_id] = ArtImage(data=data, mime=sniff_mime(data, url))
+    return art_by_album_id
+
+
 def sync_records(
     *,
     config: SyncConfig,
@@ -98,6 +125,7 @@ def sync_records(
     tracks: list[dict],
     albums_by_id: dict[int, dict],
     artists_by_id: dict[int, dict],
+    art_by_album_id: dict[int, ArtImage] | None = None,
     warning_printer=print,
 ) -> SyncStats:
     """Map the event's paths to records and write their tags into the store.
@@ -111,6 +139,7 @@ def sync_records(
         tracks=tracks,
         albums_by_id=albums_by_id,
         artists_by_id=artists_by_id,
+        art_by_album_id=art_by_album_id,
     )
     _log_skipped(skipped_paths, warning_printer=warning_printer)
 
@@ -222,12 +251,14 @@ def collect_event_payloads(*, client, event: LidarrEvent) -> EventPayloads:
             artist_id: client.artist(artist_id)
             for artist_id in _artist_ids(track_files, event.artist_id, album_artist_id)
         }
+        albums_by_id = {album_id: album}
         return EventPayloads(
             paths=[track_file["path"] for track_file in track_files],
             track_files=track_files,
             tracks=tracks,
-            albums_by_id={album_id: album},
+            albums_by_id=albums_by_id,
             artists_by_id=artists_by_id,
+            art_by_album_id=_collect_album_art(client, albums_by_id),
         )
     if event.artist_id is not None:
         track_files = client.track_files(artist_id=event.artist_id)
@@ -243,6 +274,7 @@ def collect_event_payloads(*, client, event: LidarrEvent) -> EventPayloads:
             tracks=tracks,
             albums_by_id=albums_by_id,
             artists_by_id=artists_by_id,
+            art_by_album_id=_collect_album_art(client, albums_by_id),
         )
     raise ConfigError("Lidarr event must include Lidarr_Artist_Id or Lidarr_Album_Id")
 
@@ -273,6 +305,7 @@ def collect_all_payloads(*, client) -> EventPayloads:
         tracks=tracks,
         albums_by_id=albums_by_id,
         artists_by_id=artists_by_id,
+        art_by_album_id=_collect_album_art(client, albums_by_id),
     )
 
 
@@ -284,6 +317,7 @@ def sync_event_with_payloads(
     tracks: list[dict],
     albums_by_id: dict[int, dict],
     artists_by_id: dict[int, dict],
+    art_by_album_id: dict[int, ArtImage] | None = None,
     scanner=run_scan,
 ) -> SyncStats:
     """Scan, write tags, then prune renames for one event; return its stats."""
@@ -295,6 +329,7 @@ def sync_event_with_payloads(
         tracks=tracks,
         albums_by_id=albums_by_id,
         artists_by_id=artists_by_id,
+        art_by_album_id=art_by_album_id,
     )
     sync_rename_prune(config=config, previous_paths=event.previous_paths)
     return stats

@@ -21,9 +21,11 @@ The package installs two console scripts that plug into Lidarr's hooks:
 - **`musefs-lidarr-sync`** (Custom Script notification) — fires after an
   import or rename: it queries Lidarr's API for the affected tracks' metadata
   (title, artist/albumartist, album, track/disc numbers, release date,
-  MusicBrainz ids, genres), runs `musefs scan` on the files to create/refresh
-  their track rows (the structural columns only musefs can compute), and
-  writes the tags into the store.
+  MusicBrainz ids, genres) plus each album's cover art, runs `musefs scan` on
+  the files to create/refresh their track rows (the structural columns only
+  musefs can compute), and writes the tags and art into the store. Transient
+  API failures (network errors, timeouts, 5xx) are retried with backoff so a
+  blip or a Lidarr restart mid-import doesn't silently drop the sync.
 
 musefs's auto-refresh surfaces each sync at the mount with no remount. Both
 scripts build on the shared [`python-musefs`](../python-musefs/README.md)
@@ -188,8 +190,9 @@ binary are importable/on `PATH`.
 - **Tags are fully replaced** with Lidarr's view on every sync (scanner-written
   binary tags always survive — see the
   [external-writer contract](../../ARCHITECTURE.md#the-external-writer-contract)).
-- **No art sync:** the integration writes text tags only; any art `musefs scan`
-  ingested from embedded pictures is preserved.
+- **Cover art:** each album's Lidarr cover is fetched and written as the front
+  cover, replacing the track's art rows on every sync (an over-cap or
+  unreachable cover is skipped, leaving any scanner-ingested art in place).
 - **Schema version:** the sync refuses to run if the DB's `user_version`
   differs from the version it targets — rebuild the store after upgrading
   musefs.

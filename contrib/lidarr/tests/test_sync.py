@@ -1,9 +1,11 @@
-from musefs_common import SCAN_TIMEOUT_SECONDS, connect, realpath_key
+from musefs_common import SCAN_TIMEOUT_SECONDS, ArtImage, connect, realpath_key
 
+from musefs_lidarr.errors import LidarrApiError
 from musefs_lidarr.events import EventType, LidarrEvent
 from musefs_lidarr.import_link import LinkMode
 from musefs_lidarr.sync import (
     SyncConfig,
+    _collect_album_art,
     collect_all_payloads,
     collect_event_payloads,
     config_from_env,
@@ -15,15 +17,21 @@ from musefs_lidarr.sync import (
 
 
 class FakeClient:
-    def __init__(self, *, track_files, tracks, albums, artists):
+    def __init__(self, *, track_files, tracks, albums, artists, art=None):
         self.track_file_calls = []
         self.track_calls = []
         self.artist_calls = []
         self.album_calls = []
+        self.media_cover_calls = []
         self._track_files = track_files
         self._tracks = tracks
         self._albums = {album["id"]: album for album in albums}
         self._artists = {artist["id"]: artist for artist in artists}
+        self._art = art or {}
+
+    def media_cover(self, url):
+        self.media_cover_calls.append(url)
+        return self._art[url]
 
     def track_files(self, **kwargs):
         self.track_file_calls.append(kwargs)
@@ -386,3 +394,109 @@ def test_collect_all_payloads_queries_each_artist(
     assert payloads.track_files == [sample_track_file]
     assert payloads.tracks == [sample_track]
     assert payloads.paths == [sample_track_file["path"]]
+
+
+def test_sync_records_writes_album_art(
+    db_path, make_track, sample_track_file, sample_track, sample_album, sample_artist
+):
+    key = realpath_key(sample_track_file["path"])
+    make_track(key)
+    event = LidarrEvent(
+        event_type=EventType.ALBUM_DOWNLOAD,
+        raw_type="AlbumDownload",
+        paths=[sample_track_file["path"]],
+        artist_id=10,
+        album_id=20,
+    )
+    config = SyncConfig(db_path=db_path, link_mode=LinkMode.SYMLINK, autoscan=False)
+    art = ArtImage(data=b"\xff\xd8\xff\xe0cover", mime="image/jpeg")
+
+    stats = sync_records(
+        config=config,
+        event=event,
+        track_files=[sample_track_file],
+        tracks=[sample_track],
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
+        art_by_album_id={20: art},
+    )
+
+    assert stats.art_linked == 1
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT a.data, a.mime, ta.picture_type FROM track_art ta "
+            "JOIN art a ON a.id = ta.art_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [(b"\xff\xd8\xff\xe0cover", "image/jpeg", 3)]
+
+
+def test_collect_event_payloads_fetches_album_art(
+    sample_track_file, sample_track, sample_album, sample_artist
+):
+    album = dict(
+        sample_album,
+        images=[{"coverType": "cover", "url": "/MediaCover/Albums/20/cover.jpg"}],
+    )
+    client = FakeClient(
+        track_files=[sample_track_file],
+        tracks=[sample_track],
+        albums=[album],
+        artists=[sample_artist],
+        art={"/MediaCover/Albums/20/cover.jpg": b"\xff\xd8\xff\xe0cover"},
+    )
+    event = LidarrEvent(
+        event_type=EventType.ALBUM_DOWNLOAD,
+        raw_type="AlbumDownload",
+        paths=[sample_track_file["path"]],
+        artist_id=10,
+        album_id=20,
+    )
+
+    payloads = collect_event_payloads(client=client, event=event)
+
+    assert client.media_cover_calls == ["/MediaCover/Albums/20/cover.jpg"]
+    art = payloads.art_by_album_id[20]
+    assert art.data == b"\xff\xd8\xff\xe0cover"
+    assert art.mime == "image/jpeg"
+
+
+def test_collect_event_payloads_skips_album_without_art(
+    sample_track_file, sample_track, sample_album, sample_artist
+):
+    client = FakeClient(
+        track_files=[sample_track_file],
+        tracks=[sample_track],
+        albums=[sample_album],
+        artists=[sample_artist],
+    )
+    event = LidarrEvent(
+        event_type=EventType.ALBUM_DOWNLOAD,
+        raw_type="AlbumDownload",
+        paths=[sample_track_file["path"]],
+        artist_id=10,
+        album_id=20,
+    )
+
+    payloads = collect_event_payloads(client=client, event=event)
+
+    assert client.media_cover_calls == []
+    assert payloads.art_by_album_id == {}
+
+
+def test_collect_album_art_logs_and_skips_fetch_failure(sample_album, sample_artist, capsys):
+    album = dict(
+        sample_album,
+        images=[{"coverType": "cover", "url": "/MediaCover/Albums/20/cover.jpg"}],
+    )
+
+    class FailingClient:
+        def media_cover(self, url):
+            raise LidarrApiError("boom")
+
+    result = _collect_album_art(FailingClient(), {20: album})
+
+    assert result == {}
+    assert "album 20" in capsys.readouterr().err
