@@ -46,8 +46,9 @@ Options → musefs sync:
   auto-create rows. Default `musefs`.
 - **Run `musefs scan` before syncing** — autoscan toggle (default on). With it
   off, run `musefs scan` yourself first or the sync errors on a missing DB.
-- **Extra field map** — optional `key=value` list mapping extra Picard tag names
-  to musefs keys, e.g. `comment=comment`.
+- **Extra field map** — optional `key=value` list mapping additional or custom
+  Picard tag names to musefs store keys (applied verbatim, last-wins, on top of
+  the automatic full-tag-set sync), e.g. `mymood=mood`.
 
 `MUSEFS_DB` and `MUSEFS_BIN` environment variables override the DB/binary
 settings (handy for testing).
@@ -67,6 +68,11 @@ settings (handy for testing).
   art lets the embedded picture re-seed when autoscan is on (musefs scan
   re-reads the file); with autoscan off, existing art is left untouched.
 - **Tags are fully replaced** with Picard's view on every sync.
+- **Field coverage:** every populated Picard tag is synced under its canonical
+  musefs (on-disk) key — all MusicBrainz IDs, sort and performer/credit fields,
+  movement, totals, and any custom field; multi-values expand and per-role
+  performers fold to `Name (Role)`. Picard's hidden `~` internals (length,
+  rating, …) are never written.
 - **Orphaned art:** replacing art can orphan old blobs; `musefs scan --revalidate`
   garbage-collects them.
 - **Schema version:** the plugin refuses to run if the DB's `user_version`
