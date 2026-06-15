@@ -290,3 +290,74 @@ fn scan_emits_discovered_walked_ingested_events() {
         vec!["ing:1/5", "ing:2/5", "ing:3/5", "ing:4/5", "ing:5/5"],
     );
 }
+
+// --- fingerprint_of() / full_file_hash() / ChecksumTier / MatchStrictness ---
+
+fn clone_probed(p: &Probed) -> Probed {
+    Probed {
+        format: p.format,
+        audio_offset: p.audio_offset,
+        audio_length: p.audio_length,
+        tags: p.tags.clone(),
+        pictures: Vec::new(),
+        binary_tags: Vec::new(),
+        structural_blocks: p.structural_blocks.clone(),
+    }
+}
+
+#[test]
+fn fingerprint_is_deterministic_and_sensitive_to_content() {
+    let p1 = Probed {
+        format: Format::Flac,
+        audio_offset: 8,
+        audio_length: 100,
+        tags: vec![("title".into(), "A".into())],
+        pictures: Vec::new(),
+        binary_tags: Vec::new(),
+        structural_blocks: vec![("STREAMINFO".into(), vec![1, 2, 3])],
+    };
+    let p2 = Probed {
+        tags: vec![("title".into(), "A".into())],
+        structural_blocks: vec![("STREAMINFO".into(), vec![1, 2, 3])],
+        ..clone_probed(&p1)
+    };
+    assert_eq!(
+        fingerprint_of(&p1),
+        fingerprint_of(&p2),
+        "same content => same fp"
+    );
+
+    let mut p3 = clone_probed(&p1);
+    p3.audio_length = 101;
+    assert_ne!(
+        fingerprint_of(&p1),
+        fingerprint_of(&p3),
+        "length change => fp change"
+    );
+
+    let mut p4 = clone_probed(&p1);
+    p4.tags = vec![("title".into(), "B".into())];
+    assert_ne!(
+        fingerprint_of(&p1),
+        fingerprint_of(&p4),
+        "tag change => fp change"
+    );
+}
+
+#[test]
+fn full_file_hash_matches_known_sha256() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    // sha256("abc")
+    assert_eq!(
+        full_file_hash(&path).unwrap(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[test]
+fn checksum_tier_defaults_to_fingerprint() {
+    assert_eq!(ScanOptions::default().checksum, ChecksumTier::Fingerprint);
+    assert_eq!(ScanOptions::default().strictness, MatchStrictness::Auto);
+}

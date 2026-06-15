@@ -20,6 +20,8 @@ musefs-format = { path = "../musefs-format", version = "1.0.0" }
 once_cell = "1"
 parking_lot = "0.12"
 quick_cache = { version = "0.6.23", features = ["stats"] }
+base16ct = "1.0"
+sha2 = "0.11"
 sharded-slab = "0.1"
 thiserror = "2"
 

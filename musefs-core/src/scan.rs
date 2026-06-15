@@ -737,6 +737,30 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
     }
 }
 
+/// How much checksum work a scan does per file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumTier {
+    /// No checksums (legacy behavior).
+    None,
+    /// Compute the cheap fingerprint only (rides the probe).
+    Fingerprint,
+    /// Fingerprint plus an eager full-file SHA-256.
+    Full,
+}
+
+/// How a fingerprint match is confirmed before a retarget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchStrictness {
+    /// Confirm with the full hash when the candidate has one; else trust the
+    /// fingerprint.
+    Auto,
+    /// Fingerprint match is always sufficient; never read the full file.
+    Fast,
+    /// Require a full-hash match; refuse the retarget if the candidate has no
+    /// stored content_hash.
+    Strict,
+}
+
 /// Knobs for a scan. `jobs == 0` means "use available parallelism".
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -750,6 +774,10 @@ pub struct ScanOptions {
     pub follow_symlinks: bool,
     /// Optional progress callback. `None` (the default) disables reporting.
     pub progress: Option<ProgressSink>,
+    /// Which checksums to compute and store this scan.
+    pub checksum: ChecksumTier,
+    /// How a refind fingerprint match is confirmed before retargeting.
+    pub strictness: MatchStrictness,
 }
 
 impl Default for ScanOptions {
@@ -760,6 +788,8 @@ impl Default for ScanOptions {
             batch_bytes: BATCH_BYTES,
             follow_symlinks: false,
             progress: None,
+            checksum: ChecksumTier::Fingerprint,
+            strictness: MatchStrictness::Auto,
         }
     }
 }
@@ -1441,6 +1471,66 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
 /// Back-compat shim used by the CLI and existing tests.
 pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
     revalidate_with(db, root, &ScanOptions::default())
+}
+
+/// SHA-256 of the probe's parsed output, hex-encoded. This is the cheap content
+/// fingerprint: deterministic per file (the parsed `Probed` is window- and
+/// format-independent), and excludes every filesystem-stamp field. Length-prefix
+/// every variable-length field so concatenation can't alias.
+#[allow(dead_code)]
+pub(crate) fn fingerprint_of(p: &Probed) -> String {
+    use sha2::{Digest, Sha256};
+    // Inner fn (not a closure) so it doesn't hold a borrow of `h` across the
+    // direct `h.update(...)` calls below.
+    fn feed(h: &mut Sha256, bytes: &[u8]) {
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    let mut h = Sha256::new();
+    feed(&mut h, p.format.as_str().as_bytes());
+    h.update(p.audio_offset.to_le_bytes());
+    h.update(p.audio_length.to_le_bytes());
+    h.update((p.tags.len() as u64).to_le_bytes());
+    for (k, v) in &p.tags {
+        feed(&mut h, k.as_bytes());
+        feed(&mut h, v.as_bytes());
+    }
+    h.update((p.pictures.len() as u64).to_le_bytes());
+    for pic in &p.pictures {
+        feed(&mut h, pic.mime.as_bytes());
+        h.update(u64::from(pic.picture_type.get()).to_le_bytes());
+        feed(&mut h, &pic.data);
+    }
+    h.update((p.binary_tags.len() as u64).to_le_bytes());
+    for bt in &p.binary_tags {
+        feed(&mut h, bt.key.as_bytes());
+        feed(&mut h, &bt.payload);
+    }
+    h.update((p.structural_blocks.len() as u64).to_le_bytes());
+    for (kind, body) in &p.structural_blocks {
+        feed(&mut h, kind.as_bytes());
+        feed(&mut h, body);
+    }
+    format!("{:x}", base16ct::HexDisplay(&h.finalize()))
+}
+
+/// Streaming SHA-256 of an entire backing file, hex-encoded. The authoritative
+/// content identity; reads the whole file, so callers gate it on the `Full` tier
+/// or a strict-confirmation need.
+#[allow(dead_code)]
+pub(crate) fn full_file_hash(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", base16ct::HexDisplay(&h.finalize())))
 }
 
 #[cfg(test)]
