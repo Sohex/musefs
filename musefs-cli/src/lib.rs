@@ -197,10 +197,10 @@ pub enum Command {
         #[arg(long, value_enum, env = "MUSEFS_CHECKSUM", default_value_t = ChecksumMode::Fingerprint)]
         checksum: ChecksumMode,
         /// Confirm a move only by fingerprint, never reading the full file.
-        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        #[arg(long, env = "MUSEFS_FAST", value_parser = clap::builder::BoolishValueParser::new())]
         fast: bool,
         /// Require a full-hash match to retarget a moved file.
-        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        #[arg(long, env = "MUSEFS_STRICT", value_parser = clap::builder::BoolishValueParser::new())]
         strict: bool,
     },
     /// Mount a read-only FUSE view of the store.

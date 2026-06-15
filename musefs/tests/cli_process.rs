@@ -442,6 +442,8 @@ fn scan_help_lists_env_vars() {
     assert!(stdout.contains("MUSEFS_DB"), "stdout: {stdout}");
     assert!(stdout.contains("MUSEFS_JOBS"), "stdout: {stdout}");
     assert!(stdout.contains("MUSEFS_CHECKSUM"), "stdout: {stdout}");
+    assert!(stdout.contains("MUSEFS_FAST"), "stdout: {stdout}");
+    assert!(stdout.contains("MUSEFS_STRICT"), "stdout: {stdout}");
 }
 
 // #370: the SetTrue bools parse the full boolish set from env (case-insensitive
@@ -554,5 +556,29 @@ fn boolish_quiet_env_toggles_the_summary() {
         String::from_utf8_lossy(&out.stdout).contains("scanned"),
         "MUSEFS_QUIET=0 should keep the summary, stdout: {}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn scan_fast_and_strict_are_mutually_exclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("library");
+    std::fs::create_dir(&target).unwrap();
+    let db = dir.path().join("mutual.db");
+    let out = musefs()
+        .args(["scan", "--fast", "--strict"])
+        .arg(&target)
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--fast --strict should fail, but exited successfully"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "stderr should mention 'mutually exclusive', got: {stderr}"
     );
 }
