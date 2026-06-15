@@ -935,6 +935,19 @@ trait TrackSink {
         fingerprint: Option<&str>,
         content_hash: Option<&str>,
     ) -> musefs_db::Result<()>;
+    fn track_exists_at(&mut self, path: &str) -> musefs_db::Result<bool>;
+    fn tracks_by_fingerprint(&mut self, fp: &str) -> musefs_db::Result<Vec<musefs_db::Track>>;
+    #[allow(clippy::too_many_arguments)]
+    fn retarget_track(
+        &mut self,
+        id: i64,
+        new_backing_path: &str,
+        stamp: BackingStamp,
+        audio_offset: u64,
+        audio_length: u64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> musefs_db::Result<()>;
 }
 
 impl TrackSink for &Db {
@@ -972,6 +985,35 @@ impl TrackSink for &Db {
     ) -> musefs_db::Result<()> {
         Db::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
+    fn track_exists_at(&mut self, path: &str) -> musefs_db::Result<bool> {
+        Ok(Db::get_track_by_path(self, path)?.is_some())
+    }
+    fn tracks_by_fingerprint(&mut self, fp: &str) -> musefs_db::Result<Vec<musefs_db::Track>> {
+        Db::tracks_by_fingerprint(self, fp)
+    }
+    fn retarget_track(
+        &mut self,
+        id: i64,
+        new_backing_path: &str,
+        stamp: BackingStamp,
+        audio_offset: u64,
+        audio_length: u64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> musefs_db::Result<()> {
+        Db::retarget_track(
+            self,
+            id,
+            new_backing_path,
+            stamp.size,
+            stamp.mtime_ns,
+            stamp.ctime_ns,
+            audio_offset,
+            audio_length,
+            fingerprint,
+            content_hash,
+        )
+    }
 }
 
 impl TrackSink for &mut musefs_db::BulkWriter<'_> {
@@ -1008,6 +1050,35 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
         content_hash: Option<&str>,
     ) -> musefs_db::Result<()> {
         musefs_db::BulkWriter::set_track_checksums(self, track_id, fingerprint, content_hash)
+    }
+    fn track_exists_at(&mut self, path: &str) -> musefs_db::Result<bool> {
+        Ok(musefs_db::BulkWriter::get_track_by_path(self, path)?.is_some())
+    }
+    fn tracks_by_fingerprint(&mut self, fp: &str) -> musefs_db::Result<Vec<musefs_db::Track>> {
+        musefs_db::BulkWriter::tracks_by_fingerprint(self, fp)
+    }
+    fn retarget_track(
+        &mut self,
+        id: i64,
+        new_backing_path: &str,
+        stamp: BackingStamp,
+        audio_offset: u64,
+        audio_length: u64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> musefs_db::Result<()> {
+        musefs_db::BulkWriter::retarget_track(
+            self,
+            id,
+            new_backing_path,
+            stamp.size,
+            stamp.mtime_ns,
+            stamp.ctime_ns,
+            audio_offset,
+            audio_length,
+            fingerprint,
+            content_hash,
+        )
     }
 }
 
@@ -1088,6 +1159,83 @@ fn ingest_into(
     }
     w.set_track_art(track_id, &track_arts)?;
     Ok(())
+}
+
+/// Decide how to ingest one probed unit: retarget a relocated row when a unique
+/// fingerprint match exists whose backing file is gone, otherwise ingest fresh.
+/// The strict/auto confirm hash, if computed here, is persisted on the retarget
+/// (so a fingerprint-tier strict move doesn't re-read the file next scan).
+fn ingest_unit(mut w: impl TrackSink, unit: Unit, strictness: MatchStrictness) -> Result<()> {
+    // Known path => ordinary upsert (re-scan of an in-place file).
+    if w.track_exists_at(&unit.abs_path)? {
+        return ingest_into(
+            w,
+            &unit.abs_path,
+            unit.stamp,
+            unit.probed,
+            unit.fingerprint.as_deref(),
+            unit.content_hash.as_deref(),
+        );
+    }
+    if let Some(fp) = unit.fingerprint.as_deref() {
+        let candidates: Vec<musefs_db::Track> = w
+            .tracks_by_fingerprint(fp)?
+            .into_iter()
+            .filter(|t| !std::path::Path::new(&t.backing_path).exists())
+            .collect();
+        if candidates.len() == 1 {
+            let cand = &candidates[0];
+            // Does this strictness need a full-hash confirm against this candidate?
+            let needs_full = match strictness {
+                MatchStrictness::Fast => false,
+                MatchStrictness::Auto => cand.content_hash.is_some(),
+                MatchStrictness::Strict => true,
+            };
+            // The new file's full hash: worker-computed if present, else read now
+            // (the file is present — it's the move destination). `full_file_hash`
+            // returns io::Result, which `?` converts into the crate `Result` via
+            // `CoreError::Io(#[from] io::Error)`.
+            let new_hash: Option<String> = match (&unit.content_hash, needs_full) {
+                (Some(h), _) => Some(h.clone()),
+                (None, true) => Some(full_file_hash(std::path::Path::new(&unit.abs_path))?),
+                (None, false) => None,
+            };
+            let confirmed = match strictness {
+                MatchStrictness::Fast => true,
+                MatchStrictness::Auto | MatchStrictness::Strict => match &cand.content_hash {
+                    // Strict with no stored hash => refuse; Auto with none => fingerprint is enough.
+                    None => matches!(strictness, MatchStrictness::Auto),
+                    Some(stored) => new_hash.as_deref() == Some(stored.as_str()),
+                },
+            };
+            if confirmed && !w.track_exists_at(&unit.abs_path)? {
+                w.retarget_track(
+                    cand.id,
+                    &unit.abs_path,
+                    unit.stamp,
+                    unit.probed.audio_offset,
+                    unit.probed.audio_length,
+                    unit.fingerprint.as_deref(),
+                    new_hash.as_deref(),
+                )?;
+                return Ok(());
+            }
+        } else if candidates.len() > 1 {
+            log::warn!(
+                "ambiguous fingerprint match for {} ({} missing candidates); inserting fresh",
+                unit.abs_path,
+                candidates.len(),
+            );
+        }
+    }
+    ingest_into(
+        w,
+        &unit.abs_path,
+        unit.stamp,
+        unit.probed,
+        unit.fingerprint.as_deref(),
+        unit.content_hash.as_deref(),
+    )
 }
 
 /// Upsert a track from a probed backing file through a direct `&Db`. Thin
@@ -1184,6 +1332,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     let window = opts.window;
     let follow_symlinks = opts.follow_symlinks;
     let tier = opts.checksum;
+    let strictness = opts.strictness;
     let cap = opts.batch_bytes;
     let budget = Arc::new(ByteBudget::new(cap));
     let failed = Arc::new(AtomicU64::new(0));
@@ -1292,14 +1441,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         for unit in batch.drain(..) {
             released += unit.weight;
             committed.push(unit.abs_path.clone());
-            ingest_into(
-                &mut bw,
-                &unit.abs_path,
-                unit.stamp,
-                unit.probed,
-                unit.fingerprint.as_deref(),
-                unit.content_hash.as_deref(),
-            )?;
+            ingest_unit(&mut bw, unit, strictness)?;
         }
         bw.commit()?;
         for abs_path in committed {
