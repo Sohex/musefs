@@ -5,8 +5,8 @@ an Opus, Vorbis, or FLAC logical bitstream. Multiplexed and chained Ogg is
 detected and skipped at scan time: within the header region every page must
 share the first page's serial, and only the first page may carry
 beginning-of-stream. For the segment model these layouts plug into, see
-[ARCHITECTURE.md](../ARCHITECTURE.md#the-segment-model). Native FLAC files
-are covered by [FLAC.md](FLAC.md).
+[ARCHITECTURE.md](../architecture/serving.md#the-segment-model). Native FLAC files
+are covered by [FLAC.md](flac.md).
 
 ## The Ogg invariant
 
@@ -110,7 +110,7 @@ very high sequence numbers serve correctly rather than failing the read.
 
 The forward page-walk reads (`serve_ogg_window`) flow through the shared backing
 read-ahead buffer (`BackingReader`, see
-[ARCHITECTURE.md](../ARCHITECTURE.md#backing-read-ahead)) just like PCM
+[ARCHITECTURE.md](../architecture/serving.md#backing-read-ahead)) just like PCM
 `BackingAudio` reads, so a sequential Ogg stream amortizes backing latency the
 same way. The read-ahead cache holds *raw backing bytes keyed by absolute
 offset*, so it is orthogonal to header patching: the algebraic CRC/sequence

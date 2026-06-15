@@ -48,7 +48,7 @@ cargo fmt
 | ----- | -------- |
 | Architecture: crate layout, segment model, store schema/contract, freshness, virtual tree, scanning | [Architecture](docs/src/architecture/overview.md) |
 | Dev workflow: full test tiers (fuzzing, interop, mutation gate), conventions (errors, integer casts), adding a format, contrib test suites | [CONTRIBUTING.md](CONTRIBUTING.md) |
-| Per-format synthesis behavior and lossy edges | `docs/{FLAC,MP3,M4A,OGG,WAV}.md` |
+| Per-format synthesis behavior and lossy edges | [Formats](docs/src/formats/overview.md) |
 | External-writer store contract | [architecture/store.md](docs/src/architecture/store.md#the-external-writer-contract) |
 | Usage / CLI flags | [README.md](README.md) |
 | Historical design specs / implementation plans | `docs/superpowers/specs/` / `docs/superpowers/plans/` |
