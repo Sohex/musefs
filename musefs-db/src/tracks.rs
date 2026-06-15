@@ -579,10 +579,10 @@ mod checksum_tests {
     fn set_and_read_back_checksums() {
         let db = Db::open_in_memory().unwrap();
         let id = db.upsert_track(&new_track("/a.flac")).unwrap();
-        db.set_track_checksums(id, Some("fp1"), Some(&"d".repeat(64)))
+        db.set_track_checksums(id, Some(&"a".repeat(64)), Some(&"d".repeat(64)))
             .unwrap();
         let t = db.get_track(id).unwrap().unwrap();
-        assert_eq!(t.fingerprint.as_deref(), Some("fp1"));
+        assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..]));
         assert_eq!(t.content_hash.as_deref(), Some(&"d".repeat(64)[..]));
     }
 
@@ -590,12 +590,12 @@ mod checksum_tests {
     fn set_checksums_none_does_not_clobber_existing() {
         let db = Db::open_in_memory().unwrap();
         let id = db.upsert_track(&new_track("/a.flac")).unwrap();
-        db.set_track_checksums(id, Some("fp1"), Some(&"d".repeat(64)))
+        db.set_track_checksums(id, Some(&"a".repeat(64)), Some(&"d".repeat(64)))
             .unwrap();
         // A later lower-tier pass passes None and must preserve both.
         db.set_track_checksums(id, None, None).unwrap();
         let t = db.get_track(id).unwrap().unwrap();
-        assert_eq!(t.fingerprint.as_deref(), Some("fp1"));
+        assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..]));
         assert_eq!(t.content_hash.as_deref(), Some(&"d".repeat(64)[..]));
     }
 
@@ -604,25 +604,32 @@ mod checksum_tests {
         let db = Db::open_in_memory().unwrap();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
         let b = db.upsert_track(&new_track("/b.flac")).unwrap();
-        db.set_track_checksums(a, Some("shared"), None).unwrap();
-        db.set_track_checksums(b, Some("shared"), None).unwrap();
+        db.set_track_checksums(a, Some(&"b".repeat(64)), None)
+            .unwrap();
+        db.set_track_checksums(b, Some(&"b".repeat(64)), None)
+            .unwrap();
         db.upsert_track(&new_track("/c.flac")).unwrap(); // fingerprint NULL
         let mut ids: Vec<i64> = db
-            .tracks_by_fingerprint("shared")
+            .tracks_by_fingerprint(&"b".repeat(64))
             .unwrap()
             .into_iter()
             .map(|t| t.id)
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![a, b]);
-        assert!(db.tracks_by_fingerprint("nope").unwrap().is_empty());
+        assert!(
+            db.tracks_by_fingerprint(&"c".repeat(64))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn retarget_updates_path_stamp_and_bounds_keeping_id() {
         let db = Db::open_in_memory().unwrap();
         let id = db.upsert_track(&new_track("/old.flac")).unwrap();
-        db.set_track_checksums(id, Some("fp"), None).unwrap();
+        db.set_track_checksums(id, Some(&"a".repeat(64)), None)
+            .unwrap();
         db.retarget_track(
             id,
             "/new.flac",
@@ -643,7 +650,7 @@ mod checksum_tests {
         assert_eq!(t.backing_ctime_ns, 5678);
         assert_eq!(t.bounds.audio_offset(), 42);
         assert_eq!(t.bounds.audio_length(), 50);
-        assert_eq!(t.fingerprint.as_deref(), Some("fp")); // None arg preserves
+        assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..])); // None arg preserves
         assert_eq!(t.content_hash.as_deref(), Some(&"e".repeat(64)[..]));
         assert!(db.get_track_by_path("/old.flac").unwrap().is_none());
     }
@@ -654,7 +661,8 @@ mod checksum_tests {
         let id = {
             let mut bw = db.bulk_writer().unwrap();
             let id = bw.upsert_track(&new_track("/old.flac")).unwrap();
-            bw.set_track_checksums(id, Some("fp"), None).unwrap();
+            bw.set_track_checksums(id, Some(&"a".repeat(64)), None)
+                .unwrap();
             bw.retarget_track(id, "/new.flac", 10, 1, 2, 0, 10, None, None)
                 .unwrap();
             bw.commit().unwrap();
@@ -662,6 +670,6 @@ mod checksum_tests {
         };
         let t = db.get_track(id).unwrap().unwrap();
         assert_eq!(t.backing_path, "/new.flac");
-        assert_eq!(t.fingerprint.as_deref(), Some("fp"));
+        assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..]));
     }
 }
