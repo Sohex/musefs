@@ -93,8 +93,6 @@ First stable release.
   owns the binary (`musefs-cli` is now a library crate), and a tag-triggered
   release workflow publishes all crates in dependency order.
 
-(Internal changes: fuzzing & property test infrastructure. See the full changelog for details.)
-
 ### Changed
 
 - **`mount --db` now requires an existing store.** Mounting against a missing
