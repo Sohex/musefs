@@ -34,6 +34,7 @@ _DROP_IF_ZERO = {
     "discnumber",
     "tracktotal",
     "disctotal",
+    "movement",
     "compilation",
     "bpm",
 }
