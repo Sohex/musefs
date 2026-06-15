@@ -214,7 +214,7 @@ PRAGMA user_version = 1;
 -- to SHA-256 hex (Task E2 benchmark locked the hash to SHA-256: under a
 -- realistic SSD/HDD I/O profile the fingerprint adds ~8.6%; the RAM
 -- microbench's higher ratio is an I/O-elimination artifact — see
--- BENCHMARKS.md). Hash function is now fixed, so the CHECK is added here.
+-- the benchmarks docs). Hash function is now fixed, so the CHECK is added here.
 ALTER TABLE tracks ADD COLUMN fingerprint  TEXT
     CHECK (fingerprint IS NULL OR length(fingerprint) = 64);
 ALTER TABLE tracks ADD COLUMN content_hash TEXT

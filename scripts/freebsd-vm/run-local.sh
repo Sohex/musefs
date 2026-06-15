@@ -9,7 +9,7 @@
 # execute over the console. Everything lives under the gitignored
 # .scratch/freebsd/; rerunning resets the VM from the cached base image.
 #
-# Host prerequisites (see the FreeBSD e2e section in CONTRIBUTING.md):
+# Host prerequisites (see the FreeBSD e2e section at https://sohex.github.io/musefs/contributing/setup.html#freebsd-e2e):
 #   qemu-system-x86_64, qemu-img, curl, xz, python3
 #   /dev/kvm for acceleration (works without it, just far slower)
 #
