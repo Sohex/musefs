@@ -1,0 +1,21 @@
+[book]
+title = "musefs"
+authors = ["Conor Futro"]
+description = "A read-only passthrough FUSE filesystem presenting a re-tagged, reorganized view of a music library."
+src = "src"
+language = "en"
+
+[output.html]
+site-url = "/musefs/"
+git-repository-url = "https://github.com/Sohex/musefs"
+edit-url-template = "https://github.com/Sohex/musefs/edit/main/docs/{path}"
+default-theme = "navy"
+
+[output.linkcheck]
+follow-web-links = false
+warning-policy = "error"
+# LOAD-BEARING: the migration keeps every commit green by linking cross-area
+# targets at still-existing root files via ../../FILE. mdbook-linkcheck forbids
+# links that escape the book root (docs/) unless this is set. It also permits
+# the final-state ../../../contrib/CHANGELOG.md link. Do not remove.
+traverse-parent-directories = true

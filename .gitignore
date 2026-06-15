@@ -20,3 +20,4 @@ mutants-out/
 mutants.out/
 mutants.out.old/
 .worktrees
+/docs/book/
