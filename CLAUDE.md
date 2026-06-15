@@ -21,7 +21,7 @@ of the original file, and `OggAudio`/`OggArtSlice` for Ogg's
 patched-in-place pages and incremental base64 art. `read_at`
 (`musefs-core/src/reader.rs`) serves any byte range by splicing segments —
 audio bytes are never copied. Read
-[ARCHITECTURE.md](ARCHITECTURE.md#the-segment-model) before touching
+[architecture/serving.md](docs/src/architecture/serving.md#the-segment-model) before touching
 read/synthesis paths.
 
 ## Code style
@@ -46,10 +46,10 @@ cargo fmt
 
 | Topic | Document |
 | ----- | -------- |
-| Architecture: crate layout, segment model, store schema/contract, freshness, virtual tree, scanning | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Architecture: crate layout, segment model, store schema/contract, freshness, virtual tree, scanning | [Architecture](docs/src/architecture/overview.md) |
 | Dev workflow: full test tiers (fuzzing, interop, mutation gate), conventions (errors, integer casts), adding a format, contrib test suites | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Per-format synthesis behavior and lossy edges | `docs/{FLAC,MP3,M4A,OGG,WAV}.md` |
-| External-writer store contract | [ARCHITECTURE.md](ARCHITECTURE.md#the-external-writer-contract) |
+| External-writer store contract | [architecture/store.md](docs/src/architecture/store.md#the-external-writer-contract) |
 | Usage / CLI flags | [README.md](README.md) |
 | Historical design specs / implementation plans | `docs/superpowers/specs/` / `docs/superpowers/plans/` |
 
