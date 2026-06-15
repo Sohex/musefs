@@ -920,3 +920,23 @@ is the bottleneck, making both the hash and the DB write negligible. See plan Ta
 note: the decision to keep SHA-256 and add the length CHECK was escalated to the controller because
 the raw percentage exceeded the stated threshold, even though the absolute overhead (303 µs/file) is
 operationally negligible at disk I/O rates.
+
+---
+
+## Scan fingerprint overhead — SSD latency profile (#464)
+
+**Bench:** `bench_scan_under_latency` in `musefs-core/tests/bench_ingest.rs` (`MUSEFS_BENCH_LATENCY_PROFILE=ssd`).
+**Corpus:** 200 minimal FLAC files (~200 B metadata + 4 KiB audio) on a `musefs-latencyfs` SSD-latency
+FUSE mount. Default thread count (`jobs: 0`). 3 runs each, median reported.
+
+| Tier | Median (ms) | µs/file |
+|------|------------:|--------:|
+| `None` | 222 | 1110 |
+| `Fingerprint` | 241 | 1205 |
+
+**Delta:** +19 ms / 200 files = **+95 µs/file overhead (+8.6%)**.
+
+**Interpretation:** Under an SSD latency profile the I/O dominates and the fingerprint overhead drops to
++8.6% (+95 µs/file), well within the plan's ≤15% threshold. The RAM bench's +129% (+303 µs/file) was
+an artefact of RAM eliminating the I/O that would normally dwarf the extra SHA-256 hash and DB write.
+At real SSD rates the fingerprint cost is operationally negligible.
