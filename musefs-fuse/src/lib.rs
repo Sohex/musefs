@@ -52,9 +52,11 @@ pub struct FuseConfig {
     /// Caps that class of work delivered to the pool; foreground reads are
     /// bounded separately by `MAX_INFLIGHT_READS` (#308), not by this.
     pub max_background: u16,
-    /// Keep the kernel page cache across opens (`FOPEN_KEEP_CACHE`). An external
-    /// re-tag auto-invalidates the affected inode on refresh (`poll_refresh_notify`
-    /// → `inval_inode`), so cached bytes are dropped when content changes.
+    /// Keep the kernel page cache across opens (`FOPEN_KEEP_CACHE`). On by
+    /// default (#432): the one measured storage win (~3× faster repeat-open on
+    /// HDD/NFS). An external re-tag auto-invalidates the affected inode on
+    /// refresh (`poll_refresh_notify` → `inval_inode`), so cached bytes are
+    /// dropped when content changes.
     pub keep_cache: bool,
     /// uid presented for every entry (the marker, synthetic dirs, real files).
     pub uid: u32,
@@ -81,7 +83,7 @@ impl Default for FuseConfig {
             ttl: Duration::from_secs(1),
             max_readahead: 512 * 1024,
             max_background: 64,
-            keep_cache: false,
+            keep_cache: true,
             uid: rustix::process::getuid().as_raw(),
             gid: rustix::process::getgid().as_raw(),
             file_mode: 0o444,
@@ -1049,7 +1051,8 @@ mod tests {
         assert_eq!(c.ttl, Duration::from_secs(1));
         assert_eq!(c.max_readahead, 512 * 1024);
         assert_eq!(c.max_background, 64);
-        assert!(!c.keep_cache);
+        // #432: keep-cache is the one measured storage win and is now on by default.
+        assert!(c.keep_cache);
         assert_eq!(c.file_mode, 0o444);
         assert_eq!(c.dir_mode, 0o555);
         assert_eq!(c.uid, rustix::process::getuid().as_raw());
