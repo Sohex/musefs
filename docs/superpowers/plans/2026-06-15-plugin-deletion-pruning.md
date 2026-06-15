@@ -144,7 +144,13 @@ Add to `contrib/python-musefs/tests/test_store_db.py`:
 
 ```python
 def test_delete_tracks_removes_rows_and_cascades(db_path):
-    from musefs_common import delete_tracks, tags_for_track, track_id_for_path
+    from musefs_common import (
+        delete_tracks,
+        replace_track_art,
+        tags_for_track,
+        track_id_for_path,
+        upsert_art,
+    )
     from musefs_common.store import replace_tags
 
     conn = connect(db_path)
@@ -153,10 +159,10 @@ def test_delete_tracks_removes_rows_and_cascades(db_path):
         b = insert_track(conn, "/m/b.flac")
         replace_tags(conn, a, [("artist", "Alice"), ("genre", "Rock")])
         # An art row referencing the track, to prove the cascade reaches track_art.
-        conn.execute("INSERT INTO art (sha256, mime, bytes) VALUES ('h', 'image/jpeg', ?)", (b"x",))
-        conn.execute(
-            "INSERT INTO track_art (track_id, art_sha256, ordinal) VALUES (?, 'h', 0)", (a,)
-        )
+        # Use the public helpers so the inserts match the real art/track_art schema
+        # (content-addressed sha256 + byte_len + data; track_art references art_id).
+        art_id = upsert_art(conn, b"coverbytes", "image/jpeg")
+        replace_track_art(conn, a, [(art_id, 3, "")])
         conn.commit()
 
         deleted = delete_tracks(conn, [a])
@@ -220,6 +226,8 @@ def delete_tracks(conn, track_ids):
         deleted += conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,)).rowcount
     return deleted
 ```
+
+> Do **not** "simplify" this into a single `executemany("DELETE ... IN (...)")` or `executemany(..., [(id,) for id in track_ids])`: `executemany`'s `rowcount` is undefined/aggregated across statements in sqlite3, which would break `test_delete_tracks_counts_only_rows_actually_deleted` (the per-id `rowcount` sum is the load-bearing detail).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -487,7 +495,7 @@ git commit -m "feat(lidarr): parse ArtistDeleted/AlbumDeleted events with MBIDs"
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `contrib/lidarr/tests/test_sync.py` (it already imports from `musefs_lidarr.sync`; the `db_path`, `make_track` fixtures come from the test conftests — `make_track` is in `python-musefs`'s conftest, mirrored for lidarr; if `make_track` is unavailable in the lidarr suite, insert rows via `musefs_common.connect` + the conftest `insert_track` exactly as below):
+Add to `contrib/lidarr/tests/test_sync.py` (it already imports from `musefs_lidarr.sync`; the `db_path` fixture and the `insert_track`/`make_track` helpers are defined in `contrib/lidarr/tests/conftest.py`). The tests below insert rows directly via `musefs_common.connect` so they're self-contained:
 
 ```python
 def test_prune_deleted_album_removes_matching_rows(db_path, tmp_path):
@@ -724,7 +732,7 @@ def test_sync_cli_delete_without_mbid_is_skipped(tmp_path, capsys):
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_cli.py::test_sync_cli_album_deleted_prunes_without_api -v`
-Expected: FAIL — `AlbumDeleted` currently parses to a recognized type but no dispatch exists, so it falls through to the API block and constructs a client (hitting `boom`) or errors.
+Expected: FAIL — with Task 4 already done, `AlbumDeleted` parses to `EventType.ALBUM_DELETED` but no dispatch exists yet, so it falls through to the API block and either constructs a client (hitting `boom`) or raises `ConfigError` (no URL/key) → exit 1; `"pruned 1 rows"` is never printed. (Ordering note: this red state depends on Task 4 preceding Task 6 — before Task 4, `AlbumDeleted` parses to `UNSUPPORTED` and returns 0 without touching the client, which would be a *different* failure. Do Task 4 first.)
 
 - [ ] **Step 3: Implement the dispatch**
 
