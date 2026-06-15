@@ -17,7 +17,8 @@
 - **Work on a feature branch**, merged via PR at the end. `docs.yml` deploys only on push to `main`, so intermediate states never deploy.
 - **Commit isolation.** The pre-commit hook skips the cargo/clippy/test gate only when *every* staged path is under `docs/` or is a `*.md` file. Note that `ARCHITECTURE.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `CLAUDE.md`, and `contrib/*/README.md` are all `*.md`, so editing them stays docs-only. Only **Task 2** (`.github/workflows/docs.yml`) and **Task 7** (code/scripts) trip the full gate — they are deliberately isolated.
 - **Green at every commit.** During migration, root files stay until their content is moved; book pages link cross-area targets either to already-created book pages or to still-existing root files, so `mdbook build` (which runs linkcheck) passes at every commit. Each task names the exact link forms.
-- **Validation command** for doc tasks is `mdbook build docs` (this runs the linkcheck backend; a broken intra-book link fails the build). Run it from the repo root.
+- **Validation command** for doc tasks is `mdbook build docs` (this runs the linkcheck backend; a broken intra-book link fails the build). Run it from the repo root. Note linkcheck flags broken *file* links but **not** broken `#fragment` anchors — Task 11 has a manual anchor audit for those.
+- **Page-before-entry:** never append a `SUMMARY.md` entry for a page that doesn't exist yet — `mdbook build` silently creates an empty stub for it, which a broad `git add docs/src/...` would then commit. Each task creates its pages before (or in the same step as) the SUMMARY entry; run `git status` before each commit to confirm no unexpected empty files were generated.
 - **Local tooling install (once):**
   ```bash
   cargo install mdbook --version 0.4.40 --locked
@@ -169,7 +170,14 @@ default-theme = "navy"
 [output.linkcheck]
 follow-web-links = false
 warning-policy = "error"
+# LOAD-BEARING: the migration keeps every commit green by linking cross-area
+# targets at still-existing root files via ../../FILE. mdbook-linkcheck forbids
+# links that escape the book root (docs/) unless this is set. It also permits
+# the final-state ../../../contrib/CHANGELOG.md link. Do not remove.
+traverse-parent-directories = true
 ```
+
+> **Verified behaviors** (mdbook 0.4.40 + mdbook-linkcheck 0.7.7): `mdbook build docs` runs the linkcheck backend and emits HTML to `docs/book/html`; without `traverse-parent-directories = true`, any `../../…` link fails with *"Linking outside of the root directory is forbidden"*; linkcheck **skips** `https://` links (because `follow-web-links = false`) and **does not validate `#fragment` anchors** (so a green build does not prove anchors resolve — see Task 11's anchor audit).
 
 - [ ] **Step 2: Create `docs/src/SUMMARY.md`** (intro-only for now; later tasks append)
 
@@ -568,7 +576,7 @@ git commit -m "docs: migrate CONTRIBUTING.md into the book; leave a shim"
 ```bash
 git mv BENCHMARKS.md docs/src/benchmarks.md
 ```
-Ensure the file's top heading is `# Benchmarks`.
+(The file already starts with `# Benchmarks`, so no heading edit is needed.)
 
 - [ ] **Step 2: Append to `docs/src/SUMMARY.md`** (under a `# Reference` section at the end)
 
@@ -742,7 +750,7 @@ git commit -m "docs: full changelog to the book; curate a user-facing root CHANG
 | `(../picard/README.md)` | `(picard.md)` |
 | `(../lidarr/README.md)` | `(lidarr.md)` |
 
-Some contrib pages link to files *inside* their own contrib dir (e.g. `contrib/systemd/musefs.conf.example`, beets/picard test fixtures). Those stay as repo-relative links from the book using `../../../contrib/<...>` (the files remain in `contrib/`). Verify each such link resolves with `mdbook build`.
+(The five contrib READMEs link only to other READMEs / `../../README.md` / `../../ARCHITECTURE.md`, all covered by the table above — none link to `musefs.conf.example` or test fixtures, so there are no in-dir file links to fix here. The one book→`contrib/` file link is the `contrib/CHANGELOG.md` reference created in Step 3, and the guide's `musefs.conf.example` link in Task 10; both stay repo-relative and resolve because of `traverse-parent-directories = true`.)
 
 - [ ] **Step 3: Create `docs/src/integrations/overview.md`**
 
@@ -870,12 +878,20 @@ git commit -m "docs: migrate README usage sections into the User Guide"
 ## Task 11: Slim the README, add the Security page, reconcile
 
 **Files:**
+- Modify: `SECURITY.md` (repoint internal links before it's included)
 - Rewrite: `README.md`
 - Create: `docs/src/security.md`
 - Modify: `docs/src/SUMMARY.md`
 - Modify: `docs/src/changelog.md` (convert temp absolute links back to relative)
 
-- [ ] **Step 1: Create `docs/src/security.md`** (mirrors root `SECURITY.md` via include)
+- [ ] **Step 1: Repoint `SECURITY.md`'s internal links to absolute Pages URLs.** `{{#include}}` pastes SECURITY.md verbatim into `docs/src/security.md`, so its relative links would resolve against `docs/src/` and break the build (and they point at soon-to-be-shim anchors). Absolute URLs are correct both on the GitHub Security tab and inside the book, and linkcheck skips them (`follow-web-links = false`):
+
+| Old (SECURITY.md lines 5, 28, 30) | New |
+| --- | --- |
+| `[CHANGELOG.md](CHANGELOG.md)` (both occurrences) | `[CHANGELOG.md](https://sohex.github.io/musefs/changelog.html)` |
+| `[CONTRIBUTING.md](CONTRIBUTING.md#test-tiers-beyond-cargo-test)` | `[CONTRIBUTING.md](https://sohex.github.io/musefs/contributing/testing.html#test-tiers-beyond-cargo-test)` |
+
+- [ ] **Step 2: Create `docs/src/security.md`** (mirrors root `SECURITY.md` via include)
 
 ```markdown
 # Security
@@ -883,13 +899,13 @@ git commit -m "docs: migrate README usage sections into the User Guide"
 {{#include ../../SECURITY.md}}
 ```
 
-- [ ] **Step 2: Append to `docs/src/SUMMARY.md`** (in `# Reference`, after Changelog)
+- [ ] **Step 3: Append to `docs/src/SUMMARY.md`** (in `# Reference`, after Changelog)
 
 ```markdown
 - [Security](security.md)
 ```
 
-- [ ] **Step 3: Convert the temporary absolute links in `docs/src/changelog.md`** (from Task 8 Step 1) back to relative book links now that the targets exist:
+- [ ] **Step 4: Convert the temporary absolute links in `docs/src/changelog.md`** (from Task 8 Step 1) back to relative book links now that the targets exist:
 
 | Old (temp absolute) | New (relative) |
 | --- | --- |
@@ -899,7 +915,7 @@ git commit -m "docs: migrate README usage sections into the User Guide"
 | `(https://sohex.github.io/musefs/integrations/systemd.html#hardening)` | `(integrations/systemd.md#hardening)` |
 | `(https://sohex.github.io/musefs/integrations/overview.html#contrib-changelog)` | `(integrations/overview.md#contrib-changelog)` |
 
-- [ ] **Step 4: Rewrite `README.md` as the landing page.** Keep verbatim from the current README: the title + pitch + CI badge, the **Quick start** section, and the **License** + **Acknowledgements** sections. Add a short **Documentation** section with absolute Pages URLs (crates.io-safe — the README is `musefs/Cargo.toml`'s `readme`). Structure:
+- [ ] **Step 5: Rewrite `README.md` as the landing page.** Keep verbatim from the current README: the title + pitch + CI badge, the **Quick start** section, and the **License** + **Acknowledgements** sections. Add a short **Documentation** section with absolute Pages URLs (crates.io-safe — the README is `musefs/Cargo.toml`'s `readme`). Structure:
 
 ```markdown
 # musefs
@@ -939,12 +955,20 @@ Full documentation lives at **<https://sohex.github.io/musefs/>**:
 
 In the kept Quick start block, repoint any links into other docs to absolute Pages URLs (e.g. a "see Installation" pointer → `https://sohex.github.io/musefs/guide/installation.html`).
 
-- [ ] **Step 5: Full build + link check**
+- [ ] **Step 6: Full build + link check**
 
 Run: `mdbook build docs`
 Expected: success; zero broken links across the whole book (including the `{{#include}}` of SECURITY.md and the changelog relative links).
 
-- [ ] **Step 6: Repo-wide orphan sweep** — confirm no dangling references to moved/deleted paths remain outside the book sources and intended shims:
+- [ ] **Step 7: Manual anchor audit.** mdbook-linkcheck does **not** validate `#fragment` anchors, so a green build does not prove anchor links resolve. Verify each anchor-bearing cross-page link points at a heading that exists on the destination page. For every link of the form `(<page>.md#<anchor>)` in the book, confirm the destination page has a heading whose slug is `<anchor>`:
+
+```bash
+# list every intra-book anchored link, then eyeball each against its target page's headings
+grep -rnoE '\]\([^)]+\.md#[a-z0-9-]+\)' docs/src
+```
+Spot-check the known ones: `changelog.md` → `guide/tuning.md#metrics`, `guide/configuration.md#ownership-and-permissions`, `integrations/systemd.md#hardening`, `integrations/overview.md#contrib-changelog`; `formats/*` → `architecture/serving.md#the-segment-model` / `#backing-read-ahead`; guide/integration pages → `architecture/store.md#the-sqlite-store` / `#the-external-writer-contract`, `contributing/plugins.md#python-plugins-contrib`. Fix any anchor whose target heading slug differs.
+
+- [ ] **Step 8: Repo-wide orphan sweep** — confirm no dangling references to moved/deleted paths remain outside the book sources and intended shims:
 
 ```bash
 grep -rnE '\]\((\.\./)*(ARCHITECTURE|CONTRIBUTING|BENCHMARKS)\.md' \
@@ -955,18 +979,18 @@ grep -rn 'docs/FLAC.md\|docs/MP3.md\|docs/M4A.md\|docs/OGG.md\|docs/WAV.md' \
 ```
 Expected: only the intended shim self-references (root `ARCHITECTURE.md`/`CONTRIBUTING.md` shims pointing at `docs/src/...`) and nothing pointing at the deleted `BENCHMARKS.md` or old `docs/<FMT>.md` paths. Fix any stragglers.
 
-- [ ] **Step 7: Confirm pre-commit-relevant gates**
+- [ ] **Step 9: Confirm pre-commit-relevant gates**
 
 Run: `cargo fmt --all --check` (should be clean — no Rust changed here) and re-run `yamllint -c .yamllint .github/workflows/docs.yml`.
 
-- [ ] **Step 8: Commit** (docs-only)
+- [ ] **Step 10: Commit** (docs-only — `SECURITY.md` is `*.md`, so the gate still skips)
 
 ```bash
-git add README.md docs/src/security.md docs/src/SUMMARY.md docs/src/changelog.md
+git add SECURITY.md README.md docs/src/security.md docs/src/SUMMARY.md docs/src/changelog.md
 git commit -m "docs: slim README to a landing page; add Security page; reconcile links"
 ```
 
-- [ ] **Step 9: Open the PR**
+- [ ] **Step 11: Open the PR**
 
 ```bash
 git push -u origin <branch>
@@ -978,6 +1002,6 @@ Then set repo Settings → Pages → Source = **GitHub Actions** (one-time) so t
 
 ## Self-review notes
 
-- **Spec coverage:** content model (Tasks 3–11), shims (3,5,9,11), BENCHMARKS-no-shim + ripple (6,7), CHANGELOG split (8), SECURITY include (11), book under `docs/` + gitignore (1), `docs.yml` permissions/concurrency/environment + `docs/book/html` artifact (2), one-time Pages source setting (Execution notes + Task 11 Step 9), version-pinning (1,2), ripple checklist incl. crates.io README absolute links (11) and schema-py vendor regen (7), commit isolation (Execution notes; Tasks 2 and 7 flagged). All spec sections map to a task.
-- **Cross-link integrity:** every migration task points cross-area links at targets that already exist (book pages or still-present root files); cyclic links (architecture↔formats, architecture↔contributing, changelog→guide) use a documented temporary form (root path or `follow-web-links=false` absolute URL) and are repointed once both ends exist (Tasks 4, 5, 6, 11).
-- **Anchor stability:** architecture/contributing splits cut on `##` boundaries so referenced anchors (`#the-segment-model`, `#the-external-writer-contract`, `#crate-layout`, `#the-sqlite-store`, `#the-contrib-ecosystem`, `#backing-read-ahead`, `#coverage-guided-fuzzing`, `#python-plugins-contrib`) survive on their new pages; external refs (CLAUDE.md, code/scripts) repointed in Tasks 3, 5, 7.
+- **Spec coverage:** content model (Tasks 3–11), shims (3,5,9,11), BENCHMARKS-no-shim + ripple (6,7), CHANGELOG split (8), SECURITY include + internal-link repoint (11 Steps 1–2), book under `docs/` + gitignore (1), `docs.yml` permissions/concurrency/environment + `docs/book/html` artifact (2), one-time Pages source setting (Execution notes + Task 11 Step 11), version-pinning (1,2), ripple checklist incl. crates.io README absolute links (11) and schema-py vendor regen (7), commit isolation (Execution notes; Tasks 2 and 7 flagged). The spec ripple `SECURITY.md → CHANGELOG/CONTRIBUTING` is now handled in Task 11 Step 1. All spec sections map to a task.
+- **Cross-link integrity:** every migration task points cross-area links at targets that already exist (book pages or still-present root files); cyclic links (architecture↔formats, architecture↔contributing, changelog→guide) use a documented temporary form (root path or `follow-web-links=false` absolute URL) and are repointed once both ends exist (Tasks 4, 5, 6, 11). Root-escaping `../../…` links are permitted only because `traverse-parent-directories = true` is set in `book.toml` (Task 1) — verified against mdbook-linkcheck 0.7.7.
+- **Anchor stability:** architecture/contributing splits cut on `##` boundaries so referenced anchors (`#the-segment-model`, `#the-external-writer-contract`, `#crate-layout`, `#the-sqlite-store`, `#the-contrib-ecosystem`, `#backing-read-ahead`, `#coverage-guided-fuzzing`, `#python-plugins-contrib`) survive on their new pages; external refs (CLAUDE.md, code/scripts) repointed in Tasks 3, 5, 7. Because linkcheck does **not** validate anchors, Task 11 Step 7 manually audits every intra-book `#anchor` link rather than relying on the green build.
