@@ -11,6 +11,7 @@ metrics = []
 
 [dependencies]
 arc-swap = "1"
+crossbeam-channel = "0.5"
 dashmap = "6"
 im = "15"
 log = "0.4"

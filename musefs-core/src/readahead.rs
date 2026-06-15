@@ -406,37 +406,43 @@ pub fn plan_prefetch(
 }
 
 use std::cell::Cell;
-use std::sync::mpsc;
 
-pub struct PrefetchJob {
+/// The per-dispatch inputs shared by every window planned from one read: the
+/// same file/buffer/pool/epoch at the same dispatched epoch. Held once behind an
+/// `Arc` so each `PrefetchJob` bumps a single refcount instead of re-cloning the
+/// four Arcs per window (#431).
+pub struct PrefetchContext {
     pub file: Arc<std::fs::File>,
     pub buf: Arc<Mutex<ReadAhead>>,
     pub pool: Arc<ReadAheadPool>,
-    pub epoch: Arc<std::sync::atomic::AtomicU64>,
+    pub epoch: Arc<Epoch>,
     pub dispatched_epoch: u64,
-    pub start: u64,
     pub len: u64,
     pub backing_len: u64,
 }
 
+pub struct PrefetchJob {
+    pub ctx: Arc<PrefetchContext>,
+    pub start: u64,
+}
+
 pub struct PrefetchWorkers {
-    tx: mpsc::SyncSender<PrefetchJob>,
+    tx: crossbeam_channel::Sender<PrefetchJob>,
     #[cfg(test)]
     handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl PrefetchWorkers {
     pub fn new(threads: usize) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<PrefetchJob>(threads * 4);
-        let rx = Arc::new(Mutex::new(rx));
+        // A multi-consumer channel: every worker owns its own `Receiver` clone and
+        // blocks in `recv` independently, so job hand-off and wake-ups fan out
+        // across all threads instead of serializing behind one shared lock (#430).
+        let (tx, rx) = crossbeam_channel::bounded::<PrefetchJob>(threads * 4);
         let mut handles = Vec::new();
         for _ in 0..threads {
-            let rx = Arc::clone(&rx);
+            let rx = rx.clone();
             let h = std::thread::spawn(move || {
-                while let Ok(job) = {
-                    let g = rx.lock().unwrap();
-                    g.recv()
-                } {
+                while let Ok(job) = rx.recv() {
                     Self::run_job(job);
                 }
             });
@@ -452,28 +458,29 @@ impl PrefetchWorkers {
     #[expect(clippy::needless_pass_by_value)]
     pub fn run_job(job: PrefetchJob) {
         use std::os::unix::fs::FileExt;
-        if job.epoch.load(std::sync::atomic::Ordering::Acquire) != job.dispatched_epoch {
+        let ctx = &job.ctx;
+        if ctx.epoch.load(std::sync::atomic::Ordering::Acquire) != ctx.dispatched_epoch {
             return;
         }
-        let want = job.len.min(job.backing_len.saturating_sub(job.start));
+        let want = ctx.len.min(ctx.backing_len.saturating_sub(job.start));
         if want == 0 {
             return;
         }
         // Speculative: only prefetch into free budget, never evicting a live
         // stream. Under pressure we skip rather than thrash real reads.
-        if !job.pool.has_room_for(want) {
+        if !ctx.pool.has_room_for(want) {
             return;
         }
         #[expect(clippy::cast_possible_truncation)]
         let mut bytes = vec![0u8; want as usize];
-        if job.file.read_exact_at(&mut bytes, job.start).is_err() {
+        if ctx.file.read_exact_at(&mut bytes, job.start).is_err() {
             return;
         }
         let _ = try_store_prefetch(
-            &job.pool,
-            &job.buf,
-            &job.epoch,
-            job.dispatched_epoch,
+            &ctx.pool,
+            &ctx.buf,
+            &ctx.epoch,
+            ctx.dispatched_epoch,
             job.start,
             bytes,
         );
@@ -1101,14 +1108,16 @@ mod prefetch_worker_tests {
         pool.register(1, Arc::clone(&buf));
 
         PrefetchWorkers::run_job(PrefetchJob {
-            file: Arc::clone(&file),
-            buf: Arc::clone(&buf),
-            pool: Arc::clone(&pool),
-            epoch: Arc::clone(&epoch),
-            dispatched_epoch: 0,
+            ctx: Arc::new(PrefetchContext {
+                file: Arc::clone(&file),
+                buf: Arc::clone(&buf),
+                pool: Arc::clone(&pool),
+                epoch: Arc::clone(&epoch),
+                dispatched_epoch: 0,
+                len: 1024 * 1024,
+                backing_len: data.len() as u64,
+            }),
             start: 1024 * 1024,
-            len: 1024 * 1024,
-            backing_len: data.len() as u64,
         });
         let mut out = vec![0u8; 4096];
         let mut ra = buf.lock().unwrap();
@@ -1119,6 +1128,64 @@ mod prefetch_worker_tests {
         })
         .unwrap();
         assert_eq!(fills, 0, "prefetched window should serve without a pread");
+        assert_eq!(out, data[1024 * 1024..1024 * 1024 + 4096]);
+    }
+
+    /// The worker-pool path the single-stream test skips: a job pushed through
+    /// `request` must reach one of the recv-ing worker threads and run, storing
+    /// the window. Guards the crossbeam hand-off (#430).
+    #[test]
+    fn dispatched_job_reaches_a_worker_and_fills_the_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.bin");
+        let data: Vec<u8> = (0u64..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+
+        let pool = Arc::new(ReadAheadPool::new(64 * 1024 * 1024));
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        pool.register(1, Arc::clone(&buf));
+
+        let workers = PrefetchWorkers::new(2);
+        workers.request(PrefetchJob {
+            ctx: Arc::new(PrefetchContext {
+                file: Arc::clone(&file),
+                buf: Arc::clone(&buf),
+                pool: Arc::clone(&pool),
+                epoch: Arc::clone(&epoch),
+                dispatched_epoch: 0,
+                len: 1024 * 1024,
+                backing_len: data.len() as u64,
+            }),
+            start: 1024 * 1024,
+        });
+
+        // Hand-off is asynchronous; poll until the worker has charged the stored
+        // window. Bounded so a broken hand-off fails fast rather than hanging.
+        let step = std::time::Duration::from_millis(5);
+        let mut waited = std::time::Duration::ZERO;
+        while pool.charged() == 0 && waited < std::time::Duration::from_secs(5) {
+            std::thread::sleep(step);
+            waited += step;
+        }
+        assert!(pool.charged() > 0, "dispatched job never reached a worker");
+
+        let mut out = vec![0u8; 4096];
+        let mut ra = buf.lock().unwrap();
+        let mut fills = 0;
+        ra.read_into(&mut out, 1024 * 1024, data.len() as u64, |_, _| {
+            fills += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            fills, 0,
+            "worker-prefetched window should serve without a pread"
+        );
         assert_eq!(out, data[1024 * 1024..1024 * 1024 + 4096]);
     }
 }
@@ -1236,16 +1303,16 @@ mod concurrency_tests {
                     for _ in 0..4 {
                         let mut start = 0u64;
                         while start < backing_len {
-                            PrefetchWorkers::run_job(PrefetchJob {
+                            let ctx = Arc::new(PrefetchContext {
                                 file: Arc::clone(file),
                                 buf: Arc::clone(buf1),
                                 pool: Arc::clone(pool),
                                 epoch: Arc::clone(epoch1),
                                 dispatched_epoch: epoch1.load(std::sync::atomic::Ordering::Acquire),
-                                start,
                                 len: window,
                                 backing_len,
                             });
+                            PrefetchWorkers::run_job(PrefetchJob { ctx, start });
                             start += window;
                         }
                     }
