@@ -11,6 +11,15 @@
 - [Ogg](formats/ogg.md)
 - [WAV](formats/wav.md)
 
+# Integrations
+
+- [Overview](integrations/overview.md)
+- [beets](integrations/beets.md)
+- [Picard](integrations/picard.md)
+- [Lidarr](integrations/lidarr.md)
+- [systemd](integrations/systemd.md)
+- [python-musefs](integrations/python-musefs.md)
+
 # Internals
 
 - [Architecture overview](architecture/overview.md)
