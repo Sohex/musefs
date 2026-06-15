@@ -19,7 +19,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the mount root rendering Prometheus-format counters — getattr/read/open
   activity, backing read-ahead behavior, and (when built with jemalloc)
   allocator stats. Off by default; the file is absent unless enabled. See the
-  README [Metrics](README.md#metrics) section (#394).
+  [Metrics](https://sohex.github.io/musefs/guide/tuning.html#metrics) section (#394).
 - **Scan progress indicator:** `scan` and `scan --revalidate` render a live
   progress bar (indicatif) with an elapsed-time summary on an interactive
   terminal, falling back to periodic `ingested N/M (P%)` log lines when output
@@ -80,13 +80,13 @@ First stable release.
   are enforced; `--owner`/`--group` imply `--allow-other`. A non-root
   `allow_other` mount is pre-flight checked against `/etc/fuse.conf`
   `user_allow_other` and fails early with guidance if it is missing. See the
-  README [Ownership and permissions](README.md#ownership-and-permissions)
+  [Ownership and permissions](https://sohex.github.io/musefs/guide/configuration.html#ownership-and-permissions)
   section (#293, #294).
 - **Hardened deployment assets:** the container image runs as a dedicated
   unprivileged user with a build-arg-configurable UID/GID, and the
   `musefs-scan.service` systemd unit ships a strong sandbox (the FUSE-mounting
   `musefs.service` deliberately cannot be sandboxed). See
-  [contrib/systemd/README.md](contrib/systemd/README.md#hardening)
+  [systemd hardening](https://sohex.github.io/musefs/integrations/systemd.html#hardening)
   (#317, #318, #319).
 - **crates.io distribution:** the `musefs` binary is published to crates.io as of
   this release and installable with `cargo install musefs`. A new thin `musefs` wrapper crate
@@ -176,9 +176,9 @@ First public release.
 ### Notes
 
 - Read-only mount; tag edits happen out-of-band against the SQLite store and are
-  picked up automatically (`PRAGMA data_version` polling). See the README
-  [Supported formats](README.md#supported-formats) section and the per-format
-  docs (`docs/{FLAC,MP3,M4A,OGG,WAV}.md`) for round-trip limitations.
+  picked up automatically (`PRAGMA data_version` polling). See the
+  [Supported formats](https://sohex.github.io/musefs/formats/overview.html) docs
+  for round-trip limitations.
 
 ## [0.1.0]
 
