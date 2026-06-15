@@ -10,17 +10,19 @@ from musefs_common import (
     SyncStats,
     check_schema_version,
     connect,
+    delete_tracks,
     prune_missing,
     realpath_key,
     run_scan,
     sniff_mime,
     sync_files,
     track_id_for_path,
+    track_ids_by_tag,
     track_ids_for_paths,
 )
 
 from .errors import ConfigError, LidarrApiError
-from .events import LidarrEvent
+from .events import EventType, LidarrEvent
 from .import_link import LinkMode, parse_link_mode
 from .mapping import _album_cover_url, records_for_paths
 
@@ -187,6 +189,35 @@ def sync_rename_prune(*, config: SyncConfig, previous_paths: list[str]) -> int:
         pruned = prune_missing(conn, list(ids.values()))
         conn.commit()
         return pruned
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def prune_deleted(*, config: SyncConfig, event: LidarrEvent) -> int:
+    """Delete store rows for a Lidarr album/artist deletion, mapped by MusicBrainz id.
+
+    Lidarr never touches the backing files (it only unlinks its own symlink
+    tree), so this is intent-based, not existence-based: rows are removed by
+    matching the stored ``musicbrainz_albumid`` / ``musicbrainz_artistid`` tag
+    against the id Lidarr reports in the delete event. Returns the count deleted.
+
+    The caller guarantees the relevant MBID is present (see ``cli_sync``); an
+    album event matches ``musicbrainz_albumid``, an artist event
+    ``musicbrainz_artistid``.
+    """
+    if event.event_type is EventType.ALBUM_DELETED:
+        key, value = "musicbrainz_albumid", event.album_mbid
+    else:
+        key, value = "musicbrainz_artistid", event.artist_mbid
+
+    conn = connect(config.db_path)
+    try:
+        deleted = delete_tracks(conn, track_ids_by_tag(conn, key, value))
+        conn.commit()
+        return deleted
     except Exception:
         conn.rollback()
         raise
