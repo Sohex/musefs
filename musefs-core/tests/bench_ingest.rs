@@ -113,6 +113,12 @@ fn bench_scan_under_latency() {
         "mixed".to_string()
     };
 
+    let checksum = match std::env::var("MUSEFS_BENCH_CHECKSUM").as_deref() {
+        Ok("fingerprint") => musefs_core::ChecksumTier::Fingerprint,
+        Ok("full") => musefs_core::ChecksumTier::Full,
+        _ => musefs_core::ChecksumTier::None,
+    };
+
     // Generate the corpus on a real backing dir, then mount the latency FS over
     // it so the scan and its SQLite writes traverse the injected-latency layer.
     let backing = tempfile::tempdir().unwrap();
@@ -135,6 +141,7 @@ fn bench_scan_under_latency() {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+            checksum,
             ..Default::default()
         },
     )
@@ -159,7 +166,10 @@ fn bench_scan_under_latency() {
         }
         .row()
     );
-    println!("scanned={} skipped={}\n", stats.scanned, stats.skipped);
+    println!(
+        "scanned={} skipped={} checksum={checksum:?}\n",
+        stats.scanned, stats.skipped
+    );
     assert!(
         stats.scanned > 0,
         "scanned 0 tracks under {profile} latency"
