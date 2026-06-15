@@ -11,9 +11,9 @@ mount shows a clean library while your files stay exactly as they are.
   the mount presents one consistent, template-driven tree for players and
   media managers.
 - **Tag editing without touching files.** Edit the SQLite store (directly,
-  or via the [beets plugin](https://sohex.github.io/musefs/integrations/beets.html),
-  [Picard plugin](https://sohex.github.io/musefs/integrations/picard.html), or
-  [Lidarr integration](https://sohex.github.io/musefs/integrations/lidarr.html)) and the mounted view
+  or via the [beets plugin](integrations/beets.md),
+  [Picard plugin](integrations/picard.md), or
+  [Lidarr integration](integrations/lidarr.md)) and the mounted view
   updates live — no remount, no rewrite, no re-rip anxiety.
 - **Lossless-by-construction experimentation.** Change your tags, try a different
   organization scheme, new cover art — the originals are physically
@@ -35,8 +35,8 @@ All five formats ship with embedded cover art and binary-tag preservation.
 The serve path has been through a performance/concurrency hardening pass for
 real-world player and media-manager access against large libraries on
 HDD/SSD/NFS, and the parsers are continuously fuzzed. beets, Picard, and
-Lidarr plugins ship in [`contrib/`](https://sohex.github.io/musefs/integrations/overview.html). See the
-[CHANGELOG](https://sohex.github.io/musefs/changelog.html) for history.
+Lidarr plugins ship in [`contrib/`](integrations/overview.md). See the
+[CHANGELOG](changelog.md) for history.
 
-Deeper reading: [ARCHITECTURE.md](https://sohex.github.io/musefs/architecture/overview.html) for how it works,
-[CONTRIBUTING.md](https://sohex.github.io/musefs/contributing/setup.html) for the development workflow.
+Deeper reading: [ARCHITECTURE.md](architecture/overview.md) for how it works,
+[CONTRIBUTING.md](contributing/setup.md) for the development workflow.

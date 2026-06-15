@@ -50,3 +50,4 @@
 
 - [Benchmarks](benchmarks.md)
 - [Changelog](changelog.md)
+- [Security](security.md)
