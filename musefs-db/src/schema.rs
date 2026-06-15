@@ -205,11 +205,11 @@ const MIGRATION_V2: &str = r"
 -- album in two places, genuine dupes) legitimately share both values, and a
 -- UNIQUE constraint would abort the scan batch on the second copy. Correctness
 -- comes from the refind logic (unique-missing candidate + confirmation), not
--- from DB uniqueness. A length CHECK on fingerprint is added here once the hash
--- function is locked by the benchmark (Task E2) — different hash, different hex
--- width — and the whole feature is one unreleased branch, so we amend this same
--- migration rather than adding a follow-up.
-ALTER TABLE tracks ADD COLUMN fingerprint  TEXT;
+-- from DB uniqueness. Both columns carry a length(x) = 64 CHECK locking them
+-- to SHA-256 hex (Task E2 benchmark confirmed ≤15% overhead; hash function is
+-- now fixed, so the CHECK is added here rather than in a follow-up migration).
+ALTER TABLE tracks ADD COLUMN fingerprint  TEXT
+    CHECK (fingerprint IS NULL OR length(fingerprint) = 64);
 ALTER TABLE tracks ADD COLUMN content_hash TEXT
     CHECK (content_hash IS NULL OR length(content_hash) = 64);
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
@@ -1216,6 +1216,45 @@ mod constraint_tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn v2_fingerprint_check_rejects_wrong_length_and_accepts_null_and_64_chars() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/fp.flac");
+
+        // NULL is accepted (no fingerprint yet).
+        conn.execute(
+            "UPDATE tracks SET fingerprint = NULL WHERE backing_path = '/fp.flac'",
+            [],
+        )
+        .unwrap();
+
+        // A valid 64-char SHA-256 hex string is accepted.
+        conn.execute(
+            &format!(
+                "UPDATE tracks SET fingerprint = '{}' WHERE backing_path = '/fp.flac'",
+                "a".repeat(64)
+            ),
+            [],
+        )
+        .unwrap();
+
+        // A too-short fingerprint (1 char) is rejected.
+        rejected(
+            &conn,
+            "UPDATE tracks SET fingerprint = 'x' WHERE backing_path = '/fp.flac'",
+        );
+
+        // A too-long fingerprint (65 chars) is also rejected.
+        rejected(
+            &conn,
+            &format!(
+                "UPDATE tracks SET fingerprint = '{}' WHERE backing_path = '/fp.flac'",
+                "a".repeat(65)
+            ),
+        );
     }
 }
 

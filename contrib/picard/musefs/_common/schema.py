@@ -210,11 +210,11 @@ PRAGMA user_version = 1;
 -- album in two places, genuine dupes) legitimately share both values, and a
 -- UNIQUE constraint would abort the scan batch on the second copy. Correctness
 -- comes from the refind logic (unique-missing candidate + confirmation), not
--- from DB uniqueness. A length CHECK on fingerprint is added here once the hash
--- function is locked by the benchmark (Task E2) — different hash, different hex
--- width — and the whole feature is one unreleased branch, so we amend this same
--- migration rather than adding a follow-up.
-ALTER TABLE tracks ADD COLUMN fingerprint  TEXT;
+-- from DB uniqueness. Both columns carry a length(x) = 64 CHECK locking them
+-- to SHA-256 hex (Task E2 benchmark confirmed ≤15% overhead; hash function is
+-- now fixed, so the CHECK is added here rather than in a follow-up migration).
+ALTER TABLE tracks ADD COLUMN fingerprint  TEXT
+    CHECK (fingerprint IS NULL OR length(fingerprint) = 64);
 ALTER TABLE tracks ADD COLUMN content_hash TEXT
     CHECK (content_hash IS NULL OR length(content_hash) = 64);
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
