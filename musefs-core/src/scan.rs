@@ -807,6 +807,8 @@ struct Unit {
     stamp: BackingStamp,
     probed: Probed,
     weight: u64,
+    fingerprint: Option<String>,
+    content_hash: Option<String>,
 }
 
 /// In-memory byte weight of a `Probed`, used for batch backpressure
@@ -927,6 +929,12 @@ trait TrackSink {
     ) -> musefs_db::Result<()>;
     fn upsert_art(&mut self, a: &NewArt) -> musefs_db::Result<i64>;
     fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()>;
+    fn set_track_checksums(
+        &mut self,
+        track_id: i64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> musefs_db::Result<()>;
 }
 
 impl TrackSink for &Db {
@@ -955,6 +963,14 @@ impl TrackSink for &Db {
     }
     fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()> {
         Db::set_track_art(self, track_id, items)
+    }
+    fn set_track_checksums(
+        &mut self,
+        track_id: i64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> musefs_db::Result<()> {
+        Db::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
 }
 
@@ -985,6 +1001,14 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
     fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()> {
         musefs_db::BulkWriter::set_track_art(self, track_id, items)
     }
+    fn set_track_checksums(
+        &mut self,
+        track_id: i64,
+        fingerprint: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> musefs_db::Result<()> {
+        musefs_db::BulkWriter::set_track_checksums(self, track_id, fingerprint, content_hash)
+    }
 }
 
 /// Upsert a track from a probed backing file into `w`: write the track row,
@@ -997,6 +1021,8 @@ fn ingest_into(
     abs_path: &str,
     stamp: BackingStamp,
     probed: Probed,
+    fingerprint: Option<&str>,
+    content_hash: Option<&str>,
 ) -> Result<()> {
     let track_id = w.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
@@ -1007,6 +1033,7 @@ fn ingest_into(
         backing_mtime_ns: stamp.mtime_ns,
         backing_ctime_ns: stamp.ctime_ns,
     })?;
+    w.set_track_checksums(track_id, fingerprint, content_hash)?;
 
     let mut tags = Vec::new();
     let mut ordinals: HashMap<String, u64> = HashMap::new();
@@ -1066,18 +1093,28 @@ fn ingest_into(
 /// Upsert a track from a probed backing file through a direct `&Db`. Thin
 /// wrapper over [`ingest_into`]; the `oracle`/non-bulk scan path.
 fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
-    ingest_into(db, abs_path, BackingStamp::from_metadata(meta), probed)
+    ingest_into(
+        db,
+        abs_path,
+        BackingStamp::from_metadata(meta),
+        probed,
+        None,
+        None,
+    )
 }
 
 /// Like [`ingest`], but writes through a batch `BulkWriter`. Thin wrapper over
-/// [`ingest_into`]; the `stamp` is captured once by the caller's `fstat`.
+/// [`ingest_into`]; the `stamp` is captured once by the caller's `fstat`. The
+/// production batch path inlines `ingest_into` (it threads per-unit checksums),
+/// so this wrapper now only serves the hardening tests' bulk-writer coverage.
+#[cfg(test)]
 fn ingest_bulk(
     bw: &mut musefs_db::BulkWriter<'_>,
     abs_path: &str,
     stamp: BackingStamp,
     probed: Probed,
 ) -> Result<()> {
-    ingest_into(bw, abs_path, stamp, probed)
+    ingest_into(bw, abs_path, stamp, probed, None, None)
 }
 
 /// Public entry: parallel-probe / single-writer scan of `root`.
@@ -1146,6 +1183,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     let progress = opts.progress.as_ref();
     let window = opts.window;
     let follow_symlinks = opts.follow_symlinks;
+    let tier = opts.checksum;
     let cap = opts.batch_bytes;
     let budget = Arc::new(ByteBudget::new(cap));
     let failed = Arc::new(AtomicU64::new(0));
@@ -1188,11 +1226,31 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
                         };
                         let weight = payload_weight(&probed);
                         budget.acquire(weight); // backpressure on in-flight art bytes
+                        let fingerprint = match tier {
+                            ChecksumTier::None => None,
+                            ChecksumTier::Fingerprint | ChecksumTier::Full => {
+                                Some(fingerprint_of(&probed))
+                            }
+                        };
+                        let content_hash = match tier {
+                            ChecksumTier::Full => {
+                                match full_file_hash(std::path::Path::new(&abs_path)) {
+                                    Ok(h) => Some(h),
+                                    Err(e) => {
+                                        log::warn!("content hash failed for {abs_path}: {e}");
+                                        None
+                                    }
+                                }
+                            }
+                            _ => None,
+                        };
                         let unit = Unit {
                             abs_path,
                             stamp,
                             probed,
                             weight,
+                            fingerprint,
+                            content_hash,
                         };
                         if tx.send(unit).is_err() {
                             budget.release(weight);
@@ -1231,16 +1289,17 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         // after `bw.commit()` succeeds — a failed commit aborts the scan without
         // having advanced the progress bar past unpersisted files.
         let mut committed: Vec<String> = Vec::new();
-        for Unit {
-            abs_path,
-            stamp,
-            probed,
-            weight,
-        } in batch.drain(..)
-        {
-            released += weight;
-            ingest_bulk(&mut bw, &abs_path, stamp, probed)?;
-            committed.push(abs_path);
+        for unit in batch.drain(..) {
+            released += unit.weight;
+            committed.push(unit.abs_path.clone());
+            ingest_into(
+                &mut bw,
+                &unit.abs_path,
+                unit.stamp,
+                unit.probed,
+                unit.fingerprint.as_deref(),
+                unit.content_hash.as_deref(),
+            )?;
         }
         bw.commit()?;
         for abs_path in committed {
@@ -1477,7 +1536,6 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
 /// fingerprint: deterministic per file (the parsed `Probed` is window- and
 /// format-independent), and excludes every filesystem-stamp field. Length-prefix
 /// every variable-length field so concatenation can't alias.
-#[allow(dead_code)]
 pub(crate) fn fingerprint_of(p: &Probed) -> String {
     use sha2::{Digest, Sha256};
     // Inner fn (not a closure) so it doesn't hold a borrow of `h` across the
@@ -1520,7 +1578,6 @@ pub(crate) fn fingerprint_of(p: &Probed) -> String {
 /// Streaming SHA-256 of an entire backing file, hex-encoded. The authoritative
 /// content identity; reads the whole file, so callers gate it on the `Full` tier
 /// or a strict-confirmation need.
-#[allow(dead_code)]
 pub(crate) fn full_file_hash(path: &std::path::Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     let mut f = std::fs::File::open(path)?;
