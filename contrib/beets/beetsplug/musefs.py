@@ -31,7 +31,7 @@ class MusefsPlugin(BeetsPlugin):
             "fields": {},
             "bin": "musefs",  # musefs executable (PATH name or full path)
             "autoscan": True,  # run `musefs scan` automatically before syncing
-            "write_path": True,  # emit a beets_path tag for $!{beets_path} mounts
+            "write_path": True,  # emit a beets_path tag for ${beets_path} mounts
             "restore_backing": False,  # on delete, let the backing tag value reappear
         })
         # beets has no file-move event, and `after_write` fires *before* a move
@@ -39,9 +39,12 @@ class MusefsPlugin(BeetsPlugin):
         # at cli_exit, when each item's path is final, where we also prune rows
         # whose backing file has moved away.
         self._pending = []
+        self._saw_removal = False
         self.register_listener("after_write", self._record)
         self.register_listener("item_imported", self._record)
         self.register_listener("album_imported", self._record_album)
+        self.register_listener("item_removed", self._on_removed)
+        self.register_listener("album_removed", self._on_removed)
         self.register_listener("cli_exit", self._reconcile_pending)
 
     # --- command ---------------------------------------------------------
@@ -114,23 +117,32 @@ class MusefsPlugin(BeetsPlugin):
         if album is not None:
             self._pending.extend(album.items())
 
+    def _on_removed(self, **kwargs):
+        # item_removed/album_removed only flip the reconcile guard so a
+        # removals-only command still runs the end-of-command prune. We do not
+        # scan or sync removed items; the unscoped prune_missing handles them.
+        self._saw_removal = True
+
     def _reconcile_pending(self, lib=None, **kwargs):
         """End-of-command reconcile: sync every touched item at its final path,
-        then prune rows whose backing file moved away. Best-effort — a passive
-        hook must never abort the beets operation, so errors become warnings."""
+        then prune rows whose backing file is gone (moved away or deleted at the
+        source). Best-effort — a passive hook must never abort the beets
+        operation, so errors become warnings."""
         pending, self._pending = self._pending, []
+        saw_removal, self._saw_removal = self._saw_removal, False
         # Dedup by final on-disk path (an item may fire several events).
         items = list({os.fsdecode(i.path): i for i in pending if i is not None}.values())
-        if not items:
+        if not items and not saw_removal:
             return
         db_path = self._db_path()
         if not db_path:
             self._log.warning("musefs: no `musefs.db` configured; skipping sync")
             return
         try:
-            if self._autoscan():
-                self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
-            self._sync(db_path, items, restore_backing=self._restore_backing())
+            if items:
+                if self._autoscan():
+                    self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
+                self._sync(db_path, items, restore_backing=self._restore_backing())
             self._prune_missing(db_path)
         except (ui.UserError, sqlite3.Error, OSError, subprocess.SubprocessError) as exc:
             # A passive cli_exit hook must never abort the beets operation for an
