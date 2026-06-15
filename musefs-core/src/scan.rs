@@ -1085,7 +1085,8 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
 /// Upsert a track from a probed backing file into `w`: write the track row,
 /// replace its seeded tags, and ingest its embedded art (capped, deduped,
 /// clamped). The single source of the ingest body shared by `ingest` (direct
-/// `&Db`) and `ingest_bulk` (batched `BulkWriter`). Takes `probed` by value so
+/// `&Db`), `ingest_unit` (production batch path), and `ingest_bulk` (test-only
+/// `BulkWriter` wrapper). Takes `probed` by value so
 /// picture/binary-tag/structural-block bytes are moved, not cloned (#68).
 fn ingest_into(
     mut w: impl TrackSink,
@@ -1437,7 +1438,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
             return Ok(());
         }
         let mut bw = db.bulk_writer()?;
-        // Budget weights are released only after commit, and ingest_bulk consumes
+        // Budget weights are released only after commit, and ingest_unit consumes
         // the Probed — capture each unit's weight before the move (#68).
         let mut released = 0u64;
         // `Ingested` reports committed files, so buffer the paths and emit only
@@ -1587,9 +1588,10 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     }
     db.apply_bulk_pragmas_self()?;
 
-    // Main-thread pre-dispatch skip pass: load existing (path -> stamp,id,format) once,
+    // Main-thread pre-dispatch skip pass: load existing
+    // (path -> stamp, id, format, has_fingerprint, has_content_hash) once,
     // stat each candidate, keep only changed files. Workers stay DB-free.
-    let existing: HashMap<String, (crate::freshness::BackingStamp, i64, Format)> = db
+    let existing: HashMap<String, (crate::freshness::BackingStamp, i64, Format, bool, bool)> = db
         .list_tracks()?
         .into_iter()
         .map(|t| {
@@ -1599,6 +1601,8 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
                     crate::freshness::BackingStamp::from_track(&t),
                     t.id,
                     t.format,
+                    t.fingerprint.is_some(),
+                    t.content_hash.is_some(),
                 ),
             )
         })
@@ -1632,9 +1636,19 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         } else {
             path.to_string_lossy().into_owned()
         };
-        if let Some((stamp, id, format)) = existing.get(&key).copied() {
+        if let Some((stamp, id, format, has_fingerprint, has_content_hash)) =
+            existing.get(&key).copied()
+        {
             let needs_backfill = format == Format::Flac && !have_structural.contains(&id);
-            if crate::freshness::BackingStamp::from_metadata(&meta) == stamp && !needs_backfill {
+            let needs_checksum = match opts.checksum {
+                ChecksumTier::None => false,
+                ChecksumTier::Fingerprint => !has_fingerprint,
+                ChecksumTier::Full => !has_fingerprint || !has_content_hash,
+            };
+            if crate::freshness::BackingStamp::from_metadata(&meta) == stamp
+                && !needs_backfill
+                && !needs_checksum
+            {
                 unchanged += 1;
                 continue;
             }
