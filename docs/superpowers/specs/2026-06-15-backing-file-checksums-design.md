@@ -3,7 +3,7 @@
 Issue: [#464](https://github.com/Sohex/musefs/issues/464)
 Related: [#422](https://github.com/Sohex/musefs/issues/422) (deferred — second pass)
 Date: 2026-06-15
-Status: design approved, pending spec review
+Status: design approved, reviewer pass applied, pending user spec review
 
 ## Problem
 
@@ -59,9 +59,24 @@ editable tag contract and external tools never write them.
 
 ### Fingerprint — cheap candidate filter
 
-A hash over the bytes the probe already reads (the bounded head window plus the
-128-byte tail) folded together with the file `size`. Computed *during the probe*
-at ~zero extra I/O, since those bytes are already in hand.
+A hash over a **fixed, content-only region** of the backing file: the first
+`FP_HEAD` bytes and the last `FP_TAIL` bytes, folded together with the file
+`size`. `FP_HEAD`/`FP_TAIL` are constants (exact sizes a plan/bench detail —
+start around 64 KiB head / 4 KiB tail); for a file smaller than
+`FP_HEAD + FP_TAIL` the whole file is hashed.
+
+The region is deliberately defined independently of the probe's read, **not** as
+"the bytes the probe happened to read." The probe window is adaptive (it widens
+on `NeedMore`, varies with `--window`, and M4A reads `moov` via a seek reader
+rather than a front window — `probe_body`, `scan.rs:564`), so a probe-derived
+hash would be neither content-deterministic across scans nor uniform across
+formats, and cross-scan matching would break. A fixed head+tail+size region
+sidesteps all of that.
+
+The fingerprint is therefore a small **bounded extra read** (head bytes usually
+overlap what the probe already pulled, so the page cache is warm; the tail is the
+only reliably-new read). It is near-free but not literally zero — which is
+exactly what the with/without-fingerprint benchmark measures.
 
 Its role is to cheaply answer "which orphaned row might this new file be?"
 without reading whole files. A pure `mv` preserves the probe region byte-for-byte
@@ -78,10 +93,17 @@ always differ in size), and collisions are harmless under the two-tier design
 below: a fingerprint collision costs at most one extra full-hash confirmation,
 never a wrong retarget.
 
-Because the fingerprint is defined in terms of the probe's read region, changing
-that region's definition (e.g. the head-window size) invalidates stored
-fingerprints. Regenerating them is cheap — a metadata-only rescan (bounded
-reads), not a whole-library read.
+The fingerprint hash function starts as **SHA-256** (the same primitive as the
+full hash and `art.sha256`), to keep the first implementation single-primitive.
+The benchmark below measures a scan with and without the fingerprint using
+SHA-256; if that overhead is non-negligible we revisit with a faster non-crypto
+hash (the fingerprint is a filter, not an integrity guarantee, so it does not
+need to be cryptographic). This is a hash-choice decision made from numbers, not
+up front.
+
+Changing `FP_HEAD`/`FP_TAIL` (or the fold) invalidates stored fingerprints, so
+they are versioned implicitly with the migration/scan logic. Regenerating them is
+cheap — bounded head+tail reads per file, not a whole-library read.
 
 ### Full hash — authoritative arbiter
 
@@ -131,6 +153,14 @@ ingest, then a background `fingerprint` (or `full`) pass over the whole library,
 then per-album `full` checksums as automation ingests new albums. A higher tier
 on a later pass fills in the missing column without disturbing the other.
 
+**A lower tier never clobbers a higher tier's column.** The ingest upsert writes
+a checksum column *only* when the scan's tier computes it: a `none`-tier scan
+leaves both columns intact, a `fingerprint`-tier scan refreshes `fingerprint` but
+preserves any existing `content_hash`. (`ingest_into`'s upsert,
+`scan.rs:959`, must therefore not blanket-NULL the checksum columns on
+re-ingest.) On a retarget the content is unchanged, so the moved row keeps its
+`content_hash` and its `fingerprint` is identical to the matched value anyway.
+
 **Default tier is `fingerprint`, pending a benchmark** confirming the
 probe-region hash adds negligible overhead to a scan (corpus backed on tmpfs per
 the bench harness). If the overhead is non-negligible, the default stays `none`
@@ -153,12 +183,51 @@ before the upsert, for any probed file whose path is not already a row:
 4. **Multiple** candidates (genuine duplicate-content tracks, or a fingerprint
    collision) → do not guess: insert fresh and log a warning.
 
-A retarget of a byte-identical move does not bump `content_version` (the content
-is unchanged).
+**Destination-occupied guard.** `tracks.backing_path` is UNIQUE, so a retarget
+`UPDATE` to a path that is already a row would abort the write. The refind
+precondition (the new path is not yet a row) plus the copy-vs-move guard make
+this unreachable in normal operation, but the retarget must still be defensive:
+if the destination is already occupied, skip the retarget and fall through to the
+fresh-insert path rather than letting the UNIQUE violation abort the batch.
+
+**Within-scan claim safety.** Two new files in one scan can both fingerprint-match
+the same orphan row. The refind decision runs on the single writer against
+up-to-date state, so the first claims (retargets) the orphan and the second then
+sees that orphan's `backing_path` occupied (no longer a missing candidate) and
+inserts fresh. The implementation must make refind decisions against committed/
+in-progress writer state, not a stale pre-batch snapshot, so an orphan is never
+double-claimed within a batch.
+
+**NULL-fingerprint rows are invisible to refind.** The lookup keys on a non-NULL
+fingerprint (the incoming file always has one), so rows scanned at the `none`
+tier — lacking a fingerprint — cannot be retargeted until a `fingerprint`/`full`
+pass backfills them. That is the intended consequence of incremental tiers, not a
+bug, but it means move recovery only protects rows that were fingerprinted before
+the move.
+
+**`content_version` note.** A retarget refreshes the validation stamp, and the
+`tracks_geometry_au` trigger (`schema.rs:178`) bumps `content_version` on any
+`backing_mtime_ns` change. So a retarget *does* bump `content_version` even for a
+byte-identical move. This is harmless: `content_version` is compared only for
+equality (freshness invalidation), so a spurious bump costs at most one
+header-cache refresh — the same documented monotone churn the structural-block
+triggers already accept.
 
 ### Match strictness
 
-How a fingerprint match is confirmed before retargeting:
+Strictness governs only how a fingerprint match is *confirmed* before
+retargeting, and is **independent of the scan tier** (the tier decides what gets
+stored for scanned files; strictness decides what a retarget trusts). Confirming
+with a full hash always requires reading the *new* file's bytes, whatever the
+tier — `--strict`/auto-escalate will full-hash the new file even on a
+`fingerprint`-tier scan.
+
+A precondition for any refind: the candidate rows must already carry a
+fingerprint. A `none`-tier scan computes no fingerprint for the incoming file
+either, so **refind requires at least the `fingerprint` tier** — under `none` no
+retarget is attempted regardless of strictness.
+
+The match × matrix:
 
 - **default (auto-escalate)** — if the matched row has a stored `content_hash`,
   full-hash the new file and require it to match before retargeting; if the row
@@ -166,8 +235,10 @@ How a fingerprint match is confirmed before retargeting:
   data already paid for.
 - **`--fast`** — fingerprint match is always sufficient; never read the full
   file, even when a `content_hash` exists.
-- **`--strict`** — require a `content_hash` match; if the matched row has no
-  stored full hash, refuse the retarget and insert fresh (with a warning).
+- **`--strict`** — require a `content_hash` match: full-hash the new file and
+  compare. If the matched row has no stored `content_hash` (nothing to compare
+  against), refuse the retarget and insert fresh (with a warning).
+- **`none` tier (any strictness)** — no fingerprint computed, so no refind.
 
 This aligns the security guarantee with cost: a `full`-tier library
 automatically gets collision/forgery-proof retargeting under the default; a
@@ -216,16 +287,25 @@ pass:
 
 - Schema migration round-trip and `user_version` (the existing `schema` test
   tiers); Python schema-mirror regeneration.
-- Fingerprint stability: identical bytes at a different path produce the same
-  fingerprint; a metadata edit that the probe reads changes it.
-- Refind matrix on `scan`: pure move (retarget, tags/art preserved); copy with
-  original still present (fresh insert, original untouched); ambiguous
-  multi-candidate (fresh insert + warning); no match (fresh insert).
-- Strictness: `--strict` refuses retarget without a `content_hash`; `--fast`
-  retargets on fingerprint despite a present `content_hash`; default
-  auto-escalates and rejects a forged fingerprint-match whose full hash differs.
+- Fingerprint stability and determinism: identical bytes at a different path
+  produce the same fingerprint regardless of `--window`/format; a change confined
+  to the head or tail region changes it; a small file (< `FP_HEAD + FP_TAIL`)
+  hashes the whole file and still round-trips.
+- Refind matrix on `scan`: pure move (retarget, tags/art preserved, `id`
+  stable); copy with original still present (fresh insert, original untouched);
+  ambiguous multi-candidate (fresh insert + warning); no match (fresh insert);
+  two new files matching one orphan (one retargets, one inserts fresh — no
+  double-claim); destination-occupied (no UNIQUE-violation abort).
+- Tier interactions: `none`-tier scan attempts no refind; a `none`/`fingerprint`
+  re-ingest preserves an existing `content_hash` (no clobber-to-NULL);
+  NULL-fingerprint rows are not retargeted.
+- Strictness: `--strict` refuses retarget without a candidate `content_hash` and
+  full-hashes the new file even on a `fingerprint`-tier scan; `--fast` retargets
+  on fingerprint despite a present `content_hash`; default auto-escalates and
+  rejects a forged fingerprint-match whose full hash differs.
 - Incremental backfill: an unchanged library re-`revalidate`d at a higher tier
   gains the missing checksum without a redundant re-read of files that already
   have it.
-- Benchmark: probe-region fingerprint overhead on a representative library
-  (corpus on tmpfs), to settle the default-tier decision.
+- Benchmark: scan throughput with and without the fingerprint (SHA-256) on a
+  representative library (corpus on tmpfs). Settles both the default-tier
+  decision and whether to revisit the fingerprint hash function.
