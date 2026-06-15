@@ -14,6 +14,7 @@ from musefs_common import (
     run_scan,
     sync_files,
     track_id_for_path,
+    track_ids_for_paths,
 )
 
 from .errors import ConfigError
@@ -81,6 +82,14 @@ def _log_skipped(skipped, *, warning_printer) -> None:
         )
 
 
+def _log_invalid(invalid, *, warning_printer) -> None:
+    for key, message in invalid:
+        warning_printer(
+            f"musefs-lidarr-sync: skipped {key}: invalid record: {message}",
+            file=sys.stderr,
+        )
+
+
 def sync_records(
     *,
     config: SyncConfig,
@@ -124,6 +133,7 @@ def sync_records(
             present_records.append(record)
 
         sync_files(conn, present_records, stats=stats)
+        _log_invalid(stats.invalid, warning_printer=warning_printer)
         conn.commit()
         return stats
     except Exception:
@@ -144,12 +154,8 @@ def sync_rename_prune(*, config: SyncConfig, previous_paths: list[str]) -> int:
     previous_keys = [realpath_key(path) for path in previous_paths]
     conn = connect(config.db_path)
     try:
-        placeholders = ",".join("?" for _ in previous_keys)
-        rows = conn.execute(
-            f"SELECT id FROM tracks WHERE backing_path IN ({placeholders})",
-            previous_keys,
-        ).fetchall()
-        pruned = prune_missing(conn, [row[0] for row in rows])
+        ids = track_ids_for_paths(conn, previous_keys)
+        pruned = prune_missing(conn, list(ids.values()))
         conn.commit()
         return pruned
     except Exception:
