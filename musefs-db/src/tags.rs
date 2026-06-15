@@ -119,7 +119,7 @@ impl<M> Db<M> {
     /// order. The blob bytes stream at read time; only `key` (materialized here)
     /// is length-guarded, plus the per-track row count.
     pub fn get_binary_tags(&self, track_id: i64) -> Result<Vec<BinaryTagRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT length(key), rowid, key, length(value_blob) FROM tags \
              WHERE track_id = ?1 AND value_blob IS NOT NULL ORDER BY key, ordinal",
         )?;
