@@ -37,6 +37,7 @@ _TAG_FIELDS = (
     "mb_trackid",
     "artist_sort",
     "artists_sort",
+    "albumartist_sort",
     "bitrate",
     "length",
     "format",  # file facts: present on item, NOT tag fields
@@ -107,12 +108,26 @@ def test_genre_plural_collapses_to_genre_key():
     assert [v for k, v in pairs if k == "genre"] == ["Rock", "Pop"]
 
 
-def test_comp_one_kept_zero_dropped():
-    # beets `comp` is a 0/1 int; bool here too. 1 -> kept "1", 0/False -> dropped.
-    assert dict(map_fields(item(comp=True)))["comp"] == "1"
-    assert dict(map_fields(item(comp=1)))["comp"] == "1"
-    assert "comp" not in dict(map_fields(item(comp=False)))
-    assert "comp" not in dict(map_fields(item(comp=0)))
+def test_comp_renamed_to_compilation_and_zero_dropped():
+    # beets `comp` is a 0/1 int; it maps to the on-disk `compilation` key.
+    # 1 -> kept "1", 0/False -> dropped.
+    assert dict(map_fields(item(comp=True)))["compilation"] == "1"
+    assert dict(map_fields(item(comp=1)))["compilation"] == "1"
+    assert "comp" not in dict(map_fields(item(comp=True)))
+    assert "compilation" not in dict(map_fields(item(comp=False)))
+    assert "compilation" not in dict(map_fields(item(comp=0)))
+
+
+def test_sort_fields_renamed_to_on_disk_keys():
+    # artist_sort/albumartist_sort are beets' internal attribute names; the
+    # on-disk standard (matching Picard) is artistsort/albumartistsort.
+    d = dict(map_fields(item(artist_sort="Beatles, The", albumartist_sort="V, The")))
+    assert d["artistsort"] == "Beatles, The"
+    assert d["albumartistsort"] == "V, The"
+    assert "artist_sort" not in d and "albumartist_sort" not in d
+    # plural twin collapses to the singular attr, then renames to on-disk key
+    pairs = map_fields(item(artists_sort=["A", "B"]))
+    assert [v for k, v in pairs if k == "artistsort"] == ["A", "B"]
 
 
 def test_file_facts_excluded():
