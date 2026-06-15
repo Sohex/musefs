@@ -76,6 +76,8 @@ Configure a Custom Script notification (Settings -> Connect):
 
 - On Release Import: enabled.
 - On Rename: enabled.
+- On Album Delete: enabled.
+- On Artist Delete: enabled.
 - Path: `musefs-lidarr-sync`.
 
 Test events exit successfully without touching files or the database.
@@ -196,6 +198,12 @@ binary are importable/on `PATH`.
 - **Schema version:** the sync refuses to run if the DB's `user_version`
   differs from the version it targets — rebuild the store after upgrading
   musefs.
+- **Deletions prune by MusicBrainz id.** On an Album/Artist delete, the sync
+  removes the matching store rows (`musicbrainz_albumid` / `musicbrainz_artistid`)
+  so the mount stops presenting them. The backing audio is never touched —
+  pruning only drops the store rows, not the files Lidarr keeps in the backing
+  directory. A delete event for a release with no MusicBrainz id cannot be mapped
+  and is logged and skipped; those rows clear on the next scan/reconcile.
 - **CI coverage:** a fast smoke (real Lidarr exec path + mocked API) gates PRs,
   and a full real-instance download-client import e2e gates the Python
   releases — see
