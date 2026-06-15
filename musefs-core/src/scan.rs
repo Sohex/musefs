@@ -1499,6 +1499,9 @@ pub(crate) fn fingerprint_of(p: &Probed) -> String {
     for pic in &p.pictures {
         feed(&mut h, pic.mime.as_bytes());
         h.update(u64::from(pic.picture_type.get()).to_le_bytes());
+        feed(&mut h, pic.description.as_bytes());
+        h.update(u64::from(pic.width).to_le_bytes());
+        h.update(u64::from(pic.height).to_le_bytes());
         feed(&mut h, &pic.data);
     }
     h.update((p.binary_tags.len() as u64).to_le_bytes());
