@@ -200,6 +200,22 @@ CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
     UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
 END;
 PRAGMA user_version = 1;
+
+-- ── MIGRATION_V2 ──
+-- fingerprint/content_hash are scanner-owned content identities. Neither is
+-- UNIQUE and the index is NON-unique BY DESIGN: duplicate-content tracks (same
+-- album in two places, genuine dupes) legitimately share both values, and a
+-- UNIQUE constraint would abort the scan batch on the second copy. Correctness
+-- comes from the refind logic (unique-missing candidate + confirmation), not
+-- from DB uniqueness. A length CHECK on fingerprint is added here once the hash
+-- function is locked by the benchmark (Task E2) — different hash, different hex
+-- width — and the whole feature is one unreleased branch, so we amend this same
+-- migration rather than adding a follow-up.
+ALTER TABLE tracks ADD COLUMN fingerprint  TEXT;
+ALTER TABLE tracks ADD COLUMN content_hash TEXT
+    CHECK (content_hash IS NULL OR length(content_hash) = 64);
+CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
+PRAGMA user_version = 2;
 """
 
-USER_VERSION = 1
+USER_VERSION = 2

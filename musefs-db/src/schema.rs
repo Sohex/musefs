@@ -199,12 +199,28 @@ CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
 END;
 ";
 
+const MIGRATION_V2: &str = r"
+-- fingerprint/content_hash are scanner-owned content identities. Neither is
+-- UNIQUE and the index is NON-unique BY DESIGN: duplicate-content tracks (same
+-- album in two places, genuine dupes) legitimately share both values, and a
+-- UNIQUE constraint would abort the scan batch on the second copy. Correctness
+-- comes from the refind logic (unique-missing candidate + confirmation), not
+-- from DB uniqueness. A length CHECK on fingerprint is added here once the hash
+-- function is locked by the benchmark (Task E2) — different hash, different hex
+-- width — and the whole feature is one unreleased branch, so we amend this same
+-- migration rather than adding a follow-up.
+ALTER TABLE tracks ADD COLUMN fingerprint  TEXT;
+ALTER TABLE tracks ADD COLUMN content_hash TEXT
+    CHECK (content_hash IS NULL OR length(content_hash) = 64);
+CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
+";
+
 /// Ring capacity of the `track_changes` changelog. Must match the literal in
 /// MIGRATION_V1 (guarded by `changelog_cap_constant_matches_migration_sql`).
 #[allow(dead_code)]
 pub const CHANGELOG_CAP: i64 = 8192;
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1];
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let latest = i64::try_from(MIGRATIONS.len()).expect("MIGRATIONS count must fit i64");
@@ -315,7 +331,7 @@ mod baseline_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 1);
+        assert_eq!(uv, 2);
 
         // value_blob exists on tags and defaults to NULL.
         conn.execute(
@@ -352,7 +368,37 @@ mod baseline_tests {
         let uv2: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv2, 1);
+        assert_eq!(uv2, 2);
+    }
+
+    #[test]
+    fn migration_v2_adds_fingerprint_and_content_hash_columns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            2,
+            "V2 migration must bump user_version to 2"
+        );
+        // Both columns exist, are nullable, and default to NULL.
+        conn.execute(
+            "INSERT INTO tracks
+                (backing_path, format, audio_offset, audio_length, backing_size,
+                 backing_mtime_ns, backing_ctime_ns, updated_at)
+             VALUES ('/x.flac','flac',0,10,10,0,0,0)",
+            [],
+        )
+        .unwrap();
+        let (fp, ch): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT fingerprint, content_hash FROM tracks WHERE backing_path='/x.flac'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fp, None);
+        assert_eq!(ch, None);
     }
 
     /// The SQL literal and the exported constant must not drift.
@@ -407,7 +453,7 @@ mod changelog_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 1);
+        assert_eq!(uv, 2);
 
         insert_track(&conn, "/a.flac"); // tracks AI -> 1 row
         assert_eq!(count_changes(&conn), 1);
@@ -651,7 +697,7 @@ mod constraint_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 1);
+        assert_eq!(uv, 2);
 
         insert_track(&conn, "/a.flac");
         conn.execute(
@@ -1351,7 +1397,7 @@ mod art_immutability_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 1);
+        assert_eq!(uv, 2);
     }
 
     #[test]
