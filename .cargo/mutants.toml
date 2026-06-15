@@ -147,7 +147,7 @@ exclude_re = [
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:1122:46:',
+    'musefs-core/src/scan\.rs:1128:46:',
     # run_pipeline flush cadence (batch_bytes accounting + the
     # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
     # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on
@@ -160,21 +160,21 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:1232:29:',
+    'musefs-core/src/scan\.rs:1245:29:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1234:32:',
+    'musefs-core/src/scan\.rs:1247:32:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1234:47:',
+    'musefs-core/src/scan\.rs:1247:47:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1234:62:',
+    'musefs-core/src/scan\.rs:1247:62:',
     # guard: op="+=" fn="run_pipeline" rows=2
-    'musefs-core/src/scan\.rs:1242:37:',
+    'musefs-core/src/scan\.rs:1255:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1244:40:',
+    'musefs-core/src/scan\.rs:1257:40:',
     # guard: op="||" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1244:55:',
+    'musefs-core/src/scan\.rs:1257:55:',
     # guard: op=">=" fn="run_pipeline" rows=1
-    'musefs-core/src/scan\.rs:1244:70:',
+    'musefs-core/src/scan\.rs:1257:70:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
@@ -182,11 +182,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:1365:29:',
+    'musefs-core/src/scan\.rs:1382:29:',
     # guard: op="+=" fn="revalidate_with" rows=2
-    'musefs-core/src/scan\.rs:1373:29:',
+    'musefs-core/src/scan\.rs:1391:33:',
     # guard: op="+" fn="revalidate_with" rows=1
-    'musefs-core/src/scan\.rs:1416:29: replace \+ with -',
+    'musefs-core/src/scan\.rs:1436:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
