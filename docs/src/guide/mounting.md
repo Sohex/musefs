@@ -80,3 +80,11 @@ suffix. Every rendered component is capped at 255 bytes (NAME_MAX, truncated on
 a UTF-8 boundary, extension preserved), and a plain field whose value is
 exactly `.` or `..` is dropped rather than creating an unusable directory. The
 default template is `$albumartist/$album/$title`.
+
+Brackets and braces must be balanced: an unclosed `[` section or an
+unterminated `${` / `$!{` field is rejected at mount time with an error naming
+the problem, rather than silently folding the rest of the template into the
+open construct. To check a template before committing to a mount, add
+`--dry-run`: it validates the template, prints a sample of the paths the mount
+would expose along with the total file and directory counts, then exits without
+mounting.

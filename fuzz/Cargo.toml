@@ -7,6 +7,13 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# This crate is excluded from the main workspace (libfuzzer needs its own
+# crate), so the workspace-wide `unsafe_code = "deny"` does not reach it. A fuzz
+# harness is exactly where an `unsafe` transmute of arbitrary bytes is tempting,
+# and CI only `fuzz build`s these (no clippy/lint pass), so re-declare it here.
+[lints.rust]
+unsafe_code = "deny"
+
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }

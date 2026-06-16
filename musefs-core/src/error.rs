@@ -20,7 +20,7 @@ pub enum CoreError {
         size: u64,
         cap: u64,
     },
-    #[error("io error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("backing file changed since scan: {0}")]
     BackingChanged(String),
