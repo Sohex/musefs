@@ -10,6 +10,9 @@ on:
     branches: [main]
   schedule:
     - cron: '0 5 * * 1'  # Mondays 05:00 UTC
+  # Run the long scheduled campaign on demand (e.g. to reproduce a crash or warm
+  # the corpus) without waiting for the cron.
+  workflow_dispatch:
 
 concurrency:
   group: fuzz-${{ github.ref }}
@@ -61,7 +64,7 @@ jobs:
           done
 
   scheduled:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       actions: read  # read prior runs' corpus artifacts
