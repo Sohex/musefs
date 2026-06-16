@@ -1,5 +1,5 @@
 # cargo-deny configuration: license allow-list + supply-chain bans.
-# Run locally with `cargo deny check`; CI runs it in audit.yml.
+# Run locally with `cargo deny check`; CI runs it in .github/workflows/ci.yml.
 # Advisories are also covered by rustsec/audit-check in audit.yml; cargo-deny
 # adds the license gate (which audit-check does not do) plus source/ban checks.
 

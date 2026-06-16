@@ -3,6 +3,7 @@ name = "musefs-format"
 description = "On-the-fly audio metadata synthesis and byte-layout for musefs (FLAC/MP3/MP4/Ogg/WAV)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
