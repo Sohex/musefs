@@ -64,6 +64,10 @@ impl From<ChecksumMode> for musefs_core::ChecksumTier {
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+    /// Increase log verbosity: `-v` = info, `-vv` = debug, `-vvv` = trace
+    /// (default: warn). An explicit `RUST_LOG` takes precedence over this.
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    pub verbose: u8,
 }
 
 /// Flags for `musefs mount`, grouped so the mount plumbing passes one value

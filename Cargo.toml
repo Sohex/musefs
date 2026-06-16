@@ -6,6 +6,13 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "1.0.0"
 edition = "2024"
+# Best-effort MSRV. The bundled-SQLite dependency (libsqlite3-sys) tracks the
+# newest stdlib — its build script uses `cfg_select!` — so the real floor
+# follows recent stable. Verified: the workspace builds on 1.95 but not 1.94.
+# Deliberately NOT CI-gated (it would churn on every such dep bump); a too-old
+# toolchain still fails clearly via cargo's rust-version check. Bump when a
+# dependency raises the floor.
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/Sohex/musefs"
 

@@ -34,16 +34,24 @@ fn jemalloc_stats() -> Option<musefs_fuse::AllocatorStats> {
 }
 
 fn main() {
+    let cli = Cli::parse();
     // The library crates report serve-path failures through the `log` facade;
-    // without a sink they vanish. Default to `warn` so they surface on stderr,
-    // overridable via RUST_LOG.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // without a sink they vanish. Default to `warn` so they surface on stderr;
+    // `-v`/`-vv`/`-vvv` raise the floor, and an explicit RUST_LOG overrides both.
+    let default_level = match cli.verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .init();
     #[cfg(feature = "jemalloc")]
     {
         enable_jemalloc_background_thread();
         musefs_fuse::set_alloc_probe(jemalloc_stats);
     }
-    if let Err(e) = run(Cli::parse()) {
+    if let Err(e) = run(cli) {
         eprintln!("musefs: {e:#}");
         std::process::exit(1);
     }

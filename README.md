@@ -35,7 +35,7 @@ musefs scan ~/Music --db library.db        # ingest your library
 mkdir -p ~/mnt/music
 musefs mount ~/mnt/music --db library.db \
     --template '$albumartist/$album/$title'
-# mount blocks until unmounted: fusermount -u ~/mnt/music (or Ctrl-C)
+# mount blocks until unmounted: fusermount3 -u ~/mnt/music (or Ctrl-C)
 ```
 
 `~/mnt/music` now serves your library as

@@ -174,7 +174,7 @@ python -m pytest -m e2e                   # full beets -> mount -> playback end-
 
 The `musefs_bin` gate shells out to the real `musefs` binary, so build it first
 from the repo root (`cargo build`) and run it against a fresh build. The `e2e`
-tier additionally needs `ffmpeg` and `/dev/fuse` + `fusermount`: it generates
+tier additionally needs `ffmpeg` and `/dev/fuse` + `fusermount3`: it generates
 audio, imports it with beets, retags, syncs, mounts via FUSE, and verifies the
 mount's tags and byte-identical audio (including a move-reconcile case). Both
 tiers are deselected from the default run and skip cleanly if their tools are

@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`-v`/`--verbose` flag:** a global verbosity flag (`-v` = info, `-vv` =
+  debug, `-vvv` = trace; default `warn`) on `scan` and `mount`, so diagnosing a
+  run no longer requires knowing the `RUST_LOG` env var. An explicit `RUST_LOG`
+  still takes precedence.
 - **`mount --dry-run`:** validate the `--template` and configuration and print a
   sample of the paths the mount would expose (with total file and directory
   counts), then exit without mounting — a way to check a template before
@@ -57,6 +61,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Declared MSRV (`rust-version = "1.95"`):** the workspace now states a
+  minimum supported Rust version so a too-old toolchain fails with a clear cargo
+  message instead of mid-compile. It is best-effort and tracks recent stable
+  (the bundled-SQLite dependency requires it); not CI-gated.
+- **Supply-chain license gate:** a `deny.toml` + `cargo deny` CI job enforces a
+  permissive-license allow-list (and bans/sources), closing the gap left by the
+  advisory-only `cargo audit` check.
 - **Strict template validation:** an unclosed `[ … ]` section or an unterminated
   `${` / `$!{` field is now rejected at mount time with an error naming the
   problem, instead of silently folding the rest of the template into the open
