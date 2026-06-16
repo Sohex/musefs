@@ -14,6 +14,13 @@ your music library — without modifying or duplicating a single byte of the
 original audio. Fix tags, art, and folder structure in a SQLite store; the
 mount shows a clean library while your files stay exactly as they are.
 
+Because the mount never rewrites a byte, every backing file keeps its exact
+checksum forever. That suits two jobs the usual "edit tags in place" tools
+can't: **archival**, where you retag and reorganize the presented library as
+much as you like while the originals stay bit-for-bit verifiable; and
+**torrents**, where you keep seeding from the untouched files while serving a
+clean, re-tagged view of them on top.
+
 Runs on **Linux**, **FreeBSD**, and **macOS\*** &mdash; *\*macOS builds and
 passes unit tests, but mounted end-to-end behaviour is not yet validated.*
 
