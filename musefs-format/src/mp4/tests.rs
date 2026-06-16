@@ -513,6 +513,22 @@ fn synthesize_patches_co64() {
 }
 
 #[test]
+fn synthesize_co64_offset_near_i64_max_does_not_overflow() {
+    // A `co64` chunk offset near i64::MAX must not panic when shifted by the
+    // (positive) relocation delta. The patch cast the u64 offset to i64 and added
+    // delta, overflowing i64 even though the true u64 result still fits — a fuzz
+    // crash (attempt to add with overflow). The relocated offset is computed in
+    // u64, so this synthesizes cleanly.
+    let entry = i64::MAX as u64; // 0x7FFF_FFFF_FFFF_FFFF
+    let buf = mk_mp4_co64(b"AUDIODATA", &[entry]);
+    let scan = read_structure(&buf).unwrap();
+    let layout = synthesize_layout(&scan, &[TagInput::new("title", "New")], &[], &[]).unwrap();
+    let head = inline_head(&layout);
+    let delta = head.len() as u64 - scan.mdat_payload_offset;
+    assert_eq!(first_co64(&head), vec![entry + delta]);
+}
+
+#[test]
 fn synthesize_with_art_splits_for_streaming() {
     let buf = mk_mp4(false, b"AUDIODATA", &[0]);
     let scan = read_structure(&buf).unwrap();
