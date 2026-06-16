@@ -209,30 +209,65 @@ jobs:
       - name: Canary (check-only) run of the harness
         run: MUTANTS_CANARY=1 scripts/mutants.sh musefs-db
 
+  full-plan:
+    # Scheduled or manually dispatched: size the campaign the SAME way in-diff-plan
+    # sizes the PR gate — a fresh runner per ~50 mutants. Each crate is listed with
+    # the exact --file scoping + config scripts/mutants.sh runs (MUTANTS_LIST=1
+    # forwards --list; parse-only, no build/tests), then split into n = ceil(count
+    # / 50) shards. Capping every runner at ~50 mutants isolates a single
+    # allocation-bomb mutant (the OOM-the-runner class) to one ~50-mutant shard
+    # instead of canceling a whole multi-hundred-mutant leg, so the survivor
+    # reports of the unaffected shards still come back.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Install cargo-mutants
+        # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
+        # known-good version is 27.0.0 (documented in scripts/mutants.sh).
+        run: cargo install cargo-mutants
+      - name: Plan campaign shards
+        id: plan
+        run: |
+          set -euo pipefail
+          # Per-crate mutant counts via the same scoping the run uses; grep keeps
+          # only mutant lines (file:line:col:), dropping the "== mutants: crate =="
+          # headers run_crate echoes. `|| true` guards `set -e` against grep's
+          # exit-1 on a (hypothetical) zero-mutant crate.
+          pairs=""
+          for crate in musefs-db musefs-core musefs-format musefs-fuse musefs-latencyfs; do
+            count="$(MUTANTS_LIST=1 scripts/mutants.sh "$crate" 2>/dev/null | grep -cE ':[0-9]+:[0-9]+:' || true)"
+            echo "$crate: $count mutants"
+            pairs="$pairs $crate:$count"
+          done
+          # n = ceil(count / 50) shards per crate. `shard` is cargo-mutants' 0-indexed
+          # i/n (fed to MUTANTS_SHARD); `label` is the human 1-indexed form for the
+          # job name; `name` is the slash-free artifact suffix. Mirrors in-diff-plan's
+          # matrix shape (an `include:` array). One-liner to dodge YAML/Python indent.
+          matrix="$(python3 -c 'import json,math,sys; toks=[t.rsplit(":",1) for t in sys.argv[1].split()]; out=[{"crate":c,"shard":f"{i}/{n}","label":f"{c} {i+1}/{n}","name":f"{c}-{i+1}-of-{n}"} for c,cnt in toks for n in [max(1,math.ceil(int(cnt)/50))] for i in range(n)]; print(json.dumps(out,separators=(",",":")))' "$pairs")"
+          echo "shards: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   full:
-    # Scheduled or manually dispatched: full per-crate campaign.
+    # Scheduled or manually dispatched: full per-crate campaign, fanned across the
+    # ~50-mutant shards full-plan sized. Each shard is a disjoint subset of its
+    # crate's mutants (cargo-mutants randomizes order within a shard only); their
+    # survivor reports are concatenated when (re)building the inventory.
+    needs: full-plan
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # db and core are quick (~5m / ~16m). musefs-format alone ran ~2h as a
-        # single serial leg (75% of the whole campaign's wall-clock), so it is
-        # split into 4 shards (~30m each) via cargo-mutants --shard. Each shard
-        # is a disjoint subset of the format mutants; their survivor reports are
-        # concatenated when (re)building the inventory.
-        include:
-          - { crate: musefs-db, label: musefs-db }
-          - { crate: musefs-core, label: musefs-core }
-          - { crate: musefs-format, label: musefs-format-0, shard: 0/4 }
-          - { crate: musefs-format, label: musefs-format-1, shard: 1/4 }
-          - { crate: musefs-format, label: musefs-format-2, shard: 2/4 }
-          - { crate: musefs-format, label: musefs-format-3, shard: 3/4 }
-          - { crate: musefs-fuse, label: musefs-fuse }
-          # musefs-latencyfs carries real logic (inode map, latency table, attr
-          # mapping, passthrough ops); scripts/mutants.sh runs its mounted
-          # #[ignore]d tests, so this leg needs libfuse + /dev/fuse.
-          - { crate: musefs-latencyfs, label: musefs-latencyfs }
+        include: ${{ fromJSON(needs.full-plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
@@ -249,9 +284,9 @@ jobs:
         # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).
         run: cargo install cargo-mutants
-      - name: Run mutation campaign
-        # Empty for the db/core legs (no `shard` key) → MUTANTS_SHARD unset →
-        # whole crate. Set to "k/4" for the format shards.
+      - name: Run mutation campaign (shard ${{ matrix.label }})
+        # Every shard carries an i/n (single-shard crates get "0/1"), so
+        # MUTANTS_SHARD is always set; scripts/mutants.sh forwards it as --shard.
         env:
           MUTANTS_SHARD: ${{ matrix.shard }}
         run: scripts/mutants.sh "${{ matrix.crate }}"
@@ -259,7 +294,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          # Per-shard artifact names (a slash in matrix.shard is illegal here).
-          name: mutants-${{ matrix.label }}
+          # Per-shard artifact names; matrix.name is the slash-free "crate-k-of-n"
+          # form (a slash, as in matrix.shard, is illegal in an artifact name).
+          name: mutants-${{ matrix.name }}
           path: mutants-out/${{ matrix.crate }}
           if-no-files-found: warn
