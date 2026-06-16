@@ -748,6 +748,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_page_accepts_27_byte_zero_segment_page() {
+        // A zero-segment page is exactly the 27-byte fixed header (no lacing table,
+        // no payload). `pos + 27 == buf.len()` is the valid boundary; `>=` would
+        // wrongly reject a page that fills the buffer exactly.
+        let mut page = vec![0u8; 27];
+        page[0..4].copy_from_slice(CAPTURE); // "OggS"
+        page[26] = 0; // seg_count = 0
+        let h = parse_page(&page, 0).unwrap();
+        assert_eq!(h.seg_count, 0);
+        assert_eq!(h.total_len(), 27);
+    }
+
+    #[test]
     fn patch_page_header_rejects_truncated_page() {
         let (page, _) = lace_packet(0xCAFE, 1, false, 0, &vec![0x42u8; 300]);
         let h = parse_page(&page, 0).unwrap();
