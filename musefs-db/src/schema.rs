@@ -645,6 +645,24 @@ mod schema_py_tests {
         );
     }
 
+    #[test]
+    fn migrate_does_not_reapply_an_already_applied_step() {
+        // A DB sitting at version 1 (only V1 applied) must receive ONLY the
+        // remaining steps on the next migrate. `current < target` skips the
+        // already-applied V1; `<=` would re-run V1 (`CREATE TABLE tracks` ->
+        // "table already exists"), so a clean upgrade to the latest version proves
+        // the loop never re-applies a step it already ran. (The current==latest
+        // case can't exercise this — migrate fast-paths out before the loop.)
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap(); // apply V1 only
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+        super::migrate(&mut conn).expect("upgrading from v1 must apply only the remaining steps");
+        assert_eq!(
+            user_version(&conn),
+            i64::try_from(MIGRATIONS.len()).unwrap()
+        );
+    }
+
     /// NOT #[ignore]d on purpose: the compare path must run under plain
     /// `cargo test` or the CI drift gate doesn't exist. Only the write
     /// behavior is env-gated.

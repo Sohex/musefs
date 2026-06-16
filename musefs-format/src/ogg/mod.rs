@@ -539,6 +539,25 @@ mod tests {
     }
 
     #[test]
+    fn oggflac_following_packets_accepts_minimal_9_byte_packet() {
+        // The 16-bit count lives in bytes [7],[8], so a 9-byte first packet is the
+        // minimum valid input (`len < 9` rejects anything shorter). `<=` would
+        // wrongly reject this exact-length packet.
+        let mut pkt = [0u8; 9];
+        pkt[7] = 0x00;
+        pkt[8] = 0x03; // 3 following metadata-block packets
+        assert_eq!(oggflac_following_packets(&pkt).unwrap(), 3);
+    }
+
+    #[test]
+    fn comment_body_accepts_packet_with_empty_body() {
+        // A packet exactly `prefix` bytes long has an empty (but valid) comment
+        // body: `&packet[prefix..]` is the empty slice. `len < prefix` rejects only
+        // shorter packets; `<=` would wrongly reject this one. Opus prefix = 8.
+        assert!(comment_body(Codec::Opus, b"OpusTags").unwrap().is_empty());
+    }
+
+    #[test]
     fn read_tags_opus() {
         // Build an OpusTags packet with one real comment via the shared builder.
         let body =

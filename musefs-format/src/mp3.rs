@@ -731,6 +731,44 @@ mod tests {
         );
     }
 
+    /// Minimal ID3v2.4 tag: header + one frame header whose 4-byte synchsafe size
+    /// is `frame_size`. The declared tag-body size is 10 (just the frame header),
+    /// so the frame walk reaches the size validation with the buffer ending right
+    /// after the 4 size bytes. All size bytes are 0x00/0x80, so the decoded size
+    /// (low 7 bits) is 0 — only the high-bit guard at line 514 can reject.
+    fn v24_tag_one_frame(frame_size: [u8; 4]) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(b"ID3");
+        t.extend_from_slice(&[4, 0, 0]); // v2.4, no flags
+        t.extend_from_slice(&[0, 0, 0, 10]); // synchsafe tag-body size = 10
+        t.extend_from_slice(b"TIT2"); // frame id (non-zero, not CHAP/CTOC)
+        t.extend_from_slice(&frame_size); // the guarded size bytes
+        t.extend_from_slice(&[0, 0]); // frame flags = 0
+        t
+    }
+
+    #[test]
+    fn alloc_safe_rejects_v24_frame_with_nonsynchsafe_size() {
+        // The v2.4 guard, `b4 | b5 | b6 | b7 >= 0x80`, must reject a frame whose
+        // synchsafe size has the high bit set in ANY byte (a non-synchsafe size the
+        // id3 crate could OOM on). Replacing a `|` with `&`/`^` reshapes the chain
+        // (both bind tighter than `|`, so `b4 | b5 & b6 | b7` is `b4 | (b5 & b6) | b7`),
+        // letting an even/dominated high-bit pattern slip through. Each input below
+        // pins one such weakening at a distinct position.
+        for size in [
+            [0x80, 0x00, 0x00, 0x00], // b4 high
+            [0x00, 0x80, 0x00, 0x00], // b5 high
+            [0x00, 0x00, 0x80, 0x00], // b6 high
+            [0x00, 0x80, 0x80, 0x00], // b5,b6 high
+            [0x00, 0x00, 0x80, 0x80], // b6,b7 high
+        ] {
+            assert!(
+                !id3v2_alloc_safe(&v24_tag_one_frame(size)),
+                "v2.4 frame size {size:02x?} has a high bit set and must be rejected"
+            );
+        }
+    }
+
     /// A buffer that does not start with "ID3" must be rejected by the guard.
     /// id3::Tag::read_from2 scans forward to locate a tag, so any non-ID3-prefixed
     /// buffer is unsafe regardless of what bytes appear later.
