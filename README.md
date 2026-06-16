@@ -47,7 +47,12 @@ Full documentation lives at **<https://sohex.github.io/musefs/>**:
   [Tuning](https://sohex.github.io/musefs/guide/tuning.html) ·
   [FAQ](https://sohex.github.io/musefs/guide/faq.html)
 - [Supported formats](https://sohex.github.io/musefs/formats/overview.html)
-- [Integrations: beets, Picard, Lidarr, systemd](https://sohex.github.io/musefs/integrations/overview.html)
+- [Integrations](https://sohex.github.io/musefs/integrations/overview.html):
+  [beets](https://sohex.github.io/musefs/integrations/beets.html) ·
+  [Picard](https://sohex.github.io/musefs/integrations/picard.html) ·
+  [Lidarr](https://sohex.github.io/musefs/integrations/lidarr.html) ·
+  [systemd](https://sohex.github.io/musefs/integrations/systemd.html) ·
+  [python-musefs](https://sohex.github.io/musefs/integrations/python-musefs.html)
 - [Architecture](https://sohex.github.io/musefs/architecture/overview.html) ·
   [Contributing](https://sohex.github.io/musefs/contributing/setup.html) ·
   [Benchmarks](https://sohex.github.io/musefs/benchmarks.html) ·
