@@ -35,20 +35,34 @@ def make_handler():
     album = _load("album.json")
 
     class Handler(BaseHTTPRequestHandler):
+        # Lidarr's MediaCoverService issues a HEAD before downloading cover art;
+        # an unhandled HEAD returns 501, so the cover never downloads. do_HEAD
+        # replays do_GET's routing/headers with the body suppressed.
+        _head = False
+
         def _send(self, obj, code=200):
             body = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if not self._head:
+                self.wfile.write(body)
 
         def _send_bytes(self, data, ctype):
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            if not self._head:
+                self.wfile.write(data)
+
+        def do_HEAD(self):  # noqa: N802
+            self._head = True
+            try:
+                self.do_GET()
+            finally:
+                self._head = False
 
         def do_GET(self):  # noqa: N802
             path = urlparse(self.path).path
