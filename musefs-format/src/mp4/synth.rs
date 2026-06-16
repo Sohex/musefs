@@ -280,11 +280,13 @@ pub(super) fn patch_chunk_offsets(kept: &mut [u8], delta: i64) -> Result<()> {
             let new_val = u32::try_from(v).map_err(|_| FormatError::TooLarge)?;
             kept[pos..pos + 4].copy_from_slice(&new_val.to_be_bytes());
         } else {
-            let v = read_u64_be(kept, pos)?.cast_signed() + delta;
-            if v < 0 {
-                return Err(FormatError::Malformed);
-            }
-            kept[pos..pos + 8].copy_from_slice(&v.cast_unsigned().to_be_bytes());
+            // `checked_add_signed` rejects both a negative relocated offset
+            // (underflow) and one past u64::MAX (overflow) — adding `delta` via a
+            // signed cast overflowed i64 for offsets near its bounds (fuzz crash).
+            let v = read_u64_be(kept, pos)?
+                .checked_add_signed(delta)
+                .ok_or(FormatError::Malformed)?;
+            kept[pos..pos + 8].copy_from_slice(&v.to_be_bytes());
         }
     }
     Ok(())
