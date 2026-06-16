@@ -10,7 +10,7 @@ musefs mount /path/to/mountpoint --db library.db \
     --mode synthesis        # or: structure-only
 ```
 
-`mount` blocks until the filesystem is unmounted (`fusermount -u`, or
+`mount` blocks until the filesystem is unmounted (`fusermount3 -u`, or
 Ctrl-C).
 
 > **`mount` never creates the store** — unlike `scan`, it requires a populated

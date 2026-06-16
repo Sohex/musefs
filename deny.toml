@@ -1,0 +1,57 @@
+# cargo-deny configuration: license allow-list + supply-chain bans.
+# Run locally with `cargo deny check`; CI runs it in audit.yml.
+# Advisories are also covered by rustsec/audit-check in audit.yml; cargo-deny
+# adds the license gate (which audit-check does not do) plus source/ban checks.
+
+[graph]
+all-features = true
+
+[licenses]
+# musefs is MIT. Allow only OSI-permissive / public-domain licenses compatible
+# with redistributing an MIT binary. Every entry below is present in the current
+# dependency tree (or a permissive arm of a multi-license `OR` expression);
+# weak-copyleft MPL-2.0 is file-level and fine to link. Copyleft licenses
+# (GPL/LGPL/AGPL) are intentionally absent — they only ever appear as the
+# non-selected arm of an `OR`, so the resolver picks a permissive arm instead.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are a hygiene smell, not a correctness bug here (the known
+# duplicates are test-only — see the audit notes), so warn.
+multiple-versions = "warn"
+# Forbid `version = "*"` deps, but exempt the internal workspace path crates
+# (musefs-core/-fuse/... are referenced by path with no version on purpose).
+wildcards = "deny"
+allow-wildcard-paths = true
+# A copyleft runtime dep would be a licensing problem; keep the door shut even
+# though none is present today.
+deny = []
+
+[advisories]
+# Advisories are primarily gated by rustsec/audit-check in audit.yml; cargo-deny
+# re-checks them here as defense in depth. Keep yanked crates a hard error.
+yanked = "deny"
+ignore = [
+    # paste 1.0.15 is archived/unmaintained (via tikv-jemalloc-ctl, the default
+    # allocator); no safe upgrade exists and it is a build-time proc-macro only.
+    "RUSTSEC-2024-0436",
+]
+
+[sources]
+# Only crates.io. A git or altern-registry dependency must be added here
+# deliberately.
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -118,6 +118,26 @@ jobs:
       - name: Core metrics-feature tests
         run: cargo test -p musefs-core --features metrics
 
+  deny:
+    # Supply-chain gate cargo audit doesn't cover: the license allow-list (plus
+    # bans/sources, and advisories as defense in depth alongside audit.yml).
+    # deny.toml is the source of truth. `cargo deny` reads metadata only — it
+    # runs no build scripts, so it needs no libfuse/SQLite toolchain.
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Install cargo-deny
+        # Unpinned, like cargo-mutants/cargo-fuzz: a pinned --locked install
+        # periodically breaks on the current toolchain. Known-good: 0.19.x.
+        run: cargo install cargo-deny --locked
+      - name: cargo-deny check
+        run: cargo deny check
+
   interop:
     # Property 5: an independent ecosystem reader (mutagen) reads the tags we
     # synthesize. Emits synthesized files via reader::read_at (no FUSE mount),
@@ -189,6 +209,12 @@ jobs:
         # module), NOT the system `picard`/Qt package, so they run here with no
         # system-Picard env — verified: contrib/picard/tests/test_path_gate.py:12.
         run: python -m pytest contrib/picard/tests -m musefs_bin -v
+      - name: picard vendor-sync gate (pure file compare, no Qt/Picard)
+        # test_vendor_sync.py is unmarked, so the heavyweight system-Picard
+        # `picard` job is otherwise its only runner. It imports only the bundled
+        # `musefs._common`, so it runs on this Qt-free runner too — gate it here
+        # so a forgotten vendor_to_picard.py re-vendor can't merge.
+        run: python -m pytest contrib/picard/tests/test_vendor_sync.py -v
       - name: Python -> Rust synthesis round trip
         run: bash scripts/contract-roundtrip.sh
 
@@ -522,7 +548,7 @@ jobs:
   # if any failed or was cancelled.
   ci-ok:
     if: always()
-    needs: [changes, check, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan]
+    needs: [changes, check, deny, interop, contract, python-musefs, beets, lidarr, picard, e2e, macos, freebsd, asan]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate required-job results
