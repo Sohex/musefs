@@ -3,6 +3,7 @@ name = "musefs"
 description = "Read-only FUSE filesystem presenting a re-tagged virtual view of a music library."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"

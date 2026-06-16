@@ -3,6 +3,7 @@ name = "musefs-cli"
 description = "musefs command-line interface: scan a music library and mount a re-tagged virtual view."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords = ["fuse", "music", "metadata", "filesystem", "audio"]

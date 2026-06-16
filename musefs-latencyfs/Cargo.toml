@@ -3,6 +3,7 @@ name = "musefs-latencyfs"
 description = "Bench-only passthrough FUSE with per-op latency injection for musefs benchmarks."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false

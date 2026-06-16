@@ -132,9 +132,11 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - name: Install cargo-deny
-        # Unpinned, like cargo-mutants/cargo-fuzz: a pinned --locked install
-        # periodically breaks on the current toolchain. Known-good: 0.19.x.
-        run: cargo install cargo-deny --locked
+        # Pinned to the 0.19 line: `deny` is a required gate, and cargo-deny's
+        # config schema changes across minor releases, so an unpinned install
+        # could fail unrelated PRs on a breaking upstream bump. Bump this
+        # together with the deny.toml schema.
+        run: cargo install cargo-deny --locked --version '^0.19'
       - name: cargo-deny check
         run: cargo deny check
 
