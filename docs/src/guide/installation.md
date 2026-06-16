@@ -75,3 +75,10 @@ build against the system allocator instead with
 
 On platforms without kernel passthrough, `--mode structure-only` still serves
 the original bytes, just through the daemon instead of the kernel.
+
+Filename **case-folding** is platform-aware: `--case-insensitive <true|false>`
+defaults to `true` on macOS and `false` on Linux/FreeBSD. When enabled,
+filenames are compared case-insensitively — case-variant directories merge into
+one (first-seen casing wins) and case-variant files get a numeric suffix (e.g.
+`Song (2)`); case-insensitive mounts refresh via a full rebuild rather than the
+incremental fast path.
