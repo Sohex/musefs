@@ -78,9 +78,11 @@ sandboxing is possible. The two units differ sharply:
   `musefs.conf` EnvironmentFile does **not** expand `%h` or `~` — use absolute
   paths there, and never paste `~/...` into a unit directive (it is taken
   literally).
-- **Settings.** `musefs.conf.example` is the full, canonical list of
-  `MUSEFS_*` variables. Explicit flags override env vars; `--fallback` and scan
-  targets are command-line only (set them in `ExecStart`).
+- **Settings.** `musefs.conf.example` is a commented example of the common
+  `MUSEFS_*` mount/scan variables (every scalar `mount`/`scan` flag has a
+  `MUSEFS_*` form — uppercase the long flag, dashes to underscores). Explicit
+  flags override env vars; `--fallback` and scan targets are command-line only
+  (set them in `ExecStart`).
 - **Inline overrides.** Prefer `systemctl --user edit musefs` to add
   `Environment=` lines in a drop-in; it survives reinstalls.
 - **Headless servers.** A `--user` timer only fires while your user manager
