@@ -1,6 +1,6 @@
 # Mounting & path templates
 
-### Mount
+## Mount
 
 ```bash
 musefs mount /path/to/mountpoint --db library.db \
@@ -46,7 +46,7 @@ beets/Picard/Lidarr sync, raw SQL) and the view refreshes automatically.
 
 Run `musefs <command> --help` for the full flag list.
 
-#### Path templates
+### Path templates
 
 Paths come from a beets-style template (matched case-insensitively;
 any tag key in the store works):

@@ -3,9 +3,9 @@
 This is the technical reference for musefs internals: how a virtual file is
 assembled, how the workspace is layered, what the SQLite store guarantees, and
 how external edits become visible without a remount. For usage, see the
-[README](../../../README.md); for the development workflow, see
-[CONTRIBUTING](../contributing/setup.md); for per-format behavior, see the format docs
-under `docs/`.
+[User Guide](../guide/quick-start.md); for the development workflow, see
+[Contributing](../contributing/setup.md); for per-format behavior, see the
+[format docs](../formats/overview.md).
 
 ## Design overview
 

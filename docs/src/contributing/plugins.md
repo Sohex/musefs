@@ -4,21 +4,21 @@
 
 The four packages share one drift-guarded contract; see
 [the contrib ecosystem](../architecture/tree-scanning.md#the-contrib-ecosystem) for the layout and
-each README for plugin-specific setup.
+the [integration pages](../integrations/overview.md) for plugin-specific setup.
 
 ```bash
 # python-musefs: self-contained
 cd contrib/python-musefs && python -m pytest && ruff check . && ruff format --check .
 
-# beets: python-musefs is UNPUBLISHED — install the local lib first or
-# dependency resolution fails (see contrib/beets/README.md for the venv flow)
+# beets: install the local python-musefs first so the suite tests the working
+# tree, not the PyPI release (see the beets integration page for the venv flow)
 cd contrib/beets && pip install -e ../python-musefs && pip install -e ".[test]" && python -m pytest tests
 
 # picard: no install needed (vendored + pythonpath=".")
 cd contrib/picard && python -m pytest tests
 
-# lidarr: python-musefs is UNPUBLISHED — install the local lib first or
-# dependency resolution fails (see contrib/lidarr/README.md for the env flow)
+# lidarr: install the local python-musefs first so the suite tests the working
+# tree, not the PyPI release (see the lidarr integration page for the env flow)
 cd contrib/lidarr && pip install -e ../python-musefs && pip install -e ".[test]" && python -m pytest tests
 ```
 

@@ -3,7 +3,7 @@
 `musefs --version` (or `-V`) prints the build version; `--help` on the root or
 any subcommand lists its flags.
 
-### Scan
+## Scan
 
 ```bash
 musefs scan /path/to/music --db library.db            # ingest (dirs recurse)
@@ -43,7 +43,7 @@ rescan.
 **preserving any tag edits you made in the store** — prunes tracks whose
 backing file is gone, and garbage-collects orphaned art.
 
-#### Content checksums and move re-identification
+### Content checksums and move re-identification
 
 `--checksum=none|fingerprint|full` (env `MUSEFS_CHECKSUM`, default
 `fingerprint`) controls what content checksums `scan` computes and stores.

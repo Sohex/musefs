@@ -208,12 +208,18 @@ for a custom write loop)
   extension.
 - `prune_missing(conn, track_ids=None)` → count — delete tracks whose backing
   file no longer exists (every track, or just `track_ids`).
+- `delete_tracks(conn, track_ids)` → count — unconditionally delete the given
+  track rows (intent-based, unlike `prune_missing`'s on-disk existence check);
+  their `tags` and `track_art` rows cascade away.
 
 **Reading**
 
 - `track_ids_for_paths(conn, keys)` → `{key: id}` — bulk `backing_path` → track
   id; keys with no matching row are omitted. Chunked under SQLite's parameter
   cap, so arbitrarily large lookups are safe (the bulk `track_id_for_path`).
+- `track_ids_by_tag(conn, key, value)` → `[id, …]` — track ids whose plugin-owned
+  text tag `(key, value)` matches (scanner-written binary tags never match);
+  maps a source's "I deleted this album/artist" signal back to the rows it tagged.
 - `tags_for_track(conn, track_id)` → `[TagRow, …]` ordered by key then ordinal,
   covering both plugin-owned text tags and scanner-written binary tags.
 - `TagRow(key, value, value_blob)` — one read-back tag row. Text tags have

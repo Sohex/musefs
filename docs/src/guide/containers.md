@@ -1,6 +1,6 @@
 # Running in containers
 
-### Container images
+## Container images
 
 Each tagged release also publishes multi-arch images to the GitHub Container
 Registry:
@@ -20,7 +20,7 @@ ordinary FUSE daemon and the image exists mainly to colocate musefs with
 containerized media managers (e.g. Lidarr). If you do containerize, mind the
 gotchas below.
 
-#### Required flags
+### Required flags
 
 musefs mounts via FUSE, so the container needs `/dev/fuse` and the matching
 capability:
@@ -46,7 +46,7 @@ denied`. Under rootless Podman the capability is confined to the container's use
 namespace rather than the host, so its blast radius is smaller, but it is still
 required. Running musefs on the host needs no such capability at all.
 
-#### Runs as a non-root user
+### Runs as a non-root user
 
 The images run as a dedicated unprivileged user (default uid/gid 1000), not
 root — musefs mounts via the setuid `fusermount3` helper and needs no root of
@@ -64,7 +64,7 @@ its own. Consequences for the commands above:
   containers or users, below) passes musefs's pre-flight check. See
   [Ownership and permissions](configuration.md#ownership-and-permissions).
 
-#### The mount-visibility gotcha (read this before sharing the mount)
+### The mount-visibility gotcha (read this before sharing the mount)
 
 A FUSE mount made inside a container lives in that container's mount namespace.
 By default neither the host nor other containers can see it, so pointing a second
@@ -113,7 +113,7 @@ consumer gets `Permission denied` on the mount. See
 Both the glibc and musl images carry the `fuse3` userspace tools; pick `:musl`
 if your other containers are Alpine-based, otherwise the default tags are fine.
 
-#### Sharing a host mount into a container
+### Sharing a host mount into a container
 
 Running musefs on the host instead of in a container is simpler and needs no
 `CAP_SYS_ADMIN`. Mark the mount point as shared and mount musefs there with

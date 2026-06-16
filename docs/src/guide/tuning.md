@@ -1,6 +1,6 @@
 # Tuning & metrics
 
-### Tuning
+## Tuning
 
 The defaults are sensible for most setups, including the two measured storage wins —
 daemon-level backing read-ahead (`--read-ahead-budget-mib`, the single biggest win for
@@ -22,7 +22,7 @@ and numbers).
 Filename case-folding (`--case-insensitive`) is platform behaviour rather than
 a performance knob — see [Platform support](installation.md#platform-support).
 
-### Metrics
+## Metrics
 
 `musefs mount` optionally exposes runtime telemetry through a synthetic
 `.musefs-metrics/` directory at the mount root:

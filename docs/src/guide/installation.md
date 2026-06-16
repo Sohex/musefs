@@ -10,7 +10,7 @@ Whichever you pick, mounting needs a 64-bit FUSE-capable OS (Linux, FreeBSD, mac
 >
 > At present AMD64, AARCH64, and RISC-V 64 are supported. If you'd like 32-bit support please open an issue.
 
-### Prebuilt binaries
+## Prebuilt binaries
 
 Each tagged release attaches static/portable Linux binaries for six targets:
 
@@ -46,7 +46,7 @@ the target needs the FUSE userspace tools and `/dev/fuse`:
 
 No glibc/libfuse install is needed for the musl binaries beyond `fuse3`.
 
-### Building from source
+## Building from source
 
 `cargo install musefs` compiles the latest release; building needs a stable
 Rust toolchain (2024 edition) plus the FUSE headers (`libfuse3-dev`) and
@@ -65,7 +65,7 @@ build against the system allocator instead with
 `cargo build -p musefs --no-default-features` (or `cargo install musefs
 --no-default-features`).
 
-### Platform support
+## Platform support
 
 | Platform | FUSE | Kernel passthrough (StructureOnly) | Notes |
 | --- | --- | --- | --- |
