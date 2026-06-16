@@ -544,4 +544,56 @@ exclude_re = [
     # anchor (the literal-coord detector needs `:digits:digits:`), so count=1 applies.
     # guard: count=1
     'musefs-core/src/scan\.rs:\d+:16: delete ! in ingest_unit',
+
+    # --- musefs-latencyfs: bench-only passthrough FUSE adapter survivors ---
+    # The bench harness's logic-bearing mutants (the inode map, latency table,
+    # attr mapping, the readdir kind-classification and parent-inode synthesis,
+    # the read splice) ARE killed by the mounted `#[ignore]`d tests run in the
+    # crate's own mutation leg (`-- -- --include-ignored`, scripts/mutants.sh).
+    # The entries below are the residue: the thin `fuser::Filesystem` reply
+    # plumbing — the exact class `musefs-fuse/src/lib.rs` is excluded wholesale
+    # for (exclude_globs above). They split into two unkillable kinds.
+    #
+    # Hang-class (TIMEOUT-only, the SP3 non-terminating-loop precedent): these
+    # never produce a clean kill, only flag on the timeout budget, and OOM/cancel
+    # the leg rather than fail an assertion.
+    #
+    # usize_from const-return (`-> 0` / `-> 1`, one site): the crate's sanctioned
+    # u64->usize cast, used for `read`'s buffer size and readdir's skip offset.
+    # The exact MACHINE-KILLER class as musefs-format's convert.rs usize_from
+    # above — a constant size makes `read` return 0/1 bytes forever so the mounted
+    # reader loops. Pinned functionally by every read/readdir consumer.
+    'musefs-latencyfs/src/lib\.rs:\d+:\d+: replace usize_from -> usize',
+    # readdir entry-cookie `(i + 1)` -> `(i * 1)`: the kernel re-requests the
+    # same offset forever (the cookie never advances), an infinite readdir. The
+    # `+`->`-` sibling underflows to a panic at i==0 and IS caught. Sole `+` in
+    # readdir, so description-anchored.
+    'replace \+ with \* in <impl fuser::Filesystem for PassthroughFs>::readdir',
+    # read -> (): drops the `ReplyData` without responding, so the `read()`
+    # syscall blocks forever waiting on the FUSE reply. The read I/O itself
+    # (buffer fill, offset splice) is pinned by reads_a_file_through_the_mount;
+    # only the whole-body drop hangs.
+    'replace <impl fuser::Filesystem for PassthroughFs>::read with \(\)',
+    #
+    # Unwaited-ack / unobservable thin-adapter (MISSED): replacing these bodies
+    # with () drops a reply the kernel never blocks on (release/releasedir are
+    # fire-and-forget) or skips state with no observable effect — so a clean
+    # mounted run can't distinguish them, and any test that DID invoke them on a
+    # waited reply (access/flush/fsyncdir) would hang on the dropped reply rather
+    # than fail, i.e. hang-class again.
+    #
+    # releasedir/access: bodies are literally just `reply.ok()` — pure acks.
+    'replace <impl fuser::Filesystem for PassthroughFs>::releasedir with \(\)',
+    'replace <impl fuser::Filesystem for PassthroughFs>::access with \(\)',
+    # flush: only skips a `nap()` (latency injection) before the ack — timing,
+    # not correctness.
+    'replace <impl fuser::Filesystem for PassthroughFs>::flush with \(\)',
+    # release: leaks one entry in the `handles` map (no accessor exposes it and
+    # the bench never exhausts fds), otherwise an unwaited ack.
+    'replace <impl fuser::Filesystem for PassthroughFs>::release with \(\)',
+    # fsyncdir: increments the `fsyncs` counter, but it shares that counter with
+    # `fsync` (which dominates every fsync-counting test, keeping it `> 0`), and
+    # isolating a directory fsync would hang on the dropped reply. The counter's
+    # real contract is pinned by the fsync tests.
+    'replace <impl fuser::Filesystem for PassthroughFs>::fsyncdir with \(\)',
 ]
