@@ -27,6 +27,14 @@ pub enum TemplateError {
     /// not a valid POSIX path-component byte.
     #[error("template literal contains control byte {byte:#04x}")]
     ControlByte { byte: u8 },
+    /// A `${`/`$!{` field was opened but never closed by `}` before the end of
+    /// the template, e.g. `${albumartist`.
+    #[error("template has an unterminated '${{' field (missing '}}')")]
+    UnterminatedField,
+    /// A `[...]` section was opened but never closed by `]` before the end of
+    /// the template, e.g. `$album[ - $disc`.
+    #[error("template has an unclosed '[' section (missing ']')")]
+    UnclosedSection,
 }
 
 /// A parsed path template: literal runs, `$field` / `${field}` substitutions
@@ -55,7 +63,9 @@ enum Part {
 impl Template {
     /// Parse a beets-style template. Returns `Err` for a template that cannot
     /// produce valid path components: control/NUL bytes in literal text
-    /// (#275) or `[...]` nesting deeper than [`MAX_SECTION_DEPTH`] (#304).
+    /// (#275), `[...]` nesting deeper than [`MAX_SECTION_DEPTH`] (#304), an
+    /// unterminated `${`/`$!{` field (no closing `}`), or an unclosed `[`
+    /// section (no closing `]`).
     ///
     /// - `$field` / `${field}` substitute a tag field; `${a|b|c}` is a fallback
     ///   chain (first present wins). Names are matched case-insensitively.
@@ -63,9 +73,9 @@ impl Template {
     ///   separators (each segment sanitized; empty / `.` / `..` dropped).
     /// - `[...]` is a conditional section, suppressed when every field it
     ///   references is empty. `$[` and `$]` emit literal brackets.
-    /// - A `$` not followed by a recognized form stays literal; an unterminated
-    ///   `${`/`$!{` consumes the rest as the name; an unterminated `[` runs to
-    ///   end of input.
+    /// - A `$` not followed by a recognized form stays literal. An unterminated
+    ///   `${`/`$!{` (missing `}`) or an unclosed `[` section (missing `]`) is a
+    ///   parse error.
     pub fn parse(template: &str) -> Result<Template, TemplateError> {
         let mut chars = template.chars().peekable();
         let parts = parse_parts(&mut chars, 0)?;
@@ -121,14 +131,18 @@ impl Template {
 }
 
 /// Parse parts until a closing `]` (when `depth > 0`) or end of input. `depth`
-/// is the current `[...]` nesting level (0 = top level).
+/// is the current `[...]` nesting level (0 = top level). A section opened at
+/// `depth > 0` that reaches end of input without its `]` is rejected as
+/// [`TemplateError::UnclosedSection`].
 fn parse_parts(chars: &mut Peekable<Chars>, depth: usize) -> Result<Vec<Part>, TemplateError> {
     let mut parts = Vec::new();
     let mut literal = String::new();
+    let mut closed = false;
     while let Some(&c) = chars.peek() {
         match c {
             ']' if depth > 0 => {
                 chars.next(); // consume the closing ']'
+                closed = true;
                 break;
             }
             '[' => {
@@ -155,7 +169,7 @@ fn parse_parts(chars: &mut Peekable<Chars>, depth: usize) -> Result<Vec<Part>, T
                     }
                     Some('{') => {
                         chars.next();
-                        let names = parse_braced_names(chars);
+                        let names = parse_braced_names(chars)?;
                         push_literal(&mut parts, &mut literal);
                         parts.push(Part::Field { names, raw: false });
                     }
@@ -163,7 +177,7 @@ fn parse_parts(chars: &mut Peekable<Chars>, depth: usize) -> Result<Vec<Part>, T
                         chars.next(); // consume '!'
                         if chars.peek() == Some(&'{') {
                             chars.next(); // consume '{'
-                            let names = parse_braced_names(chars);
+                            let names = parse_braced_names(chars)?;
                             push_literal(&mut parts, &mut literal);
                             parts.push(Part::Field { names, raw: true });
                         } else {
@@ -192,6 +206,9 @@ fn parse_parts(chars: &mut Peekable<Chars>, depth: usize) -> Result<Vec<Part>, T
         }
     }
     push_literal(&mut parts, &mut literal);
+    if depth > 0 && !closed {
+        return Err(TemplateError::UnclosedSection);
+    }
     Ok(parts)
 }
 
@@ -201,17 +218,23 @@ fn push_literal(parts: &mut Vec<Part>, literal: &mut String) {
     }
 }
 
-/// Consume up to the next `}` (or end of input) and split on `|` into the
-/// candidate name list, lowercased for case-insensitive lookup.
-fn parse_braced_names(chars: &mut Peekable<Chars>) -> Vec<String> {
+/// Consume up to the next `}` and split on `|` into the candidate name list,
+/// lowercased for case-insensitive lookup. Reaching end of input before the
+/// closing `}` is a [`TemplateError::UnterminatedField`].
+fn parse_braced_names(chars: &mut Peekable<Chars>) -> Result<Vec<String>, TemplateError> {
     let mut content = String::new();
+    let mut closed = false;
     for nc in chars.by_ref() {
         if nc == '}' {
+            closed = true;
             break;
         }
         content.push(nc);
     }
-    content.split('|').map(str::to_ascii_lowercase).collect()
+    if !closed {
+        return Err(TemplateError::UnterminatedField);
+    }
+    Ok(content.split('|').map(str::to_ascii_lowercase).collect())
 }
 
 fn parse_unbraced_name(chars: &mut Peekable<Chars>) -> String {
@@ -395,7 +418,7 @@ mod tests {
 
     #[test]
     fn nesting_at_limit_parses_one_past_limit_rejected() {
-        let at_limit = "[".repeat(MAX_SECTION_DEPTH);
+        let at_limit = "[".repeat(MAX_SECTION_DEPTH) + &"]".repeat(MAX_SECTION_DEPTH);
         assert!(
             Template::parse(&at_limit).is_ok(),
             "{MAX_SECTION_DEPTH} deep parses"

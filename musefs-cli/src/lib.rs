@@ -165,6 +165,11 @@ pub struct MountArgs {
     /// cargo feature, which adds the syscall counters.
     #[arg(long, env = "MUSEFS_EXPOSE_METRICS", value_parser = clap::builder::BoolishValueParser::new())]
     pub expose_metrics: bool,
+    /// Validate the template and config and print a sample of the paths the
+    /// mount would expose, then exit without mounting. Use this to check a
+    /// `--template` before committing to a mount.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -378,6 +383,18 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     if !args.db.exists() {
         anyhow::bail!("database does not exist: {}", args.db.display());
     }
+    if !args.dry_run && !args.mountpoint.is_dir() {
+        if args.mountpoint.exists() {
+            anyhow::bail!(
+                "mountpoint is not a directory: {}",
+                args.mountpoint.display()
+            );
+        }
+        anyhow::bail!(
+            "mountpoint does not exist (create it first): {}",
+            args.mountpoint.display()
+        );
+    }
     let db =
         Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
     let (config, fuse_config) = parse_mount_config(args);
@@ -387,10 +404,78 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
         }
     }
     let core = Musefs::open(db, config).context("building the virtual filesystem")?;
+    if args.dry_run {
+        return print_dry_run(&core);
+    }
     signal::install_unmount_on_signal(args.mountpoint.clone())
         .context("installing the stop-signal unmount handler")?;
     musefs_fuse::mount_with(core, &args.mountpoint, "musefs", fuse_config)
         .with_context(|| format!("mounting at {}", args.mountpoint.display()))?;
+    Ok(())
+}
+
+/// Print a sample of the paths a `mount --dry-run` would expose, walking the
+/// already-built virtual tree so the preview reflects the exact rendering the
+/// real mount uses.
+fn print_dry_run(core: &Musefs) -> Result<()> {
+    // The virtual tree root is inode 1 (the FUSE root id).
+    const ROOT_INODE: u64 = 1;
+    const SAMPLE: usize = 30;
+    let mut sample: Vec<String> = Vec::new();
+    let (mut files, mut dirs) = (0u64, 0u64);
+    walk_preview(
+        core,
+        ROOT_INODE,
+        "",
+        SAMPLE,
+        &mut sample,
+        &mut files,
+        &mut dirs,
+    )?;
+    if files == 0 {
+        println!(
+            "dry run: this template produces no files (the store is empty, or every track was dropped by --skip-on-missing)."
+        );
+        return Ok(());
+    }
+    println!("dry run: {files} files across {dirs} directories. Sample paths:");
+    for path in &sample {
+        println!("  {path}");
+    }
+    if files > sample.len() as u64 {
+        println!("  ... and {} more", files - sample.len() as u64);
+    }
+    Ok(())
+}
+
+/// Depth-first walk of the virtual tree. `readdir` returns name-sorted children,
+/// so `sample` collects the first `cap` file paths in lexicographic order while
+/// `files`/`dirs` accumulate the totals.
+fn walk_preview(
+    core: &Musefs,
+    inode: u64,
+    prefix: &str,
+    cap: usize,
+    sample: &mut Vec<String>,
+    files: &mut u64,
+    dirs: &mut u64,
+) -> Result<()> {
+    for (name, child, is_dir) in core.readdir(inode)? {
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if is_dir {
+            *dirs += 1;
+            walk_preview(core, child, &path, cap, sample, files, dirs)?;
+        } else {
+            *files += 1;
+            if sample.len() < cap {
+                sample.push(path);
+            }
+        }
+    }
     Ok(())
 }
 

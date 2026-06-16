@@ -167,6 +167,7 @@ fn parse_mount_config_defaults_are_sensible() {
         read_ahead_prefetch: false,
         skip_on_missing: false,
         expose_metrics: false,
+        dry_run: false,
     };
     let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.template, "$artist/$title");
@@ -204,6 +205,7 @@ fn parse_mount_config_keep_cache_sets_flag() {
         read_ahead_prefetch: false,
         skip_on_missing: false,
         expose_metrics: false,
+        dry_run: false,
     };
     let (config, fuse_config) = parse_mount_config(&args);
     assert_eq!(config.mode, Mode::StructureOnly);
@@ -237,6 +239,7 @@ fn parse_mount_config_saturating_readahead() {
         read_ahead_prefetch: false,
         skip_on_missing: false,
         expose_metrics: false,
+        dry_run: false,
     };
     let (_, fuse_config) = parse_mount_config(&args);
     assert_eq!(fuse_config.max_readahead, u32::MAX);
@@ -294,6 +297,7 @@ fn parse_mount_config_populates_per_field_fallbacks() {
         read_ahead_prefetch: false,
         skip_on_missing: false,
         expose_metrics: false,
+        dry_run: false,
     };
     let (config, _) = parse_mount_config(&args);
     assert_eq!(

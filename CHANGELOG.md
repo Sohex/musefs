@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`mount --dry-run`:** validate the `--template` and configuration and print a
+  sample of the paths the mount would expose (with total file and directory
+  counts), then exit without mounting — a way to check a template before
+  committing to a mount.
 - **Runtime telemetry (`.musefs-metrics`):** an opt-in `--expose-metrics` flag
   (env `MUSEFS_EXPOSE_METRICS`) surfaces a synthetic `.musefs-metrics` file at
   the mount root rendering Prometheus-format counters — getattr/read/open
@@ -51,8 +55,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   skip count is diagnosable — expected sidecars versus genuinely unexpected
   files. Log-only; the `ScanStats` struct and CLI summary are unchanged (#341).
 
+### Changed
+
+- **Strict template validation:** an unclosed `[ … ]` section or an unterminated
+  `${` / `$!{` field is now rejected at mount time with an error naming the
+  problem, instead of silently folding the rest of the template into the open
+  construct — which turned a typo'd bracket into a surprising directory tree.
+
 ### Fixed
 
+- **Clearer mount errors:** a missing or non-directory mountpoint is reported
+  with an actionable message before FUSE setup (previously a bare `os error 2`,
+  or a misleading "Permission denied" when the path was a regular file), and
+  I/O errors no longer print their OS string twice.
 - **Silent mp4 oversize drops:** oversized embedded `covr` cover art and binary
   freeform (`----`) values in `.m4a`/`.m4b` files are skipped in the format layer
   before materialization (to avoid building a large image out of a large `moov`),

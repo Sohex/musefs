@@ -54,10 +54,16 @@ fn lone_dollar_stays_literal() {
 }
 
 #[test]
-fn unterminated_brace_consumes_rest_as_field_name() {
-    let f = fields(&[("album", "X")]);
-    let path = parse("${album").render(&f, &BTreeMap::new(), "Unknown", "ogg");
-    assert_eq!(path, "X.ogg");
+fn unterminated_brace_is_rejected() {
+    assert!(matches!(
+        Template::parse("${album"),
+        Err(TemplateError::UnterminatedField)
+    ));
+    // A `$!{` path field is equally strict.
+    assert!(matches!(
+        Template::parse("$!{beets_path"),
+        Err(TemplateError::UnterminatedField)
+    ));
 }
 
 #[test]
@@ -204,9 +210,14 @@ fn stray_closing_bracket_is_literal() {
 }
 
 #[test]
-fn unterminated_section_runs_to_end_of_input() {
+fn unclosed_section_is_rejected() {
+    assert!(matches!(
+        Template::parse("$album[ CD $disc"),
+        Err(TemplateError::UnclosedSection)
+    ));
+    // A balanced section still parses and renders.
     let f = fields(&[("album", "LP"), ("disc", "2")]);
-    let path = parse("$album[ CD $disc").render(&f, &BTreeMap::new(), "Unknown", "flac");
+    let path = parse("$album[ CD $disc]").render(&f, &BTreeMap::new(), "Unknown", "flac");
     assert_eq!(path, "LP CD 2.flac");
 }
 

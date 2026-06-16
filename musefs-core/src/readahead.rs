@@ -331,7 +331,13 @@ impl ReadAhead {
         } else {
             self.window = WINDOW_FLOOR.min(self.cap);
         }
-        debug_assert!(off < backing_len && off + len as u64 <= backing_len);
+        // A read straddling EOF (`off + len > backing_len`) would clamp `want`
+        // below `len` and panic on `buf[..len]` below. The serve path never
+        // requests past the backing length, but this is a `pub` method, so fail
+        // closed with `read_exact` semantics rather than panic in release.
+        if off >= backing_len || off.saturating_add(len as u64) > backing_len {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
         let want = self
             .window
             .max(len as u64)
@@ -709,6 +715,22 @@ mod window_tests {
             off + len as u64 <= 700 * 1024,
             "fill must not read past EOF"
         );
+    }
+
+    #[test]
+    fn read_straddling_eof_errors_not_panics() {
+        let mut fake = Fake::new(1000);
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        let backing_len = fake.data.len() as u64;
+        // Range ends past EOF: off=990, len=20 → 1010 > 1000.
+        let mut dst = vec![0u8; 20];
+        let err = ra
+            .read_into(&mut dst, 990, backing_len, |b, o| fake.fill(b, o))
+            .expect_err("a read past EOF must fail, not panic");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // A read ending exactly at EOF is still valid.
+        let ok = ra.read_into(&mut dst, 980, backing_len, |b, o| fake.fill(b, o));
+        assert!(ok.is_ok(), "off+len == backing_len is in range");
     }
 }
 
