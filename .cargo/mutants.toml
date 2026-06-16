@@ -596,4 +596,87 @@ exclude_re = [
     # isolating a directory fsync would hang on the dropped reply. The counter's
     # real contract is pinned by the fsync tests.
     'replace <impl fuser::Filesystem for PassthroughFs>::fsyncdir with \(\)',
+
+    # ── Campaign #266 findings ──────────────────────────────────────────────
+    # Hang-class (non-terminating, TIMEOUT-only) advance/loop freezes and one
+    # allocation bomb, plus equivalent boundary/capacity mutants. The 9 genuinely
+    # killable survivors the same campaign found got TESTS instead of exclusions.
+
+    # VirtualTree::disambiguate candidate search assumes each ` (k)`-ranked
+    # candidate is a distinct, eventually-free key. Forcing `taken` always-true, or
+    # dropping the `!` that selects the free branch, spins the search forever
+    # (TIMEOUT-only) — the suffix_candidate / ancestor_in family. The
+    # `taken -> false` sibling IS caught and stays in scope.
+    'replace VirtualTree::taken -> bool with true',
+    # The `!` at col 16 (not the sibling at col 12, which IS caught); pinned by
+    # column like the ingest_unit `delete !` above. `delete` has no operator, so a
+    # line:col guard can't apply — column-anchored count instead.
+    # guard: count=1
+    'musefs-core/src/tree\.rs:\d+:16: delete ! in VirtualTree::disambiguate',
+    # fold (case-fold) and join_path (node-path builder) const-returns: hang-class,
+    # the InodeAllocator::key precedent. A constant fold/path collapses every node
+    # onto one key, so path_of's `while cur != ROOT` walk self-loops forever. Real
+    # behavior is pinned by the rebuild / inode-stability tests. One site each (two
+    # const-return mutants).
+    'musefs-core/src/tree\.rs:\d+:\d+: replace fold -> String with',
+    'musefs-core/src/tree\.rs:\d+:\d+: replace join_path -> String with',
+
+    # mp4 box-walk advance freezes (hang-class, the wav walk_chunks precedent).
+    # read_structure_from's `pos += total` and BoxRef::end's `start + total_len`
+    # (or a constant `end`) pin the seeking walk's position forever while it
+    # re-reads the same box. The `+= -=` / `+ -` siblings underflow to a panic and
+    # ARE caught. One site each.
+    'musefs-format/src/mp4\.rs:\d+:\d+: replace \+= with \*= in read_structure_from',
+    'musefs-format/src/mp4\.rs:\d+:\d+: replace \+ with \* in BoxRef::end',
+    'musefs-format/src/mp4\.rs:\d+:\d+: replace BoxRef::end -> usize with [01]',
+
+    # Ogg page lacer/reader advance freezes — hang-class plus the #266 OOM bomb.
+    # total_len() -> 0, the `lace_pos < laces.len()` loop bounds, and the
+    # `lace_pos += seg_count` / `+= chunk` advances each pin a page-walk index so
+    # the loop never terminates. lace_packet / lace_chunks_to_segments spin CPU-
+    # bound (TIMEOUT); read_packets's `pos += total_len` is the ALLOCATION BOMB: a
+    # continued page-0 packet makes `cur.extend_from_slice` grow without bound,
+    # OOMing the runner before the timeout fires (observed canceling shard 25/27 of
+    # campaign #266). The `+= -=` / `-> 1` siblings underflow-panic / still advance
+    # and ARE caught. One site each.
+    'musefs-format/src/ogg/page\.rs:\d+:\d+: replace PageHeader::total_len -> usize with 0',
+    'musefs-format/src/ogg/page\.rs:\d+:\d+: replace < with (<=|==) in lace_packet',
+    'musefs-format/src/ogg/page\.rs:\d+:\d+: replace < with (<=|==) in lace_chunks_to_segments',
+    # The lace_pos / pos advances specifically (cols pinned): the sibling
+    # `payload_pos`/`pages`/`seq`/`seg` advances at adjacent lines do not gate loop
+    # termination and ARE caught.
+    # guard: op="+=" fn="lace_packet" rows=1
+    'musefs-format/src/ogg/page\.rs:124:18: replace \+= with \*= in lace_packet',
+    # guard: op="+=" fn="lace_chunks_to_segments" rows=1
+    'musefs-format/src/ogg/page\.rs:351:18: replace \+= with \*= in lace_chunks_to_segments',
+    # guard: op="+=" fn="read_packets" rows=1
+    'musefs-format/src/ogg/page\.rs:189:13: replace \+= with \*= in read_packets',
+
+    # Equivalent mutants from #266.
+    # push_block_header `(if is_last {0x80} else {0}) | (block_type & 0x7F)`,
+    # `|`->`^`: bit-disjoint operands (bit 7 vs bits 0-6), so `|`/`^` are identical
+    # — the fixtures::flac_block equivalence above.
+    'musefs-format/src/flac\.rs:\d+:\d+: replace \| with \^ in push_block_header',
+    # parse_picture_block mime/desc length-bound guards `mime_end > body.len()` /
+    # `desc_end > body.len()`, `>`->`>=`: at the boundary (a field ending exactly at
+    # body end) the original proceeds and the next field read goes out of bounds ->
+    # Malformed, the same error `>=` returns directly. The data_end guard below them
+    # IS behavioral (a picture whose data fills the body exactly is valid) and stays
+    # IN scope, so these two are pinned by line:col.
+    # guard: op=">" fn="parse_picture_block" rows=1
+    'musefs-format/src/flac\.rs:475:17: replace > with >= in parse_picture_block',
+    # guard: op=">" fn="parse_picture_block" rows=1
+    'musefs-format/src/flac\.rs:483:17: replace > with >= in parse_picture_block',
+    # lace_chunks_to_segments `header_len = 27 + seg_count`, `+`->`*`: header_len
+    # only sizes a `Vec::with_capacity` hint; the header is built by `extend`, so
+    # any capacity is behavior-identical (the CACHE_ESTIMATED_ITEMS precedent). The
+    # `lace_pos + seg_count` slice `+` elsewhere IS caught, so pinned by line:col.
+    # guard: op="+" fn="lace_chunks_to_segments" rows=1
+    'musefs-format/src/ogg/page\.rs:332:29: replace \+ with \* in lace_chunks_to_segments',
+    # crc_feed_payload / emit_segments overlap guards `if os < oe`, `<`->`<=`: at
+    # os==oe the overlap is empty, so the branch folds a zero-length slice / reads 0
+    # art bytes — byte-identical CRC and segments (the serve_ogg_window empty-overlap
+    # equivalence). One `<` per fn, so description-anchored.
+    'musefs-format/src/ogg/page\.rs:\d+:\d+: replace < with <= in crc_feed_payload',
+    'musefs-format/src/ogg/page\.rs:\d+:\d+: replace < with <= in emit_segments',
 ]
