@@ -14,6 +14,9 @@ your music library — without modifying or duplicating a single byte of the
 original audio. Fix tags, art, and folder structure in a SQLite store; the
 mount shows a clean library while your files stay exactly as they are.
 
+Runs on **Linux**, **FreeBSD**, and **macOS\*** &mdash; *\*macOS builds and
+passes unit tests, but mounted end-to-end behaviour is not yet validated.*
+
 ## Quick start
 
 ```bash
@@ -61,3 +64,7 @@ Lidarr. With thanks to **[Komiku](https://loyaltyfreakmusic.com/)** (Loyalty
 Freak Music), whose track *"The calling"* (from *The Adventure Goes On, Vol. 1*)
 is dedicated to the public domain under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)
 and vendored as that test's fixture — thank you for releasing music freely.
+
+## AI Disclaimer
+
+This project was developed using AI, primarily Claude Opus and MiMo v2.5.
