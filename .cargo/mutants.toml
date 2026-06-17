@@ -259,19 +259,6 @@ exclude_re = [
     # forever instead of returning false.
     'replace == with != in VirtualTree::ancestor_in',
 
-    # SP4 storage-aware serving — equivalent mutant in serve_ogg_window's last-page
-    # memo. `total_len = header_len + payload_len` only sets the memoized page's
-    # [start, start+total_len) range, which find_page_start uses to decide whether to
-    # short-circuit. `+`->`*` only ever makes total_len LARGER (real pages) or 0
-    # (payload_len 0), never landing find_page_start on a page AFTER the true one:
-    # too-large only widens the range so the forward walk STARTS at an
-    # earlier-or-equal page (its overlap clipping then emits the identical bytes), and
-    # 0 disables the short-circuit (falls to the scan, also correct). So the served
-    # output is byte-identical either way. (`+`->`-` underflows and is caught.) Pinned
-    # by line:col — one of several `+` in this fn; the others ARE caught.
-    # guard: op="+" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:256:41: replace \+ with \* in serve_ogg_window',
-
     # SP4 crc_shift_zeros — equivalent mutants inherent to the loop/matrix hybrid.
     # crc_shift_zeros has two code paths (a per-step loop and a GF(2) matrix-power)
     # that compute the IDENTICAL value; the differential test pins the result, but no
@@ -314,9 +301,9 @@ exclude_re = [
     # were reported TIMEOUT under the parallel gate's load, not as a real hang. Pinned
     # by line:col — several `<` in this fn (the loop/length guards) ARE caught.
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:235:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:239:15: replace < with <= in serve_ogg_window',
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:244:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:248:15: replace < with <= in serve_ogg_window',
 
     # Phase 4 poll debounce (#89) — equivalent `<`->`<=` on the two wall-clock
     # gates (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <
@@ -467,7 +454,7 @@ exclude_re = [
     # the ring under the read lock); the fn's other two `+` are the observable fills
     # counters and stay killable, so this one is pinned by coordinate, not by fn.
     # guard: op="+" fn="BackingReader<'a>::read_exact_at" rows=2
-    'musefs-core/src/readahead\.rs:612:68:',
+    'musefs-core/src/readahead\.rs:613:68:',
     #
     # More hang-class (TIMEOUT-only, CANCEL the in-diff job): `len() -> 1` /
     # `clear() -> 1` force a constant resident size, so `evict_one_coldest` keeps

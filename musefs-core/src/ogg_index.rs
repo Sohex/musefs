@@ -185,6 +185,17 @@ pub fn serve_ogg_window(
 
     // Reused across pages — refilled per page, never exceeds MAX_OGG_HEADER_BYTES.
     let mut hdr_buf: Vec<u8> = Vec::new();
+    // Snapshot the memoized patched header ONCE up front: it can be reused for the
+    // single page it was recorded against (the boundary-straddling page a sequential
+    // read re-touches). The loop then collects the last page in `last_entry` and
+    // writes the memo ONCE after the walk — instead of locking the per-file memo
+    // twice per page and cloning the header on every hit (#528).
+    let mut carried: Option<(u64, Vec<u8>)> = memo.and_then(|m| {
+        crate::lock::lock_or_clear(m, "ogg last-page memo")
+            .as_ref()
+            .map(|(rel, _, h)| (*rel, h.clone()))
+    });
+    let mut last_entry: Option<(u64, u64, Vec<u8>)> = None;
     while pos < audio_end {
         let page_rel = pos - audio_offset;
         if page_rel >= rend {
@@ -205,19 +216,12 @@ pub fn serve_ogg_window(
         }
         let payload_len: usize = hdr_buf[27..header_len].iter().map(|&b| b as usize).sum();
 
-        // Reuse the patched header if this is the page the last serve ended on
-        // (sequential reads re-touch the page straddling each chunk boundary). The
-        // header for a given page_rel is deterministic for the life of the resolved
-        // file (immutable backing + fixed seq_delta), so a one-entry memo is always
-        // correct. The lock is released before patching so concurrent readers never
-        // serialize on the CRC work.
-        let cached = memo.and_then(|m| {
-            let g = crate::lock::lock_or_clear(m, "ogg last-page memo");
-            g.as_ref()
-                .filter(|(mp, _, _)| *mp == page_rel)
-                .map(|(_, _, h)| h.clone())
-        });
-        let patched_hdr = if let Some(h) = cached {
+        // Reuse the snapshotted patched header for the one page it was memoized
+        // against (the boundary-straddling page sequential reads re-touch); every
+        // other page is freshly patched. The header for a given page_rel is
+        // deterministic for the life of the resolved file (immutable backing + fixed
+        // seq_delta), so reusing it is always correct.
+        let patched_hdr = if let Some((_, h)) = carried.take_if(|(rel, _)| *rel == page_rel) {
             h
         } else {
             let old_seq = u32::from_le_bytes(hdr_buf[18..22].try_into().unwrap());
@@ -249,25 +253,28 @@ pub fn serve_ogg_window(
             backing.read_exact_at(&mut out[start..], pos + header_len as u64 + within)?;
         }
 
-        // Record this page in the memo (the patched header is moved in, not
-        // cloned). Written before the integrity guard so the last good page is
-        // memoized for the next serve even when a later page overruns the region.
-        if let Some(m) = memo {
-            let total_len = (header_len + payload_len) as u64;
-            *crate::lock::lock_or_clear(m, "ogg last-page memo") =
-                Some((page_rel, total_len, patched_hdr));
-        }
+        // Remember this page as the memo entry to write once after the loop (the
+        // patched header is moved in, not cloned). Recorded before the integrity
+        // guard so the last good page is still memoized when a later page overruns.
+        let total_len = (header_len + payload_len) as u64;
+        last_entry = Some((page_rel, total_len, patched_hdr));
 
-        pos += (header_len + payload_len) as u64;
+        pos += total_len;
 
         // Integrity guard: a page whose declared length pushes past the declared
         // audio region means the file is truncated/misaligned or the DB bounds are
         // stale. Hard error (matches the removed build_index consumed-check).
         if pos > audio_end {
+            if let Some(m) = memo {
+                *crate::lock::lock_or_clear(m, "ogg last-page memo") = last_entry.take();
+            }
             return Err(musefs_format::FormatError::Malformed.into());
         }
     }
 
+    if let Some((m, e)) = memo.zip(last_entry) {
+        *crate::lock::lock_or_clear(m, "ogg last-page memo") = Some(e);
+    }
     Ok(())
 }
 
