@@ -150,6 +150,43 @@ fn scan_succeeds_and_ingests_through_the_binary() {
 }
 
 #[test]
+fn scan_with_a_failing_file_exits_two() {
+    // A per-file ingest failure does not abort the batch, but it must surface as a
+    // non-zero exit so a pipeline like `scan && mount` can detect partial/total
+    // ingest failure. Exit 2 is the chosen signal (#554).
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("library");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(
+        target.join("good.flac"),
+        make_flac(&["TITLE=Good"], &[0xAB; 32]),
+    )
+    .unwrap();
+    std::fs::write(target.join("bad.flac"), b"not a flac at all").unwrap();
+    let db = dir.path().join("library.db");
+
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .arg("--db")
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a scan with a failing file should exit 2, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The good file still ingested; the failure is a signal, not a rollback.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("failed 1"),
+        "expected the summary to report one failure, stdout: {stdout}"
+    );
+}
+
+#[test]
 fn scan_with_checksum_full_exits_zero() {
     let (_dir, target, db) = library_with_one_flac();
     let out = musefs()

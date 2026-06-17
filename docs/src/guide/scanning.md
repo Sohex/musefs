@@ -39,6 +39,14 @@ to the wrong parser, fails, and is counted here rather than retried. Renaming
 files across formats makes them vanish from the mount; fix the extension and
 rescan.
 
+If any file fails (`failed Y` with `Y > 0`), `scan` exits **2** even though the
+batch otherwise completes and the parseable files are ingested — so a pipeline
+like `musefs scan … && musefs mount …` stops on a partial or total ingest
+failure rather than mounting an incomplete library. A successful scan exits `0`;
+a hard error (a missing target, an unreadable DB) still exits `1`. The exit code
+is the only machine-detectable signal; per-file failures otherwise surface only
+on stderr.
+
 `--revalidate` is the maintenance pass: it skips unchanged files —
 **preserving any tag edits you made in the store** — prunes tracks whose
 backing file is gone, and garbage-collects orphaned art.

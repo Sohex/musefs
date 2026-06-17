@@ -51,6 +51,24 @@ BYTES="$(wc -c < "$SONG")"
 if [ "$BYTES" -le 0 ]; then echo "FAIL: served file is empty"; exit 1; fi
 echo "smoke: read $BYTES bytes from $SONG (fLaC OK)"
 
+# The cardinal invariant: original audio bytes are served byte-identical. The
+# synthesized header legitimately differs (re-tagged metadata blocks), so compare
+# only the encoded audio packets ('-map 0:a -c copy'), which must match the
+# untouched backing file bit-for-bit. A target-specific positioned-read/offset bug
+# that corrupts the spliced audio region passes the fLaC-magic check above but is
+# caught here.
+audio_md5() {
+  ffmpeg -hide_banner -loglevel error -i "$1" -map 0:a -c copy -f md5 - 2>/dev/null
+}
+SERVED_AUDIO="$(audio_md5 "$SONG")"
+BACKING_AUDIO="$(audio_md5 "$WORK/backing/a.flac")"
+if [ -z "$SERVED_AUDIO" ]; then echo "FAIL: could not hash served audio stream"; exit 1; fi
+if [ "$SERVED_AUDIO" != "$BACKING_AUDIO" ]; then
+  echo "FAIL: served audio bytes differ from backing (served=$SERVED_AUDIO backing=$BACKING_AUDIO)"
+  exit 1
+fi
+echo "smoke: served audio stream matches backing ($SERVED_AUDIO)"
+
 # Exercise the SIGTERM graceful-unmount handler on the real binary.
 kill -TERM "$PID"
 i=0

@@ -33,7 +33,7 @@ fn jemalloc_stats() -> Option<musefs_fuse::AllocatorStats> {
     })
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     // The library crates report serve-path failures through the `log` facade;
     // without a sink they vanish. Default to `warn` so they surface on stderr;
@@ -51,9 +51,12 @@ fn main() {
         enable_jemalloc_background_thread();
         musefs_fuse::set_alloc_probe(jemalloc_stats);
     }
-    if let Err(e) = run(cli) {
-        eprintln!("musefs: {e:#}");
-        std::process::exit(1);
+    match run(cli) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("musefs: {e:#}");
+            std::process::ExitCode::from(1)
+        }
     }
 }
 
