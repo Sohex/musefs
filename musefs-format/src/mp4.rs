@@ -396,6 +396,10 @@ fn read_freeform(inner: &[u8]) -> Vec<(String, String)> {
 /// `TRCK`/`TPOS` carry the total in the shared `tracknumber`/`discnumber` value;
 /// a zero or absent total drops the `/M`. Caller guarantees `value.len() >= 4`.
 fn number_total(value: &[u8]) -> String {
+    debug_assert!(
+        value.len() >= 4,
+        "number_total requires the 4-byte number prefix"
+    );
     let number = u16::from_be_bytes([value[2], value[3]]);
     let total = if value.len() >= 6 {
         u16::from_be_bytes([value[4], value[5]])

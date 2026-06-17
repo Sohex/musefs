@@ -1098,13 +1098,16 @@ mod tests {
             TagInput::new("id3:COMM:eng:note", "see liner"),
             TagInput::new("id3:USLT:eng:Chorus", "la la"),
         ];
-        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
+        let (segments, len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
         let mut buf = Vec::new();
         for seg in &segments {
             if let Segment::Inline(bytes) = seg {
                 buf.extend_from_slice(bytes);
             }
         }
+        // No streamed segments here, so the reported length is the whole tag:
+        // pins each frame's `10 + data.len()` accounting (kills `+` -> `*`).
+        assert_eq!(len, buf.len() as u64);
         // Assert real COMM/USLT frames (with the right lang/descriptor) are emitted,
         // not generic TXXX frames that would happen to round-trip the key/value.
         let tag = id3::Tag::read_from2(std::io::Cursor::new(&buf)).unwrap();
