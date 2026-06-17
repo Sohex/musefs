@@ -1,7 +1,4 @@
 name: macos-spike
-# Temporary feasibility spike. workflow_dispatch only fires from the default
-# branch, so trigger on push to this feature branch — scoped to this file so the
-# later task commits don't re-run it. Removed once findings are recorded.
 on:
   push:
     branches: [macos-fuse-t-e2e]
@@ -13,7 +10,6 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     env:
-      # fuse-t ships fuse3.pc here (no fuse.pc); fuser's libfuse3 feature probes `fuse3`.
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
@@ -24,42 +20,41 @@ jobs:
           brew tap macos-fuse-t/homebrew-cask
           brew install --cask fuse-t
           brew install ffmpeg
+      - name: Inspect fuse-t pkg-config, headers, and exported ABI symbols
+        run: |
+          echo "== fuse-t.pc =="; cat /usr/local/lib/pkgconfig/fuse-t.pc 2>/dev/null || echo MISSING
+          echo "== fuse3.pc =="; cat /usr/local/lib/pkgconfig/fuse3.pc 2>/dev/null || echo MISSING
+          echo "== /usr/local/include (fuse headers) =="; find /usr/local/include -iname 'fuse*' 2>/dev/null | head -40
+          echo "== libs =="; ls -la /usr/local/lib/libfuse* 2>/dev/null
+          echo "== libfuse-t.dylib libfuse2/3 symbols =="
+          nm -gU /usr/local/lib/libfuse-t.dylib 2>/dev/null | grep -iE 'fuse_mount|fuse_unmount|fuse_lowlevel|fuse_session|fuse_new|fuse_chan' | head -40 || echo "nm failed"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-      - name: Approach B — swap macos-no-mount → libfuse3 inline (not committed)
+      - name: Synthesize fuse.pc shim → fuser libfuse2 build
+        id: shim_build
+        continue-on-error: true
         run: |
-          # BSD sed (macOS) needs the empty backup arg. Verify the swap took.
-          # libfuse3 (not libfuse) so fuser probes `fuse3` — the module fuse-t ships.
-          sed -i '' 's/"macos-no-mount"/"libfuse3"/' musefs-fuse/Cargo.toml
-          grep -n 'fuser' musefs-fuse/Cargo.toml
-          echo "== fuse3.pc visible? =="; pkg-config --exists fuse3 && pkg-config --modversion fuse3 || echo "fuse3 NOT found"
-      - name: Build musefs-fuse with libfuse (real mount path)
-        run: cargo build -p musefs-fuse 2>&1 | tail -20
-      - name: Run the mount suite through fuse-t (macFUSE options still present)
+          # fuser 0.17 macOS path only ever probes `fuse` (libfuse2). fuse-t ships
+          # no fuse.pc, so alias it to fuse-t's lib and see if the libfuse2 ABI links.
+          sed -i '' 's/"macos-no-mount"/"libfuse"/' musefs-fuse/Cargo.toml
+          cat > /usr/local/lib/pkgconfig/fuse.pc <<'PC'
+          prefix=/usr/local
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+          Name: fuse
+          Description: fuse-t libfuse2 shim for fuser
+          Version: 2.9.9
+          Libs: -L${libdir} -lfuse-t
+          Cflags: -I${includedir}/fuse -D_FILE_OFFSET_BITS=64
+          PC
+          echo "== shim fuse.pc =="; cat /usr/local/lib/pkgconfig/fuse.pc
+          pkg-config --exists fuse && echo "pkg-config now sees fuse $(pkg-config --modversion fuse)"
+          cargo build -p musefs-fuse 2>&1 | tail -40
+      - name: Run the mount suite through fuse-t (shim build succeeded)
+        if: steps.shim_build.outcome == 'success'
         id: mount_default
         continue-on-error: true
         run: cargo test -p musefs-fuse --test mount -- --ignored --nocapture 2>&1 | tail -80
-      - name: Retry mount suite with MUSEFS_FUSE_T (simulates Task 3 option gate)
-        if: steps.mount_default.outcome == 'failure'
-        env:
-          MUSEFS_FUSE_T: "1"
-        run: |
-          # If the default run failed on macFUSE-only mount options, prove that
-          # omitting them (what Task 3's env gate will do) lets fuse-t mount.
-          # Patch extend_os_specific inline to honor the env var for this probe.
-          python3 - <<'PY'
-          import re, pathlib
-          p = pathlib.Path("musefs-fuse/src/platform/mount.rs")
-          s = p.read_text()
-          s = s.replace(
-              "fn extend_os_specific(opts: &mut Vec<MountOption>, fs_name: &str) {",
-              "fn extend_os_specific(opts: &mut Vec<MountOption>, fs_name: &str) {\n"
-              "    if std::env::var_os(\"MUSEFS_FUSE_T\").is_some() { return; }",
-              1)
-          p.write_text(s)
-          print(s.split("extend_os_specific")[1][:400])
-          PY
-          cargo test -p musefs-fuse --test mount -- --ignored --nocapture 2>&1 | tail -80
       - name: Inspect for stale mounts after tests
         if: always()
         run: |
