@@ -549,3 +549,44 @@ the box, so the e2e suite cannot pass yet. Recommend pausing macOS fuse-t e2e
 until the LOOKUP/readdir blocker is understood (candidate next steps: try fuse-t's
 SMB backend instead of NFS; test a newer/forked fuser with macOS-fuse3 support;
 minimal C libfuse-t filesystem to isolate whether the bug is fuser or fuse-t).
+
+---
+
+## CONCLUSION (definitive — 13 spike runs)
+
+**macOS fuse-t e2e is NOT feasible on GitHub-hosted runners.** The blocker is the
+mount syscall itself, not musefs or fuser.
+
+What the deeper spikes (with fuse-t's own `~/Library/Logs/fuse-t` debug log)
+revealed, correcting the earlier "LOOKUP/readdir" guess:
+
+- The fuse↔fuse-t session negotiates fine (`profile=v3 client=libfuse3
+  proto=7.19`), but **fuse-t's mount of the local volume fails with
+  `exit status 66`** every time, so nothing is ever attached — every child path
+  then ENOENTs (statfs "passing" was spurious; it hit the still-local tmpdir).
+- The failure is **backend-independent**: `mount -o … -t nfs fuse-t:/…` and
+  `mount -o … -t smbfs //Guest@fuse-t._smb._tcp.local/…` *both* return exit 66.
+- It is **not** our code: fuser 0.17's own `hello` example fails identically
+  ("Connection closed" / short-read-0). It is **not** mountpoint existence
+  (removing the dir first — the cryptomator #4043 Sequoia workaround — didn't
+  help), **not** timing (a 15 s readiness wait still ENOENTs), **not** TMPDIR
+  location. The third backend, `fskit`, needs macOS 26 (hosted runners are 14/15).
+- Conclusion: the GitHub-hosted macOS runner refuses fuse-t's non-root
+  NFS/SMB loopback mount (exit 66 from the mount helper). Matches the broader
+  "FUSE fails to mount on GitHub runners" reports (macfuse #740).
+
+**What IS solved and reusable** (should we ever get a runner that can mount —
+i.e. a self-hosted Mac):
+- Approach B manifest: macOS `fuser = { features = ["libfuse"] }` (drop
+  `macos-no-mount`); macOS-only, no effect on Linux/FreeBSD/musl builds.
+- fuse-t links via a **`fuse.pc` libfuse2 shim** (`libfuse-t.dylib` exports the
+  libfuse2 ABI): `Libs: -L/usr/local/lib -Wl,-rpath,/usr/local/lib -lfuse-t`,
+  `Version: 2.9.9`, installed with `sudo tee` into `/usr/local/lib/pkgconfig`.
+- fuse-t tolerates the macFUSE `volname`/`noappledouble` options.
+
+**Recommended next step:** drop hosted-runner macOS e2e. Options are (a) a
+self-hosted Mac runner (where fuse-t — or kext macFUSE — can actually mount;
+this is the infra the original Approach-B/macFUSE discussion flagged), or
+(b) revisit when GitHub runners support FSKit (macOS 26) or relax the mount
+restriction. The repo source was never modified — all spike changes were inline
+in the throwaway `macos-spike.yml`.
