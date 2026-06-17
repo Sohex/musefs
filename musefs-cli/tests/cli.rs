@@ -23,7 +23,10 @@ fn parses_scan_and_mount_invocations() {
     ]);
     match cli.command {
         Command::Mount(args) => {
-            assert_eq!(args.mountpoint.to_str(), Some("/mnt/x"));
+            assert_eq!(
+                args.mountpoint.as_deref().and_then(|p| p.to_str()),
+                Some("/mnt/x")
+            );
             assert_eq!(args.db.to_str(), Some("/tmp/m.db"));
             assert_eq!(args.template, "$album/$title");
             assert_eq!(args.default_fallback, "Unknown"); // default applied
@@ -139,6 +142,62 @@ fn scan_parses_checksum_and_strictness_flags() {
     }
 }
 
+#[test]
+fn scan_help_lists_m4b_format() {
+    use clap::CommandFactory;
+    let cmd = Cli::command();
+    let scan = cmd
+        .get_subcommands()
+        .find(|c| c.get_name() == "scan")
+        .expect("scan subcommand exists");
+    let about = scan.get_about().expect("scan has help text").to_string();
+    assert!(
+        about.contains("M4B"),
+        "scan help should advertise M4B; got: {about}"
+    );
+}
+
+#[test]
+fn dry_run_does_not_require_a_mountpoint() {
+    let cli = Cli::try_parse_from(["musefs", "mount", "--db", "/tmp/m.db", "--dry-run"])
+        .expect("dry-run should parse without a mountpoint");
+    match cli.command {
+        Command::Mount(args) => {
+            assert!(args.dry_run);
+            assert_eq!(args.mountpoint, None);
+        }
+        Command::Scan { .. } => panic!("expected mount"),
+    }
+}
+
+#[test]
+fn mount_without_dry_run_still_requires_a_mountpoint() {
+    let err = Cli::try_parse_from(["musefs", "mount", "--db", "/tmp/m.db"])
+        .expect_err("a real mount must demand a mountpoint");
+    assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+}
+
+#[test]
+fn boolish_mount_flags_work_as_bare_switches() {
+    let cli = Cli::try_parse_from([
+        "musefs",
+        "mount",
+        "/mnt/x",
+        "--db",
+        "/tmp/m.db",
+        "--skip-on-missing",
+        "--read-ahead-prefetch",
+    ])
+    .expect("bare boolish switches should still parse");
+    match cli.command {
+        Command::Mount(args) => {
+            assert!(args.skip_on_missing);
+            assert!(args.read_ahead_prefetch);
+        }
+        Command::Scan { .. } => panic!("expected mount"),
+    }
+}
+
 use musefs_cli::parse_mount_config;
 use musefs_core::Mode;
 use std::time::Duration;
@@ -146,7 +205,7 @@ use std::time::Duration;
 #[test]
 fn parse_mount_config_defaults_are_sensible() {
     let args = MountArgs {
-        mountpoint: "/mnt/x".into(),
+        mountpoint: Some("/mnt/x".into()),
         db: "/tmp/x.db".into(),
         template: "$artist/$title".to_string(),
         default_fallback: "Unknown".to_string(),
@@ -184,7 +243,7 @@ fn parse_mount_config_defaults_are_sensible() {
 #[test]
 fn parse_mount_config_keep_cache_sets_flag() {
     let args = MountArgs {
-        mountpoint: "/mnt/x".into(),
+        mountpoint: Some("/mnt/x".into()),
         db: "/tmp/x.db".into(),
         template: "$title".to_string(),
         default_fallback: "Unknown".to_string(),
@@ -218,7 +277,7 @@ fn parse_mount_config_keep_cache_sets_flag() {
 #[test]
 fn parse_mount_config_saturating_readahead() {
     let args = MountArgs {
-        mountpoint: "/mnt/x".into(),
+        mountpoint: Some("/mnt/x".into()),
         db: "/tmp/x.db".into(),
         template: "$title".to_string(),
         default_fallback: "Unknown".to_string(),
@@ -273,7 +332,7 @@ fn parses_repeatable_fallback_flag() {
 #[test]
 fn parse_mount_config_populates_per_field_fallbacks() {
     let args = MountArgs {
-        mountpoint: "/mnt/x".into(),
+        mountpoint: Some("/mnt/x".into()),
         db: "/tmp/x.db".into(),
         template: "$albumartist/$title".to_string(),
         default_fallback: "Unknown".to_string(),
