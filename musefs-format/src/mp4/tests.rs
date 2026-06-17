@@ -1529,6 +1529,76 @@ fn read_binary_tags_accepts_payload_exactly_at_budget() {
 }
 
 #[test]
+fn child_boxes_lenient_recovers_prefix_before_malformed() {
+    // A well-formed box followed by one claiming a size that overruns the buffer:
+    // the strict `child_boxes` errors, but the lenient walk returns the prefix.
+    let mut buf = bx(b"free", b"ok");
+    buf.extend_from_slice(&[0, 0, 0, 99, b'b', b'a', b'd', b'!']); // claims 99, 8 present
+    assert!(child_boxes(&buf).is_err());
+    let boxes = child_boxes_lenient(&buf);
+    assert_eq!(
+        boxes.len(),
+        1,
+        "the good box before the malformed one survives"
+    );
+    assert_eq!(&boxes[0].kind, b"free");
+}
+
+#[test]
+fn read_tags_recovers_atoms_before_a_malformed_sibling() {
+    // ilst = [good ©nam title][malformed atom]. One garbled atom must not discard
+    // the well-formed tags that precede it (#524).
+    let mut ilst = bx(b"\xa9nam", &data_atom(1, b"Title One"));
+    ilst.extend_from_slice(&[0, 0, 0, 99, b'b', b'a', b'd', b'!']); // overruns buffer
+    let moov = moov_with_ilst(&ilst);
+    let tags = read_tags(&moov);
+    assert!(
+        tags.contains(&("title".to_string(), "Title One".to_string())),
+        "title before the malformed atom is recovered: {tags:?}"
+    );
+}
+
+#[test]
+fn read_tags_recovers_data_before_a_malformed_data_sibling() {
+    // A good `data` followed by a malformed `data` inside one atom: the inner walk
+    // must keep the good value rather than discarding the whole atom (#524).
+    let mut inner = data_atom(1, b"Good");
+    inner.extend_from_slice(&[0, 0, 0, 99, b'd', b'a', b't', b'a']); // overruns buffer
+    let ilst = bx(b"\xa9nam", &inner);
+    let moov = moov_with_ilst(&ilst);
+    let tags = read_tags(&moov);
+    assert!(
+        tags.contains(&("title".to_string(), "Good".to_string())),
+        "the good data box before the malformed one is recovered: {tags:?}"
+    );
+}
+
+#[test]
+fn read_binary_tags_recovers_binary_after_a_text_data() {
+    // A `----` atom whose first `data` is type-1 text and a later one is binary:
+    // the binary path must inspect every `data`, not just the first (#525).
+    let mut mean_body = 0u32.to_be_bytes().to_vec();
+    mean_body.extend_from_slice(b"com.apple.iTunes");
+    let mut name_body = 0u32.to_be_bytes().to_vec();
+    name_body.extend_from_slice(b"MIXED");
+    let mut inner = boxed(b"mean", &mean_body).unwrap();
+    inner.extend(boxed(b"name", &name_body).unwrap());
+    inner.extend(data_atom(1, b"text-value")); // type 1 text first
+    inner.extend(data_atom(0, &[0xDE, 0xAD])); // binary second
+    let atom = boxed(b"----", &inner).unwrap();
+    let moov = moov_with_ilst(&atom);
+
+    let tags = read_binary_tags(&moov, usize::MAX);
+    assert_eq!(
+        tags.len(),
+        1,
+        "the binary value after the text one is recovered"
+    );
+    assert_eq!(tags[0].key, "----:com.apple.iTunes:MIXED");
+    assert_eq!(tags[0].payload, vec![0xDE, 0xAD]);
+}
+
+#[test]
 fn read_binary_tags_reporting_reports_oversize_drop() {
     // A 5-byte value over the 4-byte cap: skipped from the tags, but reported
     // as a drop with its `----:<mean>:<name>` key and exact byte size.

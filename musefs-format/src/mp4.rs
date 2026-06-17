@@ -134,6 +134,22 @@ fn child_boxes(buf: &[u8]) -> Result<Vec<BoxRef>> {
     Ok(out)
 }
 
+/// Like [`child_boxes`] but lenient: stops at the first unreadable box and
+/// returns the well-formed ones parsed so far, rather than discarding the whole
+/// list. Box sizes chain, so a malformed box leaves no reliable way to find the
+/// next — the prefix is the most that can be recovered. Used by the metadata
+/// extractors, whose contract is to seed what they can and skip the rest (#524).
+fn child_boxes_lenient(buf: &[u8]) -> Vec<BoxRef> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 8 <= buf.len() {
+        let Ok(b) = read_box(buf, pos) else { break };
+        pos = b.end();
+        out.push(b);
+    }
+    out
+}
+
 fn find_box(buf: &[u8], kind: &[u8; 4]) -> Result<Option<BoxRef>> {
     Ok(child_boxes(buf)?.into_iter().find(|b| &b.kind == kind))
 }
@@ -370,7 +386,7 @@ fn read_freeform(inner: &[u8]) -> Vec<(String, String)> {
     let key = crate::tagmap::mp4_freeform_to_key(mean, name)
         .map_or_else(|| name.to_string(), str::to_string);
     let mut out = Vec::new();
-    for data in child_boxes(inner).unwrap_or_default() {
+    for data in child_boxes_lenient(inner) {
         if &data.kind != b"data" {
             continue;
         }
@@ -425,14 +441,14 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     };
     let ilst = &buf[start..start + len];
     let mut out = Vec::new();
-    for atom in child_boxes(ilst).unwrap_or_default() {
+    for atom in child_boxes_lenient(ilst) {
         let inner = atom.payload(ilst);
         if &atom.kind == b"----" {
             out.extend(read_freeform(inner));
             continue;
         }
         let text_key = crate::tagmap::mp4_atom_to_key(&atom.kind);
-        for data in child_boxes(inner).unwrap_or_default() {
+        for data in child_boxes_lenient(inner) {
             if &data.kind != b"data" {
                 continue;
             }
@@ -489,12 +505,12 @@ pub fn read_pictures_reporting(
     let ilst = &buf[start..start + len];
     let mut out = Vec::new();
     let mut dropped = Vec::new();
-    for atom in child_boxes(ilst).unwrap_or_default() {
+    for atom in child_boxes_lenient(ilst) {
         if &atom.kind != b"covr" {
             continue;
         }
         let inner = atom.payload(ilst);
-        for data in child_boxes(inner).unwrap_or_default() {
+        for data in child_boxes_lenient(inner) {
             if &data.kind != b"data" {
                 continue;
             }
@@ -554,24 +570,11 @@ pub fn read_binary_tags_reporting(
     let ilst = &buf[start..start + len];
     let mut out = Vec::new();
     let mut dropped = Vec::new();
-    for atom in child_boxes(ilst).unwrap_or_default() {
+    for atom in child_boxes_lenient(ilst) {
         if &atom.kind != b"----" {
             continue;
         }
         let inner = atom.payload(ilst);
-        let Ok(Some(data)) = find_box(inner, b"data") else {
-            continue;
-        };
-        let dp = data.payload(inner);
-        if dp.len() < 8 {
-            continue;
-        }
-        // `data` body is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text,
-        // which is the text path's job. Everything else is opaque binary.
-        let type_code = u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]);
-        if type_code == 1 {
-            continue;
-        }
         // name/mean payloads carry a 4-byte FullBox prefix; default mean to iTunes.
         let Some(name) = find_box(inner, b"name").ok().flatten().and_then(|n| {
             let p = n.payload(inner);
@@ -593,28 +596,46 @@ pub fn read_binary_tags_reporting(
                 }
             });
         let key = format!("----:{mean}:{name}");
-        if dp.len() - 8 > max_binary_tag_bytes {
-            dropped.push(OversizeDrop {
-                descriptor: key,
-                bytes: dp.len() - 8,
+        // Iterate every `data` sub-box, mirroring the text path: a `----` atom can
+        // carry a type-1 text value and a separate binary value, so inspecting only
+        // the first `data` would lose the binary one (#525).
+        for data in child_boxes_lenient(inner) {
+            if &data.kind != b"data" {
+                continue;
+            }
+            let dp = data.payload(inner);
+            if dp.len() < 8 {
+                continue;
+            }
+            // `data` body is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text,
+            // which is the text path's job. Everything else is opaque binary.
+            let type_code = u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]);
+            if type_code == 1 {
+                continue;
+            }
+            if dp.len() - 8 > max_binary_tag_bytes {
+                dropped.push(OversizeDrop {
+                    descriptor: key.clone(),
+                    bytes: dp.len() - 8,
+                });
+                continue;
+            }
+            out.push(EmbeddedBinaryTag {
+                key: key.clone(),
+                payload: dp[8..].to_vec(),
             });
-            continue;
         }
-        out.push(EmbeddedBinaryTag {
-            key,
-            payload: dp[8..].to_vec(),
-        });
     }
     (out, dropped)
 }
 
 /// Extract opaque (non-text) MP4 `----` freeform atoms for binary-tag passthrough.
-/// One `EmbeddedBinaryTag` per `----` atom whose first `data` sub-box is
-/// binary-typed (type code != 1): key `----:<mean>:<name>`, payload the `data`
-/// value bytes (after the 8-byte `[type][locale]` header). Text freeform atoms
-/// (type 1) are handled by `read_tags`, so the two paths never double-store.
-/// Lenient: malformed atoms are skipped. Only the first `data` sub-box is read
-/// (multi-value freeform is rare; mirrors `read_freeform`).
+/// One `EmbeddedBinaryTag` per binary-typed (type code != 1) `data` sub-box of
+/// each `----` atom: key `----:<mean>:<name>`, payload the `data` value bytes
+/// (after the 8-byte `[type][locale]` header). Text freeform atoms (type 1) are
+/// handled by `read_tags`, so the two paths never double-store. Lenient:
+/// malformed atoms are skipped. Every `data` sub-box is inspected, so a mixed
+/// atom carrying both a text and a binary value recovers the binary one.
 ///
 /// `max_binary_tag_bytes` caps each value: a `data` payload whose value bytes
 /// (after the 8-byte `[type][locale]` header) exceed it is skipped before any
