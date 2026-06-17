@@ -925,6 +925,49 @@ fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
 }
 
 #[test]
+fn entry_counts_reports_files_and_dirs() {
+    use musefs_db::{Format, NewTrack, Tag};
+    use std::collections::BTreeMap;
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    // Two tracks under two distinct artist dirs -> 2 files, 2 dirs. Both counts
+    // are >1, so this distinguishes the real result from every entry_counts
+    // constant-return mutant ((0,0)/(0,1)/(1,0)/(1,1)).
+    for (path, artist, title) in [("/a.flac", "Alice", "One"), ("/b.flac", "Bob", "Two")] {
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: path.into(),
+                format: Format::Flac,
+                audio_offset: 0,
+                audio_length: 1,
+                backing_size: 1,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
+            })
+            .unwrap();
+        db.replace_tags(
+            id,
+            &[Tag::new("artist", artist, 0), Tag::new("title", title, 0)],
+        )
+        .unwrap();
+    }
+
+    let cfg = MountConfig {
+        template: "$artist/$title".to_string(),
+        fallbacks: BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
+        read_ahead_budget: 0,
+        read_ahead_prefetch: false,
+        skip_on_missing: false,
+    };
+    let fs = Musefs::open(db, cfg).unwrap();
+    assert_eq!(fs.entry_counts(), (2, 2));
+}
+
+#[test]
 fn getattr_size_cache_hit_detects_backing_change() {
     use crate::scan::scan_directory;
     use id3::TagLike;
