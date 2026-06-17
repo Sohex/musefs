@@ -50,12 +50,29 @@ jobs:
           p.write_text(s.replace(needle, repl, 1))
           print("patched new_session: macOS removes mountpoint before mount")
           PY
+          # Force fuse-t's SMB backend via an -o mount option (fuser forwards CUSTOM
+          # opts to libfuse-t). NFS attach fails exit 66 on this runner.
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("musefs-fuse/src/platform/mount.rs")
+          s = p.read_text()
+          anchor = "    extend_os_specific(&mut opts, fs_name);"
+          inject = ('    #[cfg(target_os = "macos")]\n'
+                    '    opts.push(MountOption::CUSTOM("backend=smb".to_string()));\n')
+          assert anchor in s, "options() anchor not found"
+          p.write_text(s.replace(anchor, inject + anchor, 1))
+          print("patched options(): macOS adds -o backend=smb")
+          PY
           cargo build -p musefs-fuse 2>&1 | tail -15
       - name: Run one mount test and capture fuse-t protocol log
         continue-on-error: true
         run: |
           export TMPDIR="$HOME/spiketmp"; mkdir -p "$TMPDIR"
-          cargo test -p musefs-fuse --test mount \
+          # Try fuse-t's SMB backend (NFS mount is failing exit 66 on this runner).
+          # fuse-t reads the backend from the FUSE_NFS_BACKEND-style env / -o option;
+          # set both the documented env knob and an -o passthrough via RUSTFLAGS cfg.
+          export FUSE_T_BACKEND=smb
+          cargo test -p musefs-fuse --test mount end_to_end_read_through_mount \
             -- --ignored --nocapture --test-threads=1 2>&1 | tail -50 || true
       - name: Dump fuse-t logs
         if: always()
