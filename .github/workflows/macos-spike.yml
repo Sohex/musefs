@@ -34,16 +34,29 @@ jobs:
           PC
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-      - name: Build musefs-fuse (Approach B, libfuse → fuse-t)
+      - name: Build musefs-fuse (Approach B + macOS remove-mountpoint-before-mount)
         run: |
           sed -i '' 's/"macos-no-mount"/"libfuse"/' musefs-fuse/Cargo.toml
+          # fuse-t (macOS Sequoia) refuses to NFS-mount onto an existing dir; it
+          # creates the mountpoint itself. Remove the (empty) dir just before mount.
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("musefs-fuse/src/lib.rs")
+          s = p.read_text()
+          needle = "    Session::new(fs, mountpoint, &mount_config(fs_name, allow_other))"
+          repl = ("    #[cfg(target_os = \"macos\")]\n"
+                  "    let _ = std::fs::remove_dir(mountpoint);\n" + needle)
+          assert needle in s, "Session::new call not found"
+          p.write_text(s.replace(needle, repl, 1))
+          print("patched new_session: macOS removes mountpoint before mount")
+          PY
           cargo build -p musefs-fuse 2>&1 | tail -15
       - name: Run one mount test and capture fuse-t protocol log
         continue-on-error: true
         run: |
           export TMPDIR="$HOME/spiketmp"; mkdir -p "$TMPDIR"
-          cargo test -p musefs-fuse --test mount end_to_end_read_through_mount \
-            -- --ignored --nocapture --test-threads=1 2>&1 | tail -40 || true
+          cargo test -p musefs-fuse --test mount \
+            -- --ignored --nocapture --test-threads=1 2>&1 | tail -50 || true
       - name: Dump fuse-t logs
         if: always()
         run: |
