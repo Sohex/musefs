@@ -28,13 +28,14 @@ fn validate_opened_backing_rejects_mismatched_descriptor_metadata() {
     let resolved = ResolvedFile {
         layout: RegionLayout::validated(vec![Segment::BackingAudio { offset: 0, len: 8 }]).unwrap(),
         total_len: 8,
+        track_id: 1,
         content_version: 1,
         backing_path: expected_path,
         stamp: crate::freshness::BackingStamp::from_metadata(&expected_meta),
         mtime_secs: crate::freshness::BackingStamp::from_metadata(&expected_meta).display_secs(),
         last_page: std::sync::Mutex::new(None),
         cache_bytes: 0,
-        has_binary_tag: false,
+        streams_db_rowid: false,
     };
 
     assert!(matches!(

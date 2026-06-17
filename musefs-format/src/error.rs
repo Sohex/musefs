@@ -20,6 +20,8 @@ pub enum FormatError {
     ProducerBug(&'static str),
     #[error("failed to read art {art_id} bytes for synthesis")]
     ArtRead { art_id: i64 },
+    #[error("DB-sourced {field} contains an embedded NUL byte (crafted or corrupt DB)")]
+    EmbeddedNul { field: &'static str },
 }
 
 pub type Result<T> = std::result::Result<T, FormatError>;

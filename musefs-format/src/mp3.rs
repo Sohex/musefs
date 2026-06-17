@@ -217,6 +217,19 @@ fn is_id3_text_frame_id(key: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
+/// Reject a DB-sourced string with an embedded NUL before it is spliced into an
+/// ID3 frame. ID3 uses NUL as a field terminator/separator — the mime and
+/// description terminators in APIC, the value separator between multi-value text
+/// frames — so a NUL in the payload desyncs a downstream parser (#506).
+/// Length-prefixed formats (FLAC/Vorbis/MP4) are unaffected, so this guard is
+/// ID3-specific.
+fn reject_embedded_nul(field: &'static str, s: &str) -> Result<()> {
+    if s.as_bytes().contains(&0) {
+        return Err(FormatError::EmbeddedNul { field });
+    }
+    Ok(())
+}
+
 /// APIC frame data up to (but excluding) the image bytes:
 /// `[encoding][mime\0][picture type][description\0]`.
 fn apic_framing(art: &ArtInput) -> Vec<u8> {
@@ -274,6 +287,16 @@ pub fn build_id3v2_segments(
     binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
 ) -> Result<(Vec<Segment>, u64)> {
+    // ID3 splices these DB-sourced strings between NUL terminators/separators,
+    // so a NUL in any of them would corrupt the frame; reject up front (#506).
+    for t in tags {
+        reject_embedded_nul("tag value", &t.value)?;
+    }
+    for art in arts {
+        reject_embedded_nul("art mime", &art.mime)?;
+        reject_embedded_nul("art description", &art.description)?;
+    }
+
     // Pull the promoted scalar values out of `tags`: first `rating` /
     // `musicbrainz_trackid` wins, `playcount` takes the last parseable value. A
     // single POPM/UFID is the norm, so this only diverges from "first wins" for
@@ -1103,6 +1126,47 @@ mod tests {
             build_id3v2_segments(&[], &[], &[mk(boundary_data_len + 1)]).err(),
             Some(FormatError::TooLarge),
             "one byte past boundary must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_id3v2_segments_rejects_embedded_nul() {
+        // Regression for #506: a NUL in any DB-sourced text field would desync an
+        // ID3 frame's terminators/separators, so synthesis must reject it.
+        let nul_value = build_id3v2_segments(&[TagInput::new("TIT2", "a\0b")], &[], &[]);
+        assert_eq!(
+            nul_value.err(),
+            Some(FormatError::EmbeddedNul { field: "tag value" })
+        );
+
+        let art = |mime: &str, desc: &str| ArtInput {
+            art_id: 1,
+            mime: mime.to_string(),
+            description: desc.to_string(),
+            picture_type: PictureType::new(3).unwrap(),
+            width: 0,
+            height: 0,
+            data_len: BlobLen::new(16).unwrap(),
+        };
+        assert_eq!(
+            build_id3v2_segments(&[], &[], &[art("image/png\0junk", "")]).err(),
+            Some(FormatError::EmbeddedNul { field: "art mime" })
+        );
+        assert_eq!(
+            build_id3v2_segments(&[], &[], &[art("image/png", "front\0cover")]).err(),
+            Some(FormatError::EmbeddedNul {
+                field: "art description"
+            })
+        );
+
+        // A clean tag/art with no NUL still synthesizes.
+        assert!(
+            build_id3v2_segments(
+                &[TagInput::new("TIT2", "ok")],
+                &[],
+                &[art("image/png", "front")]
+            )
+            .is_ok()
         );
     }
 

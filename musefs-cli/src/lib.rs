@@ -354,7 +354,16 @@ fn effective_allow_other(flag: bool, owner: Option<u32>, group: Option<u32>) -> 
 pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseConfig) {
     let config = MountConfig {
         template: args.template.clone(),
-        fallbacks: args.fallbacks.iter().cloned().collect(),
+        // Field names are case-insensitive everywhere else (the template parser
+        // and `tags_to_fields` ASCII-lowercase them), so a fallback keyed under
+        // any uppercase letter would never match at render time (#504). Normalize
+        // the key the same way; later duplicates win, matching `collect`'s prior
+        // last-write semantics.
+        fallbacks: args
+            .fallbacks
+            .iter()
+            .map(|(field, value)| (field.to_ascii_lowercase(), value.clone()))
+            .collect(),
         default_fallback: args.default_fallback.clone(),
         mode: args.mode.into(),
         poll_interval: std::time::Duration::from_millis(args.poll_interval_ms),
@@ -379,6 +388,22 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
     (config, fuse_config)
 }
 
+/// Actionable hint appended to a permission-denied mount failure. Covers the
+/// common AppArmor case (Ubuntu 24.04+ / libfuse >= 3.17 restrict unprivileged
+/// FUSE mounts to whitelisted prefixes); mirrors `ALLOW_OTHER_HELP`'s role for
+/// the `user_allow_other` denial. See `docs/src/guide/mounting.md`.
+const MOUNT_DENIED_HELP: &str = "the mount was denied; on Ubuntu 24.04+ / libfuse >= 3.17 the fusermount3 \
+AppArmor profile only permits unprivileged FUSE mounts under whitelisted prefixes ($HOME, /mnt, /media, /tmp, ...). \
+Mount under a permitted prefix, or whitelist yours in /etc/apparmor.d/local/fusermount3 (check the kernel audit \
+log for an apparmor=\"DENIED\" ... profile=\"fusermount3\" line). See the mounting guide for details.";
+
+/// True if `mountpoint` is a directory containing at least one entry. A read
+/// failure is treated as "empty" — the warning is advisory, and the mount will
+/// surface any real access error itself.
+fn mountpoint_is_nonempty(mountpoint: &std::path::Path) -> bool {
+    std::fs::read_dir(mountpoint).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 /// Build a `Musefs` from the DB at `args.db` and mount it (blocking) at
 /// `args.mountpoint`. Unlike `scan`, mount never creates the store: a missing
 /// database path is a configuration error (a typo would otherwise silently
@@ -399,6 +424,16 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
             args.mountpoint.display()
         );
     }
+    // The mountpoint help says "Empty directory", but FUSE happily mounts over a
+    // populated one and shadows its contents for the mount's lifetime. Warn so a
+    // typo (or reusing a real music folder) doesn't silently hide files (#508).
+    if !args.dry_run && mountpoint_is_nonempty(&args.mountpoint) {
+        eprintln!(
+            "warning: mountpoint {} is not empty; its existing contents will be \
+             hidden behind the virtual tree until you unmount",
+            args.mountpoint.display()
+        );
+    }
     let db =
         Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
     let (config, fuse_config) = parse_mount_config(args);
@@ -413,8 +448,21 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     }
     signal::install_unmount_on_signal(args.mountpoint.clone())
         .context("installing the stop-signal unmount handler")?;
-    musefs_fuse::mount_with(core, &args.mountpoint, "musefs", fuse_config)
-        .with_context(|| format!("mounting at {}", args.mountpoint.display()))?;
+    musefs_fuse::mount_with(core, &args.mountpoint, "musefs", fuse_config).map_err(|e| {
+        // A bare EACCES from fusermount3 (e.g. an AppArmor-denied prefix) is
+        // otherwise opaque. Append actionable guidance — but not when the
+        // allow_other preflight already produced its own self-contained message
+        // (it names /etc/fuse.conf), to avoid stacking two different hints (#509).
+        let add_hint = e.kind() == std::io::ErrorKind::PermissionDenied
+            && !e.to_string().contains("/etc/fuse.conf");
+        let err =
+            anyhow::Error::new(e).context(format!("mounting at {}", args.mountpoint.display()));
+        if add_hint {
+            err.context(MOUNT_DENIED_HELP)
+        } else {
+            err
+        }
+    })?;
     Ok(())
 }
 
@@ -533,6 +581,35 @@ mod tests {
         };
         let (config, _) = parse_mount_config(&args);
         assert_eq!(config.read_ahead_budget, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn mountpoint_is_nonempty_detects_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !mountpoint_is_nonempty(dir.path()),
+            "fresh tempdir is empty"
+        );
+        std::fs::write(dir.path().join("stray.mp3"), b"x").unwrap();
+        assert!(
+            mountpoint_is_nonempty(dir.path()),
+            "a populated dir is non-empty (#508)"
+        );
+    }
+
+    #[test]
+    fn mountpoint_is_nonempty_is_false_on_unreadable_path() {
+        // A nonexistent path can't be read; the advisory check fails safe to
+        // "empty" rather than erroring.
+        assert!(!mountpoint_is_nonempty(std::path::Path::new(
+            "/nonexistent/musefs/mountpoint"
+        )));
+    }
+
+    #[test]
+    fn mount_denied_help_points_at_apparmor_and_the_fix() {
+        assert!(MOUNT_DENIED_HELP.contains("AppArmor"));
+        assert!(MOUNT_DENIED_HELP.contains("/etc/apparmor.d/local/fusermount3"));
     }
 
     #[test]

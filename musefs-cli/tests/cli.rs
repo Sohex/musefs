@@ -311,6 +311,40 @@ fn parse_mount_config_populates_per_field_fallbacks() {
 }
 
 #[test]
+fn fallback_keys_are_lowercased_to_match_template_fields() {
+    // Regression for #504: template field names are case-insensitive (the
+    // parser lowercases `$AlbumArtist` to `albumartist`), so a fallback keyed
+    // with uppercase letters must be lowercased too or it could never match.
+    let cli = Cli::parse_from([
+        "musefs",
+        "mount",
+        "/mnt/x",
+        "--db",
+        "/tmp/m.db",
+        "--fallback",
+        "AlbumArtist=Unknown Artist",
+        "--fallback",
+        "GENRE=Misc",
+    ]);
+    let args = match cli.command {
+        Command::Mount(args) => args,
+        Command::Scan { .. } => panic!("expected mount"),
+    };
+    let (config, _) = parse_mount_config(&args);
+    assert_eq!(
+        config.fallbacks.get("albumartist").map(String::as_str),
+        Some("Unknown Artist"),
+        "uppercase fallback key must normalize to the lowercased field name"
+    );
+    assert_eq!(
+        config.fallbacks.get("genre").map(String::as_str),
+        Some("Misc")
+    );
+    // The verbatim uppercase key must NOT be present.
+    assert!(!config.fallbacks.contains_key("AlbumArtist"));
+}
+
+#[test]
 fn fallback_value_may_contain_equals_and_last_duplicate_wins() {
     let cli = Cli::parse_from([
         "musefs",

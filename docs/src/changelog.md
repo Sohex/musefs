@@ -50,6 +50,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Art/serve rowid-reuse consistency:** the read fast path's WAL-snapshot +
+  `content_version` guard, previously gated only on binary-tag layouts, now
+  covers all DB-rowid segments (art `ArtImage`/`OggArtSlice` too) via
+  `RegionLayout::streams_db_rowid`, and the stateless no-fh read fallback now
+  applies the same snapshot/recheck and re-validates its freshly opened backing
+  fd against the resolved stamp. A concurrent external retag + `gc_orphan_art` +
+  reinsert can no longer splice a wrong image or stale tag bytes mid-read (the
+  audio-bytes invariant was never affected) (#502, #503).
+- **Per-field `--fallback` case-insensitivity:** fallback keys are now ASCII
+  lowercased to match template field names, so `--fallback AlbumArtist=…` (any
+  uppercase) is honored instead of silently never matching (#504).
+- **Tag value byte cap:** the read-time `tags.value` guard now counts bytes, not
+  UTF-8 characters, so the 256 KiB materialized-memory bound is exact rather than
+  up to ~4x looser for multibyte text (#505).
+- **Embedded NUL in ID3 metadata:** synthesized ID3 frames now reject a
+  DB-sourced tag value, art mime, or art description containing an embedded NUL
+  instead of emitting a frame a downstream parser would misread (#506).
+- **Orphan-art GC NULL safety:** `gc_orphan_art` uses `NOT EXISTS` rather than
+  `NOT IN (subquery)`, so a NULL `art_id` could not silently turn the GC into a
+  no-op (#507).
+- **Mount usability:** `mount` now warns when the mountpoint is non-empty (its
+  contents are shadowed for the mount's lifetime), and a permission-denied mount
+  (e.g. an AppArmor-restricted prefix) prints actionable guidance instead of a
+  bare "Permission denied" (#508, #509).
 - **Silent mp4 oversize drops:** oversized embedded `covr` cover art and binary
   freeform (`----`) values in `.m4a`/`.m4b` files are skipped in the format layer
   before materialization (to avoid building a large image out of a large `moov`),

@@ -4,8 +4,10 @@ use crate::models::{BinaryTag, BinaryTagRow, Tag};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
 
-/// Reject an over-cap text-tag row from its `length(key)`/`length(value)`
-/// columns *before* the strings are materialized. Routes through the shared
+/// Reject an over-cap text-tag row from its `length(key)` /
+/// `length(CAST(value AS BLOB))` columns *before* the strings are
+/// materialized. `value` is measured in bytes (not characters, #505) so the
+/// materialized-memory bound is exact. Routes through the shared
 /// `check_field_len`, so the allocation-free guarantee is the same one its
 /// unit test pins (spec N13).
 fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
@@ -17,7 +19,8 @@ fn check_tag_lengths(key_len: i64, value_len: i64) -> Result<()> {
 /// Columns the grouped tag readers project: `track_id` followed by the five
 /// columns `read_tag_row` consumes. Kept in lockstep with `read_tag_row`'s
 /// offset arithmetic.
-const GROUPED_TAG_COLS: &str = "track_id, length(key), length(value), key, value, ordinal";
+const GROUPED_TAG_COLS: &str =
+    "track_id, length(key), length(CAST(value AS BLOB)), key, value, ordinal";
 
 /// Read one text-tag row laid out as `length(key), length(value), key, value,
 /// ordinal` starting at column `base`; length-guards the row before its strings
@@ -49,7 +52,7 @@ fn collect_grouped_tags(
 impl<M> Db<M> {
     pub fn get_tags(&self, track_id: i64) -> Result<Vec<Tag>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT length(key), length(value), key, value, ordinal FROM tags \
+            "SELECT length(key), length(CAST(value AS BLOB)), key, value, ordinal FROM tags \
              WHERE track_id = ?1 AND value_blob IS NULL ORDER BY key, ordinal",
         )?;
         let mut rows = stmt.query(params![track_id])?;
@@ -424,6 +427,31 @@ mod tags_for_tracks_tests {
             )
             .unwrap();
         assert_eq!(db.get_tags(a).unwrap()[0].value.len(), 262_144);
+    }
+
+    #[test]
+    fn get_tags_rejects_multibyte_value_over_byte_cap() {
+        // Regression for #505: the read guard counts bytes, not characters. A
+        // value of 150_000 two-byte chars is 150_000 chars (under the schema's
+        // char-counting CHECK, so an honest writer stores it) but 300_000 bytes
+        // (over the 256 KiB materialized-memory bound). The byte-accurate guard
+        // must reject it.
+        let db = open_mem();
+        let a = db.upsert_track(&new_track("/a.flac")).unwrap();
+        let multibyte = "é".repeat(150_000);
+        assert!(multibyte.chars().count() < 262_144, "under the char CHECK");
+        assert!(multibyte.len() > 262_144, "over the byte cap");
+        db.conn
+            .execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', ?2, 0)",
+                rusqlite::params![a, multibyte],
+            )
+            .unwrap();
+        let err = db.get_tags(a).unwrap_err();
+        assert!(
+            matches!(err, crate::DbError::FieldTooLarge { field: "value", .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

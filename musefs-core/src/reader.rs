@@ -22,6 +22,10 @@ use crate::ogg_index::serve_ogg_window;
 pub struct ResolvedFile {
     pub layout: RegionLayout,
     pub total_len: u64,
+    /// Track id this entry resolves. Lets the stateless read path recheck the
+    /// live `content_version` under its WAL snapshot (#502), mirroring the
+    /// handle fast path's use of the handle's `track_id`.
+    pub track_id: i64,
     pub content_version: i64,
     pub backing_path: PathBuf,
     pub stamp: BackingStamp,
@@ -34,10 +38,11 @@ pub struct ResolvedFile {
     /// Approximate resident bytes this entry costs the cache (sum of `Inline`
     /// segment bytes; backing/art/ogg-audio bytes are not resident).
     pub cache_bytes: u64,
-    /// Precomputed from the layout: true if any segment streams an opaque binary
-    /// tag payload from the DB. Gates the transactional `content_version` guard in
-    /// the read fast path so plain Inline/BackingAudio layouts pay no per-read cost.
-    pub has_binary_tag: bool,
+    /// Precomputed from the layout: true if any segment is streamed from the DB
+    /// by a rowid (`BinaryTag`/`ArtImage`/`OggArtSlice`). Gates the transactional
+    /// `content_version` guard in the read fast path so plain Inline/BackingAudio
+    /// layouts pay no per-read cost (#502).
+    pub streams_db_rowid: bool,
 }
 
 /// Weighs an entry by its resident inline bytes. The `.max(1)` is load-bearing:
@@ -332,17 +337,18 @@ impl HeaderCache {
                 _ => 0,
             })
             .sum::<u64>();
-        let has_binary_tag = layout.has_binary_tag();
+        let streams_db_rowid = layout.streams_db_rowid();
         Ok(Arc::new(ResolvedFile {
             layout,
             total_len,
+            track_id: track.id,
             content_version: track.content_version,
             backing_path: PathBuf::from(&track.backing_path),
             stamp: BackingStamp::from_track(track),
             mtime_secs: mtime_secs_val,
             last_page: Mutex::new(None),
             cache_bytes,
-            has_binary_tag,
+            streams_db_rowid,
         }))
     }
     /// Current number of cached resolved-file entries.
@@ -367,8 +373,6 @@ impl HeaderCache {
     }
 }
 
-/// Read `size` bytes at virtual `offset` into `out` (appended), opening the
-/// backing file once for this call if the layout needs it.
 pub fn read_at_into<M>(
     resolved: &ResolvedFile,
     db: &Db<M>,
@@ -384,17 +388,71 @@ pub fn read_at_into<M>(
         .segments()
         .iter()
         .any(|s| matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }));
-    if needs_file {
+    // Open and re-validate the backing fd against the stamp the layout was
+    // resolved from (#503): between the resolve-time stat and this open the file
+    // can be rename-replaced or rewritten in place, which would otherwise splice
+    // bytes from a different/modified file behind the stamped header (or
+    // short-read against a stale size). The handle fast path validates per read
+    // via `validate_opened_backing`; this stateless fallback must too.
+    let file = if needs_file {
         crate::metrics::on_open();
-        let file = std::fs::File::open(&resolved.backing_path)?;
-        let pool = crate::readahead::ReadAheadPool::new(0);
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(crate::readahead::ReadAhead::new(0)));
-        let backing_len = resolved.stamp.size;
-        let epoch = std::sync::atomic::AtomicU64::new(0);
-        let br = crate::readahead::BackingReader::new(&file, &buf, &pool, 0, backing_len, &epoch);
-        read_segments_into(resolved, db, Some(&br), offset, size, out)
+        let f = std::fs::File::open(&resolved.backing_path)?;
+        if BackingStamp::from_metadata(&f.metadata()?) != resolved.stamp {
+            return Err(CoreError::BackingChanged(
+                resolved.backing_path.to_string_lossy().into_owned(),
+            ));
+        }
+        Some(f)
     } else {
-        read_segments_into(resolved, db, None, offset, size, out)
+        None
+    };
+
+    // DB-rowid segments (binary tags AND art) must be read under one WAL
+    // snapshot with a `content_version` recheck so a concurrent rowid-reuse
+    // (delete + reinsert reusing a freed rowid) can't splice a wrong blob
+    // mid-read (#502). Only the rare rowid-streaming layout pays this cost.
+    if resolved.streams_db_rowid {
+        db.begin_read()?;
+        let res = (|| {
+            if db.track_content_version(resolved.track_id)? != resolved.content_version {
+                // Stale resolve: the layout no longer matches the live row.
+                // Surface a retryable error rather than risk wrong bytes.
+                return Err(CoreError::BackingChanged(
+                    resolved.backing_path.to_string_lossy().into_owned(),
+                ));
+            }
+            read_with_optional_backing(resolved, db, file.as_ref(), offset, size, out)
+        })();
+        let _ = db.end_read(); // always release the snapshot
+        res
+    } else {
+        read_with_optional_backing(resolved, db, file.as_ref(), offset, size, out)
+    }
+}
+
+/// Build the optional `BackingReader` from an already-validated `file` and run
+/// the segment-splicing loop. Shared by `read_at_into`'s snapshot and
+/// non-snapshot branches so the backing-reader wiring lives in one place.
+fn read_with_optional_backing<M>(
+    resolved: &ResolvedFile,
+    db: &Db<M>,
+    file: Option<&std::fs::File>,
+    offset: u64,
+    size: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    match file {
+        Some(file) => {
+            let pool = crate::readahead::ReadAheadPool::new(0);
+            let buf =
+                std::sync::Arc::new(std::sync::Mutex::new(crate::readahead::ReadAhead::new(0)));
+            let backing_len = resolved.stamp.size;
+            let epoch = std::sync::atomic::AtomicU64::new(0);
+            let br =
+                crate::readahead::BackingReader::new(file, &buf, &pool, 0, backing_len, &epoch);
+            read_segments_into(resolved, db, Some(&br), offset, size, out)
+        }
+        None => read_segments_into(resolved, db, None, offset, size, out),
     }
 }
 
@@ -579,17 +637,16 @@ mod ogg_serve_tests {
         let resolved = ResolvedFile {
             layout,
             total_len: total,
+            track_id: 1,
             content_version: 0,
             backing_path: path.clone(),
-            stamp: BackingStamp {
-                size: 0,
-                mtime_ns: 0,
-                ctime_ns: 0,
-            },
+            // Stamp the real file so the fallback's backing-fd re-validation
+            // (#503) passes; a dummy stamp would now read as a changed backing.
+            stamp: BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap()),
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 8,
-            has_binary_tag: false,
+            streams_db_rowid: false,
         };
 
         // Read the whole virtual file; needs a Db only for ArtImage (unused here).
@@ -925,6 +982,7 @@ mod ogg_art_serve_tests {
         let resolved = ResolvedFile {
             layout,
             total_len: total,
+            track_id: 1,
             content_version: 0,
             backing_path: std::path::PathBuf::from("/dev/null"),
             stamp: BackingStamp {
@@ -935,7 +993,7 @@ mod ogg_art_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
-            has_binary_tag: false,
+            streams_db_rowid: false,
         };
 
         // Full read.
@@ -976,6 +1034,7 @@ mod ogg_art_serve_tests {
         let resolved = ResolvedFile {
             layout,
             total_len: total,
+            track_id: 1,
             content_version: 0,
             backing_path: std::path::PathBuf::from("/dev/null"),
             stamp: BackingStamp {
@@ -986,7 +1045,7 @@ mod ogg_art_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
-            has_binary_tag: false,
+            streams_db_rowid: false,
         };
         let got = read_at(&resolved, &db, 10, 50).unwrap();
         assert_eq!(got, image[10..60]);
@@ -1050,6 +1109,7 @@ mod cache_bound_tests {
         Arc::new(ResolvedFile {
             layout: RegionLayout::new_unchecked(vec![Segment::Inline(vec![0u8; inline_len])]),
             total_len: inline_len as u64,
+            track_id: 1,
             content_version,
             backing_path: std::path::PathBuf::from("/nonexistent"),
             stamp: BackingStamp {
@@ -1060,7 +1120,7 @@ mod cache_bound_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: inline_len as u64,
-            has_binary_tag: false,
+            streams_db_rowid: false,
         })
     }
 
@@ -1485,7 +1545,10 @@ mod binary_tag_serve_tests {
             }])
             .unwrap(),
             total_len: 4,
-            content_version: 0,
+            track_id: id,
+            // Match the live row: set_binary_tags bumps content_version via
+            // trigger, and the rowid-streaming read path rechecks it (#502).
+            content_version: db.track_content_version(id).unwrap(),
             backing_path: PathBuf::from("/x.mp3"),
             stamp: BackingStamp {
                 size: 0,
@@ -1495,11 +1558,102 @@ mod binary_tag_serve_tests {
             mtime_secs: 0,
             last_page: Mutex::new(None),
             cache_bytes: 0,
-            has_binary_tag: true,
+            streams_db_rowid: true,
         };
         // No BackingAudio segment, so read_at opens no file.
         let got = read_at(&resolved, &db, 1, 2).unwrap();
         assert_eq!(got, vec![20, 30]);
+    }
+
+    #[test]
+    fn fallback_read_rejects_changed_backing() {
+        // #503: the stateless read path must re-validate the freshly opened
+        // backing fd against the resolved stamp, like the handle fast path does.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.mp3");
+        std::fs::write(&path, vec![0u8; 100]).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let layout = RegionLayout::validated(vec![
+            Segment::Inline(vec![1, 2, 3]),
+            Segment::BackingAudio {
+                offset: 0,
+                len: 100,
+            },
+        ])
+        .unwrap();
+        let total = layout.total_len();
+        let resolved = ResolvedFile {
+            layout,
+            total_len: total,
+            track_id: 1,
+            content_version: 0,
+            backing_path: path.clone(),
+            stamp: BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap()),
+            mtime_secs: 0,
+            last_page: Mutex::new(None),
+            cache_bytes: 3,
+            streams_db_rowid: false,
+        };
+        // Matching stamp: the read succeeds.
+        assert!(read_at(&resolved, &db, 0, total).is_ok());
+        // Replace the backing file with a different size -> stamp mismatch.
+        std::fs::write(&path, vec![0u8; 200]).unwrap();
+        let err = read_at(&resolved, &db, 0, total).unwrap_err();
+        assert!(matches!(err, CoreError::BackingChanged(_)), "{err:?}");
+    }
+
+    #[test]
+    fn fallback_read_of_art_rechecks_content_version() {
+        // #502: an art-only layout (no BinaryTag) must take the snapshot +
+        // content_version recheck path on the stateless fallback, so a stale
+        // resolve cannot stream a reused art rowid's bytes.
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_path: "/y.mp3".into(),
+                format: Format::Mp3,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
+            })
+            .unwrap();
+        let art_id = db
+            .upsert_art(&musefs_db::NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: vec![1, 2, 3, 4],
+            })
+            .unwrap();
+        let layout = RegionLayout::validated(vec![Segment::ArtImage {
+            art_id,
+            len: musefs_format::BlobLen::new(4).unwrap(),
+        }])
+        .unwrap();
+        let live_cv = db.track_content_version(id).unwrap();
+        let mk = |content_version| ResolvedFile {
+            layout: layout.clone(),
+            total_len: 4,
+            track_id: id,
+            content_version,
+            backing_path: PathBuf::from("/y.mp3"),
+            stamp: BackingStamp {
+                size: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            },
+            mtime_secs: 0,
+            last_page: Mutex::new(None),
+            cache_bytes: 0,
+            streams_db_rowid: true,
+        };
+        // Live content_version: art bytes are served.
+        assert_eq!(read_at(&mk(live_cv), &db, 0, 4).unwrap(), vec![1, 2, 3, 4]);
+        // Stale content_version: the recheck (now covering art) rejects.
+        let err = read_at(&mk(live_cv + 1), &db, 0, 4).unwrap_err();
+        assert!(matches!(err, CoreError::BackingChanged(_)), "{err:?}");
     }
 }
 

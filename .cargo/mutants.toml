@@ -341,7 +341,7 @@ exclude_re = [
     # initializers — the equivalence rests on unobservability, not on the
     # const being out of reach.)
     # guard: op="/" fn="" rows=2
-    'musefs-core/src/reader\.rs:71:60: replace / with [%*]',
+    'musefs-core/src/reader\.rs:76:60: replace / with [%*]',
     # read_segments_into splice loop's overlap guard `if ov_start < ov_end`,
     # `<`->`<=`: the same equivalence class as serve_ogg_window's overlap-emit
     # guards above. When the bound is equal the overlap is empty (n = ov_end -

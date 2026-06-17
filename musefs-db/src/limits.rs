@@ -10,7 +10,11 @@
 
 /// Max `tags.key` length. Compared against SQLite `length()` (i64).
 pub const MAX_TAG_KEY_LEN: i64 = 256;
-/// Max `tags.value` length in bytes — 256 KiB.
+/// Max `tags.value` length in bytes — 256 KiB. The read-time guard counts
+/// bytes (`length(CAST(value AS BLOB))`) so the materialized-memory bound is
+/// exact (#505). The schema `CHECK` counts UTF-8 *characters*, so it is a
+/// coarser write-time fast-reject (up to ~4x looser for multibyte text); the
+/// byte-accurate enforcement is the reader guard in [`crate::tags`].
 pub const MAX_TAG_VALUE_LEN: i64 = 262_144;
 /// Max `art.mime` length.
 pub const MAX_ART_MIME_LEN: i64 = 255;
