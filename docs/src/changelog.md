@@ -7,7 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > The `contrib/` Python packages have their own decoupled version and changelog:
 > see [the contrib changelog](integrations/overview.md#contrib-changelog).
 
+For curated, upgrade-focused notes (highlights and per-version migration steps),
+see the [Release notes](release-notes.md).
+
 ## [Unreleased]
+
+## [1.1.0] - 2026-06-17
 
 ### Added
 
@@ -237,7 +242,8 @@ First public release.
   `synthesis` / `structure-only` mount modes, auto-refresh, `scan` /
   `scan --revalidate`). Never published publicly; superseded by 0.2.0.
 
-[Unreleased]: https://github.com/Sohex/musefs/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/Sohex/musefs/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/Sohex/musefs/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Sohex/musefs/releases/tag/v1.0.0
 [0.2.0]: https://github.com/Sohex/musefs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Sohex/musefs/releases/tag/v0.1.0

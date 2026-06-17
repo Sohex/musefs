@@ -65,6 +65,9 @@ described here is shared with WAV's embedded `id3 ` chunk — see
   files still mount and serve; they just contribute no scanned tags.
 - ID3v2.2 binary frames are not extracted (3-char ids; text and art still
   parse). `APIC` width/height are not recorded at scan time.
+- An `APIC` picture type outside the standard `0`–`20` range (the `id3`
+  crate's `Undefined(u8)` variant can exceed 20) is clamped to `0` (`Other`)
+  at scan time, matching the store's `track_art.picture_type` `CHECK`.
 
 ## How synthesis works
 

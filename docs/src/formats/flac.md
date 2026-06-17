@@ -30,6 +30,10 @@ model these layouts plug into, see
 
 - `PADDING` blocks are dropped — the synthesized file carries no padding.
 - Metadata blocks of unknown/reserved types are dropped at scan time.
+- A `PICTURE` block whose picture type falls outside the standard `0`–`20`
+  range is clamped to `0` (`Other`) at scan time, matching the store's
+  `track_art.picture_type` `CHECK`. This shared `PICTURE` parser also serves
+  FLAC-in-Ogg, so the same clamp applies there.
 - The `VORBIS_COMMENT` vendor string is replaced with musefs's own.
 - Vorbis field names are case-insensitive by spec; musefs re-emits canonical
   keys under their conventional uppercase names and upper-cases unknown

@@ -49,5 +49,6 @@
 # Reference
 
 - [Benchmarks](benchmarks.md)
+- [Release notes](release-notes.md)
 - [Changelog](changelog.md)
 - [Security](security.md)
