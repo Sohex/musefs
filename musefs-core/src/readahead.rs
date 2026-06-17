@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64 as Epoch, Ordering as O};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Floor window size: a fresh or just-seeked stream still reads this much ahead.
 pub const WINDOW_FLOOR: u64 = 512 * 1024;
@@ -363,6 +363,31 @@ impl ReadAhead {
     }
 }
 
+/// Lock a per-handle read-ahead buffer, recovering from a poisoned mutex rather
+/// than panicking. A poison means a prior reader — a foreground read or a
+/// prefetch worker — panicked mid-mutation while holding this lock, so the
+/// buffer may be partially updated; reset it to the known-good empty state (the
+/// next read cold-fills) instead of letting `unwrap()` propagate the poison into
+/// a panic on every subsequent read of this handle. Mirrors `lock::lock_or_clear`
+/// but also uncharges the cleared bytes, which a bare clear would leave
+/// over-counted against the global budget.
+fn lock_buf_or_clear<'a>(
+    buf: &'a Mutex<ReadAhead>,
+    pool: &ReadAheadPool,
+) -> MutexGuard<'a, ReadAhead> {
+    match buf.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            log::error!("cleared poisoned read-ahead buffer lock");
+            buf.clear_poison();
+            let mut g = e.into_inner();
+            let freed = g.clear();
+            pool.reconcile(freed, 0);
+            g
+        }
+    }
+}
+
 /// Store a prefetched window into `buf` iff the handle's epoch is unchanged, and
 /// charge the global budget by the resulting size delta so the
 /// `charged == Σ(registered buffers' bytes.len())` invariant is preserved. A
@@ -375,7 +400,7 @@ pub fn try_store_prefetch(
     start: u64,
     bytes: Vec<u8>,
 ) -> bool {
-    let mut ra = buf.lock().unwrap();
+    let mut ra = lock_buf_or_clear(buf, pool);
     if epoch.load(O::Acquire) != dispatched_epoch {
         return false;
     }
@@ -468,7 +493,14 @@ impl PrefetchWorkers {
             let rx = rx.clone();
             std::thread::spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    Self::run_job(job);
+                    // Isolate each job: a panic in `run_job` (e.g. a parser bug on
+                    // a hostile backing file) must not kill this worker, which
+                    // would silently drain the pool and disable prefetch. The
+                    // foreground read path recovers any buffer lock the job
+                    // poisoned via `lock_buf_or_clear`.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::run_job(job);
+                    }));
                 }
             });
         }
@@ -582,7 +614,7 @@ impl<'a> BackingReader<'a> {
             crate::metrics::on_pread(dst.len() as u64);
             return crate::metrics::backing_read_exact_at(self.file, dst, abs_offset);
         }
-        let mut ra = self.buf.lock().unwrap();
+        let mut ra = lock_buf_or_clear(self.buf, self.pool);
         if ra.covers(abs_offset, dst.len()) {
             crate::metrics::on_readahead_hit();
         } else {
@@ -753,6 +785,31 @@ mod pool_budget_tests {
         // Huge budget → abs cap wins.
         let big = ReadAheadPool::new(1024 * 1024 * 1024);
         assert_eq!(big.per_stream_cap(), WINDOW_ABS_CAP);
+    }
+
+    #[test]
+    fn poisoned_buffer_lock_recovers_and_uncharges() {
+        let pool = ReadAheadPool::new(WINDOW_ABS_CAP);
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        let (old, new) = buf.lock().unwrap().store_window(0, vec![0u8; 4096]);
+        pool.reconcile(old, new);
+        assert_eq!(pool.charged(), 4096);
+
+        // Poison the buffer mutex from a panicking thread, mirroring a reader that
+        // panicked mid-mutation while holding the lock.
+        let b2 = Arc::clone(&buf);
+        let _ = std::thread::spawn(move || {
+            let _g = b2.lock().unwrap();
+            panic!("poison the read-ahead buffer");
+        })
+        .join();
+        assert!(buf.is_poisoned());
+
+        // Recovery resets the buffer to empty and uncharges its bytes instead of
+        // panicking; poison is cleared so normal locking resumes.
+        assert_eq!(lock_buf_or_clear(&buf, &pool).len(), 0);
+        assert!(!buf.is_poisoned(), "poison cleared after recovery");
+        assert_eq!(pool.charged(), 0, "cleared bytes uncharged from the budget");
     }
 
     #[test]
@@ -1165,6 +1222,50 @@ mod prefetch_worker_tests {
         .unwrap();
         assert_eq!(fills, 0, "prefetched window should serve without a pread");
         assert_eq!(out, data[1024 * 1024..1024 * 1024 + 4096]);
+    }
+
+    /// A job whose target buffer lock is already poisoned must not panic the
+    /// worker thread (which would silently drain the pool). `run_job` recovers
+    /// the poison via `lock_buf_or_clear` and still stores the window.
+    #[test]
+    fn run_job_recovers_a_poisoned_buffer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.bin");
+        let data: Vec<u8> = (0u64..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+
+        let pool = Arc::new(ReadAheadPool::new(64 * 1024 * 1024));
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        pool.register(1, Arc::clone(&buf));
+
+        let b2 = Arc::clone(&buf);
+        let _ = std::thread::spawn(move || {
+            let _g = b2.lock().unwrap();
+            panic!("poison the read-ahead buffer");
+        })
+        .join();
+        assert!(buf.is_poisoned());
+
+        // Previously `buf.lock().unwrap()` in `try_store_prefetch` would panic here.
+        PrefetchWorkers::run_job(PrefetchJob {
+            ctx: Arc::new(PrefetchContext {
+                file: Arc::clone(&file),
+                buf: Arc::clone(&buf),
+                pool: Arc::clone(&pool),
+                epoch: Arc::clone(&epoch),
+                dispatched_epoch: 0,
+                len: 1024 * 1024,
+                backing_len: data.len() as u64,
+            }),
+            start: 1024 * 1024,
+        });
+        assert!(!buf.is_poisoned(), "poison cleared by the recovering lock");
+        assert!(pool.charged() > 0, "window stored after recovery");
     }
 
     /// The worker-pool path the single-stream test skips: a job pushed through
