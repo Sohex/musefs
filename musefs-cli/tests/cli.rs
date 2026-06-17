@@ -10,6 +10,7 @@ fn parses_scan_and_mount_invocations() {
             assert_eq!(db.to_str(), Some("/tmp/m.db"));
         }
         Command::Mount(..) => panic!("expected scan"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 
     let cli = Cli::parse_from([
@@ -32,6 +33,7 @@ fn parses_scan_and_mount_invocations() {
             assert_eq!(args.default_fallback, "Unknown"); // default applied
         }
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 }
 
@@ -51,6 +53,7 @@ fn parses_mode_and_revalidate_flags() {
     match cli.command {
         Command::Mount(args) => assert_eq!(args.mode, CliMode::StructureOnly),
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 
     // Mode defaults to synthesis; tuning knobs have conservative defaults.
@@ -65,6 +68,7 @@ fn parses_mode_and_revalidate_flags() {
             assert!(args.keep_cache); // #432: default on
         }
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 
     // Tuning flags parse to their given values.
@@ -93,6 +97,7 @@ fn parses_mode_and_revalidate_flags() {
             assert!(args.keep_cache);
         }
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 
     // Scan --revalidate flag.
@@ -107,11 +112,13 @@ fn parses_mode_and_revalidate_flags() {
     match cli.command {
         Command::Scan { revalidate, .. } => assert!(revalidate),
         Command::Mount(..) => panic!("expected scan"),
+        Command::Vacuum { .. } => unreachable!(),
     }
     let cli = Cli::parse_from(["musefs", "scan", "/music", "--db", "/tmp/m.db"]);
     match cli.command {
         Command::Scan { revalidate, .. } => assert!(!revalidate),
         Command::Mount(..) => panic!("expected scan"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 }
 
@@ -139,6 +146,7 @@ fn scan_parses_checksum_and_strictness_flags() {
             assert!(!fast);
         }
         Command::Mount(..) => panic!("expected scan"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 }
 
@@ -167,6 +175,7 @@ fn dry_run_does_not_require_a_mountpoint() {
             assert_eq!(args.mountpoint, None);
         }
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 }
 
@@ -195,6 +204,7 @@ fn boolish_mount_flags_work_as_bare_switches() {
             assert!(args.read_ahead_prefetch);
         }
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 }
 
@@ -326,6 +336,7 @@ fn parses_repeatable_fallback_flag() {
             ]
         ),
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     }
 }
 
@@ -388,6 +399,7 @@ fn fallback_keys_are_lowercased_to_match_template_fields() {
     let args = match cli.command {
         Command::Mount(args) => args,
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     };
     let (config, _) = parse_mount_config(&args);
     assert_eq!(
@@ -421,6 +433,7 @@ fn fallback_value_may_contain_equals_and_last_duplicate_wins() {
     let args = match cli.command {
         Command::Mount(args) => args,
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     };
     // Only the first '=' separates; the value keeps the rest verbatim.
     assert_eq!(
@@ -470,6 +483,7 @@ fn mount_fails_on_missing_db_without_creating_it() {
     let args = match cli.command {
         Command::Mount(args) => args,
         Command::Scan { .. } => panic!("expected mount"),
+        Command::Vacuum { .. } => unreachable!(),
     };
 
     let err = musefs_cli::run_mount(&args).unwrap_err();
