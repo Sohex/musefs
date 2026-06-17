@@ -134,6 +134,44 @@ fn collect_audio_skips_broken_symlink_when_following() {
 }
 
 #[test]
+fn collect_audio_skips_unreadable_subdir_and_continues() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("keep.flac"), b"x").unwrap();
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("hidden.flac"), b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // chmod-000 denial is meaningless under root (it bypasses permissions) — skip
+    // rather than false-pass when the directory is still readable for us.
+    if std::fs::read_dir(&locked).is_ok() {
+        eprintln!(
+            "skipping collect_audio_skips_unreadable_subdir_and_continues: directory permissions not enforced (running as root?)"
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let mut out = Vec::new();
+    let result = collect_audio(dir.path(), &mut out, false);
+
+    // Restore perms so the TempDir can be cleaned up.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        result.is_ok(),
+        "an unreadable subdirectory must not abort the whole scan"
+    );
+    assert_eq!(
+        out.len(),
+        1,
+        "the readable sibling file must still be collected"
+    );
+    assert!(out[0].ends_with("keep.flac"));
+}
+
+#[test]
 fn scan_stores_canonical_path_through_symlinked_root() {
     // Scanning through a directory symlink must still store the canonical,
     // symlink-resolved backing path, so a later revalidate — which keys on the
