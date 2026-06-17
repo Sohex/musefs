@@ -123,6 +123,59 @@ def test_records_for_paths_emits_multitrack_pairs_in_lidarr_order(
     assert titles == ["Wildlife Analysis", "Second linked track"]
 
 
+def test_records_for_paths_emits_album_artist_pairs_once_per_file(
+    sample_artist, sample_album, sample_track, sample_track_file
+):
+    # A single-file release linking N tracks (cue-style) must not duplicate the
+    # album/artist-level tags N times (#539); only track-level fields repeat.
+    second_track = dict(sample_track, id=41, title="Second linked track", trackNumber="2")
+
+    records, skipped = records_for_paths(
+        paths=[sample_track_file["path"]],
+        track_files=[sample_track_file],
+        tracks=[sample_track, second_track],
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
+    )
+
+    assert skipped == []
+    pairs = records[0].pairs
+    keys = [key for key, _ in pairs]
+    for once_key in (
+        "artist",
+        "albumartist",
+        "album",
+        "date",
+        "musicbrainz_artistid",
+        "musicbrainz_albumid",
+    ):
+        assert keys.count(once_key) == 1, f"{once_key} duplicated: {pairs!r}"
+    # Genres (album + artist, deduped) also appear once apiece, not per track.
+    assert keys.count("genre") == 2
+    # Track-level fields still repeat per linked track.
+    assert keys.count("title") == 2
+    assert [v for k, v in pairs if k == "tracknumber"] == ["1", "2"]
+
+
+def test_records_for_paths_marks_records_as_lidarr_managed(
+    sample_artist, sample_album, sample_track, sample_track_file
+):
+    # Lidarr stamps an ownership marker so prune_deleted never touches rows it
+    # did not write (scanner-seeded MBIDs look identical otherwise) (#546).
+    from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
+
+    records, _ = records_for_paths(
+        paths=[sample_track_file["path"]],
+        track_files=[sample_track_file],
+        tracks=[sample_track],
+        albums_by_id={20: sample_album},
+        artists_by_id={10: sample_artist},
+    )
+
+    pairs = records[0].pairs
+    assert pairs.count((MANAGED_KEY, MANAGED_VALUE)) == 1
+
+
 def test_records_for_paths_returns_reason_for_missing_linked_tracks(
     sample_artist, sample_album, sample_track_file
 ):

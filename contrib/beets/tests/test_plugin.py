@@ -233,12 +233,12 @@ def test_reconcile_at_cli_exit_syncs_recorded_items(
         conn.close()
 
 
-def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_path, monkeypatch):
-    """Verify reconcile prunes rows whose backing file moved."""
-    # Reconcile uses a full-table prune so stale rows from renames/moves
-    # (whose backing file no longer exists) are cleaned up even though the
-    # pending items only carry the new path.
-    make_track("/old/moved-away.flac")  # stale: file gone
+def test_reconcile_does_not_prune_only_syncs(db_path, make_track, fake_item, tmp_path, monkeypatch):
+    """Pruning is a deliberate act (#538): the passive cli_exit reconcile syncs
+    touched items but never prunes, so a transient backing-storage loss can no
+    longer mass-delete plugin metadata. Stale rows are left for the explicit
+    ``beet musefs`` command / ``musefs scan``."""
+    make_track("/old/moved-away.flac")  # stale: backing file gone
     real, tid, item = _real_track(tmp_path, make_track, fake_item, title="Now")
     plugin, _ = _autoscan_plugin(db_path, monkeypatch)
     plugin._record(item=item)
@@ -247,7 +247,7 @@ def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_pat
     conn = connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
-        assert "/old/moved-away.flac" not in paths  # stale row pruned
+        assert "/old/moved-away.flac" in paths  # NOT pruned — reconcile never prunes
         assert real in paths  # new path kept + synced
         assert (
             conn.execute(
@@ -255,6 +255,31 @@ def test_reconcile_prunes_moved_away_row(db_path, make_track, fake_item, tmp_pat
             ).fetchone()[0]
             == "Now"
         )
+    finally:
+        conn.close()
+
+
+def test_prune_missing_refuses_on_schema_mismatch(db_path, make_track, tmp_path):
+    """The destructive prune path honours the schema guard (#545): an out-of-date
+    plugin must not delete rows from a store schema it cannot understand."""
+    from beets import ui
+
+    gone = tmp_path / "gone.flac"  # never created == missing == would be pruned
+    make_track(str(gone))
+    conn = connect(db_path)
+    try:
+        conn.execute("PRAGMA user_version = 99999")  # diverged schema
+        conn.commit()
+    finally:
+        conn.close()
+
+    plugin = MusefsPlugin.__new__(MusefsPlugin)
+    with pytest.raises(ui.UserError):
+        plugin._prune_missing(db_path)
+
+    conn = connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 1
     finally:
         conn.close()
 

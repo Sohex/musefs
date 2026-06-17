@@ -16,6 +16,16 @@ class SkippedPath:
     reason: str
 
 
+# Ownership marker stamped on every track this plugin writes. ``prune_deleted``
+# matches a Lidarr album/artist deletion to store rows by MusicBrainz id, but a
+# scanner-seeded ``musicbrainz_albumid`` (read from the file's own native tags)
+# is an indistinguishable text tag. The marker scopes deletion to rows Lidarr
+# actually managed (#546). It is a normal text tag, so it DOES appear in served
+# files (e.g. a ``MUSEFS_LIDARR_MANAGED`` Vorbis comment) — see the Lidarr docs.
+MANAGED_KEY = "musefs_lidarr_managed"
+MANAGED_VALUE = "1"
+
+
 def _text(value) -> str | None:
     """Stringify and strip ``value``; return None if empty."""
     if value is None:
@@ -38,21 +48,29 @@ def _append(pairs: list[tuple[str, str]], key: str, value) -> None:
         pairs.append((key, text))
 
 
-def build_pairs(*, track: dict, album: dict, artist: dict) -> list[tuple[str, str]]:
-    """Map Lidarr track/album/artist fields to musefs ``(key, value)`` tag pairs."""
+def _track_pairs(track: dict) -> list[tuple[str, str]]:
+    """Track-level ``(key, value)`` tags — the fields that legitimately repeat
+    once per linked track of a single-file (cue-style) release."""
+    pairs: list[tuple[str, str]] = []
+    _append(pairs, "title", track.get("title"))
+    _append(pairs, "tracknumber", track.get("trackNumber") or track.get("absoluteTrackNumber"))
+    _append(pairs, "discnumber", track.get("mediumNumber"))
+    _append(pairs, "musicbrainz_trackid", track.get("foreignTrackId"))
+    _append(pairs, "musicbrainz_releasetrackid", track.get("foreignRecordingId"))
+    return pairs
+
+
+def _album_artist_pairs(album: dict, artist: dict) -> list[tuple[str, str]]:
+    """Album/artist-level ``(key, value)`` tags — emitted once per backing file,
+    not once per linked track (#539)."""
     pairs: list[tuple[str, str]] = []
     artist_name = artist.get("artistName") or artist.get("name")
-    _append(pairs, "title", track.get("title"))
     _append(pairs, "artist", artist_name)
     _append(pairs, "albumartist", artist_name)
     _append(pairs, "album", album.get("title"))
-    _append(pairs, "tracknumber", track.get("trackNumber") or track.get("absoluteTrackNumber"))
-    _append(pairs, "discnumber", track.get("mediumNumber"))
     _append(pairs, "date", _date(album.get("releaseDate")))
     _append(pairs, "musicbrainz_artistid", artist.get("foreignArtistId") or artist.get("mbId"))
     _append(pairs, "musicbrainz_albumid", album.get("foreignAlbumId"))
-    _append(pairs, "musicbrainz_trackid", track.get("foreignTrackId"))
-    _append(pairs, "musicbrainz_releasetrackid", track.get("foreignRecordingId"))
 
     seen_genres = set()
     for genre in list(album.get("genres") or []) + list(artist.get("genres") or []):
@@ -61,6 +79,14 @@ def build_pairs(*, track: dict, album: dict, artist: dict) -> list[tuple[str, st
             seen_genres.add(text)
             pairs.append(("genre", text))
     return pairs
+
+
+def build_pairs(*, track: dict, album: dict, artist: dict) -> list[tuple[str, str]]:
+    """Map one Lidarr track plus its album/artist to musefs ``(key, value)`` tag
+    pairs. ``records_for_paths`` does not call this for multi-track files — it
+    combines :func:`_album_artist_pairs` (once) with :func:`_track_pairs` (per
+    linked track) so album/artist fields are not duplicated (#539)."""
+    return _track_pairs(track) + _album_artist_pairs(album, artist)
 
 
 def match_track_file(path_key: str, track_files: list[dict]) -> dict | None:
@@ -136,9 +162,12 @@ def records_for_paths(
         if album is None or artist is None:
             skipped.append(SkippedPath(path=path, reason="album or artist metadata unavailable"))
             continue
-        pairs = []
+        # Album/artist-level tags are emitted once per file; only track-level
+        # tags repeat per linked track (a single-file/cue-style release) (#539).
+        pairs = _album_artist_pairs(album, artist)
+        pairs.append((MANAGED_KEY, MANAGED_VALUE))  # ownership marker (#546)
         for track in linked:
-            pairs.extend(build_pairs(track=track, album=album, artist=artist))
+            pairs.extend(_track_pairs(track))
         art = art_by_album_id.get(int(track_file["albumId"]))
         records.append(Record(key=key, pairs=pairs, art=[art] if art else None))
     return records, skipped

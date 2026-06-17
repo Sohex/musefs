@@ -81,10 +81,12 @@ musefs mount ~/mnt --db ~/musefs.db --template '$!{beets_path}'
 Imports and tag write-backs auto-sync via event hooks: `beet import` and
 `beet modify -w …` record the touched items and reconcile them once the command
 finishes — when each file's path is final (beets has no move event, and a write
-fires *before* its move). The reconcile scans the new path and prunes the row
-left behind at the old one. A metadata-only `beet modify` (no `-w`) doesn't fire
-a hook — re-run `beet musefs`. With `autoscan: no`, run `musefs scan` yourself
-first; the hooks then skip gracefully if the DB is missing.
+fires *before* its move). The reconcile scans the new path and writes its tags,
+but it **never prunes** — pruning is a deliberate act (see below). A move
+therefore leaves the old path's row behind until you run `beet musefs`. A
+metadata-only `beet modify` (no `-w`) doesn't fire a hook — re-run `beet musefs`.
+With `autoscan: no`, run `musefs scan` yourself first; the hooks then skip
+gracefully if the DB is missing.
 
 ## Never writing to your backing audio files
 
@@ -143,14 +145,17 @@ A few plugins ignore that gate or are redundant in this mode:
   engine can't express. Set `write_path: no` in the `musefs:` config to skip it.
   Do not add an extension in a template that consumes `beets_path`. See the
   computed-tag workflow in [the architecture overview](../architecture/overview.md).
-- **Moves & on-disk deletes:** every sync (the command and the end-of-command
-  reconcile) prunes track rows whose backing file is gone from disk, so
-  renames/moves don't leave stale entries. Caveat: a file that's merely offline
-  at sync time (e.g. an unmounted network share) is also pruned — sync while
-  the library is available.
-- **Removals prune the store.** `beet remove -d` deletes the backing file, so the
-  store row is pruned at the end of the command. A bare `beet remove` (which keeps
-  the file on disk) leaves the row in place — musefs can still serve those bytes.
+- **Pruning is a deliberate act.** Only the explicit `beet musefs` command prunes
+  track rows whose backing file is gone from disk (renames/moves/deletes). The
+  passive end-of-command reconcile (`beet import` / `beet modify -w`) syncs but
+  never prunes, so a transient backing-storage loss — an unmounted network share,
+  an offline drive, a momentary realpath divergence — can no longer mass-delete
+  plugin metadata. Run `beet musefs` (or `musefs scan`) while the library is
+  available to clear stale rows left by a move or an on-disk delete.
+- **Removals are not auto-pruned.** `beet remove` / `beet remove -d` no longer
+  prunes the store; run `beet musefs` afterwards to drop the rows whose backing
+  file is now gone. A bare `beet remove` (which keeps the file on disk) leaves a
+  servable row in place even then — musefs can still serve those bytes.
 - **Orphaned art:** replacing art can orphan old blobs; `musefs scan --revalidate`
   garbage-collects them.
 - **Schema version:** the plugin refuses to run if the DB's `user_version` differs

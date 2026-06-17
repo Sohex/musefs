@@ -198,12 +198,22 @@ binary are importable/on `PATH`.
 - **Schema version:** the sync refuses to run if the DB's `user_version`
   differs from the version it targets — rebuild the store after upgrading
   musefs.
-- **Deletions prune by MusicBrainz id.** On an Album/Artist delete, the sync
-  removes the matching store rows (`musicbrainz_albumid` / `musicbrainz_artistid`)
-  so the mount stops presenting them. The backing audio is never touched —
-  pruning only drops the store rows, not the files Lidarr keeps in the backing
-  directory. A delete event for a release with no MusicBrainz id cannot be mapped
-  and is logged and skipped; those rows clear on the next scan/reconcile.
+- **Deletions prune by MusicBrainz id, scoped to rows this plugin owns.** On an
+  Album/Artist delete, the sync removes the matching store rows
+  (`musicbrainz_albumid` / `musicbrainz_artistid`) so the mount stops presenting
+  them. The backing audio is never touched — pruning only drops the store rows,
+  not the files Lidarr keeps in the backing directory. A delete event for a
+  release with no MusicBrainz id cannot be mapped and is logged and skipped.
+- **Ownership marker.** Every track the sync writes is stamped with a
+  `musefs_lidarr_managed=1` tag, and a delete only removes rows carrying that
+  marker. Without it, a `musicbrainz_albumid` the *scanner* seeded from a file's
+  own native tags is indistinguishable from one Lidarr wrote, so an unrelated
+  Lidarr delete could drop an unmanaged track's metadata. The marker is a normal
+  text tag, so it **does appear in served files** (e.g. as a
+  `MUSEFS_LIDARR_MANAGED` Vorbis comment / a `TXXX` frame / an iTunes freeform
+  atom). A track imported under an older plugin version (before the marker
+  existed) is treated as unmanaged and is left in place on delete — re-sync it to
+  stamp the marker.
 - **CI coverage:** a fast smoke (real Lidarr exec path + mocked API) gates PRs,
   and a full real-instance download-client import e2e gates the Python
   releases — see

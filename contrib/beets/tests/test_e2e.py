@@ -527,15 +527,17 @@ def test_e2e_move_reconcile(tmp_path):
     cfg, env, db, mnt, library = _imported_library(tmp_path)
     _beet(cfg, env, "musefs")  # initial sync (original tags)
 
-    # A write-back modify renames/moves the FLAC. The plugin's cli_exit reconcile
-    # must scan the new path and prune the row left at the old one.
+    # A write-back modify renames/moves the FLAC. The passive cli_exit reconcile
+    # scans the new path but never prunes (#538: pruning is a deliberate act), so
+    # the explicit `beet musefs` is what removes the row left at the old path.
     _beet(cfg, env, "modify", "-w", "-y", "format:FLAC", "title=Relocated FLAC")
+    _beet(cfg, env, "musefs")  # deliberate prune of the moved-away row
 
     with _mounted(mnt, db, "$albumartist/$album/$title"):
         new = mnt / "Test AA" / "Orig Album" / "Relocated FLAC.flac"
         old = mnt / "Test AA" / "Orig Album" / "Orig FLAC.flac"
         assert new.exists(), sorted(p.name for p in mnt.rglob("*.flac"))
-        assert not old.exists()  # stale entry was pruned, not duplicated
+        assert not old.exists()  # stale entry pruned by the explicit sync
         assert len(list(mnt.rglob("*.flac"))) == 1
 
         ft = mutagen.File(str(new), easy=True)
