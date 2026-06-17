@@ -104,12 +104,6 @@ mod tests {
     use crate::models::NewArt;
     use crate::{Db, DbError};
 
-    fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
-        let mut p = path.to_path_buf().into_os_string();
-        p.push(suffix);
-        std::path::PathBuf::from(p)
-    }
-
     #[test]
     fn vacuum_shrinks_file_and_truncates_wal_after_deletion() {
         let dir = tempfile::tempdir().unwrap();
@@ -146,11 +140,17 @@ mod tests {
             .unwrap();
         assert_eq!(freelist, 0, "vacuum must leave no free pages");
 
-        // The TRUNCATE checkpoint inside vacuum() must zero the WAL file.
-        let wal = std::fs::metadata(sidecar(&path, "-wal"))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        assert_eq!(wal, 0, "vacuum must truncate the -wal file");
+        // The TRUNCATE checkpoint inside vacuum() must drain the WAL: a
+        // subsequent checkpoint reports 0 frames in the log (column 1 of
+        // `PRAGMA wal_checkpoint` is the WAL frame count). Deterministic, and
+        // unlike a `-wal` file-size check it does not depend on WAL internals.
+        // Without the in-method checkpoint, VACUUM's frames are still pending
+        // here, so this is non-zero and the checkpoint-removal mutant dies.
+        let wal_frames: i64 = db
+            .conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(1))
+            .unwrap();
+        assert_eq!(wal_frames, 0, "vacuum must checkpoint the WAL");
     }
 
     #[test]
@@ -178,9 +178,14 @@ mod tests {
 }
 ```
 
-Note: Step 3 already contains the implementation (the `impl`/`map_vacuum_err`) because the tests and impl live in one small file and must compile together. The "failing" state in Step 4 is the pre-edit baseline — confirm the module did not exist before. If you prefer strict red-first, temporarily stub `vacuum` to `Ok(())` without the pragmas and watch `vacuum_shrinks_file...` fail, then restore the body shown above.
+**TDD note (recommended red-first):** `vacuum()`, `map_vacuum_err`, and the tests live in one small file and must compile together. To observe a real red, first paste the module with `vacuum`'s body stubbed — `pub fn vacuum(&self) -> Result<()> { Ok(()) }` (drop the two `execute_batch` lines; keep `map_vacuum_err` so the mapping tests still compile) — run Step 4a, and watch `vacuum_shrinks_file_and_truncates_wal_after_deletion` fail (no shrink, `freelist_count != 0`) while the three other tests pass. Then restore the real two-statement body shown above and run Step 4b.
 
-- [ ] **Step 4: Run the tests to verify they pass (after Steps 1-3)**
+- [ ] **Step 4a: Run with the stub — verify the shrink test fails (red)**
+
+Run: `cargo test -p musefs-db maintenance`
+Expected: FAIL — `vacuum_shrinks_file_and_truncates_wal_after_deletion` fails on `after < before` (the stub does not compact); the two `map_vacuum_err` tests and `vacuum_on_empty_store_is_ok` PASS.
+
+- [ ] **Step 4b: Restore the real body — verify all pass (green)**
 
 Run: `cargo test -p musefs-db maintenance`
 Expected: PASS — `vacuum_shrinks_file_and_truncates_wal_after_deletion`, `vacuum_on_empty_store_is_ok`, `map_vacuum_err_maps_busy_and_locked_to_store_in_use`, `map_vacuum_err_passes_through_other_errors` all green.
@@ -309,13 +314,15 @@ In `musefs-cli/src/lib.rs`, after `run_mount` and before `pub fn run`, add:
 /// sidecars (a missing sidecar counts as 0). Summing the WAL/SHM keeps the
 /// reclaimed figure honest — a TRUNCATE checkpoint reclaims WAL bytes too.
 fn store_footprint(db: &Path) -> u64 {
-    let main = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+    // `.map_or`, not `.map(..).unwrap_or(..)`: the latter trips
+    // `clippy::map_unwrap_or` (pedantic), which the `-D warnings` gate rejects.
+    let main = std::fs::metadata(db).map_or(0, |m| m.len());
     let side: u64 = ["-wal", "-shm"]
         .iter()
         .map(|suffix| {
             let mut p = db.as_os_str().to_os_string();
             p.push(suffix);
-            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+            std::fs::metadata(p).map_or(0, |m| m.len())
         })
         .sum();
     main + side
@@ -540,7 +547,16 @@ Run the in-diff mutation gate against the new code (serial, in-place, `/tmp` TMP
 ```bash
 cargo mutants --in-place --in-diff <(git diff origin/main...HEAD -- musefs-db musefs-cli) -- --offline
 ```
-Expected: no surviving mutants in `maintenance.rs` / the new CLI functions. The shrink+wal-truncate assertions kill the `VACUUM`/checkpoint-removal mutants; the `map_vacuum_err` tests kill the predicate mutants; `vacuum_summary_reports_reclaimed_then_compact` kills the `saturating_sub`/comparison mutants.
+
+Diff-base note: PR #566's base is `main`, and the release-prep commits on this
+branch touched no `musefs-db`/`musefs-cli` **src** (only `Cargo.toml` versions,
+which `cargo mutants` ignores), so `origin/main...HEAD` restricted to those two
+crates yields exactly the three vacuum src files. If you instead want only the
+vacuum commits, diff against the commit before Task 1 (e.g. `git diff
+<task1-parent>...HEAD -- musefs-db musefs-cli`). Run `git fetch origin` first so
+`origin/main` is current.
+
+Expected: no surviving mutants in `maintenance.rs` / the new CLI functions. The `after < before` shrink assertion kills the `VACUUM`-removal mutant, and the `PRAGMA wal_checkpoint(PASSIVE)` frame-count assertion (`wal_frames == 0`) kills the checkpoint-removal mutant; the `map_vacuum_err` tests kill the predicate mutants; `vacuum_summary_reports_reclaimed_then_compact` kills the `saturating_sub`/comparison mutants.
 
 If a mutant survives and is genuinely equivalent or hang/OOM-class, add a documented `exclude_re`/anchor to `.cargo/mutants.toml` in the same commit (per the repo convention) — do **not** weaken a test to pass.
 
