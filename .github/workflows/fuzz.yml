@@ -36,9 +36,12 @@ jobs:
         with:
           workspaces: 'fuzz'
       - name: Install cargo-fuzz
-        # Not --locked: cargo-fuzz's pinned Cargo.lock has an old rustix that
-        # fails to compile on current nightly; let cargo resolve newer deps.
-        run: cargo install cargo-fuzz
+        # Pin the version (the 0.13 line) so provisioning the security harness is
+        # reproducible and a breaking upstream bump can't silently change behavior
+        # between runs of the same commit. Not --locked: cargo-fuzz's pinned
+        # Cargo.lock has an old rustix that fails to compile on current nightly,
+        # so cargo still re-resolves the dep tree within the pinned version.
+        run: cargo install cargo-fuzz --version '^0.13'
       - name: Build targets
         run: cargo +nightly fuzz build
       - name: Replay committed reproducers (-runs=0)
@@ -58,7 +61,7 @@ jobs:
           exit $status
       - name: Smoke-run each target
         run: |
-          for t in flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment; do
+          for t in flac mp3 mp4 ogg wav ogg_page b64 vorbiscomment serve; do
             echo "== $t =="
             cargo +nightly fuzz run "$t" -- -max_len=131072 -rss_limit_mb=2048 -max_total_time=15
           done
@@ -84,9 +87,12 @@ jobs:
         with:
           workspaces: 'fuzz'
       - name: Install cargo-fuzz
-        # Not --locked: cargo-fuzz's pinned Cargo.lock has an old rustix that
-        # fails to compile on current nightly; let cargo resolve newer deps.
-        run: cargo install cargo-fuzz
+        # Pin the version (the 0.13 line) so provisioning the security harness is
+        # reproducible and a breaking upstream bump can't silently change behavior
+        # between runs of the same commit. Not --locked: cargo-fuzz's pinned
+        # Cargo.lock has an old rustix that fails to compile on current nightly,
+        # so cargo still re-resolves the dep tree within the pinned version.
+        run: cargo install cargo-fuzz --version '^0.13'
       # Corpus accumulates across scheduled runs via artifacts, not the Actions
       # cache. A cache is evicted after 7 days of no access and the cron is also
       # 7 days, so a single skipped/delayed/failed run (or LRU eviction under the
