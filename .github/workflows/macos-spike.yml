@@ -79,7 +79,12 @@ jobs:
         if: steps.shim_build.outcome == 'success'
         id: mount_default
         continue-on-error: true
-        run: cargo test -p musefs-fuse --test mount -- --ignored --nocapture 2>&1 | tail -80
+        run: |
+          # tempfile::tempdir() honors TMPDIR; default macOS TMPDIR is /var/folders
+          # (a special volume) where fuse-t's NFS mount may not overlay. Point it at
+          # a normal $HOME dir so the mountpoints land somewhere NFS can attach.
+          export TMPDIR="$HOME/spiketmp"; mkdir -p "$TMPDIR"
+          cargo test -p musefs-fuse --test mount -- --ignored --nocapture 2>&1 | tail -80
       - name: Inspect for stale mounts after tests
         if: always()
         run: |
