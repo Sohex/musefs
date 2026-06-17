@@ -507,3 +507,45 @@ a real mounting platform — not merely a CI device. Tradeoff: building
 as Linux already needs `fuse3`/`libfuse3-dev`. The "dep-free macOS compile" the
 original Approach A preserved was only possible because macOS couldn't really
 mount. A second spike run (macos-no-mount removed) is needed to close Unknowns 2 & 3.
+
+---
+
+## FINDINGS (final — 7 spike runs, macos-latest arm64, fuse-t 1.2.7)
+
+**Viable, up to a hard blocker.** Summary of what the spikes established:
+
+1. **Install** — `brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t`
+   (v1.2.7, sudo pkg installer, no `--no-quarantine`) + `brew install ffmpeg`. Works.
+2. **fuser 0.17 only does libfuse2 on macOS.** Its `build.rs` macOS branch is
+   `macos-no-mount` (stub) XOR a probe of `fuse` (libfuse2/macFUSE) — it never
+   reaches the `libfuse3` branch. fuse-t ships `fuse3.pc` (+`fuse-t.pc`), **no
+   `fuse.pc`**, so the stock `libfuse`/`libfuse3` feature can't link it.
+3. **Approach A is dead** — `libfuse` + `macos-no-mount` compile but the stub wins
+   ("Mount is not enabled; this is test-only configuration"); the mount is a no-op.
+   Must drop `macos-no-mount` → **Approach B**.
+4. **The bridge that works:** `libfuse-t.dylib` *exports the libfuse2 ABI*
+   (`_fuse_mount_compat25`, `_fuse_lowlevel_new_compat25`, `_fuse_chan_new`,
+   `_fuse_session_add_chan`, …). Installing a one-line **`fuse.pc` shim**
+   (`Libs: -L/usr/local/lib -lfuse-t`, `Version: 2.9.9`) via `sudo tee` into
+   `/usr/local/lib/pkgconfig` makes fuser's libfuse2 probe link fuse-t. With
+   Approach B + the shim, `cargo build -p musefs-fuse` links cleanly.
+5. **Mounting works** — with the shim, the suite runs through fuse-t:
+   `statfs_reports_nonzero_capacity` and `concurrent_spawns_do_not_race` PASS,
+   and the BackgroundSession `Drop` unmounts cleanly ("no fuse/nfs mounts left").
+   fuse-t **tolerates** the macFUSE `volname`/`noappledouble` options → the
+   planned Task 3 env-gate is **not needed**.
+6. **BLOCKER — content is invisible through the mount.** All 3 read/readdir tests
+   fail with `ENOENT` resolving any child path (`/Alice/Song.flac`). statfs works
+   but FUSE LOOKUP/readdir/open don't surface musefs's tree through fuse-t's
+   NFS translation. Ruled out: timing (a 5 s readiness poll in `spawn_with` never
+   saw the root list — 30 s run, still empty); mountpoint location (`TMPDIR` under
+   `$HOME` instead of `/var/folders` — no change). Root cause is an open
+   fuse-t↔fuser low-level-protocol issue (likely how fuser's LOOKUP/entry replies
+   are translated to NFS), needing real investigation beyond this plan's scope.
+
+**Net:** the CI plumbing (install + libfuse2 ABI + `fuse.pc` shim + Approach B)
+is solved and reusable, but fuse-t does not serve musefs's directory tree out of
+the box, so the e2e suite cannot pass yet. Recommend pausing macOS fuse-t e2e
+until the LOOKUP/readdir blocker is understood (candidate next steps: try fuse-t's
+SMB backend instead of NFS; test a newer/forked fuser with macOS-fuse3 support;
+minimal C libfuse-t filesystem to isolate whether the bug is fuser or fuse-t).
