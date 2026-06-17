@@ -21,10 +21,10 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "tikv-jemalloc-ctl
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
-musefs-cli = { path = "../musefs-cli", version = "1.0.0" }
+musefs-cli = { path = "../musefs-cli", version = "1.1.0" }
 # Direct dep only under `jemalloc`: the binary installs the allocator-stats probe
 # (`musefs_fuse::set_alloc_probe`) since it owns the jemalloc global allocator.
-musefs-fuse = { path = "../musefs-fuse", version = "1.0.0", optional = true }
+musefs-fuse = { path = "../musefs-fuse", version = "1.1.0", optional = true }
 tikv-jemallocator = { version = "0.7", optional = true }
 tikv-jemalloc-ctl = { version = "0.7", optional = true }
 log = { version = "0.4", optional = true }

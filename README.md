@@ -6,7 +6,8 @@
 
 [![CI](https://github.com/Sohex/musefs/actions/workflows/ci.yml/badge.svg)](https://github.com/Sohex/musefs/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/Sohex/musefs/branch/main/graph/badge.svg)](https://codecov.io/gh/Sohex/musefs)
-[![Release](https://img.shields.io/github/v/release/Sohex/musefs?sort=semver)](https://github.com/Sohex/musefs/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/musefs.svg?logo=rust)](https://crates.io/crates/musefs)
+[![PyPI](https://img.shields.io/pypi/v/python-musefs.svg?logo=pypi&logoColor=white&label=python-musefs)](https://pypi.org/project/python-musefs/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A read-only FUSE filesystem that presents a re-tagged, reorganized view of

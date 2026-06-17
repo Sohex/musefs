@@ -13,9 +13,9 @@ categories = ["filesystem", "multimedia::audio", "command-line-utilities"]
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 log = "0.4"
-musefs-db = { path = "../musefs-db", version = "1.0.0" }
-musefs-core = { path = "../musefs-core", version = "1.0.0" }
-musefs-fuse = { path = "../musefs-fuse", version = "1.0.0" }
+musefs-db = { path = "../musefs-db", version = "1.1.0" }
+musefs-core = { path = "../musefs-core", version = "1.1.0" }
+musefs-fuse = { path = "../musefs-fuse", version = "1.1.0" }
 signal-hook = "0.4"
 uzers = "0.12"
 indicatif = { version = "0.18", default-features = false }

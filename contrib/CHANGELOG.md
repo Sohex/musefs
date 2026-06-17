@@ -10,6 +10,8 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-17
+
 ### Changed
 
 - **beets: pruning is now a deliberate act.** The passive `cli_exit` reconcile

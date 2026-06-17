@@ -22,7 +22,7 @@ metaflac = "0.2"
 mp4 = "0.14"
 crc = "3"
 hound = "3"
-musefs-db = { path = "../musefs-db", version = "1.0.0" }
+musefs-db = { path = "../musefs-db", version = "1.1.0" }
 proptest = "1"
 # Self-dependency: turns the `fuzzing` feature on for this crate's own test
 # builds, so tests/ can use fuzz_check and the proptests run without an

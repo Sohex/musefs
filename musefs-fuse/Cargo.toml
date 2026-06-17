@@ -16,7 +16,7 @@ fuser = { version = "0.17", default-features = false }
 libc = "0.2"
 log = "0.4"
 rustix = { version = "1", features = ["process"] }
-musefs-core = { path = "../musefs-core", version = "1.0.0" }
+musefs-core = { path = "../musefs-core", version = "1.1.0" }
 threadpool = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
