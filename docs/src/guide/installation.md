@@ -46,6 +46,12 @@ the target needs the FUSE userspace tools and `/dev/fuse`:
 
 No glibc/libfuse install is needed for the musl binaries beyond `fuse3`.
 
+> **Note:** On Ubuntu 24.04+ (libfuse ≥ 3.17) the `fusermount3` AppArmor
+> profile only permits unprivileged mounts under whitelisted prefixes
+> (`$HOME/**`, `/mnt`, `/media`, `/tmp`, …). Mounting elsewhere fails with
+> `fusermount3: mount failed: Permission denied` — see
+> [Mounting](mounting.md#mounting) for the whitelist and the fix.
+
 ## Building from source
 
 `cargo install musefs` compiles the latest release; building needs a stable

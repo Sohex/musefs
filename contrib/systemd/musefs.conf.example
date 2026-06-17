@@ -56,8 +56,8 @@ MUSEFS_DB=/home/youruser/.local/share/musefs/library.db
 #MUSEFS_READ_AHEAD_PREFETCH=false
 # Max outstanding background (readahead/async) requests the kernel queues.
 #MUSEFS_MAX_BACKGROUND=64
-# Keep the kernel page cache across opens.
-#MUSEFS_KEEP_CACHE=false
+# Keep the kernel page cache across opens. Default: true.
+#MUSEFS_KEEP_CACHE=true
 
 # --- Mount: ownership & permissions ----------------------------------------
 
