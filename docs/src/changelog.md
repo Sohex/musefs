@@ -61,12 +61,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Per-field `--fallback` case-insensitivity:** fallback keys are now ASCII
   lowercased to match template field names, so `--fallback AlbumArtist=…` (any
   uppercase) is honored instead of silently never matching (#504).
-- **Tag value byte cap:** the read-time `tags.value` guard now counts bytes, not
-  UTF-8 characters, so the 256 KiB materialized-memory bound is exact rather than
-  up to ~4x looser for multibyte text (#505).
+- **Tag value byte cap:** both the schema `CHECK` (rebuilt in the `MIGRATION_V2`
+  upgrade) and the read-time `tags.value` guard now count bytes, not UTF-8
+  characters, so the 256 KiB materialized-memory bound is exact rather than up to
+  ~4x looser for multibyte text. The upgrade drops any pre-existing over-cap rows
+  (already unreadable under the byte-counting reader guard) (#505).
 - **Embedded NUL in ID3 metadata:** synthesized ID3 frames now reject a
-  DB-sourced tag value, art mime, or art description containing an embedded NUL
-  instead of emitting a frame a downstream parser would misread (#506).
+  DB-sourced tag key, tag value, art mime, or art description containing an
+  embedded NUL instead of emitting a frame a downstream parser would misread
+  (#506).
 - **Orphan-art GC NULL safety:** `gc_orphan_art` uses `NOT EXISTS` rather than
   `NOT IN (subquery)`, so a NULL `art_id` could not silently turn the GC into a
   no-op (#507).

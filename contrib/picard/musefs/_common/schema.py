@@ -220,6 +220,53 @@ ALTER TABLE tracks ADD COLUMN fingerprint  TEXT
 ALTER TABLE tracks ADD COLUMN content_hash TEXT
     CHECK (content_hash IS NULL OR length(content_hash) = 64);
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
+
+-- Rebuild `tags` with a byte-accurate value cap (#505). SQLite's length() on
+-- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` was up to
+-- ~4x looser than the documented 256 KiB byte bound; length(CAST(value AS BLOB))
+-- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table
+-- (V2 is unreleased — this is folded in rather than added as a new migration).
+-- Pre-existing over-cap rows (only reachable on an upgraded store) are dropped:
+-- the read-time guard already counts bytes, so they were unreadable anyway, and
+-- carrying them would abort the rebuild on the new CHECK.
+CREATE TABLE tags_new (
+    track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    ordinal    INTEGER NOT NULL DEFAULT 0,
+    value_blob BLOB,
+    PRIMARY KEY (track_id, key, ordinal),
+    CHECK (ordinal >= 0),
+    CHECK (value_blob IS NULL OR value = ''),
+    CHECK (length(key) <= 256),
+    CHECK (length(key) >= 1
+           AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
+    CHECK (length(CAST(value AS BLOB)) <= 262144),
+    CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
+);
+INSERT INTO tags_new (track_id, key, value, ordinal, value_blob)
+    SELECT track_id, key, value, ordinal, value_blob FROM tags
+    WHERE length(CAST(value AS BLOB)) <= 262144;
+DROP TABLE tags;
+ALTER TABLE tags_new RENAME TO tags;
+
+-- DROP TABLE tags dropped its INSERT/UPDATE/DELETE triggers; recreate them
+-- verbatim so the content_version/updated_at bump contract is unchanged.
+CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_au AFTER UPDATE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
 PRAGMA user_version = 2;
 """
 
