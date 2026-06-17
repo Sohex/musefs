@@ -462,3 +462,48 @@ git commit -m "docs: macOS is now best-effort E2E tested via fuse-t"
 **Placeholder scan:** The only deferred values are the exact fuse-t tap/cask name and `PKG_CONFIG_PATH`, which are the literal deliverable of the Task 1 spike and are explicitly fed forward into Tasks 2/4 — not vague "TBD"s. Every code/edit step shows real content.
 
 **Type consistency:** `macos-mount` feature name, `MUSEFS_FUSE_T` env var, and `extend_os_specific` signature are used identically across Tasks 2, 3, and 4.
+
+---
+
+## FINDINGS (Task 1 spike — run 27664409801, macos-latest arm64, fuse-t 1.2.7)
+
+**Install recipe (works, no quarantine flag needed):**
+```sh
+brew tap macos-fuse-t/homebrew-cask
+brew install --cask fuse-t      # installs fuse-t 1.2.7 via a sudo pkg installer
+brew install ffmpeg
+```
+fuse-t lays libfuse down in `/usr/local/lib` (`libfuse-t.dylib`, `libfuse3.dylib`,
+`libfuse3.4.dylib`, static `.a` variants) with pkg-config files
+`/usr/local/lib/pkgconfig/fuse3.pc` and `fuse-t.pc` — **there is NO `fuse.pc`**
+(`pkg-config --exists fuse` is false; `fuse3` exists). `fuser`'s build script found
+libfuse with **no `PKG_CONFIG_PATH` override** (my `/opt/homebrew/lib/pkgconfig`
+guess was wrong, yet it linked) — pkg-config's default macOS search path already
+includes `/usr/local/lib/pkgconfig`. So no `PKG_CONFIG_PATH` is needed; the real
+job can drop it.
+
+**Unknown 1 (feature coexistence) — RESOLVED, and it kills Approach A.**
+`cargo build -p musefs-fuse --features fuser/libfuse` compiled fine WITH the crate's
+existing `macos-no-mount` macOS dep (build `Finished in 29.07s`). But the `mount`
+test then failed 5/5 instantly (3.13s) with `"Mount is not enabled; this is
+test-only configuration"` — fuser's **`macos-no-mount` stub**. Cargo unions
+features, so `libfuse` + `macos-no-mount` together leaves the mount stubbed.
+Because features are additive (no feature can remove `macos-no-mount`),
+**Approach A is not viable**; mounting requires dropping `macos-no-mount`
+entirely → **Approach B**.
+
+**Unknown 2 (fuse-t accepts volname/noappledouble) — STILL PENDING.** The stub
+short-circuited before any real mount, so we have NOT yet observed whether fuse-t
+tolerates the macFUSE options. Must be re-checked once `macos-no-mount` is removed.
+
+**Unknown 3 (clean unmount) — STILL PENDING (vacuous).** "no fuse mounts left"
+was reported, but no real mount happened, so this proves nothing. Re-check after B.
+
+**Consequence:** `macos-no-mount` is a compile-only placeholder that can never
+mount (matching the docs' "not E2E tested on macOS" / "nothing running macOS to
+test on"). Approach B (always link libfuse on macOS) is therefore what makes macOS
+a real mounting platform — not merely a CI device. Tradeoff: building
+`musefs-fuse` on macOS now needs a FUSE lib present (fuse-t or macFUSE), exactly
+as Linux already needs `fuse3`/`libfuse3-dev`. The "dep-free macOS compile" the
+original Approach A preserved was only possible because macOS couldn't really
+mount. A second spike run (macos-no-mount removed) is needed to close Unknowns 2 & 3.
