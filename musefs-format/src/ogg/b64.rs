@@ -34,10 +34,15 @@ pub fn b64_window(out_offset: u64, take: u64, img_total: u64) -> B64Window {
 }
 
 /// Encode `raw` (the bytes named by a `B64Window`) and return exactly `take`
-/// output chars starting at `skip`.
-pub fn encode_b64_slice(raw: &[u8], skip: usize, take: usize) -> Vec<u8> {
+/// output chars starting at `skip`. Returns `None` when the encoded output is
+/// shorter than `skip + take` — i.e. `raw` was shorter than the window the
+/// caller resolved against `art_total` (a truncated art blob). A checked read
+/// rather than a panic, so the serve path can surface this as `BackingChanged`
+/// like the other base64-art arms (#526).
+pub fn encode_b64_slice(raw: &[u8], skip: usize, take: usize) -> Option<Vec<u8>> {
     let enc = base64::engine::general_purpose::STANDARD.encode(raw);
-    enc.as_bytes()[skip..skip + take].to_vec()
+    let end = skip.checked_add(take)?;
+    enc.as_bytes().get(skip..end).map(<[u8]>::to_vec)
 }
 
 /// Total base64 output length for an image of `img_total` bytes, or `None` if it
@@ -80,7 +85,8 @@ mod tests {
                     let w = b64_window(o, take, img_total);
                     let raw = &img[crate::convert::usize_from(w.in_start)
                         ..crate::convert::usize_from(w.in_start + w.in_len)];
-                    let got = encode_b64_slice(raw, w.skip, crate::convert::usize_from(take));
+                    let got = encode_b64_slice(raw, w.skip, crate::convert::usize_from(take))
+                        .expect("window lies within the encoded output");
                     assert_eq!(
                         got,
                         &full[crate::convert::usize_from(o)..crate::convert::usize_from(o + take)],
@@ -89,6 +95,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn encode_b64_slice_returns_none_when_window_exceeds_output() {
+        // A 3-byte blob encodes to exactly 4 base64 chars ("YWJj"). A window that
+        // runs past that — as it would for an art blob shorter than its resolved
+        // `art_total` — must return None rather than panic on an out-of-range
+        // slice (#526).
+        assert_eq!(encode_b64_slice(b"abc", 0, 4), Some(b"YWJj".to_vec()));
+        assert_eq!(encode_b64_slice(b"abc", 2, 4), None);
+        assert_eq!(encode_b64_slice(b"abc", 5, 1), None);
     }
 
     #[test]

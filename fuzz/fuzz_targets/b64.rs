@@ -18,7 +18,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let total = b64_len(img.len() as u64);
-    let full = encode_b64_slice(&img, 0, total as usize);
+    let full = encode_b64_slice(&img, 0, total as usize)
+        .expect("full-length window lies within the encoded output");
     // img is non-empty so total >= 4; checked_sub keeps each bound
     // underflow-safe on its own, independent of statement order.
     let Some(max_off) = total.checked_sub(1) else {
@@ -47,7 +48,8 @@ fuzz_target!(|data: &[u8]| {
         &img[win.in_start as usize..(win.in_start + win.in_len) as usize],
         win.skip,
         take as usize,
-    );
+    )
+    .expect("window lies within the encoded output");
     assert_eq!(windowed.len(), take as usize, "windowed length != take");
     assert_eq!(
         windowed.as_slice(),
