@@ -42,6 +42,10 @@ v1.0.0](#upgrading-from-v100) before you update an existing store.
 - **Per-extension skip breakdown.** End-of-scan summary breaks the `skipped`
   count down by lowercased extension (e.g. `skipped 42: jpg=20, cue=10, log=8`)
   so a large skip count is diagnosable. Log-only; the counters are unchanged.
+- **`musefs vacuum`.** A maintenance command that compacts the SQLite store —
+  reclaiming the free pages that prunes, orphan-art GC, and the migration leave
+  behind — and reports the space reclaimed. Run it while unmounted. See
+  [Maintenance](guide/maintenance.md).
 
 Plus a substantial round of correctness and robustness fixes across the read
 fast path (rowid-reuse consistency for art segments), the MP4/QuickTime

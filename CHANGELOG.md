@@ -60,6 +60,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cue=10, log=8, <none>=4`), logged at `warn` so it shows by default, so a large
   skip count is diagnosable — expected sidecars versus genuinely unexpected
   files. Log-only; the `ScanStats` struct and CLI summary are unchanged (#341).
+- **`musefs vacuum` command:** compact the SQLite store, reclaiming free pages
+  left by prunes, orphan-art GC, and the schema migration. Runs `VACUUM` + a WAL
+  checkpoint and reports the space reclaimed; run it while unmounted (#566).
 
 ### Changed
 

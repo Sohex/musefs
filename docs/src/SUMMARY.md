@@ -10,6 +10,7 @@
 - [Scanning](guide/scanning.md)
 - [Mounting & path templates](guide/mounting.md)
 - [Tuning & metrics](guide/tuning.md)
+- [Maintenance](guide/maintenance.md)
 - [Ownership, permissions & config](guide/configuration.md)
 - [FAQ](guide/faq.md)
 
