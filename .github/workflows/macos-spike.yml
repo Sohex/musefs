@@ -12,6 +12,9 @@ jobs:
   spike:
     runs-on: macos-latest
     timeout-minutes: 30
+    env:
+      # fuse-t ships fuse3.pc here (no fuse.pc); fuser's libfuse3 feature probes `fuse3`.
+      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
@@ -23,11 +26,13 @@ jobs:
           brew install ffmpeg
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-      - name: Approach B — swap macos-no-mount → libfuse inline (not committed)
+      - name: Approach B — swap macos-no-mount → libfuse3 inline (not committed)
         run: |
           # BSD sed (macOS) needs the empty backup arg. Verify the swap took.
-          sed -i '' 's/"macos-no-mount"/"libfuse"/' musefs-fuse/Cargo.toml
+          # libfuse3 (not libfuse) so fuser probes `fuse3` — the module fuse-t ships.
+          sed -i '' 's/"macos-no-mount"/"libfuse3"/' musefs-fuse/Cargo.toml
           grep -n 'fuser' musefs-fuse/Cargo.toml
+          echo "== fuse3.pc visible? =="; pkg-config --exists fuse3 && pkg-config --modversion fuse3 || echo "fuse3 NOT found"
       - name: Build musefs-fuse with libfuse (real mount path)
         run: cargo build -p musefs-fuse 2>&1 | tail -20
       - name: Run the mount suite through fuse-t (macFUSE options still present)
