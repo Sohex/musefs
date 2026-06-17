@@ -629,6 +629,12 @@ exclude_re = [
     'musefs-format/src/mp4\.rs:\d+:\d+: replace \+= with \*= in read_structure_from',
     'musefs-format/src/mp4\.rs:\d+:\d+: replace \+ with \* in BoxRef::end',
     'musefs-format/src/mp4\.rs:\d+:\d+: replace BoxRef::end -> usize with [01]',
+    # read_tags' integer-atom decode assembles a big-endian value byte by byte:
+    # `n = (n << 8) | u64::from(b)`. After each `<< 8` the low byte of `n` is
+    # zero where `b` lands, so `|` and `^` are bit-for-bit identical for every
+    # input (same equivalence class as classify_binary_frame / synchsafe_decode).
+    # The `<<`->`>>` sibling IS caught (bpm 300 = [1,44] decodes to 44, not 300).
+    'musefs-format/src/mp4\.rs:\d+:\d+: replace \| with \^ in read_tags',
 
     # Ogg page lacer/reader advance freezes — hang-class plus the #266 OOM bomb.
     # total_len() -> 0, the `lace_pos < laces.len()` loop bounds, and the

@@ -66,9 +66,9 @@ fn parse_number_total(raw: &str) -> (Option<u16>, u16) {
 }
 
 /// Emit a `----` freeform atom: a `mean` and `name` sub-box (each with a 4-byte
-/// FullBox prefix) followed by one UTF-8 `data` sub-box per value. Note that the
-/// scan path (`read_freeform`) only recovers the first value on read-back, so
-/// multi-value freeform tags round-trip only their first value.
+/// FullBox prefix) followed by one UTF-8 `data` sub-box per value (the iTunes
+/// multi-value convention). The scan path (`read_freeform`) reads every `data`
+/// sub-box, so multi-value freeform tags round-trip completely.
 fn freeform_atom(mean: &str, name: &str, values: &[&str]) -> Result<Vec<u8>> {
     let mut inner = Vec::new();
     let mut mean_body = 0u32.to_be_bytes().to_vec(); // version/flags
