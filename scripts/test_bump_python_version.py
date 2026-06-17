@@ -28,6 +28,32 @@ def test_set_dep_floor_keeps_siblings():
     )
 
 
+def test_set_plugin_version():
+    assert (
+        bp.set_plugin_version('PLUGIN_VERSION = "0.1.0"\n', "0.2.0") == 'PLUGIN_VERSION = "0.2.0"\n'
+    )
+
+
+def test_set_plugin_version_missing_raises():
+    with pytest.raises(ValueError):
+        bp.set_plugin_version("PLUGIN_NAME = 'x'\n", "0.2.0")
+
+
+def test_set_test_version_bumps_pinned_assertions():
+    assert bp.set_test_version('assert __version__ == "0.1.0"\n', "0.2.0") == (
+        'assert __version__ == "0.2.0"\n'
+    )
+    # Works through an attribute prefix, too.
+    assert bp.set_test_version('assert pkg.__version__ == "0.1.0"\n', "0.2.0") == (
+        'assert pkg.__version__ == "0.2.0"\n'
+    )
+
+
+def test_set_test_version_missing_raises():
+    with pytest.raises(ValueError):
+        bp.set_test_version("assert True\n", "0.2.0")
+
+
 def test_bump_rewrites_tree(tmp_path):
     pyproject_beets = (
         '[project]\nversion = "0.1.0"\ndependencies = ["python-musefs>=0.1.0", "beets>=1.6"]\n'
@@ -42,6 +68,11 @@ def test_bump_rewrites_tree(tmp_path):
         "contrib/picard/pyproject.toml": ('[project]\nname = "musefs-picard"\nversion = "0.1.0"\n'),
         "contrib/python-musefs/src/musefs_common/__init__.py": ('__version__ = "0.1.0"\n'),
         "contrib/lidarr/src/musefs_lidarr/__init__.py": ('__version__ = "0.1.0"\n'),
+        "contrib/picard/musefs/__init__.py": ('PLUGIN_VERSION = "0.1.0"\n'),
+        "contrib/lidarr/tests/test_smoke.py": ('assert __version__ == "0.1.0"\n'),
+        "contrib/python-musefs/tests/test_public_api.py": (
+            'assert musefs_common.__version__ == "0.1.0"\n'
+        ),
     }
     for rel, content in files.items():
         p = tmp_path / rel
@@ -56,6 +87,10 @@ def test_bump_rewrites_tree(tmp_path):
         assert '__version__ = "0.2.0"' in (tmp_path / rel).read_text()
     for rel in bp.DEPENDENTS:
         assert "python-musefs>=0.2.0" in (tmp_path / rel).read_text()
+    for rel in bp.PLUGIN_VERSION_FILES:
+        assert 'PLUGIN_VERSION = "0.2.0"' in (tmp_path / rel).read_text()
+    for rel in bp.TEST_VERSION_FILES:
+        assert '__version__ == "0.2.0"' in (tmp_path / rel).read_text()
 
 
 @pytest.mark.parametrize(
