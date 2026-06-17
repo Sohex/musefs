@@ -29,18 +29,40 @@ fn text_atom(kind: &[u8; 4], values: &[&str]) -> Result<Vec<u8>> {
     boxed(kind, &inner)
 }
 
-fn number_atom(kind: &[u8; 4], n: u16, width: usize) -> Result<Vec<u8>> {
+fn number_atom(kind: &[u8; 4], number: u16, total: u16, width: usize) -> Result<Vec<u8>> {
     debug_assert!(
-        width >= 4,
-        "number_atom width must hold the 4-byte reserved+value prefix"
+        width >= 6,
+        "number_atom width must hold the 2-byte reserved prefix + number + total"
     );
     let mut data = 0u32.to_be_bytes().to_vec(); // type 0 = binary
     data.extend_from_slice(&0u32.to_be_bytes()); // locale
     let mut body = vec![0u8, 0];
-    body.extend_from_slice(&n.to_be_bytes());
+    body.extend_from_slice(&number.to_be_bytes());
+    body.extend_from_slice(&total.to_be_bytes());
     body.resize(width, 0);
     data.extend_from_slice(&body);
     boxed(kind, &boxed(b"data", &data)?)
+}
+
+/// Emit an iTunes integer atom (`tmpo`/`cpil`/`pgap`): a `data` sub-box of type
+/// code 21 (signed big-endian integer) carrying the low `width` bytes of `n`.
+fn integer_atom(kind: &[u8; 4], n: u64, width: usize) -> Result<Vec<u8>> {
+    debug_assert!(
+        (1..=8).contains(&width),
+        "integer_atom width must be 1..=8 bytes"
+    );
+    let mut data = 21u32.to_be_bytes().to_vec(); // type 21 = signed BE integer
+    data.extend_from_slice(&0u32.to_be_bytes()); // locale
+    data.extend_from_slice(&n.to_be_bytes()[8 - width..]);
+    boxed(kind, &boxed(b"data", &data)?)
+}
+
+/// Parse a canonical `tracknumber`/`discnumber` value into `(number, total)`.
+/// Accepts `"N"` or `"N/M"` (the ID3 `TRCK`/`TPOS` shape). A missing/unparseable
+/// number yields `None` (caller drops the atom); a missing/unparseable total is 0.
+fn parse_number_total(raw: &str) -> (Option<u16>, u16) {
+    let (num_str, total_str) = raw.split_once('/').unwrap_or((raw, ""));
+    (num_str.parse().ok(), total_str.parse().unwrap_or(0))
 }
 
 /// Emit a `----` freeform atom: a `mean` and `name` sub-box (each with a 4-byte
@@ -133,8 +155,14 @@ pub(super) fn build_udta(
                 ilst_inline.extend(text_atom(atom, values)?);
             }
             Some(crate::tagmap::Mp4Slot::Number(atom, width)) => {
-                if let Ok(n) = values.first().copied().unwrap_or("").parse::<u16>() {
-                    ilst_inline.extend(number_atom(atom, n, width)?);
+                let (number, total) = parse_number_total(values.first().copied().unwrap_or(""));
+                if let Some(n) = number {
+                    ilst_inline.extend(number_atom(atom, n, total, width)?);
+                }
+            }
+            Some(crate::tagmap::Mp4Slot::Integer(atom, width)) => {
+                if let Ok(n) = values.first().copied().unwrap_or("").parse::<u64>() {
+                    ilst_inline.extend(integer_atom(atom, n, width)?);
                 }
             }
             Some(crate::tagmap::Mp4Slot::Freeform(mean, name)) => {

@@ -204,6 +204,68 @@ fn reads_text_and_track_tags() {
 }
 
 #[test]
+fn read_tags_reads_all_values_of_multi_value_text_atom() {
+    // A single text atom may carry several `data` sub-boxes (the iTunes
+    // multiple-value convention); every value must round-trip, not just the first.
+    let atoms = bx(
+        b"\xa9gen",
+        &[data_atom(1, b"Rock"), data_atom(1, b"Pop")].concat(),
+    );
+    let buf = mp4_with_ilst(&atoms, true);
+    let tags = read_tags(&buf);
+    assert!(tags.contains(&("genre".into(), "Rock".into())));
+    assert!(tags.contains(&("genre".into(), "Pop".into())));
+}
+
+#[test]
+fn read_tags_trkn_includes_total_as_n_of_m() {
+    // trkn body: [reserved 2][number 2][total 2][reserved 2]; "3 of 12" -> "3/12".
+    let atoms = bx(b"trkn", &data_atom(0, &[0, 0, 0, 3, 0, 12, 0, 0]));
+    let buf = mp4_with_ilst(&atoms, true);
+    let tags = read_tags(&buf);
+    assert!(tags.contains(&("tracknumber".into(), "3/12".into())));
+}
+
+#[test]
+fn read_tags_trkn_zero_total_is_bare_number() {
+    let atoms = bx(b"trkn", &data_atom(0, &[0, 0, 0, 3, 0, 0, 0, 0]));
+    let buf = mp4_with_ilst(&atoms, true);
+    let tags = read_tags(&buf);
+    assert!(tags.contains(&("tracknumber".into(), "3".into())));
+}
+
+#[test]
+fn read_tags_disk_includes_total_as_n_of_m() {
+    let atoms = bx(b"disk", &data_atom(0, &[0, 0, 0, 1, 0, 2]));
+    let buf = mp4_with_ilst(&atoms, true);
+    let tags = read_tags(&buf);
+    assert!(tags.contains(&("discnumber".into(), "1/2".into())));
+}
+
+#[test]
+fn read_tags_decodes_integer_atoms() {
+    // iTunes binary integer atoms (type code 21): tmpo (BPM, u16), cpil & pgap
+    // (boolean flags). These were previously dropped at scan time.
+    let atoms = [
+        bx(b"tmpo", &data_atom(21, &300u16.to_be_bytes())),
+        bx(b"cpil", &data_atom(21, &[1])),
+        bx(b"pgap", &data_atom(21, &[1])),
+    ]
+    .concat();
+    let buf = mp4_with_ilst(&atoms, true);
+    let tags = read_tags(&buf);
+    assert!(tags.contains(&("bpm".into(), "300".into())), "got {tags:?}");
+    assert!(
+        tags.contains(&("compilation".into(), "1".into())),
+        "got {tags:?}"
+    );
+    assert!(
+        tags.contains(&("gapless".into(), "1".into())),
+        "got {tags:?}"
+    );
+}
+
+#[test]
 fn reads_cover_art() {
     let jpeg = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3];
     let buf = mp4_with_ilst(&bx(b"covr", &data_atom(13, &jpeg)), false);
@@ -693,9 +755,10 @@ fn read_freeform_extracts_name_and_value() {
     inner.extend(boxed(b"name", &name_body).unwrap());
     inner.extend(boxed(b"data", &data).unwrap());
 
-    let (key, value) = read_freeform(&inner).unwrap();
-    assert_eq!(key, "musicbrainz_albumid"); // folded via vocabulary
-    assert_eq!(value, "abc-123");
+    assert_eq!(
+        read_freeform(&inner),
+        vec![("musicbrainz_albumid".to_string(), "abc-123".to_string())]
+    );
 }
 
 #[test]
@@ -711,9 +774,27 @@ fn read_freeform_unknown_name_passes_through_verbatim() {
     inner.extend(boxed(b"name", &name_body).unwrap());
     inner.extend(boxed(b"data", &data).unwrap());
 
-    let (key, value) = read_freeform(&inner).unwrap();
-    assert_eq!(key, "My Custom Field"); // not in vocabulary -> verbatim name
-    assert_eq!(value, "hello");
+    assert_eq!(
+        read_freeform(&inner),
+        vec![("My Custom Field".to_string(), "hello".to_string())]
+    );
+}
+
+#[test]
+fn read_freeform_reads_all_data_boxes() {
+    // A `----` atom with two UTF-8 `data` sub-boxes must yield both values.
+    let mut name_body = 0u32.to_be_bytes().to_vec();
+    name_body.extend_from_slice(b"My Custom Field");
+    let mut inner = boxed(b"name", &name_body).unwrap();
+    inner.extend(data_atom(1, b"one"));
+    inner.extend(data_atom(1, b"two"));
+    assert_eq!(
+        read_freeform(&inner),
+        vec![
+            ("My Custom Field".to_string(), "one".to_string()),
+            ("My Custom Field".to_string(), "two".to_string()),
+        ]
+    );
 }
 
 #[test]
@@ -726,7 +807,7 @@ fn read_freeform_skips_binary_typed_data() {
     let mut inner = boxed(b"name", &name_body).unwrap();
     inner.extend(boxed(b"data", &data).unwrap());
 
-    assert!(read_freeform(&inner).is_none()); // binary-typed data is skipped
+    assert!(read_freeform(&inner).is_empty()); // binary-typed data is skipped
 }
 
 #[test]
@@ -755,6 +836,63 @@ fn build_udta_round_trips_freeform_and_vocabulary() {
             "missing {expected:?} in {tags:?}"
         );
     }
+}
+
+#[test]
+fn build_udta_round_trips_track_and_disc_totals() {
+    // A "N/M" tracknumber/discnumber must emit the total into the trkn/disk atom
+    // and read back unchanged (the prior code parsed only "N" and wrote total 0,
+    // and dropped a "N/M" value entirely on parse failure).
+    let tags = vec![
+        TagInput::new("tracknumber", "3/12"),
+        TagInput::new("discnumber", "1/2"),
+    ];
+    let (segs, _streamed) = build_udta(&tags, &[], &[]).unwrap();
+    let udta = materialize_udta(&segs);
+    let moov = boxed(b"moov", &udta).unwrap();
+    let tags = read_tags(&moov);
+    assert!(
+        tags.contains(&("tracknumber".to_string(), "3/12".to_string())),
+        "got {tags:?}"
+    );
+    assert!(
+        tags.contains(&("discnumber".to_string(), "1/2".to_string())),
+        "got {tags:?}"
+    );
+}
+
+#[test]
+fn build_udta_round_trips_integer_atoms() {
+    // bpm 300 has a non-zero high byte, so a big-endian decode is required (a
+    // byte-swapped read would yield 44, not 300).
+    let tags = vec![
+        TagInput::new("bpm", "300"),
+        TagInput::new("compilation", "1"),
+        TagInput::new("gapless", "1"),
+    ];
+    let (segs, _s) = build_udta(&tags, &[], &[]).unwrap();
+    let udta = materialize_udta(&segs);
+    // Emitted as the real iTunes atoms, not generic `----` freeform atoms, with
+    // exact widths: 8 (atom hdr) + 8 (data hdr) + 8 (type+locale) + value bytes.
+    let atom_size = |kind: &[u8; 4]| -> u32 {
+        let pos = udta.windows(4).position(|w| w == &kind[..]).unwrap();
+        u32::from_be_bytes(udta[pos - 4..pos].try_into().unwrap())
+    };
+    assert_eq!(atom_size(b"tmpo"), 26, "tmpo value must be 2 bytes");
+    assert_eq!(atom_size(b"cpil"), 25, "cpil value must be 1 byte");
+    assert_eq!(atom_size(b"pgap"), 25, "pgap value must be 1 byte");
+
+    let moov = boxed(b"moov", &udta).unwrap();
+    let read = read_tags(&moov);
+    assert!(read.contains(&("bpm".into(), "300".into())), "got {read:?}");
+    assert!(
+        read.contains(&("compilation".into(), "1".into())),
+        "got {read:?}"
+    );
+    assert!(
+        read.contains(&("gapless".into(), "1".into())),
+        "got {read:?}"
+    );
 }
 
 #[test]
@@ -885,9 +1023,7 @@ fn read_freeform_accepts_minimal_name_and_data() {
     data.extend_from_slice(&0u32.to_be_bytes()); // locale -> dp.len() == 8
     let mut inner = boxed(b"name", &name_body).unwrap();
     inner.extend(boxed(b"data", &data).unwrap());
-    let (key, value) = read_freeform(&inner).unwrap();
-    assert_eq!(key, ""); // empty name, not in vocabulary -> verbatim ""
-    assert_eq!(value, "");
+    assert_eq!(read_freeform(&inner), vec![(String::new(), String::new())]);
 }
 
 #[test]
@@ -900,7 +1036,7 @@ fn read_freeform_short_name_returns_none() {
     data.extend_from_slice(&0u32.to_be_bytes());
     let mut inner = boxed(b"name", &name_body).unwrap();
     inner.extend(boxed(b"data", &data).unwrap());
-    assert!(read_freeform(&inner).is_none());
+    assert!(read_freeform(&inner).is_empty());
 }
 
 #[test]
@@ -917,9 +1053,10 @@ fn read_freeform_mean_payload_exactly_4_uses_empty_mean() {
     let mut inner = boxed(b"mean", &mean_body).unwrap();
     inner.extend(boxed(b"name", &name_body).unwrap());
     inner.extend(boxed(b"data", &data).unwrap());
-    let (key, value) = read_freeform(&inner).unwrap();
-    assert_eq!(key, "MusicBrainz Album Id"); // empty mean -> not folded
-    assert_eq!(value, "abc-123");
+    assert_eq!(
+        read_freeform(&inner),
+        vec![("MusicBrainz Album Id".to_string(), "abc-123".to_string())]
+    );
 }
 
 #[test]
