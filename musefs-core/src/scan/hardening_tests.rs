@@ -235,6 +235,29 @@ fn collect_audio_ignores_symlink_to_non_file_target_when_following() {
 }
 
 #[test]
+fn collect_audio_tallies_direct_special_file_with_audio_extension() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    // A FIFO named like a track is a special file reached *directly* by the walk
+    // (not behind a symlink): it is neither a regular file, dir, nor symlink, so
+    // it must be tallied as a skip rather than vanishing without a trace (#544).
+    let fifo = dir.path().join("track.flac");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    #[expect(unsafe_code, reason = "libc::mkfifo FFI; no std equivalent")]
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+    assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+    let mut out = Vec::new();
+    let tally = collect_audio(dir.path(), &mut out, false).unwrap();
+    assert!(out.is_empty(), "a special file must never be collected");
+    assert_eq!(
+        tally.total, 1,
+        "a direct special file must be tallied as skipped"
+    );
+}
+
+#[test]
 fn probe_returns_none_for_supported_ext_with_garbage_contents() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["bad.flac", "bad.mp3", "bad.m4a", "bad.wav", "bad.opus"] {

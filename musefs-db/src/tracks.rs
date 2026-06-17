@@ -213,6 +213,20 @@ impl<M> Db<M> {
     /// a single consistent snapshot until `end_read`. Used to make a binary-tag
     /// read's content_version check and its blob reads mutually consistent.
     pub fn begin_read(&self) -> Result<()> {
+        // Defense-in-depth: if a prior snapshot leaked — its `end_read` ROLLBACK
+        // failed and the error was swallowed (the core callers do `let _ =
+        // db.end_read()`), or a future caller forgot the pairing — the connection
+        // is still mid-transaction and a raw BEGIN would fail with rusqlite's
+        // opaque "cannot start a transaction within a transaction", pointing at
+        // the symptom rather than the leak. Self-heal by rolling the stale
+        // snapshot back first, with a diagnostic naming the actual cause (#549).
+        if !self.conn.is_autocommit() {
+            log::warn!(
+                "begin_read found a leaked read transaction on this connection; \
+                 rolling it back (a prior end_read likely failed to release the snapshot)"
+            );
+            self.conn.execute_batch("ROLLBACK")?;
+        }
         self.conn.execute_batch("BEGIN DEFERRED")?;
         Ok(())
     }
@@ -556,6 +570,23 @@ mod render_key_tests {
         reader.end_read().unwrap();
         // After the snapshot ends, the reader sees the new version.
         assert_eq!(reader.track_content_version(id).unwrap(), 1);
+    }
+
+    /// A leaked read snapshot — a `begin_read` whose `end_read` ROLLBACK never
+    /// ran (the core callers swallow `end_read`'s error) — leaves the connection
+    /// mid-transaction. The next `begin_read` must self-heal rather than fail
+    /// with rusqlite's opaque "cannot start a transaction within a transaction"
+    /// (#549).
+    #[test]
+    fn begin_read_self_heals_a_leaked_prior_snapshot() {
+        let db = open_mem();
+        db.begin_read().unwrap();
+        // Leak it: no end_read.
+        assert!(
+            db.begin_read().is_ok(),
+            "a leaked read snapshot must self-heal, not surface an opaque error"
+        );
+        db.end_read().unwrap();
     }
 }
 
