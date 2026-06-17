@@ -85,9 +85,18 @@ impl ReadAheadPool {
     }
 
     /// Mark `key` as most-recently-served (LRU bump). No-op if unregistered.
+    ///
+    /// Best-effort: a `try_lock` that SKIPS rather than blocks on contention. It
+    /// runs at the end of every backing pread, on every stream, so a blocking
+    /// `lock` here serializes all concurrent playback on this one registry mutex
+    /// (#519). A skipped bump only leaves a stamp slightly stale, at worst evicting
+    /// a marginally-warmer stream — and eviction is already best-effort
+    /// (`try_lock` + skip), so the LRU order was never exact to begin with.
     pub fn touch(&self, key: usize) {
         let stamp = self.clock.fetch_add(1, O::Relaxed);
-        if let Some(e) = self.streams.lock().unwrap().get_mut(&key) {
+        if let Ok(mut g) = self.streams.try_lock()
+            && let Some(e) = g.get_mut(&key)
+        {
             e.last_served = stamp;
         }
     }
@@ -449,8 +458,6 @@ pub struct PrefetchJob {
 
 pub struct PrefetchWorkers {
     tx: crossbeam_channel::Sender<PrefetchJob>,
-    #[cfg(test)]
-    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl PrefetchWorkers {
@@ -459,21 +466,15 @@ impl PrefetchWorkers {
         // blocks in `recv` independently, so job hand-off and wake-ups fan out
         // across all threads instead of serializing behind one shared lock (#430).
         let (tx, rx) = crossbeam_channel::bounded::<PrefetchJob>(threads * 4);
-        let mut handles = Vec::new();
         for _ in 0..threads {
             let rx = rx.clone();
-            let h = std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 while let Ok(job) = rx.recv() {
                     Self::run_job(job);
                 }
             });
-            handles.push(h);
         }
-        PrefetchWorkers {
-            tx,
-            #[cfg(test)]
-            handles,
-        }
+        PrefetchWorkers { tx }
     }
 
     #[expect(clippy::needless_pass_by_value)]

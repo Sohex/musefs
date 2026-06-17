@@ -7,7 +7,6 @@ mod lock;
 mod mapping;
 pub mod metrics;
 mod ogg_index;
-#[allow(dead_code)]
 mod readahead;
 mod reader;
 mod refresh_diff;
