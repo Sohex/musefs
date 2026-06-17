@@ -12,32 +12,12 @@ jobs:
     env:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-        with:
-          persist-credentials: false
-      - name: Install fuse-t + ffmpeg
+      - name: Install fuse-t
         run: |
           brew tap macos-fuse-t/homebrew-cask
           brew install --cask fuse-t
-          brew install ffmpeg
-      - name: Inspect fuse-t pkg-config, headers, and exported ABI symbols
+      - name: Install fuse.pc libfuse2 shim (alias -> libfuse-t)
         run: |
-          echo "== fuse-t.pc =="; cat /usr/local/lib/pkgconfig/fuse-t.pc 2>/dev/null || echo MISSING
-          echo "== fuse3.pc =="; cat /usr/local/lib/pkgconfig/fuse3.pc 2>/dev/null || echo MISSING
-          echo "== /usr/local/include (fuse headers) =="; find /usr/local/include -iname 'fuse*' 2>/dev/null | head -40
-          echo "== libs =="; ls -la /usr/local/lib/libfuse* 2>/dev/null
-          echo "== libfuse-t.dylib libfuse2/3 symbols =="
-          nm -gU /usr/local/lib/libfuse-t.dylib 2>/dev/null | grep -iE 'fuse_mount|fuse_unmount|fuse_lowlevel|fuse_session|fuse_new|fuse_chan' | head -40 || echo "nm failed"
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-      - name: Synthesize fuse.pc shim → fuser libfuse2 build
-        id: shim_build
-        continue-on-error: true
-        run: |
-          # fuser 0.17 macOS path only ever probes `fuse` (libfuse2). fuse-t ships
-          # no fuse.pc, so alias it to fuse-t's lib and see if the libfuse2 ABI links.
-          sed -i '' 's/"macos-no-mount"/"libfuse"/' musefs-fuse/Cargo.toml
-          # /usr/local/lib/pkgconfig is root-owned (fuse-t sudo-installs); tee as root.
           sudo tee /usr/local/lib/pkgconfig/fuse.pc >/dev/null <<'PC'
           prefix=/usr/local
           libdir=${prefix}/lib
@@ -48,44 +28,31 @@ jobs:
           Libs: -L${libdir} -lfuse-t
           Cflags: -I${includedir}/fuse -D_FILE_OFFSET_BITS=64
           PC
-          echo "== shim fuse.pc =="; cat /usr/local/lib/pkgconfig/fuse.pc
-          pkg-config --exists fuse && echo "pkg-config now sees fuse $(pkg-config --modversion fuse)"
-          # Probe the readiness-race hypothesis: make spawn_with poll the mount
-          # until the root is listable on macOS (fuse-t's NFS mount is async-ready).
-          python3 - <<'PY'
-          import pathlib
-          p = pathlib.Path("musefs-fuse/src/lib.rs")
-          s = p.read_text()
-          needle = "    let _ = cell.set(session.notifier());\n    session.spawn()\n}"
-          repl = (
-              "    let _ = cell.set(session.notifier());\n"
-              "    let bg = session.spawn()?;\n"
-              "    #[cfg(target_os = \"macos\")]\n"
-              "    {\n"
-              "        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);\n"
-              "        while std::time::Instant::now() < deadline {\n"
-              "            if std::fs::read_dir(mountpoint).map(|mut d| d.next().is_some()).unwrap_or(false) { break; }\n"
-              "            std::thread::sleep(std::time::Duration::from_millis(50));\n"
-              "        }\n"
-              "    }\n"
-              "    Ok(bg)\n}"
-          )
-          assert needle in s, "spawn_with tail not found"
-          p.write_text(s.replace(needle, repl, 1))
-          print("patched spawn_with with macOS readiness poll")
-          PY
-          cargo build -p musefs-fuse 2>&1 | tail -40
-      - name: Run the mount suite through fuse-t (shim build succeeded)
-        if: steps.shim_build.outcome == 'success'
-        id: mount_default
+          pkg-config --modversion fuse
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - name: Build fuser 0.17 hello example (libfuse → fuse-t)
+        run: |
+          git clone --depth 1 --branch v0.17.0 https://github.com/cberner/fuser /tmp/fuser
+          cd /tmp/fuser
+          cargo build --example hello --features libfuse 2>&1 | tail -20
+      - name: Isolation — does a stock fuser fs serve files through fuse-t?
         continue-on-error: true
         run: |
-          # tempfile::tempdir() honors TMPDIR; default macOS TMPDIR is /var/folders
-          # (a special volume) where fuse-t's NFS mount may not overlay. Point it at
-          # a normal $HOME dir so the mountpoints land somewhere NFS can attach.
-          export TMPDIR="$HOME/spiketmp"; mkdir -p "$TMPDIR"
-          cargo test -p musefs-fuse --test mount -- --ignored --nocapture 2>&1 | tail -80
-      - name: Inspect for stale mounts after tests
+          MNT="$HOME/hellomnt"; mkdir -p "$MNT"
+          # hello.rs mounts in the foreground and blocks; run it backgrounded.
+          /tmp/fuser/target/debug/examples/hello "$MNT" &
+          HPID=$!
+          sleep 4
+          echo "== ls mountpoint =="; ls -la "$MNT" || true
+          echo "== stat hello.txt =="; stat "$MNT/hello.txt" || true
+          echo "== cat hello.txt =="; cat "$MNT/hello.txt" || echo "CAT FAILED"
+          echo "== mount table =="; mount | grep -iE 'fuse|nfs' || true
+          umount "$MNT" 2>/dev/null || diskutil unmount "$MNT" 2>/dev/null || kill "$HPID" 2>/dev/null || true
+      - name: Dump fuse-t logs (if any)
         if: always()
         run: |
-          echo "== mounts =="; mount | grep -iE 'fuse|nfs' || echo "no fuse/nfs mounts left (good)"
+          echo "== ~/Library/Logs/fuse-t =="
+          ls -la "$HOME/Library/Logs/fuse-t" 2>/dev/null && cat "$HOME/Library/Logs/fuse-t/"* 2>/dev/null | tail -120 || echo "no fuse-t logs"
+      - name: Inspect for stale mounts
+        if: always()
+        run: mount | grep -iE 'fuse|nfs' || echo "no fuse/nfs mounts left (good)"
