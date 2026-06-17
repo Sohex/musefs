@@ -24,6 +24,10 @@ pub(crate) enum Mp4Slot {
     Text(&'static [u8; 4]),
     /// A binary number atom (`trkn`/`disk`); the `usize` is the `data` body width.
     Number(&'static [u8; 4], usize),
+    /// A binary integer atom (`tmpo`/`cpil`/`pgap`), `data` type code 21; the
+    /// `usize` is the big-endian value width in bytes (2 for `tmpo`, 1 for the
+    /// boolean flags).
+    Integer(&'static [u8; 4], usize),
     /// A `----` freeform atom: `(mean, name)`.
     Freeform(&'static str, &'static str),
 }
@@ -168,6 +172,24 @@ const VOCAB: &[Entry] = &[
         mp4: Mp4Slot::Freeform("com.apple.iTunes", "MusicBrainz Artist Id"),
         vorbis: "MUSICBRAINZ_ARTISTID",
     },
+    Entry {
+        key: "bpm",
+        id3: Id3Slot::Text(b"TBPM"),
+        mp4: Mp4Slot::Integer(b"tmpo", 2),
+        vorbis: "BPM",
+    },
+    Entry {
+        key: "compilation",
+        id3: Id3Slot::Text(b"TCMP"),
+        mp4: Mp4Slot::Integer(b"cpil", 1),
+        vorbis: "COMPILATION",
+    },
+    Entry {
+        key: "gapless",
+        id3: Id3Slot::Txxx("GAPLESS"),
+        mp4: Mp4Slot::Integer(b"pgap", 1),
+        vorbis: "GAPLESS",
+    },
 ];
 
 /// ID3 text frame id (e.g. "TIT2") -> canonical key, for `Text` slots only.
@@ -198,6 +220,14 @@ pub(crate) fn key_to_id3(key: &str) -> Option<Id3Slot> {
 pub(crate) fn mp4_atom_to_key(atom: &[u8; 4]) -> Option<&'static str> {
     VOCAB.iter().find_map(|e| match e.mp4 {
         Mp4Slot::Text(a) if a == atom => Some(e.key),
+        _ => None,
+    })
+}
+
+/// MP4 integer atom (`tmpo`/`cpil`/`pgap`) -> canonical key, for `Integer` slots.
+pub(crate) fn mp4_integer_atom_to_key(atom: &[u8; 4]) -> Option<&'static str> {
+    VOCAB.iter().find_map(|e| match e.mp4 {
+        Mp4Slot::Integer(a, _) if a == atom => Some(e.key),
         _ => None,
     })
 }
@@ -260,6 +290,15 @@ mod tests {
         for e in VOCAB {
             if let Mp4Slot::Text(a) = e.mp4 {
                 assert_eq!(mp4_atom_to_key(a), Some(e.key));
+            }
+        }
+    }
+
+    #[test]
+    fn mp4_integer_round_trips() {
+        for e in VOCAB {
+            if let Mp4Slot::Integer(a, _) = e.mp4 {
+                assert_eq!(mp4_integer_atom_to_key(a), Some(e.key));
             }
         }
     }

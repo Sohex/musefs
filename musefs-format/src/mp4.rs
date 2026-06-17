@@ -339,26 +339,23 @@ fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
     Some((start, il.total_len - il.header_len))
 }
 
-/// Parse a `----` freeform atom payload into `(key, value)`. Folds (mean, name)
-/// to a canonical key via the vocabulary, else keys on the verbatim `name`. Only
-/// the first `data` atom is read (multi-value freeform is rare). None if malformed.
-fn read_freeform(inner: &[u8]) -> Option<(String, String)> {
-    let name_box = find_box(inner, b"name").ok()??;
-    let data_box = find_box(inner, b"data").ok()??;
+/// Parse a `----` freeform atom payload into `(key, value)` pairs. Folds
+/// (mean, name) to a canonical key via the vocabulary, else keys on the verbatim
+/// `name`. One pair per UTF-8 (`type 1`) `data` sub-box — the iTunes multi-value
+/// convention; binary-typed `data` boxes are left to [`read_binary_tags`]. Empty
+/// if malformed.
+fn read_freeform(inner: &[u8]) -> Vec<(String, String)> {
+    let Some(name_box) = find_box(inner, b"name").ok().flatten() else {
+        return Vec::new();
+    };
     let np = name_box.payload(inner);
-    let dp = data_box.payload(inner);
-    if np.len() < 4 || dp.len() < 8 {
-        return None;
-    }
-    // The `data` box is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text.
-    // Binary-typed freeform values are not text tags, so skip them.
-    let type_code = u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]);
-    if type_code != 1 {
-        return None;
+    if np.len() < 4 {
+        return Vec::new();
     }
     // name/mean payloads start with a 4-byte FullBox [version 1][flags 3] prefix.
-    let name = std::str::from_utf8(&np[4..]).ok()?;
-    let value = std::str::from_utf8(&dp[8..]).ok()?;
+    let Ok(name) = std::str::from_utf8(&np[4..]) else {
+        return Vec::new();
+    };
     let mean = find_box(inner, b"mean")
         .ok()
         .flatten()
@@ -372,14 +369,52 @@ fn read_freeform(inner: &[u8]) -> Option<(String, String)> {
         });
     let key = crate::tagmap::mp4_freeform_to_key(mean, name)
         .map_or_else(|| name.to_string(), str::to_string);
-    Some((key, value.to_string()))
+    let mut out = Vec::new();
+    for data in child_boxes(inner).unwrap_or_default() {
+        if &data.kind != b"data" {
+            continue;
+        }
+        let dp = data.payload(inner);
+        if dp.len() < 8 {
+            continue;
+        }
+        // The `data` box is `[type: u32][locale: u32][value]`; type 1 == UTF-8 text.
+        // Binary-typed freeform values are not text tags, so skip them.
+        let type_code = u32::from_be_bytes([dp[0], dp[1], dp[2], dp[3]]);
+        if type_code != 1 {
+            continue;
+        }
+        if let Ok(value) = std::str::from_utf8(&dp[8..]) {
+            out.push((key.clone(), value.to_string()));
+        }
+    }
+    out
+}
+
+/// Format a `trkn`/`disk` value body `[reserved 2][number 2][total 2]…` as the
+/// canonical `"N"` or `"N/M"` string. The `"N/M"` form matches how ID3
+/// `TRCK`/`TPOS` carry the total in the shared `tracknumber`/`discnumber` value;
+/// a zero or absent total drops the `/M`. Caller guarantees `value.len() >= 4`.
+fn number_total(value: &[u8]) -> String {
+    let number = u16::from_be_bytes([value[2], value[3]]);
+    let total = if value.len() >= 6 {
+        u16::from_be_bytes([value[4], value[5]])
+    } else {
+        0
+    };
+    if total != 0 {
+        format!("{number}/{total}")
+    } else {
+        number.to_string()
+    }
 }
 
 /// Lenient: returns empty / skips any malformed atom and never errors — this only
 /// seeds metadata from existing files, so a missing or garbled tag must simply be
 /// absent. Text atoms map via the vocabulary; `trkn`/`disk` yield track/disc
-/// numbers; `----` freeform atoms key on their name (folded when known). Other
-/// atoms are skipped.
+/// numbers as `"N"`/`"N/M"`; `----` freeform atoms key on their name (folded when
+/// known). Every `data` sub-box of an atom is read, so multi-value atoms recover
+/// all their values. Other atoms are skipped.
 pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     let Some((start, len)) = ilst_region(buf) else {
         return Vec::new();
@@ -389,33 +424,35 @@ pub fn read_tags(buf: &[u8]) -> Vec<(String, String)> {
     for atom in child_boxes(ilst).unwrap_or_default() {
         let inner = atom.payload(ilst);
         if &atom.kind == b"----" {
-            if let Some(pair) = read_freeform(inner) {
-                out.push(pair);
-            }
+            out.extend(read_freeform(inner));
             continue;
         }
-        let Ok(Some(data)) = find_box(inner, b"data") else {
-            continue;
-        };
-        let dp = data.payload(inner);
-        if dp.len() < 8 {
-            continue;
-        }
-        let value = &dp[8..]; // skip [type 4][locale 4]
-        if let Some(key) = crate::tagmap::mp4_atom_to_key(&atom.kind) {
-            if let Ok(s) = std::str::from_utf8(value) {
-                out.push((key.to_string(), s.to_string()));
+        let text_key = crate::tagmap::mp4_atom_to_key(&atom.kind);
+        for data in child_boxes(inner).unwrap_or_default() {
+            if &data.kind != b"data" {
+                continue;
             }
-        } else if &atom.kind == b"trkn" && value.len() >= 4 {
-            out.push((
-                "tracknumber".into(),
-                u16::from_be_bytes([value[2], value[3]]).to_string(),
-            ));
-        } else if &atom.kind == b"disk" && value.len() >= 4 {
-            out.push((
-                "discnumber".into(),
-                u16::from_be_bytes([value[2], value[3]]).to_string(),
-            ));
+            let dp = data.payload(inner);
+            if dp.len() < 8 {
+                continue;
+            }
+            let value = &dp[8..]; // skip [type 4][locale 4]
+            if let Some(key) = text_key {
+                if let Ok(s) = std::str::from_utf8(value) {
+                    out.push((key.to_string(), s.to_string()));
+                }
+            } else if &atom.kind == b"trkn" && value.len() >= 4 {
+                out.push(("tracknumber".into(), number_total(value)));
+            } else if &atom.kind == b"disk" && value.len() >= 4 {
+                out.push(("discnumber".into(), number_total(value)));
+            } else if let Some(key) = crate::tagmap::mp4_integer_atom_to_key(&atom.kind) {
+                // tmpo/cpil/pgap: a big-endian unsigned integer in the value bytes.
+                let mut n: u64 = 0;
+                for &b in value.iter().take(8) {
+                    n = (n << 8) | u64::from(b);
+                }
+                out.push((key.to_string(), n.to_string()));
+            }
         }
     }
     out

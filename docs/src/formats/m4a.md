@@ -15,8 +15,16 @@ layouts plug into, see [the segment model](../architecture/serving.md#the-segmen
   the `com.apple.iTunes` mean, matched case-insensitively.
 - **Other text freeform atoms** round-trip keyed by their verbatim `name`,
   original casing preserved.
-- **Track and disc numbers**: the binary `trkn`/`disk` atoms are decoded
-  positionally to `tracknumber`/`discnumber` and rebuilt as binary atoms.
+- **Track and disc numbers, with totals**: the binary `trkn`/`disk` atoms are
+  decoded to `tracknumber`/`discnumber` as `"N"` or `"N/M"` (the "N of M" total,
+  matching ID3 `TRCK`/`TPOS`) and rebuilt as binary atoms with the total filled
+  in.
+- **Integer atoms**: `tmpo`/`cpil`/`pgap` map to the canonical `bpm`/
+  `compilation`/`gapless` keys (shared with ID3 `TBPM`/`TCMP` and Vorbis) and
+  are rebuilt as type-21 integer atoms.
+- **Multi-value atoms**: every `data` sub-box of an atom is read (the iTunes
+  multiple-`data` convention), so a multi-valued atom round-trips all its
+  values, not just the first.
 - **Opaque binary freeform atoms, byte-exact**: a `----` atom whose payload
   is binary-typed is captured verbatim under the key `----:<mean>:<name>`
   (so the mean survives) and re-emitted streamed from the DB (`BinaryTag`
@@ -27,18 +35,13 @@ layouts plug into, see [the segment model](../architecture/serving.md#the-segmen
 
 ## Lossy edges
 
-- **Track/disc totals are dropped.** Only the number itself is read from
-  `trkn`/`disk` (the "x of N" total is not), and synthesis writes the total
-  as zero.
 - A *text* freeform atom under a mean other than `com.apple.iTunes` is
   re-emitted with the `com.apple.iTunes` mean (the scan keys text freeform
   by name only). Binary freeform atoms keep their mean via the
   `----:<mean>:<name>` key.
-- **Multi-value atoms round-trip only their first value**: synthesis writes
-  one `data` sub-box per value, but the scan reads only the first `data`
-  sub-box of each atom.
-- Binary `ilst` atoms other than `trkn`/`disk` and `----` (e.g. `tmpo`,
-  `cpil`, `pgap`) are dropped at scan time.
+- Binary `ilst` atoms outside the handled set (`trkn`/`disk`, the
+  `tmpo`/`cpil`/`pgap` integer atoms, and `----` freeform) are dropped at scan
+  time, since they are not re-emitted on synthesis.
 - `covr` ingestion accepts only JPEG (type 13) and PNG (type 14) artwork;
   other type codes are skipped. MP4 has no picture-type or description
   fields: scanned art becomes "front cover" with an empty description, and

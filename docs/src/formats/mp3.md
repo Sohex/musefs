@@ -21,8 +21,12 @@ described here is shared with WAV's embedded `id3 ` chunk — see
   synthesized tag.
 - **Other user-defined keys** round-trip as `TXXX` frames keyed by their own
   description, original casing preserved.
-- **Comments and lyrics** (`COMM`/`USLT`): the text content, one tag row per
-  frame.
+- **Comments and lyrics** (`COMM`/`USLT`): one tag row per frame. A frame with a
+  placeholder language (`XXX`/`und`/empty) and no descriptor folds to the shared
+  `comment`/`lyrics` key; one carrying a real language or descriptor is keyed
+  `id3:COMM:<lang>:<desc>` / `id3:USLT:<lang>:<desc>` so per-language or
+  description-keyed frames stay distinct, and both fields are restored on
+  synthesis.
 - **Ratings and play counts**: a `POPM` frame is promoted at scan time to
   `rating` (the raw 0–255 byte) and `playcount` (omitted when 0) text tags,
   and rebuilt as a `POPM` frame on synthesis.
@@ -39,10 +43,10 @@ described here is shared with WAV's embedded `id3 ` chunk — see
 
 - The synthesized tag is always **ID3v2.4**, regardless of the source tag's
   version (v2.2/v2.3 tags are parsed but never re-emitted as such).
-- `COMM`/`USLT` language codes and descriptions are not preserved: every
-  comment/lyric is written back with language `XXX` and an empty description.
-  The *text* of multiple comment frames survives (one `COMM` per value), but
-  frames distinguished only by language/description become indistinguishable.
+- A `COMM`/`USLT` frame folded to the shared `comment`/`lyrics` key (placeholder
+  language, no descriptor) is re-emitted with language `XXX` and an empty
+  descriptor, so a source `und` placeholder comes back as `XXX`. Frames carrying
+  a real language or descriptor are preserved (see above).
 - `POPM`: the owner ("email to user") field is dropped by design. Multiple
   `POPM` frames collapse to one (first rating wins, last parseable play
   count wins); counters above `u32::MAX` clamp to 4 bytes.

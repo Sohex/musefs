@@ -195,15 +195,57 @@ fn txxx_frame_data(desc: &str, value: &str) -> Vec<u8> {
     d
 }
 
-/// COMM/USLT share a body layout: `[enc][lang(3)][descriptor NUL][text]`. We
-/// write UTF-8 with an unknown language (`XXX`) and empty descriptor; the
-/// original language code and descriptor are not preserved on round-trip.
-fn comm_like_frame_data(value: &str) -> Vec<u8> {
+/// COMM/USLT share a body layout: `[enc][lang(3)][descriptor NUL][text]`. The
+/// language is written as exactly three bytes (padded with `X` when the supplied
+/// value is shorter); `lang`/`description` come from the tag key (see
+/// [`comm_like_key`]), defaulting to `XXX` / empty for the shared `comment` /
+/// `lyrics` key.
+fn comm_like_frame_data(lang: &str, description: &str, value: &str) -> Vec<u8> {
+    let l = lang.as_bytes();
     let mut d = vec![ENC_UTF8];
-    d.extend_from_slice(b"XXX"); // language: unknown
-    d.push(0x00); // empty content descriptor, NUL-terminated
+    d.extend_from_slice(&[
+        *l.first().unwrap_or(&b'X'),
+        *l.get(1).unwrap_or(&b'X'),
+        *l.get(2).unwrap_or(&b'X'),
+    ]);
+    d.extend_from_slice(description.as_bytes());
+    d.push(0x00); // content descriptor terminator
     d.extend_from_slice(value.as_bytes());
     d
+}
+
+/// ID3 languages treated as "no specific language": a COMM/USLT frame with one
+/// of these and an empty descriptor folds to the shared `comment`/`lyrics` key.
+fn is_placeholder_lang(lang: &str) -> bool {
+    matches!(lang.to_ascii_lowercase().as_str(), "" | "xxx" | "und")
+}
+
+/// Canonical key for a COMM/USLT frame. The common case (placeholder language,
+/// empty descriptor) folds to `default_key` (`comment`/`lyrics`), shared with
+/// MP4/Vorbis. A frame carrying a real language or descriptor keeps both under
+/// `id3:<FRAME>:<lang>:<descriptor>` so per-language / description-keyed frames
+/// stay distinct across a round-trip; only MP3/WAV re-emit that key.
+fn comm_like_key(frame: &str, lang: &str, description: &str, default_key: &str) -> String {
+    if description.is_empty() && is_placeholder_lang(lang) {
+        default_key.to_string()
+    } else {
+        format!("id3:{frame}:{lang}:{description}")
+    }
+}
+
+/// Inverse of [`comm_like_key`]: parse `id3:COMM:<lang>:<desc>` /
+/// `id3:USLT:<lang>:<desc>` into `(frame_id, lang, descriptor)`; the descriptor
+/// may itself contain `:`. None for any other key.
+fn parse_comm_like_key(key: &str) -> Option<(&'static [u8; 4], &str, &str)> {
+    let rest = key.strip_prefix("id3:")?;
+    let (frame, langdesc) = rest.split_once(':')?;
+    let frame_id: &'static [u8; 4] = match frame {
+        "COMM" => b"COMM",
+        "USLT" => b"USLT",
+        _ => return None,
+    };
+    let (lang, desc) = langdesc.split_once(':')?;
+    Some((frame_id, lang, desc))
 }
 
 /// True if `key` is shaped like an ID3v2 text frame id (`T` + 3 upper/digit),
@@ -353,7 +395,7 @@ pub fn build_id3v2_segments(
             }
             Some(crate::tagmap::Id3Slot::Comment) => {
                 for value in values {
-                    let data = comm_like_frame_data(value);
+                    let data = comm_like_frame_data("XXX", "", value);
                     push_frame_header(&mut buf, b"COMM", data.len())?;
                     buf.extend_from_slice(&data);
                     frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
@@ -361,7 +403,7 @@ pub fn build_id3v2_segments(
             }
             Some(crate::tagmap::Id3Slot::Lyrics) => {
                 for value in values {
-                    let data = comm_like_frame_data(value);
+                    let data = comm_like_frame_data("XXX", "", value);
                     push_frame_header(&mut buf, b"USLT", data.len())?;
                     buf.extend_from_slice(&data);
                     frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
@@ -376,11 +418,20 @@ pub fn build_id3v2_segments(
                 frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
             }
             None => {
-                for value in values {
-                    let data = txxx_frame_data(key, value);
-                    push_frame_header(&mut buf, b"TXXX", data.len())?;
-                    buf.extend_from_slice(&data);
-                    frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
+                if let Some((frame_id, lang, desc)) = parse_comm_like_key(key) {
+                    for value in values {
+                        let data = comm_like_frame_data(lang, desc, value);
+                        push_frame_header(&mut buf, frame_id, data.len())?;
+                        buf.extend_from_slice(&data);
+                        frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
+                    }
+                } else {
+                    for value in values {
+                        let data = txxx_frame_data(key, value);
+                        push_frame_header(&mut buf, b"TXXX", data.len())?;
+                        buf.extend_from_slice(&data);
+                        frames_len = size::checked_add(frames_len, 10 + data.len() as u64)?;
+                    }
                 }
             }
         }
@@ -611,9 +662,15 @@ pub fn read_tags(data: &[u8]) -> Vec<(String, String)> {
                 .map_or_else(|| et.description.clone(), str::to_string);
             out.push((key, et.value.clone()));
         } else if let Some(c) = content.comment() {
-            out.push(("comment".to_string(), c.text.clone()));
+            out.push((
+                comm_like_key("COMM", &c.lang, &c.description, "comment"),
+                c.text.clone(),
+            ));
         } else if let Some(l) = content.lyrics() {
-            out.push(("lyrics".to_string(), l.text.clone()));
+            out.push((
+                comm_like_key("USLT", &l.lang, &l.description, "lyrics"),
+                l.text.clone(),
+            ));
         } else if let Some(text) = content.text() {
             let id = frame.id();
             let key =
@@ -906,7 +963,7 @@ mod tests {
 
         let mut tag = Tag::new();
         tag.set_text("TIT2", "Song");
-        tag.set_text("TBPM", "120"); // standard frame, not in vocabulary
+        tag.set_text("TKEY", "120"); // standard frame, not in vocabulary
         tag.add_frame(ExtendedText {
             description: "MOOD".into(),
             value: "happy".into(),
@@ -916,12 +973,12 @@ mod tests {
             value: "-6.5 dB".into(),
         });
         tag.add_frame(Comment {
-            lang: "eng".into(),
+            lang: "XXX".into(),
             description: String::new(),
             text: "nice".into(),
         });
         tag.add_frame(Lyrics {
-            lang: "eng".into(),
+            lang: "XXX".into(),
             description: String::new(),
             text: "la la".into(),
         });
@@ -931,7 +988,7 @@ mod tests {
 
         let tags = read_tags(&buf);
         assert!(tags.contains(&("title".to_string(), "Song".to_string())));
-        assert!(tags.contains(&("TBPM".to_string(), "120".to_string())));
+        assert!(tags.contains(&("TKEY".to_string(), "120".to_string())));
         assert!(tags.contains(&("MOOD".to_string(), "happy".to_string())));
         assert!(tags.contains(&("replaygain_track_gain".to_string(), "-6.5 dB".to_string())));
         assert!(tags.contains(&("comment".to_string(), "nice".to_string())));
@@ -942,7 +999,7 @@ mod tests {
     fn synthesize_round_trips_arbitrary_id3_tags() {
         let tags = vec![
             TagInput::new("title", "Song"),
-            TagInput::new("TBPM", "120"),     // unmapped standard frame
+            TagInput::new("TKEY", "120"),     // unmapped standard frame
             TagInput::new("MyRating", "5"),   // user-defined -> TXXX
             TagInput::new("comment", "nice"), // -> COMM
             TagInput::new("lyrics", "la la"), // -> USLT
@@ -958,7 +1015,7 @@ mod tests {
         let read = read_tags(&buf);
         for expected in [
             ("title", "Song"),
-            ("TBPM", "120"),
+            ("TKEY", "120"),
             ("MyRating", "5"),
             ("comment", "nice"),
             ("lyrics", "la la"),
@@ -969,6 +1026,108 @@ mod tests {
                 "missing {expected:?} in {read:?}"
             );
         }
+    }
+
+    #[test]
+    fn read_tags_preserves_comm_uslt_language_and_descriptor() {
+        use id3::frame::{Comment, Lyrics};
+        use id3::{Tag, TagLike, Version};
+
+        let mut tag = Tag::new();
+        // Placeholder language + empty descriptor folds to the shared key.
+        tag.add_frame(Comment {
+            lang: "XXX".into(),
+            description: String::new(),
+            text: "plain".into(),
+        });
+        // A real language is preserved under a format-specific key.
+        tag.add_frame(Comment {
+            lang: "deu".into(),
+            description: String::new(),
+            text: "hallo".into(),
+        });
+        // A descriptor is preserved too (e.g. an iTunes-keyed comment).
+        tag.add_frame(Comment {
+            lang: "eng".into(),
+            description: "note".into(),
+            text: "see liner".into(),
+        });
+        // Per-language lyrics stay distinct rather than colliding under `lyrics`.
+        tag.add_frame(Lyrics {
+            lang: "eng".into(),
+            description: String::new(),
+            text: "verse".into(),
+        });
+        tag.add_frame(Lyrics {
+            lang: "deu".into(),
+            description: String::new(),
+            text: "strophe".into(),
+        });
+
+        let mut buf = Vec::new();
+        tag.write_to(&mut buf, Version::Id3v24).unwrap();
+        let tags = read_tags(&buf);
+
+        assert!(
+            tags.contains(&("comment".into(), "plain".into())),
+            "got {tags:?}"
+        );
+        assert!(
+            tags.contains(&("id3:COMM:deu:".into(), "hallo".into())),
+            "got {tags:?}"
+        );
+        assert!(
+            tags.contains(&("id3:COMM:eng:note".into(), "see liner".into())),
+            "got {tags:?}"
+        );
+        assert!(
+            tags.contains(&("id3:USLT:eng:".into(), "verse".into())),
+            "got {tags:?}"
+        );
+        assert!(
+            tags.contains(&("id3:USLT:deu:".into(), "strophe".into())),
+            "got {tags:?}"
+        );
+    }
+
+    #[test]
+    fn synthesize_round_trips_comm_uslt_language_and_descriptor() {
+        let tags = vec![
+            TagInput::new("comment", "plain"),
+            TagInput::new("id3:COMM:deu:", "hallo"),
+            TagInput::new("id3:COMM:eng:note", "see liner"),
+            TagInput::new("id3:USLT:eng:Chorus", "la la"),
+        ];
+        let (segments, _len) = build_id3v2_segments(&tags, &[], &[]).unwrap();
+        let mut buf = Vec::new();
+        for seg in &segments {
+            if let Segment::Inline(bytes) = seg {
+                buf.extend_from_slice(bytes);
+            }
+        }
+        // Assert real COMM/USLT frames (with the right lang/descriptor) are emitted,
+        // not generic TXXX frames that would happen to round-trip the key/value.
+        let tag = id3::Tag::read_from2(std::io::Cursor::new(&buf)).unwrap();
+        assert!(
+            tag.comments()
+                .any(|c| c.text == "plain" && c.description.is_empty()),
+            "plain COMM missing"
+        );
+        assert!(
+            tag.comments()
+                .any(|c| c.lang == "deu" && c.description.is_empty() && c.text == "hallo"),
+            "deu COMM missing"
+        );
+        assert!(
+            tag.comments()
+                .any(|c| c.lang == "eng" && c.description == "note" && c.text == "see liner"),
+            "descriptor-keyed COMM missing"
+        );
+        assert!(
+            tag.lyrics()
+                .any(|l| l.lang == "eng" && l.description == "Chorus" && l.text == "la la"),
+            "USLT missing"
+        );
     }
 
     #[test]

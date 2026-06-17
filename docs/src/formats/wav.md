@@ -38,8 +38,8 @@ precedence** and INFO filling gaps; only chunk headers are walked — the
   understand *only* INFO see just those fields. Everything still rides in
   the `id3 ` chunk.
 - All of MP3's ID3 lossy edges apply to the `id3 ` chunk: ID3v2.4-only
-  output, `COMM`/`USLT` language/description reset, `POPM` owner dropped,
-  ID3v1 ignored, the OOM-guard skips (the authoritative list lives in
+  output, placeholder-language `COMM`/`USLT` reset to `XXX`, `POPM` owner
+  dropped, ID3v1 ignored, the OOM-guard skips (the authoritative list lives in
   [MP3's lossy edges](mp3.md#lossy-edges)).
 - **Tags trailing a very large `data` payload are not seen.** When the `data`
   payload pushes any `LIST`/`INFO` or `id3 ` chunk beyond the scan probe
