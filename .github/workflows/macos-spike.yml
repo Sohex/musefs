@@ -1,5 +1,11 @@
 name: macos-spike
-on: workflow_dispatch
+# Temporary feasibility spike. workflow_dispatch only fires from the default
+# branch, so trigger on push to this feature branch — scoped to this file so the
+# later task commits don't re-run it. Removed once findings are recorded.
+on:
+  push:
+    branches: [macos-fuse-t-e2e]
+    paths: ['.github/workflows/macos-spike.yml']
 permissions:
   contents: read
 jobs:
