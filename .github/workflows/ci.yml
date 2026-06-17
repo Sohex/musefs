@@ -466,48 +466,11 @@ jobs:
     if: needs.changes.outputs.lidarr == 'true'
     uses: ./.github/workflows/lidarr-smoke.yml
 
-  perf-bench:
-    name: Read A/B bench (${{ matrix.which }})
-    needs: changes
-    # PR-only: on push/tag events `pull_request.base.sha` is empty, so there is
-    # no base to bench against. The A/B job is informational anyway.
-    if: needs.changes.outputs.perf == 'true' && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    strategy:
-      # Base and PR bench independently on their own runners, in parallel — the
-      # two halves of the old back-to-back A/B. perf-ab joins their baselines.
-      # Don't cancel the other half if one fails, so its status still reports
-      # which ref broke (a failed leg leaves perf-ab skipped — a red signal).
-      fail-fast: false
-      matrix:
-        include:
-          - which: base
-            ref: ${{ github.event.pull_request.base.sha }}
-          - which: pr
-            ref: HEAD
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Install libfuse3
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
-      - name: Install critcmp
-        run: cargo install critcmp --locked --version 0.1.8
-      - name: Bench ${{ matrix.which }}
-        run: scripts/perf-bench-one.sh "${{ matrix.ref }}" "${{ matrix.which }}" "$RUNNER_TEMP/${{ matrix.which }}.json"
-      - name: Upload baseline
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: perf-baseline-${{ matrix.which }}
-          path: ${{ runner.temp }}/${{ matrix.which }}.json
-          if-no-files-found: error
-
   perf-ab:
     name: Read A/B (warn-only)
-    needs: [changes, perf-bench]
+    needs: changes
+    # PR-only: on push/tag events `pull_request.base.sha` is empty, so the A/B
+    # script has no base to bench against. The job is informational anyway.
     if: needs.changes.outputs.perf == 'true' && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -517,23 +480,13 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Install libfuse3
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - name: Install critcmp
         run: cargo install critcmp --locked --version 0.1.8
-      - name: Download baselines
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          path: ${{ runner.temp }}/baselines
-          pattern: perf-baseline-*
-          merge-multiple: true
-      - name: Compare
-        run: >-
-          scripts/perf-ab-compare.sh
-          "$RUNNER_TEMP/baselines/base.json"
-          "$RUNNER_TEMP/baselines/pr.json"
-          "${{ github.event.pull_request.base.sha }}"
-          "$(git rev-parse HEAD)"
-          "$RUNNER_TEMP/perf-ab.md"
-          "Base and PR benched on separate GH runners — cross-runner variance adds noise; treat <10% moves as noise."
+      - name: Run A/B
+        run: scripts/perf-ab.sh "${{ github.event.pull_request.base.sha }}" "$RUNNER_TEMP/perf-ab.md"
       - name: Comment (same-repo PRs)
         if: github.event.pull_request.head.repo.fork == false
         uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0
