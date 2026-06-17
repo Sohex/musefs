@@ -75,9 +75,10 @@ pub struct Cli {
 #[derive(clap::Args, Debug)]
 #[allow(clippy::struct_excessive_bools)] // independent CLI toggles, not a state machine
 pub struct MountArgs {
-    /// Empty directory to mount at.
-    #[arg(env = "MUSEFS_MOUNTPOINT")]
-    pub mountpoint: PathBuf,
+    /// Empty directory to mount at. Not required with `--dry-run`, which only
+    /// previews the template and never touches a target (#555).
+    #[arg(env = "MUSEFS_MOUNTPOINT", required_unless_present = "dry_run")]
+    pub mountpoint: Option<PathBuf>,
     /// Path to the SQLite database (must already exist; unlike `scan`, mount
     /// never creates it).
     #[arg(long, env = "MUSEFS_DB")]
@@ -103,7 +104,7 @@ pub struct MountArgs {
     /// substituting `--default-fallback` (per-field `--fallback` chains and
     /// `[...]` sections still apply). Useful when an external writer only tags a
     /// subset of tracks, e.g. skipping tracks beets left without a `beets_path`.
-    #[arg(long, env = "MUSEFS_SKIP_ON_MISSING", default_value_t = false)]
+    #[arg(long, env = "MUSEFS_SKIP_ON_MISSING", value_parser = clap::builder::BoolishValueParser::new())]
     pub skip_on_missing: bool,
     /// How file contents are served.
     #[arg(long, value_enum, env = "MUSEFS_MODE", default_value_t = CliMode::Synthesis)]
@@ -125,7 +126,7 @@ pub struct MountArgs {
     /// Enable Phase-2 background prefetch threads (advanced). Off by default:
     /// read amplification alone carries the read-ahead win; the threads add
     /// overhead without benefit on tested backends (NFS, SSD). See the benchmarks docs: https://sohex.github.io/musefs/benchmarks.html
-    #[arg(long, env = "MUSEFS_READ_AHEAD_PREFETCH", default_value_t = false)]
+    #[arg(long, env = "MUSEFS_READ_AHEAD_PREFETCH", value_parser = clap::builder::BoolishValueParser::new())]
     pub read_ahead_prefetch: bool,
     /// Max outstanding background (readahead/async) requests the kernel queues.
     #[arg(long, env = "MUSEFS_MAX_BACKGROUND", default_value_t = 64)]
@@ -179,7 +180,7 @@ pub struct MountArgs {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Walk backing files or directories, ingesting supported audio
-    /// (FLAC, MP3, M4A, Ogg, WAV) into the SQLite store.
+    /// (FLAC, MP3, M4A/M4B, Ogg, WAV) into the SQLite store.
     Scan {
         /// One or more files or directories to scan (directories recurse).
         #[arg(required = true, num_args = 1..)]
@@ -412,27 +413,32 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     if !args.db.exists() {
         anyhow::bail!("database does not exist: {}", args.db.display());
     }
-    if !args.dry_run && !args.mountpoint.is_dir() {
-        if args.mountpoint.exists() {
+    // `--dry-run` previews a template and never mounts, so it needs no
+    // mountpoint (#555); clap guarantees one for every other invocation.
+    if !args.dry_run {
+        let mountpoint = args
+            .mountpoint
+            .as_deref()
+            .expect("clap requires a mountpoint unless --dry-run");
+        if !mountpoint.is_dir() {
+            if mountpoint.exists() {
+                anyhow::bail!("mountpoint is not a directory: {}", mountpoint.display());
+            }
             anyhow::bail!(
-                "mountpoint is not a directory: {}",
-                args.mountpoint.display()
+                "mountpoint does not exist (create it first): {}",
+                mountpoint.display()
             );
         }
-        anyhow::bail!(
-            "mountpoint does not exist (create it first): {}",
-            args.mountpoint.display()
-        );
-    }
-    // The mountpoint help says "Empty directory", but FUSE happily mounts over a
-    // populated one and shadows its contents for the mount's lifetime. Warn so a
-    // typo (or reusing a real music folder) doesn't silently hide files (#508).
-    if !args.dry_run && mountpoint_is_nonempty(&args.mountpoint) {
-        eprintln!(
-            "warning: mountpoint {} is not empty; its existing contents will be \
-             hidden behind the virtual tree until you unmount",
-            args.mountpoint.display()
-        );
+        // The mountpoint help says "Empty directory", but FUSE happily mounts over a
+        // populated one and shadows its contents for the mount's lifetime. Warn so a
+        // typo (or reusing a real music folder) doesn't silently hide files (#508).
+        if mountpoint_is_nonempty(mountpoint) {
+            eprintln!(
+                "warning: mountpoint {} is not empty; its existing contents will be \
+                 hidden behind the virtual tree until you unmount",
+                mountpoint.display()
+            );
+        }
     }
     let db =
         Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
@@ -447,7 +453,11 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     if args.dry_run {
         return print_dry_run(&core);
     }
-    signal::install_unmount_on_signal(args.mountpoint.clone())
+    let mountpoint = args
+        .mountpoint
+        .as_deref()
+        .expect("clap requires a mountpoint unless --dry-run");
+    signal::install_unmount_on_signal(mountpoint.to_path_buf())
         .context("installing the stop-signal unmount handler")?;
     // The "is it serving the right library?" context, logged before the blocking
     // mount call; `mount_with` emits the success line with the file/dir counts once
@@ -455,18 +465,17 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     log::info!(
         "mounting database {} at {} (template {:?})",
         args.db.display(),
-        args.mountpoint.display(),
+        mountpoint.display(),
         template,
     );
-    musefs_fuse::mount_with(core, &args.mountpoint, "musefs", fuse_config).map_err(|e| {
+    musefs_fuse::mount_with(core, mountpoint, "musefs", fuse_config).map_err(|e| {
         // A bare EACCES from fusermount3 (e.g. an AppArmor-denied prefix) is
         // otherwise opaque. Append actionable guidance — but not when the
         // allow_other preflight already produced its own self-contained message
         // (it names /etc/fuse.conf), to avoid stacking two different hints (#509).
         let add_hint = e.kind() == std::io::ErrorKind::PermissionDenied
             && !e.to_string().contains("/etc/fuse.conf");
-        let err =
-            anyhow::Error::new(e).context(format!("mounting at {}", args.mountpoint.display()));
+        let err = anyhow::Error::new(e).context(format!("mounting at {}", mountpoint.display()));
         if add_hint {
             err.context(MOUNT_DENIED_HELP)
         } else {
