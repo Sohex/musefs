@@ -1689,6 +1689,19 @@ mod tests {
     }
 
     #[test]
+    fn apply_changes_add_smaller_id_with_over_long_leaf_matches_build() {
+        // The colliding component is the FILENAME and exceeds NAME_MAX. The gate's
+        // occupancy check must truncate it as a LEAF (preserving the extension) to
+        // match the stored key — truncating it as a dir yields a different key, the
+        // collision goes undetected, and the re-rank (2 -> base, 5 -> "(2)") never
+        // happens, diverging from a full rebuild (#535).
+        let long = format!("{}.flac", "x".repeat(NAME_MAX + 45));
+        let before = vec![(5, format!("A/{long}"))];
+        let after = vec![(2, format!("A/{long}")), (5, format!("A/{long}"))];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
+    }
+
+    #[test]
     fn apply_changes_dir_reclaims_base_name_when_colliding_file_removed() {
         // File id 1 rendered "X" owns the base; the dir for id 2's "X/a.flac" was
         // disambiguated to "X (2)". Removing the file must rename the dir to "X".
