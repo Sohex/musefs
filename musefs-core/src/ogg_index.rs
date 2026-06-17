@@ -230,8 +230,16 @@ pub fn serve_ogg_window(
             patch_page_header_algebraic(&hdr_buf[..header_len], new_seq)?
         };
 
-        let hdr_end = page_rel + header_len as u64;
-        let page_end = hdr_end + payload_len as u64;
+        // Fail closed on the offset arithmetic (DB-derived bounds are semi-trusted):
+        // checked_add rather than wrap/panic, matching the bounds above.
+        let header_len_u64 = header_len as u64;
+        let payload_len_u64 = payload_len as u64;
+        let hdr_end = page_rel
+            .checked_add(header_len_u64)
+            .ok_or(musefs_format::FormatError::Malformed)?;
+        let page_end = hdr_end
+            .checked_add(payload_len_u64)
+            .ok_or(musefs_format::FormatError::Malformed)?;
 
         // Header overlap.
         let hs = rstart.max(page_rel);
@@ -250,26 +258,29 @@ pub fn serve_ogg_window(
             let n = usize_from(pe - ps);
             let start = out.len();
             out.resize(start + n, 0);
-            backing.read_exact_at(&mut out[start..], pos + header_len as u64 + within)?;
+            backing.read_exact_at(&mut out[start..], pos + header_len_u64 + within)?;
         }
 
-        // Remember this page as the memo entry to write once after the loop (the
-        // patched header is moved in, not cloned). Recorded before the integrity
-        // guard so the last good page is still memoized when a later page overruns.
-        let total_len = (header_len + payload_len) as u64;
-        last_entry = Some((page_rel, total_len, patched_hdr));
+        let total_len = header_len_u64
+            .checked_add(payload_len_u64)
+            .ok_or(musefs_format::FormatError::Malformed)?;
+        let next_pos = pos
+            .checked_add(total_len)
+            .ok_or(musefs_format::FormatError::Malformed)?;
 
-        pos += total_len;
-
-        // Integrity guard: a page whose declared length pushes past the declared
-        // audio region means the file is truncated/misaligned or the DB bounds are
-        // stale. Hard error (matches the removed build_index consumed-check).
-        if pos > audio_end {
-            if let Some(m) = memo {
-                *crate::lock::lock_or_clear(m, "ogg last-page memo") = last_entry.take();
-            }
+        // Integrity guard BEFORE memoizing: a page whose declared length pushes past
+        // the declared audio region means the file is truncated/misaligned or the DB
+        // bounds are stale. Hard error (matches the removed build_index
+        // consumed-check), and the memo is left holding the last VALID page rather
+        // than caching this overrunning one.
+        if next_pos > audio_end {
             return Err(musefs_format::FormatError::Malformed.into());
         }
+
+        // Remember only validated pages as the memo entry to write once after the
+        // loop (the patched header is moved in, not cloned).
+        last_entry = Some((page_rel, total_len, patched_hdr));
+        pos = next_pos;
     }
 
     if let Some((m, e)) = memo.zip(last_entry) {

@@ -154,6 +154,16 @@ fn find_box(buf: &[u8], kind: &[u8; 4]) -> Result<Option<BoxRef>> {
     Ok(child_boxes(buf)?.into_iter().find(|b| &b.kind == kind))
 }
 
+/// Like [`find_box`] but lenient: scans only the well-formed prefix
+/// ([`child_boxes_lenient`]), so a malformed trailing child of a `----` atom
+/// can't drop a valid `name`/`mean` that precedes it — keeping the metadata
+/// extractors' "seed what you can" contract end-to-end (#524).
+fn find_box_lenient(buf: &[u8], kind: &[u8; 4]) -> Option<BoxRef> {
+    child_boxes_lenient(buf)
+        .into_iter()
+        .find(|b| &b.kind == kind)
+}
+
 /// Descend a path of box types; return `(payload_start, payload_len)` relative to
 /// `buf` for the box at the end of the path, or None if any step is missing.
 fn find_path(buf: &[u8], path: &[&[u8; 4]]) -> Result<Option<(usize, usize)>> {
@@ -361,7 +371,7 @@ fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
 /// convention; binary-typed `data` boxes are left to [`read_binary_tags`]. Empty
 /// if malformed.
 fn read_freeform(inner: &[u8]) -> Vec<(String, String)> {
-    let Some(name_box) = find_box(inner, b"name").ok().flatten() else {
+    let Some(name_box) = find_box_lenient(inner, b"name") else {
         return Vec::new();
     };
     let np = name_box.payload(inner);
@@ -372,17 +382,14 @@ fn read_freeform(inner: &[u8]) -> Vec<(String, String)> {
     let Ok(name) = std::str::from_utf8(&np[4..]) else {
         return Vec::new();
     };
-    let mean = find_box(inner, b"mean")
-        .ok()
-        .flatten()
-        .map_or("com.apple.iTunes", |m| {
-            let p = m.payload(inner);
-            if p.len() >= 4 {
-                std::str::from_utf8(&p[4..]).unwrap_or("com.apple.iTunes")
-            } else {
-                "com.apple.iTunes"
-            }
-        });
+    let mean = find_box_lenient(inner, b"mean").map_or("com.apple.iTunes", |m| {
+        let p = m.payload(inner);
+        if p.len() >= 4 {
+            std::str::from_utf8(&p[4..]).unwrap_or("com.apple.iTunes")
+        } else {
+            "com.apple.iTunes"
+        }
+    });
     let key = crate::tagmap::mp4_freeform_to_key(mean, name)
         .map_or_else(|| name.to_string(), str::to_string);
     let mut out = Vec::new();
@@ -576,7 +583,7 @@ pub fn read_binary_tags_reporting(
         }
         let inner = atom.payload(ilst);
         // name/mean payloads carry a 4-byte FullBox prefix; default mean to iTunes.
-        let Some(name) = find_box(inner, b"name").ok().flatten().and_then(|n| {
+        let Some(name) = find_box_lenient(inner, b"name").and_then(|n| {
             let p = n.payload(inner);
             (p.len() >= 4)
                 .then(|| std::str::from_utf8(&p[4..]).ok())
@@ -584,17 +591,14 @@ pub fn read_binary_tags_reporting(
         }) else {
             continue;
         };
-        let mean = find_box(inner, b"mean")
-            .ok()
-            .flatten()
-            .map_or("com.apple.iTunes", |m| {
-                let p = m.payload(inner);
-                if p.len() >= 4 {
-                    std::str::from_utf8(&p[4..]).unwrap_or("com.apple.iTunes")
-                } else {
-                    "com.apple.iTunes"
-                }
-            });
+        let mean = find_box_lenient(inner, b"mean").map_or("com.apple.iTunes", |m| {
+            let p = m.payload(inner);
+            if p.len() >= 4 {
+                std::str::from_utf8(&p[4..]).unwrap_or("com.apple.iTunes")
+            } else {
+                "com.apple.iTunes"
+            }
+        });
         let key = format!("----:{mean}:{name}");
         // Iterate every `data` sub-box, mirroring the text path: a `----` atom can
         // carry a type-1 text value and a separate binary value, so inspecting only

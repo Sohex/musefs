@@ -449,10 +449,11 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     }
     signal::install_unmount_on_signal(args.mountpoint.clone())
         .context("installing the stop-signal unmount handler")?;
-    // The "is it serving the right library?" context, alongside the mount-success
-    // line `mount_with` emits with the file/dir counts (#522).
+    // The "is it serving the right library?" context, logged before the blocking
+    // mount call; `mount_with` emits the success line with the file/dir counts once
+    // the session is actually serving (#522).
     log::info!(
-        "serving database {} at {} (template {:?})",
+        "mounting database {} at {} (template {:?})",
         args.db.display(),
         args.mountpoint.display(),
         template,

@@ -286,14 +286,11 @@ exclude_re = [
     # shift), so anchored line-agnostically.
     'musefs-format/src/ogg/crc\.rs:\d+:\d+: replace > with >= in crc_shift_zeros',
 
-    # SP4 serve_ogg_window / find_page_start loop mutants.
-    # Non-terminating (reported TIMEOUT, never a clean kill): `i -= 1` -> `i /= 1`
-    # leaves the backward-scan index unchanged (infinite loop), and `pos += ...` ->
-    # `pos *= ...` stays 0 forever once the first page is at offset 0. Like the SP2
-    # tree.rs timeouts, these can only ever flag via the timeout budget. Each is the
-    # sole `-=` / `+=` in its function, so anchored line-agnostically.
+    # SP4 find_page_start loop mutant. Non-terminating (reported TIMEOUT, never a
+    # clean kill): `i -= 1` -> `i /= 1` leaves the backward-scan index unchanged
+    # (infinite loop). Like the SP2 tree.rs timeouts, it can only ever flag via the
+    # timeout budget. The sole `-=` in its function, so anchored line-agnostically.
     'musefs-core/src/ogg_index\.rs:\d+:\d+: replace -= with /= in find_page_start',
-    'musefs-core/src/ogg_index\.rs:\d+:\d+: replace \+= with \*= in serve_ogg_window',
     # Overlap-emit guards `if hs < he` / `if ps < pe`, `<`->`<=`: when the bound is
     # equal the extra branch emits an empty `[a..b]` slice / reads 0 payload bytes —
     # a no-op, so the served output is byte-identical (verified: the ogg tests and the
@@ -301,9 +298,9 @@ exclude_re = [
     # were reported TIMEOUT under the parallel gate's load, not as a real hang. Pinned
     # by line:col — several `<` in this fn (the loop/length guards) ARE caught.
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:239:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:247:15: replace < with <= in serve_ogg_window',
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:248:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:256:15: replace < with <= in serve_ogg_window',
 
     # Phase 4 poll debounce (#89) — equivalent `<`->`<=` on the two wall-clock
     # gates (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <

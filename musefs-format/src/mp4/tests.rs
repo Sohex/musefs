@@ -1599,6 +1599,46 @@ fn read_binary_tags_recovers_binary_after_a_text_data() {
 }
 
 #[test]
+fn read_freeform_recovers_before_malformed_trailing_child() {
+    // A `----` atom with a valid `name` + text `data` followed by a malformed
+    // trailing child: the lenient `name` lookup must still recover the value
+    // rather than the strict `find_box` dropping the whole atom (#524).
+    let mut name_body = 0u32.to_be_bytes().to_vec();
+    name_body.extend_from_slice(b"My Custom Field");
+    let mut inner = boxed(b"name", &name_body).unwrap();
+    inner.extend(data_atom(1, b"ok"));
+    inner.extend_from_slice(&[0, 0, 0, 99, b'b', b'a', b'd', b'!']); // overruns the buffer
+    assert_eq!(
+        read_freeform(&inner),
+        vec![("My Custom Field".to_string(), "ok".to_string())]
+    );
+}
+
+#[test]
+fn read_binary_tags_recovers_before_malformed_trailing_child() {
+    // A `----` atom with valid mean/name/binary-data followed by a malformed
+    // trailing child: the lenient name/mean lookup must still recover the tag (#524).
+    let mut mean_body = 0u32.to_be_bytes().to_vec();
+    mean_body.extend_from_slice(b"com.serato.dj");
+    let mut name_body = 0u32.to_be_bytes().to_vec();
+    name_body.extend_from_slice(b"analysis");
+    let mut inner = boxed(b"mean", &mean_body).unwrap();
+    inner.extend(boxed(b"name", &name_body).unwrap());
+    inner.extend(data_atom(0, &[0xDE, 0xAD]));
+    inner.extend_from_slice(&[0, 0, 0, 99, b'b', b'a', b'd', b'!']); // overruns the buffer
+    let atom = boxed(b"----", &inner).unwrap();
+    let moov = moov_with_ilst(&atom);
+    let tags = read_binary_tags(&moov, usize::MAX);
+    assert_eq!(
+        tags.len(),
+        1,
+        "valid binary tag survives a malformed sibling"
+    );
+    assert_eq!(tags[0].key, "----:com.serato.dj:analysis");
+    assert_eq!(tags[0].payload, vec![0xDE, 0xAD]);
+}
+
+#[test]
 fn read_binary_tags_reporting_reports_oversize_drop() {
     // A 5-byte value over the 4-byte cap: skipped from the tags, but reported
     // as a drop with its `----:<mean>:<name>` key and exact byte size.
