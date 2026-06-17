@@ -208,27 +208,31 @@ fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
     errno(err)
 }
 
-/// Run a read's synthesis under a panic boundary so a residual parser panic —
-/// one the format-layer alloc guards (`id3v2_alloc_safe` and friends) don't
-/// catch — becomes an `EIO` reply instead of unwinding the pool worker. fuser's
-/// reply objects send nothing when dropped, so an unwound worker leaves the
-/// kernel waiting forever and the read syscall hangs at 0% CPU with no error
-/// logged (#359). A `CoreError` maps to its errno via [`reply_errno`]; a caught
-/// panic is logged and mapped to `EIO`.
-fn read_outcome<F>(ino: u64, work: F) -> Result<(), fuser::Errno>
+/// Run metadata/handle/read synthesis under a panic boundary so a residual
+/// parser panic — one the format-layer alloc guards (`id3v2_alloc_safe` and
+/// friends) don't catch — becomes an errno reply instead of unwinding the pool
+/// worker. fuser's reply objects send nothing when dropped, so an unwound worker
+/// leaves the kernel waiting forever and the syscall hangs at 0% CPU with no
+/// error logged (#359). The same metadata synthesis runs behind `read`,
+/// `lookup`, `getattr`, and `open` (all resolve a layout via `cache.resolve`),
+/// so every one of them must guard it, not just `read` (#533). The caller makes
+/// the reply *outside* this boundary on the returned outcome. A `CoreError` maps
+/// to its errno via [`reply_errno`]; a caught panic is logged and mapped to
+/// `EIO`. `op` labels the syscall in those messages.
+fn synth_outcome<F, T>(op: &str, ino: u64, work: F) -> Result<T, fuser::Errno>
 where
-    F: FnOnce() -> Result<(), CoreError> + std::panic::UnwindSafe,
+    F: FnOnce() -> Result<T, CoreError> + std::panic::UnwindSafe,
 {
     match std::panic::catch_unwind(work) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(reply_errno("read", ino, &e)),
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(reply_errno(op, ino, &e)),
         Err(payload) => {
             let msg = payload
                 .downcast_ref::<&str>()
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("<non-string panic>");
-            log::error!("read({ino}) worker panicked in synthesis: {msg}; replying EIO");
+            log::error!("{op}({ino}) worker panicked in synthesis: {msg}; replying EIO");
             Err(fuser::Errno::EIO)
         }
     }
@@ -569,13 +573,22 @@ impl Filesystem for MusefsFs {
             self.mount_time,
             self.config.ttl,
         );
-        self.pool.execute(move || match core.getattr(child) {
-            Ok(attr) => reply.entry(
-                &ttl,
-                &to_file_attr(&attr, uid, gid, fm, dm, mt),
-                Generation(0),
-            ),
-            Err(e) => reply.error(reply_errno("lookup", child, &e)),
+        // `reply` stays outside the panic boundary so a residual synthesis panic
+        // is answered (EIO) instead of unwinding the worker and hanging the
+        // syscall (#359, #533).
+        self.pool.execute(move || {
+            match synth_outcome(
+                "lookup",
+                child,
+                std::panic::AssertUnwindSafe(|| core.getattr(child)),
+            ) {
+                Ok(attr) => reply.entry(
+                    &ttl,
+                    &to_file_attr(&attr, uid, gid, fm, dm, mt),
+                    Generation(0),
+                ),
+                Err(e) => reply.error(e),
+            }
         });
     }
 
@@ -607,9 +620,18 @@ impl Filesystem for MusefsFs {
             self.mount_time,
             self.config.ttl,
         );
-        self.pool.execute(move || match core.getattr(ino.0) {
-            Ok(attr) => reply.attr(&ttl, &to_file_attr(&attr, uid, gid, fm, dm, mt)),
-            Err(e) => reply.error(reply_errno("getattr", ino.0, &e)),
+        // `reply` stays outside the panic boundary so a residual synthesis panic
+        // is answered (EIO) instead of unwinding the worker and hanging the
+        // syscall (#359, #533).
+        self.pool.execute(move || {
+            match synth_outcome(
+                "getattr",
+                ino.0,
+                std::panic::AssertUnwindSafe(|| core.getattr(ino.0)),
+            ) {
+                Ok(attr) => reply.attr(&ttl, &to_file_attr(&attr, uid, gid, fm, dm, mt)),
+                Err(e) => reply.error(e),
+            }
         });
     }
 
@@ -651,9 +673,16 @@ impl Filesystem for MusefsFs {
         let flags = open_flags(self.config.keep_cache);
         let passthrough = self.passthrough.clone();
         self.pool.execute(move || {
-            let fh = match core.open_handle(ino.0) {
+            // `open_handle` runs the same layout synthesis as `read`; guard it so a
+            // residual panic replies EIO instead of unwinding the worker and hanging
+            // `open` (#359, #533). `reply_open` below stays outside the boundary.
+            let fh = match synth_outcome(
+                "open",
+                ino.0,
+                std::panic::AssertUnwindSafe(|| core.open_handle(ino.0)),
+            ) {
                 Ok(fh) => fh,
-                Err(e) => return reply.error(reply_errno("open", ino.0, &e)),
+                Err(e) => return reply.error(e),
             };
             // Ordering invariant (#193): `open_handle` inserts the handle into the
             // slab and returns `fh` *before* we reply here, and the kernel won't
@@ -851,7 +880,8 @@ impl Filesystem for MusefsFs {
                 // `reply` lives outside the panic boundary so a residual parser
                 // panic in `read_into` still gets answered (EIO) instead of
                 // unwinding the worker with no reply and hanging the read (#359).
-                let outcome = read_outcome(
+                let outcome = synth_outcome(
+                    "read",
                     ino.0,
                     std::panic::AssertUnwindSafe(|| {
                         core.read_into(
@@ -1072,20 +1102,20 @@ mod tests {
     }
 
     #[test]
-    fn read_outcome_passes_through_ok() {
-        let r = read_outcome(7, || Ok(()));
-        assert!(r.is_ok());
+    fn synth_outcome_passes_through_ok_value() {
+        let r: Result<u32, _> = synth_outcome("getattr", 7, || Ok(42));
+        assert_eq!(r.unwrap(), 42);
     }
 
     #[test]
-    fn read_outcome_maps_core_error_to_errno() {
-        let r = read_outcome(7, || Err(CoreError::NoEntry(7)));
+    fn synth_outcome_maps_core_error_to_errno() {
+        let r: Result<(), _> = synth_outcome("lookup", 7, || Err(CoreError::NoEntry(7)));
         assert_eq!(r.unwrap_err().code(), libc::ENOENT);
     }
 
     #[test]
-    fn read_outcome_catches_panic_as_eio() {
-        let r = read_outcome(7, || panic!("parser exploded"));
+    fn synth_outcome_catches_panic_as_eio() {
+        let r: Result<(), _> = synth_outcome("open", 7, || panic!("parser exploded"));
         assert_eq!(r.unwrap_err().code(), libc::EIO);
     }
 
