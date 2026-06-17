@@ -94,6 +94,8 @@ git commit -m "ci(spike): temporary macos fuse-t feasibility job"
 git push -u origin macos-fuse-t-e2e
 ```
 
+Note: this is a non-docs commit, so the pre-commit hook runs the full workspace test suite + clippy (not "just a workflow file" — expect a couple of minutes).
+
 - [ ] **Step 3: Trigger the spike and watch it**
 
 ```bash
@@ -163,9 +165,9 @@ Expected: builds; tests pass (`cargo test:` summary green). No new dependency pu
 
 Run:
 ```bash
-cargo metadata --features macos-mount --no-deps -q >/dev/null && echo "feature graph OK"
+cargo metadata -p musefs-fuse --features macos-mount --no-deps -q >/dev/null && echo "feature graph OK"
 ```
-Expected: `feature graph OK` (no "feature not found" error). This proves the feature name/mapping is valid; the actual libfuse link is exercised on macOS in Task 4.
+Expected: `feature graph OK`. The `-p musefs-fuse` scope is required: a workspace-root `cargo metadata --features X` silently accepts a *nonexistent* feature (verified — it exits 0 for a bogus name), so only the package-scoped form actually rejects a misspelled/missing `macos-mount`. This resolves the feature graph without compiling/linking libfuse, so it still honors "never link libfuse on Linux"; the actual link is exercised on macOS in Task 4.
 
 - [ ] **Step 4: Commit**
 
@@ -186,44 +188,60 @@ The mount path `mount_config → platform::mount::options → extend_os_specific
 - Modify: `musefs-fuse/src/platform/mount.rs:74-79` (the macOS `extend_os_specific`)
 
 **Interfaces:**
-- Produces: a runtime seam — when `MUSEFS_FUSE_T` is set in the environment, `extend_os_specific` omits the macFUSE-only options. Consumed by Task 4 (the CI job exports `MUSEFS_FUSE_T=1`).
+- Produces: a runtime seam — when `MUSEFS_FUSE_T` is set in the environment, `extend_os_specific` omits the macFUSE-only options. Consumed by Task 4 (the CI job exports `MUSEFS_FUSE_T=1`). The env read is isolated in `extend_os_specific`; the option-building logic lives in a pure helper `push_macos_options(opts, fs_name, macfuse: bool)` that the test drives directly — **no env mutation, no `unsafe` in the test** (the workspace denies `unsafe_code`; bare `unsafe {}` would fail clippy `-D warnings`).
 
 - [ ] **Step 1: Write the failing test**
 
-The existing `#[cfg(test)] mod tests` in `musefs-fuse/src/platform/mount.rs:85` runs on every platform; add a macOS-gated test there. Insert after the existing tests:
+The existing `#[cfg(test)] mod tests` in `musefs-fuse/src/platform/mount.rs:85` runs on every platform; add a macOS-gated test there. Insert after the existing tests. It calls the pure helper added in Step 3 with `macfuse = false` (the fuse-t case) — deterministic, no process-env mutation:
 
 ```rust
 #[cfg(target_os = "macos")]
 #[test]
-fn fuse_t_env_omits_macfuse_options() {
-    // SAFETY: single-threaded test; set/remove the var within this test only.
-    unsafe { std::env::set_var("MUSEFS_FUSE_T", "1") };
-    let opts = options("muse", false);
+fn fuse_t_omits_macfuse_options() {
+    let mut opts = Vec::new();
+    push_macos_options(&mut opts, "muse", false);
     let has_macfuse = opts.iter().any(|o| {
         matches!(o, MountOption::CUSTOM(s) if s.starts_with("volname=") || s == "noappledouble")
     });
-    unsafe { std::env::remove_var("MUSEFS_FUSE_T") };
     assert!(!has_macfuse, "fuse-t mount must omit macFUSE-only options");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macfuse_keeps_volname_and_noappledouble() {
+    let mut opts = Vec::new();
+    push_macos_options(&mut opts, "muse", true);
+    assert!(opts.iter().any(|o| matches!(o, MountOption::CUSTOM(s) if s == "volname=muse")));
+    assert!(opts.iter().any(|o| matches!(o, MountOption::CUSTOM(s) if s == "noappledouble")));
 }
 ```
 
 - [ ] **Step 2: Run the test to verify it fails (macOS only)**
 
-This test is `#[cfg(target_os = "macos")]`, so it compiles to nothing on Linux. Verify on the macOS runner (it will run inside the Task 4 job's `cargo test --workspace` leg — at this point in the plan, run it via the spike job by temporarily pointing `macos-spike.yml`'s test step at `--lib`). Expected: FAIL — `extend_os_specific` still pushes the options.
+This test is `#[cfg(target_os = "macos")]`, so it compiles to nothing on Linux, AND `push_macos_options` does not exist yet — so it won't even compile on macOS until Step 3. Verify on the macOS runner (it runs inside the Task 4 job's `cargo test --workspace` leg; at this point in the plan, run it via the spike job by temporarily pointing `macos-spike.yml`'s test step at `cargo test -p musefs-fuse --lib`). Expected: compile error "cannot find function `push_macos_options`", then once Step 3's helper exists but before the gate is wired, `fuse_t_omits_macfuse_options` would FAIL.
 
-If verifying locally on Linux is the only option, confirm at least that the workspace still compiles: `cargo build -p musefs-fuse` → builds (the test body isn't compiled on Linux).
+On Linux confirm only that the workspace still compiles: `cargo build -p musefs-fuse` → builds (neither test body is compiled off-macOS).
 
-- [ ] **Step 3: Implement the env gate**
+- [ ] **Step 3: Split the env read from a pure option builder**
 
-Replace `extend_os_specific` (`musefs-fuse/src/platform/mount.rs:74-80`) with:
+Replace `extend_os_specific` (`musefs-fuse/src/platform/mount.rs:74-80`) with an env-reading wrapper plus the pure helper the tests drive:
 
 ```rust
 #[cfg(target_os = "macos")]
 fn extend_os_specific(opts: &mut Vec<MountOption>, fs_name: &str) {
     // fuse-t (userspace FUSE↔NFS) does not accept macFUSE's volname/noappledouble
-    // options and aborts the mount if given them. MUSEFS_FUSE_T marks a fuse-t
-    // backend (set by CI's macOS e2e job) so we skip the macFUSE-only options.
-    if std::env::var_os("MUSEFS_FUSE_T").is_some() {
+    // options and aborts the mount if given them. MUSEFS_FUSE_T (set by CI's macOS
+    // e2e job) marks a fuse-t backend; absent it we assume macFUSE.
+    let macfuse = std::env::var_os("MUSEFS_FUSE_T").is_none();
+    push_macos_options(opts, fs_name, macfuse);
+}
+
+// Pure so it's testable without mutating the process environment (the workspace
+// denies `unsafe_code`, so a test can't call the edition-2024 `unsafe`
+// `set_var`). `macfuse` gates the macFUSE-only options.
+#[cfg(target_os = "macos")]
+fn push_macos_options(opts: &mut Vec<MountOption>, fs_name: &str, macfuse: bool) {
+    if !macfuse {
         return;
     }
     // fuser 0.17 has no `VolName` variant; macOS-specific options go through
@@ -233,9 +251,9 @@ fn extend_os_specific(opts: &mut Vec<MountOption>, fs_name: &str) {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes (macOS)**
+- [ ] **Step 4: Run the tests to verify they pass (macOS)**
 
-On the macOS runner: `cargo test -p musefs-fuse --lib platform::mount 2>&1 | tail` → PASS. On Linux: `cargo test --workspace 2>&1 | tail -5` → still green (test not compiled there; no behavior change off-macOS).
+On the macOS runner: `cargo test -p musefs-fuse --lib platform::mount 2>&1 | tail` → both tests PASS. On Linux: `cargo test --workspace 2>&1 | tail -5` → still green (tests not compiled there; no behavior change off-macOS).
 
 - [ ] **Step 5: Re-anchor mutants if the pre-commit hook complains**
 
@@ -336,10 +354,13 @@ git push
 
 The branch already touches `musefs-fuse/` and `ci.yml`, so `changes.fuse` is true and `macos-e2e` runs. Watch it:
 ```bash
-gh run watch "$(gh run list --workflow=ci.yml --branch=macos-fuse-t-e2e -L1 --json databaseId -q '.[0].databaseId')"
-gh run view --job "$(gh run list --workflow=ci.yml --branch=macos-fuse-t-e2e -L1 --json databaseId -q '.[0].databaseId')" 2>/dev/null | grep -i macos-e2e
+RUN_ID="$(gh run list --workflow=ci.yml --branch=macos-fuse-t-e2e -L1 --json databaseId -q '.[0].databaseId')"
+gh run watch "$RUN_ID"
+# `gh run view --job` needs a JOB id, not a run id; read the run and grep the
+# job's own conclusion (the run can be green while a continue-on-error job failed).
+gh run view "$RUN_ID" --json jobs -q '.jobs[] | select(.name|test("macos-e2e")) | "\(.name): \(.conclusion)"'
 ```
-Expected: `macos-e2e` mounts via fuse-t and passes the non-metrics `--ignored` subset. Because it's `continue-on-error`, confirm it genuinely PASSED (not merely "didn't block") by reading the job conclusion.
+Expected: `macos-e2e: success` — it mounts via fuse-t and passes the non-metrics `--ignored` subset. Because the job is `continue-on-error`, confirm it genuinely PASSED (not merely "didn't block the run") by reading that per-job conclusion.
 
 ---
 
@@ -347,7 +368,7 @@ Expected: `macos-e2e` mounts via fuse-t and passes the non-metrics `--ignored` s
 
 **Files:**
 - Modify: `docs/src/guide/installation.md:9` (the "not E2E tested on macOS" note) and `:74` (platform table row)
-- Modify: `docs/src/contributing/setup.md` (add a `### macOS e2e (fuse-t)` subsection after the `### FreeBSD e2e` block at `:110-138`)
+- Modify: `docs/src/contributing/setup.md` — **replace** the stale macOS paragraph at `:172-174` (which still says "Mounted e2e on macOS/FUSE-T is not yet validated") with a `### macOS e2e (fuse-t)` subsection, immediately after the FreeBSD e2e block (which ends at the `Notes:` list, ~`:165-170`)
 
 - [ ] **Step 1: Update the installation note (`installation.md:9`)**
 
@@ -373,7 +394,15 @@ with:
 
 - [ ] **Step 3: Add the `### macOS e2e (fuse-t)` subsection to `setup.md`**
 
-Insert immediately after the FreeBSD e2e block (after `docs/src/contributing/setup.md:138`):
+**Replace** the now-false macOS paragraph at `docs/src/contributing/setup.md:172-174`:
+
+```markdown
+macOS support is best-effort: CI builds there with `fuser`'s `macos-no-mount`
+feature, and the platform-specific logic is unit-tested. Mounted e2e on
+macOS/FUSE-T is not yet validated.
+```
+
+with this subsection (it sits right after the FreeBSD e2e `Notes:` list, so the FreeBSD section stays intact):
 
 ```markdown
 ### macOS e2e (fuse-t)

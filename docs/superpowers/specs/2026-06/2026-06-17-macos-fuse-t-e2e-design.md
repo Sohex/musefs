@@ -14,7 +14,7 @@ the actual mounted read path on macOS**. The Linux `e2e` and the FreeBSD
 The blocker is real, not just a missing workflow file: `musefs-fuse/Cargo.toml`
 builds `fuser` with the **`macos-no-mount`** feature on macOS — a compile-only
 stub that deliberately avoids requiring macFUSE to build. The mount path
-(`establish_session` → `fuser::Session::new`, `musefs-fuse/src/lib.rs:910-926`)
+(`new_session` → `fuser::Session::new`, `musefs-fuse/src/lib.rs:911-927`)
 is exercised only on Linux/FreeBSD today.
 
 ## Goal
