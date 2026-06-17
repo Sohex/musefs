@@ -407,6 +407,10 @@ AppArmor profile only permits unprivileged FUSE mounts under whitelisted prefixe
 Mount under a permitted prefix, or whitelist yours in /etc/apparmor.d/local/fusermount3 (check the kernel audit \
 log for an apparmor=\"DENIED\" ... profile=\"fusermount3\" line). See the mounting guide for details.";
 
+const MOUNT_NO_FUSE_HELP: &str = "the FUSE userspace appears to be missing; mounting needs the `fuse3` package \
+(fusermount3 on PATH), the `fuse` kernel module loaded, and /dev/fuse present. Install it (e.g. `apt install fuse3` \
+/ `apk add fuse3` / `dnf install fuse3`) and ensure /dev/fuse exists. See the installation guide for runtime requirements.";
+
 /// True if `mountpoint` is a directory containing at least one entry. A read
 /// failure is treated as "empty" — the warning is advisory, and the mount will
 /// surface any real access error itself.
@@ -482,11 +486,17 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
         // otherwise opaque. Append actionable guidance — but not when the
         // allow_other preflight already produced its own self-contained message
         // (it names /etc/fuse.conf), to avoid stacking two different hints (#509).
-        let add_hint = e.kind() == std::io::ErrorKind::PermissionDenied
+        let denied_hint = e.kind() == std::io::ErrorKind::PermissionDenied
             && !e.to_string().contains("/etc/fuse.conf");
+        // A missing FUSE userspace (no fusermount3 on PATH, kernel module not
+        // loaded, or /dev/fuse absent) surfaces as NotFound with an opaque
+        // message — the most common first-run failure on a fresh host/container.
+        let no_fuse_hint = !denied_hint && e.kind() == std::io::ErrorKind::NotFound;
         let err = anyhow::Error::new(e).context(format!("mounting at {}", mountpoint.display()));
-        if add_hint {
+        if denied_hint {
             err.context(MOUNT_DENIED_HELP)
+        } else if no_fuse_hint {
+            err.context(MOUNT_NO_FUSE_HELP)
         } else {
             err
         }

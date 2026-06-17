@@ -156,11 +156,15 @@ scanned track, are synthesized by the Rust serve path and read back by an
 independent reader.
 
 External writers prune in one of two ways depending on how they own files.
-In-place writers (e.g. the beets plugin) prune by file existence — a removed
-backing file drops its row via `prune_missing`. Link-tree writers (e.g. the
-Lidarr integration) never delete the backing files they point at, so they prune
-by identity instead: a source-reported album/artist deletion removes the rows
-carrying the matching MusicBrainz id.
+For in-place writers (e.g. the beets plugin), existence-based pruning — dropping
+the row of a removed backing file — is a deliberate act owned by `musefs scan
+--revalidate`; the plugin never prunes on its own (it exposes the revalidate
+scan via `beet musefs --revalidate`). The `prune_missing` helper in
+`musefs_common` implements the same by-existence delete for writers that prefer
+to own pruning themselves. Link-tree writers (e.g. the Lidarr integration) never
+delete the backing files they point at, so they prune by identity instead: a
+source-reported album/artist deletion removes the rows carrying the matching
+MusicBrainz id.
 
 Connections are mode-typed (`Db<ReadWrite>` / `Db<ReadOnly>`), opened in WAL
 mode with a busy timeout. The serve path uses a `DbPool` whose per-thread

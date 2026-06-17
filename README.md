@@ -38,6 +38,10 @@ musefs mount ~/mnt/music --db library.db \
 # mount blocks until unmounted: fusermount3 -u ~/mnt/music (or Ctrl-C)
 ```
 
+Mounting needs the `fuse3` runtime installed (`apt install fuse3` /
+`apk add fuse3` / `dnf install fuse3`) and `/dev/fuse` present — see
+[Installation](https://sohex.github.io/musefs/guide/installation.html).
+
 `~/mnt/music` now serves your library as
 `Album Artist/Album/Title.flac` — with each file's metadata generated fresh
 from the database, spliced in front of your original, untouched audio.

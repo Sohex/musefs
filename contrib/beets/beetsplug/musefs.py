@@ -13,11 +13,8 @@ from musefs_common import (
     SyncStats,
     check_schema_version,
     connect,
-    prune_missing,
-    realpath_key,
     run_scan,
     sync_files,
-    track_id_for_path,
 )
 
 from beetsplug import _core
@@ -37,7 +34,8 @@ class MusefsPlugin(BeetsPlugin):
         # beets has no file-move event, and `after_write` fires *before* a move
         # (at the old path). So imports/writes are recorded and reconciled once
         # at cli_exit, when each item's path is final. Reconcile only syncs; it
-        # never prunes (pruning is a deliberate act — see `_reconcile_pending`).
+        # never prunes. Pruning is a deliberate act owned by `musefs scan
+        # --revalidate` (reachable via `beet musefs --revalidate`).
         self._pending = []
         self.register_listener("after_write", self._record)
         self.register_listener("item_imported", self._record)
@@ -69,6 +67,14 @@ class MusefsPlugin(BeetsPlugin):
             default=False,
             help="when a tag is removed in beets, let the backing file's value reappear",
         )
+        cmd.parser.add_option(
+            "--revalidate",
+            dest="revalidate",
+            action="store_true",
+            default=False,
+            help="forward --revalidate to `musefs scan`, pruning rows whose backing "
+            "file is gone and GCing orphaned art (the only way this plugin prunes)",
+        )
         cmd.func = self._command
         return [cmd]
 
@@ -87,22 +93,22 @@ class MusefsPlugin(BeetsPlugin):
 
         query = self._query_from_args(args)
         items = list(lib.items(query))
-        if self._autoscan() and not opts.dry_run:
+        revalidate = bool(opts.revalidate)
+        # A scan runs when autoscan is on, or whenever --revalidate is requested:
+        # revalidation IS a scan operation — pruning gone backing files and GCing
+        # orphaned art live entirely in `musefs scan --revalidate`. The plugin
+        # never prunes on its own; this is the only path that removes rows.
+        if (self._autoscan() or revalidate) and not opts.dry_run:
             # Full sync: one scan of the music dir. Query: scan only the matched
             # files, so non-matched rows aren't re-seeded from their files.
             targets = (
                 [os.fsdecode(i.path) for i in items] if query else [os.fsdecode(lib.directory)]
             )
-            self._run_scan(db_path, targets)
+            self._run_scan(db_path, targets, revalidate=revalidate)
         restore_backing = bool(opts.restore_backing) or self._restore_backing()
         stats = self._sync(db_path, items, dry_run=opts.dry_run, restore_backing=restore_backing)
-        if opts.dry_run:
-            pruned = 0
-        else:
-            prune_items = items if query else None
-            pruned = self._prune_missing(db_path, items=prune_items)
         # ui.print_ (not self._log) so the summary always shows, not only at -v.
-        ui.print_(f"musefs: {stats.summary()} pruned={pruned}")
+        ui.print_(f"musefs: {stats.summary()}")
 
     # --- event listeners -------------------------------------------------
 
@@ -190,13 +196,15 @@ class MusefsPlugin(BeetsPlugin):
     def _bin(self):
         return self.config["bin"].get(str) or "musefs"
 
-    def _run_scan(self, db_path, targets):
-        """Run `musefs scan <target...> --db <db>` once for the whole batch.
-        Creates the DB if missing and fills the structural columns the plugin
-        can't compute itself. Raises ui.UserError on failure."""
+    def _run_scan(self, db_path, targets, revalidate=False):
+        """Run `musefs scan <target...> --db <db> [--revalidate]` once for the
+        whole batch. Creates the DB if missing and fills the structural columns
+        the plugin can't compute itself. With ``revalidate``, the scanner also
+        prunes rows whose backing file is gone and GCs orphaned art. Raises
+        ui.UserError on failure."""
         binary = self._bin()
         try:
-            run_scan(binary, db_path, targets, timeout=SCAN_TIMEOUT_SECONDS)
+            run_scan(binary, db_path, targets, revalidate=revalidate, timeout=SCAN_TIMEOUT_SECONDS)
         except ScanError as exc:
             raise self._scan_user_error(exc)
 
@@ -213,39 +221,6 @@ class MusefsPlugin(BeetsPlugin):
             f"musefs: `{exc.binary} scan` failed for {exc.target} "
             f"(exit {exc.returncode}):\n{exc.stderr}"
         )
-
-    @staticmethod
-    def _track_ids_for_items(conn, items):
-        ids = []
-        for item in items:
-            key = realpath_key(item.path)
-            track_id = track_id_for_path(conn, key)
-            if track_id is not None:
-                ids.append(track_id)
-        return ids
-
-    def _prune_missing(self, db_path, items=None):
-        """Drop rows whose backing file no longer exists (moved/deleted).
-        When ``items`` is provided, only their musefs track rows are checked.
-        Returns the number pruned.
-
-        Guarded by ``check_schema_version`` (#545): an out-of-date plugin must
-        not delete rows from a store schema it does not understand. A mismatch
-        surfaces as ``ui.UserError`` — the explicit ``beet musefs`` command
-        aborts with the message; the passive reconcile path swallows it."""
-        if not os.path.exists(db_path):
-            return 0
-        conn = connect(db_path)
-        try:
-            check_schema_version(conn)
-            track_ids = None if items is None else self._track_ids_for_items(conn, items)
-            pruned = prune_missing(conn, track_ids)
-            conn.commit()
-            return pruned
-        except SchemaMismatch as exc:
-            raise ui.UserError(f"musefs: {exc}")
-        finally:
-            conn.close()
 
     def _sync(self, db_path, items, dry_run=False, restore_backing=False):
         if not os.path.exists(db_path):
