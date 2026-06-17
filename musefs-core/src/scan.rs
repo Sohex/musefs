@@ -231,10 +231,34 @@ fn collect_audio_inner(
     tally: &mut SkipTally,
     progress: Option<&ProgressSink>,
 ) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
+    // A single unreadable subtree or vanished entry must drop only that entry,
+    // not abort the whole ingest — matching the log-and-continue resilience of
+    // the symlink arm below and `probe_file` (#534). The top-level root is
+    // validated upstream by `scan_directory_with`'s canonicalize, so a genuine
+    // bad root is still reported there.
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("skipping directory {}: {e}", root.display());
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                log::warn!("skipping unreadable entry in {}: {e}", root.display());
+                continue;
+            }
+        };
         let path = entry.path();
-        let ftype = entry.file_type()?;
+        let ftype = match entry.file_type() {
+            Ok(ftype) => ftype,
+            Err(e) => {
+                log::warn!("skipping {}: {e}", path.display());
+                continue;
+            }
+        };
         if ftype.is_dir() {
             descend(
                 &path,
