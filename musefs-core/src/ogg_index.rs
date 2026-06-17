@@ -66,7 +66,12 @@ fn find_page_start(
     abs_target: u64,
     memo: Option<&LastPageMemo>,
 ) -> Result<u64> {
-    if abs_target == audio_offset {
+    // The first audio page always starts at `audio_offset` (validated at scan
+    // time). A target within the first 4 bytes of the audio region provably lies
+    // in that first page, yet its backward-scan window `[audio_offset, abs_target)`
+    // is shorter than the 4-byte `OggS` capture, so the scan below would find no
+    // candidate and fail closed with EIO — resolve it directly (#537).
+    if abs_target.saturating_sub(audio_offset) < 4 {
         return Ok(audio_offset);
     }
     if let Some(m) = memo {
@@ -548,6 +553,22 @@ mod tests {
             found, ao,
             "mid-payload target should resolve to page 0's start"
         );
+    }
+
+    #[test]
+    fn find_page_start_within_first_capture_returns_first_page() {
+        let (_d, path, ao, _alen) = new_serve_fixture();
+        let backing = std::fs::File::open(&path).unwrap();
+        // A cold read (no memo) landing 1–3 bytes into the audio region: the
+        // backward-scan window `[ao, target)` is shorter than the 4-byte `OggS`
+        // capture, but the first page provably starts at `ao` (#537).
+        for delta in 1..4u64 {
+            let found = find_page_start(&backing, ao, ao + delta, None).unwrap();
+            assert_eq!(
+                found, ao,
+                "target {delta} bytes into the audio region must resolve to the first page start"
+            );
+        }
     }
 
     #[test]
