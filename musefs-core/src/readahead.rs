@@ -67,7 +67,7 @@ impl ReadAheadPool {
             .insert(key, StreamEntry { buf, last_served });
     }
 
-    /// Deregister on release; returns the bytes to uncharge. Drops the `streams`
+    /// Deregister on release; uncharges the buffer's bytes. Drops the `streams`
     /// lock BEFORE locking the buffer: a concurrent read holds its buffer mutex
     /// and then blocking-acquires `streams` (via `permitted_window`), so holding
     /// `streams` while locking the buffer here would invert that order and
@@ -75,8 +75,13 @@ impl ReadAheadPool {
     /// preserves the pool's deadlock-free invariant.
     pub fn deregister(&self, key: usize) {
         let entry = self.streams.lock().unwrap().remove(&key);
+        // Clear under the buffer lock rather than merely reading `len`: clearing is
+        // what makes the buffer length the authoritative "already uncharged"
+        // signal, so a racing eviction holding a stale `Arc` to this buffer reads
+        // `len 0` and uncharges nothing — neither side double-counts nor leaks
+        // (#536).
         let freed = match entry {
-            Some(e) => e.buf.lock().unwrap().len(),
+            Some(e) => e.buf.lock().unwrap().clear(),
             None => 0,
         };
         if freed > 0 {
@@ -175,27 +180,20 @@ impl ReadAheadPool {
                 .collect()
         };
         candidates.sort_by_key(|(_, ls, _)| *ls); // coldest (smallest stamp) first
-        for (key, _, buf) in candidates {
+        for (_, _, buf) in candidates {
             if let Ok(mut ra) = buf.try_lock() {
+                // Uncharging is tied to physically clearing the buffer under its
+                // own lock: the clearer uncharges exactly the bytes it removed, and
+                // a racing `deregister`/eviction holding a stale `Arc` to the same
+                // buffer then reads `len 0` and uncharges nothing. That makes the
+                // buffer length the single coordination point — re-checking the
+                // registry instead raced `deregister` and leaked `freed` whenever
+                // the deregister landed after this clear (#536).
                 let freed = ra.clear();
                 drop(ra);
                 if freed > 0 {
-                    // The snapshot may name a stream that `deregister` removed
-                    // after we collected it; `deregister` already uncharged that
-                    // buffer's bytes, so subtracting again here would wrap
-                    // `charged`. Only uncharge while the stream is still the one
-                    // we cleared. (clear() left the buffer empty, so a racing
-                    // deregister now reads len 0 and uncharges nothing.)
-                    let still_registered = self
-                        .streams
-                        .lock()
-                        .unwrap()
-                        .get(&key)
-                        .is_some_and(|e| Arc::ptr_eq(&e.buf, &buf));
-                    if still_registered {
-                        self.charged.fetch_sub(freed, O::Relaxed);
-                        return Some(freed);
-                    }
+                    self.charged.fetch_sub(freed, O::Relaxed);
+                    return Some(freed);
                 }
             }
         }
@@ -1433,6 +1431,60 @@ mod concurrency_tests {
                 });
             }
         });
+    }
+
+    /// Regression for the eviction/deregister budget leak (#536): `evict_one_coldest`
+    /// clears a victim buffer and drops its lock BEFORE re-checking the registry to
+    /// decide whether to uncharge. A `deregister` landing in that window removes the
+    /// stream, then reads the already-cleared buffer's `len() == 0` and uncharges
+    /// nothing — so the freed bytes are uncharged by neither side and leak from
+    /// `charged` permanently. Each cycle here charges then uncharges N bytes, so
+    /// absent the race `charged` returns to 0; a single leaked race never recovers.
+    #[test]
+    #[expect(clippy::cast_possible_truncation)]
+    fn eviction_racing_deregister_does_not_leak_charged() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        const N: u64 = 64 * 1024;
+        let pool = Arc::new(ReadAheadPool::new(8 * 1024 * 1024));
+        let victim_key = 2usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let cycles = Arc::new(AtomicU64::new(0));
+
+        std::thread::scope(|s| {
+            // Churn: install a buffer holding N charged bytes under `victim_key`,
+            // then deregister it. Charge-then-uncharge nets 0 absent a racing evict.
+            {
+                let (pool, stop, cycles) = (&pool, &stop, &cycles);
+                s.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+                        buf.lock().unwrap().store_window(0, vec![0u8; N as usize]);
+                        pool.reconcile(0, N);
+                        pool.register(victim_key, Arc::clone(&buf));
+                        pool.deregister(victim_key);
+                        cycles.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            // Two evictors hammering the victim, racing the churn's deregister.
+            for _ in 0..2 {
+                let (pool, stop, cycles) = (&pool, &stop, &cycles);
+                s.spawn(move || {
+                    while cycles.load(Ordering::Relaxed) < 200_000 {
+                        pool.evict_one_coldest(1);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                });
+            }
+        });
+
+        // The victim is deregistered at the end of every cycle, so nothing is
+        // registered now and `charged` must be exactly 0.
+        assert_eq!(
+            pool.charged(),
+            0,
+            "eviction racing deregister leaked charged budget"
+        );
     }
 }
 
