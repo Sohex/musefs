@@ -303,6 +303,52 @@ fn read_side_never_panics_on_garbage() {
 }
 
 #[test]
+fn read_tags_survives_malformed_box_after_ilst() {
+    // A single malformed sibling box trailing `ilst` inside `meta` must not
+    // suppress the well-formed `ilst`: the path-to-ilst walk is lenient, matching
+    // the metadata extractors' "seed what you can" contract (#542).
+    let ilst = bx(b"ilst", &bx(b"\xa9nam", &data_atom(1, b"Song")));
+    let mut hdlr = vec![0u8; 8];
+    hdlr.extend_from_slice(b"mdir");
+    hdlr.extend_from_slice(b"appl");
+    hdlr.extend_from_slice(&[0u8; 9]);
+    let mut meta = vec![0u8; 4]; // FullBox version/flags
+    meta.extend(bx(b"hdlr", &hdlr));
+    meta.extend(ilst);
+    meta.extend_from_slice(&100u32.to_be_bytes()); // box claims 100 bytes...
+    meta.extend_from_slice(b"junk"); // ...but only 8 are present -> malformed
+    let udta = bx(b"udta", &bx(b"meta", &meta));
+    let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), udta].concat());
+    let buf = [bx(b"ftyp", b"M4A "), moov, bx(b"mdat", b"AUDIO")].concat();
+    let tags = read_tags(&buf);
+    assert!(
+        tags.contains(&("title".into(), "Song".into())),
+        "got {tags:?}"
+    );
+}
+
+#[test]
+fn read_tags_reads_quicktime_bare_meta() {
+    // A QuickTime-style `meta` has no FullBox version/flags prefix; its children
+    // begin immediately. The +4 FullBox skip would land mid-header and drop every
+    // tag, so the version/flags prefix is only consumed when present (#543).
+    let ilst = bx(b"ilst", &bx(b"\xa9nam", &data_atom(1, b"Song")));
+    let mut hdlr = vec![0u8; 8];
+    hdlr.extend_from_slice(b"mdir");
+    hdlr.extend_from_slice(b"appl");
+    hdlr.extend_from_slice(&[0u8; 9]);
+    let meta = [bx(b"hdlr", &hdlr), ilst].concat(); // no version/flags prefix
+    let udta = bx(b"udta", &bx(b"meta", &meta));
+    let moov = bx(b"moov", &[bx(b"mvhd", &[0u8; 8]), udta].concat());
+    let buf = [bx(b"ftyp", b"M4A "), moov, bx(b"mdat", b"AUDIO")].concat();
+    let tags = read_tags(&buf);
+    assert!(
+        tags.contains(&("title".into(), "Song".into())),
+        "got {tags:?}"
+    );
+}
+
+#[test]
 fn build_udta_no_art_round_trips() {
     let tags = vec![
         TagInput::new("title", "Song"),

@@ -140,6 +140,39 @@ fn scan_fails_fast_on_a_bad_target() {
     assert!(result.is_err());
 }
 
+#[test]
+fn scan_returns_per_file_failed_count() {
+    // A per-file parse failure does not abort the batch (that stays an Ok return);
+    // instead it is tallied and surfaced via the returned `failed` count so the CLI
+    // can signal partial/total ingest failure with a non-zero exit (#554).
+    let backing = tempfile::tempdir().unwrap();
+    std::fs::write(
+        backing.path().join("good.flac"),
+        make_flac(&["TITLE=Good"], &[0xAB; 32]),
+    )
+    .unwrap();
+    std::fs::write(backing.path().join("bad.flac"), b"not a flac at all").unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("musefs.db");
+
+    let failed = run_scan(
+        &db_path,
+        &[backing.path().to_path_buf()],
+        false,
+        0,
+        false,
+        false,
+        ChecksumMode::Fingerprint,
+        false,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(failed, 1, "the one unparseable file must be tallied");
+    let db = musefs_db::Db::open(&db_path).unwrap();
+    assert_eq!(db.list_tracks().unwrap().len(), 1, "the good file ingested");
+}
+
 fn write_n_flacs(dir: &std::path::Path, n: usize) {
     for i in 0..n {
         let title = format!("TITLE=T{i}");

@@ -350,18 +350,35 @@ pub fn read_structure_from<R: Read + Seek>(
     })
 }
 
-/// Locate `moov/udta/meta/ilst`; `meta` is a FullBox (4 version/flags bytes before
-/// its children). Returns the ilst payload range absolute within `buf`.
+/// Locate `moov/udta/meta/ilst` and return the ilst payload range absolute within
+/// `buf`. The walk is lenient ([`find_box_lenient`]) at every level: a single
+/// malformed sibling box anywhere on the path must not suppress an otherwise
+/// well-formed `ilst`, matching the metadata extractors' "seed what you can"
+/// contract (#542). Strictness is reserved for the audio/structure path.
+///
+/// `meta` is normally an ISO FullBox — 4 version/flags bytes precede its children —
+/// but QuickTime also uses a bare `meta` with no such prefix. Per ISO 14496-12 the
+/// version/flags word is always zero, so a zero first word marks the FullBox variant
+/// (skip 4) and any other value marks the bare variant (skip 0) (#543). A bare
+/// first child declaring `size == 0` ("extends to end") is the one ambiguous case
+/// and is misread as a FullBox, mirroring the wider tooling's heuristic.
 fn ilst_region(buf: &[u8]) -> Option<(usize, usize)> {
-    let moov = find_box(buf, b"moov").ok()??;
+    let moov = find_box_lenient(buf, b"moov")?;
     let mp = moov.payload(buf);
     let base = moov.payload_start();
-    let (up, ul) = find_path(mp, &[b"udta"]).ok()??;
-    let udta = &mp[up..up + ul];
-    let meta = find_box(udta, b"meta").ok()??;
-    let meta_children = udta.get(meta.payload_start() + 4..meta.end())?;
-    let il = find_box(meta_children, b"ilst").ok()??;
-    let start = base + up + meta.payload_start() + 4 + il.payload_start();
+    let udta = find_box_lenient(mp, b"udta")?;
+    let up = udta.payload_start();
+    let udta_payload = udta.payload(mp);
+    let meta = find_box_lenient(udta_payload, b"meta")?;
+    let meta_payload = meta.payload(udta_payload);
+    let prefix = if meta_payload.get(..4) == Some(&[0, 0, 0, 0][..]) {
+        4
+    } else {
+        0
+    };
+    let meta_children = meta_payload.get(prefix..)?;
+    let il = find_box_lenient(meta_children, b"ilst")?;
+    let start = base + up + meta.payload_start() + prefix + il.payload_start();
     Some((start, il.total_len - il.header_len))
 }
 

@@ -2,6 +2,7 @@
 //! SQLite store) and `mount` (serve a read-only FUSE view of that store).
 
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -223,6 +224,11 @@ pub enum Command {
 /// ingest. With `quiet`, suppress the per-target summary on stdout. Fails fast:
 /// the first failing target aborts the batch; targets already scanned stay
 /// committed (ingest is an idempotent upsert).
+///
+/// Returns the total per-file `failed` count across all targets. Per-file
+/// failures (an unparseable/uningestible entry) do not abort the batch — only a
+/// hard `Err` does — so the caller inspects the returned count to signal partial
+/// or total ingest failure via the process exit code (#554).
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub fn run_scan(
     db_path: &Path,
@@ -234,7 +240,7 @@ pub fn run_scan(
     checksum: ChecksumMode,
     fast: bool,
     strict: bool,
-) -> Result<()> {
+) -> Result<u64> {
     let strictness = match (fast, strict) {
         (true, true) => anyhow::bail!("--fast and --strict are mutually exclusive"),
         (true, false) => musefs_core::MatchStrictness::Fast,
@@ -252,12 +258,14 @@ pub fn run_scan(
         strictness,
         ..Default::default()
     };
+    let mut total_failed = 0u64;
     for target in targets {
         reporter.start_target();
         let start = Instant::now();
         if revalidate {
             let stats = musefs_core::revalidate_with(&db, target, &opts)
                 .with_context(|| format!("revalidating {}", target.display()))?;
+            total_failed += stats.failed;
             if !quiet {
                 println!(
                     "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed in {}",
@@ -272,6 +280,7 @@ pub fn run_scan(
         } else {
             let stats = musefs_core::scan_directory_with(&db, target, &opts)
                 .with_context(|| format!("scanning {}", target.display()))?;
+            total_failed += stats.failed;
             if !quiet {
                 println!(
                     "scanned {}: {} file(s), skipped {}, failed {} in {}",
@@ -285,7 +294,7 @@ pub fn run_scan(
         }
     }
     reporter.finish();
-    Ok(())
+    Ok(total_failed)
 }
 
 /// Split a `--fallback FIELD=VALUE` argument. The value may contain '=' (only
@@ -550,8 +559,7 @@ fn walk_preview(
     Ok(())
 }
 
-/// Dispatch a parsed CLI invocation.
-pub fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Scan {
             targets,
@@ -563,18 +571,30 @@ pub fn run(cli: Cli) -> Result<()> {
             checksum,
             fast,
             strict,
-        } => run_scan(
-            &db,
-            &targets,
-            revalidate,
-            jobs,
-            follow_symlinks,
-            quiet,
-            checksum,
-            fast,
-            strict,
-        ),
-        Command::Mount(args) => run_mount(&args),
+        } => {
+            let failed = run_scan(
+                &db,
+                &targets,
+                revalidate,
+                jobs,
+                follow_symlinks,
+                quiet,
+                checksum,
+                fast,
+                strict,
+            )?;
+            // Per-file ingest failures are not a hard error (they don't abort the
+            // batch), but a pipeline like `scan && mount` needs a machine-detectable
+            // signal that not everything ingested. Exit 2 marks any per-file failure
+            // (partial or total); it overlaps clap's usage-error code, but only ever
+            // fires after a successful parse + run (#554).
+            Ok(if failed > 0 {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+        Command::Mount(args) => run_mount(&args).map(|()| ExitCode::SUCCESS),
     }
 }
 

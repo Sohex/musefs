@@ -88,6 +88,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   falling through to fuser's default, which logged a `[Not Implemented]` warn on
   every xattr probe (`ls -l`, indexers, backup tools). The caller-visible result
   is unchanged (#364).
+- **MP4 path-to-`ilst` leniency:** the walk to `moov/udta/meta/ilst` now uses the
+  same lenient box scan as the metadata extractors, so a single malformed or
+  truncated sibling box anywhere on the path no longer suppresses an otherwise
+  well-formed `ilst` and silently drops every tag and cover. The audio/structure
+  path stays strict (#542).
+- **QuickTime bare `meta` atoms:** the `meta` parser only consumes the 4-byte
+  FullBox version/flags prefix when it is actually present (a zero word), so a
+  QuickTime-style bare `meta` — which has no such prefix — is read instead of
+  landing mid-header and dropping all tags and art (#543).
+- **`scan` exit code on ingest failure:** `scan`/`scan --revalidate` now exit `2`
+  when any file fails to parse/ingest (`failed > 0`), instead of always exiting
+  `0`. A pipeline such as `musefs scan … && musefs mount …` can now detect a
+  partial or total ingest failure; a clean scan still exits `0` and a hard error
+  still exits `1` (#554).
+- **Release smoke audio-bytes check:** `scripts/smoke-binary.sh` (the per-arch
+  release gate) now compares the served file's encoded audio stream against the
+  untouched backing file, asserting the cardinal byte-identical-audio invariant
+  rather than only checking the `fLaC` magic — so a target-specific positioned-read
+  or offset regression in a cross-compiled binary is caught (#547).
 
 ## [1.0.0] - 2026-06-12
 
