@@ -722,9 +722,14 @@ impl VirtualTree {
             // structure; it can shift siblings only if its base key is occupied
             // (fresh-build invariant: a non-empty group owns its base key).
             if comps.get(consumed).is_some_and(|c| {
+                // The stored child key is the NAME_MAX-truncated rendered name
+                // (leaf preserves its extension), so an over-long first-new
+                // component must be truncated the same way or the occupancy check
+                // misses (#535).
+                let key = truncate_component(c, consumed + 1 == comps.len());
                 self.children
                     .get(&d)
-                    .is_some_and(|kids| kids.contains_key(*c))
+                    .is_some_and(|kids| kids.contains_key(key.as_ref()))
             }) {
                 dirty.insert(d);
             }
@@ -789,8 +794,14 @@ impl VirtualTree {
         let mut consumed = 0;
         // walk dir components only (exclude the final filename component)
         for comp in &comps[..comps.len().saturating_sub(1)] {
+            // Navigate by the SAME key the tree stores: a dir component is keyed by
+            // its NAME_MAX-truncated rendered name (`ensure_dir`), so an over-long
+            // component must be truncated here too — otherwise the lookup misses,
+            // the walk stops short, and the add-side dirty gate diverges from a full
+            // rebuild (#535).
+            let key = truncate_component(comp, false);
             let next = self
-                .children_by_rendered(dir, comp)
+                .children_by_rendered(dir, key.as_ref())
                 .into_iter()
                 .find(|&c| self.is_dir(c));
             match next {
@@ -1661,6 +1672,19 @@ mod tests {
         // re-rank the group: 2 -> "t.flac", 5 -> "t (2).flac".
         let before = vec![(5, "A/t.flac".to_string())];
         let after = vec![(2, "A/t.flac".to_string()), (5, "A/t.flac".to_string())];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
+    }
+
+    #[test]
+    fn apply_changes_add_smaller_id_under_over_long_dir_matches_build() {
+        // The dir component exceeds NAME_MAX, so the tree stores its truncated
+        // rendered name. The add-side dirty walk must navigate by that truncated
+        // key — otherwise `deepest_existing_ancestor` misses the existing dir,
+        // the collision goes undetected, and the re-rank (2 -> base, 5 -> "(2)")
+        // never happens, diverging from a full rebuild (#535).
+        let long = "d".repeat(NAME_MAX + 45);
+        let before = vec![(5, format!("{long}/t.flac"))];
+        let after = vec![(2, format!("{long}/t.flac")), (5, format!("{long}/t.flac"))];
         assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
     }
 
