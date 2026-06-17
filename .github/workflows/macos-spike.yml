@@ -50,6 +50,30 @@ jobs:
           PC
           echo "== shim fuse.pc =="; cat /usr/local/lib/pkgconfig/fuse.pc
           pkg-config --exists fuse && echo "pkg-config now sees fuse $(pkg-config --modversion fuse)"
+          # Probe the readiness-race hypothesis: make spawn_with poll the mount
+          # until the root is listable on macOS (fuse-t's NFS mount is async-ready).
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("musefs-fuse/src/lib.rs")
+          s = p.read_text()
+          needle = "    let _ = cell.set(session.notifier());\n    session.spawn()\n}"
+          repl = (
+              "    let _ = cell.set(session.notifier());\n"
+              "    let bg = session.spawn()?;\n"
+              "    #[cfg(target_os = \"macos\")]\n"
+              "    {\n"
+              "        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);\n"
+              "        while std::time::Instant::now() < deadline {\n"
+              "            if std::fs::read_dir(mountpoint).map(|mut d| d.next().is_some()).unwrap_or(false) { break; }\n"
+              "            std::thread::sleep(std::time::Duration::from_millis(50));\n"
+              "        }\n"
+              "    }\n"
+              "    Ok(bg)\n}"
+          )
+          assert needle in s, "spawn_with tail not found"
+          p.write_text(s.replace(needle, repl, 1))
+          print("patched spawn_with with macOS readiness poll")
+          PY
           cargo build -p musefs-fuse 2>&1 | tail -40
       - name: Run the mount suite through fuse-t (shim build succeeded)
         if: steps.shim_build.outcome == 'success'
