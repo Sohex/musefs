@@ -11,12 +11,16 @@ jobs:
     timeout-minutes: 30
     env:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+      DYLD_FALLBACK_LIBRARY_PATH: /usr/local/lib:/usr/lib
     steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
       - name: Install fuse-t
         run: |
           brew tap macos-fuse-t/homebrew-cask
           brew install --cask fuse-t
-      - name: Install fuse.pc libfuse2 shim (alias -> libfuse-t)
+      - name: Install fuse.pc libfuse2 shim (with rpath)
         run: |
           sudo tee /usr/local/lib/pkgconfig/fuse.pc >/dev/null <<'PC'
           prefix=/usr/local
@@ -28,32 +32,23 @@ jobs:
           Libs: -L${libdir} -Wl,-rpath,${libdir} -lfuse-t
           Cflags: -I${includedir}/fuse -D_FILE_OFFSET_BITS=64
           PC
-          pkg-config --modversion fuse
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-      - name: Build fuser 0.17 hello example (libfuse → fuse-t)
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Build musefs-fuse (Approach B, libfuse → fuse-t)
         run: |
-          git clone --depth 1 --branch v0.17.0 https://github.com/cberner/fuser /tmp/fuser
-          cd /tmp/fuser
-          cargo build --example hello --features libfuse 2>&1 | tail -20
-      - name: Isolation — does a stock fuser fs serve files through fuse-t?
+          sed -i '' 's/"macos-no-mount"/"libfuse"/' musefs-fuse/Cargo.toml
+          cargo build -p musefs-fuse 2>&1 | tail -15
+      - name: Run one mount test and capture fuse-t protocol log
         continue-on-error: true
         run: |
-          MNT="$HOME/hellomnt"; mkdir -p "$MNT"
-          export DYLD_FALLBACK_LIBRARY_PATH="/usr/local/lib:${DYLD_FALLBACK_LIBRARY_PATH:-/usr/local/lib:/usr/lib}"
-          # hello.rs mounts in the foreground and blocks; run it backgrounded.
-          /tmp/fuser/target/debug/examples/hello "$MNT" &
-          HPID=$!
-          sleep 4
-          echo "== ls mountpoint =="; ls -la "$MNT" || true
-          echo "== stat hello.txt =="; stat "$MNT/hello.txt" || true
-          echo "== cat hello.txt =="; cat "$MNT/hello.txt" || echo "CAT FAILED"
-          echo "== mount table =="; mount | grep -iE 'fuse|nfs' || true
-          umount "$MNT" 2>/dev/null || diskutil unmount "$MNT" 2>/dev/null || kill "$HPID" 2>/dev/null || true
-      - name: Dump fuse-t logs (if any)
+          export TMPDIR="$HOME/spiketmp"; mkdir -p "$TMPDIR"
+          cargo test -p musefs-fuse --test mount end_to_end_read_through_mount \
+            -- --ignored --nocapture --test-threads=1 2>&1 | tail -40 || true
+      - name: Dump fuse-t logs
         if: always()
         run: |
-          echo "== ~/Library/Logs/fuse-t =="
-          ls -la "$HOME/Library/Logs/fuse-t" 2>/dev/null && cat "$HOME/Library/Logs/fuse-t/"* 2>/dev/null | tail -120 || echo "no fuse-t logs"
+          echo "== fuse-t.log =="; cat "$HOME/Library/Logs/fuse-t/fuse-t.log" 2>/dev/null | tail -120 || echo none
+          echo "== fuse-t.err =="; cat "$HOME/Library/Logs/fuse-t/fuse-t.err" 2>/dev/null | tail -40 || echo none
       - name: Inspect for stale mounts
         if: always()
         run: mount | grep -iE 'fuse|nfs' || echo "no fuse/nfs mounts left (good)"
