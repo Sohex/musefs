@@ -84,7 +84,67 @@ The fsync-storm (403→0) signal needs a real FUSE mount and lives only in the
 release lane / the `#[ignore]` `bench_scan_under_latency`, not the per-PR gate.
 
 The release artifact is named `benchmark-snapshot-<tag>`; download it from the
-tag's workflow run and fold the numbers into the per-pass tables here.
+tag's workflow run. The job runs on a **GitHub-hosted `ubuntu-latest` runner**,
+not the dedicated box the rest of this file uses, so its wall-times are
+runner-relative and are **not** folded into the per-pass tables — only the
+portable signals (`bytes_read`, `pread`/`fsync` counts, refresh flatness) are
+cross-comparable. Each release's snapshot is recorded verbatim under
+[Release CI snapshots](#release-ci-snapshots).
+
+## Release CI snapshots
+
+Per-tag records from the `benchmarks` release job
+([CI regression gating](#ci-regression-gating) §3), run on a **GitHub-hosted
+`ubuntu-latest` runner** at the `ci` tier. This is **not** the dedicated box the
+[per-pass tables](#per-pass-detail) use, so the wall-times here are
+runner-relative and are a point-in-time record per release — not comparable to
+those sections. The **portable signals** (`scan_bytes_read`, `pread`/`fsync`
+counts, refresh flatness) *are* comparable, and are the no-regression check.
+
+### v1.1.0 — `f865afc`, single run
+
+**No regression vs the curated tables:** `scan_bytes_read` is unchanged from
+[PR2](#pr2--scan-pair-6768) (flac/ogg/wav = 845 000 / 847 400 / 828 000 B — the
+−128 B/file ID3v1 gating still holds; mp3 847 200 B unchanged; m4a uses the
+seek-reader, 0 B), and single-track refresh stays flat with library size.
+
+`read_throughput` (Criterion, median estimate, µs):
+
+| bench | flac | mp3 | m4a | m4a-last | ogg | wav |
+|-------|-----:|----:|----:|---------:|----:|----:|
+| sequential_read | 416 | 418 | 417 | 419 | 524† | 422 |
+| cold_first_read | 798 | 778 | 805 | 804 | 911 | 792 |
+| seek_read       | 368 | 353 | 372 | 370 | 582 | 365 |
+
+`concurrent_read_walk/m8_plus_walker`: 931 µs.
+
+† `sequential_read/ogg` collected only 10k iterations with 19% outliers
+(Criterion low-sample warning) — treat as noisy.
+
+`bench_ingest` — ci tier (200 tracks × 4 KiB), runner tmpfs:
+
+| format | scan (ms) | revalidate (ms) | scan_bytes_read (B) | RSS (KiB) |
+|--------|----------:|----------------:|--------------------:|----------:|
+| flac     | 31 | 1 | 845 000 | 7100 |
+| mp3      | 82 | 1 | 847 200 | 7164 |
+| m4a      | 86 | 1 | 0       | 7180 |
+| m4a-last | 87 | 1 | 0       | 7184 |
+| ogg      | 83 | 1 | 847 400 | 7184 |
+| wav      | 83 | 1 | 828 000 | 7184 |
+
+`bench_refresh` — ci tier, single-track re-tag:
+
+| library size | refresh-1 (ms) | root-fanout-1 (ms) |
+|-------------:|---------------:|-------------------:|
+| 100   | 0  | 0 |
+| 1000  | 1  | 1 |
+| 5000  | 12 | 3 |
+| 20000 | 7  | 9 |
+
+refresh-1 vs refresh-N (200-track ci, same instance): refresh-1 0 ms, refresh-N
+(100 touched) 6 ms. The 5000 > 20000 inversion is single-run noise on the shared
+runner; the dedicated-box [#69 sweep](#69--refresh-ochanged) is the clean flat
+signal.
 
 ## Methodology
 
