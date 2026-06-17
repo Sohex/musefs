@@ -134,6 +134,21 @@ impl RegionLayout {
             .any(|s| matches!(s, Segment::BinaryTag { .. }))
     }
 
+    /// True if any segment is streamed from the DB by a rowid at read time —
+    /// `BinaryTag` (a `tags` rowid), `ArtImage`, or `OggArtSlice` (both an `art`
+    /// rowid). These are the segments exposed to the rowid-reuse hazard (a
+    /// concurrent delete + reinsert reusing a freed rowid), so the serve path
+    /// must read them under a single WAL snapshot with a `content_version`
+    /// recheck. `BackingAudio`/`OggAudio`/`Inline` carry no DB rowid.
+    pub fn streams_db_rowid(&self) -> bool {
+        self.segments.iter().any(|s| {
+            matches!(
+                s,
+                Segment::BinaryTag { .. } | Segment::ArtImage { .. } | Segment::OggArtSlice { .. }
+            )
+        })
+    }
+
     /// Total size of the synthesized virtual file in bytes (stored at construction).
     pub fn total_len(&self) -> u64 {
         self.total_len
@@ -312,5 +327,40 @@ mod tests {
             !without.has_binary_tag(),
             "layout with no BinaryTag must report false"
         );
+    }
+
+    #[test]
+    fn streams_db_rowid_detects_all_rowid_streamed_segments() {
+        // #502: the snapshot guard must cover every DB-rowid segment, not only
+        // BinaryTag — ArtImage and OggArtSlice are streamed by `art` rowid too.
+        let bin = Segment::BinaryTag {
+            payload_id: 1,
+            len: BlobLen::new(3).unwrap(),
+        };
+        let art = Segment::ArtImage {
+            art_id: 1,
+            len: BlobLen::new(3).unwrap(),
+        };
+        let ogg_art = Segment::OggArtSlice {
+            art_id: 1,
+            offset: 0,
+            len: BlobLen::new(3).unwrap(),
+            base64: true,
+            art_total: 3,
+        };
+        for seg in [bin, art, ogg_art] {
+            let layout = RegionLayout::new(vec![seg.clone(), Segment::Inline(vec![0])]);
+            assert!(
+                layout.streams_db_rowid(),
+                "layout with {seg:?} must report a DB-rowid stream"
+            );
+        }
+
+        // A plain inline + backing-audio layout streams no DB rowid.
+        let plain = RegionLayout::new(vec![
+            Segment::Inline(vec![1, 2, 3]),
+            Segment::BackingAudio { offset: 0, len: 8 },
+        ]);
+        assert!(!plain.streams_db_rowid());
     }
 }

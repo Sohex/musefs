@@ -202,9 +202,15 @@ impl Db<ReadWrite> {
 
     /// Delete `art` rows no longer referenced by any `track_art`. Returns the
     /// number of rows removed.
+    ///
+    /// Uses `NOT EXISTS` rather than `NOT IN (subquery)`: SQLite's `NOT IN`
+    /// evaluates to UNKNOWN for the whole row if any subquery value is NULL,
+    /// which would silently delete nothing should a NULL `art_id` ever reach
+    /// `track_art` (#507). `NOT EXISTS` is NULL-safe.
     pub fn gc_orphan_art(&self) -> Result<usize> {
         let removed = self.conn.execute(
-            "DELETE FROM art WHERE id NOT IN (SELECT art_id FROM track_art)",
+            "DELETE FROM art WHERE NOT EXISTS \
+             (SELECT 1 FROM track_art WHERE track_art.art_id = art.id)",
             [],
         )?;
         Ok(removed)
@@ -368,6 +374,46 @@ mod guard_tests {
         assert_eq!(
             super::sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn gc_orphan_art_not_exists_is_null_safe() {
+        // Regression for #507: the orphan-art GC must use NOT EXISTS, not
+        // NOT IN (subquery). With a NULL in the subquery, SQLite's NOT IN
+        // evaluates to UNKNOWN for every row and deletes nothing; NOT EXISTS
+        // is unaffected. The live schema's NOT NULL on `track_art.art_id`
+        // makes this unreachable today, so the NULL is reproduced on a relaxed
+        // scratch schema to pin the pattern choice against regression.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE art (id INTEGER PRIMARY KEY);
+             CREATE TABLE track_art (art_id INTEGER);
+             INSERT INTO art (id) VALUES (1), (2);
+             INSERT INTO track_art (art_id) VALUES (1), (NULL);",
+        )
+        .unwrap();
+
+        // The buggy NOT IN form deletes nothing because of the NULL.
+        let not_in = conn
+            .execute(
+                "DELETE FROM art WHERE id NOT IN (SELECT art_id FROM track_art)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(not_in, 0, "NOT IN deletes nothing when a NULL is present");
+
+        // The shipped NOT EXISTS form removes the genuine orphan (id 2).
+        let not_exists = conn
+            .execute(
+                "DELETE FROM art WHERE NOT EXISTS \
+                 (SELECT 1 FROM track_art WHERE track_art.art_id = art.id)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            not_exists, 1,
+            "NOT EXISTS removes the orphan despite the NULL"
         );
     }
 }

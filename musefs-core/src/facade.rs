@@ -511,9 +511,10 @@ impl Musefs {
                     // genuine drift is terminal — propagate, don't retry the loop.
                     validate_opened_backing(&h.file, r)?;
                     let served = self.pool.with(|db| -> Result<Option<()>> {
-                        if r.has_binary_tag {
-                            // Snapshot-consistent: version check + blob reads see one
-                            // WAL snapshot, so a reused rowid can't be served.
+                        if r.streams_db_rowid {
+                            // Snapshot-consistent: version check + DB-rowid reads
+                            // (binary tags AND art) see one WAL snapshot, so a
+                            // reused rowid can't be served mid-read (#502).
                             db.begin_read()?;
                             let res = (|| {
                                 // A test seam forces the first N checks stale to

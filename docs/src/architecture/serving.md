@@ -30,10 +30,15 @@ sum to the served file size. Six variants:
 segments and splicing: inline bytes are copied, art and binary-tag payloads
 are read from the DB in chunks, backing audio comes from positioned reads of
 the original file, and Ogg pages are renumbered and CRC-patched in flight.
-This is how the cardinal invariant holds end to end. Layouts that stream
-binary tags are flagged (`RegionLayout::has_binary_tag`) so the reader can
-wrap those reads in a transactional `content_version` guard — a concurrent
-retag cannot interleave bytes from two generations of a tag.
+This is how the cardinal invariant holds end to end. Layouts that stream any
+payload from the DB by rowid — binary tags **and** art (`ArtImage` /
+`OggArtSlice`) — are flagged (`RegionLayout::streams_db_rowid`) so the reader
+wraps those reads in a single WAL snapshot with a `content_version` recheck.
+A concurrent retag (delete + reinsert reusing a freed rowid) cannot interleave
+bytes from two generations of a tag or splice the wrong image. Both the
+per-handle fast path and the stateless no-fh fallback apply the guard, and the
+fallback re-validates its freshly opened backing fd against the resolved
+stamp.
 
 ### Backing read-ahead
 

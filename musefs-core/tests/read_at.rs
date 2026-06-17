@@ -98,6 +98,7 @@ fn read_at_streams_art_image_segments() {
     let resolved = ResolvedFile {
         layout,
         total_len,
+        track_id: 0,
         content_version: 0,
         backing_path: std::path::PathBuf::from("/unused"),
         stamp: BackingStamp {
@@ -108,7 +109,9 @@ fn read_at_streams_art_image_segments() {
         mtime_secs: 0,
         last_page: std::sync::Mutex::new(None),
         cache_bytes: 0,
-        has_binary_tag: false,
+        // Splicing test: bypass the snapshot/version-recheck path (no real track
+        // row backs this hand-built entry).
+        streams_db_rowid: false,
     };
 
     // Whole read: inline framing then the streamed art bytes.
