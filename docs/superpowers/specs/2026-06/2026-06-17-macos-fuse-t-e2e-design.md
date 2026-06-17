@@ -42,6 +42,16 @@ feature, which links the system libfuse and shells out to its mount helper. With
 fuse-t installed, that libfuse *is* fuse-t's drop-in, so `fuser` mounts through
 fuse-t transitively.
 
+**Caveat — existing macOS mount code goes live for the first time.** Because the
+mount path is stubbed today (`macos-no-mount`), musefs already carries
+macOS-specific mount code that has *never executed*: `platform/mount.rs:74-79`
+unconditionally pushes macFUSE-specific `CUSTOM` options (`volname=…`,
+`noappledouble`), and `platform/spotlight.rs` has macOS branches. fuse-t mounts
+over NFS, where these macFUSE options may be unsupported or rejected. So "no
+*source* changes" holds only at the libfuse-API level — the **mount-option and
+spotlight paths must be verified, and likely conditionalized, for fuse-t**
+(Phase 0 spike checks this; Phase 1 conditionalizes as needed).
+
 ## Structural approach (chosen: A — opt-in feature)
 
 Add a `musefs-fuse` cargo feature that turns on `fuser`'s libfuse path on macOS,
@@ -80,9 +90,20 @@ On a hosted `macos-latest` runner (throwaway branch / `workflow_dispatch`):
    `libfuse` + `macos-no-mount` compile together.** If not → Approach B.
 3. Run one mount test (`cargo test -p musefs-fuse --features macos-mount --test
    mount -- --ignored`). Confirm a real fuse-t mount + read-through succeeds.
+4. **Verify fuse-t accepts (or tolerates) the existing macFUSE mount options**
+   in `platform/mount.rs:74-79` (`volname=…`, `noappledouble`). If fuse-t
+   rejects an unknown option and aborts the mount, Phase 1 must conditionalize
+   `extend_os_specific` for fuse-t. Also confirm `spotlight.rs`'s macOS path
+   doesn't break the mount.
+5. **Verify clean unmount.** The tests unmount by dropping the
+   `BackgroundSession` (`mount.rs:41` etc.). Under fuse-t the mount is an NFS
+   volume — confirm `drop(session)` fully tears it down and leaves no stale NFS
+   mount between tests (which would cascade failures). Note any explicit
+   `umount`/`diskutil unmount` cleanup the job needs.
 
 Spike output: the working install/env recipe, the confirmed feature
-combination, and a list of any tests that fail under fuse-t's NFS semantics.
+combination, the mount-option/unmount verdicts, and a list of any tests that
+fail under fuse-t's NFS semantics.
 
 ### Phase 1 — code + manifest
 
@@ -91,6 +112,9 @@ combination, and a list of any tests that fail under fuse-t's NFS semantics.
   surfaced in the e2e path, following the existing FreeBSD precedent in
   `read_consistency.rs` (`:242`, `:380`) where Linux-only assertions are already
   guarded.
+- Conditionalize the macFUSE mount options in `extend_os_specific`
+  (`platform/mount.rs:74-79`) and any `spotlight.rs` macOS branch the spike found
+  incompatible with fuse-t.
 - Keep `cargo test --workspace` (no feature) green on macOS, unchanged.
 
 ### Phase 2 — CI job
@@ -113,6 +137,8 @@ Add a `macos-e2e` job to `ci.yml`, modeled on `freebsd`:
         run: |
           brew install <fuse-t tap/formula>   # exact recipe from Phase 0
           brew install ffmpeg
+      - name: Assert ffmpeg present (loud-fail, not silent skip)
+        run: command -v ffmpeg >/dev/null || { echo "ffmpeg missing"; exit 1; }
       - uses: dtolnay/rust-toolchain@<pinned>
       - uses: Swatinem/rust-cache@<pinned>
       - name: FUSE end-to-end tests (fuse-t)
@@ -125,20 +151,23 @@ Add a `macos-e2e` job to `ci.yml`, modeled on `freebsd`:
 - **Reporting:** `continue-on-error: true` and **not** added to the `ci-ok`
   aggregator `needs` list — a flaky fuse-t run never blocks merges. Mirrors the
   `tsan` best-effort precedent.
-- **ffmpeg loud-fail:** like `scripts/freebsd-vm/run-e2e.sh`, the run must fail
-  if ffmpeg is absent rather than let `playback_pcm`/`ogg_read_through` skip
-  silently into a vacuous green. (Either a guard step or rely on the tests'
-  existing behavior — confirm during Phase 1.)
+- **ffmpeg loud-fail:** the tests skip silently when ffmpeg is absent
+  (`playback_pcm.rs:153`); the loud-fail guard lives in
+  `scripts/freebsd-vm/run-e2e.sh`, not the tests. So the macOS job needs its own
+  explicit `command -v ffmpeg || exit 1` step (shown above) to avoid a vacuous
+  green.
 
 ### Test subset
 
 `cargo test -p musefs-fuse -- --ignored` (plus `--features macos-mount`) runs
-`mount`, `keep_cache`, `playback_pcm`, `ogg_read_through`, `read_consistency`,
-`concurrency`, `concurrent_reads`, `fault_injection`. The `metrics`-gated
-`passthrough.rs` and `metrics_e2e.rs` are `#![cfg(feature = "metrics")]` and are
-**automatically excluded** (metrics not enabled) — exactly the subset FreeBSD
-runs, and the correct exclusion since fuse-t's NFS layer changes the
-syscall→FUSE-op mapping and would break the exact getattr/read-count assertions.
+the **non-metrics** mount suite: `mount`, `keep_cache`, `playback_pcm`,
+`ogg_read_through`, `read_consistency`, `concurrent_reads`. The `metrics`-gated
+tests — `passthrough.rs`, `metrics_e2e.rs`, **`concurrency.rs`, and
+`fault_injection.rs`** (all `#![cfg(feature = "metrics")]`) — are
+**automatically excluded** (metrics not enabled), compiling to empty test
+binaries. This is exactly the subset FreeBSD runs, and the correct exclusion
+since fuse-t's NFS layer changes the syscall→FUSE-op mapping and would break the
+exact getattr/read-count assertions those metrics tests assert.
 
 If the Phase 0 spike finds specific tests that fuse-t's NFS semantics break
 (caching, xattr, statfs), start with a documented narrower subset (mount +
@@ -151,6 +180,8 @@ excluded** so a narrowed run never reads as full coverage.
 | --- | --- |
 | `fuser` rejects `libfuse` + `macos-no-mount` together | Phase 0 spike gate; Approach B fallback documented |
 | fuse-t's NFS semantics break cache/xattr/statfs tests | Spike enumerates failures; start with a narrower documented subset |
+| Dead macFUSE mount options (`volname`/`noappledouble`, `platform/mount.rs:74-79`) rejected by fuse-t, aborting the mount | Phase 0 verifies; Phase 1 conditionalizes `extend_os_specific` for fuse-t |
+| `drop(session)` leaves a stale NFS mount, cascading test failures | Phase 0 verifies unmount; add explicit `umount` cleanup if needed |
 | fuse-t brew install flaky / needs quarantine flag | Pin recipe in Phase 0; job is `continue-on-error` so it never blocks |
 | Hosted macOS runner minutes (~10× multiplier) | Fuse-gated (not every PR), 30-min timeout, best-effort |
 
