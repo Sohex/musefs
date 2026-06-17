@@ -277,7 +277,11 @@ fn collect_audio_inner(
             }
         } else if ftype.is_symlink() {
             if !follow_symlinks {
-                log::warn!(
+                // Routine and expected (symlinks are off by default); a library
+                // sitting next to symlinked dirs would otherwise flood stderr at
+                // the default `warn` floor. The end-of-scan skip tally still
+                // surfaces what was passed over.
+                log::debug!(
                     "skipping symlink {} (pass --follow-symlinks to scan it)",
                     path.display()
                 );

@@ -59,7 +59,7 @@ class FakeLib:
 
 def _real_track(tmp_path, make_track, fake_item, name="a.flac", **fields):
     """Create a real file + its track row + a matching fake item. A real path
-    matters now that sync prunes rows whose backing file is missing."""
+    is needed so sync can resolve the item's realpath to its track row."""
     p = tmp_path / name
     p.write_bytes(b"x")
     real = os.path.realpath(str(p))
@@ -78,7 +78,11 @@ def _autoscan_plugin(db_path, monkeypatch):
         raising=False,
     )
     calls = []
-    monkeypatch.setattr(plugin, "_run_scan", lambda db, targets: calls.append(list(targets)))
+    monkeypatch.setattr(
+        plugin,
+        "_run_scan",
+        lambda db, targets, revalidate=False: calls.append(list(targets)),
+    )
     return plugin, calls
 
 
@@ -169,42 +173,61 @@ def test_command_dry_run_skips_autoscan(db_path, fake_item, monkeypatch):
     assert calls == []  # dry-run must not mutate the DB via scan
 
 
-def test_command_query_preserves_unrelated_missing_rows(
+def test_command_plain_sync_never_prunes(
     db_path,
     make_track,
     fake_item,
     tmp_path,
     monkeypatch,
 ):
-    """Verify query-scoped prune keeps unrelated rows."""
+    """Without --revalidate, `beet musefs` only syncs — it never prunes, so a
+    stale row whose backing file is gone survives (pruning belongs solely to
+    `musefs scan --revalidate`)."""
     make_track("/gone/x.flac")  # a stale row: its backing file does not exist
     real, _tid, item = _real_track(tmp_path, make_track, fake_item, title="Song")
     plugin, _ = _autoscan_plugin(db_path, monkeypatch)
-    cmd, opts, args = _musefs_cmd(plugin, ["title:Song"])
+    cmd, opts, args = _musefs_cmd(plugin, [])  # full sync, no --revalidate
     cmd.func(FakeLib([item]), opts, args)
 
     conn = connect(db_path)
     try:
         paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
-        assert "/gone/x.flac" in paths
+        assert "/gone/x.flac" in paths  # NOT pruned — plain sync never prunes
         assert real in paths
     finally:
         conn.close()
 
 
-def test_command_full_sync_prunes_missing_rows(db_path, make_track, fake_item, monkeypatch):
-    """Verify full sync prunes stale rows."""
-    make_track("/gone/x.flac")  # a stale row: its backing file does not exist
-    plugin, _ = _autoscan_plugin(db_path, monkeypatch)
-    cmd, opts, args = _musefs_cmd(plugin, [])
+def test_command_revalidate_forwards_to_scan(db_path, fake_item, monkeypatch):
+    """`beet musefs --revalidate` forwards --revalidate to the autoscan, where the
+    Rust scanner owns pruning gone backing files + GCing orphaned art."""
+    plugin = MusefsPlugin()
+    monkeypatch.setattr(
+        plugin,
+        "config",
+        FakeConfigView({"db": db_path, "fields": {}, "autoscan": True, "write_path": True}),
+        raising=False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        plugin,
+        "_run_scan",
+        lambda db, targets, revalidate=False: calls.append((list(targets), revalidate)),
+    )
+    cmd, opts, args = _musefs_cmd(plugin, ["--revalidate"])
+    cmd.func(FakeLib([fake_item(os.fsencode("/music/a.flac"))], directory=b"/music"), opts, args)
+
+    assert calls == [(["/music"], True)]  # revalidate forwarded to the directory scan
+
+
+def test_command_revalidate_dry_run_skips_scan(db_path, fake_item, monkeypatch):
+    """--revalidate is destructive (it prunes via the scanner), so dry-run must
+    not run the scan at all."""
+    plugin, calls = _autoscan_plugin(db_path, monkeypatch)
+    cmd, opts, args = _musefs_cmd(plugin, ["--revalidate", "-n"])
     cmd.func(FakeLib([fake_item(os.fsencode("/music/a.flac"))]), opts, args)
 
-    conn = connect(db_path)
-    try:
-        paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
-        assert "/gone/x.flac" not in paths
-    finally:
-        conn.close()
+    assert calls == []  # no scan on dry-run, even with --revalidate
 
 
 def test_reconcile_at_cli_exit_syncs_recorded_items(
@@ -255,31 +278,6 @@ def test_reconcile_does_not_prune_only_syncs(db_path, make_track, fake_item, tmp
             ).fetchone()[0]
             == "Now"
         )
-    finally:
-        conn.close()
-
-
-def test_prune_missing_refuses_on_schema_mismatch(db_path, make_track, tmp_path):
-    """The destructive prune path honours the schema guard (#545): an out-of-date
-    plugin must not delete rows from a store schema it cannot understand."""
-    from beets import ui
-
-    gone = tmp_path / "gone.flac"  # never created == missing == would be pruned
-    make_track(str(gone))
-    conn = connect(db_path)
-    try:
-        conn.execute("PRAGMA user_version = 99999")  # diverged schema
-        conn.commit()
-    finally:
-        conn.close()
-
-    plugin = MusefsPlugin.__new__(MusefsPlugin)
-    with pytest.raises(ui.UserError):
-        plugin._prune_missing(db_path)
-
-    conn = connect(db_path)
-    try:
-        assert conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 1
     finally:
         conn.close()
 

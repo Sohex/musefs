@@ -101,8 +101,9 @@ def test_reconcile_surfaces_permission_error_loudly(monkeypatch):
 def test_run_scan_passes_shared_timeout(monkeypatch):
     captured = {}
 
-    def fake_run_scan(binary, db_path, targets, *, timeout=None):
+    def fake_run_scan(binary, db_path, targets, *, revalidate=False, timeout=None):
         captured["targets"] = targets
+        captured["revalidate"] = revalidate
         captured["timeout"] = timeout
 
     monkeypatch.setattr(musefs_mod, "run_scan", fake_run_scan)
@@ -111,6 +112,7 @@ def test_run_scan_passes_shared_timeout(monkeypatch):
     plugin._run_scan("/db.sqlite", ["/a.flac", "/b.flac"])
 
     assert captured["targets"] == ["/a.flac", "/b.flac"]  # one call, full list
+    assert captured["revalidate"] is False  # reconcile/plain scan never revalidates
     assert captured["timeout"] == musefs_mod.SCAN_TIMEOUT_SECONDS == 120
 
 
@@ -118,7 +120,8 @@ def test_removal_only_command_does_not_prune(db_path, tmp_path):
     # Pruning is a deliberate act (#538): the plugin no longer reacts to
     # item/album removals, and a passive cli_exit with no writes pending is a
     # no-op. A removed-and-deleted backing file's row survives until an explicit
-    # `beet musefs` / `musefs scan` — a transient mount blip can't mass-delete.
+    # `beet musefs --revalidate` / `musefs scan --revalidate` — a transient mount
+    # blip can't mass-delete.
     gone = tmp_path / "gone.flac"  # never created on disk == already deleted
     conn = musefs_connect(db_path)
     try:

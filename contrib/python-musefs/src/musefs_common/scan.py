@@ -4,19 +4,23 @@ import subprocess
 from .errors import ScanError
 
 
-def run_scan(binary, db_path, target, *, timeout=None):
-    """Run ``<binary> scan <target...> --db <db_path>``. ``target`` is a single
-    path or an iterable of paths; all targets precede the ``--db`` flag and are
-    scanned under one process (one DB open). Creates the DB if absent and fills
-    the structural columns a plugin can't compute. Raises ``ScanError`` (with
-    ``kind`` in ``"not_found" | "timeout" | "failed"``) on failure; the caller
-    formats its own user-facing message from the exception attributes."""
+def run_scan(binary, db_path, target, *, revalidate=False, timeout=None):
+    """Run ``<binary> scan <target...> --db <db_path> [--revalidate]``. ``target``
+    is a single path or an iterable of paths; all targets precede the ``--db``
+    flag and are scanned under one process (one DB open). Creates the DB if
+    absent and fills the structural columns a plugin can't compute. With
+    ``revalidate``, the scanner re-checks stamps, prunes rows whose backing file
+    is gone, and GCs orphaned art. Raises ``ScanError`` (with ``kind`` in
+    ``"not_found" | "timeout" | "failed"``) on failure; the caller formats its
+    own user-facing message from the exception attributes."""
     if isinstance(target, (str, os.PathLike)):
         targets = [target]
     else:
         targets = list(target)
     display = str(targets[0]) if len(targets) == 1 else f"{len(targets)} target(s)"
     argv = [binary, "scan", *(str(t) for t in targets), "--db", str(db_path)]
+    if revalidate:
+        argv.append("--revalidate")
     try:
         result = subprocess.run(argv, capture_output=True, timeout=timeout)
     except FileNotFoundError as exc:
