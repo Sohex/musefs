@@ -430,17 +430,31 @@ mod tags_for_tracks_tests {
     }
 
     #[test]
-    fn get_tags_rejects_multibyte_value_over_byte_cap() {
-        // Regression for #505: the read guard counts bytes, not characters. A
-        // value of 150_000 two-byte chars is 150_000 chars (under the schema's
-        // char-counting CHECK, so an honest writer stores it) but 300_000 bytes
-        // (over the 256 KiB materialized-memory bound). The byte-accurate guard
-        // must reject it.
+    fn multibyte_value_over_byte_cap_is_rejected_at_write_and_read() {
+        // Regression for #505: the cap counts bytes, not characters. 150_000
+        // two-byte chars is 150_000 chars (under the old char-counting CHECK)
+        // but 300_000 bytes (over the 256 KiB materialized-memory bound).
         let db = open_mem();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
         let multibyte = "é".repeat(150_000);
-        assert!(multibyte.chars().count() < 262_144, "under the char CHECK");
+        assert!(multibyte.chars().count() < 262_144, "under the char count");
         assert!(multibyte.len() > 262_144, "over the byte cap");
+
+        // Write path: the byte-accurate schema CHECK rejects the honest insert.
+        let write_err = db.conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', ?2, 0)",
+            rusqlite::params![a, multibyte],
+        );
+        assert!(
+            write_err.is_err(),
+            "byte-accurate CHECK must reject the write"
+        );
+
+        // Read path (defense-in-depth): a crafted DB that bypasses the CHECK is
+        // still rejected by the byte-counting reader guard.
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
         db.conn
             .execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', ?2, 0)",

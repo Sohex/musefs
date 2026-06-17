@@ -215,6 +215,53 @@ ALTER TABLE tracks ADD COLUMN fingerprint  TEXT
 ALTER TABLE tracks ADD COLUMN content_hash TEXT
     CHECK (content_hash IS NULL OR length(content_hash) = 64);
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
+
+-- Rebuild `tags` with a byte-accurate value cap (#505). SQLite's length() on
+-- TEXT counts characters, so the V1 `CHECK (length(value) <= 262144)` was up to
+-- ~4x looser than the documented 256 KiB byte bound; length(CAST(value AS BLOB))
+-- counts bytes. SQLite cannot alter a CHECK in place, so recreate the table
+-- (V2 is unreleased — this is folded in rather than added as a new migration).
+-- Pre-existing over-cap rows (only reachable on an upgraded store) are dropped:
+-- the read-time guard already counts bytes, so they were unreadable anyway, and
+-- carrying them would abort the rebuild on the new CHECK.
+CREATE TABLE tags_new (
+    track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    ordinal    INTEGER NOT NULL DEFAULT 0,
+    value_blob BLOB,
+    PRIMARY KEY (track_id, key, ordinal),
+    CHECK (ordinal >= 0),
+    CHECK (value_blob IS NULL OR value = ''),
+    CHECK (length(key) <= 256),
+    CHECK (length(key) >= 1
+           AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
+    CHECK (length(CAST(value AS BLOB)) <= 262144),
+    CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
+);
+INSERT INTO tags_new (track_id, key, value, ordinal, value_blob)
+    SELECT track_id, key, value, ordinal, value_blob FROM tags
+    WHERE length(CAST(value AS BLOB)) <= 262144;
+DROP TABLE tags;
+ALTER TABLE tags_new RENAME TO tags;
+
+-- DROP TABLE tags dropped its INSERT/UPDATE/DELETE triggers; recreate them
+-- verbatim so the content_version/updated_at bump contract is unchanged.
+CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_au AFTER UPDATE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
 ";
 
 /// Ring capacity of the `track_changes` changelog. Must match the literal in
@@ -415,6 +462,10 @@ mod baseline_tests {
         let sql = super::MIGRATION_V1;
         assert!(sql.contains(&format!("length(key) <= {MAX_TAG_KEY_LEN}")));
         assert!(sql.contains(&format!("length(value) <= {MAX_TAG_VALUE_LEN}")));
+        // V2 rebuilds `tags` with a byte-accurate value cap (#505).
+        assert!(super::MIGRATION_V2.contains(&format!(
+            "length(CAST(value AS BLOB)) <= {MAX_TAG_VALUE_LEN}"
+        )));
         assert!(sql.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
         assert!(sql.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
         assert!(sql.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
@@ -660,6 +711,72 @@ mod schema_py_tests {
         assert_eq!(
             user_version(&conn),
             i64::try_from(MIGRATIONS.len()).unwrap()
+        );
+    }
+
+    #[test]
+    fn v2_rebuild_enforces_byte_cap_and_drops_oversize_rows() {
+        // #505: V2 rebuilds `tags` with a byte-accurate value cap. Simulate a v1
+        // store, plant an over-cap multibyte value (legal under V1's char-counting
+        // CHECK: 150_000 chars / 300_000 bytes) plus a normal one, then upgrade.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap(); // V1 only
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('/a.flac','flac',0,0,0,0,0,0)",
+            [],
+        )
+        .unwrap();
+        let big = "é".repeat(150_000);
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'big',?1,0)",
+            rusqlite::params![big],
+        )
+        .expect("V1 char-counting CHECK accepts a 150_000-char value");
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'ok','fine',0)",
+            [],
+        )
+        .unwrap();
+
+        super::migrate(&mut conn).expect("upgrade to v2");
+
+        // The over-cap row is dropped; the valid row survives.
+        let keys: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT key FROM tags ORDER BY key").unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(keys, vec!["ok".to_string()]);
+
+        // The rebuilt CHECK now rejects an over-cap multibyte value at write.
+        assert!(
+            conn.execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'big2',?1,0)",
+                rusqlite::params![big],
+            )
+            .is_err(),
+            "byte-accurate CHECK must reject the write"
+        );
+
+        // The tag triggers were recreated: an insert still bumps content_version.
+        let cv = |c: &Connection| -> i64 {
+            c.query_row("SELECT content_version FROM tracks WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let before = cv(&conn);
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'extra','v',0)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            cv(&conn) > before,
+            "tags_ai trigger must survive the rebuild"
         );
     }
 

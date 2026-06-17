@@ -289,7 +289,11 @@ pub fn build_id3v2_segments(
 ) -> Result<(Vec<Segment>, u64)> {
     // ID3 splices these DB-sourced strings between NUL terminators/separators,
     // so a NUL in any of them would corrupt the frame; reject up front (#506).
+    // The key is checked too: an unmapped key is serialized as a TXXX
+    // description (`txxx_frame_data(key, value)`), and the `tags.key` CHECK
+    // rejects control chars 1..=31 but not NUL.
     for t in tags {
+        reject_embedded_nul("tag key", &t.key)?;
         reject_embedded_nul("tag value", &t.value)?;
     }
     for art in arts {
@@ -1133,6 +1137,12 @@ mod tests {
     fn build_id3v2_segments_rejects_embedded_nul() {
         // Regression for #506: a NUL in any DB-sourced text field would desync an
         // ID3 frame's terminators/separators, so synthesis must reject it.
+        let nul_key = build_id3v2_segments(&[TagInput::new("bad\0key", "ok")], &[], &[]);
+        assert_eq!(
+            nul_key.err(),
+            Some(FormatError::EmbeddedNul { field: "tag key" })
+        );
+
         let nul_value = build_id3v2_segments(&[TagInput::new("TIT2", "a\0b")], &[], &[]);
         assert_eq!(
             nul_value.err(),
