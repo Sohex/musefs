@@ -989,11 +989,10 @@ mod tests {
                     let w = b64_window(*offset, len.get(), *art_total);
                     let raw = &image[crate::convert::usize_from(w.in_start)
                         ..crate::convert::usize_from(w.in_start + w.in_len)];
-                    bytes.extend_from_slice(&encode_b64_slice(
-                        raw,
-                        w.skip,
-                        crate::convert::usize_from(len.get()),
-                    ));
+                    bytes.extend_from_slice(
+                        &encode_b64_slice(raw, w.skip, crate::convert::usize_from(len.get()))
+                            .expect("window lies within the encoded output"),
+                    );
                 }
                 Segment::OggAudio { .. } => break, // header region ends here
                 other => panic!("unexpected {other:?}"),
@@ -1027,11 +1026,10 @@ mod tests {
                         let w = b64_window(*offset, len.get(), *art_total);
                         let raw = &img[crate::convert::usize_from(w.in_start)
                             ..crate::convert::usize_from(w.in_start + w.in_len)];
-                        bytes.extend_from_slice(&encode_b64_slice(
-                            raw,
-                            w.skip,
-                            crate::convert::usize_from(len.get()),
-                        ));
+                        bytes.extend_from_slice(
+                            &encode_b64_slice(raw, w.skip, crate::convert::usize_from(len.get()))
+                                .expect("window lies within the encoded output"),
+                        );
                     } else {
                         bytes.extend_from_slice(
                             &img[crate::convert::usize_from(*offset)

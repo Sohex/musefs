@@ -412,7 +412,8 @@ fn crc_feed_art(
         let w = crate::ogg::b64::b64_window(out_off, out_len as u64, art_total);
         let mut raw = vec![0u8; crate::convert::usize_from(w.in_len)];
         src.read_window(art_id, w.in_start, &mut raw)?;
-        let enc = crate::ogg::b64::encode_b64_slice(&raw, w.skip, out_len);
+        let enc = crate::ogg::b64::encode_b64_slice(&raw, w.skip, out_len)
+            .ok_or(crate::error::FormatError::ArtRead { art_id })?;
         *crc = crc32_update(*crc, &enc);
     } else {
         let mut raw = vec![0u8; out_len];
@@ -655,7 +656,8 @@ mod tests {
             &image,
             0,
             crate::convert::usize_from(crate::ogg::b64::b64_len(image.len() as u64)),
-        );
+        )
+        .expect("full-length window lies within the encoded output");
         let tail = vec![0xB0u8; 10];
         let chunks = vec![
             PayloadChunk::Bytes(head.clone()),
