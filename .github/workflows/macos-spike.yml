@@ -18,32 +18,44 @@ jobs:
           persist-credentials: false
       - name: Install fuse-t + ffmpeg
         run: |
-          # fuse-t ships as a cask in its own tap. Confirm the exact name from
-          # https://github.com/macos-fuse-t/fuse-t (Homebrew install section).
           brew tap macos-fuse-t/homebrew-cask
           brew install --cask fuse-t
           brew install ffmpeg
-      - name: Record fuse-t install layout
-        run: |
-          echo "== libfuse-t dylib =="; find /usr/local /opt/homebrew -name 'libfuse*' 2>/dev/null || true
-          echo "== pkg-config =="; find /usr/local /opt/homebrew -name 'fuse*.pc' 2>/dev/null || true
-          pkg-config --exists fuse && echo "pkg-config sees 'fuse'" || echo "pkg-config does NOT see 'fuse'"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-      - name: (A) Build with macos-no-mount + libfuse together
-        id: approach_a
+      - name: Approach B — swap macos-no-mount → libfuse inline (not committed)
+        run: |
+          # BSD sed (macOS) needs the empty backup arg. Verify the swap took.
+          sed -i '' 's/"macos-no-mount"/"libfuse"/' musefs-fuse/Cargo.toml
+          grep -n 'fuser' musefs-fuse/Cargo.toml
+      - name: Build musefs-fuse with libfuse (real mount path)
+        run: cargo build -p musefs-fuse 2>&1 | tail -20
+      - name: Run the mount suite through fuse-t (macFUSE options still present)
+        id: mount_default
         continue-on-error: true
+        run: cargo test -p musefs-fuse --test mount -- --ignored --nocapture 2>&1 | tail -80
+      - name: Retry mount suite with MUSEFS_FUSE_T (simulates Task 3 option gate)
+        if: steps.mount_default.outcome == 'failure'
+        env:
+          MUSEFS_FUSE_T: "1"
         run: |
-          # Temporarily add the feature inline so the spike needs no manifest commit.
-          # If this fails to compile/link, Approach B is required.
-          PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
-            cargo build -p musefs-fuse --features fuser/libfuse 2>&1 | tail -40
-      - name: Run one mount test through fuse-t
-        if: steps.approach_a.outcome == 'success'
-        run: |
-          PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
-            cargo test -p musefs-fuse --features fuser/libfuse --test mount -- --ignored --nocapture 2>&1 | tail -80
+          # If the default run failed on macFUSE-only mount options, prove that
+          # omitting them (what Task 3's env gate will do) lets fuse-t mount.
+          # Patch extend_os_specific inline to honor the env var for this probe.
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("musefs-fuse/src/platform/mount.rs")
+          s = p.read_text()
+          s = s.replace(
+              "fn extend_os_specific(opts: &mut Vec<MountOption>, fs_name: &str) {",
+              "fn extend_os_specific(opts: &mut Vec<MountOption>, fs_name: &str) {\n"
+              "    if std::env::var_os(\"MUSEFS_FUSE_T\").is_some() { return; }",
+              1)
+          p.write_text(s)
+          print(s.split("extend_os_specific")[1][:400])
+          PY
+          cargo test -p musefs-fuse --test mount -- --ignored --nocapture 2>&1 | tail -80
       - name: Inspect for stale mounts after tests
         if: always()
         run: |
-          echo "== mounts =="; mount | grep -i fuse || echo "no fuse mounts left (good)"
+          echo "== mounts =="; mount | grep -iE 'fuse|nfs' || echo "no fuse/nfs mounts left (good)"
