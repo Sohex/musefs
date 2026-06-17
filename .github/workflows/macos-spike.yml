@@ -25,7 +25,7 @@ jobs:
           Name: fuse
           Description: fuse-t libfuse2 shim for fuser
           Version: 2.9.9
-          Libs: -L${libdir} -lfuse-t
+          Libs: -L${libdir} -Wl,-rpath,${libdir} -lfuse-t
           Cflags: -I${includedir}/fuse -D_FILE_OFFSET_BITS=64
           PC
           pkg-config --modversion fuse
@@ -39,6 +39,7 @@ jobs:
         continue-on-error: true
         run: |
           MNT="$HOME/hellomnt"; mkdir -p "$MNT"
+          export DYLD_FALLBACK_LIBRARY_PATH="/usr/local/lib:${DYLD_FALLBACK_LIBRARY_PATH:-/usr/local/lib:/usr/lib}"
           # hello.rs mounts in the foreground and blocks; run it backgrounded.
           /tmp/fuser/target/debug/examples/hello "$MNT" &
           HPID=$!
