@@ -63,6 +63,29 @@ jobs:
           p.write_text(s.replace(anchor, inject + anchor, 1))
           print("patched options(): macOS adds -o backend=smb")
           PY
+          # SMB mount attaches asynchronously; make spawn_with wait for readiness.
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("musefs-fuse/src/lib.rs")
+          s = p.read_text()
+          needle = "    let _ = cell.set(session.notifier());\n    session.spawn()\n}"
+          repl = (
+              "    let _ = cell.set(session.notifier());\n"
+              "    let bg = session.spawn()?;\n"
+              "    #[cfg(target_os = \"macos\")]\n"
+              "    {\n"
+              "        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);\n"
+              "        while std::time::Instant::now() < deadline {\n"
+              "            if std::fs::read_dir(mountpoint).map(|mut d| d.next().is_some()).unwrap_or(false) { break; }\n"
+              "            std::thread::sleep(std::time::Duration::from_millis(100));\n"
+              "        }\n"
+              "    }\n"
+              "    Ok(bg)\n}"
+          )
+          assert needle in s, "spawn_with tail not found"
+          p.write_text(s.replace(needle, repl, 1))
+          print("patched spawn_with: macOS waits up to 15s for mount readiness")
+          PY
           cargo build -p musefs-fuse 2>&1 | tail -15
       - name: Run one mount test and capture fuse-t protocol log
         continue-on-error: true
