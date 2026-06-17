@@ -14,8 +14,8 @@ use threadpool::ThreadPool;
 use crate::convert::{assemble_dir_listing, to_file_attr};
 use fuser::{
     BackgroundSession, Config, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    InitFlags, KernelConfig, LockOwner, Notifier, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request, Session,
+    InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags, ReplyAttr, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request, Session,
 };
 use musefs_core::CoreError;
 use musefs_core::Fh;
@@ -177,6 +177,9 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         CoreError::NotADir(_) => fuser::Errno::ENOTDIR,
         CoreError::HandleTableFull => fuser::Errno::ENFILE,
         CoreError::Io(e) => fuser::Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)),
+        CoreError::BackingIo { source, .. } => {
+            fuser::Errno::from_i32(source.raw_os_error().unwrap_or(libc::EIO))
+        }
         CoreError::BackingChanged(_)
         | CoreError::Db(_)
         | CoreError::DbOpen { .. }
@@ -384,6 +387,11 @@ pub struct MusefsFs {
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
     /// otherwise-unbounded pool queue (#308).
     inflight_reads: Arc<AtomicUsize>,
+    /// Reads that failed rather than served bytes: an `EAGAIN` load-shed under
+    /// read-slot saturation, or any error reply from the read worker (EIO and
+    /// friends). Surfaced as `musefs_read_errors_total` — read-error rate is one
+    /// of the two most-wanted production metrics for a passthrough FS (#523).
+    read_errors: Arc<AtomicU64>,
     /// Per-open rendered `.musefs-metrics/metrics` buffers, keyed by the fh handed
     /// out at `open` (#394). Each open snapshots once; reads slice it by absolute
     /// offset; `release` drops it. Empty/untouched unless `expose_metrics` is on.
@@ -416,6 +424,7 @@ impl MusefsFs {
             dir_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dir_fh: Arc::new(AtomicU64::new(1)),
             inflight_reads: Arc::new(AtomicUsize::new(0)),
+            read_errors: Arc::new(AtomicU64::new(0)),
             metrics_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             metrics_fh: Arc::new(AtomicU64::new(1)),
         }
@@ -485,6 +494,7 @@ impl MusefsFs {
             uptime_seconds: self.mount_time.elapsed().map_or(0, |d| d.as_secs()),
             reads_inflight: self.inflight_reads.load(Ordering::Relaxed) as u64,
             reads_inflight_max: MAX_INFLIGHT_READS as u64,
+            read_errors: self.read_errors.load(Ordering::Relaxed),
             dir_handles,
             dir_handles_max: MAX_DIR_HANDLES as u64,
             pool_workers: self.pool.max_count() as u64,
@@ -603,7 +613,13 @@ impl Filesystem for MusefsFs {
         });
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        // Read-only filesystem: refuse write-intent opens at the daemon. The mount
+        // also carries MountOption::RO so the kernel VFS blocks writes, but the
+        // daemon should not itself hand back a handle for O_WRONLY/O_RDWR (#527).
+        if flags.acc_mode() != OpenAccMode::O_RDONLY {
+            return reply.error(fuser::Errno::EROFS);
+        }
         if platform::spotlight::is_marker(ino.0) {
             // Stateless empty file: fh 0 means `release` skips it (its
             // NonZeroU64 guard) and `read` short-circuits on `is_marker`.
@@ -618,6 +634,10 @@ impl Filesystem for MusefsFs {
             // Check + id + insert under one lock hold: concurrent opens can't race
             // the count past the cap, and a rejected open burns no id (#394).
             if handles.len() >= MAX_METRICS_HANDLES {
+                log::warn!(
+                    "open({}) rejected: ENFILE — metrics-handle table full at {MAX_METRICS_HANDLES}",
+                    ino.0
+                );
                 return reply.error(fuser::Errno::ENFILE);
             }
             let fh = self.metrics_fh.fetch_add(1, Ordering::Relaxed);
@@ -667,9 +687,14 @@ impl Filesystem for MusefsFs {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 try_admit_dir_handle(&mut guard, &counter, MAX_DIR_HANDLES, listing)
             };
-            match admitted {
-                Some(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
-                None => reply.error(fuser::Errno::ENFILE),
+            if let Some(fh) = admitted {
+                reply.opened(FileHandle(fh), FopenFlags::empty());
+            } else {
+                log::warn!(
+                    "opendir({ino}) rejected: ENFILE — dir-handle table full at {MAX_DIR_HANDLES}",
+                    ino = ino.0
+                );
+                reply.error(fuser::Errno::ENFILE);
             }
         });
     }
@@ -806,9 +831,15 @@ impl Filesystem for MusefsFs {
         // Reserve a slot on the dispatch thread before enqueuing; over the cap,
         // reject with EAGAIN so the unbounded pool queue can't grow (#308).
         let Some(slot) = reserve_read_slot(&self.inflight_reads, MAX_INFLIGHT_READS) else {
+            self.read_errors.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "read({}) rejected: EAGAIN — {MAX_INFLIGHT_READS} reads already in flight (load-shedding)",
+                ino.0
+            );
             return reply.error(fuser::Errno::EAGAIN);
         };
         let core = Arc::clone(&self.core);
+        let read_errors = Arc::clone(&self.read_errors);
         self.pool.execute(move || {
             // `_slot` (named) holds the guard until the read completes or the
             // worker panics, then releases it. Do NOT simplify to bare `_`: that
@@ -834,7 +865,12 @@ impl Filesystem for MusefsFs {
                 );
                 match outcome {
                     Ok(()) => reply.data(&buf),
-                    Err(e) => reply.error(e),
+                    Err(e) => {
+                        // read_outcome already logged the cause (via reply_errno or
+                        // the panic handler); count it for the read-error rate (#523).
+                        read_errors.fetch_add(1, Ordering::Relaxed);
+                        reply.error(e);
+                    }
                 }
                 if buf.capacity() > MAX_RETAINED_READ_BUF {
                     buf.shrink_to(MAX_RETAINED_READ_BUF);
@@ -939,11 +975,19 @@ pub fn mount_with(
     config: FuseConfig,
 ) -> std::io::Result<()> {
     let allow_other = config.allow_other;
+    let (files, dirs) = core.entry_counts();
+    let mode = core.mode();
     let fs = MusefsFs::new(core, config);
     let cell = fs.notifier_cell();
     let session = new_session(fs, mountpoint, fs_name, allow_other)?;
     let _ = cell.set(session.notifier());
     let bg = session.spawn()?;
+    // Mount succeeded and the session is serving: surface what was mounted so an
+    // empty or wrong DB is distinguishable from a correctly serving one (#522).
+    log::info!(
+        "musefs mounted at {}: {files} files in {dirs} directories ({mode:?})",
+        mountpoint.display()
+    );
     bg.join()
 }
 

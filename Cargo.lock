@@ -943,6 +943,7 @@ dependencies = [
  "anyhow",
  "clap",
  "indicatif",
+ "log",
  "musefs-core",
  "musefs-db",
  "musefs-fuse",

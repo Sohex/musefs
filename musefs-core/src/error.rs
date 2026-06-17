@@ -22,6 +22,12 @@ pub enum CoreError {
     },
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("backing file I/O at {path}: {source}")]
+    BackingIo {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("backing file changed since scan: {0}")]
     BackingChanged(String),
     #[error(
@@ -55,6 +61,19 @@ pub enum CoreError {
     NotADir(u64),
     #[error("handle table full")]
     HandleTableFull,
+}
+
+impl CoreError {
+    /// Attach the backing-file path to an I/O error. A moved, permission-denied,
+    /// or failing backing file is the most common passthrough failure; carrying
+    /// the path makes the warn log and any surfaced error name the file rather
+    /// than collapsing to a bare `EIO` (#521).
+    pub(crate) fn backing_io(path: impl AsRef<std::path::Path>, source: std::io::Error) -> Self {
+        CoreError::BackingIo {
+            path: path.as_ref().to_path_buf(),
+            source,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

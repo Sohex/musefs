@@ -40,6 +40,7 @@ pub struct FuseTelemetry {
     pub uptime_seconds: u64,
     pub reads_inflight: u64,
     pub reads_inflight_max: u64,
+    pub read_errors: u64,
     pub dir_handles: u64,
     pub dir_handles_max: u64,
     pub pool_workers: u64,
@@ -105,6 +106,12 @@ pub fn render_prometheus(
         "musefs_reads_inflight_max",
         "Cap before reads are rejected with EAGAIN.",
         fuse.reads_inflight_max,
+    );
+    counter(
+        &mut out,
+        "musefs_read_errors_total",
+        "Reads that failed: EAGAIN load-sheds plus error replies from the read worker.",
+        fuse.read_errors,
     );
     gauge(
         &mut out,
@@ -363,6 +370,7 @@ mod tests {
             uptime_seconds: 60,
             reads_inflight: 1,
             reads_inflight_max: 1024,
+            read_errors: 7,
             dir_handles: 2,
             dir_handles_max: 1024,
             pool_workers: 8,
@@ -381,6 +389,9 @@ mod tests {
         assert!(out.contains("# TYPE musefs_handles_open gauge\nmusefs_handles_open 3\n"));
         assert!(out.contains("musefs_reads_inflight 1\n"));
         assert!(out.contains("musefs_reads_inflight_max 1024\n"));
+        assert!(
+            out.contains("# TYPE musefs_read_errors_total counter\nmusefs_read_errors_total 7\n")
+        );
         assert!(out.contains("musefs_pool_queued 0\n"));
         assert!(out.contains("musefs_readahead_budget_bytes 67108864\n"));
         assert!(out.contains("musefs_readahead_charged_bytes 8192\n"));

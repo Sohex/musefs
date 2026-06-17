@@ -88,9 +88,10 @@ fn read_front(path: &Path, n: u64) -> crate::Result<Vec<u8>> {
         });
     }
     crate::metrics::on_open();
-    let mut f = std::fs::File::open(path)?;
+    let mut f = std::fs::File::open(path).map_err(|e| CoreError::backing_io(path, e))?;
     let mut buf = vec![0u8; usize_from(n)];
-    f.read_exact(&mut buf)?;
+    f.read_exact(&mut buf)
+        .map_err(|e| CoreError::backing_io(path, e))?;
     Ok(buf)
 }
 
@@ -123,7 +124,8 @@ impl HeaderCache {
         // Always validate the backing file first — a stale file is an error even
         // on a cache hit, because the audio region may have shifted.
         crate::metrics::on_stat();
-        let meta = std::fs::metadata(&track.backing_path)?;
+        let meta = std::fs::metadata(&track.backing_path)
+            .map_err(|e| CoreError::backing_io(&track.backing_path, e))?;
         if BackingStamp::from_metadata(&meta) != BackingStamp::from_track(&track) {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
@@ -242,12 +244,15 @@ impl HeaderCache {
                         // to reach it. The resulting layout's leading inline `head` ends
                         // in a deliberately truncated `mdat` header whose payload is the
                         // backing-audio tail.
-                        let mut f = std::fs::File::open(&track.backing_path)?;
+                        let mut f = std::fs::File::open(&track.backing_path)
+                            .map_err(|e| CoreError::backing_io(&track.backing_path, e))?;
                         // `meta` was validated against the tracked size/mtime above,
                         // so reuse it rather than issuing a second fstat.
                         let len = meta.len();
                         let scan = mp4::read_structure_from(&mut f, len).map_err(|e| match e {
-                            mp4::Mp4ScanError::Io(io) => CoreError::Io(io),
+                            mp4::Mp4ScanError::Io(io) => {
+                                CoreError::backing_io(&track.backing_path, io)
+                            }
                             mp4::Mp4ScanError::Format(fe) => CoreError::Format(fe),
                             // Unreachable in practice (an ingested file already
                             // passed the cap at scan, and backing-file drift is
@@ -396,8 +401,12 @@ pub fn read_at_into<M>(
     // via `validate_opened_backing`; this stateless fallback must too.
     let file = if needs_file {
         crate::metrics::on_open();
-        let f = std::fs::File::open(&resolved.backing_path)?;
-        if BackingStamp::from_metadata(&f.metadata()?) != resolved.stamp {
+        let f = std::fs::File::open(&resolved.backing_path)
+            .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
+        let f_meta = f
+            .metadata()
+            .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
+        if BackingStamp::from_metadata(&f_meta) != resolved.stamp {
             return Err(CoreError::BackingChanged(
                 resolved.backing_path.to_string_lossy().into_owned(),
             ));
@@ -450,9 +459,9 @@ fn read_with_optional_backing<M>(
             let epoch = std::sync::atomic::AtomicU64::new(0);
             let br =
                 crate::readahead::BackingReader::new(file, &buf, &pool, 0, backing_len, &epoch);
-            read_segments_into(resolved, db, Some(&br), offset, size, out)
+            read_segments_into(resolved, Some(db), Some(&br), offset, size, out)
         }
-        None => read_segments_into(resolved, db, None, offset, size, out),
+        None => read_segments_into(resolved, Some(db), None, offset, size, out),
     }
 }
 
@@ -479,10 +488,13 @@ pub fn read_at<M>(resolved: &ResolvedFile, db: &Db<M>, offset: u64, size: u64) -
 
 /// The single segment-splicing loop. `backing` is `Some` whenever the layout has a
 /// `BackingAudio`/`OggAudio` segment (guaranteed by `read_at`/`read_at_with_file`);
-/// the backing arms treat `None` as a contract violation.
+/// `db` is `Some` whenever the layout has a DB-backed segment
+/// (`ArtImage`/`BinaryTag`/`OggArtSlice`, i.e. `streams_db_rowid`). Both arms treat
+/// `None` as a contract violation, so a pure-backing layout can be served without a
+/// pooled DB connection at all (#520).
 fn read_segments_into<M>(
     resolved: &ResolvedFile,
-    db: &Db<M>,
+    db: Option<&Db<M>>,
     backing: Option<&crate::readahead::BackingReader>,
     offset: u64,
     size: u64,
@@ -515,12 +527,14 @@ fn read_segments_into<M>(
                     br.read_exact_at(&mut out[start..], bo + within)?;
                 }
                 Segment::ArtImage { art_id, .. } => {
+                    let db = db.expect("art segment requires a DB connection");
                     let start = out.len();
                     out.resize(start + n, 0);
                     db.read_art_chunk_into(*art_id, within, &mut out[start..])?;
                     crate::metrics::on_art_chunk();
                 }
                 Segment::BinaryTag { payload_id, .. } => {
+                    let db = db.expect("binary-tag segment requires a DB connection");
                     let start = out.len();
                     out.resize(start + n, 0);
                     db.read_binary_tag_chunk_into(*payload_id, within, &mut out[start..])?;
@@ -550,14 +564,20 @@ fn read_segments_into<M>(
                     art_total,
                     ..
                 } => {
+                    let db = db.expect("ogg-art segment requires a DB connection");
                     if *base64 {
                         let w =
                             musefs_format::ogg::b64_window(*offset + within, n as u64, *art_total);
                         let raw = db.read_art_chunk(*art_id, w.in_start, usize_from(w.in_len))?;
                         crate::metrics::on_art_chunk();
-                        out.extend_from_slice(&musefs_format::ogg::encode_b64_slice(
-                            &raw, w.skip, n,
-                        ));
+                        let slice = musefs_format::ogg::encode_b64_slice(&raw, w.skip, n)
+                            .ok_or_else(|| {
+                                CoreError::BackingChanged(format!(
+                                    "art {} shorter than its indexed base64 window",
+                                    *art_id
+                                ))
+                            })?;
+                        out.extend_from_slice(&slice);
                     } else {
                         let start = out.len();
                         out.resize(start + n, 0);
@@ -575,10 +595,12 @@ fn read_segments_into<M>(
     Ok(())
 }
 
-/// Serve into `out` from an already-open backing reader (per-handle path).
+/// Serve into `out` from an already-open backing reader (per-handle path). `db`
+/// is `None` for a pure-backing layout (no `streams_db_rowid` segment), letting
+/// the caller serve without a pooled DB connection (#520).
 pub fn read_at_with_file_into<M>(
     resolved: &ResolvedFile,
-    db: &Db<M>,
+    db: Option<&Db<M>>,
     backing: &crate::readahead::BackingReader,
     offset: u64,
     size: u64,
@@ -596,7 +618,7 @@ pub fn read_at_with_file<M>(
     size: u64,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    read_at_with_file_into(resolved, db, backing, offset, size, &mut out)?;
+    read_at_with_file_into(resolved, Some(db), backing, offset, size, &mut out)?;
     Ok(out)
 }
 
@@ -954,7 +976,8 @@ mod ogg_art_serve_tests {
             &image,
             0,
             usize_from(musefs_format::ogg::b64_len(image.len() as u64)),
-        );
+        )
+        .expect("full-length window lies within the encoded output");
 
         let db = musefs_db::Db::open_in_memory().unwrap();
         let art_id = db
@@ -1765,9 +1788,20 @@ mod serve_cap_tests {
         // `> -> >=` mutant.
         let err = read_front(std::path::Path::new("/nonexistent/musefs/front"), CAP).unwrap_err();
         assert!(
-            matches!(err, CoreError::Io(_)),
-            "expected Io error at the cap boundary, got {err:?}"
+            matches!(err, CoreError::BackingIo { .. }),
+            "expected a backing-file Io error at the cap boundary, got {err:?}"
         );
+    }
+
+    #[test]
+    fn read_front_io_error_carries_the_backing_path() {
+        // The most common passthrough failure (a moved/inaccessible backing file)
+        // must name the path rather than collapse to a pathless `Io`/EIO (#521).
+        let p = std::path::Path::new("/nonexistent/musefs/backing.flac");
+        match read_front(p, 16).unwrap_err() {
+            CoreError::BackingIo { path, .. } => assert_eq!(path, p),
+            other => panic!("expected BackingIo carrying the path, got {other:?}"),
+        }
     }
 }
 
@@ -1876,7 +1910,7 @@ mod readahead_differential_tests {
             while off < total {
                 let n = size.min(total - off);
                 let mut via = Vec::new();
-                read_segments_into(&resolved, &db, Some(&br), off, n, &mut via).unwrap();
+                read_segments_into(&resolved, Some(&db), Some(&br), off, n, &mut via).unwrap();
                 let mut direct = Vec::new();
                 oracle_read(&resolved, &file, off, n, &mut direct).unwrap();
                 assert_eq!(via, direct, "mismatch at off={off} size={size}");
@@ -1898,7 +1932,7 @@ mod readahead_differential_tests {
         while off < total {
             let n = 65536u64.min(total - off);
             let mut via = Vec::new();
-            read_segments_into(&resolved, &db, Some(&br), off, n, &mut via).unwrap();
+            read_segments_into(&resolved, Some(&db), Some(&br), off, n, &mut via).unwrap();
             let mut direct = Vec::new();
             oracle_read(&resolved, &file, off, n, &mut direct).unwrap();
             assert_eq!(via, direct, "eviction mismatch at {off}");
@@ -1921,7 +1955,7 @@ mod readahead_differential_tests {
                 continue;
             }
             let mut via = Vec::new();
-            read_segments_into(&resolved, &db, Some(&br), off, n, &mut via).unwrap();
+            read_segments_into(&resolved, Some(&db), Some(&br), off, n, &mut via).unwrap();
             let mut direct = Vec::new();
             oracle_read(&resolved, &file, off, n, &mut direct).unwrap();
             assert_eq!(via, direct, "partial-seek mismatch at {off}+{n}");

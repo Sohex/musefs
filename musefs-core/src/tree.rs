@@ -8,6 +8,17 @@ fn fold(name: &str) -> String {
     name.to_lowercase()
 }
 
+/// Split a rendered path into the components the tree actually materializes:
+/// non-empty, and never `.`/`..`. A plain (non-`$!{}`) template field whose tag
+/// value is exactly `.` or `..` survives `sanitize_into` as a literal component,
+/// so `insert_file`, the dirty-set gate, and `deepest_existing_ancestor` must all
+/// reason over this same sequence or an incremental refresh diverges from a fresh
+/// build (#518).
+fn path_components(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/')
+        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+}
+
 /// Why an incremental tree mutation could not complete; the caller falls back to
 /// a full rebuild. Carries diagnostics instead of `()` (#95).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +221,19 @@ impl VirtualTree {
         matches!(self.nodes.get(&inode).map(|n| &n.kind), Some(NodeKind::Dir))
     }
 
+    /// `(files, directories)` currently materialized: files are tracks, dirs are
+    /// every directory node except the synthetic root. O(nodes), no path
+    /// rendering — cheap enough to surface on mount (#522).
+    pub fn entry_counts(&self) -> (u64, u64) {
+        let files = self.track_to_inode.len() as u64;
+        let dir_nodes = self
+            .nodes
+            .values()
+            .filter(|n| matches!(n.kind, NodeKind::Dir))
+            .count() as u64;
+        (files, dir_nodes.saturating_sub(1))
+    }
+
     pub fn track_id(&self, inode: u64) -> Option<i64> {
         match self.nodes.get(&inode).map(|n| &n.kind) {
             Some(NodeKind::File { track_id }) => Some(*track_id),
@@ -223,10 +247,7 @@ impl VirtualTree {
     }
 
     fn insert_file(&mut self, track_id: i64, path: &str, alloc: &mut InodeAllocator) {
-        let comps: Vec<&str> = path
-            .split('/')
-            .filter(|c| !c.is_empty() && *c != "." && *c != "..")
-            .collect();
+        let comps: Vec<&str> = path_components(path).collect();
         if comps.is_empty() {
             return;
         }
@@ -695,7 +716,7 @@ impl VirtualTree {
                 .get(&id)
                 .map(|s| s.path.as_str())
                 .ok_or(RebuildError::MissingRenderedPath(id))?;
-            let comps: Vec<&str> = rendered.split('/').filter(|c| !c.is_empty()).collect();
+            let comps: Vec<&str> = path_components(rendered).collect();
             let (d, consumed) = self.deepest_existing_ancestor(rendered);
             // The first new component is the only insertion into existing
             // structure; it can shift siblings only if its base key is occupied
@@ -739,12 +760,7 @@ impl VirtualTree {
             .collect();
         // Shallow first, by component count: ROOT's path is "" (0 components),
         // which must sort before single-component dirs ("A", also 0 slashes).
-        live_dirty.sort_by_key(|d| {
-            self.path_of(*d)
-                .split('/')
-                .filter(|c| !c.is_empty())
-                .count()
-        });
+        live_dirty.sort_by_key(|d| path_components(&self.path_of(*d)).count());
         let mut done: HashSet<u64> = HashSet::new();
         let mut rebuilds = 0usize;
         for d in live_dirty {
@@ -768,7 +784,7 @@ impl VirtualTree {
     /// components it consumed — `components[consumed]` is the first component that
     /// would be newly created. Returns (ROOT, 0) if nothing below root exists.
     fn deepest_existing_ancestor(&self, rendered: &str) -> (u64, usize) {
-        let comps: Vec<&str> = rendered.split('/').filter(|c| !c.is_empty()).collect();
+        let comps: Vec<&str> = path_components(rendered).collect();
         let mut dir = Self::ROOT;
         let mut consumed = 0;
         // walk dir components only (exclude the final filename component)
@@ -974,6 +990,19 @@ mod tests {
         assert_eq!(t.inode_of_track(10), Some(song));
         assert!(t.inode_of_track(20).is_some());
         assert_eq!(t.inode_of_track(999), None);
+    }
+
+    #[test]
+    fn entry_counts_counts_files_and_non_root_dirs() {
+        // Two tracks under two album dirs plus a nested dir: 3 files, 3 dirs
+        // (Alice, Bob, Bob/Live) — the synthetic root is never counted.
+        let t = VirtualTree::build(&[
+            (10, "Alice/Song.flac".into()),
+            (20, "Bob/Tune.flac".into()),
+            (30, "Bob/Live/Encore.flac".into()),
+        ]);
+        assert_eq!(t.entry_counts(), (3, 3));
+        assert_eq!(VirtualTree::build(&[]).entry_counts(), (0, 0));
     }
 
     #[test]
@@ -1581,6 +1610,26 @@ mod tests {
             paths_of(&t).keys().collect::<Vec<_>>(),
             paths_of(&reference).keys().collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn apply_changes_dot_component_collision_matches_build() {
+        // id 2's rendered path carries a literal "." component (a plain field whose
+        // tag value sanitized to exactly "."). `insert_file` strips it to "A/t.flac",
+        // colliding with id 1 — so the dirty-set gate must strip it too and mark "A"
+        // for rebuild. Before the unify, the gate reasoned over ["A", ".", "t.flac"]
+        // and skipped the rebuild, diverging from a fresh build (#518).
+        let before = vec![(1, "A/t.flac".to_string())];
+        let after = vec![(1, "A/t.flac".to_string()), (2, "A/./t.flac".to_string())];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
+    }
+
+    #[test]
+    fn apply_changes_dotdot_component_collision_matches_build() {
+        // Same as above for a literal ".." component.
+        let before = vec![(1, "A/t.flac".to_string())];
+        let after = vec![(1, "A/t.flac".to_string()), (2, "A/../t.flac".to_string())];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
     }
 
     #[test]
