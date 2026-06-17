@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use indicatif::HumanDuration;
+use indicatif::{HumanBytes, HumanDuration};
 use musefs_core::{MountConfig, Musefs};
 use musefs_db::Db;
 
@@ -216,6 +216,14 @@ pub enum Command {
     },
     /// Mount a read-only FUSE view of the store.
     Mount(MountArgs),
+    /// Compact the SQLite store, reclaiming free pages left by deletions
+    /// (prunes, orphan-art GC, the schema migration). Run while unmounted; this
+    /// may also upgrade an older store's schema to the current version.
+    Vacuum {
+        /// Path to the SQLite database.
+        #[arg(long, env = "MUSEFS_DB")]
+        db: PathBuf,
+    },
 }
 
 /// Open (creating/migrating) the DB at `db_path` once, then scan each target in
@@ -504,6 +512,60 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     Ok(())
 }
 
+/// Total on-disk footprint of the store: the main `.db` plus its `-wal`/`-shm`
+/// sidecars (a missing sidecar counts as 0). Summing the WAL/SHM keeps the
+/// reclaimed figure honest — a TRUNCATE checkpoint reclaims WAL bytes too.
+fn store_footprint(db: &Path) -> u64 {
+    // `.map_or`, not `.map(..).unwrap_or(..)`: the latter trips
+    // `clippy::map_unwrap_or` (pedantic), which the `-D warnings` gate rejects.
+    let main = std::fs::metadata(db).map_or(0, |m| m.len());
+    let side: u64 = ["-wal", "-shm"]
+        .iter()
+        .map(|suffix| {
+            let mut p = db.as_os_str().to_os_string();
+            p.push(suffix);
+            std::fs::metadata(p).map_or(0, |m| m.len())
+        })
+        .sum();
+    main + side
+}
+
+/// One-line summary for a completed vacuum. `after >= before` (VACUUM can grow
+/// an already-compact file slightly) reports `(already compact)` rather than a
+/// zero or negative delta.
+fn vacuum_summary(path: &Path, before: u64, after: u64) -> String {
+    let reclaimed = before.saturating_sub(after);
+    if reclaimed == 0 {
+        format!(
+            "vacuumed {}: {} (already compact)",
+            path.display(),
+            HumanBytes(after)
+        )
+    } else {
+        format!(
+            "vacuumed {}: {} → {} (reclaimed {})",
+            path.display(),
+            HumanBytes(before),
+            HumanBytes(after),
+            HumanBytes(reclaimed)
+        )
+    }
+}
+
+/// Compact the SQLite store at `db`. Best-effort: a store in use (a live mount
+/// or a running scan) surfaces `DbError::StoreInUse`'s actionable message.
+pub fn run_vacuum(db: &Path) -> Result<()> {
+    if !db.exists() {
+        anyhow::bail!("database not found: {} (nothing to vacuum)", db.display());
+    }
+    let before = store_footprint(db);
+    let store = Db::open(db).with_context(|| format!("opening store {}", db.display()))?;
+    store.vacuum()?;
+    let after = store_footprint(db);
+    println!("{}", vacuum_summary(db, before, after));
+    Ok(())
+}
+
 /// Print a sample of the paths a `mount --dry-run` would expose, walking the
 /// already-built virtual tree so the preview reflects the exact rendering the
 /// real mount uses.
@@ -605,6 +667,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             })
         }
         Command::Mount(args) => run_mount(&args).map(|()| ExitCode::SUCCESS),
+        Command::Vacuum { db } => run_vacuum(&db).map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -735,6 +798,7 @@ mod tests {
                 assert_eq!(targets, vec![PathBuf::from("/m")]);
             }
             Command::Mount(..) => panic!("expected Scan"),
+            Command::Vacuum { .. } => unreachable!(),
         }
     }
 
@@ -745,6 +809,7 @@ mod tests {
         match cli.command {
             Command::Scan { quiet, .. } => assert!(!quiet),
             Command::Mount(..) => panic!("expected Scan"),
+            Command::Vacuum { .. } => unreachable!(),
         }
         for arg in ["--quiet", "-q"] {
             let cli =
@@ -752,6 +817,7 @@ mod tests {
             match cli.command {
                 Command::Scan { quiet, .. } => assert!(quiet),
                 Command::Mount(..) => panic!("expected Scan"),
+                Command::Vacuum { .. } => unreachable!(),
             }
         }
     }
@@ -773,6 +839,7 @@ mod tests {
                 follow_symlinks, ..
             } => assert!(follow_symlinks),
             Command::Mount(..) => panic!("expected scan command"),
+            Command::Vacuum { .. } => unreachable!(),
         }
     }
 
@@ -785,6 +852,7 @@ mod tests {
                 follow_symlinks, ..
             } => assert!(!follow_symlinks),
             Command::Mount(..) => panic!("expected scan command"),
+            Command::Vacuum { .. } => unreachable!(),
         }
     }
 
@@ -805,6 +873,7 @@ mod tests {
                 );
             }
             Command::Mount(..) => panic!("expected Scan"),
+            Command::Vacuum { .. } => unreachable!(),
         }
     }
 
@@ -1061,5 +1130,55 @@ mod tests {
         };
         let (_config, fuse_config) = parse_mount_config(&args);
         assert!(fuse_config.allow_other);
+    }
+
+    #[test]
+    fn vacuum_command_parses_db_path() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "vacuum", "--db", "/tmp/x.db"]).unwrap();
+        let Command::Vacuum { db } = cli.command else {
+            panic!("expected Vacuum");
+        };
+        assert_eq!(db, PathBuf::from("/tmp/x.db"));
+    }
+
+    #[test]
+    fn run_vacuum_errors_on_missing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.db");
+        assert!(run_vacuum(&missing).is_err());
+    }
+
+    #[test]
+    fn run_vacuum_compacts_a_bloated_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.db");
+        {
+            let db = musefs_db::Db::open(&path).unwrap();
+            for i in 0..16u8 {
+                db.upsert_art(&musefs_db::NewArt {
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    data: vec![i; 256 * 1024],
+                })
+                .unwrap();
+            }
+            assert_eq!(db.gc_orphan_art().unwrap(), 16);
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+        run_vacuum(&path).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before, "expected shrink: {before} -> {after}");
+    }
+
+    #[test]
+    fn vacuum_summary_reports_reclaimed_then_compact() {
+        let p = Path::new("/x.db");
+        assert!(vacuum_summary(p, 1000, 400).contains("reclaimed"));
+        // Equal sizes => already compact.
+        assert!(vacuum_summary(p, 400, 400).contains("already compact"));
+        // VACUUM can grow a tiny file; saturating delta must not go negative.
+        assert!(vacuum_summary(p, 400, 410).contains("already compact"));
     }
 }
