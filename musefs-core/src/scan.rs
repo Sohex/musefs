@@ -314,6 +314,13 @@ fn collect_audio_inner(
                     log::warn!("skipping broken symlink {}: {e}", path.display());
                 }
             }
+        } else {
+            // A direct special file (FIFO, char/block device, socket) — not a
+            // file, dir, or symlink. The audio invariant is unaffected (it is
+            // never opened), but tally it so it surfaces in the skip breakdown
+            // rather than vanishing without a trace, matching unsupported
+            // regular files above (#544).
+            tally.record(&path);
         }
     }
     Ok(())

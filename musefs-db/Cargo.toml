@@ -13,6 +13,7 @@ repository.workspace = true
 base16ct = "1.0"
 # fallible_uint enables the checked FromSql/ToSql impls for u64/usize, which
 # validate non-negative row columns at the boundary (the cast-convention spec).
+log = "0.4"
 rusqlite = { version = "0.40", features = ["bundled", "blob", "fallible_uint"] }
 sha2 = "0.11"
 strum = { version = "0.28", features = ["derive"] }

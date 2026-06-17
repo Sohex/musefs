@@ -441,14 +441,24 @@ impl Musefs {
         let cap = self.readahead_pool.per_stream_cap();
         let (start, window) = br.prefetch_plan();
         let depth = crate::readahead::prefetch_depth(cap, window);
-        let (starts, upto) = crate::readahead::plan_prefetch(
-            h.prefetched_upto.load(Ordering::Relaxed),
-            start,
-            window,
-            depth,
-            backing_len,
-        );
-        h.prefetched_upto.store(upto, Ordering::Relaxed);
+        // Publish the advanced watermark with a CAS rather than a non-atomic
+        // load-plan-store: FUSE dispatches reads on one fh concurrently across
+        // workers, so two reads observing the same `prefetched_upto` would both
+        // plan and enqueue the same windows (duplicate preads), and a plain
+        // `store` could clobber a more-advanced watermark from the other read.
+        // On contention, re-plan against the watermark the winner published so
+        // we enqueue only the still-unclaimed tail (#550).
+        let starts = loop {
+            let prev = h.prefetched_upto.load(Ordering::Relaxed);
+            let (starts, upto) =
+                crate::readahead::plan_prefetch(prev, start, window, depth, backing_len);
+            if h.prefetched_upto
+                .compare_exchange_weak(prev, upto, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break starts;
+            }
+        };
         if starts.is_empty() {
             return Ok(());
         }
@@ -572,11 +582,45 @@ impl Musefs {
             }
         }
         // Fallback (no prior open, or unknown handle): resolve by inode and open.
+        // Bounded retry mirrors the handle fast path: a refresh or same-track
+        // re-tag landing between the resolve and the snapshot's content_version
+        // recheck makes `read_at_into` return a retryable `BackingChanged`;
+        // re-resolving (a cheap content_version-cache hit when unchanged) picks
+        // up the new version and re-serves transparently, rather than mapping a
+        // perfectly servable file to a spurious EIO (#541). A genuine backing
+        // drift re-resolves to the same stale stamp and surfaces after the bound.
         let track_id = self.track_id_for(inode)?;
-        self.pool.with(|db| {
-            let resolved = self.cache.resolve(db, track_id)?;
-            read_at_into(&resolved, db, offset, size, out)
-        })
+        let mut last = None;
+        for _attempt in 0..4 {
+            out.clear();
+            // A test seam forces the first N attempts stale to drive the
+            // retry-exhaustion path deterministically; compiled out of release.
+            #[cfg(test)]
+            let forced = self
+                .force_version_mismatch
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok();
+            #[cfg(not(test))]
+            let forced = false;
+            let r = self.pool.with(|db| -> Result<()> {
+                let resolved = self.cache.resolve(db, track_id)?;
+                if forced {
+                    return Err(CoreError::BackingChanged(
+                        resolved.backing_path.to_string_lossy().into_owned(),
+                    ));
+                }
+                read_at_into(&resolved, db, offset, size, out)
+            });
+            match r {
+                Ok(()) => return Ok(()),
+                // Stale layout under the race — re-resolve next iteration.
+                Err(e @ CoreError::BackingChanged(_)) => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        // Pathological constant re-tagging raced every attempt; surface the
+        // retryable error rather than risk wrong bytes.
+        Err(last.expect("the retry loop runs at least once"))
     }
 
     /// Allocating form of `read_into`.
@@ -614,6 +658,8 @@ impl Musefs {
         let generation = self.refresh_gen.load(Ordering::Acquire);
         let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
         crate::metrics::on_open();
+        // Opens the semi-trusted DB path verbatim — see the trust-boundary note
+        // on `ResolvedFile::backing_path` in `HeaderCache::build` (#551).
         let file = Arc::new(
             std::fs::File::open(&resolved.backing_path)
                 .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?,

@@ -988,6 +988,7 @@ name = "musefs-db"
 version = "1.0.0"
 dependencies = [
  "base16ct",
+ "log",
  "rusqlite",
  "sha2",
  "strum",

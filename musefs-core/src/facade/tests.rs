@@ -455,6 +455,88 @@ fn same_track_retag_storm_exhausts_read_retry_into_backing_changed() {
     fs.release_handle(fh);
 }
 
+/// The stateless fallback path (`read` with no open handle — a freshly
+/// looked-up inode) must absorb a mid-read `content_version` race the same way
+/// the handle fast path does: re-resolve and re-serve up to the bound rather
+/// than surfacing a spurious `BackingChanged`/EIO for a perfectly servable
+/// file. Three forced misses still serve on the final attempt; a fourth
+/// exhausts the loop and errors. (#541)
+#[test]
+fn no_handle_fallback_retries_content_version_race_before_backing_changed() {
+    use crate::scan::scan_directory;
+    use id3::frame::{Content, Unknown};
+    use id3::{Encoder, Frame, TagLike, Version};
+    use std::collections::BTreeMap;
+
+    let needle = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut tag = id3::Tag::new();
+        tag.add_frame(Frame::with_content(
+            "PRIV",
+            Content::Unknown(Unknown {
+                data: needle.to_vec(),
+                version: Version::Id3v24,
+            }),
+        ));
+        let mut bytes = Vec::new();
+        Encoder::new()
+            .version(Version::Id3v24)
+            .encode(&tag, &mut bytes)
+            .unwrap();
+        bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00, 0, 0, 0, 0]);
+        std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+    }
+
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+    let cfg = MountConfig {
+        template: "$artist/$title".to_string(),
+        fallbacks: BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
+        read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
+        skip_on_missing: false,
+    };
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+
+    let artist = fs
+        .lookup(VirtualTree::ROOT, "Unknown")
+        .expect("fallback artist dir");
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+
+    // No `open_handle` — every read here exercises the stateless fallback.
+    let baseline = fs.read(file_inode, None, 0, 1 << 20).unwrap();
+    assert!(
+        baseline.windows(needle.len()).any(|w| w == needle),
+        "baseline fallback read must serve the binary-tag layout"
+    );
+
+    // bound-1 forced misses: the fallback retries and serves on the final attempt.
+    fs.force_version_mismatches_for_test(3);
+    let after_three = fs
+        .read(file_inode, None, 0, 1 << 20)
+        .expect("three retries must still serve on the final attempt");
+    assert_eq!(after_three, baseline);
+
+    // One miss per attempt: the loop exhausts and surfaces the retryable error.
+    fs.force_version_mismatches_for_test(4);
+    match fs.read(file_inode, None, 0, 1 << 20) {
+        Err(CoreError::BackingChanged(_)) => {}
+        other => panic!("exhausted fallback retry must return BackingChanged, got {other:?}"),
+    }
+
+    // Seam drained: the fallback serves again.
+    let recovered = fs.read(file_inode, None, 0, 1 << 20).unwrap();
+    assert_eq!(recovered, baseline, "fallback must recover after the storm");
+}
+
 #[test]
 fn render_entries_returns_paths_and_snapshot() {
     use crate::scan::scan_directory;

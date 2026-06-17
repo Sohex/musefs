@@ -348,6 +348,16 @@ impl HeaderCache {
             total_len,
             track_id: track.id,
             content_version: track.content_version,
+            // Trust boundary: `backing_path` is taken verbatim from the DB row
+            // and later opened with default flags (O_RDONLY, symlinks followed)
+            // at the serve sites below. The external-writer store contract
+            // treats the DB as semi-trusted, so a buggy/hostile writer could
+            // point this at an arbitrary path the mount uid can read. There is
+            // deliberately no realpath/containment check here: musefs has no
+            // serve-time library-root to contain against, and the audio-bytes
+            // invariant (served bytes are byte-identical to the named file)
+            // still holds — the served bytes are simply *some* file's, not a
+            // guaranteed-intended one. Documented, not enforced (#551).
             backing_path: PathBuf::from(&track.backing_path),
             stamp: BackingStamp::from_track(track),
             mtime_secs: mtime_secs_val,
@@ -401,6 +411,8 @@ pub fn read_at_into<M>(
     // via `validate_opened_backing`; this stateless fallback must too.
     let file = if needs_file {
         crate::metrics::on_open();
+        // Opens the semi-trusted DB path verbatim — see the trust-boundary note
+        // on `ResolvedFile::backing_path` in `HeaderCache::build` (#551).
         let f = std::fs::File::open(&resolved.backing_path)
             .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
         let f_meta = f
