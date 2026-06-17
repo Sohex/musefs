@@ -291,6 +291,15 @@ exclude_re = [
     # (infinite loop). Like the SP2 tree.rs timeouts, it can only ever flag via the
     # timeout budget. The sole `-=` in its function, so anchored line-agnostically.
     'musefs-core/src/ogg_index\.rs:\d+:\d+: replace -= with /= in find_page_start',
+    # First-page fast-path bound `abs_target.saturating_sub(audio_offset) < 4`,
+    # `<`->`<=`: the only difference is at `delta == 4`, where `<=` shortcuts to
+    # `audio_offset` while `<` falls through to the backward scan — but a 4-byte
+    # window holds the `OggS` capture and CRC-validates the first page, so the scan
+    # also returns `audio_offset`. The served bytes are identical either way, so the
+    # mutant is equivalent and unkillable (#537). Pinned by line:col — the other `<`
+    # in this fn (the memo range check) IS caught.
+    # guard: op="<" fn="find_page_start" rows=1
+    'musefs-core/src/ogg_index\.rs:74:48: replace < with <= in find_page_start',
     # Overlap-emit guards `if hs < he` / `if ps < pe`, `<`->`<=`: when the bound is
     # equal the extra branch emits an empty `[a..b]` slice / reads 0 payload bytes —
     # a no-op, so the served output is byte-identical (verified: the ogg tests and the
