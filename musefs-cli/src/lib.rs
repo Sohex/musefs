@@ -437,6 +437,7 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     let db =
         Db::open(&args.db).with_context(|| format!("opening database at {}", args.db.display()))?;
     let (config, fuse_config) = parse_mount_config(args);
+    let template = config.template.clone();
     for (flag, mode) in [("file-mode", args.file_mode), ("dir-mode", args.dir_mode)] {
         if let Some(w) = mode.and_then(|m| write_bit_warning(flag, m)) {
             eprintln!("warning: {w}");
@@ -448,6 +449,14 @@ pub fn run_mount(args: &MountArgs) -> Result<()> {
     }
     signal::install_unmount_on_signal(args.mountpoint.clone())
         .context("installing the stop-signal unmount handler")?;
+    // The "is it serving the right library?" context, alongside the mount-success
+    // line `mount_with` emits with the file/dir counts (#522).
+    log::info!(
+        "serving database {} at {} (template {:?})",
+        args.db.display(),
+        args.mountpoint.display(),
+        template,
+    );
     musefs_fuse::mount_with(core, &args.mountpoint, "musefs", fuse_config).map_err(|e| {
         // A bare EACCES from fusermount3 (e.g. an AppArmor-denied prefix) is
         // otherwise opaque. Append actionable guidance — but not when the

@@ -123,7 +123,9 @@ struct SizeEntry {
 }
 
 fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Result<()> {
-    let meta = file.metadata()?;
+    let meta = file
+        .metadata()
+        .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
     if BackingStamp::from_metadata(&meta) != resolved.stamp {
         return Err(CoreError::BackingChanged(
             resolved.backing_path.to_string_lossy().into_owned(),
@@ -340,7 +342,8 @@ impl Musefs {
                 // getattr advertise stale attrs — the one metadata surface that
                 // could outrun a backing change (read/open already re-stat).
                 crate::metrics::on_stat();
-                let meta = std::fs::metadata(&backing_path)?;
+                let meta = std::fs::metadata(&backing_path)
+                    .map_err(|err| CoreError::backing_io(&backing_path, err))?;
                 if BackingStamp::from_metadata(&meta) != e.stamp {
                     return Err(CoreError::BackingChanged(backing_path));
                 }
@@ -392,7 +395,7 @@ impl Musefs {
     fn serve_backing<M>(
         &self,
         h: &Handle,
-        db: &musefs_db::Db<M>,
+        db: Option<&musefs_db::Db<M>>,
         r: &ResolvedFile,
         offset: u64,
         size: u64,
@@ -510,11 +513,11 @@ impl Musefs {
                     // unchanged, so this is the only check that catches it. A
                     // genuine drift is terminal — propagate, don't retry the loop.
                     validate_opened_backing(&h.file, r)?;
-                    let served = self.pool.with(|db| -> Result<Option<()>> {
-                        if r.streams_db_rowid {
-                            // Snapshot-consistent: version check + DB-rowid reads
-                            // (binary tags AND art) see one WAL snapshot, so a
-                            // reused rowid can't be served mid-read (#502).
+                    let served = if r.streams_db_rowid {
+                        // Snapshot-consistent: version check + DB-rowid reads
+                        // (binary tags AND art) see one WAL snapshot, so a reused
+                        // rowid can't be served mid-read (#502).
+                        self.pool.with(|db| -> Result<Option<()>> {
                             db.begin_read()?;
                             let res = (|| {
                                 // A test seam forces the first N checks stale to
@@ -534,16 +537,20 @@ impl Musefs {
                                 {
                                     return Ok(None); // stale layout — retry after re-resolve
                                 }
-                                self.serve_backing(&h, db, r, offset, size, out)?;
+                                self.serve_backing(&h, Some(db), r, offset, size, out)?;
                                 Ok(Some(()))
                             })();
                             let _ = db.end_read(); // always release the snapshot
                             res
-                        } else {
-                            self.serve_backing(&h, db, r, offset, size, out)?;
-                            Ok(Some(()))
-                        }
-                    })?;
+                        })?
+                    } else {
+                        // No DB-backed segment (the steady state once the header is
+                        // served, where the remainder is a single backing/Ogg-audio
+                        // segment): the read is pure positioned backing I/O and never
+                        // touches the connection, so skip the pool lookup+lock (#520).
+                        self.serve_backing::<musefs_db::ReadOnly>(&h, None, r, offset, size, out)?;
+                        Some(())
+                    };
                     if served.is_some() {
                         return Ok(());
                     }
@@ -607,7 +614,10 @@ impl Musefs {
         let generation = self.refresh_gen.load(Ordering::Acquire);
         let resolved = self.pool.with(|db| self.cache.resolve(db, track_id))?;
         crate::metrics::on_open();
-        let file = Arc::new(std::fs::File::open(&resolved.backing_path)?);
+        let file = Arc::new(
+            std::fs::File::open(&resolved.backing_path)
+                .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?,
+        );
         validate_opened_backing(&file, &resolved)?;
         let key = self.handles.insert(Arc::new(Handle {
             track_id,
@@ -670,6 +680,13 @@ impl Musefs {
     /// The mount's serving mode (how file contents are produced).
     pub fn mode(&self) -> Mode {
         self.config.mode
+    }
+
+    /// `(files, directories)` in the current virtual tree — the operator's
+    /// "is it serving the right library?" answer, surfaced on a successful
+    /// mount so an empty or wrong DB is not silent (#522).
+    pub fn entry_counts(&self) -> (u64, u64) {
+        self.tree.load().entry_counts()
     }
 
     /// Snapshot the core-owned telemetry for the `.musefs-metrics` surface (#394).
