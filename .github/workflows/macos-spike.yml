@@ -37,7 +37,8 @@ jobs:
           # fuser 0.17 macOS path only ever probes `fuse` (libfuse2). fuse-t ships
           # no fuse.pc, so alias it to fuse-t's lib and see if the libfuse2 ABI links.
           sed -i '' 's/"macos-no-mount"/"libfuse"/' musefs-fuse/Cargo.toml
-          cat > /usr/local/lib/pkgconfig/fuse.pc <<'PC'
+          # /usr/local/lib/pkgconfig is root-owned (fuse-t sudo-installs); tee as root.
+          sudo tee /usr/local/lib/pkgconfig/fuse.pc >/dev/null <<'PC'
           prefix=/usr/local
           libdir=${prefix}/lib
           includedir=${prefix}/include
