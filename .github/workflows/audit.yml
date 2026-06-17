@@ -7,11 +7,13 @@ on:
     paths:
       - '**/Cargo.toml'
       - 'Cargo.lock'
+      - 'fuzz/Cargo.lock'
       - '.github/workflows/audit.yml'
   pull_request:
     paths:
       - '**/Cargo.toml'
       - 'Cargo.lock'
+      - 'fuzz/Cargo.lock'
       - '.github/workflows/audit.yml'
 
 jobs:
@@ -28,3 +30,14 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      # audit-check above scans only the root Cargo.lock. The fuzz crate is a
+      # separate workspace (root Cargo.toml: exclude = ["fuzz"]) carrying its own
+      # pinned fuzz/Cargo.lock, so a RUSTSEC advisory or yanked crate there is
+      # invisible to both this job and the ci.yml cargo-deny gate. Re-run the root
+      # deny.toml advisory + yanked checks against the fuzz lockfile (metadata
+      # only, no build). Pinned to the same 0.19 line as the ci.yml deny job.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - name: Scan fuzz lockfile (advisories + yanked)
+        run: |
+          cargo install cargo-deny --locked --version '^0.19'
+          cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories
