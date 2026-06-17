@@ -507,6 +507,7 @@ def test_prune_deleted_album_removes_matching_rows(db_path, tmp_path):
     from musefs_common.store import replace_tags
     from musefs_lidarr.events import EventType, LidarrEvent
     from musefs_lidarr.import_link import LinkMode
+    from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
     from musefs_lidarr.sync import SyncConfig, prune_deleted
 
     backing = tmp_path / "a.flac"
@@ -523,8 +524,8 @@ def test_prune_deleted_album_removes_matching_rows(db_path, tmp_path):
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
             "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/b.flac', 'flac', 0, 0, 0, 0, 0)",
         ).lastrowid
-        replace_tags(conn, a, [("musicbrainz_albumid", "rg-1")])
-        replace_tags(conn, b, [("musicbrainz_albumid", "rg-2")])
+        replace_tags(conn, a, [("musicbrainz_albumid", "rg-1"), (MANAGED_KEY, MANAGED_VALUE)])
+        replace_tags(conn, b, [("musicbrainz_albumid", "rg-2"), (MANAGED_KEY, MANAGED_VALUE)])
         conn.commit()
     finally:
         conn.close()
@@ -550,6 +551,7 @@ def test_prune_deleted_artist_removes_all_artist_rows(db_path):
     from musefs_common.store import replace_tags
     from musefs_lidarr.events import EventType, LidarrEvent
     from musefs_lidarr.import_link import LinkMode
+    from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
     from musefs_lidarr.sync import SyncConfig, prune_deleted
 
     conn = connect(db_path)
@@ -561,7 +563,7 @@ def test_prune_deleted_artist_removes_all_artist_rows(db_path):
                 "backing_size, backing_mtime_ns, updated_at) VALUES (?, 'flac', 0, 0, 0, 0, 0)",
                 (f"/m/{i}.flac",),
             ).lastrowid
-            replace_tags(conn, tid, [("musicbrainz_artistid", art)])
+            replace_tags(conn, tid, [("musicbrainz_artistid", art), (MANAGED_KEY, MANAGED_VALUE)])
             ids.append(tid)
         conn.commit()
     finally:
@@ -572,3 +574,114 @@ def test_prune_deleted_artist_removes_all_artist_rows(db_path):
         event_type=EventType.ARTIST_DELETED, raw_type="ArtistDeleted", artist_mbid="art-1"
     )
     assert prune_deleted(config=config, event=event) == 2
+
+
+def test_prune_deleted_spares_unmanaged_scanner_seeded_mbid(db_path):
+    # A track that carries the deleted album's MBID only from its own native
+    # tags (scanner-seeded, never managed by Lidarr) must survive a Lidarr
+    # delete event — prune_deleted is scoped to the ownership marker (#546).
+    from musefs_common import connect
+    from musefs_common.store import replace_tags
+    from musefs_lidarr.events import EventType, LidarrEvent
+    from musefs_lidarr.import_link import LinkMode
+    from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
+    from musefs_lidarr.sync import SyncConfig, prune_deleted
+
+    conn = connect(db_path)
+    try:
+        managed = conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
+            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/managed.flac', 'flac', "
+            "0, 0, 0, 0, 0)"
+        ).lastrowid
+        unmanaged = conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
+            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/unmanaged.flac', 'flac', "
+            "0, 0, 0, 0, 0)"
+        ).lastrowid
+        replace_tags(
+            conn, managed, [("musicbrainz_albumid", "rg-1"), (MANAGED_KEY, MANAGED_VALUE)]
+        )
+        replace_tags(conn, unmanaged, [("musicbrainz_albumid", "rg-1")])  # no marker
+        conn.commit()
+    finally:
+        conn.close()
+
+    config = SyncConfig(db_path=db_path, link_mode=LinkMode.SYMLINK)
+    event = LidarrEvent(
+        event_type=EventType.ALBUM_DELETED, raw_type="AlbumDeleted", album_mbid="rg-1"
+    )
+
+    assert prune_deleted(config=config, event=event) == 1
+    conn = connect(db_path)
+    try:
+        ids = {row[0] for row in conn.execute("SELECT id FROM tracks")}
+        assert ids == {unmanaged}  # only the Lidarr-managed row was deleted
+    finally:
+        conn.close()
+
+
+def test_prune_deleted_refuses_on_schema_mismatch(db_path):
+    # The most dangerous (row-removing) path must honour the schema guard: an
+    # out-of-date plugin must not mass-delete a store it cannot understand (#545).
+    import pytest
+    from musefs_common import connect
+    from musefs_common.errors import SchemaMismatch
+    from musefs_common.store import replace_tags
+    from musefs_lidarr.events import EventType, LidarrEvent
+    from musefs_lidarr.import_link import LinkMode
+    from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
+    from musefs_lidarr.sync import SyncConfig, prune_deleted
+
+    conn = connect(db_path)
+    try:
+        tid = conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
+            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/a.flac', 'flac', "
+            "0, 0, 0, 0, 0)"
+        ).lastrowid
+        replace_tags(conn, tid, [("musicbrainz_albumid", "rg-1"), (MANAGED_KEY, MANAGED_VALUE)])
+        conn.execute("PRAGMA user_version = 99999")  # diverged schema
+        conn.commit()
+    finally:
+        conn.close()
+
+    config = SyncConfig(db_path=db_path, link_mode=LinkMode.SYMLINK)
+    event = LidarrEvent(
+        event_type=EventType.ALBUM_DELETED, raw_type="AlbumDeleted", album_mbid="rg-1"
+    )
+    with pytest.raises(SchemaMismatch):
+        prune_deleted(config=config, event=event)
+
+    conn = connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_sync_rename_prune_refuses_on_schema_mismatch(db_path, make_track, tmp_path):
+    import pytest
+    from musefs_common import connect
+    from musefs_common.errors import SchemaMismatch
+    from musefs_lidarr.import_link import LinkMode
+    from musefs_lidarr.sync import SyncConfig, sync_rename_prune
+
+    old_path = tmp_path / "old.flac"  # never created == missing == would prune
+    make_track(str(old_path))
+    conn = connect(db_path)
+    try:
+        conn.execute("PRAGMA user_version = 99999")
+        conn.commit()
+    finally:
+        conn.close()
+
+    config = SyncConfig(db_path=db_path, link_mode=LinkMode.HARDLINK)
+    with pytest.raises(SchemaMismatch):
+        sync_rename_prune(config=config, previous_paths=[str(old_path)])
+
+    conn = connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 1
+    finally:
+        conn.close()

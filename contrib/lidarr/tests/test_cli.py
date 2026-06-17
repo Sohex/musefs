@@ -254,6 +254,7 @@ def test_sync_cli_album_deleted_prunes_without_api(tmp_path, capsys):
     from musefs_common.schema import SCHEMA_SQL
     from musefs_common.store import replace_tags
     from musefs_lidarr.cli_sync import run
+    from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
 
     db = tmp_path / "musefs.db"
     raw = sqlite3.connect(str(db))
@@ -267,7 +268,7 @@ def test_sync_cli_album_deleted_prunes_without_api(tmp_path, capsys):
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
             "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/a.flac', 'flac', 0, 0, 0, 0, 0)"
         ).lastrowid
-        replace_tags(conn, tid, [("musicbrainz_albumid", "rg-1")])
+        replace_tags(conn, tid, [("musicbrainz_albumid", "rg-1"), (MANAGED_KEY, MANAGED_VALUE)])
         conn.commit()
     finally:
         conn.close()

@@ -24,7 +24,7 @@ from musefs_common import (
 from .errors import ConfigError, LidarrApiError
 from .events import EventType, LidarrEvent
 from .import_link import LinkMode, parse_link_mode
-from .mapping import _album_cover_url, records_for_paths
+from .mapping import MANAGED_KEY, MANAGED_VALUE, _album_cover_url, records_for_paths
 
 
 @dataclass(frozen=True)
@@ -185,6 +185,7 @@ def sync_rename_prune(*, config: SyncConfig, previous_paths: list[str]) -> int:
     previous_keys = [realpath_key(path) for path in previous_paths]
     conn = connect(config.db_path)
     try:
+        check_schema_version(conn)  # never prune a store schema we don't understand (#545)
         ids = track_ids_for_paths(conn, previous_keys)
         pruned = prune_missing(conn, list(ids.values()))
         conn.commit()
@@ -204,6 +205,12 @@ def prune_deleted(*, config: SyncConfig, event: LidarrEvent) -> int:
     matching the stored ``musicbrainz_albumid`` / ``musicbrainz_artistid`` tag
     against the id Lidarr reports in the delete event. Returns the count deleted.
 
+    Deletion is scoped to rows this plugin actually wrote, identified by the
+    ``MANAGED_KEY`` ownership marker (#546): a ``musicbrainz_albumid`` the
+    *scanner* seeded from a file's own native tags is an indistinguishable text
+    tag, and an unrelated Lidarr delete must not cascade away an unmanaged
+    track's metadata.
+
     The caller guarantees the relevant MBID is present (see ``cli_sync``); an
     album event matches ``musicbrainz_albumid``, an artist event
     ``musicbrainz_artistid``.
@@ -215,7 +222,10 @@ def prune_deleted(*, config: SyncConfig, event: LidarrEvent) -> int:
 
     conn = connect(config.db_path)
     try:
-        deleted = delete_tracks(conn, track_ids_by_tag(conn, key, value))
+        check_schema_version(conn)  # never delete from a store schema we don't understand (#545)
+        managed = set(track_ids_by_tag(conn, MANAGED_KEY, MANAGED_VALUE))
+        matched = track_ids_by_tag(conn, key, value)
+        deleted = delete_tracks(conn, [tid for tid in matched if tid in managed])
         conn.commit()
         return deleted
     except Exception:
