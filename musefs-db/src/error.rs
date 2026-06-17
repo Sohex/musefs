@@ -22,6 +22,8 @@ pub enum DbError {
          (max {supported}); upgrade musefs to read this store"
     )]
     StoreTooNew { found: i64, supported: i64 },
+    #[error("the store is in use — unmount the filesystem or stop any scan before vacuuming")]
+    StoreInUse(#[source] rusqlite::Error),
     #[error("{table}.{field} length {len} exceeds the {max} cap (crafted or corrupt DB)")]
     FieldTooLarge {
         table: &'static str,
