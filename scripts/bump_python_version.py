@@ -3,9 +3,10 @@
 
 Single source of truth for the unified Python package version (decoupled from
 the Rust workspace version). Rewrites every pyproject.toml version, the
-__version__ in the packages that carry one, the python-musefs dependency floor
-in the dependents, and re-vendors python-musefs into the Picard plugin so the
-vendored copy's __version__ stays in lockstep. Does not commit or tag.
+__version__ in the packages that carry one, the Picard PLUGIN_VERSION constant,
+the pinned versions in the version-tripwire tests, the python-musefs dependency
+floor in the dependents, and re-vendors python-musefs into the Picard plugin so
+the vendored copy's __version__ stays in lockstep. Does not commit or tag.
 
 Usage: python scripts/bump_python_version.py <version>
 """
@@ -34,10 +35,23 @@ DEPENDENTS = [
     "contrib/lidarr/pyproject.toml",
 ]
 VENDOR_SCRIPT = "contrib/python-musefs/vendor_to_picard.py"
+# The Picard plugin carries its own PLUGIN_VERSION constant (shown in Picard's
+# plugin manager), separate from its pyproject version.
+PLUGIN_VERSION_FILES = [
+    "contrib/picard/musefs/__init__.py",
+]
+# Tests that pin the released __version__ as a drift tripwire; bumped in lockstep
+# so a release does not leave them asserting the old version.
+TEST_VERSION_FILES = [
+    "contrib/lidarr/tests/test_smoke.py",
+    "contrib/python-musefs/tests/test_public_api.py",
+]
 
 _VERSION_RE = re.compile(r'(?m)^version = "[^"]*"')
 _INIT_VERSION_RE = re.compile(r'(?m)^__version__ = "[^"]*"')
 _DEP_FLOOR_RE = re.compile(r"python-musefs>=[^\"]*")
+_PLUGIN_VERSION_RE = re.compile(r'(?m)^PLUGIN_VERSION = "[^"]*"')
+_TEST_VERSION_RE = re.compile(r'__version__ == "[^"]*"')
 _PEP440_RE = re.compile(r"^[0-9]+(\.[0-9]+)*((?:a|b|c|rc)[0-9]+|\.[a-z0-9.]+)?$")
 
 
@@ -90,6 +104,30 @@ def set_dep_floor(text: str, version: str) -> str:
     return new
 
 
+def set_plugin_version(text: str, version: str) -> str:
+    """Replace the module-level ``PLUGIN_VERSION`` string via ``_PLUGIN_VERSION_RE``.
+
+    Raises ``ValueError`` if no ``PLUGIN_VERSION`` line is present.
+    """
+    new, n = _PLUGIN_VERSION_RE.subn(f'PLUGIN_VERSION = "{version}"', text, count=1)
+    if n != 1:
+        raise ValueError("no PLUGIN_VERSION line found")
+    return new
+
+
+def set_test_version(text: str, version: str) -> str:
+    """Bump every pinned ``__version__ == "<v>"`` assertion to ``version``.
+
+    These hardcoded assertions are release tripwires that must move with the
+    bump. Replaces all matches of ``_TEST_VERSION_RE``. Raises ``ValueError`` if
+    no such assertion is present.
+    """
+    new, n = _TEST_VERSION_RE.subn(f'__version__ == "{version}"', text)
+    if n < 1:
+        raise ValueError("no __version__ == assertion found")
+    return new
+
+
 def bump(version: str, root: Path = REPO_ROOT, run_vendor: bool = True) -> None:
     for rel in PYPROJECTS:
         p = root / rel
@@ -100,6 +138,12 @@ def bump(version: str, root: Path = REPO_ROOT, run_vendor: bool = True) -> None:
     for rel in DEPENDENTS:
         p = root / rel
         p.write_text(set_dep_floor(p.read_text(), version))
+    for rel in PLUGIN_VERSION_FILES:
+        p = root / rel
+        p.write_text(set_plugin_version(p.read_text(), version))
+    for rel in TEST_VERSION_FILES:
+        p = root / rel
+        p.write_text(set_test_version(p.read_text(), version))
     if run_vendor:
         subprocess.run([sys.executable, str(root / VENDOR_SCRIPT)], check=True)
 

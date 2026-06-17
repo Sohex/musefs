@@ -3,5 +3,5 @@ from musefs_lidarr.errors import MusefsLidarrError
 
 
 def test_package_imports():
-    assert __version__ == "1.0.0"
+    assert __version__ == "1.1.0"
     assert str(MusefsLidarrError("problem")) == "problem"
