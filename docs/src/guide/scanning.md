@@ -8,24 +8,21 @@ any subcommand lists its flags.
 ```bash
 musefs scan /path/to/music --db library.db             # additive ingest
 musefs scan /path/to/music --db library.db --force     # reseed existing rows
-musefs revalidate /path/to/music --db library.db       # refresh Layer A only
-musefs revalidate /path/to/music --db library.db --prune
-                                                       # also delete gone rows
 ```
 
 `scan` probes each audio file (FLAC, MP3, M4A/M4B, Ogg, WAV), recording its
 audio byte range, tags, and embedded art in the store. Bare `scan` is
 additive: it leaves already tracked rows alone, while `--force` re-seeds
-existing rows from disk. `revalidate` is the maintenance pass: it refreshes
-changed rows' structural Layer A and preserves curated tags/art/binary tags;
-`--prune` is the only deletion path. It takes one or more files or directories,
-and `--jobs N` controls probe parallelism. `--follow-symlinks` walks symlinked
+existing rows from disk. (Refreshing already-tracked files and pruning gone
+ones is the job of `musefs revalidate` — see
+[Maintenance](maintenance.md#refreshing-the-store-musefs-revalidate).) It takes
+one or more files or directories, and `--jobs N` controls probe parallelism. `--follow-symlinks` walks symlinked
 files and directories (off by default, so symlinks are logged and skipped).
 `--quiet` (`-q`) suppresses the per-target summary for scripting; scan
 failures still surface on stderr (raise detail with `-v`/`-vv`, or
 `RUST_LOG=info`).
 
-`scan`, `scan --force`, and `revalidate` show a live progress indicator: on an
+`scan` (with or without `--force`) shows a live progress indicator: on an
 interactive terminal, a discovery spinner followed by a determinate bar
 (position, percent, ETA, current file); on a non-interactive stderr (piped or
 logged), throttled `ingested N/M (P%)` lines. `--quiet` (`-q`) suppresses the
@@ -56,11 +53,6 @@ failure rather than mounting an incomplete library. A successful scan exits `0`;
 a hard error (a missing target, an unreadable DB) still exits `1`. The exit code
 is the only machine-detectable signal; per-file failures otherwise surface only
 on stderr.
-
-`revalidate` skips unchanged files — **preserving any tag edits you made in the
-store** — and refreshes changed files' structural data. It ignores files that
-are new to the DB, and it only prunes tracks whose backing file is gone when
-`--prune` is set; orphaned art is garbage-collected in that pruning mode.
 
 ### Content checksums and move re-identification
 
