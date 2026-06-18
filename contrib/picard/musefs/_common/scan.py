@@ -24,6 +24,12 @@ def run_scan(binary, db_path, target, *, revalidate=False, force=False, prune=Fa
         targets = [target]
     else:
         targets = list(target)
+    if not targets:
+        raise ValueError("run_scan: at least one target is required")
+    if revalidate and force:
+        raise ValueError("run_scan: force is incompatible with revalidate")
+    if prune and not revalidate:
+        raise ValueError("run_scan: prune requires revalidate")
     display = str(targets[0]) if len(targets) == 1 else f"{len(targets)} target(s)"
     if revalidate:
         argv = [binary, "revalidate", *(str(t) for t in targets), "--db", str(db_path)]

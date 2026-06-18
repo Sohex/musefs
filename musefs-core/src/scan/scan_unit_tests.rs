@@ -519,7 +519,10 @@ fn refresh_structural_into_preserves_tags_and_art() {
             height: 1,
             data: vec![1, 2, 3],
         }],
-        binary_tags: vec![],
+        binary_tags: vec![EmbeddedBinaryTag {
+            key: "APPLICATION".into(),
+            payload: vec![1, 2, 3],
+        }],
         structural_blocks: vec![("STREAMINFO".into(), vec![1, 2, 3])],
     };
     ingest_into(&db, "/m/a.flac", stamp, seeded, None, None).unwrap();
@@ -538,7 +541,10 @@ fn refresh_structural_into_preserves_tags_and_art() {
             height: 2,
             data: vec![9, 9, 9],
         }],
-        binary_tags: vec![],
+        binary_tags: vec![EmbeddedBinaryTag {
+            key: "APPLICATION".into(),
+            payload: vec![9, 9, 9, 9, 9],
+        }],
         structural_blocks: vec![("STREAMINFO".into(), vec![9, 9, 9])],
     };
     let stamp2 = BackingStamp {
@@ -573,6 +579,16 @@ fn refresh_structural_into_preserves_tags_and_art() {
     assert_eq!(art.len(), 1);
     assert_eq!(art[0].description, "Original art");
     assert_eq!(art[0].ordinal, 0);
+
+    // Curated binary tags survive untouched: the original 3-byte APPLICATION
+    // payload, not the 5-byte one in `changed`.
+    let binary = db.get_binary_tags(id).unwrap();
+    assert_eq!(binary.len(), 1, "binary tag preserved");
+    assert_eq!(binary[0].key, "APPLICATION");
+    assert_eq!(
+        binary[0].byte_len, 3,
+        "original binary payload kept, not rewritten"
+    );
 }
 
 #[test]
