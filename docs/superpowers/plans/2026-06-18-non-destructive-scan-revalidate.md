@@ -21,6 +21,22 @@
 - **Released version is v1.1.0.** Bare-`scan` semantics change is **breaking** → prominent changelog entry; the `scan --revalidate` alias is deprecated for removal next release.
 - Commit trailer: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 
+## Test Fixture Conventions (verified against the real helpers — use these exact forms)
+
+The `musefs-core` integration tests share `tests/common/mod.rs`. The example
+test code in this plan uses these real signatures — do **not** invent variants:
+
+- **Write a FLAC fixture:** `common::write_flac(path: &Path, comments: &[&str], audio: &[u8]) -> (u64, u64)`. Comments are `KEY=VALUE` strings. Example: `let (off, len) = write_flac(&path, &["TITLE=A"], &[0xAA; 30]);`. Add `write_flac` to the test file's `use common::{…}` line (e.g. `musefs-core/tests/scan.rs` currently imports `make_flac, streaminfo_body, vorbis_comment_body` — append `write_flac`). To mutate a file so its stamp changes, `write_flac` again with different bytes/comments.
+- **Open an in-memory DB:** `musefs_db::Db::open_in_memory()`.
+- **List tracks:** `db.list_tracks() -> Vec<Track>`. There is no `db.tracks()`.
+- **Read a track's tags:** `db.get_tags(track_id) -> Vec<Tag>`; fields `Tag.key`, `Tag.value`. There is no `tags_for_track` (only `tags_for_tracks(&[i64]) -> HashMap<…>`, which is not what these tests want).
+- **Read structural blocks:** `db.get_structural_blocks(track_id) -> Vec<StructuralBlock>`; fields `.kind`, `.ordinal`, `.body`.
+- **Track audio bounds:** `track.bounds.audio_offset()` / `track.bounds.audio_length()` (NOT `track.audio_offset`); `track.backing_size` IS a direct field.
+- **Edit tags in the DB (simulate an external writer):** `db.replace_tags(id, &[musefs_db::Tag::new("title", "Curated", 0)])` — confirm `Db::replace_tags` is `pub` and reachable from the test crate; if it is crate-private, use the `TrackSink`/`BulkWriter` path the sibling tests already use to seed tags. `Tag::new(key, value, ordinal)` is correct.
+- **Clear structural blocks (simulate a V1 row):** `db.set_structural_blocks(id, &[])` — same `pub`-reachability caveat; if not public, simulate the V1 row the way `incremental_refresh.rs` already does (grep it for the existing V1 seam).
+
+The in-crate `scan_unit_tests.rs` tests build `Probed { … }` and `Unit { … }` directly (module-private fields are visible there) and call `ingest_into(&db, …)` / `ingest_unit(&db, …)` against `impl TrackSink for &Db` — Task 1's unit test follows that existing pattern.
+
 ---
 
 ## File Structure
@@ -110,17 +126,17 @@ fn refresh_structural_into_preserves_tags_and_art() {
 
     let track = &db.list_tracks().unwrap()[0];
     assert_eq!(track.id, id, "same row upserted, not replaced");
-    assert_eq!(track.audio_offset, 8, "Layer A bounds refreshed");
+    assert_eq!(track.bounds.audio_offset(), 8, "Layer A bounds refreshed");
     assert_eq!(track.backing_size, 20, "Layer A stamp refreshed");
-    let tags = db.tags_for_track(id).unwrap();
+    let tags = db.get_tags(id).unwrap();
     assert_eq!(tags.len(), 1);
     assert_eq!(tags[0].value, "Original", "Layer B tag preserved");
-    let blocks = db.structural_blocks_for_track(id).unwrap();
+    let blocks = db.get_structural_blocks(id).unwrap();
     assert_eq!(blocks[0].body, vec![9, 9, 9], "Layer A structural block refreshed");
 }
 ```
 
-> NOTE: confirm the exact read-back helper names against `musefs-db` (`tags_for_track`, `structural_blocks_for_track`, `Db::open_in_memory`). If a name differs, use the one the sibling tests in this module already use — grep `mod scan_unit_tests` for the existing read-back calls and match them.
+> NOTE: confirm the exact read-back helper names against `musefs-db` (`get_tags`, `get_structural_blocks`, `Db::open_in_memory`). If a name differs, use the one the sibling tests in this module already use — grep `mod scan_unit_tests` for the existing read-back calls and match them.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -214,13 +230,23 @@ fn ingest_unit(
 
 > The existing body below is unchanged. `strictness` stays used by the `Full` path.
 
-- [ ] **Step 5: Update the one in-crate caller signature (temporary)**
+- [ ] **Step 5: Update ALL `ingest_unit` call sites (or the crate won't compile)**
 
-`run_pipeline` calls `ingest_unit(&mut bw, unit, strictness)` — add `, WritePolicy::Full` to keep it compiling until Task 2 parameterizes it:
+`ingest_unit` has four callers — miss one and the Task 1 commit fails the pre-commit full-suite build. Grep first: `grep -rn "ingest_unit(" musefs-core/src`. The sites:
+
+- `musefs-core/src/scan.rs` (in `run_pipeline`): `ingest_unit(&mut bw, unit, strictness)` → add `, WritePolicy::Full`:
 
 ```rust
 ingest_unit(&mut bw, unit, strictness, WritePolicy::Full)?;
 ```
+
+- `musefs-core/src/scan/scan_unit_tests.rs` — three calls (currently `ingest_unit(&db, unit, MatchStrictness::Auto).unwrap();`). Add `, WritePolicy::Full` to each:
+
+```rust
+ingest_unit(&db, unit, MatchStrictness::Auto, WritePolicy::Full).unwrap();
+```
+
+> `WritePolicy` is private to `scan.rs`; `scan_unit_tests.rs` is a submodule (`mod scan_unit_tests;`) and reaches it via `use super::*` already present in that test module. Confirm the import resolves; if the module doesn't glob-import `super`, qualify as `super::WritePolicy::Full`.
 
 - [ ] **Step 6: Run the test to verify it passes**
 
@@ -229,8 +255,13 @@ Expected: PASS.
 
 - [ ] **Step 7: Re-anchor mutants + run the crate suite**
 
-Run: `python3 scripts/check_mutant_anchors.py --fix` (re-anchors `.cargo/mutants.toml` after the line shift), then `cargo test -p musefs-core` and `cargo clippy -p musefs-core --all-targets`.
-Expected: PASS / no warnings. If `--fix` can't re-anchor (non-covering-set), hand-edit the shifted `file:line:col` entries per their `# guard:` tags.
+Inserting code in `scan.rs` shifts the `file:line:col` anchors `.cargo/mutants.toml` pins for `run_pipeline`/`revalidate_with` (lines ~163–176). These are op/fn-unique line:col anchors — `--fix` can only re-anchor covering-set clusters, so expect it to **no-op them**; hand-anchoring is the normal path here, not a fallback:
+
+1. `python3 scripts/check_mutant_anchors.py` — run the **check** (no `--fix`) to see which anchors drifted.
+2. For each drifted entry, update its `file:line:col` to the new location, using its `# guard: op=… fn=…` tag to find the new site (grep the function, locate the operator/line).
+3. Re-verify: `python3 scripts/check_mutant_anchors.py` passes, then `cargo test -p musefs-core` and `cargo clippy -p musefs-core --all-targets`.
+
+Expected: anchors check clean, tests pass, no warnings.
 
 - [ ] **Step 8: Commit**
 
@@ -279,7 +310,7 @@ In the `flush` closure replace the call added in Task 1 Step 5 with the paramete
 ingest_unit(&mut bw, unit, strictness, policy)?;
 ```
 
-- [ ] **Step 2: Update both production callers**
+- [ ] **Step 2: Update both production callers — `Full` for now (no behavior change)**
 
 In `scan_directory_with`, change `run_pipeline(db, files, opts)?` to:
 
@@ -287,28 +318,28 @@ In `scan_directory_with`, change `run_pipeline(db, files, opts)?` to:
 let mut stats = run_pipeline(db, files, opts, WritePolicy::Full)?;
 ```
 
-In `revalidate_with`, change `run_pipeline(db, changed, opts)?` to:
+In `revalidate_with`, change `run_pipeline(db, changed, opts)?` to **`Full` as well** for this task — revalidate keeps its current (tag-replacing) behavior until Task 5, which flips it to `StructuralOnly` together with the test rewrite in one green commit:
 
 ```rust
-let scan = run_pipeline(db, changed, opts, WritePolicy::StructuralOnly)?;
+let scan = run_pipeline(db, changed, opts, WritePolicy::Full)?;
 ```
 
-> `scan_directory_full_oracle` uses the direct `ingest` path, not `run_pipeline` — no change.
+> `scan_directory_full_oracle` uses the direct `ingest` path, not `run_pipeline` — no change. This task is a **pure refactor: zero behavior change**, so the whole suite stays green.
 
 - [ ] **Step 3: Build + run the suite**
 
 Run: `cargo test -p musefs-core`
-Expected: PASS. (Revalidate now uses StructuralOnly — the incremental_refresh tests that asserted changed-file tag *replacement* will FAIL here; that is expected and is fixed/repurposed in Task 5. If they fail now, note which, and proceed — Task 5 rewrites them. If you prefer a green commit at every step, jump to Task 5's test rewrite before committing this task and squash; otherwise mark the known-failing tests `#[ignore]` with a `// fixed in Task 5` note and commit.)
+Expected: PASS (no behavior changed — both callers still use `Full`).
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add musefs-core/src/scan.rs
 git commit -m "$(cat <<'EOF'
-refactor(core): pass WritePolicy through run_pipeline
+refactor(core): thread WritePolicy through run_pipeline (no behavior change)
 
-scan uses Full; revalidate uses StructuralOnly. Behavioral consequence
-(revalidate no longer clobbers tags) is asserted in a later task.
+Both callers pass Full for now; revalidate flips to StructuralOnly in the
+task that rewrites its tests, keeping every commit green.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
@@ -402,7 +433,7 @@ Append to `musefs-core/tests/scan.rs` (match the file's existing helpers for wri
 fn bare_rescan_is_additive_and_preserves_db_edits() {
     let dir = tempfile::tempdir().unwrap();
     let db = musefs_db::Db::open_in_memory().unwrap();
-    write_flac(dir.path().join("a.flac"), "Title A"); // fixture helper in this file
+    write_flac(&dir.path().join("a.flac"), &["TITLE=A-on-disk"], &[0xAA; 30]);
 
     musefs_core::scan_directory(&db, dir.path()).unwrap();
     let id = db.list_tracks().unwrap()[0].id;
@@ -410,13 +441,13 @@ fn bare_rescan_is_additive_and_preserves_db_edits() {
     db.replace_tags(id, &[musefs_db::Tag::new("title", "Curated", 0)]).unwrap();
 
     // Add a NEW file, then bare scan again.
-    write_flac(dir.path().join("b.flac"), "Title B");
+    write_flac(&dir.path().join("b.flac"), &["TITLE=B"], &[0xBB; 40]);
     let stats = musefs_core::scan_directory(&db, dir.path()).unwrap();
 
     assert_eq!(stats.scanned, 1, "only the new file ingested");
     assert_eq!(stats.already_present, 1, "the existing file was skipped");
-    let a = db.tracks().unwrap().into_iter().find(|t| t.backing_path.ends_with("a.flac")).unwrap();
-    let tags = db.tags_for_track(a.id).unwrap();
+    let a = db.list_tracks().unwrap().into_iter().find(|t| t.backing_path.ends_with("a.flac")).unwrap();
+    let tags = db.get_tags(a.id).unwrap();
     assert_eq!(tags[0].value, "Curated", "bare scan did not clobber the DB edit");
 }
 
@@ -424,7 +455,7 @@ fn bare_rescan_is_additive_and_preserves_db_edits() {
 fn force_rescan_reseeds_tags_from_file() {
     let dir = tempfile::tempdir().unwrap();
     let db = musefs_db::Db::open_in_memory().unwrap();
-    write_flac(dir.path().join("a.flac"), "Title A");
+    write_flac(&dir.path().join("a.flac"), &["TITLE=A-on-disk"], &[0xAA; 30]);
     musefs_core::scan_directory(&db, dir.path()).unwrap();
     let id = db.list_tracks().unwrap()[0].id;
     db.replace_tags(id, &[musefs_db::Tag::new("title", "Curated", 0)]).unwrap();
@@ -432,12 +463,12 @@ fn force_rescan_reseeds_tags_from_file() {
     let opts = musefs_core::ScanOptions { force: true, ..Default::default() };
     musefs_core::scan_directory_with(&db, dir.path(), &opts).unwrap();
 
-    let tags = db.tags_for_track(id).unwrap();
-    assert_eq!(tags[0].value, "Title A", "--force re-seeds from the file");
+    let tags = db.get_tags(id).unwrap();
+    assert_eq!(tags[0].value, "A-on-disk", "--force re-seeds from the file");
 }
 ```
 
-> Adjust `db.tracks()` / `db.list_tracks()` / `db.tags_for_track()` / `write_flac` to the real names already used in `musefs-core/tests/scan.rs`. Do not invent helpers — reuse the file's.
+> Uses `common::write_flac` (3-arg) — add it to this file's `use common::{…}` line. See "Test Fixture Conventions" above.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -487,8 +518,8 @@ Expected: PASS.
 
 - [ ] **Step 5: Full crate suite + clippy + re-anchor**
 
-Run: `python3 scripts/check_mutant_anchors.py --fix && cargo test -p musefs-core && cargo clippy -p musefs-core --all-targets`
-Expected: PASS / clean.
+Run `python3 scripts/check_mutant_anchors.py` (check only); hand-anchor any drifted `file:line:col` entries per their `# guard:` tags (see Task 1 Step 7 — `--fix` won't move these op/fn-unique anchors), then `cargo test -p musefs-core && cargo clippy -p musefs-core --all-targets`.
+Expected: anchors clean, tests pass, no warnings.
 
 - [ ] **Step 6: Commit**
 
@@ -527,18 +558,18 @@ fn revalidate_changed_file_refreshes_layer_a_preserves_layer_b() {
     let dir = tempfile::tempdir().unwrap();
     let db = musefs_db::Db::open_in_memory().unwrap();
     let path = dir.path().join("a.flac");
-    write_flac(&path, "Title A");
+    write_flac(&path, &["TITLE=A"], &[0xAA; 30]);
     musefs_core::scan_directory(&db, dir.path()).unwrap();
     let id = db.list_tracks().unwrap()[0].id;
     db.replace_tags(id, &[musefs_db::Tag::new("title", "Curated", 0)]).unwrap();
 
     // Mutate the backing file (new bytes + new embedded title) so the stamp changes.
-    write_flac(&path, "Title B-on-disk");
+    write_flac(&path, &["TITLE=B-on-disk"], &[0xBB; 40]);
     let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
 
     assert_eq!(stats.updated, 1);
     assert_eq!(stats.pruned, 0, "no prune without --prune");
-    let tags = db.tags_for_track(id).unwrap();
+    let tags = db.get_tags(id).unwrap();
     assert_eq!(tags[0].value, "Curated", "revalidate preserved the DB edit");
     // (Optional, if the fixture varies audio bounds:) assert refreshed bounds/stamp.
 }
@@ -547,10 +578,10 @@ fn revalidate_changed_file_refreshes_layer_a_preserves_layer_b() {
 fn revalidate_ignores_new_files() {
     let dir = tempfile::tempdir().unwrap();
     let db = musefs_db::Db::open_in_memory().unwrap();
-    write_flac(dir.path().join("a.flac"), "A");
+    write_flac(&dir.path().join("a.flac"), &["TITLE=A"], &[0xAA; 30]);
     musefs_core::scan_directory(&db, dir.path()).unwrap();
 
-    write_flac(dir.path().join("b.flac"), "B"); // new, not in DB
+    write_flac(&dir.path().join("b.flac"), &["TITLE=B"], &[0xBB; 40]); // new, not in DB
     let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
 
     assert_eq!(stats.updated, 0, "new file is scan's job, not revalidate's");
@@ -562,7 +593,7 @@ fn revalidate_prunes_only_with_flag() {
     let dir = tempfile::tempdir().unwrap();
     let db = musefs_db::Db::open_in_memory().unwrap();
     let path = dir.path().join("a.flac");
-    write_flac(&path, "A");
+    write_flac(&path, &["TITLE=A"], &[0xAA; 30]);
     musefs_core::scan_directory(&db, dir.path()).unwrap();
     std::fs::remove_file(&path).unwrap();
 
@@ -577,12 +608,26 @@ fn revalidate_prunes_only_with_flag() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failures**
+- [ ] **Step 1b: Repurpose the existing replacement-asserting tests**
+
+`musefs-core/tests/incremental_refresh.rs` currently has tests asserting that revalidate **replaces** a changed file's tags (re-probe round-trips, ~lines 84–220). After Step 3a flips revalidate to `StructuralOnly`, those assertions invert. Grep the file for assertions that a changed file's DB tag now equals the file's new embedded tag, and update them to assert the **DB tag is preserved** (or delete the ones fully superseded by `revalidate_changed_file_refreshes_layer_a_preserves_layer_b`). Do this in THIS task so the commit is green.
+
+- [ ] **Step 2: Run to verify failures (pre-implementation)**
 
 Run: `cargo test -p musefs-core --test incremental_refresh revalidate_`
-Expected: `revalidate_ignores_new_files` and `revalidate_prunes_only_with_flag` FAIL (today revalidate ingests new files and always prunes). `revalidate_changed_file_refreshes_layer_a_preserves_layer_b` should already PASS if Task 2 landed (StructuralOnly) — keep it as a regression guard.
+Expected: all three new tests FAIL before Steps 3a/3b/4 (today revalidate clobbers tags on a changed file, ingests new files, and always prunes).
 
-- [ ] **Step 3: Scope revalidate to existing tracks (skip new files)**
+- [ ] **Step 3a: Flip revalidate to the Layer-A write policy**
+
+In `revalidate_with`, change the `run_pipeline` call from `WritePolicy::Full` (set in Task 2) to `StructuralOnly`:
+
+```rust
+let scan = run_pipeline(db, changed, opts, WritePolicy::StructuralOnly)?;
+```
+
+This is the commit where revalidate stops clobbering Layer B — done together with the scope/prune edits and test rewrite below so the suite is green at commit time.
+
+- [ ] **Step 3b: Scope revalidate to existing tracks (skip new files)**
 
 In `revalidate_with`, the loop currently pushes to `changed` for any non-skipped path. Change it so a path **not** in `existing` is ignored entirely. Replace the tail of the per-file loop:
 
@@ -650,7 +695,7 @@ fn revalidate_backfill_does_not_clobber_tags() {
     let dir = tempfile::tempdir().unwrap();
     let db = musefs_db::Db::open_in_memory().unwrap();
     let path = dir.path().join("a.flac");
-    write_flac(&path, "OnDisk");
+    write_flac(&path, &["TITLE=OnDisk"], &[0xAA; 30]);
     musefs_core::scan_directory(&db, dir.path()).unwrap();
     let id = db.list_tracks().unwrap()[0].id;
     // Curate, then simulate a V1 row by clearing structural blocks.
@@ -659,9 +704,9 @@ fn revalidate_backfill_does_not_clobber_tags() {
     // Backing file UNCHANGED (same stamp) — only the backfill should fire.
     let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
     assert_eq!(stats.updated, 1, "backfilled the missing structural blocks");
-    let tags = db.tags_for_track(id).unwrap();
+    let tags = db.get_tags(id).unwrap();
     assert_eq!(tags[0].value, "Curated", "backfill preserved the DB edit");
-    assert!(!db.structural_blocks_for_track(id).unwrap().is_empty(), "blocks repopulated");
+    assert!(!db.get_structural_blocks(id).unwrap().is_empty(), "blocks repopulated");
 }
 ```
 
@@ -672,14 +717,13 @@ Expected: PASS (this would FAIL on `main` — the bug this plan fixes).
 
 - [ ] **Step 7: metrics-feature + clippy + re-anchor + full suite**
 
-Run:
+Run `python3 scripts/check_mutant_anchors.py` (check only) and hand-anchor any drifted `file:line:col` entries per their `# guard:` tags (see Task 1 Step 7 — `--fix` won't move these), then:
 ```bash
-python3 scripts/check_mutant_anchors.py --fix
 cargo test -p musefs-core
 cargo test -p musefs-core --features metrics
 cargo clippy -p musefs-core --all-targets
 ```
-Expected: all PASS / clean.
+Expected: anchors clean, all PASS / clean.
 
 - [ ] **Step 8: Commit**
 
@@ -1147,16 +1191,20 @@ In `contrib/beets/beetsplug/musefs.py`:
             raise self._scan_user_error(exc)
 ```
 
-Active command path (`_command`, ~line 107): the autoscan/full-sync reset must force; `--revalidate` maps to a pruning revalidate:
+Active command path (`_command`, ~lines 101–107): the autoscan/full-sync reset must force; `--revalidate` maps to a **pruning** revalidate. **Keep the existing outer `… and not opts.dry_run` gate and the `targets` computation** — only the inner call shape changes. A `--prune` under `--dry-run` would delete rows, so the dry-run gate is load-bearing. The current block is:
 
 ```python
-        if revalidate:
-            self._run_scan(db_path, targets, revalidate=True, prune=True)
-        elif self._autoscan() and not opts.dry_run:
-            self._run_scan(db_path, targets, force=True)
+        if (self._autoscan() or revalidate) and not opts.dry_run:
+            targets = (
+                [os.fsdecode(i.path) for i in items] if query else [os.fsdecode(lib.directory)]
+            )
+            if revalidate:
+                self._run_scan(db_path, targets, revalidate=True, prune=True)
+            else:
+                self._run_scan(db_path, targets, force=True)
 ```
 
-(Preserve the existing `targets`/`dry_run` guards; only the call shape changes. Keep the `not opts.dry_run` gate around any scan.)
+(Only the two `_run_scan(...)` calls are new — the surrounding `(autoscan or revalidate) and not dry_run` guard and the `targets = …` computation are unchanged from today.)
 
 Passive reconcile path (`_reconcile_pending`, ~line 145): the per-item reset must force:
 
@@ -1283,7 +1331,7 @@ fn bare_scan_retargets_moved_file_preserving_tags() {
     let dir = tempfile::tempdir().unwrap();
     let db = musefs_db::Db::open_in_memory().unwrap();
     let a = dir.path().join("a.flac");
-    write_flac(&a, "T");
+    write_flac(&a, &["TITLE=T"], &[0xAA; 30]);
     musefs_core::scan_directory(&db, dir.path()).unwrap(); // default checksum = fingerprint
     let id = db.list_tracks().unwrap()[0].id;
     db.replace_tags(id, &[musefs_db::Tag::new("title", "Curated", 0)]).unwrap();
@@ -1293,7 +1341,7 @@ fn bare_scan_retargets_moved_file_preserving_tags() {
     let tracks = db.list_tracks().unwrap();
     assert_eq!(tracks.len(), 1, "retargeted, not duplicated");
     assert!(tracks[0].backing_path.ends_with("b.flac"), "row retargeted to new path");
-    let tags = db.tags_for_track(tracks[0].id).unwrap();
+    let tags = db.get_tags(tracks[0].id).unwrap();
     assert_eq!(tags[0].value, "Curated", "move preserved curated tags");
 }
 ```
@@ -1304,4 +1352,4 @@ fn bare_scan_retargets_moved_file_preserving_tags() {
 
 **Type consistency:** `WritePolicy` (Task 1) used identically in Tasks 1–2. `refresh_structural_into` signature matches `ingest_into`'s. `run_scan`'s new `force` param ordering (after `revalidate`) matches the `run` dispatch call (Task 6 Step 7). `run_revalidate` param order matches its call site. `run_scan(force=…, prune=…)` Python kwargs match between wrapper (Task 8 Step 3) and beets callers (Task 8 Step 6). `ScanStats.already_present` defined in Task 3, set in Task 4, printed in Task 6 Step 5.
 
-**Open verification deferred to the implementer (named at each site):** exact `musefs-db` read-back/helper names (`tags_for_track`, `structural_blocks_for_track`, `Db::open_in_memory`, `list_tracks`/`tracks`, `set_structural_blocks` visibility) — each test step says "match the sibling tests in this file." This is deliberate: the plan must not guess DB method names that vary; it pins the *behavior* and points at the existing pattern.
+**Open verification deferred to the implementer (named at each site):** exact `musefs-db` read-back/helper names (`get_tags`, `get_structural_blocks`, `Db::open_in_memory`, `list_tracks`/`tracks`, `set_structural_blocks` visibility) — each test step says "match the sibling tests in this file." This is deliberate: the plan must not guess DB method names that vary; it pins the *behavior* and points at the existing pattern.
