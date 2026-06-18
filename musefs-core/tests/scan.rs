@@ -1,6 +1,6 @@
 mod common;
-use common::{make_flac, streaminfo_body, vorbis_comment_body};
-use musefs_core::{revalidate, scan_directory};
+use common::{make_flac, streaminfo_body, vorbis_comment_body, write_flac};
+use musefs_core::{ScanOptions, revalidate, scan_directory, scan_directory_with};
 use musefs_db::{Db, Tag};
 
 #[test]
@@ -83,6 +83,81 @@ fn rescanning_is_idempotent() {
     scan_directory(&db, dir.path()).unwrap();
     scan_directory(&db, dir.path()).unwrap();
     assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
+
+#[test]
+fn bare_rescan_is_additive_and_preserves_db_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    write_flac(
+        &dir.path().join("a.flac"),
+        &["TITLE=A-on-disk"],
+        &[0xAA; 30],
+    );
+
+    scan_directory(&db, dir.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    db.replace_tags(id, &[Tag::new("title", "Curated", 0)])
+        .unwrap();
+
+    write_flac(&dir.path().join("b.flac"), &["TITLE=B"], &[0xBB; 40]);
+    let stats = scan_directory(&db, dir.path()).unwrap();
+
+    assert_eq!(stats.scanned, 1);
+    assert_eq!(stats.already_present, 1);
+    let a = db
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.backing_path.ends_with("a.flac"))
+        .unwrap();
+    let tags = db.get_tags(a.id).unwrap();
+    assert_eq!(tags[0].value, "Curated");
+}
+
+#[test]
+fn force_rescan_reseeds_tags_from_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    write_flac(
+        &dir.path().join("a.flac"),
+        &["TITLE=A-on-disk"],
+        &[0xAA; 30],
+    );
+    scan_directory(&db, dir.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    db.replace_tags(id, &[Tag::new("title", "Curated", 0)])
+        .unwrap();
+
+    let opts = ScanOptions {
+        force: true,
+        ..Default::default()
+    };
+    scan_directory_with(&db, dir.path(), &opts).unwrap();
+
+    let tags = db.get_tags(id).unwrap();
+    assert_eq!(tags[0].value, "A-on-disk");
+}
+
+#[test]
+fn bare_scan_retargets_moved_file_preserving_tags() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let a = dir.path().join("a.flac");
+    write_flac(&a, &["TITLE=T"], &[0xAA; 30]);
+    scan_directory(&db, dir.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    db.replace_tags(id, &[Tag::new("title", "Curated", 0)])
+        .unwrap();
+
+    std::fs::rename(&a, dir.path().join("b.flac")).unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert!(tracks[0].backing_path.ends_with("b.flac"));
+    let tags = db.get_tags(tracks[0].id).unwrap();
+    assert_eq!(tags[0].value, "Curated");
 }
 
 #[test]
@@ -183,19 +258,39 @@ fn revalidate_skips_unchanged_prunes_missing_and_gcs_art() {
     db.replace_tags(a_id, &[Tag::new("title", "Edited", 0)])
         .unwrap();
 
-    // Delete gone.flac from disk so revalidate prunes its track.
+    // Delete gone.flac from disk; default revalidate keeps the row now.
     std::fs::remove_file(dir.path().join("gone.flac")).unwrap();
 
     let stats = revalidate(&db, dir.path()).unwrap();
     assert_eq!(stats.unchanged, 1); // a.flac (size+mtime match) is skipped
     assert_eq!(stats.updated, 0); // nothing on disk changed, so nothing re-ingested
-    assert_eq!(stats.pruned, 1); // gone.flac's track is removed
+    assert_eq!(stats.pruned, 0); // prune is opt-in now
 
     let tracks = db.list_tracks().unwrap();
-    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks.len(), 2);
     // The skipped file kept its externally-edited tag (not re-seeded from disk).
-    let tags = db.get_tags(tracks[0].id).unwrap();
+    let tags = db
+        .get_tags(
+            tracks
+                .iter()
+                .find(|t| t.backing_path.ends_with("a.flac"))
+                .unwrap()
+                .id,
+        )
+        .unwrap();
     assert!(tags.iter().any(|t| t.key == "title" && t.value == "Edited"));
+
+    let stats = musefs_core::revalidate_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            prune: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(stats.pruned, 1); // gone.flac's track is removed
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
 }
 
 #[test]

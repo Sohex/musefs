@@ -237,11 +237,45 @@ fn scan_with_revalidate_flag_runs_the_revalidate_pass() {
         "revalidate should exit 0, stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("scan --revalidate") && stderr.contains("deprecated"),
+        "expected a deprecation warning on stderr, stderr: {stderr}"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("revalidated"),
         "the --revalidate flag should select the revalidate summary, stdout: {stdout}"
     );
+}
+
+#[test]
+fn scan_prune_and_revalidate_force_are_usage_errors() {
+    let (_dir, target, db) = library_with_one_flac();
+    for argv in [
+        [
+            "scan",
+            target.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--prune",
+        ],
+        [
+            "revalidate",
+            target.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--force",
+        ],
+    ] {
+        let out = musefs().args(argv).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "usage error should exit 2, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]

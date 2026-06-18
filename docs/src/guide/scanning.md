@@ -6,25 +6,35 @@ any subcommand lists its flags.
 ## Scan
 
 ```bash
-musefs scan /path/to/music --db library.db            # ingest (dirs recurse)
-musefs scan /path/to/music --db library.db --revalidate
+musefs scan /path/to/music --db library.db             # additive ingest
+musefs scan /path/to/music --db library.db --force     # reseed existing rows
+musefs revalidate /path/to/music --db library.db       # refresh Layer A only
+musefs revalidate /path/to/music --db library.db --prune
+                                                       # also delete gone rows
 ```
 
 `scan` probes each audio file (FLAC, MP3, M4A/M4B, Ogg, WAV), recording its
-audio byte range, tags, and embedded art in the store. It takes one or more
-files or directories, and `--jobs N` controls probe parallelism.
-`--follow-symlinks` walks symlinked files and directories (off by default, so
-symlinks are logged and skipped). `--quiet`
-(`-q`) suppresses the per-target summary for scripting; scan failures still
-surface on stderr (raise detail with `-v`/`-vv`, or `RUST_LOG=info`).
+audio byte range, tags, and embedded art in the store. Bare `scan` is
+additive: it leaves already tracked rows alone, while `--force` re-seeds
+existing rows from disk. `revalidate` is the maintenance pass: it refreshes
+changed rows' structural Layer A and preserves curated tags/art/binary tags;
+`--prune` is the only deletion path. It takes one or more files or directories,
+and `--jobs N` controls probe parallelism. `--follow-symlinks` walks symlinked
+files and directories (off by default, so symlinks are logged and skipped).
+`--quiet` (`-q`) suppresses the per-target summary for scripting; scan
+failures still surface on stderr (raise detail with `-v`/`-vv`, or
+`RUST_LOG=info`).
 
-`scan` and `scan --revalidate` show a live progress indicator: on an interactive
-terminal, a discovery spinner followed by a determinate bar (position, percent,
-ETA, current file); on a non-interactive stderr (piped or logged), throttled
-`ingested N/M (P%)` lines. `--quiet` (`-q`) suppresses the progress indicator
-and the per-target summary. Each summary line ends with the elapsed time.
+`scan`, `scan --force`, and `revalidate` show a live progress indicator: on an
+interactive terminal, a discovery spinner followed by a determinate bar
+(position, percent, ETA, current file); on a non-interactive stderr (piped or
+logged), throttled `ingested N/M (P%)` lines. `--quiet` (`-q`) suppresses the
+progress indicator and the per-target summary. Each summary line ends with the
+elapsed time.
 
-The per-target summary reads `scanned N: … skipped X, failed Y`. `skipped`
+The per-target summary reads `scanned N: … already present Z, skipped X, failed Y`.
+`already present` counts files bare `scan` skipped because they were already
+tracked. `skipped`
 counts every file that isn't a supported audio format — cover art, `.cue` /
 `.log` / `.nfo` sidecars, and anything else non-audio — so a large `skipped`
 number (hundreds or thousands on a big library) is expected, not an error.
@@ -47,9 +57,10 @@ a hard error (a missing target, an unreadable DB) still exits `1`. The exit code
 is the only machine-detectable signal; per-file failures otherwise surface only
 on stderr.
 
-`--revalidate` is the maintenance pass: it skips unchanged files —
-**preserving any tag edits you made in the store** — prunes tracks whose
-backing file is gone, and garbage-collects orphaned art.
+`revalidate` skips unchanged files — **preserving any tag edits you made in the
+store** — and refreshes changed files' structural data. It ignores files that
+are new to the DB, and it only prunes tracks whose backing file is gone when
+`--prune` is set; orphaned art is garbage-collected in that pruning mode.
 
 ### Content checksums and move re-identification
 
@@ -86,5 +97,6 @@ tags, and art are preserved. Move recovery only applies to rows that were
 fingerprinted before the move (rows scanned under `--checksum=none` have no
 fingerprint and cannot be retargeted until a later fingerprint-tier pass).
 Run `scan` after a move and ideally **before** any `revalidate` — `revalidate`
-still prunes tracks whose backing file is gone, so it will remove un-retargeted
-rows if run first.
+only refreshes already tracked rows, so a moved file must be re-seeded before
+the maintenance pass can see it. Use `revalidate --prune` only when you are
+ready to drop missing rows.
