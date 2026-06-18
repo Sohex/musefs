@@ -69,7 +69,7 @@ pip install -e "contrib/beets[test]"       # plugin + test deps
 beet musefs                      # everything
 beet musefs albumartist:"Boards of Canada"   # a subset (scans just those files)
 beet musefs -n                   # dry run: report counts, write nothing
-beet musefs --revalidate         # also prune rows whose backing file is gone
+beet musefs --revalidate         # prune rows whose backing file is gone
 
 # Mount the re-tagged view.
 musefs mount ~/mnt --db ~/musefs.db \
@@ -148,18 +148,19 @@ A few plugins ignore that gate or are redundant in this mode:
   computed-tag workflow in [the architecture overview](../architecture/overview.md).
 - **Pruning is a deliberate act.** The plugin never prunes on its own. Pruning
   track rows whose backing file is gone from disk (renames/moves/deletes) is owned
-  entirely by `musefs scan --revalidate`, reachable from beets as `beet musefs
-  --revalidate` (which forwards the flag to the auto-scan). Plain `beet musefs` and
-  the passive end-of-command reconcile (`beet import` / `beet modify -w`) only
-  sync, so a transient backing-storage loss — an unmounted network share, an
-  offline drive, a momentary realpath divergence — can never mass-delete plugin
-  metadata. Run `beet musefs --revalidate` (or `musefs scan --revalidate`) while
-  the library is available to clear stale rows left by a move or an on-disk delete.
+  entirely by `musefs revalidate --prune`, reachable from beets as `beet musefs
+  --revalidate` (which forwards to the pruning revalidate pass). Plain `beet
+  musefs` and the passive end-of-command reconcile (`beet import` / `beet
+  modify -w`) only sync, so a transient backing-storage loss — an unmounted
+  network share, an offline drive, a momentary realpath divergence — can never
+  mass-delete plugin metadata. Run `beet musefs --revalidate` (or `musefs
+  revalidate --prune`) while the library is available to clear stale rows left
+  by a move or an on-disk delete.
 - **Removals are not auto-pruned.** `beet remove` / `beet remove -d` does not
   prune the store; run `beet musefs --revalidate` afterwards to drop the rows whose
   backing file is now gone. A bare `beet remove` (which keeps the file on disk)
   leaves a servable row in place even then — musefs can still serve those bytes.
-- **Orphaned art:** replacing art can orphan old blobs; `musefs scan --revalidate`
+- **Orphaned art:** replacing art can orphan old blobs; `musefs revalidate --prune`
   garbage-collects them.
 - **Schema version:** the plugin refuses to run if the DB's `user_version` differs
   from the version it targets — rebuild after upgrading musefs.

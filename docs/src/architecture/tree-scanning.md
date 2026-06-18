@@ -104,13 +104,14 @@ under `--follow-symlinks`. Broken symlinks are logged and skipped without
 aborting the scan. The `root` argument is always followed regardless of the
 flag; only links encountered during recursion are gated.
 
-`revalidate` is the maintenance pass (`scan --revalidate`): re-probe only
-files whose `(size, mtime_ns, ctime_ns)` freshness stamp changed — a
-ctime-only move (e.g. a forged-mtime in-place rewrite) is still re-probed
-(skipping unchanged files **preserves external tag edits** in the DB),
-delete tracks under the scanned root whose
-backing file is gone, and garbage-collect now-unreferenced art. Pruning is
-scoped to the scanned root, so revalidating one library root never removes
+`revalidate` is the maintenance pass: it re-probes only files whose
+`(size, mtime_ns, ctime_ns)` freshness stamp changed — a ctime-only move (e.g.
+a forged-mtime in-place rewrite) is still re-probed — and it preserves any
+external tag edits in the DB by refreshing only Layer A. New files are
+ignored: `revalidate` only touches rows that already exist in the store.
+Deletion is opt-in via `--prune`, which removes tracks under the scanned root
+whose backing file is gone and garbage-collects now-unreferenced art. Pruning
+is scoped to the scanned root, so revalidating one library root never removes
 tracks belonging to another. Because a track is keyed by its *canonical*
 backing path, a file scanned via `--follow-symlinks` whose real target lives
 outside the scanned root falls outside the prune scope: if that target later

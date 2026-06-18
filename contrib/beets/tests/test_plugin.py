@@ -81,7 +81,12 @@ def _autoscan_plugin(db_path, monkeypatch):
     monkeypatch.setattr(
         plugin,
         "_run_scan",
-        lambda db, targets, revalidate=False: calls.append(list(targets)),
+        lambda db, targets, revalidate=False, force=False, prune=False: calls.append((
+            list(targets),
+            revalidate,
+            force,
+            prune,
+        )),
     )
     return plugin, calls
 
@@ -146,7 +151,7 @@ def test_command_autoscan_scans_matched_files(
     cmd, opts, args = _musefs_cmd(plugin, ["title:Song"])  # a query -> matched files
     cmd.func(FakeLib([item]), opts, args)
 
-    assert calls == [[real]]  # scanned the matched file, not the directory
+    assert calls == [([real], False, True, False)]  # scanned the matched file, not the directory
     conn = connect(db_path)
     try:
         assert conn.execute("SELECT value FROM tags WHERE key='title'").fetchone()[0] == "Song"
@@ -161,7 +166,9 @@ def test_command_full_sync_scans_directory(db_path, fake_item, monkeypatch):
     lib = FakeLib([fake_item(os.fsencode("/music/a.flac"))], directory=b"/music")
     cmd.func(lib, opts, args)
 
-    assert calls == [["/music"]]  # one scan of the whole music directory
+    assert calls == [
+        (["/music"], False, True, False)
+    ]  # one force-scan of the whole music directory
 
 
 def test_command_dry_run_skips_autoscan(db_path, fake_item, monkeypatch):
@@ -182,7 +189,7 @@ def test_command_plain_sync_never_prunes(
 ):
     """Without --revalidate, `beet musefs` only syncs — it never prunes, so a
     stale row whose backing file is gone survives (pruning belongs solely to
-    `musefs scan --revalidate`)."""
+    `musefs revalidate --prune`)."""
     make_track("/gone/x.flac")  # a stale row: its backing file does not exist
     real, _tid, item = _real_track(tmp_path, make_track, fake_item, title="Song")
     plugin, _ = _autoscan_plugin(db_path, monkeypatch)
@@ -199,8 +206,8 @@ def test_command_plain_sync_never_prunes(
 
 
 def test_command_revalidate_forwards_to_scan(db_path, fake_item, monkeypatch):
-    """`beet musefs --revalidate` forwards --revalidate to the autoscan, where the
-    Rust scanner owns pruning gone backing files + GCing orphaned art."""
+    """`beet musefs --revalidate` forwards to the pruning revalidate pass, where
+    the Rust scanner owns dropping gone backing files + GCing orphaned art."""
     plugin = MusefsPlugin()
     monkeypatch.setattr(
         plugin,
@@ -212,12 +219,17 @@ def test_command_revalidate_forwards_to_scan(db_path, fake_item, monkeypatch):
     monkeypatch.setattr(
         plugin,
         "_run_scan",
-        lambda db, targets, revalidate=False: calls.append((list(targets), revalidate)),
+        lambda db, targets, revalidate=False, force=False, prune=False: calls.append((
+            list(targets),
+            revalidate,
+            force,
+            prune,
+        )),
     )
     cmd, opts, args = _musefs_cmd(plugin, ["--revalidate"])
     cmd.func(FakeLib([fake_item(os.fsencode("/music/a.flac"))], directory=b"/music"), opts, args)
 
-    assert calls == [(["/music"], True)]  # revalidate forwarded to the directory scan
+    assert calls == [(["/music"], True, False, True)]  # revalidate forwarded + prune
 
 
 def test_command_revalidate_dry_run_skips_scan(db_path, fake_item, monkeypatch):
@@ -243,7 +255,7 @@ def test_reconcile_at_cli_exit_syncs_recorded_items(
     plugin._record(item=item)  # an import/write hook fired during the command
     plugin._reconcile_pending()  # cli_exit
 
-    assert calls == [[real]]
+    assert calls == [([real], False, True, False)]
     conn = connect(db_path)
     try:
         assert (
@@ -300,7 +312,7 @@ def test_reconcile_best_effort_on_scan_failure(db_path, fake_item, monkeypatch):
 
     plugin, _ = _autoscan_plugin(db_path, monkeypatch)
 
-    def boom(db, targets):
+    def boom(db, targets, **kwargs):
         """Raise a UserError to simulate scan failure."""
         raise ui.UserError("scan blew up")
 
@@ -442,7 +454,7 @@ def test_reconcile_path_merges_and_sticky_deletes(db_path, tmp_path, monkeypatch
         }),
         raising=False,
     )
-    monkeypatch.setattr(plugin, "_run_scan", lambda db, targets: None)
+    monkeypatch.setattr(plugin, "_run_scan", lambda db, targets, **kwargs: None)
     plugin._pending = [item]
     plugin._reconcile_pending(lib=None)
 

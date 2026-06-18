@@ -530,7 +530,7 @@ def test_e2e_move_reconcile(tmp_path):
     # A write-back modify renames/moves the FLAC. The passive cli_exit reconcile
     # scans the new path but never prunes (#538: pruning is a deliberate act), so
     # an explicit `beet musefs --revalidate` is what removes the row left at the
-    # old path (it forwards --revalidate to `musefs scan`).
+    # old path (it forwards to `musefs revalidate --prune`).
     _beet(cfg, env, "modify", "-w", "-y", "format:FLAC", "title=Relocated FLAC")
     _beet(cfg, env, "musefs", "--revalidate")  # deliberate prune of the moved-away row
 

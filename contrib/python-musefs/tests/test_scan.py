@@ -67,6 +67,53 @@ def test_run_scan_multiple_targets_one_invocation(monkeypatch):
     assert argv.index("/b.flac") < argv.index("--db")
 
 
+def test_run_scan_force_appends_force(monkeypatch):
+    import subprocess
+
+    import musefs_common.scan as scan
+
+    captured = {}
+
+    class FakeResult:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        return FakeResult()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    scan.run_scan("musefs", "/db.sqlite", "/only.flac", force=True)
+    assert captured["argv"] == ["musefs", "scan", "/only.flac", "--db", "/db.sqlite", "--force"]
+
+
+def test_run_scan_revalidate_uses_subcommand_and_prune(monkeypatch):
+    import subprocess
+
+    import musefs_common.scan as scan
+
+    captured = {}
+
+    class FakeResult:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        return FakeResult()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    scan.run_scan("musefs", "/db.sqlite", "/only.flac", revalidate=True, prune=True)
+    assert captured["argv"] == [
+        "musefs",
+        "revalidate",
+        "/only.flac",
+        "--db",
+        "/db.sqlite",
+        "--prune",
+    ]
+
+
 def test_run_scan_single_path_still_works(monkeypatch):
     import subprocess
 
