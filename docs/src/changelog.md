@@ -12,6 +12,8 @@ see the [Release notes](release-notes.md).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-18
+
 ### Changed
 
 - Bare `scan` is now additive: it skips rows already in the DB instead of
@@ -266,7 +268,8 @@ First public release.
   `synthesis` / `structure-only` mount modes, auto-refresh, `scan` /
   `scan --revalidate`). Never published publicly; superseded by 0.2.0.
 
-[Unreleased]: https://github.com/Sohex/musefs/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/Sohex/musefs/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/Sohex/musefs/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Sohex/musefs/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Sohex/musefs/releases/tag/v1.0.0
 [0.2.0]: https://github.com/Sohex/musefs/releases/tag/v0.2.0

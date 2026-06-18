@@ -38,7 +38,7 @@ PLUGIN_DESCRIPTION = (
     "Right-click a file/album → 'Sync to musefs' to push Picard's tags and "
     "cover images into a musefs SQLite store, without rewriting the audio file."
 )
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 # Floor: 2.0 — all required APIs (BaseAction, register_*_action, OptionsPage,
 # register_options_page, config.TextOption/BoolOption, thread.run_task,
 # iterfiles, metadata.images, is_front_image) are present since Picard 2.0.0.
