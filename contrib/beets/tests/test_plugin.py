@@ -81,7 +81,7 @@ def _autoscan_plugin(db_path, monkeypatch):
     monkeypatch.setattr(
         plugin,
         "_run_scan",
-        lambda db, targets, revalidate=False, force=False, prune=False: calls.append((
+        lambda db, targets, *, revalidate=False, force=False, prune=False: calls.append((
             list(targets),
             revalidate,
             force,
@@ -219,7 +219,7 @@ def test_command_revalidate_forwards_to_scan(db_path, fake_item, monkeypatch):
     monkeypatch.setattr(
         plugin,
         "_run_scan",
-        lambda db, targets, revalidate=False, force=False, prune=False: calls.append((
+        lambda db, targets, *, revalidate=False, force=False, prune=False: calls.append((
             list(targets),
             revalidate,
             force,

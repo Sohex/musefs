@@ -286,6 +286,9 @@ pub fn run_scan(
         if force {
             anyhow::bail!("--force and --revalidate are mutually exclusive");
         }
+        if fast || strict {
+            anyhow::bail!("--fast/--strict are scan-only and cannot be combined with --revalidate");
+        }
         log::warn!(
             "`scan --revalidate` is deprecated; use `revalidate` (now non-pruning — add `--prune` to delete gone tracks). This alias will be removed next release."
         );

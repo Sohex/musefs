@@ -279,6 +279,32 @@ fn scan_prune_and_revalidate_force_are_usage_errors() {
 }
 
 #[test]
+fn scan_revalidate_with_strictness_flags_errors() {
+    // `--fast`/`--strict` are scan-only (move-retarget confirmation); combining
+    // them with the deprecated `scan --revalidate` alias must error rather than
+    // silently ignore them.
+    let (_dir, target, db) = library_with_one_flac();
+    for flag in ["--fast", "--strict"] {
+        let out = musefs()
+            .args([
+                "scan",
+                target.to_str().unwrap(),
+                "--db",
+                db.to_str().unwrap(),
+                "--revalidate",
+                flag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "scan --revalidate {flag} must error, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn scan_missing_target_fails_with_nonzero_exit_and_stderr() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("scan.db");

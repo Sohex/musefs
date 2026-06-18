@@ -114,6 +114,21 @@ def test_run_scan_revalidate_uses_subcommand_and_prune(monkeypatch):
     ]
 
 
+def test_run_scan_rejects_incompatible_flags(monkeypatch):
+    import subprocess
+
+    def fail(*a, **k):
+        raise AssertionError("subprocess must not run on invalid flags")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    with pytest.raises(ValueError):
+        run_scan("musefs", "/db.sqlite", "/only.flac", revalidate=True, force=True)
+    with pytest.raises(ValueError):
+        run_scan("musefs", "/db.sqlite", "/only.flac", prune=True)  # prune without revalidate
+    with pytest.raises(ValueError):
+        run_scan("musefs", "/db.sqlite", [])
+
+
 def test_run_scan_single_path_still_works(monkeypatch):
     import subprocess
 
