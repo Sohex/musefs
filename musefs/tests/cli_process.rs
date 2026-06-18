@@ -237,11 +237,71 @@ fn scan_with_revalidate_flag_runs_the_revalidate_pass() {
         "revalidate should exit 0, stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("scan --revalidate") && stderr.contains("deprecated"),
+        "expected a deprecation warning on stderr, stderr: {stderr}"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("revalidated"),
         "the --revalidate flag should select the revalidate summary, stdout: {stdout}"
     );
+}
+
+#[test]
+fn scan_prune_and_revalidate_force_are_usage_errors() {
+    let (_dir, target, db) = library_with_one_flac();
+    for argv in [
+        [
+            "scan",
+            target.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--prune",
+        ],
+        [
+            "revalidate",
+            target.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+            "--force",
+        ],
+    ] {
+        let out = musefs().args(argv).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "usage error should exit 2, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn scan_revalidate_with_strictness_flags_errors() {
+    // `--fast`/`--strict` are scan-only (move-retarget confirmation); combining
+    // them with the deprecated `scan --revalidate` alias must error rather than
+    // silently ignore them.
+    let (_dir, target, db) = library_with_one_flac();
+    for flag in ["--fast", "--strict"] {
+        let out = musefs()
+            .args([
+                "scan",
+                target.to_str().unwrap(),
+                "--db",
+                db.to_str().unwrap(),
+                "--revalidate",
+                flag,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "scan --revalidate {flag} must error, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]

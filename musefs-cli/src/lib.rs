@@ -189,10 +189,14 @@ pub enum Command {
         /// Path to the SQLite database (created if absent).
         #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
-        /// Re-validate: skip unchanged files, prune tracks whose backing file is
-        /// gone, and garbage-collect orphaned art.
+        /// DEPRECATED: use the `revalidate` subcommand. Forwards to it (now
+        /// non-pruning). Removed next release.
         #[arg(long, env = "MUSEFS_REVALIDATE", value_parser = clap::builder::BoolishValueParser::new())]
         revalidate: bool,
+        /// Re-ingest files already present in the DB, overwriting curated tags
+        /// and art with the file's embedded metadata.
+        #[arg(long, env = "MUSEFS_FORCE", value_parser = clap::builder::BoolishValueParser::new())]
+        force: bool,
         /// Probe worker threads (0 = available parallelism). 1 = sequential.
         #[arg(long, env = "MUSEFS_JOBS", default_value_t = 0)]
         jobs: usize,
@@ -213,6 +217,34 @@ pub enum Command {
         /// Require a full-hash match to retarget a moved file.
         #[arg(long, env = "MUSEFS_STRICT", value_parser = clap::builder::BoolishValueParser::new())]
         strict: bool,
+    },
+    /// Refresh tracks already in the store: re-probe files whose backing bytes
+    /// changed while preserving curated tags and art. Files not yet in the
+    /// store are ignored. Never deletes anything unless `--prune`.
+    Revalidate {
+        /// One or more files or directories to revalidate (directories recurse).
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<PathBuf>,
+        /// Path to the SQLite database.
+        #[arg(long, env = "MUSEFS_DB")]
+        db: PathBuf,
+        /// Delete tracks whose backing file is gone and GC orphaned art.
+        #[arg(long, env = "MUSEFS_PRUNE", value_parser = clap::builder::BoolishValueParser::new())]
+        prune: bool,
+        /// Probe worker threads (0 = available parallelism). 1 = sequential.
+        #[arg(long, env = "MUSEFS_JOBS", default_value_t = 0)]
+        jobs: usize,
+        /// Follow symlinks while walking directories. Off by default: symlinked
+        /// files and directories are logged and skipped.
+        #[arg(long, env = "MUSEFS_FOLLOW_SYMLINKS", value_parser = clap::builder::BoolishValueParser::new())]
+        follow_symlinks: bool,
+        /// Suppress the per-target summary on stdout (failures still surface via
+        /// the `log` facade on stderr; raise detail with `RUST_LOG=info`).
+        #[arg(long, short, env = "MUSEFS_QUIET", value_parser = clap::builder::BoolishValueParser::new())]
+        quiet: bool,
+        /// Which content checksums to compute and store (none|fingerprint|full).
+        #[arg(long, value_enum, env = "MUSEFS_CHECKSUM", default_value_t = ChecksumMode::Fingerprint)]
+        checksum: ChecksumMode,
     },
     /// Mount a read-only FUSE view of the store.
     Mount(MountArgs),
@@ -242,6 +274,7 @@ pub fn run_scan(
     db_path: &Path,
     targets: &[PathBuf],
     revalidate: bool,
+    force: bool,
     jobs: usize,
     follow_symlinks: bool,
     quiet: bool,
@@ -249,6 +282,26 @@ pub fn run_scan(
     fast: bool,
     strict: bool,
 ) -> Result<u64> {
+    if revalidate {
+        if force {
+            anyhow::bail!("--force and --revalidate are mutually exclusive");
+        }
+        if fast || strict {
+            anyhow::bail!("--fast/--strict are scan-only and cannot be combined with --revalidate");
+        }
+        log::warn!(
+            "`scan --revalidate` is deprecated; use `revalidate` (now non-pruning — add `--prune` to delete gone tracks). This alias will be removed next release."
+        );
+        return run_revalidate(
+            db_path,
+            targets,
+            false,
+            jobs,
+            follow_symlinks,
+            quiet,
+            checksum,
+        );
+    }
     let strictness = match (fast, strict) {
         (true, true) => anyhow::bail!("--fast and --strict are mutually exclusive"),
         (true, false) => musefs_core::MatchStrictness::Fast,
@@ -264,41 +317,71 @@ pub fn run_scan(
         progress: reporter.sink(),
         checksum: checksum.into(),
         strictness,
+        force,
         ..Default::default()
     };
     let mut total_failed = 0u64;
     for target in targets {
         reporter.start_target();
         let start = Instant::now();
-        if revalidate {
-            let stats = musefs_core::revalidate_with(&db, target, &opts)
-                .with_context(|| format!("revalidating {}", target.display()))?;
-            total_failed += stats.failed;
-            if !quiet {
-                println!(
-                    "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed in {}",
-                    target.display(),
-                    stats.updated,
-                    stats.unchanged,
-                    stats.pruned,
-                    stats.failed,
-                    HumanDuration(start.elapsed()),
-                );
-            }
-        } else {
-            let stats = musefs_core::scan_directory_with(&db, target, &opts)
-                .with_context(|| format!("scanning {}", target.display()))?;
-            total_failed += stats.failed;
-            if !quiet {
-                println!(
-                    "scanned {}: {} file(s), skipped {}, failed {} in {}",
-                    target.display(),
-                    stats.scanned,
-                    stats.skipped,
-                    stats.failed,
-                    HumanDuration(start.elapsed()),
-                );
-            }
+        let stats = musefs_core::scan_directory_with(&db, target, &opts)
+            .with_context(|| format!("scanning {}", target.display()))?;
+        total_failed += stats.failed;
+        if !quiet {
+            println!(
+                "scanned {}: {} file(s), {} already present, skipped {}, failed {} in {}",
+                target.display(),
+                stats.scanned,
+                stats.already_present,
+                stats.skipped,
+                stats.failed,
+                HumanDuration(start.elapsed()),
+            );
+        }
+    }
+    reporter.finish();
+    Ok(total_failed)
+}
+
+/// Open the DB once and revalidate each target, preserving curated metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn run_revalidate(
+    db_path: &Path,
+    targets: &[PathBuf],
+    prune: bool,
+    jobs: usize,
+    follow_symlinks: bool,
+    quiet: bool,
+    checksum: ChecksumMode,
+) -> Result<u64> {
+    let db =
+        Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
+    let reporter = ScanReporter::new(quiet);
+    let opts = musefs_core::ScanOptions {
+        jobs,
+        follow_symlinks,
+        progress: reporter.sink(),
+        checksum: checksum.into(),
+        prune,
+        ..Default::default()
+    };
+    let mut total_failed = 0u64;
+    for target in targets {
+        reporter.start_target();
+        let start = Instant::now();
+        let stats = musefs_core::revalidate_with(&db, target, &opts)
+            .with_context(|| format!("revalidating {}", target.display()))?;
+        total_failed += stats.failed;
+        if !quiet {
+            println!(
+                "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed in {}",
+                target.display(),
+                stats.updated,
+                stats.unchanged,
+                stats.pruned,
+                stats.failed,
+                HumanDuration(start.elapsed()),
+            );
         }
     }
     reporter.finish();
@@ -637,6 +720,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             targets,
             db,
             revalidate,
+            force,
             jobs,
             follow_symlinks,
             quiet,
@@ -648,6 +732,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
                 &db,
                 &targets,
                 revalidate,
+                force,
                 jobs,
                 follow_symlinks,
                 quiet,
@@ -660,6 +745,23 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             // signal that not everything ingested. Exit 2 marks any per-file failure
             // (partial or total); it overlaps clap's usage-error code, but only ever
             // fires after a successful parse + run (#554).
+            Ok(if failed > 0 {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+        Command::Revalidate {
+            targets,
+            db,
+            prune,
+            jobs,
+            follow_symlinks,
+            quiet,
+            checksum,
+        } => {
+            let failed =
+                run_revalidate(&db, &targets, prune, jobs, follow_symlinks, quiet, checksum)?;
             Ok(if failed > 0 {
                 ExitCode::from(2)
             } else {
@@ -798,7 +900,7 @@ mod tests {
                 assert_eq!(targets, vec![PathBuf::from("/m")]);
             }
             Command::Mount(..) => panic!("expected Scan"),
-            Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
         }
     }
 
@@ -809,7 +911,7 @@ mod tests {
         match cli.command {
             Command::Scan { quiet, .. } => assert!(!quiet),
             Command::Mount(..) => panic!("expected Scan"),
-            Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
         }
         for arg in ["--quiet", "-q"] {
             let cli =
@@ -817,7 +919,7 @@ mod tests {
             match cli.command {
                 Command::Scan { quiet, .. } => assert!(quiet),
                 Command::Mount(..) => panic!("expected Scan"),
-                Command::Vacuum { .. } => unreachable!(),
+                Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
             }
         }
     }
@@ -839,7 +941,7 @@ mod tests {
                 follow_symlinks, ..
             } => assert!(follow_symlinks),
             Command::Mount(..) => panic!("expected scan command"),
-            Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
         }
     }
 
@@ -852,7 +954,7 @@ mod tests {
                 follow_symlinks, ..
             } => assert!(!follow_symlinks),
             Command::Mount(..) => panic!("expected scan command"),
-            Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
         }
     }
 
@@ -873,8 +975,44 @@ mod tests {
                 );
             }
             Command::Mount(..) => panic!("expected Scan"),
-            Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
         }
+    }
+
+    #[test]
+    fn scan_accepts_force() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "scan", "/m", "--db", "/d", "--force"]).unwrap();
+        let Command::Scan { force, .. } = cli.command else {
+            panic!("expected Scan");
+        };
+        assert!(force);
+    }
+
+    #[test]
+    fn revalidate_subcommand_parses_with_prune() {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["musefs", "revalidate", "/m", "--db", "/d", "--prune"]).unwrap();
+        let Command::Revalidate { prune, targets, .. } = cli.command else {
+            panic!("expected Revalidate");
+        };
+        assert!(prune);
+        assert_eq!(targets, vec![PathBuf::from("/m")]);
+    }
+
+    #[test]
+    fn scan_rejects_prune() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["musefs", "scan", "/m", "--db", "/d", "--prune"]).is_err());
+    }
+
+    #[test]
+    fn revalidate_rejects_force() {
+        use clap::Parser;
+        assert!(
+            Cli::try_parse_from(["musefs", "revalidate", "/m", "--db", "/d", "--force"]).is_err()
+        );
     }
 
     #[test]

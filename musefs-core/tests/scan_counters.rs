@@ -208,7 +208,8 @@ fn scans_more_than_batch_files_persists_all_once() {
         },
     )
     .unwrap();
-    assert_eq!(stats2.scanned, n as u64);
+    assert_eq!(stats2.scanned, 0);
+    assert_eq!(stats2.already_present, n as u64);
     assert_eq!(db.list_tracks().unwrap().len(), n);
 }
 
@@ -283,8 +284,8 @@ fn revalidate_unchanged_count_matches_file_count() {
 }
 
 /// `RevalidateStats.failed == scan.failed + skip_failed` (L711). We produce a
-/// nonzero `scan.failed` with `skip_failed == 0`: an unreadable (chmod 000) new
-/// `.flac` is a *changed* candidate (not in the existing set), passes the
+/// nonzero `scan.failed` with `skip_failed == 0`: an unreadable (chmod 000)
+/// *existing* `.flac` is rewritten so it becomes a changed candidate, passes the
 /// skip-pass (metadata + canonicalize succeed), then fails inside `probe_file`
 /// when `File::open` is denied → `scan.failed += 1`. With `skip_failed == 0`,
 /// `+`→`*` gives `1*0 == 0 != 1` → killed. (`+`→`-` gives `1-0 == 1`, NOT
@@ -295,16 +296,18 @@ fn revalidate_failed_carries_scan_failure() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("ok.flac"), flac_minimal(b"AUDIO-OK")).unwrap();
+    let denied = dir.path().join("denied.flac");
+    std::fs::write(&denied, flac_minimal(b"AUDIO-DENIED")).unwrap();
 
     let db = Db::open_in_memory().unwrap();
     let s0 = scan_directory(&db, dir.path()).unwrap();
-    assert_eq!(s0.scanned, 1);
+    assert_eq!(s0.scanned, 2);
     assert_eq!(s0.failed, 0);
 
-    // Add a NEW unreadable .flac: it is a changed candidate (not yet in the DB),
-    // survives the skip-pass, then probe_file's File::open is denied → failed.
-    let denied = dir.path().join("denied.flac");
-    std::fs::write(&denied, flac_minimal(b"AUDIO-DENIED")).unwrap();
+    // Rewrite the tracked file, then make it unreadable: it is now a changed
+    // existing candidate, survives the skip-pass, then probe_file's File::open
+    // is denied → failed.
+    std::fs::write(&denied, flac_minimal(b"AUDIO-DENIED-CHANGED")).unwrap();
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     // chmod-000 denial is meaningless when running as root (root bypasses file

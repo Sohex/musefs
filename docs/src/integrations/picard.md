@@ -73,7 +73,7 @@ settings (handy for testing).
   movement, totals, and any custom field; multi-values expand and per-role
   performers fold to `Name (Role)`. Picard's hidden `~` internals (length,
   rating, …) are never written.
-- **Orphaned art:** replacing art can orphan old blobs; `musefs scan --revalidate`
+- **Orphaned art:** replacing art can orphan old blobs; `musefs revalidate --prune`
   garbage-collects them.
 - **Schema version:** the plugin refuses to run if the DB's `user_version`
   differs from the version it targets — rebuild the store after upgrading musefs.

@@ -12,6 +12,29 @@ see the [Release notes](release-notes.md).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-18
+
+### Changed
+
+- Bare `scan` is now additive: it skips rows already in the DB instead of
+  re-seeding them from disk. Use `scan --force` when you want the old
+  full-reimport behavior.
+- `revalidate` is now its own subcommand and no longer prunes by default. It
+  refreshes changed rows' structural data while preserving curated tags/art;
+  use `revalidate --prune` to drop rows whose backing file is gone and
+  garbage-collect orphaned art.
+
+### Deprecated
+
+- `scan --revalidate` is a deprecated, warned alias for `revalidate` and will
+  be removed next release. It does not prune; use `revalidate --prune` when you
+  need deletion.
+
+### Fixed
+
+- Revalidating a changed file no longer clobbers curated tags, art, or binary
+  tags in the DB.
+
 ## [1.1.0] - 2026-06-17
 
 ### Added
@@ -245,7 +268,8 @@ First public release.
   `synthesis` / `structure-only` mount modes, auto-refresh, `scan` /
   `scan --revalidate`). Never published publicly; superseded by 0.2.0.
 
-[Unreleased]: https://github.com/Sohex/musefs/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/Sohex/musefs/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/Sohex/musefs/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Sohex/musefs/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Sohex/musefs/releases/tag/v1.0.0
 [0.2.0]: https://github.com/Sohex/musefs/releases/tag/v0.2.0

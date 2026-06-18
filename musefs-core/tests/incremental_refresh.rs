@@ -551,3 +551,78 @@ fn revalidate_reprobes_on_ctime_only_change() {
     let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
     assert_eq!(stats.updated, 1, "ctime-only change must be re-probed");
 }
+
+#[test]
+fn revalidate_changed_file_refreshes_layer_a_preserves_layer_b() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let path = dir.path().join("a.flac");
+    common::write_flac(&path, &["TITLE=A"], &[0xAA; 30]);
+    scan_directory(&db, dir.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    db.replace_tags(id, &[Tag::new("title", "Curated", 0)])
+        .unwrap();
+
+    common::write_flac(&path, &["TITLE=B-on-disk"], &[0xBB; 40]);
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+
+    assert_eq!(stats.updated, 1);
+    assert_eq!(stats.pruned, 0);
+    let tags = db.get_tags(id).unwrap();
+    assert_eq!(tags[0].value, "Curated");
+}
+
+#[test]
+fn revalidate_ignores_new_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    common::write_flac(&dir.path().join("a.flac"), &["TITLE=A"], &[0xAA; 30]);
+    scan_directory(&db, dir.path()).unwrap();
+
+    common::write_flac(&dir.path().join("b.flac"), &["TITLE=B"], &[0xBB; 40]);
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+
+    assert_eq!(stats.updated, 0);
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+}
+
+#[test]
+fn revalidate_prunes_only_with_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let path = dir.path().join("a.flac");
+    common::write_flac(&path, &["TITLE=A"], &[0xAA; 30]);
+    scan_directory(&db, dir.path()).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.pruned, 0);
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+
+    let opts = musefs_core::ScanOptions {
+        prune: true,
+        ..Default::default()
+    };
+    let stats = musefs_core::revalidate_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(stats.pruned, 1);
+    assert_eq!(db.list_tracks().unwrap().len(), 0);
+}
+
+#[test]
+fn revalidate_backfill_does_not_clobber_tags() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let path = dir.path().join("a.flac");
+    common::write_flac(&path, &["TITLE=OnDisk"], &[0xAA; 30]);
+    scan_directory(&db, dir.path()).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+    db.replace_tags(id, &[Tag::new("title", "Curated", 0)])
+        .unwrap();
+    db.set_structural_blocks(id, &[]).unwrap();
+
+    let stats = musefs_core::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.updated, 1);
+    let tags = db.get_tags(id).unwrap();
+    assert_eq!(tags[0].value, "Curated");
+    assert!(!db.get_structural_blocks(id).unwrap().is_empty());
+}

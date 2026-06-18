@@ -157,9 +157,9 @@ independent reader.
 
 External writers prune in one of two ways depending on how they own files.
 For in-place writers (e.g. the beets plugin), existence-based pruning — dropping
-the row of a removed backing file — is a deliberate act owned by `musefs scan
---revalidate`; the plugin never prunes on its own (it exposes the revalidate
-scan via `beet musefs --revalidate`). The `prune_missing` helper in
+the row of a removed backing file — is a deliberate act owned by `musefs
+revalidate --prune`; the plugin never prunes on its own (it exposes the
+revalidate pass via `beet musefs --revalidate`). The `prune_missing` helper in
 `musefs_common` implements the same by-existence delete for writers that prefer
 to own pruning themselves. Link-tree writers (e.g. the Lidarr integration) never
 delete the backing files they point at, so they prune by identity instead: a

@@ -174,7 +174,8 @@ fn revalidate_backfills_structural_and_binary_rows_for_legacy_flac() {
     assert!(db.get_structural_blocks(id).unwrap().is_empty());
     assert!(db.get_binary_tags(id).unwrap().is_empty());
 
-    // Maintenance pass must backfill both stores even though the file is unchanged.
+    // Maintenance pass must backfill structural rows even though the file is
+    // unchanged; curated binary tags stay untouched.
     revalidate(&db, dir.path()).unwrap();
 
     let kinds: Vec<String> = db
@@ -192,11 +193,8 @@ fn revalidate_backfills_structural_and_binary_rows_for_legacy_flac() {
         "SEEKTABLE backfilled"
     );
     assert!(
-        db.get_binary_tags(id)
-            .unwrap()
-            .iter()
-            .any(|b| b.key == "APPLICATION"),
-        "APPLICATION backfilled"
+        db.get_binary_tags(id).unwrap().is_empty(),
+        "binary tags stay untouched on revalidate"
     );
 }
 

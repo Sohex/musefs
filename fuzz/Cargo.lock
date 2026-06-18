@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "arc-swap",
  "base16ct",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-db"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "base16ct",
  "log",
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "musefs-format"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "base64",
  "id3",
