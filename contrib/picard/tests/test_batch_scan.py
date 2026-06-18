@@ -35,7 +35,7 @@ def test_autoscan_batches_into_one_run_scan(monkeypatch, db_path):
 def test_run_scan_force_appends_force(monkeypatch):
     import subprocess
 
-    import musefs_common.scan as scan
+    import musefs._common.scan as scan
 
     captured = {}
 
@@ -55,7 +55,7 @@ def test_run_scan_force_appends_force(monkeypatch):
 def test_run_scan_revalidate_uses_subcommand_and_prune(monkeypatch):
     import subprocess
 
-    import musefs_common.scan as scan
+    import musefs._common.scan as scan
 
     captured = {}
 
