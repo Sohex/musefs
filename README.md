@@ -32,12 +32,7 @@ cargo install musefs    # compiles from source — needs a Rust toolchain,
                         # libfuse3-dev and pkg-config; prebuilt binaries
                         # and container images: see Installing
 
-musefs scan ~/Music --db library.db        # additive ingest (new rows only)
-musefs scan ~/Music --db library.db --force
-                                            # re-seed existing rows from disk
-musefs revalidate ~/Music --db library.db   # refresh changed rows, keep tags
-musefs revalidate ~/Music --db library.db --prune
-                                            # also delete gone tracks
+musefs scan ~/Music --db library.db        # ingest your library
 mkdir -p ~/mnt/music
 musefs mount ~/mnt/music --db library.db \
     --template '$albumartist/$album/$title'
