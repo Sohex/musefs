@@ -34,8 +34,8 @@ class MusefsPlugin(BeetsPlugin):
         # beets has no file-move event, and `after_write` fires *before* a move
         # (at the old path). So imports/writes are recorded and reconciled once
         # at cli_exit, when each item's path is final. Reconcile only syncs; it
-        # never prunes. Pruning is a deliberate act owned by `musefs scan
-        # --revalidate` (reachable via `beet musefs --revalidate`).
+        # never prunes. Pruning is a deliberate act owned by `musefs revalidate
+        # --prune` (reachable via `beet musefs --revalidate`).
         self._pending = []
         self.register_listener("after_write", self._record)
         self.register_listener("item_imported", self._record)
@@ -72,8 +72,9 @@ class MusefsPlugin(BeetsPlugin):
             dest="revalidate",
             action="store_true",
             default=False,
-            help="forward --revalidate to `musefs scan`, pruning rows whose backing "
-            "file is gone and GCing orphaned art (the only way this plugin prunes)",
+            help="forward to the `musefs revalidate` subcommand, pruning rows "
+            "whose backing file is gone and GCing orphaned art (the only way "
+            "this plugin prunes)",
         )
         cmd.func = self._command
         return [cmd]
@@ -95,16 +96,19 @@ class MusefsPlugin(BeetsPlugin):
         items = list(lib.items(query))
         revalidate = bool(opts.revalidate)
         # A scan runs when autoscan is on, or whenever --revalidate is requested:
-        # revalidation IS a scan operation — pruning gone backing files and GCing
-        # orphaned art live entirely in `musefs scan --revalidate`. The plugin
-        # never prunes on its own; this is the only path that removes rows.
+        # revalidation is the pruning maintenance pass (`musefs revalidate
+        # --prune`). The plugin never prunes on its own; this is the only path
+        # that removes rows.
         if (self._autoscan() or revalidate) and not opts.dry_run:
             # Full sync: one scan of the music dir. Query: scan only the matched
             # files, so non-matched rows aren't re-seeded from their files.
             targets = (
                 [os.fsdecode(i.path) for i in items] if query else [os.fsdecode(lib.directory)]
             )
-            self._run_scan(db_path, targets, revalidate=revalidate)
+            if revalidate:
+                self._run_scan(db_path, targets, revalidate=True, prune=True)
+            else:
+                self._run_scan(db_path, targets, force=True)
         restore_backing = bool(opts.restore_backing) or self._restore_backing()
         stats = self._sync(db_path, items, dry_run=opts.dry_run, restore_backing=restore_backing)
         # ui.print_ (not self._log) so the summary always shows, not only at -v.
@@ -142,7 +146,7 @@ class MusefsPlugin(BeetsPlugin):
             return
         try:
             if self._autoscan():
-                self._run_scan(db_path, [os.fsdecode(i.path) for i in items])
+                self._run_scan(db_path, [os.fsdecode(i.path) for i in items], force=True)
             self._sync(db_path, items, restore_backing=self._restore_backing())
         except (ui.UserError, sqlite3.Error, OSError, subprocess.SubprocessError) as exc:
             # A passive cli_exit hook must never abort the beets operation for an
@@ -196,15 +200,23 @@ class MusefsPlugin(BeetsPlugin):
     def _bin(self):
         return self.config["bin"].get(str) or "musefs"
 
-    def _run_scan(self, db_path, targets, revalidate=False):
-        """Run `musefs scan <target...> --db <db> [--revalidate]` once for the
-        whole batch. Creates the DB if missing and fills the structural columns
-        the plugin can't compute itself. With ``revalidate``, the scanner also
-        prunes rows whose backing file is gone and GCs orphaned art. Raises
-        ui.UserError on failure."""
+    def _run_scan(self, db_path, targets, *, revalidate=False, force=False, prune=False):
+        """Run musefs once for the whole batch.
+
+        ``force`` re-seeds existing tracks from their backing files. ``revalidate``
+        forwards to the new subcommand; ``prune`` deletes gone rows and GCs
+        orphaned art."""
         binary = self._bin()
         try:
-            run_scan(binary, db_path, targets, revalidate=revalidate, timeout=SCAN_TIMEOUT_SECONDS)
+            run_scan(
+                binary,
+                db_path,
+                targets,
+                revalidate=revalidate,
+                force=force,
+                prune=prune,
+                timeout=SCAN_TIMEOUT_SECONDS,
+            )
         except ScanError as exc:
             raise self._scan_user_error(exc)
 

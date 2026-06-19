@@ -5,6 +5,62 @@ per-change list see the [Changelog](changelog.md); for the external-writer
 `contrib/` packages (which version independently) see the
 [contrib changelog](integrations/overview.md#contrib-changelog).
 
+## v1.2.0
+
+A behavior-focused release: the headline change makes `scan` **non-destructive
+by default**. The on-disk schema is unchanged (still version 2), so there is no
+migration — but a default that previously overwrote curated metadata has been
+removed, so read [Upgrading from v1.1.0](#upgrading-from-v110) before you update
+any automation that calls `scan`.
+
+### Highlights
+
+- **`scan` is now additive.** A bare `musefs scan` ingests only files not already
+  in the store and **never overwrites curated tags or art**. Re-running it to
+  pick up newly-added files is safe; the old full-reimport-from-disk behavior is
+  now opt-in via `scan --force`. This closes a footgun where a routine re-scan
+  silently clobbered tags written by Picard / beets / the store.
+- **`revalidate` is its own subcommand.** Promoted from the `scan --revalidate`
+  flag, it refreshes the structural/serving facts (audio bounds, checksums, FLAC
+  structural blocks) of in-store files whose backing bytes changed, while
+  **preserving curated tags, art, and binary tags**. Files not yet in the store
+  are ignored — that is `scan`'s job.
+- **Deletion is opt-in.** `revalidate` no longer prunes by default; pass
+  `revalidate --prune` to drop rows whose backing file is gone and
+  garbage-collect orphaned art. No bare command deletes or overwrites store data.
+- **Data-loss fix.** Revalidating a changed file no longer clobbers curated tags,
+  art, or binary tags — previously the structural/checksum backfill routed
+  through a full re-seed from disk.
+
+See the [Changelog](changelog.md#120---2026-06-18) for the full list.
+
+### Upgrading from v1.1.0
+
+**No schema migration.** The store stays at `user_version` 2; nothing about the
+on-disk format changes, and you can roll back to v1.1.0 without touching it.
+
+**Behavior changes to check:**
+
+- **Bare `scan` no longer re-imports existing tracks.** Automation that runs
+  `musefs scan <dir>` expecting it to refresh tags on files already in the store
+  now **skips** them (reported as `already present`). To re-seed curated metadata
+  from disk, use `scan --force`. The common case — re-running `scan` to pick up
+  newly-added files — is unchanged.
+- **`scan --revalidate` is deprecated.** It still works but prints a warning and
+  forwards to the non-pruning `revalidate` path; it will be removed next release.
+  Switch to the `musefs revalidate` subcommand — and note it **no longer prunes**,
+  so add `--prune` for the old delete-gone-rows-and-GC behavior.
+- **`revalidate` does not prune by default.** Scripted maintenance that relied on
+  `scan --revalidate` to remove rows for deleted files must now pass
+  `revalidate --prune` explicitly.
+
+**External writers.** The `contrib/` packages are bumped to 1.2.0; the beets and
+Picard plugins are updated for the new CLI — the beets plugin's autoscan now
+resets the store with `scan --force`, and `beet musefs --revalidate` maps to
+`revalidate --prune` (both transparent to you). Update these packages alongside
+the binary; older copies invoke the deprecated `scan --revalidate` alias, which
+still works for this release.
+
 ## v1.1.0
 
 A feature-and-hardening release on top of the v1.0.0 stable line. No CLI flags

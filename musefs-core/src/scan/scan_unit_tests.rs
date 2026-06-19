@@ -1,5 +1,5 @@
 use super::*;
-use musefs_format::PictureType;
+use musefs_format::{EmbeddedPicture, PictureType};
 use std::io::Write;
 
 // --- ScanOptions defaults (WINDOW L16, BATCH_BYTES L12) ---
@@ -400,7 +400,7 @@ fn ingest_unit_db_path_sets_checksums_on_fresh_insert() {
     let db = Db::open_in_memory().unwrap();
     let fp = "a".repeat(64);
     let unit = unit_with("/brand/new.flac", Some(fp.clone()));
-    ingest_unit(&db, unit, MatchStrictness::Auto).unwrap();
+    ingest_unit(&db, unit, MatchStrictness::Auto, WritePolicy::Full).unwrap();
 
     let tracks = db.list_tracks().unwrap();
     assert_eq!(tracks.len(), 1);
@@ -433,7 +433,7 @@ fn ingest_unit_db_path_retargets_orphan() {
 
     let new_path = "/moved/here.flac";
     let unit = unit_with(new_path, Some(fp.clone()));
-    ingest_unit(&db, unit, MatchStrictness::Auto).unwrap();
+    ingest_unit(&db, unit, MatchStrictness::Auto, WritePolicy::Full).unwrap();
 
     let tracks = db.list_tracks().unwrap();
     assert_eq!(tracks.len(), 1, "orphan retargeted, not duplicated");
@@ -488,13 +488,106 @@ fn ingest_unit_db_path_skips_unstatable_candidate() {
     db.set_track_checksums(id, Some(&fp), None).unwrap();
 
     let unit = unit_with("/fresh/new.flac", Some(fp));
-    ingest_unit(&db, unit, MatchStrictness::Auto).unwrap();
+    ingest_unit(&db, unit, MatchStrictness::Auto, WritePolicy::Full).unwrap();
 
     let tracks = db.list_tracks().unwrap();
     assert_eq!(
         tracks.len(),
         2,
         "unstatable candidate must not be retargeted"
+    );
+}
+
+#[test]
+fn refresh_structural_into_preserves_tags_and_art() {
+    let db = Db::open_in_memory().unwrap();
+    let stamp = BackingStamp {
+        size: 10,
+        mtime_ns: 1,
+        ctime_ns: 1,
+    };
+    let seeded = Probed {
+        format: Format::Flac,
+        audio_offset: 4,
+        audio_length: 6,
+        tags: vec![("title".into(), "Original".into())],
+        pictures: vec![EmbeddedPicture {
+            mime: "image/jpeg".into(),
+            picture_type: PictureType::new(3).unwrap(),
+            description: "Original art".into(),
+            width: 1,
+            height: 1,
+            data: vec![1, 2, 3],
+        }],
+        binary_tags: vec![EmbeddedBinaryTag {
+            key: "APPLICATION".into(),
+            payload: vec![1, 2, 3],
+        }],
+        structural_blocks: vec![("STREAMINFO".into(), vec![1, 2, 3])],
+    };
+    ingest_into(&db, "/m/a.flac", stamp, seeded, None, None).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+
+    let changed = Probed {
+        format: Format::Flac,
+        audio_offset: 8,
+        audio_length: 12,
+        tags: vec![("title".into(), "CLOBBERED".into())],
+        pictures: vec![EmbeddedPicture {
+            mime: "image/jpeg".into(),
+            picture_type: PictureType::new(3).unwrap(),
+            description: "Changed art".into(),
+            width: 2,
+            height: 2,
+            data: vec![9, 9, 9],
+        }],
+        binary_tags: vec![EmbeddedBinaryTag {
+            key: "APPLICATION".into(),
+            payload: vec![9, 9, 9, 9, 9],
+        }],
+        structural_blocks: vec![("STREAMINFO".into(), vec![9, 9, 9])],
+    };
+    let stamp2 = BackingStamp {
+        size: 20,
+        mtime_ns: 2,
+        ctime_ns: 2,
+    };
+    refresh_structural_into(&db, "/m/a.flac", stamp2, changed, None, None).unwrap();
+
+    let track = &db.list_tracks().unwrap()[0];
+    assert_eq!(track.id, id, "same row upserted, not replaced");
+    assert_eq!(track.bounds.audio_offset(), 8, "Layer A bounds refreshed");
+    assert_eq!(track.bounds.audio_length(), 12, "Layer A bounds refreshed");
+    assert_eq!(track.backing_size, 20, "Layer A stamp refreshed");
+    assert_eq!(track.backing_mtime_ns, 2);
+    assert_eq!(track.backing_ctime_ns, 2);
+
+    let tags = db.get_tags(id).unwrap();
+    assert_eq!(tags, vec![Tag::new("title", "Original", 0)]);
+
+    let structural = db.get_structural_blocks(id).unwrap();
+    assert_eq!(
+        structural,
+        vec![musefs_db::StructuralBlock {
+            kind: "STREAMINFO".into(),
+            ordinal: 0,
+            body: vec![9, 9, 9],
+        }]
+    );
+
+    let art = db.get_track_art(id).unwrap();
+    assert_eq!(art.len(), 1);
+    assert_eq!(art[0].description, "Original art");
+    assert_eq!(art[0].ordinal, 0);
+
+    // Curated binary tags survive untouched: the original 3-byte APPLICATION
+    // payload, not the 5-byte one in `changed`.
+    let binary = db.get_binary_tags(id).unwrap();
+    assert_eq!(binary.len(), 1, "binary tag preserved");
+    assert_eq!(binary[0].key, "APPLICATION");
+    assert_eq!(
+        binary[0].byte_len, 3,
+        "original binary payload kept, not rewritten"
     );
 }
 

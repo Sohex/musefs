@@ -7,7 +7,7 @@ user account — no root, no `CAP_SYS_ADMIN`.
 
 - `musefs.service` — the mount daemon (`musefs mount`); blocks until stopped.
 - `musefs-scan.service` + `musefs-scan.timer` — optional periodic
-  `musefs scan --revalidate`.
+  `musefs revalidate --prune`.
 - `musefs.conf.example` — every `MUSEFS_*` setting, commented with defaults.
 
 ## Install

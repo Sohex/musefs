@@ -478,7 +478,19 @@ fn revalidate_buckets_unchanged_and_prunes_missing() {
 
     std::fs::remove_file(&keep).unwrap();
     let s2 = crate::revalidate(&db, dir.path()).unwrap();
-    assert_eq!(s2.pruned, 1);
+    assert_eq!(s2.pruned, 0);
+    assert_eq!(db.list_tracks().unwrap().len(), 1);
+
+    let s3 = crate::revalidate_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            prune: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(s3.pruned, 1);
     assert!(db.list_tracks().unwrap().is_empty());
 }
 

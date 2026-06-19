@@ -7,7 +7,7 @@ Type=oneshot
 EnvironmentFile=-%h/.config/musefs/musefs.conf
 Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin
 # Scan target(s) are not env-configurable; set your library path here.
-ExecStart=musefs scan %h/Music --revalidate
+ExecStart=musefs revalidate %h/Music --prune
 
 # --- Sandbox -------------------------------------------------------------
 # The scanner creates no FUSE mount, so it can take a strong systemd sandbox

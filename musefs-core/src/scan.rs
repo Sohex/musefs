@@ -117,6 +117,8 @@ impl fmt::Debug for ProgressSink {
 pub struct ScanStats {
     pub scanned: u64,
     pub skipped: u64,
+    /// Files skipped because a track already exists at that path.
+    pub already_present: u64,
     pub failed: u64,
     pub raced: u64,
 }
@@ -796,6 +798,17 @@ pub enum MatchStrictness {
     Strict,
 }
 
+/// Whether the writer overwrites curated metadata or only refreshes structural
+/// serving facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritePolicy {
+    /// Full upsert: track row, checksums, tags, binary tags, structural blocks,
+    /// and art.
+    Full,
+    /// Layer-A-only refresh: track row, checksums, and structural blocks.
+    StructuralOnly,
+}
+
 /// Knobs for a scan. `jobs == 0` means "use available parallelism".
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -813,6 +826,12 @@ pub struct ScanOptions {
     pub checksum: ChecksumTier,
     /// How a refind fingerprint match is confirmed before retargeting.
     pub strictness: MatchStrictness,
+    /// Scan only: re-ingest files already present in the DB, overwriting
+    /// curated metadata. Off by default; bare scan is additive.
+    pub force: bool,
+    /// Revalidate only: delete tracks whose backing file is gone and GC
+    /// orphaned art. Off by default.
+    pub prune: bool,
 }
 
 impl Default for ScanOptions {
@@ -825,6 +844,8 @@ impl Default for ScanOptions {
             progress: None,
             checksum: ChecksumTier::Fingerprint,
             strictness: MatchStrictness::Auto,
+            force: false,
+            prune: false,
         }
     }
 }
@@ -942,6 +963,23 @@ fn log_mp4_oversize_drops(path: &Path, art: &[mp4::OversizeDrop], binary: &[mp4:
             d.bytes,
         );
     }
+}
+
+fn structural_blocks_from(blocks: Vec<(String, Vec<u8>)>) -> Vec<musefs_db::StructuralBlock> {
+    let mut ordinals: HashMap<String, u64> = HashMap::new();
+    blocks
+        .into_iter()
+        .map(|(kind, body)| {
+            let ord = ordinals.entry(kind.clone()).or_insert(0);
+            let block = musefs_db::StructuralBlock {
+                kind,
+                ordinal: *ord,
+                body,
+            };
+            *ord += 1;
+            block
+        })
+        .collect()
 }
 
 /// The write surface `ingest_into` drives: satisfied by both a direct `&Db`
@@ -1157,21 +1195,7 @@ fn ingest_into(
     let binary_tags = accept_binary_tags(abs_path, probed.binary_tags);
     w.set_binary_tags(track_id, &binary_tags)?;
 
-    let mut sb_ordinals: HashMap<String, u64> = HashMap::new();
-    let structural_blocks: Vec<musefs_db::StructuralBlock> = probed
-        .structural_blocks
-        .into_iter()
-        .map(|(kind, body)| {
-            let ord = sb_ordinals.entry(kind.clone()).or_insert(0);
-            let sb = musefs_db::StructuralBlock {
-                kind,
-                ordinal: *ord,
-                body,
-            };
-            *ord += 1;
-            sb
-        })
-        .collect();
+    let structural_blocks = structural_blocks_from(probed.structural_blocks);
     w.set_structural_blocks(track_id, &structural_blocks)?;
 
     let mut track_arts = Vec::new();
@@ -1197,11 +1221,51 @@ fn ingest_into(
     Ok(())
 }
 
+/// Refresh only the structural serving facts for an already-probed file.
+/// Leaves curated tags, binary tags, and art untouched.
+fn refresh_structural_into(
+    mut w: impl TrackSink,
+    abs_path: &str,
+    stamp: BackingStamp,
+    probed: Probed,
+    fingerprint: Option<&str>,
+    content_hash: Option<&str>,
+) -> Result<()> {
+    let track_id = w.upsert_track(&NewTrack {
+        backing_path: abs_path.to_string(),
+        format: probed.format,
+        audio_offset: probed.audio_offset,
+        audio_length: probed.audio_length,
+        backing_size: stamp.size,
+        backing_mtime_ns: stamp.mtime_ns,
+        backing_ctime_ns: stamp.ctime_ns,
+    })?;
+    w.set_track_checksums(track_id, fingerprint, content_hash)?;
+    let structural_blocks = structural_blocks_from(probed.structural_blocks);
+    w.set_structural_blocks(track_id, &structural_blocks)?;
+    Ok(())
+}
+
 /// Decide how to ingest one probed unit: retarget a relocated row when a unique
 /// fingerprint match exists whose backing file is gone, otherwise ingest fresh.
 /// The strict/auto confirm hash, if computed here, is persisted on the retarget
 /// (so a fingerprint-tier strict move doesn't re-read the file next scan).
-fn ingest_unit(mut w: impl TrackSink, unit: Unit, strictness: MatchStrictness) -> Result<()> {
+fn ingest_unit(
+    mut w: impl TrackSink,
+    unit: Unit,
+    strictness: MatchStrictness,
+    policy: WritePolicy,
+) -> Result<()> {
+    if policy == WritePolicy::StructuralOnly {
+        return refresh_structural_into(
+            w,
+            &unit.abs_path,
+            unit.stamp,
+            unit.probed,
+            unit.fingerprint.as_deref(),
+            unit.content_hash.as_deref(),
+        );
+    }
     // Known path => ordinary upsert (re-scan of an in-place file).
     if w.track_exists_at(&unit.abs_path)? {
         return ingest_into(
@@ -1359,15 +1423,37 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
             opts.progress.as_ref(),
         )?;
     }
+    let mut already_present = 0u64;
+    if !opts.force {
+        let existing: HashSet<String> = db
+            .list_tracks()?
+            .into_iter()
+            .map(|t| t.backing_path)
+            .collect();
+        let before = files.len();
+        files.retain(|path| {
+            let key = if opts.follow_symlinks {
+                match std::fs::canonicalize(path) {
+                    Ok(abs) => abs.to_string_lossy().into_owned(),
+                    Err(_) => return true,
+                }
+            } else {
+                path.to_string_lossy().into_owned()
+            };
+            !existing.contains(&key)
+        });
+        already_present = (before - files.len()) as u64;
+    }
     if let Some(p) = &opts.progress {
         p.emit(ScanProgress::Walked {
             total: files.len() as u64,
         });
     }
     db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
-    let mut stats = run_pipeline(db, files, opts)?;
+    let mut stats = run_pipeline(db, files, opts, WritePolicy::Full)?;
     // skipped is tallied during the walk, not the pipeline
     stats.skipped = tally.total;
+    stats.already_present = already_present;
     // Per-extension breakdown of the skip count, so a large `skipped` is
     // diagnosable (#341). Log-only: never folded into `stats`/the CLI summary.
     if let Some(summary) = tally.summary() {
@@ -1384,7 +1470,12 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
 /// Probe `files` across `jobs` workers (no DB access) and write the results from a
 /// single writer (this thread) in batched transactions. Per-file errors are
 /// counted, not fatal.
-fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<ScanStats> {
+fn run_pipeline(
+    db: &Db,
+    files: Vec<PathBuf>,
+    opts: &ScanOptions,
+    policy: WritePolicy,
+) -> Result<ScanStats> {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     let jobs = effective_jobs(opts.jobs);
@@ -1502,7 +1593,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
         for unit in batch.drain(..) {
             released += unit.weight;
             committed.push(unit.abs_path.clone());
-            ingest_unit(&mut bw, unit, strictness)?;
+            ingest_unit(&mut bw, unit, strictness, policy)?;
         }
         bw.commit()?;
         for abs_path in committed {
@@ -1568,6 +1659,7 @@ fn run_pipeline(db: &Db, files: Vec<PathBuf>, opts: &ScanOptions) -> Result<Scan
     Ok(ScanStats {
         scanned,
         skipped: 0, // counted at walk time; filled in by scan_directory_with
+        already_present: 0,
         failed: failed.load(Ordering::Relaxed),
         raced: raced.load(Ordering::Relaxed),
     })
@@ -1591,6 +1683,7 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
     let mut stats = ScanStats {
         scanned: 0,
         skipped,
+        already_present: 0,
         failed: 0,
         raced: 0,
     };
@@ -1706,8 +1799,8 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
                 unchanged += 1;
                 continue;
             }
+            changed.push(path);
         }
-        changed.push(path);
     }
 
     if let Some(p) = &opts.progress {
@@ -1716,23 +1809,24 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         });
     }
 
-    let scan = run_pipeline(db, changed, opts)?;
-
-    // Prune + GC on the writer connection (single-threaded), unchanged from before.
-    let canon_root = root;
     let mut pruned = 0u64;
-    for track in db.list_tracks()? {
-        if !Path::new(&track.backing_path).starts_with(canon_root) {
-            continue;
+    let scan = run_pipeline(db, changed, opts, WritePolicy::StructuralOnly)?;
+
+    if opts.prune {
+        let canon_root = root;
+        for track in db.list_tracks()? {
+            if !Path::new(&track.backing_path).starts_with(canon_root) {
+                continue;
+            }
+            if let Err(e) = std::fs::metadata(&track.backing_path)
+                && e.kind() == std::io::ErrorKind::NotFound
+            {
+                db.delete_track(track.id)?;
+                pruned += 1;
+            }
         }
-        if let Err(e) = std::fs::metadata(&track.backing_path)
-            && e.kind() == std::io::ErrorKind::NotFound
-        {
-            db.delete_track(track.id)?;
-            pruned += 1;
-        }
+        db.gc_orphan_art()?;
     }
-    db.gc_orphan_art()?;
 
     Ok(RevalidateStats {
         updated: scan.scanned,

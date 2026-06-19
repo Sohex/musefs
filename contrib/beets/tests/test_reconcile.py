@@ -101,26 +101,77 @@ def test_reconcile_surfaces_permission_error_loudly(monkeypatch):
 def test_run_scan_passes_shared_timeout(monkeypatch):
     captured = {}
 
-    def fake_run_scan(binary, db_path, targets, *, revalidate=False, timeout=None):
+    def fake_run_scan(
+        binary, db_path, targets, *, revalidate=False, force=False, prune=False, timeout=None
+    ):
         captured["targets"] = targets
         captured["revalidate"] = revalidate
+        captured["force"] = force
+        captured["prune"] = prune
         captured["timeout"] = timeout
 
     monkeypatch.setattr(musefs_mod, "run_scan", fake_run_scan)
     plugin = MusefsPlugin.__new__(MusefsPlugin)
     plugin._bin = lambda: "musefs"
-    plugin._run_scan("/db.sqlite", ["/a.flac", "/b.flac"])
+    plugin._run_scan("/db.sqlite", ["/a.flac", "/b.flac"], force=True)
 
     assert captured["targets"] == ["/a.flac", "/b.flac"]  # one call, full list
     assert captured["revalidate"] is False  # reconcile/plain scan never revalidates
+    assert captured["force"] is True
+    assert captured["prune"] is False
     assert captured["timeout"] == musefs_mod.SCAN_TIMEOUT_SECONDS == 120
+
+
+def test_run_scan_revalidate_passes_prune(monkeypatch):
+    captured = {}
+
+    def fake_run_scan(
+        binary, db_path, targets, *, revalidate=False, force=False, prune=False, timeout=None
+    ):
+        captured["targets"] = targets
+        captured["revalidate"] = revalidate
+        captured["force"] = force
+        captured["prune"] = prune
+        captured["timeout"] = timeout
+
+    monkeypatch.setattr(musefs_mod, "run_scan", fake_run_scan)
+    plugin = MusefsPlugin.__new__(MusefsPlugin)
+    plugin._bin = lambda: "musefs"
+    plugin._run_scan("/db.sqlite", ["/a.flac"], revalidate=True, prune=True)
+
+    assert captured["targets"] == ["/a.flac"]
+    assert captured["revalidate"] is True
+    assert captured["force"] is False
+    assert captured["prune"] is True
+    assert captured["timeout"] == musefs_mod.SCAN_TIMEOUT_SECONDS == 120
+
+
+def test_reconcile_pending_autoscan_forces_scan(monkeypatch):
+    captured = {}
+
+    def fake_run_scan(db_path, targets, *, revalidate=False, force=False, prune=False):
+        captured["targets"] = targets
+        captured["revalidate"] = revalidate
+        captured["force"] = force
+        captured["prune"] = prune
+
+    plugin = _plugin(monkeypatch)
+    plugin._autoscan = lambda: True
+    plugin._run_scan = fake_run_scan
+    plugin._pending = [SimpleNamespace(path=b"/music/a.flac")]
+    plugin._reconcile_pending()
+
+    assert captured["targets"] == ["/music/a.flac"]
+    assert captured["force"] is True
+    assert captured["revalidate"] is False
+    assert captured["prune"] is False
 
 
 def test_removal_only_command_does_not_prune(db_path, tmp_path):
     # Pruning is a deliberate act (#538): the plugin no longer reacts to
     # item/album removals, and a passive cli_exit with no writes pending is a
     # no-op. A removed-and-deleted backing file's row survives until an explicit
-    # `beet musefs --revalidate` / `musefs scan --revalidate` — a transient mount
+    # `beet musefs --revalidate` / `musefs revalidate --prune` — a transient mount
     # blip can't mass-delete.
     gone = tmp_path / "gone.flac"  # never created on disk == already deleted
     conn = musefs_connect(db_path)
