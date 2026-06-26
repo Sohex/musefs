@@ -104,11 +104,10 @@ def test_build_records_uses_real_beets_destination(tmp_path):
     # covers item.destination(relative_to_libdir=True), not just our decode.
     from beets.library import Item, Library
 
-    lib = Library(
-        ":memory:",
-        directory=str(tmp_path),
-        path_formats=[("default", "$artist/$album/$track $title")],
-    )
+    lib = Library(":memory:", directory=str(tmp_path))
+    # beets 2.12 dropped the path_formats constructor arg (it now derives from
+    # config); assigning the attribute works across versions.
+    lib.path_formats = [("default", "$artist/$album/$track $title")]
     item = Item(artist="AC/DC", album="Back in Black", title="Hells Bells", track=1)
     item.path = b"/music/x.flac"  # supplies the .flac extension
     lib.add(item)  # assigns an id and binds the library, required by destination()
