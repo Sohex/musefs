@@ -148,6 +148,19 @@ exclude_re = [
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
 'musefs-core/src/scan\.rs:1532:46:',
+    # probe_body's tail-read predicate
+    # `has_ext(mp3) || (has_ext(flac) && has_leading_id3(prefix))`, the inner `&&`
+    # (col 66) -> `||`: widening it makes every .flac pay the 128-byte tail read,
+    # not just the rare one with a leading ID3v2 tag (#602). No parsed result
+    # moves — flac::audio_end trims a trailer only when that same leading tag is
+    # present, so a stock FLAC's bounds, tags, and art are byte-identical either
+    # way. The only observable is extra I/O (`scan_bytes_read`), which lives
+    # behind the `metrics` feature the in-diff gate does not build — the same
+    # class as the batching-cadence entries below. The `||` at col 40 IS
+    # behavioral (it decides whether an .mp3 gets its ID3v1 trailer trimmed) and
+    # stays in scope, killed by scan.rs's mp3_id3v1_trailer_is_not_served_as_audio.
+    # guard: op="&&" fn="probe_body" rows=1
+'musefs-core/src/scan\.rs:691:66:',
     # run_pipeline flush cadence (batch_bytes accounting + the
     # `len >= BATCH_FILES || batch_bytes >= cap` flush triggers, both the try_recv
     # and the recv branch): the mid-loop threshold flush is belt-and-suspenders on

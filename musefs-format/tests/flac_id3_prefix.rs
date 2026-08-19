@@ -207,3 +207,44 @@ fn rejects_a_malformed_tag_header() {
     file.extend_from_slice(b"fLaC");
     assert_eq!(locate_audio(&file).unwrap_err(), FormatError::Malformed);
 }
+
+#[test]
+fn the_committed_fuzz_seed_fixture_is_a_valid_id3_prefixed_flac() {
+    // `generate_seeds` writes this fixture to fuzz/corpus/flac/seed_id3_prefix. If
+    // it ever stopped being a valid ID3-then-FLAC file the seed would still be
+    // committed, silently costing the fuzzer its only entry into the skip path.
+    let audio = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let file = musefs_format::fuzz_check::fixtures::flac_with_leading_id3(&audio);
+
+    assert!(has_leading_id3(&file));
+    let scan = locate_audio(&file).expect("fixture parses as a FLAC behind its ID3 tag");
+    assert_eq!(scan.audio_length, audio.len() as u64);
+    assert_eq!(
+        &file[usize::try_from(scan.audio_offset).unwrap()..],
+        &audio[..]
+    );
+}
+
+#[test]
+fn bounded_rejects_a_file_len_shorter_than_the_metadata() {
+    let file = id3_then_flac(&blank_id3(16), &["TITLE=Short"], &[0x77; 32]);
+    // No real file can have its audio start past its own end, so a `file_len`
+    // disagreeing with the prefix is a caller bug, not a short window.
+    assert_eq!(
+        locate_audio_bounded(&file, 8, None).unwrap_err(),
+        FormatError::Malformed
+    );
+}
+
+#[test]
+fn bounded_accepts_metadata_that_fills_the_whole_file() {
+    // audio_offset == file_len: a FLAC with no audio frames at all. Degenerate but
+    // well-formed, so it parses rather than being rejected at the bounds check.
+    let file = id3_then_flac(&blank_id3(8), &["TITLE=Empty"], &[]);
+    let Extent::Complete(scan) = locate_audio_bounded(&file, file.len() as u64, None).unwrap()
+    else {
+        panic!("a metadata-only FLAC is still a FLAC");
+    };
+    assert_eq!(scan.audio_offset, file.len() as u64);
+    assert_eq!(scan.audio_length, 0);
+}
