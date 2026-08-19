@@ -40,7 +40,7 @@ fn scans_flac_files_seeding_tracks_and_tags() {
     let tags = db.get_tags(a_track.id).unwrap();
     assert!(tags.iter().any(|t| t.key == "title" && t.value == "A"));
     assert!(tags.iter().any(|t| t.key == "artist" && t.value == "X"));
-    assert!(a_track.bounds.audio_length() == 30);
+    assert_eq!(a_track.bounds.audio_length(), 30);
 }
 
 #[test]
