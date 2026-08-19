@@ -18,15 +18,22 @@
 # ceiling tight enough to catch a hung refresh quickly would kill a slow-but-fine
 # install, turning a flake into a self-inflicted failure.
 #
-# The install budget is sized off measurement, not guesswork: on a degraded
-# afternoon these steps were observed taking 200-234s where they normally take
-# ~20s, so the ceiling has to clear that comfortably or a slow-but-progressing
-# install gets killed. Attempts are kept low to compensate, since a genuinely
-# hung mirror does not recover within a job's lifetime anyway — the retry is for
-# transient failures, and the bound is what protects the release gate.
+# Both budgets are sized off measurement, not guesswork, and both had to be
+# raised once already: a refresh against a slow Azure mirror was seen exceeding
+# 120s while still making steady progress, and installs were seen at 200-234s
+# where they normally take ~20s. Sizing either ceiling off a healthy moment
+# turns a slow-but-working step into a hard failure — the exact self-inflicted
+# outage this script exists to prevent.
 #
-# Knobs (env): APT_RETRY_ATTEMPTS (default 2), APT_UPDATE_TIMEOUT (default 120),
-# APT_INSTALL_TIMEOUT (default 420). Worst case is ~18 minutes, inside the
+# The distinction that matters is slow (seconds to a few minutes, still
+# printing progress) versus hung (15+ minutes, no progress at all). The
+# defaults sit well above the former and far below the latter. Attempts are
+# kept low because a genuinely hung mirror does not recover inside a job's
+# lifetime: the retry is for transient failures, and the bound is what protects
+# the release gate.
+#
+# Knobs (env): APT_RETRY_ATTEMPTS (default 2), APT_UPDATE_TIMEOUT (default 300),
+# APT_INSTALL_TIMEOUT (default 420). Worst case is ~24 minutes, inside the
 # release gate's 45-minute deadline, so a mirror that never recovers fails
 # loudly instead of eating the whole window.
 set -euo pipefail
@@ -37,7 +44,7 @@ if [ "$#" -eq 0 ]; then
 fi
 
 attempts="${APT_RETRY_ATTEMPTS:-2}"
-update_try="${APT_UPDATE_TIMEOUT:-120}"
+update_try="${APT_UPDATE_TIMEOUT:-300}"
 install_try="${APT_INSTALL_TIMEOUT:-420}"
 
 # Root in a container has no sudo; the runner jobs are non-root and do.
