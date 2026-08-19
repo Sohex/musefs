@@ -14,7 +14,7 @@ metrics = []
 arc-swap = "1"
 crossbeam-channel = "0.5"
 dashmap = "6"
-im = "15"
+imbl = "7"
 log = "0.4"
 musefs-db = { path = "../musefs-db", version = "1.1.0" }
 musefs-format = { path = "../musefs-format", version = "1.1.0" }

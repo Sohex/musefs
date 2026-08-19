@@ -253,6 +253,7 @@ def test_sync_cli_album_deleted_prunes_without_api(tmp_path, capsys):
     from musefs_common import connect
     from musefs_common.schema import SCHEMA_SQL
     from musefs_common.store import replace_tags
+
     from musefs_lidarr.cli_sync import run
     from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
 

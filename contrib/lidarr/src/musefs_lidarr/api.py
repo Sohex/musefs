@@ -31,7 +31,7 @@ class LidarrConfig:
     api_key: str | None = None
 
     @classmethod
-    def from_env(cls, environ: dict[str, str] | None = None) -> "LidarrConfig":
+    def from_env(cls, environ: dict[str, str] | None = None) -> LidarrConfig:
         """Read URL/key from ``MUSEFS_LIDARR_URL``/``MUSEFS_LIDARR_API_KEY``.
 
         Raises ``ConfigError`` if only one of the two is set.

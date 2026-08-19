@@ -1,4 +1,4 @@
-use im::{HashMap as ImHashMap, OrdMap};
+use imbl::{HashMap as ImHashMap, OrdMap};
 use std::borrow::Cow;
 
 /// Case-fold a name for case-insensitive comparison. Unicode-aware lowercasing;
@@ -201,7 +201,21 @@ impl VirtualTree {
         self.nodes.get(&inode).map(|n| n.parent)
     }
 
-    pub fn children(&self, inode: u64) -> Option<&OrdMap<String, u64>> {
+    /// Child entries of `inode` as `(name, inode)`, ordered by name. `None` when
+    /// `inode` is unknown or is not a directory.
+    ///
+    /// Yields an opaque iterator rather than the backing map so the
+    /// persistent-collection crate stays an implementation detail — swapping it
+    /// (as in the `im` -> `imbl` move) must not break this crate's public API.
+    /// Callers wanting a single entry by name have `lookup`.
+    pub fn children(&self, inode: u64) -> Option<impl ExactSizeIterator<Item = (&str, u64)>> {
+        self.child_map(inode)
+            .map(|kids| kids.iter().map(|(name, &ino)| (name.as_str(), ino)))
+    }
+
+    /// The backing child map, for in-crate callers that need `OrdMap`'s
+    /// by-name lookups rather than a walk.
+    fn child_map(&self, inode: u64) -> Option<&OrdMap<String, u64>> {
         self.children.get(&inode)
     }
 
@@ -1180,7 +1194,11 @@ mod tests {
         ];
         let tree = VirtualTree::build_with_ci(&entries, &mut InodeAllocator::new(true), true);
         let dir = tree.lookup(VirtualTree::ROOT, "Dir").expect("Dir");
-        let names: Vec<String> = tree.children(dir).unwrap().keys().cloned().collect();
+        let names: Vec<String> = tree
+            .children(dir)
+            .unwrap()
+            .map(|(name, _)| name.to_owned())
+            .collect();
         // First-seen "Song" keeps its name; "song" becomes "song (2)".
         assert!(names.contains(&"Song".to_string()));
         assert!(names.contains(&"song (2)".to_string()));
@@ -1397,9 +1415,9 @@ mod tests {
         let mut stack = vec![(VirtualTree::ROOT, String::new())];
         while let Some((ino, pfx)) = stack.pop() {
             if let Some(kids) = t.children(ino) {
-                for (name, &child) in kids {
+                for (name, child) in kids {
                     let p = if pfx.is_empty() {
-                        name.clone()
+                        name.to_owned()
                     } else {
                         format!("{pfx}/{name}")
                     };
@@ -1902,9 +1920,9 @@ mod tests {
     fn over_long_leaf_truncates_to_255_keeping_extension() {
         let path = format!("{}.flac", "t".repeat(300));
         let t = VirtualTree::build(&[(10, path)]);
-        let kids = t.children(VirtualTree::ROOT).unwrap();
+        let mut kids = t.children(VirtualTree::ROOT).unwrap();
         assert_eq!(kids.len(), 1);
-        let name = kids.keys().next().unwrap();
+        let (name, _) = kids.next().unwrap();
         assert!(name.len() <= 255, "leaf is {} bytes", name.len());
         assert!(
             std::path::Path::new(name)
@@ -1921,10 +1939,10 @@ mod tests {
         let dir = t
             .children(VirtualTree::ROOT)
             .unwrap()
-            .keys()
             .next()
             .unwrap()
-            .clone();
+            .0
+            .to_owned();
         assert!(dir.len() <= 255, "dir is {} bytes", dir.len());
     }
 
@@ -1935,10 +1953,10 @@ mod tests {
         let name = t
             .children(VirtualTree::ROOT)
             .unwrap()
-            .keys()
             .next()
             .unwrap()
-            .clone();
+            .0
+            .to_owned();
         assert!(name.len() <= 255);
         assert!(
             std::path::Path::new(&name)
@@ -1954,7 +1972,7 @@ mod tests {
         let t = VirtualTree::build(&entries);
         let kids = t.children(VirtualTree::ROOT).unwrap();
         assert_eq!(kids.len(), 12, "all collisions disambiguated distinctly");
-        for name in kids.keys() {
+        for (name, _) in kids {
             // Each name packs to the full NAME_MAX: the base leaf trims its stem to
             // leave room for `.flac`, and every ` (k)`-disambiguated sibling trims
             // per-rank to land on exactly 255 bytes. Pinning the exact length (not
@@ -1974,10 +1992,10 @@ mod tests {
         let name = t
             .children(VirtualTree::ROOT)
             .unwrap()
-            .keys()
             .next()
             .unwrap()
-            .clone();
+            .0
+            .to_owned();
         assert!(name.len() <= 255, "{} bytes", name.len());
         assert!(
             !name.starts_with('.'),
@@ -1998,14 +2016,12 @@ mod tests {
         let ak: Vec<_> = a
             .children(VirtualTree::ROOT)
             .unwrap()
-            .keys()
-            .cloned()
+            .map(|(name, _)| name.to_owned())
             .collect();
         let bk: Vec<_> = b
             .children(VirtualTree::ROOT)
             .unwrap()
-            .keys()
-            .cloned()
+            .map(|(name, _)| name.to_owned())
             .collect();
         assert_eq!(ak, bk);
     }

@@ -12,6 +12,26 @@ see the [Release notes](release-notes.md).
 
 ## [Unreleased]
 
+### Changed
+
+- `musefs-core` now builds its persistent virtual-tree collections on
+  [`imbl`](https://crates.io/crates/imbl) 7 instead of the archived `im` 15.
+  Clears RUSTSEC-2026-0248 / RUSTSEC-2023-0126 (`im`) and
+  RUSTSEC-2026-0251 / RUSTSEC-2026-0255 (`sized-chunks`).
+- `VirtualTree::children` now yields an opaque
+  `impl ExactSizeIterator<Item = (&str, u64)>` instead of borrowing the backing
+  `OrdMap`, taking the persistent-collection crate out of `musefs-core`'s
+  public API so swapping it stays an internal detail. In-tree the only caller
+  is `readdir`, which iterates; name lookups have always had
+  `VirtualTree::lookup`.
+
+### Fixed
+
+- Bumped `crossbeam-epoch` 0.9.18 -> 0.9.20 (RUSTSEC-2026-0204, invalid
+  pointer dereference in the `fmt::Pointer` impls) and `num-bigint`
+  0.4.7 -> 0.4.8 (0.4.7 was yanked). Both are dev-dependency-only paths
+  (criterion -> rayon, mp4 -> num-rational).
+
 ## [1.2.0] - 2026-06-18
 
 ### Changed

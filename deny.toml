@@ -47,7 +47,19 @@ yanked = "deny"
 ignore = [
     # paste 1.0.15 is archived/unmaintained (via tikv-jemalloc-ctl, the default
     # allocator); no safe upgrade exists and it is a build-time proc-macro only.
+    # (Not present in fuzz/Cargo.lock, which this config is also run against —
+    # cargo-deny warns advisory-not-detected there, which is not an error.)
     "RUSTSEC-2024-0436",
+    # bitmaps is archived/unmaintained, reached only as
+    # imbl -> imbl-sized-chunks -> bitmaps (the persistent collections behind the
+    # virtual tree). The maintained imbl fork still depends on it, so there is no
+    # upgrade path; the suggested replacements are not drop-in for SparseChunk.
+    "RUSTSEC-2026-0247",
+    # Unsound bitmaps >= 3.2.0 `TryFrom<&[u8]>`/`AsMut<[u8]>` impls for `Bitmap`.
+    # Unreachable: imbl-sized-chunks builds bitmaps only via
+    # `Bitmap::{new, default}` and mutates them only through `set`, never from
+    # bytes; the archived crate has no patched release.
+    "RUSTSEC-2025-0167",
 ]
 
 [sources]

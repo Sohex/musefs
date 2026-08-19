@@ -223,7 +223,7 @@ def test_records_for_paths_attaches_album_art(
 ):
     art = ArtImage(data=b"\xff\xd8\xffjpeg", mime="image/jpeg")
 
-    records, skipped = records_for_paths(
+    records, _skipped = records_for_paths(
         paths=[sample_track_file["path"]],
         track_files=[sample_track_file],
         tracks=[sample_track],

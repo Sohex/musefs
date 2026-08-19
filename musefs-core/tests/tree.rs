@@ -18,10 +18,9 @@ fn builds_directories_and_files_with_lookup() {
     assert_eq!(tree.track_id(pigs), Some(10));
     assert!(!tree.is_dir(pigs));
 
-    let kids = tree.children(animals).expect("children");
-    assert_eq!(kids.len(), 2);
-    assert!(kids.contains_key("Pigs.flac"));
-    assert!(kids.contains_key("Dogs.flac"));
+    assert_eq!(tree.children(animals).expect("children").len(), 2);
+    assert!(tree.lookup(animals, "Pigs.flac").is_some());
+    assert!(tree.lookup(animals, "Dogs.flac").is_some());
 }
 
 #[test]
@@ -32,11 +31,10 @@ fn disambiguates_colliding_file_names() {
         (3, "A/song.flac".to_string()),
     ]);
     let a = tree.lookup(VirtualTree::ROOT, "A").unwrap();
-    let kids = tree.children(a).unwrap();
-    assert_eq!(kids.len(), 3);
-    assert!(kids.contains_key("song.flac"));
-    assert!(kids.contains_key("song (2).flac"));
-    assert!(kids.contains_key("song (3).flac"));
+    assert_eq!(tree.children(a).unwrap().len(), 3);
+    assert!(tree.lookup(a, "song.flac").is_some());
+    assert!(tree.lookup(a, "song (2).flac").is_some());
+    assert!(tree.lookup(a, "song (3).flac").is_some());
 }
 
 #[test]
