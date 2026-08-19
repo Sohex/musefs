@@ -232,6 +232,18 @@ exclude_re = [
     # guard: count=3
     'musefs-format/src/fuzz_check\.rs:\d+:\d+: replace >> with << in fixtures::mp3_with_binary_frame::synchsafe',
 
+    # fuzz_check fixtures::flac_with_leading_id3::syncsafe ID3v2.4 size encoder
+    # `(n >> 21|14|7) & 0x7F` -> `<<`: a left shift clears the low bits it moves
+    # past, so `(n << 21|14|7) & 0x7F` is 0 for every n — and the `>>` side is 0
+    # too until n reaches 2 MiB / 16 KiB / 128 B respectively, far above the sizes
+    # this fixture encodes (a ~19-byte tag around a ~9-byte frame). Both
+    # directions emit identical bytes for every input the fixture feeds in. The
+    # low byte `n & 0x7F` and the three `& 0x7F` masks stay in scope and are
+    # caught by the_committed_fuzz_seed_fixture_is_a_valid_id3_prefixed_flac.
+    # Same class as fixtures::mp3_with_binary_frame::synchsafe above.
+    # guard: count=3
+    'musefs-format/src/fuzz_check\.rs:\d+:\d+: replace >> with << in fixtures::flac_with_leading_id3::syncsafe',
+
     # SP2 incremental tree refresh — equivalent mutants in apply_changes & friends.
     # The whole design contract is "the incrementally-mutated tree is byte-identical
     # to a full VirtualTree::build_with over the same final track set" (enforced by

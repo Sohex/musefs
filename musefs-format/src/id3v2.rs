@@ -26,6 +26,12 @@ pub(crate) const HEADER_LEN: usize = 10;
 /// Bytes in the optional ID3v2.4 footer, present when header flag bit 4 is set.
 const FOOTER_LEN: usize = 10;
 
+/// Ceiling on how many stacked leading tags the walk will step over. Real files
+/// carry one, occasionally a handful; a longer run is a malformed file. Bounding
+/// the walk also keeps it structurally terminating rather than relying on
+/// `total_len` always reporting at least `HEADER_LEN` of progress.
+const MAX_LEADING_TAGS: usize = 64;
+
 /// Does `data` begin with the `ID3` magic? A cheap pre-check for callers that
 /// want to skip work (an extra read, a fallback parse) on the common case of no
 /// tag at all; it does not validate the header.
@@ -73,11 +79,11 @@ pub(crate) fn total_len(data: &[u8]) -> Result<Option<usize>> {
 ///
 /// `NeedMore { up_to }` when a tag's declared length runs past `data`: the
 /// bytes needed to step over it are not present, so a bounded caller must widen
-/// its window to `up_to` and retry. Each tag is at least `HEADER_LEN` bytes, so
-/// the walk always makes progress.
+/// its window to `up_to` and retry. A run longer than [`MAX_LEADING_TAGS`] is
+/// `Malformed`.
 pub(crate) fn leading_tags_len(data: &[u8]) -> Result<Extent<usize>> {
     let mut off = 0usize;
-    loop {
+    for _ in 0..MAX_LEADING_TAGS {
         let rest = &data[off..];
         if !starts_with_tag(rest) {
             return Ok(Extent::Complete(off));
@@ -97,6 +103,7 @@ pub(crate) fn leading_tags_len(data: &[u8]) -> Result<Extent<usize>> {
             return Ok(Extent::NeedMore { up_to: off as u64 });
         }
     }
+    Err(FormatError::Malformed)
 }
 
 #[cfg(test)]
@@ -193,6 +200,27 @@ mod tests {
         let mut bad_size = header(4, 0);
         bad_size[7] = 0x80; // high bit set in a synchsafe byte
         assert!(leading_tags_len(&bad_size).is_err());
+    }
+
+    #[test]
+    fn a_run_longer_than_the_cap_is_malformed() {
+        let mut f = Vec::new();
+        for _ in 0..=MAX_LEADING_TAGS {
+            f.extend(tag(0, 0));
+        }
+        f.extend_from_slice(b"fLaC");
+        assert_eq!(leading_tags_len(&f).unwrap_err(), FormatError::Malformed);
+
+        // One below the cap still walks the whole run.
+        let mut ok = Vec::new();
+        for _ in 0..MAX_LEADING_TAGS - 1 {
+            ok.extend(tag(0, 0));
+        }
+        ok.extend_from_slice(b"fLaC");
+        assert_eq!(
+            leading_tags_len(&ok).unwrap(),
+            Extent::Complete((MAX_LEADING_TAGS - 1) * HEADER_LEN)
+        );
     }
 
     #[test]
