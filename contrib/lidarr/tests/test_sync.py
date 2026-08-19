@@ -505,6 +505,7 @@ def test_collect_album_art_logs_and_skips_fetch_failure(sample_album, sample_art
 def test_prune_deleted_album_removes_matching_rows(db_path, tmp_path):
     from musefs_common import connect
     from musefs_common.store import replace_tags
+
     from musefs_lidarr.events import EventType, LidarrEvent
     from musefs_lidarr.import_link import LinkMode
     from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
@@ -549,6 +550,7 @@ def test_prune_deleted_album_removes_matching_rows(db_path, tmp_path):
 def test_prune_deleted_artist_removes_all_artist_rows(db_path):
     from musefs_common import connect
     from musefs_common.store import replace_tags
+
     from musefs_lidarr.events import EventType, LidarrEvent
     from musefs_lidarr.import_link import LinkMode
     from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
@@ -582,6 +584,7 @@ def test_prune_deleted_spares_unmanaged_scanner_seeded_mbid(db_path):
     # delete event — prune_deleted is scoped to the ownership marker (#546).
     from musefs_common import connect
     from musefs_common.store import replace_tags
+
     from musefs_lidarr.events import EventType, LidarrEvent
     from musefs_lidarr.import_link import LinkMode
     from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
@@ -628,6 +631,7 @@ def test_prune_deleted_refuses_on_schema_mismatch(db_path):
     from musefs_common import connect
     from musefs_common.errors import SchemaMismatch
     from musefs_common.store import replace_tags
+
     from musefs_lidarr.events import EventType, LidarrEvent
     from musefs_lidarr.import_link import LinkMode
     from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
@@ -664,6 +668,7 @@ def test_sync_rename_prune_refuses_on_schema_mismatch(db_path, make_track, tmp_p
     import pytest
     from musefs_common import connect
     from musefs_common.errors import SchemaMismatch
+
     from musefs_lidarr.import_link import LinkMode
     from musefs_lidarr.sync import SyncConfig, sync_rename_prune
 
