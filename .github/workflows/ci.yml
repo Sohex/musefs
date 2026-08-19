@@ -98,7 +98,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install libfuse3
-        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           components: rustfmt, clippy
@@ -181,7 +181,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install FUSE + ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config ffmpeg
+        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config ffmpeg
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -311,7 +311,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Picard (system Python + PyQt5)
-        run: sudo apt-get update && sudo apt-get install -y picard
+        run: ./scripts/apt-install.sh picard
       - name: Verify Picard module path
         run: test -d /usr/lib/picard/picard || { echo "::error::picard package not at /usr/lib/picard; PYTHONPATH is stale"; exit 1; }
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
@@ -338,7 +338,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install FUSE and ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config ffmpeg
+        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config ffmpeg
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - name: FUSE end-to-end tests
@@ -414,7 +414,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install libfuse3
-        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: nightly
@@ -482,7 +482,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Install libfuse3
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+        run: ./scripts/apt-install.sh libfuse3-dev
       - name: Install critcmp
         run: cargo install critcmp --locked --version 0.1.8
       - name: Run A/B

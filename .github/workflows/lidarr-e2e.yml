@@ -28,7 +28,7 @@ jobs:
         with:
           python-version: '3.x'
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y fuse3 ffmpeg
+        run: ./scripts/apt-install.sh fuse3 ffmpeg
       - name: Build musefs (debug)
         run: cargo build -p musefs
       - name: Run the full Lidarr real-instance e2e

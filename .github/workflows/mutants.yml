@@ -279,7 +279,7 @@ jobs:
       - name: Install FUSE
         # Only the musefs-latencyfs leg mounts a passthrough FS in its tests.
         if: matrix.crate == 'musefs-latencyfs'
-        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+        run: ./scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
       - name: Install cargo-mutants
         # Unpinned (like fuzz.yml installs cargo-fuzz) for toolchain-compat;
         # known-good version is 27.0.0 (documented in scripts/mutants.sh).
