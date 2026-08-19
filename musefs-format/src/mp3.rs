@@ -1,5 +1,6 @@
 use crate::convert::usize_from;
 use crate::error::{FormatError, Result};
+use crate::id3v2;
 use crate::input::{
     ArtInput, BinaryTagInput, EmbeddedBinaryTag, EmbeddedPicture, PictureType, TagInput,
 };
@@ -17,13 +18,6 @@ pub struct Mp3Bounds {
     pub audio_length: u64,
 }
 
-fn synchsafe_decode(b: &[u8]) -> u32 {
-    u32::from(b[0] & 0x7F) << 21
-        | u32::from(b[1] & 0x7F) << 14
-        | u32::from(b[2] & 0x7F) << 7
-        | u32::from(b[3] & 0x7F)
-}
-
 /// Decode an ID3v2 frame's 4-byte size field. ID3v2.4 sizes are syncsafe (a 28-bit
 /// value with the high bit of each byte cleared); v2.3 and earlier use a plain
 /// big-endian `u32`. `major_version` is the tag header's version byte (ID3v2
@@ -34,23 +28,8 @@ fn decode_frame_size(major_version: u8, raw: &[u8]) -> u32 {
     if major_version == 3 {
         u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
     } else {
-        synchsafe_decode(raw)
+        id3v2::synchsafe_decode(raw)
     }
-}
-
-fn id3v2_header_len(data: &[u8]) -> Result<Option<usize>> {
-    if data.len() < 10 || &data[0..3] != b"ID3" {
-        return Ok(None);
-    }
-    if !matches!(data[3], 2..=4) {
-        return Err(FormatError::Malformed);
-    }
-    // A well-formed synchsafe size has the high bit clear in every byte; reject
-    // if any size byte has it set (the id3 crate may not mask those bits).
-    if data[6..10].iter().any(|&b| b & 0x80 != 0) {
-        return Err(FormatError::Malformed);
-    }
-    Ok(Some(10 + synchsafe_decode(&data[6..10]) as usize))
 }
 
 /// Locate the audio region: skip a leading ID3v2 tag (if present) and a trailing
@@ -61,12 +40,7 @@ pub fn locate_audio(data: &[u8]) -> Result<Mp3Bounds> {
     let len = data.len();
 
     let mut audio_offset = 0usize;
-    if let Some(base) = id3v2_header_len(data)? {
-        let flags = data[5];
-        let mut tag_len = base;
-        if flags & 0x10 != 0 {
-            tag_len += 10; // ID3v2.4 footer
-        }
+    if let Some(tag_len) = id3v2::total_len(data)? {
         if tag_len > len {
             return Err(FormatError::Malformed);
         }
@@ -108,12 +82,7 @@ pub fn locate_audio_bounded(
         // Not enough bytes even to read the ID3v2 header.
         return Ok(Extent::NeedMore { up_to: 10 });
     }
-    if let Some(base) = id3v2_header_len(prefix)? {
-        let flags = prefix[5];
-        let mut tag_len = base;
-        if flags & 0x10 != 0 {
-            tag_len += 10; // ID3v2.4 footer
-        }
+    if let Some(tag_len) = id3v2::total_len(prefix)? {
         if tag_len as u64 > file_len {
             return Err(FormatError::Malformed);
         }
@@ -537,7 +506,7 @@ fn id3v2_alloc_safe(data: &[u8]) -> bool {
     // extraction for ID3v1-only files (no leading ID3v2 header) is skipped;
     // ID3v1 is legacy/fixed-size and tags can be populated via the DB
     // (beets/picard) regardless.
-    let Ok(Some(tag_end)) = id3v2_header_len(data) else {
+    let Ok(Some(tag_end)) = id3v2::body_end(data) else {
         // Not an ID3v2 tag at offset 0, or a malformed header: skip parsing.
         return false;
     };
@@ -595,7 +564,7 @@ fn id3v2_alloc_safe(data: &[u8]) -> bool {
             if data[pos + 8] != 0 || data[pos + 9] != 0 {
                 return false;
             }
-            synchsafe_decode(&data[pos + 4..pos + 8]) as usize
+            id3v2::synchsafe_decode(&data[pos + 4..pos + 8]) as usize
         };
         let data_start = pos + header_len;
         // Reject if the frame header itself extends past the declared tag body,
@@ -702,7 +671,7 @@ pub fn read_binary_tags(data: &[u8]) -> (Vec<EmbeddedBinaryTag>, Vec<(String, St
     if !id3v2_alloc_safe(data) || data[3] < 3 {
         return (opaque, promoted);
     }
-    let tag_end = 10 + synchsafe_decode(&data[6..10]) as usize;
+    let tag_end = 10 + id3v2::synchsafe_decode(&data[6..10]) as usize;
     let mut pos = 10usize;
     while pos + 10 <= tag_end {
         if data[pos] == 0 {
@@ -1136,13 +1105,25 @@ mod tests {
     #[test]
     fn synchsafe_decode_assembles_7bit_groups() {
         // (1<<21)|(2<<14)|(3<<7)|4
-        assert_eq!(synchsafe_decode(&[0x01, 0x02, 0x03, 0x04]), 0x0020_8184);
+        assert_eq!(
+            id3v2::synchsafe_decode(&[0x01, 0x02, 0x03, 0x04]),
+            0x0020_8184
+        );
         // high bit of each byte masked (& 0x7F): 0xFF -> 0x7F per group.
-        assert_eq!(synchsafe_decode(&[0xFF, 0xFF, 0xFF, 0xFF]), 0x0FFF_FFFF);
+        assert_eq!(
+            id3v2::synchsafe_decode(&[0xFF, 0xFF, 0xFF, 0xFF]),
+            0x0FFF_FFFF
+        );
         // only the top group set -> pins the `<<21` (kills `<<21 -> >>21`).
-        assert_eq!(synchsafe_decode(&[0x7F, 0x00, 0x00, 0x00]), 0x0FE0_0000);
+        assert_eq!(
+            id3v2::synchsafe_decode(&[0x7F, 0x00, 0x00, 0x00]),
+            0x0FE0_0000
+        );
         // only the second group set -> pins the `<<14` (kills `<<14 -> >>14`).
-        assert_eq!(synchsafe_decode(&[0x00, 0x7F, 0x00, 0x00]), 0x001F_C000);
+        assert_eq!(
+            id3v2::synchsafe_decode(&[0x00, 0x7F, 0x00, 0x00]),
+            0x001F_C000
+        );
     }
 
     #[test]
@@ -1152,7 +1133,7 @@ mod tests {
         assert_eq!(syncsafe(0x001F_C000), [0x00, 0x7F, 0x00, 0x00]);
         // round-trip over the full 28-bit range pins every group boundary.
         for n in [0u32, 1, 127, 128, 0x0123_4567, 0x0FFF_FFFF] {
-            assert_eq!(synchsafe_decode(&syncsafe(n)), n);
+            assert_eq!(id3v2::synchsafe_decode(&syncsafe(n)), n);
         }
     }
 

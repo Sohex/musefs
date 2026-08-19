@@ -119,6 +119,33 @@ pub mod fixtures {
         )
     }
 
+    /// A FLAC preceded by an ID3v2.4 tag carrying one `TIT2` text frame — the
+    /// non-standard-but-real shape from #602. Gives the ID3-skip path in
+    /// `flac::BlockWalker` corpus coverage instead of waiting for the fuzzer to
+    /// mutate its way to a valid `ID3` header and synchsafe size.
+    pub fn flac_with_leading_id3(audio: &[u8]) -> Vec<u8> {
+        /// Encode a 28-bit synchsafe size, as an ID3v2 header does.
+        fn syncsafe(n: u32) -> [u8; 4] {
+            [
+                u8::try_from((n >> 21) & 0x7F).expect("masked to 0x7F"),
+                u8::try_from((n >> 14) & 0x7F).expect("masked to 0x7F"),
+                u8::try_from((n >> 7) & 0x7F).expect("masked to 0x7F"),
+                u8::try_from(n & 0x7F).expect("masked to 0x7F"),
+            ]
+        }
+        let mut frame = b"TIT2".to_vec();
+        let content = b"\x03From ID3"; // UTF-8 encoding byte, then the text
+        frame.extend_from_slice(&syncsafe(u32::try_from(content.len()).unwrap()));
+        frame.extend_from_slice(&[0, 0]); // frame flags
+        frame.extend_from_slice(content);
+
+        let mut out = vec![b'I', b'D', b'3', 4, 0, 0];
+        out.extend_from_slice(&syncsafe(u32::try_from(frame.len()).unwrap()));
+        out.extend_from_slice(&frame);
+        out.extend_from_slice(&flac(audio));
+        out
+    }
+
     fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut v = u32::try_from(8 + payload.len())
             .unwrap()

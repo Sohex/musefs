@@ -12,6 +12,18 @@ see the [Release notes](release-notes.md).
 
 ## [Unreleased]
 
+### Added
+
+- FLAC files carrying one or more ID3v2 tags in front of the `fLaC` marker are
+  now scanned instead of being skipped with "no parseable audio metadata"
+  ([#602](https://github.com/Sohex/musefs/issues/602)). The tag run is stepped over to reach the FLAC stream, and its text
+  frames and `APIC` pictures are ingested as a fallback beneath the file's own
+  `VORBIS_COMMENT` / `PICTURE` blocks — so a FLAC whose tags live only in the
+  ID3 header lands in the store with its tags. A trailing 128-byte ID3v1 tag is
+  trimmed from the audio length (checked only for files with a leading ID3v2
+  tag, so a stock FLAC pays no extra read). Neither tag survives into the
+  synthesized file, which is a stock FLAC starting at `fLaC`.
+
 ### Changed
 
 - `musefs-core` now builds its persistent virtual-tree collections on

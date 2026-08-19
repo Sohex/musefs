@@ -12,6 +12,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- FLAC files with a leading ID3 tag are now scanned rather than skipped with
+  "no parseable audio metadata". Any tags and cover art in the ID3 header are
+  ingested as a fallback for what the FLAC itself does not carry, and the
+  served file is a stock FLAC with no ID3 tag.
+
 ## [1.2.0] - 2026-06-18
 
 ### Changed
