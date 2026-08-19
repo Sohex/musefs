@@ -12,6 +12,8 @@ see the [Release notes](release-notes.md).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-19
+
 ### Added
 
 - FLAC files carrying one or more ID3v2 tags in front of the `fLaC` marker are

@@ -12,6 +12,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-19
+
 ### Added
 
 - FLAC files with a leading ID3 tag are now scanned rather than skipped with
