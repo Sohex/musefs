@@ -243,7 +243,9 @@ Two supply-chain gates run in CI and are worth reproducing locally before a
 dependency bump:
 
 ```bash
-cargo install cargo-audit cargo-deny
+cargo install cargo-audit
+# Same 0.19 pin both CI jobs use — the config schema shifts across minor releases.
+cargo install cargo-deny --locked --version '^0.19'
 cargo audit                                                    # root Cargo.lock, RUSTSEC advisories
 cargo deny check                                               # advisories + licenses + bans + sources
 cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories

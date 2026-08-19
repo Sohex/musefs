@@ -16,10 +16,14 @@ see the [Release notes](release-notes.md).
 
 - `musefs-core` now builds its persistent virtual-tree collections on
   [`imbl`](https://crates.io/crates/imbl) 7 instead of the archived `im` 15.
-  The API is a drop-in match; the only visible difference is that
-  `VirtualTree::children` returns an `imbl::OrdMap`. Clears
-  RUSTSEC-2026-0248 / RUSTSEC-2023-0126 (`im`) and
+  Clears RUSTSEC-2026-0248 / RUSTSEC-2023-0126 (`im`) and
   RUSTSEC-2026-0251 / RUSTSEC-2026-0255 (`sized-chunks`).
+- **Breaking (`musefs-core` API):** `VirtualTree::children` now yields an
+  opaque `impl ExactSizeIterator<Item = (&str, u64)>` instead of borrowing the
+  backing `OrdMap`. Callers that looked an entry up by name should use
+  `VirtualTree::lookup`; callers that iterated are unaffected apart from the
+  item type. This takes the persistent-collection crate out of the public API,
+  so it is the last time swapping it can break a downstream consumer.
 
 ### Fixed
 

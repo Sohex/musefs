@@ -381,8 +381,7 @@ impl Musefs {
             None => return Err(CoreError::NoEntry(inode)),
         };
         Ok(children
-            .iter()
-            .map(|(name, &child)| (name.clone(), child, tree.is_dir(child)))
+            .map(|(name, child)| (name.to_owned(), child, tree.is_dir(child)))
             .collect())
     }
 
