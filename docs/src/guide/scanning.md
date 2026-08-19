@@ -46,6 +46,12 @@ to the wrong parser, fails, and is counted here rather than retried. Renaming
 files across formats makes them vanish from the mount; fix the extension and
 rescan.
 
+Non-standard containers are tolerated where the audio is still recoverable: a
+FLAC that carries one or more ID3 tags in front of the `fLaC` marker parses,
+and any tags or cover art in that ID3 header are ingested as a fallback for
+what the FLAC itself does not carry — see
+[Leading ID3 tags](../formats/flac.md#leading-id3-tags).
+
 If any file fails (`failed Y` with `Y > 0`), `scan` exits **2** even though the
 batch otherwise completes and the parseable files are ingested — so a pipeline
 like `musefs scan … && musefs mount …` stops on a partial or total ingest
