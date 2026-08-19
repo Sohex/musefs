@@ -1,38 +1,32 @@
 #!/usr/bin/env bash
-# Install apt packages, tolerating the transient runner failures that have
-# repeatedly wedged CI and the release gate.
+# Install apt packages without depending on `apt-get update` succeeding.
 #
-# The failure mode is a *hang*, not an error exit: `apt-get update` (or the
-# install that follows) stops making progress against a sick mirror and sits
-# there until the job's own timeout fires — six jobs across three workflows
-# stalled 15+ minutes on this during the v1.3.0 release, which is long enough to
-# blow the release gate's 45-minute deadline. A plain `until ... do` retry loop
-# would never re-enter, so each attempt gets its own `timeout`; only then is a
-# retry with backoff useful.
+# Two distinct runner failures motivate this, both seen during the v1.3.0
+# release:
+#
+#   * A hang. `apt-get update`/`install` stops making progress against a sick
+#     mirror and sits there until the job's own timeout fires — six jobs across
+#     three workflows stalled 15+ minutes, long enough to blow the release
+#     gate's 45-minute deadline. Retrying only helps if each attempt is bounded,
+#     so every apt invocation gets its own `timeout`.
+#
+#   * A slow mirror. `apt-get update` alone was measured past 300s while still
+#     making steady progress, and large installs at 200-360s where they normally
+#     take ~20s. Chasing that by raising ceilings is a losing game: the ceiling
+#     that catches a hang quickly is the one that kills a slow-but-working step.
+#
+# The way out is to notice that the refresh is usually unnecessary. GitHub's
+# runner images ship with populated apt lists, and every package these workflows
+# install is a plain archive package already indexed there. So try the install
+# first, against the lists already on disk, and only pay for a refresh when that
+# genuinely fails (stale lists, rotated archive). On a healthy runner this skips
+# the slowest and most failure-prone step outright; on a degraded one it is the
+# difference between a 20s step and a 10-minute failure.
 #
 # Usage: scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
 #
-# `update` and `install` get separate budgets because their healthy runtimes
-# differ by an order of magnitude: a refresh is ~15s and is the step that hangs,
-# while installing e.g. ffmpeg's dependency tree legitimately takes 80s+. A
-# ceiling tight enough to catch a hung refresh quickly would kill a slow-but-fine
-# install, turning a flake into a self-inflicted failure.
-#
-# Both budgets are sized off measurement, not guesswork, and both had to be
-# raised once already: a refresh against a slow Azure mirror was seen exceeding
-# 120s while still making steady progress, and installs were seen at 200-234s
-# where they normally take ~20s. Sizing either ceiling off a healthy moment
-# turns a slow-but-working step into a hard failure — the exact self-inflicted
-# outage this script exists to prevent.
-#
-# The distinction that matters is slow (seconds to a few minutes, still
-# printing progress) versus hung (15+ minutes, no progress at all). The
-# defaults sit well above the former and far below the latter. Attempts are
-# kept low because a genuinely hung mirror does not recover inside a job's
-# lifetime: the retry is for transient failures, and the bound is what protects
-# the release gate.
-#
-# Knobs (env): APT_RETRY_ATTEMPTS (default 2), APT_UPDATE_TIMEOUT (default 300),
+# Knobs (env): APT_RETRY_ATTEMPTS (default 2) refresh-then-install rounds tried
+# after the fast path fails, APT_UPDATE_TIMEOUT (default 300),
 # APT_INSTALL_TIMEOUT (default 420). Worst case is ~24 minutes, inside the
 # release gate's 45-minute deadline, so a mirror that never recovers fails
 # loudly instead of eating the whole window.
@@ -55,16 +49,24 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Fast path: install straight from the image's existing apt lists.
+# shellcheck disable=SC2086  # $sudo is deliberately unquoted: it must
+# disappear entirely, not expand to an empty argument, when running as root.
+if timeout "$install_try" $sudo apt-get install -y "$@"; then
+    exit 0
+fi
+echo "install from the image's apt lists failed; refreshing" >&2
+
 delay=5
 attempt=1
 while [ "$attempt" -le "$attempts" ]; do
-    # `update` and `install` are timed separately: a mirror that hangs the
-    # refresh is the common case, and re-running it is the cheap fix.
+    # `update` and `install` are timed separately because their healthy
+    # runtimes differ by an order of magnitude, and a single shared ceiling
+    # cannot bound the hang without killing the slow case.
     # Captured via `|| status=$?` rather than `$?` after an `if`: a failed `if`
     # condition leaves `$?` at 0, which would report every failure as exit 0.
     status=0
-    # shellcheck disable=SC2086  # $sudo is deliberately unquoted: it must
-    # disappear entirely, not expand to an empty argument, when running as root.
+    # shellcheck disable=SC2086  # see above
     timeout "$update_try" $sudo apt-get update \
         && timeout "$install_try" $sudo apt-get install -y "$@" \
         || status=$?
