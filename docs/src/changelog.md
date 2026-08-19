@@ -302,7 +302,8 @@ First public release.
   `synthesis` / `structure-only` mount modes, auto-refresh, `scan` /
   `scan --revalidate`). Never published publicly; superseded by 0.2.0.
 
-[Unreleased]: https://github.com/Sohex/musefs/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/Sohex/musefs/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/Sohex/musefs/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Sohex/musefs/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Sohex/musefs/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Sohex/musefs/releases/tag/v1.0.0
