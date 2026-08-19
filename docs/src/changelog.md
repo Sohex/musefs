@@ -12,6 +12,22 @@ see the [Release notes](release-notes.md).
 
 ## [Unreleased]
 
+### Changed
+
+- `musefs-core` now builds its persistent virtual-tree collections on
+  [`imbl`](https://crates.io/crates/imbl) 7 instead of the archived `im` 15.
+  The API is a drop-in match; the only visible difference is that
+  `VirtualTree::children` returns an `imbl::OrdMap`. Clears
+  RUSTSEC-2026-0248 / RUSTSEC-2023-0126 (`im`) and
+  RUSTSEC-2026-0251 / RUSTSEC-2026-0255 (`sized-chunks`).
+
+### Fixed
+
+- Bumped `crossbeam-epoch` 0.9.18 -> 0.9.20 (RUSTSEC-2026-0204, invalid
+  pointer dereference in the `fmt::Pointer` impls) and `num-bigint`
+  0.4.7 -> 0.4.8 (0.4.7 was yanked). Both are dev-dependency-only paths
+  (criterion -> rayon, mp4 -> num-rational).
+
 ## [1.2.0] - 2026-06-18
 
 ### Changed

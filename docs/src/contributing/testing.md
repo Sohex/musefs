@@ -237,6 +237,32 @@ RUSTFLAGS="-Zsanitizer=thread" TSAN_OPTIONS="halt_on_error=0" \
   cargo +nightly test -p musefs-core -Zbuild-std --test concurrent_reads --target x86_64-unknown-linux-gnu
 ```
 
+### Dependency advisories & licenses
+
+Two supply-chain gates run in CI and are worth reproducing locally before a
+dependency bump:
+
+```bash
+cargo install cargo-audit cargo-deny
+cargo audit                                                    # root Cargo.lock, RUSTSEC advisories
+cargo deny check                                               # advisories + licenses + bans + sources
+cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories
+```
+
+`audit.yml` runs `rustsec/audit-check` (root lockfile only) plus the third
+command above, because `fuzz/` is a separate workspace with its own lockfile
+that neither the action nor the `ci.yml` `cargo-deny` job would otherwise see.
+`cargo-deny` adds the license allow-list, which `cargo-audit` does not check.
+
+Advisories with no upgrade path are allow-listed **with a written rationale at
+the ignore site** — `.cargo/audit.toml` for `cargo-audit`/the action,
+`deny.toml` for `cargo-deny` (both lists must agree). An `unmaintained`
+advisory on a compile-time-only or unreachable dependency is a candidate; a
+`vulnerability` is not — those get fixed. Note that `cargo-deny` warns
+`advisory-not-detected` for an ignore whose crate is absent from the lockfile
+being scanned, which is expected for entries that only apply to one of the two
+workspaces.
+
 ### Coverage
 
 ```bash

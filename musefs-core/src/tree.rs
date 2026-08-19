@@ -1,4 +1,4 @@
-use im::{HashMap as ImHashMap, OrdMap};
+use imbl::{HashMap as ImHashMap, OrdMap};
 use std::borrow::Cow;
 
 /// Case-fold a name for case-insensitive comparison. Unicode-aware lowercasing;
