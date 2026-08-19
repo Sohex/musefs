@@ -12,10 +12,16 @@
 #
 # Usage: scripts/apt-install.sh fuse3 libfuse3-dev pkg-config
 #
-# Knobs (env): APT_RETRY_ATTEMPTS (default 3), APT_RETRY_TIMEOUT seconds per
-# apt invocation (default 120). The defaults bound a total wedge at roughly 12
-# minutes, well inside the release gate's 45-minute deadline, so a mirror that
-# never recovers fails loudly instead of eating the whole window.
+# `update` and `install` get separate budgets because their healthy runtimes
+# differ by an order of magnitude: a refresh is ~15s and is the step that hangs,
+# while installing e.g. ffmpeg's dependency tree legitimately takes 80s+. A
+# ceiling tight enough to catch a hung refresh quickly would kill a slow-but-fine
+# install, turning a flake into a self-inflicted failure.
+#
+# Knobs (env): APT_RETRY_ATTEMPTS (default 3), APT_UPDATE_TIMEOUT (default 120),
+# APT_INSTALL_TIMEOUT (default 300). Worst case is ~21 minutes, inside the
+# release gate's 45-minute deadline, so a mirror that never recovers fails
+# loudly instead of eating the whole window.
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -24,7 +30,8 @@ if [ "$#" -eq 0 ]; then
 fi
 
 attempts="${APT_RETRY_ATTEMPTS:-3}"
-per_try="${APT_RETRY_TIMEOUT:-120}"
+update_try="${APT_UPDATE_TIMEOUT:-120}"
+install_try="${APT_INSTALL_TIMEOUT:-300}"
 
 # Root in a container has no sudo; the runner jobs are non-root and do.
 sudo=""
@@ -44,8 +51,8 @@ while [ "$attempt" -le "$attempts" ]; do
     status=0
     # shellcheck disable=SC2086  # $sudo is deliberately unquoted: it must
     # disappear entirely, not expand to an empty argument, when running as root.
-    timeout "$per_try" $sudo apt-get update \
-        && timeout "$per_try" $sudo apt-get install -y "$@" \
+    timeout "$update_try" $sudo apt-get update \
+        && timeout "$install_try" $sudo apt-get install -y "$@" \
         || status=$?
     if [ "$status" -eq 0 ]; then
         exit 0
@@ -56,7 +63,7 @@ while [ "$attempt" -le "$attempts" ]; do
     # 124 is `timeout`'s own "killed it" code, worth calling out from a plain
     # apt error because it is the flake this script exists for.
     if [ "$status" -eq 124 ]; then
-        echo "apt attempt ${attempt}/${attempts} timed out after ${per_try}s" >&2
+        echo "apt attempt ${attempt}/${attempts} timed out" >&2
     else
         echo "apt attempt ${attempt}/${attempts} failed (exit ${status})" >&2
     fi
