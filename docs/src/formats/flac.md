@@ -48,11 +48,15 @@ a converter. musefs scans them rather than skipping them:
 
 ## Lossy edges
 
-- A leading ID3v2 tag (and any ID3v1 trailer) is **not preserved**: it is
-  metadata, and the synthesized file is regenerated metadata in front of
-  untouched audio. Its contents are ingested first (above), so they come back
-  as Vorbis comments and `PICTURE` blocks — the served file is a stock FLAC that
-  starts at `fLaC`. This matches how MP3's original ID3v2 tag is treated.
+- A leading ID3v2 tag is **not preserved**: it is metadata, and the synthesized
+  file is regenerated metadata in front of untouched audio. Its contents are
+  ingested first (above), so they come back as Vorbis comments and `PICTURE`
+  blocks — the served file is a stock FLAC that starts at `fLaC`. This matches
+  how MP3's original ID3v2 tag is treated.
+- A trailing ID3v1 tag is **dropped without being read**. Unlike the leading
+  tag, its fields are never parsed into tags — it is only excluded from the
+  audio length so its 128 bytes are not served as audio. This mirrors MP3, where
+  ID3v1 is likewise not read; populate those tags through the store instead.
 - `PADDING` blocks are dropped — the synthesized file carries no padding.
 - Metadata blocks of unknown/reserved types are dropped at scan time.
 - A `PICTURE` block whose picture type falls outside the standard `0`–`20`
