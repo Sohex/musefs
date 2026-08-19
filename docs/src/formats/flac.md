@@ -26,8 +26,37 @@ model these layouts plug into, see
   at scan time (external tools must not edit them) and re-emitted on
   synthesis.
 
+## Leading ID3 tags
+
+FLAC does not define an ID3 tag, but files that put one (or several) in front
+of the `fLaC` marker exist in the wild — usually a blank header left behind by
+a converter. musefs scans them rather than skipping them:
+
+- The tag run is stepped over to find the `fLaC` marker, and the recorded audio
+  offset counts it, so the audio segment still reads the right range out of the
+  backing file.
+- The tag's **text frames and `APIC` pictures are ingested as a fallback**: the
+  FLAC's own `VORBIS_COMMENT` / `PICTURE` blocks win, and the ID3 tag only
+  supplies keys the FLAC does not define. The rule is all-or-nothing per key, so
+  a multi-value field never mixes values from both sources. A file whose tags
+  live *only* in the ID3 header is therefore still ingested with its tags.
+- A 128-byte trailing ID3v1 tag is trimmed from the audio length, so it is not
+  served as audio. This check runs only for files that carry a leading ID3v2
+  tag: a stock FLAC pays no extra read, and audio that happens to spell `TAG`
+  128 bytes from the end is never mistaken for a trailer.
+- Neither tag survives into the synthesized file — see the lossy edge below.
+
 ## Lossy edges
 
+- A leading ID3v2 tag is **not preserved**: it is metadata, and the synthesized
+  file is regenerated metadata in front of untouched audio. Its contents are
+  ingested first (above), so they come back as Vorbis comments and `PICTURE`
+  blocks — the served file is a stock FLAC that starts at `fLaC`. This matches
+  how MP3's original ID3v2 tag is treated.
+- A trailing ID3v1 tag is **dropped without being read**. Unlike the leading
+  tag, its fields are never parsed into tags — it is only excluded from the
+  audio length so its 128 bytes are not served as audio. This mirrors MP3, where
+  ID3v1 is likewise not read; populate those tags through the store instead.
 - `PADDING` blocks are dropped — the synthesized file carries no padding.
 - Metadata blocks of unknown/reserved types are dropped at scan time.
 - A `PICTURE` block whose picture type falls outside the standard `0`–`20`

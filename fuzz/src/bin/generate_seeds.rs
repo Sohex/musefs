@@ -14,6 +14,14 @@ fn write(target: &str, name: &str, bytes: &[u8]) {
 
 fn main() {
     write("flac", "seed0", &fixtures::flac(&[1, 2, 3, 4, 5, 6, 7, 8]));
+    // A FLAC behind an ID3v2 tag (#602): the ID3-skip path is only reachable
+    // through a valid `ID3` header and synchsafe size, which the fuzzer is
+    // unlikely to mutate its way to from seed0.
+    write(
+        "flac",
+        "seed_id3_prefix",
+        &fixtures::flac_with_leading_id3(&[1, 2, 3, 4, 5, 6, 7, 8]),
+    );
     write("mp3", "seed0", &fixtures::mp3());
     // An MP3 seed that already carries a binary GEOB ID3 frame, so the binary-tag
     // synthesis path gets immediate coverage instead of waiting for the fuzzer to

@@ -1,5 +1,6 @@
 use crate::bytes::read_u32_be;
 use crate::error::{FormatError, Result};
+use crate::id3v2;
 use crate::probe::Extent;
 use crate::size;
 
@@ -72,16 +73,50 @@ struct BlockWalker<'a> {
 
 impl<'a> BlockWalker<'a> {
     /// Validate the `fLaC` marker and position at the first metadata block.
+    ///
+    /// A prefix window too short to step over a leading ID3v2 tag is `NotFlac`
+    /// here; [`BlockWalker::new_bounded`] is the twin that asks for more bytes
+    /// instead.
     fn new(data: &'a [u8]) -> Result<Self> {
-        if data.len() < 4 || &data[0..4] != FLAC_MARKER {
+        match Self::new_bounded(data)? {
+            Extent::Complete(walker) => Ok(walker),
+            Extent::NeedMore { .. } => Err(FormatError::NotFlac),
+        }
+    }
+
+    /// Bounded twin of [`BlockWalker::new`]: `NeedMore` when `data` stops inside
+    /// a leading ID3v2 tag, so the marker cannot be reached yet.
+    ///
+    /// FLAC does not define a leading ID3v2 tag, but files carrying one (often a
+    /// blank header left by a converter) exist in the wild (#602). Everything
+    /// after the tag run is an ordinary FLAC stream, so the walk simply starts
+    /// there — offsets stay absolute because `data` is still indexed from the
+    /// front of the file, which keeps `audio_offset` correct for the caller.
+    fn new_bounded(data: &'a [u8]) -> Result<Extent<Self>> {
+        let base = match id3v2::leading_tags_len(data)? {
+            Extent::Complete(base) => base,
+            Extent::NeedMore { up_to } => return Ok(Extent::NeedMore { up_to }),
+        };
+        if data.len() < base + 4 {
+            // With a tag skipped, a short window is a window problem; with none,
+            // the file is simply not FLAC (preserving the unbounded behavior).
+            return if base == 0 {
+                Err(FormatError::NotFlac)
+            } else {
+                Ok(Extent::NeedMore {
+                    up_to: (base + 4) as u64,
+                })
+            };
+        }
+        if &data[base..base + 4] != FLAC_MARKER {
             return Err(FormatError::NotFlac);
         }
-        Ok(Self {
+        Ok(Extent::Complete(Self {
             data,
-            pos: 4,
+            pos: base + 4,
             index: 0,
             done: false,
-        })
+        }))
     }
 
     /// Byte offset just past the last fully-walked block. Once the walk has
@@ -170,7 +205,10 @@ pub fn read_metadata(data: &[u8]) -> Result<FlacMeta> {
 /// body runs past the prefix, return `NeedMore { up_to }` with the exact end of
 /// that block — the caller widens the window and retries. Otherwise `Complete`.
 pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
-    let mut walker = BlockWalker::new(prefix)?;
+    let mut walker = match BlockWalker::new_bounded(prefix)? {
+        Extent::Complete(walker) => walker,
+        Extent::NeedMore { up_to } => return Ok(Extent::NeedMore { up_to }),
+    };
     let mut preserved = Vec::new();
     while let Some(step) = walker.next_block() {
         match step {
@@ -204,15 +242,73 @@ pub fn read_metadata_bounded(prefix: &[u8]) -> Result<Extent<FlacMeta>> {
     }))
 }
 
+/// Does this file put an ID3v2 tag in front of the `fLaC` marker? Non-standard
+/// but present in the wild (#602). Callers use it to decide whether the
+/// ID3-specific extra work — a tail read, a fallback tag parse — is worth doing.
+#[must_use]
+pub fn has_leading_id3(data: &[u8]) -> bool {
+    id3v2::starts_with_tag(data)
+}
+
+/// Where the audio ends: the file end, less a 128-byte ID3v1 trailer when one is
+/// present.
+///
+/// Gated on a *leading* ID3v2 tag, which is what makes the trailer plausible in
+/// the first place: a stock FLAC then pays no tail read at all, and audio bytes
+/// that happen to spell `TAG` 128 bytes from the end can never be mistaken for a
+/// trailer and truncated away.
+fn audio_end(file_len: u64, audio_offset: u64, has_id3: bool, tail: Option<&[u8; 128]>) -> u64 {
+    if has_id3
+        && let Some(tail) = tail
+        && file_len >= audio_offset + 128
+        && &tail[0..3] == b"TAG"
+    {
+        file_len - 128
+    } else {
+        file_len
+    }
+}
+
 /// Parse the FLAC metadata section of a complete file, returning the audio
 /// boundary, audio length, and the structural blocks to carry over.
 pub fn locate_audio(data: &[u8]) -> Result<FlacScan> {
     let meta = parse_blocks(data)?;
+    let end = audio_end(
+        data.len() as u64,
+        meta.audio_offset,
+        has_leading_id3(data),
+        data.last_chunk::<128>(),
+    );
     Ok(FlacScan {
         audio_offset: meta.audio_offset,
-        audio_length: data.len() as u64 - meta.audio_offset,
+        audio_length: end - meta.audio_offset,
         preserved: meta.preserved,
     })
+}
+
+/// Bounded twin of [`locate_audio`]. `prefix` is a front window, `file_len` the
+/// true size, and `tail` the file's last 128 bytes — needed only to spot an
+/// ID3v1 trailer, so callers may pass `None` when [`has_leading_id3`] is false.
+pub fn locate_audio_bounded(
+    prefix: &[u8],
+    file_len: u64,
+    tail: Option<&[u8; 128]>,
+) -> Result<Extent<FlacScan>> {
+    let meta = match read_metadata_bounded(prefix)? {
+        Extent::Complete(meta) => meta,
+        Extent::NeedMore { up_to } => return Ok(Extent::NeedMore { up_to }),
+    };
+    // A window is a prefix of the file, so this only trips on a caller passing a
+    // `file_len` that disagrees with `prefix`.
+    if meta.audio_offset > file_len {
+        return Err(FormatError::Malformed);
+    }
+    let end = audio_end(file_len, meta.audio_offset, has_leading_id3(prefix), tail);
+    Ok(Extent::Complete(FlacScan {
+        audio_offset: meta.audio_offset,
+        audio_length: end - meta.audio_offset,
+        preserved: meta.preserved,
+    }))
 }
 
 use crate::input::{

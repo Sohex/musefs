@@ -453,21 +453,63 @@ fn wav_probed(prefix: &[u8], bounds: &wav::WavBounds) -> Probed {
     }
 }
 
+/// Assemble the FLAC `Probed` for an already-located audio region, reading tags
+/// and pictures out of `prefix`.
+///
+/// A FLAC carrying a leading ID3v2 tag (#602) has that tag's contents ingested
+/// too, as a *fallback*: the Vorbis comments are authoritative, and ID3 frames
+/// only fill keys the Vorbis block does not define. So a file tagged both ways
+/// keeps what a FLAC-aware editor wrote, while a file whose tags live only in
+/// the ID3 header still lands in the store instead of being skipped. Pictures
+/// follow the same rule — `PICTURE` blocks win outright, ID3 `APIC` frames are
+/// the fallback.
+///
+/// The ID3 tag itself is not preserved: like MP3's, it is metadata, and the
+/// synthesized file is regenerated metadata in front of untouched audio.
+fn flac_probed(prefix: &[u8], scan: &flac::FlacScan) -> Probed {
+    let (structural_blocks, binary_tags) = flac::split_preserved(&scan.preserved);
+    let mut tags = flac::read_vorbis_comments(prefix).unwrap_or_default();
+    let mut pictures = flac::read_pictures(prefix).unwrap_or_default();
+    if flac::has_leading_id3(prefix) {
+        fill_absent_keys(&mut tags, mp3::read_tags(prefix));
+        if pictures.is_empty() {
+            pictures = mp3::read_pictures(prefix);
+        }
+    }
+    Probed {
+        format: Format::Flac,
+        audio_offset: scan.audio_offset,
+        audio_length: scan.audio_length,
+        tags,
+        pictures,
+        binary_tags,
+        structural_blocks,
+    }
+}
+
+/// Append the `fallback` pairs whose key is absent from `tags`, comparing keys
+/// case-insensitively as the store does.
+///
+/// All-or-nothing per key: a key already in `tags` keeps every one of its values
+/// and takes none from `fallback`, so two sources never interleave values for one
+/// key (which would silently double a multi-value field like `artist`).
+fn fill_absent_keys(tags: &mut Vec<(String, String)>, fallback: Vec<(String, String)>) {
+    if fallback.is_empty() {
+        return;
+    }
+    let present: HashSet<String> = tags.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+    tags.extend(
+        fallback
+            .into_iter()
+            .filter(|(k, _)| !present.contains(&k.to_ascii_lowercase())),
+    );
+}
+
 /// Full-buffer probe (legacy path). Retained as the reference implementation the
 /// bounded path is checked against (see the equivalence property test).
 pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
     if has_ext(path, "flac") {
-        let scan = flac::locate_audio(bytes).ok()?;
-        let (structural_blocks, binary_tags) = flac::split_preserved(&scan.preserved);
-        Some(Probed {
-            format: Format::Flac,
-            audio_offset: scan.audio_offset,
-            audio_length: scan.audio_length,
-            tags: flac::read_vorbis_comments(bytes).unwrap_or_default(),
-            pictures: flac::read_pictures(bytes).unwrap_or_default(),
-            binary_tags,
-            structural_blocks,
-        })
+        Some(flac_probed(bytes, &flac::locate_audio(bytes).ok()?))
     } else if has_ext(path, "mp3") {
         let bounds = mp3::locate_audio(bytes).ok()?;
         let (binary_tags, promoted) = mp3::read_binary_tags(bytes);
@@ -635,19 +677,23 @@ fn probe_body(
         }));
     }
 
-    // Front-anchored formats: read a window, widen on NeedMore. Only the MP3
-    // arm of probe_prefix consumes the ID3v1 tail, and dispatch is by
-    // extension — so only .mp3 pays the tail read (#67).
-    let tail = if has_ext(path, "mp3") {
-        read_tail_128(file, file_len)?
-    } else {
-        None
-    };
+    // Front-anchored formats: read a window, widen on NeedMore.
     // Never read past the probe ceiling, however large the file or whatever a
     // (possibly corrupt) header asks for via `NeedMore`.
     let probe_cap = file_len.min(MAX_PROBE_BYTES);
     let mut want = usize_from((window as u64).min(probe_cap));
     let mut prefix = read_window(file, want)?;
+    // Only the MP3 arm of probe_prefix consumes the ID3v1 tail, plus the FLAC arm
+    // for the rare file that puts an ID3v2 tag in front of the `fLaC` marker
+    // (#602) — a stock .flac still pays no tail read (#67), and .ogg/.wav never
+    // do. The `ID3` magic sits in the first 3 bytes, so this verdict does not
+    // change as the window widens below.
+    let tail = if has_ext(path, "mp3") || (has_ext(path, "flac") && flac::has_leading_id3(&prefix))
+    {
+        read_tail_128(file, file_len)?
+    } else {
+        None
+    };
     for _ in 0..MAX_WIDEN_RETRIES {
         match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
             Probe::Done(p) => return Ok(Some(p)),
@@ -707,19 +753,8 @@ enum Probe {
 /// Dispatch the front-anchored formats against `prefix` + `file_len`.
 fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 128]>) -> Probe {
     if has_ext(path, "flac") {
-        match flac::read_metadata_bounded(prefix) {
-            Ok(Extent::Complete(meta)) => {
-                let (structural_blocks, binary_tags) = flac::split_preserved(&meta.preserved);
-                Probe::Done(Probed {
-                    format: Format::Flac,
-                    audio_offset: meta.audio_offset,
-                    audio_length: file_len - meta.audio_offset,
-                    tags: flac::read_vorbis_comments(prefix).unwrap_or_default(),
-                    pictures: flac::read_pictures(prefix).unwrap_or_default(),
-                    binary_tags,
-                    structural_blocks,
-                })
-            }
+        match flac::locate_audio_bounded(prefix, file_len, tail) {
+            Ok(Extent::Complete(scan)) => Probe::Done(flac_probed(prefix, &scan)),
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
             Err(_) => Probe::Skip,
         }

@@ -5,6 +5,59 @@ per-change list see the [Changelog](changelog.md); for the external-writer
 `contrib/` packages (which version independently) see the
 [contrib changelog](integrations/overview.md#contrib-changelog).
 
+## v1.3.0
+
+A compatibility and maintenance release. The headline change makes musefs
+ingest **FLAC files that carry a leading ID3 tag** instead of rejecting them,
+and the dependency tree is clear of open RUSTSEC advisories. The on-disk schema
+is unchanged (still version 2) and no CLI flag or default moved, so upgrading is
+a drop-in — but a re-scan is worth running, see
+[Upgrading from v1.2.0](#upgrading-from-v120).
+
+### Highlights
+
+- **FLAC with a leading ID3 tag now scans** ([#602]). Some FLAC files put one or
+  more ID3v2 tags in front of the `fLaC` marker — non-standard, but common in
+  the wild, often a blank header left behind by a converter. musefs used to
+  reject these with `no parseable audio metadata`, counting them `failed`; they
+  now parse normally.
+- **Their ID3 tags come with them.** Text frames and embedded cover art in the
+  ID3 header are ingested as a *fallback*: the FLAC's own `VORBIS_COMMENT` and
+  `PICTURE` blocks win, and the ID3 tag only supplies what the FLAC itself does
+  not carry. A FLAC whose tags live only in its ID3 header therefore arrives
+  tagged rather than blank. The served file is a stock FLAC with no ID3 tag —
+  the tag is metadata, and musefs regenerates metadata rather than copying it.
+- **No open security advisories.** `musefs-core`'s persistent collections moved
+  from the archived `im` crate to the maintained `imbl` fork, clearing two
+  unsoundness advisories along with the unmaintained ones, and a
+  `crossbeam-epoch` vulnerability was patched. Both lockfiles were refreshed.
+
+See the [Changelog](changelog.md#130---2026-08-19) for the full list.
+
+### Upgrading from v1.2.0
+
+**No schema migration.** The store stays at `user_version` 2, and you can roll
+back to v1.2.0 without touching it.
+
+**Re-scan to pick up previously-rejected files.** FLACs with a leading ID3 tag
+were never added to the store, so a bare `musefs scan <dir>` ingests them now —
+no `--force` needed, and files already tracked are left alone. If a scripted
+pipeline was exiting **2** because of these files (`failed Y` with `Y > 0`), it
+will now succeed.
+
+**`musefs-core` API.** `VirtualTree::children` returns an opaque
+`impl ExactSizeIterator<Item = (&str, u64)>` instead of borrowing the backing
+`OrdMap`. This only affects code depending on the `musefs-core` crate directly;
+callers that iterated are unaffected apart from the item type, and by-name
+lookups have always had `VirtualTree::lookup`. The change takes the
+persistent-collection crate out of the public API, so swapping it again cannot
+break a downstream consumer.
+
+**External writers.** The `contrib/` packages are unchanged this cycle; no
+update is needed alongside musefs.
+
+[#602]: https://github.com/Sohex/musefs/issues/602
+
 ## v1.2.0
 
 A behavior-focused release: the headline change makes `scan` **non-destructive

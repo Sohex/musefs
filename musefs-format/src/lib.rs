@@ -2,6 +2,7 @@ mod bytes;
 mod convert;
 mod error;
 pub mod flac;
+pub mod id3v2;
 mod input;
 mod layout;
 pub mod mp3;

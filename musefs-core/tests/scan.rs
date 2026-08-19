@@ -161,6 +161,37 @@ fn bare_scan_retargets_moved_file_preserving_tags() {
 }
 
 #[test]
+fn mp3_id3v1_trailer_is_not_served_as_audio() {
+    use musefs_db::Format;
+
+    // An MP3 with both an ID3v2 tag and a 128-byte ID3v1 trailer. The trailer is
+    // metadata, so the stored audio length must stop short of it — the scan path
+    // only reads the file's tail for formats that can carry one.
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = b"ID3".to_vec();
+    bytes.extend_from_slice(&[0x04, 0x00, 0x00]); // v2.4.0, no flags
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // synchsafe size 0
+    let audio_offset = bytes.len() as u64;
+    let audio = [0xFFu8, 0xFB, 1, 2, 3, 4, 5, 6];
+    bytes.extend_from_slice(&audio);
+    bytes.extend_from_slice(b"TAG");
+    bytes.extend(std::iter::repeat_n(0u8, 125));
+    std::fs::write(dir.path().join("trailed.mp3"), &bytes).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    assert_eq!(scan_directory(&db, dir.path()).unwrap().scanned, 1);
+
+    let t = &db.list_tracks().unwrap()[0];
+    assert_eq!(t.format, Format::Mp3);
+    assert_eq!(t.bounds.audio_offset(), audio_offset);
+    assert_eq!(
+        t.bounds.audio_length(),
+        audio.len() as u64,
+        "the 128-byte ID3v1 trailer is metadata, not audio"
+    );
+}
+
+#[test]
 fn scans_mp3_files_seeding_tracks_and_tags() {
     use id3::TagLike;
     use musefs_db::Format;
