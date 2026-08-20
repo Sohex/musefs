@@ -16,16 +16,18 @@
 //!                                    internal locking; no std::sync::Mutex to poison.
 //!   ResolvedFile::last_page (reader.rs:32, locked in ogg_index.rs as LastPageMemo)
 //!                                 -> cat 1 (clear): deterministic one-entry cache, re-derived.
-//! Out of scope (handled elsewhere): byte_budget.rs (#93, currently panics on
-//! poison), db_pool.rs (#94), scan.rs work-queue (scan-internal, not on the
-//! FUSE serving path).
+//! Off the serving path but on the same policy since #618:
+//!   byte_budget.rs `state`        -> cat 3 (recover + `wait_recover`): in-flight
+//!                                    total and the shutdown flag, both replace-only.
+//! Out of scope (handled elsewhere): db_pool.rs (#94), scan.rs work-queue
+//! (scan-internal, not on the FUSE serving path).
 //!
 //! Recovery is one-shot: each helper calls `Mutex::clear_poison` after restoring
 //! the guarded state to a known-good value, so normal (non-clearing) operation
 //! resumes on the next acquisition rather than degrading permanently.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// State that can be reset to empty for `lock_or_clear`.
 pub(crate) trait Clearable {
@@ -42,6 +44,23 @@ impl<T> Clearable for Option<T> {
 pub(crate) fn lock_recover<'a, T>(m: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| {
         log::error!("recovered poisoned scalar lock ({what}); continuing on inner value");
+        m.clear_poison();
+        e.into_inner()
+    })
+}
+
+/// Category 3 across a condvar wait: the wait re-locks `m` (which must be the
+/// mutex `g` came from), so it carries the same poison policy as `lock_recover`.
+pub(crate) fn wait_recover<'a, T>(
+    cv: &Condvar,
+    m: &Mutex<T>,
+    g: MutexGuard<'a, T>,
+    what: &str,
+) -> MutexGuard<'a, T> {
+    cv.wait(g).unwrap_or_else(|e| {
+        log::error!(
+            "recovered poisoned scalar lock ({what}) across a condvar wait; continuing on inner value"
+        );
         m.clear_poison();
         e.into_inner()
     })
@@ -97,6 +116,32 @@ mod tests {
         let m = Arc::new(Mutex::new(7u32));
         poison(&m);
         assert_eq!(*lock_recover(&m, "scalar"), 7);
+        assert!(!m.is_poisoned(), "poison cleared after recovery");
+    }
+
+    #[test]
+    fn wait_recover_returns_inner_after_poison() {
+        use std::sync::atomic::AtomicBool;
+        let m = Arc::new(Mutex::new(7u32));
+        let cv = Arc::new(Condvar::new());
+        poison(&m);
+        // Take the guard without clearing the poison, so the wait's re-lock is the
+        // acquisition that has to recover.
+        let g = m.lock().unwrap_err().into_inner();
+        // Notify repeatedly: a single notify racing ahead of the wait would be lost.
+        let woken = Arc::new(AtomicBool::new(false));
+        let (cv2, woken2) = (Arc::clone(&cv), Arc::clone(&woken));
+        let notifier = std::thread::spawn(move || {
+            while !woken2.load(Ordering::Acquire) {
+                cv2.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let g = wait_recover(&cv, &m, g, "scalar");
+        assert_eq!(*g, 7);
+        drop(g);
+        woken.store(true, Ordering::Release);
+        notifier.join().unwrap();
         assert!(!m.is_poisoned(), "poison cleared after recovery");
     }
 

@@ -1657,23 +1657,35 @@ fn run_pipeline(
     // that, whenever the channel momentarily drains we flush the pending batch —
     // releasing the budget so blocked producers proceed — *before* blocking on the
     // next item.
+    // A fatal flush error leaves the loop through `fatal` rather than `?`: the
+    // pipeline must be torn down (below) before it propagates.
+    let mut fatal: Option<crate::error::CoreError> = None;
     loop {
         match rx.try_recv() {
             Ok(unit) => {
                 batch_bytes += unit.weight;
                 batch.push(unit);
-                if batch.len() >= BATCH_FILES || batch_bytes >= cap {
-                    flush(&mut batch, &mut batch_bytes, &mut scanned)?;
+                if (batch.len() >= BATCH_FILES || batch_bytes >= cap)
+                    && let Err(e) = flush(&mut batch, &mut batch_bytes, &mut scanned)
+                {
+                    fatal = Some(e);
+                    break;
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                flush(&mut batch, &mut batch_bytes, &mut scanned)?;
+                if let Err(e) = flush(&mut batch, &mut batch_bytes, &mut scanned) {
+                    fatal = Some(e);
+                    break;
+                }
                 match rx.recv() {
                     Ok(unit) => {
                         batch_bytes += unit.weight;
                         batch.push(unit);
-                        if batch.len() >= BATCH_FILES || batch_bytes >= cap {
-                            flush(&mut batch, &mut batch_bytes, &mut scanned)?;
+                        if (batch.len() >= BATCH_FILES || batch_bytes >= cap)
+                            && let Err(e) = flush(&mut batch, &mut batch_bytes, &mut scanned)
+                        {
+                            fatal = Some(e);
+                            break;
                         }
                     }
                     Err(_) => break, // all workers finished; channel closed
@@ -1682,14 +1694,27 @@ fn run_pipeline(
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    flush(&mut batch, &mut batch_bytes, &mut scanned)?;
-    // A fatal flush error above returns via `?` *before* this join, abandoning the
-    // worker threads — acceptable because a DB-write failure aborts the whole scan.
+    let outcome = match fatal {
+        Some(e) => Err(e),
+        None => flush(&mut batch, &mut batch_bytes, &mut scanned),
+    };
+    if outcome.is_err() {
+        // A DB-write failure aborts the whole scan, but the workers must still be
+        // wound down before the error propagates: `scan_directory_with` /
+        // `revalidate_with` are public API, and an embedder that catches the error
+        // and carries on would otherwise leak a thread — plus its in-flight art
+        // bytes — per worker parked in `budget.acquire`, waiting on a release the
+        // failed batch will never make (#618). Dropping the receiver unblocks
+        // `send`; closing the budget unblocks `acquire`; both make the workers exit.
+        drop(rx);
+        budget.close();
+    }
     // On the success path every worker has already exited (the work queue drained
     // and `drop(tx)` closed the channel), so these joins return promptly.
     for w in workers {
         let _ = w.join();
     }
+    outcome?;
 
     Ok(ScanStats {
         scanned,

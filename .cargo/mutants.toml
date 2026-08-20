@@ -175,19 +175,28 @@ exclude_re = [
     # guard: op="+=" fn="run_pipeline" rows=2
 'musefs-core/src/scan\.rs:1629:22:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1665:32:',
+'musefs-core/src/scan\.rs:1668:33:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1665:47:',
+'musefs-core/src/scan\.rs:1668:48:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1665:62:',
+'musefs-core/src/scan\.rs:1668:63:',
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:1673:37:',
+'musefs-core/src/scan\.rs:1682:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1675:40:',
+'musefs-core/src/scan\.rs:1684:41:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1675:55:',
+'musefs-core/src/scan\.rs:1684:56:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1675:70:',
+'musefs-core/src/scan\.rs:1684:71:',
+    # Same cadence class, one level up: each threshold flush is a let-chain
+    # (`(len >= BATCH_FILES || batch_bytes >= cap) && let Err(e) = flush(..)`), so
+    # `&&`->`||` short-circuits past the mid-loop flush exactly when the threshold
+    # IS met — deferring the commit to the flush-on-empty / final flush, which
+    # persist the identical track set and still surface a flush error (#618).
+    # guard: op="&&" fn="run_pipeline" rows=1
+'musefs-core/src/scan\.rs:1669:21:',
+    # guard: op="&&" fn="run_pipeline" rows=1
+'musefs-core/src/scan\.rs:1685:29:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
@@ -195,11 +204,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:1805:29:',
+'musefs-core/src/scan\.rs:1830:29:',
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:1814:33:',
+'musefs-core/src/scan\.rs:1839:33:',
     # guard: op="+" fn="revalidate_with" rows=1
-'musefs-core/src/scan\.rs:1870:29: replace \+ with -',
+'musefs-core/src/scan\.rs:1895:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are

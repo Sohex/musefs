@@ -2,11 +2,20 @@
 //! blocking until the in-flight total would stay within the cap; the consumer
 //! releases bytes after persisting. Bounds peak in-flight art memory.
 
+use crate::lock::{lock_recover, wait_recover};
 use std::sync::{Condvar, Mutex};
+
+/// The guarded scalars: bytes currently reserved, plus the one-way shutdown flag
+/// `close` sets. Both are replace-only writes, hence the `lock_recover` policy.
+#[derive(Default)]
+struct State {
+    in_flight: u64,
+    closed: bool,
+}
 
 pub struct ByteBudget {
     cap: u64,
-    state: Mutex<u64>,
+    state: Mutex<State>,
     cv: Condvar,
 }
 
@@ -14,28 +23,38 @@ impl ByteBudget {
     pub fn new(cap: u64) -> Self {
         Self {
             cap,
-            state: Mutex::new(0),
+            state: Mutex::new(State::default()),
             cv: Condvar::new(),
         }
     }
 
     /// Reserve `n` bytes, blocking until they fit (a single item larger than the
     /// cap is admitted alone once in-flight is zero, to guarantee progress).
+    /// Once the budget is closed every reservation is admitted immediately.
     pub fn acquire(&self, n: u64) {
-        let mut in_flight = self.state.lock().unwrap();
+        let mut st = lock_recover(&self.state, "byte budget");
         // `saturating_add` mirrors `release`'s saturating style; art weights are
         // file-bounded so this never saturates in practice, but it keeps the
         // guard total-order-safe regardless.
-        while *in_flight != 0 && in_flight.saturating_add(n) > self.cap {
-            in_flight = self.cv.wait(in_flight).unwrap();
+        while !st.closed && st.in_flight != 0 && st.in_flight.saturating_add(n) > self.cap {
+            st = wait_recover(&self.cv, &self.state, st, "byte budget");
         }
-        *in_flight = in_flight.saturating_add(n);
+        st.in_flight = st.in_flight.saturating_add(n);
     }
 
     /// Release `n` previously reserved bytes.
     pub fn release(&self, n: u64) {
-        let mut in_flight = self.state.lock().unwrap();
-        *in_flight = in_flight.saturating_sub(n);
+        let mut st = lock_recover(&self.state, "byte budget");
+        st.in_flight = st.in_flight.saturating_sub(n);
+        self.cv.notify_all();
+    }
+
+    /// Stop gating: wake every waiter and admit every later reservation without
+    /// blocking. Called when a scan aborts — the failed batch never releases what
+    /// it reserved, so a producer parked here would otherwise wait forever and
+    /// outlive the pipeline, holding its probed buffers (#618).
+    pub fn close(&self) {
+        lock_recover(&self.state, "byte budget").closed = true;
         self.cv.notify_all();
     }
 }
@@ -76,7 +95,7 @@ mod tests {
     /// progress). Run on a worker: the `!=`→`==` and `&&`→`||` mutants both turn
     /// this into an infinite wait (`0 == 0 && 1000 > 10` / `0 != 0 || 1000 > 10`
     /// both stay true with nothing to release), so a hang here means CAUGHT.
-    // kills byte_budget L29 `!=`→`==` and `&&`→`||`
+    // kills byte_budget L39 `!=`→`==` and `&&`→`||`
     #[test]
     fn oversized_item_admitted_when_idle() {
         let b = Arc::new(ByteBudget::new(10));
@@ -87,8 +106,8 @@ mod tests {
     }
 
     /// A blocked reservation proceeds once enough is released. Pins `release`
-    /// (line 37): if it is a no-op the worker never unblocks → not completed.
-    // kills byte_budget L37 release→no-op
+    /// (line 47): if it is a no-op the worker never unblocks → not completed.
+    // kills byte_budget L47 release→no-op
     #[test]
     fn blocked_acquire_proceeds_after_release() {
         let b = Arc::new(ByteBudget::new(10));
@@ -114,12 +133,12 @@ mod tests {
     }
 
     /// Accumulation must be additive: from idle, `acquire(4)` then `acquire(7)`
-    /// (4+7=11 > cap 10) MUST block. Pins `*in_flight += n` (line 32) and the
+    /// (4+7=11 > cap 10) MUST block. Pins the in-flight add (line 42) and the
     /// acquire body:
     ///   - no-op (`acquire` body → `()`): in_flight stays 0, so the 2nd acquire
     ///     sees 0 and admits 7 → would NOT block → killed.
-    ///   - `+=`→`*=`: first acquire makes 0*4 = 0, so in_flight stays 0 → killed.
-    // kills byte_budget L25 acquire→no-op and L32 `+=`→`*=`
+    ///   - `+`→`*`: first acquire makes 0*4 = 0, so in_flight stays 0 → killed.
+    // kills byte_budget L35 acquire→no-op and L42 `+`→`*`
     #[test]
     fn accumulates_additively_then_blocks() {
         let b = Arc::new(ByteBudget::new(10));
@@ -132,9 +151,9 @@ mod tests {
 
     /// Boundary: `in_flight + n == cap` is admitted (guard is strictly `> cap`).
     /// From idle, `acquire(6)` then `acquire(4)` → 6+4 == 10, `10 > 10` false →
-    /// must NOT block. Kills L29 `>`→`>=` (`10>=10` true → block) and `>`→`==`
+    /// must NOT block. Kills L39 `>`→`>=` (`10>=10` true → block) and `>`→`==`
     /// (`10==10` true → block).
-    // kills byte_budget L29 `>`→`>=` and `>`→`==`
+    // kills byte_budget L39 `>`→`>=` and `>`→`==`
     #[test]
     fn exact_cap_is_admitted() {
         let b = Arc::new(ByteBudget::new(10));
@@ -146,8 +165,8 @@ mod tests {
     }
 
     /// Over cap blocks: `acquire(6)` then `acquire(8)` → 6+8=14, `14 > 10` true →
-    /// must block. Kills L29 `>`→`<` (`14 < 10` false → wrongly admitted).
-    // kills byte_budget L29 `>`→`<`
+    /// must block. Kills L39 `>`→`<` (`14 < 10` false → wrongly admitted).
+    // kills byte_budget L39 `>`→`<`
     #[test]
     fn over_cap_blocks() {
         let b = Arc::new(ByteBudget::new(10));
@@ -155,6 +174,48 @@ mod tests {
         assert!(
             !completes_within(&b, 8, WAIT),
             "6+8=14 > cap 10 must block; if it completed, the guard admitted an over-cap reservation"
+        );
+    }
+
+    /// `close` releases the gate: a reservation already parked in `acquire` must
+    /// wake and complete, even though nothing is ever released. This is the
+    /// aborted-scan path — pins `close` (line 57) against a no-op mutation, which
+    /// would leave the worker blocked exactly as pre-#618.
+    // kills byte_budget L57 close→no-op
+    #[test]
+    fn close_wakes_a_blocked_acquire() {
+        let b = Arc::new(ByteBudget::new(10));
+        b.acquire(10); // idle → admitted inline; the budget is now full
+        let done = Arc::new(AtomicBool::new(false));
+        let b2 = Arc::clone(&b);
+        let done2 = Arc::clone(&done);
+        std::thread::spawn(move || {
+            b2.acquire(5); // 10+5 > 10 → blocks
+            done2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(WAIT);
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "acquire(5) must block while full"
+        );
+        b.close();
+        std::thread::sleep(WAIT);
+        assert!(
+            done.load(Ordering::SeqCst),
+            "close must wake a blocked acquire; without it the producer waits for a release that never comes"
+        );
+    }
+
+    /// A closed budget no longer gates: an over-cap reservation made after `close`
+    /// must not block either, so a worker that reaches `acquire` late still exits.
+    #[test]
+    fn closed_budget_admits_later_acquires() {
+        let b = Arc::new(ByteBudget::new(10));
+        b.acquire(6); // idle → admitted inline; in_flight = 6
+        b.close();
+        assert!(
+            completes_within(&b, 8, WAIT),
+            "a closed budget must admit 6+8 > cap 10 without blocking"
         );
     }
 }
