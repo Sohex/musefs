@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 thiserror = "2"
 id3 = "1"
-base64 = "0.22"
+base64 = "0.23"
 
 [features]
 # Exposes pure check helpers + minimal-file fixtures for proptest, the fuzz
