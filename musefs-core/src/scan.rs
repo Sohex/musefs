@@ -1460,11 +1460,9 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
     }
     let mut already_present = 0u64;
     if !opts.force {
-        let existing: HashSet<String> = db
-            .list_tracks()?
-            .into_iter()
-            .map(|t| t.backing_path)
-            .collect();
+        // Projected to the one column this set needs: a full `list_tracks` would
+        // materialize every row's checksum strings just to drop them (#621).
+        let existing: HashSet<String> = db.list_backing_paths()?.into_iter().collect();
         let before = files.len();
         files.retain(|path| {
             let key = if opts.follow_symlinks {

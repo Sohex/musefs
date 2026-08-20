@@ -73,7 +73,7 @@ impl Musefs {
     ///
     /// The returned entries are ordered by `order_entries` (ascending by track
     /// `id`), which is what makes both full-rebuild paths establish disambiguation
-    /// order locally rather than inheriting it from `list_tracks`'s `ORDER BY id`
+    /// order locally rather than inheriting it from `list_render_keys`'s `ORDER BY id`
     /// (#188): the build path's insertion order decides which member of a colliding
     /// path keeps the bare name, and that must match the incremental path's min-id
     /// rule regardless of the source query's ordering.
@@ -86,26 +86,28 @@ impl Musefs {
         template: &Template,
         config: &MountConfig,
     ) -> Result<(Vec<(i64, String)>, HashMap<i64, TrackRenderState>)> {
-        let tracks = db.list_tracks()?;
+        // The projection this loop actually reads: a full `list_tracks` would
+        // materialize every row's path and checksum strings unused (#621).
+        let tracks = db.list_render_keys()?;
         let field_names = template.referenced_fields();
         let keys: Vec<&str> = field_names.iter().map(String::as_str).collect();
         let mut tags_by_track = db.tags_grouped_for_keys(&keys)?;
         let mut entries = Vec::with_capacity(tracks.len());
         let mut snapshot = HashMap::with_capacity(tracks.len());
-        for t in &tracks {
-            let tags = tags_by_track.remove(&t.id).unwrap_or_default();
-            let Some(path) = Self::render_one(template, config, t.format, &tags) else {
+        for &(id, content_version, format) in &tracks {
+            let tags = tags_by_track.remove(&id).unwrap_or_default();
+            let Some(path) = Self::render_one(template, config, format, &tags) else {
                 continue;
             };
             snapshot.insert(
-                t.id,
+                id,
                 TrackRenderState {
-                    content_version: t.content_version,
-                    format: t.format,
+                    content_version,
+                    format,
                     path: path.clone(),
                 },
             );
-            entries.push((t.id, path));
+            entries.push((id, path));
         }
         Ok((Self::order_entries(entries), snapshot))
     }
@@ -115,7 +117,7 @@ impl Musefs {
     /// keeps the bare name in `build_with_ci`'s insertion order (#188); it must NOT
     /// move into the build primitive, whose `tree.rs` tests feed it id-unordered
     /// entries on purpose. Kept as a pure helper so its sort is observable (and
-    /// mutation-testable) independent of `list_tracks`'s incidental `ORDER BY id`.
+    /// mutation-testable) independent of `list_render_keys`'s incidental `ORDER BY id`.
     pub(crate) fn order_entries(mut entries: Vec<(i64, String)>) -> Vec<(i64, String)> {
         entries.sort_by_key(|(id, _)| *id);
         entries
