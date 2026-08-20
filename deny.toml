@@ -43,6 +43,14 @@ deny = []
 [advisories]
 # Advisories are primarily gated by rustsec/audit-check in audit.yml; cargo-deny
 # re-checks them here as defense in depth. Keep yanked crates a hard error.
+#
+# Every `ignore` entry below must still match a crate in the graph — a stale one
+# silently pre-exempts the next real advisory for the same crate, so drop it as
+# soon as `cargo deny check` reports `advisory-not-detected` for it. That
+# diagnostic is deliberately left a warning rather than promoted to an error:
+# this config is also run against `fuzz/Cargo.lock` (audit.yml), where a
+# legitimately-ignored root advisory need not be present, so promoting it would
+# fail that job for an entry that is not stale at all.
 yanked = "deny"
 ignore = [
     # paste 1.0.15 is archived/unmaintained (via tikv-jemalloc-ctl, the default
@@ -55,11 +63,6 @@ ignore = [
     # virtual tree). The maintained imbl fork still depends on it, so there is no
     # upgrade path; the suggested replacements are not drop-in for SparseChunk.
     "RUSTSEC-2026-0247",
-    # Unsound bitmaps >= 3.2.0 `TryFrom<&[u8]>`/`AsMut<[u8]>` impls for `Bitmap`.
-    # Unreachable: imbl-sized-chunks builds bitmaps only via
-    # `Bitmap::{new, default}` and mutates them only through `set`, never from
-    # bytes; the archived crate has no patched release.
-    "RUSTSEC-2025-0167",
 ]
 
 [sources]
