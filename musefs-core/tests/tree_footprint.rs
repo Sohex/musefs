@@ -122,6 +122,14 @@ fn virtual_tree_resident_cost_per_track_stays_under_ceiling() {
         tracks,
         "every entry must materialize a file"
     );
+    // Directories are the other half of the corpus shape: without this, flattening
+    // `rendered_paths` would keep the file and intern counts true while lowering the
+    // measured per-track cost, quietly making the ceiling easier to meet.
+    assert_eq!(
+        usize_from(dirs),
+        tracks.div_ceil(ALBUMS_PER_ARTIST * TRACKS_PER_ALBUM) + tracks.div_ceil(TRACKS_PER_ALBUM),
+        "corpus must render one directory per artist and per album"
+    );
     assert_eq!(
         interned,
         tree.node_count(),

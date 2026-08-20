@@ -33,10 +33,14 @@ and scales with the **track count**, not with I/O. Measured on Linux, release bu
 | ------- | ---------------- | -------- | --------- | ---------- |
 | 200,000 tracks / 22,000 directories (v1.3.0) | 451 MB | 475 MB | ~2.31 KB | 2.3 s |
 
-Size a host at **~2 KB of RAM per track** — ~200 MB at 100,000 tracks, ~2 GB at a
-million — on top of the read-ahead budget (64 MiB by default) and SQLite's page cache.
-The peak above steady state is the transient of building the tree, so it reappears
-whenever a refresh takes the full-rebuild path. The cost is dominated by rendered
+Size a host against the **peak** — **~2.4 KB of RAM per track**, so ~240 MB at
+100,000 tracks and ~2.4 GB at a million — on top of the read-ahead budget (64 MiB by
+default) and SQLite's page cache. Size against the peak rather than the steady state
+because the peak is the transient of building the tree, and it recurs whenever a
+refresh takes the full-rebuild path rather than being a one-off at mount. The
+reductions described below cut the tree's own share of this, but the table is the
+last end-to-end mount measurement, so it remains the number to size against until a
+mount is measured again. The cost is dominated by rendered
 names and paths rather than by audio, so a deeply nested `--template` (more path
 components, longer names) raises it and a flatter one lowers it.
 

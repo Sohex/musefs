@@ -223,9 +223,10 @@ cargo test -p musefs-fuse --test concurrent_reads -- --ignored  # mount: DbPool:
 The core binary also carries the read-ahead pool's budget-accounting stress
 (`readahead_*`, #628): 16 threads register/read/deregister streams against a
 4 MiB budget so eviction fires constantly, then assert
-`charged == Σ(registered buffers' bytes.len())` at quiescence — the invariant
-#536 restored. It lives in this binary precisely so the sanitizer legs below
-reach it; the serve-path tests around it run with read-ahead disabled. Rounds
+`charged == Σ(registered buffers' bytes.len())` at quiescence — the
+invariant #536 restored. It lives in this binary precisely so the sanitizer
+legs below reach it; the serve-path tests around it run with read-ahead
+disabled. Rounds
 default to a sanitizer-friendly 24 per thread;
 `MUSEFS_READAHEAD_STRESS_ROUNDS=200` soaks it locally.
 

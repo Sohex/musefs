@@ -1128,6 +1128,18 @@ mod tests {
         );
         let handles = stored_handles(&tree, d, "song.flac", "song (2).flac");
         assert!(Arc::ptr_eq(handles[0], &node.name), "children key");
+        // The outer `rendered_children` key is NOT this node's `rendered_name`: it was
+        // interned by the first node to render "song.flac", and this one collided
+        // afterwards. Pin it against that first node, so a copied outer key still
+        // fails — the bumped node's own `rendered_name` stays a second allocation of
+        // the same value, which is one per collision and rare by construction.
+        let first = tree
+            .node(tree.lookup(d, "song.flac").unwrap())
+            .expect("first");
+        assert!(
+            Arc::ptr_eq(handles[1], &first.name),
+            "rendered outer key shares with the node that interned it"
+        );
         assert!(Arc::ptr_eq(handles[2], &node.name), "rendered inner key");
     }
 
