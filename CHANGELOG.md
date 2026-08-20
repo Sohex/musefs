@@ -31,6 +31,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Serve-path failure warnings are rate-limited: a burst of 10 per 30-second
+  window logs at warn, the rest drop to debug, and the first warn of each new
+  window carries the suppressed count. A library walk over missing backing
+  files previously warned once per file — 200,000 lines (tens of MB of log)
+  for a single enumeration. The read load-shed (`EAGAIN`) warning shares the
+  same limiter, since a saturated client retries in a tight loop.
 - Worker read connections now cap their SQLite page cache at 512 KiB (the
   default is ~2 MiB). The serve path opens one connection per worker thread
   (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS
