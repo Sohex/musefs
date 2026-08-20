@@ -314,17 +314,18 @@ fn reply_dir_page(mut reply: ReplyDirectory, listing: &[(u64, FileType, String)]
 
 /// Admit a directory handle under the caller's `dir_handles` lock, enforcing
 /// `MAX_DIR_HANDLES` (#307). Returns the freshly allocated handle id on admit, or
-/// `None` when the table is at `cap` (the caller falls back to the stateless
-/// fh; see [`dir_open_fh`]). The id is
-/// drawn from `counter` only on the admit path, and the whole check-then-insert
-/// runs under the single lock the caller holds, so concurrent `opendir` closures
-/// cannot race the count past the cap and a rejected open burns no id.
+/// `None` when the table is at `cap` and the caller falls back to the stateless
+/// fh (see [`dir_open_fh`]). The id is drawn from `counter` only on the admit
+/// path, and the whole check-then-insert runs under the single lock the caller
+/// holds, so concurrent `opendir` closures cannot race the count past the cap
+/// and a rejected open burns no id.
 ///
 /// The miss path bumps `rejections`, surfaced as
 /// `musefs_dir_handle_rejections_total`. Saturation is bursty — a parallel walk
 /// can rack up thousands of rejections between two samples of the
 /// `musefs_dir_handles` gauge, which reads healthy the whole time — so the
-/// monotonic counter is the only after-the-fact signal that the cap bit (#626).
+/// monotonic counter is the only after-the-fact signal that the cap was hit
+/// (#626).
 fn try_admit_dir_handle(
     handles: &mut std::collections::HashMap<u64, Arc<DirListing>>,
     counter: &AtomicU64,
@@ -773,11 +774,12 @@ impl Filesystem for MusefsFs {
             };
             if admitted.is_none() {
                 // Debug, not warn: a parallel walk over a large mount produces
-                // thousands of these in seconds, and the walk still succeeds.
+                // thousands of these in seconds, the walk still succeeds, and
+                // the listing is simply rebuilt per `readdir` from here on.
                 // `musefs_dir_handle_rejections_total` is the operator-facing
                 // signal that the degraded path is in use (#626).
                 log::debug!(
-                    "opendir({ino}) over the {MAX_DIR_HANDLES}-handle cap: serving it                      statelessly, listing rebuilt per readdir",
+                    "opendir({ino}) over the {MAX_DIR_HANDLES}-handle cap: serving it statelessly",
                     ino = ino.0
                 );
             }
