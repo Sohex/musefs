@@ -40,4 +40,14 @@ jobs:
       - name: Scan fuzz lockfile (advisories + yanked)
         run: |
           cargo install cargo-deny --locked --version '^0.19'
-          cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml advisories
+          # `--allow advisory-not-detected`: deny.toml's ignore list is authored
+          # against the root graph, and the ci.yml deny job promotes that
+          # diagnostic there to keep the list honest. This job reuses the same
+          # config over a *different* graph, where a root-only entry (currently
+          # RUSTSEC-2024-0436 / `paste`, reached via the jemalloc allocator the
+          # fuzz crate does not pull in) is legitimately unmatched — off the
+          # authoring graph the diagnostic is noise, not a rot signal. If the
+          # fuzz lockfile ever needs an exemption of its own, give it a separate
+          # config rather than widening the root list.
+          cargo deny --manifest-path fuzz/Cargo.toml check --config deny.toml \
+            --allow advisory-not-detected advisories

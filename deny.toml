@@ -13,6 +13,11 @@ all-features = true
 # weak-copyleft MPL-2.0 is file-level and fine to link. Copyleft licenses
 # (GPL/LGPL/AGPL) are intentionally absent — they only ever appear as the
 # non-selected arm of an `OR`, so the resolver picks a permissive arm instead.
+#
+# The "every entry is present" claim above is enforced, not aspirational: the
+# ci.yml deny job promotes `license-not-encountered` to an error, so an entry
+# that stops matching — a dep drops it, a bump relicenses — fails the gate and
+# has to be dropped rather than accumulating as a silent pre-approval.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -20,7 +25,6 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "0BSD",
-    "ISC",
     "Zlib",
     "Unlicense",
     "Unicode-3.0",
@@ -45,12 +49,18 @@ deny = []
 # re-checks them here as defense in depth. Keep yanked crates a hard error.
 #
 # Every `ignore` entry below must still match a crate in the graph — a stale one
-# silently pre-exempts the next real advisory for the same crate, so drop it as
-# soon as `cargo deny check` reports `advisory-not-detected` for it. That
-# diagnostic is deliberately left a warning rather than promoted to an error:
-# this config is also run against `fuzz/Cargo.lock` (audit.yml), where a
-# legitimately-ignored root advisory need not be present, so promoting it would
-# fail that job for an entry that is not stale at all.
+# silently pre-exempts the next real advisory for the same crate. The ci.yml
+# deny job promotes `advisory-not-detected` to an error, so a stale entry fails
+# the gate instead of warning into a log nobody reads.
+#
+# That promotion is scoped to the root graph, which is the graph this list is
+# authored against. audit.yml runs this same config over `fuzz/Cargo.lock` — a
+# different graph, where RUSTSEC-2024-0436 (`paste`, reached via the jemalloc
+# allocator the fuzz crate does not pull in) is legitimately unmatched. That job
+# passes `--allow advisory-not-detected` because off the authoring graph the
+# diagnostic carries no rot signal, only noise. If the fuzz lockfile ever needs
+# an exemption of its own, give it a separate config so each list stays strictly
+# checked against the graph it was written for — do not widen this one.
 yanked = "deny"
 ignore = [
     # paste 1.0.15 is archived/unmaintained (via tikv-jemalloc-ctl, the default
