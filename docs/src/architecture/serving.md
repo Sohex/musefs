@@ -96,11 +96,12 @@ handles so a client that opens directories without closing them cannot pin
 unbounded memory.
 
 Over that cap, `opendir` degrades rather than failing: it returns the stateless
-handle, and `readdir` falls back to rebuilding the listing on each call.
-Listings stay complete — parallel walkers routinely exceed 1024 concurrent
-directory handles on a large mount — at the cost of that rebuild.
-`musefs_dir_handle_rejections_total` counts the opens that
-took the fallback; the `musefs_dir_handles` gauge cannot show this, because
+handle, and `readdir` falls back to rebuilding the listing on each call (on the
+worker pool, like every other blocking operation, not on the single fuser
+dispatch thread). Listings stay complete — parallel walkers routinely exceed
+1024 concurrent directory handles on a large mount — at the cost of that
+rebuild. `musefs_dir_handle_rejections_total` counts the opens that took the
+fallback; the `musefs_dir_handles` gauge cannot show this, because
 saturation is bursty enough to read healthy in every sample while thousands of
 opens are degraded between them.
 

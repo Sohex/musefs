@@ -297,6 +297,20 @@ fn build_dir_listing(
     Ok(listing)
 }
 
+/// Answer a `readdir` with the page of `listing` starting at `offset`. Slicing
+/// from `offset` directly keeps a paginated enumeration O(n) rather than O(n^2):
+/// the skipped prefix is never re-walked (#442). The offset stored with each
+/// entry is the index of the *next* entry to return.
+fn reply_dir_page(mut reply: ReplyDirectory, listing: &[(u64, FileType, String)], offset: u64) {
+    let start = usize_from(offset).min(listing.len());
+    for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
+        if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
+            break;
+        }
+    }
+    reply.ok();
+}
+
 /// Admit a directory handle under the caller's `dir_handles` lock, enforcing
 /// `MAX_DIR_HANDLES` (#307). Returns the freshly allocated handle id on admit, or
 /// `None` when the table is at `cap` (the caller falls back to the stateless
@@ -957,18 +971,11 @@ impl Filesystem for MusefsFs {
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
-        mut reply: ReplyDirectory,
+        reply: ReplyDirectory,
     ) {
         self.fire_poll_refresh();
         if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
-            let listing = metrics_dir::dir_listing();
-            let start = usize_from(offset).min(listing.len());
-            for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
-                if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
-                    break;
-                }
-            }
-            return reply.ok();
+            return reply_dir_page(reply, &metrics_dir::dir_listing(), offset);
         }
         let snapshot = self
             .dir_handles
@@ -976,25 +983,24 @@ impl Filesystem for MusefsFs {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&fh.0)
             .map(Arc::clone);
-        // Lock released; the reply loop below runs without holding it.
-        let listing = match snapshot {
-            Some(l) => l,
-            // Unknown fh (e.g. fh 0): build once inline so we never regress.
-            None => match build_dir_listing(&self.core, ino.0, self.config.expose_metrics) {
-                Ok(l) => Arc::new(l),
-                Err(e) => return reply.error(reply_errno("readdir", ino.0, &e)),
-            },
+        // Lock released; the reply below runs without holding it.
+        let Some(listing) = snapshot else {
+            // Unknown fh — the stateless sentinel, from a synthetic directory or
+            // an over-cap `opendir` (#616). Rebuilding walks the virtual tree and
+            // resolves the parent, so it is offloaded like every other blocking
+            // op rather than run on the single dispatch thread: since #616 this
+            // is the normal path for exactly the wide directories that make it
+            // expensive (#623). `ReplyDirectory` is `Send`, so the worker answers.
+            let core = Arc::clone(&self.core);
+            let expose_metrics = self.config.expose_metrics;
+            return self.pool.execute(move || {
+                match build_dir_listing(&core, ino.0, expose_metrics) {
+                    Ok(listing) => reply_dir_page(reply, &listing, offset),
+                    Err(e) => reply.error(reply_errno("readdir", ino.0, &e)),
+                }
+            });
         };
-        // Slice from `offset` directly so paginated calls don't re-walk the
-        // skipped prefix; full enumeration stays O(n), not O(n^2) (#442).
-        let start = usize_from(offset).min(listing.len());
-        for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
-            // The stored offset is the index of the *next* entry to return.
-            if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
-                break;
-            }
-        }
-        reply.ok();
+        reply_dir_page(reply, &listing, offset);
     }
 }
 
