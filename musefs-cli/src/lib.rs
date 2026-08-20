@@ -132,6 +132,13 @@ pub struct MountArgs {
     /// Max outstanding background (readahead/async) requests the kernel queues.
     #[arg(long, env = "MUSEFS_MAX_BACKGROUND", default_value_t = 64)]
     pub max_background: u16,
+    /// Worker threads for offloaded FUSE ops (reads, metadata synthesis).
+    /// 0 = auto: 2× the CPU count, oversized because the work is I/O-bound.
+    /// Each worker lazily opens its own read-only SQLite connection, so
+    /// steady-state memory also scales with this — lower it on
+    /// memory-constrained or many-core hosts (see the tuning guide).
+    #[arg(long, env = "MUSEFS_WORKERS", default_value_t = 0)]
+    pub workers: usize,
     /// Keep the kernel page cache across opens. On by default: it is the one
     /// measured storage win (~3× faster repeat-open on HDD/NFS, #432). External
     /// re-tags auto-invalidate the affected inodes on refresh, so cached bytes
@@ -485,6 +492,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         dir_mode: args.dir_mode.unwrap_or(defaults.dir_mode),
         allow_other: effective_allow_other(args.allow_other, args.owner, args.group),
         expose_metrics: args.expose_metrics,
+        workers: args.workers,
     };
     (config, fuse_config)
 }
@@ -1053,6 +1061,23 @@ mod tests {
         assert_eq!(fuse_config.max_readahead, 64 * 1024);
         assert_eq!(fuse_config.max_background, 32);
         assert!(fuse_config.expose_metrics);
+    }
+
+    #[test]
+    fn workers_flag_maps_through_with_auto_default() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["musefs", "mount", "/mnt/muse", "--db", "/tmp/x.db"];
+            argv.extend_from_slice(extra);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Command::Mount(args) = cli.command else {
+                panic!("expected Mount");
+            };
+            parse_mount_config(&args).1.workers
+        };
+        // Absent → 0, the "auto: 2× CPUs" sentinel resolved in musefs-fuse.
+        assert_eq!(parse(&[]), 0);
+        assert_eq!(parse(&["--workers", "8"]), 8);
     }
 
     #[test]

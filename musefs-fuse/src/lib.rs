@@ -76,6 +76,12 @@ pub struct FuseConfig {
     /// mount root (#394). Default off; named distinctly from the compile-time
     /// `metrics` cargo feature (which gates the syscall counters).
     pub expose_metrics: bool,
+    /// Worker-pool size for offloaded ops (reads, metadata synthesis).
+    /// `0` = auto: 2× the CPU count, oversized because the work is I/O-bound.
+    /// Each worker lazily opens its own read-only DB connection, so this also
+    /// bounds the SQLite connection count — steady-state memory scales with it
+    /// (#631). Lower it on memory-constrained or many-core hosts.
+    pub workers: usize,
 }
 
 impl Default for FuseConfig {
@@ -91,6 +97,7 @@ impl Default for FuseConfig {
             dir_mode: 0o555,
             allow_other: false,
             expose_metrics: false,
+            workers: 0,
         }
     }
 }
@@ -194,17 +201,102 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
     }
 }
 
+/// Burst of serve-path failure warns allowed per [`WARN_WINDOW_SECS`] window;
+/// the rest of the window is downgraded to debug and counted.
+const WARN_BURST: u64 = 10;
+/// Length of one warn rate-limit window, in seconds.
+const WARN_WINDOW_SECS: u64 = 30;
+
+/// What [`WarnLimiter::decide`] told the caller to do with one warn.
+#[derive(Debug, PartialEq, Eq)]
+enum WarnDecision {
+    /// Emit the warn. `suppressed` is the count dropped since the last window
+    /// opened (nonzero only on the first warn of a new window) so the log
+    /// still reflects the true failure volume.
+    Log { suppressed: u64 },
+    /// Over budget for this window: downgrade to debug.
+    Suppress,
+}
+
+/// Rate limit for serve-path failure warns. Without it, a library enumeration
+/// over a corpus whose backing files are missing emits one warn per file —
+/// 200,000 lines (tens of MB of log) for a single walk (#631). Failures stay
+/// visible — a burst per window plus a suppressed-count on each new window —
+/// without the log scaling with library size. Lock-free; a lost race under
+/// concurrent windows-rollover merely logs one extra line.
+struct WarnLimiter {
+    /// Unix seconds when the current window opened.
+    window_start: AtomicU64,
+    /// Warns emitted in the current window (the burst budget).
+    in_window: AtomicU64,
+    /// Warns downgraded in the current window, reported when the next opens.
+    suppressed: AtomicU64,
+}
+
+impl WarnLimiter {
+    const fn new() -> WarnLimiter {
+        WarnLimiter {
+            window_start: AtomicU64::new(0),
+            in_window: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// Decide one warn's fate at `now_secs` (Unix seconds; injected so tests
+    /// don't sleep).
+    fn decide(&self, now_secs: u64) -> WarnDecision {
+        let start = self.window_start.load(Ordering::Relaxed);
+        if now_secs >= start.saturating_add(WARN_WINDOW_SECS)
+            && self
+                .window_start
+                .compare_exchange(start, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.in_window.store(1, Ordering::Relaxed);
+            return WarnDecision::Log {
+                suppressed: self.suppressed.swap(0, Ordering::Relaxed),
+            };
+        }
+        if self.in_window.fetch_add(1, Ordering::Relaxed) < WARN_BURST {
+            WarnDecision::Log { suppressed: 0 }
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            WarnDecision::Suppress
+        }
+    }
+}
+
+/// The one process-wide limiter for serve-path failure warns.
+static SERVE_WARN_LIMITER: WarnLimiter = WarnLimiter::new();
+
+/// Emit a serve-path failure warn through [`SERVE_WARN_LIMITER`]. Over-budget
+/// messages drop to debug so `RUST_LOG=debug` still sees every failure.
+fn rate_limited_warn(message: std::fmt::Arguments<'_>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    match SERVE_WARN_LIMITER.decide(now) {
+        WarnDecision::Log { suppressed: 0 } => log::warn!("{message}"),
+        WarnDecision::Log { suppressed } => log::warn!(
+            "{message} ({suppressed} similar serve-path warnings suppressed in the last {WARN_WINDOW_SECS}s)"
+        ),
+        WarnDecision::Suppress => log::debug!("{message} (over warn budget)"),
+    }
+}
+
 /// Log a serve-path failure before it collapses to an errno reply, so the
 /// cause (e.g. the offending path in `BackingChanged`, or an `Io` error with
 /// no raw OS errno) is not lost. Routine tree-shape misses — a stale inode
-/// after a refresh, kernel path probing — stay at debug to avoid noise.
+/// after a refresh, kernel path probing — stay at debug to avoid noise, and
+/// the warn arm is rate-limited so per-file failures (a walk over missing
+/// backing files) can't scale the log with library size.
 fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
     match err {
         CoreError::NoEntry(_)
         | CoreError::TrackNotFound(_)
         | CoreError::IsDir(_)
         | CoreError::NotADir(_) => log::debug!("{op}({ino}) failed: {err}"),
-        _ => log::warn!("{op}({ino}) failed: {err}"),
+        _ => rate_limited_warn(format_args!("{op}({ino}) failed: {err}")),
     }
     errno(err)
 }
@@ -459,8 +551,14 @@ pub struct MusefsFs {
 
 impl MusefsFs {
     pub fn new(core: Musefs, config: FuseConfig) -> MusefsFs {
-        // Work is I/O-bound (especially on NFS), so oversize the pool vs CPUs.
-        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2;
+        // Work is I/O-bound (especially on NFS), so the auto default oversizes
+        // the pool vs CPUs. An explicit `--workers` wins: besides concurrency,
+        // the pool size bounds the per-worker DB connections and their memory
+        // (#631), so operators may deliberately size it down.
+        let workers = match config.workers {
+            0 => std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2,
+            n => n,
+        };
         let structure_only = core.mode() == musefs_core::Mode::StructureOnly;
         MusefsFs {
             core: Arc::new(core),
@@ -564,9 +662,11 @@ impl MusefsFs {
                 .telemetry()
                 .map(|(disabled, active)| musefs_core::PassthroughTelemetry { disabled, active }),
         };
+        let process = musefs_core::process_stats();
         let alloc = allocator_stats();
         let syscalls = syscall_snapshot();
-        musefs_core::render_prometheus(&core, &fuse, alloc.as_ref(), syscalls.as_ref()).into_bytes()
+        musefs_core::render_prometheus(&core, &fuse, &process, alloc.as_ref(), syscalls.as_ref())
+            .into_bytes()
     }
 }
 
@@ -932,10 +1032,12 @@ impl Filesystem for MusefsFs {
         // reject with EAGAIN so the unbounded pool queue can't grow (#308).
         let Some(slot) = reserve_read_slot(&self.inflight_reads, MAX_INFLIGHT_READS) else {
             self.read_errors.fetch_add(1, Ordering::Relaxed);
-            log::warn!(
+            // Rate-limited: a saturated client retries rejected reads in a tight
+            // loop, so this otherwise warns once per shed read for the whole storm.
+            rate_limited_warn(format_args!(
                 "read({}) rejected: EAGAIN — {MAX_INFLIGHT_READS} reads already in flight (load-shedding)",
                 ino.0
-            );
+            ));
             return reply.error(fuser::Errno::EAGAIN);
         };
         let core = Arc::clone(&self.core);
@@ -1238,6 +1340,75 @@ mod tests {
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
         (dir, MusefsFs::new(core, FuseConfig::default()))
+    }
+
+    #[test]
+    fn warn_limiter_allows_a_burst_then_suppresses() {
+        let l = WarnLimiter::new();
+        // First call opens the window; the burst budget covers WARN_BURST warns.
+        for i in 0..WARN_BURST {
+            assert_eq!(
+                l.decide(100),
+                WarnDecision::Log { suppressed: 0 },
+                "warn {i} is within the burst"
+            );
+        }
+        assert_eq!(l.decide(100), WarnDecision::Suppress);
+        assert_eq!(l.decide(100), WarnDecision::Suppress);
+    }
+
+    #[test]
+    fn warn_limiter_new_window_reports_suppressed_count() {
+        let l = WarnLimiter::new();
+        for _ in 0..WARN_BURST {
+            l.decide(100);
+        }
+        for _ in 0..5 {
+            assert_eq!(l.decide(100), WarnDecision::Suppress);
+        }
+        // Window rolls over: log again, carrying the dropped count once.
+        assert_eq!(
+            l.decide(100 + WARN_WINDOW_SECS),
+            WarnDecision::Log { suppressed: 5 }
+        );
+        assert_eq!(
+            l.decide(100 + WARN_WINDOW_SECS),
+            WarnDecision::Log { suppressed: 0 }
+        );
+    }
+
+    #[test]
+    fn explicit_workers_sets_pool_size() {
+        use musefs_core::{Mode, MountConfig, Musefs};
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: std::collections::BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
+            skip_on_missing: false,
+        };
+        let core =
+            Musefs::open(musefs_db::Db::open(dir.path().join("w.db")).unwrap(), cfg).unwrap();
+        let fs = MusefsFs::new(
+            core,
+            FuseConfig {
+                workers: 3,
+                ..FuseConfig::default()
+            },
+        );
+        assert_eq!(fs.pool.max_count(), 3);
+    }
+
+    #[test]
+    fn workers_zero_means_auto_oversized_pool() {
+        let (_dir, fs) = test_fs(); // default config: workers == 0
+        let auto = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2;
+        assert_eq!(fs.pool.max_count(), auto);
     }
 
     #[test]

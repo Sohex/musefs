@@ -17,9 +17,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
   given a cached directory snapshot, so directory-handle pressure stays visible
   after a burst rather than only as a gauge that reads healthy between samples.
+- `--workers` (env `MUSEFS_WORKERS`) sizes the FUSE worker pool explicitly.
+  The default stays auto (2× the CPU count, oversized for I/O-bound work), but
+  each worker lazily opens its own read-only SQLite connection, so steady-state
+  memory scales with the pool — many-core hosts serving few concurrent readers
+  can now cap that component (#631).
+- `musefs_process_resident_bytes` (Linux) reports the whole-process RSS, and
+  `musefs_sqlite_memory_bytes` reports what SQLite holds across all connections.
+  SQLite allocates through libc, so the jemalloc `musefs_alloc_*` gauges never
+  saw it — a full-library walk grew the process by hundreds of MB while the
+  allocator gauges barely moved (#631). The metrics surface now answers "how
+  much memory is this using" honestly.
 
 ### Changed
 
+- Serve-path failure warnings are rate-limited: a burst of 10 per 30-second
+  window logs at warn, the rest drop to debug, and the first warn of each new
+  window carries the suppressed count. A library walk over missing backing
+  files previously warned once per file — 200,000 lines (tens of MB of log)
+  for a single enumeration. The read load-shed (`EAGAIN`) warning shares the
+  same limiter, since a saturated client retries in a tight loop.
+- Worker read connections now cap their SQLite page cache at 512 KiB (the
+  default is ~2 MiB). The serve path opens one connection per worker thread
+  (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS
+  after a full-library enumeration; the cap saved ~110 MB on a 200,000-track
+  walk with 64 workers and no measured latency change (#631). The tuning guide
+  now documents the post-enumeration steady state as the number to size a host
+  against, and the transparent-hugepage inflation some distros' `THP=always`
+  default adds on top.
 - The virtual tree stores each node name in one shared allocation instead of
   five copies, cutting about a quarter of its resident cost (~1.7 KB to ~1.3 KB
   per track, measured over 200,000 tracks). The tuning guide now documents the

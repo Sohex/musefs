@@ -51,12 +51,54 @@ pub struct FuseTelemetry {
 }
 
 /// jemalloc allocator stats (present only on a `jemalloc`-feature build).
+///
+/// These cover the Rust heap only: bundled SQLite is C and allocates through
+/// libc, so its memory — which dominates a metadata walk's RSS growth (#631) —
+/// is invisible here. [`ProcessStats`] carries the process-level truth.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AllocatorStats {
     pub allocated: u64,
     pub resident: u64,
     pub active: u64,
     pub retained: u64,
+}
+
+/// Process-level memory stats: what the OS charges the daemon, regardless of
+/// which allocator (jemalloc, libc/SQLite) is holding it. Complements
+/// [`AllocatorStats`], which under-reports the process by whatever SQLite
+/// holds (#631).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessStats {
+    /// Whole-process resident set size in bytes, from the OS. `None` where no
+    /// cheap source exists (`/proc/self/status` is the only one wired up, so
+    /// in practice Linux-only).
+    pub resident_bytes: Option<u64>,
+    /// Live bytes held by SQLite's C allocator across all connections.
+    pub sqlite_bytes: u64,
+}
+
+/// Gather [`ProcessStats`] from the running process. Best-effort: the RSS read
+/// is `None` off Linux or if `/proc` parsing fails; the SQLite counter is a
+/// process-global from the library itself and always present.
+pub fn process_stats() -> ProcessStats {
+    ProcessStats {
+        resident_bytes: read_own_rss_bytes(),
+        sqlite_bytes: musefs_db::sqlite_memory_used(),
+    }
+}
+
+/// `VmRSS` from `/proc/self/status`, in bytes. The `status` field is chosen
+/// over `statm` because it needs no page-size lookup; both cost one small read.
+///
+/// Deliberately not cfg-gated to Linux: the body is portable std code that
+/// returns `None` wherever the file or field is absent (macOS has no `/proc`;
+/// FreeBSD's optional procfs has no `VmRSS:` line), and a cfg'd-out stub would
+/// be dead weight the mutation gate can't exercise on the Linux runner.
+fn read_own_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 fn gauge(out: &mut String, name: &str, help: &str, val: u64) {
@@ -74,10 +116,13 @@ fn counter(out: &mut String, name: &str, help: &str, val: u64) {
 }
 
 /// Render a full Prometheus exposition-format document. Feature-gated blocks
-/// (`alloc`, `syscalls`) are omitted entirely when their `Option` is `None`.
+/// (`alloc`, `syscalls`) are omitted entirely when their `Option` is `None`;
+/// the `process` block always renders (its RSS gauge is skipped where the OS
+/// offers no cheap source).
 pub fn render_prometheus(
     core: &CoreTelemetry,
     fuse: &FuseTelemetry,
+    process: &ProcessStats,
     alloc: Option<&AllocatorStats>,
     syscalls: Option<&crate::metrics::Snapshot>,
 ) -> String {
@@ -249,17 +294,32 @@ pub fn render_prometheus(
         );
     }
 
+    if let Some(rss) = process.resident_bytes {
+        gauge(
+            &mut out,
+            "musefs_process_resident_bytes",
+            "Whole-process RSS from the OS; the number to size a host against (includes SQLite, which the jemalloc gauges miss).",
+            rss,
+        );
+    }
+    gauge(
+        &mut out,
+        "musefs_sqlite_memory_bytes",
+        "Live bytes held by SQLite's C allocator across all connections; outside the Rust allocator, so the jemalloc gauges exclude it.",
+        process.sqlite_bytes,
+    );
+
     if let Some(a) = alloc {
         gauge(
             &mut out,
             "musefs_alloc_allocated_bytes",
-            "jemalloc bytes allocated and in use.",
+            "jemalloc bytes allocated and in use (Rust heap only; SQLite allocates via libc).",
             a.allocated,
         );
         gauge(
             &mut out,
             "musefs_alloc_resident_bytes",
-            "jemalloc resident bytes (RSS proxy).",
+            "jemalloc resident bytes (Rust-heap RSS; see musefs_process_resident_bytes for the whole process).",
             a.resident,
         );
         gauge(
@@ -391,9 +451,59 @@ mod tests {
         }
     }
 
+    fn sample_process() -> ProcessStats {
+        ProcessStats {
+            resident_bytes: Some(500_000_000),
+            sqlite_bytes: 150_000_000,
+        }
+    }
+
+    #[test]
+    fn process_block_renders_rss_and_sqlite() {
+        let out = render_prometheus(
+            &sample_core(),
+            &sample_fuse(),
+            &sample_process(),
+            None,
+            None,
+        );
+        assert!(out.contains("musefs_process_resident_bytes 500000000\n"));
+        assert!(out.contains("musefs_sqlite_memory_bytes 150000000\n"));
+    }
+
+    #[test]
+    fn process_rss_gauge_omitted_when_unavailable() {
+        let p = ProcessStats {
+            resident_bytes: None,
+            sqlite_bytes: 7,
+        };
+        let out = render_prometheus(&sample_core(), &sample_fuse(), &p, None, None);
+        assert!(!out.contains("musefs_process_resident_bytes"));
+        assert!(out.contains("musefs_sqlite_memory_bytes 7\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_stats_reads_own_rss_on_linux() {
+        let rss = process_stats().resident_bytes.unwrap();
+        // A running test binary is megabytes resident, never terabytes. The
+        // lower bound also pins the KiB→bytes scaling: mis-scaled values
+        // (kib + 1024, kib / 1024, or a constant) land far below 1 MiB.
+        assert!(
+            (1 << 20..1u64 << 40).contains(&rss),
+            "VmRSS of a running test process should be MBs-to-GBs, got {rss}"
+        );
+    }
+
     #[test]
     fn renders_core_and_fuse_gauges() {
-        let out = render_prometheus(&sample_core(), &sample_fuse(), None, None);
+        let out = render_prometheus(
+            &sample_core(),
+            &sample_fuse(),
+            &sample_process(),
+            None,
+            None,
+        );
         assert!(out.contains("# TYPE musefs_handles_open gauge\nmusefs_handles_open 3\n"));
         assert!(out.contains("musefs_reads_inflight 1\n"));
         assert!(out.contains("musefs_reads_inflight_max 1024\n"));
@@ -415,19 +525,31 @@ mod tests {
 
     #[test]
     fn passthrough_block_present_when_some_absent_when_none() {
-        let with = render_prometheus(&sample_core(), &sample_fuse(), None, None);
+        let with = render_prometheus(
+            &sample_core(),
+            &sample_fuse(),
+            &sample_process(),
+            None,
+            None,
+        );
         assert!(with.contains("musefs_passthrough_active 4\n"));
         assert!(with.contains("musefs_passthrough_disabled 0\n"));
 
         let mut f = sample_fuse();
         f.passthrough = None;
-        let without = render_prometheus(&sample_core(), &f, None, None);
+        let without = render_prometheus(&sample_core(), &f, &sample_process(), None, None);
         assert!(!without.contains("musefs_passthrough"));
     }
 
     #[test]
     fn alloc_and_syscall_blocks_are_omitted_when_none() {
-        let out = render_prometheus(&sample_core(), &sample_fuse(), None, None);
+        let out = render_prometheus(
+            &sample_core(),
+            &sample_fuse(),
+            &sample_process(),
+            None,
+            None,
+        );
         assert!(!out.contains("musefs_alloc_"));
         assert!(!out.contains("musefs_backing_"));
     }
@@ -440,7 +562,13 @@ mod tests {
             active: 3,
             retained: 4,
         };
-        let out = render_prometheus(&sample_core(), &sample_fuse(), Some(&a), None);
+        let out = render_prometheus(
+            &sample_core(),
+            &sample_fuse(),
+            &sample_process(),
+            Some(&a),
+            None,
+        );
         assert!(out.contains("musefs_alloc_resident_bytes 2\n"));
         assert!(out.contains("musefs_alloc_retained_bytes 4\n"));
     }
@@ -454,7 +582,13 @@ mod tests {
             readahead_misses: 44,
             ..crate::metrics::Snapshot::default()
         };
-        let out = render_prometheus(&sample_core(), &sample_fuse(), None, Some(&s));
+        let out = render_prometheus(
+            &sample_core(),
+            &sample_fuse(),
+            &sample_process(),
+            None,
+            Some(&s),
+        );
         assert!(out.contains(
             "# TYPE musefs_backing_opens_total counter\nmusefs_backing_opens_total 11\n"
         ));
@@ -469,7 +603,7 @@ mod tests {
     fn refresh_needs_rebuild_true_renders_as_one() {
         let mut c = sample_core();
         c.refresh_needs_rebuild = true;
-        let out = render_prometheus(&c, &sample_fuse(), None, None);
+        let out = render_prometheus(&c, &sample_fuse(), &sample_process(), None, None);
         assert!(out.contains("musefs_refresh_needs_rebuild 1\n"));
     }
 }
