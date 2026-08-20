@@ -324,7 +324,7 @@ exclude_re = [
     # mutant is equivalent and unkillable (#537). Pinned by line:col — the other `<`
     # in this fn (the memo range check) IS caught.
     # guard: op="<" fn="find_page_start" rows=1
-    'musefs-core/src/ogg_index\.rs:74:48: replace < with <= in find_page_start',
+    'musefs-core/src/ogg_index\.rs:90:48: replace < with <= in find_page_start',
     # Overlap-emit guards `if hs < he` / `if ps < pe`, `<`->`<=`: when the bound is
     # equal the extra branch emits an empty `[a..b]` slice / reads 0 payload bytes —
     # a no-op, so the served output is byte-identical (verified: the ogg tests and the
@@ -332,9 +332,9 @@ exclude_re = [
     # were reported TIMEOUT under the parallel gate's load, not as a real hang. Pinned
     # by line:col — several `<` in this fn (the loop/length guards) ARE caught.
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:252:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:275:15: replace < with <= in serve_ogg_window',
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:261:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:284:15: replace < with <= in serve_ogg_window',
 
     # Phase 4 poll debounce (#89) — equivalent `<`->`<=` on the two wall-clock
     # gates (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <
