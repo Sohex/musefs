@@ -25,9 +25,9 @@ a performance knob — see [Platform support](installation.md#platform-support).
 
 ## Memory footprint
 
-`--read-ahead-budget-mib` is the only memory knob, but on a sizeable library it is
-not the biggest number. Two other components dominate, and they grow at different
-moments:
+`--read-ahead-budget-mib` is the only direct byte-budget knob, but on a sizeable
+library it is not the biggest number. Two other components dominate, and they grow
+at different moments:
 
 - **The virtual tree** — one node per rendered file and directory, plus the inode
   allocator's path map — is built at mount, held resident for the lifetime of the
