@@ -1,0 +1,12 @@
+# Free-form issues stay available: not everything is a bug or a request.
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://sohex.github.io/musefs/
+    about: Usage, per-format synthesis behaviour, internals, and the FAQ.
+  - name: Contributing guide
+    url: https://sohex.github.io/musefs/contributing/setup.html
+    about: Getting set up, the test tiers, conventions, and adding a format.
+  - name: Security
+    url: https://sohex.github.io/musefs/security.html
+    about: Report a security issue privately rather than in a public issue.

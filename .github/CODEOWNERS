@@ -1,0 +1,7 @@
+# Review routing. One maintainer today, so a single catch-all rule covers the
+# repository; per-area rules go below it (last matching rule wins) when there is
+# more than one owner to route to.
+#
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+* @Sohex

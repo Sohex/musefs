@@ -25,15 +25,46 @@ use std::time::Duration;
 /// `TimeoutStopSec` (90s) so we exit well before it would SIGKILL us.
 const GRACE: Duration = Duration::from_secs(5);
 
+/// Directories searched, in order, for an unmount helper before falling back to
+/// a bare-name `PATH` lookup.
+const HELPER_DIRS: [&str; 3] = ["/usr/bin", "/bin", "/usr/local/bin"];
+
+/// Resolve an unmount helper to an absolute path, preferring [`HELPER_DIRS`] in
+/// order and falling back to the bare name — i.e. a `PATH` lookup performed by
+/// `Command::new` — when the helper is in none of them.
+///
+/// The mounting guide steers operators toward a privileged daemon (uid 0, for
+/// kernel passthrough in `StructureOnly` mode) and nothing sanitizes `PATH`
+/// there, so a bare program name lets a writable `PATH` entry choose what we
+/// execute as root on `SIGTERM`. Pinning the usual install locations closes
+/// that; the fallback keeps unusual layouts (NixOS store paths, `/sbin`-only
+/// busybox) working.
+///
+/// `exists` is injected so the preference order is testable without depending on
+/// the host's layout.
+fn resolve_helper(name: &str, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    HELPER_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|candidate| exists(candidate))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// [`resolve_helper`] against the real filesystem.
+fn helper(name: &str) -> PathBuf {
+    resolve_helper(name, Path::exists)
+}
+
 /// Unmount commands tried in order, most-preferred first, as `(program, args)`.
 /// `fusermount3`/`fusermount` are the unprivileged FUSE unmount tools; `umount`
-/// is the last resort.
-fn unmount_commands(mountpoint: &Path) -> Vec<(&'static str, Vec<OsString>)> {
+/// is the last resort. Each program is resolved by [`resolve_helper`] rather
+/// than left to a `PATH` lookup.
+fn unmount_commands(mountpoint: &Path) -> Vec<(PathBuf, Vec<OsString>)> {
     let mp = mountpoint.as_os_str().to_owned();
     vec![
-        ("fusermount3", vec!["-u".into(), mp.clone()]),
-        ("fusermount", vec!["-u".into(), mp.clone()]),
-        ("umount", vec![mp]),
+        (helper("fusermount3"), vec!["-u".into(), mp.clone()]),
+        (helper("fusermount"), vec!["-u".into(), mp.clone()]),
+        (helper("umount"), vec![mp]),
     ]
 }
 
@@ -59,7 +90,7 @@ fn run_unmount(mountpoint: &Path) {
 /// mountpoint from the namespace even while it is busy. The escalation step
 /// before a forced exit.
 fn lazy_detach(mountpoint: &Path) {
-    let _ = std::process::Command::new("fusermount3")
+    let _ = std::process::Command::new(helper("fusermount3"))
         .args([OsStr::new("-u"), OsStr::new("-z"), mountpoint.as_os_str()])
         .status();
 }
@@ -116,13 +147,19 @@ pub fn install_unmount_on_signal(mountpoint: PathBuf) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
     #[test]
     fn unmount_commands_try_fusermount3_then_fallbacks() {
         let cmds = unmount_commands(Path::new("/mnt/x"));
-        let progs: Vec<&str> = cmds.iter().map(|(p, _)| *p).collect();
+        // A program is absolute (pinned) or bare (PATH fallback) depending on the
+        // host layout, so compare the file names: the helper *order* is what this
+        // pins down.
+        let progs: Vec<&OsStr> = cmds
+            .iter()
+            .map(|(p, _)| p.file_name().expect("helper has a file name"))
+            .collect();
         assert_eq!(progs, ["fusermount3", "fusermount", "umount"]);
         // fusermount variants pass `-u <mp>`; umount passes just `<mp>`.
         assert_eq!(
@@ -130,5 +167,44 @@ mod tests {
             vec![OsString::from("-u"), OsString::from("/mnt/x")]
         );
         assert_eq!(cmds[2].1, vec![OsString::from("/mnt/x")]);
+    }
+
+    #[test]
+    fn unmount_commands_pin_installed_helpers_to_an_absolute_path() {
+        // Whatever the host layout, a helper present in one of the pinned
+        // directories must be spawned by absolute path — never via `PATH`.
+        for (prog, _) in unmount_commands(Path::new("/mnt/x")) {
+            let name = prog.file_name().expect("helper has a file name");
+            if HELPER_DIRS
+                .iter()
+                .any(|dir| Path::new(dir).join(name).exists())
+            {
+                assert!(prog.is_absolute(), "{} was not pinned", prog.display());
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_helper_prefers_the_first_directory_holding_it() {
+        assert_eq!(
+            resolve_helper("fusermount3", |_| true),
+            Path::new("/usr/bin/fusermount3")
+        );
+        assert_eq!(
+            resolve_helper("fusermount3", |c| c != Path::new("/usr/bin/fusermount3")),
+            Path::new("/bin/fusermount3")
+        );
+        assert_eq!(
+            resolve_helper("umount", |c| c == Path::new("/usr/local/bin/umount")),
+            Path::new("/usr/local/bin/umount")
+        );
+    }
+
+    #[test]
+    fn resolve_helper_falls_back_to_a_bare_path_lookup() {
+        // Unusual layouts (NixOS store paths, /sbin-only busybox) must keep
+        // working, so a helper in none of the pinned directories degrades to the
+        // bare name.
+        assert_eq!(resolve_helper("umount", |_| false), Path::new("umount"));
     }
 }
