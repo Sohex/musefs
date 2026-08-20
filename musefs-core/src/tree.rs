@@ -1,11 +1,24 @@
 use imbl::{HashMap as ImHashMap, OrdMap};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// Case-fold a name for case-insensitive comparison. Unicode-aware lowercasing;
 /// ASCII is the floor. Applied identically to every comparison (collision,
 /// disambiguation, lookup) - never compare a folded value against an unfolded one.
 fn fold(name: &str) -> String {
     name.to_lowercase()
+}
+
+/// The folded-index key for an already-interned `name`: `name`'s own allocation
+/// when folding leaves it unchanged (an all-lowercase name), a fresh one
+/// otherwise — so a folded mount pays for a second copy only where it must.
+fn fold_key(name: &Name) -> Name {
+    let folded = fold(name);
+    if folded == **name {
+        Arc::clone(name)
+    } else {
+        Name::from(folded)
+    }
 }
 
 /// Split a rendered path into the components the tree actually materializes:
@@ -109,11 +122,18 @@ pub enum NodeKind {
     File { track_id: i64 },
 }
 
+/// A name as the tree stores it: one refcounted allocation shared by the node
+/// and by every map keyed on that name. A leaf name is held in five places
+/// (six on a folded mount), which at ~200k tracks was the dominant resident
+/// cost of the mount (#617); `Arc<str>` compares, orders and hashes by value,
+/// so sharing is invisible to lookups and to the equivalence oracle.
+type Name = Arc<str>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub parent: u64,
-    pub name: String,          // disambiguated name
-    pub rendered_name: String, // pre-disambiguation base name
+    pub name: Name,          // disambiguated name
+    pub rendered_name: Name, // pre-disambiguation base name
     pub kind: NodeKind,
 }
 
@@ -122,8 +142,8 @@ pub struct Node {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualTree {
     nodes: ImHashMap<u64, Node>,
-    children: ImHashMap<u64, OrdMap<String, u64>>,
-    rendered_children: ImHashMap<u64, OrdMap<String, OrdMap<String, u64>>>,
+    children: ImHashMap<u64, OrdMap<Name, u64>>,
+    rendered_children: ImHashMap<u64, OrdMap<Name, OrdMap<Name, u64>>>,
     /// `parent -> fold(name) -> inode`, populated ONLY when `case_insensitive`.
     /// Kept in sync with `children` on every insert AND removal, so a folded
     /// `lookup` never resolves a stale inode even if the tree is mutated in place
@@ -131,7 +151,7 @@ pub struct VirtualTree {
     /// `build_with_ci` + mutators must stay consistent). Gives O(1) folded lookup
     /// and collision checks. Part of structural equality; built deterministically,
     /// so fresh and re-rendered folded trees compare equal.
-    folded_children: ImHashMap<u64, ImHashMap<String, u64>>,
+    folded_children: ImHashMap<u64, ImHashMap<Name, u64>>,
     track_to_inode: ImHashMap<i64, u64>,
     /// When true, names are compared case-insensitively (dirs merge, files
     /// disambiguate). Defaults to false (exact matching, identical to Linux).
@@ -171,8 +191,8 @@ impl VirtualTree {
             Self::ROOT,
             Node {
                 parent: Self::ROOT,
-                name: String::new(),
-                rendered_name: String::new(),
+                name: Name::from(""),
+                rendered_name: Name::from(""),
                 kind: NodeKind::Dir,
             },
         );
@@ -210,12 +230,12 @@ impl VirtualTree {
     /// Callers wanting a single entry by name have `lookup`.
     pub fn children(&self, inode: u64) -> Option<impl ExactSizeIterator<Item = (&str, u64)>> {
         self.child_map(inode)
-            .map(|kids| kids.iter().map(|(name, &ino)| (name.as_str(), ino)))
+            .map(|kids| kids.iter().map(|(name, &ino)| (&**name, ino)))
     }
 
     /// The backing child map, for in-crate callers that need `OrdMap`'s
     /// by-name lookups rather than a walk.
-    fn child_map(&self, inode: u64) -> Option<&OrdMap<String, u64>> {
+    fn child_map(&self, inode: u64) -> Option<&OrdMap<Name, u64>> {
         self.children.get(&inode)
     }
 
@@ -223,7 +243,7 @@ impl VirtualTree {
         if self.case_insensitive {
             self.folded_children
                 .get(&parent)
-                .and_then(|b| b.get(&fold(name)).copied())
+                .and_then(|b| b.get(fold(name).as_str()).copied())
         } else {
             self.children
                 .get(&parent)
@@ -275,7 +295,7 @@ impl VirtualTree {
         let raw_name = comps[comps.len() - 1];
         let truncated = truncate_component(raw_name, true);
         let raw_name = truncated.as_ref();
-        let name = self.disambiguate(dir, raw_name);
+        let (name, rendered) = self.intern_names(dir, raw_name);
         let full = join_path(&dir_path, &name);
         let inode = alloc.intern(&full);
         self.track_to_inode.insert(track_id, inode);
@@ -283,16 +303,16 @@ impl VirtualTree {
             inode,
             Node {
                 parent: dir,
-                name: name.clone(),
-                rendered_name: raw_name.to_string(),
+                name: Arc::clone(&name),
+                rendered_name: Arc::clone(&rendered),
                 kind: NodeKind::File { track_id },
             },
         );
         self.children
             .get_mut(&dir)
             .unwrap()
-            .insert(name.clone(), inode);
-        self.insert_rendered_child(dir, raw_name, &name, inode);
+            .insert(Arc::clone(&name), inode);
+        self.insert_rendered_child(dir, &rendered, &name, inode);
         self.insert_folded_child(dir, &name, inode);
     }
 
@@ -306,22 +326,18 @@ impl VirtualTree {
         let truncated = truncate_component(name, false);
         let name = truncated.as_ref();
         if let Some(existing) = self.dir_child_named(parent, name) {
-            let stored = self
-                .node(existing)
-                .expect("dir_child_named node")
-                .name
-                .clone();
-            return (existing, join_path(parent_path, &stored));
+            let stored = &self.node(existing).expect("dir_child_named node").name;
+            return (existing, join_path(parent_path, stored));
         }
-        let unique = self.disambiguate(parent, name);
+        let (unique, rendered) = self.intern_names(parent, name);
         let full = join_path(parent_path, &unique);
         let inode = alloc.intern(&full);
         self.nodes.insert(
             inode,
             Node {
                 parent,
-                name: unique.clone(),
-                rendered_name: name.to_string(),
+                name: Arc::clone(&unique),
+                rendered_name: Arc::clone(&rendered),
                 kind: NodeKind::Dir,
             },
         );
@@ -330,10 +346,25 @@ impl VirtualTree {
         self.children
             .get_mut(&parent)
             .unwrap()
-            .insert(unique.clone(), inode);
-        self.insert_rendered_child(parent, name, &unique, inode);
+            .insert(Arc::clone(&unique), inode);
+        self.insert_rendered_child(parent, &rendered, &unique, inode);
         self.insert_folded_child(parent, &unique, inode);
         (inode, full)
+    }
+
+    /// The `(disambiguated, rendered)` name pair for a new child of `dir`, as
+    /// shared handles. When disambiguation is a no-op — every name in a library
+    /// without collisions — both halves are the SAME allocation, and each map
+    /// keyed on either name stores a clone of one of these two handles rather
+    /// than its own copy of the bytes (#617).
+    fn intern_names(&self, dir: u64, rendered: &str) -> (Name, Name) {
+        let unique = self.disambiguate(dir, rendered);
+        if unique == rendered {
+            let shared = Name::from(unique);
+            (Arc::clone(&shared), shared)
+        } else {
+            (Name::from(unique), Name::from(rendered))
+        }
     }
 
     /// Return `name` if free in `dir`, else append ` (k)` before the extension.
@@ -352,14 +383,14 @@ impl VirtualTree {
     }
 
     /// Mirror a child insertion into the folded index (no-op unless folding).
-    fn insert_folded_child(&mut self, parent: u64, name: &str, inode: u64) {
+    fn insert_folded_child(&mut self, parent: u64, name: &Name, inode: u64) {
         if !self.case_insensitive {
             return;
         }
         self.folded_children
             .entry(parent)
             .or_default()
-            .insert(fold(name), inode);
+            .insert(fold_key(name), inode);
     }
 
     /// Mirror a child removal out of the folded index, dropping an emptied parent
@@ -369,7 +400,7 @@ impl VirtualTree {
             return;
         }
         if let Some(bucket) = self.folded_children.get_mut(&parent) {
-            bucket.remove(&fold(name));
+            bucket.remove(fold(name).as_str());
             if bucket.is_empty() {
                 self.folded_children.remove(&parent);
             }
@@ -381,7 +412,7 @@ impl VirtualTree {
         if self.case_insensitive {
             self.folded_children
                 .get(&dir)
-                .is_some_and(|b| b.contains_key(&fold(name)))
+                .is_some_and(|b| b.contains_key(fold(name).as_str()))
         } else {
             self.children
                 .get(&dir)
@@ -395,7 +426,7 @@ impl VirtualTree {
         let ino = if self.case_insensitive {
             self.folded_children
                 .get(&dir)
-                .and_then(|b| b.get(&fold(name)).copied())
+                .and_then(|b| b.get(fold(name).as_str()).copied())
         } else {
             self.children.get(&dir).and_then(|c| c.get(name).copied())
         }?;
@@ -423,13 +454,13 @@ impl VirtualTree {
         // generated candidate keys until the first free rank.
         for k in 2u32.. {
             let candidate = suffix_candidate(rendered, k);
-            match kids.get(&candidate) {
+            match kids.get(candidate.as_str()) {
                 None => return false,
                 Some(c) => {
                     if self
                         .nodes
                         .get(c)
-                        .is_some_and(|n| n.rendered_name == rendered)
+                        .is_some_and(|n| &*n.rendered_name == rendered)
                     {
                         return true;
                     }
@@ -481,13 +512,13 @@ impl VirtualTree {
         self.children_by_rendered_with_examined(dir, rendered).1
     }
 
-    fn insert_rendered_child(&mut self, parent: u64, rendered: &str, name: &str, inode: u64) {
+    fn insert_rendered_child(&mut self, parent: u64, rendered: &Name, name: &Name, inode: u64) {
         self.rendered_children
             .entry(parent)
             .or_default()
-            .entry(rendered.to_string())
+            .entry(Arc::clone(rendered))
             .or_default()
-            .insert(name.to_string(), inode);
+            .insert(Arc::clone(name), inode);
     }
 
     fn remove_rendered_child(&mut self, parent: u64, rendered: &str, name: &str) {
@@ -540,7 +571,7 @@ impl VirtualTree {
             let Some(n) = self.nodes.get(&cur) else {
                 break;
             };
-            parts.push(n.name.clone());
+            parts.push(&*n.name);
             cur = n.parent;
         }
         parts.reverse();
@@ -555,7 +586,7 @@ impl VirtualTree {
         &mut self,
         track_id: i64,
         _alloc: &mut InodeAllocator,
-    ) -> Option<(u64, Option<(String, String)>)> {
+    ) -> Option<(u64, Option<(Name, Name)>)> {
         let ino = self.track_to_inode.remove(&track_id)?;
         let parent = self.nodes.get(&ino)?.parent;
         let names = self
@@ -849,7 +880,7 @@ impl VirtualTree {
     /// Walk up from `dir`, removing empty directories; return the first non-empty
     /// (surviving) ancestor and the `(name, rendered_name)` of the last (topmost)
     /// dir removed, if any.
-    fn prune_empty_dirs_upward(&mut self, mut dir: u64) -> (u64, Option<(String, String)>) {
+    fn prune_empty_dirs_upward(&mut self, mut dir: u64) -> (u64, Option<(Name, Name)>) {
         let mut last_pruned = None;
         while dir != Self::ROOT && self.children.get(&dir).is_none_or(OrdMap::is_empty) {
             let Some(node) = self.nodes.get(&dir) else {
@@ -1005,6 +1036,90 @@ mod tests {
         assert_eq!(tree.node_count(), 5);
         // interned: "" (root) + the four component paths above
         assert_eq!(alloc.interned_path_count(), 5);
+    }
+
+    /// Every stored handle for the child `name` of `dir`: the `children` key,
+    /// the `rendered_children` outer key (keyed by `rendered`), and that
+    /// bucket's inner key. Interning means all of them are one allocation.
+    fn stored_handles<'a>(
+        tree: &'a VirtualTree,
+        dir: u64,
+        rendered: &str,
+        name: &str,
+    ) -> Vec<&'a Name> {
+        let (child_key, _) = tree
+            .children
+            .get(&dir)
+            .and_then(|kids| kids.get_key_value(name))
+            .expect("children key");
+        let (outer_key, bucket) = tree
+            .rendered_children
+            .get(&dir)
+            .and_then(|by_rendered| by_rendered.get_key_value(rendered))
+            .expect("rendered_children outer key");
+        let (inner_key, _) = bucket.get_key_value(name).expect("rendered_children key");
+        vec![child_key, outer_key, inner_key]
+    }
+
+    #[test]
+    fn undisambiguated_names_are_stored_as_one_shared_allocation() {
+        let tree = VirtualTree::build(&[(10, "Alice/Song.flac".into())]);
+        let alice = tree.lookup(VirtualTree::ROOT, "Alice").unwrap();
+        let song = tree.lookup(alice, "Song.flac").unwrap();
+        // Both a dir (ensure_dir) and a leaf (insert_file) intern their names.
+        for (parent, ino, name) in [
+            (VirtualTree::ROOT, alice, "Alice"),
+            (alice, song, "Song.flac"),
+        ] {
+            let node = tree.node(ino).expect("node");
+            assert!(
+                Arc::ptr_eq(&node.name, &node.rendered_name),
+                "{name}: an undisambiguated node holds one name, not two"
+            );
+            for handle in stored_handles(&tree, parent, name, name) {
+                assert!(
+                    Arc::ptr_eq(handle, &node.name),
+                    "{name}: every child-map key shares the node's allocation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disambiguated_name_shares_each_half_of_the_pair() {
+        let tree = VirtualTree::build(&[(10, "D/song.flac".into()), (20, "D/song.flac".into())]);
+        let d = tree.lookup(VirtualTree::ROOT, "D").unwrap();
+        let bumped = tree.lookup(d, "song (2).flac").unwrap();
+        let node = tree.node(bumped).expect("node");
+        assert_eq!(&*node.rendered_name, "song.flac");
+        assert!(
+            !Arc::ptr_eq(&node.name, &node.rendered_name),
+            "a collision genuinely needs two distinct names"
+        );
+        let handles = stored_handles(&tree, d, "song.flac", "song (2).flac");
+        assert!(Arc::ptr_eq(handles[0], &node.name), "children key");
+        assert!(Arc::ptr_eq(handles[2], &node.name), "rendered inner key");
+    }
+
+    #[test]
+    fn folded_index_shares_an_already_folded_name() {
+        let tree = VirtualTree::build_with_ci(
+            &[(10, "artist/song.flac".into())],
+            &mut InodeAllocator::new(true),
+            true,
+        );
+        let artist = tree.lookup(VirtualTree::ROOT, "artist").unwrap();
+        let song = tree.lookup(artist, "song.flac").unwrap();
+        let node = tree.node(song).expect("node");
+        let (folded_key, _) = tree
+            .folded_children
+            .get(&artist)
+            .and_then(|bucket| bucket.get_key_value("song.flac"))
+            .expect("folded key");
+        assert!(
+            Arc::ptr_eq(folded_key, &node.name),
+            "folding a lowercase name must not allocate a sixth copy"
+        );
     }
 
     #[test]
