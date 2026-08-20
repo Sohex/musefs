@@ -1,0 +1,66 @@
+name: Feature or format request
+description: Ask for a new capability, or for musefs to support another container.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two shapes of request live here: "musefs should support format X" and
+        "musefs should be able to do Y". Say which below.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of request is this?
+      options:
+        - Support for a new audio format / container
+        - A new or changed capability in an existing area
+    validations:
+      required: true
+
+  - type: textarea
+    id: request
+    attributes:
+      label: What should musefs do?
+      description: |
+        For a format request, name the container and extensions, and say which
+        tag scheme it carries (Vorbis comments, ID3v2, MP4 atoms, ...) and how
+        cover art is embedded. For anything else, describe the behaviour you
+        want and the situation it comes up in.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why does the current behaviour not cover it?
+      description: |
+        What you tried, and where it fell short. Existing behaviour per format
+        is documented in the
+        [format notes](https://sohex.github.io/musefs/formats/overview.html).
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### If you would like to implement it
+
+        Adding a format is a well-trodden path in this codebase — the
+        [Adding a format](https://sohex.github.io/musefs/contributing/conventions.html#adding-a-format)
+        section walks through the synthesis trait, the segment layout, and the
+        test tiers a new format has to clear (including the round trip through
+        an independent reader). Start from
+        [Getting set up](https://sohex.github.io/musefs/contributing/setup.html).
+
+        The hard constraint for any format: the original audio bytes are never
+        copied or modified. A container whose audio payload cannot be served by
+        positioned reads of the untouched backing file does not fit musefs.
+
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to work on this myself.
+          required: false
