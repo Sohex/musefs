@@ -197,6 +197,19 @@ exclude_re = [
 'musefs-core/src/scan\.rs:1667:21:',
     # guard: op="&&" fn="run_pipeline" rows=1
 'musefs-core/src/scan\.rs:1683:29:',
+    # `ByteBudget::acquire`'s wait guard (`!st.closed && in_flight != 0 && ...`),
+    # the FIRST `&&`->`||`. `&&` binds tighter than `||`, so the guard becomes
+    # `!closed || (in_flight != 0 && over_cap)` and every reservation against an
+    # OPEN budget waits forever. That is a genuine break, but it can only ever
+    # surface as a hang rather than a failure: roughly a dozen `scan::*` tests
+    # reserve through `scan_directory_with`, so the test binary stalls and
+    # cargo-mutants scores TIMEOUT — which fails the gate — instead of CAUGHT.
+    # Verified locally: the `byte_budget` unit tests can be made to fail fast, but
+    # the scan tests still hang, so killing it properly would mean putting a
+    # deadline on every scan test. The hang is the detection (#618). The second
+    # `&&` on the same line is caught by `oversized_item_admitted_when_idle`.
+    # guard: op="&&" fn="ByteBudget::acquire" rows=1
+'musefs-core/src/byte_budget\.rs:39:26:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
