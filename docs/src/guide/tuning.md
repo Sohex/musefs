@@ -31,14 +31,19 @@ and scales with the **track count**, not with I/O. Measured on Linux, release bu
 
 | Library | Steady-state RSS | Peak RSS | Per track | Tree build |
 | ------- | ---------------- | -------- | --------- | ---------- |
-| 200,000 tracks / 22,000 directories | 451 MB | 475 MB | ~2.31 KB | 2.3 s |
+| 200,000 tracks / 22,000 directories (v1.3.0) | 451 MB | 475 MB | ~2.31 KB | 2.3 s |
 
-Size a host at **~2.3 KB of RAM per track** — ~230 MB at 100,000 tracks, ~2.3 GB at a
+Size a host at **~2 KB of RAM per track** — ~200 MB at 100,000 tracks, ~2 GB at a
 million — on top of the read-ahead budget (64 MiB by default) and SQLite's page cache.
 The peak above steady state is the transient of building the tree, so it reappears
 whenever a refresh takes the full-rebuild path. The cost is dominated by rendered
 names and paths rather than by audio, so a deeply nested `--template` (more path
 components, longer names) raises it and a flatter one lowers it.
+
+Since v1.3.0 the tree stores each name once and shares that one allocation with every
+index keyed on it, which cut the tree's own resident cost from 1.71 KB to 1.28 KB per
+track (−25%) on a 200,000-track build — so the v1.3.0 row above is an upper bound
+until the next full-mount measurement.
 
 Two gauges in the metrics surface below size a live mount:
 `musefs_tree_nodes` (live virtual-tree inodes: files plus directories) and
