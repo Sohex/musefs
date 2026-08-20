@@ -22,6 +22,31 @@ and numbers).
 Filename case-folding (`--case-insensitive`) is platform behaviour rather than
 a performance knob — see [Platform support](installation.md#platform-support).
 
+## Memory footprint
+
+`--read-ahead-budget-mib` is the only memory knob, but on a sizeable library it is
+not the biggest number: the virtual tree — one node per rendered file and directory,
+plus the inode allocator's path map — is held resident for the lifetime of the mount
+and scales with the **track count**, not with I/O. Measured on Linux, release build:
+
+| Library | Steady-state RSS | Peak RSS | Per track | Tree build |
+| ------- | ---------------- | -------- | --------- | ---------- |
+| 200,000 tracks / 22,000 directories | 451 MB | 475 MB | ~2.31 KB | 2.3 s |
+
+Size a host at **~2.3 KB of RAM per track** — ~230 MB at 100,000 tracks, ~2.3 GB at a
+million — on top of the read-ahead budget (64 MiB by default) and SQLite's page cache.
+The peak above steady state is the transient of building the tree, so it reappears
+whenever a refresh takes the full-rebuild path. The cost is dominated by rendered
+names and paths rather than by audio, so a deeply nested `--template` (more path
+components, longer names) raises it and a flatter one lowers it.
+
+Two gauges in the metrics surface below size a live mount:
+`musefs_tree_nodes` (live virtual-tree inodes: files plus directories) and
+`musefs_inode_paths` (paths interned by the inode allocator — up to 2× the live node
+count between prunes, since retired paths are kept until they outnumber live ones).
+On a `jemalloc` build, `musefs_alloc_resident_bytes` reports the allocator's resident
+total as an RSS proxy.
+
 ## Metrics
 
 `musefs mount` optionally exposes runtime telemetry through a synthetic
