@@ -188,6 +188,19 @@ impl<M> Db<M> {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Just the `backing_path` column for every track: the projection a scan's
+    /// "already present" set needs, without materializing a `Track` (and its
+    /// `fingerprint`/`content_hash` strings) per row — ~40 MB of transient
+    /// allocation on a 200k-track store, on a path already holding a connection.
+    /// Unordered by design; the caller collects into a set.
+    pub fn list_backing_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT backing_path FROM tracks")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn track_content_version(&self, id: i64) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT content_version FROM tracks WHERE id = ?1",
@@ -514,6 +527,18 @@ mod render_key_tests {
         assert_eq!(keys[1].1, 0, "b content_version untouched");
         assert_eq!(keys[0].2, Format::Flac);
         assert_eq!(keys[1].2, Format::Mp3);
+    }
+
+    #[test]
+    fn list_backing_paths_returns_every_stored_path() {
+        let db = open_mem();
+        db.upsert_track(&new_track("/a.flac", Format::Flac))
+            .unwrap();
+        db.upsert_track(&new_track("/b.mp3", Format::Mp3)).unwrap();
+
+        let mut paths = db.list_backing_paths().unwrap();
+        paths.sort();
+        assert_eq!(paths, vec!["/a.flac".to_string(), "/b.mp3".to_string()]);
     }
 
     #[test]
