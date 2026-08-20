@@ -246,11 +246,31 @@ type DirListing = Vec<(u64, FileType, String)>;
 /// Cap on concurrently-open directory handles (#307). Each `opendir` snapshots a
 /// full `DirListing`, so an unreleased handle pins memory ~ (entries × name
 /// length); the cap bounds the *number* of snapshots, not their inherent size (a
-/// single `ls` of the widest directory already allocates one). 1024 sits well
-/// above a heavy parallel indexer's concurrent-dir-handle count (~hundreds), so
-/// legitimate clients never hit it, while an over-cap `opendir` returns `ENFILE`
-/// — the directory-side analogue of the file-handle `HandleTableFull → ENFILE`.
+/// single `ls` of the widest directory already allocates one).
+///
+/// The cap bounds memory, not correctness: an ordinary parallel walker (`bfs`,
+/// the default `find` on some distributions) blows past 1024 concurrent dir
+/// handles on a large mount, so over-cap opens must still *work* (#616). They
+/// are served statelessly via [`DIR_FH_STATELESS`] and counted, never refused.
 const MAX_DIR_HANDLES: usize = 1024;
+
+/// The `opendir` fh that stores no snapshot: `readdir` treats an unknown fh as a
+/// cache miss and rebuilds the listing, and `releasedir` on it removes nothing.
+/// Handed out for the synthetic `.musefs-metrics` directory and for any open
+/// over `MAX_DIR_HANDLES` (#616), so a saturated table costs a client a rebuild
+/// per `readdir` rather than the directory itself. `dir_fh` starts at 1, so no
+/// real handle can collide with it.
+const DIR_FH_STATELESS: u64 = 0;
+
+/// The fh an `opendir` reply carries, given the [`try_admit_dir_handle`]
+/// outcome: the admitted snapshot id, or the stateless sentinel when the table
+/// was full. Over-cap opens degrade instead of failing (#616) — replying
+/// `ENFILE` lost the directory from a parallel walk entirely, and surfaced to
+/// the operator as "Too many open files in system", pointing at their kernel
+/// rather than at the mount.
+fn dir_open_fh(admitted: Option<u64>) -> FileHandle {
+    FileHandle(admitted.unwrap_or(DIR_FH_STATELESS))
+}
 
 /// Cap on concurrently-open `.musefs-metrics/metrics` handles (#394). Each `open`
 /// pins one rendered snapshot until `release`; the cap bounds the map the same way
@@ -279,7 +299,8 @@ fn build_dir_listing(
 
 /// Admit a directory handle under the caller's `dir_handles` lock, enforcing
 /// `MAX_DIR_HANDLES` (#307). Returns the freshly allocated handle id on admit, or
-/// `None` when the table is at `cap` (the caller replies `ENFILE`). The id is
+/// `None` when the table is at `cap` (the caller falls back to the stateless
+/// fh; see [`dir_open_fh`]). The id is
 /// drawn from `counter` only on the admit path, and the whole check-then-insert
 /// runs under the single lock the caller holds, so concurrent `opendir` closures
 /// cannot race the count past the cap and a rejected open burns no id.
@@ -386,7 +407,7 @@ pub struct MusefsFs {
     /// poisoning panic can't tear a later `readdir`'s view; recovery is deliberate.
     #[allow(clippy::type_complexity)]
     dir_handles: Arc<Mutex<std::collections::HashMap<u64, Arc<Vec<(u64, FileType, String)>>>>>,
-    /// Monotonic dir-handle id (starts at 1; 0 stays the stateless sentinel).
+    /// Monotonic dir-handle id (starts at 1; 0 stays [`DIR_FH_STATELESS`]).
     ///
     /// Unlike the file slab's generation-encoded keys (`facade.rs`, ABA-safe by
     /// construction), this is a bare never-recycled counter — sufficient precisely
@@ -395,10 +416,13 @@ pub struct MusefsFs {
     /// handle, never evict a different open dir (#192). A 64-bit monotonic counter
     /// cannot wrap within any real process lifetime.
     dir_fh: Arc<AtomicU64>,
-    /// `opendir` calls that found `dir_handles` at `MAX_DIR_HANDLES`. Surfaced as
+    /// `opendir` calls that found `dir_handles` at `MAX_DIR_HANDLES` and fell back
+    /// to the stateless listing path. Surfaced as
     /// `musefs_dir_handle_rejections_total`: the `dir_handles` gauge alone cannot
     /// show saturation, because it is bursty enough to sit at 0 in every sample
-    /// while thousands of opens are turned away between them (#626).
+    /// while thousands of opens are turned away between them (#626). Since #616
+    /// this is also the only signal that directories are being re-listed on every
+    /// `readdir` — worth knowing before it shows up as CPU.
     dir_handle_rejections: Arc<AtomicU64>,
     /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
@@ -714,7 +738,7 @@ impl Filesystem for MusefsFs {
         if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
             // Stateless: readdir(METRICS_DIR_INO) serves an inline listing and
             // never consults dir_handles, so this fh burns no MAX_DIR_HANDLES slot.
-            return reply.opened(FileHandle(0), FopenFlags::empty());
+            return reply.opened(FileHandle(DIR_FH_STATELESS), FopenFlags::empty());
         }
         let core = Arc::clone(&self.core);
         let handles = Arc::clone(&self.dir_handles);
@@ -732,15 +756,17 @@ impl Filesystem for MusefsFs {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 try_admit_dir_handle(&mut guard, &counter, &rejections, MAX_DIR_HANDLES, listing)
             };
-            if let Some(fh) = admitted {
-                reply.opened(FileHandle(fh), FopenFlags::empty());
-            } else {
-                log::warn!(
-                    "opendir({ino}) rejected: ENFILE — dir-handle table full at {MAX_DIR_HANDLES}",
+            if admitted.is_none() {
+                // Debug, not warn: a parallel walk over a large mount produces
+                // thousands of these in seconds, and the walk still succeeds.
+                // `musefs_dir_handle_rejections_total` is the operator-facing
+                // signal that the degraded path is in use (#626).
+                log::debug!(
+                    "opendir({ino}) over the {MAX_DIR_HANDLES}-handle cap: serving it                      statelessly, listing rebuilt per readdir",
                     ino = ino.0
                 );
-                reply.error(fuser::Errno::ENFILE);
             }
+            reply.opened(dir_open_fh(admitted), FopenFlags::empty());
         });
     }
 
@@ -1290,6 +1316,24 @@ mod tests {
             rejections.load(Ordering::Relaxed),
             1,
             "the reject must be metered (#626)"
+        );
+    }
+
+    #[test]
+    fn over_cap_opendir_falls_back_to_the_stateless_fh() {
+        assert_eq!(
+            dir_open_fh(Some(7)),
+            FileHandle(7),
+            "an admitted handle keeps its snapshot id"
+        );
+        assert_eq!(
+            dir_open_fh(None),
+            FileHandle(DIR_FH_STATELESS),
+            "over cap must degrade to the stateless fh, not reply ENFILE (#616)"
+        );
+        assert_eq!(
+            DIR_FH_STATELESS, 0,
+            "readdir rebuilds for an unknown fh and releasedir(0) removes nothing"
         );
     }
 

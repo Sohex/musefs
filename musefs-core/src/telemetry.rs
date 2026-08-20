@@ -123,13 +123,13 @@ pub fn render_prometheus(
     gauge(
         &mut out,
         "musefs_dir_handles_max",
-        "Cap before opendir is rejected with ENFILE.",
+        "Directory snapshots retained before opendir degrades to stateless listing.",
         fuse.dir_handles_max,
     );
     counter(
         &mut out,
         "musefs_dir_handle_rejections_total",
-        "opendir calls rejected because the dir-handle table was full.",
+        "opendir calls that found the dir-handle table full and were served statelessly.",
         fuse.dir_handle_rejections,
     );
 
