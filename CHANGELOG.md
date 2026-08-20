@@ -17,6 +17,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
   given a cached directory snapshot, so directory-handle pressure stays visible
   after a burst rather than only as a gauge that reads healthy between samples.
+- `musefs_process_resident_bytes` (Linux) reports the whole-process RSS, and
+  `musefs_sqlite_memory_bytes` reports what SQLite holds across all connections.
+  SQLite allocates through libc, so the jemalloc `musefs_alloc_*` gauges never
+  saw it — a full-library walk grew the process by hundreds of MB while the
+  allocator gauges barely moved (#631). The metrics surface now answers "how
+  much memory is this using" honestly.
 
 ### Changed
 

@@ -73,6 +73,23 @@ pub(crate) fn query_in_chunks<T: rusqlite::ToSql>(
 /// `PRAGMA cache_size` form). See the comment at the pragma site.
 const READ_CONN_CACHE_KIB: i64 = 512;
 
+/// Bytes SQLite currently holds through its C allocator, summed across every
+/// connection in the process (`sqlite3_memory_used`).
+///
+/// This memory is invisible to the Rust global allocator: on a jemalloc build
+/// the `musefs_alloc_*` gauges exclude it entirely, which made the metrics
+/// surface under-report a metadata-walk's growth by hundreds of MB (#631).
+/// Exposed so the telemetry layer can report it as its own gauge.
+pub fn sqlite_memory_used() -> u64 {
+    #[expect(
+        unsafe_code,
+        reason = "sqlite3_memory_used FFI; rusqlite has no safe wrapper"
+    )]
+    let used = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+    // Never negative in practice; clamp rather than wrap if SQLite misbehaves.
+    u64::try_from(used.max(0)).expect("non-negative i64 fits u64")
+}
+
 /// Type-state markers for [`Db`]: the connection's write capability, at the
 /// type level. Write APIs exist only on `Db<ReadWrite>`.
 #[derive(Debug)]
@@ -237,7 +254,7 @@ impl Default for Db {
 
 #[cfg(test)]
 mod tests {
-    use super::{Db, READ_CONN_CACHE_KIB};
+    use super::{Db, READ_CONN_CACHE_KIB, sqlite_memory_used};
 
     #[test]
     fn open_uses_wal_and_busy_timeout() {
@@ -298,6 +315,15 @@ mod tests {
             cache, -READ_CONN_CACHE_KIB,
             "worker read connections must carry the reduced page cache (#631)"
         );
+    }
+
+    #[test]
+    fn sqlite_memory_used_sees_live_connections() {
+        // Any open connection holds at least schema + page cache, so the
+        // global counter must be visibly nonzero while one is alive.
+        let db = Db::open_in_memory().unwrap();
+        db.data_version().unwrap();
+        assert!(sqlite_memory_used() > 0);
     }
 
     #[test]

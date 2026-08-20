@@ -564,9 +564,11 @@ impl MusefsFs {
                 .telemetry()
                 .map(|(disabled, active)| musefs_core::PassthroughTelemetry { disabled, active }),
         };
+        let process = musefs_core::process_stats();
         let alloc = allocator_stats();
         let syscalls = syscall_snapshot();
-        musefs_core::render_prometheus(&core, &fuse, alloc.as_ref(), syscalls.as_ref()).into_bytes()
+        musefs_core::render_prometheus(&core, &fuse, &process, alloc.as_ref(), syscalls.as_ref())
+            .into_bytes()
     }
 }
 

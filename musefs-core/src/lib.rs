@@ -27,7 +27,8 @@ pub use scan::{
     ScanStats, revalidate, revalidate_with, scan_directory, scan_directory_with,
 };
 pub use telemetry::{
-    AllocatorStats, CoreTelemetry, FuseTelemetry, PassthroughTelemetry, render_prometheus,
+    AllocatorStats, CoreTelemetry, FuseTelemetry, PassthroughTelemetry, ProcessStats,
+    process_stats, render_prometheus,
 };
 pub use template::{Template, TemplateError};
 pub use tree::{InodeAllocator, Node, NodeKind, VirtualTree};
