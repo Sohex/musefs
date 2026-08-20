@@ -461,7 +461,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
-      - uses: vmactions/freebsd-vm@b84ab5559b5a1bb4b8ee2737d2506a16e1737636
+      - uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093
         with:
           usesh: true
           # Pass/fail e2e gate — we keep no build artifacts, so skip the rsync
