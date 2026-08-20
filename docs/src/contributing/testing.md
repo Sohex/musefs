@@ -247,6 +247,19 @@ RUSTFLAGS="-Zsanitizer=thread" TSAN_OPTIONS="halt_on_error=0" \
   cargo +nightly test -p musefs-core -Zbuild-std --test concurrent_reads --target x86_64-unknown-linux-gnu
 ```
 
+The uninstrumented-C caveat is not theoretical, and it reaches the core test —
+not just the mounted one. The `tsan` leg intermittently reports a `data race` on
+a `memcpy` inside `walIndexWriteHdr` / `walIndexTryHdr` (`sqlite3.c`), reached
+through `Db::open_readonly` from the serve-path tests. That is SQLite's
+WAL-index header, guarded by barriers of its own that TSan cannot see — a false
+positive, not a musefs defect. Every test still passes when it fires; the leg
+reddens only because TSan exits 66 whenever it emits a warning at all. It is
+probabilistic, so it shows up on some runs and not others.
+
+So before treating a red `tsan` leg as a finding, check whether any frame in the
+reported stacks names musefs code. Pure `sqlite3.c` stacks are this known noise;
+a frame in `musefs_core` is worth investigating.
+
 ### Dependency advisories & licenses
 
 Two supply-chain gates run in CI and are worth reproducing locally before a
