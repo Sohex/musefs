@@ -42,8 +42,17 @@ components, longer names) raises it and a flatter one lowers it.
 
 Since v1.3.0 the tree stores each name once and shares that one allocation with every
 index keyed on it, which cut the tree's own resident cost from 1.71 KB to 1.28 KB per
-track (−25%) on a 200,000-track build — so the v1.3.0 row above is an upper bound
-until the next full-mount measurement.
+track (−25%) on a 200,000-track build. Rendered paths are now shared the same way:
+the inode allocator's key and the refresh snapshot's entry for a track are one
+allocation rather than two, so the tree carries one fewer whole path per track. That
+is worth −78 B/track (−7%) on a short `$artist/$album/$title` corpus and −173 B/track
+(−14%) when the same three levels carry long names — the saving is one full path, so
+it grows with the template's depth and with name length. Both figures leave the
+v1.3.0 row above an upper bound until the next full-mount measurement.
+
+`musefs-core/tests/tree_footprint.rs` re-measures the per-track cost on every
+`cargo test` run and fails above a ceiling, so a regression surfaces without a
+full-mount run; set `MUSEFS_TREE_FOOTPRINT_TRACKS` to re-measure at library scale.
 
 Two gauges in the metrics surface below size a live mount:
 `musefs_tree_nodes` (live virtual-tree inodes: files plus directories) and

@@ -427,15 +427,15 @@ exclude_re = [
     # #305 folded-inode allocator — hang-class (TIMEOUT-only) mutants, the SP3
     # non-terminating-loop precedent. InodeAllocator::key() transforms a path into
     # the inode map key (case-folded on folded mounts, identity otherwise).
-    # Replacing its body with ANY constant — empty or "xyzzy", borrowed or owned —
-    # makes every path intern to one key, so every node collapses onto a single
-    # inode and becomes its own parent; path_of's `while cur != ROOT` walk then
-    # spins forever (observed canceling the in-diff CI job). All four const-returns
-    # share site 52:9 (one distinct site). key()'s real behavior is pinned
-    # functionally: the fold-vs-identity branch is exercised by
+    # Replacing its body with a constant — `Default::default()` is the empty
+    # `Arc<str>` since #629 made the key a shared handle — makes every path intern
+    # to one key, so every node collapses onto a single inode and becomes its own
+    # parent; path_of's `while cur != ROOT` walk then spins forever (observed
+    # canceling the in-diff CI job). One const-return at one site. key()'s real
+    # behavior is pinned functionally: the fold-vs-identity branch is exercised by
     # folded_dir_recase_keeps_survivor_inode (folded) and
     # case_sensitive_keeps_both_dirs_separate (identity).
-    'musefs-core/src/tree\.rs:\d+:\d+: replace InodeAllocator::key -> Cow<.a, str> with',
+    'musefs-core/src/tree\.rs:\d+:\d+: replace InodeAllocator::key -> RenderedPath with',
     # intern const-returns `-> 0` / `-> 1`: same hang-class. A constant inode for
     # every path collides all nodes (inode 0, or ROOT for 1) into a self-parenting
     # cycle, so path_of loops forever. intern's real contract — a fresh inode per

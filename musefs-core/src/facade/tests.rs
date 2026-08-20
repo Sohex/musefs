@@ -574,9 +574,9 @@ fn render_entries_returns_paths_and_snapshot() {
     )
     .unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].1, "Pix/Song.mp3");
+    assert_eq!(&*entries[0].1, "Pix/Song.mp3");
     let id = entries[0].0;
-    assert_eq!(snapshot[&id].path, "Pix/Song.mp3");
+    assert_eq!(&*snapshot[&id].path, "Pix/Song.mp3");
     assert!(snapshot[&id].content_version >= 1);
 }
 
@@ -622,7 +622,7 @@ fn render_entries_skips_tracks_missing_top_level_field_when_enabled() {
     )
     .unwrap();
     assert_eq!(entries.len(), 1, "the artist-less track must be skipped");
-    assert_eq!(entries[0].1, "Pix/Song.mp3");
+    assert_eq!(&*entries[0].1, "Pix/Song.mp3");
     let id = entries[0].0;
     assert_eq!(snapshot.len(), 1);
     assert!(snapshot.contains_key(&id));
@@ -921,9 +921,9 @@ fn order_entries_sorts_ascending_by_id() {
     // ORDER BY id), so this descending input is constructed directly to pin
     // the sort itself. Deleting/mutating order_entries' sort fails this test.
     let unordered = vec![
-        (9_i64, "z.flac".to_string()),
-        (2_i64, "a.flac".to_string()),
-        (5_i64, "m.flac".to_string()),
+        (9_i64, "z.flac".into()),
+        (2_i64, "a.flac".into()),
+        (5_i64, "m.flac".into()),
     ];
     let ordered = Musefs::order_entries(unordered);
     let ids: Vec<i64> = ordered.iter().map(|(id, _)| *id).collect();
@@ -936,9 +936,9 @@ fn order_entries_sorts_ascending_by_id() {
     assert_eq!(
         ordered,
         vec![
-            (2_i64, "a.flac".to_string()),
-            (5_i64, "m.flac".to_string()),
-            (9_i64, "z.flac".to_string()),
+            (2_i64, "a.flac".into()),
+            (5_i64, "m.flac".into()),
+            (9_i64, "z.flac".into()),
         ]
     );
 }
