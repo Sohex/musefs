@@ -319,11 +319,17 @@ mod tests {
 
     #[test]
     fn sqlite_memory_used_sees_live_connections() {
-        // Any open connection holds at least schema + page cache, so the
-        // global counter must be visibly nonzero while one is alive.
+        // Any open connection holds at least the parsed schema plus page-cache
+        // pages — tens of KB, never a token constant. The floor keeps the
+        // counter honest without assuming a particular SQLite build's exact
+        // footprint.
         let db = Db::open_in_memory().unwrap();
         db.data_version().unwrap();
-        assert!(sqlite_memory_used() > 0);
+        let used = sqlite_memory_used();
+        assert!(
+            used > 4096,
+            "a live migrated connection must hold more than a page, got {used}"
+        );
     }
 
     #[test]

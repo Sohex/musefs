@@ -70,7 +70,8 @@ pub struct AllocatorStats {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessStats {
     /// Whole-process resident set size in bytes, from the OS. `None` where no
-    /// cheap source exists (only Linux's `/proc/self/status` is wired up).
+    /// cheap source exists (`/proc/self/status` is the only one wired up, so
+    /// in practice Linux-only).
     pub resident_bytes: Option<u64>,
     /// Live bytes held by SQLite's C allocator across all connections.
     pub sqlite_bytes: u64,
@@ -88,17 +89,16 @@ pub fn process_stats() -> ProcessStats {
 
 /// `VmRSS` from `/proc/self/status`, in bytes. The `status` field is chosen
 /// over `statm` because it needs no page-size lookup; both cost one small read.
-#[cfg(target_os = "linux")]
+///
+/// Deliberately not cfg-gated to Linux: the body is portable std code that
+/// returns `None` wherever the file or field is absent (macOS has no `/proc`;
+/// FreeBSD's optional procfs has no `VmRSS:` line), and a cfg'd-out stub would
+/// be dead weight the mutation gate can't exercise on the Linux runner.
 fn read_own_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kib * 1024)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_own_rss_bytes() -> Option<u64> {
-    None
 }
 
 fn gauge(out: &mut String, name: &str, help: &str, val: u64) {
@@ -485,10 +485,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn process_stats_reads_own_rss_on_linux() {
-        let p = process_stats();
+        let rss = process_stats().resident_bytes.unwrap();
+        // A running test binary is megabytes resident, never terabytes. The
+        // lower bound also pins the KiB→bytes scaling: mis-scaled values
+        // (kib + 1024, kib / 1024, or a constant) land far below 1 MiB.
         assert!(
-            p.resident_bytes.unwrap() > 0,
-            "VmRSS of a running test process must be nonzero"
+            (1 << 20..1u64 << 40).contains(&rss),
+            "VmRSS of a running test process should be MBs-to-GBs, got {rss}"
         );
     }
 
