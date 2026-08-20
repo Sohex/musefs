@@ -283,13 +283,21 @@ fn build_dir_listing(
 /// drawn from `counter` only on the admit path, and the whole check-then-insert
 /// runs under the single lock the caller holds, so concurrent `opendir` closures
 /// cannot race the count past the cap and a rejected open burns no id.
+///
+/// The miss path bumps `rejections`, surfaced as
+/// `musefs_dir_handle_rejections_total`. Saturation is bursty — a parallel walk
+/// can rack up thousands of rejections between two samples of the
+/// `musefs_dir_handles` gauge, which reads healthy the whole time — so the
+/// monotonic counter is the only after-the-fact signal that the cap bit (#626).
 fn try_admit_dir_handle(
     handles: &mut std::collections::HashMap<u64, Arc<DirListing>>,
     counter: &AtomicU64,
+    rejections: &AtomicU64,
     cap: usize,
     listing: DirListing,
 ) -> Option<u64> {
     if handles.len() >= cap {
+        rejections.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let fh = counter.fetch_add(1, Ordering::Relaxed);
@@ -387,6 +395,11 @@ pub struct MusefsFs {
     /// handle, never evict a different open dir (#192). A 64-bit monotonic counter
     /// cannot wrap within any real process lifetime.
     dir_fh: Arc<AtomicU64>,
+    /// `opendir` calls that found `dir_handles` at `MAX_DIR_HANDLES`. Surfaced as
+    /// `musefs_dir_handle_rejections_total`: the `dir_handles` gauge alone cannot
+    /// show saturation, because it is bursty enough to sit at 0 in every sample
+    /// while thousands of opens are turned away between them (#626).
+    dir_handle_rejections: Arc<AtomicU64>,
     /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
     /// otherwise-unbounded pool queue (#308).
@@ -427,6 +440,7 @@ impl MusefsFs {
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
             dir_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dir_fh: Arc::new(AtomicU64::new(1)),
+            dir_handle_rejections: Arc::new(AtomicU64::new(0)),
             inflight_reads: Arc::new(AtomicUsize::new(0)),
             read_errors: Arc::new(AtomicU64::new(0)),
             metrics_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -501,6 +515,7 @@ impl MusefsFs {
             read_errors: self.read_errors.load(Ordering::Relaxed),
             dir_handles,
             dir_handles_max: MAX_DIR_HANDLES as u64,
+            dir_handle_rejections: self.dir_handle_rejections.load(Ordering::Relaxed),
             pool_workers: self.pool.max_count() as u64,
             pool_active: self.pool.active_count() as u64,
             pool_queued: self.pool.queued_count() as u64,
@@ -704,6 +719,7 @@ impl Filesystem for MusefsFs {
         let core = Arc::clone(&self.core);
         let handles = Arc::clone(&self.dir_handles);
         let counter = Arc::clone(&self.dir_fh);
+        let rejections = Arc::clone(&self.dir_handle_rejections);
         let expose_metrics = self.config.expose_metrics;
         self.pool.execute(move || {
             let listing = match build_dir_listing(&core, ino.0, expose_metrics) {
@@ -714,7 +730,7 @@ impl Filesystem for MusefsFs {
                 let mut guard = handles
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                try_admit_dir_handle(&mut guard, &counter, MAX_DIR_HANDLES, listing)
+                try_admit_dir_handle(&mut guard, &counter, &rejections, MAX_DIR_HANDLES, listing)
             };
             if let Some(fh) = admitted {
                 reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -1238,7 +1254,8 @@ mod tests {
     fn try_admit_dir_handle_admits_and_allocates_id_below_cap() {
         let mut handles = empty_dir_handles();
         let counter = AtomicU64::new(1); // matches the live `dir_fh` start
-        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        let rejections = AtomicU64::new(0);
+        let fh = try_admit_dir_handle(&mut handles, &counter, &rejections, 2, Vec::new());
         assert_eq!(
             fh,
             Some(1),
@@ -1247,6 +1264,11 @@ mod tests {
         assert_eq!(handles.len(), 1);
         assert!(handles.contains_key(&1));
         assert_eq!(counter.load(Ordering::Relaxed), 2, "id allocated on admit");
+        assert_eq!(
+            rejections.load(Ordering::Relaxed),
+            0,
+            "an admit must not count as a rejection"
+        );
     }
 
     #[test]
@@ -1255,13 +1277,44 @@ mod tests {
         handles.insert(10, Arc::new(Vec::new()));
         handles.insert(11, Arc::new(Vec::new()));
         let counter = AtomicU64::new(12);
-        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        let rejections = AtomicU64::new(0);
+        let fh = try_admit_dir_handle(&mut handles, &counter, &rejections, 2, Vec::new());
         assert_eq!(fh, None, "at cap must reject");
         assert_eq!(handles.len(), 2, "must not insert on reject");
         assert_eq!(
             counter.load(Ordering::Relaxed),
             12,
             "must not burn a dir_fh id on reject"
+        );
+        assert_eq!(
+            rejections.load(Ordering::Relaxed),
+            1,
+            "the reject must be metered (#626)"
+        );
+    }
+
+    #[test]
+    fn try_admit_dir_handle_counts_every_rejection_once() {
+        // The gauge cannot substitute for this: occupancy sits pinned at the cap
+        // while the counter climbs, so only the counter records how many opens
+        // were turned away (#626).
+        let mut handles = empty_dir_handles();
+        let counter = AtomicU64::new(1);
+        let rejections = AtomicU64::new(0);
+        assert!(
+            try_admit_dir_handle(&mut handles, &counter, &rejections, 1, Vec::new()).is_some(),
+            "the first open fits cap 1"
+        );
+        for _ in 0..3 {
+            assert!(
+                try_admit_dir_handle(&mut handles, &counter, &rejections, 1, Vec::new()).is_none(),
+                "the table is full"
+            );
+        }
+        assert_eq!(
+            rejections.load(Ordering::Relaxed),
+            3,
+            "one increment per rejected opendir, not per burst"
         );
     }
 
@@ -1271,14 +1324,20 @@ mod tests {
         handles.insert(10, Arc::new(Vec::new()));
         handles.insert(11, Arc::new(Vec::new()));
         let counter = AtomicU64::new(12);
+        let rejections = AtomicU64::new(0);
         handles.remove(&10); // releasedir frees a slot
-        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        let fh = try_admit_dir_handle(&mut handles, &counter, &rejections, 2, Vec::new());
         assert_eq!(fh, Some(12), "a freed slot admits again");
         assert_eq!(handles.len(), 2);
         assert!(!handles.contains_key(&10), "the freed handle stays gone");
         assert!(
             handles.contains_key(&12),
             "the new handle fills the freed slot"
+        );
+        assert_eq!(
+            rejections.load(Ordering::Relaxed),
+            0,
+            "re-admitting into a freed slot is not a rejection"
         );
     }
 
