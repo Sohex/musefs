@@ -30,8 +30,17 @@ see the [Release notes](release-notes.md).
   tracks / 222,001 nodes: ~1713 to ~1284 bytes per track (~84 MiB, -25%), with
   tree build 10-15% faster from the removed allocations. A case-insensitive
   mount saves more, since `folded_children` held a sixth copy. The tuning guide
-  gained a "Memory footprint" section. The full rendered paths are still stored
-  twice; that remainder is tracked in [#629](https://github.com/Sohex/musefs/issues/629).
+  gained a "Memory footprint" section. The full rendered paths were still stored
+  twice at this point; the next entry shares those as well.
+- Each entry's rendered path is stored once and shared between the inode
+  allocator's map key and `TrackRenderState.path`, rather than allocated
+  independently by each ([#629](https://github.com/Sohex/musefs/issues/629)). Measured over 200,000 tracks with
+  41-byte paths: 1150 to 1078 bytes per track (-6%); with 137-byte paths the
+  saving is -14%. What it removes is exactly one whole path per track, so the
+  gain tracks path length and template depth rather than track count — a flat
+  `--template` gains little. Sharing is conditional: a disambiguated leaf keeps
+  its own allocation, since keying it on the path its bare-named sibling already
+  interned would collapse two nodes onto one inode.
 - Full tree rebuilds and the head of every scan read projected columns instead
   of materializing a whole `Track` per row ([#621](https://github.com/Sohex/musefs/issues/621)) — roughly 40 MB of
   transient allocation on a 200,000-track store, on a path already holding a
@@ -91,6 +100,14 @@ see the [Release notes](release-notes.md).
   ([#628](https://github.com/Sohex/musefs/issues/628)). The sanitizer legs previously ran a test that builds
   `ReadAheadPool::new(0)`, leaving the pool disabled throughout. No live bug was
   found; this closes the coverage gap.
+- `musefs-core/tests/tree_footprint.rs` gates the virtual tree's per-track
+  resident cost ([#629](https://github.com/Sohex/musefs/issues/629)), turning #617's throwaway probe into a
+  committed ceiling. It samples `VmRSS` either side of `VirtualTree::build_with`
+  with the rendered paths materialized beforehand, so the delta is the tree's
+  own marginal cost. The ceiling is deliberately loose — a gate that catches
+  only a large regression is worth more than one that reddens on a loaded
+  runner — and a floor assertion keeps a broken measurement from passing
+  vacuously.
 - `deny.toml`'s allow and ignore lists can no longer rot ([#622](https://github.com/Sohex/musefs/issues/622)). A
   stale `RUSTSEC-2025-0167` ignore and an unmatched `ISC` license allowance both
   warned and exited 0, so neither surfaced on a PR — which is how an entry ends

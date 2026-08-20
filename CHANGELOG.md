@@ -24,6 +24,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   five copies, cutting about a quarter of its resident cost (~1.7 KB to ~1.3 KB
   per track, measured over 200,000 tracks). The tuning guide now documents the
   footprint and how to size a host against it.
+- Each entry's rendered path is stored once and shared between the inode
+  allocator and the refresh snapshot instead of being allocated twice, taking a
+  further ~7% off the tree's resident cost. The saving tracks path length, so a
+  deeper `--template` gains proportionally more.
 - Full tree rebuilds and the head of every scan read only the columns they use
   instead of materializing whole track rows.
 
