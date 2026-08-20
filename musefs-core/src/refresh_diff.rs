@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use musefs_db::Format;
 
@@ -6,11 +7,18 @@ use musefs_db::Format;
 /// re-render. `(content_version, format)` is the render key (the only track-level
 /// inputs to `Template::render`); `path` is the last rendered path, reused verbatim for
 /// unchanged tracks. See SP2 Component 1/2.
+///
+/// `path` is refcounted rather than owned outright: the inode allocator keys its
+/// map on the same rendered path, and one snapshot entry plus one allocator entry
+/// per track used to mean two independent copies of a string that scales with
+/// tree depth. Both now share this allocation (#629). `Arc<str>` compares by
+/// value, so the equality this derives — and through it the incremental-vs-fresh
+/// equivalence oracle — is unaffected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackRenderState {
     pub content_version: i64,
     pub format: Format,
-    pub path: String,
+    pub path: Arc<str>,
 }
 
 /// The result of partitioning a changelog read against the previous snapshot.

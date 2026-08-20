@@ -85,7 +85,7 @@ impl Musefs {
         db: &Db<M>,
         template: &Template,
         config: &MountConfig,
-    ) -> Result<(Vec<(i64, String)>, HashMap<i64, TrackRenderState>)> {
+    ) -> Result<(Vec<(i64, Arc<str>)>, HashMap<i64, TrackRenderState>)> {
         // The projection this loop actually reads: a full `list_tracks` would
         // materialize every row's path and checksum strings unused (#621).
         let tracks = db.list_render_keys()?;
@@ -99,12 +99,16 @@ impl Musefs {
             let Some(path) = Self::render_one(template, config, format, &tags) else {
                 continue;
             };
+            // One allocation per rendered path, shared by the snapshot entry, the
+            // build's entry list, and — when the materialized path matches — the
+            // inode allocator's key for it (#629).
+            let path: Arc<str> = Arc::from(path);
             snapshot.insert(
                 id,
                 TrackRenderState {
                     content_version,
                     format,
-                    path: path.clone(),
+                    path: Arc::clone(&path),
                 },
             );
             entries.push((id, path));
@@ -118,7 +122,7 @@ impl Musefs {
     /// move into the build primitive, whose `tree.rs` tests feed it id-unordered
     /// entries on purpose. Kept as a pure helper so its sort is observable (and
     /// mutation-testable) independent of `list_render_keys`'s incidental `ORDER BY id`.
-    pub(crate) fn order_entries(mut entries: Vec<(i64, String)>) -> Vec<(i64, String)> {
+    pub(crate) fn order_entries(mut entries: Vec<(i64, Arc<str>)>) -> Vec<(i64, Arc<str>)> {
         entries.sort_by_key(|(id, _)| *id);
         entries
     }
@@ -300,7 +304,7 @@ impl Musefs {
                             TrackRenderState {
                                 content_version: cv,
                                 format: fmt,
-                                path,
+                                path: Arc::from(path),
                             },
                         )
                     })
@@ -358,8 +362,10 @@ impl Musefs {
                 #[cfg(debug_assertions)]
                 {
                     let mut ref_alloc = alloc.clone();
-                    let mut entries: Vec<(i64, String)> =
-                        snap.iter().map(|(&id, s)| (id, s.path.clone())).collect();
+                    let mut entries: Vec<(i64, Arc<str>)> = snap
+                        .iter()
+                        .map(|(&id, s)| (id, Arc::clone(&s.path)))
+                        .collect();
                     entries.sort_by_key(|(id, _)| *id);
                     let reference = VirtualTree::build_with_ci(
                         &entries,
@@ -377,8 +383,10 @@ impl Musefs {
                 log::warn!(
                     "incremental tree mutation failed ({reason:?}); falling back to full rebuild"
                 );
-                let mut entries: Vec<(i64, String)> =
-                    snap.iter().map(|(&id, s)| (id, s.path.clone())).collect();
+                let mut entries: Vec<(i64, Arc<str>)> = snap
+                    .iter()
+                    .map(|(&id, s)| (id, Arc::clone(&s.path)))
+                    .collect();
                 entries.sort_by_key(|(id, _)| *id);
                 VirtualTree::build_with_ci(&entries, &mut alloc, self.config.case_insensitive)
             }

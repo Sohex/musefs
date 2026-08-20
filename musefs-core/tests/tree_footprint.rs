@@ -22,6 +22,8 @@
 //! The ceiling is deliberately loose. A gate that catches only a large regression
 //! is worth far more than one that reddens on a loaded runner.
 
+use std::sync::Arc;
+
 use musefs_core::convert::usize_from;
 use musefs_core::{InodeAllocator, VirtualTree};
 
@@ -63,8 +65,10 @@ fn rss_bytes() -> Option<usize> {
 }
 
 /// `$artist/$album/$title` paths for `tracks` tracks, in the ascending-id order a
-/// full rebuild uses.
-fn rendered_paths(tracks: usize) -> Vec<(i64, String)> {
+/// full rebuild uses. Each path is the single refcounted allocation the refresh
+/// snapshot would hold, so the build measured below pays only for whatever it
+/// cannot share with it.
+fn rendered_paths(tracks: usize) -> Vec<(i64, Arc<str>)> {
     let mut entries = Vec::with_capacity(tracks);
     for i in 0..tracks {
         let artist = i / (ALBUMS_PER_ARTIST * TRACKS_PER_ALBUM);
@@ -72,7 +76,9 @@ fn rendered_paths(tracks: usize) -> Vec<(i64, String)> {
         let track = i % TRACKS_PER_ALBUM;
         entries.push((
             i64::try_from(i).unwrap(),
-            format!("Artist {artist:05}/Album {album:02}/{track:02} Title {i:06}.flac"),
+            Arc::from(format!(
+                "Artist {artist:05}/Album {album:02}/{track:02} Title {i:06}.flac"
+            )),
         ));
     }
     entries
