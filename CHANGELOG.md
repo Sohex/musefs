@@ -20,6 +20,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Worker read connections now cap their SQLite page cache at 512 KiB (the
+  default is ~2 MiB). The serve path opens one connection per worker thread
+  (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS
+  after a full-library enumeration; the cap saved ~110 MB on a 200,000-track
+  walk with 64 workers and no measured latency change (#631). The tuning guide
+  now documents the post-enumeration steady state as the number to size a host
+  against, and the transparent-hugepage inflation some distros' `THP=always`
+  default adds on top.
 - The virtual tree stores each node name in one shared allocation instead of
   five copies, cutting about a quarter of its resident cost (~1.7 KB to ~1.3 KB
   per track, measured over 200,000 tracks). The tuning guide now documents the

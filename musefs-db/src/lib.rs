@@ -69,6 +69,10 @@ pub(crate) fn query_in_chunks<T: rusqlite::ToSql>(
     Ok(())
 }
 
+/// Page-cache cap for [`Db::open_readonly`] connections, in KiB (negative
+/// `PRAGMA cache_size` form). See the comment at the pragma site.
+const READ_CONN_CACHE_KIB: i64 = 512;
+
 /// Type-state markers for [`Db`]: the connection's write capability, at the
 /// type level. Write APIs exist only on `Db<ReadWrite>`.
 #[derive(Debug)]
@@ -163,6 +167,13 @@ impl Db<ReadOnly> {
         // No configure()/migrate and no foreign_keys pragma: the schema already
         // exists and no writes are possible on a read-only connection.
         conn.busy_timeout(Duration::from_secs(5))?;
+        // Cap this connection's page cache well below SQLite's ~2 MiB default.
+        // The serve path opens one of these per worker thread (up to 2×CPUs),
+        // so the default multiplies into hundreds of MB of process RSS on a
+        // full-library walk, while the queries are point lookups over indexes
+        // that stay hot in the OS page cache anyway — a 200k-track enumeration
+        // measured ~110 MB smaller with no walk-latency change (#631).
+        conn.pragma_update(None, "cache_size", -READ_CONN_CACHE_KIB)?;
         schema::validate_identity(&conn)?;
         Ok(Db {
             conn,
@@ -226,7 +237,7 @@ impl Default for Db {
 
 #[cfg(test)]
 mod tests {
-    use super::Db;
+    use super::{Db, READ_CONN_CACHE_KIB};
 
     #[test]
     fn open_uses_wal_and_busy_timeout() {
@@ -271,6 +282,22 @@ mod tests {
         // A read-only connection can run a read pragma without error.
         assert!(r.data_version().is_ok());
         assert_eq!(r.path().unwrap(), path.as_path());
+    }
+
+    #[test]
+    fn open_readonly_caps_page_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.db");
+        Db::open(&path).unwrap();
+        let r = Db::open_readonly(&path).unwrap();
+        let cache: i64 = r
+            .conn
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            cache, -READ_CONN_CACHE_KIB,
+            "worker read connections must carry the reduced page cache (#631)"
+        );
     }
 
     #[test]
