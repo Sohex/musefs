@@ -12,6 +12,99 @@ see the [Release notes](release-notes.md).
 
 ## [Unreleased]
 
+### Added
+
+- `musefs_dir_handle_rejections_total` ([#626](https://github.com/Sohex/musefs/issues/626)), a monotonic counter of
+  `opendir` calls that could not be given a cached directory snapshot. The
+  existing `musefs_dir_handles` gauge cannot stand in for it: saturation is
+  bursty, and a walk that produced 7,525 rejections never showed a gauge sample
+  above 593. It is also the signal that the stateless path from
+  [#616](https://github.com/Sohex/musefs/issues/616) is in use and directories are being rebuilt on every
+  `readdir`.
+
+### Changed
+
+- The virtual tree interns each node name into one shared `Arc<str>` rather than
+  storing it separately in `Node.name`, `Node.rendered_name`, the `children` key
+  and both `rendered_children` keys ([#617](https://github.com/Sohex/musefs/issues/617)). Measured over 200,000
+  tracks / 222,001 nodes: ~1713 to ~1284 bytes per track (~84 MiB, -25%), with
+  tree build 10-15% faster from the removed allocations. A case-insensitive
+  mount saves more, since `folded_children` held a sixth copy. The tuning guide
+  gained a "Memory footprint" section. The full rendered paths are still stored
+  twice; that remainder is tracked in [#629](https://github.com/Sohex/musefs/issues/629).
+- Full tree rebuilds and the head of every scan read projected columns instead
+  of materializing a whole `Track` per row ([#621](https://github.com/Sohex/musefs/issues/621)) — roughly 40 MB of
+  transient allocation on a 200,000-track store, on a path already holding a
+  pool connection.
+- `readdir`'s unknown-`fh` fallback runs on the worker pool instead of inline on
+  the fuser dispatch thread ([#623](https://github.com/Sohex/musefs/issues/623)), matching the offload every other
+  blocking operation already used. This matters more now that over-cap `opendir`
+  makes that fallback the normal path for large directories.
+
+### Fixed
+
+- Over-cap `opendir` degrades to a stateless directory handle instead of
+  replying `ENFILE` ([#616](https://github.com/Sohex/musefs/issues/616)). The 1024-handle cap was assumed to sit
+  well above any real client, but `bfs` — an ordinary parallel `find`, and the
+  default `find` in several distributions — exceeded it immediately: 7,525
+  rejections over a 200,000-track mount, 17,910 files never enumerated. The
+  rejection surfaced to the operator as "Too many open files in system", which
+  points at the kernel rather than the mount, and an indexer that logs and
+  continues would simply present an incomplete library. Serving over-cap
+  directories through the existing stateless fallback keeps listings complete
+  and preserves the memory bound the cap was added for, at the cost of an O(N)
+  rebuild per `readdir`.
+- Unmount helpers are resolved against `/usr/bin`, `/bin` and `/usr/local/bin`
+  before falling back to a bare-name `PATH` lookup ([#620](https://github.com/Sohex/musefs/issues/620)). The
+  mounting guide steers operators toward running as root for kernel passthrough
+  in `StructureOnly` mode, and nothing sanitizes `PATH` there, so a writable
+  `PATH` entry meant attacker-chosen code executed as root on `SIGTERM`.
+- A failed batch commit during a scan winds the pipeline down before the error
+  propagates ([#618](https://github.com/Sohex/musefs/issues/618)). `ByteBudget` gained a `close()` that wakes
+  waiters, so a worker parked in `acquire` on a condvar only `flush` ever
+  signalled is no longer stranded. This was benign for the CLI, where process
+  exit reaps everything, but `scan_directory_with` / `revalidate_with` are
+  public API and an embedder that caught the error accumulated leaked threads
+  and their in-flight art bytes. The two state-mutex `unwrap()`s adopted the
+  daemon's `lock_recover` policy at the same time, retiring the open note in
+  `lock.rs`.
+- `find_page_start` bounds the number of candidate pages it CRC-validates per
+  call ([#619](https://github.com/Sohex/musefs/issues/619)). The header pre-filter almost never admits a false
+  `OggS` on real audio, but a file whose audio region is deliberately packed
+  with `OggS\x00\x00` cleared it at every offset, allowing up to ~65,000 CRC
+  validations — each with its own positioned reads — for a single seeking read.
+  Hardening rather than a live vulnerability: the attacker is whoever can place
+  a file in the scanned library.
+- `access` is implemented and replies `ok` ([#624](https://github.com/Sohex/musefs/issues/624)), so fuser's default
+  no longer logs `[Not Implemented]` per mount. The mount carries `RO` and, with
+  `allow_other`, `DefaultPermissions`, so the kernel already enforces the
+  presented mode bits.
+
+### Internal
+
+- The `ogg_page` fuzz target round-trips the page machinery the serve path
+  actually depends on — `verify_page_crc` and `patch_page_header_algebraic` —
+  instead of only decoding a header ([#625](https://github.com/Sohex/musefs/issues/625)). Coverage against the
+  committed seed rose from 51 edges / 69 features to 129 / 267.
+- The read-ahead budget invariant restored by #536 now has a concurrent
+  regression test that the ASan and TSan CI legs actually reach
+  ([#628](https://github.com/Sohex/musefs/issues/628)). The sanitizer legs previously ran a test that builds
+  `ReadAheadPool::new(0)`, leaving the pool disabled throughout. No live bug was
+  found; this closes the coverage gap.
+- `deny.toml`'s allow and ignore lists can no longer rot ([#622](https://github.com/Sohex/musefs/issues/622)). A
+  stale `RUSTSEC-2025-0167` ignore and an unmatched `ISC` license allowance both
+  warned and exited 0, so neither surfaced on a PR — which is how an entry ends
+  up silently pre-exempting the next real advisory for the same crate. Both were
+  dropped, and `advisory-not-detected` / `license-not-encountered` are now
+  errors in the `deny` job. The promotion is scoped to the root graph, which is
+  what the lists are authored against; the fuzz-lockfile scan in `audit.yml`
+  allows the advisory diagnostic explicitly, since off that graph it is noise.
+- Issue, pull-request and `CODEOWNERS` templates ([#627](https://github.com/Sohex/musefs/issues/627)). The PR
+  checklist covers the steps that are easy to forget and silently break
+  something: the pre-commit hook, `cargo +nightly fuzz build` after a
+  format-layer API change, regenerating the Python schema mirror after a
+  `musefs-db` change, and a changelog entry.
+
 ## [1.3.0] - 2026-08-19
 
 ### Added

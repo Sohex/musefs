@@ -12,6 +12,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
+  given a cached directory snapshot, so directory-handle pressure stays visible
+  after a burst rather than only as a gauge that reads healthy between samples.
+
+### Changed
+
+- The virtual tree stores each node name in one shared allocation instead of
+  five copies, cutting about a quarter of its resident cost (~1.7 KB to ~1.3 KB
+  per track, measured over 200,000 tracks). The tuning guide now documents the
+  footprint and how to size a host against it.
+- Full tree rebuilds and the head of every scan read only the columns they use
+  instead of materializing whole track rows.
+
+### Fixed
+
+- A parallel directory walk over a large mount no longer loses entries. Once
+  1024 directory handles were open, further `opendir` calls were rejected with
+  `ENFILE` — `bfs` over a 200,000-track mount silently lost about 9% of the
+  tree. Over-cap directories are now served without a cached snapshot instead,
+  so listings stay complete.
+- Unmount helpers (`fusermount3`, `fusermount`, `umount`) are resolved to an
+  absolute path before being spawned, so a daemon running as root can no longer
+  be made to execute an attacker-supplied binary from a writable `PATH` entry
+  when it receives `SIGTERM`.
+- A scan whose batch commit fails no longer leaves worker threads parked on the
+  byte budget forever. They are woken and joined before the error propagates, so
+  an embedder that catches the error and keeps running no longer leaks a thread
+  and its in-flight art bytes per failed scan.
+- Locating an Ogg page for a seeking read now bounds how many candidate pages it
+  will CRC-validate, so a file whose audio region is packed with false `OggS`
+  markers cannot amplify a single read into thousands of positioned reads.
+- `access` is implemented, so a mount no longer logs a `[Not Implemented]`
+  warning from fuser.
+
 ## [1.3.0] - 2026-08-19
 
 ### Added
