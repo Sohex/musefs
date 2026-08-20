@@ -38,7 +38,7 @@ rusqlite = { version = "0.40", features = ["bundled", "blob"] }
 musefs-format = { path = "../musefs-format", features = ["fuzzing"] }
 ogg = "0.9"
 crc = "3"
-base64 = "0.22"
+base64 = "0.23"
 
 [[bench]]
 name = "read_throughput"
