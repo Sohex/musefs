@@ -43,6 +43,7 @@ pub struct FuseTelemetry {
     pub read_errors: u64,
     pub dir_handles: u64,
     pub dir_handles_max: u64,
+    pub dir_handle_rejections: u64,
     pub pool_workers: u64,
     pub pool_active: u64,
     pub pool_queued: u64,
@@ -122,8 +123,14 @@ pub fn render_prometheus(
     gauge(
         &mut out,
         "musefs_dir_handles_max",
-        "Cap before opendir is rejected with ENFILE.",
+        "Directory snapshots retained before opendir degrades to stateless listing.",
         fuse.dir_handles_max,
+    );
+    counter(
+        &mut out,
+        "musefs_dir_handle_rejections_total",
+        "opendir calls that found the dir-handle table full and were served statelessly.",
+        fuse.dir_handle_rejections,
     );
 
     gauge(
@@ -373,6 +380,7 @@ mod tests {
             read_errors: 7,
             dir_handles: 2,
             dir_handles_max: 1024,
+            dir_handle_rejections: 11,
             pool_workers: 8,
             pool_active: 1,
             pool_queued: 0,
@@ -392,6 +400,9 @@ mod tests {
         assert!(
             out.contains("# TYPE musefs_read_errors_total counter\nmusefs_read_errors_total 7\n")
         );
+        assert!(out.contains(
+            "# TYPE musefs_dir_handle_rejections_total counter\nmusefs_dir_handle_rejections_total 11\n"
+        ));
         assert!(out.contains("musefs_pool_queued 0\n"));
         assert!(out.contains("musefs_readahead_budget_bytes 67108864\n"));
         assert!(out.contains("musefs_readahead_charged_bytes 8192\n"));

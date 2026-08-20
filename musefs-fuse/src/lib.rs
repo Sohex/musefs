@@ -13,9 +13,10 @@ use threadpool::ThreadPool;
 
 use crate::convert::{assemble_dir_listing, to_file_attr};
 use fuser::{
-    BackgroundSession, Config, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request, Session,
+    AccessFlags, BackgroundSession, Config, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    ReplyXattr, Request, Session,
 };
 use musefs_core::CoreError;
 use musefs_core::Fh;
@@ -246,11 +247,31 @@ type DirListing = Vec<(u64, FileType, String)>;
 /// Cap on concurrently-open directory handles (#307). Each `opendir` snapshots a
 /// full `DirListing`, so an unreleased handle pins memory ~ (entries × name
 /// length); the cap bounds the *number* of snapshots, not their inherent size (a
-/// single `ls` of the widest directory already allocates one). 1024 sits well
-/// above a heavy parallel indexer's concurrent-dir-handle count (~hundreds), so
-/// legitimate clients never hit it, while an over-cap `opendir` returns `ENFILE`
-/// — the directory-side analogue of the file-handle `HandleTableFull → ENFILE`.
+/// single `ls` of the widest directory already allocates one).
+///
+/// The cap bounds memory, not correctness: an ordinary parallel walker (`bfs`,
+/// the default `find` on some distributions) blows past 1024 concurrent dir
+/// handles on a large mount, so over-cap opens must still *work* (#616). They
+/// are served statelessly via [`DIR_FH_STATELESS`] and counted, never refused.
 const MAX_DIR_HANDLES: usize = 1024;
+
+/// The `opendir` fh that stores no snapshot: `readdir` treats an unknown fh as a
+/// cache miss and rebuilds the listing, and `releasedir` on it removes nothing.
+/// Handed out for the synthetic `.musefs-metrics` directory and for any open
+/// over `MAX_DIR_HANDLES` (#616), so a saturated table costs a client a rebuild
+/// per `readdir` rather than the directory itself. `dir_fh` starts at 1, so no
+/// real handle can collide with it.
+const DIR_FH_STATELESS: u64 = 0;
+
+/// The fh an `opendir` reply carries, given the [`try_admit_dir_handle`]
+/// outcome: the admitted snapshot id, or the stateless sentinel when the table
+/// was full. Over-cap opens degrade instead of failing (#616) — replying
+/// `ENFILE` lost the directory from a parallel walk entirely, and surfaced to
+/// the operator as "Too many open files in system", pointing at their kernel
+/// rather than at the mount.
+fn dir_open_fh(admitted: Option<u64>) -> FileHandle {
+    FileHandle(admitted.unwrap_or(DIR_FH_STATELESS))
+}
 
 /// Cap on concurrently-open `.musefs-metrics/metrics` handles (#394). Each `open`
 /// pins one rendered snapshot until `release`; the cap bounds the map the same way
@@ -277,19 +298,43 @@ fn build_dir_listing(
     Ok(listing)
 }
 
+/// Answer a `readdir` with the page of `listing` starting at `offset`. Slicing
+/// from `offset` directly keeps a paginated enumeration O(n) rather than O(n^2):
+/// the skipped prefix is never re-walked (#442). The offset stored with each
+/// entry is the index of the *next* entry to return.
+fn reply_dir_page(mut reply: ReplyDirectory, listing: &[(u64, FileType, String)], offset: u64) {
+    let start = usize_from(offset).min(listing.len());
+    for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
+        if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
+            break;
+        }
+    }
+    reply.ok();
+}
+
 /// Admit a directory handle under the caller's `dir_handles` lock, enforcing
 /// `MAX_DIR_HANDLES` (#307). Returns the freshly allocated handle id on admit, or
-/// `None` when the table is at `cap` (the caller replies `ENFILE`). The id is
-/// drawn from `counter` only on the admit path, and the whole check-then-insert
-/// runs under the single lock the caller holds, so concurrent `opendir` closures
-/// cannot race the count past the cap and a rejected open burns no id.
+/// `None` when the table is at `cap` and the caller falls back to the stateless
+/// fh (see [`dir_open_fh`]). The id is drawn from `counter` only on the admit
+/// path, and the whole check-then-insert runs under the single lock the caller
+/// holds, so concurrent `opendir` closures cannot race the count past the cap
+/// and a rejected open burns no id.
+///
+/// The miss path bumps `rejections`, surfaced as
+/// `musefs_dir_handle_rejections_total`. Saturation is bursty — a parallel walk
+/// can rack up thousands of rejections between two samples of the
+/// `musefs_dir_handles` gauge, which reads healthy the whole time — so the
+/// monotonic counter is the only after-the-fact signal that the cap was hit
+/// (#626).
 fn try_admit_dir_handle(
     handles: &mut std::collections::HashMap<u64, Arc<DirListing>>,
     counter: &AtomicU64,
+    rejections: &AtomicU64,
     cap: usize,
     listing: DirListing,
 ) -> Option<u64> {
     if handles.len() >= cap {
+        rejections.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let fh = counter.fetch_add(1, Ordering::Relaxed);
@@ -378,7 +423,7 @@ pub struct MusefsFs {
     /// poisoning panic can't tear a later `readdir`'s view; recovery is deliberate.
     #[allow(clippy::type_complexity)]
     dir_handles: Arc<Mutex<std::collections::HashMap<u64, Arc<Vec<(u64, FileType, String)>>>>>,
-    /// Monotonic dir-handle id (starts at 1; 0 stays the stateless sentinel).
+    /// Monotonic dir-handle id (starts at 1; 0 stays [`DIR_FH_STATELESS`]).
     ///
     /// Unlike the file slab's generation-encoded keys (`facade.rs`, ABA-safe by
     /// construction), this is a bare never-recycled counter — sufficient precisely
@@ -387,6 +432,14 @@ pub struct MusefsFs {
     /// handle, never evict a different open dir (#192). A 64-bit monotonic counter
     /// cannot wrap within any real process lifetime.
     dir_fh: Arc<AtomicU64>,
+    /// `opendir` calls that found `dir_handles` at `MAX_DIR_HANDLES` and fell back
+    /// to the stateless listing path. Surfaced as
+    /// `musefs_dir_handle_rejections_total`: the `dir_handles` gauge alone cannot
+    /// show saturation, because it is bursty enough to sit at 0 in every sample
+    /// while thousands of opens are turned away between them (#626). Since #616
+    /// this is also the only signal that directories are being re-listed on every
+    /// `readdir` — worth knowing before it shows up as CPU.
+    dir_handle_rejections: Arc<AtomicU64>,
     /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
     /// otherwise-unbounded pool queue (#308).
@@ -427,6 +480,7 @@ impl MusefsFs {
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
             dir_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dir_fh: Arc::new(AtomicU64::new(1)),
+            dir_handle_rejections: Arc::new(AtomicU64::new(0)),
             inflight_reads: Arc::new(AtomicUsize::new(0)),
             read_errors: Arc::new(AtomicU64::new(0)),
             metrics_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -501,6 +555,7 @@ impl MusefsFs {
             read_errors: self.read_errors.load(Ordering::Relaxed),
             dir_handles,
             dir_handles_max: MAX_DIR_HANDLES as u64,
+            dir_handle_rejections: self.dir_handle_rejections.load(Ordering::Relaxed),
             pool_workers: self.pool.max_count() as u64,
             pool_active: self.pool.active_count() as u64,
             pool_queued: self.pool.queued_count() as u64,
@@ -699,11 +754,12 @@ impl Filesystem for MusefsFs {
         if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
             // Stateless: readdir(METRICS_DIR_INO) serves an inline listing and
             // never consults dir_handles, so this fh burns no MAX_DIR_HANDLES slot.
-            return reply.opened(FileHandle(0), FopenFlags::empty());
+            return reply.opened(FileHandle(DIR_FH_STATELESS), FopenFlags::empty());
         }
         let core = Arc::clone(&self.core);
         let handles = Arc::clone(&self.dir_handles);
         let counter = Arc::clone(&self.dir_fh);
+        let rejections = Arc::clone(&self.dir_handle_rejections);
         let expose_metrics = self.config.expose_metrics;
         self.pool.execute(move || {
             let listing = match build_dir_listing(&core, ino.0, expose_metrics) {
@@ -714,17 +770,20 @@ impl Filesystem for MusefsFs {
                 let mut guard = handles
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                try_admit_dir_handle(&mut guard, &counter, MAX_DIR_HANDLES, listing)
+                try_admit_dir_handle(&mut guard, &counter, &rejections, MAX_DIR_HANDLES, listing)
             };
-            if let Some(fh) = admitted {
-                reply.opened(FileHandle(fh), FopenFlags::empty());
-            } else {
-                log::warn!(
-                    "opendir({ino}) rejected: ENFILE — dir-handle table full at {MAX_DIR_HANDLES}",
+            if admitted.is_none() {
+                // Debug, not warn: a parallel walk over a large mount produces
+                // thousands of these in seconds, the walk still succeeds, and
+                // the listing is simply rebuilt per `readdir` from here on.
+                // `musefs_dir_handle_rejections_total` is the operator-facing
+                // signal that the degraded path is in use (#626).
+                log::debug!(
+                    "opendir({ino}) over the {MAX_DIR_HANDLES}-handle cap: serving it statelessly",
                     ino = ino.0
                 );
-                reply.error(fuser::Errno::ENFILE);
             }
+            reply.opened(dir_open_fh(admitted), FopenFlags::empty());
         });
     }
 
@@ -827,6 +886,18 @@ impl Filesystem for MusefsFs {
         reply.error(fuser::Errno::ENOTSUP);
     }
 
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        // Every entry the daemon presents is accessible to whoever can reach the
+        // mount, so there is no per-inode check to make here. The mount carries
+        // `MountOption::RO`, so the kernel refuses write-intent access before it
+        // reaches us; with `allow_other` it also carries `default_permissions`
+        // and enforces the presented owner/mode bits itself (in which case this
+        // is never called at all). Replied explicitly rather than left to
+        // fuser's default, which logs a `[Not Implemented]` warn at the default
+        // log floor — the same stream the serve-failure lines use (#364, #624).
+        reply.ok();
+    }
+
     fn read(
         &self,
         _req: &Request,
@@ -915,18 +986,11 @@ impl Filesystem for MusefsFs {
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
-        mut reply: ReplyDirectory,
+        reply: ReplyDirectory,
     ) {
         self.fire_poll_refresh();
         if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
-            let listing = metrics_dir::dir_listing();
-            let start = usize_from(offset).min(listing.len());
-            for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
-                if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
-                    break;
-                }
-            }
-            return reply.ok();
+            return reply_dir_page(reply, &metrics_dir::dir_listing(), offset);
         }
         let snapshot = self
             .dir_handles
@@ -934,25 +998,24 @@ impl Filesystem for MusefsFs {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&fh.0)
             .map(Arc::clone);
-        // Lock released; the reply loop below runs without holding it.
-        let listing = match snapshot {
-            Some(l) => l,
-            // Unknown fh (e.g. fh 0): build once inline so we never regress.
-            None => match build_dir_listing(&self.core, ino.0, self.config.expose_metrics) {
-                Ok(l) => Arc::new(l),
-                Err(e) => return reply.error(reply_errno("readdir", ino.0, &e)),
-            },
+        // Lock released; the reply below runs without holding it.
+        let Some(listing) = snapshot else {
+            // Unknown fh — the stateless sentinel, from a synthetic directory or
+            // an over-cap `opendir` (#616). Rebuilding walks the virtual tree and
+            // resolves the parent, so it is offloaded like every other blocking
+            // op rather than run on the single dispatch thread: since #616 this
+            // is the normal path for exactly the wide directories that make it
+            // expensive (#623). `ReplyDirectory` is `Send`, so the worker answers.
+            let core = Arc::clone(&self.core);
+            let expose_metrics = self.config.expose_metrics;
+            return self.pool.execute(move || {
+                match build_dir_listing(&core, ino.0, expose_metrics) {
+                    Ok(listing) => reply_dir_page(reply, &listing, offset),
+                    Err(e) => reply.error(reply_errno("readdir", ino.0, &e)),
+                }
+            });
         };
-        // Slice from `offset` directly so paginated calls don't re-walk the
-        // skipped prefix; full enumeration stays O(n), not O(n^2) (#442).
-        let start = usize_from(offset).min(listing.len());
-        for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
-            // The stored offset is the index of the *next* entry to return.
-            if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
-                break;
-            }
-        }
-        reply.ok();
+        reply_dir_page(reply, &listing, offset);
     }
 }
 
@@ -1238,7 +1301,8 @@ mod tests {
     fn try_admit_dir_handle_admits_and_allocates_id_below_cap() {
         let mut handles = empty_dir_handles();
         let counter = AtomicU64::new(1); // matches the live `dir_fh` start
-        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        let rejections = AtomicU64::new(0);
+        let fh = try_admit_dir_handle(&mut handles, &counter, &rejections, 2, Vec::new());
         assert_eq!(
             fh,
             Some(1),
@@ -1247,6 +1311,11 @@ mod tests {
         assert_eq!(handles.len(), 1);
         assert!(handles.contains_key(&1));
         assert_eq!(counter.load(Ordering::Relaxed), 2, "id allocated on admit");
+        assert_eq!(
+            rejections.load(Ordering::Relaxed),
+            0,
+            "an admit must not count as a rejection"
+        );
     }
 
     #[test]
@@ -1255,13 +1324,62 @@ mod tests {
         handles.insert(10, Arc::new(Vec::new()));
         handles.insert(11, Arc::new(Vec::new()));
         let counter = AtomicU64::new(12);
-        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        let rejections = AtomicU64::new(0);
+        let fh = try_admit_dir_handle(&mut handles, &counter, &rejections, 2, Vec::new());
         assert_eq!(fh, None, "at cap must reject");
         assert_eq!(handles.len(), 2, "must not insert on reject");
         assert_eq!(
             counter.load(Ordering::Relaxed),
             12,
             "must not burn a dir_fh id on reject"
+        );
+        assert_eq!(
+            rejections.load(Ordering::Relaxed),
+            1,
+            "the reject must be metered (#626)"
+        );
+    }
+
+    #[test]
+    fn over_cap_opendir_falls_back_to_the_stateless_fh() {
+        assert_eq!(
+            dir_open_fh(Some(7)),
+            FileHandle(7),
+            "an admitted handle keeps its snapshot id"
+        );
+        assert_eq!(
+            dir_open_fh(None),
+            FileHandle(DIR_FH_STATELESS),
+            "over cap must degrade to the stateless fh, not reply ENFILE (#616)"
+        );
+        assert_eq!(
+            DIR_FH_STATELESS, 0,
+            "readdir rebuilds for an unknown fh and releasedir(0) removes nothing"
+        );
+    }
+
+    #[test]
+    fn try_admit_dir_handle_counts_every_rejection_once() {
+        // The gauge cannot substitute for this: occupancy sits pinned at the cap
+        // while the counter climbs, so only the counter records how many opens
+        // were turned away (#626).
+        let mut handles = empty_dir_handles();
+        let counter = AtomicU64::new(1);
+        let rejections = AtomicU64::new(0);
+        assert!(
+            try_admit_dir_handle(&mut handles, &counter, &rejections, 1, Vec::new()).is_some(),
+            "the first open fits cap 1"
+        );
+        for _ in 0..3 {
+            assert!(
+                try_admit_dir_handle(&mut handles, &counter, &rejections, 1, Vec::new()).is_none(),
+                "the table is full"
+            );
+        }
+        assert_eq!(
+            rejections.load(Ordering::Relaxed),
+            3,
+            "one increment per rejected opendir, not per burst"
         );
     }
 
@@ -1271,14 +1389,20 @@ mod tests {
         handles.insert(10, Arc::new(Vec::new()));
         handles.insert(11, Arc::new(Vec::new()));
         let counter = AtomicU64::new(12);
+        let rejections = AtomicU64::new(0);
         handles.remove(&10); // releasedir frees a slot
-        let fh = try_admit_dir_handle(&mut handles, &counter, 2, Vec::new());
+        let fh = try_admit_dir_handle(&mut handles, &counter, &rejections, 2, Vec::new());
         assert_eq!(fh, Some(12), "a freed slot admits again");
         assert_eq!(handles.len(), 2);
         assert!(!handles.contains_key(&10), "the freed handle stays gone");
         assert!(
             handles.contains_key(&12),
             "the new handle fills the freed slot"
+        );
+        assert_eq!(
+            rejections.load(Ordering::Relaxed),
+            0,
+            "re-admitting into a freed slot is not a rejection"
         );
     }
 
