@@ -6,6 +6,14 @@
 //! would accumulate one leaked thread — plus its in-flight art bytes — per
 //! blocked worker, per failed scan (#618).
 
+// The stranding this guards against is platform-independent; the *observation* is
+// not. `live_threads` counts entries under `/proc/self/task`, which exists only on
+// Linux — and the macOS and FreeBSD legs both run `cargo test --workspace`, so
+// without this gate the helper's `expect` panics there rather than testing
+// anything. Linux carries the required gates (including both sanitizer legs), so
+// the regression stays covered where it is checked.
+#![cfg(target_os = "linux")]
+
 use musefs_core::{ScanOptions, scan_directory_with};
 use musefs_db::{Db, Format, NewTrack};
 use std::time::{Duration, Instant};
