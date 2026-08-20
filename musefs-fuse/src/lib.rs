@@ -76,6 +76,12 @@ pub struct FuseConfig {
     /// mount root (#394). Default off; named distinctly from the compile-time
     /// `metrics` cargo feature (which gates the syscall counters).
     pub expose_metrics: bool,
+    /// Worker-pool size for offloaded ops (reads, metadata synthesis).
+    /// `0` = auto: 2× the CPU count, oversized because the work is I/O-bound.
+    /// Each worker lazily opens its own read-only DB connection, so this also
+    /// bounds the SQLite connection count — steady-state memory scales with it
+    /// (#631). Lower it on memory-constrained or many-core hosts.
+    pub workers: usize,
 }
 
 impl Default for FuseConfig {
@@ -91,6 +97,7 @@ impl Default for FuseConfig {
             dir_mode: 0o555,
             allow_other: false,
             expose_metrics: false,
+            workers: 0,
         }
     }
 }
@@ -459,8 +466,14 @@ pub struct MusefsFs {
 
 impl MusefsFs {
     pub fn new(core: Musefs, config: FuseConfig) -> MusefsFs {
-        // Work is I/O-bound (especially on NFS), so oversize the pool vs CPUs.
-        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2;
+        // Work is I/O-bound (especially on NFS), so the auto default oversizes
+        // the pool vs CPUs. An explicit `--workers` wins: besides concurrency,
+        // the pool size bounds the per-worker DB connections and their memory
+        // (#631), so operators may deliberately size it down.
+        let workers = match config.workers {
+            0 => std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2,
+            n => n,
+        };
         let structure_only = core.mode() == musefs_core::Mode::StructureOnly;
         MusefsFs {
             core: Arc::new(core),
@@ -1240,6 +1253,40 @@ mod tests {
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
         (dir, MusefsFs::new(core, FuseConfig::default()))
+    }
+
+    #[test]
+    fn explicit_workers_sets_pool_size() {
+        use musefs_core::{Mode, MountConfig, Musefs};
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MountConfig {
+            template: "$artist/$title".to_string(),
+            fallbacks: std::collections::BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+            read_ahead_budget: 64 * 1024 * 1024,
+            read_ahead_prefetch: false,
+            skip_on_missing: false,
+        };
+        let core =
+            Musefs::open(musefs_db::Db::open(dir.path().join("w.db")).unwrap(), cfg).unwrap();
+        let fs = MusefsFs::new(
+            core,
+            FuseConfig {
+                workers: 3,
+                ..FuseConfig::default()
+            },
+        );
+        assert_eq!(fs.pool.max_count(), 3);
+    }
+
+    #[test]
+    fn workers_zero_means_auto_oversized_pool() {
+        let (_dir, fs) = test_fs(); // default config: workers == 0
+        let auto = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2;
+        assert_eq!(fs.pool.max_count(), auto);
     }
 
     #[test]

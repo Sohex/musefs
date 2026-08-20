@@ -17,6 +17,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
   given a cached directory snapshot, so directory-handle pressure stays visible
   after a burst rather than only as a gauge that reads healthy between samples.
+- `--workers` (env `MUSEFS_WORKERS`) sizes the FUSE worker pool explicitly.
+  The default stays auto (2× the CPU count, oversized for I/O-bound work), but
+  each worker lazily opens its own read-only SQLite connection, so steady-state
+  memory scales with the pool — many-core hosts serving few concurrent readers
+  can now cap that component (#631).
 - `musefs_process_resident_bytes` (Linux) reports the whole-process RSS, and
   `musefs_sqlite_memory_bytes` reports what SQLite holds across all connections.
   SQLite allocates through libc, so the jemalloc `musefs_alloc_*` gauges never
