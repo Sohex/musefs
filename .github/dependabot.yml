@@ -1,37 +1,42 @@
 version: 2
 updates:
+  # One grouped PR per ecosystem per week. `directories` lets a single update
+  # config span manifests, and a group spanning them collapses the lot into one
+  # PR instead of one per dependency per directory.
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories:
+      - "/"
+      - "/fuzz"
     schedule:
       interval: "weekly"
-  - package-ecosystem: "cargo"
-    directory: "/fuzz"
-    schedule:
-      interval: "weekly"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
   - package-ecosystem: "pip"
-    directory: "/contrib/beets"
+    directories:
+      - "/contrib/beets"
+      - "/contrib/lidarr"
+      - "/contrib/python-musefs"
+      - "/contrib/picard"
+      - "/tests/interop"
     schedule:
       interval: "weekly"
-  - package-ecosystem: "pip"
-    directory: "/contrib/lidarr"
-    schedule:
-      interval: "weekly"
-  - package-ecosystem: "pip"
-    directory: "/contrib/python-musefs"
-    schedule:
-      interval: "weekly"
-  - package-ecosystem: "pip"
-    directory: "/contrib/picard"
-    schedule:
-      interval: "weekly"
-  - package-ecosystem: "pip"
-    directory: "/tests/interop"
-    schedule:
-      interval: "weekly"
+    groups:
+      pip:
+        patterns:
+          - "*"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
   # Tracks the FROM base images in docker/Dockerfile.{glibc,musl}. Numeric tags
   # (alpine:3.x) get version-bump PRs; the debian codename tag (trixie-slim) is
   # not version-comparable, so it stays manual unless digest-pinned.
@@ -39,3 +44,7 @@ updates:
     directory: "/docker"
     schedule:
       interval: "weekly"
+    groups:
+      docker:
+        patterns:
+          - "*"
