@@ -220,6 +220,16 @@ cargo test -p musefs-core --test concurrent_reads          # core: HeaderCache +
 cargo test -p musefs-fuse --test concurrent_reads -- --ignored  # mount: DbPool::PerThread (needs /dev/fuse)
 ```
 
+The core binary also carries the read-ahead pool's budget-accounting stress
+(`readahead_*`, #628): 16 threads register/read/deregister streams against a
+4 MiB budget so eviction fires constantly, then assert
+`charged == Σ(registered buffers' bytes.len())` at quiescence — the
+invariant #536 restored. It lives in this binary precisely so the sanitizer
+legs below reach it; the serve-path tests around it run with read-ahead
+disabled. Rounds
+default to a sanitizer-friendly 24 per thread;
+`MUSEFS_READAHEAD_STRESS_ROUNDS=200` soaks it locally.
+
 CI runs the core test under **AddressSanitizer** as a required gate (`asan` job)
 and both tests under **ThreadSanitizer** as a non-required best-effort signal
 (`tsan` job, `continue-on-error`). TSan cannot instrument the system C libraries
@@ -236,6 +246,19 @@ RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS="detect_leaks=0" \
 RUSTFLAGS="-Zsanitizer=thread" TSAN_OPTIONS="halt_on_error=0" \
   cargo +nightly test -p musefs-core -Zbuild-std --test concurrent_reads --target x86_64-unknown-linux-gnu
 ```
+
+The uninstrumented-C caveat is not theoretical, and it reaches the core test —
+not just the mounted one. The `tsan` leg intermittently reports a `data race` on
+a `memcpy` inside `walIndexWriteHdr` / `walIndexTryHdr` (`sqlite3.c`), reached
+through `Db::open_readonly` from the serve-path tests. That is SQLite's
+WAL-index header, guarded by barriers of its own that TSan cannot see — a false
+positive, not a musefs defect. Every test still passes when it fires; the leg
+reddens only because TSan exits 66 whenever it emits a warning at all. It is
+probabilistic, so it shows up on some runs and not others.
+
+So before treating a red `tsan` leg as a finding, check whether any frame in the
+reported stacks names musefs code. Pure `sqlite3.c` stacks are this known noise;
+a frame in `musefs_core` is worth investigating.
 
 ### Dependency advisories & licenses
 

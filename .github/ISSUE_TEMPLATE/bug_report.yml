@@ -1,0 +1,117 @@
+name: Bug report
+description: Something musefs serves, scans, or mounts is wrong.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing. musefs never copies or rewrites audio bytes, so a
+        report is almost always pinned down by the same four facts: the mount
+        mode, the backing format, who wrote the store, and the log.
+
+        Before filing, please check the
+        [format notes](https://sohex.github.io/musefs/formats/overview.html)
+        — some differences from the source file (dropped non-standard frames,
+        re-ordered tags) are documented lossy edges rather than bugs.
+
+  - type: input
+    id: version
+    attributes:
+      label: musefs version
+      description: Output of `musefs --version`. For a build from source, the commit sha.
+      placeholder: musefs 1.3.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mount mode (`--mode`)
+      description: |
+        `synthesis` serves a freshly generated metadata region in front of the
+        audio; `structure-only` serves the backing file's bytes unchanged.
+      options:
+        - synthesis (default)
+        - structure-only
+        - not a mount problem (scan, CLI, or plugin)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: Backing format
+      description: The container of the file that misbehaves.
+      multiple: true
+      options:
+        - FLAC
+        - MP3
+        - M4A / M4B
+        - Ogg (Vorbis / Opus)
+        - WAV
+        - other / not format specific
+    validations:
+      required: true
+
+  - type: dropdown
+    id: writer
+    attributes:
+      label: Who wrote the store?
+      description: |
+        The SQLite store is the source of truth for tags and art, and external
+        writers go through a documented
+        [contract](https://sohex.github.io/musefs/architecture/store.html#the-external-writer-contract).
+        A store written by another tool narrows triage a lot.
+      options:
+        - musefs itself (`musefs scan` only)
+        - beets plugin
+        - Picard plugin
+        - Lidarr integration
+        - python-musefs directly
+        - another tool / hand-written SQL
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what you expected instead
+      description: Include the affected path under the mount if there is one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The exact `musefs scan` / `musefs mount` invocations, and how you read
+        the file back (player, `ffprobe`, `cmp`, mutagen, ...).
+      placeholder: |
+        1. musefs scan --db ... --library ...
+        2. musefs mount --db ... --mode synthesis ~/mnt/music
+        3. ffprobe ~/mnt/music/...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: |
+        Re-run with `RUST_LOG=info` (or `RUST_LOG=debug` for a read-path
+        problem) and paste the relevant lines. This is rendered as a code
+        block, so no backticks needed.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS and kernel, plus the libfuse version if the problem is a mount.
+      placeholder: Debian 13, Linux 6.12, libfuse 3.17
+    validations:
+      required: false

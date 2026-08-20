@@ -22,6 +22,49 @@ and numbers).
 Filename case-folding (`--case-insensitive`) is platform behaviour rather than
 a performance knob — see [Platform support](installation.md#platform-support).
 
+## Memory footprint
+
+`--read-ahead-budget-mib` is the only memory knob, but on a sizeable library it is
+not the biggest number: the virtual tree — one node per rendered file and directory,
+plus the inode allocator's path map — is held resident for the lifetime of the mount
+and scales with the **track count**, not with I/O. Measured on Linux, release build:
+
+| Library | Steady-state RSS | Peak RSS | Per track | Tree build |
+| ------- | ---------------- | -------- | --------- | ---------- |
+| 200,000 tracks / 22,000 directories (v1.3.0) | 451 MB | 475 MB | ~2.31 KB | 2.3 s |
+
+Size a host against the **peak** — **~2.4 KB of RAM per track**, so ~240 MB at
+100,000 tracks and ~2.4 GB at a million — on top of the read-ahead budget (64 MiB by
+default) and SQLite's page cache. Size against the peak rather than the steady state
+because the peak is the transient of building the tree, and it recurs whenever a
+refresh takes the full-rebuild path rather than being a one-off at mount. The
+reductions described below cut the tree's own share of this, but the table is the
+last end-to-end mount measurement, so it remains the number to size against until a
+mount is measured again. The cost is dominated by rendered
+names and paths rather than by audio, so a deeply nested `--template` (more path
+components, longer names) raises it and a flatter one lowers it.
+
+Since v1.3.0 the tree stores each name once and shares that one allocation with every
+index keyed on it, which cut the tree's own resident cost from 1.71 KB to 1.28 KB per
+track (−25%) on a 200,000-track build. Rendered paths are now shared the same way:
+the inode allocator's key and the refresh snapshot's entry for a track are one
+allocation rather than two, so the tree carries one fewer whole path per track. That
+is worth −78 B/track (−7%) on a short `$artist/$album/$title` corpus and −173 B/track
+(−14%) when the same three levels carry long names — the saving is one full path, so
+it grows with the template's depth and with name length. Both figures leave the
+v1.3.0 row above an upper bound until the next full-mount measurement.
+
+`musefs-core/tests/tree_footprint.rs` re-measures the per-track cost on every
+`cargo test` run and fails above a ceiling, so a regression surfaces without a
+full-mount run; set `MUSEFS_TREE_FOOTPRINT_TRACKS` to re-measure at library scale.
+
+Two gauges in the metrics surface below size a live mount:
+`musefs_tree_nodes` (live virtual-tree inodes: files plus directories) and
+`musefs_inode_paths` (paths interned by the inode allocator — up to 2× the live node
+count between prunes, since retired paths are kept until they outnumber live ones).
+On a `jemalloc` build, `musefs_alloc_resident_bytes` reports the allocator's resident
+total as an RSS proxy.
+
 ## Metrics
 
 `musefs mount` optionally exposes runtime telemetry through a synthetic

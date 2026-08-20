@@ -138,7 +138,17 @@ jobs:
         # together with the deny.toml schema.
         run: cargo install cargo-deny --locked --version '^0.19'
       - name: cargo-deny check
-        run: cargo deny check
+        # `advisory-not-detected` / `license-not-encountered` are promoted to
+        # errors so deny.toml's ignore and allow lists cannot rot: an entry that
+        # stops matching the graph fails this gate instead of emitting a warning
+        # into a log that nothing reads, which is how a stale entry ends up
+        # silently pre-exempting the next real advisory for the same crate. This
+        # is the graph both lists are authored against; audit.yml's fuzz-lockfile
+        # scan is not, and allows the advisory diagnostic accordingly.
+        run: |
+          cargo deny check \
+            --deny advisory-not-detected \
+            --deny license-not-encountered
 
   interop:
     # Property 5: an independent ecosystem reader (mutagen) reads the tags we

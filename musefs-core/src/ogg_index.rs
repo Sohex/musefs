@@ -27,6 +27,19 @@ pub type LastPageMemo = std::sync::Mutex<Option<(u64, u64, Vec<u8>)>>;
 const MAX_OGG_PAGE_BYTES: u64 = 65_307;
 /// Maximum Ogg page header size: 27 fixed + 255 seg-table.
 const MAX_OGG_HEADER_BYTES: usize = 282;
+/// Maximum full-page CRC validations one `find_page_start` backwards scan may pay.
+///
+/// Each validation is two positioned reads of up to ~64 KiB (#619). The cheap
+/// header pre-filter is what normally keeps the count at one: a coincidental `OggS`
+/// in audio payload also has to carry a zero version byte and a zero-topped
+/// header-type byte, so a real file resolves on its first surviving candidate. A
+/// backing file whose audio region is packed with `OggS\x00\x00` clears the
+/// pre-filter at every offset instead, and without a bound a single non-sequential
+/// read would pay one validation per window byte — up to ~65,000. This budget caps
+/// that at a fixed, small multiple of the legitimate cost while leaving orders of
+/// magnitude more headroom than any real stream needs; past it the scan fails
+/// closed like every other file-derived value on this path.
+const MAX_CRC_CHECKS: usize = 64;
 
 /// Positioned read that records serve-path pread metrics (count + bytes).
 /// Counts on the attempt, like `on_open` — a failed read is still a round-trip.
@@ -53,7 +66,10 @@ fn read_counted(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Resu
 /// a byte scan and a full-page CRC per OggS candidate — is paid only on
 /// non-sequential reads; sequential playback rides the memo fast path below. It is
 /// accepted as-is (#437) rather than reintroducing the page index this stateless
-/// design deliberately removed.
+/// design deliberately removed. The CRC validations are capped at
+/// `MAX_CRC_CHECKS` per invocation, so a backing file crafted to clear the cheap
+/// pre-filter at every offset cannot amplify one seek into ~65,000 full-page reads
+/// — the scan errors `Malformed` past the budget (#619).
 ///
 /// Fast path: if `memo` holds a page whose `[start, start+total_len)` region
 /// contains `abs_target`, return that start directly — skipping both the backward
@@ -100,6 +116,7 @@ fn find_page_start(
 
     // Scan backwards for the rightmost CRC-valid OggS capture.
     let mut i = window_len.saturating_sub(4);
+    let mut crc_checks = 0usize;
     loop {
         if window[i..].starts_with(b"OggS") {
             // Cheap pre-filter on whatever header bytes fall inside the window.
@@ -110,6 +127,12 @@ fn find_page_start(
             let cheap_ok = window.get(i + 4).is_none_or(|&v| v == 0)       // version == 0
                 && window.get(i + 5).is_none_or(|&ht| ht & 0xF8 == 0); // header_type
             if cheap_ok {
+                // Spend from the CRC budget before the I/O, so a packed region can
+                // never amplify one seek into ~65,000 full-page reads (#619).
+                if crc_checks == MAX_CRC_CHECKS {
+                    return Err(musefs_format::FormatError::Malformed.into());
+                }
+                crc_checks += 1;
                 let candidate = scan_start + i as u64;
                 if page_crc_ok(backing, candidate)? {
                     return Ok(candidate);
@@ -530,6 +553,36 @@ mod tests {
 
     // ── find_page_start tests ─────────────────────────────────────────────────
 
+    /// A complete 27-byte fake page header: OggS | ver(1)=0 | htype(1)=0 |
+    /// granule(8)=0 | serial(4) | seq(4) | crc(4)=garbage | seg_count(1)=0. It clears
+    /// `find_page_start`'s cheap pre-filter (version 0, header_type 0) so every copy
+    /// costs a full `page_crc_ok` round trip, then fails the CRC and is rejected.
+    const FAKE_PAGE_HEADER: &[u8; 27] =
+        b"OggS\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x9a\x9a\x9a\x9a\x11\x22\x33\x44\xde\xad\xbe\xef\x00";
+
+    /// Write `[16 pad bytes][one real Ogg page][`fakes` × `FAKE_PAGE_HEADER`]` and
+    /// return `(dir, path, audio_offset, end_of_file)`. Scanning backwards from
+    /// end-of-file hits every fake — one CRC validation each — before reaching the
+    /// real page start at `audio_offset`.
+    fn packed_false_oggs_fixture(
+        fakes: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf, u64, u64) {
+        let (audio, _) = lace_packet_pub(0xABCD, 5, false, 100, &[0u8; 64]);
+        let mut file = vec![0u8; 16];
+        file.extend_from_slice(&audio);
+        for _ in 0..fakes {
+            file.extend_from_slice(FAKE_PAGE_HEADER);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("packed.ogg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&file)
+            .unwrap();
+        let end = file.len() as u64;
+        (dir, path, 16, end)
+    }
+
     #[test]
     fn find_page_start_at_audio_offset_returns_immediately() {
         let (_d, path, ao, _alen) = new_serve_fixture();
@@ -594,12 +647,7 @@ mod tests {
         // backward scan finds this fake first (it is to the right of the real start),
         // must reject it via the CRC guard, and return the real page start.
         let mut payload = vec![0u8; 600];
-        // A complete 27-byte fake header: OggS | ver(1)=0 | htype(1)=0 | granule(8)=0
-        // | serial(4) | seq(4) | crc(4)=garbage | seg_count(1)=0. Passes the cheap
-        // checks (version 0, header_type 0, seg_count 0) but its CRC field is garbage.
-        let fake: &[u8] =
-            b"OggS\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x9a\x9a\x9a\x9a\x11\x22\x33\x44\xde\xad\xbe\xef\x00";
-        assert_eq!(fake.len(), 27);
+        let fake = FAKE_PAGE_HEADER;
         payload[100..100 + fake.len()].copy_from_slice(fake);
         let (audio, _) = lace_packet_pub(0xABCD, 5, false, 100, &payload);
         let dir = tempfile::tempdir().unwrap();
@@ -619,6 +667,30 @@ mod tests {
         assert_eq!(
             found, ao,
             "must reject the CRC-invalid fake OggS and return the real start"
+        );
+    }
+
+    #[test]
+    fn find_page_start_bounds_crc_validations() {
+        // One short of the budget: every fake is rejected in turn and the real page
+        // start — the MAX_CRC_CHECKS-th validation — still resolves. This is the
+        // keep-scanning-past-false-positives behaviour the bound must not break.
+        let (_d, path, ao, target) = packed_false_oggs_fixture(MAX_CRC_CHECKS - 1);
+        let backing = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            find_page_start(&backing, ao, target, None).unwrap(),
+            ao,
+            "{} false candidates must still leave budget for the real page start",
+            MAX_CRC_CHECKS - 1,
+        );
+        // One more fake exhausts the budget before the scan reaches the real start,
+        // so it fails closed rather than paying an unbounded number of full-page
+        // reads for a single seek into a crafted region (#619).
+        let (_d, path, ao, target) = packed_false_oggs_fixture(MAX_CRC_CHECKS);
+        let backing = std::fs::File::open(&path).unwrap();
+        assert!(
+            find_page_start(&backing, ao, target, None).is_err(),
+            "the CRC-validation budget must fail closed on a packed OggS region",
         );
     }
 

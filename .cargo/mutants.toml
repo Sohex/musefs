@@ -147,7 +147,7 @@ exclude_re = [
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:1532:46:',
+'musefs-core/src/scan\.rs:1530:46:',
     # probe_body's tail-read predicate
     # `has_ext(mp3) || (has_ext(flac) && has_leading_id3(prefix))`, the inner `&&`
     # (col 66) -> `||`: widening it makes every .flac pay the 128-byte tail read,
@@ -173,21 +173,43 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:1629:22:',
+'musefs-core/src/scan\.rs:1627:22:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1665:32:',
+'musefs-core/src/scan\.rs:1666:33:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1665:47:',
+'musefs-core/src/scan\.rs:1666:48:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1665:62:',
+'musefs-core/src/scan\.rs:1666:63:',
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:1673:37:',
+'musefs-core/src/scan\.rs:1680:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1675:40:',
+'musefs-core/src/scan\.rs:1682:41:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1675:55:',
+'musefs-core/src/scan\.rs:1682:56:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:1675:70:',
+'musefs-core/src/scan\.rs:1682:71:',
+    # Same cadence class, one level up: each threshold flush is a let-chain
+    # (`(len >= BATCH_FILES || batch_bytes >= cap) && let Err(e) = flush(..)`), so
+    # `&&`->`||` short-circuits past the mid-loop flush exactly when the threshold
+    # IS met — deferring the commit to the flush-on-empty / final flush, which
+    # persist the identical track set and still surface a flush error (#618).
+    # guard: op="&&" fn="run_pipeline" rows=1
+'musefs-core/src/scan\.rs:1667:21:',
+    # guard: op="&&" fn="run_pipeline" rows=1
+'musefs-core/src/scan\.rs:1683:29:',
+    # `ByteBudget::acquire`'s wait guard (`!st.closed && in_flight != 0 && ...`),
+    # the FIRST `&&`->`||`. `&&` binds tighter than `||`, so the guard becomes
+    # `!closed || (in_flight != 0 && over_cap)` and every reservation against an
+    # OPEN budget waits forever. That is a genuine break, but it can only ever
+    # surface as a hang rather than a failure: roughly a dozen `scan::*` tests
+    # reserve through `scan_directory_with`, so the test binary stalls and
+    # cargo-mutants scores TIMEOUT — which fails the gate — instead of CAUGHT.
+    # Verified locally: the `byte_budget` unit tests can be made to fail fast, but
+    # the scan tests still hang, so killing it properly would mean putting a
+    # deadline on every scan test. The hang is the detection (#618). The second
+    # `&&` on the same line is caught by `oversized_item_admitted_when_idle`.
+    # guard: op="&&" fn="ByteBudget::acquire" rows=1
+'musefs-core/src/byte_budget\.rs:39:26:',
     # revalidate_with `skip_failed += 1`: unreachable defensive accounting.
     # collect_audio yields only existing regular files, so a just-collected file's
     # metadata()/canonicalize() fails solely under a TOCTOU race — not reachable
@@ -195,11 +217,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:1805:29:',
+'musefs-core/src/scan\.rs:1828:29:',
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:1814:33:',
+'musefs-core/src/scan\.rs:1837:33:',
     # guard: op="+" fn="revalidate_with" rows=1
-'musefs-core/src/scan\.rs:1870:29: replace \+ with -',
+'musefs-core/src/scan\.rs:1893:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
@@ -324,7 +346,7 @@ exclude_re = [
     # mutant is equivalent and unkillable (#537). Pinned by line:col — the other `<`
     # in this fn (the memo range check) IS caught.
     # guard: op="<" fn="find_page_start" rows=1
-    'musefs-core/src/ogg_index\.rs:74:48: replace < with <= in find_page_start',
+    'musefs-core/src/ogg_index\.rs:90:48: replace < with <= in find_page_start',
     # Overlap-emit guards `if hs < he` / `if ps < pe`, `<`->`<=`: when the bound is
     # equal the extra branch emits an empty `[a..b]` slice / reads 0 payload bytes —
     # a no-op, so the served output is byte-identical (verified: the ogg tests and the
@@ -332,9 +354,9 @@ exclude_re = [
     # were reported TIMEOUT under the parallel gate's load, not as a real hang. Pinned
     # by line:col — several `<` in this fn (the loop/length guards) ARE caught.
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:252:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:275:15: replace < with <= in serve_ogg_window',
     # guard: op="<" fn="serve_ogg_window" rows=1
-    'musefs-core/src/ogg_index\.rs:261:15: replace < with <= in serve_ogg_window',
+    'musefs-core/src/ogg_index\.rs:284:15: replace < with <= in serve_ogg_window',
 
     # Phase 4 poll debounce (#89) — equivalent `<`->`<=` on the two wall-clock
     # gates (`last_poll.elapsed() < poll_interval`, `last_failed.elapsed() <
@@ -418,15 +440,15 @@ exclude_re = [
     # #305 folded-inode allocator — hang-class (TIMEOUT-only) mutants, the SP3
     # non-terminating-loop precedent. InodeAllocator::key() transforms a path into
     # the inode map key (case-folded on folded mounts, identity otherwise).
-    # Replacing its body with ANY constant — empty or "xyzzy", borrowed or owned —
-    # makes every path intern to one key, so every node collapses onto a single
-    # inode and becomes its own parent; path_of's `while cur != ROOT` walk then
-    # spins forever (observed canceling the in-diff CI job). All four const-returns
-    # share site 52:9 (one distinct site). key()'s real behavior is pinned
-    # functionally: the fold-vs-identity branch is exercised by
+    # Replacing its body with a constant — `Default::default()` is the empty
+    # `Arc<str>` since #629 made the key a shared handle — makes every path intern
+    # to one key, so every node collapses onto a single inode and becomes its own
+    # parent; path_of's `while cur != ROOT` walk then spins forever (observed
+    # canceling the in-diff CI job). One const-return at one site. key()'s real
+    # behavior is pinned functionally: the fold-vs-identity branch is exercised by
     # folded_dir_recase_keeps_survivor_inode (folded) and
     # case_sensitive_keeps_both_dirs_separate (identity).
-    'musefs-core/src/tree\.rs:\d+:\d+: replace InodeAllocator::key -> Cow<.a, str> with',
+    'musefs-core/src/tree\.rs:\d+:\d+: replace InodeAllocator::key -> RenderedPath with',
     # intern const-returns `-> 0` / `-> 1`: same hang-class. A constant inode for
     # every path collides all nodes (inode 0, or ROOT for 1) into a self-parenting
     # cycle, so path_of loops forever. intern's real contract — a fresh inode per
