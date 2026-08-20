@@ -13,9 +13,10 @@ use threadpool::ThreadPool;
 
 use crate::convert::{assemble_dir_listing, to_file_attr};
 use fuser::{
-    BackgroundSession, Config, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request, Session,
+    AccessFlags, BackgroundSession, Config, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    ReplyXattr, Request, Session,
 };
 use musefs_core::CoreError;
 use musefs_core::Fh;
@@ -881,6 +882,18 @@ impl Filesystem for MusefsFs {
     fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
         // Read-only: removing an xattr is unsupported. See `setxattr`.
         reply.error(fuser::Errno::ENOTSUP);
+    }
+
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        // Every entry the daemon presents is accessible to whoever can reach the
+        // mount, so there is no per-inode check to make here. The mount carries
+        // `MountOption::RO`, so the kernel refuses write-intent access before it
+        // reaches us; with `allow_other` it also carries `default_permissions`
+        // and enforces the presented owner/mode bits itself (in which case this
+        // is never called at all). Replied explicitly rather than left to
+        // fuser's default, which logs a `[Not Implemented]` warn at the default
+        // log floor — the same stream the serve-failure lines use (#364, #624).
+        reply.ok();
     }
 
     fn read(
