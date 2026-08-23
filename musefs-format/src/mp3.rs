@@ -510,6 +510,13 @@ fn id3v2_alloc_safe(data: &[u8]) -> bool {
         // Not an ID3v2 tag at offset 0, or a malformed header: skip parsing.
         return false;
     };
+    // `body_end` admits any version the spec's detection pattern allows, since
+    // stepping over a tag needs only its size. Walking its frames does not: an
+    // unrecognised major version has no frame layout we can validate, so the
+    // bounds below would be guesses and the allocation guard meaningless.
+    if !id3v2::frames_are_parseable(data) {
+        return false;
+    }
     let flags = data[5];
     // Extended header (0x40) and unsynchronisation (0x80) complicate frame
     // bounds; skip rather than risk mis-validating.
@@ -2413,10 +2420,28 @@ mod tests {
     }
 
     #[test]
-    fn locate_audio_rejects_unsupported_major_version() {
+    fn locate_audio_steps_over_an_unsupported_major_version() {
+        // A version we cannot parse still declares its own length, and the spec
+        // says to ignore such a tag — so the audio behind it is located rather
+        // than the file rejected. Its frames stay unparsed (`id3v2_alloc_safe`).
         let mut data = Vec::new();
         data.extend_from_slice(b"ID3");
         data.extend_from_slice(&[0x05, 0x00, 0x00]); // major 5 (unsupported)
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        let bounds = locate_audio(&data).expect("the tag is skippable");
+        assert_eq!(bounds.audio_offset, 10);
+        assert!(!id3v2_alloc_safe(&data), "frames are not walked");
+        assert!(read_tags(&data).is_empty());
+    }
+
+    #[test]
+    fn locate_audio_rejects_a_version_byte_of_ff() {
+        // $FF is excluded by the spec's own detection pattern: these bytes are
+        // not an ID3v2 header, so there is no length here to step over.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ID3");
+        data.extend_from_slice(&[0xFF, 0x00, 0x00]);
         data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         data.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
         assert_eq!(locate_audio(&data), Err(FormatError::Malformed));

@@ -58,6 +58,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A leading ID3v2 tag on an MP3 (or a FLAC) is stepped over by its declared size
+  even when its major version is not one musefs can parse the frames of, instead
+  of the whole file being rejected. The ID3v2 header has the same shape in every
+  version, so its size is enough to step over the tag, and the spec's rule for a
+  version a reader does not understand is to ignore it. Such a tag's frames are
+  still not read.
 - A parallel directory walk over a large mount no longer loses entries. Once
   1024 directory handles were open, further `opendir` calls were rejected with
   `ENFILE` — `bfs` over a 200,000-track mount silently lost about 9% of the

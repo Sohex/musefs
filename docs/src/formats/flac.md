@@ -34,7 +34,15 @@ a converter. musefs scans them rather than skipping them:
 
 - The tag run is stepped over to find the `fLaC` marker, and the recorded audio
   offset counts it, so the audio segment still reads the right range out of the
-  backing file.
+  backing file. A tag is stepped over by its **declared size**, whatever its
+  version: the ID3v2 header has the same shape in every version, and the spec's
+  own rule for a version a reader does not understand is to ignore the tag. A
+  header musefs cannot parse the *frames* of is therefore still skipped
+  correctly — only its contents go unread. What is required is that the header
+  matches the spec's detection pattern (`$49 44 33 yy yy xx zz zz zz zz`, both
+  version bytes below `$FF`, every size byte below `$80`) and that its declared
+  length lands on the marker. A header that fails either test contradicts the
+  file it is in, and the file is skipped rather than guessed at.
 - The tag's **text frames and `APIC` pictures are ingested as a fallback**: the
   FLAC's own `VORBIS_COMMENT` / `PICTURE` blocks win, and the ID3 tag only
   supplies keys the FLAC does not define. The rule is all-or-nothing per key, so
