@@ -3,9 +3,10 @@
 ## The SQLite store
 
 `musefs-db/src/schema.rs` defines the schema as an ordered list of migrations
-(`MIGRATIONS`: the `MIGRATION_V1` baseline plus `MIGRATION_V2`, which adds the
-scanner-owned `fingerprint`/`content_hash` columns); `user_version` records the
-schema version (2).
+(`MIGRATIONS`: the `MIGRATION_V1` baseline, `MIGRATION_V2`, which adds the
+scanner-owned `fingerprint`/`content_hash` columns, and `MIGRATION_V3`, which
+widens the `tags.value` and `track_art.description` caps); `user_version`
+records the schema version (3).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 

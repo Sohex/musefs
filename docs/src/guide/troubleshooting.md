@@ -43,6 +43,11 @@ directly to stderr — `warning: mountpoint … is not empty`, the `--file-mode`
 `--dir-mode` write-bit warnings, and the final `musefs: <error>` on a hard
 failure.
 
+They share stderr with the log, but they do not collide with it: the progress
+bar is drawn through a target the log sink suspends around every record, so a
+warning emitted mid-scan clears the bar, prints, and the bar is redrawn beneath
+it. Raising verbosity during an interactive scan is safe.
+
 ## What each level buys
 
 ### `warn` — the default
@@ -51,12 +56,22 @@ failure.
   `lookup(…) failed: …`, and `read(…) rejected: EAGAIN` load-shedding. These
   go through the [warn limiter](#the-serve-path-warn-limiter).
 - Scan-time refusals: `skipping <path>: <reason>`, `skipping <path>: no
-  parseable audio metadata`, and the per-extension breakdown of the skip count
-  (`skipped 42: jpg=20, cue=10, …`).
+  parseable audio metadata`. These are capped per reason — see
+  [Scanning](scanning.md#scan).
+- The end-of-scan failure summaries: `failed 37: unparseable=30, io=5,
+  oversize=2` (these four reasons partition the `failed` count the CLI reports
+  and the exit-`2` signal keys on) and `walk errors 12: unreadable=9,
+  symlink=3` for entries the walk never queued. Neither fires on a healthy
+  library.
 - Degraded-but-correct fallbacks: `incremental tree mutation failed …; falling
   back to full rebuild`, `poll_refresh failed`, `inval_inode(…) failed`.
 - Tag keys dropped during Vorbis synthesis (`track N: dropping tag key … (not a
-  valid field name)`) — these are per-synthesis and are *not* rate-limited.
+  valid field name)`). Like the serve-path failures above, these go through the
+  [warn limiter](#the-serve-path-warn-limiter).
+- An in-place store schema upgrade: `upgrading store schema at … from version 1
+  to version 3; this is irreversible …`. Once per store per schema bump — it is
+  at `warn` precisely so it lands in your scrollback before you ever try to run
+  an older musefs against that store.
 - `scan --revalidate` deprecation.
 - `error` sits above it, reserved for a caught panic in a synthesis or scan
   worker, a scan aborted mid-ingest, and recovered lock poisoning.
@@ -93,6 +108,17 @@ behaviour are all `info`, so by default they are invisible:
   external edits than the changelog ring retains, so it rebuilt the tree
   wholesale instead of applying a diff. Correct, just more expensive.
 
+- The per-extension breakdown of a scan's skip count (`skipped 42: jpg=20,
+  cue=10, …`). This sits at `info` rather than `warn` because cover art and
+  `.cue`/`.log` sidecars are the normal contents of a music library, so it
+  fires on every healthy scan — and a warning that always fires teaches you to
+  filter warnings, which would cost you the failure summary that matters. The
+  `skipped N` total is in the CLI's per-target summary at any level; `-v` gates
+  only the breakdown.
+
+- `store schema at … is now at version 3 (took 0.4s)` — the completion half of
+  the upgrade announcement above.
+
 If a mount is behaving oddly and you only reach for one thing, reach for `-v`.
 
 ### `-vv` (`debug`)
@@ -106,6 +132,9 @@ If a mount is behaving oddly and you only reach for one thing, reach for `-v`.
   signal for this is the `musefs_dir_handle_rejections_total` counter in the
   [metrics surface](tuning.md#metrics); the log line is per-occurrence.
 - Scan-walk detail: duplicate backing targets, symlink handling.
+- Scan skips past their per-reason cap. After the first 10 of a given reason,
+  one line says `further "<reason>" skips are logged at debug …` and the rest
+  go here; the end-of-scan summary still has the totals.
 
 ## The serve-path warn limiter
 
@@ -125,12 +154,24 @@ multiplicity of that message.
 The limiter exists because the failure mode it guards is per-file: a library
 enumeration over a corpus whose backing files have moved would otherwise emit
 one warn per file — hundreds of thousands of lines, tens of MB of log, for a
-single walk. It covers the `reply_errno` warn arm (the failures behind
-`lookup`, `getattr`, `open`, `read`, `readdir`) and the read load-shedding
-`EAGAIN` line. It does not cover scan-time warns or synthesis warns.
+single walk. One budget is shared across the whole serve path: the
+`reply_errno` warn arm (the failures behind `lookup`, `getattr`, `open`,
+`read`, `readdir`), the read load-shedding `EAGAIN` line, and the synthesis
+warns — dropped Vorbis tag keys, over-cap art, art-blob read failures — which
+are emitted per cache miss and so scale the same way. Scan-time warns are
+capped separately and per reason; see [Scanning](scanning.md#scan).
+
+Sharing the budget does not merge the log targets: each message is still
+attributed to the module that raised it (`musefs_fuse`, `musefs_core::reader`,
+`musefs_core::mapping`), so per-crate `RUST_LOG` filtering works as described
+above.
 
 To see every suppressed failure, run at `-vv` (or `RUST_LOG=debug`): nothing is
-discarded, only downgraded.
+discarded, only downgraded. For the rate rather than the events, the
+`musefs_serve_warns_suppressed_total` counter on the
+[metrics surface](tuning.md#metrics) counts every downgraded warn since start —
+a scrape landing between bursts sees a quiet log either way, so the counter is
+what distinguishes a healthy serve path from a throttled one.
 
 ## Reading the logs under systemd
 
