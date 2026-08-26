@@ -379,6 +379,30 @@ const _: () = assert!(
     "LATEST_VERSION must match MIGRATIONS"
 );
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn fire_before_lock() {
+    // Take the hook out before running it: it opens a second connection and
+    // migrates, which re-enters `migrate` on this same thread and would
+    // otherwise recurse until the stack gives out.
+    let hook = BEFORE_LOCK_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = hook {
+        f();
+    }
+}
+#[cfg(test)]
+fn set_before_lock_hook(f: impl FnMut() + 'static) {
+    BEFORE_LOCK_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+#[cfg(test)]
+fn clear_before_lock_hook() {
+    BEFORE_LOCK_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let latest = LATEST_VERSION;
     let current = conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))?;
@@ -396,6 +420,12 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     if current >= latest {
         return Ok(());
     }
+    // Test seam: the window between the read above and the write lock below is
+    // exactly where a competing writer can migrate the store out from under us.
+    // Nothing in a single-process test can land there on its own, so the race
+    // arm of the announcement guard below is only reachable through this hook.
+    #[cfg(test)]
+    fire_before_lock();
     // Use an IMMEDIATE transaction so the write lock is acquired up front. The
     // user_version read below is then authoritative: a second process opening
     // the same database concurrently blocks here until the first commits, then
@@ -525,6 +555,61 @@ mod migration_logging_tests {
     fn store_at_v1(conn: &Connection) {
         conn.execute_batch(super::MIGRATION_V1).unwrap();
         conn.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+
+    /// The announcement fires only for an upgrade this call actually performs.
+    /// Another writer can migrate the store while we wait for the write lock, in
+    /// which case the version read *under* the lock is already the latest and
+    /// the loop applies nothing — announcing there would report an irreversible
+    /// upgrade that this process did not do, on a store it did not change.
+    ///
+    /// Only reachable through the before-lock seam: the pre-lock read has to see
+    /// an old version and the post-lock read a current one, which no
+    /// single-threaded test can arrange otherwise.
+    #[test]
+    fn a_migration_lost_to_a_competing_writer_says_nothing() {
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                super::clear_before_lock_hook();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        let mut conn = Connection::open(&path).unwrap();
+        store_at_v1(&conn);
+
+        // Stand in for the competing process: migrate the store to the latest
+        // version on a second connection, after our pre-lock read but before we
+        // take the write lock.
+        let racer_path = path.clone();
+        let captured = capture();
+        super::set_before_lock_hook(move || {
+            let mut racer = Connection::open(&racer_path).unwrap();
+            super::migrate(&mut racer).unwrap();
+            // The racer re-enters `migrate` on this thread, so its own — entirely
+            // correct — announcement lands in the same capture buffer. Drop it,
+            // leaving only whatever the call that lost the race goes on to say.
+            RECORDS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        });
+        let _guard = HookGuard;
+
+        super::migrate(&mut conn).unwrap();
+        let records = captured.records();
+
+        assert!(
+            records.is_empty(),
+            "a call that migrated nothing must say nothing; got {records:?}"
+        );
+        // The store is still correctly migrated — by the racer, not by us.
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, super::LATEST_VERSION);
     }
 
     #[test]
