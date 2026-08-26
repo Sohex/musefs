@@ -52,6 +52,12 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- A leading ID3v2 tag on an MP3 (or a FLAC) is stepped over by its declared size
+  even when its major version is not one musefs can parse the frames of, instead
+  of the whole file being rejected. The ID3v2 header has the same shape in every
+  version, so its size is enough to step over the tag, and the spec's rule for a
+  version a reader does not understand is to ignore it. Such a tag's frames are
+  still not read.
 - Over-cap `opendir` degrades to a stateless directory handle instead of
   replying `ENFILE` ([#616](https://github.com/Sohex/musefs/issues/616)). The 1024-handle cap was assumed to sit
   well above any real client, but `bfs` — an ordinary parallel `find`, and the

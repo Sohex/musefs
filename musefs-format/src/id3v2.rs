@@ -50,7 +50,11 @@ pub(crate) fn body_end(data: &[u8]) -> Result<Option<usize>> {
     if data.len() < HEADER_LEN || &data[0..3] != b"ID3" {
         return Ok(None);
     }
-    if !matches!(data[3], 2..=4) {
+    // The spec's own detection pattern is `$49 44 33 yy yy xx zz zz zz zz`,
+    // where neither version byte is $FF and every size byte is below $80. Bytes
+    // that fail it are not an ID3v2 tag of *any* version, so there is no
+    // declared length here worth trusting.
+    if data[3] == 0xFF || data[4] == 0xFF {
         return Err(FormatError::Malformed);
     }
     // A well-formed synchsafe size has the high bit clear in every byte; reject
@@ -58,9 +62,23 @@ pub(crate) fn body_end(data: &[u8]) -> Result<Option<usize>> {
     if data[6..HEADER_LEN].iter().any(|&b| b & 0x80 != 0) {
         return Err(FormatError::Malformed);
     }
+    // Deliberately no check that the version is one we can parse: the header is
+    // laid out the same way in every version, so its size is enough to step
+    // *over* the tag. Stepping *into* it needs the frame layout, which is what
+    // [`frames_are_parseable`] gates.
     Ok(Some(
         HEADER_LEN + synchsafe_decode(&data[6..HEADER_LEN]) as usize,
     ))
+}
+
+/// Is this tag's major version one whose frame layout the crate knows? Callers
+/// that parse frame contents must gate on this; callers that only need to know
+/// where the tag ends must not, or they reject a tag the spec says to skip.
+///
+/// The ID3v2 rule for a version you do not understand is to ignore the tag —
+/// which means stepping over it by its declared size, not refusing the file.
+pub(crate) fn frames_are_parseable(data: &[u8]) -> bool {
+    data.len() >= HEADER_LEN && matches!(data[3], 2..=4)
 }
 
 /// Total on-disk length of the ID3v2 tag at the front of `data`: header, body,
@@ -70,7 +88,9 @@ pub(crate) fn total_len(data: &[u8]) -> Result<Option<usize>> {
     let Some(end) = body_end(data)? else {
         return Ok(None);
     };
-    let has_footer = data[5] & 0x10 != 0;
+    // Only ID3v2.4 defines a footer, so only there does that flag bit mean one
+    // is present. In an unknown version the flags are not ours to interpret.
+    let has_footer = data[3] == 4 && data[5] & 0x10 != 0;
     Ok(Some(if has_footer { end + FOOTER_LEN } else { end }))
 }
 
@@ -192,14 +212,43 @@ mod tests {
     }
 
     #[test]
-    fn bad_version_and_size_are_malformed() {
-        let mut bad_version = header(4, 0);
-        bad_version[3] = 9;
-        assert!(leading_tags_len(&bad_version).is_err());
+    fn a_version_we_cannot_parse_is_still_stepped_over() {
+        // The header layout does not vary by version, so an unknown one still
+        // says how long it is. The spec's rule for a version you do not
+        // understand is to ignore the tag, and ignoring it means skipping it.
+        let mut unknown = tag(20, 0);
+        unknown[3] = 9;
+        assert_eq!(
+            leading_tags_len(&unknown).unwrap(),
+            Extent::Complete(HEADER_LEN + 20)
+        );
+        assert!(!frames_are_parseable(&unknown), "but not parsed");
+    }
+
+    #[test]
+    fn bytes_outside_the_detection_pattern_are_malformed() {
+        // `$49 44 33 yy yy xx zz zz zz zz`, yy < $FF and zz < $80. Fail that and
+        // this is not an ID3v2 tag of any version, so its "size" means nothing.
+        let mut bad_major = header(4, 0);
+        bad_major[3] = 0xFF;
+        assert!(leading_tags_len(&bad_major).is_err());
+
+        let mut bad_revision = header(4, 0);
+        bad_revision[4] = 0xFF;
+        assert!(leading_tags_len(&bad_revision).is_err());
 
         let mut bad_size = header(4, 0);
         bad_size[7] = 0x80; // high bit set in a synchsafe byte
         assert!(leading_tags_len(&bad_size).is_err());
+    }
+
+    #[test]
+    fn only_v2_4_has_a_footer() {
+        // Bit 4 of the flags means "footer present" in ID3v2.4 and nothing at
+        // all elsewhere, so it must not add ten bytes to a v2.3 tag's length.
+        let mut v23 = header(20, 0x10);
+        v23[3] = 3;
+        assert_eq!(total_len(&v23).unwrap(), Some(HEADER_LEN + 20));
     }
 
     #[test]

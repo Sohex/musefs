@@ -240,3 +240,64 @@ fn bounded_widening_matches_the_full_probe_over_a_large_tag() {
     assert_eq!(oracle.1, 512, "the oracle located the audio");
     assert_eq!(oracle, rows(&bounded_db));
 }
+
+#[test]
+fn scans_a_flac_behind_a_tag_whose_version_we_cannot_parse() {
+    // `ID3` and nothing but zeros: the spec's detection pattern accepts it and
+    // its declared size lands exactly on `fLaC`, so it is stepped over like any
+    // other tag. Only its frames go unread — version 0 has no layout we know.
+    let dir = tempfile::tempdir().unwrap();
+    let audio = vec![0xCD; 4096];
+    let mut bytes = vec![b'I', b'D', b'3', 0, 0, 0, 0, 0, 0, 0];
+    bytes.extend(make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &audio,
+    ));
+    std::fs::write(dir.path().join("a.flac"), &bytes).unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+
+    assert_eq!(stats.scanned, 1, "the file is no longer skipped");
+    assert_eq!(stats.failed, 0);
+    let track = &db.list_tracks().unwrap()[0];
+    assert_eq!(track.bounds.audio_length(), audio.len() as u64);
+    assert_eq!(
+        track.bounds.audio_offset(),
+        (bytes.len() - audio.len()) as u64
+    );
+    let tags = db.get_tags(track.id).unwrap();
+    assert!(tags.iter().any(|t| t.key == "title" && t.value == "Song"));
+}
+
+#[test]
+fn serves_untouched_audio_from_behind_an_unparseable_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = vec![0xCD; 4096];
+    let mut bytes = vec![b'I', b'D', b'3', 0, 0, 0, 0, 0, 0, 0];
+    bytes.extend(make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice", "TITLE=Song"])),
+        ],
+        &audio,
+    ));
+    std::fs::write(dir.path().join("a.flac"), &bytes).unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let fs = Musefs::open(db, config()).unwrap();
+
+    let artist = fs.lookup(VirtualTree::ROOT, "Alice").unwrap();
+    let (_, inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let served = read_whole(&fs, inode);
+
+    assert_eq!(&served[0..4], b"fLaC", "no ID3 prefix on the served file");
+    metaflac::Tag::read_from(&mut std::io::Cursor::new(&served)).expect("valid FLAC");
+    let scan = musefs_format::flac::locate_audio(&served).unwrap();
+    let start = usize::try_from(scan.audio_offset).unwrap();
+    assert_eq!(&served[start..], &audio[..]);
+}

@@ -248,3 +248,67 @@ fn bounded_accepts_metadata_that_fills_the_whole_file() {
     assert_eq!(scan.audio_offset, file.len() as u64);
     assert_eq!(scan.audio_length, 0);
 }
+
+#[test]
+fn steps_over_a_tag_whose_version_we_cannot_parse() {
+    // `ID3` followed by nothing but zeros — "blank header" read literally. It
+    // satisfies the spec's detection pattern (neither version byte is $FF, every
+    // size byte is below $80) and declares a zero-length body, so the `fLaC`
+    // marker is exactly ten bytes in. There is nothing to guess at here: musefs
+    // used to reject it only because version 0 is not a version it can parse,
+    // which is a question about frames, not about where the tag ends.
+    let audio = vec![0xAB; 128];
+    let prefix = vec![b'I', b'D', b'3', 0, 0, 0, 0, 0, 0, 0];
+    let file = id3_then_flac(&prefix, &["TITLE=Blank"], &audio);
+
+    let scan = locate_audio(&file).unwrap();
+    assert_eq!(scan.audio_offset, (file.len() - audio.len()) as u64);
+    assert_eq!(scan.audio_length, audio.len() as u64);
+    let comments = read_vorbis_comments(&file).unwrap();
+    assert!(comments.contains(&("title".to_string(), "Blank".to_string())));
+}
+
+#[test]
+fn an_unparseable_version_still_bounds_a_non_empty_tag() {
+    // The declared size is what does the work, so it has to be honoured for an
+    // unknown version too — not treated as an empty tag.
+    let audio = vec![0xAB; 128];
+    let mut prefix = vec![b'I', b'D', b'3', 9, 0, 0, 0, 0, 0, 64];
+    prefix.extend(std::iter::repeat_n(0u8, 64));
+    let file = id3_then_flac(&prefix, &[], &audio);
+
+    let scan = locate_audio(&file).unwrap();
+    assert_eq!(scan.audio_offset, (file.len() - audio.len()) as u64);
+}
+
+#[test]
+fn still_rejects_a_version_byte_of_ff() {
+    // $FF is the one version byte the spec's detection pattern excludes, so
+    // these bytes are not a tag header and the file is not FLAC.
+    let file = id3_then_flac(
+        &[b'I', b'D', b'3', 0xFF, 0, 0, 0, 0, 0, 0],
+        &[],
+        &[0xAB; 128],
+    );
+    assert_eq!(locate_audio(&file).unwrap_err(), FormatError::Malformed);
+}
+
+#[test]
+fn still_rejects_a_tag_whose_declared_length_misses_the_marker() {
+    // Slack between the tag's declared end and `fLaC`. The header contradicts
+    // the file, and recovering would mean searching for the marker — guessing.
+    let mut prefix = blank_id3(16);
+    prefix.extend(std::iter::repeat_n(0u8, 1024));
+    let file = id3_then_flac(&prefix, &[], &[0xAB; 128]);
+    assert_eq!(locate_audio(&file).unwrap_err(), FormatError::NotFlac);
+}
+
+#[test]
+fn still_rejects_a_non_synchsafe_size() {
+    // A size written as a plain big-endian integer sets a high bit the spec's
+    // detection pattern forbids, so the declared length cannot be trusted.
+    let mut prefix = vec![b'I', b'D', b'3', 3, 0, 0, 0, 0, 0, 200];
+    prefix.extend(std::iter::repeat_n(0u8, 200));
+    let file = id3_then_flac(&prefix, &[], &[0xAB; 128]);
+    assert_eq!(locate_audio(&file).unwrap_err(), FormatError::Malformed);
+}
