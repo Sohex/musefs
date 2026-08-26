@@ -17,7 +17,7 @@ from .constants import (
 )
 from .errors import ScanError, SchemaMismatch
 from .paths import realpath_key
-from .scan import run_scan
+from .scan import ScanResult, run_scan
 from .store import (
     TagRow,
     check_schema_version,
@@ -45,6 +45,7 @@ __all__ = [
     "SCAN_TIMEOUT_SECONDS",
     "SchemaMismatch",
     "ScanError",
+    "ScanResult",
     "realpath_key",
     "run_scan",
     "connect",

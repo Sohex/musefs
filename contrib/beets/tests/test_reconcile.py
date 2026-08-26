@@ -6,6 +6,7 @@ import pytest
 pytest.importorskip("beets")
 
 from conftest import insert_track  # noqa: E402,F401
+from musefs_common import ScanResult  # noqa: E402
 from musefs_common import connect as musefs_connect  # noqa: E402
 
 from beetsplug import musefs as musefs_mod  # noqa: E402
@@ -144,6 +145,59 @@ def test_run_scan_revalidate_passes_prune(monkeypatch):
     assert captured["force"] is False
     assert captured["prune"] is True
     assert captured["timeout"] == musefs_mod.SCAN_TIMEOUT_SECONDS == 120
+
+
+def _partial_result():
+    """What `run_scan` returns when the batch committed but a file didn't parse."""
+    return ScanResult(
+        binary="musefs",
+        target="/a.flac",
+        returncode=2,
+        partial=True,
+        stderr="skipping /b.flac: no parseable audio metadata",
+    )
+
+
+def test_run_scan_partial_warns_instead_of_raising(monkeypatch):
+    """Exit 2 is a partial success, not a failure: it must not abort, and it must
+    be visible — beets hides plugin warnings at default verbosity (#647)."""
+    result = _partial_result()
+    monkeypatch.setattr(musefs_mod, "run_scan", lambda *a, **kw: result)
+    prints = _capture_prints(monkeypatch)
+    plugin = MusefsPlugin.__new__(MusefsPlugin)
+    plugin._bin = lambda: "musefs"
+
+    assert plugin._run_scan("/db.sqlite", ["/a.flac"], force=True) is result
+    assert len(prints) == 1
+    assert "no parseable audio metadata" in prints[0][0]
+
+
+def test_run_scan_clean_scan_prints_nothing(monkeypatch):
+    monkeypatch.setattr(
+        musefs_mod, "run_scan", lambda *a, **kw: ScanResult(binary="musefs", target="/a.flac")
+    )
+    prints = _capture_prints(monkeypatch)
+    plugin = MusefsPlugin.__new__(MusefsPlugin)
+    plugin._bin = lambda: "musefs"
+    plugin._run_scan("/db.sqlite", ["/a.flac"], force=True)
+
+    assert prints == []
+
+
+def test_reconcile_pending_still_syncs_after_a_partial_scan(monkeypatch):
+    """The whole point of #647: one unparseable file must not silently skip the
+    sync of everything that did scan."""
+    monkeypatch.setattr(musefs_mod, "run_scan", lambda *a, **kw: _partial_result())
+    _capture_prints(monkeypatch)
+    synced = []
+    plugin = _plugin(monkeypatch)
+    plugin._autoscan = lambda: True
+    plugin._bin = lambda: "musefs"
+    plugin._sync = lambda db, items, **kwargs: synced.append(items)
+    plugin._reconcile_pending()
+
+    assert len(synced) == 1
+    assert plugin._log.warnings == []  # a partial scan is not an error
 
 
 def test_reconcile_pending_autoscan_forces_scan(monkeypatch):
