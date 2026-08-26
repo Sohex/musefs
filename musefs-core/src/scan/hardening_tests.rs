@@ -1365,3 +1365,52 @@ fn ingest_bulk_assigns_sequential_structural_ordinals_per_kind() {
     assert_eq!(got[1].ordinal, 1);
     assert_eq!(got[1].body, vec![0xB2]);
 }
+
+// --- #655 / #651: mutation-gate survivors from PR #656 ---
+
+/// `uncommitted_total` sums the two ways a dispatched file can finish without a
+/// commit. A difference would pass every test that can drive the pipeline
+/// (`raced` is always 0 there — the probe race hook is thread-local and the
+/// probes run on worker threads), so the sum is pinned directly.
+#[test]
+fn uncommitted_total_sums_failures_and_races() {
+    assert_eq!(super::uncommitted_total(3, 2), 5, "failures plus races");
+    // The mutation this exists to kill: a difference agrees on every input
+    // where one side is zero, which is every case a pipeline test can build.
+    assert_ne!(super::uncommitted_total(3, 2), 3 - 2);
+    assert_eq!(super::uncommitted_total(0, 4), 4, "races alone still count");
+    assert_eq!(
+        super::uncommitted_total(4, 0),
+        4,
+        "failures alone still count"
+    );
+    assert_eq!(super::uncommitted_total(0, 0), 0);
+}
+
+/// The end-of-scan failure breakdown has to actually reach the log. The
+/// `failed_summary`/`walk_summary` formatters are unit-tested above, but
+/// nothing asserted that `run_pipeline` emits them — so stubbing the emission
+/// out entirely went unnoticed.
+#[test]
+fn scan_emits_the_failure_breakdown_to_the_log() {
+    crate::warn_limit::log_capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    // Supported extension, unparseable content: counted `failed`, so the
+    // breakdown must name the `unparseable` bucket.
+    for i in 0..3 {
+        std::fs::write(dir.path().join(format!("broken{i}.flac")), b"not a flac").unwrap();
+    }
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory_with(&db, dir.path(), &ScanOptions::default()).unwrap();
+    assert_eq!(stats.failed, 3);
+
+    // Asserted by substring rather than by count: the capture buffer is shared
+    // across this binary's parallel tests. Presence is enough to kill the
+    // stub-the-emission mutant, which would leave the buffer without any
+    // breakdown line at all.
+    let breakdowns = crate::warn_limit::log_capture::messages_containing("unparseable=");
+    assert!(
+        breakdowns.iter().any(|m| m.starts_with("failed ")),
+        "expected a `failed N: unparseable=N` breakdown; captured: {breakdowns:?}"
+    );
+}

@@ -1961,6 +1961,19 @@ fn log_failure_summaries(failures: &FailureTally) {
     }
 }
 
+/// Dispatched files that finished without being committed: probe failures plus
+/// races. Both leave the writer with nothing to persist, so both have to
+/// advance the progress sequence for it to reach the walked total (#655).
+///
+/// A free function rather than an inline sum so the arithmetic is reachable
+/// from a unit test: the pipeline cannot produce `raced > 0` under test at all,
+/// because the probe's mid-read race hook is a `thread_local!` and the probes
+/// run on worker threads the test never touches. Left inline, the sum would be
+/// indistinguishable from a difference in every test that can be written.
+fn uncommitted_total(failed: u64, raced: u64) -> u64 {
+    failed + raced
+}
+
 /// Back-compat shim used by the CLI and existing tests.
 pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
     scan_directory_with(db, root, &ScanOptions::default())
@@ -2171,7 +2184,10 @@ fn run_pipeline(
     // tracks failures as they happen) and once more after the final flush (so a
     // tail of failures with no commit behind them still lands).
     let catch_up = |finished: &mut u64, failures_seen: &mut u64| {
-        let tallied = failed.load(Ordering::Relaxed) + raced.load(Ordering::Relaxed);
+        let tallied = uncommitted_total(
+            failed.load(Ordering::Relaxed),
+            raced.load(Ordering::Relaxed),
+        );
         while *failures_seen < tallied {
             *failures_seen += 1;
             *finished += 1;
