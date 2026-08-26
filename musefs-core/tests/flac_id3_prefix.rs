@@ -301,3 +301,58 @@ fn serves_untouched_audio_from_behind_an_unparseable_tag() {
     let start = usize::try_from(scan.audio_offset).unwrap();
     assert_eq!(&served[start..], &audio[..]);
 }
+
+/// #644: merging an ID3 prefix into a FLAC's own comments is the one route by
+/// which a scanned FLAC's tags can outgrow what a `VORBIS_COMMENT` block can
+/// hold — ID3v2's synchsafe tag size is 256 MiB, FLAC's block length is 24 bits.
+/// Without a scan-time check such a file lands in the store and then serves
+/// `EIO` on every read, present in the mount and unreadable with nothing in the
+/// log to explain it. It must fail at scan instead, naming the file, and must
+/// not take the rest of the directory down with it.
+#[test]
+fn a_flac_whose_id3_prefix_overflows_the_comment_block_fails_only_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let audio = vec![0xCD; 4096];
+
+    // Two ID3 text frames, each comfortably *under* the per-tag cap but together
+    // past FLAC's 24-bit block ceiling, under keys the FLAC itself does not
+    // carry so `fill_absent_keys` appends both. Splitting them is deliberate: a
+    // single over-ceiling frame would trip the per-value cap instead, and this
+    // test is about the total.
+    let ceiling = usize::try_from(musefs_format::flac::MAX_BLOCK_BODY).unwrap();
+    let half = "z".repeat(ceiling * 6 / 10);
+    let mut bytes = id3_tag(&[("TIT2", &half), ("TALB", &half)]);
+    bytes.extend(make_flac(
+        &[
+            (0, streaminfo_body()),
+            (4, vorbis_comment_body("v", &["ARTIST=Alice"])),
+        ],
+        &audio,
+    ));
+    std::fs::write(dir.path().join("big.flac"), &bytes).unwrap();
+
+    std::fs::write(
+        dir.path().join("ok.flac"),
+        make_flac(
+            &[
+                (0, streaminfo_body()),
+                (4, vorbis_comment_body("v", &["ARTIST=Bob", "TITLE=Fine"])),
+            ],
+            &audio,
+        ),
+    )
+    .unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).expect("one bad file must not abort the scan");
+
+    assert_eq!(stats.failed, 1, "the overflowing file is counted as failed");
+    assert_eq!(stats.scanned, 1, "its neighbour still lands");
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert!(
+        tracks[0].backing_path.ends_with("ok.flac"),
+        "got {}",
+        tracks[0].backing_path
+    );
+}

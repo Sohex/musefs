@@ -31,6 +31,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The `tags.value` cap rises from 256 KiB to 16 MiB − 1, and
+  `track_art.description` from 1 KiB to 8 KiB (schema `MIGRATION_V3`). The new
+  tag cap is FLAC's 24-bit metadata-block ceiling — the largest tag synthesis
+  could ever serve — so the store no longer refuses a tag the format itself can
+  carry. Existing stores upgrade in place, and automatically, on the next
+  `musefs scan` or `musefs mount`: both open the store read-write and run the
+  migration, which only widens the constraints and so carries every existing row
+  across. No rescan of audio is needed and nothing has to be regenerated.
+- A backing file whose metadata exceeds a store limit now fails **that file**
+  instead of being stored with the offending part quietly dropped. Oversize
+  embedded art and binary tags were previously omitted from an otherwise-stored
+  track with only a `warn` to show for it, which is easy to lose in a scan of
+  ten thousand files and leaves a mount silently missing data. Such a file is
+  now logged with its path, what was too big, its size and the limit, counted
+  `failed`, and skipped; the rest of the directory scans normally.
 - Serve-path failure warnings are rate-limited: a burst of 10 per 30-second
   window logs at warn, the rest drop to debug, and the first warn of each new
   window carries the suppressed count. A library walk over missing backing
@@ -58,6 +73,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A tag larger than the store's cap no longer aborts the entire scan
+  ([#644](https://github.com/Sohex/musefs/issues/644)). The scanner had no
+  length check on text tags, so an over-cap value reached the DB `CHECK` inside
+  a batch commit and failed the whole run with
+  `CHECK constraint failed: length(CAST(value AS BLOB)) <= 262144` — naming
+  neither the offending file nor what the number meant. Every cap the scanner
+  can trip is now checked in one place before anything is written, and a
+  violation fails only that file, with a message naming it. The same applies to
+  the `tags.key`, `art.mime` and `track_art.description` caps, which had the
+  identical unattributed-abort failure mode. Should a store write still fail
+  fatally, the error now names the file it died on.
+- A FLAC whose tags outgrow what a `VORBIS_COMMENT` block can hold is rejected
+  at scan time rather than stored and then served `EIO` on every read. This is
+  reachable by merging a leading ID3v2 tag's fields into a FLAC's own comments
+  ([#602](https://github.com/Sohex/musefs/issues/602)): ID3v2's tag size is
+  synchsafe 28-bit (256 MiB) while a FLAC metadata block is 24-bit.
 - A leading ID3v2 tag on an MP3 (or a FLAC) is stepped over by its declared size
   even when its major version is not one musefs can parse the frames of, instead
   of the whole file being rejected. The ID3v2 header has the same shape in every

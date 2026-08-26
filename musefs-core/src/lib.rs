@@ -43,4 +43,20 @@ mod cross_layer_caps {
             "db structural body cap must equal FLAC's 24-bit block limit",
         );
     }
+
+    /// #644 put the `tags.value` cap *at* FLAC's block ceiling rather than below
+    /// it, and that equality is load-bearing twice over. It is why the cap can
+    /// be described as inherited from the format rather than invented, and it is
+    /// what makes an over-cap tag structurally unreachable through a legal FLAC:
+    /// the whole `VORBIS_COMMENT` body is length-prefixed with 24 bits, so no
+    /// comment inside it can exceed the cap. Drop the cap below this and the
+    /// crash class #644 reported becomes reachable again for stock FLAC files.
+    #[test]
+    fn tag_value_cap_is_not_below_the_flac_block_limit() {
+        assert!(
+            u64::try_from(musefs_db::limits::MAX_TAG_VALUE_LEN).unwrap()
+                >= musefs_format::flac::MAX_BLOCK_BODY,
+            "a legal FLAC comment must never be too large for the store to hold",
+        );
+    }
 }

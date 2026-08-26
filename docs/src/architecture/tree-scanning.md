@@ -85,12 +85,28 @@ collect supported audio files, probe each (format detection → audio
 offset/length, tags, pictures, structural blocks) on a parallel probe
 pipeline feeding a single DB writer, committing in batches. Probing reads
 are bounded — the scanner never slurps whole files — and ingestion caps
-per-item sizes (`MAX_ART_BYTES`, `MAX_BINARY_TAG_BYTES`) so a crafted file
-cannot balloon the store. An over-cap picture or binary tag is dropped and
-logged (`RUST_LOG=warn`) rather than vanishing silently, so a track that
-appears to have lost its cover art has an explanation in the logs; a
-supported-extension file that fails to parse, or errors mid-probe, is
-likewise logged with the reason and counted `failed`.
+per-item sizes (`MAX_ART_BYTES`, `MAX_BINARY_TAG_BYTES`, and the store's
+`tags.key`/`tags.value`/`art.mime`/`track_art.description` limits) so a crafted
+file cannot balloon the store.
+
+`check_storable` applies every one of those caps in a single place, before
+anything is written. **A file that exceeds any of them fails — that file, not
+the scan.** It is logged with its path, what was too big, its size, and the
+limit (`RUST_LOG=warn`), and counted `failed`; the rest of the directory scans
+normally. Nothing partial is stored for it, so the mount never contains a track
+that is quietly missing a tag or its cover art. FLAC gets one extra check: tags
+merged from a leading ID3v2 tag (#602) can push the total past what a
+`VORBIS_COMMENT` block can hold, which would scan clean and then serve `EIO` on
+every read, so that total is checked at scan time too. A supported-extension
+file that fails to parse, or errors mid-probe, is likewise logged with the
+reason and counted `failed`.
+
+Before v1.4 an over-cap picture or binary tag was instead dropped with a warning
+and the rest of the track stored. That left users with a mount quietly missing
+data behind a `warn` that is easy to lose in a scan of ten thousand files, and
+it did not cover text tags at all — an over-cap `tags.value` reached the DB
+`CHECK` and aborted the entire scan with an error naming neither the file nor
+the limit (#644).
 
 Symlinks are **not followed by default**: a symlinked file or directory is
 logged (`RUST_LOG=info`/`warn`) and skipped, which keeps the walk immune to

@@ -8,6 +8,9 @@ use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, 
 use crate::byte_budget::ByteBudget;
 use crate::error::Result;
 use crate::freshness::BackingStamp;
+use musefs_db::limits::{
+    MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
+};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
@@ -27,14 +30,15 @@ const MAX_WIDEN_RETRIES: usize = 8;
 /// giant `NeedMore` widen.
 pub(crate) const MAX_PROBE_BYTES: u64 = 64 << 20; // 64 MiB
 
-/// The artwork-size ceiling. Enforced here at ingest (oversize scanned art is
-/// dropped) and at resolve in `mapping::track_art_to_inputs` (oversize art from
-/// any writer is rejected). Sized to clear FLAC's 24-bit block length with
-/// headroom for the picture-block framing.
+/// The artwork-size ceiling. Enforced here at ingest (a file carrying oversize
+/// art fails, see [`check_storable`]) and at resolve in
+/// `mapping::track_art_to_inputs` (oversize art from any writer is rejected).
+/// Sized to clear FLAC's 24-bit block length with headroom for the
+/// picture-block framing.
 pub(crate) const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 
-/// Per-frame cap for opaque binary tags, mirroring `MAX_ART_BYTES`. Oversize
-/// payloads (e.g. a GEOB embedding a multi-MB file) are logged-and-skipped.
+/// Per-frame cap for opaque binary tags, mirroring `MAX_ART_BYTES`. A file with
+/// an oversize payload (e.g. a GEOB embedding a multi-MB file) fails.
 const MAX_BINARY_TAG_BYTES: usize = MAX_ART_BYTES;
 
 /// Outcome of probing one backing file. `Unparseable` is a supported-extension
@@ -528,7 +532,13 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
         let bounds = mp4::locate_audio(bytes).ok()?;
         let (pictures, art_drops) = mp4::read_pictures_reporting(bytes, MAX_ART_BYTES);
         let (binary_tags, bin_drops) = mp4::read_binary_tags_reporting(bytes, MAX_BINARY_TAG_BYTES);
-        log_mp4_oversize_drops(path, &art_drops, &bin_drops);
+        // Oversize `covr`/`----` payloads fail the file (#644). This oracle path
+        // has no error channel, so it reports the same verdict as `None` — which
+        // its caller already counts as `failed`, matching the bounded probe.
+        if let Some(e) = mp4_oversize_error(path, &art_drops, &bin_drops) {
+            log::warn!("skipping {e}");
+            return None;
+        }
         Some(Probed {
             format: Format::M4a,
             audio_offset: bounds.audio_offset,
@@ -665,7 +675,14 @@ fn probe_body(
         let (pictures, art_drops) = mp4::read_pictures_reporting(&scan.moov, MAX_ART_BYTES);
         let (binary_tags, bin_drops) =
             mp4::read_binary_tags_reporting(&scan.moov, MAX_BINARY_TAG_BYTES);
-        log_mp4_oversize_drops(path, &art_drops, &bin_drops);
+        // Oversize `covr`/`----` payloads fail the file (#644). Reported as
+        // "no probe result", which the caller counts as `failed` — the same
+        // verdict `check_storable` produces for every other format, reached one
+        // layer earlier because the payload is never materialized here.
+        if let Some(e) = mp4_oversize_error(path, &art_drops, &bin_drops) {
+            log::warn!("skipping {e}");
+            return Ok(None);
+        }
         return Ok(Some(Probed {
             format: Format::M4a,
             audio_offset: scan.mdat_payload_offset,
@@ -928,44 +945,170 @@ fn key_passes_floor(key: &str) -> bool {
     !key.is_empty() && key.bytes().all(|b| b >= 0x20)
 }
 
-/// Drops embedded pictures over [`MAX_ART_BYTES`], logging each so a cover that
-/// vanishes from the synthesized view is explained rather than silent (#284).
-/// Filtering here, before the caller enumerates, keeps stored art ordinals
-/// gap-free. Note: the mp4 `covr` path caps oversize art earlier, inside
-/// `mp4::read_pictures`, so those drops never reach this filter.
-fn accept_pictures(abs_path: &str, pictures: Vec<EmbeddedPicture>) -> Vec<EmbeddedPicture> {
-    pictures
-        .into_iter()
-        .filter(|p| {
-            if p.data.len() > MAX_ART_BYTES {
-                log::warn!(
-                    "{abs_path}: dropping embedded {} art ({} bytes), over the {MAX_ART_BYTES}-byte cap",
-                    p.mime,
-                    p.data.len(),
-                );
-                return false;
-            }
-            true
-        })
-        .collect()
+/// Every store cap the scanner can trip on an honest read of a legal file,
+/// checked in one place before anything is written (#644).
+///
+/// A violation fails **that file**, not the scan. The caps are DB `CHECK`
+/// constraints, so before this existed an over-cap tag surfaced as
+/// `CHECK constraint failed: ...` from inside a batch commit — fatal, and with
+/// the per-file context already gone. Checking here instead means the caller
+/// counts one `failed` file, names it, and keeps going.
+///
+/// It also replaces the older drop-and-warn treatment of oversize art and
+/// binary tags (#284): silently omitting a payload from the store leaves the
+/// user with a mount that is quietly missing data, and a `warn` buried in a
+/// scan of ten thousand files is easy to miss. Refusing the file is louder and
+/// leaves no state nobody asked for.
+///
+/// Units are not uniform and the messages say which applies: SQLite's `length()`
+/// counts **characters** on a TEXT column but **bytes** on a blob, and the
+/// schema deliberately uses `length(CAST(value AS BLOB))` for `tags.value` so
+/// its cap is a real memory bound (#505).
+fn check_storable(abs_path: &str, probed: &Probed) -> Result<()> {
+    // The two scanner-owned caps are `usize` consts; the DB's are `i64` because
+    // they are compared against SQLite `length()`. Convert once here so the
+    // per-field checks below all read the same way.
+    let art_cap = i64::try_from(MAX_ART_BYTES).expect("art cap fits i64");
+    let binary_cap = i64::try_from(MAX_BINARY_TAG_BYTES).expect("binary tag cap fits i64");
+    let too_large = |item: String, len: usize, cap: i64, unit: &'static str| {
+        crate::error::CoreError::TrackFieldTooLarge {
+            path: abs_path.to_string(),
+            item,
+            len: len as u64,
+            cap: cap.unsigned_abs(),
+            unit,
+        }
+    };
+
+    for (key, value) in &probed.tags {
+        // Skipped keys are not stored, so they cannot violate anything.
+        if !key_passes_floor(key) {
+            continue;
+        }
+        let key_chars = key.chars().count();
+        if i64::try_from(key_chars).unwrap_or(i64::MAX) > MAX_TAG_KEY_LEN {
+            return Err(too_large(
+                format!("tag key {key:?}"),
+                key_chars,
+                MAX_TAG_KEY_LEN,
+                "characters",
+            ));
+        }
+        if i64::try_from(value.len()).unwrap_or(i64::MAX) > MAX_TAG_VALUE_LEN {
+            return Err(too_large(
+                format!("tag {key:?}"),
+                value.len(),
+                MAX_TAG_VALUE_LEN,
+                "bytes",
+            ));
+        }
+    }
+
+    for b in &probed.binary_tags {
+        if b.payload.len() > MAX_BINARY_TAG_BYTES {
+            return Err(too_large(
+                format!("binary tag {:?}", b.key),
+                b.payload.len(),
+                binary_cap,
+                "bytes",
+            ));
+        }
+    }
+
+    for p in &probed.pictures {
+        if p.data.len() > MAX_ART_BYTES {
+            return Err(too_large(
+                format!("embedded {} art", p.mime),
+                p.data.len(),
+                art_cap,
+                "bytes",
+            ));
+        }
+        let mime_chars = p.mime.chars().count();
+        if i64::try_from(mime_chars).unwrap_or(i64::MAX) > MAX_ART_MIME_LEN {
+            return Err(too_large(
+                "art MIME type".to_string(),
+                mime_chars,
+                MAX_ART_MIME_LEN,
+                "characters",
+            ));
+        }
+        let desc_chars = p.description.chars().count();
+        if i64::try_from(desc_chars).unwrap_or(i64::MAX) > MAX_ART_DESCRIPTION_LEN {
+            return Err(too_large(
+                format!("description of the embedded {} art", p.mime),
+                desc_chars,
+                MAX_ART_DESCRIPTION_LEN,
+                "characters",
+            ));
+        }
+    }
+
+    check_metadata_fits_format(abs_path, probed)
 }
 
-/// Filters embedded binary tags to those worth storing, logging oversize drops
-/// (#284). Empty payloads carry nothing to serve, so they are dropped silently;
-/// payloads over [`MAX_BINARY_TAG_BYTES`] are a lossy drop and get a warning.
-fn accept_binary_tags(abs_path: &str, tags: Vec<EmbeddedBinaryTag>) -> Vec<musefs_db::BinaryTag> {
+/// Reject a file whose tags, taken together, cannot fit the metadata container
+/// its format synthesizes into.
+///
+/// Only the FLAC family needs this, and the reachable case is narrower than it
+/// looks. A stock FLAC cannot trip it: its whole `VORBIS_COMMENT` body is
+/// length-prefixed with 24 bits, so the comments inside can never sum past the
+/// ceiling they were read from. What breaks that arithmetic is a **second tag
+/// source merged into the first** — a FLAC carrying a leading ID3v2 tag (#602),
+/// whose absent keys `fill_absent_keys` appends. ID3v2's synchsafe tag size is
+/// 256 MiB, so the merged set can exceed what a FLAC comment block can hold.
+///
+/// Left unchecked, such a file scans clean and then fails synthesis with
+/// `FormatError::TooLarge`, serving `EIO` on every read — a file that is
+/// present in the mount and unreadable, with nothing in the scan log to explain
+/// it. That is precisely the unanticipated state the fail-the-file policy
+/// exists to prevent, so the arithmetic runs here, where it can still name the
+/// file.
+///
+/// Conservative by construction: this is the *lower bound* on the synthesized
+/// body (real synthesis maps and may add comments, never shrinks below the raw
+/// pairs), so a file over the ceiling here provably cannot be served. Under it,
+/// nothing is claimed.
+///
+/// The remaining formats need no equivalent. Ogg Opus/Vorbis comment packets
+/// carry 32-bit lengths and span pages, so they have no ceiling worth checking;
+/// MP4 and WAV use 32-bit box/chunk lengths; and MP3 synthesizes back into the
+/// same 256 MiB ID3v2 container it was read from.
+fn check_metadata_fits_format(abs_path: &str, probed: &Probed) -> Result<()> {
+    let (format_name, cap) = match probed.format {
+        Format::Flac => ("FLAC", musefs_format::flac::MAX_BLOCK_BODY),
+        Format::OggFlac => ("Ogg FLAC", musefs_format::flac::MAX_BLOCK_BODY),
+        _ => return Ok(()),
+    };
+    // VORBIS_COMMENT body: 4-byte vendor length + vendor string + 4-byte comment
+    // count + per comment (4-byte length + "KEY=VALUE"). The vendor string is
+    // synthesis's own and unknown here; omitting it only makes the bound more
+    // conservative, which is the safe direction.
+    let mut total: u64 = 8;
+    for (key, value) in &probed.tags {
+        if !key_passes_floor(key) {
+            continue;
+        }
+        total = total.saturating_add(4 + key.len() as u64 + 1 + value.len() as u64);
+    }
+    if total > cap {
+        return Err(crate::error::CoreError::TrackMetadataTooLarge {
+            path: abs_path.to_string(),
+            format: format_name,
+            len: total,
+            cap,
+        });
+    }
+    Ok(())
+}
+
+/// Assign storage ordinals to the binary tags worth keeping. Empty payloads are
+/// dropped silently: they carry nothing to serve, so unlike an oversize payload
+/// their absence costs the user nothing. Size is not decided here — that is
+/// [`check_storable`]'s job, and by the time this runs the file has passed it.
+fn storable_binary_tags(tags: Vec<EmbeddedBinaryTag>) -> Vec<musefs_db::BinaryTag> {
     tags.into_iter()
-        .filter(|b| {
-            if b.payload.len() > MAX_BINARY_TAG_BYTES {
-                log::warn!(
-                    "{abs_path}: dropping binary tag {} ({} bytes), over the {MAX_BINARY_TAG_BYTES}-byte cap",
-                    b.key,
-                    b.payload.len(),
-                );
-                return false;
-            }
-            !b.payload.is_empty()
-        })
+        .filter(|b| !b.payload.is_empty())
         .enumerate()
         .map(|(ordinal, b)| musefs_db::BinaryTag {
             key: b.key,
@@ -975,29 +1118,41 @@ fn accept_binary_tags(abs_path: &str, tags: Vec<EmbeddedBinaryTag>) -> Vec<musef
         .collect()
 }
 
-/// Logs each oversized mp4 `covr` image / binary `----` value that the format
-/// layer skipped before materialization (#343). These drops happen inside
-/// `mp4::read_pictures` / `mp4::read_binary_tags` — earlier than the `accept_*`
-/// ingest filters that log the lossy drops for the other formats (#284), and
-/// deliberately so, to avoid building a large image out of a large `moov` — so
-/// they are surfaced here at probe time, mirroring the `accept_*` message shape.
-fn log_mp4_oversize_drops(path: &Path, art: &[mp4::OversizeDrop], binary: &[mp4::OversizeDrop]) {
-    for d in art {
-        log::warn!(
-            "{}: dropping embedded {} art ({} bytes), over the {MAX_ART_BYTES}-byte cap",
-            path.display(),
-            d.descriptor,
+/// Build the [`CoreError`](crate::error::CoreError) for an mp4 payload the
+/// format layer skipped before materialization (#343).
+///
+/// These drops happen inside `mp4::read_pictures_reporting` /
+/// `mp4::read_binary_tags_reporting` — deliberately earlier than
+/// [`check_storable`], to avoid building a large image out of a large `moov`
+/// just to reject it. Only the *report* reaches here, never the payload, so the
+/// decision is made at the probe site instead; routing the message through this
+/// one helper keeps it identical to the ingest-time refusals.
+fn mp4_oversize_error(
+    path: &Path,
+    art: &[mp4::OversizeDrop],
+    binary: &[mp4::OversizeDrop],
+) -> Option<crate::error::CoreError> {
+    let (item, bytes, cap) = if let Some(d) = art.first() {
+        (
+            format!("embedded {} art", d.descriptor),
             d.bytes,
-        );
-    }
-    for d in binary {
-        log::warn!(
-            "{}: dropping binary tag {} ({} bytes), over the {MAX_BINARY_TAG_BYTES}-byte cap",
-            path.display(),
-            d.descriptor,
+            MAX_ART_BYTES,
+        )
+    } else {
+        let d = binary.first()?;
+        (
+            format!("binary tag {:?}", d.descriptor),
             d.bytes,
-        );
-    }
+            MAX_BINARY_TAG_BYTES,
+        )
+    };
+    Some(crate::error::CoreError::TrackFieldTooLarge {
+        path: path.display().to_string(),
+        item,
+        len: bytes as u64,
+        cap: cap as u64,
+        unit: "bytes",
+    })
 }
 
 fn structural_blocks_from(blocks: Vec<(String, Vec<u8>)>) -> Vec<musefs_db::StructuralBlock> {
@@ -1204,6 +1359,12 @@ fn ingest_into(
     fingerprint: Option<&str>,
     content_hash: Option<&str>,
 ) -> Result<()> {
+    // The pipeline already rejected an over-cap file in the worker, before the
+    // payload was ever buffered. Re-checking here is what makes the direct
+    // `ingest` / `ingest_bulk` entry points honour the same contract instead of
+    // writing a row the `CHECK` will reject mid-transaction.
+    check_storable(abs_path, &probed)?;
+
     let track_id = w.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
         format: probed.format,
@@ -1227,17 +1388,14 @@ fn ingest_into(
     }
     w.replace_tags(track_id, &tags)?;
 
-    let binary_tags = accept_binary_tags(abs_path, probed.binary_tags);
+    let binary_tags = storable_binary_tags(probed.binary_tags);
     w.set_binary_tags(track_id, &binary_tags)?;
 
     let structural_blocks = structural_blocks_from(probed.structural_blocks);
     w.set_structural_blocks(track_id, &structural_blocks)?;
 
     let mut track_arts = Vec::new();
-    for (ordinal, pic) in accept_pictures(abs_path, probed.pictures)
-        .into_iter()
-        .enumerate()
-    {
+    for (ordinal, pic) in probed.pictures.into_iter().enumerate() {
         let art_id = w.upsert_art(&NewArt {
             mime: pic.mime,
             width: (pic.width != 0).then_some(pic.width),
@@ -1558,6 +1716,20 @@ fn run_pipeline(
                         } else {
                             path.to_string_lossy().into_owned()
                         };
+                        // Reject an over-cap file here, before its payload is
+                        // charged to the budget and buffered into a batch: a
+                        // `CHECK` violation discovered at commit time is fatal
+                        // to the whole scan and has lost the path by then
+                        // (#644). Full-write policy only — `StructuralOnly`
+                        // (revalidate) writes neither tags nor art, so failing
+                        // a stored track for them would be inventing a failure.
+                        if policy == WritePolicy::Full
+                            && let Err(e) = check_storable(&abs_path, &probed)
+                        {
+                            log::warn!("skipping {e}");
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         let weight = payload_weight(&probed);
                         budget.acquire(weight); // backpressure on in-flight art bytes
                         let fingerprint = match tier {
@@ -1626,7 +1798,14 @@ fn run_pipeline(
         for unit in batch.drain(..) {
             released += unit.weight;
             committed.push(unit.abs_path.clone());
-            ingest_unit(&mut bw, unit, strictness, policy)?;
+            // A write failure here is still fatal (the store, not the file, is
+            // the problem), but it must say which file it died on — issue #644
+            // was reported as an unattributed `CHECK constraint failed`.
+            let abs_path = unit.abs_path.clone();
+            ingest_unit(&mut bw, unit, strictness, policy).map_err(|e| {
+                log::error!("aborting scan while ingesting {abs_path}: {e}");
+                e
+            })?;
         }
         bw.commit()?;
         for abs_path in committed {

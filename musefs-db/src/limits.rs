@@ -10,16 +10,36 @@
 
 /// Max `tags.key` length. Compared against SQLite `length()` (i64).
 pub const MAX_TAG_KEY_LEN: i64 = 256;
-/// Max `tags.value` length in bytes — 256 KiB. Both the schema `CHECK`
-/// (`length(CAST(value AS BLOB)) <= 262144`) and the read-time guard in
+/// Max `tags.value` length in bytes — 16 MiB − 1. Both the schema `CHECK`
+/// (`length(CAST(value AS BLOB)) <= 16777215`) and the read-time guard in
 /// [`crate::tags`] count bytes, not UTF-8 characters, so the
 /// materialized-memory bound is exact rather than ~4x looser for multibyte
 /// text (#505).
-pub const MAX_TAG_VALUE_LEN: i64 = 262_144;
+///
+/// The value is FLAC's 24-bit metadata-block ceiling
+/// (`musefs_format::flac::MAX_BLOCK_BODY`, equal to [`MAX_STRUCTURAL_BODY_LEN`]),
+/// i.e. the largest tag synthesis could ever serve. It was 256 KiB until #644,
+/// which was a number musefs invented: a lyrics/cuesheet/review tag past it
+/// aborted the whole scan on the `CHECK`. Capping below what the format can
+/// carry is enumerating badness against people who do unusual-but-legal things
+/// to their files, so the cap now sits exactly at the format ceiling and
+/// anything past it fails that one file with a legible message.
+///
+/// Materialization bound, stated plainly rather than papered over: a crafted DB
+/// can pair this with [`MAX_TAGS_PER_TRACK`] for ~64 GiB of text on one track.
+/// That is a wider DoS surface than the old 256 KiB gave (~1 GiB), accepted as
+/// low-severity — it needs a hand-crafted store the reader already distrusts,
+/// and the payoff is that no honest file can be rejected for a limit musefs
+/// made up.
+pub const MAX_TAG_VALUE_LEN: i64 = 0x00FF_FFFF;
 /// Max `art.mime` length.
 pub const MAX_ART_MIME_LEN: i64 = 255;
-/// Max `track_art.description` length — 1 KiB.
-pub const MAX_ART_DESCRIPTION_LEN: i64 = 1024;
+/// Max `track_art.description` length — 8 KiB. Raised from 1 KiB in #644: a
+/// picture description is free-form UTF-8 with a 32-bit length in both FLAC
+/// `PICTURE` and ID3 `APIC`, and a tagger pasting a paragraph of provenance
+/// into it is odd but legal. The row cost is negligible next to the art blob it
+/// annotates, so the tight cap bought nothing and only risked failing a file.
+pub const MAX_ART_DESCRIPTION_LEN: i64 = 8192;
 /// Max `structural_blocks.body` length in bytes. Mirrors
 /// `musefs_format::flac::MAX_BLOCK_BODY` (FLAC's 24-bit block limit); the db
 /// layer cannot depend on the format layer, so the equality is asserted by a
@@ -51,8 +71,12 @@ mod tests {
 
     #[test]
     fn cap_values_are_pinned() {
-        assert_eq!(MAX_TAG_VALUE_LEN, 256 * 1024);
-        assert_eq!(MAX_ART_DESCRIPTION_LEN, 1024);
+        assert_eq!(MAX_TAG_VALUE_LEN, 16 * 1024 * 1024 - 1);
+        // The tag cap is the format ceiling, not an independent number: it must
+        // track FLAC's 24-bit block limit, which `MAX_STRUCTURAL_BODY_LEN`
+        // already mirrors (and a musefs-core test ties to the format constant).
+        assert_eq!(MAX_TAG_VALUE_LEN, MAX_STRUCTURAL_BODY_LEN);
+        assert_eq!(MAX_ART_DESCRIPTION_LEN, 8 * 1024);
         assert_eq!(MAX_STRUCTURAL_BODY_LEN, 0x00FF_FFFF);
         assert_eq!(MAX_BINARY_TAG_BYTES, 16 * 1024 * 1024 - 64 * 1024);
         assert_eq!(MAX_ART_BYTES, 16 * 1024 * 1024 - 64 * 1024);

@@ -30,6 +30,29 @@ pub enum CoreError {
     },
     #[error("backing file changed since scan: {0}")]
     BackingChanged(String),
+    #[error("{path}: {item} is {len} {unit}, over musefs's limit of {cap} {unit}")]
+    TrackFieldTooLarge {
+        path: String,
+        /// What was too big, in the user's terms — `tag "LYRICS"`,
+        /// `binary tag "GEOB"`, `embedded image/jpeg art`, `art description`.
+        item: String,
+        len: u64,
+        cap: u64,
+        /// `bytes` or `characters` — the schema `CHECK`s count TEXT columns in
+        /// characters and blobs/`CAST(... AS BLOB)` in bytes, and a message that
+        /// quotes the wrong unit sends the user measuring the wrong thing.
+        unit: &'static str,
+    },
+    #[error(
+        "{path}: its {format} tag block would be {len} bytes, over the {cap}-byte \
+         {format} metadata limit — musefs could not serve this file"
+    )]
+    TrackMetadataTooLarge {
+        path: String,
+        format: &'static str,
+        len: u64,
+        cap: u64,
+    },
     #[error(
         "track {track_id} references art {art_id}, which has no metadata row (orphaned track_art — DB contract violation)"
     )]

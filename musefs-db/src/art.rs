@@ -220,6 +220,7 @@ impl Db<ReadWrite> {
 #[cfg(test)]
 mod guard_tests {
     use crate::error::DbError;
+    use crate::limits::MAX_ART_DESCRIPTION_LEN;
     use crate::models::{NewArt, TrackArt};
     use crate::{Db, Format, NewTrack};
 
@@ -286,7 +287,7 @@ mod guard_tests {
         db.conn
             .execute_batch("PRAGMA ignore_check_constraints=ON")
             .unwrap();
-        let desc = "d".repeat(1025);
+        let desc = "d".repeat(usize::try_from(MAX_ART_DESCRIPTION_LEN).unwrap() + 1);
         db.set_track_art(
             track,
             &[TrackArt {

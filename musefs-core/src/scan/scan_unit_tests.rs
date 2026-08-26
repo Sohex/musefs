@@ -198,42 +198,52 @@ fn mp4_with_covr(type_code: u32, value: &[u8]) -> Vec<u8> {
     [bx(b"ftyp", b"M4A "), moov, bx(b"mdat", b"AUDIODATA")].concat()
 }
 
+/// #644: an oversize `covr` fails the whole file rather than being dropped from
+/// an otherwise-stored track. The size check still happens before any copy, so
+/// the image is described and refused, never materialized — that property is
+/// what forces the verdict here at the probe rather than in `check_storable`.
 #[test]
-fn probe_file_skips_oversized_mp4_covr() {
+fn probe_file_fails_file_with_oversized_mp4_covr() {
     let oversized = vec![0xFFu8; MAX_ART_BYTES + 1];
     let bytes = mp4_with_covr(13, &oversized);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oversized_art.m4a");
     std::fs::write(&path, &bytes).unwrap();
-    let probed = match probe_file(&path, 0).unwrap() {
-        ProbeOutcome::Probed(p, _) => p,
-        other => panic!("expected Probed, got {other:?}"),
-    };
-    assert_eq!(probed.format, Format::M4a);
     assert!(
-        probed.pictures.is_empty(),
-        "oversized covr must be skipped at extraction, not materialized"
+        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Unparseable),
+        "an oversized covr must fail the file, not yield a track without its art"
     );
 }
 
 #[test]
-fn probe_file_skips_oversized_mp4_binary_freeform() {
-    // A `----` value larger than MAX_BINARY_TAG_BYTES must be skipped at
-    // extraction by the real seek-path scanner, so it is absent from Probed.
+fn probe_file_fails_file_with_oversized_mp4_binary_freeform() {
     let oversized = vec![0xABu8; MAX_BINARY_TAG_BYTES + 1];
     let bytes = mp4_with_binary_freeform("com.serato.dj", "analysis", &oversized);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oversized_bin.m4a");
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(
+        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Unparseable),
+        "an oversized `----` value must fail the file"
+    );
+}
+
+/// An at-cap `covr` is still stored: the boundary is inclusive, and a drop here
+/// would be exactly the silent art loss #644 set out to remove.
+#[test]
+fn probe_file_keeps_mp4_covr_at_cap() {
+    let at_cap = vec![0xFFu8; MAX_ART_BYTES];
+    let bytes = mp4_with_covr(13, &at_cap);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("at_cap_art.m4a");
     std::fs::write(&path, &bytes).unwrap();
     let probed = match probe_file(&path, 0).unwrap() {
         ProbeOutcome::Probed(p, _) => p,
         other => panic!("expected Probed, got {other:?}"),
     };
     assert_eq!(probed.format, Format::M4a);
-    assert!(
-        probed.binary_tags.is_empty(),
-        "oversized binary freeform must be skipped at extraction, not materialized"
-    );
+    assert_eq!(probed.pictures.len(), 1);
+    assert_eq!(probed.pictures[0].data.len(), MAX_ART_BYTES);
 }
 
 #[test]
