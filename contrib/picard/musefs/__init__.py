@@ -113,12 +113,13 @@ if _PICARD:
 
     def _do_sync(opts, files):
         """Background-thread worker: autoscan each file, then write tags/art.
-        Returns SyncStats. Raises MusefsError / SchemaMismatch on hard failure."""
+        Returns SyncStats. Raises MusefsError / SchemaMismatch on hard failure;
+        a partial scan is logged, not raised."""
         if not opts.db:
             raise MusefsError("no musefs DB configured; set the DB path in Options → musefs sync")
         if opts.autoscan:
             try:
-                run_scan(
+                result = run_scan(
                     opts.bin,
                     opts.db,
                     [f.filename for f in files.values()],
@@ -126,6 +127,11 @@ if _PICARD:
                 )
             except ScanError as exc:
                 raise _scan_error(exc)
+            # A partial scan (exit 2) means some file could not be ingested while
+            # the batch still committed. Warn and sync the rest rather than
+            # dropping every file's tags and art over one bad file (#647).
+            if result is not None and result.partial:
+                log.warning("musefs: %s", result.warning())
         elif not os.path.exists(opts.db):
             raise MusefsError(
                 f"musefs DB not found at {opts.db}; enable autoscan or run `musefs scan` first"
