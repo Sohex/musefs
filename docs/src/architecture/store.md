@@ -90,6 +90,15 @@ third-party tool bumped the schema) is refused up front with a distinct
 "store is newer than this binary" error rather than silently treated as
 already-migrated — an older binary must not risk misreading a newer contract.
 
+**Migrations announce themselves.** The opposite direction — an open that finds
+an *older* store and upgrades it in place — is irreversible (the store stops
+opening with the previous musefs build), so it is logged at `warn`, the default
+filter level: the store path, the version found and the version reached,
+followed by a completion line at `info`. Creating a store from scratch is not a
+one-way step for existing data and logs at `info` only, and the common case — a
+store already at the latest version — stays silent, since that path runs on
+every open and every mount.
+
 **Art is immutable once written.** `art` rows are content-addressed by
 `sha256`; a trigger rejects any in-place `UPDATE` of an art row's
 content columns (`data`, `sha256`, `mime`, `byte_len`, `width`, `height`) with
