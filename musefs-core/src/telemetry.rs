@@ -7,7 +7,8 @@
 use std::fmt::Write;
 
 /// Core-owned telemetry: the file-handle slab count, header/size caches, the
-/// virtual-tree footprint, and refresh health. Produced by `Musefs::telemetry`.
+/// virtual-tree footprint, refresh health, and the shared serve-path warn
+/// limiter's suppressed count. Produced by `Musefs::telemetry`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CoreTelemetry {
     pub handles_open: u64,
@@ -24,6 +25,7 @@ pub struct CoreTelemetry {
     pub refresh_generation: u64,
     pub refresh_gap_fallbacks: u64,
     pub refresh_needs_rebuild: bool,
+    pub serve_warns_suppressed: u64,
 }
 
 /// Passthrough sub-telemetry; `None` (in [`FuseTelemetry`]) off Linux.
@@ -176,6 +178,12 @@ pub fn render_prometheus(
         "musefs_dir_handle_rejections_total",
         "opendir calls that found the dir-handle table full and were served statelessly.",
         fuse.dir_handle_rejections,
+    );
+    counter(
+        &mut out,
+        "musefs_serve_warns_suppressed_total",
+        "Serve-path failure warnings downgraded to debug by the warn rate limiter.",
+        core.serve_warns_suppressed,
     );
 
     gauge(
@@ -429,6 +437,7 @@ mod tests {
             refresh_generation: 2,
             refresh_gap_fallbacks: 1,
             refresh_needs_rebuild: false,
+            serve_warns_suppressed: 13,
         }
     }
 
@@ -512,6 +521,9 @@ mod tests {
         );
         assert!(out.contains(
             "# TYPE musefs_dir_handle_rejections_total counter\nmusefs_dir_handle_rejections_total 11\n"
+        ));
+        assert!(out.contains(
+            "# TYPE musefs_serve_warns_suppressed_total counter\nmusefs_serve_warns_suppressed_total 13\n"
         ));
         assert!(out.contains("musefs_pool_queued 0\n"));
         assert!(out.contains("musefs_readahead_budget_bytes 67108864\n"));

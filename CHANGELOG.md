@@ -17,6 +17,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
   given a cached directory snapshot, so directory-handle pressure stays visible
   after a burst rather than only as a gauge that reads healthy between samples.
+- `musefs_serve_warns_suppressed_total` counts the serve-path failure warnings
+  the rate limiter downgraded to `debug`, so log throttling is visible to
+  anything scraping metrics. Without it the count escaped only as prose inside
+  the next warning that was admitted, and an operator could not tell a quiet
+  serve path from one failing faster than it logs.
 - `--workers` (env `MUSEFS_WORKERS`) sizes the FUSE worker pool explicitly.
   The default stays auto (2× the CPU count, oversized for I/O-bound work), but
   each worker lazily opens its own read-only SQLite connection, so steady-state

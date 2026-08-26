@@ -9,7 +9,9 @@
 //! its own.
 //!
 //! Lives in `musefs-core` (the integration layer) next to [`crate::telemetry`],
-//! since both crates above it feed the same budget.
+//! since both crates above it feed the same budget — which is also what makes
+//! [`serve_warns_suppressed`] a local read for
+//! `musefs_serve_warns_suppressed_total` (#653).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,6 +45,10 @@ struct WarnLimiter {
     in_window: AtomicU64,
     /// Warns downgraded in the current window, reported when the next opens.
     suppressed: AtomicU64,
+    /// Every warn ever downgraded, never reset: the monotonic source for
+    /// `musefs_serve_warns_suppressed_total` (#653). Distinct from
+    /// `suppressed`, which each new window drains into its first log line.
+    suppressed_total: AtomicU64,
 }
 
 impl WarnLimiter {
@@ -51,6 +57,7 @@ impl WarnLimiter {
             window_start: AtomicU64::new(0),
             in_window: AtomicU64::new(0),
             suppressed: AtomicU64::new(0),
+            suppressed_total: AtomicU64::new(0),
         }
     }
 
@@ -73,8 +80,14 @@ impl WarnLimiter {
             WarnDecision::Log { suppressed: 0 }
         } else {
             self.suppressed.fetch_add(1, Ordering::Relaxed);
+            self.suppressed_total.fetch_add(1, Ordering::Relaxed);
             WarnDecision::Suppress
         }
+    }
+
+    /// Warns downgraded to debug over the limiter's whole lifetime.
+    fn suppressed_total(&self) -> u64 {
+        self.suppressed_total.load(Ordering::Relaxed)
     }
 }
 
@@ -96,6 +109,15 @@ pub fn rate_limited_warn(message: std::fmt::Arguments<'_>) {
         ),
         WarnDecision::Suppress => log::debug!("{message} (over warn budget)"),
     }
+}
+
+/// Serve-path warns downgraded to debug since process start, rendered as
+/// `musefs_serve_warns_suppressed_total` (#653). Neither a gauge nor the
+/// parenthetical on an admitted log line can stand in for it: suppression is
+/// bursty by construction, so a scrape landing between bursts sees nothing and
+/// the operator cannot tell a quiet serve path from a throttled one.
+pub(crate) fn serve_warns_suppressed() -> u64 {
+    SERVE_WARN_LIMITER.suppressed_total()
 }
 
 #[cfg(test)]
@@ -134,6 +156,53 @@ mod tests {
         assert_eq!(
             l.decide(100 + WARN_WINDOW_SECS),
             WarnDecision::Log { suppressed: 0 }
+        );
+    }
+
+    #[test]
+    fn suppressed_total_is_monotonic_across_windows() {
+        // The per-window count is drained into the next window's first log
+        // line; the total is not, so the metric survives a rollover (#653).
+        let l = WarnLimiter::new();
+        for _ in 0..WARN_BURST + 5 {
+            l.decide(100);
+        }
+        assert_eq!(l.suppressed_total(), 5);
+        assert_eq!(
+            l.decide(100 + WARN_WINDOW_SECS),
+            WarnDecision::Log { suppressed: 5 }
+        );
+        assert_eq!(l.suppressed_total(), 5, "rollover must not reset the total");
+        // That rollover call spent one of the new window's budget, so these
+        // WARN_BURST + 3 leave 4 over budget: 5 + 4.
+        for _ in 0..WARN_BURST + 3 {
+            l.decide(100 + WARN_WINDOW_SECS);
+        }
+        assert_eq!(l.suppressed_total(), 9);
+    }
+
+    #[test]
+    fn admitted_warns_never_count_as_suppressed() {
+        let l = WarnLimiter::new();
+        for _ in 0..WARN_BURST {
+            assert_eq!(l.decide(100), WarnDecision::Log { suppressed: 0 });
+        }
+        assert_eq!(l.suppressed_total(), 0);
+    }
+
+    #[test]
+    fn process_wide_counter_advances_through_rate_limited_warn() {
+        // End-to-end over the real static: a burst past the budget must move
+        // the counter the metric reads, whichever crate emitted the warns.
+        // Delta-based and `>=`, since the static is shared with the rest of
+        // the suite and the window may already be part-spent.
+        let before = serve_warns_suppressed();
+        for i in 0..=WARN_BURST * 2 {
+            rate_limited_warn(format_args!("warn-limit self-test {i}"));
+        }
+        assert!(
+            serve_warns_suppressed() > before,
+            "an over-budget burst must be counted"
         );
     }
 }

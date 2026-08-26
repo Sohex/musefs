@@ -22,6 +22,19 @@ see the [Release notes](release-notes.md).
   [#616](https://github.com/Sohex/musefs/issues/616) is in use and directories are being rebuilt on every
   `readdir`.
 
+- `musefs_serve_warns_suppressed_total`
+  ([#653](https://github.com/Sohex/musefs/issues/653)), a monotonic counter of
+  serve-path failure warnings the rate limiter downgraded to `debug`. The count
+  previously escaped only as a parenthetical inside the next admitted warning,
+  which is both unscrapeable and carried by the admitted lines alone. The
+  failure mode matches
+  [#626](https://github.com/Sohex/musefs/issues/626)'s: suppression is bursty by
+  construction — 10 admitted per 30-second window, the rest dropped — so a
+  scrape landing between bursts sees nothing, and "quiet" and "failing faster
+  than it can log" look identical. Since the limiter moved into `musefs-core`
+  ([#650](https://github.com/Sohex/musefs/issues/650)) the counter covers the
+  synthesis warns too, not just the FUSE errno path.
+
 ### Changed
 
 - The `tags.value` cap rises from 256 KiB to 16 MiB − 1, and
