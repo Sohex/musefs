@@ -73,6 +73,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Scan log records no longer shred the progress bar (and vice versa) on an
+  interactive terminal ([#648](https://github.com/Sohex/musefs/issues/648)).
+  The bar and the `log` sink both write to stderr with nothing between them, so
+  a warning landed mid-frame and the next tick erased part of it — which is the
+  common case, not an edge one: the end-of-scan skip tally warns about the
+  `cover.jpg`/`.cue`/`.log` sidecars essentially every library contains.
+  Records are now emitted with the bar lifted out of the way and redrawn
+  beneath them, as is the per-target summary line. Piped (non-interactive)
+  output is byte-for-byte unchanged.
 - A tag larger than the store's cap no longer aborts the entire scan
   ([#644](https://github.com/Sohex/musefs/issues/644)). The scanner had no
   length check on text tags, so an over-cap value reached the DB `CHECK` inside

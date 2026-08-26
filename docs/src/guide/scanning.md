@@ -27,7 +27,9 @@ interactive terminal, a discovery spinner followed by a determinate bar
 (position, percent, ETA, current file); on a non-interactive stderr (piped or
 logged), throttled `ingested N/M (P%)` lines. `--quiet` (`-q`) suppresses the
 progress indicator and the per-target summary. Each summary line ends with the
-elapsed time.
+elapsed time. Anything logged during the scan (skip warnings, per-file
+failures) is printed above the bar, which is lifted out of the way and redrawn
+underneath, so warnings stay readable and scroll back intact.
 
 The per-target summary reads `scanned N: … already present Z, skipped X, failed Y`.
 `already present` counts files bare `scan` skipped because they were already

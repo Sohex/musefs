@@ -13,8 +13,11 @@ use musefs_db::Db;
 
 use crate::progress::ScanReporter;
 
+mod logging;
 mod progress;
 mod signal;
+
+pub use crate::logging::install_logger;
 
 /// Mount content mode (CLI surface for `musefs_core::Mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -335,15 +338,19 @@ pub fn run_scan(
             .with_context(|| format!("scanning {}", target.display()))?;
         total_failed += stats.failed;
         if !quiet {
-            println!(
-                "scanned {}: {} file(s), {} already present, skipped {}, failed {} in {}",
-                target.display(),
-                stats.scanned,
-                stats.already_present,
-                stats.skipped,
-                stats.failed,
-                HumanDuration(start.elapsed()),
-            );
+            // Suspended like a log record: the bar is still ticking between
+            // targets, and an un-lifted frame would swallow the summary line.
+            progress::suspend(|| {
+                println!(
+                    "scanned {}: {} file(s), {} already present, skipped {}, failed {} in {}",
+                    target.display(),
+                    stats.scanned,
+                    stats.already_present,
+                    stats.skipped,
+                    stats.failed,
+                    HumanDuration(start.elapsed()),
+                );
+            });
         }
     }
     reporter.finish();
@@ -380,15 +387,17 @@ pub fn run_revalidate(
             .with_context(|| format!("revalidating {}", target.display()))?;
         total_failed += stats.failed;
         if !quiet {
-            println!(
-                "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed in {}",
-                target.display(),
-                stats.updated,
-                stats.unchanged,
-                stats.pruned,
-                stats.failed,
-                HumanDuration(start.elapsed()),
-            );
+            progress::suspend(|| {
+                println!(
+                    "revalidated {}: {} updated, {} unchanged, {} pruned, {} failed in {}",
+                    target.display(),
+                    stats.updated,
+                    stats.unchanged,
+                    stats.pruned,
+                    stats.failed,
+                    HumanDuration(start.elapsed()),
+                );
+            });
         }
     }
     reporter.finish();
