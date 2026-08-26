@@ -379,6 +379,30 @@ const _: () = assert!(
     "LATEST_VERSION must match MIGRATIONS"
 );
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn fire_before_lock() {
+    // Take the hook out before running it: it opens a second connection and
+    // migrates, which re-enters `migrate` on this same thread and would
+    // otherwise recurse until the stack gives out.
+    let hook = BEFORE_LOCK_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(mut f) = hook {
+        f();
+    }
+}
+#[cfg(test)]
+fn set_before_lock_hook(f: impl FnMut() + 'static) {
+    BEFORE_LOCK_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+#[cfg(test)]
+fn clear_before_lock_hook() {
+    BEFORE_LOCK_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let latest = LATEST_VERSION;
     let current = conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))?;
@@ -396,12 +420,46 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     if current >= latest {
         return Ok(());
     }
+    // Test seam: the window between the read above and the write lock below is
+    // exactly where a competing writer can migrate the store out from under us.
+    // Nothing in a single-process test can land there on its own, so the race
+    // arm of the announcement guard below is only reachable through this hook.
+    #[cfg(test)]
+    fire_before_lock();
     // Use an IMMEDIATE transaction so the write lock is acquired up front. The
     // user_version read below is then authoritative: a second process opening
     // the same database concurrently blocks here until the first commits, then
     // sees the updated version and skips re-applying the migration.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    // Announce only an upgrade this call actually performs: another process may
+    // have migrated the store while we waited for the write lock, in which case
+    // the version read under the lock is already the latest and the loop below
+    // applies nothing.
+    let mut work = None;
+    if current < latest {
+        // `Connection::path` is `Some("")` for an in-memory or temporary store.
+        let at = match tx.path().filter(|p| !p.is_empty()) {
+            Some(path) => format!(" at {path}"),
+            None => String::new(),
+        };
+        if current == 0 {
+            // A store this binary is creating from scratch — nothing is being
+            // taken anywhere it cannot come back from, so this stays quiet at
+            // the default filter.
+            log::info!("creating store schema{at} at version {latest}");
+        } else {
+            // A pre-existing store is about to be rewritten in place, one way.
+            // The user gets this once per store, and wants it in their
+            // scrollback if they ever try to roll musefs back.
+            log::warn!(
+                "upgrading store schema{at} from version {current} to version {latest}; \
+                 this is irreversible and the store will no longer open with musefs \
+                 builds older than this one"
+            );
+        }
+        work = Some((at, std::time::Instant::now()));
+    }
     for (target, sql) in (1i64..).zip(MIGRATIONS) {
         if current < target {
             tx.execute_batch(sql)?;
@@ -409,7 +467,241 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         }
     }
     tx.commit()?;
+    if let Some((at, started)) = work {
+        let secs = started.elapsed().as_secs_f64();
+        log::info!("store schema{at} is now at version {latest} (took {secs:.1}s)");
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_logging_tests {
+    use log::{Level, LevelFilter, Log, Metadata, Record};
+    use rusqlite::Connection;
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+    use std::thread::ThreadId;
+
+    /// Records emitted on the capturing thread, newest last.
+    static RECORDS: Mutex<Vec<(Level, String)>> = Mutex::new(Vec::new());
+    /// Serializes the capturing tests: `log::set_logger` installs one logger per
+    /// process, so they share a single buffer.
+    static SERIAL: Mutex<()> = Mutex::new(());
+    /// The thread whose records are being captured. Everything the rest of the
+    /// (parallel) test binary logs is dropped, so a capture only ever sees what
+    /// the test itself provoked.
+    static CAPTURING: Mutex<Option<ThreadId>> = Mutex::new(None);
+
+    struct Capture;
+    static CAPTURE: Capture = Capture;
+
+    impl Log for Capture {
+        fn enabled(&self, _: &Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &Record) {
+            if *CAPTURING.lock().unwrap() == Some(std::thread::current().id()) {
+                RECORDS
+                    .lock()
+                    .unwrap()
+                    .push((record.level(), record.args().to_string()));
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    /// Holds the capture open; the buffer is reachable only through the guard,
+    /// so no test can read records it does not own.
+    struct Captured {
+        records: &'static Mutex<Vec<(Level, String)>>,
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl Captured {
+        fn records(&self) -> Vec<(Level, String)> {
+            self.records.lock().unwrap().clone()
+        }
+        /// Drop everything logged so far, so the next assertion sees only what
+        /// follows this call.
+        fn clear(&self) {
+            self.records.lock().unwrap().clear();
+        }
+    }
+
+    impl Drop for Captured {
+        fn drop(&mut self) {
+            *CAPTURING.lock().unwrap() = None;
+            RECORDS.lock().unwrap().clear();
+        }
+    }
+
+    /// Start capturing this thread's log records until the returned guard drops.
+    fn capture() -> Captured {
+        let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            log::set_logger(&CAPTURE).expect("no other logger is installed in this test binary");
+            log::set_max_level(LevelFilter::Trace);
+        });
+        RECORDS.lock().unwrap().clear();
+        *CAPTURING.lock().unwrap() = Some(std::thread::current().id());
+        Captured {
+            records: &RECORDS,
+            _serial: serial,
+        }
+    }
+
+    /// A store stamped at v1 with only MIGRATION_V1 applied — what an older
+    /// musefs build left behind.
+    fn store_at_v1(conn: &Connection) {
+        conn.execute_batch(super::MIGRATION_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+
+    /// The announcement fires only for an upgrade this call actually performs.
+    /// Another writer can migrate the store while we wait for the write lock, in
+    /// which case the version read *under* the lock is already the latest and
+    /// the loop applies nothing — announcing there would report an irreversible
+    /// upgrade that this process did not do, on a store it did not change.
+    ///
+    /// Only reachable through the before-lock seam: the pre-lock read has to see
+    /// an old version and the post-lock read a current one, which no
+    /// single-threaded test can arrange otherwise.
+    #[test]
+    fn a_migration_lost_to_a_competing_writer_says_nothing() {
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                super::clear_before_lock_hook();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        let mut conn = Connection::open(&path).unwrap();
+        store_at_v1(&conn);
+
+        // Stand in for the competing process: migrate the store to the latest
+        // version on a second connection, after our pre-lock read but before we
+        // take the write lock.
+        let racer_path = path.clone();
+        let captured = capture();
+        super::set_before_lock_hook(move || {
+            let mut racer = Connection::open(&racer_path).unwrap();
+            super::migrate(&mut racer).unwrap();
+            // The racer re-enters `migrate` on this thread, so its own — entirely
+            // correct — announcement lands in the same capture buffer. Drop it,
+            // leaving only whatever the call that lost the race goes on to say.
+            RECORDS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        });
+        let _guard = HookGuard;
+
+        super::migrate(&mut conn).unwrap();
+        let records = captured.records();
+
+        assert!(
+            records.is_empty(),
+            "a call that migrated nothing must say nothing; got {records:?}"
+        );
+        // The store is still correctly migrated — by the racer, not by us.
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, super::LATEST_VERSION);
+    }
+
+    #[test]
+    fn upgrading_an_existing_store_warns_with_both_versions() {
+        let captured = capture();
+        let mut conn = Connection::open_in_memory().unwrap();
+        store_at_v1(&conn);
+        captured.clear();
+
+        super::migrate(&mut conn).unwrap();
+
+        let records = captured.records();
+        let warnings: Vec<&String> = records
+            .iter()
+            .filter(|(level, _)| *level == Level::Warn)
+            .map(|(_, msg)| msg)
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "an in-place upgrade must announce itself exactly once at warn, \
+             which is the default filter level; got {records:?}"
+        );
+        let warning = warnings[0];
+        assert!(
+            warning.contains("from version 1")
+                && warning.contains(&format!("to version {}", super::LATEST_VERSION)),
+            "the warning must name the version found and the version reached: {warning}"
+        );
+        assert!(
+            records.iter().any(|(level, msg)| *level == Level::Info
+                && msg.contains(&format!("version {}", super::LATEST_VERSION))),
+            "a completion line must follow the upgrade: {records:?}"
+        );
+    }
+
+    #[test]
+    fn the_warning_names_the_store_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            store_at_v1(&conn);
+        }
+        let captured = capture();
+        let mut conn = Connection::open(&path).unwrap();
+        super::migrate(&mut conn).unwrap();
+
+        let records = captured.records();
+        let path = path.to_str().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|(level, msg)| *level == Level::Warn && msg.contains(path)),
+            "the upgrade warning must identify which store was upgraded: {records:?}"
+        );
+    }
+
+    #[test]
+    fn opening_an_already_current_store_logs_nothing() {
+        let captured = capture();
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::migrate(&mut conn).unwrap();
+        captured.clear();
+
+        // The fast path, taken on every open and every mount.
+        super::migrate(&mut conn).unwrap();
+
+        assert!(
+            captured.records().is_empty(),
+            "a store already at the latest version must stay silent: {:?}",
+            captured.records()
+        );
+    }
+
+    #[test]
+    fn creating_a_fresh_store_does_not_warn() {
+        let captured = capture();
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::migrate(&mut conn).unwrap();
+
+        let records = captured.records();
+        assert!(
+            records.iter().all(|(level, _)| *level != Level::Warn),
+            "creating a store is not an irreversible upgrade of the user's data, \
+             so nothing may reach the default filter: {records:?}"
+        );
+        assert!(
+            records.iter().any(|(level, _)| *level == Level::Info),
+            "creating a store should still be visible under -v: {records:?}"
+        );
+    }
 }
 
 fn reference_objects() -> &'static std::collections::BTreeMap<(String, String), String> {

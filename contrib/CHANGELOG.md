@@ -12,6 +12,10 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ### Added
 
+- **`musefs_common.ScanResult`** — what a completed `run_scan` did. Carries
+  `binary`, `target`, `verb`, `returncode`, `partial` and `stderr`, and renders
+  the shared non-fatal message via `.warning()` (`None` for a clean run). See
+  the `run_scan` change below.
 - **`musefs_common.MAX_TAG_VALUE_LEN`** — the store's byte cap on a
   `tags.value`, generated from the Rust constant into the schema mirror rather
   than hand-kept. A writer can now check a value against the contract instead of
@@ -21,6 +25,23 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ### Changed
 
+- **`run_scan` no longer treats a partial scan as a failure** (musefs #647).
+  `musefs scan` exits `2` when the batch completed and committed but some file
+  could not be ingested; `run_scan` raised `ScanError` for any non-zero code, so
+  a single unparseable file took down the whole sync. Picard reported
+  `sync failed` and wrote **no tags at all**; the beets `cli_exit` hook skipped
+  its sync silently, surfacing only as a `WARNING` beets hides at default
+  verbosity; `beet musefs` and the Lidarr adapter aborted outright. `run_scan`
+  now reads the three-state contract — `0` success, `2` partial, anything else a
+  hard failure — and returns a `ScanResult` for the first two. All three
+  adapters warn and go on to sync. Hard failures still raise `ScanError`.
+  **Callers of `run_scan` that relied on it raising for exit `2` need updating.**
+- **`SchemaMismatch` now names the direction of the skew and the remedy**
+  (musefs #654). It reported both version numbers and said the versions "have
+  diverged", leaving the user to work out which side was behind and what to do.
+  It now says whether the store was written by a newer musefs (upgrade the
+  plugin) or predates the plugin (upgrade musefs and run `musefs scan`, which
+  migrates in place). This string is what Picard and beets surface verbatim.
 - The store schema is now at `user_version` 3 (musefs #644 widens the
   `tags.value` and `track_art.description` caps). `EXPECTED_USER_VERSION`
   tracks it automatically; no plugin change is needed, but a store must be

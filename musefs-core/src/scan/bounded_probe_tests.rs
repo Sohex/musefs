@@ -174,7 +174,7 @@ fn oversize_unparseable_file_is_skipped_not_read_whole() {
 
     assert!(matches!(
         probe_file(&path, WINDOW).unwrap(),
-        ProbeOutcome::Unparseable
+        ProbeOutcome::Failed(_)
     ));
 }
 

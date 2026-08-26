@@ -2,6 +2,7 @@ from musefs_common import (
     MAX_TAG_VALUE_LEN,
     SCAN_TIMEOUT_SECONDS,
     ArtImage,
+    ScanResult,
     connect,
     realpath_key,
 )
@@ -128,6 +129,54 @@ def test_scan_if_enabled_passes_shared_timeout(tmp_path):
     scan_if_enabled(config=config, paths=["/music/a.flac"], runner=fake_runner)
 
     assert captured["timeout"] == SCAN_TIMEOUT_SECONDS == 120
+
+
+def test_scan_if_enabled_warns_and_continues_on_partial_scan(tmp_path):
+    """Exit 2 is a partial success: the batch committed, some file didn't parse.
+    It must not abort the sync (#647)."""
+    warnings = []
+    config = SyncConfig(
+        db_path=str(tmp_path / "m.db"),
+        link_mode=LinkMode.SYMLINK,
+        autoscan=True,
+    )
+    partial = ScanResult(
+        binary="musefs",
+        target="/music/a.flac",
+        returncode=2,
+        partial=True,
+        stderr="skipping /music/a.flac: no parseable audio metadata",
+    )
+
+    scan_if_enabled(
+        config=config,
+        paths=["/music/a.flac"],
+        runner=lambda *a, **kw: partial,
+        warning_printer=lambda message, **kw: warnings.append(message),
+    )
+
+    assert len(warnings) == 1
+    assert "musefs-lidarr-sync:" in warnings[0]
+    assert "no parseable audio metadata" in warnings[0]
+
+
+def test_scan_if_enabled_is_quiet_on_a_clean_scan(tmp_path):
+    warnings = []
+    config = SyncConfig(
+        db_path=str(tmp_path / "m.db"),
+        link_mode=LinkMode.SYMLINK,
+        autoscan=True,
+    )
+    clean = ScanResult(binary="musefs", target="/music/a.flac")
+
+    scan_if_enabled(
+        config=config,
+        paths=["/music/a.flac"],
+        runner=lambda *a, **kw: clean,
+        warning_printer=lambda message, **kw: warnings.append(message),
+    )
+
+    assert warnings == []
 
 
 def test_sync_records_writes_tags(

@@ -214,7 +214,7 @@ impl HeaderCache {
                                 (structural, &binary_tag_inputs)
                             };
                         for key in invalid_vorbis_keys(&inputs) {
-                            log::warn!(
+                            crate::serve_warn!(
                                 "track {}: dropping tag key {key:?} from Vorbis \
                                  synthesis (not a valid field name)",
                                 track.id
@@ -300,7 +300,7 @@ impl HeaderCache {
                             .collect();
                         let src = crate::mapping::DbArtSource(db);
                         for key in invalid_vorbis_keys(&inputs) {
-                            log::warn!(
+                            crate::serve_warn!(
                                 "track {}: dropping tag key {key:?} from Vorbis \
                                  synthesis (not a valid field name)",
                                 track.id
@@ -1972,5 +1972,32 @@ mod readahead_differential_tests {
             oracle_read(&resolved, &file, off, n, &mut direct).unwrap();
             assert_eq!(via, direct, "partial-seek mismatch at {off}+{n}");
         }
+    }
+}
+
+/// Emit one `serve_warn!` from this module's own scope so a test can pin the
+/// target the two Vorbis-key drops on the synthesis path log under. Deliberately
+/// at module scope rather than inside the test module: `module_path!()` — and so
+/// the record's target — is per module, and it is *this* module's name the
+/// production call sites carry.
+#[cfg(test)]
+fn serve_warn_target_probe(msg: &str) {
+    crate::serve_warn!("{msg}");
+}
+
+/// The Vorbis-key drops (#650) must stay attributed to `musefs_core::reader`:
+/// they are what an operator filters for with `RUST_LOG=musefs_core=debug`, and
+/// routing them through a shared limiter *function* would have relabelled every
+/// one of them `musefs_core::warn_limit`.
+#[cfg(test)]
+mod warn_target_tests {
+    use crate::warn_limit::log_capture::{install, target_of};
+
+    #[test]
+    fn serve_warns_from_the_reader_module_are_attributed_to_it() {
+        install();
+        let probe = format!("serve-warn target probe from {}", module_path!());
+        super::serve_warn_target_probe(&probe);
+        assert_eq!(target_of(&probe), "musefs_core::reader");
     }
 }

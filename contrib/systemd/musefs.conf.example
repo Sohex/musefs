@@ -85,6 +85,14 @@ MUSEFS_DB=/home/youruser/.local/share/musefs/library.db
 # `metrics` cargo feature, which adds backing-syscall counters. Default: false.
 #MUSEFS_EXPOSE_METRICS=true
 
+# Log verbosity. Default: warn (failures only). `info` adds the lines that
+# explain a mount's behaviour — the post-mount summary with its file/directory
+# counts, and whether kernel passthrough was available. Per-crate filtering
+# works too, e.g. `warn,musefs_fuse=debug`. See the Troubleshooting guide.
+# This is the systemd-friendly equivalent of the `-v` flag, which would mean
+# editing ExecStart.
+#RUST_LOG=info
+
 # --- Scan -------------------------------------------------------------------
 # (scan targets are set in musefs-scan.service, not here.)
 

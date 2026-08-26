@@ -44,7 +44,11 @@ def sync(db_path, files, *, musefs_bin="musefs"):
     # plugin cannot compute (format, audio offset/length, backing size/mtime).
     # On a brand-new store it must precede `connect`, which has nothing to open
     # until the scan has created the file.
-    run_scan(musefs_bin, db_path, files, timeout=SCAN_TIMEOUT_SECONDS)
+    result = run_scan(musefs_bin, db_path, files, timeout=SCAN_TIMEOUT_SECONDS)
+    if result.partial:
+        # Exit 2: the batch committed, but some file could not be ingested.
+        # Warn and sync the rest — don't abort over one unparseable file.
+        print(result.warning())
 
     conn = connect(db_path)
     try:
@@ -72,10 +76,17 @@ def sync(db_path, files, *, musefs_bin="musefs"):
 For a dry run, pass `dry_run=True` to `sync_files` and `conn.rollback()` instead
 of committing — `SyncStats` still reports what *would* change.
 
-`run_scan` raises `ScanError` (`kind` ∈ `{"not_found", "timeout", "failed"}`)
-and `check_schema_version` raises `SchemaMismatch`; a host adapter formats its
-own user-facing message from the exception attributes (see the beets plugin's
-`_scan_user_error`).
+`run_scan` reads the scanner's three-state exit code and returns a `ScanResult`:
+`0` is a clean run, and `2` is a **partial success** — the batch completed and
+committed, but at least one file could not be ingested (see
+[Scanning](../guide/scanning.md)). A partial run is not a failure, so it sets
+`result.partial` rather than raising; `result.warning()` renders the one-line,
+non-fatal message an adapter should surface before going on to sync the files
+that *did* land. Any other exit code is a hard failure and raises `ScanError`
+(`kind` ∈ `{"not_found", "timeout", "failed"}`), as do a missing binary and a
+timeout. `check_schema_version` raises `SchemaMismatch`; a host adapter formats
+its own user-facing message from the exception attributes (see the beets
+plugin's `_scan_user_error`).
 
 ### The `Record` shape
 
@@ -168,9 +179,12 @@ Everything in `__all__`, imported from the top-level `musefs_common` package.
 
 **Scanning**
 
-- `run_scan(binary, db_path, target, *, timeout=None)` — shell out to `musefs
-  scan`; `target` is one path or an iterable, all scanned under one process.
-  Creates the DB if absent. Raises `ScanError`.
+- `run_scan(binary, db_path, target, *, timeout=None)` → `ScanResult` — shell
+  out to `musefs scan`; `target` is one path or an iterable, all scanned under
+  one process. Creates the DB if absent. Raises `ScanError` on a hard failure.
+- `ScanResult(binary, target, verb, returncode, partial, stderr)` — a completed
+  run. `partial` marks the exit-2 partial success (the batch committed; some
+  file failed to ingest) and `warning()` renders its non-fatal message.
 
 **Building records**
 
@@ -234,6 +248,9 @@ for a custom write loop)
 **Exceptions**
 
 - `SchemaMismatch(found)` — schema-version skew; `.found` is the DB's version.
+  The message names which side is behind and the fix: a store newer than the
+  plugin means upgrading the plugin, an older one means rescanning with musefs
+  to migrate it.
 - `ScanError(kind, *, binary, target, …)` — a `musefs scan` failure; `.kind` ∈
   `{"not_found", "timeout", "failed"}`, with context attributes for messaging.
 

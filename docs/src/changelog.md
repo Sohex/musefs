@@ -22,6 +22,19 @@ see the [Release notes](release-notes.md).
   [#616](https://github.com/Sohex/musefs/issues/616) is in use and directories are being rebuilt on every
   `readdir`.
 
+- `musefs_serve_warns_suppressed_total`
+  ([#653](https://github.com/Sohex/musefs/issues/653)), a monotonic counter of
+  serve-path failure warnings the rate limiter downgraded to `debug`. The count
+  previously escaped only as a parenthetical inside the next admitted warning,
+  which is both unscrapeable and carried by the admitted lines alone. The
+  failure mode matches
+  [#626](https://github.com/Sohex/musefs/issues/626)'s: suppression is bursty by
+  construction — 10 admitted per 30-second window, the rest dropped — so a
+  scrape landing between bursts sees nothing, and "quiet" and "failing faster
+  than it can log" look identical. Since the limiter moved into `musefs-core`
+  ([#650](https://github.com/Sohex/musefs/issues/650)) the counter covers the
+  synthesis warns too, not just the FUSE errno path.
+
 ### Changed
 
 - The `tags.value` cap rises from 256 KiB to 16 MiB − 1, and
@@ -60,13 +73,75 @@ see the [Release notes](release-notes.md).
   of materializing a whole `Track` per row ([#621](https://github.com/Sohex/musefs/issues/621)) — roughly 40 MB of
   transient allocation on a 200,000-track store, on a path already holding a
   pool connection.
+- The serve-path warn rate limiter is process-wide instead of FUSE-local
+  ([#650](https://github.com/Sohex/musefs/issues/650)). It bounds failure warns
+  to a burst of 10 per 30-second window, but it lived in `musefs-fuse` and was
+  reachable only from the errno-reply path, so the warns synthesis itself emits
+  bypassed it: a dropped Vorbis tag key (once per header-cache miss, and that
+  cache is byte-budgeted, so an evicting library re-warns for the same track
+  indefinitely), art over the byte cap, and a failed art-blob read — the last
+  fires per art *window*, so one bad blob produced many lines for one file. The
+  limiter now lives in `musefs-core` next to `telemetry.rs` and both crates
+  share one budget, which is the right unit: the operator's concern is total
+  serve-path log volume, not per-crate volume. Only the budget is shared, not
+  the attribution: the emit side is the `musefs_core::serve_warn!` macro, so
+  each record still takes its target from the call site's own module and
+  per-crate `RUST_LOG` filtering (`RUST_LOG=warn,musefs_fuse=debug`) reaches
+  exactly what it did before.
 - `readdir`'s unknown-`fh` fallback runs on the worker pool instead of inline on
   the fuser dispatch thread ([#623](https://github.com/Sohex/musefs/issues/623)), matching the offload every other
   blocking operation already used. This matters more now that over-cap `opendir`
   makes that fallback the normal path for large directories.
+- Scan failures are now broken down by reason and their per-file warnings capped
+  ([#651](https://github.com/Sohex/musefs/issues/651)). A scan that ends
+  `failed 37` also logs `failed 37: unparseable=30, io=5, oversize=2` (and
+  `walk errors N: …` for directories the walk could not read), so the number
+  that drives the exit-2 partial-failure signal explains itself instead of
+  having to be reconstructed from N individual lines. The per-file messages
+  themselves are capped at ten per reason per scan, the rest dropping to
+  `debug` — an unreadable subtree or a share that went away mid-scan no longer
+  emits one warning per file. The existing per-extension skip breakdown moves
+  from `warn` to `info` (so it now needs `-v` / `RUST_LOG=info`): cover art and
+  `.cue` sidecars are the normal contents of a music library, and a warning on
+  every healthy scan only teaches operators to tune warnings out. The `skipped`
+  count itself is unchanged and still printed in the per-target summary.
 
 ### Fixed
 
+- Scan log records and the progress bar no longer clobber each other on an
+  interactive terminal ([#648](https://github.com/Sohex/musefs/issues/648)).
+  `ScanReporter` renders an `indicatif` bar on stderr and the `log` facade
+  writes to the same stderr, with nothing coordinating the two: a record was
+  emitted at whatever column the last bar frame left the cursor on, and the
+  next 120 ms tick issued a clear-line that ate part of it. Both the warning
+  and the bar came out mangled. This was reachable on essentially the first
+  interactive scan of any real library, because the end-of-walk skip tally
+  ([#341](https://github.com/Sohex/musefs/issues/341)) warns about `cover.jpg`
+  / `.cue` / `.log` / `.nfo` sidecars, and every unparseable file warns from
+  inside the pipeline. The CLI now owns a single process-wide stderr draw
+  target: the scan bar draws through it, and the binary's `env_logger` is
+  installed wrapped in a sink that emits each record while that target is
+  suspended — bar cleared, record written, bar redrawn below it. The per-target
+  summary line (`scanned N: …`, on stdout) is suspended the same way; it used
+  to be glued onto a bar frame whenever no log record happened to precede it.
+  Off a terminal the draw target is hidden and suspending is a no-op, so this
+  change left the `--quiet` and piped milestone paths byte-for-byte alone, as it
+  did the verbosity policy (`-v`/`-vv`/`-vvv`, `RUST_LOG` taking precedence),
+  which stays in the binary. (The milestone line is renamed by the progress-bar
+  convergence fix below, in this same release.)
+- The scan progress indicator now reaches 100% when files fail
+  ([#655](https://github.com/Sohex/musefs/issues/655)). The bar's length is the
+  walked file count, but its position only advanced on a committed file, so any
+  failure left it permanently short — a run with 12 unparseable files out of 42
+  finished at `30/42 (71%)` and was then cleared, which reads as an aborted scan
+  rather than a completed one about to report `failed 12`. On the piped path the
+  final `100%` milestone was simply never printed, so a log-scraping consumer
+  waited for a line that could not arrive. A dispatched file that fails or races
+  now advances the same progress sequence as a committed one; the two together
+  always account for the walked total, and a debug assertion pins that. The
+  piped milestone line is renamed `ingested N/M (P%)` → `processed N/M (P%)`,
+  because it now counts every file the pipeline finished with rather than only
+  the successes — scripts matching the old prefix need updating.
 - A tag larger than the store's cap no longer aborts the entire scan
   ([#644](https://github.com/Sohex/musefs/issues/644)). The scanner had no
   length check on text tags, so an over-cap value reached the DB `CHECK` inside

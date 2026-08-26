@@ -17,6 +17,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
   given a cached directory snapshot, so directory-handle pressure stays visible
   after a burst rather than only as a gauge that reads healthy between samples.
+- `musefs_serve_warns_suppressed_total` counts the serve-path failure warnings
+  the rate limiter downgraded to `debug`, so log throttling is visible to
+  anything scraping metrics. Without it the count escaped only as prose inside
+  the next warning that was admitted, and an operator could not tell a quiet
+  serve path from one failing faster than it logs.
 - `--workers` (env `MUSEFS_WORKERS`) sizes the FUSE worker pool explicitly.
   The default stays auto (2× the CPU count, oversized for I/O-bound work), but
   each worker lazily opens its own read-only SQLite connection, so steady-state
@@ -51,7 +56,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   window carries the suppressed count. A library walk over missing backing
   files previously warned once per file — 200,000 lines (tens of MB of log)
   for a single enumeration. The read load-shed (`EAGAIN`) warning shares the
-  same limiter, since a saturated client retries in a tight loop.
+  same limiter, since a saturated client retries in a tight loop. The limiter is
+  now process-wide rather than FUSE-local, so the warns emitted from inside
+  synthesis — a dropped Vorbis tag key, over-cap art, a failed art-blob read —
+  are bounded by the same budget instead of bypassing it (#650). Log targets are
+  unchanged: each warning is still attributed to the module that raised it, so
+  per-crate `RUST_LOG` filters keep working.
+- Scan failures are broken down by reason, and the per-file warnings capped
+  ([#651](https://github.com/Sohex/musefs/issues/651)). A scan ending `failed 37`
+  now also logs `failed 37: unparseable=30, io=5, oversize=2` — the four reasons
+  partition the count exactly — plus `walk errors N: unreadable=…, symlink=…`
+  for entries the walk never queued. Previously `failed N` had no explanation
+  and the only way to get one was to read N individual warnings out of the
+  scrollback. Per-file skip warnings are capped at ten per reason per scan;
+  past that, one line says the rest are going to `debug`, and they do.
+  **The per-extension skip breakdown moves from `warn` to `info`**, so it now
+  needs `-v` or `RUST_LOG=info`: cover art and `.cue`/`.log` sidecars are the
+  normal contents of a library, so that line fired on every healthy scan, and a
+  warning that always fires teaches operators to filter warnings out — which
+  would now also cost them the failure summary that matters. The `skipped N`
+  count itself is unchanged and still prints at any log level.
 - Worker read connections now cap their SQLite page cache at 512 KiB (the
   default is ~2 MiB). The serve path opens one connection per worker thread
   (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS
@@ -60,6 +84,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now documents the post-enumeration steady state as the number to size a host
   against, and the transparent-hugepage inflation some distros' `THP=always`
   default adds on top.
+- An in-place store schema upgrade now announces itself
+  ([#649](https://github.com/Sohex/musefs/issues/649)). `Db::open` migrates on
+  every open, so an older store was rewritten irreversibly on the first
+  `musefs scan` after a binary upgrade with nothing said about it — and the
+  first the user heard of it was `StoreTooNew` when they tried to run the older
+  build again. The announcement is at `warn` (once per store per schema bump,
+  so it is in the scrollback when it is needed) and names both versions;
+  completion is at `info`. Creating a fresh store stays at `info`, and opening
+  an already-current store stays silent.
 - The virtual tree stores each node name in one shared allocation instead of
   five copies, cutting about a quarter of its resident cost (~1.7 KB to ~1.3 KB
   per track, measured over 200,000 tracks). The tuning guide now documents the
@@ -73,6 +106,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Scan log records no longer shred the progress bar (and vice versa) on an
+  interactive terminal ([#648](https://github.com/Sohex/musefs/issues/648)).
+  The bar and the `log` sink both write to stderr with nothing between them, so
+  a warning landed mid-frame and the next tick erased part of it — which is the
+  common case, not an edge one: the end-of-scan skip tally warns about the
+  `cover.jpg`/`.cue`/`.log` sidecars essentially every library contains.
+  Records are now emitted with the bar lifted out of the way and redrawn
+  beneath them, as is the per-target summary line. This change left piped
+  (non-interactive) output byte-for-byte alone.
+- The scan progress indicator now reaches 100% when files fail
+  ([#655](https://github.com/Sohex/musefs/issues/655)). The bar's length is the
+  walked file count, but its position advanced only on a committed file, so any
+  failure left it permanently short: 12 unparseable files out of 42 finished at
+  `30/42 (71%)` and were then cleared, which reads as an aborted scan rather
+  than a completed one about to report `failed 12`. Piped output never printed
+  its final `100%` milestone at all. A dispatched file that fails or races now
+  advances the same progress sequence as a committed one. **The piped milestone
+  line is renamed `ingested N/M (P%)` → `processed N/M (P%)`**, since it counts
+  every file the pipeline finished with rather than only the successes; scripts
+  matching the old prefix need updating.
 - A tag larger than the store's cap no longer aborts the entire scan
   ([#644](https://github.com/Sohex/musefs/issues/644)). The scanner had no
   length check on text tags, so an over-cap value reached the DB `CHECK` inside
