@@ -13,6 +13,7 @@ use musefs_db::limits::{
 };
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
 
 const BATCH_FILES: usize = 256;
@@ -41,14 +42,17 @@ pub(crate) const MAX_ART_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
 /// an oversize payload (e.g. a GEOB embedding a multi-MB file) fails.
 const MAX_BINARY_TAG_BYTES: usize = MAX_ART_BYTES;
 
-/// Outcome of probing one backing file. `Unparseable` is a supported-extension
-/// file whose bytes did not parse (counted as a scan `failed`). `Raced` means
-/// the file changed under us between the pre- and post-probe `fstat` — the probe
-/// may be torn, so nothing is committed for it (#276).
+/// Outcome of probing one backing file. `Failed` carries the reason and the
+/// line to log for a file that was supported and then lost — unparseable bytes,
+/// oversize metadata, a caught parser panic — and is counted as a scan `failed`;
+/// the caller tallies and logs it rather than the probe, so the warns can be
+/// capped per reason (#651). `Raced` means the file changed under us between the
+/// pre- and post-probe `fstat` — the probe may be torn, so nothing is committed
+/// for it (#276).
 #[derive(Debug)]
 enum ProbeOutcome {
     Probed(Probed, BackingStamp),
-    Unparseable,
+    Failed(Failure),
     Raced,
 }
 
@@ -169,6 +173,234 @@ impl SkipTally {
     }
 }
 
+/// Warn budget per skip reason, per scan. The first `SCAN_WARN_BURST` skips of
+/// a kind are logged individually at their natural level; the rest fall to
+/// `debug` and are carried by the end-of-scan breakdown instead. Without a cap,
+/// an unreadable subtree or a share that vanished mid-scan emits one line per
+/// file (#651). Mirrors the serve path's `rate_limited_warn` burst
+/// (`musefs-fuse`), but a scan is a bounded operation rather than a long-lived
+/// mount, so the budget is a plain per-reason count and not a sliding window.
+const SCAN_WARN_BURST: u64 = 10;
+
+/// Why one entry was passed over. Buckets the end-of-scan breakdowns and keys
+/// the per-reason warn budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// Supported extension, but the bytes did not parse.
+    Unparseable,
+    /// Metadata over a storage cap — art, tag field, or binary frame (#644).
+    Oversize,
+    /// `open`/`stat`/`canonicalize` failed on a file the walk had accepted.
+    Io,
+    /// A parser panic caught by [`probe_file_caught`] (#425).
+    Panicked,
+    /// The file changed under the probe, so nothing was committed (#276).
+    Raced,
+    /// A directory or directory entry the walk could not read or classify.
+    WalkUnreadable,
+    /// A symlink the walk could not resolve, or one closing a cycle.
+    WalkSymlink,
+}
+
+impl SkipReason {
+    /// Every reason, in [`FailureTally`]'s array order (each reason indexes that
+    /// array by its discriminant).
+    const ALL: [SkipReason; 7] = [
+        SkipReason::Unparseable,
+        SkipReason::Oversize,
+        SkipReason::Io,
+        SkipReason::Panicked,
+        SkipReason::Raced,
+        SkipReason::WalkUnreadable,
+        SkipReason::WalkSymlink,
+    ];
+
+    /// The reasons that increment `ScanStats::failed`. They partition it
+    /// exactly, which is what makes the `failed N: ...` breakdown trustworthy.
+    const FAILED: [SkipReason; 4] = [
+        SkipReason::Unparseable,
+        SkipReason::Oversize,
+        SkipReason::Io,
+        SkipReason::Panicked,
+    ];
+
+    /// Walk-time entries, counted in no `ScanStats` field: no file was ever
+    /// queued for them, so they are neither `skipped` (the unsupported-extension
+    /// tally) nor `failed` (a probe or ingest that ran and lost).
+    const WALK: [SkipReason; 2] = [SkipReason::WalkUnreadable, SkipReason::WalkSymlink];
+
+    fn label(self) -> &'static str {
+        match self {
+            SkipReason::Unparseable => "unparseable",
+            SkipReason::Oversize => "oversize",
+            SkipReason::Io => "io",
+            SkipReason::Panicked => "panicked",
+            SkipReason::Raced => "changed-during-probe",
+            SkipReason::WalkUnreadable => "unreadable",
+            SkipReason::WalkSymlink => "symlink",
+        }
+    }
+
+    /// The level the in-budget lines for this reason are logged at. A caught
+    /// parser panic keeps `error`: it is a musefs bug, not a property of the
+    /// library being scanned.
+    fn level(self) -> log::Level {
+        match self {
+            SkipReason::Panicked => log::Level::Error,
+            _ => log::Level::Warn,
+        }
+    }
+}
+
+/// What the warn budget says about one skip. Split out of [`FailureTally::record`]
+/// so the policy is testable without a capturing logger, mirroring
+/// `WarnLimiter::decide` on the serve path.
+#[derive(Debug, PartialEq, Eq)]
+enum WarnBudget {
+    /// In budget: log the line at the reason's own level.
+    Spend(log::Level),
+    /// The first line over budget: say once that the rest are going to `debug`.
+    Exhausted,
+    /// Over budget: `debug` only.
+    Over,
+}
+
+/// Per-reason tally of everything a scan passed over, doing two jobs off one
+/// counter: it caps the per-file warns (the first [`SCAN_WARN_BURST`] of each
+/// reason at their natural level, the rest at `debug`) and it backs the
+/// end-of-scan breakdown that explains the otherwise bare `failed N` — the
+/// number the CLI reports and the one that drives the exit-2 partial-failure
+/// signal, so the one users most need explained (#651).
+///
+/// Distinct from [`SkipTally`], which buckets *unsupported-extension* files by
+/// extension: that breakdown is log-only and must never reach `ScanStats`
+/// (#341), whereas these failure counts partition `ScanStats::failed` exactly.
+///
+/// Shared across probe workers through `&self` — relaxed counters, no lock. The
+/// summaries are read after every worker has joined, and the warn budget only
+/// needs each caller to draw a distinct sequence number.
+#[derive(Debug, Default)]
+struct FailureTally {
+    counts: [AtomicU64; SkipReason::ALL.len()],
+}
+
+impl FailureTally {
+    /// Count one skip and decide its log level, spending this reason's warn
+    /// budget. Counting and deciding are the same atomic step: two callers can
+    /// never draw the same sequence number, so the "rest are at debug" notice is
+    /// emitted exactly once per reason however many workers race here.
+    fn decide(&self, reason: SkipReason) -> WarnBudget {
+        let prior = self.counts[reason as usize].fetch_add(1, Ordering::Relaxed);
+        // Fully qualified: the atomic `Ordering` is what this module imports.
+        match prior.cmp(&SCAN_WARN_BURST) {
+            std::cmp::Ordering::Less => WarnBudget::Spend(reason.level()),
+            std::cmp::Ordering::Equal => WarnBudget::Exhausted,
+            std::cmp::Ordering::Greater => WarnBudget::Over,
+        }
+    }
+
+    /// Record one skip and log `message` under this reason's warn budget: the
+    /// first [`SCAN_WARN_BURST`] go out at [`SkipReason::level`], then one line
+    /// says where the rest went, and the remainder are `debug`.
+    fn record(&self, reason: SkipReason, message: fmt::Arguments<'_>) {
+        match self.decide(reason) {
+            WarnBudget::Spend(level) => log::log!(level, "{message}"),
+            WarnBudget::Exhausted => {
+                log::warn!(
+                    "further \"{}\" skips are logged at debug ({SCAN_WARN_BURST} already reported); \
+                     the end-of-scan summary has the totals",
+                    reason.label()
+                );
+                log::debug!("{message}");
+            }
+            WarnBudget::Over => log::debug!("{message}"),
+        }
+    }
+
+    fn count(&self, reason: SkipReason) -> u64 {
+        self.counts[reason as usize].load(Ordering::Relaxed)
+    }
+
+    /// Everything counted toward `ScanStats::failed`.
+    fn failed_total(&self) -> u64 {
+        SkipReason::FAILED.iter().map(|r| self.count(*r)).sum()
+    }
+
+    /// `failed 37: unparseable=30, io=5, oversize=2` — the breakdown of
+    /// `ScanStats::failed`. `None` when nothing failed.
+    fn failed_summary(&self) -> Option<String> {
+        self.summary("failed", &SkipReason::FAILED)
+    }
+
+    /// `walk errors 12: unreadable=9, symlink=3` — entries the walk could not
+    /// read or classify, counted in no `ScanStats` field. `None` when the walk
+    /// was clean.
+    fn walk_summary(&self) -> Option<String> {
+        self.summary("walk errors", &SkipReason::WALK)
+    }
+
+    /// One summary line over `group`: `<label> <total>: reason=n, ...`, buckets
+    /// ordered by descending count with ties broken by reason name (matching
+    /// [`SkipTally::summary`]) and empty buckets omitted. `None` when the group
+    /// is empty, so there is no line to emit.
+    ///
+    /// [`SkipReason::Raced`] belongs to no group: it has exactly one cause, so a
+    /// breakdown would only repeat its own name, and its total is already
+    /// reported as `ScanStats::raced`.
+    fn summary(&self, label: &str, group: &[SkipReason]) -> Option<String> {
+        let mut buckets: Vec<(&'static str, u64)> = group
+            .iter()
+            .map(|r| (r.label(), self.count(*r)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let total: u64 = buckets.iter().map(|(_, n)| *n).sum();
+        if total == 0 {
+            return None;
+        }
+        buckets.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let breakdown = buckets
+            .iter()
+            .map(|(reason, n)| format!("{reason}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("{label} {total}: {breakdown}"))
+    }
+}
+
+/// Outcome of [`probe_body`]'s per-format dispatch: a parse, or the [`Failure`]
+/// for the caller to tally and log.
+#[derive(Debug)]
+enum ProbeBody {
+    Parsed(Probed),
+    Failed(Failure),
+}
+
+/// One per-file failure on its way from the probe to the tally: the bucket it
+/// counts toward and the line to log for it. Carried out of the probe rather
+/// than logged where it happens so the tally — which lives with the worker
+/// pool — sees every failure and can cap the warns (#651).
+#[derive(Debug)]
+struct Failure {
+    reason: SkipReason,
+    message: String,
+}
+
+impl Failure {
+    fn new(reason: SkipReason, message: String) -> Failure {
+        Failure { reason, message }
+    }
+}
+
+/// The tallies threaded through the directory walk: the owned per-extension skip
+/// breakdown handed back to the caller, plus a borrow of the scan-wide
+/// [`FailureTally`] (shared with the probe workers) for entries the walk itself
+/// cannot read. Bundled into one parameter so the recursion's argument list
+/// stays inside clippy's limit.
+struct WalkTally<'a> {
+    skips: SkipTally,
+    failures: &'a FailureTally,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevalidateStats {
     pub updated: u64,
@@ -196,12 +428,14 @@ fn is_supported_audio(path: &Path) -> bool {
         || has_ext(path, "wav")
 }
 
+/// Walk `root` with a throwaway failure tally — the callers that do not
+/// aggregate walk errors (the legacy oracle scan, unit tests).
 fn collect_audio(
     root: &Path,
     out: &mut Vec<PathBuf>,
     follow_symlinks: bool,
 ) -> std::io::Result<SkipTally> {
-    collect_audio_with(root, out, follow_symlinks, None)
+    collect_audio_with(root, out, follow_symlinks, None, &FailureTally::default())
 }
 
 fn collect_audio_with(
@@ -209,10 +443,14 @@ fn collect_audio_with(
     out: &mut Vec<PathBuf>,
     follow_symlinks: bool,
     progress: Option<&ProgressSink>,
+    failures: &FailureTally,
 ) -> std::io::Result<SkipTally> {
     let mut visited = HashSet::new();
     let mut files_visited = HashSet::new();
-    let mut tally = SkipTally::default();
+    let mut tally = WalkTally {
+        skips: SkipTally::default(),
+        failures,
+    };
     if follow_symlinks && let Ok(meta) = std::fs::metadata(root) {
         visited.insert(dir_key(&meta));
     }
@@ -225,7 +463,7 @@ fn collect_audio_with(
         &mut tally,
         progress,
     )?;
-    Ok(tally)
+    Ok(tally.skips)
 }
 
 fn collect_audio_inner(
@@ -234,7 +472,7 @@ fn collect_audio_inner(
     follow_symlinks: bool,
     visited: &mut HashSet<(u64, u64)>,
     files_visited: &mut HashSet<(u64, u64)>,
-    tally: &mut SkipTally,
+    tally: &mut WalkTally<'_>,
     progress: Option<&ProgressSink>,
 ) -> std::io::Result<()> {
     // A single unreadable subtree or vanished entry must drop only that entry,
@@ -245,7 +483,10 @@ fn collect_audio_inner(
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) => {
-            log::warn!("skipping directory {}: {e}", root.display());
+            tally.failures.record(
+                SkipReason::WalkUnreadable,
+                format_args!("skipping directory {}: {e}", root.display()),
+            );
             return Ok(());
         }
     };
@@ -253,7 +494,10 @@ fn collect_audio_inner(
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                log::warn!("skipping unreadable entry in {}: {e}", root.display());
+                tally.failures.record(
+                    SkipReason::WalkUnreadable,
+                    format_args!("skipping unreadable entry in {}: {e}", root.display()),
+                );
                 continue;
             }
         };
@@ -261,7 +505,10 @@ fn collect_audio_inner(
         let ftype = match entry.file_type() {
             Ok(ftype) => ftype,
             Err(e) => {
-                log::warn!("skipping {}: {e}", path.display());
+                tally.failures.record(
+                    SkipReason::WalkUnreadable,
+                    format_args!("skipping {}: {e}", path.display()),
+                );
                 continue;
             }
         };
@@ -279,7 +526,7 @@ fn collect_audio_inner(
             if is_supported_audio(&path) {
                 push_file(&path, out, follow_symlinks, files_visited, None, progress);
             } else {
-                tally.record(&path);
+                tally.skips.record(&path);
             }
         } else if ftype.is_symlink() {
             if !follow_symlinks {
@@ -316,12 +563,15 @@ fn collect_audio_inner(
                             progress,
                         );
                     } else {
-                        tally.record(&path);
+                        tally.skips.record(&path);
                     }
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    log::warn!("skipping broken symlink {}: {e}", path.display());
+                    tally.failures.record(
+                        SkipReason::WalkSymlink,
+                        format_args!("skipping broken symlink {}: {e}", path.display()),
+                    );
                 }
             }
         } else {
@@ -330,7 +580,7 @@ fn collect_audio_inner(
             // never opened), but tally it so it surfaces in the skip breakdown
             // rather than vanishing without a trace, matching unsupported
             // regular files above (#544).
-            tally.record(&path);
+            tally.skips.record(&path);
         }
     }
     Ok(())
@@ -342,7 +592,7 @@ fn descend(
     follow_symlinks: bool,
     visited: &mut HashSet<(u64, u64)>,
     files_visited: &mut HashSet<(u64, u64)>,
-    tally: &mut SkipTally,
+    tally: &mut WalkTally<'_>,
     progress: Option<&ProgressSink>,
 ) -> std::io::Result<()> {
     if !follow_symlinks {
@@ -359,12 +609,20 @@ fn descend(
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) => {
-            log::warn!("skipping directory {}: {e}", path.display());
+            // `path` is a directory or a symlink to one; a failed `stat` cannot
+            // tell them apart, so it buckets with the walk's other unreadables.
+            tally.failures.record(
+                SkipReason::WalkUnreadable,
+                format_args!("skipping directory {}: {e}", path.display()),
+            );
             return Ok(());
         }
     };
     if !visited.insert(dir_key(&meta)) {
-        log::warn!("skipping symlink cycle at {}", path.display());
+        tally.failures.record(
+            SkipReason::WalkSymlink,
+            format_args!("skipping symlink cycle at {}", path.display()),
+        );
         return Ok(());
     }
     collect_audio_inner(
@@ -602,9 +860,10 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
 /// probe. Never reads the audio payload (M4A uses the seek reader;
 /// front-anchored formats read only the metadata extent).
 ///
-/// Returns `ProbeOutcome::Unparseable` for a supported-extension file that does
-/// not parse (counted as `failed`) and `ProbeOutcome::Raced` if the file
-/// changed under us.
+/// Returns `ProbeOutcome::Failed` for a supported-extension file that does not
+/// parse or cannot be stored (counted as `failed`) and `ProbeOutcome::Raced` if
+/// the file changed under us — a race outranks a failure, since a torn probe
+/// says nothing about whether the settled file would parse.
 fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
@@ -616,12 +875,11 @@ fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
 
     let s2 = BackingStamp::from_metadata(&file.metadata()?);
     if s1 != s2 {
-        log::warn!("skipping {}: changed during probe", path.display());
         return Ok(ProbeOutcome::Raced);
     }
     Ok(match probed {
-        Some(p) => ProbeOutcome::Probed(p, s1),
-        None => ProbeOutcome::Unparseable,
+        ProbeBody::Parsed(p) => ProbeOutcome::Probed(p, s1),
+        ProbeBody::Failed(f) => ProbeOutcome::Failed(f),
     })
 }
 
@@ -630,9 +888,11 @@ fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
 /// drops just that file instead of unwinding the scan worker thread. An unwound
 /// worker would skip its `failed.fetch_add`, and a crafted directory could kill
 /// every worker, closing the channel so the writer reports success while
-/// silently truncating the rest of the library (#425). A caught panic is logged
-/// and folded into `ProbeOutcome::Unparseable`, which the worker already counts
-/// as `failed`. Mirrors the read path's `read_outcome` boundary (#359).
+/// silently truncating the rest of the library (#425). A caught panic is folded
+/// into a `Panicked` `ProbeOutcome::Failed`, which the worker already counts as
+/// `failed` — and which keeps its `error` level when the caller logs it, since a
+/// panic is a musefs bug rather than a property of the library being scanned.
+/// Mirrors the read path's `read_outcome` boundary (#359).
 fn probe_file_caught(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe_file(path, window))) {
         Ok(res) => res,
@@ -642,11 +902,13 @@ fn probe_file_caught(path: &Path, window: usize) -> std::io::Result<ProbeOutcome
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("<non-string panic>");
-            log::error!(
-                "scan worker panicked probing {}: {msg}; counting as failed",
-                path.display()
-            );
-            Ok(ProbeOutcome::Unparseable)
+            Ok(ProbeOutcome::Failed(Failure::new(
+                SkipReason::Panicked,
+                format!(
+                    "scan worker panicked probing {}: {msg}; counting as failed",
+                    path.display()
+                ),
+            )))
         }
     }
 }
@@ -654,22 +916,26 @@ fn probe_file_caught(path: &Path, window: usize) -> std::io::Result<ProbeOutcome
 /// The per-format metadata dispatch for one already-opened backing file, over
 /// its first `file_len` bytes. Split out of `probe_file` so the fstat-sandwich
 /// wrapper stays legible. Never reads the audio payload (M4A uses the seek
-/// reader; front-anchored formats read only the metadata extent). Returns
-/// `Ok(None)` for an unsupported/unparseable file.
+/// reader; front-anchored formats read only the metadata extent).
+/// `ProbeBody::Failed` is an unsupported/unparseable/oversize file — a verdict
+/// for the caller to tally and log, distinct from the outer `Err`, which is an
+/// I/O error on the already-open file.
 fn probe_body(
     path: &Path,
     file: &std::fs::File,
     file_len: u64,
     window: usize,
-) -> std::io::Result<Option<Probed>> {
+) -> std::io::Result<ProbeBody> {
     // M4A: seek reader, never touches mdat.
     if has_ext(path, "m4a") || has_ext(path, "m4b") {
         let mut f = file;
         let scan = match mp4::read_structure_from(&mut f, file_len) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("skipping {}: {e}", path.display());
-                return Ok(None);
+                return Ok(ProbeBody::Failed(Failure::new(
+                    SkipReason::Unparseable,
+                    format!("skipping {}: {e}", path.display()),
+                )));
             }
         };
         let (pictures, art_drops) = mp4::read_pictures_reporting(&scan.moov, MAX_ART_BYTES);
@@ -680,10 +946,12 @@ fn probe_body(
         // verdict `check_storable` produces for every other format, reached one
         // layer earlier because the payload is never materialized here.
         if let Some(e) = mp4_oversize_error(path, &art_drops, &bin_drops) {
-            log::warn!("skipping {e}");
-            return Ok(None);
+            return Ok(ProbeBody::Failed(Failure::new(
+                SkipReason::Oversize,
+                format!("skipping {e}"),
+            )));
         }
-        return Ok(Some(Probed {
+        return Ok(ProbeBody::Parsed(Probed {
             format: Format::M4a,
             audio_offset: scan.mdat_payload_offset,
             audio_length: scan.mdat_payload_len,
@@ -713,10 +981,12 @@ fn probe_body(
     };
     for _ in 0..MAX_WIDEN_RETRIES {
         match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
-            Probe::Done(p) => return Ok(Some(p)),
+            Probe::Done(p) => return Ok(ProbeBody::Parsed(p)),
             Probe::Skip => {
-                log::warn!("skipping {}: no parseable audio metadata", path.display());
-                return Ok(None);
+                return Ok(ProbeBody::Failed(Failure::new(
+                    SkipReason::Unparseable,
+                    format!("skipping {}: no parseable audio metadata", path.display()),
+                )));
             }
             Probe::NeedMore(up_to) => {
                 // Read everything we're willing to probe? Widening can't help.
@@ -737,7 +1007,7 @@ fn probe_body(
         prefix = read_window(file, usize_from(probe_cap))?;
     }
     if let Some(p) = probe_full(path, &prefix) {
-        return Ok(Some(p));
+        return Ok(ProbeBody::Parsed(p));
     }
     // A WAV whose `data` payload runs past the probe ceiling fails the strict
     // full-buffer parse (the payload isn't present to bound), yet its `fmt `/`data`
@@ -747,17 +1017,23 @@ fn probe_body(
         && file_len > MAX_PROBE_BYTES
         && let Ok(bounds) = wav::locate_audio_at_ceiling(&prefix, file_len)
     {
-        return Ok(Some(wav_probed(&prefix, &bounds)));
+        return Ok(ProbeBody::Parsed(wav_probed(&prefix, &bounds)));
     }
-    if file_len > MAX_PROBE_BYTES {
-        log::warn!(
+    Ok(ProbeBody::Failed(unparseable(path, file_len)))
+}
+
+/// The "nothing parsed" verdict for one file, naming the probe ceiling when the
+/// file is large enough that the ceiling is the likely reason.
+fn unparseable(path: &Path, file_len: u64) -> Failure {
+    let message = if file_len > MAX_PROBE_BYTES {
+        format!(
             "skipping {}: no parseable metadata within first {MAX_PROBE_BYTES} bytes",
             path.display()
-        );
+        )
     } else {
-        log::warn!("skipping {}: no parseable audio metadata", path.display());
-    }
-    Ok(None)
+        format!("skipping {}: no parseable audio metadata", path.display())
+    };
+    Failure::new(SkipReason::Unparseable, message)
 }
 
 /// Outcome of a single bounded dispatch attempt against the current `prefix`.
@@ -1593,7 +1869,9 @@ fn ingest_bulk(
 /// increment `ScanStats::skipped` and are tallied by extension for the
 /// end-of-scan summary log line (#341); supported-extension files with a
 /// per-file I/O or parse error increment `ScanStats::failed` and do not abort
-/// the scan.
+/// the scan. Those failures are tallied by reason and summarized at the end too
+/// (#651), and their per-file warns are capped per reason so a whole unreadable
+/// subtree cannot scale the log with the library.
 pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<ScanStats> {
     // Canonicalize the root once. With symlinks unfollowed (the default) every
     // path the walk yields is then already absolute and symlink-free — i.e.
@@ -1602,6 +1880,7 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
     let root = canon.as_path();
     let mut files = Vec::new();
     let mut tally = SkipTally::default();
+    let failures = Arc::new(FailureTally::default());
     if root.is_file() {
         if is_supported_audio(root) {
             files.push(root.to_path_buf());
@@ -1614,6 +1893,7 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
             &mut files,
             opts.follow_symlinks,
             opts.progress.as_ref(),
+            &failures,
         )?;
     }
     let mut already_present = 0u64;
@@ -1641,16 +1921,36 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
         });
     }
     db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
-    let mut stats = run_pipeline(db, files, opts, WritePolicy::Full)?;
+    let mut stats = run_pipeline(db, files, opts, WritePolicy::Full, &failures)?;
     // skipped is tallied during the walk, not the pipeline
     stats.skipped = tally.total;
     stats.already_present = already_present;
     // Per-extension breakdown of the skip count, so a large `skipped` is
     // diagnosable (#341). Log-only: never folded into `stats`/the CLI summary.
+    //
+    // `info`, not `warn`: every ordinary library has cover art, `.cue` and
+    // `.log` sidecars, so a `warn` here fires on every healthy scan and teaches
+    // operators to tune warnings out. The count itself is never hidden — the CLI
+    // prints `skipped N` regardless of log level — so `-v` gates only the
+    // breakdown, which is a diagnostic you go looking for (#651).
     if let Some(summary) = tally.summary() {
+        log::info!("{summary}");
+    }
+    log_failure_summaries(&failures);
+    Ok(stats)
+}
+
+/// Emit the end-of-scan breakdowns of everything that went wrong, at `warn`:
+/// unlike the skip summary these do not fire on a healthy library, and `failed`
+/// is what drives the CLI's exit-2 partial-failure signal, so it must be legible
+/// at the default log floor (#651).
+fn log_failure_summaries(failures: &FailureTally) {
+    if let Some(summary) = failures.failed_summary() {
         log::warn!("{summary}");
     }
-    Ok(stats)
+    if let Some(summary) = failures.walk_summary() {
+        log::warn!("{summary}");
+    }
 }
 
 /// Back-compat shim used by the CLI and existing tests.
@@ -1660,14 +1960,17 @@ pub fn scan_directory(db: &Db, root: &Path) -> Result<ScanStats> {
 
 /// Probe `files` across `jobs` workers (no DB access) and write the results from a
 /// single writer (this thread) in batched transactions. Per-file errors are
-/// counted, not fatal.
+/// counted, not fatal: every one of them is recorded in `failures` (which also
+/// caps their warns) so the reason breakdown its caller logs partitions
+/// `ScanStats::failed` exactly.
 fn run_pipeline(
     db: &Db,
     files: Vec<PathBuf>,
     opts: &ScanOptions,
     policy: WritePolicy,
+    failures: &Arc<FailureTally>,
 ) -> Result<ScanStats> {
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     let jobs = effective_jobs(opts.jobs);
     let total = files.len() as u64;
@@ -1680,6 +1983,7 @@ fn run_pipeline(
     let budget = Arc::new(ByteBudget::new(cap));
     let failed = Arc::new(AtomicU64::new(0));
     let raced = Arc::new(AtomicU64::new(0));
+    let failed_before = failures.failed_total();
 
     // Work queue: a shared slice with an atomic cursor — each worker claims the
     // next index with a single relaxed `fetch_add`, no per-file lock contention.
@@ -1695,6 +1999,7 @@ fn run_pipeline(
         let budget = Arc::clone(&budget);
         let failed = Arc::clone(&failed);
         let raced = Arc::clone(&raced);
+        let failures = Arc::clone(failures);
         workers.push(std::thread::spawn(move || {
             loop {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
@@ -1708,7 +2013,10 @@ fn run_pipeline(
                             match std::fs::canonicalize(path) {
                                 Ok(abs) => abs.to_string_lossy().into_owned(),
                                 Err(e) => {
-                                    log::warn!("skipping {}: {e}", path.display());
+                                    failures.record(
+                                        SkipReason::Io,
+                                        format_args!("skipping {}: {e}", path.display()),
+                                    );
                                     failed.fetch_add(1, Ordering::Relaxed);
                                     continue;
                                 }
@@ -1726,7 +2034,7 @@ fn run_pipeline(
                         if policy == WritePolicy::Full
                             && let Err(e) = check_storable(&abs_path, &probed)
                         {
-                            log::warn!("skipping {e}");
+                            failures.record(SkipReason::Oversize, format_args!("skipping {e}"));
                             failed.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
@@ -1763,14 +2071,25 @@ fn run_pipeline(
                             break;
                         }
                     }
-                    Ok(ProbeOutcome::Unparseable) => {
+                    Ok(ProbeOutcome::Failed(f)) => {
+                        failures.record(f.reason, format_args!("{}", f.message));
                         failed.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        log::warn!("skipping {}: {e}", path.display());
+                        failures.record(
+                            SkipReason::Io,
+                            format_args!("skipping {}: {e}", path.display()),
+                        );
                         failed.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(ProbeOutcome::Raced) => {
+                        // Its own bucket, capped like the rest but left out of the
+                        // failure breakdown: a race has exactly one cause and is
+                        // already reported whole as `ScanStats::raced`.
+                        failures.record(
+                            SkipReason::Raced,
+                            format_args!("skipping {}: changed during probe", path.display()),
+                        );
                         raced.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1893,13 +2212,23 @@ fn run_pipeline(
     }
     outcome?;
 
-    Ok(ScanStats {
+    let stats = ScanStats {
         scanned,
         skipped: 0, // counted at walk time; filled in by scan_directory_with
         already_present: 0,
         failed: failed.load(Ordering::Relaxed),
         raced: raced.load(Ordering::Relaxed),
-    })
+    };
+    // Every `failed` increment must be paired with a `failures.record`, or the
+    // breakdown would silently understate the number it exists to explain.
+    // Checked as a delta: the tally may already carry the walk's errors, or
+    // revalidate's pre-dispatch skip-pass failures.
+    debug_assert_eq!(
+        failures.failed_total() - failed_before,
+        stats.failed,
+        "every scan failure must be tallied by reason"
+    );
+    Ok(stats)
 }
 
 /// Test/oracle only: scan using the legacy whole-file probe (`probe_full`). The
@@ -1958,6 +2287,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     let canon = std::fs::canonicalize(root)?;
     let root = canon.as_path();
     let mut files = Vec::new();
+    let failures = Arc::new(FailureTally::default());
     if root.is_file() {
         if is_supported_audio(root) {
             files.push(root.to_path_buf());
@@ -1968,6 +2298,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             &mut files,
             opts.follow_symlinks,
             opts.progress.as_ref(),
+            &failures,
         )?;
     }
     db.apply_bulk_pragmas_self()?;
@@ -2003,7 +2334,10 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         let meta = match std::fs::metadata(&path) {
             Ok(meta) => meta,
             Err(e) => {
-                log::warn!("skipping {}: {e}", path.display());
+                failures.record(
+                    SkipReason::Io,
+                    format_args!("skipping {}: {e}", path.display()),
+                );
                 skip_failed += 1;
                 continue;
             }
@@ -2012,7 +2346,10 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             match std::fs::canonicalize(&path) {
                 Ok(abs) => abs.to_string_lossy().into_owned(),
                 Err(e) => {
-                    log::warn!("skipping {}: {e}", path.display());
+                    failures.record(
+                        SkipReason::Io,
+                        format_args!("skipping {}: {e}", path.display()),
+                    );
                     skip_failed += 1;
                     continue;
                 }
@@ -2047,7 +2384,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     }
 
     let mut pruned = 0u64;
-    let scan = run_pipeline(db, changed, opts, WritePolicy::StructuralOnly)?;
+    let scan = run_pipeline(db, changed, opts, WritePolicy::StructuralOnly, &failures)?;
 
     if opts.prune {
         let canon_root = root;
@@ -2065,6 +2402,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         db.gc_orphan_art()?;
     }
 
+    log_failure_summaries(&failures);
     Ok(RevalidateStats {
         updated: scan.scanned,
         unchanged,

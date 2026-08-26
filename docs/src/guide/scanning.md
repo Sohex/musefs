@@ -35,11 +35,21 @@ tracked. `skipped`
 counts every file that isn't a supported audio format — cover art, `.cue` /
 `.log` / `.nfo` sidecars, and anything else non-audio — so a large `skipped`
 number (hundreds or thousands on a big library) is expected, not an error.
-A per-extension breakdown of the skip count is logged at end of scan (e.g.
-`skipped 42: jpg=20, cue=10, log=8, <none>=4`), so you can tell expected
-sidecars from anything genuinely unexpected. `failed` is the one
-to watch: those are audio files musefs recognised by extension but could not
-parse. Format dispatch is by **extension only** —
+A per-extension breakdown of the skip count is logged at end of scan at
+`info` (e.g. `skipped 42: jpg=20, cue=10, log=8, <none>=4`, so it needs `-v` or
+`RUST_LOG=info`), letting you tell expected sidecars from anything genuinely
+unexpected. `failed` is the one to watch: those are audio files musefs
+recognised by extension but could not parse. Its own breakdown by reason is
+logged at end of scan too — `failed 37: unparseable=30, io=5, oversize=2` — at
+`warn`, so it is visible without `-v`; a further `walk errors N: unreadable=9,
+symlink=3` line accounts for directories and entries the walk itself could not
+read (those are counted in neither `skipped` nor `failed`, since no file was
+ever queued for them).
+
+Per-file skip messages are capped at ten per reason per scan; the rest drop to
+`debug` (`-vv` / `RUST_LOG=debug`) so an unreadable subtree or a share that
+vanished mid-scan cannot emit one line per file. The end-of-scan breakdowns
+carry the full counts either way. Format dispatch is by **extension only** —
 there is no content sniffing and no fallback to another parser, so a file
 whose contents don't match its extension (e.g. a FLAC named `.mp3`) is handed
 to the wrong parser, fails, and is counted here rather than retried. Renaming

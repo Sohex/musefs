@@ -210,7 +210,7 @@ fn probe_file_fails_file_with_oversized_mp4_covr() {
     let path = dir.path().join("oversized_art.m4a");
     std::fs::write(&path, &bytes).unwrap();
     assert!(
-        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Unparseable),
+        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Failed(_)),
         "an oversized covr must fail the file, not yield a track without its art"
     );
 }
@@ -223,7 +223,7 @@ fn probe_file_fails_file_with_oversized_mp4_binary_freeform() {
     let path = dir.path().join("oversized_bin.m4a");
     std::fs::write(&path, &bytes).unwrap();
     assert!(
-        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Unparseable),
+        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Failed(_)),
         "an oversized `----` value must fail the file"
     );
 }
