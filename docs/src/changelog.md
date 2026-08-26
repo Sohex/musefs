@@ -60,6 +60,17 @@ see the [Release notes](release-notes.md).
   of materializing a whole `Track` per row ([#621](https://github.com/Sohex/musefs/issues/621)) — roughly 40 MB of
   transient allocation on a 200,000-track store, on a path already holding a
   pool connection.
+- The serve-path warn rate limiter is process-wide instead of FUSE-local
+  ([#650](https://github.com/Sohex/musefs/issues/650)). It bounds failure warns
+  to a burst of 10 per 30-second window, but it lived in `musefs-fuse` and was
+  reachable only from the errno-reply path, so the warns synthesis itself emits
+  bypassed it: a dropped Vorbis tag key (once per header-cache miss, and that
+  cache is byte-budgeted, so an evicting library re-warns for the same track
+  indefinitely), art over the byte cap, and a failed art-blob read — the last
+  fires per art *window*, so one bad blob produced many lines for one file. The
+  limiter now lives in `musefs-core` next to `telemetry.rs` and both crates
+  share one budget, which is the right unit: the operator's concern is total
+  serve-path log volume, not per-crate volume.
 - `readdir`'s unknown-`fh` fallback runs on the worker pool instead of inline on
   the fuser dispatch thread ([#623](https://github.com/Sohex/musefs/issues/623)), matching the offload every other
   blocking operation already used. This matters more now that over-cap `opendir`

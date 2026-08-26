@@ -214,11 +214,11 @@ impl HeaderCache {
                                 (structural, &binary_tag_inputs)
                             };
                         for key in invalid_vorbis_keys(&inputs) {
-                            log::warn!(
+                            crate::warn_limit::rate_limited_warn(format_args!(
                                 "track {}: dropping tag key {key:?} from Vorbis \
                                  synthesis (not a valid field name)",
                                 track.id
-                            );
+                            ));
                         }
                         flac::synthesize_layout(
                             &structural,
@@ -300,11 +300,11 @@ impl HeaderCache {
                             .collect();
                         let src = crate::mapping::DbArtSource(db);
                         for key in invalid_vorbis_keys(&inputs) {
-                            log::warn!(
+                            crate::warn_limit::rate_limited_warn(format_args!(
                                 "track {}: dropping tag key {key:?} from Vorbis \
                                  synthesis (not a valid field name)",
                                 track.id
-                            );
+                            ));
                         }
                         musefs_format::ogg::synthesize_layout(
                             &header,

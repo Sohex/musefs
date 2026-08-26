@@ -51,7 +51,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   window carries the suppressed count. A library walk over missing backing
   files previously warned once per file — 200,000 lines (tens of MB of log)
   for a single enumeration. The read load-shed (`EAGAIN`) warning shares the
-  same limiter, since a saturated client retries in a tight loop.
+  same limiter, since a saturated client retries in a tight loop. The limiter is
+  now process-wide rather than FUSE-local, so the warns emitted from inside
+  synthesis — a dropped Vorbis tag key, over-cap art, a failed art-blob read —
+  are bounded by the same budget instead of bypassing it (#650).
 - Worker read connections now cap their SQLite page cache at 512 KiB (the
   default is ~2 MiB). The serve path opens one connection per worker thread
   (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS

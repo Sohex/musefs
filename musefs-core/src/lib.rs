@@ -14,6 +14,7 @@ mod scan;
 mod telemetry;
 mod template;
 mod tree;
+mod warn_limit;
 
 pub use db_pool::DbPool;
 pub use error::{CoreError, Result};
@@ -32,6 +33,7 @@ pub use telemetry::{
 };
 pub use template::{Template, TemplateError};
 pub use tree::{InodeAllocator, Node, NodeKind, VirtualTree};
+pub use warn_limit::rate_limited_warn;
 
 #[cfg(test)]
 mod cross_layer_caps {
