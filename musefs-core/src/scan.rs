@@ -96,6 +96,14 @@ pub enum ScanProgress<'a> {
         total: u64,
         path: &'a str,
     },
+    /// A dispatched file finished without being committed — it failed to probe
+    /// or raced. `done` shares the same 1..=total sequence as [`Self::Ingested`],
+    /// so the two together always reach `total` however many files fail (#655).
+    ///
+    /// There is no `path`: the failure was recorded on a probe worker, and only
+    /// the count crosses back to the writer thread a [`ProgressSink`] may be
+    /// invoked from. The `warn` line naming the file is the record of *which*.
+    Failed { done: u64, total: u64 },
 }
 
 /// UI-agnostic progress callback for [`ScanOptions`]. Invoked only from the
@@ -2100,9 +2108,22 @@ fn run_pipeline(
 
     // Writer: this thread. Batch by file count and accumulated art bytes.
     let mut scanned = 0u64;
+    // Files the pipeline is finished with, committed *or* failed. Both progress
+    // events report it, so the bar converges on `total` however many files fail
+    // (#655): a bar stalled at 93% reads as "this was aborted", which is the
+    // wrong story for a scan that completed and is about to report `failed N`.
+    let mut finished = 0u64;
+    // Failures already folded into `finished`. Workers tally on their own
+    // threads; only the counts cross back here, because a `ProgressSink` may be
+    // invoked from the writer and the walk but never from a probe worker.
+    let mut failures_seen = 0u64;
     let mut batch: Vec<Unit> = Vec::new();
     let mut batch_bytes = 0u64;
-    let flush = |batch: &mut Vec<Unit>, batch_bytes: &mut u64, scanned: &mut u64| -> Result<()> {
+    let flush = |batch: &mut Vec<Unit>,
+                 batch_bytes: &mut u64,
+                 scanned: &mut u64,
+                 finished: &mut u64|
+     -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -2129,9 +2150,10 @@ fn run_pipeline(
         bw.commit()?;
         for abs_path in committed {
             *scanned += 1;
+            *finished += 1;
             if let Some(p) = progress {
                 p.emit(ScanProgress::Ingested {
-                    done: *scanned,
+                    done: *finished,
                     total,
                     path: &abs_path,
                 });
@@ -2142,6 +2164,24 @@ fn run_pipeline(
         budget.release(released);
         *batch_bytes = 0;
         Ok(())
+    };
+
+    // Fold any failures the workers have tallied since the last check into the
+    // progress sequence. Called at the top of each writer iteration (so the bar
+    // tracks failures as they happen) and once more after the final flush (so a
+    // tail of failures with no commit behind them still lands).
+    let catch_up = |finished: &mut u64, failures_seen: &mut u64| {
+        let tallied = failed.load(Ordering::Relaxed) + raced.load(Ordering::Relaxed);
+        while *failures_seen < tallied {
+            *failures_seen += 1;
+            *finished += 1;
+            if let Some(p) = progress {
+                p.emit(ScanProgress::Failed {
+                    done: *finished,
+                    total,
+                });
+            }
+        }
     };
 
     // Drain the channel, batching by file count and accumulated art bytes. The
@@ -2157,19 +2197,20 @@ fn run_pipeline(
     // pipeline must be torn down (below) before it propagates.
     let mut fatal: Option<crate::error::CoreError> = None;
     loop {
+        catch_up(&mut finished, &mut failures_seen);
         match rx.try_recv() {
             Ok(unit) => {
                 batch_bytes += unit.weight;
                 batch.push(unit);
                 if (batch.len() >= BATCH_FILES || batch_bytes >= cap)
-                    && let Err(e) = flush(&mut batch, &mut batch_bytes, &mut scanned)
+                    && let Err(e) = flush(&mut batch, &mut batch_bytes, &mut scanned, &mut finished)
                 {
                     fatal = Some(e);
                     break;
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if let Err(e) = flush(&mut batch, &mut batch_bytes, &mut scanned) {
+                if let Err(e) = flush(&mut batch, &mut batch_bytes, &mut scanned, &mut finished) {
                     fatal = Some(e);
                     break;
                 }
@@ -2178,7 +2219,8 @@ fn run_pipeline(
                         batch_bytes += unit.weight;
                         batch.push(unit);
                         if (batch.len() >= BATCH_FILES || batch_bytes >= cap)
-                            && let Err(e) = flush(&mut batch, &mut batch_bytes, &mut scanned)
+                            && let Err(e) =
+                                flush(&mut batch, &mut batch_bytes, &mut scanned, &mut finished)
                         {
                             fatal = Some(e);
                             break;
@@ -2192,8 +2234,15 @@ fn run_pipeline(
     }
     let outcome = match fatal {
         Some(e) => Err(e),
-        None => flush(&mut batch, &mut batch_bytes, &mut scanned),
+        None => flush(&mut batch, &mut batch_bytes, &mut scanned, &mut finished),
     };
+    if outcome.is_ok() {
+        // Every worker has exited by now, so the tallies are final: this is the
+        // catch-up that matters when the tail of the run is failures with no
+        // commit behind them to drive the loop (the whole-target failure case,
+        // where nothing was ever sent and the loop ran once).
+        catch_up(&mut finished, &mut failures_seen);
+    }
     if outcome.is_err() {
         // A DB-write failure aborts the whole scan, but the workers must still be
         // wound down before the error propagates: `scan_directory_with` /
@@ -2227,6 +2276,15 @@ fn run_pipeline(
         failures.failed_total() - failed_before,
         stats.failed,
         "every scan failure must be tallied by reason"
+    );
+    // The companion invariant for the progress bar: every dispatched file is
+    // committed, failed, or raced, so the two progress events must together
+    // account for the walked total. If this ever trips, the bar has silently
+    // gone back to stalling short of 100% (#655).
+    debug_assert_eq!(
+        finished, total,
+        "progress must reach the walked total (scanned {} + failed {} + raced {})",
+        stats.scanned, stats.failed, stats.raced
     );
     Ok(stats)
 }

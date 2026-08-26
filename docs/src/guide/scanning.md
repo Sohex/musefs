@@ -25,7 +25,7 @@ failures still surface on stderr (raise detail with `-v`/`-vv`, or
 `scan` (with or without `--force`) shows a live progress indicator: on an
 interactive terminal, a discovery spinner followed by a determinate bar
 (position, percent, ETA, current file); on a non-interactive stderr (piped or
-logged), throttled `ingested N/M (P%)` lines. `--quiet` (`-q`) suppresses the
+logged), throttled `processed N/M (P%)` lines. `--quiet` (`-q`) suppresses the
 progress indicator and the per-target summary. Each summary line ends with the
 elapsed time. Anything logged during the scan (skip warnings, per-file
 failures) is printed above the bar, which is lifted out of the way and redrawn

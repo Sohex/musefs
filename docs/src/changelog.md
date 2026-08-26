@@ -124,10 +124,24 @@ see the [Release notes](release-notes.md).
   suspended — bar cleared, record written, bar redrawn below it. The per-target
   summary line (`scanned N: …`, on stdout) is suspended the same way; it used
   to be glued onto a bar frame whenever no log record happened to precede it.
-  Off a terminal the draw target is hidden and suspending is a no-op, so the
-  `--quiet` and piped `ingested N/M (P%)` paths are byte-for-byte unchanged, as
-  is the verbosity policy (`-v`/`-vv`/`-vvv`, `RUST_LOG` taking precedence),
-  which stays in the binary.
+  Off a terminal the draw target is hidden and suspending is a no-op, so this
+  change left the `--quiet` and piped milestone paths byte-for-byte alone, as it
+  did the verbosity policy (`-v`/`-vv`/`-vvv`, `RUST_LOG` taking precedence),
+  which stays in the binary. (The milestone line is renamed by the progress-bar
+  convergence fix below, in this same release.)
+- The scan progress indicator now reaches 100% when files fail
+  ([#655](https://github.com/Sohex/musefs/issues/655)). The bar's length is the
+  walked file count, but its position only advanced on a committed file, so any
+  failure left it permanently short — a run with 12 unparseable files out of 42
+  finished at `30/42 (71%)` and was then cleared, which reads as an aborted scan
+  rather than a completed one about to report `failed 12`. On the piped path the
+  final `100%` milestone was simply never printed, so a log-scraping consumer
+  waited for a line that could not arrive. A dispatched file that fails or races
+  now advances the same progress sequence as a committed one; the two together
+  always account for the walked total, and a debug assertion pins that. The
+  piped milestone line is renamed `ingested N/M (P%)` → `processed N/M (P%)`,
+  because it now counts every file the pipeline finished with rather than only
+  the successes — scripts matching the old prefix need updating.
 - A tag larger than the store's cap no longer aborts the entire scan
   ([#644](https://github.com/Sohex/musefs/issues/644)). The scanner had no
   length check on text tags, so an over-cap value reached the DB `CHECK` inside

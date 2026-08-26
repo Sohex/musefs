@@ -275,6 +275,7 @@ fn scan_emits_discovered_walked_ingested_events() {
             ScanProgress::Discovered { found } => format!("disc:{found}"),
             ScanProgress::Walked { total } => format!("walk:{total}"),
             ScanProgress::Ingested { done, total, .. } => format!("ing:{done}/{total}"),
+            ScanProgress::Failed { done, total } => format!("fail:{done}/{total}"),
         };
         recorder.lock().unwrap().push(line);
     });
@@ -299,6 +300,62 @@ fn scan_emits_discovered_walked_ingested_events() {
         ing,
         vec!["ing:1/5", "ing:2/5", "ing:3/5", "ing:4/5", "ing:5/5"],
     );
+}
+
+/// #655: a file that fails to probe still has to advance the progress sequence,
+/// or the bar stalls short of its length and a completed scan reads as aborted.
+/// Three good files and two unparseable ones must produce a 1..=5 run of events
+/// ending at 5/5, whatever order the two kinds interleave in.
+#[test]
+fn progress_reaches_the_total_when_files_fail() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..3 {
+        let mut bytes = b"fLaC".to_vec();
+        bytes.push(0x80);
+        bytes.extend_from_slice(&[0, 0, 34]);
+        bytes.extend(std::iter::repeat_n(0u8, 34));
+        bytes.extend_from_slice(format!("AUDIO-{i}").as_bytes());
+        std::fs::write(dir.path().join(format!("good{i}.flac")), &bytes).unwrap();
+    }
+    // Supported extension, unparseable content: the walk queues these, and the
+    // probe worker fails them — the case that used to leave the bar short.
+    for i in 0..2 {
+        std::fs::write(dir.path().join(format!("bad{i}.flac")), b"not a flac").unwrap();
+    }
+
+    let events = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+    let recorder = Arc::clone(&events);
+    let sink = ProgressSink::new(move |ev| match ev {
+        ScanProgress::Ingested { done, total, .. } | ScanProgress::Failed { done, total } => {
+            recorder.lock().unwrap().push((done, total));
+        }
+        _ => {}
+    });
+
+    let db = Db::open_in_memory().unwrap();
+    let opts = ScanOptions {
+        jobs: 1,
+        progress: Some(sink),
+        ..Default::default()
+    };
+    let stats = scan_directory_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(stats.scanned, 3, "the three parseable files ingest");
+    assert_eq!(
+        stats.failed, 2,
+        "the two unparseable files are counted failed"
+    );
+
+    let ev = events.lock().unwrap();
+    // Every dispatched file reports exactly once, and `done` is a dense 1..=5
+    // sequence — so the bar lands on its length rather than stopping at 3/5.
+    assert_eq!(
+        ev.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5],
+        "events: {ev:?}"
+    );
+    assert!(ev.iter().all(|(_, t)| *t == 5), "events: {ev:?}");
 }
 
 // --- fingerprint_of() / full_file_hash() / ChecksumTier / MatchStrictness ---

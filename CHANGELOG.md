@@ -90,8 +90,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   common case, not an edge one: the end-of-scan skip tally warns about the
   `cover.jpg`/`.cue`/`.log` sidecars essentially every library contains.
   Records are now emitted with the bar lifted out of the way and redrawn
-  beneath them, as is the per-target summary line. Piped (non-interactive)
-  output is byte-for-byte unchanged.
+  beneath them, as is the per-target summary line. This change left piped
+  (non-interactive) output byte-for-byte alone.
+- The scan progress indicator now reaches 100% when files fail
+  ([#655](https://github.com/Sohex/musefs/issues/655)). The bar's length is the
+  walked file count, but its position advanced only on a committed file, so any
+  failure left it permanently short: 12 unparseable files out of 42 finished at
+  `30/42 (71%)` and were then cleared, which reads as an aborted scan rather
+  than a completed one about to report `failed 12`. Piped output never printed
+  its final `100%` milestone at all. A dispatched file that fails or races now
+  advances the same progress sequence as a committed one. **The piped milestone
+  line is renamed `ingested N/M (P%)` → `processed N/M (P%)`**, since it counts
+  every file the pipeline finished with rather than only the successes; scripts
+  matching the old prefix need updating.
 - A tag larger than the store's cap no longer aborts the entire scan
   ([#644](https://github.com/Sohex/musefs/issues/644)). The scanner had no
   length check on text tags, so an over-cap value reached the DB `CHECK` inside

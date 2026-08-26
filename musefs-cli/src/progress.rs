@@ -82,10 +82,25 @@ impl Renderer {
                 bar.set_position(done);
                 bar.set_message(basename(path));
             }
-            (Mode::Plain, ScanProgress::Ingested { done, total, .. }) => {
+            // A failed file advances the bar but leaves the message on the last
+            // file actually ingested: the failure is already named in a `warn`
+            // line, and blanking the message would make the bar flicker between
+            // a name and nothing on a run with many failures (#655).
+            (Mode::Tty(bar), ScanProgress::Failed { done, .. }) => {
+                bar.set_position(done);
+            }
+            (
+                Mode::Plain,
+                ScanProgress::Ingested { done, total, .. } | ScanProgress::Failed { done, total },
+            ) => {
                 let prev = self.prev_done.load(Ordering::Relaxed);
                 if let Some(pct) = next_milestone(prev, done, total) {
-                    eprintln!("ingested {done}/{total} ({pct}%)");
+                    // "processed", not "ingested": `done` counts every file the
+                    // pipeline finished with, failures included, because that is
+                    // what has to reach `total` (#655). Calling 12 failures
+                    // "ingested" to make the line hit 100% would trade one
+                    // inaccuracy for a worse one.
+                    eprintln!("processed {done}/{total} ({pct}%)");
                     self.prev_done.store(done, Ordering::Relaxed);
                 }
             }
