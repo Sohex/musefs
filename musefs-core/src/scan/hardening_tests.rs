@@ -416,7 +416,14 @@ fn probe_file_caught_isolates_parser_panic_as_failed() {
     set_after_s1_hook(|| panic!("parser exploded"));
     let out = probe_file_caught(&path, WINDOW);
     clear_after_s1_hook();
-    assert!(matches!(out, Ok(ProbeOutcome::Unparseable)), "got {out:?}");
+    match out {
+        Ok(ProbeOutcome::Failed(f)) => assert_eq!(
+            f.reason,
+            SkipReason::Panicked,
+            "a caught panic must have its own bucket, not merge into unparseable"
+        ),
+        other => panic!("got {other:?}"),
+    }
 }
 
 #[test]
@@ -461,6 +468,238 @@ fn skip_tally_ties_break_by_extension_name() {
 #[test]
 fn skip_tally_empty_has_no_summary() {
     assert!(super::SkipTally::default().summary().is_none());
+}
+
+/// `SkipReason` indexes `FailureTally`'s array by its discriminant, so `ALL`
+/// must list the variants in declaration order — a mismatch would silently
+/// credit one reason's skips to another.
+#[test]
+fn skip_reason_all_is_in_discriminant_order() {
+    for (i, reason) in SkipReason::ALL.iter().enumerate() {
+        assert_eq!(*reason as usize, i, "{reason:?} is out of order in ALL");
+    }
+}
+
+/// Every reason belongs to exactly one summary group, or (for `Raced`) to none
+/// deliberately: an accidentally ungrouped reason would be counted but never
+/// reported.
+#[test]
+fn skip_reason_groups_partition_all_reasons_except_raced() {
+    for reason in SkipReason::ALL {
+        let in_failed = SkipReason::FAILED.contains(&reason);
+        let in_walk = SkipReason::WALK.contains(&reason);
+        if reason == SkipReason::Raced {
+            assert!(
+                !in_failed && !in_walk,
+                "a race is reported whole as ScanStats::raced, not in a breakdown"
+            );
+        } else {
+            assert!(
+                in_failed ^ in_walk,
+                "{reason:?} must be in exactly one summary group"
+            );
+        }
+    }
+}
+
+/// The line the issue asked for: `failed N` explained by reason, ordered by
+/// descending count with ties broken by name (matching the extension tally).
+#[test]
+fn failure_tally_breaks_down_failed_by_reason() {
+    let tally = super::FailureTally::default();
+    for _ in 0..30 {
+        tally.record(SkipReason::Unparseable, format_args!("x"));
+    }
+    for _ in 0..5 {
+        tally.record(SkipReason::Io, format_args!("x"));
+    }
+    for _ in 0..2 {
+        tally.record(SkipReason::Oversize, format_args!("x"));
+    }
+    assert_eq!(
+        tally.failed_summary().unwrap(),
+        "failed 37: unparseable=30, io=5, oversize=2"
+    );
+    // Failure reasons are not walk errors, and neither breakdown may leak into
+    // the other.
+    assert!(tally.walk_summary().is_none());
+}
+
+#[test]
+fn failure_tally_omits_empty_buckets_and_breaks_ties_by_reason_name() {
+    let tally = super::FailureTally::default();
+    tally.record(SkipReason::Panicked, format_args!("x"));
+    tally.record(SkipReason::Io, format_args!("x"));
+    assert_eq!(
+        tally.failed_summary().unwrap(),
+        "failed 2: io=1, panicked=1"
+    );
+}
+
+/// A race is already reported whole as `ScanStats::raced`, and its breakdown
+/// would only repeat its own name — but it is still counted, because that is
+/// what caps its warns.
+#[test]
+fn failure_tally_counts_races_without_folding_them_into_failed() {
+    let tally = super::FailureTally::default();
+    for _ in 0..3 {
+        tally.record(SkipReason::Raced, format_args!("x"));
+    }
+    assert_eq!(tally.count(SkipReason::Raced), 3);
+    assert!(tally.failed_summary().is_none());
+    assert!(tally.walk_summary().is_none());
+}
+
+/// Walk-time errors get their own line: they are counted in no `ScanStats`
+/// field, so without it an unreadable subtree leaves no trace but its (capped)
+/// per-entry warns.
+#[test]
+fn failure_tally_summarizes_walk_errors_separately() {
+    let tally = super::FailureTally::default();
+    for _ in 0..9 {
+        tally.record(SkipReason::WalkUnreadable, format_args!("x"));
+    }
+    for _ in 0..3 {
+        tally.record(SkipReason::WalkSymlink, format_args!("x"));
+    }
+    assert_eq!(
+        tally.walk_summary().unwrap(),
+        "walk errors 12: unreadable=9, symlink=3"
+    );
+    assert!(tally.failed_summary().is_none());
+}
+
+#[test]
+fn failure_tally_empty_has_no_summaries() {
+    let tally = super::FailureTally::default();
+    assert!(tally.failed_summary().is_none());
+    assert!(tally.walk_summary().is_none());
+}
+
+/// The cap: the first `SCAN_WARN_BURST` of a reason are logged at their own
+/// level, one line announces the downgrade, and the rest are debug — so a
+/// vanished share cannot emit one warn per file (#651).
+#[test]
+fn warn_budget_caps_each_reason_after_the_burst() {
+    let tally = super::FailureTally::default();
+    for i in 0..SCAN_WARN_BURST {
+        assert_eq!(
+            tally.decide(SkipReason::Unparseable),
+            super::WarnBudget::Spend(log::Level::Warn),
+            "skip {i} is still within the burst"
+        );
+    }
+    assert_eq!(
+        tally.decide(SkipReason::Unparseable),
+        super::WarnBudget::Exhausted,
+        "the first over-budget skip must announce the downgrade"
+    );
+    for _ in 0..100 {
+        assert_eq!(
+            tally.decide(SkipReason::Unparseable),
+            super::WarnBudget::Over,
+            "the announcement must be made once, not per file"
+        );
+    }
+    assert_eq!(
+        tally.count(SkipReason::Unparseable),
+        SCAN_WARN_BURST + 101,
+        "capped warns must still be counted in full"
+    );
+}
+
+/// The budget is per reason: a flood of unparseable files must not hide the
+/// first I/O error behind it.
+#[test]
+fn warn_budget_is_spent_per_reason() {
+    let tally = super::FailureTally::default();
+    for _ in 0..SCAN_WARN_BURST * 2 {
+        tally.decide(SkipReason::Unparseable);
+    }
+    assert_eq!(
+        tally.decide(SkipReason::Io),
+        super::WarnBudget::Spend(log::Level::Warn)
+    );
+}
+
+/// A caught parser panic is a musefs bug, not a property of the library, so its
+/// in-budget lines keep `error` while everything else warns.
+#[test]
+fn warn_budget_keeps_caught_panics_at_error() {
+    let tally = super::FailureTally::default();
+    assert_eq!(
+        tally.decide(SkipReason::Panicked),
+        super::WarnBudget::Spend(log::Level::Error)
+    );
+    assert_eq!(
+        tally.decide(SkipReason::WalkUnreadable),
+        super::WarnBudget::Spend(log::Level::Warn)
+    );
+}
+
+/// The walk's failure tally must see entries it could not read, so an
+/// unreadable subtree is summarized rather than only warned about per entry.
+#[test]
+fn collect_audio_records_an_unreadable_subdir_in_the_failure_tally() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("a.flac"), b"x").unwrap();
+    let reachable = dir.path().join("b.flac");
+    std::fs::write(&reachable, b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!(
+            "skipping collect_audio_records_an_unreadable_subdir_in_the_failure_tally: directory permissions not enforced (running as root?)"
+        );
+        return;
+    }
+
+    let failures = super::FailureTally::default();
+    let mut out = Vec::new();
+    let skips = collect_audio_with(dir.path(), &mut out, false, None, &failures).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        out,
+        vec![reachable],
+        "the readable file must still be found"
+    );
+    assert_eq!(
+        failures.walk_summary().unwrap(),
+        "walk errors 1: unreadable=1"
+    );
+    assert!(
+        failures.failed_summary().is_none(),
+        "a directory the walk could not read is not a file that failed to ingest"
+    );
+    assert_eq!(
+        skips.total, 0,
+        "walk errors must stay out of the extension tally that feeds ScanStats::skipped"
+    );
+}
+
+/// An unparseable backing file must arrive at the caller as a tallyable
+/// `Failure`, not as a warn the probe already spent.
+#[test]
+fn probe_reports_unparseable_with_its_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.flac");
+    std::fs::write(&path, b"not a real audio file").unwrap();
+    match probe_file(&path, WINDOW).unwrap() {
+        ProbeOutcome::Failed(f) => {
+            assert_eq!(f.reason, SkipReason::Unparseable);
+            assert!(
+                f.message.contains("no parseable audio metadata"),
+                "got {:?}",
+                f.message
+            );
+        }
+        other => panic!("got {other:?}"),
+    }
 }
 
 #[test]

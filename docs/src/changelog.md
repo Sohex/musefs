@@ -64,6 +64,19 @@ see the [Release notes](release-notes.md).
   the fuser dispatch thread ([#623](https://github.com/Sohex/musefs/issues/623)), matching the offload every other
   blocking operation already used. This matters more now that over-cap `opendir`
   makes that fallback the normal path for large directories.
+- Scan failures are now broken down by reason and their per-file warnings capped
+  ([#651](https://github.com/Sohex/musefs/issues/651)). A scan that ends
+  `failed 37` also logs `failed 37: unparseable=30, io=5, oversize=2` (and
+  `walk errors N: …` for directories the walk could not read), so the number
+  that drives the exit-2 partial-failure signal explains itself instead of
+  having to be reconstructed from N individual lines. The per-file messages
+  themselves are capped at ten per reason per scan, the rest dropping to
+  `debug` — an unreadable subtree or a share that went away mid-scan no longer
+  emits one warning per file. The existing per-extension skip breakdown moves
+  from `warn` to `info` (so it now needs `-v` / `RUST_LOG=info`): cover art and
+  `.cue` sidecars are the normal contents of a music library, and a warning on
+  every healthy scan only teaches operators to tune warnings out. The `skipped`
+  count itself is unchanged and still printed in the per-target summary.
 
 ### Fixed
 
