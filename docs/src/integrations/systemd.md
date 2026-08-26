@@ -88,4 +88,7 @@ sandboxing is possible. The two units differ sharply:
 - **Headless servers.** A `--user` timer only fires while your user manager
   runs. For a daily scan when you are not logged in:
   `loginctl enable-linger <user>`.
-- **Logs.** `journalctl --user -u musefs -f`.
+- **Logs.** `journalctl --user -u musefs -f`. The units log at `warn` by
+  default; raise it with `Environment=RUST_LOG=info` in a drop-in or in
+  `musefs.conf` — see
+  [Logging & troubleshooting](../guide/troubleshooting.md#reading-the-logs-under-systemd).

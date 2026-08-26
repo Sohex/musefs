@@ -58,7 +58,9 @@ like `musefs scan … && musefs mount …` stops on a partial or total ingest
 failure rather than mounting an incomplete library. A successful scan exits `0`;
 a hard error (a missing target, an unreadable DB) still exits `1`. The exit code
 is the only machine-detectable signal; per-file failures otherwise surface only
-on stderr.
+on stderr. The full exit-code contract, and how to raise log detail on those
+failures, are in
+[Logging & troubleshooting](troubleshooting.md#exit-codes).
 
 ### Content checksums and move re-identification
 
