@@ -440,6 +440,32 @@ fn scan_ingests_and_dedups_embedded_art() {
     assert_eq!(db.get_art_meta(only).unwrap().unwrap().byte_len, 100);
 }
 
+/// The raise itself (#644): 300 KB of lyrics is over the old 256 KiB cap and
+/// well under the new one, so the file that prompted the report now scans and
+/// round-trips its tag.
+#[test]
+fn scan_stores_a_tag_value_the_old_cap_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let lyrics_body = "z".repeat(300_000);
+    std::fs::write(
+        dir.path().join("a.flac"),
+        flac_with_pictures(&["TITLE=A", &format!("LYRICS={lyrics_body}")], &[]),
+    )
+    .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+    assert_eq!((stats.scanned, stats.failed), (1, 0));
+
+    let t = &db.list_tracks().unwrap()[0];
+    let tags = db.get_tags(t.id).unwrap();
+    let lyrics = tags
+        .iter()
+        .find(|t| t.key.eq_ignore_ascii_case("LYRICS"))
+        .expect("the 300 KB lyrics tag is stored");
+    assert_eq!(lyrics.value, lyrics_body);
+}
+
 fn flac_with_pictures(comments: &[&str], pics: &[(u32, &[u8])]) -> Vec<u8> {
     use common::{flac_block, streaminfo_body, vorbis_comment_body};
     fn picture_body(pic_type: u32, mime: &str, data: &[u8]) -> Vec<u8> {
@@ -494,10 +520,13 @@ fn scan_clamps_out_of_range_picture_type() {
     assert_eq!(ta[0].ordinal, 0);
 }
 
+/// #644: a file carrying oversize art fails outright rather than being stored
+/// with that art quietly missing. Its neighbours in the same directory are
+/// unaffected — the whole point of failing the file instead of the scan.
 #[test]
-fn scan_filters_oversized_art_without_ordinal_gaps() {
+fn scan_fails_only_the_file_with_oversized_art() {
     let dir = tempfile::tempdir().unwrap();
-    // Over MAX_ART_BYTES (16 MiB - 1 KiB) but still within FLAC's 24-bit block limit.
+    // Over MAX_ART_BYTES (16 MiB - 64 KiB) but still within FLAC's 24-bit block limit.
     let big = vec![0u8; 16_776_500];
     let small = vec![0x22u8; 50];
     std::fs::write(
@@ -505,15 +534,26 @@ fn scan_filters_oversized_art_without_ordinal_gaps() {
         flac_with_pictures(&["TITLE=A"], &[(3, &big), (4, &small)]),
     )
     .unwrap();
+    std::fs::write(
+        dir.path().join("b.flac"),
+        flac_with_pictures(&["TITLE=B"], &[(3, &small)]),
+    )
+    .unwrap();
 
     let db = Db::open_in_memory().unwrap();
-    scan_directory(&db, dir.path()).unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
 
-    let t = &db.list_tracks().unwrap()[0];
-    let ta = db.get_track_art(t.id).unwrap();
-    // The oversized first picture is skipped; the survivor keeps a gapless ordinal 0.
+    assert_eq!(stats.failed, 1, "the oversize file is counted as failed");
+    assert_eq!(stats.scanned, 1, "its neighbour still lands");
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert!(
+        tracks[0].backing_path.ends_with("b.flac"),
+        "only the clean file is stored, got {}",
+        tracks[0].backing_path
+    );
+    // No partial row for the failed file, and no orphan art from it either.
+    let ta = db.get_track_art(tracks[0].id).unwrap();
     assert_eq!(ta.len(), 1);
-    assert_eq!(ta[0].ordinal, 0);
-    assert_eq!(ta[0].picture_type, 4);
     assert_eq!(db.get_art_meta(ta[0].art_id).unwrap().unwrap().byte_len, 50);
 }

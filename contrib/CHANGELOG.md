@@ -10,6 +10,23 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ## [Unreleased]
 
+### Added
+
+- **`musefs_common.MAX_TAG_VALUE_LEN`** — the store's byte cap on a
+  `tags.value`, generated from the Rust constant into the schema mirror rather
+  than hand-kept. A writer can now check a value against the contract instead of
+  discovering the limit as an `IntegrityError` from the `CHECK`. The cap moved
+  in the same change (musefs #644), which is exactly why it should not be a
+  literal in anyone's source.
+
+### Changed
+
+- The store schema is now at `user_version` 3 (musefs #644 widens the
+  `tags.value` and `track_art.description` caps). `EXPECTED_USER_VERSION`
+  tracks it automatically; no plugin change is needed, but a store must be
+  migrated by `musefs scan`/`musefs mount` from a build carrying that migration
+  before these packages will open it.
+
 ## [1.1.0] - 2026-06-17
 
 ### Changed

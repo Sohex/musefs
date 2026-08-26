@@ -241,6 +241,19 @@ mod tags_for_tracks_tests {
     fn open_mem() -> Db {
         Db::open_in_memory().unwrap()
     }
+    /// The `tags.value` cap in bytes. Derived, never spelled out: these
+    /// boundary tests exist to pin the guard's `>` comparison, not the cap's
+    /// current value, and hardcoding it means every cap change (#644) breaks
+    /// tests that were never about the number.
+    fn cap() -> usize {
+        usize::try_from(MAX_TAG_VALUE_LEN).unwrap()
+    }
+    fn at_cap_value() -> String {
+        "v".repeat(cap())
+    }
+    fn over_cap_value() -> String {
+        "v".repeat(cap() + 1)
+    }
     fn new_track(path: &str) -> NewTrack {
         NewTrack {
             backing_path: path.into(),
@@ -401,7 +414,7 @@ mod tags_for_tracks_tests {
         db.conn
             .execute_batch("PRAGMA ignore_check_constraints=ON")
             .unwrap();
-        let big = "v".repeat(262_145);
+        let big = over_cap_value();
         db.conn
             .execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', ?2, 0)",
@@ -419,26 +432,27 @@ mod tags_for_tracks_tests {
     fn get_tags_accepts_value_at_cap() {
         let db = open_mem();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
-        let at = "v".repeat(262_144);
+        let at = at_cap_value();
         db.conn
             .execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', ?2, 0)",
                 rusqlite::params![a, at],
             )
             .unwrap();
-        assert_eq!(db.get_tags(a).unwrap()[0].value.len(), 262_144);
+        assert_eq!(db.get_tags(a).unwrap()[0].value.len(), cap());
     }
 
     #[test]
     fn multibyte_value_over_byte_cap_is_rejected_at_write_and_read() {
-        // Regression for #505: the cap counts bytes, not characters. 150_000
-        // two-byte chars is 150_000 chars (under the old char-counting CHECK)
-        // but 300_000 bytes (over the 256 KiB materialized-memory bound).
+        // Regression for #505: the cap counts bytes, not characters. Half the
+        // cap's worth of two-byte chars is under the cap by character count but
+        // one byte over it by byte count — the exact gap the old char-counting
+        // CHECK left open.
         let db = open_mem();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
-        let multibyte = "é".repeat(150_000);
-        assert!(multibyte.chars().count() < 262_144, "under the char count");
-        assert!(multibyte.len() > 262_144, "over the byte cap");
+        let multibyte = "é".repeat(cap() / 2 + 1);
+        assert!(multibyte.chars().count() < cap(), "under the char count");
+        assert!(multibyte.len() > cap(), "over the byte cap");
 
         // Write path: the byte-accurate schema CHECK rejects the honest insert.
         let write_err = db.conn.execute(
@@ -530,7 +544,7 @@ mod tags_for_tracks_tests {
         db.conn
             .execute_batch("PRAGMA ignore_check_constraints=ON")
             .unwrap();
-        let big = "v".repeat(262_145);
+        let big = over_cap_value();
         db.conn
             .execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, 'k', ?2, 0)",

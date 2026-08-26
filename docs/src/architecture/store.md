@@ -64,7 +64,9 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - an `art.byte_len` that disagrees with its blob, or a `sha256` of the wrong
   length;
 - a `picture_type` outside `0..=20`;
-- a `tags.key` over 256 chars or `tags.value` over 256 KiB;
+- a `tags.key` over 256 chars or `tags.value` over 16 MiB − 1 bytes (FLAC's
+  24-bit metadata-block ceiling — the largest tag synthesis could serve, so the
+  store never refuses a tag the format could carry);
 - `tags.key` must be non-empty and contain no ASCII control characters (a DB
   `CHECK` enforces this, rejecting violating writes — with one blind spot: an
   embedded NUL terminates SQLite's `length()`/`GLOB`, so a key like `a\0b` slips
@@ -75,7 +77,7 @@ malformed *shapes* at commit, so an external writer cannot persist them:
   wider set (e.g. `=`, `:`, spaces, non-ASCII).
 - a `value_blob` over `MAX_BINARY_TAG_BYTES`;
 - an `art.mime` over 255 chars or `byte_len` over `MAX_ART_BYTES`;
-- a `track_art.description` over 1 KiB;
+- a `track_art.description` over 8 KiB;
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
 
@@ -108,8 +110,8 @@ degrading to a controlled
 `BackingChanged`/layout error, never undefined behavior. The store's
 `CHECK` rejects art over `MAX_ART_BYTES` (16 MiB − 64 KiB) at write time;
 resolve also re-checks it (`ArtTooLarge`, all formats) to backstop a writer
-that disables check enforcement, and the scanner's ingest-time drop is
-tracked in #284.
+that disables check enforcement, and the scanner refuses to ingest a file
+carrying such art at all (#644).
 Referential gaps are treated the same way: a `track_art` row whose `art_id`
 has no matching `art` row (an orphan an external writer can produce with FK
 enforcement disabled) fails the serve with `EIO` rather than silently dropping

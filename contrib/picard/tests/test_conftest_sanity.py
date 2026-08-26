@@ -1,11 +1,13 @@
-from musefs._common import connect, track_id_for_path
+from musefs._common import EXPECTED_USER_VERSION, connect, track_id_for_path
 
 
 def test_db_path_has_schema(db_path):
     conn = connect(db_path)
     try:
-        # user_version applied from the fixture SQL.
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        # user_version applied from the fixture SQL. Compared against the
+        # vendored mirror rather than a literal, so a schema migration does not
+        # break a test that is really only asserting "the fixture ran".
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == EXPECTED_USER_VERSION
     finally:
         conn.close()
 

@@ -264,15 +264,123 @@ CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
 END;
 ";
 
+const MIGRATION_V3: &str = r"
+-- Widen the two caps musefs invented rather than inherited (#644).
+--
+-- `tags.value` moves 256 KiB -> 16 MiB - 1 (FLAC's 24-bit metadata-block
+-- ceiling, the largest tag synthesis could ever serve) and
+-- `track_art.description` moves 1 KiB -> 8 KiB. Both are *widenings*, so the
+-- refills need no WHERE filter and drop no rows -- unlike V2's narrowing, which
+-- had to shed over-cap rows to avoid aborting on its own new CHECK.
+--
+-- SQLite cannot alter a CHECK in place, so both tables are recreated. V1/V2
+-- text is left untouched: they must stay replayable for a V1 -> V2 -> V3
+-- upgrade, and their literals are frozen history, not the current caps.
+
+-- `art_ad`'s body reads `track_art`. ALTER TABLE ... RENAME reparses the whole
+-- schema and would fail with 'error in trigger art_ad: no such table' while
+-- track_art is momentarily absent, so drop it up front and recreate it verbatim
+-- below. (V2's `tags` rebuild needed no such dance: nothing referenced `tags`.)
+DROP TRIGGER art_ad;
+
+CREATE TABLE tags_v3 (
+    track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    ordinal    INTEGER NOT NULL DEFAULT 0,
+    value_blob BLOB,
+    PRIMARY KEY (track_id, key, ordinal),
+    CHECK (ordinal >= 0),
+    CHECK (value_blob IS NULL OR value = ''),
+    CHECK (length(key) <= 256),
+    CHECK (length(key) >= 1
+           AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
+    CHECK (length(CAST(value AS BLOB)) <= 16777215),
+    CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
+);
+INSERT INTO tags_v3 (track_id, key, value, ordinal, value_blob)
+    SELECT track_id, key, value, ordinal, value_blob FROM tags;
+DROP TABLE tags;
+ALTER TABLE tags_v3 RENAME TO tags;
+
+CREATE TABLE track_art_v3 (
+    track_id     INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    art_id       INTEGER NOT NULL REFERENCES art(id),
+    picture_type INTEGER NOT NULL DEFAULT 3,
+    description  TEXT NOT NULL DEFAULT '',
+    ordinal      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (track_id, ordinal),
+    CHECK (picture_type BETWEEN 0 AND 20),
+    CHECK (ordinal >= 0),
+    CHECK (length(description) <= 8192)
+);
+INSERT INTO track_art_v3 (track_id, art_id, picture_type, description, ordinal)
+    SELECT track_id, art_id, picture_type, description, ordinal FROM track_art;
+DROP TABLE track_art;
+ALTER TABLE track_art_v3 RENAME TO track_art;
+
+-- DROP TABLE took each table's triggers (and track_art's index) with it;
+-- recreate them verbatim so the content_version/updated_at bump contract and
+-- the reverse art -> track_art edge are unchanged.
+CREATE INDEX track_art_art_id_idx ON track_art(art_id);
+
+CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_au AFTER UPDATE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER track_art_ai AFTER INSERT ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_au AFTER UPDATE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
+END;
+";
+
 /// Ring capacity of the `track_changes` changelog. Must match the literal in
 /// MIGRATION_V1 (guarded by `changelog_cap_constant_matches_migration_sql`).
 #[allow(dead_code)]
 pub const CHANGELOG_CAP: i64 = 8192;
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
+
+/// The `user_version` a fully-migrated store carries. Exported so callers and
+/// tests assert "the latest schema" rather than a literal that has to be chased
+/// through every test file each time a migration is appended.
+pub const LATEST_VERSION: i64 = 3;
+const _: () = assert!(
+    MIGRATIONS.len() == 3,
+    "LATEST_VERSION must match MIGRATIONS"
+);
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    let latest = i64::try_from(MIGRATIONS.len()).expect("MIGRATIONS count must fit i64");
+    let latest = LATEST_VERSION;
     let current = conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))?;
     // A store at a user_version past anything this binary knows about was written
     // by a newer (or third-party) tool that bumped the schema. Refuse it loudly
@@ -380,7 +488,11 @@ mod baseline_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(
+            uv,
+            super::LATEST_VERSION,
+            "migrate() must reach the latest migration"
+        );
 
         // value_blob exists on tags and defaults to NULL.
         conn.execute(
@@ -417,7 +529,7 @@ mod baseline_tests {
         let uv2: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv2, 2);
+        assert_eq!(uv2, super::LATEST_VERSION);
     }
 
     #[test]
@@ -427,8 +539,8 @@ mod baseline_tests {
         assert_eq!(
             conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            2,
-            "V2 migration must bump user_version to 2"
+            super::LATEST_VERSION,
+            "migrate() must stamp user_version with the latest migration index"
         );
         // Both columns exist, are nullable, and default to NULL.
         conn.execute(
@@ -456,27 +568,48 @@ mod baseline_tests {
         assert!(super::MIGRATION_V1.contains(&format!("NEW.seq - {}", super::CHANGELOG_CAP)));
     }
 
+    /// The caps a later migration has since widened live in V1/V2 as *frozen
+    /// history* — those steps must stay replayable byte-for-byte for the
+    /// V1 -> V2 -> V3 upgrade path, so their literals are pinned to the values
+    /// they shipped with and deliberately NOT to `crate::limits`. Binding them
+    /// to the live constants (as this test once did) makes any future cap
+    /// change look like it must be back-edited into released migration text.
+    #[test]
+    fn superseded_migration_literals_are_frozen() {
+        assert!(super::MIGRATION_V1.contains("length(value) <= 262144"));
+        assert!(super::MIGRATION_V1.contains("length(description) <= 1024"));
+        assert!(
+            super::MIGRATION_V2.contains("length(CAST(value AS BLOB)) <= 262144"),
+            "V2's byte-accurate rebuild (#505) shipped at the 256 KiB cap"
+        );
+    }
+
+    /// The literals in the *latest* definition of each table are what a fresh
+    /// `migrate()` leaves behind, so those are the ones that must track
+    /// `crate::limits`. V3 owns `tags` and `track_art`; V1 still owns `art` and
+    /// `structural_blocks`.
     #[test]
     fn check_literals_match_limits_constants() {
         use crate::limits::*;
-        let sql = super::MIGRATION_V1;
-        assert!(sql.contains(&format!("length(key) <= {MAX_TAG_KEY_LEN}")));
-        assert!(sql.contains(&format!("length(value) <= {MAX_TAG_VALUE_LEN}")));
-        // V2 rebuilds `tags` with a byte-accurate value cap (#505).
-        assert!(super::MIGRATION_V2.contains(&format!(
+        let v1 = super::MIGRATION_V1;
+        let v3 = super::MIGRATION_V3;
+        // V3 rebuilds `tags` at FLAC's block ceiling and `track_art` at 8 KiB (#644).
+        assert!(v3.contains(&format!("length(key) <= {MAX_TAG_KEY_LEN}")));
+        assert!(v3.contains(&format!(
             "length(CAST(value AS BLOB)) <= {MAX_TAG_VALUE_LEN}"
         )));
-        assert!(sql.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
-        assert!(sql.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
-        assert!(sql.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
-        assert!(sql.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
-        assert!(sql.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));
+        assert!(v3.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
+        assert!(v3.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
+        // Still V1-owned: no later migration recreates `art` or `structural_blocks`.
+        assert!(v1.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
+        assert!(v1.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
+        assert!(v1.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));
         let kinds = STRUCTURAL_KINDS
             .iter()
             .map(|k| format!("'{k}'"))
             .collect::<Vec<_>>()
             .join(",");
-        assert!(sql.contains(&format!("kind IN ({kinds})")));
+        assert!(v1.contains(&format!("kind IN ({kinds})")));
     }
 }
 
@@ -506,7 +639,7 @@ mod changelog_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, super::LATEST_VERSION);
 
         insert_track(&conn, "/a.flac"); // tracks AI -> 1 row
         assert_eq!(count_changes(&conn), 1);
@@ -657,9 +790,15 @@ mod schema_py_tests {
              SCHEMA_SQL = \"\"\"\\\n\
              {sql}\"\"\"\n\
              \n\
-             USER_VERSION = {version}\n",
+             USER_VERSION = {version}\n\
+             \n\
+             # Byte cap on `tags.value`, mirrored so an external writer can check a\n\
+             # value before the `CHECK` does. Generated from the Rust constant: it\n\
+             # moved once already (#644) and a hand-kept copy would silently rot.\n\
+             MAX_TAG_VALUE_LEN = {max_tag_value_len}\n",
             sql = render_schema_sql(),
-            version = MIGRATIONS.len()
+            version = MIGRATIONS.len(),
+            max_tag_value_len = crate::limits::MAX_TAG_VALUE_LEN
         )
     }
 
@@ -690,10 +829,7 @@ mod schema_py_tests {
 
         assert_eq!(dump_master(&rendered), dump_master(&migrated));
         assert_eq!(user_version(&rendered), user_version(&migrated));
-        assert_eq!(
-            user_version(&rendered),
-            i64::try_from(MIGRATIONS.len()).unwrap()
-        );
+        assert_eq!(user_version(&rendered), super::LATEST_VERSION);
     }
 
     #[test]
@@ -708,10 +844,7 @@ mod schema_py_tests {
         conn.execute_batch(MIGRATIONS[0]).unwrap(); // apply V1 only
         conn.pragma_update(None, "user_version", 1i64).unwrap();
         super::migrate(&mut conn).expect("upgrading from v1 must apply only the remaining steps");
-        assert_eq!(
-            user_version(&conn),
-            i64::try_from(MIGRATIONS.len()).unwrap()
-        );
+        assert_eq!(user_version(&conn), super::LATEST_VERSION);
     }
 
     #[test]
@@ -719,7 +852,7 @@ mod schema_py_tests {
         // #505: V2 rebuilds `tags` with a byte-accurate value cap. Simulate a v1
         // store, plant an over-cap multibyte value (legal under V1's char-counting
         // CHECK: 150_000 chars / 300_000 bytes) plus a normal one, then upgrade.
-        let mut conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(MIGRATIONS[0]).unwrap(); // V1 only
         conn.pragma_update(None, "user_version", 1i64).unwrap();
         conn.execute(
@@ -741,7 +874,11 @@ mod schema_py_tests {
         )
         .unwrap();
 
-        super::migrate(&mut conn).expect("upgrade to v2");
+        // V2 only, applied directly. `migrate()` would run on through V3, whose
+        // widened cap (#644) accepts this value — that is the later step's
+        // business, asserted separately below. This test is about what V2 did.
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.pragma_update(None, "user_version", 2i64).unwrap();
 
         // The over-cap row is dropped; the valid row survives.
         let keys: Vec<String> = {
@@ -751,7 +888,7 @@ mod schema_py_tests {
         };
         assert_eq!(keys, vec!["ok".to_string()]);
 
-        // The rebuilt CHECK now rejects an over-cap multibyte value at write.
+        // The rebuilt CHECK rejects an over-cap multibyte value at write.
         assert!(
             conn.execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'big2',?1,0)",
@@ -778,6 +915,122 @@ mod schema_py_tests {
             cv(&conn) > before,
             "tags_ai trigger must survive the rebuild"
         );
+    }
+
+    /// #644: V3 widens `tags.value` to FLAC's block ceiling and
+    /// `track_art.description` to 8 KiB. Both are widenings, so unlike V2's
+    /// narrowing the rebuild must carry every existing row across — losing user
+    /// tags to a migration that only relaxes a limit would be gratuitous.
+    #[test]
+    fn v3_rebuild_widens_caps_and_preserves_rows() {
+        use crate::limits::{MAX_ART_DESCRIPTION_LEN, MAX_TAG_VALUE_LEN};
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.pragma_update(None, "user_version", 2i64).unwrap();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('/a.flac','flac',0,0,0,0,0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1,'image/png',1,1,1,X'00')",
+            [&"a".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'artist','A',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+             VALUES (1,1,3,'cover',0)",
+            [],
+        )
+        .unwrap();
+
+        super::migrate(&mut conn).expect("upgrade to v3");
+
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            super::LATEST_VERSION
+        );
+        // Rows survive: a widening must never drop data.
+        let (key, value): (String, String) = conn
+            .query_row("SELECT key, value FROM tags", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((key.as_str(), value.as_str()), ("artist", "A"));
+        let desc: String = conn
+            .query_row("SELECT description FROM track_art", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(desc, "cover");
+
+        // A value the V2 cap rejected now writes cleanly — the point of #644.
+        let over_v2 = "é".repeat(150_000);
+        assert!(
+            over_v2.len() > 262_144 && i64::try_from(over_v2.len()).unwrap() < MAX_TAG_VALUE_LEN
+        );
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1,'lyrics',?1,0)",
+            rusqlite::params![over_v2],
+        )
+        .expect("V3 accepts a value the 256 KiB cap rejected");
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+             VALUES (1,1,3,?1,1)",
+            rusqlite::params!["d".repeat(2048)],
+        )
+        .expect("V3 accepts a description the 1 KiB cap rejected");
+
+        // The triggers and the reverse-edge index came back with the rebuild.
+        let objects: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE name IN ('tags_ai','tags_au','tags_ad','track_art_ai', \
+                                    'track_art_au','track_art_ad','art_ad', \
+                                    'track_art_art_id_idx') ORDER BY name",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(
+            objects,
+            vec![
+                "art_ad",
+                "tags_ad",
+                "tags_ai",
+                "tags_au",
+                "track_art_ad",
+                "track_art_ai",
+                "track_art_art_id_idx",
+                "track_art_au",
+            ],
+            "V3 must restore every object its two DROP TABLEs took with them"
+        );
+        // `art_ad` reads `track_art`; a rebuild that renamed the table out from
+        // under that trigger leaves a body that errors at *fire* time, not at
+        // migration time, so the object-name check above would not catch it.
+        // Fire it, in the exact shape it was written for: an art row deleted
+        // while track_art still references it (only reachable with FKs off).
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute("DELETE FROM art WHERE id = 1", [])
+            .expect("art_ad must still resolve track_art after the V3 rebuild");
+        let bumped: i64 = conn
+            .query_row("SELECT content_version FROM tracks WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(bumped > 0, "art_ad must bump the referencing track");
+        assert_eq!(MAX_ART_DESCRIPTION_LEN, 8192);
     }
 
     /// NOT #[ignore]d on purpose: the compare path must run under plain
@@ -834,7 +1087,7 @@ mod constraint_tests {
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, super::LATEST_VERSION);
 
         insert_track(&conn, "/a.flac");
         conn.execute(
@@ -871,6 +1124,15 @@ mod constraint_tests {
             )
             .unwrap();
         assert_eq!(pic, 3);
+    }
+
+    /// SQL expression yielding `n` copies of `c`, for cap-boundary inserts.
+    /// `hex(zeroblob(k))` is `2k` ASCII '0's, so one `replace` plus a `substr`
+    /// builds any length without materializing a multi-MiB Rust string just to
+    /// interpolate it into a statement.
+    fn repeated_char_sql(c: char, n: i64) -> String {
+        let half = n / 2 + n % 2;
+        format!("substr(replace(hex(zeroblob({half})), '0', '{c}'), 1, {n})")
     }
 
     fn rejected(conn: &Connection, sql: &str) {
@@ -1212,16 +1474,39 @@ mod constraint_tests {
 
     #[test]
     fn v4_tags_rejects_oversize_value() {
+        use crate::limits::MAX_TAG_VALUE_LEN;
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
         insert_track(&conn, "/a.flac");
-        let big = "v".repeat(262_145);
+        // Built in SQL rather than Rust: at the post-#644 cap the string is
+        // 16 MiB, and interpolating one into a statement costs twice that for a
+        // test whose whole point is the `<=` boundary.
+        let over = repeated_char_sql('v', MAX_TAG_VALUE_LEN + 1);
         rejected(
             &conn,
-            &format!(
-                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'k', '{big}', 0)"
-            ),
+            &format!("INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'k', {over}, 0)"),
         );
+    }
+
+    /// The widened cap (#644) accepts exactly at the boundary, so the pair pins
+    /// the `CHECK`'s `<=` against an off-by-one in either direction.
+    #[test]
+    fn v4_tags_accepts_value_at_cap() {
+        use crate::limits::MAX_TAG_VALUE_LEN;
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        insert_track(&conn, "/a.flac");
+        let at = repeated_char_sql('v', MAX_TAG_VALUE_LEN);
+        conn.execute_batch(&format!(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'k', {at}, 0)"
+        ))
+        .unwrap();
+        let len: i64 = conn
+            .query_row("SELECT length(CAST(value AS BLOB)) FROM tags", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(len, MAX_TAG_VALUE_LEN);
     }
 
     #[test]
@@ -1280,16 +1565,36 @@ mod constraint_tests {
 
     #[test]
     fn v4_track_art_rejects_oversize_description() {
+        use crate::limits::MAX_ART_DESCRIPTION_LEN;
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
         seed_track_and_art(&conn);
-        let desc = "d".repeat(1025);
+        let over = repeated_char_sql('d', MAX_ART_DESCRIPTION_LEN + 1);
         rejected(
             &conn,
             &format!(
-                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) VALUES (1, 1, 3, '{desc}', 0)"
+                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) VALUES (1, 1, 3, {over}, 0)"
             ),
         );
+    }
+
+    #[test]
+    fn v4_track_art_accepts_description_at_cap() {
+        use crate::limits::MAX_ART_DESCRIPTION_LEN;
+        let mut conn = Connection::open_in_memory().unwrap();
+        fresh(&mut conn);
+        seed_track_and_art(&conn);
+        let at = repeated_char_sql('d', MAX_ART_DESCRIPTION_LEN);
+        conn.execute_batch(&format!(
+            "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) VALUES (1, 1, 3, {at}, 0)"
+        ))
+        .unwrap();
+        let len: i64 = conn
+            .query_row("SELECT length(description) FROM track_art", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(len, MAX_ART_DESCRIPTION_LEN);
     }
 
     #[test]
@@ -1568,12 +1873,12 @@ mod art_immutability_tests {
     }
 
     #[test]
-    fn migration_reaches_user_version_1() {
+    fn migration_reaches_latest_user_version() {
         let conn = migrated();
         let uv: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, super::LATEST_VERSION);
     }
 
     #[test]

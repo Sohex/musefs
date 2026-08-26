@@ -6,6 +6,7 @@ pub mod limits;
 mod maintenance;
 mod models;
 mod schema;
+pub use schema::LATEST_VERSION;
 mod structural;
 mod tags;
 mod tracks;

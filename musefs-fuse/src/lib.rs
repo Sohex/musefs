@@ -196,6 +196,11 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
         | CoreError::ArtTooLarge { .. }
         | CoreError::InvalidPictureType { .. }
         | CoreError::HeaderTooLarge { .. }
+        // Scan-time refusals (#644). They cannot reach a FUSE reply — nothing
+        // over-cap is ever written — but EIO is the right collapse if the
+        // scanner's validation is ever reused on a serve path.
+        | CoreError::TrackFieldTooLarge { .. }
+        | CoreError::TrackMetadataTooLarge { .. }
         | CoreError::Format(_)
         | CoreError::InvalidTemplate(_) => fuser::Errno::EIO,
     }

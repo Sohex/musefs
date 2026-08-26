@@ -268,6 +268,110 @@ CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
     WHERE id = OLD.track_id;
 END;
 PRAGMA user_version = 2;
+
+-- ── MIGRATION_V3 ──
+-- Widen the two caps musefs invented rather than inherited (#644).
+--
+-- `tags.value` moves 256 KiB -> 16 MiB - 1 (FLAC's 24-bit metadata-block
+-- ceiling, the largest tag synthesis could ever serve) and
+-- `track_art.description` moves 1 KiB -> 8 KiB. Both are *widenings*, so the
+-- refills need no WHERE filter and drop no rows -- unlike V2's narrowing, which
+-- had to shed over-cap rows to avoid aborting on its own new CHECK.
+--
+-- SQLite cannot alter a CHECK in place, so both tables are recreated. V1/V2
+-- text is left untouched: they must stay replayable for a V1 -> V2 -> V3
+-- upgrade, and their literals are frozen history, not the current caps.
+
+-- `art_ad`'s body reads `track_art`. ALTER TABLE ... RENAME reparses the whole
+-- schema and would fail with 'error in trigger art_ad: no such table' while
+-- track_art is momentarily absent, so drop it up front and recreate it verbatim
+-- below. (V2's `tags` rebuild needed no such dance: nothing referenced `tags`.)
+DROP TRIGGER art_ad;
+
+CREATE TABLE tags_v3 (
+    track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    ordinal    INTEGER NOT NULL DEFAULT 0,
+    value_blob BLOB,
+    PRIMARY KEY (track_id, key, ordinal),
+    CHECK (ordinal >= 0),
+    CHECK (value_blob IS NULL OR value = ''),
+    CHECK (length(key) <= 256),
+    CHECK (length(key) >= 1
+           AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
+    CHECK (length(CAST(value AS BLOB)) <= 16777215),
+    CHECK (value_blob IS NULL OR length(value_blob) <= 16711680)
+);
+INSERT INTO tags_v3 (track_id, key, value, ordinal, value_blob)
+    SELECT track_id, key, value, ordinal, value_blob FROM tags;
+DROP TABLE tags;
+ALTER TABLE tags_v3 RENAME TO tags;
+
+CREATE TABLE track_art_v3 (
+    track_id     INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    art_id       INTEGER NOT NULL REFERENCES art(id),
+    picture_type INTEGER NOT NULL DEFAULT 3,
+    description  TEXT NOT NULL DEFAULT '',
+    ordinal      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (track_id, ordinal),
+    CHECK (picture_type BETWEEN 0 AND 20),
+    CHECK (ordinal >= 0),
+    CHECK (length(description) <= 8192)
+);
+INSERT INTO track_art_v3 (track_id, art_id, picture_type, description, ordinal)
+    SELECT track_id, art_id, picture_type, description, ordinal FROM track_art;
+DROP TABLE track_art;
+ALTER TABLE track_art_v3 RENAME TO track_art;
+
+-- DROP TABLE took each table's triggers (and track_art's index) with it;
+-- recreate them verbatim so the content_version/updated_at bump contract and
+-- the reverse art -> track_art edge are unchanged.
+CREATE INDEX track_art_art_id_idx ON track_art(art_id);
+
+CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_au AFTER UPDATE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER track_art_ai AFTER INSERT ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_au AFTER UPDATE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
+END;
+PRAGMA user_version = 3;
 """
 
-USER_VERSION = 2
+USER_VERSION = 3
+
+# Byte cap on `tags.value`, mirrored so an external writer can check a
+# value before the `CHECK` does. Generated from the Rust constant: it
+# moved once already (#644) and a hand-kept copy would silently rot.
+MAX_TAG_VALUE_LEN = 16777215

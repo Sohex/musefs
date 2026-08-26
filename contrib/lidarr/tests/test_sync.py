@@ -1,4 +1,10 @@
-from musefs_common import SCAN_TIMEOUT_SECONDS, ArtImage, connect, realpath_key
+from musefs_common import (
+    MAX_TAG_VALUE_LEN,
+    SCAN_TIMEOUT_SECONDS,
+    ArtImage,
+    connect,
+    realpath_key,
+)
 
 from musefs_lidarr.errors import LidarrApiError
 from musefs_lidarr.events import EventType, LidarrEvent
@@ -217,7 +223,10 @@ def test_sync_records_logs_invalid_record(
 ):
     key = realpath_key(sample_track_file["path"])
     make_track(key)
-    bad_track = {**sample_track, "title": "x" * 262145}  # over the value-length CHECK
+    # One byte over the store's tags.value cap, taken from the contract rather
+    # than written out: the cap moved once already (#644) and a literal here
+    # silently stops testing anything the moment it moves again.
+    bad_track = {**sample_track, "title": "x" * (MAX_TAG_VALUE_LEN + 1)}
     event = LidarrEvent(
         event_type=EventType.ALBUM_DOWNLOAD,
         raw_type="AlbumDownload",

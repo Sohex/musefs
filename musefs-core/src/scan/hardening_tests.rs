@@ -583,10 +583,11 @@ fn scan_ingests_binary_tags_and_promotes() {
     );
 }
 
-/// Probed carrying a valid, an empty, and an oversize binary tag. Only the
-/// valid one is stored: the filter drops empty (`EmptySegment` would fail
-/// layout validation) and oversize (`> MAX_BINARY_TAG_BYTES`) payloads, with
-/// gap-free ordinals.
+/// Probed carrying a valid and an empty binary tag. Only the valid one is
+/// stored: an empty payload carries nothing to serve (and `EmptySegment` would
+/// fail layout validation), so dropping it costs the user nothing. Oversize
+/// payloads are a different matter and no longer appear here — they fail the
+/// whole file (#644), asserted separately below.
 fn probed_with_mixed_binary_tags() -> Probed {
     Probed {
         format: musefs_db::Format::Mp3,
@@ -603,17 +604,23 @@ fn probed_with_mixed_binary_tags() -> Probed {
                 key: "GEOB".into(),
                 payload: Vec::new(),
             },
-            EmbeddedBinaryTag {
-                key: "SYLT".into(),
-                payload: vec![0u8; MAX_BINARY_TAG_BYTES + 1],
-            },
         ],
         structural_blocks: Vec::new(),
     }
 }
 
+/// `probed_with_mixed_binary_tags` plus one payload a single byte over the cap.
+fn probed_with_oversize_binary_tag() -> Probed {
+    let mut p = probed_with_mixed_binary_tags();
+    p.binary_tags.push(EmbeddedBinaryTag {
+        key: "SYLT".into(),
+        payload: vec![0u8; MAX_BINARY_TAG_BYTES + 1],
+    });
+    p
+}
+
 #[test]
-fn ingest_filters_empty_and_oversize_binary_tags() {
+fn ingest_filters_empty_binary_tags() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.mp3");
     std::fs::write(&path, b"x").unwrap();
@@ -639,8 +646,40 @@ fn ingest_filters_empty_and_oversize_binary_tags() {
     assert_eq!(rows[0].byte_len, 3);
 }
 
+/// #644: an oversize payload is not quietly omitted from an otherwise-stored
+/// track. The direct `ingest` entry point rejects the whole file, so a caller
+/// cannot end up with a track that is silently missing data.
 #[test]
-fn ingest_bulk_filters_empty_and_oversize_binary_tags() {
+fn ingest_rejects_a_file_with_an_oversize_binary_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.mp3");
+    std::fs::write(&path, b"x").unwrap();
+    let meta = std::fs::metadata(&path).unwrap();
+    let db = Db::open_in_memory().unwrap();
+
+    let err = ingest(
+        &db,
+        &path.to_string_lossy(),
+        &meta,
+        probed_with_oversize_binary_tag(),
+    )
+    .expect_err("an oversize binary tag must fail the file");
+
+    let msg = err.to_string();
+    assert!(msg.contains("SYLT"), "names the offending tag: {msg}");
+    assert!(
+        msg.contains(&MAX_BINARY_TAG_BYTES.to_string()),
+        "quotes the limit: {msg}"
+    );
+    // Nothing partial was written.
+    assert!(
+        db.list_tracks().unwrap().is_empty(),
+        "no track row survives"
+    );
+}
+
+#[test]
+fn ingest_bulk_filters_empty_binary_tags() {
     let db = Db::open_in_memory().unwrap();
     {
         let mut bw = db.bulk_writer().unwrap();
@@ -669,34 +708,218 @@ fn ingest_bulk_filters_empty_and_oversize_binary_tags() {
 }
 
 #[test]
-fn accept_pictures_keeps_at_cap_and_drops_over_cap() {
-    let mk = |len: usize| EmbeddedPicture {
+fn ingest_bulk_rejects_a_file_with_an_oversize_binary_tag() {
+    let db = Db::open_in_memory().unwrap();
+    let mut bw = db.bulk_writer().unwrap();
+    let err = ingest_bulk(
+        &mut bw,
+        "/a.mp3",
+        BackingStamp {
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        },
+        probed_with_oversize_binary_tag(),
+    )
+    .expect_err("an oversize binary tag must fail the file");
+    assert!(err.to_string().contains("SYLT"), "{err}");
+}
+
+fn picture_of_len(len: usize) -> EmbeddedPicture {
+    EmbeddedPicture {
         mime: "image/jpeg".to_string(),
         picture_type: musefs_format::PictureType::new(3).unwrap(),
         description: String::new(),
         width: 0,
         height: 0,
         data: vec![0u8; len],
-    };
-    // A picture exactly at the cap is kept; one byte over is dropped. The
-    // boundary pins `>` against `>=` (an at-cap drop would be silent loss).
-    let kept = accept_pictures("/x.flac", vec![mk(MAX_ART_BYTES), mk(MAX_ART_BYTES + 1)]);
-    assert_eq!(kept.len(), 1, "exactly the at-cap picture survives");
-    assert_eq!(kept[0].data.len(), MAX_ART_BYTES);
+    }
+}
+
+fn probed_with_pictures(pictures: Vec<EmbeddedPicture>) -> Probed {
+    Probed {
+        format: musefs_db::Format::Mp3,
+        audio_offset: 0,
+        audio_length: 0,
+        tags: Vec::new(),
+        pictures,
+        binary_tags: Vec::new(),
+        structural_blocks: Vec::new(),
+    }
+}
+
+/// The cap boundary is inclusive on both sides of every field, pinning each
+/// `>` against a `>=`/`==` mutant. An at-cap rejection would fail a file that
+/// stores fine; an over-cap acceptance is the #644 crash.
+#[test]
+fn check_storable_accepts_art_at_cap_and_rejects_one_over() {
+    assert!(
+        check_storable(
+            "/x.flac",
+            &probed_with_pictures(vec![picture_of_len(MAX_ART_BYTES)])
+        )
+        .is_ok()
+    );
+    let err = check_storable(
+        "/x.flac",
+        &probed_with_pictures(vec![picture_of_len(MAX_ART_BYTES + 1)]),
+    )
+    .expect_err("one byte over the art cap fails the file");
+    assert!(err.to_string().contains("/x.flac"), "names the file: {err}");
 }
 
 #[test]
-fn accept_binary_tags_keeps_at_cap_and_drops_over_cap() {
-    let mk = |len: usize| EmbeddedBinaryTag {
-        key: "PRIV".to_string(),
-        payload: vec![0u8; len],
+fn check_storable_accepts_binary_tag_at_cap_and_rejects_one_over() {
+    let mk = |len: usize| {
+        let mut p = probed_with_pictures(Vec::new());
+        p.binary_tags = vec![EmbeddedBinaryTag {
+            key: "PRIV".to_string(),
+            payload: vec![0u8; len],
+        }];
+        p
     };
-    let kept = accept_binary_tags(
-        "/x.mp3",
-        vec![mk(MAX_BINARY_TAG_BYTES), mk(MAX_BINARY_TAG_BYTES + 1)],
+    assert!(check_storable("/x.mp3", &mk(MAX_BINARY_TAG_BYTES)).is_ok());
+    assert!(check_storable("/x.mp3", &mk(MAX_BINARY_TAG_BYTES + 1)).is_err());
+}
+
+#[test]
+fn check_storable_accepts_tag_value_at_cap_and_rejects_one_over() {
+    let cap = usize::try_from(musefs_db::limits::MAX_TAG_VALUE_LEN).unwrap();
+    // MP3, so the FLAC block-total check does not confound the per-value one.
+    let mk = |len: usize| probed_with_text_tags(&[("LYRICS", &"v".repeat(len))]);
+    assert!(check_storable("/x.mp3", &mk(cap)).is_ok());
+    let err = check_storable("/x.mp3", &mk(cap + 1))
+        .expect_err("one byte over the tag-value cap fails the file");
+    let msg = err.to_string();
+    assert!(msg.contains("LYRICS"), "names the tag: {msg}");
+    assert!(msg.contains(&cap.to_string()), "quotes the limit: {msg}");
+}
+
+#[test]
+fn check_storable_accepts_tag_key_at_cap_and_rejects_one_over() {
+    let cap = usize::try_from(musefs_db::limits::MAX_TAG_KEY_LEN).unwrap();
+    let at = "k".repeat(cap);
+    let over = "k".repeat(cap + 1);
+    assert!(check_storable("/x.mp3", &probed_with_text_tags(&[(&at, "v")])).is_ok());
+    assert!(check_storable("/x.mp3", &probed_with_text_tags(&[(&over, "v")])).is_err());
+}
+
+#[test]
+fn check_storable_accepts_art_description_at_cap_and_rejects_one_over() {
+    let cap = usize::try_from(musefs_db::limits::MAX_ART_DESCRIPTION_LEN).unwrap();
+    let mk = |len: usize| {
+        let mut pic = picture_of_len(1);
+        pic.description = "d".repeat(len);
+        probed_with_pictures(vec![pic])
+    };
+    assert!(check_storable("/x.flac", &mk(cap)).is_ok());
+    assert!(check_storable("/x.flac", &mk(cap + 1)).is_err());
+}
+
+/// The TEXT caps are compared against SQLite `length()`, which counts
+/// characters, not bytes. Counting bytes here would reject a legal multibyte
+/// key/description the `CHECK` would have accepted — failing a file for a limit
+/// it does not exceed, the mirror image of the bug #644 reported.
+#[test]
+fn check_storable_counts_characters_not_bytes_for_text_caps() {
+    let cap = usize::try_from(musefs_db::limits::MAX_TAG_KEY_LEN).unwrap();
+    let key = "é".repeat(cap); // `cap` chars, 2 * cap bytes
+    assert!(key.len() > cap, "fixture must be multibyte");
+    assert!(
+        check_storable("/x.mp3", &probed_with_text_tags(&[(&key, "v")])).is_ok(),
+        "a key at the character cap must pass even when its byte length exceeds it"
     );
-    assert_eq!(kept.len(), 1, "exactly the at-cap binary tag survives");
-    assert_eq!(kept[0].payload.len(), MAX_BINARY_TAG_BYTES);
+}
+
+#[test]
+fn check_storable_accepts_art_mime_at_cap_and_rejects_one_over() {
+    let cap = usize::try_from(musefs_db::limits::MAX_ART_MIME_LEN).unwrap();
+    let mk = |len: usize| {
+        let mut pic = picture_of_len(1);
+        pic.mime = "m".repeat(len);
+        probed_with_pictures(vec![pic])
+    };
+    assert!(check_storable("/x.flac", &mk(cap)).is_ok());
+    let err = check_storable("/x.flac", &mk(cap + 1))
+        .expect_err("one character over the MIME cap fails the file");
+    assert!(err.to_string().contains("MIME"), "{err}");
+}
+
+/// One tag whose `VORBIS_COMMENT` framing lands the running total on *exactly*
+/// the block ceiling, and the same tag one byte longer.
+///
+/// The pair pins the whole size computation, not just its verdict: the framing
+/// is `4-byte comment length + KEY + '=' + VALUE` on top of an 8-byte header,
+/// so getting any of those terms wrong shifts the total off the boundary and
+/// flips one of these two assertions. A test using values far over the ceiling
+/// (as the FLAC case below does) cannot see that — it is over either way.
+fn probed_with_comment_block_total(format: musefs_db::Format, total: usize) -> Probed {
+    // total = 8 (vendor len + comment count) + 4 (comment len) + "A" + '=' + value
+    let value = "v".repeat(total - 14);
+    let mut p = probed_with_text_tags(&[("A", &value)]);
+    p.format = format;
+    p
+}
+
+#[test]
+fn check_storable_comment_block_boundary_is_inclusive_and_exactly_framed() {
+    let cap = usize::try_from(musefs_format::flac::MAX_BLOCK_BODY).unwrap();
+    assert!(
+        check_storable(
+            "/x.flac",
+            &probed_with_comment_block_total(musefs_db::Format::Flac, cap)
+        )
+        .is_ok(),
+        "a comment block landing exactly on the ceiling still fits"
+    );
+    assert!(
+        check_storable(
+            "/x.flac",
+            &probed_with_comment_block_total(musefs_db::Format::Flac, cap + 1)
+        )
+        .is_err(),
+        "one byte past the ceiling cannot be synthesized"
+    );
+}
+
+/// Ogg FLAC carries the same FLAC metadata blocks as native FLAC, so it is
+/// bound by the same 24-bit ceiling and must not be waved through.
+#[test]
+fn check_storable_applies_the_comment_block_ceiling_to_ogg_flac() {
+    let cap = usize::try_from(musefs_format::flac::MAX_BLOCK_BODY).unwrap();
+    assert!(
+        check_storable(
+            "/x.oga",
+            &probed_with_comment_block_total(musefs_db::Format::OggFlac, cap)
+        )
+        .is_ok()
+    );
+    let err = check_storable(
+        "/x.oga",
+        &probed_with_comment_block_total(musefs_db::Format::OggFlac, cap + 1),
+    )
+    .expect_err("Ogg FLAC is bound by FLAC's block ceiling too");
+    assert!(err.to_string().contains("Ogg FLAC"), "{err}");
+}
+
+/// A tag value is capped at exactly FLAC's block ceiling, so one always fits
+/// alone — but two need not. Without this check the file would scan clean and
+/// then `EIO` on every read, which is the state #644's fail-the-file policy
+/// exists to prevent.
+#[test]
+fn check_storable_rejects_flac_tags_that_cannot_fit_a_comment_block() {
+    let cap = usize::try_from(musefs_db::limits::MAX_TAG_VALUE_LEN).unwrap();
+    let big = "v".repeat(cap * 2 / 3);
+    let mut probed = probed_with_text_tags(&[("A", &big), ("B", &big)]);
+    probed.format = musefs_db::Format::Flac;
+    let err = check_storable("/x.flac", &probed)
+        .expect_err("two two-thirds-cap tags overflow the comment block");
+    assert!(err.to_string().contains("FLAC"), "{err}");
+
+    // The same tags in an MP3 are fine: ID3v2's ceiling is 256 MiB.
+    let mut mp3 = probed_with_text_tags(&[("A", &big), ("B", &big)]);
+    mp3.format = musefs_db::Format::Mp3;
+    assert!(check_storable("/x.mp3", &mp3).is_ok());
 }
 
 fn probed_with_text_tags(tags: &[(&str, &str)]) -> Probed {

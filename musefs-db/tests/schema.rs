@@ -1,9 +1,9 @@
-use musefs_db::Db;
+use musefs_db::{Db, LATEST_VERSION};
 
 #[test]
 fn open_in_memory_runs_migration_to_latest() {
     let db = Db::open_in_memory().expect("open");
-    assert_eq!(db.user_version().expect("user_version"), 2);
+    assert_eq!(db.user_version().expect("user_version"), LATEST_VERSION);
 }
 
 #[test]
@@ -12,12 +12,12 @@ fn migration_is_idempotent_across_reopen() {
     let path = dir.path().join("musefs.db");
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.user_version().unwrap(), 2);
+    assert_eq!(db.user_version().unwrap(), LATEST_VERSION);
     drop(db);
 
     // Reopening must not error and must not advance the version.
     let db2 = Db::open(&path).unwrap();
-    assert_eq!(db2.user_version().unwrap(), 2);
+    assert_eq!(db2.user_version().unwrap(), LATEST_VERSION);
 }
 
 #[test]
@@ -28,9 +28,10 @@ fn opening_a_store_newer_than_the_binary_fails_loudly() {
     // Create a normal store, then simulate a future/third-party tool bumping the
     // schema past what this binary knows about.
     Db::open(&path).unwrap();
+    let future = LATEST_VERSION + 1;
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.pragma_update(None, "user_version", future).unwrap();
     }
 
     // Reopening must refuse the store instead of silently treating it as
@@ -39,12 +40,10 @@ fn opening_a_store_newer_than_the_binary_fails_loudly() {
     assert!(
         matches!(
             err,
-            musefs_db::DbError::StoreTooNew {
-                found: 3,
-                supported: 2
-            }
+            musefs_db::DbError::StoreTooNew { found, supported }
+                if found == future && supported == LATEST_VERSION
         ),
-        "expected StoreTooNew {{ found: 3, supported: 2 }}, got {err:?}"
+        "expected StoreTooNew {{ found: {future}, supported: {LATEST_VERSION} }}, got {err:?}"
     );
 }
 
@@ -52,7 +51,9 @@ fn opening_a_store_newer_than_the_binary_fails_loudly() {
 #[test]
 fn default_db_is_unmigrated_version_zero() {
     // Kills `Db::user_version -> Ok(1)`: Default opens an UNMIGRATED in-memory
-    // connection, so user_version is 0, distinct from the always-migrated 2.
+    // connection, so user_version is 0, distinct from the always-migrated
+    // LATEST_VERSION.
     let db = Db::default();
     assert_eq!(db.user_version().unwrap(), 0);
+    assert_ne!(0, LATEST_VERSION);
 }
