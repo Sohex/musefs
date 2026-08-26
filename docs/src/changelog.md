@@ -22,6 +22,19 @@ see the [Release notes](release-notes.md).
   [#616](https://github.com/Sohex/musefs/issues/616) is in use and directories are being rebuilt on every
   `readdir`.
 
+- `musefs_serve_warns_suppressed_total`
+  ([#653](https://github.com/Sohex/musefs/issues/653)), a monotonic counter of
+  serve-path failure warnings the rate limiter downgraded to `debug`. The count
+  previously escaped only as a parenthetical inside the next admitted warning,
+  which is both unscrapeable and carried by the admitted lines alone. The
+  failure mode matches
+  [#626](https://github.com/Sohex/musefs/issues/626)'s: suppression is bursty by
+  construction — 10 admitted per 30-second window, the rest dropped — so a
+  scrape landing between bursts sees nothing, and "quiet" and "failing faster
+  than it can log" look identical. Since the limiter moved into `musefs-core`
+  ([#650](https://github.com/Sohex/musefs/issues/650)) the counter covers the
+  synthesis warns too, not just the FUSE errno path.
+
 ### Changed
 
 - The `tags.value` cap rises from 256 KiB to 16 MiB − 1, and
@@ -60,6 +73,21 @@ see the [Release notes](release-notes.md).
   of materializing a whole `Track` per row ([#621](https://github.com/Sohex/musefs/issues/621)) — roughly 40 MB of
   transient allocation on a 200,000-track store, on a path already holding a
   pool connection.
+- The serve-path warn rate limiter is process-wide instead of FUSE-local
+  ([#650](https://github.com/Sohex/musefs/issues/650)). It bounds failure warns
+  to a burst of 10 per 30-second window, but it lived in `musefs-fuse` and was
+  reachable only from the errno-reply path, so the warns synthesis itself emits
+  bypassed it: a dropped Vorbis tag key (once per header-cache miss, and that
+  cache is byte-budgeted, so an evicting library re-warns for the same track
+  indefinitely), art over the byte cap, and a failed art-blob read — the last
+  fires per art *window*, so one bad blob produced many lines for one file. The
+  limiter now lives in `musefs-core` next to `telemetry.rs` and both crates
+  share one budget, which is the right unit: the operator's concern is total
+  serve-path log volume, not per-crate volume. Only the budget is shared, not
+  the attribution: the emit side is the `musefs_core::serve_warn!` macro, so
+  each record still takes its target from the call site's own module and
+  per-crate `RUST_LOG` filtering (`RUST_LOG=warn,musefs_fuse=debug`) reaches
+  exactly what it did before.
 - `readdir`'s unknown-`fh` fallback runs on the worker pool instead of inline on
   the fuser dispatch thread ([#623](https://github.com/Sohex/musefs/issues/623)), matching the offload every other
   blocking operation already used. This matters more now that over-cap `opendir`

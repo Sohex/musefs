@@ -17,6 +17,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
   given a cached directory snapshot, so directory-handle pressure stays visible
   after a burst rather than only as a gauge that reads healthy between samples.
+- `musefs_serve_warns_suppressed_total` counts the serve-path failure warnings
+  the rate limiter downgraded to `debug`, so log throttling is visible to
+  anything scraping metrics. Without it the count escaped only as prose inside
+  the next warning that was admitted, and an operator could not tell a quiet
+  serve path from one failing faster than it logs.
 - `--workers` (env `MUSEFS_WORKERS`) sizes the FUSE worker pool explicitly.
   The default stays auto (2× the CPU count, oversized for I/O-bound work), but
   each worker lazily opens its own read-only SQLite connection, so steady-state
@@ -51,7 +56,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   window carries the suppressed count. A library walk over missing backing
   files previously warned once per file — 200,000 lines (tens of MB of log)
   for a single enumeration. The read load-shed (`EAGAIN`) warning shares the
-  same limiter, since a saturated client retries in a tight loop.
+  same limiter, since a saturated client retries in a tight loop. The limiter is
+  now process-wide rather than FUSE-local, so the warns emitted from inside
+  synthesis — a dropped Vorbis tag key, over-cap art, a failed art-blob read —
+  are bounded by the same budget instead of bypassing it (#650). Log targets are
+  unchanged: each warning is still attributed to the module that raised it, so
+  per-crate `RUST_LOG` filters keep working.
 - Worker read connections now cap their SQLite page cache at 512 KiB (the
   default is ~2 MiB). The serve path opens one connection per worker thread
   (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS
