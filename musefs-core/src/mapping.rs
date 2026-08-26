@@ -55,12 +55,12 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
         // writer that disables check enforcement can still plant an oversize row,
         // and Component B would stream it with bounded memory, but we refuse it.
         if data_len.get() > crate::scan::MAX_ART_BYTES as u64 {
-            crate::warn_limit::rate_limited_warn(format_args!(
+            crate::serve_warn!(
                 "track {track_id} art {} is {} bytes, exceeds the {}-byte art cap; refusing to serve",
                 ta.art_id,
                 data_len.get(),
                 crate::scan::MAX_ART_BYTES,
-            ));
+            );
             return Err(crate::error::CoreError::ArtTooLarge {
                 track_id,
                 art_id: ta.art_id,
@@ -101,9 +101,9 @@ impl<M> musefs_format::ogg::ArtSource for DbArtSource<'_, M> {
         self.0
             .read_art_chunk_into(art_id, offset, buf)
             .map_err(|e| {
-                crate::warn_limit::rate_limited_warn(format_args!(
+                crate::serve_warn!(
                     "ogg synthesis: art {art_id} read failed at offset {offset}: {e}"
-                ));
+                );
                 musefs_format::FormatError::ArtRead { art_id }
             })
     }

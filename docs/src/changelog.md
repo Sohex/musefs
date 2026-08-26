@@ -83,7 +83,11 @@ see the [Release notes](release-notes.md).
   fires per art *window*, so one bad blob produced many lines for one file. The
   limiter now lives in `musefs-core` next to `telemetry.rs` and both crates
   share one budget, which is the right unit: the operator's concern is total
-  serve-path log volume, not per-crate volume.
+  serve-path log volume, not per-crate volume. Only the budget is shared, not
+  the attribution: the emit side is the `musefs_core::serve_warn!` macro, so
+  each record still takes its target from the call site's own module and
+  per-crate `RUST_LOG` filtering (`RUST_LOG=warn,musefs_fuse=debug`) reaches
+  exactly what it did before.
 - `readdir`'s unknown-`fh` fallback runs on the worker pool instead of inline on
   the fuser dispatch thread ([#623](https://github.com/Sohex/musefs/issues/623)), matching the offload every other
   blocking operation already used. This matters more now that over-cap `opendir`

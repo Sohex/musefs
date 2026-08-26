@@ -22,7 +22,7 @@ use musefs_core::CoreError;
 use musefs_core::Fh;
 use musefs_core::Musefs;
 use musefs_core::convert::usize_from;
-use musefs_core::rate_limited_warn;
+use musefs_core::serve_warn;
 use std::num::NonZeroU64;
 
 mod convert;
@@ -221,7 +221,7 @@ fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
         | CoreError::TrackNotFound(_)
         | CoreError::IsDir(_)
         | CoreError::NotADir(_) => log::debug!("{op}({ino}) failed: {err}"),
-        _ => rate_limited_warn(format_args!("{op}({ino}) failed: {err}")),
+        _ => serve_warn!("{op}({ino}) failed: {err}"),
     }
     errno(err)
 }
@@ -959,10 +959,10 @@ impl Filesystem for MusefsFs {
             self.read_errors.fetch_add(1, Ordering::Relaxed);
             // Rate-limited: a saturated client retries rejected reads in a tight
             // loop, so this otherwise warns once per shed read for the whole storm.
-            rate_limited_warn(format_args!(
+            serve_warn!(
                 "read({}) rejected: EAGAIN — {MAX_INFLIGHT_READS} reads already in flight (load-shedding)",
                 ino.0
-            ));
+            );
             return reply.error(fuser::Errno::EAGAIN);
         };
         let core = Arc::clone(&self.core);
@@ -1526,5 +1526,60 @@ mod errno_tests {
     #[test]
     fn handle_table_full_maps_to_enfile() {
         assert_eq!(errno(&CoreError::HandleTableFull).code(), libc::ENFILE);
+    }
+}
+
+/// The serve-path warn limiter lives in `musefs-core`, but `reply_errno`'s warn
+/// must still be *attributed* to this crate: the troubleshooting guide documents
+/// per-crate filtering (`RUST_LOG=warn,musefs_fuse=debug`), and that only works
+/// while the record's target follows the call site. This is what makes
+/// `musefs_core::serve_warn!` a macro rather than a shared function (#650).
+#[cfg(test)]
+mod warn_target_tests {
+    use std::sync::Mutex;
+
+    use super::reply_errno;
+    use musefs_core::CoreError;
+
+    static CAPTURED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+    /// Global logger keeping each record's target and rendered message.
+    struct CaptureLogger;
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            CAPTURED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((record.target().to_string(), record.args().to_string()));
+        }
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn reply_errno_warn_is_attributed_to_musefs_fuse() {
+        log::set_logger(&CAPTURE_LOGGER).expect("only this test installs a logger");
+        // Over-budget warns drop to debug and must carry the same target.
+        log::set_max_level(log::LevelFilter::Debug);
+
+        let err = CoreError::BackingChanged("warn-target-probe.flac".into());
+        reply_errno("read", 4242, &err);
+
+        let captured = CAPTURED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hits: Vec<&(String, String)> = captured
+            .iter()
+            .filter(|(_, m)| m.contains("warn-target-probe.flac"))
+            .collect();
+        assert_eq!(hits.len(), 1, "expected exactly one record, got {hits:?}");
+        assert_eq!(
+            hits[0].0, "musefs_fuse",
+            "reply_errno must log under this crate, not the limiter's module"
+        );
     }
 }

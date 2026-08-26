@@ -59,7 +59,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same limiter, since a saturated client retries in a tight loop. The limiter is
   now process-wide rather than FUSE-local, so the warns emitted from inside
   synthesis — a dropped Vorbis tag key, over-cap art, a failed art-blob read —
-  are bounded by the same budget instead of bypassing it (#650).
+  are bounded by the same budget instead of bypassing it (#650). Log targets are
+  unchanged: each warning is still attributed to the module that raised it, so
+  per-crate `RUST_LOG` filters keep working.
 - Worker read connections now cap their SQLite page cache at 512 KiB (the
   default is ~2 MiB). The serve path opens one connection per worker thread
   (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS

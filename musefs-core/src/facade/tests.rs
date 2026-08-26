@@ -1187,7 +1187,7 @@ fn telemetry_surfaces_serve_warns_suppressed() {
     let before = fs.telemetry().serve_warns_suppressed;
     // Well past the per-window burst budget, so warns are certainly dropped.
     for i in 0..64 {
-        crate::warn_limit::rate_limited_warn(format_args!("telemetry warn probe {i}"));
+        crate::serve_warn!("telemetry warn probe {i}");
     }
     assert!(
         fs.telemetry().serve_warns_suppressed > before,
