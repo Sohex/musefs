@@ -62,6 +62,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are bounded by the same budget instead of bypassing it (#650). Log targets are
   unchanged: each warning is still attributed to the module that raised it, so
   per-crate `RUST_LOG` filters keep working.
+- Scan failures are broken down by reason, and the per-file warnings capped
+  ([#651](https://github.com/Sohex/musefs/issues/651)). A scan ending `failed 37`
+  now also logs `failed 37: unparseable=30, io=5, oversize=2` — the four reasons
+  partition the count exactly — plus `walk errors N: unreadable=…, symlink=…`
+  for entries the walk never queued. Previously `failed N` had no explanation
+  and the only way to get one was to read N individual warnings out of the
+  scrollback. Per-file skip warnings are capped at ten per reason per scan;
+  past that, one line says the rest are going to `debug`, and they do.
+  **The per-extension skip breakdown moves from `warn` to `info`**, so it now
+  needs `-v` or `RUST_LOG=info`: cover art and `.cue`/`.log` sidecars are the
+  normal contents of a library, so that line fired on every healthy scan, and a
+  warning that always fires teaches operators to filter warnings out — which
+  would now also cost them the failure summary that matters. The `skipped N`
+  count itself is unchanged and still prints at any log level.
 - Worker read connections now cap their SQLite page cache at 512 KiB (the
   default is ~2 MiB). The serve path opens one connection per worker thread
   (2× CPUs), so the default multiplied into hundreds of MB of steady-state RSS
@@ -70,6 +84,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now documents the post-enumeration steady state as the number to size a host
   against, and the transparent-hugepage inflation some distros' `THP=always`
   default adds on top.
+- An in-place store schema upgrade now announces itself
+  ([#649](https://github.com/Sohex/musefs/issues/649)). `Db::open` migrates on
+  every open, so an older store was rewritten irreversibly on the first
+  `musefs scan` after a binary upgrade with nothing said about it — and the
+  first the user heard of it was `StoreTooNew` when they tried to run the older
+  build again. The announcement is at `warn` (once per store per schema bump,
+  so it is in the scrollback when it is needed) and names both versions;
+  completion is at `info`. Creating a fresh store stays at `info`, and opening
+  an already-current store stays silent.
 - The virtual tree stores each node name in one shared allocation instead of
   five copies, cutting about a quarter of its resident cost (~1.7 KB to ~1.3 KB
   per track, measured over 200,000 tracks). The tuning guide now documents the
