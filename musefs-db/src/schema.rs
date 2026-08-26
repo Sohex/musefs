@@ -790,9 +790,15 @@ mod schema_py_tests {
              SCHEMA_SQL = \"\"\"\\\n\
              {sql}\"\"\"\n\
              \n\
-             USER_VERSION = {version}\n",
+             USER_VERSION = {version}\n\
+             \n\
+             # Byte cap on `tags.value`, mirrored so an external writer can check a\n\
+             # value before the `CHECK` does. Generated from the Rust constant: it\n\
+             # moved once already (#644) and a hand-kept copy would silently rot.\n\
+             MAX_TAG_VALUE_LEN = {max_tag_value_len}\n",
             sql = render_schema_sql(),
-            version = MIGRATIONS.len()
+            version = MIGRATIONS.len(),
+            max_tag_value_len = crate::limits::MAX_TAG_VALUE_LEN
         )
     }
 

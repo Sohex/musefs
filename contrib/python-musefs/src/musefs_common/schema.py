@@ -367,3 +367,8 @@ PRAGMA user_version = 3;
 """
 
 USER_VERSION = 3
+
+# Byte cap on `tags.value`, mirrored so an external writer can check a
+# value before the `CHECK` does. Generated from the Rust constant: it
+# moved once already (#644) and a hand-kept copy would silently rot.
+MAX_TAG_VALUE_LEN = 16777215
