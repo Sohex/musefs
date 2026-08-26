@@ -41,8 +41,10 @@ a converter. musefs scans them rather than skipping them:
   correctly — only its contents go unread. What is required is that the header
   matches the spec's detection pattern (`$49 44 33 yy yy xx zz zz zz zz`, both
   version bytes below `$FF`, every size byte below `$80`) and that its declared
-  length lands on the marker. A header that fails either test contradicts the
-  file it is in, and the file is skipped rather than guessed at.
+  length lands where the next thing in the file starts — the following ID3v2
+  header, or the `fLaC` marker for the last tag in the run. A header that fails
+  either test contradicts the file it is in, and the file is skipped rather than
+  guessed at.
 - The tag's **text frames and `APIC` pictures are ingested as a fallback**: the
   FLAC's own `VORBIS_COMMENT` / `PICTURE` blocks win, and the ID3 tag only
   supplies keys the FLAC does not define. The rule is all-or-nothing per key, so
