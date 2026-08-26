@@ -67,6 +67,26 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- Scan log records and the progress bar no longer clobber each other on an
+  interactive terminal ([#648](https://github.com/Sohex/musefs/issues/648)).
+  `ScanReporter` renders an `indicatif` bar on stderr and the `log` facade
+  writes to the same stderr, with nothing coordinating the two: a record was
+  emitted at whatever column the last bar frame left the cursor on, and the
+  next 120 ms tick issued a clear-line that ate part of it. Both the warning
+  and the bar came out mangled. This was reachable on essentially the first
+  interactive scan of any real library, because the end-of-walk skip tally
+  ([#341](https://github.com/Sohex/musefs/issues/341)) warns about `cover.jpg`
+  / `.cue` / `.log` / `.nfo` sidecars, and every unparseable file warns from
+  inside the pipeline. The CLI now owns a single process-wide stderr draw
+  target: the scan bar draws through it, and the binary's `env_logger` is
+  installed wrapped in a sink that emits each record while that target is
+  suspended — bar cleared, record written, bar redrawn below it. The per-target
+  summary line (`scanned N: …`, on stdout) is suspended the same way; it used
+  to be glued onto a bar frame whenever no log record happened to precede it.
+  Off a terminal the draw target is hidden and suspending is a no-op, so the
+  `--quiet` and piped `ingested N/M (P%)` paths are byte-for-byte unchanged, as
+  is the verbosity policy (`-v`/`-vv`/`-vvv`, `RUST_LOG` taking precedence),
+  which stays in the binary.
 - A tag larger than the store's cap no longer aborts the entire scan
   ([#644](https://github.com/Sohex/musefs/issues/644)). The scanner had no
   length check on text tags, so an over-cap value reached the DB `CHECK` inside

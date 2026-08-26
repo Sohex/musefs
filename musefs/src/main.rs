@@ -44,8 +44,14 @@ fn main() -> std::process::ExitCode {
         2 => "debug",
         _ => "trace",
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
-        .init();
+    // Built rather than `.init()`ed: `musefs_cli` installs it wrapped so records
+    // are emitted with the scan progress bar suspended instead of shredding it
+    // (#648). The verbosity policy above still belongs to the binary.
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+            .build();
+    let level = logger.filter();
+    musefs_cli::install_logger(Box::new(logger), level);
     #[cfg(feature = "jemalloc")]
     {
         enable_jemalloc_background_thread();
