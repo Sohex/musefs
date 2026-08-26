@@ -2188,8 +2188,10 @@ fn run_pipeline(
             failed.load(Ordering::Relaxed),
             raced.load(Ordering::Relaxed),
         );
-        while *failures_seen < tallied {
-            *failures_seen += 1;
+        // A bounded `for` rather than a `while` advancing its own cursor: the
+        // loop cannot outrun the tally, and it holds no increment whose failure
+        // to advance would spin forever.
+        for _ in *failures_seen..tallied {
             *finished += 1;
             if let Some(p) = progress {
                 p.emit(ScanProgress::Failed {
@@ -2198,6 +2200,7 @@ fn run_pipeline(
                 });
             }
         }
+        *failures_seen = tallied;
     };
 
     // Drain the channel, batching by file count and accumulated art bytes. The
