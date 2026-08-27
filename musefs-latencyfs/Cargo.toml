@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 # Pure-rust fusermount3 mount path; never enable `libfuse` (keeps workspace feature unification consistent).
-fuser = { version = "0.17", default-features = false }
+fuser = { version = "0.18", default-features = false }
 libc = "0.2"
 rustix = { version = "1", features = ["process", "fs"] }
 tempfile = "3"
