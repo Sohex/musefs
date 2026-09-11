@@ -106,6 +106,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A scan no longer aborts on a file that carries one tag key as both text and a
+  binary payload ([#659](https://github.com/Sohex/musefs/issues/659)). The
+  `tags` primary key is `(track_id, key, ordinal)` and does not discriminate on
+  `value_blob`, but the two row classes were numbered from 0 independently, so
+  such a file wrote two rows at the same key and ordinal and failed its ingest
+  transaction with `UNIQUE constraint failed: tags.track_id, tags.key,
+  tags.ordinal` — fatal to the whole scan, hours in. Text and binary rows now
+  share one per-key counter. Real shapes that hit this: a FLAC `CUESHEET`
+  Vorbis comment beside a CUESHEET metadata block, an MP3 `TXXX` frame whose
+  description names a binary frame (`PRIV`, `GEOB`, `MCDI`) the same tag
+  carries, and an MP4 freeform atom written as both.
 - Scan log records no longer shred the progress bar (and vice versa) on an
   interactive terminal ([#648](https://github.com/Sohex/musefs/issues/648)).
   The bar and the `log` sink both write to stderr with nothing between them, so

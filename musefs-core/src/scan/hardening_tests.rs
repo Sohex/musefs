@@ -1366,6 +1366,168 @@ fn ingest_bulk_assigns_sequential_structural_ordinals_per_kind() {
     assert_eq!(got[1].body, vec![0xB2]);
 }
 
+// --- #659: text and binary tag rows share one ordinal space per key ---
+
+/// A track whose backing file carries the same key as both a text tag and a
+/// binary payload. Real shapes: a FLAC `CUESHEET` Vorbis comment beside a
+/// CUESHEET metadata block, or an ID3 `TXXX` frame whose description names a
+/// binary frame (`PRIV`, `GEOB`, `MCDI`) the tag also carries.
+fn probed_with_key_in_both_tag_classes() -> Probed {
+    Probed {
+        format: musefs_db::Format::Flac,
+        audio_offset: 0,
+        audio_length: 0,
+        tags: vec![("CUESHEET".to_string(), "text value".to_string())],
+        pictures: Vec::new(),
+        binary_tags: vec![EmbeddedBinaryTag {
+            key: "CUESHEET".to_string(),
+            payload: vec![0xC0, 0xDE],
+        }],
+        structural_blocks: Vec::new(),
+    }
+}
+
+/// `tags`' primary key is `(track_id, key, ordinal)` and does not discriminate
+/// on `value_blob`, so numbering the text and binary rows from 0 independently
+/// wrote two rows at the same key and ordinal. That surfaced as
+/// `UNIQUE constraint failed: tags.track_id, tags.key, tags.ordinal` from
+/// inside the ingest transaction, which aborts the whole scan rather than
+/// failing the one file (#659).
+#[test]
+fn ingest_keeps_text_and_binary_rows_of_one_key_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.flac");
+    std::fs::write(&path, b"x").unwrap();
+    let meta = std::fs::metadata(&path).unwrap();
+    let db = Db::open_in_memory().unwrap();
+
+    ingest(
+        &db,
+        &path.to_string_lossy(),
+        &meta,
+        probed_with_key_in_both_tag_classes(),
+    )
+    .unwrap();
+
+    let tid = db.list_tracks().unwrap()[0].id;
+    let text = db.get_tags(tid).unwrap();
+    assert_eq!(text.len(), 1);
+    assert_eq!(text[0].ordinal, 0);
+    assert_eq!(text[0].value, "text value");
+    // The binary row continues the same key's numbering rather than restarting.
+    let binary = db.get_binary_tags(tid).unwrap();
+    assert_eq!(binary.len(), 1);
+    assert_eq!(binary[0].key, "CUESHEET");
+    assert_eq!(
+        db.read_binary_tag_chunk(binary[0].rowid, 0, 2).unwrap(),
+        vec![0xC0, 0xDE]
+    );
+}
+
+/// Same collision through the production batch writer, whose transaction is
+/// the one the scan aborts on.
+#[test]
+fn ingest_bulk_keeps_text_and_binary_rows_of_one_key_apart() {
+    let db = Db::open_in_memory().unwrap();
+    {
+        let mut bw = db.bulk_writer().unwrap();
+        ingest_bulk(
+            &mut bw,
+            "/a.flac",
+            BackingStamp {
+                size: 1,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            },
+            probed_with_key_in_both_tag_classes(),
+        )
+        .unwrap();
+        bw.commit().unwrap();
+    }
+    let tid = db.list_tracks().unwrap()[0].id;
+    assert_eq!(db.get_tags(tid).unwrap().len(), 1);
+    assert_eq!(db.get_binary_tags(tid).unwrap().len(), 1);
+}
+
+/// Binary ordinals are per key, not one running index across the whole track:
+/// two payloads under one key must number 0 then 1, and a second key restarts.
+#[test]
+fn ingest_numbers_binary_tags_per_key() {
+    let db = Db::open_in_memory().unwrap();
+    {
+        let mut bw = db.bulk_writer().unwrap();
+        ingest_bulk(
+            &mut bw,
+            "/a.mp3",
+            BackingStamp {
+                size: 1,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            },
+            Probed {
+                format: musefs_db::Format::Mp3,
+                audio_offset: 0,
+                audio_length: 0,
+                tags: Vec::new(),
+                pictures: Vec::new(),
+                binary_tags: vec![
+                    EmbeddedBinaryTag {
+                        key: "PRIV".to_string(),
+                        payload: vec![0xA1],
+                    },
+                    EmbeddedBinaryTag {
+                        key: "GEOB".to_string(),
+                        payload: vec![0xB2],
+                    },
+                    EmbeddedBinaryTag {
+                        key: "PRIV".to_string(),
+                        payload: vec![0xC3],
+                    },
+                ],
+                structural_blocks: Vec::new(),
+            },
+        )
+        .unwrap();
+        bw.commit().unwrap();
+    }
+    let tid = db.list_tracks().unwrap()[0].id;
+    // ORDER BY key, ordinal: GEOB(0), then PRIV(0), PRIV(1).
+    let rows = db.get_binary_tags(tid).unwrap();
+    let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(keys, vec!["GEOB", "PRIV", "PRIV"]);
+    assert_eq!(
+        db.read_binary_tag_chunk(rows[1].rowid, 0, 1).unwrap(),
+        vec![0xA1],
+        "the first PRIV payload sorts first"
+    );
+    assert_eq!(
+        db.read_binary_tag_chunk(rows[2].rowid, 0, 1).unwrap(),
+        vec![0xC3]
+    );
+}
+
+/// An empty payload is dropped before numbering, so it must not consume an
+/// ordinal the next payload under that key then skips.
+#[test]
+fn storable_binary_tags_skips_empty_payloads_without_burning_ordinals() {
+    let mut ordinals = HashMap::new();
+    let got = super::storable_binary_tags(
+        vec![
+            EmbeddedBinaryTag {
+                key: "PRIV".to_string(),
+                payload: Vec::new(),
+            },
+            EmbeddedBinaryTag {
+                key: "PRIV".to_string(),
+                payload: vec![0xA1],
+            },
+        ],
+        &mut ordinals,
+    );
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].ordinal, 0);
+}
+
 // --- #655 / #651: mutation-gate survivors from PR #656 ---
 
 /// `uncommitted_total` sums the two ways a dispatched file can finish without a
