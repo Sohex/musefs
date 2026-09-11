@@ -473,7 +473,10 @@ mod tests {
 
     #[test]
     fn oracle_new_vorbis_stream_is_clean() {
-        let id = b"\x01vorbis\x00\x00\x00\x00\x02\x44\xac\x00\x00\x00\x00\x00\x00\x00\xee\x02\x00\x00\x00\x00\x00\x01".as_slice();
+        // Vorbis I §4.2.1 identification header: magic, version, channels, sample
+        // rate, the three bitrates, packed block sizes, framing bit — 30 bytes.
+        let id = b"\x01vorbis\x00\x00\x00\x00\x02\x44\xac\x00\x00\x00\x00\x00\x00\x00\xee\x02\x00\x00\x00\x00\x00\xb8\x01".as_slice();
+        assert_eq!(id.len(), 30, "a short id header is silently accepted here");
         let comment = b"\x03vorbis\x06\x00\x00\x00musefs\x00\x00\x00\x00\x01".as_slice();
         let setup = b"\x05vorbis-setup-stub".as_slice();
         let audio0 = vec![0xB1u8; 5000];

@@ -367,11 +367,21 @@ pub fn write_ogg_vorbis(
     use musefs_format::ogg::page_test_support::lace_packet_pub;
     let serial = 0x7662_7273; // "vbrs"
 
-    // 30-byte identification header: 2 channels, 44 100 Hz. musefs carries it
-    // through verbatim, so only its length matters to the page geometry.
-    let id =
-        b"\x01vorbis\x00\x00\x00\x00\x02\x44\xac\x00\x00\x00\x00\x00\x00\x00\xee\x02\x00\x00\x00\x00\x00\x01"
-            .to_vec();
+    // Identification header (Vorbis I §4.2.1): 2 channels at 44 100 Hz, 192 kbps
+    // nominal, 256/2048 block sizes, framing bit set. musefs carries the packet
+    // through verbatim, so only its length reaches the page geometry — but a
+    // fixture that claims to be encoder-realistic should be a valid packet, and
+    // the spec's field list is what fixes the length at 30 bytes.
+    let mut id = b"\x01vorbis".to_vec();
+    id.extend_from_slice(&0u32.to_le_bytes()); // vorbis_version
+    id.push(2); // audio_channels
+    id.extend_from_slice(&44_100u32.to_le_bytes()); // audio_sample_rate
+    id.extend_from_slice(&0u32.to_le_bytes()); // bitrate_maximum
+    id.extend_from_slice(&192_000u32.to_le_bytes()); // bitrate_nominal
+    id.extend_from_slice(&0u32.to_le_bytes()); // bitrate_minimum
+    id.push(0xb8); // blocksize_0 = 2^8, blocksize_1 = 2^11
+    id.push(1); // framing flag
+    assert_eq!(id.len(), 30, "Vorbis identification header is 30 bytes");
     let mbp = picture.map(|p| {
         format!(
             "METADATA_BLOCK_PICTURE={}",
