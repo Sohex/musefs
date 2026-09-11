@@ -37,6 +37,22 @@ see the [Release notes](release-notes.md).
 
 ### Changed
 
+- **Behavior change.** A scan that hits a DB constraint violation on one file
+  now runs to completion instead of stopping there
+  ([#662](https://github.com/Sohex/musefs/issues/662)). Three observable
+  consequences. It exits **2** — `scan` completed, at least one file failed —
+  where it previously exited **1** as a hard error, so a pipeline keying on the
+  exit code sees a different value for the same library. The store ends up
+  holding every file in the library except the rejected one, rather than only
+  the batches that committed before the abort, so a rescan after the fix no
+  longer has an unknown amount of the walk left to redo. And the rejected file
+  is reported rather than fatal: it is named in the log with the constraint
+  text, counted in the new `rejected` bucket of the `failed N: …` summary, and
+  missing from the mount while everything else is served. Anything that treated
+  a constraint violation as a signal to stop the scan no longer gets one; the
+  exit code and that summary are the signals to key on. The engineering is in
+  Fixed below. See [Scanning](guide/scanning.md#scan) and
+  [Exit codes](guide/troubleshooting.md#exit-codes).
 - The `tags.value` cap rises from 256 KiB to 16 MiB − 1, and
   `track_art.description` from 1 KiB to 8 KiB (schema `MIGRATION_V3`). The new
   tag cap is FLAC's 24-bit metadata-block ceiling — the largest tag synthesis
@@ -107,6 +123,55 @@ see the [Release notes](release-notes.md).
   count itself is unchanged and still printed in the per-target summary.
 
 ### Fixed
+
+- A DB constraint violation raised while ingesting one file no longer aborts the
+  whole scan ([#662](https://github.com/Sohex/musefs/issues/662)). This changes
+  observable behavior — the exit code and what the store holds afterwards — and
+  Changed above states that part; what follows is why and how. Cap
+  violations were pre-checked in `check_storable`
+  ([#644](https://github.com/Sohex/musefs/issues/644)), but that covers only the
+  caps the scanner knows to look for; every other constraint the schema enforces
+  — the `CHECK`s and the `UNIQUE`/primary-key constraints — was discovered by
+  SQLite inside the ingest transaction, where the per-file context is gone, and
+  propagated out as fatal. The reported case
+  ([#659](https://github.com/Sohex/musefs/issues/659)) killed a scan 41% into an
+  891k-file library, about an hour in, leaving whatever the earlier batches had
+  committed and no record of where the walk stopped. Pre-checking each newly
+  discovered constraint does not converge, so the error is now classified at the
+  ingest boundary instead: a constraint violation (`SQLITE_CONSTRAINT`, any
+  extended code) is attributable to the rows one file wrote, and becomes one
+  `failed` file in a new `rejected` bucket, named in the log with the constraint
+  text and reported in the end-of-scan breakdown. Errors that say the run itself
+  cannot proceed — `SQLITE_CORRUPT`, `SQLITE_FULL`, `SQLITE_IOERR`,
+  `SQLITE_READONLY`, `SQLITE_NOTADB`, and any code this build does not recognise
+  — still abort with the message they always did; `SQLITE_BUSY` is neither and
+  stays with the writer's locking policy. Because the production path commits
+  through `BulkWriter`, whose transaction holds a whole batch, each file is now
+  ingested inside a `SAVEPOINT` (`BulkWriter::item`): a statement-level `ABORT`
+  undoes only the statement that hit the constraint, so without one the batch
+  would commit a half-ingested track — a `tracks` row whose tags never landed.
+  The savepoint rolls the rejected file back whole and leaves the rest of the
+  batch committable.
+- A scan no longer aborts on a backing file that carries the same tag key as
+  both a text value and a binary payload
+  ([#659](https://github.com/Sohex/musefs/issues/659)). `tags`' primary key is
+  `(track_id, key, ordinal)`; it does not discriminate on `value_blob`, so a
+  track's text rows and binary rows occupy one ordinal space per key. `ingest`
+  numbered them independently — text rows from a per-key counter, binary rows
+  from a single running index across the track — so a key present in both
+  classes produced two rows at ordinal 0 and the ingest transaction failed with
+  `UNIQUE constraint failed: tags.track_id, tags.key, tags.ordinal`. Unlike a
+  cap violation ([#644](https://github.com/Sohex/musefs/issues/644)) this was
+  not routed to a per-file failure, so it killed the whole scan — the reported
+  case died 41% into a 891k-file library after an hour. Generalising that
+  containment to any constraint violation is tracked separately in
+  [#662](https://github.com/Sohex/musefs/issues/662). The two classes now
+  draw from one shared per-key counter, text first, which also makes binary
+  ordinals per-key rather than track-wide. Reachable shapes: a FLAC `CUESHEET`
+  Vorbis comment beside a CUESHEET metadata block, an MP3 `TXXX` frame whose
+  description names a binary frame the same tag carries (`PRIV`, `GEOB`,
+  `MCDI`, a non-MusicBrainz `UFID`), and an MP4 freeform atom written with both
+  a text and a binary `data` box.
 
 - Scan log records and the progress bar no longer clobber each other on an
   interactive terminal ([#648](https://github.com/Sohex/musefs/issues/648)).

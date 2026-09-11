@@ -6,7 +6,7 @@ use crate::tracks::{
     get_track_by_path_in, retarget_track_in, set_track_checksums_in, tracks_by_fingerprint_in,
     upsert_track_in,
 };
-use crate::{Db, ReadWrite, Result};
+use crate::{Db, DbError, ReadWrite, Result};
 use rusqlite::Transaction;
 
 impl Db<ReadWrite> {
@@ -116,6 +116,46 @@ impl BulkWriter<'_> {
         set_track_art_in(&self.tx, track_id, items)
     }
 
+    /// Run one item's writes inside a `SAVEPOINT`, so an error discards only
+    /// the rows that item wrote and leaves the rest of the batch live and
+    /// committable. The caller decides which errors are worth failing a single
+    /// item over — [`DbError::is_constraint_violation`] draws that line (#662).
+    ///
+    /// Generic over the closure's error so callers above this crate can keep
+    /// their own error type, as long as it carries a [`DbError`]. A rollback
+    /// that itself fails is returned in place of the error that provoked it:
+    /// the transaction's state is then unknown, which is the more serious fact.
+    ///
+    /// One fixed savepoint name, so this does not nest — a nested call would
+    /// silently release the outer scope. The scan's one-file-at-a-time ingest
+    /// needs no nesting.
+    pub fn item<T, E>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<DbError>,
+    {
+        self.batch("SAVEPOINT musefs_item")?;
+        match f(self) {
+            Ok(v) => {
+                self.batch("RELEASE musefs_item")?;
+                Ok(v)
+            }
+            Err(e) => {
+                self.batch("ROLLBACK TO musefs_item; RELEASE musefs_item")?;
+                Err(e)
+            }
+        }
+    }
+
+    /// One savepoint statement, with its error mapped into the caller's type.
+    fn batch<E: From<DbError>>(&self, sql: &str) -> std::result::Result<(), E> {
+        self.tx
+            .execute_batch(sql)
+            .map_err(|e| E::from(DbError::from(e)))
+    }
+
     pub fn commit(self) -> Result<()> {
         self.tx.commit()?;
         Ok(())
@@ -195,6 +235,107 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM track_art", [], |r| r.get(0))
             .unwrap();
         assert_eq!(track_art_count, 3);
+    }
+
+    fn new_track(path: &str) -> NewTrack {
+        NewTrack {
+            backing_path: path.into(),
+            format: Format::Flac,
+            audio_offset: 0,
+            audio_length: 0,
+            backing_size: 0,
+            backing_mtime_ns: 0,
+            backing_ctime_ns: 0,
+        }
+    }
+
+    /// The point of the savepoint: a failed item takes its own rows with it and
+    /// nothing else, and the batch is still committable afterwards (#662).
+    #[test]
+    fn item_rolls_back_only_the_failing_item_and_leaves_the_batch_committable() {
+        let db = Db::open_in_memory().unwrap();
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            bw.upsert_track(&new_track("/m/before.flac")).unwrap();
+
+            let err = bw
+                .item(|bw| -> crate::Result<()> {
+                    // A real write, then a failure after it: the first has to be
+                    // undone, which a plain early return could not do.
+                    bw.upsert_track(&new_track("/m/doomed.flac"))?;
+                    Err(crate::DbError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+                })
+                .expect_err("the closure's error must propagate");
+            assert!(matches!(err, crate::DbError::Sqlite(_)), "{err}");
+
+            bw.upsert_track(&new_track("/m/after.flac")).unwrap();
+            bw.commit().unwrap();
+        }
+        let paths: Vec<String> = db
+            .list_tracks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.backing_path)
+            .collect();
+        assert_eq!(
+            paths.len(),
+            2,
+            "the doomed item must leave nothing: {paths:?}"
+        );
+        assert!(!paths.iter().any(|p| p.contains("doomed")), "{paths:?}");
+    }
+
+    /// A successful item releases its savepoint rather than rolling it back, and
+    /// the release must not undo the writes.
+    #[test]
+    fn item_keeps_the_writes_of_a_successful_item() {
+        let db = Db::open_in_memory().unwrap();
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            let id = bw
+                .item(|bw| bw.upsert_track(&new_track("/m/kept.flac")))
+                .unwrap();
+            bw.replace_tags(id, &[Tag::new("title", "kept", 0)])
+                .unwrap();
+            bw.commit().unwrap();
+        }
+        assert_eq!(db.list_tracks().unwrap().len(), 1);
+    }
+
+    /// Back-to-back calls: the fixed savepoint name is reused, so a released or
+    /// rolled-back scope must leave nothing behind that breaks the next one.
+    #[test]
+    fn item_is_reusable_across_a_run_of_items() {
+        let db = Db::open_in_memory().unwrap();
+        {
+            let mut bw = db.bulk_writer().unwrap();
+            for i in 0..4 {
+                let path = format!("/m/{i}.flac");
+                let outcome = bw.item(|bw| -> crate::Result<()> {
+                    bw.upsert_track(&new_track(&path))?;
+                    // Every other item fails, so releases and rollbacks alternate.
+                    if i % 2 == 0 {
+                        return Err(crate::DbError::Sqlite(rusqlite::Error::QueryReturnedNoRows));
+                    }
+                    Ok(())
+                });
+                assert_eq!(outcome.is_err(), i % 2 == 0, "item {i}");
+            }
+            bw.commit().unwrap();
+        }
+        let paths: Vec<String> = db
+            .list_tracks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.backing_path)
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(
+            paths
+                .iter()
+                .all(|p| p.ends_with("1.flac") || p.ends_with("3.flac")),
+            "{paths:?}"
+        );
     }
 
     #[test]

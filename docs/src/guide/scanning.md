@@ -41,12 +41,21 @@ A per-extension breakdown of the skip count is logged at end of scan at
 `info` (e.g. `skipped 42: jpg=20, cue=10, log=8, <none>=4`, so it needs `-v` or
 `RUST_LOG=info`), letting you tell expected sidecars from anything genuinely
 unexpected. `failed` is the one to watch: those are audio files musefs
-recognised by extension but could not parse. Its own breakdown by reason is
-logged at end of scan too — `failed 37: unparseable=30, io=5, oversize=2` — at
-`warn`, so it is visible without `-v`; a further `walk errors N: unreadable=9,
-symlink=3` line accounts for directories and entries the walk itself could not
-read (those are counted in neither `skipped` nor `failed`, since no file was
-ever queued for them).
+recognised by extension but could not parse, or could not store. Its own
+breakdown by reason is logged at end of scan too —
+`failed 38: unparseable=30, io=5, oversize=2, rejected=1` — at `warn`, so it is
+visible without `-v`; a further `walk errors N: unreadable=9, symlink=3` line
+accounts for directories and entries the walk itself could not read (those are
+counted in neither `skipped` nor `failed`, since no file was ever queued for
+them).
+
+A `rejected` bucket in that breakdown means the store refused a file's rows on
+a constraint — the tag, art or track values it parsed were not something the
+schema accepts. Each one is logged with its path and the constraint text, and
+the rest of the library scans normally; nothing partial is stored for a rejected
+file, so the mount never shows a track quietly missing its tags. These are worth
+reporting: unlike `oversize`, which names a documented limit, a `rejected` file
+is a shape musefs did not anticipate.
 
 Per-file skip messages are capped at ten per reason per scan; the rest drop to
 `debug` (`-vv` / `RUST_LOG=debug`) so an unreadable subtree or a share that

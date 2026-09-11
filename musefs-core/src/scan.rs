@@ -198,6 +198,10 @@ enum SkipReason {
     Unparseable,
     /// Metadata over a storage cap — art, tag field, or binary frame (#644).
     Oversize,
+    /// The store refused this file's rows on a constraint the scanner does not
+    /// pre-check — a `CHECK`, `UNIQUE` or primary-key violation raised inside
+    /// the ingest transaction (#662).
+    Rejected,
     /// `open`/`stat`/`canonicalize` failed on a file the walk had accepted.
     Io,
     /// A parser panic caught by [`probe_file_caught`] (#425).
@@ -213,9 +217,10 @@ enum SkipReason {
 impl SkipReason {
     /// Every reason, in [`FailureTally`]'s array order (each reason indexes that
     /// array by its discriminant).
-    const ALL: [SkipReason; 7] = [
+    const ALL: [SkipReason; 8] = [
         SkipReason::Unparseable,
         SkipReason::Oversize,
+        SkipReason::Rejected,
         SkipReason::Io,
         SkipReason::Panicked,
         SkipReason::Raced,
@@ -225,9 +230,10 @@ impl SkipReason {
 
     /// The reasons that increment `ScanStats::failed`. They partition it
     /// exactly, which is what makes the `failed N: ...` breakdown trustworthy.
-    const FAILED: [SkipReason; 4] = [
+    const FAILED: [SkipReason; 5] = [
         SkipReason::Unparseable,
         SkipReason::Oversize,
+        SkipReason::Rejected,
         SkipReason::Io,
         SkipReason::Panicked,
     ];
@@ -241,6 +247,7 @@ impl SkipReason {
         match self {
             SkipReason::Unparseable => "unparseable",
             SkipReason::Oversize => "oversize",
+            SkipReason::Rejected => "rejected",
             SkipReason::Io => "io",
             SkipReason::Panicked => "panicked",
             SkipReason::Raced => "changed-during-probe",
@@ -1386,18 +1393,39 @@ fn check_metadata_fits_format(abs_path: &str, probed: &Probed) -> Result<()> {
     Ok(())
 }
 
-/// Assign storage ordinals to the binary tags worth keeping. Empty payloads are
-/// dropped silently: they carry nothing to serve, so unlike an oversize payload
-/// their absence costs the user nothing. Size is not decided here — that is
-/// [`check_storable`]'s job, and by the time this runs the file has passed it.
-fn storable_binary_tags(tags: Vec<EmbeddedBinaryTag>) -> Vec<musefs_db::BinaryTag> {
+/// Hand out the next `ordinal` for `key` from the shared per-key counter in
+/// `ordinals`, starting at 0.
+///
+/// One counter serves a track's text *and* binary tag rows because
+/// `tags`' primary key is `(track_id, key, ordinal)` — it does not
+/// discriminate on `value_blob`, so the two row classes share one ordinal
+/// space per key. Numbering them independently let a key carried by both (a
+/// FLAC `CUESHEET` comment beside a CUESHEET block, an ID3 `TXXX:PRIV`
+/// description beside a `PRIV` frame) produce two rows at ordinal 0 (#659).
+fn next_ordinal(ordinals: &mut HashMap<String, u64>, key: &str) -> u64 {
+    let ord = ordinals.entry(key.to_string()).or_insert(0);
+    let assigned = *ord;
+    *ord += 1;
+    assigned
+}
+
+/// Assign storage ordinals to the binary tags worth keeping, continuing the
+/// per-key numbering `ordinals` already holds for the track's text tags (see
+/// [`next_ordinal`]). Empty payloads are dropped silently: they carry nothing
+/// to serve, so unlike an oversize payload their absence costs the user
+/// nothing. Size is not decided here — that is [`check_storable`]'s job, and by
+/// the time this runs the file has passed it.
+fn storable_binary_tags(
+    tags: Vec<EmbeddedBinaryTag>,
+    ordinals: &mut HashMap<String, u64>,
+) -> Vec<musefs_db::BinaryTag> {
     tags.into_iter()
         .filter(|b| !b.payload.is_empty())
-        .enumerate()
-        .map(|(ordinal, b)| musefs_db::BinaryTag {
+        .map(|b| musefs_db::BinaryTag {
+            // Evaluated before `key` is moved out of `b`.
+            ordinal: next_ordinal(ordinals, &b.key),
             key: b.key,
             payload: b.payload,
-            ordinal: ordinal as u64,
         })
         .collect()
 }
@@ -1660,19 +1688,20 @@ fn ingest_into(
     })?;
     w.set_track_checksums(track_id, fingerprint, content_hash)?;
 
-    let mut tags = Vec::new();
+    // Text rows first, then binary rows continuing the same per-key counters —
+    // the `tags` primary key spans both classes (see `next_ordinal`).
     let mut ordinals: HashMap<String, u64> = HashMap::new();
+    let mut tags = Vec::new();
     for (key, value) in probed.tags {
         if !key_passes_floor(&key) {
             continue;
         }
-        let ord = ordinals.entry(key.clone()).or_insert(0);
-        tags.push(Tag::new(&key, &value, *ord));
-        *ord += 1;
+        let ordinal = next_ordinal(&mut ordinals, &key);
+        tags.push(Tag::new(&key, &value, ordinal));
     }
     w.replace_tags(track_id, &tags)?;
 
-    let binary_tags = storable_binary_tags(probed.binary_tags);
+    let binary_tags = storable_binary_tags(probed.binary_tags, &mut ordinals);
     w.set_binary_tags(track_id, &binary_tags)?;
 
     let structural_blocks = structural_blocks_from(probed.structural_blocks);
@@ -1721,6 +1750,23 @@ fn refresh_structural_into(
     let structural_blocks = structural_blocks_from(probed.structural_blocks);
     w.set_structural_blocks(track_id, &structural_blocks)?;
     Ok(())
+}
+
+/// Does this ingest error fail one file, or the whole run?
+///
+/// A constraint violation is decided by the values in the statement, so it
+/// belongs to the file whose rows were being written: the scanner fails that
+/// file and carries on. Everything else — a corrupt, full, read-only or
+/// I/O-failing store, and any error this build does not recognise — still
+/// aborts, because carrying on would produce one identical failure per
+/// remaining file rather than useful work (#662).
+///
+/// The classification lives here rather than being enumerated ahead of time as
+/// pre-checks: [`check_storable`] covers the caps the scanner knows to look
+/// for, and adding one pre-check per newly discovered constraint does not
+/// converge.
+fn is_store_rejection(e: &crate::error::CoreError) -> bool {
+    matches!(e, crate::error::CoreError::Db(db) if db.is_constraint_violation())
 }
 
 /// Decide how to ingest one probed unit: retarget a relocated row when a unique
@@ -2150,15 +2196,34 @@ fn run_pipeline(
         let mut committed: Vec<String> = Vec::new();
         for unit in batch.drain(..) {
             released += unit.weight;
-            committed.push(unit.abs_path.clone());
-            // A write failure here is still fatal (the store, not the file, is
-            // the problem), but it must say which file it died on — issue #644
-            // was reported as an unattributed `CHECK constraint failed`.
             let abs_path = unit.abs_path.clone();
-            ingest_unit(&mut bw, unit, strictness, policy).map_err(|e| {
-                log::error!("aborting scan while ingesting {abs_path}: {e}");
-                e
-            })?;
+            // One savepoint per file. A constraint the scanner cannot pre-check
+            // is discovered here, with the rest of the batch's rows already in
+            // the transaction, so the offending file's writes have to be undone
+            // without taking the batch down with them (#662).
+            match bw.item(|bw| ingest_unit(bw, unit, strictness, policy)) {
+                Ok(()) => committed.push(abs_path),
+                // The store refused this file's rows, and only this file's: the
+                // savepoint has rolled them back, so the batch is still
+                // committable. Count it like any other per-file failure and
+                // name the constraint, so a file musefs will not store is
+                // visible rather than quietly missing from the mount (#284).
+                Err(e) if is_store_rejection(&e) => {
+                    failures.record(
+                        SkipReason::Rejected,
+                        format_args!("skipping {abs_path}: the store rejected its rows: {e}"),
+                    );
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
+                // Anything else says the run itself cannot proceed (a corrupt,
+                // full, read-only or I/O-failing store), so it stays fatal —
+                // but it must say which file it died on, since issue #644 was
+                // reported as an unattributed `CHECK constraint failed`.
+                Err(e) => {
+                    log::error!("aborting scan while ingesting {abs_path}: {e}");
+                    return Err(e);
+                }
+            }
         }
         bw.commit()?;
         for abs_path in committed {
