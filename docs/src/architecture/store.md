@@ -99,10 +99,22 @@ sync — must not grow a key past the lowest ordinal its binary rows already
 hold. In practice the two key namespaces barely meet: binary keys are
 `APPLICATION` / `CUESHEET` (FLAC), uppercase four-character ID3 frame ids such
 as `PRIV`, `GEOB`, `MCDI`, `SYLT`, `UFID` (MP3/WAV), or `----:<mean>:<name>`
-(MP4, while the text path keys the same atom on its bare `name`). Keys compare
-byte-exactly under the default `BINARY` collation, so a lowercase `cuesheet`
-never meets the FLAC block's `CUESHEET`, and the beets plugin — which
-lowercases every key it emits — cannot reach the namespace at all. Splitting
+(MP4, while the text path keys the same atom on its bare `name`). The primary
+key compares byte-exactly under the default `BINARY` collation, so a lowercase
+`cuesheet` row can never collide with the FLAC block's `CUESHEET` row, and the
+beets plugin — which lowercases every key it emits — cannot produce a colliding
+row at all.
+
+Case-folding cuts the other way for the *delete* half, and the difference is
+worth holding onto: `merge_tags` clears by `lower(key) = lower(?)`, so that same
+lowercase `cuesheet` does remove the scan-seeded `CUESHEET` *text* row
+([#407](https://github.com/Sohex/musefs/issues/407) —
+Vorbis keys render case-insensitively, and an exact-case delete would leave the
+scan row behind as a visible duplicate). The binary row is untouched, being
+scoped out by `value_blob IS NULL`, and keeps whatever ordinal it was given.
+Nothing breaks — ordinals need not be dense — but a writer reasoning about
+these keys should expect the case-insensitive match when clearing text rows and
+the byte-exact one when the constraint is checked. Splitting
 the two classes into independent ordinal spaces would take a schema migration
 (the primary key replaced by two partial unique indexes on `value_blob IS
 NULL`); it was judged not worth a store older builds refuse to open, and
