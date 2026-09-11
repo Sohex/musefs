@@ -117,6 +117,14 @@ musefs_handles_open 3
 musefs_cache_header_hits_total 100
 ```
 
+Serve-path failure warnings are rate-limited (a burst of 10 per 30-second
+window; the rest drop to `debug`), so a mount that is failing fast logs far less
+than it fails. `musefs_serve_warns_suppressed_total` counts what the limiter
+dropped, which is the signal that separates "the serve path is quiet" from "the
+serve path is failing faster than it can log". Suppression is bursty by
+construction, so watch the counter's rate rather than any single sample, and
+raise the log level to `debug` to see the individual failures behind it.
+
 `--expose-metrics` (default off) is a **runtime** flag that gates the virtual
 file; it is unrelated to the compile-time `metrics` cargo feature, which adds
 syscall counters (opens, preads, etc.) to the output. The jemalloc allocator

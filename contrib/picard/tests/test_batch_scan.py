@@ -32,6 +32,44 @@ def test_autoscan_batches_into_one_run_scan(monkeypatch, db_path):
     assert timeout == plugin_mod.SCAN_TIMEOUT_SECONDS == 120
 
 
+def test_partial_scan_warns_and_still_syncs(monkeypatch, db_path):
+    """`musefs scan` exits 2 when the batch committed but some file could not be
+    ingested. Syncing everything else beats dropping every file's tags (#647)."""
+    from musefs._common import ScanResult
+
+    warnings = []
+    synced = []
+    partial = ScanResult(
+        binary="musefs",
+        target="2 target(s)",
+        returncode=2,
+        partial=True,
+        stderr="skipping /music/b.flac: no parseable audio metadata",
+    )
+
+    def fake_sync_files(conn, records):
+        synced.append(records)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(plugin_mod, "run_scan", lambda *a, **kw: partial)
+    monkeypatch.setattr(plugin_mod, "log", SimpleNamespace(warning=lambda *a: warnings.append(a)))
+    monkeypatch.setattr(plugin_mod, "check_schema_version", lambda conn: None)
+    monkeypatch.setattr(plugin_mod, "sync_files", fake_sync_files)
+    monkeypatch.setattr(plugin_mod, "map_fields", lambda md, fields: [])
+    monkeypatch.setattr(plugin_mod, "images", lambda md: [])
+
+    opts = SimpleNamespace(db=db_path, bin="musefs", autoscan=True, fields={})
+    files = {
+        "/music/a.flac": SimpleNamespace(filename="/music/a.flac", metadata=object()),
+        "/music/b.flac": SimpleNamespace(filename="/music/b.flac", metadata=object()),
+    }
+    plugin_mod._do_sync(opts, files)  # must NOT raise
+
+    assert len(synced) == 1
+    assert len(warnings) == 1
+    assert "no parseable audio metadata" in warnings[0][1]
+
+
 def test_run_scan_force_appends_force(monkeypatch):
     import subprocess
 

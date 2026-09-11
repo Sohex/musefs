@@ -3,9 +3,10 @@
 ## The SQLite store
 
 `musefs-db/src/schema.rs` defines the schema as an ordered list of migrations
-(`MIGRATIONS`: the `MIGRATION_V1` baseline plus `MIGRATION_V2`, which adds the
-scanner-owned `fingerprint`/`content_hash` columns); `user_version` records the
-schema version (2).
+(`MIGRATIONS`: the `MIGRATION_V1` baseline, `MIGRATION_V2`, which adds the
+scanner-owned `fingerprint`/`content_hash` columns, and `MIGRATION_V3`, which
+widens the `tags.value` and `track_art.description` caps); `user_version`
+records the schema version (3).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
@@ -89,6 +90,15 @@ with a message telling the user to run `musefs scan`. A store whose
 third-party tool bumped the schema) is refused up front with a distinct
 "store is newer than this binary" error rather than silently treated as
 already-migrated — an older binary must not risk misreading a newer contract.
+
+**Migrations announce themselves.** The opposite direction — an open that finds
+an *older* store and upgrades it in place — is irreversible (the store stops
+opening with the previous musefs build), so it is logged at `warn`, the default
+filter level: the store path, the version found and the version reached,
+followed by a completion line at `info`. Creating a store from scratch is not a
+one-way step for existing data and logs at `info` only, and the common case — a
+store already at the latest version — stays silent, since that path runs on
+every open and every mount.
 
 **Art is immutable once written.** `art` rows are content-addressed by
 `sha256`; a trigger rejects any in-place `UPDATE` of an art row's

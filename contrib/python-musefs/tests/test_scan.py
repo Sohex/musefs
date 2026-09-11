@@ -147,14 +147,14 @@ def test_run_scan_single_path_still_works(monkeypatch):
     assert seen["argv"] == ["musefs", "scan", "/only.flac", "--db", "/db.sqlite"]
 
 
-def test_run_scan_failed_batch_error_names_count(monkeypatch):
+def test_run_scan_hard_failure_error_names_count(monkeypatch):
     import subprocess
 
     import musefs_common.scan as scan
     from musefs_common import ScanError
 
     class FakeResult:
-        returncode = 2
+        returncode = 1
         stderr = b"boom"
 
     monkeypatch.setattr(subprocess, "run", lambda argv, **kw: FakeResult())
@@ -165,3 +165,63 @@ def test_run_scan_failed_batch_error_names_count(monkeypatch):
         assert "2" in str(exc.target)  # "2 target(s)"
     else:
         raise AssertionError("expected ScanError")
+
+
+# --- the three-state exit contract (#647) ---------------------------------
+#
+# 0 = success, 2 = partial success (the batch committed; some files failed to
+# ingest), anything else = hard failure.
+
+
+def _fake_exit(monkeypatch, code, stderr=b""):
+    """Make `subprocess.run` report ``code``/``stderr`` for a musefs invocation."""
+    import subprocess
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        subprocess, "run", lambda argv, **kw: SimpleNamespace(returncode=code, stderr=stderr)
+    )
+
+
+def test_run_scan_success_returns_non_partial_result(monkeypatch):
+    _fake_exit(monkeypatch, 0)
+    result = run_scan("musefs", "/db.sqlite", "/a.flac")
+    assert result.partial is False
+    assert result.returncode == 0
+    assert result.verb == "scan"
+    assert result.warning() is None
+
+
+def test_run_scan_partial_returns_result_instead_of_raising(monkeypatch):
+    _fake_exit(monkeypatch, 2, b"skipping /b.flac: no parseable audio metadata")
+    result = run_scan("musefs", "/db.sqlite", ["/a.flac", "/b.flac"])
+    assert result.partial is True
+    assert result.returncode == 2
+    assert result.target == "2 target(s)"
+    assert "no parseable audio metadata" in result.stderr
+
+
+def test_run_scan_partial_warning_names_binary_target_and_stderr(monkeypatch):
+    _fake_exit(monkeypatch, 2, b"skipping /b.flac: no parseable audio metadata")
+    warning = run_scan("musefs", "/db.sqlite", "/b.flac").warning()
+    assert "musefs scan" in warning
+    assert "/b.flac" in warning
+    assert "continuing" in warning
+    assert "no parseable audio metadata" in warning
+
+
+def test_run_scan_partial_revalidate_names_the_verb(monkeypatch):
+    _fake_exit(monkeypatch, 2)
+    result = run_scan("musefs", "/db.sqlite", "/a.flac", revalidate=True)
+    assert result.verb == "revalidate"
+    assert "musefs revalidate" in result.warning()
+
+
+def test_run_scan_other_nonzero_is_still_a_hard_failure(monkeypatch):
+    from musefs_common import ScanError
+
+    _fake_exit(monkeypatch, 1, b"opening database: permission denied")
+    with pytest.raises(ScanError) as ei:
+        run_scan("musefs", "/db.sqlite", "/a.flac")
+    assert ei.value.kind == "failed"
+    assert ei.value.returncode == 1

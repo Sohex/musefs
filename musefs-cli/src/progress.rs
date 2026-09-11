@@ -1,13 +1,38 @@
 use std::io::IsTerminal;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use musefs_core::{ProgressSink, ScanProgress};
 
 const STEP: u64 = 5;
+
+/// The process-wide stderr draw target.
+///
+/// Both the scan bar and the global log sink write to stderr, so they have to
+/// share one target for [`suspend`] to be able to lift the bar out of the way
+/// of a log record (#648). The logger is installed once at startup while a bar
+/// lives only for the duration of a `run_scan`, so the target — not the bar —
+/// is what outlives both.
+///
+/// Off a terminal it is [`ProgressDrawTarget::hidden`], which makes [`suspend`]
+/// an unconditional no-op: the `Plain` and `Quiet` paths write nothing through
+/// it and are unaffected.
+static DRAW: LazyLock<MultiProgress> = LazyLock::new(|| {
+    if std::io::stderr().is_terminal() {
+        MultiProgress::new()
+    } else {
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    }
+});
+
+/// Run `f` with any live progress bar cleared from the terminal, redrawing it
+/// afterwards. Used by the log sink so records never land mid-frame.
+pub(crate) fn suspend<R>(f: impl FnOnce() -> R) -> R {
+    DRAW.suspend(f)
+}
 
 pub(crate) fn next_milestone(prev_done: u64, done: u64, total: u64) -> Option<u64> {
     if total == 0 || done <= prev_done {
@@ -57,10 +82,25 @@ impl Renderer {
                 bar.set_position(done);
                 bar.set_message(basename(path));
             }
-            (Mode::Plain, ScanProgress::Ingested { done, total, .. }) => {
+            // A failed file advances the bar but leaves the message on the last
+            // file actually ingested: the failure is already named in a `warn`
+            // line, and blanking the message would make the bar flicker between
+            // a name and nothing on a run with many failures (#655).
+            (Mode::Tty(bar), ScanProgress::Failed { done, .. }) => {
+                bar.set_position(done);
+            }
+            (
+                Mode::Plain,
+                ScanProgress::Ingested { done, total, .. } | ScanProgress::Failed { done, total },
+            ) => {
                 let prev = self.prev_done.load(Ordering::Relaxed);
                 if let Some(pct) = next_milestone(prev, done, total) {
-                    eprintln!("ingested {done}/{total} ({pct}%)");
+                    // "processed", not "ingested": `done` counts every file the
+                    // pipeline finished with, failures included, because that is
+                    // what has to reach `total` (#655). Calling 12 failures
+                    // "ingested" to make the line hit 100% would trade one
+                    // inaccuracy for a worse one.
+                    eprintln!("processed {done}/{total} ({pct}%)");
                     self.prev_done.store(done, Ordering::Relaxed);
                 }
             }
@@ -84,7 +124,8 @@ impl ScanReporter {
         let mode = if quiet {
             Mode::Quiet
         } else if std::io::stderr().is_terminal() {
-            let bar = ProgressBar::new_spinner();
+            // Draw through the shared target so log records can suspend the bar.
+            let bar = DRAW.add(ProgressBar::new_spinner());
             bar.enable_steady_tick(Duration::from_millis(120));
             bar.set_message("discovering files…");
             Mode::Tty(bar)
@@ -119,6 +160,8 @@ impl ScanReporter {
     pub(crate) fn finish(&self) {
         if let Mode::Tty(bar) = &self.inner.mode {
             bar.finish_and_clear();
+            // Drop it from the shared target too; the target outlives the scan.
+            DRAW.remove(bar);
         }
     }
 }

@@ -12,6 +12,7 @@
 - [Tuning & metrics](guide/tuning.md)
 - [Maintenance](guide/maintenance.md)
 - [Ownership, permissions & config](guide/configuration.md)
+- [Logging & troubleshooting](guide/troubleshooting.md)
 - [FAQ](guide/faq.md)
 
 # Formats

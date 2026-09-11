@@ -55,7 +55,7 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
         // writer that disables check enforcement can still plant an oversize row,
         // and Component B would stream it with bounded memory, but we refuse it.
         if data_len.get() > crate::scan::MAX_ART_BYTES as u64 {
-            log::warn!(
+            crate::serve_warn!(
                 "track {track_id} art {} is {} bytes, exceeds the {}-byte art cap; refusing to serve",
                 ta.art_id,
                 data_len.get(),
@@ -91,7 +91,9 @@ pub(crate) fn track_art_to_inputs<M>(db: &Db<M>, track_id: i64) -> Result<Vec<Ar
 
 /// `ArtSource` over the SQLite blob store, used by Ogg synthesis to stream art
 /// bytes for page CRCs. Read failures (e.g. a deleted/short blob) are logged with
-/// the underlying DB error and surfaced as `FormatError::ArtRead`.
+/// the underlying DB error and surfaced as `FormatError::ArtRead`. The log goes
+/// through the shared serve-path warn limiter (#650): this fires per art
+/// *window*, so one failing blob would otherwise emit many lines for one file.
 pub(crate) struct DbArtSource<'a, M>(pub &'a Db<M>);
 
 impl<M> musefs_format::ogg::ArtSource for DbArtSource<'_, M> {
@@ -99,7 +101,9 @@ impl<M> musefs_format::ogg::ArtSource for DbArtSource<'_, M> {
         self.0
             .read_art_chunk_into(art_id, offset, buf)
             .map_err(|e| {
-                log::warn!("ogg synthesis: art {art_id} read failed at offset {offset}: {e}");
+                crate::serve_warn!(
+                    "ogg synthesis: art {art_id} read failed at offset {offset}: {e}"
+                );
                 musefs_format::FormatError::ArtRead { art_id }
             })
     }

@@ -46,6 +46,22 @@ beets/Picard/Lidarr sync, raw SQL) and the view refreshes automatically.
 
 Run `musefs <command> --help` for the full flag list.
 
+### Raising log detail
+
+A mount logs at `warn` by default, which means it says nothing while it is
+working normally. The lines that explain what it *did* — the post-mount summary
+naming the store, mountpoint, and file/directory counts, and whether reads are
+being served by the kernel or by the daemon — are `info`, so add `-v` (or set
+`RUST_LOG=info`) when a mount is not behaving as expected:
+
+```bash
+musefs mount /path/to/mountpoint --db library.db -v
+```
+
+See [Logging & troubleshooting](troubleshooting.md) for the full level model,
+the serve-path warn limiter, and reading the log under systemd or in a
+container.
+
 ### Path templates
 
 Paths come from a beets-style template (matched case-insensitively;
