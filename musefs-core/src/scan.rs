@@ -1386,18 +1386,39 @@ fn check_metadata_fits_format(abs_path: &str, probed: &Probed) -> Result<()> {
     Ok(())
 }
 
-/// Assign storage ordinals to the binary tags worth keeping. Empty payloads are
-/// dropped silently: they carry nothing to serve, so unlike an oversize payload
-/// their absence costs the user nothing. Size is not decided here — that is
-/// [`check_storable`]'s job, and by the time this runs the file has passed it.
-fn storable_binary_tags(tags: Vec<EmbeddedBinaryTag>) -> Vec<musefs_db::BinaryTag> {
+/// Hand out the next `ordinal` for `key` from the shared per-key counter in
+/// `ordinals`, starting at 0.
+///
+/// One counter serves a track's text *and* binary tag rows because
+/// `tags`' primary key is `(track_id, key, ordinal)` — it does not
+/// discriminate on `value_blob`, so the two row classes share one ordinal
+/// space per key. Numbering them independently let a key carried by both (a
+/// FLAC `CUESHEET` comment beside a CUESHEET block, an ID3 `TXXX:PRIV`
+/// description beside a `PRIV` frame) produce two rows at ordinal 0 (#659).
+fn next_ordinal(ordinals: &mut HashMap<String, u64>, key: &str) -> u64 {
+    let ord = ordinals.entry(key.to_string()).or_insert(0);
+    let assigned = *ord;
+    *ord += 1;
+    assigned
+}
+
+/// Assign storage ordinals to the binary tags worth keeping, continuing the
+/// per-key numbering `ordinals` already holds for the track's text tags (see
+/// [`next_ordinal`]). Empty payloads are dropped silently: they carry nothing
+/// to serve, so unlike an oversize payload their absence costs the user
+/// nothing. Size is not decided here — that is [`check_storable`]'s job, and by
+/// the time this runs the file has passed it.
+fn storable_binary_tags(
+    tags: Vec<EmbeddedBinaryTag>,
+    ordinals: &mut HashMap<String, u64>,
+) -> Vec<musefs_db::BinaryTag> {
     tags.into_iter()
         .filter(|b| !b.payload.is_empty())
-        .enumerate()
-        .map(|(ordinal, b)| musefs_db::BinaryTag {
+        .map(|b| musefs_db::BinaryTag {
+            // Evaluated before `key` is moved out of `b`.
+            ordinal: next_ordinal(ordinals, &b.key),
             key: b.key,
             payload: b.payload,
-            ordinal: ordinal as u64,
         })
         .collect()
 }
@@ -1660,19 +1681,20 @@ fn ingest_into(
     })?;
     w.set_track_checksums(track_id, fingerprint, content_hash)?;
 
-    let mut tags = Vec::new();
+    // Text rows first, then binary rows continuing the same per-key counters —
+    // the `tags` primary key spans both classes (see `next_ordinal`).
     let mut ordinals: HashMap<String, u64> = HashMap::new();
+    let mut tags = Vec::new();
     for (key, value) in probed.tags {
         if !key_passes_floor(&key) {
             continue;
         }
-        let ord = ordinals.entry(key.clone()).or_insert(0);
-        tags.push(Tag::new(&key, &value, *ord));
-        *ord += 1;
+        let ordinal = next_ordinal(&mut ordinals, &key);
+        tags.push(Tag::new(&key, &value, ordinal));
     }
     w.replace_tags(track_id, &tags)?;
 
-    let binary_tags = storable_binary_tags(probed.binary_tags);
+    let binary_tags = storable_binary_tags(probed.binary_tags, &mut ordinals);
     w.set_binary_tags(track_id, &binary_tags)?;
 
     let structural_blocks = structural_blocks_from(probed.structural_blocks);
