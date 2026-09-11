@@ -3,9 +3,10 @@
 ## The SQLite store
 
 `musefs-db/src/schema.rs` defines the schema as an ordered list of migrations
-(`MIGRATIONS`: the `MIGRATION_V1` baseline plus `MIGRATION_V2`, which adds the
-scanner-owned `fingerprint`/`content_hash` columns); `user_version` records the
-schema version (2).
+(`MIGRATIONS`: the `MIGRATION_V1` baseline, `MIGRATION_V2`, which adds the
+scanner-owned `fingerprint`/`content_hash` columns, and `MIGRATION_V3`, which
+widens the `tags.value` and `track_art.description` caps); `user_version`
+records the schema version (3).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
@@ -81,6 +82,44 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
 
+**One ordinal space per key.** `tags`' primary key is `(track_id, key,
+ordinal)`, which does not discriminate on `value_blob`: a track's text rows and
+its binary rows are numbered in the *same* space per key. A writer that holds a
+key in both classes must not restart at 0 for the binary rows, or the insert
+fails with `UNIQUE constraint failed: tags.track_id, tags.key, tags.ordinal`.
+The scanner numbers text rows first and continues the same counters for the
+binary rows ([#659](https://github.com/Sohex/musefs/issues/659)), so a track's
+binary rows for a key begin above however many text values the scan seeded
+under it.
+
+The rule this leaves for an external writer: a rewrite of the text rows alone —
+which is what `musefs_common.store`'s `replace_tags` / `merge_tags` do, scoping
+their `DELETE` to `value_blob IS NULL` so scanner-written payloads survive a
+sync — must not grow a key past the lowest ordinal its binary rows already
+hold. In practice the two key namespaces barely meet: binary keys are
+`APPLICATION` / `CUESHEET` (FLAC), uppercase four-character ID3 frame ids such
+as `PRIV`, `GEOB`, `MCDI`, `SYLT`, `UFID` (MP3/WAV), or `----:<mean>:<name>`
+(MP4, while the text path keys the same atom on its bare `name`). The primary
+key compares byte-exactly under the default `BINARY` collation, so a lowercase
+`cuesheet` row can never collide with the FLAC block's `CUESHEET` row, and the
+beets plugin — which lowercases every key it emits — cannot produce a colliding
+row at all.
+
+Case-folding cuts the other way for the *delete* half, and the difference is
+worth holding onto: `merge_tags` clears by `lower(key) = lower(?)`, so that same
+lowercase `cuesheet` does remove the scan-seeded `CUESHEET` *text* row
+([#407](https://github.com/Sohex/musefs/issues/407) —
+Vorbis keys render case-insensitively, and an exact-case delete would leave the
+scan row behind as a visible duplicate). The binary row is untouched, being
+scoped out by `value_blob IS NULL`, and keeps whatever ordinal it was given.
+Nothing breaks — ordinals need not be dense — but a writer reasoning about
+these keys should expect the case-insensitive match when clearing text rows and
+the byte-exact one when the constraint is checked. Splitting
+the two classes into independent ordinal spaces would take a schema migration
+(the primary key replaced by two partial unique indexes on `value_blob IS
+NULL`); it was judged not worth a store older builds refuse to open, and
+[#663](https://github.com/Sohex/musefs/issues/663) records that decision.
+
 **Schema identity.** On open, musefs also validates schema identity: a
 `sqlite_master` comparison against a freshly-migrated reference plus `PRAGMA
 foreign_key_check`, rejecting anything that is not the canonical latest schema
@@ -89,6 +128,15 @@ with a message telling the user to run `musefs scan`. A store whose
 third-party tool bumped the schema) is refused up front with a distinct
 "store is newer than this binary" error rather than silently treated as
 already-migrated — an older binary must not risk misreading a newer contract.
+
+**Migrations announce themselves.** The opposite direction — an open that finds
+an *older* store and upgrades it in place — is irreversible (the store stops
+opening with the previous musefs build), so it is logged at `warn`, the default
+filter level: the store path, the version found and the version reached,
+followed by a completion line at `info`. Creating a store from scratch is not a
+one-way step for existing data and logs at `info` only, and the common case — a
+store already at the latest version — stays silent, since that path runs on
+every open and every mount.
 
 **Art is immutable once written.** `art` rows are content-addressed by
 `sha256`; a trigger rejects any in-place `UPDATE` of an art row's

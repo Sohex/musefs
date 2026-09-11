@@ -1,5 +1,6 @@
 import pytest
 
+from musefs_common.constants import EXPECTED_USER_VERSION
 from musefs_common.errors import ScanError, SchemaMismatch
 
 
@@ -7,7 +8,24 @@ def test_schema_mismatch_message_and_found():
     exc = SchemaMismatch(5)
     assert exc.found == 5
     assert "user_version is 5" in str(exc)
-    assert "diverged" in str(exc)
+    # Both versions stay in the text whichever way the skew runs.
+    assert str(EXPECTED_USER_VERSION) in str(exc)
+
+
+def test_schema_mismatch_newer_store_says_upgrade_the_plugin():
+    """A store ahead of the plugin: the plugin is the side that must move."""
+    message = str(SchemaMismatch(EXPECTED_USER_VERSION + 1))
+    assert f"user_version is {EXPECTED_USER_VERSION + 1}" in message
+    assert "newer musefs" in message
+    assert "upgrade the plugin" in message
+
+
+def test_schema_mismatch_older_store_says_rescan_to_migrate():
+    """A store behind the plugin: `musefs scan` migrates it in place."""
+    message = str(SchemaMismatch(EXPECTED_USER_VERSION - 1))
+    assert f"user_version is {EXPECTED_USER_VERSION - 1}" in message
+    assert "predates this plugin" in message
+    assert "`musefs scan`" in message
 
 
 def test_scan_error_not_found():

@@ -13,6 +13,7 @@ def test_public_api_surface():
         "SCAN_TIMEOUT_SECONDS",
         "SchemaMismatch",
         "ScanError",
+        "ScanResult",
         "realpath_key",
         "run_scan",
         "connect",

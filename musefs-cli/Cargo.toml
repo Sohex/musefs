@@ -12,7 +12,9 @@ categories = ["filesystem", "multimedia::audio", "command-line-utilities"]
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
-log = "0.4"
+# `std` for `set_boxed_logger`: the CLI installs the process-wide log sink
+# (wrapped so scan progress and log records do not clobber each other).
+log = { version = "0.4", features = ["std"] }
 musefs-db = { path = "../musefs-db", version = "1.3.0" }
 musefs-core = { path = "../musefs-core", version = "1.3.0" }
 musefs-fuse = { path = "../musefs-fuse", version = "1.3.0" }

@@ -14,6 +14,7 @@ mod scan;
 mod telemetry;
 mod template;
 mod tree;
+pub mod warn_limit;
 
 pub use db_pool::DbPool;
 pub use error::{CoreError, Result};

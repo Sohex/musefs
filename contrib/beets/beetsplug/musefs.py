@@ -205,10 +205,14 @@ class MusefsPlugin(BeetsPlugin):
 
         ``force`` re-seeds existing tracks from their backing files. ``revalidate``
         forwards to the new subcommand; ``prune`` deletes gone rows and GCs
-        orphaned art."""
+        orphaned art.
+
+        A partial scan (some file unparseable, the batch still committed) is not
+        an error: it is reported and the sync goes on, so one bad file can't cost
+        the whole library its tags (#647)."""
         binary = self._bin()
         try:
-            run_scan(
+            result = run_scan(
                 binary,
                 db_path,
                 targets,
@@ -219,6 +223,11 @@ class MusefsPlugin(BeetsPlugin):
             )
         except ScanError as exc:
             raise self._scan_user_error(exc)
+        if result is not None and result.partial:
+            # ui.print_ (not self._log): beets hides plugin WARNINGs at default
+            # verbosity, and files missing from the store is worth seeing.
+            ui.print_(f"musefs: {result.warning()}")
+        return result
 
     @staticmethod
     def _scan_user_error(exc):

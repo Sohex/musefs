@@ -117,7 +117,8 @@ The metrics file is `/proc`-style: it advertises `st_size == 0` and is served
 via `FOPEN_DIRECT_IO`, so readers must read to EOF rather than trusting the
 stated size. Content is rendered at `open` time from a snapshot of
 `CoreTelemetry` (header/size caches, read-ahead budget/charge, virtual-tree
-footprint, refresh health), `FuseTelemetry` (uptime, read/dir-handle gates,
+footprint, refresh health, suppressed serve-path warnings), `FuseTelemetry`
+(uptime, read/dir-handle gates,
 worker pool, passthrough state), and optional jemalloc/syscall counters
 (including read-ahead hit/miss) — see
 [`musefs-core/src/telemetry.rs`](../../../musefs-core/src/telemetry.rs) for the full

@@ -1176,3 +1176,21 @@ fn telemetry_counts_open_handles() {
     fs.release_handle(fh);
     assert_eq!(fs.telemetry().handles_open, base);
 }
+
+/// The suppressed-warn count reaches the metrics surface through `telemetry()`,
+/// so `musefs_serve_warns_suppressed_total` tracks the live limiter rather than
+/// a constant (#653). Delta-based and `>`: the limiter is a process-wide static
+/// shared with everything else in this test binary.
+#[test]
+fn telemetry_surfaces_serve_warns_suppressed() {
+    let (_dir, fs) = fs_with_poll_interval(std::time::Duration::ZERO);
+    let before = fs.telemetry().serve_warns_suppressed;
+    // Well past the per-window burst budget, so warns are certainly dropped.
+    for i in 0..64 {
+        crate::serve_warn!("telemetry warn probe {i}");
+    }
+    assert!(
+        fs.telemetry().serve_warns_suppressed > before,
+        "an over-budget burst must move the counter telemetry reports"
+    );
+}
