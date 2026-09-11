@@ -25,9 +25,11 @@ failures still surface on stderr (raise detail with `-v`/`-vv`, or
 `scan` (with or without `--force`) shows a live progress indicator: on an
 interactive terminal, a discovery spinner followed by a determinate bar
 (position, percent, ETA, current file); on a non-interactive stderr (piped or
-logged), throttled `ingested N/M (P%)` lines. `--quiet` (`-q`) suppresses the
+logged), throttled `processed N/M (P%)` lines. `--quiet` (`-q`) suppresses the
 progress indicator and the per-target summary. Each summary line ends with the
-elapsed time.
+elapsed time. Anything logged during the scan (skip warnings, per-file
+failures) is printed above the bar, which is lifted out of the way and redrawn
+underneath, so warnings stay readable and scroll back intact.
 
 The per-target summary reads `scanned N: … already present Z, skipped X, failed Y`.
 `already present` counts files bare `scan` skipped because they were already
@@ -35,11 +37,30 @@ tracked. `skipped`
 counts every file that isn't a supported audio format — cover art, `.cue` /
 `.log` / `.nfo` sidecars, and anything else non-audio — so a large `skipped`
 number (hundreds or thousands on a big library) is expected, not an error.
-A per-extension breakdown of the skip count is logged at end of scan (e.g.
-`skipped 42: jpg=20, cue=10, log=8, <none>=4`), so you can tell expected
-sidecars from anything genuinely unexpected. `failed` is the one
-to watch: those are audio files musefs recognised by extension but could not
-parse. Format dispatch is by **extension only** —
+A per-extension breakdown of the skip count is logged at end of scan at
+`info` (e.g. `skipped 42: jpg=20, cue=10, log=8, <none>=4`, so it needs `-v` or
+`RUST_LOG=info`), letting you tell expected sidecars from anything genuinely
+unexpected. `failed` is the one to watch: those are audio files musefs
+recognised by extension but could not parse, or could not store. Its own
+breakdown by reason is logged at end of scan too —
+`failed 38: unparseable=30, io=5, oversize=2, rejected=1` — at `warn`, so it is
+visible without `-v`; a further `walk errors N: unreadable=9, symlink=3` line
+accounts for directories and entries the walk itself could not read (those are
+counted in neither `skipped` nor `failed`, since no file was ever queued for
+them).
+
+A `rejected` bucket in that breakdown means the store refused a file's rows on
+a constraint — the tag, art or track values it parsed were not something the
+schema accepts. Each one is logged with its path and the constraint text, and
+the rest of the library scans normally; nothing partial is stored for a rejected
+file, so the mount never shows a track quietly missing its tags. These are worth
+reporting: unlike `oversize`, which names a documented limit, a `rejected` file
+is a shape musefs did not anticipate.
+
+Per-file skip messages are capped at ten per reason per scan; the rest drop to
+`debug` (`-vv` / `RUST_LOG=debug`) so an unreadable subtree or a share that
+vanished mid-scan cannot emit one line per file. The end-of-scan breakdowns
+carry the full counts either way. Format dispatch is by **extension only** —
 there is no content sniffing and no fallback to another parser, so a file
 whose contents don't match its extension (e.g. a FLAC named `.mp3`) is handed
 to the wrong parser, fails, and is counted here rather than retried. Renaming
@@ -58,7 +79,9 @@ like `musefs scan … && musefs mount …` stops on a partial or total ingest
 failure rather than mounting an incomplete library. A successful scan exits `0`;
 a hard error (a missing target, an unreadable DB) still exits `1`. The exit code
 is the only machine-detectable signal; per-file failures otherwise surface only
-on stderr.
+on stderr. The full exit-code contract, and how to raise log detail on those
+failures, are in
+[Logging & troubleshooting](troubleshooting.md#exit-codes).
 
 ### Content checksums and move re-identification
 

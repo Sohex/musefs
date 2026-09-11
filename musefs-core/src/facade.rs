@@ -757,6 +757,7 @@ impl Musefs {
             refresh_generation: self.refresh_gen.load(Ordering::Acquire),
             refresh_gap_fallbacks: self.gap_fallbacks.load(Ordering::Relaxed),
             refresh_needs_rebuild: self.needs_rebuild.load(Ordering::Relaxed),
+            serve_warns_suppressed: crate::warn_limit::serve_warns_suppressed(),
         }
     }
 }

@@ -72,11 +72,20 @@ def config_from_env(environ: dict[str, str] | None = None) -> SyncConfig:
     )
 
 
-def scan_if_enabled(*, config: SyncConfig, paths: list[str], runner=run_scan) -> None:
-    """Run ``musefs scan`` over ``paths`` when autoscan is on and paths exist."""
+def scan_if_enabled(
+    *, config: SyncConfig, paths: list[str], runner=run_scan, warning_printer=print
+) -> None:
+    """Run ``musefs scan`` over ``paths`` when autoscan is on and paths exist.
+
+    A partial scan (exit 2: some file could not be ingested, the batch still
+    committed) is logged and tolerated — the import went through, so writing the
+    tags Lidarr has for the files that did land beats writing none (#647).
+    """
     if not config.autoscan or not paths:
         return
-    runner(config.musefs_bin, config.db_path, paths, timeout=SCAN_TIMEOUT_SECONDS)
+    result = runner(config.musefs_bin, config.db_path, paths, timeout=SCAN_TIMEOUT_SECONDS)
+    if result is not None and result.partial:
+        warning_printer(f"musefs-lidarr-sync: {result.warning()}", file=sys.stderr)
 
 
 def _log_skipped(skipped, *, warning_printer) -> None:

@@ -16,9 +16,10 @@ build/
 
 # beets' pre-migration DB backups. Its test suite opens an in-memory library, so
 # beets names each backup after the literal `:memory:` and writes it to the CWD
-# — the repo root when the suite is run from there, where a broad `git add`
-# will happily stage a dozen binary blobs.
-/:memory:-*.bak
+# — where a broad `git add` will happily stage a dozen binary blobs. Left
+# unanchored: the CWD is the repo root when the suite is run from there, but
+# `contrib/beets/` when it is run from the package directory.
+:memory:-*.bak
 
 # cargo-mutants scratch + reports
 .mutants-tmp/
