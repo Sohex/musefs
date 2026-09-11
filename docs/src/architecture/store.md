@@ -82,6 +82,32 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
 
+**One ordinal space per key.** `tags`' primary key is `(track_id, key,
+ordinal)`, which does not discriminate on `value_blob`: a track's text rows and
+its binary rows are numbered in the *same* space per key. A writer that holds a
+key in both classes must not restart at 0 for the binary rows, or the insert
+fails with `UNIQUE constraint failed: tags.track_id, tags.key, tags.ordinal`.
+The scanner numbers text rows first and continues the same counters for the
+binary rows ([#659](https://github.com/Sohex/musefs/issues/659)), so a track's
+binary rows for a key begin above however many text values the scan seeded
+under it.
+
+The rule this leaves for an external writer: a rewrite of the text rows alone —
+which is what `musefs_common.store`'s `replace_tags` / `merge_tags` do, scoping
+their `DELETE` to `value_blob IS NULL` so scanner-written payloads survive a
+sync — must not grow a key past the lowest ordinal its binary rows already
+hold. In practice the two key namespaces barely meet: binary keys are
+`APPLICATION` / `CUESHEET` (FLAC), uppercase four-character ID3 frame ids such
+as `PRIV`, `GEOB`, `MCDI`, `SYLT`, `UFID` (MP3/WAV), or `----:<mean>:<name>`
+(MP4, while the text path keys the same atom on its bare `name`). Keys compare
+byte-exactly under the default `BINARY` collation, so a lowercase `cuesheet`
+never meets the FLAC block's `CUESHEET`, and the beets plugin — which
+lowercases every key it emits — cannot reach the namespace at all. Splitting
+the two classes into independent ordinal spaces would take a schema migration
+(the primary key replaced by two partial unique indexes on `value_blob IS
+NULL`); it was judged not worth a store older builds refuse to open, and
+[#663](https://github.com/Sohex/musefs/issues/663) records that decision.
+
 **Schema identity.** On open, musefs also validates schema identity: a
 `sqlite_master` comparison against a freshly-migrated reference plus `PRAGMA
 foreign_key_check`, rejecting anything that is not the canonical latest schema

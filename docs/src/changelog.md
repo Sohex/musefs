@@ -108,6 +108,27 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- A scan no longer aborts on a backing file that carries the same tag key as
+  both a text value and a binary payload
+  ([#659](https://github.com/Sohex/musefs/issues/659)). `tags`' primary key is
+  `(track_id, key, ordinal)`; it does not discriminate on `value_blob`, so a
+  track's text rows and binary rows occupy one ordinal space per key. `ingest`
+  numbered them independently — text rows from a per-key counter, binary rows
+  from a single running index across the track — so a key present in both
+  classes produced two rows at ordinal 0 and the ingest transaction failed with
+  `UNIQUE constraint failed: tags.track_id, tags.key, tags.ordinal`. Unlike a
+  cap violation ([#644](https://github.com/Sohex/musefs/issues/644)) this was
+  not routed to a per-file failure, so it killed the whole scan — the reported
+  case died 41% into a 891k-file library after an hour. Generalising that
+  containment to any constraint violation is tracked separately in
+  [#662](https://github.com/Sohex/musefs/issues/662). The two classes now
+  draw from one shared per-key counter, text first, which also makes binary
+  ordinals per-key rather than track-wide. Reachable shapes: a FLAC `CUESHEET`
+  Vorbis comment beside a CUESHEET metadata block, an MP3 `TXXX` frame whose
+  description names a binary frame the same tag carries (`PRIV`, `GEOB`,
+  `MCDI`, a non-MusicBrainz `UFID`), and an MP4 freeform atom written with both
+  a text and a binary `data` box.
+
 - Scan log records and the progress bar no longer clobber each other on an
   interactive terminal ([#648](https://github.com/Sohex/musefs/issues/648)).
   `ScanReporter` renders an `indicatif` bar on stderr and the `log` facade
