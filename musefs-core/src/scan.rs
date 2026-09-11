@@ -198,6 +198,10 @@ enum SkipReason {
     Unparseable,
     /// Metadata over a storage cap — art, tag field, or binary frame (#644).
     Oversize,
+    /// The store refused this file's rows on a constraint the scanner does not
+    /// pre-check — a `CHECK`, `UNIQUE` or primary-key violation raised inside
+    /// the ingest transaction (#662).
+    Rejected,
     /// `open`/`stat`/`canonicalize` failed on a file the walk had accepted.
     Io,
     /// A parser panic caught by [`probe_file_caught`] (#425).
@@ -213,9 +217,10 @@ enum SkipReason {
 impl SkipReason {
     /// Every reason, in [`FailureTally`]'s array order (each reason indexes that
     /// array by its discriminant).
-    const ALL: [SkipReason; 7] = [
+    const ALL: [SkipReason; 8] = [
         SkipReason::Unparseable,
         SkipReason::Oversize,
+        SkipReason::Rejected,
         SkipReason::Io,
         SkipReason::Panicked,
         SkipReason::Raced,
@@ -225,9 +230,10 @@ impl SkipReason {
 
     /// The reasons that increment `ScanStats::failed`. They partition it
     /// exactly, which is what makes the `failed N: ...` breakdown trustworthy.
-    const FAILED: [SkipReason; 4] = [
+    const FAILED: [SkipReason; 5] = [
         SkipReason::Unparseable,
         SkipReason::Oversize,
+        SkipReason::Rejected,
         SkipReason::Io,
         SkipReason::Panicked,
     ];
@@ -241,6 +247,7 @@ impl SkipReason {
         match self {
             SkipReason::Unparseable => "unparseable",
             SkipReason::Oversize => "oversize",
+            SkipReason::Rejected => "rejected",
             SkipReason::Io => "io",
             SkipReason::Panicked => "panicked",
             SkipReason::Raced => "changed-during-probe",
@@ -1745,6 +1752,23 @@ fn refresh_structural_into(
     Ok(())
 }
 
+/// Does this ingest error fail one file, or the whole run?
+///
+/// A constraint violation is decided by the values in the statement, so it
+/// belongs to the file whose rows were being written: the scanner fails that
+/// file and carries on. Everything else — a corrupt, full, read-only or
+/// I/O-failing store, and any error this build does not recognise — still
+/// aborts, because carrying on would produce one identical failure per
+/// remaining file rather than useful work (#662).
+///
+/// The classification lives here rather than being enumerated ahead of time as
+/// pre-checks: [`check_storable`] covers the caps the scanner knows to look
+/// for, and adding one pre-check per newly discovered constraint does not
+/// converge.
+fn is_store_rejection(e: &crate::error::CoreError) -> bool {
+    matches!(e, crate::error::CoreError::Db(db) if db.is_constraint_violation())
+}
+
 /// Decide how to ingest one probed unit: retarget a relocated row when a unique
 /// fingerprint match exists whose backing file is gone, otherwise ingest fresh.
 /// The strict/auto confirm hash, if computed here, is persisted on the retarget
@@ -2172,15 +2196,34 @@ fn run_pipeline(
         let mut committed: Vec<String> = Vec::new();
         for unit in batch.drain(..) {
             released += unit.weight;
-            committed.push(unit.abs_path.clone());
-            // A write failure here is still fatal (the store, not the file, is
-            // the problem), but it must say which file it died on — issue #644
-            // was reported as an unattributed `CHECK constraint failed`.
             let abs_path = unit.abs_path.clone();
-            ingest_unit(&mut bw, unit, strictness, policy).map_err(|e| {
-                log::error!("aborting scan while ingesting {abs_path}: {e}");
-                e
-            })?;
+            // One savepoint per file. A constraint the scanner cannot pre-check
+            // is discovered here, with the rest of the batch's rows already in
+            // the transaction, so the offending file's writes have to be undone
+            // without taking the batch down with them (#662).
+            match bw.item(|bw| ingest_unit(bw, unit, strictness, policy)) {
+                Ok(()) => committed.push(abs_path),
+                // The store refused this file's rows, and only this file's: the
+                // savepoint has rolled them back, so the batch is still
+                // committable. Count it like any other per-file failure and
+                // name the constraint, so a file musefs will not store is
+                // visible rather than quietly missing from the mount (#284).
+                Err(e) if is_store_rejection(&e) => {
+                    failures.record(
+                        SkipReason::Rejected,
+                        format_args!("skipping {abs_path}: the store rejected its rows: {e}"),
+                    );
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
+                // Anything else says the run itself cannot proceed (a corrupt,
+                // full, read-only or I/O-failing store), so it stays fatal —
+                // but it must say which file it died on, since issue #644 was
+                // reported as an unattributed `CHECK constraint failed`.
+                Err(e) => {
+                    log::error!("aborting scan while ingesting {abs_path}: {e}");
+                    return Err(e);
+                }
+            }
         }
         bw.commit()?;
         for abs_path in committed {

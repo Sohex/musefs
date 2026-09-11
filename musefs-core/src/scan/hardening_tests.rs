@@ -1576,3 +1576,138 @@ fn scan_emits_the_failure_breakdown_to_the_log() {
         "expected a `failed N: unparseable=N` breakdown; captured: {breakdowns:?}"
     );
 }
+
+/// Minimal FLAC: marker, STREAMINFO, a VORBIS_COMMENT carrying one `TITLE`,
+/// then audio. The title matters — it is the row the poison trigger below fires
+/// on, which is what puts the violation *after* this file's `tracks` row has
+/// already been written.
+fn flac_titled(title: &str) -> Vec<u8> {
+    let mut comment = Vec::new();
+    comment.extend_from_slice(&0u32.to_le_bytes()); // empty vendor string
+    comment.extend_from_slice(&1u32.to_le_bytes()); // one user comment
+    let field = format!("TITLE={title}");
+    comment.extend_from_slice(&u32::try_from(field.len()).unwrap().to_le_bytes());
+    comment.extend_from_slice(field.as_bytes());
+
+    let mut bytes = b"fLaC".to_vec();
+    bytes.push(0x00); // type 0 (STREAMINFO), more blocks follow
+    bytes.extend_from_slice(&[0, 0, 34]); // 24-bit length = 34
+    bytes.extend(std::iter::repeat_n(0u8, 34));
+    bytes.push(0x84); // last-block flag set, type 4 (VORBIS_COMMENT)
+    let len = u32::try_from(comment.len()).unwrap().to_be_bytes();
+    bytes.extend_from_slice(&len[1..]); // 24-bit length
+    bytes.extend_from_slice(&comment);
+    bytes.extend_from_slice(b"AUDIOPAYLOAD");
+    bytes
+}
+
+/// Make the store refuse one file's rows, the way a constraint the scanner does
+/// not pre-check would. Installed over a second connection to the store file,
+/// so the scan's own connection is untouched, and `RAISE(ABORT)` raises
+/// `SQLITE_CONSTRAINT_TRIGGER` — the same primary code as the primary-key
+/// collision that aborted the scan in #659, which is what the classifier keys
+/// on.
+/// Make the store refuse one file's rows, the way a constraint the scanner does
+/// not pre-check would. Installed over a second connection to the store file,
+/// so the scan's own connection is untouched, and `RAISE(ABORT)` raises
+/// `SQLITE_CONSTRAINT_TRIGGER` — the same primary code as the primary-key
+/// collision that aborted the scan in #659, which is what the classifier keys
+/// on.
+///
+/// It fires on the `tags` insert, not the `tracks` insert, so the file's
+/// `tracks` row is already in the transaction when the violation lands. That is
+/// the case the savepoint exists for: a statement-level `ABORT` undoes only its
+/// own statement, so without one the batch would commit a half-ingested track.
+fn poison_one_title(store: &std::path::Path, needle: &str) {
+    let conn = rusqlite::Connection::open(store).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER musefs_test_poison BEFORE INSERT ON tags \
+         WHEN NEW.value LIKE '%{needle}%' \
+         BEGIN SELECT RAISE(ABORT, 'synthetic constraint failed: tags.value'); END;"
+    ))
+    .unwrap();
+}
+
+/// The #662 acceptance case, driven through the production batch path: one
+/// file's rows are refused inside the ingest transaction that holds the whole
+/// batch, and the scan has to fail that one file and ingest the rest.
+#[test]
+fn scan_fails_only_the_file_whose_rows_the_store_rejects() {
+    crate::warn_limit::log_capture::install();
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.flac", "poison.flac", "b.flac"] {
+        std::fs::write(dir.path().join(name), flac_titled(name)).unwrap();
+    }
+    let store = dir.path().join("musefs.db");
+    let db = Db::open(&store).unwrap();
+    poison_one_title(&store, "poison");
+
+    let stats = scan_directory_with(&db, dir.path(), &ScanOptions::default())
+        .expect("a rejected file must not abort the scan");
+
+    assert_eq!(stats.failed, 1, "the rejected file is one `failed` file");
+    assert_eq!(stats.scanned, 2, "the other two files are still ingested");
+    let paths: Vec<String> = db
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.backing_path)
+        .collect();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.contains("poison")),
+        "the rejected file must leave no rows behind, not a track with no tags: {paths:?}"
+    );
+
+    // Not silence: the file is named and the constraint text preserved, so a
+    // file musefs refuses to store is visible rather than quietly missing from
+    // the mount (#284). Substring assertions — the capture buffer is shared
+    // across this binary's parallel tests.
+    let named = crate::warn_limit::log_capture::messages_containing("poison.flac");
+    assert!(
+        named
+            .iter()
+            .any(|m| m.contains("synthetic constraint failed")),
+        "expected the rejected file named with its constraint text; captured: {named:?}"
+    );
+    let breakdowns = crate::warn_limit::log_capture::messages_containing("rejected=");
+    assert!(
+        breakdowns.iter().any(|m| m.starts_with("failed ")),
+        "expected a `failed N: rejected=N` breakdown; captured: {breakdowns:?}"
+    );
+}
+
+/// The other half of the classification, at the boundary the writer keys on: a
+/// constraint violation fails one file, and everything that says the run itself
+/// cannot proceed still aborts it (#662).
+#[test]
+fn only_constraint_violations_are_per_file_rejections() {
+    let rejection =
+        crate::error::CoreError::Db(musefs_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+            Some("UNIQUE constraint failed: tags.track_id, tags.key, tags.ordinal".into()),
+        )));
+    assert!(super::is_store_rejection(&rejection), "{rejection}");
+
+    for code in [
+        rusqlite::ffi::SQLITE_CORRUPT,
+        rusqlite::ffi::SQLITE_FULL,
+        rusqlite::ffi::SQLITE_IOERR,
+        rusqlite::ffi::SQLITE_READONLY,
+        rusqlite::ffi::SQLITE_NOTADB,
+        rusqlite::ffi::SQLITE_BUSY,
+    ] {
+        let fatal = crate::error::CoreError::Db(musefs_db::DbError::Sqlite(
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+        ));
+        assert!(
+            !super::is_store_rejection(&fatal),
+            "SQLite code {code} must still abort the scan"
+        );
+    }
+
+    // Not every ingest error is a DB error, and none of the others may be
+    // mistaken for one the scan can carry on past.
+    let io = crate::error::CoreError::BackingChanged("/a.flac".into());
+    assert!(!super::is_store_rejection(&io), "{io}");
+}
