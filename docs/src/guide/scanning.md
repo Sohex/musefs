@@ -43,11 +43,11 @@ A per-extension breakdown of the skip count is logged at end of scan at
 unexpected. `failed` is the one to watch: those are audio files musefs
 recognised by extension but could not parse, or could not store. Its own
 breakdown by reason is logged at end of scan too —
-`failed 37: unparseable=30, io=5, oversize=2` — at `warn`, so it is visible
-without `-v`; a further `walk errors N: unreadable=9,
-symlink=3` line accounts for directories and entries the walk itself could not
-read (those are counted in neither `skipped` nor `failed`, since no file was
-ever queued for them).
+`failed 38: unparseable=30, io=5, oversize=2, rejected=1` — at `warn`, so it is
+visible without `-v`; a further `walk errors N: unreadable=9, symlink=3` line
+accounts for directories and entries the walk itself could not read (those are
+counted in neither `skipped` nor `failed`, since no file was ever queued for
+them).
 
 A `rejected` bucket in that breakdown means the store refused a file's rows on
 a constraint — the tag, art or track values it parsed were not something the

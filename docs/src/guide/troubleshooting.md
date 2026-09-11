@@ -58,11 +58,11 @@ it. Raising verbosity during an interactive scan is safe.
 - Scan-time refusals: `skipping <path>: <reason>`, `skipping <path>: no
   parseable audio metadata`. These are capped per reason — see
   [Scanning](scanning.md#scan).
-- The end-of-scan failure summaries: `failed 37: unparseable=30, io=5,
-  oversize=2` (these five reasons partition the `failed` count the CLI reports
-  and the exit-`2` signal keys on) and `walk errors 12: unreadable=9,
-  symlink=3` for entries the walk never queued. Neither fires on a healthy
-  library.
+- The end-of-scan failure summaries: `failed 38: unparseable=30, io=5,
+  oversize=2, rejected=1` (these reasons, plus `panicked`, partition the
+  `failed` count the CLI reports and the exit-`2` signal keys on; empty buckets
+  are omitted) and `walk errors 12: unreadable=9, symlink=3` for entries the
+  walk never queued. Neither fires on a healthy library.
 - Degraded-but-correct fallbacks: `incremental tree mutation failed …; falling
   back to full rebuild`, `poll_refresh failed`, `inval_inode(…) failed`.
 - Tag keys dropped during Vorbis synthesis (`track N: dropping tag key … (not a
