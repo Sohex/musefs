@@ -115,6 +115,7 @@ fn goldens(fmt: Format) -> (u64, u64, u64, u64) {
     match fmt {
         Format::Mp3 => (33, 4_194_306, 1, 131_072),
         Format::Ogg => (194, 4_221_658, 9, 262_250),
+        Format::OggVorbis => (4_503, 4_829_368, 143, 215_911),
         Format::Flac | Format::M4aMoovFirst | Format::M4aMoovLast | Format::Wav => {
             (33, 4_194_304, 1, 131_072)
         }
