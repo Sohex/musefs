@@ -14,6 +14,13 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- `Musefs::drain_prefetch` waits for the Phase-2 prefetch pool to finish every
+  job it accepted, or a timeout to elapse. Serving never needs it — prefetch is
+  fire-and-forget there — but sampling the prefetch counters without it misses
+  reads still in flight, and a caller that owns the backing filesystem itself
+  (the latency-injecting mount the read benches use) can otherwise tear it down
+  under a worker mid-read and park that thread in uninterruptible sleep (#671).
+
 - `musefs_readahead_prefetch_reads_total` and
   `musefs_readahead_prefetch_bytes_total`
   ([#671](https://github.com/Sohex/musefs/issues/671)) report the positioned

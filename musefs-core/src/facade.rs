@@ -272,9 +272,12 @@ impl Musefs {
             handles: sharded_slab::Slab::new(),
             readahead_pool: Arc::new(crate::readahead::ReadAheadPool::new(read_ahead_budget)),
             // Phase 2 (background prefetch threads) runs only when read-ahead is
-            // on AND explicitly opted in. Off by default: Phase-1 amplification
-            // carries the whole win, and the threads add ~10% overhead without
-            // benefit on the backends benchmarked (#255).
+            // on AND explicitly opted in. Off by default: on local and
+            // low-latency backing, Phase-1 amplification carries the whole win
+            // and the threads only re-read the stream speculatively (#255). They
+            // earn their keep on high-latency network backing — ~30% on a
+            // 200 ms-RTT NFS mount, once the prefetcher stopped amplifying
+            // (#671).
             prefetch: if read_ahead_budget > 0 && read_ahead_prefetch {
                 Some(crate::readahead::PrefetchWorkers::new(2))
             } else {
@@ -390,6 +393,16 @@ impl Musefs {
 
     /// Serve a read into `out` (cleared first). The FUSE layer passes a reused
     /// per-worker buffer so the hot path allocates nothing per read (#70).
+    /// Wait for the Phase-2 prefetch pool to finish every job it accepted, or
+    /// `timeout` to elapse; reports whether it reached idle (trivially true when
+    /// prefetch is off). Serving never needs this — prefetch is speculative and
+    /// fire-and-forget — but a caller that samples the prefetch counters, or
+    /// that owns the backing filesystem itself and is about to tear it down,
+    /// does. See [`crate::readahead::PrefetchWorkers::drain`].
+    pub fn drain_prefetch(&self, timeout: std::time::Duration) -> bool {
+        self.prefetch.as_ref().is_none_or(|pf| pf.drain(timeout))
+    }
+
     /// Serve `[offset, offset+size)` through the per-handle read-ahead buffer,
     /// then (when Phase-2 prefetch is enabled and the stream is sequential)
     /// enqueue depth-adaptive next-window jobs. Shared by the binary-tag

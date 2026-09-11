@@ -893,16 +893,19 @@ is already material at SSD speeds (1.7×).
 ### Phase 2 is off by default
 
 > **Superseded in part by [#671](#phase-2-was-also-amplifying-not-just-overhead-671).** The
-> numbers below stand as measured, but the cause attributed to them does not: the prefetcher
-> was evicting the window the reader was inside and re-dispatching windows already in flight.
-> With that fixed, Phase 2 is a ~30 % single-stream win at 200 ms RTT rather than a ~10 % loss.
-> It remains off by default; see that section for when to turn it on.
+> numbers below stand as measured; the cause attributed to them was a bug, and Phase 2 is a win
+> on high-RTT backing once it is fixed. It remains off by default — see that section for when
+> to turn it on, and this one for what was originally measured.
 
-Background prefetch threads (Phase 2) **never beat amplification alone** and cost a consistent
-~10 %: single-stream NFS 6.8 vs 7.4, concurrent NFS 12.1 vs 13.6, neutral on HDD. A single large
-`pread` already lets the NFS client pipeline its RPCs, so the threads add coordination overhead
-without overlap to exploit. Phase 2 is therefore opt-in (`--read-ahead-prefetch`), retained for
-hypothetical backends where one large read does not self-pipeline.
+**As measured before #671**, background prefetch threads (Phase 2) never beat amplification
+alone and cost a consistent ~10 %: single-stream NFS 6.8 vs 7.4, concurrent NFS 12.1 vs 13.6,
+neutral on HDD. The reading at the time was that a single large `pread` already lets the NFS
+client pipeline its RPCs, leaving the threads coordination overhead and no overlap to exploit.
+That explanation was wrong: the prefetcher was evicting the window the reader was inside and
+re-dispatching windows already in flight, and the ~10 % was the cost of that. Re-measured on the
+same shape of backing, Phase 2 is now ~30 % faster than amplification alone on a single stream.
+It stays opt-in (`--read-ahead-prefetch`) either way — for the reasons in
+[#671](#phase-2-was-also-amplifying-not-just-overhead-671), not the ones in this paragraph.
 
 **Defaults:** read-ahead on at `--read-ahead-budget-mib 64`, Phase-1 amplification only. Set
 `0` to disable on local-disk-only setups (no benefit there, though no harm either).

@@ -525,6 +525,9 @@ pub struct PrefetchJob {
 
 pub struct PrefetchWorkers {
     tx: crossbeam_channel::Sender<PrefetchJob>,
+    /// Jobs accepted by `request` and not yet finished (queued or running).
+    /// Only [`Self::drain`] reads it; the serve path never waits on prefetch.
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PrefetchWorkers {
@@ -533,8 +536,10 @@ impl PrefetchWorkers {
         // blocks in `recv` independently, so job hand-off and wake-ups fan out
         // across all threads instead of serializing behind one shared lock (#430).
         let (tx, rx) = crossbeam_channel::bounded::<PrefetchJob>(threads * 4);
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for _ in 0..threads {
             let rx = rx.clone();
+            let inflight = Arc::clone(&inflight);
             std::thread::spawn(move || {
                 while let Ok(job) = rx.recv() {
                     // Isolate each job: a panic in `run_job` (e.g. a parser bug on
@@ -545,10 +550,34 @@ impl PrefetchWorkers {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         Self::run_job(job);
                     }));
+                    // After `run_job` returns, so the job's `Arc<File>` is already
+                    // released: a drained pool holds no backing handles.
+                    inflight.fetch_sub(1, O::AcqRel);
                 }
             });
         }
-        PrefetchWorkers { tx }
+        PrefetchWorkers { tx, inflight }
+    }
+
+    /// Block until every accepted job has finished, or `timeout` elapses;
+    /// reports whether the pool reached idle. Nothing on the serve path calls
+    /// this — prefetch is fire-and-forget there. It exists for callers that must
+    /// observe the pool's effects or outlive it: sampling the prefetch counters
+    /// without missing reads still in flight, and tearing down a backing
+    /// filesystem that lives in this process (the latency-injecting mount the
+    /// read benches use), which otherwise can vanish under a worker mid-read and
+    /// park that thread in uninterruptible sleep.
+    pub fn drain(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.inflight.load(O::Acquire) == 0 {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     #[expect(clippy::needless_pass_by_value)]
@@ -584,7 +613,13 @@ impl PrefetchWorkers {
     }
 
     pub fn request(&self, job: PrefetchJob) {
-        let _ = self.tx.try_send(job);
+        // Count before the send and uncount a rejected one, so `inflight` is
+        // never below the truth: a `drain` racing a `request` must not report
+        // idle while a job is on its way to a worker.
+        self.inflight.fetch_add(1, O::AcqRel);
+        if self.tx.try_send(job).is_err() {
+            self.inflight.fetch_sub(1, O::AcqRel);
+        }
     }
 }
 
@@ -1419,6 +1454,53 @@ mod prefetch_worker_tests {
         assert!(pool.charged() > 0, "window stored after recovery");
     }
 
+    /// `drain` is a barrier, not a hint: while a job is still outstanding it
+    /// must report the pool busy rather than idle. A 16 MiB read cannot finish
+    /// in the two atomic loads between `request` and an already-expired
+    /// deadline, so the busy answer here is the real one.
+    #[test]
+    fn drain_reports_busy_until_the_pool_is_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.bin");
+        let data = vec![7u8; 16 * 1024 * 1024];
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+
+        let pool = Arc::new(ReadAheadPool::new(64 * 1024 * 1024));
+        let buf = Arc::new(Mutex::new(ReadAhead::new(pool.per_stream_cap())));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        pool.register(1, Arc::clone(&buf));
+
+        let workers = PrefetchWorkers::new(1);
+        // An idle pool is idle immediately, whatever the timeout.
+        assert!(workers.drain(std::time::Duration::ZERO), "idle pool");
+
+        workers.request(PrefetchJob {
+            ctx: Arc::new(PrefetchContext {
+                file: Arc::clone(&file),
+                buf: Arc::clone(&buf),
+                pool: Arc::clone(&pool),
+                epoch: Arc::clone(&epoch),
+                dispatched_epoch: 0,
+                len: data.len() as u64,
+                backing_len: data.len() as u64,
+            }),
+            start: 0,
+        });
+        assert!(
+            !workers.drain(std::time::Duration::ZERO),
+            "a pool with an outstanding job is not idle"
+        );
+        assert!(
+            workers.drain(std::time::Duration::from_secs(30)),
+            "pool must go idle once the job finishes"
+        );
+        assert!(pool.charged() > 0, "the drained job stored its window");
+    }
+
     /// The worker-pool path the single-stream test skips: a job pushed through
     /// `request` must reach one of the recv-ing worker threads and run, storing
     /// the window. Guards the crossbeam hand-off (#430).
@@ -1452,14 +1534,12 @@ mod prefetch_worker_tests {
             start: 1024 * 1024,
         });
 
-        // Hand-off is asynchronous; poll until the worker has charged the stored
-        // window. Bounded so a broken hand-off fails fast rather than hanging.
-        let step = std::time::Duration::from_millis(5);
-        let mut waited = std::time::Duration::ZERO;
-        while pool.charged() == 0 && waited < std::time::Duration::from_secs(5) {
-            std::thread::sleep(step);
-            waited += step;
-        }
+        // Hand-off is asynchronous; `drain` is the barrier. Bounded so a broken
+        // hand-off fails fast rather than hanging.
+        assert!(
+            workers.drain(std::time::Duration::from_secs(5)),
+            "pool never went idle"
+        );
         assert!(pool.charged() > 0, "dispatched job never reached a worker");
 
         let mut out = vec![0u8; 4096];

@@ -272,19 +272,21 @@ fn bench_read_under_latency() {
             let _ = fs.read(inode, Some(fh), off, 128 * 1024).unwrap();
         }
         let ms = t0.elapsed().as_millis();
+        // Wait out the Phase-2 prefetch pool before doing anything else. Two
+        // reasons, both of which bit this bench: the counters are sampled next,
+        // and a worker still reading counts toward the speculative volume this
+        // sweep is measuring; and the workers are detached, so a mount torn down
+        // under one of them leaves its FUSE op unanswered and parks that thread
+        // in uninterruptible sleep, taking the whole run with it. Generous
+        // timeout — the slowest profile fills an 8 MiB window at 8.6 ms per
+        // 128 KiB op — and a false return means the pool never went idle.
+        assert!(
+            fs.drain_prefetch(std::time::Duration::from_secs(30)),
+            "prefetch pool did not drain"
+        );
         let s = metrics::snapshot();
         fs.release_handle(fh);
-        // Phase-2 prefetch workers are detached: dropping `Musefs` closes the job
-        // channel but does not join them, so a worker can still be mid-`pread`
-        // through the latency mount. Letting the mount unmount underneath it
-        // wedges the process — the in-flight FUSE op never completes and its
-        // thread parks in uninterruptible sleep, taking the whole run with it.
-        // Drop the filesystem first, then give the workers a moment to drain
-        // before `mount` goes out of scope at the end of this iteration. Best
-        // effort — there is no handle to join — so allow more than the slowest
-        // profile's window fill (8 MiB at 8.6 ms per 128 KiB FUSE op).
         drop(fs);
-        std::thread::sleep(std::time::Duration::from_secs(1));
         println!(
             "{}",
             RunReport {
