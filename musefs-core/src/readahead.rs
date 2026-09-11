@@ -1455,14 +1455,16 @@ mod prefetch_worker_tests {
     }
 
     /// `drain` is a barrier, not a hint: while a job is still outstanding it
-    /// must report the pool busy rather than idle. A 16 MiB read cannot finish
-    /// in the two atomic loads between `request` and an already-expired
-    /// deadline, so the busy answer here is the real one.
+    /// must report the pool busy rather than idle. A helper thread holds the
+    /// buffer lock the worker needs to store its window, so the job stays
+    /// outstanding for a fixed window rather than for however long a read
+    /// happens to take. The helper releases on its own timer, so a `drain` that
+    /// wrongly keeps waiting still finishes the test instead of deadlocking.
     #[test]
     fn drain_reports_busy_until_the_pool_is_idle() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.bin");
-        let data = vec![7u8; 16 * 1024 * 1024];
+        let data = vec![7u8; 1024 * 1024];
         std::fs::File::create(&path)
             .unwrap()
             .write_all(&data)
@@ -1477,6 +1479,19 @@ mod prefetch_worker_tests {
         let workers = PrefetchWorkers::new(1);
         // An idle pool is idle immediately, whatever the timeout.
         assert!(workers.drain(std::time::Duration::ZERO), "idle pool");
+
+        // Hold the buffer the job must store into, from a thread that releases
+        // on its own timer; `rx` makes sure the lock is held before the job is
+        // even queued.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gate_buf = Arc::clone(&buf);
+        let gate = std::thread::spawn(move || {
+            let held = gate_buf.lock().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            drop(held);
+        });
+        rx.recv().unwrap();
 
         workers.request(PrefetchJob {
             ctx: Arc::new(PrefetchContext {
@@ -1494,6 +1509,7 @@ mod prefetch_worker_tests {
             !workers.drain(std::time::Duration::ZERO),
             "a pool with an outstanding job is not idle"
         );
+        gate.join().unwrap();
         assert!(
             workers.drain(std::time::Duration::from_secs(30)),
             "pool must go idle once the job finishes"

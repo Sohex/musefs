@@ -1237,13 +1237,28 @@ fn drain_prefetch_reports_the_pool_state() {
     let buf = Arc::new(std::sync::Mutex::new(crate::readahead::ReadAhead::new(
         on.readahead_pool.per_stream_cap(),
     )));
+    // Gate the job on the target buffer's lock rather than on the read being
+    // slow: a worker has to take that lock to store its window. A helper thread
+    // holds it on a timer (`rx` confirms it is held before the job is queued),
+    // so the job stays outstanding for a fixed window and a `drain` that wrongly
+    // keeps waiting still finishes the test rather than deadlocking against it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let gate_buf = Arc::clone(&buf);
+    let gate = std::thread::spawn(move || {
+        let held = gate_buf.lock().unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        drop(held);
+    });
+    rx.recv().unwrap();
+
     on.prefetch
         .as_ref()
         .expect("Phase 2 enabled")
         .request(crate::readahead::PrefetchJob {
             ctx: Arc::new(crate::readahead::PrefetchContext {
                 file,
-                buf,
+                buf: Arc::clone(&buf),
                 pool: Arc::clone(&on.readahead_pool),
                 epoch: Arc::new(AtomicU64::new(0)),
                 dispatched_epoch: 0,
@@ -1256,6 +1271,7 @@ fn drain_prefetch_reports_the_pool_state() {
         !on.drain_prefetch(Duration::ZERO),
         "a pool with an outstanding job is not drained"
     );
+    gate.join().unwrap();
     assert!(
         on.drain_prefetch(Duration::from_secs(30)),
         "the pool drains once the job finishes"
