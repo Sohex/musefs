@@ -12,11 +12,19 @@
 #   storage_tunables_bench.sh local      <backing-dir> [size_mib] [streams]
 #   storage_tunables_bench.sh nfs        <export-dir>  <netem_ms_per_way> [size_mib] [streams]
 #   storage_tunables_bench.sh window-cap <backing-dir> [size_mib] [streams]
+#   storage_tunables_bench.sh prefetch   <export-dir>  <netem_ms_per_way> [size_mib] [streams]
 #
 #   local:      <backing-dir> is a real disk (e.g. an HDD) holding the corpus.
 #   nfs:        <export-dir> is exported via loopback NFSv4 and `tc netem` adds
 #               <netem_ms_per_way> per packet (~2x that as RPC RTT). Backing it on tmpfs
 #               isolates the RPC tax; on HDD adds real seeks. Needs nfs-kernel-server + tc.
+#   prefetch:   Phase-2 (--read-ahead-prefetch) A/B over the same NFS+netem backing
+#               as `nfs`, but only the read-ahead rows, and across one or more
+#               musefs binaries: set MUSEFS_PREFETCH_BINS to a space-separated
+#               "label=/path/to/musefs" list to compare builds (e.g. a pre-fix
+#               baseline against the working tree). Netem 0 measures local backing.
+#               Added for issue #671, where Phase-2 evicted the window the reader
+#               was inside and turned read-ahead into read amplification.
 #   window-cap: sweeps the daemon-internal read-amplification window cap
 #               (WINDOW_ABS_CAP) on real backing (issue #433). Builds one release
 #               binary per value in $WINDOW_CAP_MIB (default "1 2 4 8 16"), patching
@@ -25,8 +33,12 @@
 #               drop the page cache. Point MUSEFS_BENCH_CORPUS_SRC at a real audio tree.
 set -euo pipefail
 
-MODE="${1:?usage: $0 local|nfs|window-cap <dir> ...}"
-ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+MODE="${1:?usage: $0 local|nfs|prefetch|window-cap <dir> ...}"
+# `git rev-parse` refuses a repo owned by another user ("dubious ownership"),
+# which is exactly the case for the root-run modes, so fall back to the script's
+# parent directory rather than failing before the first sample.
+ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null)" || ROOT=""
+[ -n "$ROOT" ] || ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/release/musefs"
 RA="$ROOT/musefs-core/src/readahead.rs"
 # window-cap (issue #433) builds its own per-cap-value binaries; the other modes
@@ -37,6 +49,13 @@ NFSMNT=/tmp/sp-nfsmnt
 MMNT=/tmp/sp-musefs-mnt
 DB=/tmp/sp-tunables.db
 MP=""; NETEM=0; NFS_EXP=""
+# Linux 6.12+ negotiates NFS LOCALIO: when client and server are the same host
+# the client bypasses the RPC transport and does local I/O, so `tc netem` on `lo`
+# never touches the data path and every "NFS" row silently measures local disk.
+# The symptom is unmistakable — cold reads at GB/s while `ping 127.0.0.1` shows
+# the injected RTT. Disabled for the run (affects new mounts) and restored on exit.
+LOCALIO=/sys/module/nfs/parameters/localio_enabled
+LOCALIO_SAVED=""
 # Internal read-amplification window caps to sweep (WINDOW_ABS_CAP, MiB).
 CAP_MIB="${WINDOW_CAP_MIB:-1 2 4 8 16}"
 
@@ -49,6 +68,7 @@ cleanup() {
     mountpoint -q "$NFSMNT" && umount -l "$NFSMNT" 2>/dev/null || true
     exportfs -u localhost:"$NFS_EXP" 2>/dev/null || true
   fi
+  if [ -n "$LOCALIO_SAVED" ]; then echo "$LOCALIO_SAVED" > "$LOCALIO" 2>/dev/null || true; fi
   # window-cap patches WINDOW_ABS_CAP in-place to build each variant; always
   # restore the source so an interrupt can't leave the tree modified.
   [ -n "${RA:-}" ] && git -C "$ROOT" checkout -- "$RA" 2>/dev/null || true
@@ -81,7 +101,7 @@ gen_corpus() { # $1=backing-dir $2=size_mib $3=streams
     # copied extension, and require >= streams+1 distinct files so a rerun after
     # a SMALLER bench still tops up the corpus.
     if [ "$(find "$1" -maxdepth 1 -type f \
-      \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.ogg' \) \
+      \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.ogg' -o -iname '*.opus' \) \
       -printf '.' 2>/dev/null | wc -c)" -ge "$n" ]; then
       return 0
     fi
@@ -94,7 +114,7 @@ gen_corpus() { # $1=backing-dir $2=size_mib $3=streams
     # and trip `pipefail`, so collect the list in a substitution (|| true) first.
     local list
     list=$(find "$MUSEFS_BENCH_CORPUS_SRC" -type f \
-      \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.ogg' \) \
+      \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.ogg' -o -iname '*.opus' \) \
       -printf '%s\t%p\n' 2>/dev/null | awk -v m="$maxb" -F'\t' 'm==0 || $1<=m' |
       sort -rn | head -n "$n" | cut -f2-) || true
     while IFS= read -r f; do
@@ -115,15 +135,19 @@ case "$MODE" in
     gen_corpus "$BACKING/backing" "$SIZE" "$STREAMS"
     SCANDIR="$BACKING/backing"
     echo "local backing=$BACKING ($(stat -f -c %T "$BACKING"))  size=${SIZE}MiB  streams=$STREAMS" ;;
-  nfs)
+  nfs|prefetch)
     NFS_EXP="${2:?need export dir}"; NETEM_MS="${3:?need netem ms/way}"; SIZE="${4:-96}"; STREAMS="${5:-16}"
     gen_corpus "$NFS_EXP/backing" "$SIZE" "$STREAMS"
     mkdir -p "$NFSMNT"
     systemctl start nfs-server 2>/dev/null || true
+    # Must happen BEFORE the mount: LOCALIO is negotiated at mount time.
+    if [ -w "$LOCALIO" ] && [ "$(cat "$LOCALIO")" != N ]; then
+      LOCALIO_SAVED="$(cat "$LOCALIO")"; echo N > "$LOCALIO"
+    fi
     exportfs -o rw,sync,no_subtree_check,insecure,no_root_squash localhost:"$NFS_EXP"
     mount -t nfs -o vers=4.2 localhost:"$NFS_EXP" "$NFSMNT"
     SCANDIR="$NFSMNT/backing"
-    echo "nfs export=$NFS_EXP ($(stat -f -c %T "$NFS_EXP"))  netem=${NETEM_MS}ms/way  size=${SIZE}MiB  streams=$STREAMS" ;;
+    echo "$MODE export=$NFS_EXP ($(stat -f -c %T "$NFS_EXP"))  netem=${NETEM_MS}ms/way  size=${SIZE}MiB  streams=$STREAMS  localio=$(cat "$LOCALIO" 2>/dev/null || echo n/a)" ;;
   window-cap)
     BACKING="${2:?need backing dir}"; SIZE="${3:-512}"; STREAMS="${4:-8}"
     gen_corpus "$BACKING/backing" "$SIZE" "$STREAMS"
@@ -138,7 +162,9 @@ mkdir -p "$MMNT"
 if [ "$MODE" != window-cap ]; then
   rm -f "$DB"; "$BIN" scan "$SCANDIR" --db "$DB" >/dev/null   # scan before adding netem
 fi
-if [ "$MODE" = nfs ]; then tc qdisc add dev lo root netem delay "${NETEM_MS}ms"; NETEM=1; fi
+if { [ "$MODE" = nfs ] || [ "$MODE" = prefetch ]; } && [ "$NETEM_MS" != 0 ]; then
+  tc qdisc add dev lo root netem delay "${NETEM_MS}ms"; NETEM=1
+fi
 
 # shellcheck disable=SC2016  # '$title' is a musefs output-template literal, not a shell var
 mount_mode() { local m="$1"; shift; "$BIN" mount "$MMNT" --db "$DB" --mode "$m" --template '$title' "$@" >/dev/null 2>&1 & MP=$!
@@ -164,7 +190,7 @@ cold_mbps() { local v; v="$(biggest)"; local o
 
 # The kernel/mount-knob sweeps below are the #256 investigation; window-cap (#433)
 # runs its own section instead — the cap is a daemon-internal const, not a knob.
-if [ "$MODE" != window-cap ]; then
+if [ "$MODE" = local ] || [ "$MODE" = nfs ]; then
 echo "## read_ahead_budget (cold single-stream MB/s; issue #255)"
 printf '%-24s %10s\n' config MBps
 # off (ra=0) vs the default Phase-1 read amplification (ra=64, prefetch off).
@@ -199,7 +225,47 @@ for kc in false true; do
   c=$(secs "$v"); r=$(secs "$v"); umount_m
   printf '%-16s %10s %10s\n' "$kc" "$c" "$r"
 done
-fi  # end non-window-cap sweeps
+fi  # end kernel-knob sweeps (local|nfs)
+
+if [ "$MODE" = prefetch ]; then
+  # Phase-2 A/B (#671). `MUSEFS_PREFETCH_BINS` is a "label=path" list so a
+  # pre-fix baseline binary and the working tree can be measured back to back on
+  # one corpus, one netem setting and one scan.
+  read -ra PF_BINS <<< "${MUSEFS_PREFETCH_BINS:-current=$BIN}"
+  for entry in "${PF_BINS[@]}"; do
+    [ -x "${entry#*=}" ] || { echo "not executable: ${entry#*=}" >&2; exit 1; }
+  done
+
+  echo "## prefetch (cold single-stream MB/s; higher is better)"
+  printf '%-12s %-12s %10s\n' build config MBps
+  for entry in "${PF_BINS[@]}"; do
+    BIN="${entry#*=}"
+    mount_m --read-ahead-budget-mib 0
+    printf '%-12s %-12s %10s\n' "${entry%%=*}" "off" "$(cold_mbps)"; umount_m
+    mount_m --read-ahead-budget-mib 64
+    printf '%-12s %-12s %10s\n' "${entry%%=*}" "phase1" "$(cold_mbps)"; umount_m
+    mount_m --read-ahead-budget-mib 64 --read-ahead-prefetch
+    printf '%-12s %-12s %10s\n' "${entry%%=*}" "phase1+2" "$(cold_mbps)"; umount_m
+  done
+
+  if [ "$STREAMS" -gt 0 ]; then
+    echo "## prefetch ($STREAMS concurrent cold streams, wall s; lower is better)"
+    printf '%-12s %-12s %10s\n' build config wall_s
+    for entry in "${PF_BINS[@]}"; do
+      BIN="${entry#*=}"
+      for cfg in phase1 phase1+2; do
+        if [ "$cfg" = phase1 ]; then mount_m --read-ahead-budget-mib 64
+        else mount_m --read-ahead-budget-mib 64 --read-ahead-prefetch; fi
+        mapfile -t files < <(find "$MMNT" -type f ! -path "$(biggest)")
+        drop; t0=$(date +%s.%N); pids=()
+        for f in "${files[@]:0:$STREAMS}"; do dd if="$f" of=/dev/null bs=1M 2>/dev/null & pids+=("$!"); done
+        wait "${pids[@]}"; t1=$(date +%s.%N); umount_m
+        printf '%-12s %-12s %10s\n' "${entry%%=*}" "$cfg" \
+          "$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f",b-a}')"
+      done
+    done
+  fi
+fi
 
 if [ "$MODE" = window-cap ]; then
   # Sweep the daemon-internal read-amplification window cap (WINDOW_ABS_CAP) on

@@ -849,6 +849,12 @@ on a btrfs HDD; NFS via a loopback **NFSv4.2** export plus `tc netem` for RTT. *
 is real FLAC** (`MUSEFS_BENCH_CORPUS_SRC`) — a `/dev/zero` corpus on a compressing fs
 (btrfs `compress=zstd`) collapses to a cached extent and never touches the platter, which
 silently inverts the HDD numbers; real already-compressed audio is incompressible.
+**Loopback NFS needs LOCALIO off on Linux 6.12+.** The client and server are the same host,
+so the kernel negotiates NFS LOCALIO and does local I/O instead of RPC — `tc netem` on `lo`
+then never touches the data path and every "NFS" row silently measures local disk. The tell is
+cold reads at GB/s while `ping 127.0.0.1` shows the injected RTT. The bench now writes `N` to
+`/sys/module/nfs/parameters/localio_enabled` before mounting (restored on exit) and prints
+`localio=` in its header line; numbers taken on an older kernel predate the feature.
 **In-process** (`musefs-core/tests/bench_ingest.rs::bench_read_under_latency`): the core read
 path over `musefs-latencyfs` (per-op injected latency), isolating the daemon from the kernel
 FUSE layer. `off` = `--read-ahead-budget-mib 0`; `phase1` = the default (amplification only);
@@ -892,6 +898,85 @@ hypothetical backends where one large read does not self-pipeline.
 
 **Defaults:** read-ahead on at `--read-ahead-budget-mib 64`, Phase-1 amplification only. Set
 `0` to disable on local-disk-only setups (no benefit there, though no harm either).
+
+### Phase 2 was also amplifying, not just overhead (#671)
+
+The "~10 % overhead" above understated it. Two defects, both reachable only with
+`--read-ahead-prefetch`, turned the prefetcher into read amplification:
+
+1. **Eviction dropped the window the reader was inside.** The ring trimmed to the first
+   window lying fully *behind* the read frontier and fell back to index 0 — the lowest
+   start, which is the window serving the reader — when nothing was fully consumed yet.
+   `next_expected` is the end of the last served *read*, not of the window it came from, so
+   a 512 KiB window serving 128 KiB reads is never fully behind until the reader has
+   consumed all of it. Every completed prefetch therefore evicted the window in use.
+2. **A legitimate watermark overshoot was read as a seek.** A dispatch stops at the first
+   window boundary at or past the horizon, so `prefetched_upto` normally sits *beyond* it.
+   `plan_prefetch` treated that as a backward seek and re-dispatched the whole horizon from
+   the reader's position on the very next read.
+
+Defect 2 was masked by defect 1 (the ring never held the windows that trigger it), so
+fixing the eviction order alone made real-mount prefetch **worse**: 9.9× the backing bytes.
+Both are fixed together.
+
+**Measured, in-process over `musefs-latencyfs`** (32 MiB FLAC, whole-file read in 128 KiB
+chunks, `--read-ahead-budget-mib 64`; serve-path backing bytes, i.e. foreground refills):
+
+| profile | phase 1 | phase 1+2 before | phase 1+2 after |
+|--------:|--------:|-----------------:|----------------:|
+| ssd (80 µs/op) | 33.6 MB / 8 fills | 34.5 MB / 7 | 39.7 MB / 8 |
+| nfs-ssd (600 µs/op) | 33.6 MB / 8 | **230.0 MB / 31** | 37.6 MB / 8 |
+| nfs-hdd (8.6 ms/op) | 33.6 MB / 8 | **240.1 MB / 38** | 37.6 MB / 8 |
+
+**Measured on a real kernel mount** (866 MiB FLAC from a real 4290-track library, daemon
+bytes from `/proc/<pid>/io` so the prefetch threads are counted):
+
+| build | daemon bytes read | amplification |
+|------:|------------------:|--------------:|
+| before | 873 MiB | 1.01× |
+| eviction fix only | 8543 MiB | 9.9× |
+| both fixes | 874 MiB | 1.01× |
+
+A synthetic drive loop over the real `ReadAhead` (400 sequential 128 KiB reads, 256 MiB
+backing, 8 MiB cap) puts a number on the eviction defect alone: 398 of 400 reads missed and
+refilled synchronously, 3159 MiB read for 50 MiB asked. After the fix: 1 miss, 0.5 MiB.
+
+**Measured on a real NFS mount** (loopback NFSv4.2, `tc netem` 100 ms/way = 200 ms RTT,
+LOCALIO disabled, real FLAC corpus, cold each sample, median of 3 —
+`benches/storage_tunables_bench.sh prefetch`):
+
+| build | off | phase 1 | phase 1+2 |
+|------:|----:|--------:|----------:|
+| before | 1.4 MB/s | 6.1 | 6.9 |
+| after | 1.4 MB/s | 6.3 | **8.2** |
+
+| 4 concurrent cold streams | phase 1 | phase 1+2 |
+|--------------------------:|--------:|----------:|
+| before | 17.46 s | 18.87 s |
+| after | 17.25 s | **16.44 s** |
+
+This changes the Phase-2 story on high-RTT backends. The earlier finding that the threads cost
+a consistent ~10 % was measuring the amplification: with it fixed, prefetch is a **~30 %
+single-stream win** at 200 ms RTT (6.3 → 8.2 MB/s) and a ~5 % win on four concurrent streams,
+where before it was a regression on both.
+
+Phase 2 nevertheless stays **off by default** for now. The win is one backend and one run, and
+the other harnesses still show it doing redundant work: over `musefs-latencyfs` and on a
+local-disk kernel mount it reads the stream a second time speculatively (≈2× total backing
+bytes) for wall time within noise of Phase 1 alone. Enable it on a high-latency network
+backend, where the overlap it buys has something to hide.
+`musefs_readahead_prefetch_reads_total` / `_bytes_total` report that speculative volume, which
+is what made the defect measurable — the serve-path `musefs_backing_pread_*` counters never saw
+the prefetch threads.
+
+Reproduce (needs root for `exportfs`/`mount`/`tc`/`drop_caches`; build a binary from before the
+fix to fill the "before" rows):
+
+```sh
+MUSEFS_BENCH_CORPUS_SRC=<music-tree> MUSEFS_BENCH_CORPUS_MAX_MIB=60 \
+MUSEFS_PREFETCH_BINS="baseline=<old-musefs> fixed=<new-musefs>" \
+  benches/storage_tunables_bench.sh prefetch <export-dir> 100 96 4
+```
 
 ### Internal window cap on HDD (#433)
 

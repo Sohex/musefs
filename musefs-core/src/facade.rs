@@ -47,7 +47,8 @@ pub struct MountConfig {
     pub read_ahead_budget: u64,
     /// Enable Phase-2 background prefetch threads. Off by default: Phase-1 read
     /// amplification carries the entire measured read-ahead win (#255); the
-    /// prefetch threads add overhead without benefit on the backends tested.
+    /// prefetch threads then re-read the stream speculatively for no measured
+    /// gain on the backends tested (#671).
     pub read_ahead_prefetch: bool,
     /// Drop a track from the mount when a top-level template field is unresolved,
     /// instead of substituting `default_fallback`. Per-field fallback chains and

@@ -228,8 +228,16 @@ fn bench_read_under_latency() {
     }
 
     let mut params = CorpusParams::from_env();
-    params.format_mix = vec![common::corpus::Format::Ogg];
+    // Ogg by default (its patched-in-place pages are the hardest serve path),
+    // but honour an explicit MUSEFS_BENCH_FORMAT_MIX: backing reads for Ogg are
+    // deliberately NON-contiguous (the serve path skips the page headers it
+    // rewrites), so a read-ahead/prefetch sweep needs a contiguous-backing
+    // format such as FLAC to exercise the sequential path at all (#671).
+    if std::env::var_os("MUSEFS_BENCH_FORMAT_MIX").is_none() {
+        params.format_mix = vec![common::corpus::Format::Ogg];
+    }
     params.tracks_per_album = params.tracks_per_album.max(1);
+    let format = format_token(params.format_mix[0]).to_string();
 
     println!("\n{}", RunReport::header());
     // Each row rebuilds a fresh mount + scan so the read is genuinely cold (no
@@ -241,7 +249,7 @@ fn bench_read_under_latency() {
         let db = Db::open_in_memory().unwrap();
         scan_directory_with(&db, &mount.path(), &ScanOptions::default()).unwrap();
         let fs = Musefs::open(db, cfg()).unwrap();
-        let inode = first_inode(&fs, VirtualTree::ROOT).expect("an ogg inode");
+        let inode = first_inode(&fs, VirtualTree::ROOT).expect("a track inode");
         let size = fs.getattr(inode).unwrap().size;
         // Read through a real handle: `None` would take the fallback path (a
         // fresh disabled-pool reader), bypassing the per-handle read-ahead this
@@ -266,11 +274,22 @@ fn bench_read_under_latency() {
         let ms = t0.elapsed().as_millis();
         let s = metrics::snapshot();
         fs.release_handle(fh);
+        // Phase-2 prefetch workers are detached: dropping `Musefs` closes the job
+        // channel but does not join them, so a worker can still be mid-`pread`
+        // through the latency mount. Letting the mount unmount underneath it
+        // wedges the process — the in-flight FUSE op never completes and its
+        // thread parks in uninterruptible sleep, taking the whole run with it.
+        // Drop the filesystem first, then give the workers a moment to drain
+        // before `mount` goes out of scope at the end of this iteration. Best
+        // effort — there is no handle to join — so allow more than the slowest
+        // profile's window fill (8 MiB at 8.6 ms per 128 KiB FUSE op).
+        drop(fs);
+        std::thread::sleep(std::time::Duration::from_secs(1));
         println!(
             "{}",
             RunReport {
                 label: label.into(),
-                format: "ogg".into(),
+                format: format.clone(),
                 tier: tier.clone(),
                 storage: format!(
                     "{profile}/ra{ra_mib}/pf{}",
@@ -284,6 +303,14 @@ fn bench_read_under_latency() {
                 peak_rss_kib: None,
             }
             .row()
+        );
+        // Not RunReport columns (that layout is shared with the scan benches),
+        // but the decisive signal for a read-ahead sweep: a sequential stream
+        // that keeps missing is refilling windows it should have been served
+        // from (#671).
+        println!(
+            "  read_ahead: hits={} misses={} fills={} prefetch_reads={} prefetch_bytes={}",
+            s.readahead_hits, s.readahead_misses, s.preads, s.prefetch_reads, s.prefetch_bytes
         );
     }
 }

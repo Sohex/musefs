@@ -401,6 +401,18 @@ pub fn render_prometheus(
         );
         counter(
             &mut out,
+            "musefs_readahead_prefetch_reads_total",
+            "Positioned backing reads issued by Phase-2 prefetch workers.",
+            s.prefetch_reads,
+        );
+        counter(
+            &mut out,
+            "musefs_readahead_prefetch_bytes_total",
+            "Backing bytes read speculatively by Phase-2 prefetch workers.",
+            s.prefetch_bytes,
+        );
+        counter(
+            &mut out,
             "musefs_readahead_hits_total",
             "Reads served wholly from a read-ahead buffer (no backing pread).",
             s.readahead_hits,

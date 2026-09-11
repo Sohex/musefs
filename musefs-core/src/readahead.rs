@@ -291,19 +291,52 @@ impl ReadAhead {
             }
         }
         while self.windows.len() > self.max_windows {
-            let frontier = self.next_expected;
-            // Sorted by `start`, so the first window lying fully behind the read
-            // frontier is also the lowest-start such window — the victim the
-            // previous min-by-start scan picked. Fall back to the oldest (index
-            // 0) when nothing is fully consumed yet.
-            let idx = self
-                .windows
-                .iter()
-                .position(|w| w.start + w.bytes.len() as u64 <= frontier)
-                .unwrap_or(0);
+            let idx = self.evict_victim();
             self.cached_bytes -= self.windows[idx].bytes.len() as u64;
             self.windows.remove(idx);
         }
+    }
+
+    /// Pick the window to drop when the ring is over `max_windows`. Never the
+    /// window the reader is currently inside (#671): `next_expected` is the end
+    /// of the last *served read*, not the end of the window that served it, so a
+    /// window only becomes "fully behind" once the reader has consumed all of
+    /// it. Falling back to index 0 (the lowest start) therefore evicted exactly
+    /// the window serving the frontier whenever the ring saturated, and every
+    /// subsequent read missed and refilled it synchronously.
+    ///
+    /// Preference order: a window already fully consumed, then the
+    /// furthest-future window the reader is not inside — the most speculative
+    /// bytes resident, and the cheapest to re-dispatch because prefetch is still
+    /// running ahead of the reader.
+    fn evict_victim(&self) -> usize {
+        let frontier = self.next_expected;
+        // Sorted by `start`, so the first window lying fully behind the read
+        // frontier is also the lowest-start such window — the victim the
+        // previous min-by-start scan picked.
+        if let Some(i) = self
+            .windows
+            .iter()
+            .position(|w| w.start + w.bytes.len() as u64 <= frontier)
+        {
+            return i;
+        }
+        // Nothing consumed yet: drop from the far end instead. Every remaining
+        // window either contains the frontier or starts strictly ahead of it —
+        // one that started behind and ended before it would have been fully
+        // consumed, which the branch above already took — so `start > frontier`
+        // is exactly "the reader is not inside this one", and scanning down from
+        // the highest start finds the furthest-future such window.
+        if let Some(i) = self.windows.iter().rposition(|w| w.start > frontier) {
+            return i;
+        }
+        // Every window covers the frontier (overlapping refills after a seek).
+        // Keep the one reaching furthest forward; drop the shortest reach.
+        self.windows
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, w)| w.start + w.bytes.len() as u64)
+            .map_or(0, |(i, _)| i)
     }
 
     pub fn store_window(&mut self, start: u64, bytes: Vec<u8>) -> (u64, u64) {
@@ -354,11 +387,16 @@ impl ReadAhead {
         let mut buf = vec![0u8; want as usize];
         fill(&mut buf, off)?;
         dst.copy_from_slice(&buf[..len]);
+        // Advance the frontier BEFORE inserting (#671): the insert may trim the
+        // ring, and the trim must see where the reader now is. A stale frontier
+        // still points into the window this read seeked away FROM, so the freshly
+        // filled window — the one serving this very read — looks like the most
+        // speculative thing in the ring and gets dropped immediately.
+        self.next_expected = off + len as u64;
         self.insert_window(Window {
             start: off,
             bytes: buf,
         });
-        self.next_expected = off + len as u64;
         Ok((old, self.len()))
     }
 }
@@ -445,9 +483,15 @@ pub fn plan_prefetch(
         .saturating_add(depth.saturating_mul(window))
         .min(backing_len);
     let mut s = prefetched_upto;
-    // Outside [start, horizon] means a seek (reader moved before the watermark)
-    // or the watermark ran past the horizon: dispatch from the current position.
-    if !(start..=horizon).contains(&s) {
+    // A dispatch stops at the first window boundary at or past the horizon, so
+    // the watermark legitimately sits up to one window BEYOND it. Treating that
+    // overshoot as a seek (the old `s > horizon` reset) re-dispatched the whole
+    // horizon from the reader's position on the very next read, re-reading
+    // windows already in flight — ~2.5 windows of speculative backing I/O per
+    // served read once the adaptive window outgrew the read size (#671). Only a
+    // watermark the reader has passed, or one further than a full window beyond
+    // the horizon (a genuine backward seek), restarts dispatch.
+    if !(start..horizon.saturating_add(window)).contains(&s) {
         s = start;
     }
     let mut starts = Vec::new();
@@ -528,6 +572,7 @@ impl PrefetchWorkers {
         if ctx.file.read_exact_at(&mut bytes, job.start).is_err() {
             return;
         }
+        crate::metrics::on_prefetch_read(want);
         let _ = try_store_prefetch(
             &ctx.pool,
             &ctx.buf,
@@ -1052,6 +1097,43 @@ mod ring_tests {
         assert_eq!(w2, 6 * win);
     }
 
+    /// Regression (#671): a dispatch stops at the first window boundary at or
+    /// past the horizon, so the watermark normally ends up BEYOND it. The old
+    /// reset condition read that overshoot as a seek and re-dispatched the whole
+    /// horizon from the reader's position on the next read, so a stream whose
+    /// adaptive window had outgrown the read size re-read the file several times
+    /// over. Drives a sequential reader end to end and asserts each window is
+    /// dispatched at most once.
+    #[test]
+    fn plan_prefetch_overshoot_is_not_a_seek() {
+        let win = 1024 * 1024;
+        let cap = WINDOW_ABS_CAP;
+        let depth = prefetch_depth(cap, win);
+        let blen = 64 * 1024 * 1024;
+        let read = 256 * 1024; // the FUSE read size: smaller than the window
+        let mut upto = 0;
+        let mut seen = std::collections::HashMap::new();
+        let mut off = read;
+        while off < blen {
+            let (starts, w) = plan_prefetch(upto, off, win, depth, blen);
+            upto = w;
+            for s in starts {
+                *seen.entry(s).or_insert(0u32) += 1;
+            }
+            off += read;
+        }
+        let repeats: Vec<_> = seen.iter().filter(|&(_, &n)| n > 1).collect();
+        assert!(
+            repeats.is_empty(),
+            "sequential dispatch must not re-request windows: {repeats:?}"
+        );
+        let dispatched = seen.len() as u64 * win;
+        assert!(
+            dispatched <= blen + depth * win,
+            "dispatched {dispatched} bytes for a {blen}-byte file"
+        );
+    }
+
     #[test]
     fn plan_prefetch_seek_resets_watermark() {
         let win = WINDOW_FLOOR;
@@ -1071,6 +1153,75 @@ mod ring_tests {
         let (s, w) = plan_prefetch(0, win, win, 4, blen);
         assert!(s.iter().all(|&x| x < blen), "no job starts past EOF");
         assert!(w <= blen, "watermark clamped to EOF");
+    }
+
+    /// Regression (#671): with the ring saturated by Phase-2 prefetch, a
+    /// sequential reader must keep hitting the window it is *inside*. The ring
+    /// trim used to fall back to index 0 — the lowest start, i.e. the window
+    /// serving the frontier — whenever nothing was fully consumed yet, so every
+    /// completed prefetch evicted the reader's own window. The reader then
+    /// missed, refilled synchronously at the (still doubling) window size, and
+    /// read ~63x the bytes the client asked for.
+    ///
+    /// Drives the real `ReadAhead` with the real `prefetch_depth` /
+    /// `plan_prefetch` / `set_max_windows` bookkeeping that `BackingReader` and
+    /// `serve_backing` perform, storing each planned window synchronously in
+    /// place of the worker threads. Asserts the *fill count over the whole
+    /// drive loop*, which is what the bug moved; asserting the victim index of
+    /// one `insert_window` call would not have caught it.
+    #[test]
+    fn saturated_ring_keeps_the_window_the_reader_is_reading() {
+        let cap = WINDOW_ABS_CAP;
+        let backing_len = 256 * 1024 * 1024;
+        let read_len = 128 * 1024usize;
+        let reads = 400u32;
+
+        let mut ra = ReadAhead::new(cap);
+        let mut dst = vec![0u8; read_len];
+        let mut fills = 0u64;
+        let mut sync_bytes = 0u64;
+        let mut prefetched_upto = 0u64;
+        let mut off = 0u64;
+
+        for _ in 0..reads {
+            ra.read_into(&mut dst, off, backing_len, |b, _| {
+                fills += 1;
+                sync_bytes += b.len() as u64;
+                b.fill(7);
+                Ok(())
+            })
+            .unwrap();
+            // Mirrors BackingReader::read_exact_at's prefetch-planning tail.
+            let window = ra.window();
+            let depth = prefetch_depth(cap, window);
+            ra.set_max_windows(usize::try_from(depth).unwrap() + 1);
+            let (starts, upto) = plan_prefetch(
+                prefetched_upto,
+                ra.next_expected(),
+                window,
+                depth,
+                backing_len,
+            );
+            prefetched_upto = upto;
+            for s in starts {
+                let want = window.min(backing_len - s);
+                #[expect(clippy::cast_possible_truncation)]
+                ra.store_window(s, vec![0u8; want as usize]);
+            }
+            off += read_len as u64;
+        }
+
+        let asked = u64::from(reads) * read_len as u64;
+        assert!(
+            fills <= 8,
+            "sequential reads must be served from the ring, not refilled: \
+             {fills} foreground fills over {reads} reads"
+        );
+        assert!(
+            sync_bytes <= asked,
+            "foreground read amplification: {sync_bytes} bytes synchronously \
+             read for {asked} bytes asked"
+        );
     }
 
     #[test]
@@ -1785,6 +1936,51 @@ mod mutation_guard_tests {
         assert!(!ra.covers(0, 10), "fully-behind window evicted");
         assert!(ra.covers(1000, 10), "nearer behind window kept");
         assert!(ra.covers(2000, 10), "just-stored ahead window kept");
+    }
+
+    /// A window starting exactly AT the frontier is the next thing the reader
+    /// needs, not speculation: the victim search must exclude it (`start >
+    /// frontier`, not `>=`). Here it is also the highest-start window, which is
+    /// where the two differ — otherwise a window further ahead absorbs the
+    /// eviction and both behave alike.
+    #[test]
+    fn ring_trim_keeps_the_window_starting_at_the_frontier() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.set_max_windows(2);
+        ra.store_window(0, vec![0u8; 1500]); // [0, 1500)
+        let mut dst = vec![0u8; 10];
+        ra.read_into(&mut dst, 990, 1 << 20, fillb).unwrap(); // hit → frontier 1000
+        ra.store_window(1000, vec![0u8; 1000]); // [1000, 2000), starts at the frontier
+        // Trim to one: neither window is fully consumed, and none starts ahead of
+        // the frontier, so the shortest-reaching one goes and the reader keeps
+        // the bytes it is about to ask for.
+        ra.set_max_windows(1);
+        ra.store_window(1000, vec![0u8; 1000]);
+        assert!(
+            ra.covers(1900, 10),
+            "the window the reader is about to enter must survive"
+        );
+    }
+
+    /// The degenerate eviction case: a refill after a backward seek can leave
+    /// overlapping windows that ALL contain the read frontier, so neither
+    /// "fully consumed" nor "not the window the reader is in" picks a victim.
+    /// The window reaching furthest forward is the one worth keeping.
+    #[test]
+    fn ring_trim_keeps_the_furthest_reaching_window_when_all_cover_the_reader() {
+        let mut ra = ReadAhead::new(WINDOW_ABS_CAP);
+        ra.set_max_windows(3);
+        ra.store_window(0, vec![0u8; 4000]); // [0, 4000)
+        ra.store_window(1000, vec![0u8; 1000]); // [1000, 2000) — shortest reach
+        ra.store_window(1200, vec![0u8; 2000]); // [1200, 3200)
+        let mut dst = vec![0u8; 10];
+        ra.read_into(&mut dst, 1490, 1 << 20, fillb).unwrap(); // hit → frontier 1500
+        // Every window contains 1500. Trimming to one must leave [0, 4000): it
+        // covers the most of what the reader has yet to read.
+        ra.set_max_windows(1);
+        ra.store_window(0, vec![0u8; 4000]);
+        assert_eq!(ra.len(), 4000, "exactly one window survives");
+        assert!(ra.covers(3990, 10), "the furthest-reaching window is kept");
     }
 
     #[test]

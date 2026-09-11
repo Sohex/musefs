@@ -128,8 +128,9 @@ pub struct MountArgs {
     #[arg(long, env = "MUSEFS_READ_AHEAD_BUDGET_MIB", default_value_t = 64)]
     pub read_ahead_budget_mib: u32,
     /// Enable Phase-2 background prefetch threads (advanced). Off by default:
-    /// read amplification alone carries the read-ahead win; the threads add
-    /// overhead without benefit on tested backends (NFS, SSD). See the benchmarks docs: https://sohex.github.io/musefs/benchmarks.html
+    /// read amplification alone carries the read-ahead win, and the threads then
+    /// read the stream a second time speculatively for no measured gain on
+    /// tested backends (NFS, SSD). See the benchmarks docs: https://sohex.github.io/musefs/benchmarks.html
     #[arg(long, env = "MUSEFS_READ_AHEAD_PREFETCH", value_parser = clap::builder::BoolishValueParser::new())]
     pub read_ahead_prefetch: bool,
     /// Max outstanding background (readahead/async) requests the kernel queues.
