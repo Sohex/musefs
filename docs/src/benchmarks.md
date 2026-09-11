@@ -838,8 +838,10 @@ served one ≤256 KiB FUSE chunk at a time, each paying the full backing RTT, so
 The fix is **read amplification in the daemon** — `BackingReader` coalesces a stream's
 small reads into one large positioned `pread` (geometric window growth, global RAM budget
 with LRU eviction), so the backing client can pipeline/parallelize the RPCs behind one
-syscall. A background-prefetch-threads layer ("Phase 2") was also built but is **off by
-default** (see below).
+syscall. A background-prefetch-threads layer ("Phase 2") was also built and is **off by
+default** — originally because it measured as pure overhead, which
+[#671](#phase-2-was-also-amplifying-not-just-overhead-671) later showed was a bug in the
+prefetcher rather than a property of the design.
 
 ### Methodology
 
@@ -889,6 +891,12 @@ Amplification collapses 774 backing round-trips to 32; the win scales with per-o
 is already material at SSD speeds (1.7×).
 
 ### Phase 2 is off by default
+
+> **Superseded in part by [#671](#phase-2-was-also-amplifying-not-just-overhead-671).** The
+> numbers below stand as measured, but the cause attributed to them does not: the prefetcher
+> was evicting the window the reader was inside and re-dispatching windows already in flight.
+> With that fixed, Phase 2 is a ~30 % single-stream win at 200 ms RTT rather than a ~10 % loss.
+> It remains off by default; see that section for when to turn it on.
 
 Background prefetch threads (Phase 2) **never beat amplification alone** and cost a consistent
 ~10 %: single-stream NFS 6.8 vs 7.4, concurrent NFS 12.1 vs 13.6, neutral on HDD. A single large

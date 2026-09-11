@@ -46,9 +46,11 @@ pub struct MountConfig {
     /// Global read-ahead RAM envelope in bytes. `0` disables read-ahead.
     pub read_ahead_budget: u64,
     /// Enable Phase-2 background prefetch threads. Off by default: Phase-1 read
-    /// amplification carries the entire measured read-ahead win (#255); the
-    /// prefetch threads then re-read the stream speculatively for no measured
-    /// gain on the backends tested (#671).
+    /// amplification carries the read-ahead win on local and low-latency backing,
+    /// where the threads only re-read the stream speculatively (#255). They pay
+    /// for themselves once per-read latency is high enough for the overlap to
+    /// hide something — ~30% on a 200 ms-RTT NFS mount, measured after the
+    /// prefetch amplification bug was fixed (#671).
     pub read_ahead_prefetch: bool,
     /// Drop a track from the mount when a top-level template field is unresolved,
     /// instead of substituting `default_fallback`. Per-field fallback chains and
