@@ -265,6 +265,168 @@ pub fn write_ogg(path: &Path, audio: &[u8]) -> (u64, u64) {
     (header_len as u64, (bytes.len() - header_len) as u64)
 }
 
+/// The payload size of one audio page in [`write_ogg_vorbis`]. Real libvorbis
+/// output averages ~1 890 B per page; the number is load-bearing because the
+/// algebraic CRC patch advances across `5 + seg_count + payload_len` zero bytes
+/// per served page, so page size *is* the per-page serve cost (#666).
+pub const VORBIS_PAGE_PAYLOAD: usize = 1890;
+
+/// Lace `packets` into one run of Ogg pages, packing as many packets per page as
+/// the 255-value segment table holds. Returns (bytes, pages_used).
+///
+/// `lace_packet` gives every packet a page of its own. A real Vorbis encoder
+/// instead packs the comment and setup headers together, and that difference is
+/// the whole point of this helper: `musefs` re-lays each header packet onto its
+/// own page, so a file packed this way has a *shorter* header than the file
+/// musefs serves and every audio page is renumbered. Opus cannot show this —
+/// RFC 7845 requires one header packet per page, so an Opus fixture's sequence
+/// numbers survive synthesis untouched and its `crc32(DELTA)` is always zero.
+fn pack_packets(serial: u32, seq_start: u32, bos: bool, packets: &[&[u8]]) -> (Vec<u8>, u32) {
+    // One lacing table across the whole run, plus a flag per value marking where
+    // a packet begins — that is what decides a continuation page's FLAG_CONTINUED.
+    let mut table: Vec<u8> = Vec::new();
+    let mut starts: Vec<bool> = Vec::new();
+    let mut payload: Vec<u8> = Vec::new();
+    for pkt in packets {
+        starts.push(true);
+        let full = pkt.len() / 255;
+        table.resize(table.len() + full, 255u8);
+        starts.resize(starts.len() + full, false);
+        table.push(u8::try_from(pkt.len() % 255).expect("x % 255 < 256"));
+        payload.extend_from_slice(pkt);
+    }
+
+    let mut out = Vec::new();
+    let mut seq = seq_start;
+    let (mut lace_pos, mut payload_pos) = (0usize, 0usize);
+    let mut first = true;
+    while first || lace_pos < table.len() {
+        let chunk = (table.len() - lace_pos).min(255);
+        let laces = &table[lace_pos..lace_pos + chunk];
+        let page_payload: usize = laces.iter().map(|&b| b as usize).sum();
+
+        let mut header_type = 0u8;
+        if bos && first {
+            header_type |= 0x02; // BOS
+        }
+        if !starts.get(lace_pos).copied().unwrap_or(true) {
+            header_type |= 0x01; // continued packet
+        }
+
+        let page_start = out.len();
+        out.extend_from_slice(b"OggS");
+        out.push(0); // stream structure version
+        out.push(header_type);
+        out.extend_from_slice(&0u64.to_le_bytes()); // granule: header pages carry 0
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // CRC, stamped below
+        out.push(u8::try_from(chunk).expect("chunk is .min(255) so fits in u8"));
+        out.extend_from_slice(laces);
+        out.extend_from_slice(&payload[payload_pos..payload_pos + page_payload]);
+
+        // Re-stamping the sequence number the page already carries leaves the page
+        // unchanged apart from the CRC, which `patch_page_header` recomputes.
+        let patched = musefs_format::ogg::patch_page_header(&out[page_start..], seq).unwrap();
+        out[page_start..page_start + patched.len()].copy_from_slice(&patched);
+
+        lace_pos += chunk;
+        payload_pos += page_payload;
+        seq = seq.wrapping_add(1);
+        first = false;
+    }
+    (out, seq.wrapping_sub(seq_start))
+}
+
+/// Write an Ogg **Vorbis** file with the page geometry a real encoder produces:
+/// the identification header alone on the BOS page, the comment and setup
+/// headers packed onto the page after it, then audio laced into
+/// [`VORBIS_PAGE_PAYLOAD`]-sized pages. Returns (audio_offset, audio_length),
+/// where audio_length is the page span.
+///
+/// Neither property is reachable through [`write_ogg`], and both decide what the
+/// Ogg serve path actually costs:
+///
+/// * **Renumbering.** Synthesis gives each of the three header packets its own
+///   page, so the served header is longer than the original one and every audio
+///   page's sequence number shifts. That non-zero delta is what makes
+///   `patch_page_header_algebraic` do work at all.
+/// * **Page size.** `write_ogg` laces the whole track as a single packet, so
+///   every page is max-size — a regime where the per-page CRC advance is
+///   amortized over 65 025 payload bytes instead of ~1 890.
+///
+/// `picture`, when given, is a FLAC PICTURE block body (see
+/// [`picture_block_body`]) carried as a base64 `METADATA_BLOCK_PICTURE` comment.
+pub fn write_ogg_vorbis(
+    path: &Path,
+    comments: &[&str],
+    picture: Option<&[u8]>,
+    audio: &[u8],
+) -> (u64, u64) {
+    use base64::Engine as _;
+    use musefs_format::ogg::page_test_support::lace_packet_pub;
+    let serial = 0x7662_7273; // "vbrs"
+
+    // Identification header (Vorbis I §4.2.1): 2 channels at 44 100 Hz, 192 kbps
+    // nominal, 256/2048 block sizes, framing bit set. musefs carries the packet
+    // through verbatim, so only its length reaches the page geometry — but a
+    // fixture that claims to be encoder-realistic should be a valid packet, and
+    // the spec's field list is what fixes the length at 30 bytes.
+    let mut id = b"\x01vorbis".to_vec();
+    id.extend_from_slice(&0u32.to_le_bytes()); // vorbis_version
+    id.push(2); // audio_channels
+    id.extend_from_slice(&44_100u32.to_le_bytes()); // audio_sample_rate
+    id.extend_from_slice(&0u32.to_le_bytes()); // bitrate_maximum
+    id.extend_from_slice(&192_000u32.to_le_bytes()); // bitrate_nominal
+    id.extend_from_slice(&0u32.to_le_bytes()); // bitrate_minimum
+    id.push(0xb8); // blocksize_0 = 2^8, blocksize_1 = 2^11
+    id.push(1); // framing flag
+    assert_eq!(id.len(), 30, "Vorbis identification header is 30 bytes");
+    let mbp = picture.map(|p| {
+        format!(
+            "METADATA_BLOCK_PICTURE={}",
+            base64::engine::general_purpose::STANDARD.encode(p)
+        )
+    });
+    let mut all: Vec<&str> = comments.to_vec();
+    if let Some(m) = &mbp {
+        all.push(m);
+    }
+    let mut comment = b"\x03vorbis".to_vec();
+    comment.extend_from_slice(&vorbis_comment_body("Xiph.Org libVorbis I 20200704", &all));
+    comment.push(1); // Vorbis framing bit
+    // Stand-in for the codebook setup header: opaque to musefs (carried verbatim),
+    // sized like a real one so it shares the comment's page the way libvorbis packs it.
+    let mut setup = b"\x05vorbis".to_vec();
+    setup.extend((0..4096u32).map(|i| u8::try_from(i % 251).unwrap()));
+
+    // The identification header must own the BOS page (Vorbis I §4.2.1); the
+    // comment and setup headers share the pages after it, which is the packing
+    // musefs does not reproduce.
+    let (mut bytes, id_pages) = pack_packets(serial, 0, true, &[&id]);
+    let (rest, rest_pages) = pack_packets(serial, id_pages, false, &[&comment, &setup]);
+    bytes.extend_from_slice(&rest);
+    let header_pages = id_pages + rest_pages;
+    let header_len = bytes.len();
+
+    // `chunks` yields nothing for empty audio; emit one empty page instead so the
+    // file still has an audio region (the rule `lace_packet` follows internally).
+    let pages: Vec<&[u8]> = if audio.is_empty() {
+        vec![&[]]
+    } else {
+        audio.chunks(VORBIS_PAGE_PAYLOAD).collect()
+    };
+    let mut seq = header_pages;
+    for (i, chunk) in pages.iter().enumerate() {
+        let granule = (i as u64 + 1) * 1024;
+        let (page, used) = lace_packet_pub(serial, seq, false, granule, chunk);
+        bytes.extend_from_slice(&page);
+        seq += used;
+    }
+    std::fs::write(path, &bytes).unwrap();
+    (header_len as u64, (bytes.len() - header_len) as u64)
+}
+
 /// A FLAC PICTURE block body (type 3 = front cover, image/png) carrying `data`.
 /// The identical bytes serve three fixtures: a native FLAC PICTURE block, the
 /// base64 payload of an Opus/Vorbis `METADATA_BLOCK_PICTURE` comment, and an

@@ -409,13 +409,14 @@ segments without reaching the backing file. Near-equal whole/seek wall time
 indicates per-file open+resolve latency dominates under nfs-hdd; the local
 cold/seek benches above are the clean signal.
 
-#### Why `crc_shift_zeros` is a hybrid
+#### Why `crc_shift_zeros` shipped as a hybrid (superseded by [#666](#666--precomputed-crc-matrix-powers))
 
 `patch_page_header_algebraic` advances the CRC past a page's payload via
 `crc_shift_zeros`. The per-step loop is O(n) and dominated linear `sequential_read`
-on max-size 65 KB pages; a GF(2) matrix-power method is O(log n) but carries a
-fixed ~32-matmul cost, so it is *slower* for the small pages real Opus/Vorbis
-streams carry. The evolution across implementations (ogg benches):
+on max-size 65 KB pages; the GF(2) matrix-power method as SP4 wrote it is O(log n)
+but rebuilt and re-squared the base matrix on every call, so it was *slower* for the
+small pages real Opus/Vorbis streams carry. The evolution across implementations
+(ogg benches):
 
 | ogg bench | linear crc | +matrix | +matrix +memo-amortized guard (shipped) |
 |-----------|-----------:|--------:|----------------------------------------:|
@@ -423,8 +424,10 @@ streams carry. The evolution across implementations (ogg benches):
 | cold_first_read | ~17 ms  | 7.42 ms | **1.61 ms** |
 | seek_read       | —       | 821 µs  | **829 µs**  |
 
-Shipped as a hybrid: per-step loop below n=16384, matrix at/above; a differential
-test covers both paths + the boundary.
+SP4 shipped the hybrid: per-step loop below n=16384, matrix at/above, with a
+differential test over both paths and the boundary. [#666](#666--precomputed-crc-matrix-powers)
+later removed the threshold by hoisting the squarings into a `const`, which makes
+the matrix win at every n.
 
 ```bash
 cargo bench -p musefs-core --bench read_throughput -- cold_first_read seek_read sequential_read
@@ -1000,3 +1003,79 @@ FUSE mount. Default thread count (`jobs: 0`). 3 runs each, median reported.
 +8.6% (+95 µs/file), well within the plan's ≤15% threshold. The RAM bench's +129% (+303 µs/file) was
 an artefact of RAM eliminating the I/O that would normally dwarf the extra SHA-256 hash and DB write.
 At real SSD rates the fingerprint cost is operationally negligible.
+
+---
+
+## #666 — Precomputed CRC matrix powers
+
+**Box:** not the reference 8-core machine of [Methodology](#methodology) — a
+16-core/32-thread desktop, rustc 1.97, release. Before/after run back to back on
+that one box, so the deltas are internally comparable; the absolutes are not
+comparable with the per-pass sections above.
+
+**What changed:** `crc_shift_zeros` (`musefs-format/src/ogg/crc.rs`) dropped its
+`MATRIX_THRESHOLD` hybrid. The power-of-two GF(2) transition matrices are now a
+compile-time `const`, so a shift by `n` costs `n.count_ones()` matrix applies at
+every `n` — no per-byte loop below the threshold and no per-call re-squaring above
+it.
+
+### The function itself (standalone harness, 20 000 calls per point)
+
+| `n` (trailing zero bytes) | before | after | speedup |
+|---|---:|---:|---:|
+| 255 | 327 ns | 49 ns | 7× |
+| 1 890 | 2 566 ns | 39 ns | 67× |
+| 4 096 | 5 584 ns | 16 ns | 345× |
+| 8 192 | 11 166 ns | 16 ns | 692× |
+| 16 384 | 8 015 ns | 16 ns | 491× |
+| 65 025 | 12 254 ns | 49 ns | 249× |
+
+The discontinuity between 8 192 and 16 384 on the *before* side is the old
+threshold: below it the per-step loop, at/above it the re-squared matrix. 1 890 B
+is the mean page size of ffmpeg/libvorbis output; 65 025 B is a max-size page.
+
+### `read_throughput` — the new `ogg-vorbis` fixture
+
+Overlay run: the fixture landed with this change, so the before side is the old
+`crc_shift_zeros` measured with the new harness.
+
+| ogg-vorbis bench | before | after | Δ |
+|---|---:|---:|--:|
+| sequential_read | 7.738 ms | 2.172 ms | **−71.9%** |
+| cold_first_read | 8.180 ms | 2.538 ms | **−69.0%** |
+| seek_read | 580.4 µs | 398.4 µs | **−31.4%** |
+
+All three at p < 0.05.
+
+### Why the pre-existing `ogg` (Opus) fixture shows nothing
+
+| ogg bench | Δ | significance |
+|---|---:|---|
+| sequential_read | −2.2% | p < 0.05 |
+| cold_first_read | −5.5% | p < 0.05 |
+| seek_read | +0.1% | p = 0.68 |
+
+Those deltas are contended-box noise, not the change. Instrumenting
+`patch_page_header_algebraic` shows every call against that fixture passes
+`crc32(DELTA) == 0` and takes the zero-state early return, so the shift costs
+nothing on either side. Two properties of `write_ogg` cause it, and
+`write_ogg_vorbis` was added to cover both:
+
+- **Page size.** `write_ogg` laces a whole track as one packet, so every page is
+  max-size (`trailing = 65 285`). The CRC advance is per-page and scales with
+  payload length, so that measures a different regime from the ~1 890 B pages real
+  encoders emit.
+- **Renumbering.** RFC 7845 puts each Opus header packet on its own page, which is
+  also how synthesis lays them out — so the served header matches the original, no
+  audio page is renumbered, and every DELTA is all-zero. A real Vorbis encoder
+  instead packs the comment and setup headers together, so synthesis always
+  lengthens the header and every audio page shifts. That is the case the algebraic
+  patch exists for, and it is now a fixture.
+
+The two properties are pinned by `write_ogg_vorbis_uses_encoder_realistic_page_sizes`
+and `write_ogg_vorbis_renumbers_every_audio_page_on_serve`, and the format carries
+its own row in the `perf_counters` golden gate.
+
+```bash
+cargo bench -p musefs-core --bench read_throughput -- ogg
+```

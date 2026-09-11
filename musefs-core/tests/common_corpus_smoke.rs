@@ -3,7 +3,7 @@ mod common;
 use common::corpus::{CorpusParams, Format, Tier, prepare};
 use common::report::{RunReport, peak_rss_kib};
 use common::write_m4a_moov_last;
-use common::write_ogg;
+use common::{VORBIS_PAGE_PAYLOAD, write_ogg, write_ogg_vorbis};
 use musefs_core::scan_directory;
 use musefs_db::Db;
 
@@ -183,6 +183,147 @@ fn write_ogg_is_deterministic() {
         std::fs::read(&b).unwrap(),
         "same audio bytes => identical Ogg file"
     );
+}
+
+/// Sequence numbers of every page in `data`, with each page's payload length.
+fn page_geometry(data: &[u8]) -> Vec<(u32, usize)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let h = musefs_format::ogg::parse_page(data, pos).unwrap();
+        out.push((h.seq, h.total_len() - h.header_len));
+        pos += h.total_len();
+    }
+    out
+}
+
+#[test]
+fn write_ogg_vorbis_uses_encoder_realistic_page_sizes() {
+    // `write_ogg` laces a whole track as one packet, so every page is max-size.
+    // This fixture exists to cover the other regime — the ~1 890 B pages real
+    // Vorbis streams carry — because the algebraic CRC patch costs scale with
+    // page payload length (#666).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.ogg");
+    let audio = vec![0x5Au8; 200 * 1024];
+    let (audio_offset, _) = write_ogg_vorbis(&path, &["ARTIST=A"], None, &audio);
+    let bytes = std::fs::read(&path).unwrap();
+
+    let audio_start = usize::try_from(audio_offset).unwrap();
+    let header_pages = page_geometry(&bytes[..audio_start]);
+    assert_eq!(
+        header_pages.len(),
+        2,
+        "libvorbis packs comment+setup behind the BOS page: {header_pages:?}"
+    );
+
+    let audio_pages = page_geometry(&bytes[audio_start..]);
+    assert!(audio_pages.len() > 100, "expected many small pages");
+    for (seq, payload) in &audio_pages[..audio_pages.len() - 1] {
+        assert_eq!(
+            *payload, VORBIS_PAGE_PAYLOAD,
+            "page {seq} should carry one realistic page of audio"
+        );
+    }
+}
+
+#[test]
+fn write_ogg_vorbis_renumbers_every_audio_page_on_serve() {
+    // The property the fixture exists for: synthesis gives each header packet its
+    // own page, so the served header outgrows the original and every audio page's
+    // sequence number shifts. Without that shift `crc32(DELTA)` is zero and the
+    // algebraic patch short-circuits — which is exactly what the Opus fixture does.
+    use musefs_core::{Mode, MountConfig, Musefs, VirtualTree};
+
+    let dir = tempfile::tempdir().unwrap();
+    let audio = vec![0x5Au8; 64 * 1024];
+    let (audio_offset, _) =
+        write_ogg_vorbis(&dir.path().join("a.ogg"), &["ARTIST=A"], None, &audio);
+    let original = std::fs::read(dir.path().join("a.ogg")).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let fs = Musefs::open(
+        db,
+        MountConfig {
+            template: "$artist/$album/$title".to_string(),
+            fallbacks: std::collections::BTreeMap::new(),
+            default_fallback: "Unknown".to_string(),
+            mode: Mode::Synthesis,
+            poll_interval: std::time::Duration::ZERO,
+            case_insensitive: false,
+            read_ahead_budget: 0,
+            read_ahead_prefetch: false,
+            skip_on_missing: false,
+        },
+    )
+    .unwrap();
+
+    let mut inodes = Vec::new();
+    collect_file_inodes(&fs, VirtualTree::ROOT, &mut inodes);
+    let inode = inodes[0];
+    let size = fs.getattr(inode).unwrap().size;
+    let mut served = Vec::new();
+    while (served.len() as u64) < size {
+        let got = fs
+            .read(inode, None, served.len() as u64, 128 * 1024)
+            .unwrap();
+        assert!(!got.is_empty());
+        served.extend_from_slice(&got);
+    }
+
+    let audio_start = usize::try_from(audio_offset).unwrap();
+    let original_seqs: Vec<u32> = page_geometry(&original[audio_start..])
+        .into_iter()
+        .map(|(seq, _)| seq)
+        .collect();
+    // Locate the served audio region the way the serve path does. Trimming the
+    // served pages down to the original count instead would make the length check
+    // below vacuous, and a dropped or duplicated audio page would pass.
+    let served_header = musefs_format::ogg::read_header(&served).unwrap();
+    let original_header = musefs_format::ogg::read_header(&original).unwrap();
+    assert!(
+        served_header.header_pages > original_header.header_pages,
+        "synthesis must lengthen the header ({} -> {}); that is what shifts the audio pages",
+        original_header.header_pages,
+        served_header.header_pages
+    );
+    let served_start = usize::try_from(served_header.audio_offset).unwrap();
+    let served_seqs: Vec<u32> = page_geometry(&served[served_start..])
+        .into_iter()
+        .map(|(seq, _)| seq)
+        .collect();
+    assert_eq!(
+        served_seqs.len(),
+        original_seqs.len(),
+        "synthesis must carry every audio page through"
+    );
+    let deltas: std::collections::BTreeSet<i64> = served_seqs
+        .iter()
+        .zip(&original_seqs)
+        .map(|(new, old)| i64::from(*new) - i64::from(*old))
+        .collect();
+    assert_eq!(
+        deltas.len(),
+        1,
+        "every audio page shifts by the same amount: {deltas:?}"
+    );
+    assert_ne!(
+        *deltas.iter().next().unwrap(),
+        0,
+        "audio pages must be renumbered, or the CRC patch never does work"
+    );
+}
+
+/// Recursively collect every file inode reachable from `dir`.
+fn collect_file_inodes(fs: &musefs_core::Musefs, dir: u64, out: &mut Vec<u64>) {
+    for (_, ino, is_dir) in fs.readdir(dir).unwrap() {
+        if is_dir {
+            collect_file_inodes(fs, ino, out);
+        } else {
+            out.push(ino);
+        }
+    }
 }
 
 #[test]

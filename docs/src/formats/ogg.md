@@ -154,9 +154,9 @@ the CRC over" the trailing zeros (the rest of the header plus the whole payload
 length, read straight from the segment table). That advance is `crc_shift_zeros`
 — the CRC-32 of *appending n zero bytes*. Appending one zero byte is a fixed
 linear map on the 32-bit CRC state, so appending `n` of them is that 32×32 GF(2)
-matrix raised to the `n`-th power by repeated squaring: **O(log n)**, independent
-of page size. Small, typical pages take a cheaper per-byte loop; only a huge
-single packet laced into max-size pages crosses the matrix threshold.
+matrix raised to the `n`-th power. The power-of-two matrices are precomputed once
+as a `const`, so a shift by `n` costs `n.count_ones()` matrix applies — **O(log
+n)** with no per-call setup, at every page size.
 
 The net effect is that `patch_page_header_algebraic`
 (`musefs-format/src/ogg/page.rs`) repairs each served audio page's header from

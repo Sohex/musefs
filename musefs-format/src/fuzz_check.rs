@@ -284,8 +284,20 @@ pub mod fixtures {
     /// body so synthesis can splice tags without erroring.
     pub fn ogg_vorbis() -> Vec<u8> {
         use crate::ogg::page_test_support::{build_header_pub, lace_packet_pub, vorbis_body_empty};
+        // Vorbis I §4.2.1 identification header: 2 channels at 44 100 Hz, 256/2048
+        // block sizes, framing bit set. musefs carries the packet through verbatim,
+        // so the field values never steer it — but an all-zero pad declares zero
+        // channels and clears the framing bit, which no decoder would accept.
         let mut id = b"\x01vorbis".to_vec();
-        id.extend_from_slice(&[0u8; 23]); // pad toward the 30-byte id-header shape
+        id.extend_from_slice(&0u32.to_le_bytes()); // vorbis_version
+        id.push(2); // audio_channels
+        id.extend_from_slice(&44_100u32.to_le_bytes()); // audio_sample_rate
+        id.extend_from_slice(&0u32.to_le_bytes()); // bitrate_maximum
+        id.extend_from_slice(&192_000u32.to_le_bytes()); // bitrate_nominal
+        id.extend_from_slice(&0u32.to_le_bytes()); // bitrate_minimum
+        id.push(0xb8); // blocksize_0 = 2^8, blocksize_1 = 2^11
+        id.push(1); // framing flag
+        debug_assert_eq!(id.len(), 30);
         let mut comment = b"\x03vorbis".to_vec();
         comment.extend_from_slice(&vorbis_body_empty());
         let setup = b"\x05vorbis".to_vec();
