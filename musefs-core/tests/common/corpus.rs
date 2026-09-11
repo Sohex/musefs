@@ -18,6 +18,7 @@ pub enum Format {
     M4aMoovFirst,
     M4aMoovLast,
     Ogg,
+    OggVorbis,
     Wav,
 }
 
@@ -30,6 +31,7 @@ pub fn format_from_token(token: &str) -> Option<Format> {
         "m4a" => Some(Format::M4aMoovFirst),
         "m4a-last" => Some(Format::M4aMoovLast),
         "ogg" => Some(Format::Ogg),
+        "ogg-vorbis" => Some(Format::OggVorbis),
         "wav" => Some(Format::Wav),
         _ => None,
     }
@@ -44,12 +46,15 @@ pub fn format_token(f: Format) -> &'static str {
         Format::M4aMoovFirst => "m4a",
         Format::M4aMoovLast => "m4a-last",
         Format::Ogg => "ogg",
+        Format::OggVorbis => "ogg-vorbis",
         Format::Wav => "wav",
     }
 }
 
-/// Every supported format, plus the M4A moov-last layout variant (the SP1
-/// bounded-read hard case). The per-format benches sweep this set.
+/// Every supported format, plus two layout variants that are their own hard
+/// cases: M4A moov-last (the SP1 bounded read) and Ogg Vorbis (encoder-realistic
+/// page sizes and a header that renumbers on serve — see `write_ogg_vorbis`).
+/// The per-format benches sweep this set.
 ///
 /// Not enforced by a compile check: if you add a `Format` variant, add it here
 /// too. The round-trip test guards token drift, not omission from this list.
@@ -59,6 +64,7 @@ pub const ALL_FORMATS: &[Format] = &[
     Format::M4aMoovFirst,
     Format::M4aMoovLast,
     Format::Ogg,
+    Format::OggVorbis,
     Format::Wav,
 ];
 
@@ -151,7 +157,7 @@ impl CorpusParams {
 
     /// Read `MUSEFS_BENCH_TIER` (default `ci`) then apply any `MUSEFS_BENCH_*`
     /// overrides. `MUSEFS_BENCH_FORMAT_MIX` is a comma list of
-    /// flac|mp3|m4a|m4a-last|ogg|wav.
+    /// flac|mp3|m4a|m4a-last|ogg|ogg-vorbis|wav.
     pub fn from_env() -> Self {
         let tier = match std::env::var("MUSEFS_BENCH_TIER").as_deref() {
             Ok("large-compute") => Tier::LargeCompute,
@@ -364,9 +370,9 @@ pub fn prepare_format(p: &CorpusParams, base: &Path, fmt: Format) -> Target {
     }
 }
 
-/// `comments` and `art` are only consumed by [`Format::Flac`]; the other formats
-/// carry tags via the DB at scan time and have no embedded-art builder, so they
-/// ignore both here.
+/// `comments` and `art` are consumed by [`Format::Flac`] and
+/// [`Format::OggVorbis`]; the other formats carry tags via the DB at scan time
+/// and have no embedded-art builder, so they ignore both here.
 fn generate_one(
     adir: &Path,
     idx: usize,
@@ -405,6 +411,13 @@ fn generate_one(
         Format::Ogg => {
             let path = adir.join(format!("track-{idx:06}.ogg"));
             super::write_ogg(&path, audio);
+            path
+        }
+        Format::OggVorbis => {
+            let path = adir.join(format!("track-{idx:06}.ogg"));
+            let refs: Vec<&str> = comments.iter().map(String::as_str).collect();
+            let picture = art.map(super::picture_block_body);
+            super::write_ogg_vorbis(&path, &refs, picture.as_deref(), audio);
             path
         }
         Format::Wav => {
