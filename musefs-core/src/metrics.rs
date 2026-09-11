@@ -322,6 +322,7 @@ mod tests {
         on_art_chunk();
         on_binary_tag_chunk();
         on_readahead_miss();
+        on_prefetch_read(4096);
         let s = snapshot();
         assert_eq!(s.opens, 2);
         assert_eq!(s.preads, 1);
@@ -330,6 +331,10 @@ mod tests {
         assert_eq!(s.binary_tag_chunks, 1);
         assert_eq!(s.readahead_misses, 1);
         assert_eq!(s.readahead_hits, 0);
+        // Prefetch reads are counted apart from the serve path: a speculative
+        // read must never inflate `preads`/`pread_bytes`.
+        assert_eq!(s.prefetch_reads, 1);
+        assert_eq!(s.prefetch_bytes, 4096);
         reset();
         assert_eq!(snapshot(), Snapshot::default());
     }

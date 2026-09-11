@@ -604,6 +604,8 @@ mod tests {
             preads: 22,
             readahead_hits: 33,
             readahead_misses: 44,
+            prefetch_reads: 55,
+            prefetch_bytes: 66,
             ..crate::metrics::Snapshot::default()
         };
         let out = render_prometheus(
@@ -621,6 +623,8 @@ mod tests {
             "# TYPE musefs_readahead_hits_total counter\nmusefs_readahead_hits_total 33\n"
         ));
         assert!(out.contains("musefs_readahead_misses_total 44\n"));
+        assert!(out.contains("musefs_readahead_prefetch_reads_total 55\n"));
+        assert!(out.contains("musefs_readahead_prefetch_bytes_total 66\n"));
     }
 
     #[test]
