@@ -277,12 +277,27 @@ fn write_ogg_vorbis_renumbers_every_audio_page_on_serve() {
         .into_iter()
         .map(|(seq, _)| seq)
         .collect();
-    let served_seqs: Vec<u32> = page_geometry(&served)
+    // Locate the served audio region the way the serve path does. Trimming the
+    // served pages down to the original count instead would make the length check
+    // below vacuous, and a dropped or duplicated audio page would pass.
+    let served_header = musefs_format::ogg::read_header(&served).unwrap();
+    let original_header = musefs_format::ogg::read_header(&original).unwrap();
+    assert!(
+        served_header.header_pages > original_header.header_pages,
+        "synthesis must lengthen the header ({} -> {}); that is what shifts the audio pages",
+        original_header.header_pages,
+        served_header.header_pages
+    );
+    let served_start = usize::try_from(served_header.audio_offset).unwrap();
+    let served_seqs: Vec<u32> = page_geometry(&served[served_start..])
         .into_iter()
         .map(|(seq, _)| seq)
-        .skip(page_geometry(&served).len() - original_seqs.len())
         .collect();
-    assert_eq!(served_seqs.len(), original_seqs.len());
+    assert_eq!(
+        served_seqs.len(),
+        original_seqs.len(),
+        "synthesis must carry every audio page through"
+    );
     let deltas: std::collections::BTreeSet<i64> = served_seqs
         .iter()
         .zip(&original_seqs)
