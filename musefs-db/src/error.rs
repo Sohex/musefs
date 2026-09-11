@@ -51,6 +51,30 @@ pub enum DbError {
     },
 }
 
+impl DbError {
+    /// Is this error a property of the rows the caller just tried to write,
+    /// rather than of the store as a whole?
+    ///
+    /// True only for a SQLite constraint violation (`SQLITE_CONSTRAINT`, every
+    /// extended code): a `CHECK`, `UNIQUE`, primary-key, `NOT NULL`,
+    /// foreign-key or `RAISE(ABORT)` failure is decided by the values in the
+    /// statement, so a caller writing one item at a time can fail that item and
+    /// keep going (#662).
+    ///
+    /// An allowlist rather than a list of fatal codes, deliberately: a store
+    /// that is corrupt, full, read-only, not a database, or failing I/O must
+    /// keep aborting the run, and so must any code this build has never seen.
+    /// `SQLITE_BUSY` is likewise excluded — locking is the writer's retry
+    /// policy to own, not a row-level rejection.
+    pub fn is_constraint_violation(&self) -> bool {
+        matches!(
+            self,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Reject a field whose SQL-computed `length()` exceeds `max`, before the value
@@ -132,5 +156,105 @@ mod guard_helper_tests {
         // Pins the single `>` site so a `>`→`>=`/`==` mutant cannot survive.
         assert!(super::check_art_count(1, MAX_ART_ROWS_PER_TRACK).is_ok());
         assert!(super::check_art_count(1, MAX_ART_ROWS_PER_TRACK + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use crate::DbError;
+
+    /// Every code the scan is required to keep aborting on (#662), by their
+    /// primary SQLite result codes.
+    const FATAL_CODES: [(&str, i32); 6] = [
+        ("SQLITE_CORRUPT", rusqlite::ffi::SQLITE_CORRUPT),
+        ("SQLITE_FULL", rusqlite::ffi::SQLITE_FULL),
+        ("SQLITE_IOERR", rusqlite::ffi::SQLITE_IOERR),
+        ("SQLITE_READONLY", rusqlite::ffi::SQLITE_READONLY),
+        ("SQLITE_NOTADB", rusqlite::ffi::SQLITE_NOTADB),
+        // Locking is the writer's retry policy to own, not a row rejection.
+        ("SQLITE_BUSY", rusqlite::ffi::SQLITE_BUSY),
+    ];
+
+    fn sqlite_failure(code: i32) -> DbError {
+        DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    }
+
+    #[test]
+    fn a_real_unique_violation_is_attributed_to_the_rows() {
+        // Driven through the schema rather than a constructed error: what the
+        // classifier has to recognise is whatever SQLite actually raises for a
+        // primary-key collision on `tags` — the shape #659 hit.
+        let db = crate::Db::open_in_memory().unwrap();
+        let tid = db
+            .upsert_track(&crate::NewTrack {
+                backing_path: "/a.mp3".into(),
+                format: crate::Format::Mp3,
+                audio_offset: 0,
+                audio_length: 0,
+                backing_size: 0,
+                backing_mtime_ns: 0,
+                backing_ctime_ns: 0,
+            })
+            .unwrap();
+        let insert = "INSERT INTO tags (track_id, key, ordinal, value) \
+                      VALUES (?1, 'title', 0, 'x')";
+        db.conn.execute(insert, [tid]).unwrap();
+        let err: DbError = db.conn.execute(insert, [tid]).unwrap_err().into();
+        assert!(
+            err.is_constraint_violation(),
+            "a primary-key collision must be attributable to the rows: {err}"
+        );
+    }
+
+    #[test]
+    fn extended_constraint_codes_are_all_recognised() {
+        // The classifier keys on the primary code, so every extended
+        // `SQLITE_CONSTRAINT_*` must classify the same way — that is the point
+        // of not enumerating causes one at a time.
+        for code in [
+            rusqlite::ffi::SQLITE_CONSTRAINT,
+            rusqlite::ffi::SQLITE_CONSTRAINT_CHECK,
+            rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+            rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL,
+            rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+            rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
+        ] {
+            assert!(
+                sqlite_failure(code).is_constraint_violation(),
+                "extended code {code} must classify as a constraint violation"
+            );
+        }
+    }
+
+    #[test]
+    fn store_wide_failures_are_not_attributed_to_the_rows() {
+        for (name, code) in FATAL_CODES {
+            let err = sqlite_failure(code);
+            assert!(
+                !err.is_constraint_violation(),
+                "{name} condemns the run, not one item"
+            );
+        }
+    }
+
+    #[test]
+    fn non_sqlite_errors_are_not_constraint_violations() {
+        // The allowlist is on the SQLite code alone: musefs's own guard errors
+        // are raised by readers against a crafted store, so they say nothing
+        // about one write's rows.
+        assert!(
+            !DbError::SchemaMismatch {
+                object: "tags".into()
+            }
+            .is_constraint_violation()
+        );
+        assert!(
+            !DbError::Sqlite(rusqlite::Error::QueryReturnedNoRows).is_constraint_violation(),
+            "a rusqlite error carrying no SQLite code cannot be a constraint violation"
+        );
     }
 }

@@ -59,7 +59,7 @@ it. Raising verbosity during an interactive scan is safe.
   parseable audio metadata`. These are capped per reason — see
   [Scanning](scanning.md#scan).
 - The end-of-scan failure summaries: `failed 37: unparseable=30, io=5,
-  oversize=2` (these four reasons partition the `failed` count the CLI reports
+  oversize=2` (these five reasons partition the `failed` count the CLI reports
   and the exit-`2` signal keys on) and `walk errors 12: unreadable=9,
   symlink=3` for entries the walk never queued. Neither fires on a healthy
   library.

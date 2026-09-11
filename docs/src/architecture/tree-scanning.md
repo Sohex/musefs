@@ -101,6 +101,27 @@ every read, so that total is checked at scan time too. A supported-extension
 file that fails to parse, or errors mid-probe, is likewise logged with the
 reason and counted `failed`.
 
+`check_storable` covers the caps the scanner knows to look for, and no set of
+pre-checks can cover the rest: `CHECK`, `UNIQUE` and primary-key constraints are
+enforced by SQLite inside the ingest transaction, which is where #659 was
+discovered and where the next unanticipated shape will be. So the outcome is
+classified at the ingest boundary instead of enumerated ahead of time. A
+constraint violation (`SQLITE_CONSTRAINT`, any extended code) is attributable to
+the rows one file wrote: it fails that file, which is named in the log with the
+constraint text and counted in the `rejected` bucket of `failed`. Anything else
+— a corrupt, full, read-only or I/O-failing store, and any code this build does
+not recognise — still aborts the run, because carrying on would produce one
+identical failure per remaining file. `SQLITE_BUSY` is neither, and belongs to
+the writer's locking policy.
+
+The production path commits through `BulkWriter`, whose transaction holds a
+whole batch, so failing one file means undoing only its rows. Each file is
+ingested inside a `SAVEPOINT` (`BulkWriter::item`) for exactly that: a
+statement-level `ABORT` rolls back only the statement that hit the constraint,
+which would otherwise leave the batch committing a half-ingested track — a
+`tracks` row whose tags or art never landed. The savepoint rolls the file back
+whole, and the rest of the batch stays committable (#662).
+
 Before v1.4 an over-cap picture or binary tag was instead dropped with a warning
 and the rest of the track stored. That left users with a mount quietly missing
 data behind a `warn` that is easy to lose in a scan of ten thousand files, and
