@@ -116,7 +116,8 @@ impl std::os::fd::AsFd for PassthroughFd {
 
 /// A cached file size/attr entry: validated at `content_version`, plus the
 /// backing-file stamp it was built from so `getattr` can re-stat on a hit and
-/// catch an on-disk backing change that left `content_version` untouched (#279).
+/// catch an on-disk backing change that left `content_version` untouched (#279),
+/// and can tell a re-stamped row from a live one (#679).
 #[derive(Clone, Copy)]
 struct SizeEntry {
     content_version: i64,
@@ -331,16 +332,27 @@ impl Musefs {
             }
         };
         let (size, mtime_secs) = self.pool.with(|db| {
-            // Cheap, indexed: the current content_version drives lazy invalidation.
-            // Only the two columns the validation needs — no full-row materialization.
-            let (content_version, backing_path) = db
-                .track_version_and_path(track_id)?
+            // Cheap, indexed: the row's identity columns drive lazy invalidation.
+            // Only what the validation needs — no full-row materialization.
+            let identity = db
+                .track_identity(track_id)?
                 .ok_or(CoreError::TrackNotFound(track_id))?;
             // `.map(|e| *e)` copies the SizeEntry (Copy) so the shard Ref drops
             // before the miss-path insert below — same key → same shard, and
             // holding the Ref across the re-lock would deadlock.
             if let Some(e) = self.size_cache.get(&track_id).map(|e| *e)
-                && e.content_version == content_version
+                && e.content_version == identity.content_version
+                // The backing-source axis too, not just the content one. A scan
+                // that retargets the row — onto a moved file, or onto the same
+                // path with a fresh stamp — rewrites the stamp and deliberately
+                // leaves content_version alone, and the hit below validates the
+                // live file against the stamp the entry was built from. Taking
+                // such a hit would compare the file to a superseded stamp and
+                // fail forever (#679). The row's path needs no comparison of its
+                // own: the re-stat below reads the live path, and an entry
+                // agreeing on both versions describes the same bytes wherever
+                // they now live.
+                && e.stamp == BackingStamp::from_identity(&identity)
             {
                 // Hit: re-stat the backing file (no synthesis) and compare to
                 // the stamp the cached attrs were built from. An on-disk change
@@ -348,10 +360,10 @@ impl Musefs {
                 // getattr advertise stale attrs — the one metadata surface that
                 // could outrun a backing change (read/open already re-stat).
                 crate::metrics::on_stat();
-                let meta = std::fs::metadata(&backing_path)
-                    .map_err(|err| CoreError::backing_io(&backing_path, err))?;
+                let meta = std::fs::metadata(&identity.backing_path)
+                    .map_err(|err| CoreError::backing_io(&identity.backing_path, err))?;
                 if BackingStamp::from_metadata(&meta) != e.stamp {
-                    return Err(CoreError::BackingChanged(backing_path));
+                    return Err(CoreError::BackingChanged(identity.backing_path));
                 }
                 return Ok((e.total_len, e.mtime_secs));
             }
@@ -360,7 +372,7 @@ impl Musefs {
             self.size_cache.insert(
                 track_id,
                 SizeEntry {
-                    content_version,
+                    content_version: identity.content_version,
                     total_len: resolved.total_len,
                     mtime_secs: resolved.mtime_secs,
                     stamp: resolved.stamp,

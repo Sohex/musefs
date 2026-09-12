@@ -22,7 +22,7 @@ fn insert_then_get_by_id_and_path() {
 }
 
 #[test]
-fn track_version_and_path_returns_stamp_and_path() {
+fn track_identity_returns_content_version_and_backing_identity() {
     let db = Db::open_in_memory().unwrap();
     let id = db.upsert_track(&new_track("/music/a.flac")).unwrap();
     // Link art so content_version is bumped off its 0 default, pinning the
@@ -44,11 +44,18 @@ fn track_version_and_path_returns_stamp_and_path() {
         cv > 0,
         "linking art must bump content_version above the default"
     );
+    let track = db.get_track(id).unwrap().expect("track by id");
     assert_eq!(
-        db.track_version_and_path(id).unwrap(),
-        Some((cv, "/music/a.flac".to_string())),
+        db.track_identity(id).unwrap(),
+        Some(musefs_db::TrackIdentity {
+            content_version: cv,
+            backing_path: "/music/a.flac".to_string(),
+            backing_size: track.backing_size,
+            backing_mtime_ns: track.backing_mtime_ns,
+            backing_ctime_ns: track.backing_ctime_ns,
+        }),
     );
-    assert!(db.track_version_and_path(999_999).unwrap().is_none());
+    assert!(db.track_identity(999_999).unwrap().is_none());
 }
 
 #[test]

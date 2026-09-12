@@ -124,14 +124,23 @@ impl HeaderCache {
         // Always validate the backing file first — a stale file is an error even
         // on a cache hit, because the audio region may have shifted.
         crate::metrics::on_stat();
+        let stamp = BackingStamp::from_track(&track);
         let meta = std::fs::metadata(&track.backing_path)
             .map_err(|e| CoreError::backing_io(&track.backing_path, e))?;
-        if BackingStamp::from_metadata(&meta) != BackingStamp::from_track(&track) {
+        if BackingStamp::from_metadata(&meta) != stamp {
             return Err(CoreError::BackingChanged(track.backing_path.clone()));
         }
 
+        // A hit must match the row's backing-source identity as well as its
+        // content identity. `content_version` answers "did the served bytes
+        // change?", so a scan that retargets the row to a moved file leaves it
+        // alone — and an entry accepted on it alone carries the pre-move path
+        // and stamp, which `open_handle` would open and validate against
+        // verbatim (#679).
         if let Some(hit) = self.cache.get(&track_id)
             && hit.content_version == track.content_version
+            && hit.stamp == stamp
+            && hit.backing_path.as_os_str() == std::ffi::OsStr::new(&track.backing_path)
         {
             return Ok(hit);
         }

@@ -41,6 +41,14 @@ impl BackingStamp {
         }
     }
 
+    pub fn from_identity(i: &musefs_db::TrackIdentity) -> BackingStamp {
+        BackingStamp {
+            size: i.backing_size,
+            mtime_ns: i.backing_mtime_ns,
+            ctime_ns: i.backing_ctime_ns,
+        }
+    }
+
     /// Whole-second mtime for the FUSE `getattr` display surface (never the raw
     /// nanosecond value, which would advertise a ~10^18-second timestamp).
     pub fn display_secs(&self) -> i64 {

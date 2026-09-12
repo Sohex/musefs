@@ -17,8 +17,18 @@ ctime_ns)` tuple from the **probed file descriptor** using a pre/post `fstat`
 sandwich: if the file's metadata changes between the two stats, the entry is
 dropped. `ctime` defeats an mtime-forging writer (e.g. `touch -m`). The
 `HeaderCache` (`reader.rs`) — a byte-budgeted concurrent cache (64 MiB
-default) of resolved layouts — keys each entry on it: a hit with a stale
-`content_version` rebuilds the layout. Independently of the cache, **every**
+default) of resolved layouts — keys each entry on it *and* on the
+**backing-source identity** the entry was built from: the row's
+`backing_path` and its stamp. Both axes are load-bearing. `content_version`
+answers a question about content, so a scan that retargets a row to a moved
+file — same bytes, new locator — deliberately leaves it alone, while the
+cached entry still carries the pre-move path that `open_handle` opens and the
+pre-move stamp that every serve validates against. A hit that mismatches
+either axis rebuilds. The `getattr` size cache compares `content_version` and
+the stamp for the same reason; it needs no path comparison of its own, because
+it re-stats the live path and holds no locator anything opens
+([#679](https://github.com/Sohex/musefs/issues/679)).
+Independently of the cache, **every**
 resolve re-stats the backing file and errors with `BackingChanged` if its
 size, mtime, or ctime drifted from the scanned values, so a silently replaced
 backing file is never spliced at stale offsets. The per-handle read path
@@ -30,7 +40,10 @@ commit anything?"*. `Musefs::poll_refresh` compares it to the last seen
 value; on a change it consults the `track_changes` ring and applies an
 **incremental, O(changed)** rebuild: only the affected tracks' tree entries
 are re-rendered, exactly the removed tracks' cache entries are dropped, and
-the inodes whose `content_version` rose are reported to the FUSE layer. If
+the inodes whose `content_version` rose are reported to the FUSE layer. Any
+poll whose changelog names a track advances the refresh generation — not only
+one that changed a render key — because an open handle caches its resolved
+layout, backing path and stamp included, until that generation moves. If
 the mount slept past the ring's capacity (or the ring was truncated), it
 falls back to a full tree rebuild — correct by construction, and a bulk
 change wants one anyway. The new version stamp is committed **only after** a

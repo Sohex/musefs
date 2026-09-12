@@ -32,12 +32,6 @@ pub(crate) struct ChangeSet {
     pub removed: Vec<i64>,
 }
 
-impl ChangeSet {
-    pub fn is_empty(&self) -> bool {
-        self.changed.is_empty() && self.added.is_empty() && self.removed.is_empty()
-    }
-}
-
 /// Partition a changelog read against the previous snapshot. `prev_states` holds
 /// the prior states of just the changelog ids (the caller extracts them under a
 /// short snapshot lock); `keys` are the live render keys for those ids (absent =
@@ -66,30 +60,6 @@ pub(crate) fn partition_changelog(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn is_empty_false_when_any_single_category_is_nonempty() {
-        // Each category alone must make `is_empty` false. A single non-empty
-        // category isolates the three `&&` conjuncts: it would read as empty
-        // under any `&&`->`||` swap, and (with the default empty case below) it
-        // also pins the function against a constant-`true` body.
-        let only_changed = ChangeSet {
-            changed: vec![1],
-            ..Default::default()
-        };
-        let only_added = ChangeSet {
-            added: vec![1],
-            ..Default::default()
-        };
-        let only_removed = ChangeSet {
-            removed: vec![1],
-            ..Default::default()
-        };
-        assert!(!only_changed.is_empty());
-        assert!(!only_added.is_empty());
-        assert!(!only_removed.is_empty());
-        assert!(ChangeSet::default().is_empty());
-    }
 
     #[test]
     fn changelog_partition_classifies_changed_added_removed_and_churn() {

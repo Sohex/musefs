@@ -40,6 +40,11 @@ struct IncrementalOutcome {
     displaced: std::collections::HashMap<i64, TrackRenderState>,
     /// Freshly rendered states (changed ∪ added ids).
     new_states: std::collections::HashMap<i64, TrackRenderState>,
+    /// Did the changelog name any track at all? Strictly wider than
+    /// `!change.is_empty()`: a row rewritten in place without a render-key or
+    /// content change — a retarget onto a moved file — logs an id but produces
+    /// no `ChangeSet` entry, and open handles still have to re-resolve (#679).
+    any_logged: bool,
     new_seq: i64,
 }
 
@@ -399,6 +404,7 @@ impl Musefs {
             change,
             displaced,
             new_states,
+            any_logged: !log.changed_ids.is_empty(),
             new_seq,
         }))
     }
@@ -553,7 +559,12 @@ impl Musefs {
                 );
                 self.last_seq.store(out.new_seq, Ordering::Release);
                 self.last_data_version.store(version, Ordering::Release);
-                if !out.change.is_empty() {
+                // Any logged id, not just a ChangeSet entry: an open handle
+                // caches its resolved layout — path and backing stamp included —
+                // until the generation moves, and a retarget rewrites exactly
+                // those while leaving the render key and content_version alone
+                // (#679). Re-resolving is a cheap cache hit when nothing moved.
+                if out.any_logged {
                     self.refresh_gen.fetch_add(1, Ordering::AcqRel);
                 }
                 self.stamp_successful_poll();
