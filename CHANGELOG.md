@@ -14,6 +14,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`musefs migrate`.** An explicit, confirmed store upgrade — the command the
+  gated-migration refusal names. It refuses a store anything else has open,
+  reports what will change and what it needs in free disk, snapshots the store
+  to `<db>.v<version>.bak` first so the upgrade stays reversible, and then
+  offers to vacuum and to revalidate what the upgrade retired. Off a terminal
+  it never blocks on a prompt: `--yes` confirms the upgrade, `--no-snapshot`,
+  `--snapshot PATH`, `--vacuum` and `--revalidate` answer the rest
+  ([#705](https://github.com/Sohex/musefs/issues/705)).
+
 - `readdirplus` is implemented, folding the per-entry `lookup` into the
   directory read: a client that stats what it lists — `ls -l`, every media
   scanner — spends one round trip on the directory instead of one more per
@@ -169,10 +178,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now documents the post-enumeration steady state as the number to size a host
   against, and the transparent-hugepage inflation some distros' `THP=always`
   default adds on top.
+- **Migrations are classified transparent or gated.** A schema step used to be
+  applied as a side effect of opening the store, whatever it did. A gated step —
+  one that rewrites data, needs the store's size again in free disk, or ends
+  compatibility with older musefs builds — is now refused on open, with an error
+  naming the `musefs migrate` command that applies it deliberately. Transparent
+  steps still just happen, and a store being created is never gated. `mount` and
+  `vacuum` therefore no longer upgrade an older store implicitly
+  ([#706](https://github.com/Sohex/musefs/issues/706)).
+
+  A gated step may only be introduced by a **major** release, which a `const`
+  assertion enforces at build time: crossing a major version may ask for
+  `musefs migrate`, and a minor or patch upgrade never will.
+
 - An in-place store schema upgrade now announces itself
-  ([#649](https://github.com/Sohex/musefs/issues/649)). `Db::open` migrates on
-  every open, so an older store was rewritten irreversibly on the first
-  `musefs scan` after a binary upgrade with nothing said about it — and the
+  ([#649](https://github.com/Sohex/musefs/issues/649)). `Db::open` applies a
+  transparent migration on every open, so an older store was rewritten
+  irreversibly on the first `musefs scan` after a binary upgrade with nothing
+  said about it — and the
   first the user heard of it was `StoreTooNew` when they tried to run the older
   build again. The announcement is at `warn` (once per store per schema bump,
   so it is in the scrollback when it is needed) and names both versions;

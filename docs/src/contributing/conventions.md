@@ -33,6 +33,15 @@
 - **Hidden API consumers.** `benches/` directories and each crate's
   `tests/` are compiled only by `--all-targets`: after an API change,
   compile-check with `cargo clippy --all-targets`, not `cargo build`.
+- **Schema migrations.** Append to `MIGRATIONS` in `musefs-db/src/schema.rs`;
+  each entry carries its SQL, the release that introduced it (`since`), a
+  one-line `summary` the `migrate` command prints, and a `Gate`. **A `Gated`
+  step may only be introduced by a major release** — a `const` assertion
+  rejects the build otherwise. Gate a step that rewrites data the user did not
+  ask to have rewritten, needs the store's size again in free disk, or ends
+  compatibility with older binaries; everything else is `Transparent` and is
+  applied by any open. See
+  [the store](../architecture/store.md#transparent-and-gated-migrations).
 
 ## Adding a format
 

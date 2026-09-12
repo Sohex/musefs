@@ -14,6 +14,26 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- **`musefs migrate`.** The command the gate above names: an explicit,
+  confirmed store upgrade. It refuses a store anything else has open, reports
+  the current version, the target version and what each pending step does, and
+  reports the free space the upgrade needs against what the filesystem has,
+  refusing up front rather than failing part-way through the transaction.
+  Before touching anything it writes a compacted copy of the store to
+  `<db>.v<version>.bak` with `VACUUM INTO`, which is what turns an irreversible
+  upgrade into a reversible one; `--snapshot PATH` moves it and `--no-snapshot`
+  skips it, and an existing destination is refused rather than overwritten.
+  Afterwards it reports that the store grew and offers a vacuum, and reports
+  how many tracks lost the fingerprint this upgrade retires and offers a
+  `revalidate` over the directory the library shares, which recomputes them.
+  Prompts come from `dialoguer`, the console-rs sibling of the `indicatif`
+  dependency the scan progress bar already uses, so a question is lifted clear
+  of a live progress frame by the same path a log record takes. Off a terminal
+  nothing blocks on stdin: the upgrade needs `--yes` or it refuses and names
+  the flag, and the two offers decline themselves unless `--vacuum` or
+  `--revalidate` asked for them
+  ([#705](https://github.com/Sohex/musefs/issues/705)).
+
 - `readdirplus` is implemented, folding the per-entry `lookup` into the
   directory read: a client that stats what it lists — `ls -l`, every media
   scanner — spends one round trip on the directory instead of one more per
@@ -151,6 +171,34 @@ see the [Release notes](release-notes.md).
   changed. Like every migration this is one-way: the store will no longer open
   with an older musefs
   ([#691](https://github.com/Sohex/musefs/issues/691)).
+
+- **Migrations are classified transparent or gated.** Every schema step up to
+  1.3.0 was applied as a side effect of opening the store. That is right for a
+  step whose cost and consequences nobody notices, and wrong for one that
+  rewrites data the user did not ask to have rewritten, transiently needs the
+  store's size again in free disk, or ends compatibility with the binary they
+  were running yesterday. Each entry in `MIGRATIONS` now declares which it is.
+  An open applies the transparent steps and stops at the first gated one,
+  refusing with `DbError::StoreNeedsMigration`, which names the `musefs migrate`
+  command. That is the opposite direction from `StoreTooNew` and carries the
+  opposite remedy — upgrade the store, not the binary — so the two are separate
+  variants with separate messages. Nothing is stored: the binary owns the
+  classification, so a user jumping from 1.2 straight to 2.1 is still gated on
+  the step that needs it. A store being *created* is exempt, having no data to
+  endanger, or `scan` could never build a new library. The consequence for two
+  callers is visible: `mount` and `vacuum` stop upgrading an older store
+  implicitly, and `vacuum`'s help text, which advertised that it did, no longer
+  says so. `MIGRATION_V4` is the first gated step
+  ([#706](https://github.com/Sohex/musefs/issues/706)).
+
+  Which release a step came from is recorded alongside it, and the contract
+  that follows is enforced by a `const` assertion rather than by review: **a
+  gated step may only be introduced by a major release**, so musefs will not
+  build if one is added to a minor or a patch. That turns the classification
+  into something a user can act on without knowing what a `user_version` is —
+  crossing a major boundary may ask for `musefs migrate`, and a minor or patch
+  upgrade never will. The converse is not asserted: a major release is free to
+  carry only transparent steps, as `MIGRATION_V3` does.
 
 - The `tags.value` cap rises from 256 KiB to 16 MiB − 1, and
   `track_art.description` from 1 KiB to 8 KiB (schema `MIGRATION_V3`). The new

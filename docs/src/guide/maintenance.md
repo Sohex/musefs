@@ -72,6 +72,96 @@ error: the store is in use — unmount the filesystem or stop any scan before va
   free disk space roughly equal to the store size (it builds a complete copy
   before swapping). Running it again on an already-compact store is safe and
   reports `(already compact)`.
-- **May upgrade the schema.** Like every musefs command that opens the store for
-  writing, `vacuum` migrates an older store to the current schema version before
-  compacting.
+- **May upgrade the schema.** Like every musefs command that opens the store,
+  `vacuum` applies any pending *transparent* migration before compacting. A
+  store needing a **gated** one is refused instead, naming
+  [`musefs migrate`](#upgrading-the-store-musefs-migrate).
+
+## Upgrading the store (`musefs migrate`)
+
+**You need this only when crossing a major version.** Upgrading 2.0 to 2.1, or
+2.1.3 to 2.1.4, never asks for it; going from 1.x to 2.x may. That is a promise,
+not a habit: a migration invasive enough to be gated is only ever introduced by
+a major release, and musefs will not build if one is added anywhere else.
+
+Most schema changes are applied the moment any musefs command opens the store,
+and you never hear about them. Some are not: a change that rewrites data,
+transiently needs the store's size again in free disk, or ends compatibility
+with older musefs builds is more than anyone running `mount` can reasonably
+expect. Those are **gated**, and a major release is the only place they appear.
+Every command that opens a store for ordinary work refuses one that needs it:
+
+```text
+error: store schema version 3 needs an explicit upgrade to version 4 before this
+musefs build can open it; run `musefs migrate --db <store>`.
+```
+
+`musefs migrate` is where that upgrade happens, deliberately:
+
+```bash
+musefs migrate --db library.db
+```
+
+It reports what it is about to do, takes a snapshot, upgrades the store, and
+then offers to clean up after itself:
+
+```text
+store library.db is at schema version 3; this build needs 4.
+  v4 — clears every stored fingerprint; a scan or revalidate recomputes them  [needs this command]
+This rewrites the store in place. Once it is done, musefs builds older than this one will no longer open it.
+store is 412.7 MiB; the upgrade needs about 825.4 MiB free and has 27.7 GiB.
+a snapshot will be written to library.db.v3.bak first.
+Upgrade library.db now? [y/N]
+```
+
+### Run it while unmounted
+
+The upgrade takes the store for itself and refuses to start if anything else
+has it open — a mount, a running scan, another `musefs migrate`:
+
+```text
+error: the store is in use — unmount the filesystem or stop any scan before migrating
+```
+
+### The snapshot
+
+Before touching anything, `migrate` writes a compacted, consistent copy of the
+store to `<db>.v<version>.bak` using SQLite's `VACUUM INTO`. It takes about as
+long as a vacuum — under two seconds on a reference-shaped library — and it is
+what makes an otherwise one-way upgrade reversible: if anything goes wrong,
+that file is your store exactly as it was. Put it somewhere else with
+`--snapshot PATH`, or skip it with `--no-snapshot`. `migrate` refuses to
+overwrite an existing snapshot.
+
+The free-space figure it reports accounts for the snapshot and for SQLite
+staging the rewritten pages before committing them. If the filesystem is short,
+the command refuses up front rather than failing part-way through.
+
+### Afterwards
+
+An upgrade that rewrites rows leaves the store larger than it was, so `migrate`
+offers a vacuum. It also reports how many tracks lost a scanner-derived value
+the upgrade retired — the fingerprint, in the 2.0.0 upgrade — and offers to run
+a [`revalidate`](#refreshing-the-store-musefs-revalidate) over the directory
+your library shares, which recomputes them. Until that runs, those tracks
+cannot be re-identified after a move; nothing else about the mount is affected.
+
+### Flags, for scripts
+
+There is no terminal in a pipeline, so `migrate` never blocks waiting on one.
+The confirmation has to come from `--yes`, or the command refuses and says so.
+The two offers decline themselves unless you ask for them:
+
+| Flag | Effect |
+| ---- | ------ |
+| `--yes` / `-y` | Upgrade without asking. Required off a terminal. |
+| `--snapshot PATH` | Write the snapshot here instead of beside the store. |
+| `--no-snapshot` | Take no snapshot. The upgrade is then not reversible. |
+| `--vacuum` / `--vacuum=false` | Compact afterwards, or do not. Omit to be asked. |
+| `--revalidate` / `--revalidate=false` | Revalidate afterwards, or do not. Omit to be asked. |
+| `--jobs N` | Probe worker threads for that revalidate. |
+
+Running it against a store that is already current reports so and changes
+nothing, so it is safe to put in a provisioning script ahead of `mount` — and
+because only a major release can ever need it, that script will sit there doing
+nothing for every upgrade in between.

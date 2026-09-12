@@ -1,7 +1,7 @@
 //! The `musefs` command-line interface: `scan` (ingest a backing directory into a
 //! SQLite store) and `mount` (serve a read-only FUSE view of that store).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -9,12 +9,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{HumanBytes, HumanDuration};
 use musefs_core::{MountConfig, Musefs};
-use musefs_db::Db;
+use musefs_db::{Db, PendingMigration};
 
 use crate::progress::ScanReporter;
 
 mod logging;
 mod progress;
+mod prompt;
 mod signal;
 
 pub use crate::logging::install_logger;
@@ -270,13 +271,51 @@ pub enum Command {
     /// Mount a read-only FUSE view of the store.
     Mount(MountArgs),
     /// Compact the SQLite store, reclaiming free pages left by deletions
-    /// (prunes, orphan-art GC, the schema migration). Run while unmounted; this
-    /// may also upgrade an older store's schema to the current version.
+    /// (prunes, orphan-art GC, the schema migration). Run while unmounted. A
+    /// store needing a gated schema upgrade is refused: run `musefs migrate`
+    /// first.
     Vacuum {
         /// Path to the SQLite database.
         #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
     },
+    /// Upgrade the store's schema to the version this build needs.
+    ///
+    /// Some schema changes are too invasive to apply as a side effect of
+    /// opening the store: they rewrite data, transiently need the store's size
+    /// again in free disk, and end compatibility with older musefs builds.
+    /// Those are refused by `mount`, `scan` and `vacuum`, and applied here,
+    /// after reporting what they will do. Run it while unmounted. A snapshot is
+    /// taken first unless `--no-snapshot`, so the upgrade stays reversible.
+    Migrate(MigrateArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct MigrateArgs {
+    /// Path to the SQLite database.
+    #[arg(long, env = "MUSEFS_DB")]
+    pub db: PathBuf,
+    /// Upgrade without asking. Required when not running on a terminal.
+    #[arg(long, short = 'y', env = "MUSEFS_YES")]
+    pub yes: bool,
+    /// Where to write the pre-upgrade snapshot. Default: the store's own path
+    /// with `.v<version>.bak` appended, alongside it.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_snapshot")]
+    pub snapshot: Option<PathBuf>,
+    /// Upgrade without taking a snapshot first. The upgrade is then not
+    /// reversible.
+    #[arg(long)]
+    pub no_snapshot: bool,
+    /// Compact the store afterwards (an upgrade grows it). Omit to be asked.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub vacuum: Option<bool>,
+    /// Revalidate the library afterwards, recomputing what the upgrade retired.
+    /// Omit to be asked.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub revalidate: Option<bool>,
+    /// Probe worker threads for that revalidate (0 = available parallelism).
+    #[arg(long, env = "MUSEFS_JOBS", default_value_t = 0)]
+    pub jobs: usize,
 }
 
 /// Open (creating/migrating) the DB at `db_path` once, then scan each target in
@@ -678,6 +717,263 @@ pub fn run_vacuum(db: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The peak free space an upgrade of a `footprint`-byte store needs on one
+/// filesystem, as `copies` whole copies of it.
+///
+/// SQLite stages a rewritten page in the write-ahead log before committing it,
+/// so a migration that touches every row transiently has the store on disk
+/// twice; a snapshot alongside it is another whole copy. Both are estimates
+/// from the store's current size, which is the only number available before the
+/// work is done — deliberately not padded, since the point is to refuse a run
+/// that would fail part-way through rather than to reserve headroom.
+fn space_needed(footprint: u64, copies: u64) -> u64 {
+    footprint.saturating_mul(copies)
+}
+
+/// Free space on the filesystem holding `path`'s directory. `path` itself need
+/// not exist; its parent must.
+fn free_space_for(path: &Path) -> Result<u64> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs4::available_space(dir).with_context(|| format!("checking free space on {}", dir.display()))
+}
+
+/// Where a snapshot goes when the user did not say: the store's own path with
+/// the version it is being taken from appended, so two upgrades of one store
+/// never collide and the file says what it is.
+fn default_snapshot_path(db: &Path, from_version: i64) -> PathBuf {
+    let mut p = db.as_os_str().to_os_string();
+    p.push(format!(".v{from_version}.bak"));
+    PathBuf::from(p)
+}
+
+/// The deepest directory containing every stored backing file — the one target
+/// a `revalidate` has to walk to reach the whole library.
+///
+/// `None` when there is no such place worth walking: an empty store, or paths
+/// that share nothing above the filesystem root. Revalidating from `/` is never
+/// what anyone meant, so the caller prints the command instead of offering to
+/// run it.
+fn common_library_root(paths: &[String]) -> Option<PathBuf> {
+    let mut dirs = paths.iter().filter_map(|p| Path::new(p).parent());
+    let mut common: Vec<Component<'_>> = dirs.next()?.components().collect();
+    for dir in dirs {
+        let shared = common
+            .iter()
+            .zip(dir.components())
+            .take_while(|(a, b)| **a == *b)
+            .count();
+        common.truncate(shared);
+        if common.is_empty() {
+            return None;
+        }
+    }
+    // A prefix or a bare root separator is not a library.
+    common
+        .iter()
+        .any(|c| matches!(c, Component::Normal(_)))
+        .then(|| common.iter().collect())
+}
+
+/// Upgrade the store at `args.db` to the schema this build needs.
+///
+/// The order is the point: everything that can refuse the run does so before
+/// anything is written, the user is told what is about to happen and agrees to
+/// it, a snapshot makes it reversible, and only then does the store change.
+pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
+    let db = args.db.as_path();
+    if !db.exists() {
+        anyhow::bail!(
+            "database not found: {} (nothing to migrate; `musefs scan` creates one)",
+            db.display()
+        );
+    }
+    let pending =
+        PendingMigration::open(db).with_context(|| format!("opening store {}", db.display()))?;
+    let from = pending.current_version();
+    let to = pending.target_version();
+    if pending.is_current() {
+        println!(
+            "{} is already at schema version {to}; nothing to migrate.",
+            db.display()
+        );
+        return Ok(());
+    }
+
+    // Refuse a store somebody else is using before reporting anything, so the
+    // report is never a description of work that was never on the table.
+    pending.claim_exclusive()?;
+
+    println!(
+        "store {} is at schema version {from}; this build needs {to}.",
+        db.display()
+    );
+    for step in pending.pending() {
+        let mark = if step.gated {
+            "  [needs this command]"
+        } else {
+            ""
+        };
+        println!(
+            "  v{} (musefs {}) — {}{mark}",
+            step.version, step.since, step.summary
+        );
+    }
+    println!(
+        "This rewrites the store in place. Once it is done, musefs builds older \
+         than this one will no longer open it."
+    );
+
+    let footprint = store_footprint(db);
+    let snapshot = if args.no_snapshot {
+        None
+    } else {
+        Some(
+            args.snapshot
+                .clone()
+                .unwrap_or_else(|| default_snapshot_path(db, from)),
+        )
+    };
+    if let Some(dest) = &snapshot
+        && dest.exists()
+    {
+        anyhow::bail!(
+            "snapshot destination already exists: {} (move it, or pass --snapshot PATH, \
+             or --no-snapshot to skip the snapshot)",
+            dest.display()
+        );
+    }
+
+    // The store's own filesystem carries the rewrite, and the snapshot too when
+    // it is going alongside; a --snapshot elsewhere is checked on its own.
+    let snapshot_is_alongside = snapshot.as_ref().is_some_and(|d| d.parent() == db.parent());
+    let copies = 1 + u64::from(snapshot_is_alongside);
+    let needed = space_needed(footprint, copies);
+    let available = free_space_for(db)?;
+    println!(
+        "store is {}; the upgrade needs about {} free and has {}.",
+        HumanBytes(footprint),
+        HumanBytes(needed),
+        HumanBytes(available)
+    );
+    if available < needed {
+        anyhow::bail!(
+            "not enough free space on {}: need about {}, have {}. Free some space, \
+             or pass --no-snapshot to skip the copy",
+            db.parent().unwrap_or(Path::new(".")).display(),
+            HumanBytes(needed),
+            HumanBytes(available)
+        );
+    }
+    if let Some(dest) = &snapshot
+        && !snapshot_is_alongside
+    {
+        let there = free_space_for(dest)?;
+        if there < footprint {
+            anyhow::bail!(
+                "not enough free space for the snapshot at {}: need about {}, have {}",
+                dest.display(),
+                HumanBytes(footprint),
+                HumanBytes(there)
+            );
+        }
+    }
+    match &snapshot {
+        Some(dest) => println!("a snapshot will be written to {} first.", dest.display()),
+        None => println!("no snapshot will be taken (--no-snapshot): this is not reversible."),
+    }
+
+    if !args.yes {
+        if !prompt::interactive() {
+            anyhow::bail!(
+                "refusing to upgrade {} without confirmation; pass --yes to proceed \
+                 (there is no terminal here to ask on)",
+                db.display()
+            );
+        }
+        if !prompt::confirm(&format!("Upgrade {} now?", db.display()), false)? {
+            println!("aborted; the store is unchanged.");
+            return Ok(());
+        }
+    }
+
+    if let Some(dest) = &snapshot {
+        pending
+            .snapshot_to(dest)
+            .with_context(|| format!("writing the snapshot to {}", dest.display()))?;
+        println!("snapshot written to {}", dest.display());
+    }
+
+    let started = Instant::now();
+    let store = pending.apply()?;
+    println!(
+        "migrated {} from schema version {from} to {to} in {}",
+        db.display(),
+        HumanDuration(started.elapsed())
+    );
+
+    let grown = store_footprint(db);
+    if grown > footprint {
+        println!(
+            "the store grew from {} to {}; a vacuum reclaims the difference.",
+            HumanBytes(footprint),
+            HumanBytes(grown)
+        );
+    }
+    if prompt::decide(args.vacuum, "Compact the store now?", grown > footprint)? {
+        store.vacuum()?;
+        println!("{}", vacuum_summary(db, grown, store_footprint(db)));
+    } else if grown > footprint {
+        println!("  run later: musefs vacuum --db {}", db.display());
+    }
+
+    // Every read of the store has to happen before the handle is dropped, and
+    // the handle has to be dropped before a revalidate can open its own: the
+    // exclusive claim taken above is held for as long as it lives.
+    let owed = store.count_tracks_without_fingerprint()?;
+    let root = if owed > 0 {
+        common_library_root(&store.list_backing_paths()?)
+    } else {
+        None
+    };
+    drop(store);
+
+    if owed > 0 {
+        println!(
+            "{owed} track(s) now carry no fingerprint; a revalidate recomputes them, and \
+             until it runs those tracks cannot be recovered by a move."
+        );
+        let offer = root
+            .as_ref()
+            .map(|r| format!("Revalidate {} now?", r.display()));
+        match (root, offer) {
+            (Some(root), Some(question)) if prompt::decide(args.revalidate, &question, false)? => {
+                run_revalidate(
+                    db,
+                    &[root],
+                    false,
+                    args.jobs,
+                    false,
+                    false,
+                    ChecksumMode::Fingerprint,
+                )?;
+            }
+            (Some(root), _) => println!(
+                "  run later: musefs revalidate {} --db {}",
+                root.display(),
+                db.display()
+            ),
+            (None, _) => println!(
+                "  run later: musefs revalidate <library path> --db {}",
+                db.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// Print a sample of the paths a `mount --dry-run` would expose, walking the
 /// already-built virtual tree so the preview reflects the exact rendering the
 /// real mount uses.
@@ -799,12 +1095,146 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Mount(args) => run_mount(&args).map(|()| ExitCode::SUCCESS),
         Command::Vacuum { db } => run_vacuum(&db).map(|()| ExitCode::SUCCESS),
+        Command::Migrate(args) => run_migrate(&args).map(|()| ExitCode::SUCCESS),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn space_needed_scales_with_the_copies_and_saturates() {
+        assert_eq!(space_needed(100, 1), 100);
+        assert_eq!(space_needed(100, 2), 200);
+        // A nonsense footprint must not wrap the estimate to a small number and
+        // wave through a run that cannot fit.
+        assert_eq!(space_needed(u64::MAX, 2), u64::MAX);
+    }
+
+    #[test]
+    fn default_snapshot_path_names_the_version_it_came_from() {
+        assert_eq!(
+            default_snapshot_path(Path::new("/srv/library.db"), 3),
+            PathBuf::from("/srv/library.db.v3.bak")
+        );
+        // Two upgrades of one store must not collide on the same backup file.
+        assert_ne!(
+            default_snapshot_path(Path::new("/srv/library.db"), 3),
+            default_snapshot_path(Path::new("/srv/library.db"), 4)
+        );
+    }
+
+    #[test]
+    fn common_library_root_is_the_deepest_shared_directory() {
+        let paths = [
+            "/srv/music/a/one.flac".to_string(),
+            "/srv/music/b/two.mp3".to_string(),
+            "/srv/music/b/c/three.mp3".to_string(),
+        ];
+        assert_eq!(
+            common_library_root(&paths),
+            Some(PathBuf::from("/srv/music"))
+        );
+        // One track's own directory is the whole library.
+        assert_eq!(
+            common_library_root(&["/srv/music/a/one.flac".to_string()]),
+            Some(PathBuf::from("/srv/music/a"))
+        );
+    }
+
+    /// Revalidating from the filesystem root is never what anyone meant, so a
+    /// library that spans unrelated trees gets the command printed instead of
+    /// an offer to walk everything.
+    #[test]
+    fn common_library_root_declines_to_offer_the_filesystem_root() {
+        let split = [
+            "/srv/music/one.flac".to_string(),
+            "/home/u/music/two.mp3".to_string(),
+        ];
+        assert_eq!(common_library_root(&split), None);
+        assert_eq!(common_library_root(&["/one.flac".to_string()]), None);
+        assert_eq!(common_library_root(&[]), None);
+    }
+
+    /// An explicit flag is answered without consulting a terminal, which is
+    /// what keeps a script from ever being stuck on a prompt.
+    #[test]
+    fn an_explicit_answer_is_taken_as_given() {
+        assert!(prompt::decide(Some(true), "unused", false).unwrap());
+        assert!(!prompt::decide(Some(false), "unused", true).unwrap());
+        // No flag and no terminal (the shape a test runs in): decline, leaving
+        // the user something they can still run by hand.
+        assert!(!prompt::decide(None, "unused", true).unwrap());
+    }
+
+    #[test]
+    fn migrate_command_parses_its_flags() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "musefs",
+            "migrate",
+            "--db",
+            "/tmp/x.db",
+            "--yes",
+            "--snapshot",
+            "/tmp/backup.db",
+            "--vacuum",
+            "--revalidate=false",
+            "--jobs",
+            "4",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Migrate(args) => {
+                assert_eq!(args.db, PathBuf::from("/tmp/x.db"));
+                assert!(args.yes);
+                assert_eq!(args.snapshot, Some(PathBuf::from("/tmp/backup.db")));
+                assert!(!args.no_snapshot);
+                assert_eq!(args.vacuum, Some(true));
+                assert_eq!(args.revalidate, Some(false));
+                assert_eq!(args.jobs, 4);
+            }
+            _ => panic!("expected Migrate"),
+        }
+    }
+
+    /// Unset is distinct from `false`: it means "ask", and off a terminal it
+    /// means "skip and print the command". Collapsing the two would make a
+    /// scripted run silently do work nobody asked for.
+    #[test]
+    fn migrate_offers_default_to_unset_not_false() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["musefs", "migrate", "--db", "/tmp/x.db"]).unwrap();
+        match cli.command {
+            Command::Migrate(args) => {
+                assert_eq!(args.vacuum, None);
+                assert_eq!(args.revalidate, None);
+                assert!(!args.yes);
+                assert_eq!(args.snapshot, None);
+            }
+            _ => panic!("expected Migrate"),
+        }
+    }
+
+    /// Naming a snapshot and refusing to take one are contradictory, and clap
+    /// says so rather than silently honouring one of them.
+    #[test]
+    fn migrate_rejects_a_named_snapshot_alongside_no_snapshot() {
+        use clap::Parser;
+        assert!(
+            Cli::try_parse_from([
+                "musefs",
+                "migrate",
+                "--db",
+                "/tmp/x.db",
+                "--snapshot",
+                "/tmp/b.db",
+                "--no-snapshot",
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn read_ahead_budget_flag_maps_to_mount_config() {
@@ -952,7 +1382,9 @@ mod tests {
                 assert_eq!(targets, vec![PathBuf::from("/m")]);
             }
             Command::Mount(..) => panic!("expected Scan"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
     }
 
@@ -963,7 +1395,9 @@ mod tests {
         match cli.command {
             Command::Scan { quiet, .. } => assert!(!quiet),
             Command::Mount(..) => panic!("expected Scan"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
         for arg in ["--quiet", "-q"] {
             let cli =
@@ -971,7 +1405,9 @@ mod tests {
             match cli.command {
                 Command::Scan { quiet, .. } => assert!(quiet),
                 Command::Mount(..) => panic!("expected Scan"),
-                Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+                Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                    unreachable!()
+                }
             }
         }
     }
@@ -993,7 +1429,9 @@ mod tests {
                 follow_symlinks, ..
             } => assert!(follow_symlinks),
             Command::Mount(..) => panic!("expected scan command"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
     }
 
@@ -1006,7 +1444,9 @@ mod tests {
                 follow_symlinks, ..
             } => assert!(!follow_symlinks),
             Command::Mount(..) => panic!("expected scan command"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
     }
 
@@ -1027,7 +1467,9 @@ mod tests {
                 );
             }
             Command::Mount(..) => panic!("expected Scan"),
-            Command::Revalidate { .. } | Command::Vacuum { .. } => unreachable!(),
+            Command::Revalidate { .. } | Command::Vacuum { .. } | Command::Migrate(..) => {
+                unreachable!()
+            }
         }
     }
 
