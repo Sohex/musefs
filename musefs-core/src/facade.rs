@@ -32,6 +32,7 @@ pub enum Mode {
 
 /// Per-mount configuration for rendering the virtual hierarchy.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent mount toggles, not a state machine
 pub struct MountConfig {
     pub template: String,
     pub fallbacks: BTreeMap<String, String>,
@@ -56,6 +57,19 @@ pub struct MountConfig {
     /// instead of substituting `default_fallback`. Per-field fallback chains and
     /// `[...]` sections are unaffected. Set by the CLI (`--skip-on-missing`).
     pub skip_on_missing: bool,
+    /// Serve `getattr` straight from the size cache on a hit, skipping the
+    /// backing re-stat that would otherwise catch an on-disk change made
+    /// without a `content_version` bump (#279). Off by default; set by the CLI
+    /// (`--trust-backing-mtime`) for high-latency backings, where that stat is
+    /// a network round trip or a head seek paid once per track per traversal,
+    /// on every traversal after the first (#668).
+    ///
+    /// Scoped to `getattr` alone: `open` and the read paths validate
+    /// unconditionally, so a changed backing is still caught before any byte is
+    /// served and the `BackingChanged` guarantee is untouched. What the flag
+    /// trades away is the freshness of the size and mtime a `stat` reports
+    /// between the change and the next `open`.
+    pub trust_backing_mtime: bool,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -354,8 +368,16 @@ impl Musefs {
                 // they now live.
                 && e.stamp == BackingStamp::from_identity(&identity)
             {
-                // Hit: re-stat the backing file (no synthesis) and compare to
-                // the stamp the cached attrs were built from. An on-disk change
+                // Hit. `--trust-backing-mtime` takes the cached attrs as-is and
+                // skips the re-stat below, for backings where that stat is a
+                // network round trip rather than a microsecond (#668). The
+                // opt-out stops here: the miss path below still stats, and so do
+                // `open` and the read paths, so no stale byte is ever served.
+                if self.config.trust_backing_mtime {
+                    return Ok((e.total_len, e.mtime_secs));
+                }
+                // Re-stat the backing file (no synthesis) and compare to the
+                // stamp the cached attrs were built from. An on-disk change
                 // that left content_version untouched would otherwise let
                 // getattr advertise stale attrs — the one metadata surface that
                 // could outrun a backing change (read/open already re-stat).
@@ -786,6 +808,7 @@ impl Musefs {
             refresh_gap_fallbacks: self.gap_fallbacks.load(Ordering::Relaxed),
             refresh_needs_rebuild: self.needs_rebuild.load(Ordering::Relaxed),
             serve_warns_suppressed: crate::warn_limit::serve_warns_suppressed(),
+            trust_backing_mtime: self.config.trust_backing_mtime,
         }
     }
 }

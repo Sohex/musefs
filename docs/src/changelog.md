@@ -14,6 +14,25 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- `--trust-backing-mtime` skips the backing re-stat that `getattr` performs on
+  a metadata-cache hit, serving the cached size and mtime instead. Off by
+  default, and scoped to `getattr` alone. The re-stat exists to catch an
+  on-disk change that left `content_version` untouched
+  ([#279](https://github.com/Sohex/musefs/issues/279)), which is the right
+  default and stays the default; it has no escape hatch for backings where a
+  `stat` is not roughly a microsecond. On NFS, SMB, or a spun-down array it is
+  a network round trip or a head seek, and a warm cache does not help: a
+  scanner walking ten thousand tracks pays ten thousand synchronous stats on
+  every pass, and `--attr-ttl-ms` cannot debounce them because each track is
+  stated once per traversal and a traversal outlives any TTL worth setting.
+  `open` and the read paths validate unconditionally either way, so a replaced
+  backing file is still caught before a byte is served, and the cold traversal
+  that populates the cache stats regardless — the hit-path stat is the cost of
+  every pass *after* the first, not of the first.
+  `musefs_trust_backing_mtime` reports the flag state, which is what tells a
+  quiet `musefs_backing_stats_total` from a disabled counter
+  ([#668](https://github.com/Sohex/musefs/issues/668)).
+
 - Chaptered `.m4b` files are supported. A `moov` may now hold chapter tracks
   (`text`, `sbtl`) alongside its single audio (`soun`) track, and every track's
   `stco`/`co64` chunk offsets are relocated when the `moov` is regenerated, not

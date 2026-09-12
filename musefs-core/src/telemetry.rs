@@ -26,6 +26,7 @@ pub struct CoreTelemetry {
     pub refresh_gap_fallbacks: u64,
     pub refresh_needs_rebuild: bool,
     pub serve_warns_suppressed: u64,
+    pub trust_backing_mtime: bool,
 }
 
 /// Passthrough sub-telemetry; `None` (in [`FuseTelemetry`]) off Linux.
@@ -286,6 +287,15 @@ pub fn render_prometheus(
         "1 if a poisoned-lock recovery left a full rebuild pending.",
         u64::from(core.refresh_needs_rebuild),
     );
+    // Reads alongside musefs_backing_stats_total: with the flag at 1 that
+    // counter stops moving on repeat traversals, and the gauge is what tells a
+    // quiet counter from a disabled one (#668).
+    gauge(
+        &mut out,
+        "musefs_trust_backing_mtime",
+        "1 if --trust-backing-mtime is skipping the getattr backing re-stat.",
+        u64::from(core.trust_backing_mtime),
+    );
 
     if let Some(pt) = fuse.passthrough {
         gauge(
@@ -450,6 +460,7 @@ mod tests {
             refresh_gap_fallbacks: 1,
             refresh_needs_rebuild: false,
             serve_warns_suppressed: 13,
+            trust_backing_mtime: false,
         }
     }
 
@@ -633,5 +644,15 @@ mod tests {
         c.refresh_needs_rebuild = true;
         let out = render_prometheus(&c, &sample_fuse(), &sample_process(), None, None);
         assert!(out.contains("musefs_refresh_needs_rebuild 1\n"));
+    }
+
+    #[test]
+    fn trust_backing_mtime_renders_the_flag_state() {
+        let mut c = sample_core();
+        let out = render_prometheus(&c, &sample_fuse(), &sample_process(), None, None);
+        assert!(out.contains("musefs_trust_backing_mtime 0\n"));
+        c.trust_backing_mtime = true;
+        let out = render_prometheus(&c, &sample_fuse(), &sample_process(), None, None);
+        assert!(out.contains("musefs_trust_backing_mtime 1\n"));
     }
 }
