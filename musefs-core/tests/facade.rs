@@ -1506,8 +1506,11 @@ fn restamped_backing_file_does_not_wedge_a_warm_mount() {
     let row_before = writer.list_tracks().unwrap().remove(0);
 
     // A bare scan skips known paths; revalidation is the pass that re-probes a
-    // file whose stamp moved and rewrites the row in place.
-    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o640)).unwrap();
+    // file whose stamp moved and rewrites the row in place. Derive the new mode
+    // from the current one so this is a real permission change under any umask,
+    // rather than a request for whatever mode the file already happens to have.
+    let mode = std::fs::metadata(&src).unwrap().permissions().mode();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(mode ^ 0o040)).unwrap();
     musefs_core::revalidate(&writer, &lib).unwrap();
     let row_after = writer.list_tracks().unwrap().remove(0);
     assert_ne!(
