@@ -1143,6 +1143,143 @@ fn getattr_size_cache_hit_detects_backing_change() {
     );
 }
 
+/// `TreeSnapshot::parent` is what `readdir` builds its `..` entry from, and a
+/// nested tree is what tells a real answer apart from the degenerate ones: root
+/// is its own parent, so a one-level tree cannot distinguish "the parent" from
+/// "the root" or from "the inode itself".
+#[test]
+fn tree_snapshot_parent_reports_the_real_parent_of_a_nested_directory() {
+    use crate::scan::scan_directory;
+    use id3::TagLike;
+    use std::collections::BTreeMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut tag = id3::Tag::new();
+        tag.set_artist("Pix");
+        tag.set_album("Album");
+        tag.set_title("Song");
+        let mut bytes = Vec::new();
+        tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+        bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+        std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+    }
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let cfg = MountConfig {
+        template: "$artist/$album/$title".to_string(),
+        fallbacks: BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
+        read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
+        skip_on_missing: false,
+        trust_backing_mtime: false,
+    };
+    let fs = Musefs::open(db, cfg).unwrap();
+
+    let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+    let album = fs.lookup(artist, "Album").expect("album dir");
+    let (_, file_inode, _) = fs.readdir(album).unwrap().into_iter().next().unwrap();
+    assert!(
+        artist > VirtualTree::ROOT && album > artist,
+        "the fixture needs allocated inodes above the root: {artist}, {album}"
+    );
+
+    let snapshot = fs.tree_snapshot();
+    assert_eq!(
+        snapshot.parent(album),
+        Some(artist),
+        "a nested directory's parent is the directory above it"
+    );
+    assert_eq!(
+        snapshot.parent(file_inode),
+        Some(album),
+        "a file's parent is the directory holding it"
+    );
+    assert_eq!(
+        snapshot.parent(VirtualTree::ROOT),
+        Some(VirtualTree::ROOT),
+        "the root is its own parent"
+    );
+    assert_eq!(
+        snapshot.parent(u64::MAX),
+        None,
+        "an inode this tree does not hold has no parent"
+    );
+}
+
+/// `TreeSnapshot::id` names the pinned generation, and the FUSE layer keys
+/// shared `readdir` listings on it (#675). Two things have to hold for that key
+/// to mean anything: clones of one snapshot agree, and a snapshot of a rebuilt
+/// tree does not agree with one taken before the rebuild. A constant would
+/// satisfy the first and collapse the second, serving one generation's listing
+/// to the next.
+#[test]
+fn tree_snapshot_id_distinguishes_generations_and_not_clones() {
+    use crate::scan::scan_directory;
+    use id3::TagLike;
+    use std::collections::BTreeMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut tag = id3::Tag::new();
+        tag.set_artist("Pix");
+        tag.set_title("Song");
+        let mut bytes = Vec::new();
+        tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+        bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+        std::fs::write(dir.path().join("a.mp3"), &bytes).unwrap();
+    }
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+    let cfg = MountConfig {
+        template: "$artist/$title".to_string(),
+        fallbacks: BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
+        read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
+        skip_on_missing: false,
+        trust_backing_mtime: false,
+    };
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+
+    let before = fs.tree_snapshot();
+    assert_eq!(
+        before.id(),
+        before.clone().id(),
+        "a clone pins the same generation, so it must name it the same"
+    );
+
+    // Re-tag out of band and refresh: the rebuild publishes a new tree.
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        let track_id = db.list_tracks().unwrap().into_iter().next().unwrap().id;
+        db.replace_tags(track_id, &[musefs_db::Tag::new("artist", "Nix", 0)])
+            .unwrap();
+    }
+    assert!(
+        fs.poll_refresh().unwrap(),
+        "poll_refresh must detect the re-tag"
+    );
+
+    let after = fs.tree_snapshot();
+    assert_ne!(
+        before.id(),
+        after.id(),
+        "a rebuilt tree is a different generation and must not reuse the name of \
+         the one still pinned by `before`"
+    );
+}
+
 /// A one-track mount over a backing file the caller is about to change out of
 /// band, plus that track's inode and the backing path to change. Shared by the
 /// `--trust-backing-mtime` tests, which differ only in which serve path they

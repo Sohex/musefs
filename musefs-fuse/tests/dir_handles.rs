@@ -8,6 +8,11 @@
 //! `readdir`'s stateless fallback, and the rejections must show up in the
 //! telemetry counter (#626) rather than as lost files.
 //!
+//! The second test covers the other half of the same table: what a thousand
+//! handles on *one* directory cost (#675). Each used to pin its own copy of the
+//! listing, so the table's memory was width times handle count; they now share
+//! one, which `musefs_dir_listings` is the visible proof of.
+//!
 //! Run with:
 //!   cargo test -p musefs-fuse --test dir_handles -- --ignored --nocapture
 
@@ -170,6 +175,90 @@ fn over_cap_opendir_still_lists_every_directory() {
     assert!(
         metric(&after, "musefs_dir_handle_rejections_total") > before,
         "the degraded path must be visible in musefs_dir_handle_rejections_total (#626)"
+    );
+
+    drop(held);
+    drop(session);
+}
+
+/// Tracks in the one wide directory the sharing test opens. Enough that 1,024
+/// private copies would be obvious, small enough to scan quickly.
+const WIDE: usize = 512;
+
+#[test]
+#[ignore = "requires /dev/fuse + libfuse; run with --ignored"]
+fn many_handles_on_one_directory_share_one_listing() {
+    if !raise_nofile(NEEDED_FDS) {
+        eprintln!("skipping: RLIMIT_NOFILE cannot reach {NEEDED_FDS}");
+        return;
+    }
+
+    // One artist, many titles: the template renders a single wide directory.
+    let backing = tempfile::tempdir().unwrap();
+    for i in 0..WIDE {
+        let flac = make_flac(
+            &["ARTIST=Wide", &format!("TITLE=Song{i:04}")],
+            &[0xAAu8; 32],
+        );
+        std::fs::write(backing.path().join(format!("{i:04}.flac")), &flac).unwrap();
+    }
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, backing.path()).unwrap();
+    let core = Musefs::open(db, config()).unwrap();
+
+    let mountpoint = tempfile::tempdir().unwrap();
+    let session = musefs_fuse::spawn_with(
+        core,
+        mountpoint.path(),
+        "musefs-dir-sharing-e2e",
+        FuseConfig {
+            expose_metrics: true,
+            ..FuseConfig::default()
+        },
+    )
+    .unwrap();
+    let root = mountpoint.path();
+    let wide = root.join("Wide");
+
+    // Fill the table from one directory. Nothing else has opened a directory on
+    // this mount, so the index holds exactly what these opens put there.
+    let held: Vec<File> = (0..CAP)
+        .map(|i| File::open(&wide).unwrap_or_else(|e| panic!("opendir #{i} failed: {e}")))
+        .collect();
+
+    let saturated = read_metrics(root);
+    let handles = metric(&saturated, "musefs_dir_handles");
+
+    // The shared listing is also what an over-cap `readdir` finds, so a
+    // saturated table still lists the directory in full. True on every platform,
+    // whatever the VFS did with the opens above.
+    assert_eq!(
+        count_flacs(&wide),
+        WIDE,
+        "a saturated table must still list every entry"
+    );
+
+    // Whether those opens reached the daemon as separate `opendir`s is the
+    // platform's business: Linux sends one per `open(2)`, FreeBSD's fusefs
+    // shares a single handle across opens of the same directory, which leaves
+    // nothing to share and so nothing to assert.
+    if handles < 2 {
+        eprintln!(
+            "skipping the sharing assertion: this VFS reused {handles} directory \
+             handle(s) across {CAP} opens, so per-handle listings never multiply here"
+        );
+        drop(held);
+        drop(session);
+        return;
+    }
+    assert_eq!(
+        handles, CAP as u64,
+        "the held fds must have pinned the whole table"
+    );
+    assert_eq!(
+        metric(&saturated, "musefs_dir_listings"),
+        1,
+        "handles on one directory at one tree generation must share one listing (#675)"
     );
 
     drop(held);

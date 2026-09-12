@@ -18,7 +18,7 @@ pub mod warn_limit;
 
 pub use db_pool::DbPool;
 pub use error::{CoreError, Result};
-pub use facade::{Attr, Fh, Mode, MountConfig, Musefs, PassthroughFd};
+pub use facade::{Attr, Fh, Mode, MountConfig, Musefs, PassthroughFd, TreeSnapshot};
 pub use musefs_db::convert;
 pub use readahead::{BackingReader, ReadAhead, ReadAheadPool};
 pub use reader::{HeaderCache, ResolvedFile, read_at, read_at_with_file};

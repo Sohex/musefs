@@ -82,6 +82,18 @@ see the [Release notes](release-notes.md).
 
 ### Changed
 
+- Directory handles on the same directory share one listing instead of copying
+  it each. `opendir` took a private snapshot per handle, so the table's memory
+  was the directory's width times the handle count: on a template that
+  collapses a library into one directory, a client opening the 1,024-handle cap
+  on it — which needs no privilege — pinned tens of gigabytes. A listing is now
+  keyed by directory and virtual-tree generation, and handles that agree on
+  both share it. All but the first also skip the tree walk that builds one,
+  which an over-cap `readdir` consults before rebuilding as well.
+  `musefs_dir_listings` reports the distinct-listing count behind
+  `musefs_dir_handles`
+  ([#675](https://github.com/Sohex/musefs/issues/675)).
+
 - An MP4 file skipped for its track layout now reports the handler types found
   (`unsupported MP4 track layout: expected one audio (soun) track, optionally
   with text/sbtl chapter tracks; found [soun, vide]`) instead of a bare "not a

@@ -45,6 +45,8 @@ pub struct FuseTelemetry {
     pub reads_inflight_max: u64,
     pub read_errors: u64,
     pub dir_handles: u64,
+    /// Distinct directory listings those handles hold between them (#675).
+    pub dir_listings: u64,
     pub dir_handles_max: u64,
     pub dir_handle_rejections: u64,
     pub pool_workers: u64,
@@ -167,6 +169,16 @@ pub fn render_prometheus(
         "musefs_dir_handles",
         "Open directory-listing snapshots.",
         fuse.dir_handles,
+    );
+    // Reads against musefs_dir_handles: handles on one directory at one tree
+    // generation share a listing, so the gap between the two is the sharing
+    // doing its job, and equality means every open handle is on a distinct
+    // directory (#675).
+    gauge(
+        &mut out,
+        "musefs_dir_listings",
+        "Distinct directory listings held by the open directory handles.",
+        fuse.dir_listings,
     );
     gauge(
         &mut out,
@@ -471,6 +483,7 @@ mod tests {
             reads_inflight_max: 1024,
             read_errors: 7,
             dir_handles: 2,
+            dir_listings: 1,
             dir_handles_max: 1024,
             dir_handle_rejections: 11,
             pool_workers: 8,

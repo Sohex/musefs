@@ -91,11 +91,24 @@ represents the spliced bytes, so passthrough never applies.
 
 ## Directory listings
 
-`opendir` builds a directory's entries once and snapshots them, so a paginated
+`opendir` builds a directory's entries once and holds them, so a paginated
 `readdir` is a map lookup rather than a fresh tree walk per call — enumeration
-stays O(n) in the directory, not O(n²). Snapshots are capped at 1024 concurrent
-handles so a client that opens directories without closing them cannot pin
-unbounded memory.
+stays O(n) in the directory, not O(n²). Handles are capped at 1024 concurrent
+so a client that opens directories without closing them cannot pin unbounded
+memory.
+
+Handles do not each pay for their own copy. A listing is keyed by the directory
+and the virtual-tree generation it was built from, and every handle that agrees
+on both shares it: a thousand opens of one directory cost one listing and a
+thousand refcounts, not a thousand copies of a listing whose size scales with
+the directory's width. All but the first also skip the tree walk outright,
+which is what an over-cap `readdir` consults before rebuilding. `opendir` pins
+the generation it read, so the address that identifies it cannot be reused
+while any handle still names it, and a refresh simply means the next `opendir`
+builds against the new generation while open handles keep serving the view they
+were opened on. `musefs_dir_listings` is the distinct-listing count behind
+`musefs_dir_handles`: the gap between them is the sharing, and equality means
+every open handle is on a different directory.
 
 Over that cap, `opendir` degrades rather than failing: it returns the stateless
 handle, and `readdir` falls back to rebuilding the listing on each call (on the
