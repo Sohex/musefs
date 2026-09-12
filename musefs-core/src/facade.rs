@@ -81,6 +81,54 @@ pub struct Attr {
     pub mtime_secs: i64,
 }
 
+/// One pinned generation of the virtual tree, handed out by
+/// [`Musefs::tree_snapshot`]. Holding it keeps that generation alive, so every
+/// read taken through it describes the same tree even if a refresh publishes a
+/// newer one meanwhile.
+///
+/// [`id`](TreeSnapshot::id) additionally makes the pinned generation a usable
+/// cache key: the FUSE layer keys shared `readdir` listings on it, so handles
+/// opened on one directory at one generation collapse onto a single listing
+/// instead of one copy each (#675).
+#[derive(Clone)]
+pub struct TreeSnapshot(Arc<VirtualTree>);
+
+impl TreeSnapshot {
+    /// An identity for the pinned generation, unique among *live* snapshots:
+    /// it is the tree's heap address, so it is unique only for as long as this
+    /// snapshot (or a clone of it) is alive, and a later generation may well
+    /// reuse the address of one that has been dropped.
+    ///
+    /// A cache keyed on this must therefore keep a clone of the snapshot
+    /// alongside every entry it would hand out, which is exactly what makes the
+    /// key sound: while an entry is reachable its generation is pinned, and no
+    /// other tree can hold that address; once nothing holds it the entry has to
+    /// be gone too.
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    /// The parent inode of `inode` (root's parent is itself), from this
+    /// generation.
+    pub fn parent(&self, inode: u64) -> Option<u64> {
+        self.0.parent(inode)
+    }
+
+    /// Directory entries as `(name, child_inode, is_dir)`, from this generation.
+    pub fn readdir(&self, inode: u64) -> Result<Vec<(String, u64, bool)>> {
+        let children = match self.0.children(inode) {
+            Some(children) => children,
+            // Only directories have a children map; tell apart a known
+            // non-directory (ENOTDIR) from an unknown inode (ENOENT).
+            None if self.0.node(inode).is_some() => return Err(CoreError::NotADir(inode)),
+            None => return Err(CoreError::NoEntry(inode)),
+        };
+        Ok(children
+            .map(|(name, child)| (name.to_owned(), child, self.0.is_dir(child)))
+            .collect())
+    }
+}
+
 struct Handle {
     track_id: i64,
     resolved: arc_swap::ArcSwap<ResolvedFile>,
@@ -327,6 +375,14 @@ impl Musefs {
         self.tree.load().parent(inode)
     }
 
+    /// Pin the current virtual-tree generation, so a caller that needs several
+    /// reads to agree with one another — a directory's children and its parent,
+    /// say — takes them from one view instead of racing a refresh between two
+    /// `ArcSwap` loads. See [`TreeSnapshot`].
+    pub fn tree_snapshot(&self) -> TreeSnapshot {
+        TreeSnapshot(self.tree.load_full())
+    }
+
     pub fn getattr(&self, inode: u64) -> Result<Attr> {
         let track_id = {
             let tree = self.tree.load();
@@ -412,17 +468,7 @@ impl Musefs {
 
     /// Directory entries as `(name, child_inode, is_dir)`.
     pub fn readdir(&self, inode: u64) -> Result<Vec<(String, u64, bool)>> {
-        let tree = self.tree.load();
-        let children = match tree.children(inode) {
-            Some(children) => children,
-            // Only directories have a children map; tell apart a known
-            // non-directory (ENOTDIR) from an unknown inode (ENOENT).
-            None if tree.node(inode).is_some() => return Err(CoreError::NotADir(inode)),
-            None => return Err(CoreError::NoEntry(inode)),
-        };
-        Ok(children
-            .map(|(name, child)| (name.to_owned(), child, tree.is_dir(child)))
-            .collect())
+        self.tree_snapshot().readdir(inode)
     }
 
     /// Serve a read into `out` (cleared first). The FUSE layer passes a reused
