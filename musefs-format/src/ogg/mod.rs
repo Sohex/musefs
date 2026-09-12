@@ -164,22 +164,55 @@ use crate::input::EmbeddedPicture;
 /// packets (block type 6). Plan 1 only *reads* art (to seed the DB); synthesis does
 /// not yet re-embed it.
 pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
-    use base64::Engine;
+    Ok(read_pictures_reporting(data)?.0)
+}
+
+/// An embedded picture the reader skipped because it could not be decoded, so
+/// the caller can log the lossy drop (the format layer has no logging facade).
+/// Carries only a reason and the skipped value's encoded size — never the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PictureDrop {
+    /// Why the picture was skipped.
+    pub reason: &'static str,
+    /// Size of the skipped value as it appeared in the file, in bytes.
+    pub bytes: usize,
+}
+
+/// Like [`read_pictures`], but also returns the pictures skipped as undecodable.
+///
+/// A bad picture skips *that* picture and nothing else: returning early would let
+/// one unparseable `METADATA_BLOCK_PICTURE` discard every valid picture in the
+/// same file, and the scan path swallows the error, so the loss would be silent
+/// (#673). Only a malformed *container* (a bad header or comment packet) still
+/// errors, since then there is no list of pictures to salvage.
+pub fn read_pictures_reporting(data: &[u8]) -> Result<(Vec<EmbeddedPicture>, Vec<PictureDrop>)> {
     let header = read_header(data)?;
     let mut out = Vec::new();
+    let mut dropped = Vec::new();
     match header.codec {
         Codec::Opus | Codec::Vorbis => {
             let idx = comment_packet_index(&header);
             if idx == 0 {
-                return Ok(out);
+                return Ok((out, dropped));
             }
             let body = comment_body(header.codec, &header.packets[idx])?;
             for (field, value) in crate::vorbiscomment::parse(body)? {
-                if field.eq_ignore_ascii_case("METADATA_BLOCK_PICTURE") {
-                    let raw = base64::engine::general_purpose::STANDARD
-                        .decode(value.as_bytes())
-                        .map_err(|_| FormatError::Malformed)?;
-                    out.push(crate::flac::parse_picture_block(&raw)?);
+                if !field.eq_ignore_ascii_case("METADATA_BLOCK_PICTURE") {
+                    continue;
+                }
+                let Some(raw) = decode_picture_base64(&value) else {
+                    dropped.push(PictureDrop {
+                        reason: "undecodable base64",
+                        bytes: value.len(),
+                    });
+                    continue;
+                };
+                match crate::flac::parse_picture_block(&raw) {
+                    Ok(pic) => out.push(pic),
+                    Err(_) => dropped.push(PictureDrop {
+                        reason: "malformed PICTURE block",
+                        bytes: raw.len(),
+                    }),
                 }
             }
         }
@@ -189,12 +222,37 @@ pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
                 // attacker-controlled, so a 1-3 byte type-6 packet must not panic.
                 if pkt.len() >= 4 && (pkt[0] & 0x7F) == 6 {
                     // Strip the 4-byte FLAC metadata block header.
-                    out.push(crate::flac::parse_picture_block(&pkt[4..])?);
+                    match crate::flac::parse_picture_block(&pkt[4..]) {
+                        Ok(pic) => out.push(pic),
+                        Err(_) => dropped.push(PictureDrop {
+                            reason: "malformed PICTURE block",
+                            bytes: pkt.len() - 4,
+                        }),
+                    }
                 }
             }
         }
     }
-    Ok(out)
+    Ok((out, dropped))
+}
+
+/// Base64-decode a `METADATA_BLOCK_PICTURE` value, tolerating ASCII whitespace.
+///
+/// Vorbis comment values are length-prefixed, so the 76-column wrapping of the
+/// older MIME style is unnecessary and is not what the Xiph recommendation
+/// describes — but the strict engine rejects a wrapped value outright at the
+/// first line break, costing the whole picture. Filtering is leniency, not
+/// conformance, so it allocates a stripped copy only when whitespace is actually
+/// present; the overwhelmingly common unwrapped value decodes in place (#673).
+fn decode_picture_base64(value: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    if value.bytes().any(|b| b.is_ascii_whitespace()) {
+        let stripped: Vec<u8> = value.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        engine.decode(&stripped).ok()
+    } else {
+        engine.decode(value.as_bytes()).ok()
+    }
 }
 
 /// Audio bounds + codec from a complete file, for the scanner.
@@ -609,6 +667,126 @@ mod tests {
         let pics = read_pictures(&data).unwrap();
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].data, vec![0xAB]);
+    }
+
+    /// A FLAC PICTURE block body (the payload a `METADATA_BLOCK_PICTURE` value
+    /// base64-encodes) carrying a PNG of `len` bytes, every one of them `marker`.
+    fn picture_block_n(marker: u8, len: usize) -> Vec<u8> {
+        let mut block = Vec::new();
+        block.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
+        block.extend_from_slice(&9u32.to_be_bytes());
+        block.extend_from_slice(b"image/png");
+        block.extend_from_slice(&0u32.to_be_bytes()); // description length
+        block.extend_from_slice(&1u32.to_be_bytes()); // width
+        block.extend_from_slice(&1u32.to_be_bytes()); // height
+        block.extend_from_slice(&8u32.to_be_bytes()); // depth
+        block.extend_from_slice(&0u32.to_be_bytes()); // colors used
+        block.extend_from_slice(&u32::try_from(len).unwrap().to_be_bytes());
+        block.extend(std::iter::repeat_n(marker, len));
+        block
+    }
+
+    /// [`picture_block_n`] with a single image byte.
+    fn picture_block(marker: u8) -> Vec<u8> {
+        picture_block_n(marker, 1)
+    }
+
+    /// A complete Opus file whose comment packet carries `comments`, plus one
+    /// audio page so `audio_offset` lands before EOF.
+    fn opus_with_comments(comments: &[(&str, &str)]) -> Vec<u8> {
+        let inputs: Vec<crate::input::TagInput> = comments
+            .iter()
+            .map(|(k, v)| crate::input::TagInput::new(k, v))
+            .collect();
+        let mut tags_pkt = b"OpusTags".to_vec();
+        tags_pkt.extend_from_slice(&crate::vorbiscomment::build(&inputs).unwrap());
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let (mut data, _) = build_header(7, &[&head, &tags_pkt]);
+        let (audio, _) = lace_packet(7, 2, false, 960, &[0u8; 50]);
+        data.extend_from_slice(&audio);
+        data
+    }
+
+    /// Wrap `s` at 76 columns with CRLF, the older MIME base64 style.
+    fn wrap76(s: &str) -> String {
+        s.as_bytes()
+            .chunks(76)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    #[test]
+    fn read_pictures_accepts_whitespace_wrapped_base64() {
+        // Vorbis comment values are length-prefixed so wrapping is unnecessary,
+        // but the strict engine used to fail at the first line break and discard
+        // the picture (#673). A wrapped value must decode to the same bytes.
+        // 200 image bytes so the encoded value is comfortably past 76 columns.
+        let value = base64::engine::general_purpose::STANDARD.encode(picture_block_n(0xAB, 200));
+        let wrapped = wrap76(&value);
+        assert!(wrapped.contains("\r\n"), "test value must actually wrap");
+
+        let data = opus_with_comments(&[("METADATA_BLOCK_PICTURE", &wrapped)]);
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert_eq!(dropped, vec![]);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].data, vec![0xAB; 200]);
+    }
+
+    #[test]
+    fn read_pictures_skips_one_bad_value_and_keeps_the_others() {
+        // One unparseable picture used to abandon the loop, discarding every
+        // valid picture in the same file — and the scan path swallowed the
+        // error, so the loss was silent (#673).
+        let good_a = base64::engine::general_purpose::STANDARD.encode(picture_block(0xAA));
+        let good_b = base64::engine::general_purpose::STANDARD.encode(picture_block(0xBB));
+        let data = opus_with_comments(&[
+            ("METADATA_BLOCK_PICTURE", "not!valid!base64"),
+            ("METADATA_BLOCK_PICTURE", &good_a),
+            ("METADATA_BLOCK_PICTURE", &good_b),
+        ]);
+
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].data, vec![0xAA]);
+        assert_eq!(pics[1].data, vec![0xBB]);
+        assert_eq!(
+            dropped,
+            vec![PictureDrop {
+                reason: "undecodable base64",
+                bytes: "not!valid!base64".len(),
+            }]
+        );
+    }
+
+    #[test]
+    fn read_pictures_reports_a_decodable_but_malformed_picture_block() {
+        // Valid base64 whose decoded bytes are a truncated PICTURE block: the
+        // drop is attributed to the block, not to the base64.
+        let truncated = base64::engine::general_purpose::STANDARD.encode([0u8; 3]);
+        let good = base64::engine::general_purpose::STANDARD.encode(picture_block(0xCD));
+        let data = opus_with_comments(&[
+            ("METADATA_BLOCK_PICTURE", &truncated),
+            ("METADATA_BLOCK_PICTURE", &good),
+        ]);
+
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].data, vec![0xCD]);
+        assert_eq!(
+            dropped,
+            vec![PictureDrop {
+                reason: "malformed PICTURE block",
+                bytes: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn read_pictures_still_errors_on_a_malformed_container() {
+        // Per-picture leniency must not extend to the container: with no parsable
+        // header there is no list of pictures to salvage.
+        assert!(read_pictures_reporting(b"not an ogg stream").is_err());
     }
 
     #[test]

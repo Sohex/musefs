@@ -164,6 +164,13 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- One unparseable `METADATA_BLOCK_PICTURE` no longer discards every other
+  embedded picture in the same Ogg file, and the drop is logged instead of
+  being swallowed by the scan path. Base64 decoding also tolerates ASCII
+  whitespace, so a value wrapped in the older 76-column MIME style decodes
+  rather than failing at the first line break
+  ([#673](https://github.com/Sohex/musefs/issues/673)).
+
 - A panicking worker-pool task permanently leaked a SQLite read connection and
   up to three file descriptors ([#669](https://github.com/Sohex/musefs/issues/669)).
   `threadpool` retires a worker that unwinds and spawns a replacement, and the

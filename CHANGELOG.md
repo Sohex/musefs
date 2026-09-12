@@ -151,6 +151,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- One unparseable `METADATA_BLOCK_PICTURE` no longer discards every other
+  embedded picture in the same Ogg file, and the drop is logged instead of
+  being swallowed by the scan path. Base64 decoding also tolerates ASCII
+  whitespace, so a value wrapped in the older 76-column MIME style decodes
+  rather than failing at the first line break
+  ([#673](https://github.com/Sohex/musefs/issues/673)).
+
 - A panicking worker-pool task leaked a SQLite read connection and up to three
   file descriptors for the life of the mount
   ([#669](https://github.com/Sohex/musefs/issues/669)). The pool retires a

@@ -828,12 +828,14 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             ogg::Codec::Vorbis => Format::Vorbis,
             ogg::Codec::OggFlac => Format::OggFlac,
         };
+        let (pictures, art_drops) = ogg::read_pictures_reporting(bytes).unwrap_or_default();
+        log_ogg_art_drops(path, &art_drops);
         Some(Probed {
             format,
             audio_offset: scan.audio_offset,
             audio_length: scan.audio_length,
             tags: ogg::read_tags(bytes).unwrap_or_default(),
-            pictures: ogg::read_pictures(bytes).unwrap_or_default(),
+            pictures,
             binary_tags: Vec::new(),
             structural_blocks: Vec::new(),
         })
@@ -1093,12 +1095,15 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
                     ogg::Codec::Vorbis => Format::Vorbis,
                     ogg::Codec::OggFlac => Format::OggFlac,
                 };
+                let (pictures, art_drops) =
+                    ogg::read_pictures_reporting(prefix).unwrap_or_default();
+                log_ogg_art_drops(path, &art_drops);
                 Probe::Done(Probed {
                     format,
                     audio_offset: header.audio_offset,
                     audio_length: file_len - header.audio_offset,
                     tags: ogg::read_tags(prefix).unwrap_or_default(),
-                    pictures: ogg::read_pictures(prefix).unwrap_or_default(),
+                    pictures,
                     binary_tags: Vec::new(),
                     structural_blocks: Vec::new(),
                 })
@@ -1428,6 +1433,24 @@ fn storable_binary_tags(
             payload: b.payload,
         })
         .collect()
+}
+
+/// Log every embedded picture the Ogg reader skipped as undecodable (#673).
+///
+/// Unlike the MP4 oversize drops these do not fail the file: one bad
+/// `METADATA_BLOCK_PICTURE` costs that picture alone, and the rest of the file
+/// ingests normally. What they must not be is silent — the scan path swallows
+/// the reader's error, so without this line an operator sees a track appear with
+/// no art and no explanation.
+fn log_ogg_art_drops(path: &Path, drops: &[ogg::PictureDrop]) {
+    for d in drops {
+        log::warn!(
+            "{}: skipping undecodable embedded art ({}, {} bytes)",
+            path.display(),
+            d.reason,
+            d.bytes
+        );
+    }
 }
 
 /// Build the [`CoreError`](crate::error::CoreError) for an mp4 payload the
