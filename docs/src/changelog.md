@@ -225,6 +225,19 @@ see the [Release notes](release-notes.md).
   platform — the same library therefore mounts to the same paths and inodes
   whichever way the flag is set and wherever it runs.
 
+- A directory that had been ranked away from its base name by a collision is no
+  longer re-created once per track. Which directory a path component belongs to
+  is now decided by the rendered name rather than the stored one, so a library
+  where a *file* renders to the same name as a *directory* — say a track that
+  renders to `Live` next to an album directory `Live` — serves that directory's
+  tracks from one `Live (2)` instead of scattering them across `Live (2)`,
+  `Live (3)`, `Live (4)`, one directory per track. By the same correction, a
+  directory whose rendered name is literally another's rank keeps its own
+  contents instead of absorbing them: `Live` (ranked to `Live (2)`) and a real
+  `Live (2)` are two directories again. Surfaced while reserving the injected
+  root names, which reach the same collision path
+  ([#681](https://github.com/Sohex/musefs/issues/681)).
+
 - Moving a backing file no longer wedges its track for the life of the mount
   ([#679](https://github.com/Sohex/musefs/issues/679)). A scan that retargets a
   row to a relocated file rewrites the path and the freshness stamp and

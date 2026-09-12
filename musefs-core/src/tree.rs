@@ -337,7 +337,7 @@ impl VirtualTree {
             dir_path = child_path;
         }
         let raw_name = comps[comps.len() - 1];
-        let truncated = self.component_key(dir, raw_name, true);
+        let truncated = truncate_component(raw_name, true);
         let raw_name = truncated.as_ref();
         let (name, rendered) = self.intern_names(dir, raw_name);
         let full = join_path(&dir_path, &name);
@@ -377,7 +377,7 @@ impl VirtualTree {
         name: &str,
         alloc: &mut InodeAllocator,
     ) -> (u64, String) {
-        let truncated = self.component_key(parent, name, false);
+        let truncated = truncate_component(name, false);
         let name = truncated.as_ref();
         if let Some(existing) = self.dir_child_named(parent, name) {
             let stored = &self.node(existing).expect("dir_child_named node").name;
@@ -461,26 +461,6 @@ impl VirtualTree {
         }
     }
 
-    /// The child key a rendered component materializes to under `dir`: truncated
-    /// to NAME_MAX, and — at the mount root only — pushed off a name the FUSE
-    /// layer injects (`RESERVED_ROOT_NAMES`) onto its ` (2)` rank, so the
-    /// synthetic entry keeps the base key and the user's subtree stays reachable
-    /// (#681).
-    ///
-    /// The single place a rendered component becomes a stored name: `insert_file`
-    /// and `ensure_dir` materialize with it, and `deepest_existing_ancestor` and
-    /// the add-side dirty gate navigate with it. All four must agree, or an
-    /// incremental refresh diverges from a fresh build.
-    fn component_key<'a>(&self, dir: u64, name: &'a str, preserve_ext: bool) -> Cow<'a, str> {
-        let truncated = truncate_component(name, preserve_ext);
-        if dir == Self::ROOT && self.is_reserved_root_name(&truncated) {
-            // Reserved names are short constants, so the pushed name cannot
-            // exceed NAME_MAX and needs no re-truncation.
-            return Cow::Owned(suffix_candidate(&truncated, 2));
-        }
-        truncated
-    }
-
     /// True if `name` is one of the names the FUSE layer injects at the root,
     /// compared the way this tree compares every other name — case-folded on a
     /// case-insensitive mount, exact otherwise. `RESERVED_ROOT_NAMES` is lowercase,
@@ -493,8 +473,15 @@ impl VirtualTree {
         }
     }
 
-    /// True if `name` is already taken in `dir` (folded when case-insensitive).
+    /// True if `name` is already taken in `dir` (folded when case-insensitive) —
+    /// by an existing child, or, at the root, by a name the FUSE layer injects
+    /// there (#681). The reserved name is occupied by that synthetic entry as
+    /// surely as by a node, so `disambiguate` must rank a rendered name that
+    /// lands on one exactly as it ranks a collision with a real sibling.
     fn taken(&self, dir: u64, name: &str) -> bool {
+        if dir == Self::ROOT && self.is_reserved_root_name(name) {
+            return true;
+        }
         if self.case_insensitive {
             self.folded_children
                 .get(&dir)
@@ -506,17 +493,38 @@ impl VirtualTree {
         }
     }
 
-    /// An existing *directory* child of `dir` matching `name` (folded when
-    /// case-insensitive), for merge reuse. `None` if absent or a non-dir.
-    fn dir_child_named(&self, dir: u64, name: &str) -> Option<u64> {
-        let ino = if self.case_insensitive {
-            self.folded_children
-                .get(&dir)
-                .and_then(|b| b.get(fold(name).as_str()).copied())
+    /// The `rendered_children` key for a rendered name: case-folded on a
+    /// case-insensitive mount, identity otherwise. The rendered index is keyed
+    /// with it so a group is found the way every other name comparison in this
+    /// tree works — case-variant rendered names share one group on a folded
+    /// mount, exactly as their disambiguated names share one directory.
+    fn rendered_key<'a>(&self, rendered: &'a str) -> Cow<'a, str> {
+        if self.case_insensitive {
+            Cow::Owned(fold(rendered))
         } else {
-            self.children.get(&dir).and_then(|c| c.get(name).copied())
-        }?;
-        self.is_dir(ino).then_some(ino)
+            Cow::Borrowed(rendered)
+        }
+    }
+
+    /// An existing *directory* child of `dir` that RENDERED `rendered`, for merge
+    /// reuse; `None` if absent or if only non-directories rendered that name.
+    ///
+    /// Keyed on the rendered name, not the stored one, because the rendered name
+    /// is what identifies the directory a path component belongs to: the stored
+    /// name may carry a ` (k)` rank this component knows nothing about. Merging
+    /// on the stored name instead conflated the two — a directory that had been
+    /// ranked away from its base name was re-created once per track rather than
+    /// merged into, and an unrelated directory whose rendered name was literally
+    /// that rank absorbed its contents. `deepest_existing_ancestor` navigates
+    /// with this same predicate, so the build path and the incremental walk agree
+    /// on which directory a component names.
+    fn dir_child_named(&self, dir: u64, rendered: &str) -> Option<u64> {
+        self.rendered_children
+            .get(&dir)?
+            .get(self.rendered_key(rendered).as_ref())?
+            .values()
+            .copied()
+            .find(|&c| self.is_dir(c))
     }
 
     /// Cheap rename-relevance gate for the child of `dir` whose current key is
@@ -577,7 +585,7 @@ impl VirtualTree {
         match self
             .rendered_children
             .get(&dir)
-            .and_then(|kids| kids.get(rendered))
+            .and_then(|kids| kids.get(self.rendered_key(rendered).as_ref()))
         {
             None => (Vec::new(), 0),
             Some(same_rendered) => {
@@ -599,15 +607,22 @@ impl VirtualTree {
     }
 
     fn insert_rendered_child(&mut self, parent: u64, rendered: &Name, name: &Name, inode: u64) {
+        let key = if self.case_insensitive {
+            fold_key(rendered)
+        } else {
+            Arc::clone(rendered)
+        };
         self.rendered_children
             .entry(parent)
             .or_default()
-            .entry(Arc::clone(rendered))
+            .entry(key)
             .or_default()
             .insert(Arc::clone(name), inode);
     }
 
     fn remove_rendered_child(&mut self, parent: u64, rendered: &str, name: &str) {
+        let rendered = self.rendered_key(rendered).into_owned();
+        let rendered = rendered.as_str();
         let Some(by_rendered) = self.rendered_children.get_mut(&parent) else {
             return;
         };
@@ -856,12 +871,14 @@ impl VirtualTree {
                 // The stored child key is the NAME_MAX-truncated rendered name
                 // (leaf preserves its extension), so an over-long first-new
                 // component must be truncated the same way or the occupancy check
-                // misses (#535). At the root it also carries the reserved-name
-                // push (#681), for the same reason.
-                let key = self.component_key(d, c, consumed + 1 == comps.len());
-                self.children
-                    .get(&d)
-                    .is_some_and(|kids| kids.contains_key(key.as_ref()))
+                // misses (#535).
+                let key = truncate_component(c, consumed + 1 == comps.len());
+                // `taken`, not a bare `children` probe: the base key of a reserved
+                // root name is held by the FUSE-injected entry, so a group that
+                // renders to one is rename-relevant from its very first member
+                // (#681). Folding on a case-insensitive mount is the same
+                // widening — both only ever add rebuilds, never skip one.
+                self.taken(d, key.as_ref())
             }) {
                 dirty.insert(d);
             }
@@ -930,14 +947,9 @@ impl VirtualTree {
             // its NAME_MAX-truncated rendered name (`ensure_dir`), so an over-long
             // component must be truncated here too — otherwise the lookup misses,
             // the walk stops short, and the add-side dirty gate diverges from a full
-            // rebuild (#535). A root component carries the reserved-name push for
-            // the same reason (#681).
-            let key = self.component_key(dir, comp, false);
-            let next = self
-                .children_by_rendered(dir, key.as_ref())
-                .into_iter()
-                .find(|&c| self.is_dir(c));
-            match next {
+            // rebuild (#535).
+            let key = truncate_component(comp, false);
+            match self.dir_child_named(dir, key.as_ref()) {
                 Some(c) => {
                     dir = c;
                     consumed += 1;
@@ -1522,6 +1534,69 @@ mod tests {
     }
 
     #[test]
+    fn reserved_dir_stays_distinct_from_a_literal_suffixed_dir() {
+        // The pushed directory keeps its true rendered name, so a directory that
+        // literally renders `.musefs-metrics (2)` is a different rendered group and
+        // keeps its own contents instead of absorbing, or being absorbed by, the
+        // pushed one.
+        let t = VirtualTree::build(&[
+            (1, format!("{METRICS_DIR_NAME}/a.flac").into()),
+            (2, ".musefs-metrics (2)/b.flac".into()),
+        ]);
+        let pushed = t.lookup(VirtualTree::ROOT, ".musefs-metrics (2)").unwrap();
+        let literal = t
+            .lookup(VirtualTree::ROOT, ".musefs-metrics (2) (2)")
+            .unwrap();
+        assert_ne!(pushed, literal);
+        assert!(t.lookup(pushed, "a.flac").is_some());
+        assert!(
+            t.lookup(pushed, "b.flac").is_none(),
+            "contents must not mix"
+        );
+        assert!(t.lookup(literal, "b.flac").is_some());
+    }
+
+    #[test]
+    fn a_ranked_away_directory_is_merged_into_not_recreated() {
+        // The merge is keyed on the rendered name, so every track under one
+        // rendered directory lands in one directory even when a same-rendered file
+        // pushed it off its base name. Keyed on the STORED name it was re-created
+        // per track: "X (2)/a.flac", "X (3)/b.flac", one directory per track.
+        let t = VirtualTree::build(&[
+            (1, "X".into()),
+            (2, "X/a.flac".into()),
+            (3, "X/b.flac".into()),
+        ]);
+        assert_eq!(
+            t.children(VirtualTree::ROOT)
+                .unwrap()
+                .map(|(n, _)| n.to_owned())
+                .collect::<Vec<_>>(),
+            vec!["X".to_string(), "X (2)".to_string()],
+        );
+        let dir = t.lookup(VirtualTree::ROOT, "X (2)").unwrap();
+        assert!(t.lookup(dir, "a.flac").is_some());
+        assert!(t.lookup(dir, "b.flac").is_some());
+    }
+
+    #[test]
+    fn a_literal_suffixed_dir_does_not_absorb_a_ranked_away_one() {
+        // The same distinction without a reserved name in sight: "X (2)" as a
+        // rendered name is its own group, not the rank the pushed "X" directory
+        // was moved to.
+        let t = VirtualTree::build(&[
+            (1, "X".into()),
+            (2, "X/a.flac".into()),
+            (3, "X (2)/b.flac".into()),
+        ]);
+        let pushed = t.lookup(VirtualTree::ROOT, "X (2)").unwrap();
+        let literal = t.lookup(VirtualTree::ROOT, "X (2) (2)").unwrap();
+        assert_ne!(pushed, literal);
+        assert!(t.lookup(pushed, "a.flac").is_some());
+        assert!(t.lookup(literal, "b.flac").is_some());
+    }
+
+    #[test]
     fn reserved_push_stacks_with_ordinary_disambiguation() {
         // The pushed name is an ordinary key: a track that genuinely renders to it
         // ranks against the pushed one by track id, as any collision group does.
@@ -2028,11 +2103,25 @@ mod tests {
 
     #[test]
     fn apply_changes_add_reserved_root_file_matches_build() {
-        // A new root file landing on the reserved name: the occupancy gate probes
-        // the PUSHED key, so it must agree with a fresh build about the free rank.
+        // A new root file landing on the reserved name. The base key is held by the
+        // synthetic entry, so the occupancy gate sees an occupied key and rebuilds
+        // the root — one rebuild rather than none, which is the conservative side.
         let before = vec![(1, "Z/a.flac".into())];
         let after = vec![(1, "Z/a.flac".into()), (2, ".musefs-metrics".into())];
-        assert_apply_matches_build(&before, &after, &[], &[2], &[], 0);
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
+    }
+
+    #[test]
+    fn apply_changes_lower_id_reranks_a_reserved_group() {
+        // Why the gate must treat the reserved base key as occupied. The group does
+        // not own its base name — the synthetic entry does — so the fresh-build
+        // invariant the gate normally probes ("a non-empty group occupies its base
+        // key") does not hold here. A later-arriving LOWER id outranks the sitting
+        // member, and without the rebuild the incremental tree would leave id 5 at
+        // ` (2)` and put id 2 at ` (3)`, the reverse of a fresh build.
+        let before = vec![(5, ".musefs-metrics".into())];
+        let after = vec![(2, ".musefs-metrics".into()), (5, ".musefs-metrics".into())];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
     }
 
     #[test]
