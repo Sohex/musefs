@@ -98,7 +98,8 @@ malformed *shapes* at commit, so an external writer cannot persist them:
   `CHECK` enforces this, rejecting violating writes — with one blind spot: an
   embedded NUL terminates SQLite's `length()`/`GLOB`, so a key like `a\0b` slips
   the `CHECK`. The scanner's own floor drops it before insert, and the Vorbis
-  path rejects it on synthesis). Additionally, only keys within the Vorbis
+  path rejects it on synthesis; see **The NUL blind spot** below for what the
+  readers do about a row an external writer plants). Additionally, only keys within the Vorbis
   field-name grammar (ASCII `0x20`–`0x7D`, excluding `=`) survive FLAC/Ogg
   synthesis — others are dropped and logged. MP3/M4A custom keys may use the
   wider set (e.g. `=`, `:`, spaces, non-ASCII).
@@ -107,6 +108,30 @@ malformed *shapes* at commit, so an external writer cannot persist them:
 - a `track_art.description` over 8 KiB;
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
+
+**The NUL blind spot.** SQLite permits an embedded U+0000 in a TEXT value and
+`length()` counts characters only up to the first one, so every `CHECK` above
+that caps a TEXT column in *characters* — `tags.key`, `art.mime`,
+`track_art.description` — measures 1 for a value of `"X\0"` followed by a
+hundred megabytes ([#693](https://github.com/Sohex/musefs/issues/693)). Blob
+columns are unaffected: `length()` on a BLOB counts bytes, which is why
+`tags.value` is capped as `length(CAST(value AS BLOB))`.
+
+The readers do not rely on those caps. Every reader that materializes one of
+these fields first projects *both* `length(col)` and `length(CAST(col AS
+BLOB))`, and rejects the row if either is over — the character cap the schema
+states, or the byte ceiling that cap implies, which is four bytes per character
+because that is UTF-8's widest scalar value. The byte bound is the one that
+matters against a hostile row: `Row::get::<String>` allocates the column's full
+byte length, so without it a NUL-prefixed field is an unbounded allocation on
+the serve path. Rejection is decided from the two lengths alone, never from the
+value, so an over-cap field provably cannot be materialized in order to reject
+it.
+
+The ceiling does not narrow what a field may hold: a `tags.key` of 256
+four-byte characters sits exactly on both bounds and reads back intact. Nor is
+it a ban on NUL — a short NUL-bearing value still reads. Forbidding NUL outright
+in the `CHECK`s is a schema change, and rides the 2.0.0 store migration.
 
 **One ordinal space per key.** `tags`' primary key is `(track_id, key,
 ordinal)`, which does not discriminate on `value_blob`: a track's text rows and

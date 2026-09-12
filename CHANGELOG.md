@@ -358,6 +358,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `access` is implemented, so a mount no longer logs a `[Not Implemented]`
   warning from fuser.
 
+- A hostile store row can no longer smuggle an unbounded payload past a
+  character cap by hiding it behind an embedded NUL
+  ([#693](https://github.com/Sohex/musefs/issues/693)). SQLite permits U+0000 in
+  a TEXT value and stops counting characters at it, so `tags.key`, `art.mime`
+  and `track_art.description` — all capped in characters — measured 1 for a
+  value of `"X\0"` followed by a hundred megabytes, and the reader guard that
+  exists to reject an over-cap field *before* it is materialized measured 1 too.
+  Every reader of those fields now also bounds the value's byte length against
+  the ceiling its character cap implies, so a row already in the store is
+  rejected before the allocation rather than after. The ceiling is four bytes
+  per character, which is what UTF-8 already guarantees, so no legitimate value
+  is narrowed. Forbidding NUL outright in the constraints themselves is a schema
+  change and rides the 2.0.0 store migration.
+
 ## [1.3.0] - 2026-08-19
 
 ### Added
