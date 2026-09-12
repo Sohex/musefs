@@ -14,6 +14,23 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- `Musefs::drain_prefetch` waits for the Phase-2 prefetch pool to finish every
+  job it accepted, or a timeout to elapse. Serving never needs it — prefetch is
+  fire-and-forget there — but sampling the prefetch counters without it misses
+  reads still in flight, and a caller that owns the backing filesystem itself
+  (the latency-injecting mount the read benches use) can otherwise tear it down
+  under a worker mid-read and park that thread in uninterruptible sleep (#671).
+
+- `musefs_readahead_prefetch_reads_total` and
+  `musefs_readahead_prefetch_bytes_total`
+  ([#671](https://github.com/Sohex/musefs/issues/671)) report the positioned
+  backing reads issued by the Phase-2 prefetch workers. The serve-path
+  `musefs_backing_pread_*` counters never saw those threads, so a prefetcher
+  re-reading the stream several times over was invisible to every counter the
+  daemon exposes and showed up only as backing I/O nothing accounted for. That
+  is exactly the shape of the amplification bug fixed in this release, which is
+  why the counters exist.
+
 - `musefs_dir_handle_rejections_total` ([#626](https://github.com/Sohex/musefs/issues/626)), a monotonic counter of
   `opendir` calls that could not be given a cached directory snapshot. The
   existing `musefs_dir_handles` gauge cannot stand in for it: saturation is
@@ -36,6 +53,14 @@ see the [Release notes](release-notes.md).
   synthesis warns too, not just the FUSE errno path.
 
 ### Changed
+
+- `benches/storage_tunables_bench.sh` gains a `prefetch` mode that A/Bs two or
+  more musefs binaries (`MUSEFS_PREFETCH_BINS="label=path ..."`) over one
+  NFS+netem corpus, and its real-corpus filter now picks up `.opus` files. Its
+  NFS modes also disable NFS LOCALIO for the run: on Linux 6.12+ a loopback mount
+  negotiates local I/O and bypasses the RPC transport, so `tc netem` on `lo` had
+  no effect on the data path and every "NFS" row measured local disk at GB/s
+  (#671).
 
 - **Behavior change.** A scan that hits a DB constraint violation on one file
   now runs to completion instead of stopping there
@@ -123,6 +148,44 @@ see the [Release notes](release-notes.md).
   count itself is unchanged and still printed in the per-target summary.
 
 ### Fixed
+
+- Phase-2 read-ahead prefetch (`--read-ahead-prefetch`) amplified reads instead
+  of merely adding overhead ([#671](https://github.com/Sohex/musefs/issues/671)).
+  `ReadAhead::insert_window` trimmed the ring to the first window lying fully
+  behind the read frontier and fell back to index 0 when it found none. Windows
+  are sorted by start, so index 0 is the lowest offset — the window the reader is
+  currently inside. The frontier (`next_expected`) is the end of the last served
+  *read*, not the end of the window that served it, so a 512 KiB window feeding
+  128 KiB reads is never "fully behind" until the reader has consumed all of it,
+  and under ring pressure the fallback dropped exactly that window. Driving the
+  real `ReadAhead` with the real `plan_prefetch`/`prefetch_depth` logic over 400
+  sequential 128 KiB reads: 398 of 400 reads missed and refilled synchronously,
+  3159 MiB of foreground backing reads for 50 MiB asked. The window keeps
+  doubling across those refills because `off == next_expected` still holds, so it
+  is pure amplification rather than seek thrash. The eviction order now prefers a
+  window already fully consumed, then the furthest-future window the reader is
+  not inside, and `read_into` advances the frontier before inserting so the trim
+  sees where the reader actually is.
+
+  Fixing that exposed a second defect it had been masking. A prefetch dispatch
+  stops at the first window boundary at or past the horizon, so `prefetched_upto`
+  legitimately ends up *beyond* the horizon; `plan_prefetch` read that overshoot
+  as a backward seek and re-dispatched the whole horizon from the reader's
+  position on the very next read, once the adaptive window outgrew the FUSE read
+  size. With the eviction fix alone, a real 866 MiB FLAC read through a real
+  kernel mount cost 8.5 GiB of backing reads (9.9x). `plan_prefetch` now tolerates
+  an overshoot of up to one window before treating the watermark as a seek, and
+  the same read costs 1.01x the file.
+
+  With both fixed, the Phase-2 story changes on high-latency backends. On a real
+  loopback NFS mount at 200 ms RTT (`tc netem`, LOCALIO disabled) prefetch is now
+  a ~30% single-stream win, 6.3 → 8.2 MB/s, and a ~5% win on four concurrent
+  streams; before the fix it was a regression on both, which is what the earlier
+  "~10% overhead" finding was actually measuring. It stays opt-in: on local disk
+  and over `musefs-latencyfs` it still reads the stream a second time
+  speculatively (≈2x the backing bytes) for wall time within noise of
+  amplification alone, so the win is one backend and one run. Measurements and
+  method are in [Benchmarks](benchmarks.md).
 
 - A DB constraint violation raised while ingesting one file no longer aborts the
   whole scan ([#662](https://github.com/Sohex/musefs/issues/662)). This changes

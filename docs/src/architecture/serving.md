@@ -54,8 +54,10 @@ deadlock-free `try_lock` LRU eviction. Keying on the absolute backing offset (no
 the synthesized output) makes the cache retag-immune, and serving still flows
 through the per-read `validate_opened_backing` re-stat, so the cardinal
 audio-bytes invariant and freshness semantics are untouched. An optional Phase-2
-background-prefetch layer (`--read-ahead-prefetch`) exists but is off by default —
-read amplification carries the whole win (see
+background-prefetch layer (`--read-ahead-prefetch`) exists and is off by default:
+amplification alone carries the win on local and low-latency backing, while the
+threads add a measured ~30 % on top of it only once per-read latency is high
+enough for the overlap to hide something (see
 [the backing read-ahead benchmarks](../benchmarks.md#backing-read-ahead-255)).
 
 How each format builds its layout differs enough to warrant its own document:

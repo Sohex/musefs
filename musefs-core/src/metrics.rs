@@ -40,6 +40,8 @@ macro_rules! for_each_counter {
             scan_bytes_read => SCAN_BYTES_READ,
             readahead_hits => READAHEAD_HITS,
             readahead_misses => READAHEAD_MISSES,
+            prefetch_reads => PREFETCH_READS,
+            prefetch_bytes => PREFETCH_BYTES,
         }
     };
 }
@@ -234,6 +236,15 @@ mod imp {
         READAHEAD_HITS.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A Phase-2 prefetch worker issued a positioned backing read. Counted apart
+    /// from `on_pread`, which is the serve path: prefetch bytes are speculative
+    /// and a runaway prefetcher is invisible in the serve-path counters (it
+    /// shows up only as backing I/O the daemon cannot account for, #671).
+    pub fn on_prefetch_read(bytes: u64) {
+        PREFETCH_READS.fetch_add(1, Ordering::Relaxed);
+        PREFETCH_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub fn on_readahead_miss() {
         READAHEAD_MISSES.fetch_add(1, Ordering::Relaxed);
     }
@@ -268,6 +279,8 @@ mod imp {
     pub fn on_scan_read(_bytes: u64) {}
     #[inline(always)]
     pub fn on_readahead_hit() {}
+    #[inline(always)]
+    pub fn on_prefetch_read(_bytes: u64) {}
     #[inline(always)]
     pub fn on_readahead_miss() {}
     #[inline(always)]
@@ -309,6 +322,7 @@ mod tests {
         on_art_chunk();
         on_binary_tag_chunk();
         on_readahead_miss();
+        on_prefetch_read(4096);
         let s = snapshot();
         assert_eq!(s.opens, 2);
         assert_eq!(s.preads, 1);
@@ -317,6 +331,10 @@ mod tests {
         assert_eq!(s.binary_tag_chunks, 1);
         assert_eq!(s.readahead_misses, 1);
         assert_eq!(s.readahead_hits, 0);
+        // Prefetch reads are counted apart from the serve path: a speculative
+        // read must never inflate `preads`/`pread_bytes`.
+        assert_eq!(s.prefetch_reads, 1);
+        assert_eq!(s.prefetch_bytes, 4096);
         reset();
         assert_eq!(snapshot(), Snapshot::default());
     }

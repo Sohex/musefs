@@ -484,7 +484,7 @@ exclude_re = [
     # the ring under the read lock); the fn's other two `+` are the observable fills
     # counters and stay killable, so this one is pinned by coordinate, not by fn.
     # guard: op="+" fn="BackingReader<'a>::read_exact_at" rows=2
-    'musefs-core/src/readahead\.rs:643:68:',
+    'musefs-core/src/readahead\.rs:723:68:',
     #
     # More hang-class (TIMEOUT-only, CANCEL the in-diff job): `len() -> 1` /
     # `clear() -> 1` force a constant resident size, so `evict_one_coldest` keeps
@@ -493,12 +493,6 @@ exclude_re = [
     # caught (the len/clear-sum test). Sole returns.
     'replace ReadAhead::len -> u64 with 1',
     'replace ReadAhead::clear -> u64 with 1',
-    # insert_window eviction-filter arithmetic `w.start + w.bytes.len() <= frontier`,
-    # `+`->`*`: only changes WHICH cached window is dropped in a contrived spanning
-    # case, never the served bytes (the byte-differential tests pin those) — cache
-    # eviction policy, not correctness. The `<=`->`>` at the same site IS caught by
-    # the ring-trim test. Sole `+` in insert_window.
-    'replace \+ with \* in ReadAhead::insert_window',
     # PrefetchWorkers::request -> (): drops the speculative job instead of queuing
     # it. Phase-2 is opt-in and best-effort — a dropped prefetch just means a later
     # synchronous fill, identical served bytes. Sole site.

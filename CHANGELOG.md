@@ -14,6 +14,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Musefs::drain_prefetch` waits for the Phase-2 prefetch pool to finish every
+  job it accepted, or a timeout to elapse. Serving never needs it — prefetch is
+  fire-and-forget there — but sampling the prefetch counters without it misses
+  reads still in flight, and a caller that owns the backing filesystem itself
+  (the latency-injecting mount the read benches use) can otherwise tear it down
+  under a worker mid-read and park that thread in uninterruptible sleep (#671).
+
+- `musefs_readahead_prefetch_reads_total` and
+  `musefs_readahead_prefetch_bytes_total` count the backing reads the Phase-2
+  prefetch workers issue. The serve-path `musefs_backing_pread_*` counters never
+  saw those threads, so a runaway prefetcher was invisible to the daemon's own
+  telemetry (#671).
+
 - `musefs_dir_handle_rejections_total` counts `opendir` calls that could not be
   given a cached directory snapshot, so directory-handle pressure stays visible
   after a burst rather than only as a gauge that reads healthy between samples.
@@ -35,6 +48,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   much memory is this using" honestly.
 
 ### Changed
+
+- `benches/storage_tunables_bench.sh` gains a `prefetch` mode that A/Bs two or
+  more musefs binaries (`MUSEFS_PREFETCH_BINS="label=path ..."`) over one
+  NFS+netem corpus, and its real-corpus filter now picks up `.opus` files. Its
+  NFS modes also disable NFS LOCALIO for the run: on Linux 6.12+ a loopback mount
+  negotiates local I/O and bypasses the RPC transport, so `tc netem` on `lo` had
+  no effect on the data path and every "NFS" row measured local disk at GB/s
+  (#671).
 
 - **Behavior change.** A scan that hits a DB constraint violation on one file
   now runs to completion instead of stopping there
@@ -114,6 +135,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of materializing whole track rows.
 
 ### Fixed
+
+- `--read-ahead-prefetch` turned read-ahead into read *amplification* instead of
+  merely costing overhead ([#671](https://github.com/Sohex/musefs/issues/671)).
+  Two defects, both reachable only with Phase-2 prefetch enabled (the default
+  keeps a single window, where neither can occur). First, the eviction ring
+  dropped the window the reader was **inside**: it looked for a window lying
+  fully behind the read frontier and otherwise fell back to the lowest-start
+  window, which is the one serving the reader, because the frontier is the end
+  of the last served *read* rather than of the window it came from. Every
+  completed prefetch evicted the window in use, so a sequential stream missed on
+  essentially every read and refilled synchronously at the still-doubling window
+  size — 3159 MiB read for 50 MiB asked over a 400-read drive loop. Second,
+  `plan_prefetch` read a legitimate watermark overshoot as a backward seek and
+  re-dispatched the whole horizon from the reader's position on the next read.
+  The second was masked by the first, so fixing the eviction order alone made a
+  real kernel mount read 9.9x the file; both are fixed together, and a real
+  866 MiB track now costs 1.01x its size in backing reads with prefetch on.
+  Phase 2 remains off by default, but the reason has changed: on a real NFS mount
+  at 200 ms RTT it is now a ~30% single-stream win (6.3 → 8.2 MB/s) where it used
+  to be a regression, while on local-disk and injected-latency harnesses it still
+  does redundant work (≈2x the backing bytes, wall time within noise). Worth
+  enabling on a high-latency network backend.
 
 - A constraint violation on one file now fails that file instead of aborting the
   scan ([#662](https://github.com/Sohex/musefs/issues/662)) — a behavior change,

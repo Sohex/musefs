@@ -1194,3 +1194,86 @@ fn telemetry_surfaces_serve_warns_suppressed() {
         "an over-budget burst must move the counter telemetry reports"
     );
 }
+
+/// `drain_prefetch` must report the pool's real state, not a constant: trivially
+/// satisfied when Phase 2 is off (there is no pool), busy while a job is still
+/// outstanding, and satisfied again once that job lands. The busy answer is what
+/// callers rely on — the read benches sample the prefetch counters behind this
+/// barrier and tear down an in-process backing filesystem after it.
+#[test]
+fn drain_prefetch_reports_the_pool_state() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("backing.bin");
+    // Large enough that the job cannot finish in the time it takes to ask.
+    std::fs::write(&path, vec![3u8; 16 * 1024 * 1024]).unwrap();
+    let file = Arc::new(std::fs::File::open(&path).unwrap());
+    let len = std::fs::metadata(&path).unwrap().len();
+
+    let cfg = |prefetch: bool| MountConfig {
+        template: "$title".to_string(),
+        fallbacks: BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: Mode::Synthesis,
+        poll_interval: Duration::ZERO,
+        case_insensitive: false,
+        read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: prefetch,
+        skip_on_missing: false,
+    };
+
+    let off = Musefs::open(musefs_db::Db::open_in_memory().unwrap(), cfg(false)).unwrap();
+    assert!(
+        off.drain_prefetch(Duration::ZERO),
+        "no pool to wait for when Phase 2 is off"
+    );
+
+    let on = Musefs::open(musefs_db::Db::open_in_memory().unwrap(), cfg(true)).unwrap();
+    assert!(on.drain_prefetch(Duration::ZERO), "a fresh pool is idle");
+
+    let buf = Arc::new(std::sync::Mutex::new(crate::readahead::ReadAhead::new(
+        on.readahead_pool.per_stream_cap(),
+    )));
+    // Gate the job on the target buffer's lock rather than on the read being
+    // slow: a worker has to take that lock to store its window. A helper thread
+    // holds it on a timer (`rx` confirms it is held before the job is queued),
+    // so the job stays outstanding for a fixed window and a `drain` that wrongly
+    // keeps waiting still finishes the test rather than deadlocking against it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let gate_buf = Arc::clone(&buf);
+    let gate = std::thread::spawn(move || {
+        let held = gate_buf.lock().unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        drop(held);
+    });
+    rx.recv().unwrap();
+
+    on.prefetch
+        .as_ref()
+        .expect("Phase 2 enabled")
+        .request(crate::readahead::PrefetchJob {
+            ctx: Arc::new(crate::readahead::PrefetchContext {
+                file,
+                buf: Arc::clone(&buf),
+                pool: Arc::clone(&on.readahead_pool),
+                epoch: Arc::new(AtomicU64::new(0)),
+                dispatched_epoch: 0,
+                len,
+                backing_len: len,
+            }),
+            start: 0,
+        });
+    assert!(
+        !on.drain_prefetch(Duration::ZERO),
+        "a pool with an outstanding job is not drained"
+    );
+    gate.join().unwrap();
+    assert!(
+        on.drain_prefetch(Duration::from_secs(30)),
+        "the pool drains once the job finishes"
+    );
+}
