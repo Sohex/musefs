@@ -218,17 +218,28 @@ pub fn read_pictures_reporting(data: &[u8]) -> Result<(Vec<EmbeddedPicture>, Vec
         }
         Codec::OggFlac => {
             for pkt in header.packets.iter().skip(1) {
-                // `pkt.len() >= 4` guards the `&pkt[4..]` slice: the packet length is
-                // attacker-controlled, so a 1-3 byte type-6 packet must not panic.
-                if pkt.len() >= 4 && (pkt[0] & 0x7F) == 6 {
-                    // Strip the 4-byte FLAC metadata block header.
-                    match crate::flac::parse_picture_block(&pkt[4..]) {
-                        Ok(pic) => out.push(pic),
-                        Err(_) => dropped.push(PictureDrop {
-                            reason: "malformed PICTURE block",
-                            bytes: pkt.len() - 4,
-                        }),
-                    }
+                // An empty packet carries no block type, so it is not a picture at
+                // all; `is_empty` also guards the `pkt[0]` index below.
+                if pkt.is_empty() || (pkt[0] & 0x7F) != 6 {
+                    continue;
+                }
+                // The packet length is attacker-controlled, so a 1-3 byte type-6
+                // packet must not reach the `&pkt[4..]` slice (#365). It is a
+                // truncated block header rather than a packet to ignore, so it is
+                // reported like any other undecodable picture.
+                let Some(body) = pkt.get(4..) else {
+                    dropped.push(PictureDrop {
+                        reason: "truncated PICTURE block header",
+                        bytes: pkt.len(),
+                    });
+                    continue;
+                };
+                match crate::flac::parse_picture_block(body) {
+                    Ok(pic) => out.push(pic),
+                    Err(_) => dropped.push(PictureDrop {
+                        reason: "malformed PICTURE block",
+                        bytes: body.len(),
+                    }),
                 }
             }
         }
@@ -1017,7 +1028,17 @@ mod tests {
 
         // Sanity: the header parses, so we actually reach the picture loop.
         assert_eq!(read_header(&data).unwrap().codec, Codec::OggFlac);
-        assert!(read_pictures(&data).unwrap().is_empty());
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert!(pics.is_empty());
+        // Too short to be a picture, but it claimed to be one: report the drop
+        // rather than passing over it silently (#673).
+        assert_eq!(
+            dropped,
+            vec![PictureDrop {
+                reason: "truncated PICTURE block header",
+                bytes: 1,
+            }]
+        );
     }
 
     fn oggflac_headers() -> Vec<u8> {

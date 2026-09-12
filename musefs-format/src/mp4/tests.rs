@@ -709,8 +709,8 @@ fn chpl_box(titles: &[&str]) -> Vec<u8> {
 
 #[test]
 fn synthesize_carries_the_nero_chapter_list_through() {
-    // ffmpeg writes a `chpl` alongside the chapter track on every chaptered file,
-    // so rebuilding `udta` from the store alone would cost chapters on players
+    // ffmpeg writes a `chpl` alongside the chapter track by default, so
+    // rebuilding `udta` from the store alone would cost chapters on players
     // that read only `chpl` (#672).
     let chpl = chpl_box(&["Chapter One", "Chapter Two"]);
     let udta = bx(b"udta", &[bx(b"meta", &[0u8; 4]), chpl.clone()].concat());

@@ -40,8 +40,8 @@ segment model these layouts plug into, see
   alongside the audio track's. A Nero chapter list (`moov/udta/chpl`) is copied
   through byte-for-byte into the regenerated `udta`; it holds timestamps and
   titles, never a file offset, so relocating `mdat` cannot invalidate it.
-  ffmpeg writes both on every chaptered file, and players differ on which they
-  read, so both are preserved.
+  ffmpeg writes both by default (`-movflags +disable_chpl` suppresses the
+  `chpl`), and players differ on which form they read, so both are preserved.
 
 ## Lossy edges
 

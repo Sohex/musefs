@@ -135,10 +135,10 @@ pub(super) fn freeform_binary_prefix(mean: &str, name: &str, payload_len: u64) -
 /// `chpl` is the original `udta`'s Nero chapter-list box, complete with its
 /// header, copied through verbatim after the regenerated `meta` (#672). It is
 /// the one part of the old `udta` that is not rebuilt from the store: ffmpeg
-/// writes a `chpl` alongside the chapter *track* on every chaptered file, and a
-/// player that reads only `chpl` would otherwise see an audiobook lose its
-/// chapters. Copying is safe because `chpl` holds timestamps and titles — never
-/// a file offset — so relocating `mdat` does not touch it.
+/// writes a `chpl` alongside the chapter *track* by default, and a player that
+/// reads only `chpl` would otherwise see an audiobook lose its chapters.
+/// Copying is safe because `chpl` holds timestamps and titles — never a file
+/// offset — so relocating `mdat` does not touch it.
 pub(super) fn build_udta(
     tags: &[TagInput],
     binary_tags: &[BinaryTagInput],
