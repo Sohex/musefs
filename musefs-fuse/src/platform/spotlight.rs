@@ -10,9 +10,12 @@ use fuser::{FileAttr, FileType};
 #[cfg(target_os = "macos")]
 const ROOT_INO: u64 = 1;
 
-/// Marker filename Spotlight recognizes.
+/// Marker filename Spotlight recognizes. Defined in `musefs-core`, which
+/// reserves it in the virtual-tree namespace — on every platform, so the same
+/// library mounts to the same paths — so a track can never render to the same
+/// root name and make `readdir` and `lookup` disagree (#681).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub const MARKER_NAME: &str = ".metadata_never_index";
+pub const MARKER_NAME: &str = musefs_core::SPOTLIGHT_MARKER_NAME;
 
 /// Reserved sentinel inode for the marker. `InodeAllocator` starts at 2 and only
 /// ever increments with no upper bound, so `u64::MAX` is unreachable in practice
@@ -75,6 +78,13 @@ mod tests {
     use fuser::INodeNo;
 
     use super::*;
+
+    #[test]
+    fn the_marker_name_is_reserved_in_the_tree_namespace() {
+        // Checked off macOS too: the reservation is unconditional, so a library
+        // renders to the same paths on every platform (#681).
+        assert!(musefs_core::RESERVED_ROOT_NAMES.contains(&MARKER_NAME));
+    }
 
     #[test]
     fn marker_attr_is_zero_byte_read_only_file() {

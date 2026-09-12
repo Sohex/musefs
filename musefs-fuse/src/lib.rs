@@ -391,8 +391,10 @@ const MAX_METRICS_HANDLES: usize = 1024;
 /// Build a directory's full readdir listing once, from one pinned tree
 /// generation. Shared by `opendir` (held per fh) and the `readdir` fallback for
 /// an unknown fh. When `expose_metrics` is on, the synthetic `.musefs-metrics`
-/// entry is appended to the root listing (append-without-dedup, matching the
-/// Spotlight marker; #394).
+/// entry is appended to the root listing (#394), like the Spotlight marker. No
+/// dedup is needed: both names are reserved in the virtual-tree namespace
+/// (`musefs_core::RESERVED_ROOT_NAMES`), so the tree cannot supply a root entry
+/// of the same name for this to duplicate or hide (#681).
 ///
 /// Reading the children and the parent from one [`TreeSnapshot`] rather than
 /// two `Musefs` calls is what lets the result be keyed by generation and shared

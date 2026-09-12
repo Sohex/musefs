@@ -91,9 +91,25 @@ while a `$!{field}` path field keeps '/' as directory separators (sanitizing
 each segment and dropping empty/`.`/`..` segments) so a precomputed multi-level
 path expands into real directories. Path collisions are resolved
 deterministically by appending ` (k)` before the extension
-(`disambiguate`). `mapping.rs` bridges DB tag rows to the format layer's
-inputs and to template fields — ordering and multi-value semantics live
-there.
+(`disambiguate`). A node therefore carries two names: the `rendered_name` it
+came from and the possibly-ranked `name` it is served under. Which directory a
+path component belongs to is decided by the *rendered* name
+(`dir_child_named`), so every track under one rendered directory lands in one
+directory even when that directory was ranked away from its base name, and a
+directory whose rendered name is literally someone else's rank stays a separate
+directory.
+
+The names the FUSE layer injects at the mount root — `.musefs-metrics` and
+`.metadata_never_index`, listed in `RESERVED_ROOT_NAMES` — are reserved in that
+namespace. The synthetic entry holds the base key the way a sibling node would
+(`taken`), so a rendered root component landing on one is ranked to ` (2)` by
+the ordinary collision path and `readdir` can never emit a root name `lookup`
+will not return (#681). The reservation is unconditional — independent of
+`--expose-metrics` and of the host OS — so a library mounts to the same paths
+and inodes however the flag is set and wherever it runs.
+
+`mapping.rs` bridges DB tag rows to the format layer's inputs and to template
+fields — ordering and multi-value semantics live there.
 
 Inodes are **stable across rebuilds**: a persistent path→inode allocator
 (`InodeAllocator`) reuses an unchanged rendered path's inode and never

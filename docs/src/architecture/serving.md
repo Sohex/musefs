@@ -170,3 +170,10 @@ metric list. This namespace deliberately bypasses the virtual tree
 (`VirtualTree`) and the `RegionLayout` / segment model: it is injected into
 root-directory `readdir` and resolved by direct inode checks, so the cardinal
 audio path is untouched.
+
+Injecting into `readdir` while intercepting `lookup` is only coherent because
+the tree cannot supply a root child of the same name: `.musefs-metrics` and the
+Spotlight marker are reserved in the virtual-tree namespace, and a track that
+renders to one is ranked to ` (2)` at build time — see
+the [virtual tree](tree-scanning.md#virtual-tree) (#681). The injected
+entry therefore needs no dedup, and the two surfaces cannot disagree.

@@ -34,6 +34,30 @@ fn path_components(path: &str) -> impl Iterator<Item = &str> {
         .filter(|c| !c.is_empty() && *c != "." && *c != "..")
 }
 
+/// The synthetic telemetry directory `musefs-fuse` injects at the mount root
+/// under `--expose-metrics` (`musefs-fuse/src/metrics_dir.rs`).
+pub const METRICS_DIR_NAME: &str = ".musefs-metrics";
+
+/// The macOS Spotlight opt-out marker `musefs-fuse` injects at the mount root
+/// on macOS (`musefs-fuse/src/platform/spotlight.rs`).
+pub const SPOTLIGHT_MARKER_NAME: &str = ".metadata_never_index";
+
+/// Every name the FUSE layer may inject as a synthetic child of the mount root.
+/// Such a name is *reserved* in the tree namespace: a rendered root component
+/// that lands on one is pushed to its ` (2)` disambiguation rank exactly as a
+/// colliding rendered name would be, so the synthetic entry always owns the base
+/// key and `readdir` can never emit a name `lookup` will not return (#681).
+///
+/// The reservation is unconditional — independent of `--expose-metrics` and of
+/// the target OS — so a mount's paths and inodes do not shift when the flag is
+/// toggled or the same library is mounted on another platform. It applies at the
+/// root only, because both surfaces are root children; a synthetic entry placed
+/// deeper would need the reservation extended to that depth.
+///
+/// Entries must be lowercase: a case-insensitive mount matches the reservation
+/// against the case-folded component (`is_reserved_root_name`).
+pub const RESERVED_ROOT_NAMES: [&str; 2] = [METRICS_DIR_NAME, SPOTLIGHT_MARKER_NAME];
+
 /// Why an incremental tree mutation could not complete; the caller falls back to
 /// a full rebuild. Carries diagnostics instead of `()` (#95).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,8 +461,27 @@ impl VirtualTree {
         }
     }
 
-    /// True if `name` is already taken in `dir` (folded when case-insensitive).
+    /// True if `name` is one of the names the FUSE layer injects at the root,
+    /// compared the way this tree compares every other name — case-folded on a
+    /// case-insensitive mount, exact otherwise. `RESERVED_ROOT_NAMES` is lowercase,
+    /// so the folded comparison needs no second fold of the constants.
+    fn is_reserved_root_name(&self, name: &str) -> bool {
+        if self.case_insensitive {
+            RESERVED_ROOT_NAMES.contains(&fold(name).as_str())
+        } else {
+            RESERVED_ROOT_NAMES.contains(&name)
+        }
+    }
+
+    /// True if `name` is already taken in `dir` (folded when case-insensitive) —
+    /// by an existing child, or, at the root, by a name the FUSE layer injects
+    /// there (#681). The reserved name is occupied by that synthetic entry as
+    /// surely as by a node, so `disambiguate` must rank a rendered name that
+    /// lands on one exactly as it ranks a collision with a real sibling.
     fn taken(&self, dir: u64, name: &str) -> bool {
+        if dir == Self::ROOT && self.is_reserved_root_name(name) {
+            return true;
+        }
         if self.case_insensitive {
             self.folded_children
                 .get(&dir)
@@ -450,17 +493,38 @@ impl VirtualTree {
         }
     }
 
-    /// An existing *directory* child of `dir` matching `name` (folded when
-    /// case-insensitive), for merge reuse. `None` if absent or a non-dir.
-    fn dir_child_named(&self, dir: u64, name: &str) -> Option<u64> {
-        let ino = if self.case_insensitive {
-            self.folded_children
-                .get(&dir)
-                .and_then(|b| b.get(fold(name).as_str()).copied())
+    /// The `rendered_children` key for a rendered name: case-folded on a
+    /// case-insensitive mount, identity otherwise. The rendered index is keyed
+    /// with it so a group is found the way every other name comparison in this
+    /// tree works — case-variant rendered names share one group on a folded
+    /// mount, exactly as their disambiguated names share one directory.
+    fn rendered_key<'a>(&self, rendered: &'a str) -> Cow<'a, str> {
+        if self.case_insensitive {
+            Cow::Owned(fold(rendered))
         } else {
-            self.children.get(&dir).and_then(|c| c.get(name).copied())
-        }?;
-        self.is_dir(ino).then_some(ino)
+            Cow::Borrowed(rendered)
+        }
+    }
+
+    /// An existing *directory* child of `dir` that RENDERED `rendered`, for merge
+    /// reuse; `None` if absent or if only non-directories rendered that name.
+    ///
+    /// Keyed on the rendered name, not the stored one, because the rendered name
+    /// is what identifies the directory a path component belongs to: the stored
+    /// name may carry a ` (k)` rank this component knows nothing about. Merging
+    /// on the stored name instead conflated the two — a directory that had been
+    /// ranked away from its base name was re-created once per track rather than
+    /// merged into, and an unrelated directory whose rendered name was literally
+    /// that rank absorbed its contents. `deepest_existing_ancestor` navigates
+    /// with this same predicate, so the build path and the incremental walk agree
+    /// on which directory a component names.
+    fn dir_child_named(&self, dir: u64, rendered: &str) -> Option<u64> {
+        self.rendered_children
+            .get(&dir)?
+            .get(self.rendered_key(rendered).as_ref())?
+            .values()
+            .copied()
+            .find(|&c| self.is_dir(c))
     }
 
     /// Cheap rename-relevance gate for the child of `dir` whose current key is
@@ -521,7 +585,7 @@ impl VirtualTree {
         match self
             .rendered_children
             .get(&dir)
-            .and_then(|kids| kids.get(rendered))
+            .and_then(|kids| kids.get(self.rendered_key(rendered).as_ref()))
         {
             None => (Vec::new(), 0),
             Some(same_rendered) => {
@@ -543,15 +607,22 @@ impl VirtualTree {
     }
 
     fn insert_rendered_child(&mut self, parent: u64, rendered: &Name, name: &Name, inode: u64) {
+        let key = if self.case_insensitive {
+            fold_key(rendered)
+        } else {
+            Arc::clone(rendered)
+        };
         self.rendered_children
             .entry(parent)
             .or_default()
-            .entry(Arc::clone(rendered))
+            .entry(key)
             .or_default()
             .insert(Arc::clone(name), inode);
     }
 
     fn remove_rendered_child(&mut self, parent: u64, rendered: &str, name: &str) {
+        let rendered = self.rendered_key(rendered).into_owned();
+        let rendered = rendered.as_str();
         let Some(by_rendered) = self.rendered_children.get_mut(&parent) else {
             return;
         };
@@ -802,9 +873,12 @@ impl VirtualTree {
                 // component must be truncated the same way or the occupancy check
                 // misses (#535).
                 let key = truncate_component(c, consumed + 1 == comps.len());
-                self.children
-                    .get(&d)
-                    .is_some_and(|kids| kids.contains_key(key.as_ref()))
+                // `taken`, not a bare `children` probe: the base key of a reserved
+                // root name is held by the FUSE-injected entry, so a group that
+                // renders to one is rename-relevant from its very first member
+                // (#681). Folding on a case-insensitive mount is the same
+                // widening — both only ever add rebuilds, never skip one.
+                self.taken(d, key.as_ref())
             }) {
                 dirty.insert(d);
             }
@@ -875,11 +949,7 @@ impl VirtualTree {
             // the walk stops short, and the add-side dirty gate diverges from a full
             // rebuild (#535).
             let key = truncate_component(comp, false);
-            let next = self
-                .children_by_rendered(dir, key.as_ref())
-                .into_iter()
-                .find(|&c| self.is_dir(c));
-            match next {
+            match self.dir_child_named(dir, key.as_ref()) {
                 Some(c) => {
                     dir = c;
                     consumed += 1;
@@ -1349,6 +1419,198 @@ mod tests {
         );
         assert!(t.lookup(d, "a.ext").is_some());
         assert!(t.lookup(d, "a (2).ext").is_some());
+    }
+
+    #[test]
+    fn reserved_root_names_are_lowercase_and_single_components() {
+        // `is_reserved_root_name` folds the candidate and compares it against these
+        // constants unfolded, so a non-lowercase entry would never match on a
+        // case-insensitive mount. They must also survive `path_components` intact.
+        for name in RESERVED_ROOT_NAMES {
+            assert_eq!(fold(name), name, "{name} must already be case-folded");
+            assert_eq!(
+                path_components(name).collect::<Vec<_>>(),
+                vec![name],
+                "{name} must be one materializable component"
+            );
+        }
+        assert!(RESERVED_ROOT_NAMES.contains(&METRICS_DIR_NAME));
+        assert!(RESERVED_ROOT_NAMES.contains(&SPOTLIGHT_MARKER_NAME));
+    }
+
+    #[test]
+    fn reserved_root_file_is_pushed_off_the_synthetic_name() {
+        // #681: a track rendering straight to the synthetic name at the root. The
+        // base key stays free for the FUSE-injected entry, and the track is served
+        // at the ` (2)` rank instead of duplicating the name in readdir.
+        let t = VirtualTree::build(&[(1, METRICS_DIR_NAME.into())]);
+        assert_eq!(
+            t.lookup(VirtualTree::ROOT, METRICS_DIR_NAME),
+            None,
+            "the reserved base key must stay free for the synthetic entry"
+        );
+        let pushed = t
+            .lookup(VirtualTree::ROOT, ".musefs-metrics (2)")
+            .expect("the track must be reachable at the pushed name");
+        assert_eq!(t.track_id(pushed), Some(1));
+        assert_eq!(
+            t.children(VirtualTree::ROOT).unwrap().count(),
+            1,
+            "the push must not leave a second root entry behind"
+        );
+    }
+
+    #[test]
+    fn reserved_root_dir_merges_under_one_pushed_name() {
+        // Every track under the reserved directory must land in the SAME pushed
+        // directory: the reservation is a property of the rendered component, so
+        // `ensure_dir` merges into it exactly as it would without the push.
+        let t = VirtualTree::build(&[
+            (1, format!("{METRICS_DIR_NAME}/a.flac").into()),
+            (2, format!("{METRICS_DIR_NAME}/b.flac").into()),
+        ]);
+        assert_eq!(
+            t.children(VirtualTree::ROOT)
+                .unwrap()
+                .map(|(n, _)| n.to_owned())
+                .collect::<Vec<_>>(),
+            vec![".musefs-metrics (2)".to_string()],
+        );
+        let dir = t.lookup(VirtualTree::ROOT, ".musefs-metrics (2)").unwrap();
+        assert!(t.is_dir(dir));
+        assert!(t.lookup(dir, "a.flac").is_some());
+        assert!(t.lookup(dir, "b.flac").is_some());
+    }
+
+    #[test]
+    fn spotlight_marker_name_is_reserved_on_every_platform() {
+        // Reserved unconditionally, so a library mounts to the same paths and
+        // inodes on macOS (where the marker is injected) and off it.
+        let t = VirtualTree::build(&[(1, format!("{SPOTLIGHT_MARKER_NAME}/a.flac").into())]);
+        assert_eq!(t.lookup(VirtualTree::ROOT, SPOTLIGHT_MARKER_NAME), None);
+        assert!(
+            t.lookup(VirtualTree::ROOT, ".metadata_never_index (2)")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reserved_name_is_only_reserved_at_the_root() {
+        // The synthetic surfaces are root children; a deeper directory of the same
+        // name collides with nothing and must be left alone.
+        let t = VirtualTree::build(&[(1, format!("A/{METRICS_DIR_NAME}/a.flac").into())]);
+        let a = t.lookup(VirtualTree::ROOT, "A").unwrap();
+        assert!(
+            t.lookup(a, METRICS_DIR_NAME).is_some(),
+            "a non-root component keeps its rendered name"
+        );
+    }
+
+    #[test]
+    fn reserved_name_does_not_capture_a_longer_name() {
+        // Only an exact component match is reserved: the check must not fire on a
+        // name that merely starts with (or extends) a reserved one.
+        let t = VirtualTree::build(&[
+            (1, ".musefs-metrics.flac".into()),
+            (2, ".musefs-metrics-2".into()),
+        ]);
+        assert!(
+            t.lookup(VirtualTree::ROOT, ".musefs-metrics.flac")
+                .is_some()
+        );
+        assert!(t.lookup(VirtualTree::ROOT, ".musefs-metrics-2").is_some());
+    }
+
+    #[test]
+    fn reserved_root_name_folds_on_a_case_insensitive_mount() {
+        // A folded mount resolves `.MUSEFS-METRICS` and `.musefs-metrics` to the
+        // same key, so the case variant must be pushed too — otherwise the FUSE
+        // lookup of the synthetic name would resolve to the user's directory.
+        let mut alloc = InodeAllocator::new(true);
+        let t =
+            VirtualTree::build_with_ci(&[(1, ".MUSEFS-METRICS/a.flac".into())], &mut alloc, true);
+        assert_eq!(t.lookup(VirtualTree::ROOT, METRICS_DIR_NAME), None);
+        assert!(t.lookup(VirtualTree::ROOT, ".MUSEFS-METRICS (2)").is_some());
+    }
+
+    #[test]
+    fn reserved_dir_stays_distinct_from_a_literal_suffixed_dir() {
+        // The pushed directory keeps its true rendered name, so a directory that
+        // literally renders `.musefs-metrics (2)` is a different rendered group and
+        // keeps its own contents instead of absorbing, or being absorbed by, the
+        // pushed one.
+        let t = VirtualTree::build(&[
+            (1, format!("{METRICS_DIR_NAME}/a.flac").into()),
+            (2, ".musefs-metrics (2)/b.flac".into()),
+        ]);
+        let pushed = t.lookup(VirtualTree::ROOT, ".musefs-metrics (2)").unwrap();
+        let literal = t
+            .lookup(VirtualTree::ROOT, ".musefs-metrics (2) (2)")
+            .unwrap();
+        assert_ne!(pushed, literal);
+        assert!(t.lookup(pushed, "a.flac").is_some());
+        assert!(
+            t.lookup(pushed, "b.flac").is_none(),
+            "contents must not mix"
+        );
+        assert!(t.lookup(literal, "b.flac").is_some());
+    }
+
+    #[test]
+    fn a_ranked_away_directory_is_merged_into_not_recreated() {
+        // The merge is keyed on the rendered name, so every track under one
+        // rendered directory lands in one directory even when a same-rendered file
+        // pushed it off its base name. Keyed on the STORED name it was re-created
+        // per track: "X (2)/a.flac", "X (3)/b.flac", one directory per track.
+        let t = VirtualTree::build(&[
+            (1, "X".into()),
+            (2, "X/a.flac".into()),
+            (3, "X/b.flac".into()),
+        ]);
+        assert_eq!(
+            t.children(VirtualTree::ROOT)
+                .unwrap()
+                .map(|(n, _)| n.to_owned())
+                .collect::<Vec<_>>(),
+            vec!["X".to_string(), "X (2)".to_string()],
+        );
+        let dir = t.lookup(VirtualTree::ROOT, "X (2)").unwrap();
+        assert!(t.lookup(dir, "a.flac").is_some());
+        assert!(t.lookup(dir, "b.flac").is_some());
+    }
+
+    #[test]
+    fn a_literal_suffixed_dir_does_not_absorb_a_ranked_away_one() {
+        // The same distinction without a reserved name in sight: "X (2)" as a
+        // rendered name is its own group, not the rank the pushed "X" directory
+        // was moved to.
+        let t = VirtualTree::build(&[
+            (1, "X".into()),
+            (2, "X/a.flac".into()),
+            (3, "X (2)/b.flac".into()),
+        ]);
+        let pushed = t.lookup(VirtualTree::ROOT, "X (2)").unwrap();
+        let literal = t.lookup(VirtualTree::ROOT, "X (2) (2)").unwrap();
+        assert_ne!(pushed, literal);
+        assert!(t.lookup(pushed, "a.flac").is_some());
+        assert!(t.lookup(literal, "b.flac").is_some());
+    }
+
+    #[test]
+    fn reserved_push_stacks_with_ordinary_disambiguation() {
+        // The pushed name is an ordinary key: a track that genuinely renders to it
+        // ranks against the pushed one by track id, as any collision group does.
+        let t = VirtualTree::build(&[
+            (1, METRICS_DIR_NAME.into()),
+            (2, ".musefs-metrics (2)".into()),
+        ]);
+        assert_eq!(t.lookup(VirtualTree::ROOT, METRICS_DIR_NAME), None);
+        let first = t.lookup(VirtualTree::ROOT, ".musefs-metrics (2)").unwrap();
+        let second = t
+            .lookup(VirtualTree::ROOT, ".musefs-metrics (2) (2)")
+            .unwrap();
+        assert_eq!(t.track_id(first), Some(1));
+        assert_eq!(t.track_id(second), Some(2));
     }
 
     #[test]
@@ -1824,6 +2086,51 @@ mod tests {
             paths_of(&t).keys().collect::<Vec<_>>(),
             paths_of(&reference).keys().collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn apply_changes_add_under_reserved_root_dir_matches_build() {
+        // The pushed name is what the tree stores, so the add-side walk must find
+        // the existing reserved directory and merge into it with no rebuild — the
+        // same shape as adding to any other existing directory (#681).
+        let before = vec![(1, ".musefs-metrics/a.flac".into())];
+        let after = vec![
+            (1, ".musefs-metrics/a.flac".into()),
+            (2, ".musefs-metrics/b.flac".into()),
+        ];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 0);
+    }
+
+    #[test]
+    fn apply_changes_add_reserved_root_file_matches_build() {
+        // A new root file landing on the reserved name. The base key is held by the
+        // synthetic entry, so the occupancy gate sees an occupied key and rebuilds
+        // the root — one rebuild rather than none, which is the conservative side.
+        let before = vec![(1, "Z/a.flac".into())];
+        let after = vec![(1, "Z/a.flac".into()), (2, ".musefs-metrics".into())];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
+    }
+
+    #[test]
+    fn apply_changes_lower_id_reranks_a_reserved_group() {
+        // Why the gate must treat the reserved base key as occupied. The group does
+        // not own its base name — the synthetic entry does — so the fresh-build
+        // invariant the gate normally probes ("a non-empty group occupies its base
+        // key") does not hold here. A later-arriving LOWER id outranks the sitting
+        // member, and without the rebuild the incremental tree would leave id 5 at
+        // ` (2)` and put id 2 at ` (3)`, the reverse of a fresh build.
+        let before = vec![(5, ".musefs-metrics".into())];
+        let after = vec![(2, ".musefs-metrics".into()), (5, ".musefs-metrics".into())];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
+    }
+
+    #[test]
+    fn apply_changes_second_reserved_root_file_collides_and_rebuilds() {
+        // Two tracks pushed onto the same key are an ordinary collision group: the
+        // gate must see the occupied pushed key and rebuild the root.
+        let before = vec![(1, ".musefs-metrics".into())];
+        let after = vec![(1, ".musefs-metrics".into()), (2, ".musefs-metrics".into())];
+        assert_apply_matches_build(&before, &after, &[], &[2], &[], 1);
     }
 
     #[test]

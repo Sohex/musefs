@@ -1,6 +1,12 @@
 #![cfg(feature = "metrics")]
 //! E2E: `.musefs-metrics` read model + audio invariant (#394).
 //!
+//! Keep this binary to the one test. The rendered body carries process-global
+//! gauges — resident set size, and the syscall counters under the `metrics`
+//! feature — so a second test mounting and reading in the same process moves
+//! them between the two reads assertion 4 compares, and that assertion fails.
+//! A test that needs its own mount belongs in its own file.
+//!
 //! Run with:
 //!   cargo test -p musefs-fuse --features metrics --test metrics_e2e -- --ignored --nocapture
 
