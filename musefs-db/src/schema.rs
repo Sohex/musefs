@@ -423,7 +423,8 @@ enum Gate {
 /// Neither `since` nor `summary` is decoration. `musefs migrate` has to tell
 /// the user what it is about to do to their store and which upgrade brought it,
 /// and the only place either can be kept honest is next to the SQL (#705).
-/// `since` is also what the gated-migration contract below is checked against.
+/// `since` is also what [`Migration::new`] checks the gated-migration contract
+/// against.
 struct Migration {
     sql: &'static str,
     gate: Gate,
@@ -431,67 +432,78 @@ struct Migration {
     summary: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        sql: MIGRATION_V1,
-        gate: Gate::Transparent,
-        since: "1.0.0",
-        summary: "creates the baseline schema",
-    },
-    Migration {
-        sql: MIGRATION_V2,
-        gate: Gate::Transparent,
-        since: "1.1.0",
-        summary: "adds the scanner-owned fingerprint and content_hash columns",
-    },
-    Migration {
-        sql: MIGRATION_V3,
-        gate: Gate::Transparent,
-        since: "2.0.0",
-        summary: "widens the tags.value and track_art.description caps",
-    },
-    // The 2.0.0 store change. It rewrites data the user did not ask to have
-    // rewritten and ends compatibility with every older musefs build, which is
-    // more than anyone running `mount` can reasonably expect (#705).
-    Migration {
-        sql: MIGRATION_V4,
-        gate: Gate::Gated,
-        since: "2.0.0",
-        summary: "clears every stored fingerprint; a scan or revalidate recomputes them",
-    },
-];
-
-/// **The gated-migration contract: a gated step ships only in a major release.**
-///
-/// The classification decides whether a user's upgrade is a restart or an
-/// errand, so what they need to know is not which `user_version` they are on
-/// but whether the release they are moving to crossed a major boundary. Under
-/// semver a major is where an incompatible change is allowed to live, and a
-/// gated migration — data rewritten, disk needed, older binaries locked out —
-/// is exactly that. Tying the two together gives one rule that holds for every
-/// upgrade anyone ever does: crossing a major version may ask for `musefs
-/// migrate`; a minor or a patch never will.
-///
-/// The converse is deliberately *not* asserted. A major release is free to
-/// carry only transparent steps, or none — `MIGRATION_V3` rides 2.0.0 and is
-/// transparent — and a release with nothing to gate should not have to invent
-/// something.
-///
-/// Checked by the compiler rather than by review, because the failure mode is
-/// silent: a gated step slipped into a point release is a schema change nobody
-/// was warned about, and it would only be discovered by the mounts that stopped
-/// coming back after an unattended upgrade.
-const _: () = {
-    let mut i = 0;
-    while i < MIGRATIONS.len() {
+impl Migration {
+    /// Declare a migration, enforcing the contract below.
+    ///
+    /// **A gated step may only be introduced by a major release.** The
+    /// classification decides whether someone's upgrade is a restart or an
+    /// errand, so what they need to know is not which `user_version` they are
+    /// on but whether the release they are moving to crossed a major boundary.
+    /// Under semver a major is where an incompatible change is allowed to live,
+    /// and a gated migration — data rewritten, disk needed, older binaries
+    /// locked out — is exactly that. Tying the two together gives one rule that
+    /// holds for every upgrade anyone ever does: crossing a major version may
+    /// ask for `musefs migrate`; a minor or a patch never will.
+    ///
+    /// The converse is deliberately *not* checked. A major release is free to
+    /// carry only transparent steps, or none — `MIGRATION_V3` rides 2.0.0 and
+    /// is transparent — and a release with nothing to gate should not have to
+    /// invent something.
+    ///
+    /// Every entry in `MIGRATIONS` is built here, in a `const` context, so this
+    /// is checked by the compiler rather than by review. That matters because
+    /// the failure mode is silent: a gated step slipped into a point release is
+    /// a schema change nobody was warned about, and it would be discovered by
+    /// the mounts that stopped coming back after an unattended upgrade.
+    const fn new(
+        sql: &'static str,
+        gate: Gate,
+        since: &'static str,
+        summary: &'static str,
+    ) -> Migration {
         assert!(
-            !MIGRATIONS[i].gate.is_gated() || is_major_release(MIGRATIONS[i].since),
+            !gate.is_gated() || is_major_release(since),
             "a gated migration may only be introduced by a major release (x.0.0): \
              move it to the next major, or make it transparent"
         );
-        i += 1;
+        Migration {
+            sql,
+            gate,
+            since,
+            summary,
+        }
     }
-};
+}
+
+const MIGRATIONS: &[Migration] = &[
+    Migration::new(
+        MIGRATION_V1,
+        Gate::Transparent,
+        "1.0.0",
+        "creates the baseline schema",
+    ),
+    Migration::new(
+        MIGRATION_V2,
+        Gate::Transparent,
+        "1.1.0",
+        "adds the scanner-owned fingerprint and content_hash columns",
+    ),
+    Migration::new(
+        MIGRATION_V3,
+        Gate::Transparent,
+        "2.0.0",
+        "widens the tags.value and track_art.description caps",
+    ),
+    // The 2.0.0 store change. It rewrites data the user did not ask to have
+    // rewritten and ends compatibility with every older musefs build, which is
+    // more than anyone running `mount` can reasonably expect (#705).
+    Migration::new(
+        MIGRATION_V4,
+        Gate::Gated,
+        "2.0.0",
+        "clears every stored fingerprint; a scan or revalidate recomputes them",
+    ),
+];
 
 impl Gate {
     const fn is_gated(self) -> bool {
@@ -499,14 +511,42 @@ impl Gate {
     }
 }
 
-/// Whether `version` is a major release, i.e. its minor and patch are both 0.
-/// Takes the text apart by hand because a semver parser is not available in a
-/// const context, and the shape it accepts is the only one this crate writes.
+/// Whether `version` is a major release, i.e. the minor and patch of its semver
+/// core are both 0. A pre-release or build-metadata suffix is allowed and
+/// ignored, so `2.0.0-rc.1` is a major release and `2.1.0-rc.0.0` is not.
+///
+/// Parses the core rather than matching a suffix, which is the difference
+/// between the two examples above: a `.0.0` anywhere in the string is not a
+/// major release, and this gate is the only thing standing between a gated
+/// migration and a point release. Written by hand because no semver parser is
+/// available in a const context.
 const fn is_major_release(version: &str) -> bool {
     let b = version.as_bytes();
-    let n = b.len();
-    // The shortest major release is "N.0.0", five bytes.
-    n >= 5 && b[n - 4] == b'.' && b[n - 3] == b'0' && b[n - 2] == b'.' && b[n - 1] == b'0'
+    let mut i = 0;
+    // Major: one or more digits.
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i == b.len() || b[i] != b'.' {
+        return false;
+    }
+    i += 1;
+    // Minor and patch: each exactly the single digit `0`, separated by a dot.
+    if i == b.len() || b[i] != b'0' {
+        return false;
+    }
+    i += 1;
+    if i == b.len() || b[i] != b'.' {
+        return false;
+    }
+    i += 1;
+    if i == b.len() || b[i] != b'0' {
+        return false;
+    }
+    i += 1;
+    // The core ends here: end of string, or the start of a pre-release or
+    // build-metadata suffix. Anything else is a longer number or a fourth part.
+    i == b.len() || b[i] == b'-' || b[i] == b'+'
 }
 
 /// One step a store has yet to receive, as [`pending`] reports it.
@@ -633,7 +673,9 @@ fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
     // by a newer (or third-party) tool that bumped the schema. Refuse it loudly
     // rather than treating it as already-migrated and silently misreading the
     // external-writer contract. Distinct from the gated refusal below, and with
-    // the opposite remedy: upgrade the binary, not the store.
+    // the opposite remedy: upgrade the binary, not the store. Repeated under the
+    // write lock, which is where the decision actually binds; this one only
+    // saves taking the lock in the common case.
     if current > latest {
         return Err(crate::error::DbError::StoreTooNew {
             found: current,
@@ -656,6 +698,16 @@ fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
     // sees the updated version and skips re-applying the migration.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    // Both refusals are decided from the version read under the lock, not the
+    // one read before it. A newer binary can commit a version past `latest`
+    // while we wait here, and `reachable` would then find nothing left to apply
+    // and report a successful migration of a store this build cannot read.
+    if current > latest {
+        return Err(crate::error::DbError::StoreTooNew {
+            found: current,
+            supported: latest,
+        });
+    }
     // The version this run will actually reach: short of `latest` when a gated
     // step stops it. Both the gate decision and the announcement are taken from
     // the version read under the lock, so neither can be decided on a reading
@@ -1023,10 +1075,41 @@ mod gate_tests {
     /// quietly turn the assertion into one that accepts everything.
     #[test]
     fn only_an_x_0_0_version_counts_as_a_major_release() {
-        for major in ["1.0.0", "2.0.0", "10.0.0", "2.0.0-rc.0.0"] {
+        for major in [
+            "1.0.0",
+            "2.0.0",
+            "10.0.0",
+            // A suffix describes the same core, so a release candidate for a
+            // major is still a major.
+            "2.0.0-rc.1",
+            "2.0.0+build.7",
+        ] {
             assert!(super::is_major_release(major), "{major}");
         }
-        for not_major in ["1.1.0", "1.0.1", "0.2.0", "1.0.10", "2.0", "", "0.0"] {
+        for not_major in [
+            "1.1.0",
+            "1.0.1",
+            "0.2.0",
+            "1.0.10",
+            // The core is 2.1.0; only a suffix ends in `.0.0`. Matching the end
+            // of the string rather than parsing the core would let this one
+            // carry a gated migration into a minor release.
+            "2.1.0-rc.0.0",
+            "1.1.0+0.0",
+            // Not three parts, or not a number where one belongs.
+            "1.0.0.0",
+            "1.00.0",
+            "v1.0.0",
+            // The digit run has to end *at* a dot. Without that the parse would
+            // skip over the offending byte and land on a `0.0` that reads like
+            // a minor and patch, which is the one way a non-version could pass.
+            "1-0.0",
+            "1x0.0",
+            "2.0",
+            "",
+            "0.0",
+            ".0.0",
+        ] {
             assert!(!super::is_major_release(not_major), "{not_major}");
         }
     }
@@ -1190,6 +1273,42 @@ mod gate_tests {
         super::migrate(&mut conn)
             .expect("the store is at the latest version by the time we hold the lock");
         assert_eq!(user_version(&conn), LATEST_VERSION);
+    }
+
+    /// The too-new refusal is decided under the write lock as well, not only
+    /// from the read before it. A newer binary can take the store past this
+    /// build's ceiling while we wait, and reporting a successful migration of a
+    /// store this build cannot read would be the worst of both answers.
+    ///
+    /// Only reachable through the before-lock seam, like the race above.
+    #[test]
+    fn a_store_taken_past_the_ceiling_while_we_waited_is_refused() {
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                super::clear_before_lock_hook();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        let mut conn = Connection::open(&path).unwrap();
+        store_at(&conn, WALL);
+
+        let racer_path = path.clone();
+        super::set_before_lock_hook(move || {
+            let racer = Connection::open(&racer_path).unwrap();
+            racer
+                .pragma_update(None, "user_version", LATEST_VERSION + 1)
+                .unwrap();
+        });
+        let _guard = HookGuard;
+
+        let err = super::migrate(&mut conn).expect_err("the store is now from the future");
+        assert!(
+            matches!(err, DbError::StoreTooNew { found, .. } if found == LATEST_VERSION + 1),
+            "{err:?}"
+        );
     }
 
     /// Two directions, two remedies. A store from a newer binary wants a newer

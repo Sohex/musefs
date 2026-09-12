@@ -39,8 +39,18 @@ pub(crate) fn claim_exclusive(conn: &Connection, op: &'static str) -> Result<()>
 /// `VACUUM INTO` runs against a read transaction, so it neither blocks a
 /// serving mount nor needs one to stop. `dest` must not exist; SQLite refuses
 /// to overwrite, which is the behaviour a backup wants.
+///
+/// A destination that is not valid UTF-8 is refused rather than lossily
+/// converted: `to_string_lossy` would substitute U+FFFD and SQLite would write
+/// a perfectly good backup to a path the caller never named, which the caller
+/// would then report as the snapshot it can fall back on.
 pub(crate) fn snapshot_into(conn: &Connection, dest: &Path, op: &'static str) -> Result<()> {
-    conn.execute("VACUUM INTO ?1", [&*dest.to_string_lossy()])
+    let Some(dest_str) = dest.to_str() else {
+        return Err(DbError::Sqlite(rusqlite::Error::InvalidPath(
+            dest.to_path_buf(),
+        )));
+    };
+    conn.execute("VACUUM INTO ?1", [dest_str])
         .map_err(|e| map_busy(e, op))?;
     Ok(())
 }

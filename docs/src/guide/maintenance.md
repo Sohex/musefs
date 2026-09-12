@@ -89,7 +89,7 @@ and you never hear about them. Some are not: a change that rewrites data,
 transiently needs the store's size again in free disk, or ends compatibility
 with older musefs builds is more than anyone running `mount` can reasonably
 expect. Those are **gated**, and a major release is the only place they appear.
-Every command refuses a store that needs one:
+Every command that opens a store for ordinary work refuses one that needs it:
 
 ```text
 error: store schema version 3 needs an explicit upgrade to version 4 before this

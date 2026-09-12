@@ -40,9 +40,23 @@ impl PendingMigration {
     /// reason the migration is: the schema is not yet the one this build
     /// validates against. A store from a *newer* build is still refused, since
     /// no amount of migrating fixes that direction.
+    ///
+    /// Opened without `SQLITE_OPEN_CREATE`, which is the one way these flags
+    /// differ from the default every other constructor in this crate takes.
+    /// There is nothing to migrate about a store that does not exist, and
+    /// creating one here would turn a typo'd `--db` into a brand new empty
+    /// library reported as a successful upgrade.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        use rusqlite::OpenFlags;
+
         let path = path.as_ref().to_path_buf();
-        let conn = Connection::open(&path)?;
+        // Spelled as the default minus one flag rather than as a list, so this
+        // says the same thing the paragraph above does and cannot drift if
+        // rusqlite's default gains a flag.
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE),
+        )?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -110,7 +124,17 @@ impl PendingMigration {
     /// Run every pending step, gated ones included, and hand back the migrated
     /// store. The identity check runs here, against the shape the migration was
     /// supposed to produce.
+    ///
+    /// This is where the connection stops being a migration handle and becomes
+    /// an ordinary [`Db`], so it picks up the one pragma [`Db::open`] sets that
+    /// the pre-flight had no use for: write-ahead logging, which is what keeps
+    /// a reader and a writer off each other's backs. A musefs store is already
+    /// in WAL — the mode is persistent and every other open sets it — so this
+    /// is belt and braces for a store that arrived some other way.
     pub fn apply(mut self) -> Result<Db> {
+        let _: String = self
+            .conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         schema::migrate_all(&mut self.conn)?;
         schema::validate_identity(&self.conn)?;
         Ok(Db::from_migrated(self.conn, self.path))
@@ -223,6 +247,46 @@ mod tests {
         );
     }
 
+    /// There is nothing to migrate about a store that does not exist, and a
+    /// typo'd path must not become a brand new empty library that `apply` then
+    /// reports as a successful upgrade.
+    #[test]
+    fn a_missing_store_is_refused_and_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.db");
+
+        PendingMigration::open(&path).expect_err("there is no store here");
+
+        assert!(!path.exists(), "opening must not create the store");
+    }
+
+    /// A lossy conversion would hand SQLite a path the caller never named, and
+    /// the caller would then report that as the snapshot it can fall back on.
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_destination_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        gated_store(&path);
+
+        let dest = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"snap\xff\xfe.bak"));
+        let pending = PendingMigration::open(&path).unwrap();
+        let err = pending.snapshot_to(&dest).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                DbError::Sqlite(rusqlite::Error::InvalidPath(ref p)) if *p == dest
+            ),
+            "{err:?}"
+        );
+        assert!(!dest.exists(), "nothing may be written under another name");
+    }
+
     #[test]
     fn the_snapshot_is_a_usable_store_and_refuses_to_overwrite() {
         let dir = tempfile::tempdir().unwrap();
@@ -281,6 +345,25 @@ mod tests {
         );
 
         drop(other);
+
+        // The connections a mount actually holds most of are read-only, and a
+        // WAL reader needs the same shared-memory index, so those are caught
+        // too. This is the case the whole check exists for: rewriting the
+        // schema under a mount that is serving from it.
+        let reader = Db::open_readonly(&path).unwrap();
+        let err = pending.claim_exclusive().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::StoreInUse {
+                    op: "migrating",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        drop(reader);
+
         pending
             .claim_exclusive()
             .expect("nobody else has the store now");

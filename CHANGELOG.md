@@ -192,9 +192,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `musefs migrate`, and a minor or patch upgrade never will.
 
 - An in-place store schema upgrade now announces itself
-  ([#649](https://github.com/Sohex/musefs/issues/649)). `Db::open` migrates on
-  every open, so an older store was rewritten irreversibly on the first
-  `musefs scan` after a binary upgrade with nothing said about it — and the
+  ([#649](https://github.com/Sohex/musefs/issues/649)). `Db::open` applies a
+  transparent migration on every open, so an older store was rewritten
+  irreversibly on the first `musefs scan` after a binary upgrade with nothing
+  said about it — and the
   first the user heard of it was `StoreTooNew` when they tried to run the older
   build again. The announcement is at `warn` (once per store per schema bump,
   so it is in the scrollback when it is needed) and names both versions;
