@@ -14,6 +14,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Chaptered `.m4b` files are supported. A `moov` may now hold chapter tracks
+  (`text`, `sbtl`) alongside its single audio (`soun`) track, and every track's
+  `stco`/`co64` chunk offsets are relocated when the `moov` is regenerated, not
+  just the first track's. A Nero chapter list (`moov/udta/chpl`) is copied
+  verbatim into the rebuilt `udta`. Previously every chaptered file — which is
+  to say most of an audiobook library, and chapters are why the `.m4b`
+  extension exists — was counted as `unparseable` at scan time
+  ([#672](https://github.com/Sohex/musefs/issues/672)).
+
 - `Musefs::drain_prefetch` waits for the Phase-2 prefetch pool to finish every
   job it accepted, or a timeout to elapse. Serving never needs it — prefetch is
   fire-and-forget there — but sampling the prefetch counters without it misses
@@ -48,6 +57,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   much memory is this using" honestly.
 
 ### Changed
+
+- An MP4 file skipped for its track layout now reports the handler types found
+  (`unsupported MP4 track layout: expected one audio (soun) track, optionally
+  with text/sbtl chapter tracks; found [soun, vide]`) instead of a bare "not a
+  supported MP4/M4A file", so the skip explains itself
+  ([#672](https://github.com/Sohex/musefs/issues/672)).
 
 - `benches/storage_tunables_bench.sh` gains a `prefetch` mode that A/Bs two or
   more musefs binaries (`MUSEFS_PREFETCH_BINS="label=path ..."`) over one
@@ -135,6 +150,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of materializing whole track rows.
 
 ### Fixed
+
+- One unparseable `METADATA_BLOCK_PICTURE` no longer discards every other
+  embedded picture in the same Ogg file, and the drop is logged instead of
+  being swallowed by the scan path. Base64 decoding also tolerates ASCII
+  whitespace, so a value wrapped in the older 76-column MIME style decodes
+  rather than failing at the first line break
+  ([#673](https://github.com/Sohex/musefs/issues/673)).
 
 - A panicking worker-pool task leaked a SQLite read connection and up to three
   file descriptors for the life of the mount

@@ -50,6 +50,13 @@ Verified by `musefs-format/tests/proptest_ogg.rs` (crate feature `fuzzing`),
 - Embedded pictures are parsed through FLAC's `PICTURE` block reader, so a
   picture type outside the standard `0`–`20` range is clamped to `0` (`Other`)
   at scan time, matching the store's `track_art.picture_type` `CHECK`.
+- An embedded picture that cannot be decoded is skipped on its own, and the
+  drop is logged (a `warn` line on stderr) so it is explained rather than
+  silent. The rest of the file's pictures still ingest. Base64 decoding
+  tolerates ASCII whitespace, so a `METADATA_BLOCK_PICTURE` wrapped in the
+  older 76-column MIME style still decodes — Vorbis comment values are
+  length-prefixed, so wrapping is unnecessary, but rejecting it cost the whole
+  picture.
 - **Embedded picture descriptions are right-padded with up to two trailing
   spaces.** The FLAC PICTURE block is built with its description padded so the
   *prefix* length — `32 + mime.len() + description.len()`, i.e. everything

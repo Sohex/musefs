@@ -1,6 +1,6 @@
 use super::{
     ArtInput, BinaryTagInput, FormatError, Mp4Scan, RegionLayout, Result, Segment, TagInput,
-    child_boxes, find_path, read_box, read_u32_be, read_u64_be, size,
+    child_boxes, child_boxes_lenient, find_path, read_box, read_u32_be, read_u64_be, size,
 };
 
 pub(super) fn boxed(kind: &[u8; 4], payload: &[u8]) -> Result<Vec<u8>> {
@@ -131,10 +131,19 @@ pub(super) fn freeform_binary_prefix(mean: &str, name: &str, payload_len: u64) -
 /// length (binary `----` values + art). Every enclosing box size
 /// (`----`/`ilst`/`meta`/`udta`) accounts for `streamed_total` at the right nesting
 /// depth, so the streamed bytes splice in correctly at read time.
+///
+/// `chpl` is the original `udta`'s Nero chapter-list box, complete with its
+/// header, copied through verbatim after the regenerated `meta` (#672). It is
+/// the one part of the old `udta` that is not rebuilt from the store: ffmpeg
+/// writes a `chpl` alongside the chapter *track* by default, and a player that
+/// reads only `chpl` would otherwise see an audiobook lose its chapters.
+/// Copying is safe because `chpl` holds timestamps and titles — never a file
+/// offset — so relocating `mdat` does not touch it.
 pub(super) fn build_udta(
     tags: &[TagInput],
     binary_tags: &[BinaryTagInput],
     arts: &[ArtInput],
+    chpl: Option<&[u8]>,
 ) -> Result<(Vec<Segment>, u64)> {
     // Group consecutive same-key text values (the DB returns tags ordered by key).
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -243,7 +252,9 @@ pub(super) fn build_udta(
     let ilst_size = size::checked_sum([8, ilst_inline_len, streamed_total])?;
     let meta_inline_len = 4 + hdlr.len() as u64 + 8 + ilst_inline_len; // [vf][hdlr][ilst hdr][ilst inline]
     let meta_size = size::checked_sum([8, meta_inline_len, streamed_total])?;
-    let udta_inline_len = 8 + meta_inline_len; // [meta hdr][meta inline]
+    // [meta hdr][meta inline][chpl], the chpl copied verbatim after meta.
+    let chpl_len = chpl.map_or(0, <[u8]>::len) as u64;
+    let udta_inline_len = size::checked_sum([8, meta_inline_len, chpl_len])?;
     let udta_size = size::checked_sum([8, udta_inline_len, streamed_total])?;
 
     // MP4 box sizes are 32-bit. udta encloses all inner boxes, so converting it
@@ -276,10 +287,15 @@ pub(super) fn build_udta(
             }
         }
     }
+    // The chpl closes the udta, after the meta box the ilst segments just ended.
+    if let Some(chpl) = chpl {
+        lead.extend_from_slice(chpl);
+    }
     // `lead` is empty only when the loop's last segment was streamed (it was
-    // `take`n); otherwise it still holds the udta/meta/ilst header (when there are
-    // no streamed segments) or trailing framing. Pushing an empty `lead` would
-    // produce an EmptySegment that fails layout validation, so guard on non-empty.
+    // `take`n) and there is no chpl; otherwise it still holds the udta/meta/ilst
+    // header (when there are no streamed segments) or trailing framing. Pushing an
+    // empty `lead` would produce an EmptySegment that fails layout validation, so
+    // guard on non-empty.
     if !lead.is_empty() {
         segments.push(Segment::Inline(lead));
     }
@@ -288,33 +304,57 @@ pub(super) fn build_udta(
 
 /// Patch every `stco` (4-byte) or `co64` (8-byte) chunk offset in `kept` (moov
 /// children minus udta) by `delta`. Errors if a 32-bit offset would overflow.
+///
+/// Every track is walked, not just the first. A chaptered `.m4b` carries its
+/// chapter text track's chunks in the same (single) `mdat` as the audio, so they
+/// relocate by the same `delta`; patching only the first `trak` would leave the
+/// second pointing into the old layout (#672). A `trak` with no chunk-offset box
+/// is rejected rather than skipped — `stbl` requires one, and silently leaving a
+/// track unpatched is corruption.
 pub(super) fn patch_chunk_offsets(kept: &mut [u8], delta: i64) -> Result<()> {
-    let (range, entry) = match find_path(kept, &[b"trak", b"mdia", b"minf", b"stbl", b"stco"])? {
-        Some(r) => (r, 4usize),
-        None => match find_path(kept, &[b"trak", b"mdia", b"minf", b"stbl", b"co64"])? {
-            Some(r) => (r, 8usize),
-            None => return Err(FormatError::Malformed),
-        },
-    };
-    let (start, len) = range;
-    let count = read_u32_be(kept, start + 4)? as usize;
-    for i in 0..count {
-        let pos = start + 8 + i * entry;
-        if pos + entry > start + len {
-            return Err(FormatError::Malformed);
-        }
-        if entry == 4 {
-            let v = i64::from(read_u32_be(kept, pos)?) + delta;
-            let new_val = u32::try_from(v).map_err(|_| FormatError::TooLarge)?;
-            kept[pos..pos + 4].copy_from_slice(&new_val.to_be_bytes());
-        } else {
-            // `checked_add_signed` rejects both a negative relocated offset
-            // (underflow) and one past u64::MAX (overflow) — adding `delta` via a
-            // signed cast overflowed i64 for offsets near its bounds (fuzz crash).
-            let v = read_u64_be(kept, pos)?
-                .checked_add_signed(delta)
-                .ok_or(FormatError::Malformed)?;
-            kept[pos..pos + 8].copy_from_slice(&v.to_be_bytes());
+    // Locate every table first: `find_path` borrows `kept` immutably, and the
+    // patch loop below needs it mutably.
+    let mut tables: Vec<(usize, usize, usize)> = Vec::new();
+    for t in child_boxes(kept)?
+        .into_iter()
+        .filter(|b| &b.kind == b"trak")
+    {
+        let base = t.payload_start();
+        let trak = t.payload(kept);
+        let (range, entry) = match find_path(trak, &[b"mdia", b"minf", b"stbl", b"stco"])? {
+            Some(r) => (r, 4usize),
+            None => match find_path(trak, &[b"mdia", b"minf", b"stbl", b"co64"])? {
+                Some(r) => (r, 8usize),
+                None => return Err(FormatError::Malformed),
+            },
+        };
+        let (start, len) = range;
+        tables.push((base + start, len, entry));
+    }
+    if tables.is_empty() {
+        return Err(FormatError::Malformed);
+    }
+
+    for (start, len, entry) in tables {
+        let count = read_u32_be(kept, start + 4)? as usize;
+        for i in 0..count {
+            let pos = start + 8 + i * entry;
+            if pos + entry > start + len {
+                return Err(FormatError::Malformed);
+            }
+            if entry == 4 {
+                let v = i64::from(read_u32_be(kept, pos)?) + delta;
+                let new_val = u32::try_from(v).map_err(|_| FormatError::TooLarge)?;
+                kept[pos..pos + 4].copy_from_slice(&new_val.to_be_bytes());
+            } else {
+                // `checked_add_signed` rejects both a negative relocated offset
+                // (underflow) and one past u64::MAX (overflow) — adding `delta` via a
+                // signed cast overflowed i64 for offsets near its bounds (fuzz crash).
+                let v = read_u64_be(kept, pos)?
+                    .checked_add_signed(delta)
+                    .ok_or(FormatError::Malformed)?;
+                kept[pos..pos + 8].copy_from_slice(&v.to_be_bytes());
+            }
         }
     }
     Ok(())
@@ -335,15 +375,28 @@ pub fn synthesize_layout(
     let moov_payload_start = read_box(&scan.moov, 0)?.payload_start();
     let moov_payload = &scan.moov[moov_payload_start..];
     let mut kept = Vec::new();
+    let mut chpl: Option<Vec<u8>> = None;
     for b in child_boxes(moov_payload)? {
         if &b.kind != b"udta" {
             kept.extend_from_slice(&moov_payload[b.start..b.end()]);
+            continue;
+        }
+        // The old udta is dropped — the store is the source of truth for tags and
+        // art — except its Nero chapter list, which the store does not model and
+        // which is carried through verbatim (#672). The walk is lenient: a garbled
+        // sibling in a metadata box must not fail synthesis of the audio.
+        let udta = b.payload(moov_payload);
+        if let Some(c) = child_boxes_lenient(udta)
+            .into_iter()
+            .find(|c| &c.kind == b"chpl")
+        {
+            chpl = Some(udta[c.start..c.end()].to_vec());
         }
     }
 
     // All art inputs are non-zero-length (the bridge drops zero-length at construction).
     let arts: Vec<ArtInput> = arts.to_vec();
-    let (udta_segments, _streamed_total) = build_udta(tags, binary_tags, &arts)?;
+    let (udta_segments, _streamed_total) = build_udta(tags, binary_tags, &arts, chpl.as_deref())?;
     let udta_total: u64 = udta_segments.iter().map(Segment::len).sum();
 
     let new_moov_size = size::checked_sum([8, kept.len() as u64, udta_total])?;

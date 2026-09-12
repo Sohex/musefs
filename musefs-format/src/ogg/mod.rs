@@ -164,37 +164,106 @@ use crate::input::EmbeddedPicture;
 /// packets (block type 6). Plan 1 only *reads* art (to seed the DB); synthesis does
 /// not yet re-embed it.
 pub fn read_pictures(data: &[u8]) -> Result<Vec<EmbeddedPicture>> {
-    use base64::Engine;
+    Ok(read_pictures_reporting(data)?.0)
+}
+
+/// An embedded picture the reader skipped because it could not be decoded, so
+/// the caller can log the lossy drop (the format layer has no logging facade).
+/// Carries only a reason and the skipped value's encoded size — never the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PictureDrop {
+    /// Why the picture was skipped.
+    pub reason: &'static str,
+    /// Size of the skipped value as it appeared in the file, in bytes.
+    pub bytes: usize,
+}
+
+/// Like [`read_pictures`], but also returns the pictures skipped as undecodable.
+///
+/// A bad picture skips *that* picture and nothing else: returning early would let
+/// one unparseable `METADATA_BLOCK_PICTURE` discard every valid picture in the
+/// same file, and the scan path swallows the error, so the loss would be silent
+/// (#673). Only a malformed *container* (a bad header or comment packet) still
+/// errors, since then there is no list of pictures to salvage.
+pub fn read_pictures_reporting(data: &[u8]) -> Result<(Vec<EmbeddedPicture>, Vec<PictureDrop>)> {
     let header = read_header(data)?;
     let mut out = Vec::new();
+    let mut dropped = Vec::new();
     match header.codec {
         Codec::Opus | Codec::Vorbis => {
             let idx = comment_packet_index(&header);
             if idx == 0 {
-                return Ok(out);
+                return Ok((out, dropped));
             }
             let body = comment_body(header.codec, &header.packets[idx])?;
             for (field, value) in crate::vorbiscomment::parse(body)? {
-                if field.eq_ignore_ascii_case("METADATA_BLOCK_PICTURE") {
-                    let raw = base64::engine::general_purpose::STANDARD
-                        .decode(value.as_bytes())
-                        .map_err(|_| FormatError::Malformed)?;
-                    out.push(crate::flac::parse_picture_block(&raw)?);
+                if !field.eq_ignore_ascii_case("METADATA_BLOCK_PICTURE") {
+                    continue;
+                }
+                let Some(raw) = decode_picture_base64(&value) else {
+                    dropped.push(PictureDrop {
+                        reason: "undecodable base64",
+                        bytes: value.len(),
+                    });
+                    continue;
+                };
+                match crate::flac::parse_picture_block(&raw) {
+                    Ok(pic) => out.push(pic),
+                    Err(_) => dropped.push(PictureDrop {
+                        reason: "malformed PICTURE block",
+                        bytes: raw.len(),
+                    }),
                 }
             }
         }
         Codec::OggFlac => {
             for pkt in header.packets.iter().skip(1) {
-                // `pkt.len() >= 4` guards the `&pkt[4..]` slice: the packet length is
-                // attacker-controlled, so a 1-3 byte type-6 packet must not panic.
-                if pkt.len() >= 4 && (pkt[0] & 0x7F) == 6 {
-                    // Strip the 4-byte FLAC metadata block header.
-                    out.push(crate::flac::parse_picture_block(&pkt[4..])?);
+                // An empty packet carries no block type, so it is not a picture at
+                // all; `is_empty` also guards the `pkt[0]` index below.
+                if pkt.is_empty() || (pkt[0] & 0x7F) != 6 {
+                    continue;
+                }
+                // The packet length is attacker-controlled, so a 1-3 byte type-6
+                // packet must not reach the `&pkt[4..]` slice (#365). It is a
+                // truncated block header rather than a packet to ignore, so it is
+                // reported like any other undecodable picture.
+                let Some(body) = pkt.get(4..) else {
+                    dropped.push(PictureDrop {
+                        reason: "truncated PICTURE block header",
+                        bytes: pkt.len(),
+                    });
+                    continue;
+                };
+                match crate::flac::parse_picture_block(body) {
+                    Ok(pic) => out.push(pic),
+                    Err(_) => dropped.push(PictureDrop {
+                        reason: "malformed PICTURE block",
+                        bytes: body.len(),
+                    }),
                 }
             }
         }
     }
-    Ok(out)
+    Ok((out, dropped))
+}
+
+/// Base64-decode a `METADATA_BLOCK_PICTURE` value, tolerating ASCII whitespace.
+///
+/// Vorbis comment values are length-prefixed, so the 76-column wrapping of the
+/// older MIME style is unnecessary and is not what the Xiph recommendation
+/// describes — but the strict engine rejects a wrapped value outright at the
+/// first line break, costing the whole picture. Filtering is leniency, not
+/// conformance, so it allocates a stripped copy only when whitespace is actually
+/// present; the overwhelmingly common unwrapped value decodes in place (#673).
+fn decode_picture_base64(value: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    if value.bytes().any(|b| b.is_ascii_whitespace()) {
+        let stripped: Vec<u8> = value.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        engine.decode(&stripped).ok()
+    } else {
+        engine.decode(value.as_bytes()).ok()
+    }
 }
 
 /// Audio bounds + codec from a complete file, for the scanner.
@@ -495,6 +564,20 @@ pub mod page_test_support {
     pub fn vorbis_body_empty() -> Vec<u8> {
         crate::vorbiscomment::build(&[]).unwrap()
     }
+
+    /// A VorbisComment body carrying `comments` in order, for fixtures that need
+    /// a specific field — an embedded `METADATA_BLOCK_PICTURE` above all.
+    /// Keys are normalized to lowercase on the way in, as they are for any tag
+    /// musefs writes; Vorbis field names are case-insensitive by spec and the
+    /// picture reader matches accordingly. Panics on a key the format rejects,
+    /// which in a fixture is a test bug.
+    pub fn vorbis_body_with(comments: &[(&str, &str)]) -> Vec<u8> {
+        let inputs: Vec<crate::input::TagInput> = comments
+            .iter()
+            .map(|(k, v)| crate::input::TagInput::new(k, v))
+            .collect();
+        crate::vorbiscomment::build(&inputs).unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -609,6 +692,160 @@ mod tests {
         let pics = read_pictures(&data).unwrap();
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].data, vec![0xAB]);
+    }
+
+    /// A FLAC PICTURE block body (the payload a `METADATA_BLOCK_PICTURE` value
+    /// base64-encodes) carrying a PNG of `len` bytes, every one of them `marker`.
+    fn picture_block_n(marker: u8, len: usize) -> Vec<u8> {
+        let mut block = Vec::new();
+        block.extend_from_slice(&3u32.to_be_bytes()); // picture type: front cover
+        block.extend_from_slice(&9u32.to_be_bytes());
+        block.extend_from_slice(b"image/png");
+        block.extend_from_slice(&0u32.to_be_bytes()); // description length
+        block.extend_from_slice(&1u32.to_be_bytes()); // width
+        block.extend_from_slice(&1u32.to_be_bytes()); // height
+        block.extend_from_slice(&8u32.to_be_bytes()); // depth
+        block.extend_from_slice(&0u32.to_be_bytes()); // colors used
+        block.extend_from_slice(&u32::try_from(len).unwrap().to_be_bytes());
+        block.extend(std::iter::repeat_n(marker, len));
+        block
+    }
+
+    /// [`picture_block_n`] with a single image byte.
+    fn picture_block(marker: u8) -> Vec<u8> {
+        picture_block_n(marker, 1)
+    }
+
+    /// A complete Opus file whose comment packet carries `comments`, plus one
+    /// audio page so `audio_offset` lands before EOF.
+    fn opus_with_comments(comments: &[(&str, &str)]) -> Vec<u8> {
+        let inputs: Vec<crate::input::TagInput> = comments
+            .iter()
+            .map(|(k, v)| crate::input::TagInput::new(k, v))
+            .collect();
+        let mut tags_pkt = b"OpusTags".to_vec();
+        tags_pkt.extend_from_slice(&crate::vorbiscomment::build(&inputs).unwrap());
+        let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let (mut data, _) = build_header(7, &[&head, &tags_pkt]);
+        let (audio, _) = lace_packet(7, 2, false, 960, &[0u8; 50]);
+        data.extend_from_slice(&audio);
+        data
+    }
+
+    /// Wrap `s` at 76 columns with CRLF, the older MIME base64 style.
+    fn wrap76(s: &str) -> String {
+        s.as_bytes()
+            .chunks(76)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    #[test]
+    fn read_pictures_accepts_whitespace_wrapped_base64() {
+        // Vorbis comment values are length-prefixed so wrapping is unnecessary,
+        // but the strict engine used to fail at the first line break and discard
+        // the picture (#673). A wrapped value must decode to the same bytes.
+        // 200 image bytes so the encoded value is comfortably past 76 columns.
+        let value = base64::engine::general_purpose::STANDARD.encode(picture_block_n(0xAB, 200));
+        let wrapped = wrap76(&value);
+        assert!(wrapped.contains("\r\n"), "test value must actually wrap");
+
+        let data = opus_with_comments(&[("METADATA_BLOCK_PICTURE", &wrapped)]);
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert_eq!(dropped, vec![]);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].data, vec![0xAB; 200]);
+    }
+
+    #[test]
+    fn read_pictures_skips_one_bad_value_and_keeps_the_others() {
+        // One unparseable picture used to abandon the loop, discarding every
+        // valid picture in the same file — and the scan path swallowed the
+        // error, so the loss was silent (#673).
+        let good_a = base64::engine::general_purpose::STANDARD.encode(picture_block(0xAA));
+        let good_b = base64::engine::general_purpose::STANDARD.encode(picture_block(0xBB));
+        let data = opus_with_comments(&[
+            ("METADATA_BLOCK_PICTURE", "not!valid!base64"),
+            ("METADATA_BLOCK_PICTURE", &good_a),
+            ("METADATA_BLOCK_PICTURE", &good_b),
+        ]);
+
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert_eq!(pics.len(), 2);
+        assert_eq!(pics[0].data, vec![0xAA]);
+        assert_eq!(pics[1].data, vec![0xBB]);
+        assert_eq!(
+            dropped,
+            vec![PictureDrop {
+                reason: "undecodable base64",
+                bytes: "not!valid!base64".len(),
+            }]
+        );
+    }
+
+    #[test]
+    fn read_pictures_reports_a_decodable_but_malformed_picture_block() {
+        // Valid base64 whose decoded bytes are a truncated PICTURE block: the
+        // drop is attributed to the block, not to the base64.
+        let truncated = base64::engine::general_purpose::STANDARD.encode([0u8; 3]);
+        let good = base64::engine::general_purpose::STANDARD.encode(picture_block(0xCD));
+        let data = opus_with_comments(&[
+            ("METADATA_BLOCK_PICTURE", &truncated),
+            ("METADATA_BLOCK_PICTURE", &good),
+        ]);
+
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].data, vec![0xCD]);
+        assert_eq!(
+            dropped,
+            vec![PictureDrop {
+                reason: "malformed PICTURE block",
+                bytes: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn read_pictures_ignores_oggflac_packets_that_are_not_pictures() {
+        // OggFLAC's following packets are metadata blocks of every type, not just
+        // PICTURE. A non-type-6 block must be passed over silently — neither
+        // parsed as art nor reported as a drop.
+        let mut mapping = vec![0x7F];
+        mapping.extend_from_slice(b"FLAC");
+        mapping.push(1);
+        mapping.push(0);
+        mapping.extend_from_slice(&1u16.to_be_bytes()); // one following packet
+        mapping.extend_from_slice(b"fLaC");
+        let mut streaminfo = Vec::new();
+        crate::flac::push_block_header(&mut streaminfo, 0, 34, false).unwrap();
+        streaminfo.extend(std::iter::repeat_n(0u8, 34));
+        mapping.extend_from_slice(&streaminfo);
+
+        // A VORBIS_COMMENT block (type 4), long enough to survive the 4-byte
+        // header slice if the type check were to let it through.
+        let mut comment = Vec::new();
+        crate::flac::push_block_header(&mut comment, 4, 8, true).unwrap();
+        comment.extend(std::iter::repeat_n(0u8, 8));
+
+        let (data, _) = build_header(78, &[&mapping, &comment]);
+        assert_eq!(read_header(&data).unwrap().codec, Codec::OggFlac);
+
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert!(pics.is_empty());
+        assert_eq!(
+            dropped,
+            vec![],
+            "a non-picture block is not a dropped picture"
+        );
+    }
+
+    #[test]
+    fn read_pictures_still_errors_on_a_malformed_container() {
+        // Per-picture leniency must not extend to the container: with no parsable
+        // header there is no list of pictures to salvage.
+        assert!(read_pictures_reporting(b"not an ogg stream").is_err());
     }
 
     #[test]
@@ -839,7 +1076,17 @@ mod tests {
 
         // Sanity: the header parses, so we actually reach the picture loop.
         assert_eq!(read_header(&data).unwrap().codec, Codec::OggFlac);
-        assert!(read_pictures(&data).unwrap().is_empty());
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert!(pics.is_empty());
+        // Too short to be a picture, but it claimed to be one: report the drop
+        // rather than passing over it silently (#673).
+        assert_eq!(
+            dropped,
+            vec![PictureDrop {
+                reason: "truncated PICTURE block header",
+                bytes: 1,
+            }]
+        );
     }
 
     fn oggflac_headers() -> Vec<u8> {
@@ -1598,6 +1845,23 @@ mod page_test_support_tests {
         let body = super::page_test_support::vorbis_body_empty();
         let parsed = crate::vorbiscomment::parse(&body).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    /// Same contract, for the fixture that carries fields: the comments come back
+    /// in order, with their keys normalized to lowercase the way every tag
+    /// musefs writes is.
+    #[test]
+    fn vorbis_body_with_round_trips_its_comments() {
+        let body =
+            super::page_test_support::vorbis_body_with(&[("TITLE", "Sun"), ("ARTIST", "Boc")]);
+        let parsed = crate::vorbiscomment::parse(&body).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("title".to_string(), "Sun".to_string()),
+                ("artist".to_string(), "Boc".to_string()),
+            ]
+        );
     }
 }
 

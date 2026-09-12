@@ -12,6 +12,11 @@ pub enum FormatError {
     TooLarge,
     #[error("not a supported MP4/M4A file")]
     NotMp4,
+    /// The `moov` holds a track layout musefs cannot serve. Distinct from
+    /// [`FormatError::NotMp4`] so the scan log names the handler types found
+    /// rather than reporting a bare "unparseable" (#672).
+    #[error("unsupported MP4 track layout: {0}")]
+    Mp4Tracks(String),
     #[error("not a supported WAV/RIFF file")]
     NotWav,
     #[error("synthesized region layout violates producer invariants: {0}")]
