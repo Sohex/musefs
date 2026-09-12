@@ -1,6 +1,12 @@
 #![cfg(feature = "metrics")]
 //! E2E: `.musefs-metrics` read model + audio invariant (#394).
 //!
+//! Keep this binary to the one test. The rendered body carries process-global
+//! gauges — resident set size, and the syscall counters under the `metrics`
+//! feature — so a second test mounting and reading in the same process moves
+//! them between the two reads assertion 4 compares, and that assertion fails.
+//! A test that needs its own mount belongs in its own file.
+//!
 //! Run with:
 //!   cargo test -p musefs-fuse --features metrics --test metrics_e2e -- --ignored --nocapture
 
@@ -164,70 +170,6 @@ fn metrics_surface_e2e() {
             "audio payload must be byte-identical (cardinal invariant)"
         );
     }
-
-    drop(session);
-}
-
-/// #681: a track whose rendered root component is the synthetic name. The
-/// reservation in the virtual tree pushes it to `.musefs-metrics (2)`, so
-/// `readdir` and `lookup` agree and the user's subtree stays reachable — before
-/// the fix the name appeared twice with different inodes and the tracks under it
-/// could not be reached at all.
-#[test]
-#[ignore = "requires /dev/fuse + libfuse; run with --ignored"]
-fn a_track_rendering_to_the_metrics_name_stays_reachable() {
-    use std::os::unix::fs::{DirEntryExt, MetadataExt};
-
-    let backing = tempfile::tempdir().unwrap();
-    let audio_bytes: Vec<u8> = (0..=255).cycle().take(256).collect();
-    let flac = make_flac(&["ARTIST=.musefs-metrics", "TITLE=Song"], &audio_bytes);
-    std::fs::write(backing.path().join("a.flac"), &flac).unwrap();
-    let db = musefs_db::Db::open_in_memory().unwrap();
-    scan_directory(&db, backing.path()).unwrap();
-    let fs = Musefs::open(db, config()).unwrap();
-
-    let mountpoint = tempfile::tempdir().unwrap();
-    let session =
-        musefs_fuse::spawn_with(fs, mountpoint.path(), "musefs-681-e2e", fuse_config()).unwrap();
-
-    // readdir names are unique, and the synthetic entry keeps the base name.
-    let rows: Vec<(String, u64)> = std::fs::read_dir(mountpoint.path())
-        .unwrap()
-        .map(|e| {
-            let e = e.unwrap();
-            (e.file_name().into_string().unwrap(), e.ino())
-        })
-        .collect();
-    let mut names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        vec![".musefs-metrics", ".musefs-metrics (2)"],
-        "the real entry must be pushed off the synthetic name"
-    );
-
-    // Every listed inode is the one `lookup` resolves the same name to.
-    for (name, ino) in &rows {
-        let stat = std::fs::metadata(mountpoint.path().join(name)).unwrap();
-        assert_eq!(
-            stat.ino(),
-            *ino,
-            "readdir and lookup disagree on the inode of {name}"
-        );
-    }
-
-    // Both surfaces work: telemetry under the synthetic name, the track under the
-    // pushed one.
-    assert!(
-        mountpoint.path().join(".musefs-metrics/metrics").exists(),
-        "the telemetry file must still be served"
-    );
-    let song = mountpoint
-        .path()
-        .join(".musefs-metrics (2)")
-        .join("Song.flac");
-    assert!(song.is_file(), "the track must be reachable at {song:?}");
-    assert!(!std::fs::read(&song).unwrap().is_empty());
 
     drop(session);
 }
