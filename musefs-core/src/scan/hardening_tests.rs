@@ -414,7 +414,7 @@ fn probe_file_caught_isolates_parser_panic_as_failed() {
     let path = dir.path().join("boom.flac");
     write_flac(&path, &["ARTIST=A", "TITLE=T"], None);
     set_after_s1_hook(|| panic!("parser exploded"));
-    let out = probe_file_caught(&path, WINDOW);
+    let out = probe_file_caught(&path, WINDOW, ChecksumTier::Fingerprint);
     clear_after_s1_hook();
     match out {
         Ok(ProbeOutcome::Failed(f)) => assert_eq!(
@@ -689,7 +689,7 @@ fn probe_reports_unparseable_with_its_reason() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad.flac");
     std::fs::write(&path, b"not a real audio file").unwrap();
-    match probe_file(&path, WINDOW).unwrap() {
+    match probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap() {
         ProbeOutcome::Failed(f) => {
             assert_eq!(f.reason, SkipReason::Unparseable);
             assert!(

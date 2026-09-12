@@ -95,7 +95,9 @@ failures, are in
   is sufficient for routine move detection.
 - **`full`** — fingerprint plus an eager full-file SHA-256. Use this when you
   want collision-proof retargeting or a forensic content identity for every
-  file.
+  file. A file this tier cannot hash is **failed**, not ingested one tier
+  lower: it is counted in `failed` (under `checksum-failed` in the end-of-scan
+  breakdown) and so reaches the exit-`2` partial-failure signal.
 
 Two flags govern how a fingerprint match is confirmed before retargeting a
 moved file:

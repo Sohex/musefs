@@ -210,7 +210,10 @@ fn probe_file_fails_file_with_oversized_mp4_covr() {
     let path = dir.path().join("oversized_art.m4a");
     std::fs::write(&path, &bytes).unwrap();
     assert!(
-        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Failed(_)),
+        matches!(
+            probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap(),
+            ProbeOutcome::Failed(_)
+        ),
         "an oversized covr must fail the file, not yield a track without its art"
     );
 }
@@ -223,7 +226,10 @@ fn probe_file_fails_file_with_oversized_mp4_binary_freeform() {
     let path = dir.path().join("oversized_bin.m4a");
     std::fs::write(&path, &bytes).unwrap();
     assert!(
-        matches!(probe_file(&path, 0).unwrap(), ProbeOutcome::Failed(_)),
+        matches!(
+            probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap(),
+            ProbeOutcome::Failed(_)
+        ),
         "an oversized `----` value must fail the file"
     );
 }
@@ -237,8 +243,8 @@ fn probe_file_keeps_mp4_covr_at_cap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("at_cap_art.m4a");
     std::fs::write(&path, &bytes).unwrap();
-    let probed = match probe_file(&path, 0).unwrap() {
-        ProbeOutcome::Probed(p, _) => p,
+    let probed = match probe_file(&path, 0, ChecksumTier::Fingerprint).unwrap() {
+        ProbeOutcome::Probed(p, _, _) => p,
         other => panic!("expected Probed, got {other:?}"),
     };
     assert_eq!(probed.format, Format::M4a);
@@ -418,7 +424,7 @@ fn full_file_hash_matches_known_sha256() {
     std::fs::write(&path, b"abc").unwrap();
     // sha256("abc")
     assert_eq!(
-        full_file_hash(&path).unwrap(),
+        full_file_hash(&std::fs::File::open(&path).unwrap()).unwrap(),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
 }
@@ -797,5 +803,100 @@ fn ingest_unit_db_path_keeps_the_hash_of_unchanged_bytes() {
         tracks[0].content_hash.as_deref(),
         Some(hash.as_str()),
         "an unchanged file's hash is still true of it"
+    );
+}
+
+// --- #690: checksums come from the probe's descriptor, inside its sandwich ---
+
+/// The point of `full_file_hash` taking a `&File`: once the caller has stamped
+/// this inode the hash describes it, not whatever later takes its name.
+/// Reopening the pathname is how a row came to pair one generation's stamp,
+/// geometry and tags with another generation's hash (#690).
+#[test]
+fn full_file_hash_follows_the_descriptor_not_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    let held = std::fs::File::open(&path).unwrap();
+
+    // Replace the name with different content, atomically, the way an external
+    // tool rewriting a file in place does.
+    let other = dir.path().join("g.bin");
+    std::fs::write(&other, b"zzz").unwrap();
+    std::fs::rename(&other, &path).unwrap();
+
+    assert_eq!(
+        full_file_hash(&held).unwrap(),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "sha256(\"abc\") — the descriptor's bytes, not the path's"
+    );
+}
+
+/// The retarget confirm decides an identity question, so it must refuse to
+/// answer rather than compare a hash of bytes the probe never stamped (#690).
+#[test]
+fn hash_confirm_refuses_a_file_that_no_longer_matches_the_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, b"abc").unwrap();
+    let stamp = BackingStamp::from_metadata(&std::fs::metadata(&path).unwrap());
+    assert_eq!(
+        hash_confirm(&path, stamp).unwrap().as_deref(),
+        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        "the stamped file confirms"
+    );
+
+    // The file moves on; the stamp the probe committed to no longer describes it.
+    std::fs::write(&path, b"abcd").unwrap();
+    assert_eq!(
+        hash_confirm(&path, stamp).unwrap(),
+        None,
+        "a changed file must not be confirmed against a stale stamp"
+    );
+}
+
+/// A checksum the tier asked for and could not produce fails that file under
+/// its own reason, instead of committing a row one tier below what the flag
+/// promised behind a warn nothing counted (#690). Being in `SkipReason::FAILED`
+/// is what puts it in `ScanStats::failed` and so in the exit-2 contract.
+#[test]
+fn a_checksum_that_cannot_be_produced_fails_the_file() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("p");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    #[expect(unsafe_code, reason = "libc::mkfifo FFI; no std equivalent")]
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo");
+    // A FIFO's read end opens without a writer under O_NONBLOCK, and `pread` on
+    // it fails with ESPIPE — the shape of any I/O error the checksum reads can
+    // hit on a descriptor the probe already opened and parsed successfully.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    let probed = Probed {
+        format: Format::Flac,
+        audio_offset: 0,
+        audio_length: 4096,
+        tags: Vec::new(),
+        pictures: Vec::new(),
+        binary_tags: Vec::new(),
+        structural_blocks: Vec::new(),
+    };
+
+    let err = checksums_of(&f, &probed, ChecksumTier::Full).expect_err("pread on a FIFO fails");
+    assert_eq!(checksum_failure(&fifo, &err).reason, SkipReason::Checksum);
+    assert!(
+        SkipReason::FAILED.contains(&SkipReason::Checksum),
+        "a checksum failure must count in ScanStats::failed"
+    );
+    // The `none` tier asks for nothing, so it has nothing to fail on.
+    assert_eq!(
+        checksums_of(&f, &probed, ChecksumTier::None).unwrap(),
+        Checksums::default()
     );
 }

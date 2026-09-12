@@ -496,3 +496,26 @@ fn fast_retarget_without_a_new_hash_clears_the_stale_one() {
         "an unconfirmed retarget must not inherit the departed file's hash"
     );
 }
+
+/// The `fingerprint`-tier move of a file whose row already carries a
+/// `content_hash`: Auto escalates, re-reads the moved file, confirms it against
+/// the stored hash, and persists the value so the next scan need not re-read.
+/// The confirm is the one hash computed outside the probe, and it now refuses to
+/// answer unless the file still matches the stamp the probe committed to (#690).
+#[test]
+fn fingerprint_tier_move_confirms_against_the_stored_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, seeded) = seed_at_full(dir.path(), &[0xAA; 64]);
+
+    std::fs::rename(dir.path().join("a.flac"), dir.path().join("moved.flac")).unwrap();
+    scan_directory_with(&db, dir.path(), &opts(ChecksumTier::Fingerprint)).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1, "the confirmed move must retarget in place");
+    assert_eq!(tracks[0].id, seeded.id);
+    assert!(tracks[0].backing_path.ends_with("moved.flac"));
+    assert_eq!(
+        tracks[0].content_hash, seeded.content_hash,
+        "the confirm's hash is persisted, so the next scan need not re-read"
+    );
+}

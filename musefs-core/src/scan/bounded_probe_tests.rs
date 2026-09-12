@@ -173,7 +173,7 @@ fn oversize_unparseable_file_is_skipped_not_read_whole() {
     drop(f);
 
     assert!(matches!(
-        probe_file(&path, WINDOW).unwrap(),
+        probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap(),
         ProbeOutcome::Failed(_)
     ));
 }
@@ -216,8 +216,8 @@ fn oversize_wav_is_served_via_data_header() {
     f.set_len(file_len).unwrap();
     drop(f);
 
-    let probed = match probe_file(&path, WINDOW).unwrap() {
-        ProbeOutcome::Probed(p, _) => p,
+    let probed = match probe_file(&path, WINDOW, ChecksumTier::Fingerprint).unwrap() {
+        ProbeOutcome::Probed(p, _, _) => p,
         other => panic!("expected Probed, got {other:?}"),
     };
     assert_eq!(probed.format, Format::Wav);
@@ -266,6 +266,6 @@ fn probe_file_reports_raced_on_mid_probe_mutation() {
         g.write_all(&[0u8; 4096]).unwrap(); // size moves -> S2 != S1
     });
     let _guard = HookGuard;
-    let out = probe_file(&path, WINDOW);
+    let out = probe_file(&path, WINDOW, ChecksumTier::Fingerprint);
     assert!(matches!(out, Ok(ProbeOutcome::Raced)), "got {out:?}");
 }

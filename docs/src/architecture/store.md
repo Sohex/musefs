@@ -49,11 +49,16 @@ SHA-256 of the *current* backing file, stored as 64-char hex; it is computed
 only at the `full` checksum tier (`--checksum=full`), which requires an eager
 whole-file read.
 
-A pass that computes no full hash never leaves a stale one behind: every
-checksum write carries an explicit intent — keep the stored value, set a new
-one, or clear it — and a pass below the `full` tier clears the column whenever
-it observes that the recorded bytes changed. A pass over a file that has not
-changed keeps what is stored, so a cheap pass never undoes an expensive one.
+Two rules keep "of the current backing file" true. Both checksums are derived
+inside the probe's `fstat` sandwich, from its own descriptor rather than by
+reopening the pathname, so a file that changes mid-probe is discarded as raced
+instead of committing a row whose stamp, geometry and tags describe one
+generation and whose hash describes another. And a pass that computes no full
+hash never leaves a stale one behind: every checksum write carries an explicit
+intent — keep the stored value, set a new one, or clear it — and a pass below
+the `full` tier clears the column whenever it observes that the recorded bytes
+changed. A pass over a file that has not changed keeps what is stored, so a
+cheap pass never undoes an expensive one.
 
 Neither column is `UNIQUE` by design — duplicate-content tracks legitimately share
 both values. On a normal `scan`, when a probed file's path is not yet in the

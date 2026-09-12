@@ -210,6 +210,22 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- Both checksums are now derived inside the probe's stability transaction, from
+  the descriptor it already holds, instead of reopening the pathname afterwards.
+  The stamp was always captured first, so the skew was one-directional: a row
+  could record one generation's stamp, geometry and tags alongside a hash of the
+  next generation, or of a torn mid-write state. Serving failed closed on the
+  stamp later, but the value stored as the authoritative content identity was
+  garbage, and the retarget confirm — which decides an identity question and has
+  no such backstop — could compare a torn hash against a stored one. A file that
+  changes during hashing is now discarded as raced like any other, and the
+  retarget confirm refuses to answer unless the file still matches the stamp the
+  probe committed to. Separately, a `--checksum=full` run that cannot hash a
+  file now **fails** that file — counted in `failed` under a `checksum-failed`
+  bucket, and so reaching the exit-`2` signal — rather than committing a row one
+  tier below what the flag promised behind a warning nothing counted
+  ([#690](https://github.com/Sohex/musefs/issues/690)).
+
 - A row no longer claims a `content_hash` its bytes do not have. The checksum
   write read a `None` argument as "leave the stored value alone", which is
   right for a pass that computed nothing and wrong for a pass that watched the

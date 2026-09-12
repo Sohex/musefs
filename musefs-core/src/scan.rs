@@ -51,9 +51,19 @@ const MAX_BINARY_TAG_BYTES: usize = MAX_ART_BYTES;
 /// for it (#276).
 #[derive(Debug)]
 enum ProbeOutcome {
-    Probed(Probed, BackingStamp),
+    Probed(Probed, BackingStamp, Checksums),
     Failed(Failure),
     Raced,
+}
+
+/// The content identities one probe derived for one file. Both are produced
+/// from the probe's own descriptor inside its fstat sandwich, so neither can
+/// describe a generation of the file that the stamp, geometry and tags stored
+/// beside it do not (#690).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Checksums {
+    fingerprint: Option<String>,
+    content_hash: Option<String>,
 }
 
 #[cfg(test)]
@@ -206,6 +216,9 @@ enum SkipReason {
     Io,
     /// A parser panic caught by [`probe_file_caught`] (#425).
     Panicked,
+    /// `--checksum=full` could not hash the file, so the row would have
+    /// committed without the identity the tier promises (#690).
+    Checksum,
     /// The file changed under the probe, so nothing was committed (#276).
     Raced,
     /// A directory or directory entry the walk could not read or classify.
@@ -217,12 +230,13 @@ enum SkipReason {
 impl SkipReason {
     /// Every reason, in [`FailureTally`]'s array order (each reason indexes that
     /// array by its discriminant).
-    const ALL: [SkipReason; 8] = [
+    const ALL: [SkipReason; 9] = [
         SkipReason::Unparseable,
         SkipReason::Oversize,
         SkipReason::Rejected,
         SkipReason::Io,
         SkipReason::Panicked,
+        SkipReason::Checksum,
         SkipReason::Raced,
         SkipReason::WalkUnreadable,
         SkipReason::WalkSymlink,
@@ -230,12 +244,13 @@ impl SkipReason {
 
     /// The reasons that increment `ScanStats::failed`. They partition it
     /// exactly, which is what makes the `failed N: ...` breakdown trustworthy.
-    const FAILED: [SkipReason; 5] = [
+    const FAILED: [SkipReason; 6] = [
         SkipReason::Unparseable,
         SkipReason::Oversize,
         SkipReason::Rejected,
         SkipReason::Io,
         SkipReason::Panicked,
+        SkipReason::Checksum,
     ];
 
     /// Walk-time entries, counted in no `ScanStats` field: no file was ever
@@ -250,6 +265,7 @@ impl SkipReason {
             SkipReason::Rejected => "rejected",
             SkipReason::Io => "io",
             SkipReason::Panicked => "panicked",
+            SkipReason::Checksum => "checksum-failed",
             SkipReason::Raced => "changed-during-probe",
             SkipReason::WalkUnreadable => "unreadable",
             SkipReason::WalkSymlink => "symlink",
@@ -873,15 +889,22 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
 
 /// Bounded probe of one backing file: open once, fstat before and after the
 /// probe, and report `Raced` when the file moved mid-probe — so the stored
-/// stamp and the probed bytes provably share one inode held still across the
-/// probe. Never reads the audio payload (M4A uses the seek reader;
-/// front-anchored formats read only the metadata extent).
+/// stamp, the probed bytes and the derived checksums provably share one inode
+/// held still across the whole probe. Never reads the audio payload (M4A uses
+/// the seek reader; front-anchored formats read only the metadata extent),
+/// beyond the whole-file stream `--checksum=full` asks for.
+///
+/// `tier`'s checksums are computed *here*, not by the caller, and from this
+/// descriptor rather than by reopening the pathname. Both used to sit outside
+/// the sandwich, which let a row pair one generation's stamp, geometry and tags
+/// with another generation's hash (#690).
 ///
 /// Returns `ProbeOutcome::Failed` for a supported-extension file that does not
-/// parse or cannot be stored (counted as `failed`) and `ProbeOutcome::Raced` if
-/// the file changed under us — a race outranks a failure, since a torn probe
-/// says nothing about whether the settled file would parse.
-fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
+/// parse, cannot be stored, or (at `--checksum=full`) cannot be hashed — all
+/// counted as `failed` — and `ProbeOutcome::Raced` if the file changed under us.
+/// A race outranks a failure, since a torn probe says nothing about whether the
+/// settled file would parse or hash.
+fn probe_file(path: &Path, window: usize, tier: ChecksumTier) -> std::io::Result<ProbeOutcome> {
     let file = std::fs::File::open(path)?;
     crate::metrics::on_scan_open();
     let s1 = BackingStamp::from_metadata(&file.metadata()?);
@@ -889,14 +912,53 @@ fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
     fire_after_s1();
 
     let probed = probe_body(path, &file, s1.size, window)?;
+    // Inside the sandwich: the s2 check below covers the checksum reads too.
+    let settled = match probed {
+        ProbeBody::Failed(f) => Err(f),
+        ProbeBody::Parsed(p) => match checksums_of(&file, &p, tier) {
+            Ok(c) => Ok((p, c)),
+            Err(e) => Err(checksum_failure(path, &e)),
+        },
+    };
 
     let s2 = BackingStamp::from_metadata(&file.metadata()?);
     if s1 != s2 {
         return Ok(ProbeOutcome::Raced);
     }
-    Ok(match probed {
-        ProbeBody::Parsed(p) => ProbeOutcome::Probed(p, s1),
-        ProbeBody::Failed(f) => ProbeOutcome::Failed(f),
+    Ok(match settled {
+        Ok((p, c)) => ProbeOutcome::Probed(p, s1, c),
+        Err(f) => ProbeOutcome::Failed(f),
+    })
+}
+
+/// The failure a file gets when the checksum its tier asked for could not be
+/// produced. Its own reason, so it lands in `ScanStats::failed` and in the
+/// end-of-scan breakdown: a `--checksum=full` run that cannot hash a file used
+/// to commit the row anyway, one tier below what the flag promised, behind a
+/// warn nothing counted (#690).
+fn checksum_failure(path: &Path, e: &std::io::Error) -> Failure {
+    Failure::new(
+        SkipReason::Checksum,
+        format!("skipping {}: checksum failed: {e}", path.display()),
+    )
+}
+
+/// The checksums `tier` asks for, read from the probe's own descriptor.
+fn checksums_of(
+    file: &std::fs::File,
+    p: &Probed,
+    tier: ChecksumTier,
+) -> std::io::Result<Checksums> {
+    Ok(match tier {
+        ChecksumTier::None => Checksums::default(),
+        ChecksumTier::Fingerprint => Checksums {
+            fingerprint: Some(fingerprint_of(p)),
+            content_hash: None,
+        },
+        ChecksumTier::Full => Checksums {
+            fingerprint: Some(fingerprint_of(p)),
+            content_hash: Some(full_file_hash(file)?),
+        },
     })
 }
 
@@ -910,8 +972,14 @@ fn probe_file(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
 /// `failed` — and which keeps its `error` level when the caller logs it, since a
 /// panic is a musefs bug rather than a property of the library being scanned.
 /// Mirrors the read path's `read_outcome` boundary (#359).
-fn probe_file_caught(path: &Path, window: usize) -> std::io::Result<ProbeOutcome> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe_file(path, window))) {
+fn probe_file_caught(
+    path: &Path,
+    window: usize,
+    tier: ChecksumTier,
+) -> std::io::Result<ProbeOutcome> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        probe_file(path, window, tier)
+    })) {
         Ok(res) => res,
         Err(payload) => {
             let msg = payload
@@ -1129,7 +1197,9 @@ pub enum ChecksumTier {
     None,
     /// Compute the cheap fingerprint only (rides the probe).
     Fingerprint,
-    /// Fingerprint plus an eager full-file SHA-256.
+    /// Fingerprint plus an eager full-file SHA-256. A file this tier cannot
+    /// hash is failed under [`SkipReason::Checksum`] rather than ingested one
+    /// tier lower (#690).
     Full,
 }
 
@@ -1883,8 +1953,18 @@ fn ingest_unit(
             // which fails the confirm and inserts this unit fresh.
             let new_hash: Option<String> = match (&unit.content_hash, needs_full) {
                 (Some(h), _) => Some(h.clone()),
-                (None, true) => match full_file_hash(std::path::Path::new(&unit.abs_path)) {
-                    Ok(h) => Some(h),
+                (None, true) => match hash_confirm(Path::new(&unit.abs_path), unit.stamp) {
+                    Ok(Some(h)) => Some(h),
+                    // Hashed a file that is no longer the one the probe
+                    // stamped, so the comparison below would decide an identity
+                    // question on torn bytes (#690). Refuse to answer.
+                    Ok(None) => {
+                        log::warn!(
+                            "hash confirm for {} saw the file change under it; inserting fresh",
+                            unit.abs_path
+                        );
+                        None
+                    }
                     Err(e) => {
                         log::warn!(
                             "hash confirm failed for {}: {e}; inserting fresh",
@@ -2140,8 +2220,8 @@ fn run_pipeline(
             loop {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 let Some(path) = files.get(i) else { break };
-                match probe_file_caught(path, window) {
-                    Ok(ProbeOutcome::Probed(probed, stamp)) => {
+                match probe_file_caught(path, window, tier) {
+                    Ok(ProbeOutcome::Probed(probed, stamp, checksums)) => {
                         // No-follow paths are canonical by construction (the root
                         // was canonicalized up front); only the opt-in symlink walk
                         // can yield a path with a symlink component to resolve (#440).
@@ -2176,31 +2256,16 @@ fn run_pipeline(
                         }
                         let weight = payload_weight(&probed);
                         budget.acquire(weight); // backpressure on in-flight art bytes
-                        let fingerprint = match tier {
-                            ChecksumTier::None => None,
-                            ChecksumTier::Fingerprint | ChecksumTier::Full => {
-                                Some(fingerprint_of(&probed))
-                            }
-                        };
-                        let content_hash = match tier {
-                            ChecksumTier::Full => {
-                                match full_file_hash(std::path::Path::new(&abs_path)) {
-                                    Ok(h) => Some(h),
-                                    Err(e) => {
-                                        log::warn!("content hash failed for {abs_path}: {e}");
-                                        None
-                                    }
-                                }
-                            }
-                            _ => None,
-                        };
+                        // Both checksums came back from the probe, derived from
+                        // its descriptor inside its fstat sandwich — computing
+                        // them here reopened the pathname outside it (#690).
                         let unit = Unit {
                             abs_path,
                             stamp,
                             probed,
                             weight,
-                            fingerprint,
-                            content_hash,
+                            fingerprint: checksums.fingerprint,
+                            content_hash: checksums.content_hash,
                         };
                         if tx.send(unit).is_err() {
                             budget.release(weight);
@@ -2674,19 +2739,55 @@ pub(crate) fn fingerprint_of(p: &Probed) -> String {
 /// Streaming SHA-256 of an entire backing file, hex-encoded. The authoritative
 /// content identity; reads the whole file, so callers gate it on the `Full` tier
 /// or a strict-confirmation need.
-pub(crate) fn full_file_hash(path: &std::path::Path) -> std::io::Result<String> {
+///
+/// Takes the descriptor, not a path, and reads it positionally: reopening the
+/// pathname hashed whatever was at that name *now*, which need not be the inode
+/// the caller stamped and parsed (#690). Every caller therefore has to hold the
+/// file open across its own stability check.
+pub(crate) fn full_file_hash(file: &std::fs::File) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
-    let mut f = std::fs::File::open(path)?;
+    use std::os::unix::fs::FileExt;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
+    // `checked_add`, not `+=`: the offset must advance by exactly what was read
+    // or the loop is unbounded, and this says so rather than leaving a silent
+    // `at` that a wrong-operator edit could pin at zero forever.
+    let mut at = 0u64;
     loop {
-        let n = std::io::Read::read(&mut f, &mut buf)?;
+        let n = file.read_at(&mut buf, at)?;
         if n == 0 {
             break;
         }
         h.update(&buf[..n]);
+        at = at
+            .checked_add(n as u64)
+            .expect("a file offset reached by reading fits u64");
+        crate::metrics::on_scan_read(n as u64);
     }
     Ok(format!("{:x}", base16ct::HexDisplay(&h.finalize())))
+}
+
+/// Full-hash a retarget destination, refusing to answer if the file is not the
+/// one `expect` describes.
+///
+/// The retarget confirm decides an *identity* question — is this new file the
+/// candidate row's old file? — so it must not compare a torn hash against the
+/// stored one. Unlike the ingest path there is no stamp mismatch downstream to
+/// fail closed on later, because a confirmed retarget writes the stamp it was
+/// handed. So the descriptor is fstat'd before and after hashing and both must
+/// equal the stamp the probe committed to; `Ok(None)` means "changed under us,
+/// cannot confirm", which the caller treats as an unconfirmed match (#690).
+fn hash_confirm(path: &Path, expect: BackingStamp) -> std::io::Result<Option<String>> {
+    let file = std::fs::File::open(path)?;
+    crate::metrics::on_scan_open();
+    if BackingStamp::from_metadata(&file.metadata()?) != expect {
+        return Ok(None);
+    }
+    let hash = full_file_hash(&file)?;
+    if BackingStamp::from_metadata(&file.metadata()?) != expect {
+        return Ok(None);
+    }
+    Ok(Some(hash))
 }
 
 #[cfg(test)]
