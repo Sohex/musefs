@@ -417,24 +417,38 @@ enum Gate {
     Gated,
 }
 
-/// One numbered schema step: the SQL, and whether an ordinary open may run it.
+/// One numbered schema step: the SQL, whether an ordinary open may run it, the
+/// musefs release that introduced it, and a line saying what it does.
+///
+/// Neither `since` nor `summary` is decoration. `musefs migrate` has to tell
+/// the user what it is about to do to their store and which upgrade brought it,
+/// and the only place either can be kept honest is next to the SQL (#705).
+/// `since` is also what the gated-migration contract below is checked against.
 struct Migration {
     sql: &'static str,
     gate: Gate,
+    since: &'static str,
+    summary: &'static str,
 }
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
         sql: MIGRATION_V1,
         gate: Gate::Transparent,
+        since: "1.0.0",
+        summary: "creates the baseline schema",
     },
     Migration {
         sql: MIGRATION_V2,
         gate: Gate::Transparent,
+        since: "1.1.0",
+        summary: "adds the scanner-owned fingerprint and content_hash columns",
     },
     Migration {
         sql: MIGRATION_V3,
         gate: Gate::Transparent,
+        since: "2.0.0",
+        summary: "widens the tags.value and track_art.description caps",
     },
     // The 2.0.0 store change. It rewrites data the user did not ask to have
     // rewritten and ends compatibility with every older musefs build, which is
@@ -442,8 +456,88 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         sql: MIGRATION_V4,
         gate: Gate::Gated,
+        since: "2.0.0",
+        summary: "clears every stored fingerprint; a scan or revalidate recomputes them",
     },
 ];
+
+/// **The gated-migration contract: a gated step ships only in a major release.**
+///
+/// The classification decides whether a user's upgrade is a restart or an
+/// errand, so what they need to know is not which `user_version` they are on
+/// but whether the release they are moving to crossed a major boundary. Under
+/// semver a major is where an incompatible change is allowed to live, and a
+/// gated migration — data rewritten, disk needed, older binaries locked out —
+/// is exactly that. Tying the two together gives one rule that holds for every
+/// upgrade anyone ever does: crossing a major version may ask for `musefs
+/// migrate`; a minor or a patch never will.
+///
+/// The converse is deliberately *not* asserted. A major release is free to
+/// carry only transparent steps, or none — `MIGRATION_V3` rides 2.0.0 and is
+/// transparent — and a release with nothing to gate should not have to invent
+/// something.
+///
+/// Checked by the compiler rather than by review, because the failure mode is
+/// silent: a gated step slipped into a point release is a schema change nobody
+/// was warned about, and it would only be discovered by the mounts that stopped
+/// coming back after an unattended upgrade.
+const _: () = {
+    let mut i = 0;
+    while i < MIGRATIONS.len() {
+        assert!(
+            !MIGRATIONS[i].gate.is_gated() || is_major_release(MIGRATIONS[i].since),
+            "a gated migration may only be introduced by a major release (x.0.0): \
+             move it to the next major, or make it transparent"
+        );
+        i += 1;
+    }
+};
+
+impl Gate {
+    const fn is_gated(self) -> bool {
+        matches!(self, Gate::Gated)
+    }
+}
+
+/// Whether `version` is a major release, i.e. its minor and patch are both 0.
+/// Takes the text apart by hand because a semver parser is not available in a
+/// const context, and the shape it accepts is the only one this crate writes.
+const fn is_major_release(version: &str) -> bool {
+    let b = version.as_bytes();
+    let n = b.len();
+    // The shortest major release is "N.0.0", five bytes.
+    n >= 5 && b[n - 4] == b'.' && b[n - 3] == b'0' && b[n - 2] == b'.' && b[n - 1] == b'0'
+}
+
+/// One step a store has yet to receive, as [`pending`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingStep {
+    /// The `user_version` the store carries once this step has been applied.
+    pub version: i64,
+    /// The musefs release that introduced it.
+    pub since: &'static str,
+    /// What the step does, in one line fit to print.
+    pub summary: &'static str,
+    /// Whether an ordinary open refuses this step rather than applying it.
+    /// True only for a step a major release introduced — see the contract on
+    /// `MIGRATIONS`.
+    pub gated: bool,
+}
+
+/// Every step between `current` and [`LATEST_VERSION`], in the order they run.
+/// Empty for a store already at the latest version, and for one past it.
+pub fn pending(current: i64) -> Vec<PendingStep> {
+    (1i64..)
+        .zip(MIGRATIONS)
+        .filter(|(version, _)| *version > current)
+        .map(|(version, migration)| PendingStep {
+            version,
+            since: migration.since,
+            summary: migration.summary,
+            gated: migration.gate.is_gated(),
+        })
+        .collect()
+}
 
 /// The `user_version` a fully-migrated store carries. Exported so callers and
 /// tests assert "the latest schema" rather than a literal that has to be chased
@@ -501,7 +595,7 @@ fn reachable(current: i64, policy: GatePolicy) -> i64 {
         return LATEST_VERSION;
     }
     for (target, migration) in (1i64..).zip(MIGRATIONS) {
-        if target > current && migration.gate == Gate::Gated {
+        if target > current && migration.gate.is_gated() {
             return target - 1;
         }
     }
@@ -921,6 +1015,52 @@ mod gate_tests {
                 Gate::Gated
             ]
         );
+    }
+
+    /// The contract is enforced by a `const` assertion, which by construction
+    /// no test can observe failing — a violation is a build error. What a test
+    /// can pin is the predicate it rests on, so a rewrite of the parsing cannot
+    /// quietly turn the assertion into one that accepts everything.
+    #[test]
+    fn only_an_x_0_0_version_counts_as_a_major_release() {
+        for major in ["1.0.0", "2.0.0", "10.0.0", "2.0.0-rc.0.0"] {
+            assert!(super::is_major_release(major), "{major}");
+        }
+        for not_major in ["1.1.0", "1.0.1", "0.2.0", "1.0.10", "2.0", "", "0.0"] {
+            assert!(!super::is_major_release(not_major), "{not_major}");
+        }
+    }
+
+    /// Every step says which release brought it, and the one the user is being
+    /// asked to run a command for says a major.
+    #[test]
+    fn every_step_names_its_release_and_the_gated_one_names_a_major() {
+        for migration in MIGRATIONS {
+            assert!(!migration.since.is_empty());
+            assert!(!migration.summary.is_empty());
+            if migration.gate.is_gated() {
+                assert!(
+                    super::is_major_release(migration.since),
+                    "gated step from {}",
+                    migration.since
+                );
+            }
+        }
+    }
+
+    /// What `musefs migrate` prints comes from the table, so the report has to
+    /// carry the release and the summary through, not just the version.
+    #[test]
+    fn pending_carries_the_release_and_the_summary() {
+        let steps = super::pending(WALL);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].version, LATEST_VERSION);
+        assert_eq!(steps[0].since, "2.0.0");
+        assert!(steps[0].gated);
+        assert!(super::pending(LATEST_VERSION).is_empty());
+        // A store older than the wall sees the transparent steps too.
+        assert_eq!(super::pending(1).len(), 3);
+        assert!(!super::pending(1)[0].gated);
     }
 
     #[test]

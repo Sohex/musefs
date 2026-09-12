@@ -4,9 +4,11 @@ pub mod convert;
 mod error;
 pub mod limits;
 mod maintenance;
+mod migrate;
 mod models;
 mod schema;
-pub use schema::LATEST_VERSION;
+pub use migrate::PendingMigration;
+pub use schema::{LATEST_VERSION, PendingStep};
 mod structural;
 mod tags;
 mod tracks;
@@ -119,39 +121,11 @@ pub struct Db<M = ReadWrite> {
     _mode: PhantomData<M>,
 }
 
-/// What an open does about a migration that is gated — one that rewrites the
-/// store in ways nobody running `mount` or `scan` would expect (#706).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Gated {
-    /// Refuse the open, naming `musefs migrate`. Every ordinary open.
-    Refuse,
-    /// Apply it. Only `musefs migrate`, after saying what it will do.
-    Apply,
-}
-
 impl Db<ReadWrite> {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Db> {
         let p = path.as_ref().to_path_buf();
         let mut conn = Connection::open(&p)?;
-        Self::configure(&mut conn, true, Gated::Refuse)?;
-        Ok(Db {
-            conn,
-            path: Some(p),
-            _mode: PhantomData,
-        })
-    }
-
-    /// Open the store and apply **every** pending migration, including the
-    /// gated ones [`Db::open`] refuses.
-    ///
-    /// The intended caller is `musefs migrate` and nothing else: a step is
-    /// gated because it rewrites data, needs disk headroom, or ends
-    /// compatibility with older binaries, and this constructor is the point at
-    /// which the user has already been told so and said yes (#706).
-    pub fn open_migrating<P: AsRef<Path>>(path: P) -> Result<Db> {
-        let p = path.as_ref().to_path_buf();
-        let mut conn = Connection::open(&p)?;
-        Self::configure(&mut conn, true, Gated::Apply)?;
+        Self::configure(&mut conn, true)?;
         Ok(Db {
             conn,
             path: Some(p),
@@ -161,7 +135,7 @@ impl Db<ReadWrite> {
 
     pub fn open_in_memory() -> Result<Db> {
         let mut conn = Connection::open_in_memory()?;
-        Self::configure(&mut conn, false, Gated::Refuse)?;
+        Self::configure(&mut conn, false)?;
         Ok(Db {
             conn,
             path: None,
@@ -173,9 +147,9 @@ impl Db<ReadWrite> {
     /// logging (file-backed DBs only) so a reader (the FUSE mount) and a writer
     /// (e.g. a beets-plugin sync) don't block each other; the busy timeout lets
     /// brief lock contention retry instead of failing immediately with
-    /// SQLITE_BUSY. `gated` decides whether a migration the store cannot be
-    /// taken through unasked is applied or refused.
-    fn configure(conn: &mut Connection, wal: bool, gated: Gated) -> Result<()> {
+    /// SQLITE_BUSY. A gated migration is refused rather than applied here; the
+    /// only door that applies one is [`crate::PendingMigration`].
+    fn configure(conn: &mut Connection, wal: bool) -> Result<()> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", true)?;
         if wal {
@@ -183,10 +157,7 @@ impl Db<ReadWrite> {
             // (pragma_update would error on a result-returning pragma).
             let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         }
-        match gated {
-            Gated::Refuse => schema::migrate(conn)?,
-            Gated::Apply => schema::migrate_all(conn)?,
-        }
+        schema::migrate(conn)?;
         schema::validate_identity(conn)?;
         Ok(())
     }

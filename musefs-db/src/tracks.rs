@@ -212,6 +212,21 @@ impl<M> Db<M> {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// How many tracks carry no `fingerprint`.
+    ///
+    /// This is the deficiency a migration that retires the column leaves
+    /// behind, and the number `musefs migrate` reports so the user knows a
+    /// rescan is owed. `revalidate` already re-probes a row missing the
+    /// checksum its tier asks for, so it is also the number that goes back to
+    /// zero when they run one.
+    pub fn count_tracks_without_fingerprint(&self) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM tracks WHERE fingerprint IS NULL",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn track_content_version(&self, id: i64) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT content_version FROM tracks WHERE id = ?1",
@@ -550,6 +565,27 @@ mod render_key_tests {
         assert_eq!(keys[1].1, 0, "b content_version untouched");
         assert_eq!(keys[0].2, Format::Flac);
         assert_eq!(keys[1].2, Format::Mp3);
+    }
+
+    /// The number `musefs migrate` reports after retiring the column, so it has
+    /// to count the rows that are missing one and no others.
+    #[test]
+    fn count_tracks_without_fingerprint_counts_only_the_missing() {
+        use crate::models::ChecksumWrite;
+        let db = open_mem();
+        let a = db
+            .upsert_track(&new_track("/a.flac", Format::Flac))
+            .unwrap();
+        db.upsert_track(&new_track("/b.mp3", Format::Mp3)).unwrap();
+        assert_eq!(db.count_tracks_without_fingerprint().unwrap(), 2);
+
+        db.set_track_checksums(a, ChecksumWrite::Set(&"a".repeat(64)), ChecksumWrite::Keep)
+            .unwrap();
+        assert_eq!(db.count_tracks_without_fingerprint().unwrap(), 1);
+
+        db.set_track_checksums(a, ChecksumWrite::Clear, ChecksumWrite::Keep)
+            .unwrap();
+        assert_eq!(db.count_tracks_without_fingerprint().unwrap(), 2);
     }
 
     #[test]

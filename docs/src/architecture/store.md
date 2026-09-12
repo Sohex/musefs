@@ -11,31 +11,6 @@ audio); `user_version` records the schema version (4).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
-### Transparent and gated migrations
-
-Each entry declares itself **transparent** or **gated**. A transparent step is
-applied as a side effect of opening the store, which is how every migration up
-to 1.3.0 behaved: nobody running `mount` or `scan` learns it happened, and for a
-step whose cost and consequences they would not notice that is right. A gated
-step is one that rewrites data nobody asked to have rewritten, transiently needs
-the store's size again in free disk, or ends compatibility with the binary they
-were running yesterday. Opening a store that needs one refuses with
-`DbError::StoreNeedsMigration`, naming the `musefs migrate` command; that
-command is the only caller of `Db::open_migrating`, the one door that applies a
-gated step.
-
-Nothing about the classification is stored: the binary owns it, so a user
-jumping from 1.2 straight to 2.1 is still gated on the step that needs it. Two
-rules follow from what the runner already knows. A store being *created* is
-exempt — it has no data to endanger, and gating it would stop `scan` from ever
-building a new library. And the transparent steps ahead of a gate are applied
-and committed before the refusal, because a step is transparent for reasons a
-later gated step does not retroactively change.
-
-`DbError::StoreNeedsMigration` is the opposite direction from
-`DbError::StoreTooNew`, and carries the opposite remedy: upgrade the store, not
-the binary.
-
 - The **baseline schema** (`MIGRATION_V1`): the core tables — `tracks` (one row
   per backing file: path, format, audio byte range, size/nanosecond-mtime/ctime
   stamps, `content_version`), `tags` (multi-value key/value rows ordered by
@@ -55,6 +30,44 @@ the binary.
   `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
   a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
   changes), and `structural_blocks_ai`/`_ad`.
+
+### Transparent and gated migrations
+
+Each entry in `MIGRATIONS` declares itself **transparent** or **gated**. A transparent step is
+applied as a side effect of opening the store, which is how every migration up
+to 1.3.0 behaved: nobody running `mount` or `scan` learns it happened, and for a
+step whose cost and consequences they would not notice that is right. A gated
+step is one that rewrites data nobody asked to have rewritten, transiently needs
+the store's size again in free disk, or ends compatibility with the binary they
+were running yesterday. Opening a store that needs one refuses with
+`DbError::StoreNeedsMigration`, naming
+[`musefs migrate`](../guide/maintenance.md#upgrading-the-store-musefs-migrate).
+That command drives `PendingMigration`, the one door that applies a gated step:
+it opens the store *without* migrating or validating it — the schema is by
+definition not the one this build expects — exposes the versions, the step
+list, an exclusive claim and a `VACUUM INTO` snapshot for the command's
+pre-flight, and hands back an ordinary `Db` once the migration has run.
+
+**A gated step ships only in a major release.** This is the contract, and the
+compiler enforces it: each entry records the release that introduced it, and a
+`const` assertion rejects the build if a `Gated` step names anything but an
+`x.0.0`. What a user needs to know is then not which `user_version` they are on
+but whether the release they are moving to crossed a major boundary — crossing
+one may ask for `musefs migrate`, a minor or a patch never will. The converse is
+deliberately not asserted: a major is free to carry only transparent steps, as
+`MIGRATION_V3` is, or none at all.
+
+Nothing about the classification is stored: the binary owns it, so a user
+jumping from 1.2 straight to 2.1 is still gated on the step that needs it. Two
+further rules follow from what the runner already knows. A store being *created*
+is exempt — it has no data to endanger, and gating it would stop `scan` from
+ever building a new library. And the transparent steps ahead of a gate are
+applied and committed before the refusal, because a step is transparent for
+reasons a later gated step does not retroactively change.
+
+`DbError::StoreNeedsMigration` is the opposite direction from
+`DbError::StoreTooNew`, and carries the opposite remedy: upgrade the store, not
+the binary.
 
 ### The external-writer contract
 

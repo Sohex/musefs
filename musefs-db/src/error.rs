@@ -35,8 +35,15 @@ pub enum DbError {
          longer open it, which is why it is not applied automatically"
     )]
     StoreNeedsMigration { found: i64, target: i64 },
-    #[error("the store is in use — unmount the filesystem or stop any scan before vacuuming")]
-    StoreInUse(#[source] rusqlite::Error),
+    /// Another connection holds the store. `op` is the present participle of
+    /// what was refused, so one variant serves every operation that needs the
+    /// store to itself (`vacuuming`, `migrating`).
+    #[error("the store is in use — unmount the filesystem or stop any scan before {op}")]
+    StoreInUse {
+        op: &'static str,
+        #[source]
+        source: rusqlite::Error,
+    },
     #[error("{table}.{field} is {len} {unit}, over the {max}-{unit} cap (crafted or corrupt DB)")]
     FieldTooLarge {
         table: &'static str,
