@@ -1,3 +1,4 @@
+import os
 import sqlite3
 
 import pytest
@@ -74,6 +75,114 @@ def test_prune_missing_scoped_to_track_ids(db_path, tmp_path):
         conn.commit()
         assert pruned == 1
         assert track_id_for_path(conn, str(tmp_path / "b.flac")) == b
+    finally:
+        conn.close()
+
+
+def test_prune_missing_counts_a_repeated_track_id_once(db_path, tmp_path):
+    """A caller passing the same id twice gets one delete and one count."""
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, str(tmp_path / "gone.flac"))
+        conn.commit()
+        assert prune_missing(conn, track_ids=[tid, tid]) == 1
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_prune_missing_keeps_a_track_it_cannot_stat(db_path, tmp_path, monkeypatch):
+    """A stat failure is not a deletion: the row and its cascaded tags survive,
+    and the caller can see why nothing was pruned (#692)."""
+    from musefs_common.store import replace_tags
+
+    unstattable = tmp_path / "locked" / "a.flac"
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        if str(path) == str(unstattable):
+            raise PermissionError(13, "Permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, str(unstattable))
+        replace_tags(conn, tid, [("artist", "Alice")])
+        conn.commit()
+        unreadable = []
+        pruned = prune_missing(conn, unreadable=unreadable)
+        conn.commit()
+        assert pruned == 0
+        assert track_id_for_path(conn, str(unstattable)) == tid
+        assert conn.execute("SELECT COUNT(*) FROM tags WHERE track_id=?", (tid,)).fetchone()[0] == 1
+        assert unreadable == [(tid, str(unstattable), "[Errno 13] Permission denied")]
+    finally:
+        conn.close()
+
+
+def test_prune_missing_scoped_keeps_a_track_it_cannot_stat(db_path, tmp_path, monkeypatch):
+    """The scoped path shares the confirmed-absent rule with the full sweep."""
+    unstattable = tmp_path / "locked" / "a.flac"
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        if str(path) == str(unstattable):
+            raise OSError(5, "Input/output error")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, str(unstattable))
+        conn.commit()
+        unreadable = []
+        assert prune_missing(conn, track_ids=[tid], unreadable=unreadable) == 0
+        conn.commit()
+        assert track_id_for_path(conn, str(unstattable)) == tid
+        assert [row[0] for row in unreadable] == [tid]
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can stat through a 0o000 directory")
+def test_prune_missing_keeps_a_track_under_an_unsearchable_directory(db_path, tmp_path):
+    """The real-world shape of #692: a permissions change on a parent directory
+    makes an existing file unstattable, and the row must survive it."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    track = locked / "a.flac"
+    track.write_bytes(b"x")
+    locked.chmod(0o000)
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, str(track))
+        conn.commit()
+        unreadable = []
+        assert prune_missing(conn, unreadable=unreadable) == 0
+        conn.commit()
+        assert track_id_for_path(conn, str(track)) == tid
+        assert [row[:2] for row in unreadable] == [(tid, str(track))]
+    finally:
+        conn.close()
+        locked.chmod(0o700)  # let tmp_path cleanup remove it
+
+
+def test_prune_missing_reports_nothing_unreadable_for_a_clean_sweep(db_path, tmp_path):
+    present = tmp_path / "present.flac"
+    present.write_bytes(b"x")
+    conn = connect(db_path)
+    try:
+        insert_track(conn, str(present))
+        insert_track(conn, str(tmp_path / "gone.flac"))
+        conn.commit()
+        unreadable = []
+        assert prune_missing(conn, unreadable=unreadable) == 1
+        conn.commit()
+        assert unreadable == []
     finally:
         conn.close()
 

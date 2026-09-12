@@ -176,25 +176,59 @@ def tags_for_track(conn, track_id):
     return [TagRow(key, value, value_blob) for key, value, value_blob in rows]
 
 
-def prune_missing(conn, track_ids=None):
-    """Delete track rows whose backing file no longer exists on disk.
+def _rows_to_prune(conn, track_ids):
+    """Yield ``(track_id, backing_path)`` for the rows a prune should consider:
+    every track, or just ``track_ids`` (ids with no row are skipped). A repeated
+    id is considered once, in first-seen order, so a caller that passes
+    duplicates neither over-counts the prune nor reports one path twice."""
+    if track_ids is None:
+        yield from conn.execute("SELECT id, backing_path FROM tracks")
+        return
+    for track_id in dict.fromkeys(track_ids):
+        row = conn.execute("SELECT backing_path FROM tracks WHERE id=?", (track_id,)).fetchone()
+        if row is not None:
+            yield track_id, row[0]
+
+
+def _backing_is_gone(track_id, path, unreadable):
+    """True only if ``path`` is confirmed absent. A path that cannot be stat'd
+    for any other reason is not a deletion: the row is kept and, when
+    ``unreadable`` is a list, recorded there as ``(track_id, path, message)``."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        if unreadable is not None:
+            unreadable.append((track_id, path, str(exc)))
+    return False
+
+
+def prune_missing(conn, track_ids=None, *, unreadable=None):
+    """Delete track rows whose backing file is confirmed gone; return the count.
+
+    "Confirmed" is the whole point: a path counts as missing only when
+    ``os.stat`` raises ``FileNotFoundError``. Every other ``OSError`` -- a
+    permission change on a parent directory, a network or removable mount that
+    is momentarily unreachable -- means "cannot tell", and the row survives.
+    ``ON DELETE CASCADE`` would take that track's plugin-written ``tags`` and
+    ``track_art`` rows with it, so a path we merely failed to stat must never
+    read as a deletion (#692). ``os.path.exists`` is deliberately not used: it
+    collapses "absent" and "cannot stat" into one ``False``. This mirrors
+    ``musefs revalidate --prune``, which deletes only on ``ErrorKind::NotFound``.
 
     When ``track_ids`` is provided, only those tracks are checked and
     potentially pruned. Otherwise, every track in the database is checked.
-    Returns the number pruned.
+
+    Pass a list as ``unreadable`` to collect ``(track_id, backing_path,
+    message)`` for each row kept because its path could not be stat'd; a pass
+    that pruned nothing can then tell an intact library from an unreachable one.
     """
-    if track_ids is not None:
-        gone = []
-        for tid in track_ids:
-            row = conn.execute("SELECT backing_path FROM tracks WHERE id=?", (tid,)).fetchone()
-            if row is not None and not os.path.exists(row[0]):
-                gone.append((tid,))
-    else:
-        gone = [
-            (tid,)
-            for tid, path in conn.execute("SELECT id, backing_path FROM tracks")
-            if not os.path.exists(path)
-        ]
+    gone = [
+        (track_id,)
+        for track_id, path in _rows_to_prune(conn, track_ids)
+        if _backing_is_gone(track_id, path, unreadable)
+    ]
     conn.executemany("DELETE FROM tracks WHERE id = ?", gone)
     return len(gone)
 

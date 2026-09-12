@@ -1,3 +1,5 @@
+import os
+
 from musefs_common import (
     MAX_TAG_VALUE_LEN,
     SCAN_TIMEOUT_SECONDS,
@@ -322,6 +324,42 @@ def test_hardlink_rename_prunes_previous_missing_path(db_path, make_track, tmp_p
     pruned = sync_rename_prune(config=config, previous_paths=[str(old_path)])
 
     assert pruned == 1
+
+
+def test_hardlink_rename_keeps_a_previous_path_it_cannot_stat(
+    db_path, make_track, tmp_path, monkeypatch
+):
+    """A stat failure on the old path is not a rename: the row survives and the
+    operator is told why nothing was pruned (#692)."""
+    old_path = tmp_path / "old.flac"
+    key = realpath_key(old_path)
+    make_track(key)
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        if str(path) == key:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+    config = SyncConfig(db_path=db_path, link_mode=LinkMode.HARDLINK, autoscan=False)
+    warnings = []
+
+    pruned = sync_rename_prune(
+        config=config,
+        previous_paths=[str(old_path)],
+        warning_printer=lambda message, **kwargs: warnings.append(message),
+    )
+
+    assert pruned == 0
+    conn = connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert len(warnings) == 1
+    assert key in warnings[0]
+    assert "cannot stat" in warnings[0]
 
 
 def test_sync_event_with_payloads_scans_then_syncs(

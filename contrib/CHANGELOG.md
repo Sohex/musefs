@@ -16,6 +16,11 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   `binary`, `target`, `verb`, `returncode`, `partial` and `stderr`, and renders
   the shared non-fatal message via `.warning()` (`None` for a clean run). See
   the `run_scan` change below.
+- **`prune_missing`'s `unreadable` keyword** — pass a list to collect
+  `(track_id, backing_path, message)` for every row kept because its backing
+  path could not be stat'd, so a pass that pruned nothing can be told from one
+  that could not look. Existing callers are unaffected: the return value is
+  still the count actually pruned. See the `prune_missing` fix below.
 - **`musefs_common.MAX_TAG_VALUE_LEN`** — the store's byte cap on a
   `tags.value`, generated from the Rust constant into the schema mirror rather
   than hand-kept. A writer can now check a value against the contract instead of
@@ -47,6 +52,23 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   tracks it automatically; no plugin change is needed, but a store must be
   migrated by `musefs scan`/`musefs mount` from a build carrying that migration
   before these packages will open it.
+
+### Fixed
+
+- **`prune_missing` no longer treats an unstattable path as a deletion**
+  (musefs #692). It decided with `os.path.exists`, which answers `False` both
+  for "absent" and for "there, but I could not stat it" — so a permissions
+  change on a parent directory, or a network or removable mount that was
+  momentarily unreachable, deleted the track row and cascaded away exactly the
+  plugin-written `tags` and `track_art` rows these packages exist to preserve.
+  It now deletes only on a `FileNotFoundError` and keeps the row for every other
+  `OSError`, mirroring `musefs revalidate --prune`. The scoped
+  `prune_missing(track_ids=…)` form gets the same rule. #538 fixed the beets
+  blast radius; this fixes the shared helper every consumer calls.
+- **Lidarr rename pruning says when it could not look.** `sync_rename_prune`
+  now logs each store row it kept because the old path could not be stat'd, so
+  a rename that pruned nothing because the mount was unreachable is
+  distinguishable from one with nothing to prune.
 
 ## [1.1.0] - 2026-06-17
 
