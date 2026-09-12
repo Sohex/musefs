@@ -24,12 +24,18 @@ pub enum DbError {
     StoreTooNew { found: i64, supported: i64 },
     #[error("the store is in use — unmount the filesystem or stop any scan before vacuuming")]
     StoreInUse(#[source] rusqlite::Error),
-    #[error("{table}.{field} length {len} exceeds the {max} cap (crafted or corrupt DB)")]
+    #[error("{table}.{field} is {len} {unit}, over the {max}-{unit} cap (crafted or corrupt DB)")]
     FieldTooLarge {
         table: &'static str,
         field: &'static str,
         len: i64,
         max: i64,
+        /// `bytes` or `characters`. SQLite's `length()` counts characters on a
+        /// TEXT column and bytes on a BLOB or a `CAST(... AS BLOB)`, and both
+        /// projections guard the same fields (#693), so the message has to say
+        /// which one it measured or it sends the reader counting the wrong
+        /// thing. Mirrors `musefs_core::CoreError::TrackFieldTooLarge`.
+        unit: &'static str,
     },
     #[error("structural block for track {track_id} is invalid: {detail} (crafted or corrupt DB)")]
     InvalidStructuralBlock { track_id: i64, detail: String },
@@ -77,15 +83,28 @@ impl DbError {
 
 pub type Result<T> = std::result::Result<T, DbError>;
 
+/// Max bytes UTF-8 spends on one Unicode scalar value.
+const MAX_UTF8_CHAR_BYTES: i64 = 4;
+
+/// The byte ceiling implied by a cap of `max_chars` Unicode characters. No
+/// honest value can exceed it, so it is a sound allocation bound to place
+/// alongside the character cap without narrowing what the field may hold
+/// (#693).
+pub(crate) const fn max_utf8_bytes(max_chars: i64) -> i64 {
+    max_chars.saturating_mul(MAX_UTF8_CHAR_BYTES)
+}
+
 /// Reject a field whose SQL-computed `length()` exceeds `max`, before the value
 /// is ever materialized. Takes only the length, so by construction it cannot
 /// touch the (potentially huge) payload — the allocation-free guarantee the
-/// reader guards rely on (spec N13).
-pub(crate) fn check_field_len(
+/// reader guards rely on (spec N13). The single `>` for every reader guard in
+/// the crate lives here, so it is one mutation target rather than a dozen.
+fn check_field_len(
     table: &'static str,
     field: &'static str,
     len: i64,
     max: i64,
+    unit: &'static str,
 ) -> Result<()> {
     if len > max {
         return Err(DbError::FieldTooLarge {
@@ -93,9 +112,57 @@ pub(crate) fn check_field_len(
             field,
             len,
             max,
+            unit,
         });
     }
     Ok(())
+}
+
+/// Bound a `length(col)` projection over a TEXT column, which SQLite counts in
+/// characters.
+pub(crate) fn check_field_chars(
+    table: &'static str,
+    field: &'static str,
+    len: i64,
+    max: i64,
+) -> Result<()> {
+    check_field_len(table, field, len, max, "characters")
+}
+
+/// Bound a `length(col)` projection over a BLOB, or a `length(CAST(col AS
+/// BLOB))` over TEXT — both of which SQLite counts in bytes.
+pub(crate) fn check_field_bytes(
+    table: &'static str,
+    field: &'static str,
+    len: i64,
+    max: i64,
+) -> Result<()> {
+    check_field_len(table, field, len, max, "bytes")
+}
+
+/// Bound a character-capped TEXT field from *both* its projections before the
+/// value is materialized (#693).
+///
+/// SQLite permits an embedded U+0000 in a TEXT value and stops counting at it,
+/// so `length(col)` reports 1 for `"X\0"` followed by a hundred megabytes. The
+/// character cap alone therefore guarantees neither the documented field
+/// grammar nor, more importantly here, any bound at all on what
+/// `Row::get::<String>` is about to allocate — rusqlite takes the column's byte
+/// length, and an embedded NUL is valid UTF-8. Pairing the character cap with
+/// [`max_utf8_bytes`] closes that without narrowing the field: the byte ceiling
+/// is what the character cap already implies for honest UTF-8.
+///
+/// Checked character-first, so a plainly over-long field keeps reporting the
+/// cap the schema states rather than its byte ceiling.
+pub(crate) fn check_text_field(
+    table: &'static str,
+    field: &'static str,
+    char_len: i64,
+    byte_len: i64,
+    max_chars: i64,
+) -> Result<()> {
+    check_field_chars(table, field, char_len, max_chars)?;
+    check_field_bytes(table, field, byte_len, max_utf8_bytes(max_chars))
 }
 
 /// Reject a track whose materialized tag-row count exceeds the per-track cap.
@@ -130,14 +197,72 @@ pub(crate) fn check_art_count(track_id: i64, count: usize) -> Result<()> {
 
 #[cfg(test)]
 mod guard_helper_tests {
-    use super::check_field_len;
+    use super::{check_field_bytes, check_field_chars, check_text_field, max_utf8_bytes};
 
     #[test]
     fn rejects_on_length_only_inclusive_boundary() {
         // The decision is a pure function of length — the value is never passed
         // in, so an over-cap row provably cannot be materialized to reject it.
-        assert!(check_field_len("tags", "value", 262_145, 262_144).is_err());
-        assert!(check_field_len("tags", "value", 262_144, 262_144).is_ok());
+        assert!(check_field_bytes("tags", "value", 262_145, 262_144).is_err());
+        assert!(check_field_bytes("tags", "value", 262_144, 262_144).is_ok());
+    }
+
+    /// The unit reaches the message, so an operator reading it counts the thing
+    /// that was actually measured (#693).
+    #[test]
+    fn the_message_names_the_unit_it_measured() {
+        let chars = check_field_chars("tags", "key", 257, 256).unwrap_err();
+        assert_eq!(
+            chars.to_string(),
+            "tags.key is 257 characters, over the 256-characters cap (crafted or corrupt DB)"
+        );
+        let bytes = check_field_bytes("tags", "value", 9, 8).unwrap_err();
+        assert_eq!(
+            bytes.to_string(),
+            "tags.value is 9 bytes, over the 8-bytes cap (crafted or corrupt DB)"
+        );
+    }
+
+    /// UTF-8 spends at most four bytes on a scalar value, so this is the widest
+    /// an honestly-encoded character-capped field can be.
+    #[test]
+    fn the_byte_ceiling_is_four_times_the_character_cap() {
+        assert_eq!(max_utf8_bytes(256), 1024);
+        assert_eq!(max_utf8_bytes(0), 0);
+        // Saturating, so a nonsense cap cannot wrap the ceiling negative and
+        // turn the guard into a pass-through.
+        assert_eq!(max_utf8_bytes(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn text_field_bounds_both_projections_at_an_inclusive_boundary() {
+        // 256 four-byte characters: at both caps, and accepted.
+        assert!(check_text_field("tags", "key", 256, 1024, 256).is_ok());
+        // One character over, whatever the byte count.
+        assert!(check_text_field("tags", "key", 257, 257, 256).is_err());
+        // Under the character cap but past the byte ceiling — the NUL-truncated
+        // shape, which the character count alone cannot see.
+        assert!(check_text_field("tags", "key", 1, 1025, 256).is_err());
+        assert!(check_text_field("tags", "key", 1, 1024, 256).is_ok());
+    }
+
+    /// A field over both caps reports the character cap the schema states, not
+    /// the byte ceiling derived from it.
+    #[test]
+    fn character_overflow_is_reported_before_byte_overflow() {
+        let err = check_text_field("tags", "key", 300, 100_000, 256).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::DbError::FieldTooLarge {
+                    len: 300,
+                    max: 256,
+                    unit: "characters",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

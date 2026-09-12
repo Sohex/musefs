@@ -1,5 +1,5 @@
-use crate::error::{check_art_count, check_field_len};
-use crate::limits::{MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN};
+use crate::error::{check_art_count, check_field_bytes, check_text_field};
+use crate::limits::{ART_SHA256_LEN, MAX_ART_BYTES, MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN};
 use crate::models::{Art, ArtMeta, NewArt, TrackArt};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::params;
@@ -10,20 +10,32 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
 }
 
 impl<M> Db<M> {
+    /// A whole `art` row, image blob included. Unlike [`Self::get_art_meta`] and
+    /// the streaming readers, this one materializes every column, so all three
+    /// of its unbounded columns are length-guarded first: `sha256` and `mime`
+    /// are TEXT and carry the NUL-truncation problem (#693), and `data` is
+    /// bounded only by two `CHECK`s a crafted store can have been written
+    /// without.
     pub fn get_art(&self, id: i64) -> Result<Option<Art>> {
         crate::query_optional(
             &self.conn,
-            "SELECT id, sha256, mime, width, height, byte_len, data FROM art WHERE id = ?1",
+            "SELECT length(sha256), length(CAST(sha256 AS BLOB)), \
+             length(mime), length(CAST(mime AS BLOB)), length(data), \
+             id, sha256, mime, width, height, byte_len, data \
+             FROM art WHERE id = ?1",
             params![id],
             |r| {
+                check_text_field("art", "sha256", r.get(0)?, r.get(1)?, ART_SHA256_LEN)?;
+                check_text_field("art", "mime", r.get(2)?, r.get(3)?, MAX_ART_MIME_LEN)?;
+                check_field_bytes("art", "data", r.get(4)?, MAX_ART_BYTES)?;
                 Ok(Art {
-                    id: r.get(0)?,
-                    sha256: r.get(1)?,
-                    mime: r.get(2)?,
-                    width: r.get(3)?,
-                    height: r.get(4)?,
-                    byte_len: r.get(5)?,
-                    data: r.get(6)?,
+                    id: r.get(5)?,
+                    sha256: r.get(6)?,
+                    mime: r.get(7)?,
+                    width: r.get(8)?,
+                    height: r.get(9)?,
+                    byte_len: r.get(10)?,
+                    data: r.get(11)?,
                 })
             },
         )
@@ -34,15 +46,16 @@ impl<M> Db<M> {
     pub fn get_art_meta(&self, id: i64) -> Result<Option<ArtMeta>> {
         crate::query_optional(
             &self.conn,
-            "SELECT length(mime), mime, width, height, byte_len FROM art WHERE id = ?1",
+            "SELECT length(mime), length(CAST(mime AS BLOB)), mime, width, height, byte_len \
+             FROM art WHERE id = ?1",
             params![id],
             |r| {
-                check_field_len("art", "mime", r.get(0)?, MAX_ART_MIME_LEN)?;
+                check_text_field("art", "mime", r.get(0)?, r.get(1)?, MAX_ART_MIME_LEN)?;
                 Ok(ArtMeta {
-                    mime: r.get(1)?,
-                    width: r.get(2)?,
-                    height: r.get(3)?,
-                    byte_len: r.get(4)?,
+                    mime: r.get(2)?,
+                    width: r.get(3)?,
+                    height: r.get(4)?,
+                    byte_len: r.get(5)?,
                 })
             },
         )
@@ -67,23 +80,25 @@ impl<M> Db<M> {
 
     pub fn get_track_art(&self, track_id: i64) -> Result<Vec<TrackArt>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT length(description), art_id, picture_type, description, ordinal
+            "SELECT length(description), length(CAST(description AS BLOB)),
+                    art_id, picture_type, description, ordinal
              FROM track_art WHERE track_id = ?1 ORDER BY ordinal",
         )?;
         let mut rows = stmt.query(params![track_id])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            check_field_len(
+            check_text_field(
                 "track_art",
                 "description",
                 r.get(0)?,
+                r.get(1)?,
                 MAX_ART_DESCRIPTION_LEN,
             )?;
             out.push(TrackArt {
-                art_id: r.get(1)?,
-                picture_type: r.get(2)?,
-                description: r.get(3)?,
-                ordinal: r.get(4)?,
+                art_id: r.get(2)?,
+                picture_type: r.get(3)?,
+                description: r.get(4)?,
+                ordinal: r.get(5)?,
             });
             check_art_count(track_id, out.len())?;
         }
@@ -101,39 +116,42 @@ impl<M> Db<M> {
         track_id: i64,
     ) -> Result<Vec<(TrackArt, Option<ArtMeta>)>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT length(ta.description), ta.art_id, ta.picture_type, ta.description, ta.ordinal, \
-             length(a.mime), a.mime, a.width, a.height, a.byte_len \
+            "SELECT length(ta.description), length(CAST(ta.description AS BLOB)), \
+             ta.art_id, ta.picture_type, ta.description, ta.ordinal, \
+             length(a.mime), length(CAST(a.mime AS BLOB)), \
+             a.mime, a.width, a.height, a.byte_len \
              FROM track_art ta LEFT JOIN art a ON a.id = ta.art_id \
              WHERE ta.track_id = ?1 ORDER BY ta.ordinal",
         )?;
         let mut rows = stmt.query(params![track_id])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            check_field_len(
+            check_text_field(
                 "track_art",
                 "description",
                 r.get(0)?,
+                r.get(1)?,
                 MAX_ART_DESCRIPTION_LEN,
             )?;
             let track_art = TrackArt {
-                art_id: r.get(1)?,
-                picture_type: r.get(2)?,
-                description: r.get(3)?,
-                ordinal: r.get(4)?,
+                art_id: r.get(2)?,
+                picture_type: r.get(3)?,
+                description: r.get(4)?,
+                ordinal: r.get(5)?,
             };
             // A NULL `length(a.mime)` means the LEFT JOIN found no `art` row
             // (orphaned link); `mime` is NOT NULL in the schema, so the length
             // column is a reliable presence sentinel — and checking it lets us
             // reject an over-cap mime before the string is ever materialized
             // (the allocation-free guarantee, spec N13).
-            let meta = match r.get::<_, Option<i64>>(5)? {
-                Some(mime_len) => {
-                    check_field_len("art", "mime", mime_len, MAX_ART_MIME_LEN)?;
+            let meta = match r.get::<_, Option<i64>>(6)? {
+                Some(mime_chars) => {
+                    check_text_field("art", "mime", mime_chars, r.get(7)?, MAX_ART_MIME_LEN)?;
                     Some(ArtMeta {
-                        mime: r.get(6)?,
-                        width: r.get(7)?,
-                        height: r.get(8)?,
-                        byte_len: r.get(9)?,
+                        mime: r.get(8)?,
+                        width: r.get(9)?,
+                        height: r.get(10)?,
+                        byte_len: r.get(11)?,
                     })
                 }
                 None => None,
@@ -220,7 +238,7 @@ impl Db<ReadWrite> {
 #[cfg(test)]
 mod guard_tests {
     use crate::error::DbError;
-    use crate::limits::MAX_ART_DESCRIPTION_LEN;
+    use crate::limits::{ART_SHA256_LEN, MAX_ART_BYTES, MAX_ART_DESCRIPTION_LEN, MAX_ART_MIME_LEN};
     use crate::models::{NewArt, TrackArt};
     use crate::{Db, Format, NewTrack};
 
@@ -279,6 +297,293 @@ mod guard_tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// A value whose SQLite character length is 1 and whose byte length is
+    /// `bytes`: SQLite stops counting characters at an embedded NUL, which is
+    /// how #693 slips an unbounded payload past a character cap.
+    fn nul_truncated(bytes: usize) -> String {
+        let mut v = String::from("x\0");
+        v.push_str(&"y".repeat(bytes - v.len()));
+        v
+    }
+
+    fn mime_byte_ceiling() -> usize {
+        usize::try_from(MAX_ART_MIME_LEN).unwrap() * 4
+    }
+
+    fn description_byte_ceiling() -> usize {
+        usize::try_from(MAX_ART_DESCRIPTION_LEN).unwrap() * 4
+    }
+
+    /// Plant an `art` row with an arbitrary mime, returning its id. `art` rows
+    /// are immutable under the V5 `art_reject_content_update` trigger, so the
+    /// row goes in by INSERT rather than by mutating an existing one.
+    fn insert_art_with_mime(db: &Db, mime: &str) -> i64 {
+        db.conn
+            .execute(
+                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+                 VALUES (?1, ?2, NULL, NULL, 1, X'00')",
+                rusqlite::params!["c".repeat(64), mime],
+            )
+            .unwrap();
+        db.conn.last_insert_rowid()
+    }
+
+    /// `get_art` materializes the whole row, blob included, so every one of its
+    /// unbounded columns must be bounded from a length before the read. The
+    /// mime case is the #693 shape: the schema `CHECK` counts characters, so
+    /// this row goes in on the honest write path.
+    #[test]
+    fn get_art_rejects_a_nul_truncated_mime() {
+        let (db, _t, _art) = db_track_art();
+        let bad = insert_art_with_mime(&db, &nul_truncated(mime_byte_ceiling() + 1));
+        let err = db.get_art(bad).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::FieldTooLarge {
+                    table: "art",
+                    field: "mime",
+                    unit: "bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The digest column is the semantic variant #693 names: `length(sha256) =
+    /// 64` is satisfied by 64 valid hex characters, a NUL, and any amount of
+    /// suffix — so the constraint does not in fact pin a 64-character stored
+    /// identity, and the reader must not allocate the suffix.
+    #[test]
+    fn get_art_rejects_a_nul_truncated_sha256() {
+        let (db, _t, _art) = db_track_art();
+        let mut sha = "a".repeat(usize::try_from(ART_SHA256_LEN).unwrap());
+        sha.push('\0');
+        sha.push_str(&"b".repeat(usize::try_from(ART_SHA256_LEN).unwrap() * 4));
+        db.conn
+            .execute(
+                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+                 VALUES (?1, 'image/png', NULL, NULL, 1, X'00')",
+                rusqlite::params![sha],
+            )
+            .unwrap();
+        let bad = db.conn.last_insert_rowid();
+        let err = db.get_art(bad).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::FieldTooLarge {
+                    table: "art",
+                    field: "sha256",
+                    unit: "bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The blob is the largest allocation in the row and is bounded only by two
+    /// `CHECK`s — `byte_len <= MAX_ART_BYTES` and `byte_len = length(data)` —
+    /// which a crafted store can have been written without. Here both are
+    /// bypassed, so `byte_len` claims 1 while the blob is over the cap.
+    #[test]
+    fn get_art_rejects_an_oversize_blob() {
+        let (db, _t, _art) = db_track_art();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+                 VALUES (?1, 'image/png', NULL, NULL, 1, zeroblob(?2))",
+                rusqlite::params!["d".repeat(64), MAX_ART_BYTES + 1],
+            )
+            .unwrap();
+        let bad = db.conn.last_insert_rowid();
+        let err = db.get_art(bad).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::FieldTooLarge {
+                    table: "art",
+                    field: "data",
+                    unit: "bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The guards must not narrow an honest row: a real digest, a real mime and
+    /// a blob at the cap all read back intact.
+    #[test]
+    fn get_art_accepts_an_honest_row_at_the_blob_cap() {
+        let db = Db::open_in_memory().unwrap();
+        let data = vec![0u8; usize::try_from(MAX_ART_BYTES).unwrap()];
+        let id = db
+            .upsert_art(&NewArt {
+                mime: "image/png".into(),
+                width: None,
+                height: None,
+                data: data.clone(),
+            })
+            .unwrap();
+        let got = db.get_art(id).unwrap().expect("art row");
+        assert_eq!(got.sha256.len(), usize::try_from(ART_SHA256_LEN).unwrap());
+        assert_eq!(got.mime, "image/png");
+        assert_eq!(got.byte_len, u64::try_from(MAX_ART_BYTES).unwrap());
+        assert_eq!(got.data.len(), data.len());
+    }
+
+    #[test]
+    fn get_art_meta_rejects_a_nul_truncated_mime() {
+        let (db, _t, _art) = db_track_art();
+        // No `ignore_check_constraints`: the schema CHECK counts characters
+        // too, so this row is accepted on the honest write path. That is the
+        // bug — only the byte projection can see it.
+        let bad = insert_art_with_mime(&db, &nul_truncated(mime_byte_ceiling() + 1));
+        let err = db.get_art_meta(bad).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::FieldTooLarge {
+                    table: "art",
+                    field: "mime",
+                    unit: "bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The ceiling must not narrow the field: a mime of four-byte characters at
+    /// the character cap sits exactly on the ceiling and still reads.
+    #[test]
+    fn get_art_meta_accepts_four_byte_characters_at_cap() {
+        let (db, _t, _art) = db_track_art();
+        let mime = "\u{1D11E}".repeat(usize::try_from(MAX_ART_MIME_LEN).unwrap());
+        assert_eq!(mime.len(), mime_byte_ceiling());
+        let id = insert_art_with_mime(&db, &mime);
+        assert_eq!(db.get_art_meta(id).unwrap().unwrap().mime, mime);
+    }
+
+    #[test]
+    fn get_track_art_rejects_a_nul_truncated_description() {
+        let (db, track, art) = db_track_art();
+        db.set_track_art(
+            track,
+            &[TrackArt {
+                art_id: art,
+                picture_type: 3,
+                description: nul_truncated(description_byte_ceiling() + 1),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        let err = db.get_track_art(track).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::FieldTooLarge {
+                    table: "track_art",
+                    field: "description",
+                    unit: "bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The join reads both NUL-truncatable fields, so it carries both guards.
+    #[test]
+    fn get_track_art_with_meta_rejects_a_nul_truncated_description() {
+        let (db, track, art) = db_track_art();
+        db.set_track_art(
+            track,
+            &[TrackArt {
+                art_id: art,
+                picture_type: 3,
+                description: nul_truncated(description_byte_ceiling() + 1),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        let err = db.get_track_art_with_meta(track).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::FieldTooLarge {
+                    table: "track_art",
+                    field: "description",
+                    unit: "bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn get_track_art_with_meta_rejects_a_nul_truncated_mime() {
+        let (db, track, _art) = db_track_art();
+        let bad = insert_art_with_mime(&db, &nul_truncated(mime_byte_ceiling() + 1));
+        db.set_track_art(
+            track,
+            &[TrackArt {
+                art_id: bad,
+                picture_type: 3,
+                description: "ok".into(),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        let err = db.get_track_art_with_meta(track).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::FieldTooLarge {
+                    table: "art",
+                    field: "mime",
+                    unit: "bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// An orphaned link still reads as `None` rather than tripping the mime
+    /// guard: the NULL byte-length column must not be mistaken for a violation.
+    #[test]
+    fn get_track_art_with_meta_still_reports_an_orphaned_link() {
+        let (db, track, art) = db_track_art();
+        db.set_track_art(
+            track,
+            &[TrackArt {
+                art_id: art,
+                picture_type: 3,
+                description: "ok".into(),
+                ordinal: 0,
+            }],
+        )
+        .unwrap();
+        // The production Db sets foreign_keys=true, so the delete would
+        // RESTRICT-fail; FK enforcement is per-connection, which is exactly how
+        // an external writer leaves a link dangling in the first place.
+        db.conn.pragma_update(None, "foreign_keys", false).unwrap();
+        db.conn
+            .execute("DELETE FROM art WHERE id = ?1", rusqlite::params![art])
+            .unwrap();
+        let got = db.get_track_art_with_meta(track).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].1.is_none(), "the orphaned link surfaces as None");
     }
 
     #[test]

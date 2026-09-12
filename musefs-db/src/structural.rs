@@ -40,7 +40,7 @@ impl<M> Db<M> {
                     detail: format!("negative ordinal {ordinal}"),
                 });
             }
-            crate::error::check_field_len(
+            crate::error::check_field_bytes(
                 "structural_blocks",
                 "body",
                 body_len,

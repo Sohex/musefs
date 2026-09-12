@@ -960,6 +960,7 @@ mod baseline_tests {
         assert!(v3.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
         // Still V1-owned: no later migration recreates `art` or `structural_blocks`.
         assert!(v1.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
+        assert!(v1.contains(&format!("length(sha256) = {ART_SHA256_LEN}")));
         assert!(v1.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
         assert!(v1.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));
         let kinds = STRUCTURAL_KINDS
