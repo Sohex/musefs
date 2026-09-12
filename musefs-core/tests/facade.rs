@@ -1410,3 +1410,123 @@ fn getattr_size_cache_rejects_subsecond_rewrite() {
     let err = fs.getattr(inode).unwrap_err();
     assert!(matches!(err, CoreError::BackingChanged(_)), "got {err:?}");
 }
+
+// A pure move retargets the `tracks` row in place and deliberately leaves
+// `content_version` alone — the served bytes did not change (#679). Every cache
+// that keys on that version while holding a backing-file locator must still
+// notice the new locator, or the track is wedged for the life of the mount.
+#[test]
+fn moved_backing_file_does_not_wedge_a_warm_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("store.db");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir(&lib).unwrap();
+    let src = lib.join("a.flac");
+    common::write_flac(&src, &["TITLE=T", "ARTIST=A"], &[0xAB; 4096]);
+
+    let writer = musefs_db::Db::open(&db_path).unwrap();
+    scan_directory(&writer, &lib).unwrap();
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let inode = first_file_inode(&fs);
+    let attr = fs.getattr(inode).unwrap(); // warms the size cache
+    let before = fs.read(inode, None, 0, attr.size).unwrap(); // warms the header cache
+
+    std::fs::rename(&src, lib.join("b.flac")).unwrap();
+    scan_directory(&writer, &lib).unwrap();
+    assert!(
+        writer.list_tracks().unwrap()[0]
+            .backing_path
+            .ends_with("b.flac"),
+        "the rescan must retarget the row in place"
+    );
+    fs.poll_refresh().unwrap();
+
+    assert_eq!(fs.getattr(inode).unwrap().size, attr.size);
+    assert_eq!(fs.read(inode, None, 0, attr.size).unwrap(), before);
+    let fh = fs.open_handle(inode).unwrap();
+    assert_eq!(fs.read(inode, Some(fh), 0, attr.size).unwrap(), before);
+    fs.release_handle(fh);
+}
+
+// The same move, with a handle opened *before* it: the held fd still points at
+// the (renamed) inode, so the reads must keep succeeding rather than failing
+// against the pre-move stamp the handle's resolved layout carries (#679).
+#[test]
+fn move_does_not_wedge_a_handle_opened_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("store.db");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir(&lib).unwrap();
+    let src = lib.join("a.flac");
+    common::write_flac(&src, &["TITLE=T", "ARTIST=A"], &[0xAB; 4096]);
+
+    let writer = musefs_db::Db::open(&db_path).unwrap();
+    scan_directory(&writer, &lib).unwrap();
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let inode = first_file_inode(&fs);
+    let attr = fs.getattr(inode).unwrap();
+    let fh = fs.open_handle(inode).unwrap();
+    let before = fs.read(inode, Some(fh), 0, attr.size).unwrap();
+
+    std::fs::rename(&src, lib.join("b.flac")).unwrap();
+    scan_directory(&writer, &lib).unwrap();
+    fs.poll_refresh().unwrap();
+
+    assert_eq!(fs.read(inode, Some(fh), 0, attr.size).unwrap(), before);
+    fs.release_handle(fh);
+}
+
+// The move's sibling: a metadata-only change (here a chmod) bumps the backing
+// file's ctime without touching its bytes, so a rescan rewrites the row's stamp
+// in place and — correctly — leaves `content_version` alone. Same wedge class as
+// #679: a cache keyed on the content axis alone validates the live file against
+// the stamp it was built from, which no longer matches.
+#[test]
+fn restamped_backing_file_does_not_wedge_a_warm_mount() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("store.db");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir(&lib).unwrap();
+    // MP3: its synthesis carries no structural blocks, so a re-probe rewrites
+    // the stamp without the structural-store triggers bumping content_version.
+    let src = lib.join("a.mp3");
+    common::write_mp3(&src, &[0xFFu8; 4096]);
+
+    let writer = musefs_db::Db::open(&db_path).unwrap();
+    scan_directory(&writer, &lib).unwrap();
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), config()).unwrap();
+
+    let inode = first_file_inode(&fs);
+    let attr = fs.getattr(inode).unwrap();
+    let before = fs.read(inode, None, 0, attr.size).unwrap();
+    let row_before = writer.list_tracks().unwrap().remove(0);
+
+    // A bare scan skips known paths; revalidation is the pass that re-probes a
+    // file whose stamp moved and rewrites the row in place.
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o640)).unwrap();
+    musefs_core::revalidate(&writer, &lib).unwrap();
+    let row_after = writer.list_tracks().unwrap().remove(0);
+    assert_ne!(
+        row_after.backing_ctime_ns, row_before.backing_ctime_ns,
+        "the revalidation must re-stamp the row in place"
+    );
+    assert_eq!(
+        row_after.content_version, row_before.content_version,
+        "a metadata-only change must not bump the content axis"
+    );
+    assert_eq!(
+        row_after.backing_path, row_before.backing_path,
+        "the locator is unchanged — only the stamp moved"
+    );
+    fs.poll_refresh().unwrap();
+
+    assert_eq!(fs.getattr(inode).unwrap().size, attr.size);
+    assert_eq!(fs.read(inode, None, 0, attr.size).unwrap(), before);
+    let fh = fs.open_handle(inode).unwrap();
+    assert_eq!(fs.read(inode, Some(fh), 0, attr.size).unwrap(), before);
+    fs.release_handle(fh);
+}

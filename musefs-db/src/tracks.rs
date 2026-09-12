@@ -209,16 +209,25 @@ impl<M> Db<M> {
         )?)
     }
 
-    /// The two columns `getattr` needs to validate cached attrs — the freshness
-    /// stamp (`content_version`) and the path to re-stat (`backing_path`) —
-    /// without materializing a full `Track` (no `format` parse, no
-    /// `TrackBounds`) on the hottest metadata op. `None` if the id is unknown.
-    pub fn track_version_and_path(&self, id: i64) -> Result<Option<(i64, String)>> {
+    /// The identity columns `getattr` needs to validate cached attrs — the
+    /// content stamp (`content_version`) plus the backing-source identity (the
+    /// path to re-stat and the stamp recorded for it) — without materializing a
+    /// full `Track` on the hottest metadata op. `None` if the id is unknown.
+    pub fn track_identity(&self, id: i64) -> Result<Option<crate::TrackIdentity>> {
         crate::query_optional(
             &self.conn,
-            "SELECT content_version, backing_path FROM tracks WHERE id = ?1",
+            "SELECT content_version, backing_path, backing_size, backing_mtime_ns, \
+             backing_ctime_ns FROM tracks WHERE id = ?1",
             params![id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| {
+                Ok(crate::TrackIdentity {
+                    content_version: r.get(0)?,
+                    backing_path: r.get(1)?,
+                    backing_size: r.get(2)?,
+                    backing_mtime_ns: r.get(3)?,
+                    backing_ctime_ns: r.get(4)?,
+                })
+            },
         )
     }
 

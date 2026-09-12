@@ -138,6 +138,22 @@ pub struct Track {
     pub content_hash: Option<String>,
 }
 
+/// The identity columns `getattr` validates a cached entry against, without
+/// materializing a full `Track` (no `format` parse, no `TrackBounds`) on the
+/// hottest metadata op. Two independent axes: `content_version` is the served-
+/// content identity, and the backing columns are the *source* identity — a
+/// scan that retargets a moved file rewrites the latter and deliberately leaves
+/// the former alone, so a cache holding a locator must compare both (#679).
+#[cfg_attr(feature = "mutants", derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackIdentity {
+    pub content_version: i64,
+    pub backing_path: String,
+    pub backing_size: u64,
+    pub backing_mtime_ns: i64,
+    pub backing_ctime_ns: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewTrack {
     pub backing_path: String,

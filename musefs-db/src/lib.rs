@@ -15,7 +15,7 @@ pub use bulk::BulkWriter;
 pub use error::{DbError, Result};
 pub use models::{
     Art, ArtMeta, BinaryTag, BinaryTagRow, Format, NewArt, NewTrack, StructuralBlock, Tag, Track,
-    TrackArt, TrackBounds,
+    TrackArt, TrackBounds, TrackIdentity,
 };
 pub use tracks::ChangelogRead;
 
@@ -26,7 +26,7 @@ use std::time::Duration;
 
 /// Run a single-row query, mapping the row with `map` if present. The shared
 /// shape behind every `Result<Option<T>>` point read (`get_art`,
-/// `track_version_and_path`, the `Track` readers, …): prepare-cached, step once,
+/// `track_identity`, the `Track` readers, …): prepare-cached, step once,
 /// map-or-`None`.
 pub(crate) fn query_optional<T>(
     conn: &Connection,

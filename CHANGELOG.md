@@ -151,6 +151,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Moving a backing file no longer wedges its track for the life of the mount
+  ([#679](https://github.com/Sohex/musefs/issues/679)). A scan that retargets a
+  row to a relocated file rewrites the path and the freshness stamp and
+  correctly leaves `content_version` alone — the served bytes did not change —
+  but the `getattr` size cache, the layout cache and every open file handle
+  accepted their cached entry on `content_version` alone while holding the
+  pre-move path and stamp. Each then validated the live file against the old
+  stamp and failed, permanently: the file listed as `-????????? ?` and every
+  read returned `EIO` until a remount. Both caches now compare the row's
+  backing-source identity as well as its content identity, and a poll whose
+  changelog names any track advances the refresh generation, so open handles
+  re-resolve too. A move is not the only way in: any in-place re-stamp that
+  leaves the content unchanged reached the same wedge.
+
 - One unparseable `METADATA_BLOCK_PICTURE` no longer discards every other
   embedded picture in the same Ogg file, and the drop is logged instead of
   being swallowed by the scan path. Base64 decoding also tolerates ASCII
