@@ -108,6 +108,15 @@ exclude_re = [
     # candidates is pinned by the disambiguation and collision-gate tests; only
     # the un-rankable constant replacements are excluded.
     'replace suffix_candidate -> String with',
+    # Same hang class, reached through `taken`: `disambiguate` probes ranks until
+    # one is free, so a `taken` that answers "occupied" to everything never
+    # terminates. Both of these do exactly that at the root — `-> true` directly,
+    # and `&&`->`||` by making every root name reserved — so the only observable
+    # is a spin. Their behavioral siblings stay in scope and are caught: the
+    # `-> false` return by the reserved-name tests, the `==`->`!=` by them too
+    # (it moves the reservation off the root, where nothing injects).
+    'replace VirtualTree::is_reserved_root_name -> bool with true',
+    'replace && with \|\| in VirtualTree::taken',
     # probe_body widen loop: `.max(want + 1)` is dominated — the bounded probers
     # only return `NeedMore{up_to}` with `up_to > want` (we widen precisely to a
     # block end past the prefix), so `up_to.min(probe_cap)` always wins the max and
