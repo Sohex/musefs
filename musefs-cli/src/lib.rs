@@ -150,6 +150,15 @@ pub struct MountArgs {
     /// are dropped when content changes. Disable with `--keep-cache false`.
     #[arg(long, env = "MUSEFS_KEEP_CACHE", default_value_t = true, num_args = 0..=1, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub keep_cache: bool,
+    /// Skip the backing re-stat that `getattr` does on a metadata-cache hit,
+    /// serving the cached size/mtime instead. Off by default. Worth setting only
+    /// on high-latency backing (NFS, SMB, a spun-down array), where that stat is
+    /// a round trip paid once per track on every traversal after the first.
+    /// `open` and reads keep validating, so no stale bytes are ever served; what
+    /// goes stale is the size/mtime a `stat` reports for a backing file changed
+    /// without the store being updated.
+    #[arg(long, env = "MUSEFS_TRUST_BACKING_MTIME", value_parser = clap::builder::BoolishValueParser::new())]
+    pub trust_backing_mtime: bool,
     /// Compare filenames case-insensitively: case-variant directories merge and
     /// case-variant files are disambiguated. Defaults to true on macOS (whose
     /// volumes are usually case-insensitive), false on Linux/FreeBSD. Override
@@ -490,6 +499,7 @@ pub fn parse_mount_config(args: &MountArgs) -> (MountConfig, musefs_fuse::FuseCo
         read_ahead_budget: u64::from(args.read_ahead_budget_mib).saturating_mul(1024 * 1024),
         read_ahead_prefetch: args.read_ahead_prefetch,
         skip_on_missing: args.skip_on_missing,
+        trust_backing_mtime: args.trust_backing_mtime,
     };
     let defaults = musefs_fuse::FuseConfig::default();
     let fuse_config = musefs_fuse::FuseConfig {
@@ -884,6 +894,29 @@ mod tests {
         };
         assert!(
             parse_mount_config(&args).0.read_ahead_prefetch,
+            "flag opts in"
+        );
+    }
+
+    #[test]
+    fn trust_backing_mtime_defaults_off_and_opts_in() {
+        use clap::Parser;
+        let base = ["musefs", "mount", "/mnt", "--db", "/tmp/x.db"];
+        let off = Cli::try_parse_from(base).unwrap();
+        let Command::Mount(args) = off.command else {
+            panic!("expected Mount");
+        };
+        assert!(
+            !parse_mount_config(&args).0.trust_backing_mtime,
+            "the getattr re-stat must stay the default"
+        );
+
+        let on = Cli::try_parse_from(base.iter().chain(["--trust-backing-mtime"].iter())).unwrap();
+        let Command::Mount(args) = on.command else {
+            panic!("expected Mount");
+        };
+        assert!(
+            parse_mount_config(&args).0.trust_backing_mtime,
             "flag opts in"
         );
     }

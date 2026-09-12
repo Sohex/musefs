@@ -35,6 +35,21 @@ backing file is never spliced at stale offsets. The per-handle read path
 re-stats the held descriptor on every read too, so this guarantee holds on the
 hot path and not only through `resolve()`.
 
+**`--trust-backing-mtime`** opts out of the `getattr` half of that, and of
+nothing else ([#668](https://github.com/Sohex/musefs/issues/668)). On a
+size-cache hit the mount then serves the cached size and mtime without the
+re-stat, because on NFS, SMB, or a spun-down array that stat is a network round
+trip or a head seek rather than a microsecond — one per track per traversal, on
+every traversal after the first. Resolve, `open`, and the per-handle read path
+keep validating unconditionally, so a silently replaced backing is still caught
+before a single byte is served, and the cold traversal that populates the cache
+stats regardless. What the flag trades away is the freshness of the one
+metadata surface that can outrun a backing change: between such a change and
+the next `open`, a `stat` reports the pre-change size and mtime. Off by
+default. `musefs_trust_backing_mtime` in `.musefs-metrics` reports the flag
+state, which is what tells a quiet `musefs_backing_stats_total` from a disabled
+counter.
+
 **`data_version`** (`PRAGMA data_version`, whole-DB) answers *"did anyone
 commit anything?"*. `Musefs::poll_refresh` compares it to the last seen
 value; on a change it consults the `track_changes` ring and applies an

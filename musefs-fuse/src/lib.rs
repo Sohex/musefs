@@ -1398,6 +1398,7 @@ mod tests {
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
             skip_on_missing: false,
+            trust_backing_mtime: false,
         };
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
@@ -1418,6 +1419,7 @@ mod tests {
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
             skip_on_missing: false,
+            trust_backing_mtime: false,
         };
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("w.db")).unwrap(), cfg).unwrap();

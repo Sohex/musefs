@@ -76,6 +76,7 @@ fn open_handle_reresolves_after_content_version_bump() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -123,6 +124,7 @@ fn prefetch_workers_created_only_with_budget_and_flag() {
             read_ahead_budget: budget,
             read_ahead_prefetch: prefetch,
             skip_on_missing: false,
+            trust_backing_mtime: false,
         };
         Musefs::open(musefs_db::Db::open_in_memory().unwrap(), cfg).unwrap()
     };
@@ -169,6 +171,7 @@ fn read_then_release_does_not_leak_budget() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
     let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
@@ -217,6 +220,7 @@ fn two_handles_get_distinct_pool_keys() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
     let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
@@ -300,6 +304,7 @@ fn binary_tag_handle_never_serves_reused_rowid_bytes() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -417,6 +422,7 @@ fn same_track_retag_storm_exhausts_read_retry_into_backing_changed() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -443,11 +449,24 @@ fn same_track_retag_storm_exhausts_read_retry_into_backing_changed() {
     );
 
     // One miss per attempt with none left over: the loop exhausts.
+    let _ = fs.getattr(file_inode).expect("attrs to cache");
+    assert_eq!(
+        fs.telemetry().cache_size_entries,
+        1,
+        "the getattr above must have cached this track's attrs"
+    );
     fs.force_version_mismatches_for_test(4);
     match fs.read(file_inode, Some(fh), 0, 1 << 20) {
         Err(CoreError::BackingChanged(_)) => {}
         other => panic!("exhausted retry must return BackingChanged, got {other:?}"),
     }
+    // No cached attrs survive a read that could not be served: under
+    // `--trust-backing-mtime` nothing else would retire them (#668).
+    assert_eq!(
+        fs.telemetry().cache_size_entries,
+        0,
+        "exhausted retries must drop the attrs the read could not stand behind"
+    );
 
     // Seam drained: the handle is otherwise healthy and serves again.
     let recovered = fs.read(file_inode, Some(fh), 0, 1 << 20).unwrap();
@@ -503,6 +522,7 @@ fn no_handle_fallback_retries_content_version_race_before_backing_changed() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -565,6 +585,7 @@ fn render_entries_returns_paths_and_snapshot() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
 
     let (entries, snapshot) = Musefs::render_entries(
@@ -613,6 +634,7 @@ fn render_entries_skips_tracks_missing_top_level_field_when_enabled() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: true,
+        trust_backing_mtime: false,
     };
 
     let (entries, snapshot) = Musefs::render_entries(
@@ -659,6 +681,7 @@ fn needs_rebuild_flag_forces_full_rebuild_on_next_poll() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -750,6 +773,7 @@ fn failed_case_insensitive_rebuild_does_not_arm_needs_rebuild() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -809,6 +833,7 @@ fn fs_with_poll_interval(interval: std::time::Duration) -> (tempfile::TempDir, M
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
     (dir, fs)
@@ -879,6 +904,7 @@ fn passthrough_fd_exposes_backing_only_in_structure_only() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
 
     // StructureOnly: exposed, and the fd refers to the backing inode.
@@ -989,6 +1015,7 @@ fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let template = Template::parse(&config.template).expect("valid template");
 
@@ -1044,6 +1071,7 @@ fn entry_counts_reports_files_and_dirs() {
         read_ahead_budget: 0,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(db, cfg).unwrap();
     assert_eq!(fs.entry_counts(), (2, 2));
@@ -1082,6 +1110,7 @@ fn getattr_size_cache_hit_detects_backing_change() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
 
@@ -1114,6 +1143,138 @@ fn getattr_size_cache_hit_detects_backing_change() {
     );
 }
 
+/// A one-track mount over a backing file the caller is about to change out of
+/// band, plus that track's inode and the backing path to change. Shared by the
+/// `--trust-backing-mtime` tests, which differ only in which serve path they
+/// then use to prove the cached attrs wrong. The `TempDir` is returned because
+/// dropping it would take the store and the backing file with it.
+fn drifting_mount(
+    trust_backing_mtime: bool,
+) -> (tempfile::TempDir, Musefs, u64, std::path::PathBuf) {
+    use crate::scan::scan_directory;
+    use id3::TagLike;
+    use std::collections::BTreeMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backing = dir.path().join("a.mp3");
+    {
+        let mut tag = id3::Tag::new();
+        tag.set_artist("Pix");
+        tag.set_title("Song");
+        let mut bytes = Vec::new();
+        tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+        bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+        std::fs::write(&backing, &bytes).unwrap();
+    }
+
+    let db_path = dir.path().join("m.db");
+    {
+        let db = musefs_db::Db::open(&db_path).unwrap();
+        scan_directory(&db, dir.path()).unwrap();
+    }
+    let cfg = MountConfig {
+        template: "$artist/$title".to_string(),
+        fallbacks: BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
+        read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
+        skip_on_missing: false,
+        trust_backing_mtime,
+    };
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    (dir, fs, file_inode, backing)
+}
+
+/// Change the backing file's bytes without any DB write, so `content_version`
+/// stays put and the size cache would otherwise keep hitting.
+fn append_out_of_band(backing: &std::path::Path) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(backing)
+        .unwrap();
+    f.write_all(&[0u8; 64]).unwrap();
+}
+
+/// `--trust-backing-mtime` (#668) is scoped to the `getattr` hit path: the
+/// cached attrs are served without the re-stat that
+/// `getattr_size_cache_hit_detects_backing_change` relies on, while `open` —
+/// which resolves through `HeaderCache::resolve` — still validates and still
+/// refuses the changed backing. That scoping is the whole safety argument for
+/// the flag, so both halves are asserted together.
+#[test]
+fn trust_backing_mtime_skips_the_getattr_restat_but_not_open() {
+    let (_dir, fs, file_inode, backing) = drifting_mount(true);
+
+    // Miss path: full resolve, populating size_cache.
+    let before = fs.getattr(file_inode).unwrap();
+    assert!(before.size > 0, "baseline attr must be non-empty");
+
+    append_out_of_band(&backing);
+
+    let after = fs
+        .getattr(file_inode)
+        .expect("trusted getattr must serve the cached attrs, not BackingChanged");
+    assert_eq!(
+        before.size, after.size,
+        "trusted getattr must not re-stat, so the cached size stands"
+    );
+    assert!(
+        matches!(
+            fs.open_handle(file_inode),
+            Err(CoreError::BackingChanged(_))
+        ),
+        "open must still validate: the flag is scoped to getattr"
+    );
+
+    // And that open bounds the staleness the flag admits. Without dropping the
+    // attrs it just proved wrong, `getattr` would keep serving the pre-change
+    // size for as long as the store went unupdated — the flag's documented
+    // window is "until the next open", not "forever".
+    assert!(
+        matches!(fs.getattr(file_inode), Err(CoreError::BackingChanged(_))),
+        "the failed open must have dropped the attrs it proved wrong"
+    );
+}
+
+/// The stateless read path — no prior `open`, so no handle — proves the cached
+/// attrs wrong the same way, and must retire them the same way. It resolves and
+/// validates per read rather than through a held fd, so it is the path a client
+/// that only ever `pread`s takes, and under `--trust-backing-mtime` it is then
+/// the only thing standing between a changed backing and an indefinitely stale
+/// `stat`.
+#[test]
+fn trust_backing_mtime_stateless_read_also_retires_the_cached_attrs() {
+    let (_dir, fs, file_inode, backing) = drifting_mount(true);
+
+    let before = fs.getattr(file_inode).unwrap();
+    assert!(before.size > 0, "baseline attr must be non-empty");
+
+    append_out_of_band(&backing);
+
+    assert_eq!(
+        fs.getattr(file_inode).unwrap().size,
+        before.size,
+        "trusted getattr serves the cached size until something proves it wrong"
+    );
+    assert!(
+        matches!(
+            fs.read(file_inode, None, 0, 1 << 20),
+            Err(CoreError::BackingChanged(_))
+        ),
+        "a read with no handle must still validate the backing file"
+    );
+    assert!(
+        matches!(fs.getattr(file_inode), Err(CoreError::BackingChanged(_))),
+        "the failed read must have dropped the attrs it proved wrong"
+    );
+}
+
 #[test]
 fn open_rejects_template_with_control_byte() {
     let db = musefs_db::Db::open_in_memory().unwrap();
@@ -1127,6 +1288,7 @@ fn open_rejects_template_with_control_byte() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     assert!(matches!(
         Musefs::open(db, config),
@@ -1165,6 +1327,7 @@ fn telemetry_counts_open_handles() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
     let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
@@ -1223,6 +1386,7 @@ fn drain_prefetch_reports_the_pool_state() {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: prefetch,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
 
     let off = Musefs::open(musefs_db::Db::open_in_memory().unwrap(), cfg(false)).unwrap();

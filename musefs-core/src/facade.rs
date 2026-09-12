@@ -32,6 +32,7 @@ pub enum Mode {
 
 /// Per-mount configuration for rendering the virtual hierarchy.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent mount toggles, not a state machine
 pub struct MountConfig {
     pub template: String,
     pub fallbacks: BTreeMap<String, String>,
@@ -56,6 +57,19 @@ pub struct MountConfig {
     /// instead of substituting `default_fallback`. Per-field fallback chains and
     /// `[...]` sections are unaffected. Set by the CLI (`--skip-on-missing`).
     pub skip_on_missing: bool,
+    /// Serve `getattr` straight from the size cache on a hit, skipping the
+    /// backing re-stat that would otherwise catch an on-disk change made
+    /// without a `content_version` bump (#279). Off by default; set by the CLI
+    /// (`--trust-backing-mtime`) for high-latency backings, where that stat is
+    /// a network round trip or a head seek paid once per track per traversal,
+    /// on every traversal after the first (#668).
+    ///
+    /// Scoped to `getattr` alone: `open` and the read paths validate
+    /// unconditionally, so a changed backing is still caught before any byte is
+    /// served and the `BackingChanged` guarantee is untouched. What the flag
+    /// trades away is the freshness of the size and mtime a `stat` reports
+    /// between the change and the next `open`.
+    pub trust_backing_mtime: bool,
 }
 
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
@@ -65,6 +79,54 @@ pub struct Attr {
     pub is_dir: bool,
     pub size: u64,
     pub mtime_secs: i64,
+}
+
+/// One pinned generation of the virtual tree, handed out by
+/// [`Musefs::tree_snapshot`]. Holding it keeps that generation alive, so every
+/// read taken through it describes the same tree even if a refresh publishes a
+/// newer one meanwhile.
+///
+/// [`id`](TreeSnapshot::id) additionally makes the pinned generation a usable
+/// cache key: the FUSE layer keys shared `readdir` listings on it, so handles
+/// opened on one directory at one generation collapse onto a single listing
+/// instead of one copy each (#675).
+#[derive(Clone)]
+pub struct TreeSnapshot(Arc<VirtualTree>);
+
+impl TreeSnapshot {
+    /// An identity for the pinned generation, unique among *live* snapshots:
+    /// it is the tree's heap address, so it is unique only for as long as this
+    /// snapshot (or a clone of it) is alive, and a later generation may well
+    /// reuse the address of one that has been dropped.
+    ///
+    /// A cache keyed on this must therefore keep a clone of the snapshot
+    /// alongside every entry it would hand out, which is exactly what makes the
+    /// key sound: while an entry is reachable its generation is pinned, and no
+    /// other tree can hold that address; once nothing holds it the entry has to
+    /// be gone too.
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    /// The parent inode of `inode` (root's parent is itself), from this
+    /// generation.
+    pub fn parent(&self, inode: u64) -> Option<u64> {
+        self.0.parent(inode)
+    }
+
+    /// Directory entries as `(name, child_inode, is_dir)`, from this generation.
+    pub fn readdir(&self, inode: u64) -> Result<Vec<(String, u64, bool)>> {
+        let children = match self.0.children(inode) {
+            Some(children) => children,
+            // Only directories have a children map; tell apart a known
+            // non-directory (ENOTDIR) from an unknown inode (ENOENT).
+            None if self.0.node(inode).is_some() => return Err(CoreError::NotADir(inode)),
+            None => return Err(CoreError::NoEntry(inode)),
+        };
+        Ok(children
+            .map(|(name, child)| (name.to_owned(), child, self.0.is_dir(child)))
+            .collect())
+    }
 }
 
 struct Handle {
@@ -313,6 +375,14 @@ impl Musefs {
         self.tree.load().parent(inode)
     }
 
+    /// Pin the current virtual-tree generation, so a caller that needs several
+    /// reads to agree with one another — a directory's children and its parent,
+    /// say — takes them from one view instead of racing a refresh between two
+    /// `ArcSwap` loads. See [`TreeSnapshot`].
+    pub fn tree_snapshot(&self) -> TreeSnapshot {
+        TreeSnapshot(self.tree.load_full())
+    }
+
     pub fn getattr(&self, inode: u64) -> Result<Attr> {
         let track_id = {
             let tree = self.tree.load();
@@ -354,8 +424,16 @@ impl Musefs {
                 // they now live.
                 && e.stamp == BackingStamp::from_identity(&identity)
             {
-                // Hit: re-stat the backing file (no synthesis) and compare to
-                // the stamp the cached attrs were built from. An on-disk change
+                // Hit. `--trust-backing-mtime` takes the cached attrs as-is and
+                // skips the re-stat below, for backings where that stat is a
+                // network round trip rather than a microsecond (#668). The
+                // opt-out stops here: the miss path below still stats, and so do
+                // `open` and the read paths, so no stale byte is ever served.
+                if self.config.trust_backing_mtime {
+                    return Ok((e.total_len, e.mtime_secs));
+                }
+                // Re-stat the backing file (no synthesis) and compare to the
+                // stamp the cached attrs were built from. An on-disk change
                 // that left content_version untouched would otherwise let
                 // getattr advertise stale attrs — the one metadata surface that
                 // could outrun a backing change (read/open already re-stat).
@@ -363,6 +441,10 @@ impl Musefs {
                 let meta = std::fs::metadata(&identity.backing_path)
                     .map_err(|err| CoreError::backing_io(&identity.backing_path, err))?;
                 if BackingStamp::from_metadata(&meta) != e.stamp {
+                    // Proved wrong: drop it rather than re-stat and re-reject it
+                    // on every later call. The next `getattr` takes the miss
+                    // path, which resolves against the live file.
+                    self.size_cache.remove(&track_id);
                     return Err(CoreError::BackingChanged(identity.backing_path));
                 }
                 return Ok((e.total_len, e.mtime_secs));
@@ -390,17 +472,7 @@ impl Musefs {
 
     /// Directory entries as `(name, child_inode, is_dir)`.
     pub fn readdir(&self, inode: u64) -> Result<Vec<(String, u64, bool)>> {
-        let tree = self.tree.load();
-        let children = match tree.children(inode) {
-            Some(children) => children,
-            // Only directories have a children map; tell apart a known
-            // non-directory (ENOTDIR) from an unknown inode (ENOENT).
-            None if tree.node(inode).is_some() => return Err(CoreError::NotADir(inode)),
-            None => return Err(CoreError::NoEntry(inode)),
-        };
-        Ok(children
-            .map(|(name, child)| (name.to_owned(), child, tree.is_dir(child)))
-            .collect())
+        self.tree_snapshot().readdir(inode)
     }
 
     /// Serve a read into `out` (cleared first). The FUSE layer passes a reused
@@ -510,6 +582,15 @@ impl Musefs {
         Ok(())
     }
 
+    /// Serve a read, retiring this track's cached attrs if the read reports the
+    /// backing file changed under it.
+    ///
+    /// The invalidation sits here, at the boundary, rather than at the handful
+    /// of places inside that can raise `BackingChanged` — the per-read stamp
+    /// check, either re-resolve, a segment that no longer matches its index, the
+    /// retry loops giving up. Every one of those means the same thing to
+    /// `getattr`, and a rule that has to be re-applied at each new one is a rule
+    /// that will be missed (#668).
     pub fn read_into(
         &self,
         inode: u64,
@@ -518,11 +599,39 @@ impl Musefs {
         size: u64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
+        // Which track the read actually worked on, recorded by the inner path as
+        // soon as it commits to one. Looking the inode up again out here would
+        // be a different question: an open handle carries the track it was
+        // opened on, and a refresh landing mid-read can re-point the inode or
+        // retire it — so the answer could name another track, or none, and the
+        // entry the read just proved wrong would survive.
+        let mut served_track = None;
+        let served = self.read_into_inner(inode, fh, offset, size, out, &mut served_track);
+        if let Err(err) = &served
+            && let Some(track_id) = served_track
+        {
+            self.forget_attrs_on_drift(track_id, err);
+        }
+        served
+    }
+
+    fn read_into_inner(
+        &self,
+        inode: u64,
+        fh: Option<Fh>,
+        offset: u64,
+        size: u64,
+        out: &mut Vec<u8>,
+        served_track: &mut Option<i64>,
+    ) -> Result<()> {
         out.clear();
         // Fast path: serve from the per-handle fd + cached layout (no open/stat).
         if let Some(fh) = fh {
             let handle = self.handles.get(fh.slab_key()).map(|g| Arc::clone(&g));
             if let Some(h) = handle {
+                // The handle's track, fixed when it was opened, is the one this
+                // path serves from here on.
+                *served_track = Some(h.track_id);
                 // Bounded retry absorbs a refresh or same-track re-tag landing
                 // mid-read. A batch import touching distinct tracks won't loop
                 // here, but a writer tight-looping commits to *this* track can
@@ -617,6 +726,7 @@ impl Musefs {
         // perfectly servable file to a spurious EIO (#541). A genuine backing
         // drift re-resolves to the same stale stamp and surfaces after the bound.
         let track_id = self.track_id_for(inode)?;
+        *served_track = Some(track_id);
         let mut last = None;
         for _attempt in 0..4 {
             out.clear();
@@ -672,11 +782,37 @@ impl Musefs {
         }
     }
 
+    /// Drop a track's cached `getattr` attrs once a serve path has proved them
+    /// wrong. Called at the two serve boundaries — [`Musefs::read_into`] and
+    /// [`Musefs::open_handle`] — plus `getattr`'s own re-stat.
+    ///
+    /// The size cache is validated against the row's identity, not against the
+    /// file, so nothing in it expires when the backing file changes underneath a
+    /// `content_version` that did not move. `getattr` re-stats on a hit to catch
+    /// exactly that — but under `--trust-backing-mtime` it does not, and then a
+    /// resolve, an `open`, or a read hitting `BackingChanged` is the only thing
+    /// that ever proves the entry wrong. Dropping it here is what bounds the
+    /// staleness that flag admits: it ends at the next open of the file, rather
+    /// than running until the store is updated (#668).
+    fn forget_attrs_on_drift(&self, track_id: i64, err: &CoreError) {
+        if matches!(err, CoreError::BackingChanged(_)) {
+            self.size_cache.remove(&track_id);
+        }
+    }
+
     /// Open a file handle: resolve + validate the layout and open the backing fd
     /// once, store it, and return a handle. Subsequent `read`s with this handle
     /// reuse the fd (no per-read open/stat).
+    ///
+    /// Like [`Musefs::read_into`], a `BackingChanged` from anywhere inside
+    /// retires this track's cached attrs on the way out (#668).
     pub fn open_handle(&self, inode: u64) -> Result<Fh> {
         let track_id = self.track_id_for(inode)?;
+        self.open_handle_inner(track_id)
+            .inspect_err(|err| self.forget_attrs_on_drift(track_id, err))
+    }
+
+    fn open_handle_inner(&self, track_id: i64) -> Result<Fh> {
         // Snapshot the generation BEFORE resolving: if a refresh lands during the
         // resolve, stamping the post-refresh gen onto this (pre-refresh) layout
         // would make the first read skip re-resolution and serve stale bytes. With
@@ -786,6 +922,7 @@ impl Musefs {
             refresh_gap_fallbacks: self.gap_fallbacks.load(Ordering::Relaxed),
             refresh_needs_rebuild: self.needs_rebuild.load(Ordering::Relaxed),
             serve_warns_suppressed: crate::warn_limit::serve_warns_suppressed(),
+            trust_backing_mtime: self.config.trust_backing_mtime,
         }
     }
 }

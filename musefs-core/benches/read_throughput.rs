@@ -20,6 +20,7 @@ fn config() -> MountConfig {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     }
 }
 

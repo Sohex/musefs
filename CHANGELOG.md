@@ -14,6 +14,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `--trust-backing-mtime` skips the backing re-stat that `getattr` performs on
+  a metadata-cache hit, serving the cached size and mtime instead. Off by
+  default. It is for backings where a `stat` is a network round trip or a head
+  seek rather than a microsecond: the hit path otherwise pays one per track on
+  every traversal after the first, and the kernel attr TTL cannot debounce
+  across a traversal. `open` and the read paths validate unconditionally either
+  way, so a replaced backing file is still caught before any byte is served;
+  what the flag trades away is the freshness of the size and mtime a `stat`
+  reports between such a change and the next `open`.
+  `musefs_trust_backing_mtime` reports the flag state alongside
+  `musefs_backing_stats_total`
+  ([#668](https://github.com/Sohex/musefs/issues/668)).
+
 - Chaptered `.m4b` files are supported. A `moov` may now hold chapter tracks
   (`text`, `sbtl`) alongside its single audio (`soun`) track, and every track's
   `stco`/`co64` chunk offsets are relocated when the `moov` is regenerated, not
