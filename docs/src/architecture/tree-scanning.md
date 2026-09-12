@@ -91,7 +91,14 @@ while a `$!{field}` path field keeps '/' as directory separators (sanitizing
 each segment and dropping empty/`.`/`..` segments) so a precomputed multi-level
 path expands into real directories. Path collisions are resolved
 deterministically by appending ` (k)` before the extension
-(`disambiguate`). `mapping.rs` bridges DB tag rows to the format layer's
+(`disambiguate`). The names the FUSE layer injects at the mount root —
+`.musefs-metrics` and `.metadata_never_index`, listed in
+`RESERVED_ROOT_NAMES` — are reserved in that namespace: a rendered *root*
+component landing on one is pushed to its ` (2)` rank by the same mechanism,
+so the synthetic entry always owns the base key and `readdir` can never emit a
+root name `lookup` will not return (#681). The reservation is unconditional —
+independent of `--expose-metrics` and of the host OS — so a library mounts to
+the same paths and inodes however the flag is set and wherever it runs. `mapping.rs` bridges DB tag rows to the format layer's
 inputs and to template fields — ordering and multi-value semantics live
 there.
 

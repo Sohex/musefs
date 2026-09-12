@@ -32,7 +32,10 @@ pub use telemetry::{
     process_stats, render_prometheus,
 };
 pub use template::{Template, TemplateError};
-pub use tree::{InodeAllocator, Node, NodeKind, VirtualTree};
+pub use tree::{
+    InodeAllocator, METRICS_DIR_NAME, Node, NodeKind, RESERVED_ROOT_NAMES, SPOTLIGHT_MARKER_NAME,
+    VirtualTree,
+};
 
 #[cfg(test)]
 mod cross_layer_caps {

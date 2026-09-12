@@ -191,6 +191,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A track that renders to `.musefs-metrics` or `.metadata_never_index` at the
+  mount root no longer collides with the synthetic entry the FUSE layer injects
+  there ([#681](https://github.com/Sohex/musefs/issues/681)). `readdir` appended
+  the synthetic name to the root listing while `lookup` intercepted it before
+  consulting the tree, so the name appeared twice with different inodes, `ls`
+  reported the synthetic inode for both rows, and the user's own subtree was
+  unreachable anywhere under the mount. Both names are now reserved in the
+  virtual-tree namespace: a rendered root component that lands on one is pushed
+  to its ` (2)` rank, exactly as a colliding rendered name already is, so the
+  synthetic entry keeps the base name and the user's data keeps a reachable one.
+  The reservation is applied once, when the tree is built, and does not depend on
+  `--expose-metrics` or on the platform — the same library therefore mounts to
+  the same paths and inodes whichever way the flag is set and wherever it runs.
+
 - Moving a backing file no longer wedges its track for the life of the mount
   ([#679](https://github.com/Sohex/musefs/issues/679)). A scan that retargets a
   row to a relocated file rewrites the path and the freshness stamp and

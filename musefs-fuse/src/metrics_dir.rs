@@ -15,8 +15,10 @@ use fuser::{FileAttr, FileType};
 /// Mount root inode (fuser's FUSE root id).
 const ROOT_INO: u64 = 1;
 
-/// The synthetic directory's name at the mount root.
-pub const METRICS_DIR_NAME: &str = ".musefs-metrics";
+/// The synthetic directory's name at the mount root. Defined in `musefs-core`,
+/// which reserves it in the virtual-tree namespace so a track can never render
+/// to the same root name and make `readdir` and `lookup` disagree (#681).
+pub const METRICS_DIR_NAME: &str = musefs_core::METRICS_DIR_NAME;
 /// The single file inside it.
 pub const METRICS_FILE_NAME: &str = "metrics";
 
@@ -119,6 +121,14 @@ mod tests {
         assert_eq!(metrics_lookup(1, "metrics"), None);
         assert_eq!(metrics_lookup(METRICS_DIR_INO, ".musefs-metrics"), None);
         assert_eq!(metrics_lookup(2, METRICS_DIR_NAME), None);
+    }
+
+    #[test]
+    fn the_injected_name_is_reserved_in_the_tree_namespace() {
+        // The whole guarantee of #681: `readdir` appends this name to the root
+        // listing without dedup, which is only sound while the virtual tree
+        // refuses to materialize a root child of the same name.
+        assert!(musefs_core::RESERVED_ROOT_NAMES.contains(&METRICS_DIR_NAME));
     }
 
     #[test]
