@@ -296,8 +296,12 @@ fn revalidate_full_reprocesses_row_missing_fingerprint() {
     )
     .unwrap();
     let id = db.list_tracks().unwrap()[0].id;
-    db.set_track_checksums(id, None, Some(&"d".repeat(64)))
-        .unwrap();
+    db.set_track_checksums(
+        id,
+        musefs_db::ChecksumWrite::Keep,
+        musefs_db::ChecksumWrite::Set(&"d".repeat(64)),
+    )
+    .unwrap();
     let seeded = &db.list_tracks().unwrap()[0];
     assert!(seeded.fingerprint.is_none(), "fingerprint absent");
     assert!(seeded.content_hash.is_some(), "content_hash present");
@@ -354,4 +358,141 @@ fn two_new_files_matching_one_orphan_retarget_one_insert_one() {
     // The non-retargeted row has a new id.
     let fresh: Vec<_> = tracks.iter().filter(|t| t.id != id_a).collect();
     assert_eq!(fresh.len(), 1, "exactly one fresh row");
+}
+
+/// Seed one FLAC at the `full` tier and hand back its row.
+fn seed_at_full(dir: &std::path::Path, audio: &[u8]) -> (Db, musefs_db::Track) {
+    write_a_flac(dir, "a.flac", audio);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory_with(&db, dir, &full_opts(MatchStrictness::Auto)).unwrap();
+    let row = db.list_tracks().unwrap()[0].clone();
+    assert!(row.content_hash.is_some(), "full tier seeds a hash");
+    (db, row)
+}
+
+/// #689: a pass at a tier below `full` must not leave the previous bytes'
+/// `content_hash` on a row whose file was rewritten in place. The column is the
+/// documented forensic identity of the *current* backing file, and a stale one
+/// also poisons move recovery, because a later move is then refused on a hash
+/// comparison it can never satisfy.
+///
+/// Both in-place paths reach this: `scan --force`, which re-ingests a known
+/// path, and `revalidate`, which refreshes only the structural columns.
+#[test]
+fn in_place_rewrite_at_fingerprint_tier_clears_the_stale_content_hash() {
+    for revalidating in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, seeded) = seed_at_full(dir.path(), &[0xAA; 64]);
+        let stale = seeded.content_hash.clone().unwrap();
+
+        // Rewrite the same path with different bytes, then re-probe it at the
+        // default tier, which computes no full hash for it.
+        write_a_flac(dir.path(), "a.flac", &[0xBB; 96]);
+        let reprobe = ScanOptions {
+            force: true,
+            ..opts(ChecksumTier::Fingerprint)
+        };
+        if revalidating {
+            musefs_core::revalidate_with(&db, dir.path(), &reprobe).unwrap();
+        } else {
+            scan_directory_with(&db, dir.path(), &reprobe).unwrap();
+        }
+
+        let t = &db.list_tracks().unwrap()[0];
+        assert_eq!(t.id, seeded.id, "same row, rewritten in place");
+        assert_ne!(
+            t.fingerprint, seeded.fingerprint,
+            "sanity: the rewrite really did change the content (revalidating={revalidating})"
+        );
+        assert_eq!(
+            t.content_hash, None,
+            "a hash of the old bytes must be cleared, not preserved (was {stale})"
+        );
+    }
+}
+
+/// The user-visible half of #689: after an in-place rewrite, a later move of
+/// that file still retargets its row. With the stale hash left in place, Auto
+/// full-hashes the moved file, compares it against the *old* bytes' hash,
+/// refuses, and orphans the curated tags and art.
+#[test]
+fn a_rewritten_file_can_still_be_move_recovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, seeded) = seed_at_full(dir.path(), &[0xAA; 64]);
+    let path = write_a_flac(dir.path(), "a.flac", &[0xBB; 96]);
+    scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            force: true,
+            ..opts(ChecksumTier::Fingerprint)
+        },
+    )
+    .unwrap();
+
+    std::fs::rename(&path, dir.path().join("moved.flac")).unwrap();
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1, "moved file must not orphan its row");
+    assert_eq!(tracks[0].id, seeded.id);
+    assert!(tracks[0].backing_path.ends_with("moved.flac"));
+}
+
+/// An unchanged file re-probed at a lower tier keeps the hash it already has:
+/// `Clear` is driven by an observed content change, not by the pass's tier, so
+/// the tier-preservation property the old `COALESCE` protected survives (#689).
+#[test]
+fn unchanged_file_at_fingerprint_tier_keeps_its_content_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, seeded) = seed_at_full(dir.path(), &[0xAA; 64]);
+
+    scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            force: true,
+            ..opts(ChecksumTier::Fingerprint)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        db.list_tracks().unwrap()[0].content_hash,
+        seeded.content_hash,
+        "an untouched file's hash is still true of it"
+    );
+}
+
+/// A `--fast` retarget confirms nothing by design, so when it produces no hash
+/// for the arriving file the candidate's stored one — which described the file
+/// that left — has to be dropped rather than inherited (#689).
+#[test]
+fn fast_retarget_without_a_new_hash_clears_the_stale_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_a_flac(dir.path(), "a.flac", &[0xAA; 64]);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Fast)).unwrap();
+    assert!(db.list_tracks().unwrap()[0].content_hash.is_some());
+
+    std::fs::remove_file(&a).unwrap();
+    write_a_flac(dir.path(), "b.flac", &[0xBB; 64]);
+    scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 1,
+            checksum: ChecksumTier::Fingerprint,
+            strictness: MatchStrictness::Fast,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1, "Fast still retargets");
+    assert!(tracks[0].backing_path.ends_with("b.flac"));
+    assert_eq!(
+        tracks[0].content_hash, None,
+        "an unconfirmed retarget must not inherit the departed file's hash"
+    );
 }

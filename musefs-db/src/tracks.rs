@@ -1,4 +1,4 @@
-use crate::models::{Format, NewTrack, Track, TrackBounds};
+use crate::models::{ChecksumWrite, Format, NewTrack, Track, TrackBounds};
 use crate::{Db, ReadWrite, Result};
 use rusqlite::{Row, params};
 
@@ -107,18 +107,25 @@ pub(crate) fn tracks_by_fingerprint_in(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Both checksum writers below take each column as a `(overwrite?, value)`
+/// pair, which is what makes all three [`ChecksumWrite`] intents expressible:
+/// `Keep` leaves the column alone, `Set` and `Clear` write the value, and that
+/// value is NULL for `Clear`. The `COALESCE(?, col)` these replaced could only
+/// express two of them, and read `Clear` as `Keep` (#689).
 pub(crate) fn set_track_checksums_in(
     conn: &rusqlite::Connection,
     id: i64,
-    fingerprint: Option<&str>,
-    content_hash: Option<&str>,
+    fingerprint: ChecksumWrite<'_>,
+    content_hash: ChecksumWrite<'_>,
 ) -> Result<()> {
+    let (fp_set, fp_val) = fingerprint.params();
+    let (ch_set, ch_val) = content_hash.params();
     conn.execute(
         "UPDATE tracks SET
-            fingerprint  = COALESCE(?2, fingerprint),
-            content_hash = COALESCE(?3, content_hash)
+            fingerprint  = CASE WHEN ?2 THEN ?3 ELSE fingerprint  END,
+            content_hash = CASE WHEN ?4 THEN ?5 ELSE content_hash END
          WHERE id = ?1",
-        params![id, fingerprint, content_hash],
+        params![id, fp_set, fp_val, ch_set, ch_val],
     )?;
     Ok(())
 }
@@ -133,9 +140,11 @@ pub(crate) fn retarget_track_in(
     backing_ctime_ns: i64,
     audio_offset: u64,
     audio_length: u64,
-    fingerprint: Option<&str>,
-    content_hash: Option<&str>,
+    fingerprint: ChecksumWrite<'_>,
+    content_hash: ChecksumWrite<'_>,
 ) -> Result<()> {
+    let (fp_set, fp_val) = fingerprint.params();
+    let (ch_set, ch_val) = content_hash.params();
     conn.execute(
         "UPDATE tracks SET
             backing_path     = ?2,
@@ -144,8 +153,8 @@ pub(crate) fn retarget_track_in(
             backing_ctime_ns = ?5,
             audio_offset     = ?6,
             audio_length     = ?7,
-            fingerprint      = COALESCE(?8, fingerprint),
-            content_hash     = COALESCE(?9, content_hash),
+            fingerprint      = CASE WHEN ?8  THEN ?9  ELSE fingerprint  END,
+            content_hash     = CASE WHEN ?10 THEN ?11 ELSE content_hash END,
             updated_at       = CAST(strftime('%s','now') AS INTEGER)
          WHERE id = ?1",
         params![
@@ -156,8 +165,10 @@ pub(crate) fn retarget_track_in(
             backing_ctime_ns,
             audio_offset,
             audio_length,
-            fingerprint,
-            content_hash,
+            fp_set,
+            fp_val,
+            ch_set,
+            ch_val,
         ],
     )?;
     Ok(())
@@ -358,23 +369,26 @@ impl Db<ReadWrite> {
         tracks_by_fingerprint_in(&self.conn, fp)
     }
 
-    /// Set the scanner-owned checksums for a track. A `None` argument leaves the
-    /// existing column value intact (COALESCE), so a lower-tier pass never clears
-    /// a higher tier's value.
+    /// Set the scanner-owned checksums for a track. Each column is written
+    /// under its own [`ChecksumWrite`] intent: `Keep` leaves the stored value
+    /// intact, so a lower-tier pass never clears a higher tier's value, while
+    /// `Clear` nulls a value the pass knows no longer describes the file.
     pub fn set_track_checksums(
         &self,
         id: i64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> Result<()> {
         set_track_checksums_in(&self.conn, id, fingerprint, content_hash)
     }
 
     /// Point an existing track at a relocated backing file: update its path,
     /// validation stamp, and audio bounds in place, preserving its `id` (and
-    /// thus its tags/art/structural blocks). Checksum args COALESCE like
-    /// `set_track_checksums`. `updated_at` is refreshed; `content_version` is
-    /// left to the geometry trigger (it bumps only if `backing_mtime_ns`
+    /// thus its tags/art/structural blocks). Checksum args carry the same
+    /// [`ChecksumWrite`] intent as `set_track_checksums`: a retarget that could
+    /// not confirm the new file's full hash passes `Clear`, never `Keep`, so
+    /// the row cannot keep the departed file's hash. `updated_at` is refreshed;
+    /// `content_version` is left to the geometry trigger (it bumps only if `backing_mtime_ns`
     /// actually changed — a pure move preserves mtime, so no bump).
     #[allow(clippy::too_many_arguments)]
     pub fn retarget_track(
@@ -386,8 +400,8 @@ impl Db<ReadWrite> {
         backing_ctime_ns: i64,
         audio_offset: u64,
         audio_length: u64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> Result<()> {
         retarget_track_in(
             &self.conn,
@@ -626,7 +640,7 @@ mod render_key_tests {
 
 #[cfg(test)]
 mod checksum_tests {
-    use crate::{Db, NewTrack, models::Format};
+    use crate::{ChecksumWrite, Db, NewTrack, models::Format};
 
     fn new_track(path: &str) -> NewTrack {
         NewTrack {
@@ -644,24 +658,56 @@ mod checksum_tests {
     fn set_and_read_back_checksums() {
         let db = Db::open_in_memory().unwrap();
         let id = db.upsert_track(&new_track("/a.flac")).unwrap();
-        db.set_track_checksums(id, Some(&"a".repeat(64)), Some(&"d".repeat(64)))
-            .unwrap();
+        db.set_track_checksums(
+            id,
+            ChecksumWrite::Set(&"a".repeat(64)),
+            ChecksumWrite::Set(&"d".repeat(64)),
+        )
+        .unwrap();
         let t = db.get_track(id).unwrap().unwrap();
         assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..]));
         assert_eq!(t.content_hash.as_deref(), Some(&"d".repeat(64)[..]));
     }
 
     #[test]
-    fn set_checksums_none_does_not_clobber_existing() {
+    fn set_checksums_keep_does_not_clobber_existing() {
         let db = Db::open_in_memory().unwrap();
         let id = db.upsert_track(&new_track("/a.flac")).unwrap();
-        db.set_track_checksums(id, Some(&"a".repeat(64)), Some(&"d".repeat(64)))
+        db.set_track_checksums(
+            id,
+            ChecksumWrite::Set(&"a".repeat(64)),
+            ChecksumWrite::Set(&"d".repeat(64)),
+        )
+        .unwrap();
+        // A later pass with nothing new to say must preserve both.
+        db.set_track_checksums(id, ChecksumWrite::Keep, ChecksumWrite::Keep)
             .unwrap();
-        // A later lower-tier pass passes None and must preserve both.
-        db.set_track_checksums(id, None, None).unwrap();
         let t = db.get_track(id).unwrap().unwrap();
         assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..]));
         assert_eq!(t.content_hash.as_deref(), Some(&"d".repeat(64)[..]));
+    }
+
+    /// The #689 distinction: `Clear` nulls a column `Keep` would have left
+    /// standing, and does so per column.
+    #[test]
+    fn set_checksums_clear_nulls_only_the_cleared_column() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_track(&new_track("/a.flac")).unwrap();
+        db.set_track_checksums(
+            id,
+            ChecksumWrite::Set(&"a".repeat(64)),
+            ChecksumWrite::Set(&"d".repeat(64)),
+        )
+        .unwrap();
+        db.set_track_checksums(id, ChecksumWrite::Keep, ChecksumWrite::Clear)
+            .unwrap();
+        let t = db.get_track(id).unwrap().unwrap();
+        assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..]));
+        assert_eq!(t.content_hash, None, "Clear must null, not preserve");
+
+        db.set_track_checksums(id, ChecksumWrite::Clear, ChecksumWrite::Keep)
+            .unwrap();
+        assert_eq!(db.get_track(id).unwrap().unwrap().fingerprint, None);
     }
 
     #[test]
@@ -669,9 +715,9 @@ mod checksum_tests {
         let db = Db::open_in_memory().unwrap();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
         let b = db.upsert_track(&new_track("/b.flac")).unwrap();
-        db.set_track_checksums(a, Some(&"b".repeat(64)), None)
+        db.set_track_checksums(a, ChecksumWrite::Set(&"b".repeat(64)), ChecksumWrite::Keep)
             .unwrap();
-        db.set_track_checksums(b, Some(&"b".repeat(64)), None)
+        db.set_track_checksums(b, ChecksumWrite::Set(&"b".repeat(64)), ChecksumWrite::Keep)
             .unwrap();
         db.upsert_track(&new_track("/c.flac")).unwrap(); // fingerprint NULL
         let mut ids: Vec<i64> = db
@@ -693,7 +739,7 @@ mod checksum_tests {
     fn retarget_updates_path_stamp_and_bounds_keeping_id() {
         let db = Db::open_in_memory().unwrap();
         let id = db.upsert_track(&new_track("/old.flac")).unwrap();
-        db.set_track_checksums(id, Some(&"a".repeat(64)), None)
+        db.set_track_checksums(id, ChecksumWrite::Set(&"a".repeat(64)), ChecksumWrite::Keep)
             .unwrap();
         db.retarget_track(
             id,
@@ -703,8 +749,8 @@ mod checksum_tests {
             5678,
             42,
             50,
-            None,
-            Some(&"e".repeat(64)),
+            ChecksumWrite::Keep,
+            ChecksumWrite::Set(&"e".repeat(64)),
         )
         .unwrap();
         let t = db.get_track(id).unwrap().unwrap();
@@ -715,9 +761,38 @@ mod checksum_tests {
         assert_eq!(t.backing_ctime_ns, 5678);
         assert_eq!(t.bounds.audio_offset(), 42);
         assert_eq!(t.bounds.audio_length(), 50);
-        assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..])); // None arg preserves
+        assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..])); // Keep preserves
         assert_eq!(t.content_hash.as_deref(), Some(&"e".repeat(64)[..]));
         assert!(db.get_track_by_path("/old.flac").unwrap().is_none());
+    }
+
+    /// A retarget that could not confirm the new file must not carry the
+    /// departed file's `content_hash` forward (#689).
+    #[test]
+    fn retarget_clear_drops_the_previous_content_hash() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_track(&new_track("/old.flac")).unwrap();
+        db.set_track_checksums(
+            id,
+            ChecksumWrite::Set(&"a".repeat(64)),
+            ChecksumWrite::Set(&"d".repeat(64)),
+        )
+        .unwrap();
+        db.retarget_track(
+            id,
+            "/new.flac",
+            10,
+            1,
+            2,
+            0,
+            10,
+            ChecksumWrite::Set(&"b".repeat(64)),
+            ChecksumWrite::Clear,
+        )
+        .unwrap();
+        let t = db.get_track(id).unwrap().unwrap();
+        assert_eq!(t.fingerprint.as_deref(), Some(&"b".repeat(64)[..]));
+        assert_eq!(t.content_hash, None);
     }
 
     // Direct coverage of the BulkWriter read accessors used by ingest_unit's
@@ -729,7 +804,8 @@ mod checksum_tests {
         let fp = "f".repeat(64);
         let mut bw = db.bulk_writer().unwrap();
         let id = bw.upsert_track(&new_track("/x.flac")).unwrap();
-        bw.set_track_checksums(id, Some(&fp), None).unwrap();
+        bw.set_track_checksums(id, ChecksumWrite::Set(&fp), ChecksumWrite::Keep)
+            .unwrap();
 
         let by_fp = bw.tracks_by_fingerprint(&fp).unwrap();
         assert_eq!(by_fp.len(), 1, "fingerprint match must be returned");
@@ -747,10 +823,20 @@ mod checksum_tests {
         let id = {
             let mut bw = db.bulk_writer().unwrap();
             let id = bw.upsert_track(&new_track("/old.flac")).unwrap();
-            bw.set_track_checksums(id, Some(&"a".repeat(64)), None)
+            bw.set_track_checksums(id, ChecksumWrite::Set(&"a".repeat(64)), ChecksumWrite::Keep)
                 .unwrap();
-            bw.retarget_track(id, "/new.flac", 10, 1, 2, 0, 10, None, None)
-                .unwrap();
+            bw.retarget_track(
+                id,
+                "/new.flac",
+                10,
+                1,
+                2,
+                0,
+                10,
+                ChecksumWrite::Keep,
+                ChecksumWrite::Keep,
+            )
+            .unwrap();
             bw.commit().unwrap();
             id
         };

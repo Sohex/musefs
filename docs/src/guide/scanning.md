@@ -117,6 +117,13 @@ whose old path is gone, and retargets the unique match in place — its `id`,
 tags, and art are preserved. Move recovery only applies to rows that were
 fingerprinted before the move (rows scanned under `--checksum=none` have no
 fingerprint and cannot be retargeted until a later fingerprint-tier pass).
+
+A `content_hash` only ever describes the file a row currently points at. A pass
+that computes no full hash — a `fingerprint`-tier re-scan of a rewritten file,
+or a `--fast` retarget that confirms nothing — clears the column rather than
+leaving the previous bytes' hash standing. Re-run with `--checksum=full` to
+restore it. A pass over a file that has not changed keeps the hash it already
+has, so a cheap pass never undoes an expensive one.
 Run `scan` after a move and ideally **before** any `revalidate` — `revalidate`
 only refreshes already tracked rows, so a moved file must be re-seeded before
 the maintenance pass can see it. Use `revalidate --prune` only when you are

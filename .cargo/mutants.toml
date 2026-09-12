@@ -148,7 +148,7 @@ exclude_re = [
     # run_pipeline sync_channel capacity `jobs * 2`: pure throughput/blocking knob;
     # the persisted track set is identical for any positive capacity.
     # guard: op="*" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2082:46:',
+'musefs-core/src/scan\.rs:2128:46:',
     # probe_body's tail-read predicate
     # `has_ext(mp3) || (has_ext(flac) && has_leading_id3(prefix))`, the inner `&&`
     # (col 66) -> `||`: widening it makes every .flac pay the 128-byte tail read,
@@ -174,30 +174,30 @@ exclude_re = [
     # safely description-anchored. Re-verify these coordinates (via
     # `cargo mutants --list`) after any change that reformats scan.rs.
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2221:22:',
+'musefs-core/src/scan\.rs:2267:22:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2312:33:',
+'musefs-core/src/scan\.rs:2358:33:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2312:48:',
+'musefs-core/src/scan\.rs:2358:48:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2312:63:',
+'musefs-core/src/scan\.rs:2358:63:',
     # guard: op="+=" fn="run_pipeline" rows=2
-'musefs-core/src/scan\.rs:2326:37:',
+'musefs-core/src/scan\.rs:2372:37:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2328:41:',
+'musefs-core/src/scan\.rs:2374:41:',
     # guard: op="||" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2328:56:',
+'musefs-core/src/scan\.rs:2374:56:',
     # guard: op=">=" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2328:71:',
+'musefs-core/src/scan\.rs:2374:71:',
     # Same cadence class, one level up: each threshold flush is a let-chain
     # (`(len >= BATCH_FILES || batch_bytes >= cap) && let Err(e) = flush(..)`), so
     # `&&`->`||` short-circuits past the mid-loop flush exactly when the threshold
     # IS met — deferring the commit to the flush-on-empty / final flush, which
     # persist the identical track set and still surface a flush error (#618).
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2313:21:',
+'musefs-core/src/scan\.rs:2359:21:',
     # guard: op="&&" fn="run_pipeline" rows=1
-'musefs-core/src/scan\.rs:2329:29:',
+'musefs-core/src/scan\.rs:2375:29:',
     # `ByteBudget::acquire`'s wait guard (`!st.closed && in_flight != 0 && ...`),
     # the FIRST `&&`->`||`. `&&` binds tighter than `||`, so the guard becomes
     # `!closed || (in_flight != 0 && over_cap)` and every reservation against an
@@ -218,11 +218,11 @@ exclude_re = [
     # scan.failed + skip_failed` sum is also insensitive to `+`->`-` (the `+`->`*`
     # variant IS caught, so only `-` is excluded here).
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:2506:29:',
+'musefs-core/src/scan\.rs:2552:29:',
     # guard: op="+=" fn="revalidate_with" rows=2
-'musefs-core/src/scan\.rs:2518:33:',
+'musefs-core/src/scan\.rs:2564:33:',
     # guard: op="+" fn="revalidate_with" rows=1
-'musefs-core/src/scan\.rs:2575:29: replace \+ with -',
+'musefs-core/src/scan\.rs:2621:29: replace \+ with -',
     # Phase 2 ID3 binary tags: classify_binary_frame's POPM counter fold
     # `(a << 8) | b` -> `(a << 8) ^ b`. The accumulator is left-shifted by 8 before
     # each combine, so its low byte is always zero where `b` lands; `|` and `^` are
@@ -525,23 +525,15 @@ exclude_re = [
 
     # #464 backing-file checksums — ingest_unit retarget path equivalents.
     #
-    # TrackSink::track_exists_at -> Ok(false), for BOTH the &Db and the
-    # &mut BulkWriter impls: equivalent. ingest_unit calls track_exists_at twice and
-    # both are pure optimization/defense. The known-path short-circuit (the function's
-    # first `if`) only avoids the fingerprint lookup on an in-place re-scan; forced
-    # false, that re-scan just takes the refind path and falls through to the IDENTICAL
-    # upsert (its own row is filtered out by the copy-vs-move metadata filter, since its
-    # path still exists). The destination-occupied guard (`!w.track_exists_at` in the
-    # retarget `if`) only fires on a contrived input where the move destination already
-    # has a row; forced false there it would attempt a retarget onto an occupied path,
-    # which can only ever error on the UNIQUE(backing_path) constraint — never corrupt
-    # state. Neither is reachable as a corrupting divergence from a correctness test.
-    # The `Ok(true)` siblings at these sites stay IN scope (killed by
-    # ingest_unit_db_path_retargets_orphan / the retarget integration tests).
-    # guard: count=1
-    'replace <impl TrackSink for &Db>::track_exists_at -> musefs_db::Result<bool> with Ok\(false\)',
-    # guard: count=1
-    'replace <impl TrackSink for &mut musefs_db::BulkWriter<._>>::track_exists_at -> musefs_db::Result<bool> with Ok\(false\)',
+    # NB: `TrackSink::track_exists_at -> Ok(false)` used to be excluded here for
+    # both sink impls, as a pure optimization/defense whose forced-false form fell
+    # through to an identical upsert. The sink now returns the row itself
+    # (`existing_track`), because the ingest paths decide their ChecksumWrite
+    # intents from the stored stamp and geometry (#689) — so a const-return there
+    # also mislabels a byte-identical re-probe as changed content, which
+    # ingest_unit_db_path_keeps_the_hash_of_unchanged_bytes and
+    # unchanged_file_at_fingerprint_tier_keeps_its_content_hash catch. Both
+    # const-return mutants at those sites are in scope and killable.
     #
     # ingest_unit log-only branches: both gate ONLY a `log::warn!` with no effect on
     # persisted state, and the suite has no log-capture harness (same class as the

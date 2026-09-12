@@ -138,6 +138,90 @@ pub struct Track {
     pub content_hash: Option<String>,
 }
 
+/// What one scanner pass knows about one checksum column (`tracks.fingerprint`
+/// or `tracks.content_hash`).
+///
+/// `Option<&str>` could not express this: "I computed nothing, leave the stored
+/// value alone" and "the recorded bytes changed and I have no replacement" are
+/// different operations, and collapsing them onto `None` left a row pairing new
+/// bytes with a checksum of the old ones (#689). The tier-preservation property
+/// the old `COALESCE` protected survives, because `Clear` is driven by an
+/// observed content change rather than by the pass's checksum tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumWrite<'a> {
+    /// No new information: leave whatever is stored. Only correct when the
+    /// recorded bytes are known not to have changed.
+    Keep,
+    /// A checksum computed over the bytes being recorded now.
+    Set(&'a str),
+    /// The recorded content changed and this pass computed no replacement, so
+    /// the stored value no longer describes the file. Writes NULL.
+    Clear,
+}
+
+impl<'a> ChecksumWrite<'a> {
+    /// `(overwrite?, value)` for the `CASE` arms in the checksum UPDATEs.
+    pub(crate) fn params(self) -> (bool, Option<&'a str>) {
+        match self {
+            ChecksumWrite::Keep => (false, None),
+            ChecksumWrite::Set(v) => (true, Some(v)),
+            ChecksumWrite::Clear => (true, None),
+        }
+    }
+
+    /// `Set` when this pass computed a value, otherwise `Keep`/`Clear` on
+    /// whether the recorded bytes are known to be the same ones.
+    pub fn from_computed(computed: Option<&'a str>, bytes_unchanged: bool) -> ChecksumWrite<'a> {
+        match computed {
+            Some(v) => ChecksumWrite::Set(v),
+            None if bytes_unchanged => ChecksumWrite::Keep,
+            None => ChecksumWrite::Clear,
+        }
+    }
+}
+
+#[cfg(test)]
+mod checksum_write_tests {
+    use super::ChecksumWrite;
+
+    /// `from_computed` is the whole Keep-vs-Clear decision (#689), and it lives
+    /// here rather than in the scanner, so it needs its own coverage here: the
+    /// mutation gate tests a `musefs-db` mutant against `musefs-db`'s tests
+    /// alone, and every caller is in `musefs-core`.
+    #[test]
+    fn from_computed_maps_all_three_intents() {
+        assert_eq!(
+            ChecksumWrite::from_computed(Some("h"), true),
+            ChecksumWrite::Set("h"),
+            "a computed value is always written, changed bytes or not"
+        );
+        assert_eq!(
+            ChecksumWrite::from_computed(Some("h"), false),
+            ChecksumWrite::Set("h")
+        );
+        assert_eq!(
+            ChecksumWrite::from_computed(None, true),
+            ChecksumWrite::Keep,
+            "nothing computed over bytes that did not change: keep the value"
+        );
+        assert_eq!(
+            ChecksumWrite::from_computed(None, false),
+            ChecksumWrite::Clear,
+            "nothing computed over bytes that did change: the value is stale"
+        );
+    }
+
+    /// The `(overwrite?, value)` pair each intent hands the `CASE` arms. `Keep`
+    /// and `Clear` differ only here, which is the distinction `COALESCE` could
+    /// not express.
+    #[test]
+    fn params_distinguish_keep_from_clear() {
+        assert_eq!(ChecksumWrite::Keep.params(), (false, None));
+        assert_eq!(ChecksumWrite::Clear.params(), (true, None));
+        assert_eq!(ChecksumWrite::Set("h").params(), (true, Some("h")));
+    }
+}
+
 /// The identity columns `getattr` validates a cached entry against, without
 /// materializing a full `Track` (no `format` parse, no `TrackBounds`) on the
 /// hottest metadata op. Two independent axes: `content_version` is the served-

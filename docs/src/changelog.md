@@ -210,6 +210,21 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- A row no longer claims a `content_hash` its bytes do not have. The checksum
+  write read a `None` argument as "leave the stored value alone", which is
+  right for a pass that computed nothing and wrong for a pass that watched the
+  file change, so a file rewritten in place and then re-probed at the
+  `fingerprint` tier kept the *previous* bytes' hash beside its new stamp,
+  geometry and tags. That broke the documented forensic identity and poisoned
+  move recovery: a later move of the rewritten file was refused on a hash
+  comparison it could never satisfy, orphaning the curated row. Each checksum
+  write now carries an explicit intent — keep, set, or clear — and a pass below
+  the `full` tier clears the column whenever it observes that the recorded bytes
+  changed, while still keeping a higher tier's value for a file that has not
+  changed. A `--fast` retarget, which confirms nothing by design, likewise no
+  longer inherits the departed file's hash
+  ([#689](https://github.com/Sohex/musefs/issues/689)).
+
 - A track that renders to `.musefs-metrics` or `.metadata_never_index` at the
   mount root no longer collides with the synthetic entry the FUSE layer injects
   there ([#681](https://github.com/Sohex/musefs/issues/681)). `readdir` appended

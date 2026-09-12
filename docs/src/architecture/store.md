@@ -45,9 +45,17 @@ the editable tag contract and external tools never write them.
 `fingerprint` is a SHA-256 over the probe's parsed output (deterministic per
 file, excludes filesystem stamps such as `mtime`/`ctime`), computed in the
 parallel probe worker at zero extra I/O. `content_hash` is a full-file
-SHA-256, stored as 64-char hex; it is computed only at the `full` checksum
-tier (`--checksum=full`), which requires an eager whole-file read. Neither
-column is `UNIQUE` by design — duplicate-content tracks legitimately share
+SHA-256 of the *current* backing file, stored as 64-char hex; it is computed
+only at the `full` checksum tier (`--checksum=full`), which requires an eager
+whole-file read.
+
+A pass that computes no full hash never leaves a stale one behind: every
+checksum write carries an explicit intent — keep the stored value, set a new
+one, or clear it — and a pass below the `full` tier clears the column whenever
+it observes that the recorded bytes changed. A pass over a file that has not
+changed keeps what is stored, so a cheap pass never undoes an expensive one.
+
+Neither column is `UNIQUE` by design — duplicate-content tracks legitimately share
 both values. On a normal `scan`, when a probed file's path is not yet in the
 store and its fingerprint matches exactly one orphaned row (a row whose
 `backing_path` no longer exists on disk), the scanner retargets that row to

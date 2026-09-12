@@ -1,5 +1,7 @@
 use crate::art::{set_track_art_in, upsert_art_in};
-use crate::models::{BinaryTag, NewArt, NewTrack, StructuralBlock, Tag, Track, TrackArt};
+use crate::models::{
+    BinaryTag, ChecksumWrite, NewArt, NewTrack, StructuralBlock, Tag, Track, TrackArt,
+};
 use crate::structural::set_structural_blocks_in;
 use crate::tags::{replace_tags_in, set_binary_tags_in};
 use crate::tracks::{
@@ -55,8 +57,8 @@ impl BulkWriter<'_> {
     pub fn set_track_checksums(
         &self,
         id: i64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> Result<()> {
         set_track_checksums_in(&self.tx, id, fingerprint, content_hash)
     }
@@ -71,8 +73,8 @@ impl BulkWriter<'_> {
         backing_ctime_ns: i64,
         audio_offset: u64,
         audio_length: u64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> Result<()> {
         retarget_track_in(
             &self.tx,

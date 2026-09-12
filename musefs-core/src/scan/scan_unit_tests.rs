@@ -496,7 +496,8 @@ fn ingest_unit_db_path_retargets_orphan() {
             backing_ctime_ns: 0,
         })
         .unwrap();
-    db.set_track_checksums(id, Some(&fp), None).unwrap();
+    db.set_track_checksums(id, ChecksumWrite::Set(&fp), ChecksumWrite::Keep)
+        .unwrap();
 
     let new_path = "/moved/here.flac";
     let unit = unit_with(new_path, Some(fp.clone()));
@@ -552,7 +553,8 @@ fn ingest_unit_db_path_skips_unstatable_candidate() {
             backing_ctime_ns: 0,
         })
         .unwrap();
-    db.set_track_checksums(id, Some(&fp), None).unwrap();
+    db.set_track_checksums(id, ChecksumWrite::Set(&fp), ChecksumWrite::Keep)
+        .unwrap();
 
     let unit = unit_with("/fresh/new.flac", Some(fp));
     ingest_unit(&db, unit, MatchStrictness::Auto, WritePolicy::Full).unwrap();
@@ -592,7 +594,15 @@ fn refresh_structural_into_preserves_tags_and_art() {
         }],
         structural_blocks: vec![("STREAMINFO".into(), vec![1, 2, 3])],
     };
-    ingest_into(&db, "/m/a.flac", stamp, seeded, None, None).unwrap();
+    ingest_into(
+        &db,
+        "/m/a.flac",
+        stamp,
+        seeded,
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
+    )
+    .unwrap();
     let id = db.list_tracks().unwrap()[0].id;
 
     let changed = Probed {
@@ -619,7 +629,15 @@ fn refresh_structural_into_preserves_tags_and_art() {
         mtime_ns: 2,
         ctime_ns: 2,
     };
-    refresh_structural_into(&db, "/m/a.flac", stamp2, changed, None, None).unwrap();
+    refresh_structural_into(
+        &db,
+        "/m/a.flac",
+        stamp2,
+        changed,
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
+    )
+    .unwrap();
 
     let track = &db.list_tracks().unwrap()[0];
     assert_eq!(track.id, id, "same row upserted, not replaced");
@@ -685,5 +703,99 @@ fn fingerprint_changes_with_picture_description() {
         fingerprint_of(&base),
         fingerprint_of(&other),
         "picture description change => fp change"
+    );
+}
+
+/// `records_same_bytes` is the whole Keep-vs-Clear decision (#689), so each of
+/// the four facts it compares has to be able to say "not the same content" on
+/// its own — an `||` slipped between them would let three agreeing fields vouch
+/// for a fourth that does not.
+#[test]
+fn records_same_bytes_needs_every_field_to_agree() {
+    let unit = unit_with("/m/a.flac", Some("a".repeat(64)));
+    let row = |stamp: BackingStamp, format, offset, length| musefs_db::Track {
+        id: 1,
+        backing_path: unit.abs_path.clone(),
+        format,
+        bounds: musefs_db::TrackBounds::new(offset, length, stamp.size).unwrap(),
+        backing_size: stamp.size,
+        backing_mtime_ns: stamp.mtime_ns,
+        backing_ctime_ns: stamp.ctime_ns,
+        content_version: 0,
+        updated_at: 0,
+        fingerprint: None,
+        content_hash: None,
+    };
+    let same = row(unit.stamp, Format::Flac, 0, 0);
+    assert!(
+        records_same_bytes(&unit, Some(&same)),
+        "a row agreeing on stamp, format and geometry is the same content"
+    );
+    assert!(
+        !records_same_bytes(&unit, None),
+        "no stored row means nothing is known to be unchanged"
+    );
+
+    // One disagreement at a time, the rest agreeing.
+    let other_stamp = BackingStamp {
+        ctime_ns: unit.stamp.ctime_ns + 1,
+        ..unit.stamp
+    };
+    for (label, t) in [
+        ("stamp", row(other_stamp, Format::Flac, 0, 0)),
+        ("format", row(unit.stamp, Format::Mp3, 0, 0)),
+        ("audio_offset", row(unit.stamp, Format::Flac, 4, 0)),
+        ("audio_length", row(unit.stamp, Format::Flac, 0, 4)),
+    ] {
+        assert!(
+            !records_same_bytes(&unit, Some(&t)),
+            "a differing {label} must not read as the same content"
+        );
+    }
+}
+
+/// The `&Db` sink's known-path arm: a unit whose path already has a row must be
+/// upserted through `ingest_into`, and a pass that computed no full hash over
+/// unchanged bytes must leave the stored one alone (#689).
+///
+/// Also the only coverage of `<&Db>::existing_track` returning a row — the
+/// other `&Db` ingest tests all use paths the store has never seen, so a sink
+/// that always answers "no row here" is invisible to them.
+#[test]
+fn ingest_unit_db_path_keeps_the_hash_of_unchanged_bytes() {
+    let db = Db::open_in_memory().unwrap();
+    let fp = "a".repeat(64);
+    let hash = "d".repeat(64);
+    let unit = unit_with("/exists.flac", Some(fp.clone()));
+    let id = db
+        .upsert_track(&NewTrack {
+            backing_path: unit.abs_path.clone(),
+            format: unit.probed.format,
+            audio_offset: unit.probed.audio_offset,
+            audio_length: unit.probed.audio_length,
+            backing_size: unit.stamp.size,
+            backing_mtime_ns: unit.stamp.mtime_ns,
+            backing_ctime_ns: unit.stamp.ctime_ns,
+        })
+        .unwrap();
+    db.set_track_checksums(id, ChecksumWrite::Keep, ChecksumWrite::Set(&hash))
+        .unwrap();
+
+    // The unit carries a fingerprint but no content hash, over bytes the row
+    // already describes.
+    ingest_unit(&db, unit, MatchStrictness::Auto, WritePolicy::Full).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(
+        tracks.len(),
+        1,
+        "the known path is upserted, not duplicated"
+    );
+    assert_eq!(tracks[0].id, id, "same row");
+    assert_eq!(tracks[0].fingerprint.as_deref(), Some(fp.as_str()));
+    assert_eq!(
+        tracks[0].content_hash.as_deref(),
+        Some(hash.as_str()),
+        "an unchanged file's hash is still true of it"
     );
 }

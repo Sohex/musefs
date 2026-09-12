@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use musefs_db::convert::usize_from;
-use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
+use musefs_db::{ChecksumWrite, Db, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, ogg, wav};
 
 use crate::byte_budget::ByteBudget;
@@ -1530,10 +1530,13 @@ trait TrackSink {
     fn set_track_checksums(
         &mut self,
         track_id: i64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> musefs_db::Result<()>;
-    fn track_exists_at(&mut self, path: &str) -> musefs_db::Result<bool>;
+    /// The row already stored at `path`, if any. Returns the whole row rather
+    /// than a bool because the ingest paths decide their [`ChecksumWrite`]
+    /// intents by comparing the stored stamp and geometry against the probe's.
+    fn existing_track(&mut self, path: &str) -> musefs_db::Result<Option<musefs_db::Track>>;
     fn tracks_by_fingerprint(&mut self, fp: &str) -> musefs_db::Result<Vec<musefs_db::Track>>;
     #[allow(clippy::too_many_arguments)]
     fn retarget_track(
@@ -1543,8 +1546,8 @@ trait TrackSink {
         stamp: BackingStamp,
         audio_offset: u64,
         audio_length: u64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> musefs_db::Result<()>;
 }
 
@@ -1578,13 +1581,13 @@ impl TrackSink for &Db {
     fn set_track_checksums(
         &mut self,
         track_id: i64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> musefs_db::Result<()> {
         Db::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
-    fn track_exists_at(&mut self, path: &str) -> musefs_db::Result<bool> {
-        Ok(Db::get_track_by_path(self, path)?.is_some())
+    fn existing_track(&mut self, path: &str) -> musefs_db::Result<Option<musefs_db::Track>> {
+        Db::get_track_by_path(self, path)
     }
     fn tracks_by_fingerprint(&mut self, fp: &str) -> musefs_db::Result<Vec<musefs_db::Track>> {
         Db::tracks_by_fingerprint(self, fp)
@@ -1596,8 +1599,8 @@ impl TrackSink for &Db {
         stamp: BackingStamp,
         audio_offset: u64,
         audio_length: u64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> musefs_db::Result<()> {
         Db::retarget_track(
             self,
@@ -1644,13 +1647,13 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
     fn set_track_checksums(
         &mut self,
         track_id: i64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> musefs_db::Result<()> {
         musefs_db::BulkWriter::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
-    fn track_exists_at(&mut self, path: &str) -> musefs_db::Result<bool> {
-        Ok(musefs_db::BulkWriter::get_track_by_path(self, path)?.is_some())
+    fn existing_track(&mut self, path: &str) -> musefs_db::Result<Option<musefs_db::Track>> {
+        musefs_db::BulkWriter::get_track_by_path(self, path)
     }
     fn tracks_by_fingerprint(&mut self, fp: &str) -> musefs_db::Result<Vec<musefs_db::Track>> {
         musefs_db::BulkWriter::tracks_by_fingerprint(self, fp)
@@ -1662,8 +1665,8 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
         stamp: BackingStamp,
         audio_offset: u64,
         audio_length: u64,
-        fingerprint: Option<&str>,
-        content_hash: Option<&str>,
+        fingerprint: ChecksumWrite<'_>,
+        content_hash: ChecksumWrite<'_>,
     ) -> musefs_db::Result<()> {
         musefs_db::BulkWriter::retarget_track(
             self,
@@ -1691,8 +1694,8 @@ fn ingest_into(
     abs_path: &str,
     stamp: BackingStamp,
     probed: Probed,
-    fingerprint: Option<&str>,
-    content_hash: Option<&str>,
+    fingerprint: ChecksumWrite<'_>,
+    content_hash: ChecksumWrite<'_>,
 ) -> Result<()> {
     // The pipeline already rejected an over-cap file in the worker, before the
     // payload was ever buffered. Re-checking here is what makes the direct
@@ -1757,8 +1760,8 @@ fn refresh_structural_into(
     abs_path: &str,
     stamp: BackingStamp,
     probed: Probed,
-    fingerprint: Option<&str>,
-    content_hash: Option<&str>,
+    fingerprint: ChecksumWrite<'_>,
+    content_hash: ChecksumWrite<'_>,
 ) -> Result<()> {
     let track_id = w.upsert_track(&NewTrack {
         backing_path: abs_path.to_string(),
@@ -1792,6 +1795,25 @@ fn is_store_rejection(e: &crate::error::CoreError) -> bool {
     matches!(e, crate::error::CoreError::Db(db) if db.is_constraint_violation())
 }
 
+/// Do the bytes this unit records look like the ones a stored row already
+/// describes?
+///
+/// Keyed on the freshness stamp — size plus nanosecond mtime plus ctime, the
+/// same identity serving fails closed on — widened with the parsed geometry, so
+/// a re-parse that moves the audio region also counts as new content.
+///
+/// A `false` here is what turns an uncomputed checksum into `Clear` rather than
+/// `Keep`: a pass below the `full` tier must not leave the previous bytes'
+/// `content_hash` sitting beside the new ones (#689).
+fn records_same_bytes(unit: &Unit, existing: Option<&musefs_db::Track>) -> bool {
+    existing.is_some_and(|t| {
+        BackingStamp::from_track(t) == unit.stamp
+            && t.format == unit.probed.format
+            && t.bounds.audio_offset() == unit.probed.audio_offset
+            && t.bounds.audio_length() == unit.probed.audio_length
+    })
+}
+
 /// Decide how to ingest one probed unit: retarget a relocated row when a unique
 /// fingerprint match exists whose backing file is gone, otherwise ingest fresh.
 /// The strict/auto confirm hash, if computed here, is persisted on the retarget
@@ -1802,25 +1824,34 @@ fn ingest_unit(
     strictness: MatchStrictness,
     policy: WritePolicy,
 ) -> Result<()> {
+    let existing = w.existing_track(&unit.abs_path)?;
+    // One decision serves both columns and every write path below: `Set` what
+    // this pass computed, and for what it did not, `Keep` only where the row's
+    // bytes are provably the same ones. Tier alone cannot make that call — it
+    // was the old `COALESCE`'s mistake (#689).
+    let unchanged = records_same_bytes(&unit, existing.as_ref());
+    let fp_write = ChecksumWrite::from_computed(unit.fingerprint.as_deref(), unchanged);
+    let hash_write = ChecksumWrite::from_computed(unit.content_hash.as_deref(), unchanged);
+
     if policy == WritePolicy::StructuralOnly {
         return refresh_structural_into(
             w,
             &unit.abs_path,
             unit.stamp,
             unit.probed,
-            unit.fingerprint.as_deref(),
-            unit.content_hash.as_deref(),
+            fp_write,
+            hash_write,
         );
     }
     // Known path => ordinary upsert (re-scan of an in-place file).
-    if w.track_exists_at(&unit.abs_path)? {
+    if existing.is_some() {
         return ingest_into(
             w,
             &unit.abs_path,
             unit.stamp,
             unit.probed,
-            unit.fingerprint.as_deref(),
-            unit.content_hash.as_deref(),
+            fp_write,
+            hash_write,
         );
     }
     if let Some(fp) = unit.fingerprint.as_deref() {
@@ -1872,15 +1903,22 @@ fn ingest_unit(
                     Some(stored) => new_hash.as_deref() == Some(stored.as_str()),
                 },
             };
-            if confirmed && !w.track_exists_at(&unit.abs_path)? {
+            // `existing` is None here (the known-path arm returned above), so
+            // the retarget cannot collide with a row already at this path.
+            if confirmed {
                 w.retarget_track(
                     cand.id,
                     &unit.abs_path,
                     unit.stamp,
                     unit.probed.audio_offset,
                     unit.probed.audio_length,
-                    unit.fingerprint.as_deref(),
-                    new_hash.as_deref(),
+                    ChecksumWrite::Set(fp),
+                    // The candidate's stored hash described the file that left
+                    // this row, so unless this retarget produced one for the
+                    // file arriving, the column has to go — never `Keep`.
+                    // `--fast` confirms nothing by design and so inherits
+                    // nothing either (#689).
+                    ChecksumWrite::from_computed(new_hash.as_deref(), false),
                 )?;
                 return Ok(());
             }
@@ -1904,21 +1942,22 @@ fn ingest_unit(
         &unit.abs_path,
         unit.stamp,
         unit.probed,
-        unit.fingerprint.as_deref(),
-        unit.content_hash.as_deref(),
+        fp_write,
+        hash_write,
     )
 }
 
 /// Upsert a track from a probed backing file through a direct `&Db`. Thin
-/// wrapper over [`ingest_into`]; the `oracle`/non-bulk scan path.
+/// wrapper over [`ingest_into`]; the `oracle`/non-bulk scan path. Computes no
+/// checksums, so both columns are left exactly as they are.
 fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
     ingest_into(
         db,
         abs_path,
         BackingStamp::from_metadata(meta),
         probed,
-        None,
-        None,
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
     )
 }
 
@@ -1933,7 +1972,14 @@ fn ingest_bulk(
     stamp: BackingStamp,
     probed: Probed,
 ) -> Result<()> {
-    ingest_into(bw, abs_path, stamp, probed, None, None)
+    ingest_into(
+        bw,
+        abs_path,
+        stamp,
+        probed,
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
+    )
 }
 
 /// Public entry: parallel-probe / single-writer scan of `root`.
