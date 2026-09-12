@@ -11,12 +11,12 @@ use std::time::{Duration, SystemTime};
 
 use threadpool::ThreadPool;
 
-use crate::convert::{assemble_dir_listing, to_file_attr};
+use crate::convert::{assemble_dir_listing, make_attr, to_file_attr};
 use fuser::{
-    AccessFlags, BackgroundSession, Config, FileHandle, FileType, Filesystem, FopenFlags,
+    AccessFlags, BackgroundSession, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyXattr, Request, Session,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyXattr, Request, Session,
 };
 use musefs_core::CoreError;
 use musefs_core::Fh;
@@ -437,6 +437,273 @@ fn shared_listing(handles: &DirHandles, key: DirListingKey) -> Option<Arc<DirLis
         .and_then(|shared| shared.listing.upgrade())
 }
 
+/// Entries one `readdirplus` round resolves before it tries to fill the reply
+/// (#667).
+///
+/// fuser does not expose the reply buffer's size, so the handler cannot know
+/// where the kernel's page ends until it has filled it: a `DirEntryPlus` is a
+/// 152-byte header plus the name, so a 4 KiB buffer holds roughly 25 entries and
+/// a 32 KiB one roughly 200. Rounds bound the over-resolution to less than one
+/// round per page, and even that is not wasted — a resolved attr lands in the
+/// size cache, so the page that does ask for it finds it warm.
+const READDIRPLUS_BATCH: usize = 64;
+
+/// A round must be able to fill the smallest reply buffer the kernel will send
+/// on its own, or every listing pays extra rounds to reach the end of one page.
+const _: () = assert!(READDIRPLUS_BATCH * 160 >= 4096);
+
+/// The mount-wide constants every attr reply is built from.
+#[derive(Clone, Copy)]
+struct AttrStyle {
+    uid: u32,
+    gid: u32,
+    file_mode: u16,
+    dir_mode: u16,
+    mount_time: SystemTime,
+    ttl: Duration,
+}
+
+/// One entry's attrs and how long the kernel may trust them. The TTL is the
+/// mount's, except for an entry whose attrs could not be resolved: see
+/// [`unresolved_plus_entry`].
+#[derive(Clone, Copy)]
+struct PlusEntry {
+    attr: FileAttr,
+    ttl: Duration,
+}
+
+/// A `readdirplus` reply being filled (#667). Rounds run strictly one after
+/// another — the round that finishes starts the next — so nothing here is
+/// contended except by the resolutions within one round.
+struct PlusFill {
+    /// The listing being paged, shared with the directory handle (#675).
+    listing: Arc<DirListing>,
+    /// The reply, until the round that fills or exhausts it sends it. `None`
+    /// afterwards, so a stray second finish cannot double-reply.
+    reply: Mutex<Option<ReplyDirectoryPlus>>,
+    core: Arc<Musefs>,
+    pool: ThreadPool,
+    style: AttrStyle,
+    expose_metrics: bool,
+}
+
+/// One round's resolutions: a slice of the listing, a slot per entry, and the
+/// countdown that decides who assembles it.
+struct PlusRound {
+    fill: Arc<PlusFill>,
+    /// Index into `fill.listing` of the first entry this round covers; the
+    /// round covers `slots.len()` entries from there.
+    start: usize,
+    /// One slot per entry, each set exactly once by the task that owns it.
+    slots: Vec<OnceLock<PlusEntry>>,
+    /// Resolutions still to come, plus one held by the dispatcher until every
+    /// task is queued.
+    outstanding: AtomicUsize,
+}
+
+/// Counts one resolution out of its round on every exit path: normal
+/// completion, a panic caught by [`execute_guarded`], and a task a dead pool
+/// dropped without running (the shape [`PollPendingGuard`] guards against,
+/// #369). The last one out assembles the round, so a lost task costs that
+/// entry's attrs and never the reply — which, dropped unsent, would hang the
+/// syscall (#359).
+struct PlusSlot(Arc<PlusRound>);
+
+impl Drop for PlusSlot {
+    fn drop(&mut self) {
+        // AcqRel: the assembling thread must see every slot written by the
+        // tasks it is counting out.
+        if self.0.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            finish_plus_round(&self.0);
+        }
+    }
+}
+
+/// Attrs for an entry that needs no DB work, or `None` when it has to go to the
+/// pool. Directories are free — `Musefs::getattr` returns immediately for one
+/// without touching the DB — and the synthetic entries carry static attrs
+/// already (#667).
+fn inline_plus_entry(
+    child: u64,
+    kind: FileType,
+    expose_metrics: bool,
+    style: &AttrStyle,
+) -> Option<PlusEntry> {
+    let attr = if kind == FileType::Directory {
+        // What `getattr` reports for a directory: size 0, and the mount time
+        // standing in for its absent mtime.
+        make_attr(
+            child,
+            0,
+            (FileType::Directory, style.dir_mode, 2),
+            style.uid,
+            style.gid,
+            style.mount_time,
+        )
+    } else if platform::spotlight::is_marker(child) {
+        platform::spotlight::marker_attr(style.uid, style.gid, style.file_mode, style.mount_time)
+    } else if expose_metrics && child == metrics_dir::METRICS_FILE_INO {
+        metrics_dir::file_attr(style.uid, style.gid, style.file_mode, style.mount_time)
+    } else {
+        return None;
+    };
+    Some(PlusEntry {
+        attr,
+        ttl: style.ttl,
+    })
+}
+
+/// Stand-in attrs for an entry whose synthesis failed, or whose resolution was
+/// lost with a dropped task.
+///
+/// The entry still has to appear, or the file vanishes from the listing — which
+/// is a worse answer than today's, where `readdir` lists it and the client's own
+/// `lookup` reports the error. A zero TTL is what preserves that: the kernel
+/// caches neither the entry nor these attrs, so the next access goes back to
+/// `lookup`/`getattr` and gets the real error. The protocol's own way of saying
+/// "no attrs for this one" — a zero `nodeid` — is not reachable through fuser's
+/// API, which derives both the nodeid and the dirent's inode from `attr.ino`,
+/// and a zero inode makes `readdir` skip the name entirely.
+fn unresolved_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusEntry {
+    let node = if kind == FileType::Directory {
+        (FileType::Directory, style.dir_mode, 2)
+    } else {
+        (FileType::RegularFile, style.file_mode, 1)
+    };
+    PlusEntry {
+        attr: make_attr(child, 0, node, style.uid, style.gid, style.mount_time),
+        ttl: Duration::ZERO,
+    }
+}
+
+/// Start filling `reply` with `listing` from `offset` (#667).
+fn start_plus_fill(
+    core: &Arc<Musefs>,
+    pool: &ThreadPool,
+    style: AttrStyle,
+    expose_metrics: bool,
+    listing: Arc<DirListing>,
+    offset: u64,
+    reply: ReplyDirectoryPlus,
+) {
+    let start = usize_from(offset).min(listing.len());
+    let fill = Arc::new(PlusFill {
+        listing,
+        reply: Mutex::new(Some(reply)),
+        core: Arc::clone(core),
+        pool: pool.clone(),
+        style,
+        expose_metrics,
+    });
+    spawn_plus_round(&fill, start);
+}
+
+/// Resolve the round starting at `start`: fill what needs no DB work inline,
+/// fan the rest across the pool, and let the last one out assemble the reply.
+///
+/// Nothing waits here. A worker that blocked on tasks it queued to its own
+/// bounded pool could deadlock behind them, so the round is a countdown rather
+/// than a join — the reason this op is shaped unlike every other one in this
+/// file. Fanning out is the point: concurrent `lookup`s already spread across
+/// the pool, so a handler that resolved a page serially would be slower than the
+/// round trips it removes for a threaded scanner (#667).
+fn spawn_plus_round(fill: &Arc<PlusFill>, start: usize) {
+    let end = start
+        .saturating_add(READDIRPLUS_BATCH)
+        .min(fill.listing.len());
+    let round = Arc::new(PlusRound {
+        fill: Arc::clone(fill),
+        start,
+        slots: (start..end).map(|_| OnceLock::new()).collect(),
+        // The dispatcher's own count, released below: without it a task that
+        // finishes while later ones are still being queued would assemble a
+        // half-resolved round.
+        outstanding: AtomicUsize::new(1),
+    });
+    let dispatching = PlusSlot(Arc::clone(&round));
+    for (idx, (child, kind, _)) in fill.listing[start..end].iter().enumerate() {
+        let (child, kind) = (*child, *kind);
+        if let Some(entry) = inline_plus_entry(child, kind, fill.expose_metrics, &fill.style) {
+            let _ = round.slots[idx].set(entry);
+            continue;
+        }
+        round.outstanding.fetch_add(1, Ordering::Relaxed);
+        let slot = PlusSlot(Arc::clone(&round));
+        let style = fill.style;
+        execute_guarded(&fill.pool, "readdirplus", move || {
+            let round = &slot.0;
+            let entry = match synth_outcome(
+                "readdirplus",
+                child,
+                std::panic::AssertUnwindSafe(|| round.fill.core.getattr(child)),
+            ) {
+                Ok(attr) => PlusEntry {
+                    attr: to_file_attr(
+                        &attr,
+                        style.uid,
+                        style.gid,
+                        style.file_mode,
+                        style.dir_mode,
+                        style.mount_time,
+                    ),
+                    ttl: style.ttl,
+                },
+                Err(_) => unresolved_plus_entry(child, kind, &style),
+            };
+            let _ = round.slots[idx].set(entry);
+            // `slot` drops here, counting this resolution out and, if it is the
+            // last, assembling the round.
+        });
+    }
+    drop(dispatching);
+}
+
+/// Emit a finished round into the reply, then send it or start the next one.
+///
+/// Runs exactly once per round, on whichever thread counted the last resolution
+/// out, so it needs no lock of its own beyond taking the reply.
+fn finish_plus_round(round: &PlusRound) {
+    let fill = &round.fill;
+    let Some(mut reply) = fill
+        .reply
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    let next = round.start + round.slots.len();
+    for (i, slot) in (round.start..).zip(&round.slots) {
+        let (child, kind, name) = &fill.listing[i];
+        let entry = slot
+            .get()
+            .copied()
+            .unwrap_or_else(|| unresolved_plus_entry(*child, *kind, &fill.style));
+        // The stored offset is the index of the *next* entry, as in
+        // `reply_dir_page`: the kernel hands it back to resume from here.
+        if reply.add(
+            INodeNo(*child),
+            (i + 1) as u64,
+            name,
+            &entry.ttl,
+            &entry.attr,
+            Generation(0),
+        ) {
+            // Buffer full: what fits is the page, and the kernel asks again
+            // from the last accepted offset.
+            return reply.ok();
+        }
+    }
+    if next >= fill.listing.len() {
+        return reply.ok();
+    }
+    *fill
+        .reply
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reply);
+    spawn_plus_round(fill, next);
+}
+
 /// Admit a directory handle under the caller's `dir_handles` lock, enforcing
 /// `MAX_DIR_HANDLES` (#307). Returns the freshly allocated handle id on admit, or
 /// `None` when the table is at `cap` and the caller falls back to the stateless
@@ -609,6 +876,11 @@ pub struct MusefsFs {
     /// this is also the only signal that directories are being re-listed on every
     /// `readdir` — worth knowing before it shows up as CPU.
     dir_handle_rejections: Arc<AtomicU64>,
+    /// `readdirplus` calls served, surfaced as `musefs_readdirplus_total`. The
+    /// op is negotiated at mount and `FUSE_READDIRPLUS_AUTO` lets the kernel
+    /// choose per listing, so whether a mount is getting the folded-in lookups
+    /// at all is otherwise unobservable from the daemon (#667).
+    readdirplus_calls: Arc<AtomicU64>,
     /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
     /// otherwise-unbounded pool queue (#308).
@@ -656,6 +928,7 @@ impl MusefsFs {
             dir_handles: Arc::new(Mutex::new(DirHandles::default())),
             dir_fh: Arc::new(AtomicU64::new(1)),
             dir_handle_rejections: Arc::new(AtomicU64::new(0)),
+            readdirplus_calls: Arc::new(AtomicU64::new(0)),
             inflight_reads: Arc::new(AtomicUsize::new(0)),
             read_errors: Arc::new(AtomicU64::new(0)),
             metrics_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -716,6 +989,18 @@ impl MusefsFs {
     /// Assemble and render the `.musefs-metrics/metrics` body (#394). Best-effort:
     /// every source is an atomic load, a brief lock, or a fallible probe mapped to
     /// `None`/0; nothing here can panic the daemon or perturb a read.
+    /// The mount-wide constants every attr reply is built from.
+    fn attr_style(&self) -> AttrStyle {
+        AttrStyle {
+            uid: self.uid,
+            gid: self.gid,
+            file_mode: self.config.file_mode,
+            dir_mode: self.config.dir_mode,
+            mount_time: self.mount_time,
+            ttl: self.config.ttl,
+        }
+    }
+
     fn render_metrics(&self) -> Vec<u8> {
         let core = self.core.telemetry();
         let (dir_handles, dir_listings) = {
@@ -734,6 +1019,7 @@ impl MusefsFs {
             dir_listings,
             dir_handles_max: MAX_DIR_HANDLES as u64,
             dir_handle_rejections: self.dir_handle_rejections.load(Ordering::Relaxed),
+            readdirplus_calls: self.readdirplus_calls.load(Ordering::Relaxed),
             pool_workers: self.pool.max_count() as u64,
             pool_active: self.pool.active_count() as u64,
             pool_queued: self.pool.queued_count() as u64,
@@ -764,6 +1050,15 @@ impl Filesystem for MusefsFs {
         // default; PARALLEL_DIROPS may be unsupported on older kernels (ignored).
         let _ = config.add_capabilities(InitFlags::FUSE_ASYNC_READ);
         let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+        // READDIRPLUS folds the per-entry `lookup` into the directory read, and
+        // AUTO lets the kernel drop back to plain `readdir` when the caller is
+        // not stat-ing what it lists — an attr-laden reply is a pessimization
+        // for a bare `ls`, since each entry carries ~128 bytes of attrs and so
+        // fewer of them fit in a page (#667). Requested separately: without the
+        // handler below the kernel would never send the op anyway, and without
+        // AUTO it would send it for every listing.
+        let _ = config.add_capabilities(InitFlags::FUSE_DO_READDIRPLUS);
+        let _ = config.add_capabilities(InitFlags::FUSE_READDIRPLUS_AUTO);
         // Kernel passthrough (Linux-only) is requested by the platform module;
         // off Linux this is a no-op and reads are served through the daemon.
         platform::passthrough::request_capabilities(config);
@@ -1258,6 +1553,91 @@ impl Filesystem for MusefsFs {
             });
         };
         reply_dir_page(reply, &listing, offset);
+    }
+
+    /// `readdir` with each entry's attrs inline, so a client that stats what it
+    /// lists — `ls -l`, every media scanner — spends one round trip on the
+    /// directory instead of one more per entry (#667).
+    ///
+    /// The listing is found exactly as `readdir` finds it. What is new is the
+    /// attrs: directories and the synthetic entries are filled inline, and the
+    /// file entries fan out across the worker pool in rounds, since resolving a
+    /// page serially on one worker would be slower for a threaded scanner than
+    /// the `lookup`s it replaces. See [`spawn_plus_round`].
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectoryPlus,
+    ) {
+        self.fire_poll_refresh();
+        self.readdirplus_calls.fetch_add(1, Ordering::Relaxed);
+        let style = self.attr_style();
+        if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
+            // Every entry here is inline, so this fills and replies without
+            // touching the pool at all.
+            return start_plus_fill(
+                &self.core,
+                &self.pool,
+                style,
+                true,
+                Arc::new(metrics_dir::dir_listing()),
+                offset,
+                reply,
+            );
+        }
+        let held = self
+            .dir_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .open
+            .get(&fh.0)
+            .map(|handle| Arc::clone(&handle.listing));
+        // Lock released; the fill below runs without holding it.
+        let expose_metrics = self.config.expose_metrics;
+        let Some(listing) = held else {
+            // Unknown fh — the stateless sentinel, from a synthetic directory or
+            // an over-cap `opendir` (#616). Rebuilding walks the tree, so it is
+            // offloaded like every other blocking op; the shared index usually
+            // spares it even that (#675).
+            let core = Arc::clone(&self.core);
+            let handles = Arc::clone(&self.dir_handles);
+            let pool = self.pool.clone();
+            return execute_guarded(&self.pool, "readdirplus", move || {
+                let snapshot = core.tree_snapshot();
+                let cached = shared_listing(
+                    &handles
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    (snapshot.id(), ino.0),
+                );
+                let listing = match cached {
+                    Some(listing) => listing,
+                    None => match synth_outcome(
+                        "readdirplus",
+                        ino.0,
+                        std::panic::AssertUnwindSafe(|| {
+                            build_dir_listing(&snapshot, ino.0, expose_metrics)
+                        }),
+                    ) {
+                        Ok(listing) => Arc::new(listing),
+                        Err(e) => return reply.error(e),
+                    },
+                };
+                start_plus_fill(&core, &pool, style, expose_metrics, listing, offset, reply);
+            });
+        };
+        start_plus_fill(
+            &self.core,
+            &self.pool,
+            style,
+            expose_metrics,
+            listing,
+            offset,
+            reply,
+        );
     }
 }
 
@@ -2033,6 +2413,86 @@ mod tests {
             0,
             "re-admitting into a freed slot is not a rejection"
         );
+    }
+
+    fn test_style() -> AttrStyle {
+        AttrStyle {
+            uid: 501,
+            gid: 20,
+            file_mode: 0o444,
+            dir_mode: 0o555,
+            mount_time: SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
+            ttl: Duration::from_secs(1),
+        }
+    }
+
+    /// What `readdirplus` must not send to the pool: directories (free —
+    /// `Musefs::getattr` answers them without touching the DB) and the
+    /// synthetic entries, whose attrs are static (#667).
+    #[test]
+    fn inline_plus_entry_covers_dirs_and_synthetic_entries() {
+        let style = test_style();
+
+        let dir = inline_plus_entry(7, FileType::Directory, false, &style).expect("dirs are free");
+        assert_eq!(dir.attr.ino, INodeNo(7));
+        assert_eq!(dir.attr.kind, FileType::Directory);
+        assert_eq!(dir.attr.perm, style.dir_mode);
+        assert_eq!(dir.attr.nlink, 2);
+        assert_eq!(dir.attr.size, 0);
+        assert_eq!(dir.attr.mtime, style.mount_time, "no mtime: the mount's");
+        assert_eq!(dir.ttl, style.ttl);
+
+        let metrics = inline_plus_entry(
+            metrics_dir::METRICS_FILE_INO,
+            FileType::RegularFile,
+            true,
+            &style,
+        )
+        .expect("the metrics file has static attrs");
+        assert_eq!(metrics.attr.ino, INodeNo(metrics_dir::METRICS_FILE_INO));
+        assert_eq!(metrics.ttl, style.ttl);
+
+        assert!(
+            inline_plus_entry(9, FileType::RegularFile, true, &style).is_none(),
+            "a real file needs the DB, so it belongs on the pool"
+        );
+        assert!(
+            inline_plus_entry(
+                metrics_dir::METRICS_FILE_INO,
+                FileType::RegularFile,
+                false,
+                &style
+            )
+            .is_none(),
+            "without --expose-metrics that inode is not ours to answer for"
+        );
+    }
+
+    /// An entry whose attrs could not be resolved still has to appear, or the
+    /// file drops out of the listing entirely — worse than today, where
+    /// `readdir` lists it and the client's own `lookup` reports the error. The
+    /// zero TTL is what keeps that: the kernel caches neither the entry nor the
+    /// placeholder attrs, so the next access goes back to `lookup` (#667).
+    #[test]
+    fn unresolved_plus_entry_is_placeholder_attrs_the_kernel_may_not_cache() {
+        let style = test_style();
+        let file = unresolved_plus_entry(9, FileType::RegularFile, &style);
+        assert_eq!(file.ttl, Duration::ZERO, "the kernel must not cache these");
+        assert_eq!(
+            file.attr.ino,
+            INodeNo(9),
+            "a zero inode would hide the name"
+        );
+        assert_eq!(file.attr.kind, FileType::RegularFile);
+        assert_eq!(file.attr.size, 0);
+
+        let dir = unresolved_plus_entry(7, FileType::Directory, &style);
+        assert_eq!(
+            dir.attr.kind,
+            FileType::Directory,
+            "type comes from readdir"
+        );
+        assert_eq!(dir.ttl, Duration::ZERO);
     }
 
     #[test]
