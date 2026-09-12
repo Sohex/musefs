@@ -1,7 +1,8 @@
 //! Hand-rolled MP4/M4A box layer: parse the structure, read iTunes metadata, and
 //! regenerate `moov` (with patched chunk offsets) to synthesize a re-tagged file
 //! whose `mdat` audio payload is served verbatim. Strict: anything outside the
-//! supported shape (single audio track, one `mdat`, non-fragmented) is rejected.
+//! supported shape (one audio track plus optional chapter tracks, one `mdat`,
+//! non-fragmented) is rejected.
 
 use crate::bytes::{read_u32_be, read_u64_be};
 use crate::convert::usize_from;
@@ -188,9 +189,19 @@ pub struct Mp4Bounds {
     pub audio_length: u64,
 }
 
+/// Track handler types musefs serves alongside the audio track: QuickTime-style
+/// chapter tracks, carried as a second `text` (or `sbtl`) track. Chapters are
+/// the reason the `.m4b` extension exists, so rejecting every chaptered file
+/// rejected most of an audiobook library (#672).
+const CHAPTER_HANDLERS: [[u8; 4]; 2] = [*b"text", *b"sbtl"];
+
 /// Validate the internal `moov` shape: no fragmentation (`mvex`), exactly one
-/// track, and that track is audio (`soun`). `moov_payload` is the bytes inside
-/// the `moov` box (after its header).
+/// audio (`soun`) track, and every other track a chapter track
+/// ([`CHAPTER_HANDLERS`]). `moov_payload` is the bytes inside the `moov` box
+/// (after its header).
+///
+/// On rejection the error names the handler types found, so a skipped file
+/// explains itself instead of landing in an `unparseable` tally.
 fn validate_moov(moov_payload: &[u8]) -> Result<()> {
     if find_box(moov_payload, b"mvex")?.is_some() {
         return Err(FormatError::NotMp4);
@@ -199,19 +210,41 @@ fn validate_moov(moov_payload: &[u8]) -> Result<()> {
         .into_iter()
         .filter(|b| &b.kind == b"trak")
         .collect();
-    if traks.len() != 1 {
-        return Err(FormatError::NotMp4);
+
+    let mut handlers: Vec<String> = Vec::new();
+    let mut soun = 0usize;
+    let mut unsupported = false;
+    for t in &traks {
+        let trak = t.payload(moov_payload);
+        // A `trak` with no readable `hdlr` cannot be classified; describe it and
+        // let the tally below reject, rather than erroring with no explanation.
+        let handler = find_path(trak, &[b"mdia", b"hdlr"])?
+            .and_then(|(hp, hl)| trak[hp..hp + hl].get(8..12))
+            .and_then(|h| <[u8; 4]>::try_from(h).ok());
+        match handler {
+            Some(h) if h == *b"soun" => soun += 1,
+            Some(h) if CHAPTER_HANDLERS.contains(&h) => {}
+            _ => unsupported = true,
+        }
+        handlers.push(match handler {
+            Some(h) => String::from_utf8_lossy(&h).into_owned(),
+            None => "<no hdlr>".to_string(),
+        });
     }
-    let trak = traks[0].payload(moov_payload);
-    let (hp, hl) = find_path(trak, &[b"mdia", b"hdlr"])?.ok_or(FormatError::NotMp4)?;
-    if trak[hp..hp + hl].get(8..12) != Some(b"soun") {
-        return Err(FormatError::NotMp4);
+
+    if soun != 1 || unsupported {
+        return Err(FormatError::Mp4Tracks(format!(
+            "expected one audio (soun) track, optionally with text/sbtl chapter \
+             tracks; found [{}]",
+            handlers.join(", ")
+        )));
     }
     Ok(())
 }
 
 /// Validate the supported shape; return the ftyp/moov/mdat boxes (absolute offsets
-/// in `buf`). Rejects fragmented, video, multi-track, and multi-`mdat` files.
+/// in `buf`). Rejects fragmented, video, and multi-`mdat` files; accepts one audio
+/// track plus any number of chapter tracks (see [`validate_moov`]).
 fn locate(buf: &[u8]) -> Result<(BoxRef, BoxRef, BoxRef)> {
     let top = child_boxes(buf).map_err(|_| FormatError::NotMp4)?;
     if top.iter().any(|b| &b.kind == b"moof") {

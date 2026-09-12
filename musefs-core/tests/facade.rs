@@ -990,6 +990,93 @@ fn reads_m4b_alias() {
     assert!(attr.size > 0);
 }
 
+/// Walk `buf`'s top-level boxes and return `(payload_start, payload_len)` of the
+/// first one of `kind`, or None.
+fn find_top_box(buf: &[u8], kind: &[u8; 4]) -> Option<(usize, usize)> {
+    let mut pos = 0;
+    while pos + 8 <= buf.len() {
+        let size = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        if size < 8 || pos + size > buf.len() {
+            return None;
+        }
+        if &buf[pos + 4..pos + 8] == kind {
+            return Some((pos + 8, size - 8));
+        }
+        pos += size;
+    }
+    None
+}
+
+/// Every `stco` entry in `moov`, in track order. Byte-scanning is enough here:
+/// the synthesized `moov` holds no audio, so a false `stco` match cannot occur.
+fn stco_entries(moov: &[u8]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(at) = moov[pos..].windows(4).position(|w| w == b"stco") {
+        let base = pos + at + 4 + 4; // past the type and version/flags
+        let count = u32::from_be_bytes(moov[base..base + 4].try_into().unwrap()) as usize;
+        for i in 0..count {
+            let e = base + 4 + i * 4;
+            out.push(u32::from_be_bytes(moov[e..e + 4].try_into().unwrap()));
+        }
+        pos = base + 4;
+    }
+    out
+}
+
+#[test]
+fn serves_a_chaptered_m4b_with_every_track_relocated() {
+    // A chaptered .m4b was rejected outright before #672. It must now ingest,
+    // and the served file must relocate the chapter track's chunk offsets along
+    // with the audio track's — an unpatched second track is corruption, which is
+    // why rejecting the file used to be the safer behavior.
+    let dir = tempfile::tempdir().unwrap();
+    let audio = b"AUDIODATAAUDIODATA";
+    let bytes = common::chaptered_m4b(audio);
+    std::fs::write(dir.path().join("book.m4b"), &bytes).unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    scan_directory(&db, dir.path()).unwrap();
+    let track = db.list_tracks().unwrap().into_iter().next().unwrap();
+    assert_eq!(track.format, musefs_db::Format::M4a);
+
+    let fs = Musefs::open(db, config()).unwrap();
+    let (_, artist, _) = fs
+        .readdir(VirtualTree::ROOT)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    let attr = fs.getattr(file_inode).unwrap();
+    let served = fs.read(file_inode, None, 0, attr.size).unwrap();
+
+    // Both tracks survive, and both chunk offsets moved by the same delta — so
+    // the gap between the audio chunk and the chapter chunk is preserved and
+    // each still points at its own bytes inside the relocated mdat.
+    let (moov_start, moov_len) = find_top_box(&served, b"moov").expect("moov");
+    let moov = &served[moov_start..moov_start + moov_len];
+    let entries = stco_entries(moov);
+    assert_eq!(entries.len(), 2, "audio and chapter track offsets");
+    let (mdat_start, _) = find_top_box(&served, b"mdat").expect("mdat");
+    assert_eq!(
+        entries[0] as usize, mdat_start,
+        "audio chunk at payload start"
+    );
+    assert_eq!(
+        entries[1] as usize,
+        mdat_start + 4,
+        "chapter chunk 4 bytes in"
+    );
+
+    // The audio payload itself is untouched, and the Nero chapter list survives.
+    assert_eq!(&served[mdat_start..], &audio[..]);
+    assert!(
+        served.windows(4).any(|w| w == b"chpl"),
+        "Nero chapter list should be carried through"
+    );
+}
+
 #[test]
 fn refresh_picks_up_externally_added_track() {
     use musefs_db::{Format, NewTrack, Tag};

@@ -173,6 +173,74 @@ pub fn minimal_m4a(mdat_payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Build a chaptered `.m4b`: `minimal_m4a`'s layout plus a QuickTime chapter
+/// track (a second `trak` with a `text` handler and its own 1-entry `stco`) and
+/// a Nero chapter list (`chpl`) in `udta` — what ffmpeg writes for a file with
+/// chapters. Both tracks' chunks live in the single `mdat`, and both `stco`
+/// entries are set to their true absolute file offsets, so a retag that resizes
+/// the `moov` must relocate both or the chapter track points into the wrong
+/// place (#672).
+///
+/// `mdat_payload` must be at least 4 bytes: the audio chunk starts at its front
+/// and the chapter chunk 4 bytes in.
+pub fn chaptered_m4b(mdat_payload: &[u8]) -> Vec<u8> {
+    assert!(mdat_payload.len() >= 4, "need room for two chunks");
+
+    let ilst = bx(b"ilst", &bx(b"\xa9nam", &m4a_data_atom(1, b"Orig Book")));
+    let mut meta_hdlr = vec![0u8; 8];
+    meta_hdlr.extend_from_slice(b"mdir");
+    meta_hdlr.extend_from_slice(b"appl");
+    meta_hdlr.extend_from_slice(&[0u8; 9]);
+    let mut meta = vec![0u8; 4]; // FullBox version/flags
+    meta.extend(bx(b"hdlr", &meta_hdlr));
+    meta.extend(ilst);
+    // chpl: version/flags + reserved, a chapter count, then per chapter a 64-bit
+    // timestamp and a length-prefixed title. No file offsets.
+    let title = "Chapter One";
+    let mut chpl_p = vec![0u8; 5];
+    chpl_p.push(1); // one chapter
+    chpl_p.extend_from_slice(&0u64.to_be_bytes()); // start, in 100ns units
+    chpl_p.push(u8::try_from(title.len()).unwrap());
+    chpl_p.extend_from_slice(title.as_bytes());
+    let udta = bx(
+        b"udta",
+        &[bx(b"meta", &meta), bx(b"chpl", &chpl_p)].concat(),
+    );
+
+    let trak = |handler: &[u8; 4]| {
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend_from_slice(handler);
+        hdlr.extend_from_slice(&[0u8; 12]);
+        let mut stco = vec![0u8; 4];
+        stco.extend_from_slice(&1u32.to_be_bytes());
+        stco.extend_from_slice(&0u32.to_be_bytes()); // patched below
+        let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+        bx(b"trak", &bx(b"mdia", &[bx(b"hdlr", &hdlr), minf].concat()))
+    };
+    let moov = bx(
+        b"moov",
+        &[bx(b"mvhd", &[0u8; 8]), trak(b"soun"), trak(b"text"), udta].concat(),
+    );
+    let mut out = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", mdat_payload)].concat();
+
+    // Point each track's chunk offset at a real position inside the mdat payload:
+    // the audio chunk at its start, the chapter chunk 4 bytes in. Both `stco`
+    // occurrences precede `mdat`, in track order.
+    let payload_start = u32::try_from(out.len() - mdat_payload.len()).unwrap();
+    let mut from = 0;
+    for chunk in [payload_start, payload_start + 4] {
+        let at = from
+            + out[from..]
+                .windows(4)
+                .position(|w| w == b"stco")
+                .expect("stco present");
+        let entry = at + 4 + 4 + 4; // past "stco" type + version/flags + entry count
+        out[entry..entry + 4].copy_from_slice(&chunk.to_be_bytes());
+        from = entry;
+    }
+    out
+}
+
 /// Build a minimal valid M4A with `moov` AFTER `mdat`. Same box contents as
 /// `minimal_m4a`; only top-level order differs — `moov` trails `mdat`, so a
 /// bounded-read implementation must seek backward over the payload to reach the

@@ -354,7 +354,7 @@ fn build_udta_no_art_round_trips() {
         TagInput::new("title", "Song"),
         TagInput::new("tracknumber", "5"),
     ];
-    let (segs, streamed) = build_udta(&tags, &[], &[]).unwrap();
+    let (segs, streamed) = build_udta(&tags, &[], &[], None).unwrap();
     assert_eq!(streamed, 0);
     let prefix = materialize_udta(&segs);
     let b = read_box(&prefix, 0).unwrap();
@@ -383,7 +383,7 @@ fn build_udta_with_art_reserves_size_without_image() {
         height: 0,
         data_len: BlobLen::new(100).unwrap(),
     };
-    let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], &[art]).unwrap();
+    let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], &[art], None).unwrap();
     assert_eq!(streamed, 100);
     // The image streams as the final segment; the udta size field accounts for it.
     assert!(matches!(
@@ -418,7 +418,7 @@ fn build_udta_rejects_oversize_art() {
         data_len: BlobLen::new(u64::from(u32::MAX) + 1).unwrap(),
     };
     assert!(matches!(
-        build_udta(&[TagInput::new("title", "T")], &[], &[art]),
+        build_udta(&[TagInput::new("title", "T")], &[], &[art], None),
         Err(FormatError::TooLarge)
     ));
 }
@@ -432,7 +432,7 @@ fn build_udta_groups_multi_value_text() {
         TagInput::new("genre", "Rock"),
         TagInput::new("genre", "Metal"),
     ];
-    let (segs, streamed) = build_udta(&tags, &[], &[]).unwrap();
+    let (segs, streamed) = build_udta(&tags, &[], &[], None).unwrap();
     assert_eq!(streamed, 0);
     let prefix = materialize_udta(&segs);
 
@@ -467,7 +467,7 @@ fn build_udta_groups_multi_value_text() {
 fn build_udta_empty_tags_is_valid() {
     // A real file with no tags must still yield a structurally valid (empty)
     // udta, not a malformed box.
-    let (segs, streamed) = build_udta(&[], &[], &[]).unwrap();
+    let (segs, streamed) = build_udta(&[], &[], &[], None).unwrap();
     assert_eq!(streamed, 0);
     let prefix = materialize_udta(&segs);
     let b = read_box(&prefix, 0).unwrap();
@@ -561,6 +561,209 @@ fn synthesize_no_art_patches_stco() {
     // The new file head re-parses as a valid moov of the declared size.
     let moov = find_moov_in_head(&head);
     assert_eq!(moov.end(), head.len() - scan.mdat_header.len());
+}
+
+/// A non-audio trak with the given handler and a one-entry `stco` holding
+/// `chunk_offset` — the shape a QuickTime chapter track has.
+fn handler_trak(handler: &[u8; 4], chunk_offset: u32) -> Vec<u8> {
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&chunk_offset.to_be_bytes());
+    let mut hdlr_p = vec![0u8; 8];
+    hdlr_p.extend_from_slice(handler);
+    hdlr_p.extend_from_slice(&[0u8; 12]);
+    let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+    let mdia = bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat());
+    bx(b"trak", &mdia)
+}
+
+/// A chaptered `.m4b`: one `soun` trak whose single chunk is at `audio_chunk`,
+/// plus a chapter trak (handler `handler`) whose chunk is at `chapter_chunk`.
+/// Both chunks live in the same `mdat`, as ffmpeg and mp4v2 emit them.
+fn mk_mp4_chaptered(handler: &[u8; 4], audio_chunk: u32, chapter_chunk: u32) -> Vec<u8> {
+    let mut stco = vec![0u8; 4];
+    stco.extend_from_slice(&1u32.to_be_bytes());
+    stco.extend_from_slice(&audio_chunk.to_be_bytes());
+    let mut hdlr_p = vec![0u8; 8];
+    hdlr_p.extend_from_slice(b"soun");
+    hdlr_p.extend_from_slice(&[0u8; 12]);
+    let minf = bx(b"minf", &bx(b"stbl", &bx(b"stco", &stco)));
+    let soun = bx(
+        b"trak",
+        &bx(b"mdia", &[bx(b"hdlr", &hdlr_p), minf].concat()),
+    );
+    let moov = bx(
+        b"moov",
+        &[
+            bx(b"mvhd", &[0u8; 8]),
+            soun,
+            handler_trak(handler, chapter_chunk),
+        ]
+        .concat(),
+    );
+    [
+        bx(b"ftyp", b"M4A isom"),
+        moov,
+        bx(b"mdat", b"AUDIODATACHAPTERS"),
+    ]
+    .concat()
+}
+
+#[test]
+fn accepts_one_audio_track_plus_a_chapter_track() {
+    // Chapters ride as a second `text`/`sbtl` track, which is the whole reason
+    // the .m4b extension exists — rejecting them rejected most audiobooks (#672).
+    for handler in [b"text", b"sbtl"] {
+        let buf = mk_mp4_chaptered(handler, 0, 9);
+        let b = locate_audio(&buf).unwrap();
+        assert_eq!(b.audio_length, 17);
+        assert_eq!(&buf[usize_from(b.audio_offset)..][..9], b"AUDIODATA");
+    }
+}
+
+#[test]
+fn rejects_a_video_track_alongside_audio_and_names_the_handlers() {
+    let buf = mk_mp4_chaptered(b"vide", 0, 9);
+    let err = locate_audio(&buf).unwrap_err();
+    // The message names what was found, so the skip explains itself instead of
+    // landing in an opaque `unparseable` tally.
+    let msg = err.to_string();
+    assert!(msg.contains("soun"), "{msg}");
+    assert!(msg.contains("vide"), "{msg}");
+}
+
+#[test]
+fn rejects_a_moov_with_no_audio_track() {
+    let moov = bx(
+        b"moov",
+        &[bx(b"mvhd", &[0u8; 8]), handler_trak(b"text", 0)].concat(),
+    );
+    let buf = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", b"X")].concat();
+    let msg = locate_audio(&buf).unwrap_err().to_string();
+    assert!(msg.contains("text"), "{msg}");
+}
+
+#[test]
+fn rejects_a_trak_whose_handler_is_unreadable() {
+    // A `trak` with no `mdia/hdlr` cannot be classified; it is described rather
+    // than silently accepted.
+    let headless = bx(b"trak", &bx(b"mdia", &bx(b"minf", b"")));
+    let moov = bx(
+        b"moov",
+        &[bx(b"mvhd", &[0u8; 8]), soun_trak(), headless].concat(),
+    );
+    let buf = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", b"X")].concat();
+    let msg = locate_audio(&buf).unwrap_err().to_string();
+    assert!(msg.contains("<no hdlr>"), "{msg}");
+}
+
+/// Every trak's `stco` entries in a synthesized head, in track order.
+fn all_stco(head: &[u8]) -> Vec<Vec<u32>> {
+    let moov = find_moov_in_head(head);
+    let mp = moov.payload(head);
+    child_boxes(mp)
+        .unwrap()
+        .into_iter()
+        .filter(|b| &b.kind == b"trak")
+        .map(|t| {
+            let trak = t.payload(mp);
+            let (sp, sl) = find_path(trak, &[b"mdia", b"minf", b"stbl", b"stco"])
+                .unwrap()
+                .unwrap();
+            let stco = &trak[sp..sp + sl];
+            let count = u32::from_be_bytes(stco[4..8].try_into().unwrap()) as usize;
+            (0..count)
+                .map(|i| u32::from_be_bytes(stco[8 + i * 4..12 + i * 4].try_into().unwrap()))
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn synthesize_patches_the_chapter_tracks_offsets_too() {
+    // Patching only the first trak would leave the chapter track pointing into
+    // the old layout — worse than rejecting the file (#672).
+    let buf = mk_mp4_chaptered(b"text", 0, 9);
+    let scan = read_structure(&buf).unwrap();
+    let layout = synthesize_layout(&scan, &[TagInput::new("title", "New")], &[], &[]).unwrap();
+
+    let head = inline_head(&layout);
+    // The mdat payload is the BackingAudio tail, so it now starts where the head ends.
+    let delta = u32::try_from(head.len() as u64 - scan.mdat_payload_offset).unwrap();
+    assert_eq!(all_stco(&head), vec![vec![delta], vec![9 + delta]]);
+}
+
+/// A Nero chapter-list box: version/flags, a count, then per chapter a 64-bit
+/// timestamp and a length-prefixed title. No file offsets, which is why it can be
+/// copied through verbatim.
+fn chpl_box(titles: &[&str]) -> Vec<u8> {
+    let mut p = vec![0u8; 5]; // version/flags + reserved
+    p.push(u8::try_from(titles.len()).unwrap());
+    for (i, t) in titles.iter().enumerate() {
+        p.extend_from_slice(&(i as u64 * 10_000_000).to_be_bytes());
+        p.push(u8::try_from(t.len()).unwrap());
+        p.extend_from_slice(t.as_bytes());
+    }
+    bx(b"chpl", &p)
+}
+
+#[test]
+fn synthesize_carries_the_nero_chapter_list_through() {
+    // ffmpeg writes a `chpl` alongside the chapter track on every chaptered file,
+    // so rebuilding `udta` from the store alone would cost chapters on players
+    // that read only `chpl` (#672).
+    let chpl = chpl_box(&["Chapter One", "Chapter Two"]);
+    let udta = bx(b"udta", &[bx(b"meta", &[0u8; 4]), chpl.clone()].concat());
+    let moov = bx(
+        b"moov",
+        &[bx(b"mvhd", &[0u8; 8]), soun_trak(), udta].concat(),
+    );
+    let buf = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", b"AUDIO")].concat();
+
+    let scan = read_structure(&buf).unwrap();
+    let layout = synthesize_layout(&scan, &[TagInput::new("title", "New")], &[], &[]).unwrap();
+    let head = inline_head(&layout);
+
+    // The chpl survives byte-for-byte, inside the regenerated udta and after meta.
+    let moov_box = find_moov_in_head(&head);
+    let mp = moov_box.payload(&head);
+    let new_udta = find_box(mp, b"udta").unwrap().unwrap();
+    let inner = new_udta.payload(mp);
+    let kinds: Vec<[u8; 4]> = child_boxes(inner).unwrap().iter().map(|b| b.kind).collect();
+    assert_eq!(kinds, vec![*b"meta", *b"chpl"]);
+    let c = find_box(inner, b"chpl").unwrap().unwrap();
+    assert_eq!(&inner[c.start..c.end()], &chpl[..]);
+    // The declared moov size still matches what was emitted.
+    assert_eq!(moov_box.end(), head.len() - scan.mdat_header.len());
+}
+
+#[test]
+fn synthesize_rejects_a_track_with_no_chunk_offset_box() {
+    // Leaving a track unpatched is corruption, so a `stbl` with neither `stco`
+    // nor `co64` fails synthesis rather than being skipped.
+    let chapterless = bx(
+        b"trak",
+        &bx(
+            b"mdia",
+            &[
+                bx(b"hdlr", &{
+                    let mut p = vec![0u8; 8];
+                    p.extend_from_slice(b"text");
+                    p.extend_from_slice(&[0u8; 12]);
+                    p
+                }),
+                bx(b"minf", &bx(b"stbl", b"")),
+            ]
+            .concat(),
+        ),
+    );
+    let moov = bx(
+        b"moov",
+        &[bx(b"mvhd", &[0u8; 8]), soun_trak(), chapterless].concat(),
+    );
+    let buf = [bx(b"ftyp", b"M4A isom"), moov, bx(b"mdat", b"X")].concat();
+    let scan = read_structure(&buf).unwrap();
+    assert!(synthesize_layout(&scan, &[TagInput::new("title", "N")], &[], &[]).is_err());
 }
 
 /// Like `mk_mp4` but the soun trak's stbl carries a `co64` (8-byte offsets)
@@ -864,7 +1067,7 @@ fn build_udta_round_trips_freeform_and_vocabulary() {
         TagInput::new("MyRating", "5"), // user-defined -> ----
         TagInput::new("musicbrainz_albumid", "abc-123"), // vocabulary -> ----
     ];
-    let (segs, _streamed) = build_udta(&tags, &[], &[]).unwrap();
+    let (segs, _streamed) = build_udta(&tags, &[], &[], None).unwrap();
     let udta = materialize_udta(&segs);
     // build_udta returns a full `udta` box; read_tags expects a buffer containing
     // moov/udta/meta/ilst, so wrap udta in a minimal moov for the round trip.
@@ -893,7 +1096,7 @@ fn build_udta_round_trips_track_and_disc_totals() {
         TagInput::new("tracknumber", "3/12"),
         TagInput::new("discnumber", "1/2"),
     ];
-    let (segs, _streamed) = build_udta(&tags, &[], &[]).unwrap();
+    let (segs, _streamed) = build_udta(&tags, &[], &[], None).unwrap();
     let udta = materialize_udta(&segs);
     let moov = boxed(b"moov", &udta).unwrap();
     let tags = read_tags(&moov);
@@ -916,7 +1119,7 @@ fn build_udta_round_trips_integer_atoms() {
         TagInput::new("compilation", "1"),
         TagInput::new("gapless", "1"),
     ];
-    let (segs, _s) = build_udta(&tags, &[], &[]).unwrap();
+    let (segs, _s) = build_udta(&tags, &[], &[], None).unwrap();
     let udta = materialize_udta(&segs);
     // Emitted as the real iTunes atoms, not generic `----` freeform atoms, with
     // exact widths: 8 (atom hdr) + 8 (data hdr) + 8 (type+locale) + value bytes.
@@ -1257,7 +1460,7 @@ fn build_udta_png_art_uses_type_code_14() {
             height: 0,
             data_len: BlobLen::new(10).unwrap(),
         };
-        let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art]).unwrap();
+        let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art], None).unwrap();
         let prefix = materialize_udta(&segs);
         // covr layout: [covr_size u32]["covr"][data_size u32]["data"][type u32][locale u32]
         let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
@@ -1280,7 +1483,7 @@ fn build_udta_art_box_sizes_are_exact() {
         height: 0,
         data_len: BlobLen::new(10).unwrap(),
     };
-    let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art]).unwrap();
+    let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art], None).unwrap();
     let prefix = materialize_udta(&segs);
     let cpos = prefix.windows(4).position(|w| w == b"covr").expect("covr");
     let covr_size = u32::from_be_bytes(prefix[cpos - 4..cpos].try_into().unwrap());
@@ -1301,7 +1504,7 @@ fn build_udta_multiple_arts_one_covr_n_data_atoms() {
         data_len: BlobLen::new(len).unwrap(),
     };
     let arts = [art(1, "image/jpeg", 10), art(2, "image/png", 20)];
-    let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], &arts).unwrap();
+    let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], &arts, None).unwrap();
     assert_eq!(streamed, 30);
 
     // Exactly one covr atom, sized for both data atoms: 8 + Σ(16 + len).
@@ -1363,7 +1566,7 @@ fn build_udta_two_arts_round_trips_through_read_pictures() {
         data_len: BlobLen::new(len).unwrap(),
     };
     let arts = [art(1, "image/jpeg", 5), art(2, "image/png", 9)];
-    let (segs, _) = build_udta(&[TagInput::new("title", "Song")], &[], &arts).unwrap();
+    let (segs, _) = build_udta(&[TagInput::new("title", "Song")], &[], &arts, None).unwrap();
     let prefix = materialize_udta(&segs);
     let buf = [
         bx(b"ftyp", b"M4A "),
@@ -1397,7 +1600,7 @@ fn build_udta_udta_size_exactly_u32_max_is_ok() {
     }
     // Derive the fixed overhead from the udta size field (segs[0] inline), with
     // data_len 1 (BlobLen is non-zero), without materializing any image bytes.
-    let (segs0, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art(1)]).unwrap();
+    let (segs0, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art(1)], None).unwrap();
     let Segment::Inline(h0) = &segs0[0] else {
         panic!("inline head")
     };
@@ -1405,7 +1608,7 @@ fn build_udta_udta_size_exactly_u32_max_is_ok() {
     let max_len = u64::from(u32::MAX) - overhead;
 
     let (segs_max, streamed) =
-        build_udta(&[TagInput::new("title", "T")], &[], &[art(max_len)]).unwrap();
+        build_udta(&[TagInput::new("title", "T")], &[], &[art(max_len)], None).unwrap();
     assert_eq!(streamed, max_len);
     let Segment::Inline(h_max) = &segs_max[0] else {
         panic!("inline head")
@@ -1416,7 +1619,12 @@ fn build_udta_udta_size_exactly_u32_max_is_ok() {
     );
 
     assert!(matches!(
-        build_udta(&[TagInput::new("title", "T")], &[], &[art(max_len + 1)]),
+        build_udta(
+            &[TagInput::new("title", "T")],
+            &[],
+            &[art(max_len + 1)],
+            None
+        ),
         Err(FormatError::TooLarge)
     ));
 }
@@ -1910,7 +2118,7 @@ fn build_udta_checked_art_len_rejects_overflow() {
         data_len: BlobLen::new(data_len).unwrap(),
     };
     assert_eq!(
-        build_udta(&[], &[], &[mk(u64::MAX)]).err(),
+        build_udta(&[], &[], &[mk(u64::MAX)], None).err(),
         Some(FormatError::TooLarge)
     );
 }
@@ -1926,7 +2134,7 @@ fn build_udta_checked_binary_tag_len_rejects_overflow() {
         len: BlobLen::new(u64::MAX).unwrap(),
     }];
     assert_eq!(
-        build_udta(&[], &bins, &[]).err(),
+        build_udta(&[], &bins, &[], None).err(),
         Some(FormatError::TooLarge)
     );
 }

@@ -1,9 +1,11 @@
 # M4A
 
 How musefs scans and synthesizes MP4-container audio (`.m4a`, `.m4b`). Only
-unfragmented files with exactly one track, and that track audio (`soun`), are
-accepted; anything else is skipped at scan time. For the segment model these
-layouts plug into, see [the segment model](../architecture/serving.md#the-segment-model).
+unfragmented files with exactly one audio (`soun`) track are accepted; chapter
+tracks (`text`, `sbtl`) may accompany it, and any other track — video above all
+— is skipped at scan time with an error naming the handler types found. For the
+segment model these layouts plug into, see
+[the segment model](../architecture/serving.md#the-segment-model).
 
 ## What round-trips
 
@@ -32,6 +34,14 @@ layouts plug into, see [the segment model](../architecture/serving.md#the-segmen
 - **Cover art**: every `data` child of a `covr` atom (the iTunes
   multiple-artwork convention) is ingested; synthesis emits one `covr` atom
   with one `data` child per stored art row, in order, image bytes streamed.
+- **Chapters, both conventions.** A QuickTime chapter track — the second
+  `text`/`sbtl` track that is the reason `.m4b` exists — is kept verbatim like
+  any other structural `moov` child, and its chunk offsets are relocated
+  alongside the audio track's. A Nero chapter list (`moov/udta/chpl`) is copied
+  through byte-for-byte into the regenerated `udta`; it holds timestamps and
+  titles, never a file offset, so relocating `mdat` cannot invalidate it.
+  ffmpeg writes both on every chaptered file, and players differ on which they
+  read, so both are preserved.
 
 ## Lossy edges
 
@@ -61,10 +71,11 @@ box and serves `[ftyp][regenerated moov][mdat header][mdat payload]`:
  ┌──────────────────────────────────────────────┐ ┐
  │ █ ftyp, copied verbatim              (Inline) │ │
  │ █ moov: kept structural children,    (Inline) │ │ regenerated
- │ █   stco/co64 offset values += Δ              │ │ front
+ │ █   every track's stco/co64 += Δ              │ │ front
  │ █ fresh udta/meta/ilst framing       (Inline) │ │
  │ █ ---- framing + ▒ freeform body  (BinaryTag) │ │
  │ █ covr framing + ▒ image bytes     (ArtImage) │ │
+ │ █ chpl, copied from the old udta     (Inline) │ │
  │ █ mdat header                        (Inline) │ │
  ├──────────────────────────────────────────────┤ ┘
  │ ░ mdat payload, verbatim       (BackingAudio) │
@@ -73,18 +84,21 @@ box and serves `[ftyp][regenerated moov][mdat header][mdat payload]`:
          Δ = new mdat payload offset − old
 ```
 
-1. The scan keeps `moov`'s structural children and drops its old `udta`. A
-   fresh `udta`/`meta`/`ilst` is built from the DB: inline box framing, with
+1. The scan keeps `moov`'s structural children and drops its old `udta`, save
+   for a `chpl` chapter list, which is carried through. A fresh
+   `udta`/`meta`/`ilst` is built from the DB: inline box framing, with
    each opaque `----` value and each cover image spliced in as streamed
    `BinaryTag`/`ArtImage` segments. Every enclosing box size accounts for
    the streamed lengths, so the spliced bytes land exactly where the sizes
    say.
 2. The `mdat` payload is served verbatim (`BackingAudio`), merely relocated:
-   every chunk offset in `stco` (32-bit) or `co64` (64-bit) shifts by one
-   constant delta. Only offset *values* are patched, never box sizes, so the
-   new `moov` size is computable before the delta — no circular dependency.
-   A 32-bit `stco` offset that would overflow fails synthesis rather than
-   corrupt.
+   every chunk offset in `stco` (32-bit) or `co64` (64-bit), in *every* track,
+   shifts by one constant delta. One delta suffices because a file has a single
+   `mdat`, so a chapter track's chunks relocate exactly as the audio track's do.
+   Only offset *values* are patched, never box sizes, so the new `moov` size is
+   computable before the delta — no circular dependency. A 32-bit `stco` offset
+   that would overflow fails synthesis rather than corrupt, and a track with
+   neither `stco` nor `co64` fails it too rather than being left unpatched.
 3. A `moov` that sits after `mdat` (common for faststart-less files) is
    handled by a streaming reader that skips the mdat payload — the
    potentially hundreds-of-MB payload is never read at resolve time.

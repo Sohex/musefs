@@ -14,6 +14,15 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- Chaptered `.m4b` files are supported. A `moov` may now hold chapter tracks
+  (`text`, `sbtl`) alongside its single audio (`soun`) track, and every track's
+  `stco`/`co64` chunk offsets are relocated when the `moov` is regenerated, not
+  just the first track's. A Nero chapter list (`moov/udta/chpl`) is copied
+  verbatim into the rebuilt `udta`. Previously every chaptered file — which is
+  to say most of an audiobook library, and chapters are why the `.m4b`
+  extension exists — was counted as `unparseable` at scan time
+  ([#672](https://github.com/Sohex/musefs/issues/672)).
+
 - `Musefs::drain_prefetch` waits for the Phase-2 prefetch pool to finish every
   job it accepted, or a timeout to elapse. Serving never needs it — prefetch is
   fire-and-forget there — but sampling the prefetch counters without it misses
@@ -53,6 +62,12 @@ see the [Release notes](release-notes.md).
   synthesis warns too, not just the FUSE errno path.
 
 ### Changed
+
+- An MP4 file skipped for its track layout now reports the handler types found
+  (`unsupported MP4 track layout: expected one audio (soun) track, optionally
+  with text/sbtl chapter tracks; found [soun, vide]`) instead of a bare "not a
+  supported MP4/M4A file", so the skip explains itself
+  ([#672](https://github.com/Sohex/musefs/issues/672)).
 
 - `benches/storage_tunables_bench.sh` gains a `prefetch` mode that A/Bs two or
   more musefs binaries (`MUSEFS_PREFETCH_BINS="label=path ..."`) over one
