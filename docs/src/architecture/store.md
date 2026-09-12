@@ -4,9 +4,10 @@
 
 `musefs-db/src/schema.rs` defines the schema as an ordered list of migrations
 (`MIGRATIONS`: the `MIGRATION_V1` baseline, `MIGRATION_V2`, which adds the
-scanner-owned `fingerprint`/`content_hash` columns, and `MIGRATION_V3`, which
-widens the `tags.value` and `track_art.description` caps); `user_version`
-records the schema version (3).
+scanner-owned `fingerprint`/`content_hash` columns, `MIGRATION_V3`, which
+widens the `tags.value` and `track_art.description` caps, and `MIGRATION_V4`,
+which retires every fingerprint written before the value included sampled
+audio); `user_version` records the schema version (4).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
@@ -42,12 +43,24 @@ external tools must run `musefs scan` rather than compute them.
 `tracks.fingerprint` and `tracks.content_hash` are also scanner-owned,
 read-only-derived columns — like `structural_blocks`, they are never part of
 the editable tag contract and external tools never write them.
-`fingerprint` is a SHA-256 over the probe's parsed output (deterministic per
-file, excludes filesystem stamps such as `mtime`/`ctime`), computed in the
-parallel probe worker at zero extra I/O. `content_hash` is a full-file
-SHA-256 of the *current* backing file, stored as 64-char hex; it is computed
-only at the `full` checksum tier (`--checksum=full`), which requires an eager
-whole-file read.
+
+`fingerprint` is a SHA-256 over the probe's parsed output — format, audio
+bounds, text tags, art, binary tags, structural blocks — plus three bounded
+windows of sampled audio, taken at the start, midpoint and end of the audio
+region. It is deterministic per file and excludes every filesystem stamp such
+as `mtime`/`ctime`. The audio windows are what make it content-discriminating
+outside FLAC: the parsed output alone carries no audio bytes for MP3, M4A, Ogg
+or WAV, so two different files with the same tags, the same art and an equal
+audio length used to share one fingerprint, and a move could retarget the wrong
+one. Sampling adds at most 24 KiB of positioned reads per file, against the
+descriptor the probe already holds. It samples the audio rather than hashing all
+of it, so the fingerprint stays a heuristic: two files agreeing on every sampled
+window and differing only between them still collide, which is what
+`content_hash` arbitrates.
+
+`content_hash` is a full-file SHA-256 of the *current* backing file, stored as
+64-char hex. It is computed only at the `full` checksum tier
+(`--checksum=full`), which requires an eager whole-file read.
 
 Two rules keep "of the current backing file" true. Both checksums are derived
 inside the probe's `fstat` sandwich, from its own descriptor rather than by
@@ -60,9 +73,9 @@ the `full` tier clears the column whenever it observes that the recorded bytes
 changed. A pass over a file that has not changed keeps what is stored, so a
 cheap pass never undoes an expensive one.
 
-Neither column is `UNIQUE` by design — duplicate-content tracks legitimately share
-both values. On a normal `scan`, when a probed file's path is not yet in the
-store and its fingerprint matches exactly one orphaned row (a row whose
+Neither column is `UNIQUE` by design — duplicate-content tracks legitimately
+share both values. On a normal `scan`, when a probed file's path is not yet in
+the store and its fingerprint matches exactly one orphaned row (a row whose
 `backing_path` no longer exists on disk), the scanner retargets that row to
 the new path in place, preserving its `id`, tags, and art rather than
 orphaning them. This is how musefs recovers from a backing-library move or

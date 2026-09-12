@@ -134,37 +134,100 @@ fn strict_refuses_when_candidate_has_no_content_hash() {
     );
 }
 
+/// Bytes per sampled audio window in the cheap fingerprint, mirrored from
+/// `scan::AUDIO_SAMPLE_BYTES`. If that constant grows past a third of
+/// `colliding_audio`'s region the collision stops being one, and the two tests
+/// built on it fail loudly rather than quietly testing nothing.
+const AUDIO_SAMPLE_BYTES: usize = 8 << 10;
+
+/// Audio bytes that fingerprint identically but hash differently.
+///
+/// The fingerprint samples the start, middle and end of the audio region, so a
+/// deliberate collision puts `marker` in the gap between the first and middle
+/// windows — sampled by neither, covered by the full-file hash. Constructing it
+/// on purpose is what keeps the two tests below about *strictness*: before
+/// audio sampling, any two same-length files with the same tags collided for
+/// free (#691), and these fixtures were accidentally relying on that.
+fn colliding_audio(marker: u8) -> Vec<u8> {
+    let mut audio = vec![0x11u8; 10 * AUDIO_SAMPLE_BYTES];
+    audio[AUDIO_SAMPLE_BYTES + 16] = marker;
+    audio
+}
+
 #[test]
 fn fast_retargets_despite_content_mismatch() {
     let dir = tempfile::tempdir().unwrap();
-    let a = write_a_flac(dir.path(), "a.flac", &[0xAA; 64]);
+    let a = write_a_flac(dir.path(), "a.flac", &colliding_audio(0xAA));
     let db = Db::open_in_memory().unwrap();
     scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Fast)).unwrap();
-    let id = db.list_tracks().unwrap()[0].id;
+    let seeded = db.list_tracks().unwrap()[0].clone();
 
-    // Delete A; create B with the same tags + same length but different bytes:
-    // same fingerprint, different content_hash.
+    // Delete A; create B sharing its fingerprint but not its content hash.
     std::fs::remove_file(&a).unwrap();
-    write_a_flac(dir.path(), "b.flac", &[0xBB; 64]);
+    write_a_flac(dir.path(), "b.flac", &colliding_audio(0xBB));
     scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Fast)).unwrap();
 
     let tracks = db.list_tracks().unwrap();
     assert_eq!(tracks.len(), 1, "Fast retargets despite content mismatch");
-    assert_eq!(tracks[0].id, id, "retarget keeps the id");
+    assert_eq!(tracks[0].id, seeded.id, "retarget keeps the id");
     assert!(tracks[0].backing_path.ends_with("b.flac"));
+    assert_eq!(
+        tracks[0].fingerprint, seeded.fingerprint,
+        "the fixture's collision is what Fast retargeted on"
+    );
+    // #689: the row must not keep A's hash now that it describes B.
+    let hash = tracks[0]
+        .content_hash
+        .as_deref()
+        .expect("full tier hashes B");
+    assert_ne!(Some(hash), seeded.content_hash.as_deref());
+}
+
+/// The same collision under `--fast` at the fingerprint tier, where no hash for
+/// the arriving file exists: the retarget still happens, but the candidate's
+/// stored hash describes the file that left, so it must be dropped (#689).
+#[test]
+fn fast_retarget_without_a_new_hash_clears_the_stale_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_a_flac(dir.path(), "a.flac", &colliding_audio(0xAA));
+    let db = Db::open_in_memory().unwrap();
+    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Fast)).unwrap();
+    assert!(db.list_tracks().unwrap()[0].content_hash.is_some());
+
+    std::fs::remove_file(&a).unwrap();
+    write_a_flac(dir.path(), "b.flac", &colliding_audio(0xBB));
+    scan_directory_with(
+        &db,
+        dir.path(),
+        &ScanOptions {
+            jobs: 1,
+            checksum: ChecksumTier::Fingerprint,
+            strictness: MatchStrictness::Fast,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1, "Fast still retargets");
+    assert!(tracks[0].backing_path.ends_with("b.flac"));
+    assert_eq!(
+        tracks[0].content_hash, None,
+        "an unconfirmed retarget must not inherit the departed file's hash"
+    );
 }
 
 #[test]
 fn auto_rejects_forged_fingerprint_match() {
     let dir = tempfile::tempdir().unwrap();
-    let a = write_a_flac(dir.path(), "a.flac", &[0xAA; 64]);
+    let a = write_a_flac(dir.path(), "a.flac", &colliding_audio(0xAA));
     let db = Db::open_in_memory().unwrap();
     scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
     let id = db.list_tracks().unwrap()[0].id;
 
     // Delete A; create B with the same fingerprint but different content.
     std::fs::remove_file(&a).unwrap();
-    write_a_flac(dir.path(), "b.flac", &[0xBB; 64]);
+    write_a_flac(dir.path(), "b.flac", &colliding_audio(0xBB));
     scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Auto)).unwrap();
 
     // A carries a content_hash (Full seed) => Auto full-hashes B, mismatch => fresh insert.
@@ -463,38 +526,57 @@ fn unchanged_file_at_fingerprint_tier_keeps_its_content_hash() {
     );
 }
 
-/// A `--fast` retarget confirms nothing by design, so when it produces no hash
-/// for the arriving file the candidate's stored one — which described the file
-/// that left — has to be dropped rather than inherited (#689).
+/// #691, end to end on a non-FLAC format: two different files agreeing on tags
+/// and audio length must not be confused for each other. WAV (like MP3, M4A and
+/// Ogg) preserves no structural block, so before the fingerprint sampled audio
+/// this pair shared one fingerprint and the second file silently retargeted the
+/// first's curated row.
 #[test]
-fn fast_retarget_without_a_new_hash_clears_the_stale_one() {
+fn distinct_wavs_with_equal_tags_and_length_do_not_retarget_onto_each_other() {
     let dir = tempfile::tempdir().unwrap();
-    let a = write_a_flac(dir.path(), "a.flac", &[0xAA; 64]);
+    let a = dir.path().join("a.wav");
+    common::write_wav(&a, &[0xAA; 4096]);
     let db = Db::open_in_memory().unwrap();
-    scan_directory_with(&db, dir.path(), &full_opts(MatchStrictness::Fast)).unwrap();
-    assert!(db.list_tracks().unwrap()[0].content_hash.is_some());
+    scan_directory_with(&db, dir.path(), &opts(ChecksumTier::Fingerprint)).unwrap();
+    let seeded = db.list_tracks().unwrap()[0].clone();
 
+    // A carries no content_hash (fingerprint tier), so the default Auto
+    // strictness has nothing to arbitrate with: the fingerprint alone decides.
     std::fs::remove_file(&a).unwrap();
-    write_a_flac(dir.path(), "b.flac", &[0xBB; 64]);
-    scan_directory_with(
-        &db,
-        dir.path(),
-        &ScanOptions {
-            jobs: 1,
-            checksum: ChecksumTier::Fingerprint,
-            strictness: MatchStrictness::Fast,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    common::write_wav(&dir.path().join("b.wav"), &[0xBB; 4096]);
+    scan_directory_with(&db, dir.path(), &opts(ChecksumTier::Fingerprint)).unwrap();
 
     let tracks = db.list_tracks().unwrap();
-    assert_eq!(tracks.len(), 1, "Fast still retargets");
-    assert!(tracks[0].backing_path.ends_with("b.flac"));
-    assert_eq!(
-        tracks[0].content_hash, None,
-        "an unconfirmed retarget must not inherit the departed file's hash"
+    let b = tracks
+        .iter()
+        .find(|t| t.backing_path.ends_with("b.wav"))
+        .expect("b.wav ingested");
+    assert_ne!(
+        b.id, seeded.id,
+        "different audio must not claim the other file's row"
     );
+    assert_ne!(b.fingerprint, seeded.fingerprint);
+}
+
+/// The other side of the same coin: a genuine move of a non-FLAC file still
+/// retargets, so the sampling did not buy discrimination by breaking move
+/// recovery.
+#[test]
+fn moved_wav_still_retargets_at_fingerprint_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.wav");
+    common::write_wav(&a, &[0xAA; 4096]);
+    let db = Db::open_in_memory().unwrap();
+    scan_directory_with(&db, dir.path(), &opts(ChecksumTier::Fingerprint)).unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+
+    std::fs::rename(&a, dir.path().join("moved.wav")).unwrap();
+    scan_directory_with(&db, dir.path(), &opts(ChecksumTier::Fingerprint)).unwrap();
+
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1, "moved file must not create a second row");
+    assert_eq!(tracks[0].id, id);
+    assert!(tracks[0].backing_path.ends_with("moved.wav"));
 }
 
 /// The `fingerprint`-tier move of a file whose row already carries a

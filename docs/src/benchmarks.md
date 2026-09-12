@@ -1100,6 +1100,13 @@ FUSE mount. Default thread count (`jobs: 0`). 3 runs each, median reported.
 an artefact of RAM eliminating the I/O that would normally dwarf the extra SHA-256 hash and DB write.
 At real SSD rates the fingerprint cost is operationally negligible.
 
+**Both figures above predate #691**, which added three bounded audio windows
+(≤ 24 KiB) to the fingerprint's input. The extra cost is up to three more
+positioned reads per file on a descriptor the probe already holds, so the shape
+is unchanged — a bounded constant per file, not a pass over the file — but on a
+seek-bound backing the tail window is one more seek per file and these
+percentages understate the current tier. Neither bench has been re-run.
+
 ---
 
 ## #666 — Precomputed CRC matrix powers

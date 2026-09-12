@@ -47,11 +47,14 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
   It now says whether the store was written by a newer musefs (upgrade the
   plugin) or predates the plugin (upgrade musefs and run `musefs scan`, which
   migrates in place). This string is what Picard and beets surface verbatim.
-- The store schema is now at `user_version` 3 (musefs #644 widens the
-  `tags.value` and `track_art.description` caps). `EXPECTED_USER_VERSION`
-  tracks it automatically; no plugin change is needed, but a store must be
-  migrated by `musefs scan`/`musefs mount` from a build carrying that migration
-  before these packages will open it.
+- The store schema is now at `user_version` 4 (musefs #644 widens the
+  `tags.value` and `track_art.description` caps; musefs #691 retires every
+  stored `tracks.fingerprint`, whose value now includes sampled audio).
+  `EXPECTED_USER_VERSION` tracks it automatically; no plugin change is needed,
+  but a store must be migrated by `musefs scan`/`musefs mount` from a build
+  carrying those migrations before these packages will open it. Neither
+  migration touches a column these packages write: `fingerprint` is
+  scanner-owned and was never part of the tag contract.
 
 ### Fixed
 

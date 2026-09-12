@@ -90,9 +90,16 @@ failures, are in
 
 - **`none`** — no checksums (legacy behavior).
 - **`fingerprint`** — compute a cheap fingerprint for each file, derived from
-  the probe's parsed output (tags, audio bounds, embedded art). This is the
-  default: it rides the existing probe at essentially no extra I/O cost and
-  is sufficient for routine move detection.
+  the probe's parsed output (tags, audio bounds, embedded art) plus three
+  bounded windows of audio sampled at the start, midpoint and end of the audio
+  region. This is the default: it rides the existing probe, adding at most
+  24 KiB of positioned reads per file and no whole-file pass, and it is
+  sufficient for routine move detection. The audio windows are what make it so
+  for every format — without them, two different MP3, M4A, Ogg or WAV files
+  with the same tags, the same art and an equal audio length share one
+  fingerprint, and a move can retarget the wrong row. It samples the audio
+  rather than hashing all of it, so it remains a heuristic: two files that agree
+  on every sampled window and differ only between them still collide.
 - **`full`** — fingerprint plus an eager full-file SHA-256. Use this when you
   want collision-proof retargeting or a forensic content identity for every
   file. A file this tier cannot hash is **failed**, not ingested one tier
@@ -111,6 +118,14 @@ moved file:
   and trust the fingerprint alone when it does not.
 
 `--fast` and `--strict` are mutually exclusive.
+
+**Upgrading from musefs 1.3.0 or earlier.** The schema upgrade clears every
+stored fingerprint, because the value now includes sampled audio and the old
+ones were computed without it. The next `scan` or `revalidate` recomputes them
+with no flag needed — `revalidate` already re-probes a row missing the checksum
+its tier asks for. Until then those rows cannot be move-recovered, exactly as
+an unfingerprinted row never could, so run one pass before moving files around.
+`content_hash` is untouched by the upgrade.
 
 **Move re-identification workflow.** After moving or reorganizing your backing
 library, run a normal `musefs scan` on the new locations. For each file not

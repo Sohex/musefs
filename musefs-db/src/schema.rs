@@ -363,19 +363,47 @@ CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
 END;
 ";
 
+const MIGRATION_V4: &str = r"
+-- Retire every V1-era `fingerprint` (#691).
+--
+-- The cheap fingerprint used to hash only the probe's *parsed* output. Outside
+-- FLAC -- whose STREAMINFO carries an MD5 of the unencoded audio, and is the
+-- one structural block the probe preserves -- that input domain holds no audio
+-- bytes at all, so two different MP3/M4A/Ogg/WAV files with the same tags, the
+-- same art and an equal audio-region length shared one fingerprint. The
+-- default strictness accepts a fingerprint-only candidate, so such a collision
+-- could retarget a curated row onto audio it was never written for.
+--
+-- The fingerprint now folds in sampled audio bytes, which changes the value for
+-- every file. Rows carrying the old value would claim a fingerprint under an
+-- algorithm that no longer produces it -- a stale content identity of exactly
+-- the kind #689 is about -- so they are nulled here rather than silently
+-- reinterpreted. The next `scan` or `revalidate` recomputes them: revalidate
+-- already re-probes a row missing the checksum its tier asks for, so no new
+-- backfill machinery is needed. `content_hash` is untouched: it is a full-file
+-- SHA-256 and its meaning has not changed.
+--
+-- The cost of nulling is bounded and one-way: a file that moves between this
+-- upgrade and the next scan is not move-recovered (it inserts fresh, as an
+-- unfingerprinted row always has). Leaving the old values in place would not
+-- recover it either -- they cannot match a new-algorithm fingerprint -- so this
+-- trades nothing away for an honest column.
+UPDATE tracks SET fingerprint = NULL;
+";
+
 /// Ring capacity of the `track_changes` changelog. Must match the literal in
 /// MIGRATION_V1 (guarded by `changelog_cap_constant_matches_migration_sql`).
 #[allow(dead_code)]
 pub const CHANGELOG_CAP: i64 = 8192;
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
 
 /// The `user_version` a fully-migrated store carries. Exported so callers and
 /// tests assert "the latest schema" rather than a literal that has to be chased
 /// through every test file each time a migration is appended.
-pub const LATEST_VERSION: i64 = 3;
+pub const LATEST_VERSION: i64 = 4;
 const _: () = assert!(
-    MIGRATIONS.len() == 3,
+    MIGRATIONS.len() == 4,
     "LATEST_VERSION must match MIGRATIONS"
 );
 
@@ -852,6 +880,44 @@ mod baseline_tests {
             .unwrap();
         assert_eq!(fp, None);
         assert_eq!(ch, None);
+    }
+
+    /// V4 retires every fingerprint written under the pre-audio-sampling
+    /// algorithm (#691): an upgraded store must not carry values that claim to
+    /// be fingerprints the current code no longer produces. `content_hash` is
+    /// a full-file SHA-256 whose meaning did not change, so it must survive.
+    #[test]
+    fn migration_v4_clears_stale_fingerprints_and_keeps_content_hashes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Stop at V3 and seed a row the way a V3-era scanner would have.
+        for (target, sql) in (1i64..).zip(super::MIGRATIONS).take(3) {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", target).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tracks
+                (backing_path, format, audio_offset, audio_length, backing_size,
+                 backing_mtime_ns, backing_ctime_ns, updated_at, fingerprint, content_hash)
+             VALUES ('/x.flac','flac',0,10,10,0,0,0, ?1, ?2)",
+            rusqlite::params!["a".repeat(64), "d".repeat(64)],
+        )
+        .unwrap();
+
+        super::migrate(&mut conn).unwrap();
+
+        let (fp, ch): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT fingerprint, content_hash FROM tracks WHERE backing_path='/x.flac'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fp, None, "a pre-V4 fingerprint must not be carried forward");
+        assert_eq!(
+            ch.as_deref(),
+            Some(&"d".repeat(64)[..]),
+            "content_hash means what it always meant"
+        );
     }
 
     /// The SQL literal and the exported constant must not drift.

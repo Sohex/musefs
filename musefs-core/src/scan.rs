@@ -874,6 +874,30 @@ fn read_window(file: &std::fs::File, len: usize) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Append exactly `len` bytes read at `offset` to `out`, counting the read.
+///
+/// `read_exact_at` rather than a tolerated short read (which is what
+/// [`read_window`] wants for a probe prefix that may run past EOF): the only
+/// caller feeds this to a content fingerprint, which has to be deterministic,
+/// so a window that cannot be filled is an error rather than a shorter sample.
+/// Every window asked for lies inside the declared audio region, which the
+/// store's geometry `CHECK` in turn requires to lie inside the file — so a
+/// short one means a torn or mis-declared file, and failing it is the honest
+/// answer.
+fn read_into(
+    file: &std::fs::File,
+    offset: u64,
+    len: usize,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let base = out.len();
+    out.resize(base + len, 0);
+    file.read_exact_at(&mut out[base..], offset)?;
+    crate::metrics::on_scan_read(len as u64);
+    Ok(())
+}
+
 /// Read the file's last 128 bytes (for the MP3 ID3v1 trailer check), or `None`
 /// if the file is shorter than 128 bytes.
 fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<[u8; 128]>> {
@@ -890,9 +914,9 @@ fn read_tail_128(file: &std::fs::File, file_len: u64) -> std::io::Result<Option<
 /// Bounded probe of one backing file: open once, fstat before and after the
 /// probe, and report `Raced` when the file moved mid-probe — so the stored
 /// stamp, the probed bytes and the derived checksums provably share one inode
-/// held still across the whole probe. Never reads the audio payload (M4A uses
-/// the seek reader; front-anchored formats read only the metadata extent),
-/// beyond the whole-file stream `--checksum=full` asks for.
+/// held still across the whole probe. Reads no more of the audio payload than
+/// `tier` asks for (M4A uses the seek reader; front-anchored formats read only
+/// the metadata extent, plus the fingerprint's bounded audio samples).
 ///
 /// `tier`'s checksums are computed *here*, not by the caller, and from this
 /// descriptor rather than by reopening the pathname. Both used to sit outside
@@ -952,11 +976,11 @@ fn checksums_of(
     Ok(match tier {
         ChecksumTier::None => Checksums::default(),
         ChecksumTier::Fingerprint => Checksums {
-            fingerprint: Some(fingerprint_of(p)),
+            fingerprint: Some(fingerprint_of(p, &audio_sample(file, p)?)),
             content_hash: None,
         },
         ChecksumTier::Full => Checksums {
-            fingerprint: Some(fingerprint_of(p)),
+            fingerprint: Some(fingerprint_of(p, &audio_sample(file, p)?)),
             content_hash: Some(full_file_hash(file)?),
         },
     })
@@ -1195,7 +1219,10 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
 pub enum ChecksumTier {
     /// No checksums (legacy behavior).
     None,
-    /// Compute the cheap fingerprint only (rides the probe).
+    /// Compute the cheap fingerprint only. Rides the probe: the hash covers its
+    /// parsed output plus three bounded audio windows read from the descriptor
+    /// the probe already holds (see [`audio_sample`]), so the extra I/O is a
+    /// per-file constant rather than a pass over the file.
     Fingerprint,
     /// Fingerprint plus an eager full-file SHA-256. A file this tier cannot
     /// hash is failed under [`SkipReason::Checksum`] rather than ingested one
@@ -2693,11 +2720,68 @@ pub fn revalidate(db: &Db, root: &Path) -> Result<RevalidateStats> {
     revalidate_with(db, root, &ScanOptions::default())
 }
 
-/// SHA-256 of the probe's parsed output, hex-encoded. This is the cheap content
-/// fingerprint: deterministic per file (the parsed `Probed` is window- and
-/// format-independent), and excludes every filesystem-stamp field. Length-prefix
-/// every variable-length field so concatenation can't alias.
-pub(crate) fn fingerprint_of(p: &Probed) -> String {
+/// Bytes per sampled audio window in the cheap fingerprint. Three windows, so
+/// at most 24 KiB of extra positioned reads per file, against a descriptor the
+/// probe already holds — a bounded constant, not a whole-file stream, so the
+/// tier still rides the probe rather than becoming a second pass over the
+/// library.
+const AUDIO_SAMPLE_BYTES: u64 = 8 << 10;
+
+/// The audio bytes the cheap fingerprint folds in: the start, middle and end of
+/// the file's audio region, concatenated.
+///
+/// This is what makes a non-FLAC fingerprint content-discriminating (#691).
+/// Before it, the fingerprint hashed only the probe's *parsed* output — tags,
+/// art, audio bounds — plus structural blocks, which are FLAC-only and carry
+/// STREAMINFO's MD5 of the unencoded audio. Every other format therefore
+/// contributed no audio bytes at all, so two different MP3/M4A/Ogg/WAV files
+/// with the same tags, the same art and an equal audio length collided — and
+/// the default strictness accepts a fingerprint-only candidate, so the
+/// collision could retarget a curated row onto audio it never described. That
+/// is a collision in a small input domain, not a SHA-256 collision.
+///
+/// Reads are positioned against the probe's descriptor and stay inside its
+/// fstat sandwich, so they see the same generation of the file the parse did.
+fn audio_sample(file: &std::fs::File, p: &Probed) -> std::io::Result<Vec<u8>> {
+    let (off, len) = (p.audio_offset, p.audio_length);
+    // A declared region running past `u64`, or an empty one, samples nothing.
+    // The overflow case is a malformed header the store's geometry `CHECK`
+    // rejects at commit anyway; refusing to sample it keeps the offset
+    // arithmetic below — which is all relative to `off + len` — in range on
+    // untrusted input, rather than relying on the probe's panic boundary.
+    if len == 0 || off.checked_add(len).is_none() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    // Short region: one read covers it, and three windows would overlap anyway.
+    if len <= 3 * AUDIO_SAMPLE_BYTES {
+        read_into(file, off, usize_from(len), &mut out)?;
+        return Ok(out);
+    }
+    let span = usize_from(AUDIO_SAMPLE_BYTES);
+    for at in [
+        off,
+        off + (len - AUDIO_SAMPLE_BYTES) / 2,
+        off + len - AUDIO_SAMPLE_BYTES,
+    ] {
+        read_into(file, at, span, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Domain separator for the fingerprint's hash input. Bumped when the input
+/// domain changes, so a value computed under an older definition is
+/// structurally distinct rather than silently reinterpreted. `MIGRATION_V4`
+/// retired the v1 values this way (audio sampling made every one of them stale).
+const FINGERPRINT_DOMAIN: &[u8] = b"musefs-fingerprint-v2";
+
+/// SHA-256 of the probe's parsed output plus `audio_sample`'s bytes,
+/// hex-encoded. This is the cheap content fingerprint: deterministic per file
+/// (the parsed `Probed` is window- and format-independent, and the sample
+/// offsets are derived from the audio bounds), and excludes every
+/// filesystem-stamp field. Length-prefix every variable-length field so
+/// concatenation can't alias.
+pub(crate) fn fingerprint_of(p: &Probed, audio_sample: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     // Inner fn (not a closure) so it doesn't hold a borrow of `h` across the
     // direct `h.update(...)` calls below.
@@ -2706,6 +2790,7 @@ pub(crate) fn fingerprint_of(p: &Probed) -> String {
         h.update(bytes);
     }
     let mut h = Sha256::new();
+    feed(&mut h, FINGERPRINT_DOMAIN);
     feed(&mut h, p.format.as_str().as_bytes());
     h.update(p.audio_offset.to_le_bytes());
     h.update(p.audio_length.to_le_bytes());
@@ -2733,6 +2818,7 @@ pub(crate) fn fingerprint_of(p: &Probed) -> String {
         feed(&mut h, kind.as_bytes());
         feed(&mut h, body);
     }
+    feed(&mut h, audio_sample);
     format!("{:x}", base16ct::HexDisplay(&h.finalize()))
 }
 

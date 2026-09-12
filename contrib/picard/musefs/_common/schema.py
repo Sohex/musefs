@@ -367,9 +367,37 @@ CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
     WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
 END;
 PRAGMA user_version = 3;
+
+-- ── MIGRATION_V4 ──
+-- Retire every V1-era `fingerprint` (#691).
+--
+-- The cheap fingerprint used to hash only the probe's *parsed* output. Outside
+-- FLAC -- whose STREAMINFO carries an MD5 of the unencoded audio, and is the
+-- one structural block the probe preserves -- that input domain holds no audio
+-- bytes at all, so two different MP3/M4A/Ogg/WAV files with the same tags, the
+-- same art and an equal audio-region length shared one fingerprint. The
+-- default strictness accepts a fingerprint-only candidate, so such a collision
+-- could retarget a curated row onto audio it was never written for.
+--
+-- The fingerprint now folds in sampled audio bytes, which changes the value for
+-- every file. Rows carrying the old value would claim a fingerprint under an
+-- algorithm that no longer produces it -- a stale content identity of exactly
+-- the kind #689 is about -- so they are nulled here rather than silently
+-- reinterpreted. The next `scan` or `revalidate` recomputes them: revalidate
+-- already re-probes a row missing the checksum its tier asks for, so no new
+-- backfill machinery is needed. `content_hash` is untouched: it is a full-file
+-- SHA-256 and its meaning has not changed.
+--
+-- The cost of nulling is bounded and one-way: a file that moves between this
+-- upgrade and the next scan is not move-recovered (it inserts fresh, as an
+-- unfingerprinted row always has). Leaving the old values in place would not
+-- recover it either -- they cannot match a new-algorithm fingerprint -- so this
+-- trades nothing away for an honest column.
+UPDATE tracks SET fingerprint = NULL;
+PRAGMA user_version = 4;
 """
 
-USER_VERSION = 3
+USER_VERSION = 4
 
 # Byte cap on `tags.value`, mirrored so an external writer can check a
 # value before the `CHECK` does. Generated from the Rust constant: it

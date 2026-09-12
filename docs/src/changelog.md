@@ -139,6 +139,19 @@ see the [Release notes](release-notes.md).
   exit code and that summary are the signals to key on. The engineering is in
   Fixed below. See [Scanning](guide/scanning.md#scan) and
   [Exit codes](guide/troubleshooting.md#exit-codes).
+- **Schema migration (`user_version` 3 → 4).** `MIGRATION_V4` sets every
+  `tracks.fingerprint` to NULL. The fingerprint's input domain changed (it now
+  includes sampled audio), so a value computed by an earlier musefs claims to be
+  something this build no longer produces. Nulling is honest and costs nothing
+  that leaving them would have saved: an old value cannot match a new one
+  either. The next `scan` or `revalidate` recomputes them — `revalidate` already
+  re-probes a row missing the checksum its tier asks for — and until then those
+  rows cannot be move-recovered, exactly as an unfingerprinted row never could.
+  `content_hash` is untouched; it is a full-file SHA-256 and its meaning has not
+  changed. Like every migration this is one-way: the store will no longer open
+  with an older musefs
+  ([#691](https://github.com/Sohex/musefs/issues/691)).
+
 - The `tags.value` cap rises from 256 KiB to 16 MiB − 1, and
   `track_art.description` from 1 KiB to 8 KiB (schema `MIGRATION_V3`). The new
   tag cap is FLAC's 24-bit metadata-block ceiling — the largest tag synthesis
@@ -240,6 +253,20 @@ see the [Release notes](release-notes.md).
   changed. A `--fast` retarget, which confirms nothing by design, likewise no
   longer inherits the departed file's hash
   ([#689](https://github.com/Sohex/musefs/issues/689)).
+
+- A move no longer risks retargeting a curated row onto the wrong file. The
+  cheap `fingerprint` — the default tier — hashed only the probe's *parsed*
+  output, and structural blocks are FLAC-only, so for MP3, M4A, Ogg and WAV it
+  contained no audio bytes at all: two different files with the same tags, the
+  same art and an equal audio-region length shared one fingerprint. The default
+  strictness accepts a fingerprint-only candidate, so scanning such a file
+  where an orphaned row was the unique match moved that row's tags and art onto
+  audio they were never written for, silently. The fingerprint now folds in
+  three bounded windows of audio, sampled at the start, midpoint and end of the
+  audio region — at most 24 KiB of positioned reads per file against a
+  descriptor the probe already holds, so the tier still rides the probe rather
+  than becoming a whole-file pass
+  ([#691](https://github.com/Sohex/musefs/issues/691)).
 
 - A track that renders to `.musefs-metrics` or `.metadata_never_index` at the
   mount root no longer collides with the synthetic entry the FUSE layer injects

@@ -69,7 +69,7 @@ it. Raising verbosity during an interactive scan is safe.
   valid field name)`). Like the serve-path failures above, these go through the
   [warn limiter](#the-serve-path-warn-limiter).
 - An in-place store schema upgrade: `upgrading store schema at … from version 1
-  to version 3; this is irreversible …`. Once per store per schema bump — it is
+  to version 4; this is irreversible …`. Once per store per schema bump — it is
   at `warn` precisely so it lands in your scrollback before you ever try to run
   an older musefs against that store.
 - `scan --revalidate` deprecation.
@@ -116,7 +116,7 @@ behaviour are all `info`, so by default they are invisible:
   `skipped N` total is in the CLI's per-target summary at any level; `-v` gates
   only the breakdown.
 
-- `store schema at … is now at version 3 (took 0.4s)` — the completion half of
+- `store schema at … is now at version 4 (took 0.4s)` — the completion half of
   the upgrade announcement above.
 
 If a mount is behaving oddly and you only reach for one thing, reach for `-v`.
