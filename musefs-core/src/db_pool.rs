@@ -11,6 +11,14 @@
 //! connection in the map until the pool is dropped; that bound is the pool's
 //! lifetime, not the thread's. Each pool has its own map, so multiple mounts
 //! (or test DBs) on the same thread don't collide.
+//!
+//! That bound only stays cheap because the serve path's threads are long-lived.
+//! `threadpool` retires any worker that unwinds and spawns a replacement with a
+//! fresh `ThreadId`, which would strand the dead worker's connection for the
+//! rest of the mount; `musefs-fuse` therefore submits every pool task behind a
+//! panic boundary (`execute_guarded`) so no worker is ever retired (#669). A
+//! caller that does retire threads while holding a pool pays one connection per
+//! dead thread — keep pool-owning threads for the pool's lifetime.
 
 use std::path::PathBuf;
 use std::sync::Arc;

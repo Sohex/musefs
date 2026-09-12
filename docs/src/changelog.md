@@ -149,6 +149,21 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- A panicking worker-pool task permanently leaked a SQLite read connection and
+  up to three file descriptors ([#669](https://github.com/Sohex/musefs/issues/669)).
+  `threadpool` retires a worker that unwinds and spawns a replacement, and the
+  replacement gets a fresh `ThreadId` — the key `DbPool::PerThread` stores
+  connections under, and never evicts. The dead worker's connection therefore
+  stayed in the map for the life of the mount while `musefs_pool_workers` kept
+  reading healthy. `read`, `lookup`, `getattr` and `open` already ran their
+  synthesis inside a `catch_unwind`, but `opendir`, the `readdir` stateless
+  fallback and both `poll_refresh` tasks did not. Every pool submission now goes
+  through one outer panic boundary, so no task can unwind out of a worker, and
+  the two directory paths additionally guard their listing build so a panic
+  there is answered with `EIO` instead of dropping the reply and hanging the
+  syscall. Per-worker connection counts are now genuinely bounded by
+  `--workers`.
+
 - Phase-2 read-ahead prefetch (`--read-ahead-prefetch`) amplified reads instead
   of merely adding overhead ([#671](https://github.com/Sohex/musefs/issues/671)).
   `ReadAhead::insert_window` trimmed the ring to the first window lying fully

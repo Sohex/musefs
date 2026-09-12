@@ -226,6 +226,43 @@ fn reply_errno(op: &str, ino: u64, err: &CoreError) -> fuser::Errno {
     errno(err)
 }
 
+/// Best-effort text of a caught panic payload, for the log line that reports it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic>")
+}
+
+/// Submit `work` to the worker pool behind an outer panic boundary. Every pool
+/// submission goes through this; none calls `pool.execute` directly.
+///
+/// `threadpool` retires any worker that unwinds and spawns a replacement, which
+/// gets a fresh `ThreadId`. `DbPool::PerThread` keys its connections on that id
+/// and never evicts, so the retired worker's SQLite connection — and up to three
+/// file descriptors — is stranded for the life of the mount, while
+/// `musefs_pool_workers` keeps reading healthy (#669). Catching here keeps the
+/// worker, and therefore its connection, alive.
+///
+/// This is a backstop, not the reply guarantee: fuser's reply objects send
+/// nothing when dropped, so a task that panics before replying still hangs the
+/// syscall. Reply-bearing tasks guard their synthesis with [`synth_outcome`] and
+/// reply *outside* that boundary, which is what answers the caller (#359, #533).
+/// What reaches this boundary is the rest of the task body — the reply call
+/// itself, handle bookkeeping — and the poll-refresh tasks, which carry no reply
+/// at all. `op` labels the syscall in the log line.
+fn execute_guarded(pool: &ThreadPool, op: &'static str, work: impl FnOnce() + Send + 'static) {
+    pool.execute(move || {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            log::error!(
+                "{op} worker task panicked outside the synthesis boundary: {}; worker retained",
+                panic_message(&*payload)
+            );
+        }
+    });
+}
+
 /// Run metadata/handle/read synthesis under a panic boundary so a residual
 /// parser panic — one the format-layer alloc guards (`id3v2_alloc_safe` and
 /// friends) don't catch — becomes an errno reply instead of unwinding the pool
@@ -245,11 +282,7 @@ where
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(reply_errno(op, ino, &e)),
         Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("<non-string panic>");
+            let msg = panic_message(&*payload);
             log::error!("{op}({ino}) worker panicked in synthesis: {msg}; replying EIO");
             Err(fuser::Errno::EIO)
         }
@@ -539,7 +572,7 @@ impl MusefsFs {
         let core = Arc::clone(&self.core);
         if self.config.keep_cache {
             let notifier = Arc::clone(&self.notifier);
-            self.pool.execute(move || {
+            execute_guarded(&self.pool, "poll_refresh_notify", move || {
                 let _guard = guard;
                 if let Err(e) = core.poll_refresh_notify(|ino| {
                     if let Some(n) = notifier.get()
@@ -552,7 +585,7 @@ impl MusefsFs {
                 }
             });
         } else {
-            self.pool.execute(move || {
+            execute_guarded(&self.pool, "poll_refresh", move || {
                 let _guard = guard;
                 if let Err(e) = core.poll_refresh() {
                     log::warn!("poll_refresh failed: {e}");
@@ -656,7 +689,7 @@ impl Filesystem for MusefsFs {
         // `reply` stays outside the panic boundary so a residual synthesis panic
         // is answered (EIO) instead of unwinding the worker and hanging the
         // syscall (#359, #533).
-        self.pool.execute(move || {
+        execute_guarded(&self.pool, "lookup", move || {
             match synth_outcome(
                 "lookup",
                 child,
@@ -703,7 +736,7 @@ impl Filesystem for MusefsFs {
         // `reply` stays outside the panic boundary so a residual synthesis panic
         // is answered (EIO) instead of unwinding the worker and hanging the
         // syscall (#359, #533).
-        self.pool.execute(move || {
+        execute_guarded(&self.pool, "getattr", move || {
             match synth_outcome(
                 "getattr",
                 ino.0,
@@ -752,7 +785,7 @@ impl Filesystem for MusefsFs {
         let core = Arc::clone(&self.core);
         let flags = open_flags(self.config.keep_cache);
         let passthrough = self.passthrough.clone();
-        self.pool.execute(move || {
+        execute_guarded(&self.pool, "open", move || {
             // `open_handle` runs the same layout synthesis as `read`; guard it so a
             // residual panic replies EIO instead of unwinding the worker and hanging
             // `open` (#359, #533). `reply_open` below stays outside the boundary.
@@ -786,10 +819,18 @@ impl Filesystem for MusefsFs {
         let counter = Arc::clone(&self.dir_fh);
         let rejections = Arc::clone(&self.dir_handle_rejections);
         let expose_metrics = self.config.expose_metrics;
-        self.pool.execute(move || {
-            let listing = match build_dir_listing(&core, ino.0, expose_metrics) {
+        execute_guarded(&self.pool, "opendir", move || {
+            // `build_dir_listing` walks the virtual tree and resolves the parent,
+            // so guard it like every other synthesis: a residual panic replies EIO
+            // instead of unwinding the worker (#359, #533, #669). `reply` stays
+            // outside the boundary so the answer is always sent.
+            let listing = match synth_outcome(
+                "opendir",
+                ino.0,
+                std::panic::AssertUnwindSafe(|| build_dir_listing(&core, ino.0, expose_metrics)),
+            ) {
                 Ok(l) => l,
-                Err(e) => return reply.error(reply_errno("opendir", ino.0, &e)),
+                Err(e) => return reply.error(e),
             };
             let admitted = {
                 let mut guard = handles
@@ -967,7 +1008,7 @@ impl Filesystem for MusefsFs {
         };
         let core = Arc::clone(&self.core);
         let read_errors = Arc::clone(&self.read_errors);
-        self.pool.execute(move || {
+        execute_guarded(&self.pool, "read", move || {
             // `_slot` (named) holds the guard until the read completes or the
             // worker panics, then releases it. Do NOT simplify to bare `_`: that
             // drops the guard immediately, releasing the slot before the work
@@ -1035,10 +1076,16 @@ impl Filesystem for MusefsFs {
             // expensive (#623). `ReplyDirectory` is `Send`, so the worker answers.
             let core = Arc::clone(&self.core);
             let expose_metrics = self.config.expose_metrics;
-            return self.pool.execute(move || {
-                match build_dir_listing(&core, ino.0, expose_metrics) {
+            return execute_guarded(&self.pool, "readdir", move || {
+                match synth_outcome(
+                    "readdir",
+                    ino.0,
+                    std::panic::AssertUnwindSafe(|| {
+                        build_dir_listing(&core, ino.0, expose_metrics)
+                    }),
+                ) {
                     Ok(listing) => reply_dir_page(reply, &listing, offset),
-                    Err(e) => reply.error(reply_errno("readdir", ino.0, &e)),
+                    Err(e) => reply.error(e),
                 }
             });
         };
@@ -1207,6 +1254,96 @@ mod tests {
     fn synth_outcome_catches_panic_as_eio() {
         let r: Result<(), _> = synth_outcome("open", 7, || panic!("parser exploded"));
         assert_eq!(r.unwrap_err().code(), libc::EIO);
+    }
+
+    /// Pins the upstream `threadpool` behavior the outer boundary defends
+    /// against: a task that unwinds retires its worker, and the replacement gets
+    /// a fresh `ThreadId` — the id `DbPool::PerThread` keys connections on
+    /// (#669). If this ever stops holding, `execute_guarded` is free to shrink.
+    #[test]
+    fn an_unguarded_pool_task_retires_its_worker() {
+        let pool = ThreadPool::new(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = tx.clone();
+        pool.execute(move || {
+            t.send(std::thread::current().id()).unwrap();
+            panic!("unguarded");
+        });
+        pool.join();
+        pool.execute(move || tx.send(std::thread::current().id()).unwrap());
+        pool.join();
+        let (first, second) = (rx.recv().unwrap(), rx.recv().unwrap());
+        assert_ne!(first, second, "an unwinding task must retire its worker");
+        assert_eq!(pool.panic_count(), 1);
+    }
+
+    #[test]
+    fn execute_guarded_keeps_the_worker_across_a_panic() {
+        let pool = ThreadPool::new(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = tx.clone();
+        execute_guarded(&pool, "read", move || {
+            t.send(std::thread::current().id()).unwrap();
+            panic!("guarded");
+        });
+        pool.join();
+        execute_guarded(&pool, "read", move || {
+            tx.send(std::thread::current().id()).unwrap();
+        });
+        pool.join();
+        let (first, second) = (rx.recv().unwrap(), rx.recv().unwrap());
+        assert_eq!(first, second, "a caught panic must not retire the worker");
+        assert_eq!(pool.panic_count(), 0);
+    }
+
+    /// Count this process's open fds pointing at `db_path` or its WAL sidecars
+    /// (prefix match: a WAL reader holds up to three). Linux-only — it reads
+    /// `/proc/self/fd`, which FreeBSD has no default equivalent for.
+    #[cfg(target_os = "linux")]
+    fn db_fd_count(db_path: &Path) -> usize {
+        let prefix = db_path.to_str().unwrap();
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.unwrap().path()).ok())
+            .filter(|target| target.to_string_lossy().starts_with(prefix))
+            .count()
+    }
+
+    /// The end of #669: a panicking pool task used to retire its worker, and the
+    /// replacement opened a second `DbPool` connection while the dead thread's
+    /// entry stayed in the map forever. Guarded, the worker survives and the one
+    /// connection is reused.
+    // Linux-only: asserts fd counts via `db_fd_count` (/proc/self/fd).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_panicking_task_strands_no_db_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guard.db");
+        musefs_db::Db::open(&path).unwrap(); // create + migrate (writer, sets WAL)
+        let db = Arc::new(musefs_core::DbPool::new(musefs_db::Db::open(&path).unwrap()).unwrap());
+        let pool = ThreadPool::new(1);
+
+        // Opens this worker's connection, then panics inside the boundary.
+        let d = Arc::clone(&db);
+        execute_guarded(&pool, "read", move || {
+            d.with(|c| Ok(c.data_version()?)).unwrap();
+            panic!("synthesis exploded");
+        });
+        pool.join();
+        let after_panic = db_fd_count(&path);
+        assert!(after_panic > 0, "the worker must have opened a connection");
+
+        // The same worker serves the next task, so it reuses that connection.
+        let d = Arc::clone(&db);
+        execute_guarded(&pool, "read", move || {
+            d.with(|c| Ok(c.data_version()?)).unwrap();
+        });
+        pool.join();
+        assert_eq!(
+            db_fd_count(&path),
+            after_panic,
+            "a caught panic must not cost a second connection"
+        );
     }
 
     #[test]
