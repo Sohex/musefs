@@ -14,6 +14,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `readdirplus` is implemented, folding the per-entry `lookup` into the
+  directory read: a client that stats what it lists — `ls -l`, every media
+  scanner — spends one round trip on the directory instead of one more per
+  entry. Expect a few tens of percent off a repeat traversal rather than a
+  multiple; a cold one is dominated by synthesis, where the round trip is a
+  few percent. Directories and the synthetic entries are answered inline, and
+  the file entries fan out across the worker pool in rounds, because concurrent
+  `lookup`s already spread across that pool and a serially resolved page would
+  be slower for a threaded scanner than what it replaces.
+  `FUSE_READDIRPLUS_AUTO` is requested too, so the kernel keeps using plain
+  `readdir` for a listing nobody stats, where the larger entries would only cost
+  reply pages. `musefs_readdirplus_total` reports whether the kernel is sending
+  the op at all
+  ([#667](https://github.com/Sohex/musefs/issues/667)).
+
 - `--trust-backing-mtime` skips the backing re-stat that `getattr` performs on
   a metadata-cache hit, serving the cached size and mtime instead. Off by
   default. It is for backings where a `stat` is a network round trip or a head

@@ -49,6 +49,10 @@ pub struct FuseTelemetry {
     pub dir_listings: u64,
     pub dir_handles_max: u64,
     pub dir_handle_rejections: u64,
+    /// `readdirplus` calls served. Zero means the kernel is not sending the op
+    /// — it is negotiated at mount, and `FUSE_READDIRPLUS_AUTO` also lets the
+    /// kernel fall back per listing (#667).
+    pub readdirplus_calls: u64,
     pub pool_workers: u64,
     pub pool_active: u64,
     pub pool_queued: u64,
@@ -191,6 +195,12 @@ pub fn render_prometheus(
         "musefs_dir_handle_rejections_total",
         "opendir calls that found the dir-handle table full and were served statelessly.",
         fuse.dir_handle_rejections,
+    );
+    counter(
+        &mut out,
+        "musefs_readdirplus_total",
+        "readdirplus calls served; 0 means the kernel is serving listings as plain readdir.",
+        fuse.readdirplus_calls,
     );
     counter(
         &mut out,
@@ -486,6 +496,7 @@ mod tests {
             dir_listings: 1,
             dir_handles_max: 1024,
             dir_handle_rejections: 11,
+            readdirplus_calls: 17,
             pool_workers: 8,
             pool_active: 1,
             pool_queued: 0,
@@ -558,6 +569,9 @@ mod tests {
         assert!(out.contains(
             "# TYPE musefs_dir_handle_rejections_total counter\nmusefs_dir_handle_rejections_total 11\n"
         ));
+        assert!(
+            out.contains("# TYPE musefs_readdirplus_total counter\nmusefs_readdirplus_total 17\n")
+        );
         assert!(out.contains(
             "# TYPE musefs_serve_warns_suppressed_total counter\nmusefs_serve_warns_suppressed_total 13\n"
         ));
