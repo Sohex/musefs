@@ -178,11 +178,13 @@ def tags_for_track(conn, track_id):
 
 def _rows_to_prune(conn, track_ids):
     """Yield ``(track_id, backing_path)`` for the rows a prune should consider:
-    every track, or just ``track_ids`` (ids with no row are skipped)."""
+    every track, or just ``track_ids`` (ids with no row are skipped). A repeated
+    id is considered once, in first-seen order, so a caller that passes
+    duplicates neither over-counts the prune nor reports one path twice."""
     if track_ids is None:
         yield from conn.execute("SELECT id, backing_path FROM tracks")
         return
-    for track_id in track_ids:
+    for track_id in dict.fromkeys(track_ids):
         row = conn.execute("SELECT backing_path FROM tracks WHERE id=?", (track_id,)).fetchone()
         if row is not None:
             yield track_id, row[0]

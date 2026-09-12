@@ -79,6 +79,19 @@ def test_prune_missing_scoped_to_track_ids(db_path, tmp_path):
         conn.close()
 
 
+def test_prune_missing_counts_a_repeated_track_id_once(db_path, tmp_path):
+    """A caller passing the same id twice gets one delete and one count."""
+    conn = connect(db_path)
+    try:
+        tid = insert_track(conn, str(tmp_path / "gone.flac"))
+        conn.commit()
+        assert prune_missing(conn, track_ids=[tid, tid]) == 1
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_prune_missing_keeps_a_track_it_cannot_stat(db_path, tmp_path, monkeypatch):
     """A stat failure is not a deletion: the row and its cascaded tags survive,
     and the caller can see why nothing was pruned (#692)."""

@@ -1,3 +1,5 @@
+import os
+
 from musefs_common import (
     MAX_TAG_VALUE_LEN,
     SCAN_TIMEOUT_SECONDS,
@@ -329,8 +331,6 @@ def test_hardlink_rename_keeps_a_previous_path_it_cannot_stat(
 ):
     """A stat failure on the old path is not a rename: the row survives and the
     operator is told why nothing was pruned (#692)."""
-    import os
-
     old_path = tmp_path / "old.flac"
     key = realpath_key(old_path)
     make_track(key)
