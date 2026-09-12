@@ -136,6 +136,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A panicking worker-pool task leaked a SQLite read connection and up to three
+  file descriptors for the life of the mount
+  ([#669](https://github.com/Sohex/musefs/issues/669)). The pool retires a
+  worker that unwinds and spawns a replacement, and the replacement opens a
+  connection of its own while the dead worker's is never reclaimed —
+  `musefs_pool_workers` reads healthy throughout. `read`, `lookup`, `getattr`
+  and `open` already guarded their synthesis; `opendir`, the `readdir` fallback
+  and the background refresh tasks did not. Every pool task now runs behind a
+  panic boundary, and a panic while building a directory listing is answered
+  with `EIO` instead of leaving the syscall hung. Per-worker connection counts
+  are now genuinely bounded by `--workers`.
+
 - `--read-ahead-prefetch` turned read-ahead into read *amplification* instead of
   merely costing overhead ([#671](https://github.com/Sohex/musefs/issues/671)).
   Two defects, both reachable only with Phase-2 prefetch enabled (the default

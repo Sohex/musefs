@@ -41,7 +41,9 @@ at different moments:
   carries a 512 KiB page-cache cap plus roughly as much again in per-connection
   state). `--workers` is the lever: on a many-core host that serves few
   concurrent readers, `--workers 8` keeps the read path fully concurrent while
-  capping this component at 8 connections.
+  capping this component at 8 connections. The cap is real: pool tasks run
+  behind a panic boundary, so a worker is never retired and replaced by one
+  that would open a connection of its own.
 
 Measured on Linux, release build, 64 workers (32 CPUs):
 
