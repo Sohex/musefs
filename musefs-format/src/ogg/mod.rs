@@ -564,6 +564,20 @@ pub mod page_test_support {
     pub fn vorbis_body_empty() -> Vec<u8> {
         crate::vorbiscomment::build(&[]).unwrap()
     }
+
+    /// A VorbisComment body carrying `comments` in order, for fixtures that need
+    /// a specific field — an embedded `METADATA_BLOCK_PICTURE` above all.
+    /// Keys are normalized to lowercase on the way in, as they are for any tag
+    /// musefs writes; Vorbis field names are case-insensitive by spec and the
+    /// picture reader matches accordingly. Panics on a key the format rejects,
+    /// which in a fixture is a test bug.
+    pub fn vorbis_body_with(comments: &[(&str, &str)]) -> Vec<u8> {
+        let inputs: Vec<crate::input::TagInput> = comments
+            .iter()
+            .map(|(k, v)| crate::input::TagInput::new(k, v))
+            .collect();
+        crate::vorbiscomment::build(&inputs).unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -790,6 +804,40 @@ mod tests {
                 reason: "malformed PICTURE block",
                 bytes: 3,
             }]
+        );
+    }
+
+    #[test]
+    fn read_pictures_ignores_oggflac_packets_that_are_not_pictures() {
+        // OggFLAC's following packets are metadata blocks of every type, not just
+        // PICTURE. A non-type-6 block must be passed over silently — neither
+        // parsed as art nor reported as a drop.
+        let mut mapping = vec![0x7F];
+        mapping.extend_from_slice(b"FLAC");
+        mapping.push(1);
+        mapping.push(0);
+        mapping.extend_from_slice(&1u16.to_be_bytes()); // one following packet
+        mapping.extend_from_slice(b"fLaC");
+        let mut streaminfo = Vec::new();
+        crate::flac::push_block_header(&mut streaminfo, 0, 34, false).unwrap();
+        streaminfo.extend(std::iter::repeat_n(0u8, 34));
+        mapping.extend_from_slice(&streaminfo);
+
+        // A VORBIS_COMMENT block (type 4), long enough to survive the 4-byte
+        // header slice if the type check were to let it through.
+        let mut comment = Vec::new();
+        crate::flac::push_block_header(&mut comment, 4, 8, true).unwrap();
+        comment.extend(std::iter::repeat_n(0u8, 8));
+
+        let (data, _) = build_header(78, &[&mapping, &comment]);
+        assert_eq!(read_header(&data).unwrap().codec, Codec::OggFlac);
+
+        let (pics, dropped) = read_pictures_reporting(&data).unwrap();
+        assert!(pics.is_empty());
+        assert_eq!(
+            dropped,
+            vec![],
+            "a non-picture block is not a dropped picture"
         );
     }
 
@@ -1797,6 +1845,23 @@ mod page_test_support_tests {
         let body = super::page_test_support::vorbis_body_empty();
         let parsed = crate::vorbiscomment::parse(&body).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    /// Same contract, for the fixture that carries fields: the comments come back
+    /// in order, with their keys normalized to lowercase the way every tag
+    /// musefs writes is.
+    #[test]
+    fn vorbis_body_with_round_trips_its_comments() {
+        let body =
+            super::page_test_support::vorbis_body_with(&[("TITLE", "Sun"), ("ARTIST", "Boc")]);
+        let parsed = crate::vorbiscomment::parse(&body).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("title".to_string(), "Sun".to_string()),
+                ("artist".to_string(), "Boc".to_string()),
+            ]
+        );
     }
 }
 
