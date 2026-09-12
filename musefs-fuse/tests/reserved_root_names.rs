@@ -54,8 +54,21 @@ fn a_track_rendering_to_the_metrics_name_stays_reachable() {
         .collect();
     let mut names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
     names.sort_unstable();
+    let mut unique = names.clone();
+    unique.dedup();
     assert_eq!(
-        names,
+        names, unique,
+        "readdir must not list any name twice, got: {names:?}"
+    );
+    // Only the metrics names: macOS also lists the Spotlight marker at the root,
+    // and this test is about the entry the track collides with.
+    let metrics: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| n.starts_with(".musefs-metrics"))
+        .collect();
+    assert_eq!(
+        metrics,
         vec![".musefs-metrics", ".musefs-metrics (2)"],
         "the real entry must be pushed off the synthetic name"
     );
