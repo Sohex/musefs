@@ -191,6 +191,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The mtime `getattr` reports for a backing file dated before 1970 is no longer
+  rounded up by a second ([#696](https://github.com/Sohex/musefs/issues/696)).
+  The stamp is a signed nanosecond offset from the epoch, and the conversion to
+  whole seconds truncated toward zero, so a pre-epoch file advertised the second
+  *after* the one its backing file reports. It now floors, matching `st_mtime`.
+  Such a file is still refused by the store's non-negative constraint on the
+  stamp and so never reaches the mount; dropping that constraint rides the
+  2.0.0 store migration.
+
 - A track that renders to `.musefs-metrics` or `.metadata_never_index` at the
   mount root no longer collides with the synthetic entry the FUSE layer injects
   there ([#681](https://github.com/Sohex/musefs/issues/681)). `readdir` appended

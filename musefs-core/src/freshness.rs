@@ -51,8 +51,15 @@ impl BackingStamp {
 
     /// Whole-second mtime for the FUSE `getattr` display surface (never the raw
     /// nanosecond value, which would advertise a ~10^18-second timestamp).
+    ///
+    /// Floors rather than truncates (#696). A pre-epoch backing file carries a
+    /// negative stamp, and truncating division rounds toward zero, which for a
+    /// negative value rounds the displayed second *up* — 1969-12-31 23:59:58.5
+    /// would advertise as 23:59:59. `mtime_ns` is built from a `timespec` whose
+    /// `tv_nsec` is non-negative, so the floor is exactly the `st_mtime` the
+    /// backing file reports and the round trip through this method is lossless.
     pub fn display_secs(&self) -> i64 {
-        self.mtime_ns / NANOS_PER_SEC
+        self.mtime_ns.div_euclid(NANOS_PER_SEC)
     }
 }
 
@@ -74,6 +81,34 @@ mod tests {
         assert_eq!(s.ctime_ns, meta.ctime() * 1_000_000_000 + meta.ctime_nsec());
         // Display is whole-second mtime, never the raw nanosecond value.
         assert_eq!(s.display_secs(), meta.mtime());
+    }
+
+    /// #696: a pre-epoch backing file gives a negative stamp, and the displayed
+    /// second must be the floor — the `st_mtime` the file itself reports — not
+    /// the truncation toward zero that `/` would give.
+    #[test]
+    fn display_secs_floors_a_pre_epoch_stamp() {
+        let secs_of = |mtime_ns| {
+            BackingStamp {
+                size: 0,
+                mtime_ns,
+                ctime_ns: 0,
+            }
+            .display_secs()
+        };
+
+        // Exactly on a second boundary: floor and truncation agree.
+        assert_eq!(secs_of(-2 * NANOS_PER_SEC), -2);
+        // Mid-second before the epoch: 1969-12-31 23:59:58.5 is second -2, and
+        // truncation would round it up to -1.
+        assert_eq!(secs_of(-2 * NANOS_PER_SEC + NANOS_PER_SEC / 2), -2);
+        // The last nanosecond before the epoch is still second -1, not 0.
+        assert_eq!(secs_of(-1), -1);
+        // The epoch itself and the first nanosecond after it are second 0.
+        assert_eq!(secs_of(0), 0);
+        assert_eq!(secs_of(1), 0);
+        // Post-epoch is unchanged: floor and truncation agree for positives.
+        assert_eq!(secs_of(NANOS_PER_SEC + NANOS_PER_SEC / 2), 1);
     }
 
     #[test]

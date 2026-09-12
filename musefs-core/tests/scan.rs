@@ -1,5 +1,5 @@
 mod common;
-use common::{make_flac, streaminfo_body, vorbis_comment_body, write_flac};
+use common::{make_flac, set_mtime, streaminfo_body, vorbis_comment_body, write_flac};
 use musefs_core::{ScanOptions, revalidate, scan_directory, scan_directory_with};
 use musefs_db::{Db, Tag};
 
@@ -464,6 +464,66 @@ fn scan_stores_a_tag_value_the_old_cap_rejected() {
         .find(|t| t.key.eq_ignore_ascii_case("LYRICS"))
         .expect("the 300 KB lyrics tag is stored");
     assert_eq!(lyrics.value, lyrics_body);
+}
+
+/// #696, the corpus entry: a backing file whose mtime predates the Unix epoch.
+/// Archival rips, restored backups and anything whose mtime was set from the
+/// original media's metadata can carry one, and `tar`/`rsync` preserve it, so
+/// this is legitimate input rather than a crafted one.
+///
+/// It probes cleanly and produces a valid unit, then dies at the store's
+/// `CHECK (backing_mtime_ns >= 0)`. `is_store_rejection` classifies that
+/// constraint violation as belonging to the file, so the scan counts it under
+/// `failed` and carries on — and the track is simply absent from the mount.
+///
+/// This pins the current behaviour rather than endorsing it. Dropping the lower
+/// bound rides the `tracks` rebuild in #711, at which point this test flips to
+/// asserting the track is stored with its negative stamp intact.
+#[test]
+fn pre_epoch_backing_mtime_is_rejected_by_the_stamp_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("archival.flac");
+    write_flac(&old, &["TITLE=Archival"], &[0xAA; 30]);
+    // 1969-12-31 23:59:58.5 UTC: negative whole seconds with a non-negative
+    // `tv_nsec` fraction, which is the shape the kernel actually stores.
+    set_mtime(&old, -2, 500_000_000);
+
+    // A sibling with an ordinary mtime proves the failure is contained to the
+    // one file rather than aborting the run.
+    let modern = dir.path().join("modern.flac");
+    write_flac(&modern, &["TITLE=Modern"], &[0xBB; 30]);
+
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(&old).unwrap();
+    assert_eq!(
+        meta.mtime(),
+        -2,
+        "the filesystem must preserve a pre-epoch mtime for this test to mean anything"
+    );
+
+    // The Rust half of #696, against a real filesystem stamp: the stamp keeps
+    // the negative nanosecond value, and the `getattr` display second is the
+    // file's own `st_mtime` rather than the truncation toward zero.
+    let stamp = musefs_core::freshness::BackingStamp::from_metadata(&meta);
+    assert_eq!(stamp.mtime_ns, -1_500_000_000);
+    assert_eq!(stamp.display_secs(), meta.mtime());
+
+    let db = Db::open_in_memory().unwrap();
+    let stats = scan_directory(&db, dir.path()).unwrap();
+
+    assert_eq!(stats.scanned, 1, "only the modern file reaches the store");
+    assert_eq!(stats.failed, 1, "the pre-epoch file fails as its own file");
+
+    let paths: Vec<String> = db
+        .list_tracks()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.backing_path)
+        .collect();
+    assert!(
+        paths.iter().all(|p| !p.ends_with("archival.flac")),
+        "the pre-epoch file is absent from the store: {paths:?}"
+    );
 }
 
 fn flac_with_pictures(comments: &[&str], pics: &[(u32, &[u8])]) -> Vec<u8> {

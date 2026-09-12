@@ -29,6 +29,43 @@ pub fn real_mtime_ns(p: &std::path::Path) -> i64 {
     meta.mtime() * 1_000_000_000 + meta.mtime_nsec()
 }
 
+/// Set the mtime of `p` to `secs`/`nanos` since the Unix epoch, leaving the
+/// atime alone. `secs` may be negative: a pre-1970 mtime is legitimate on an
+/// archival rip or a restored backup, and both `tar` and `rsync` preserve one
+/// faithfully, so it belongs in the scan corpus (#696). `nanos` is the
+/// `timespec` fraction and must be non-negative, matching the kernel's own
+/// representation.
+pub fn set_mtime(p: &Path, secs: i64, nanos: i64) {
+    assert!(
+        (0..1_000_000_000).contains(&nanos),
+        "tv_nsec is non-negative"
+    );
+    let path = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let times = [
+        // UTIME_OMIT leaves atime untouched; only mtime is being set.
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: nanos,
+        },
+    ];
+    #[expect(
+        unsafe_code,
+        reason = "test-only utimensat; std offers no API for setting a pre-epoch mtime"
+    )]
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(
+        rc,
+        0,
+        "utimensat({}) failed: {}",
+        p.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
 /// Return the ctime of `p` as nanoseconds since the Unix epoch.
 pub fn real_ctime_ns(p: &std::path::Path) -> i64 {
     use std::os::unix::fs::MetadataExt;
