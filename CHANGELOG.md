@@ -169,6 +169,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now documents the post-enumeration steady state as the number to size a host
   against, and the transparent-hugepage inflation some distros' `THP=always`
   default adds on top.
+- **Migrations are classified transparent or gated.** A schema step used to be
+  applied as a side effect of opening the store, whatever it did. A gated step —
+  one that rewrites data, needs the store's size again in free disk, or ends
+  compatibility with older musefs builds — is now refused on open, with an error
+  naming the `musefs migrate` command that applies it deliberately. Transparent
+  steps still just happen, and a store being created is never gated. `mount` and
+  `vacuum` therefore no longer upgrade an older store implicitly
+  ([#706](https://github.com/Sohex/musefs/issues/706)).
+
 - An in-place store schema upgrade now announces itself
   ([#649](https://github.com/Sohex/musefs/issues/649)). `Db::open` migrates on
   every open, so an older store was rewritten irreversibly on the first

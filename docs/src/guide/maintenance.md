@@ -72,6 +72,8 @@ error: the store is in use — unmount the filesystem or stop any scan before va
   free disk space roughly equal to the store size (it builds a complete copy
   before swapping). Running it again on an already-compact store is safe and
   reports `(already compact)`.
-- **May upgrade the schema.** Like every musefs command that opens the store for
-  writing, `vacuum` migrates an older store to the current schema version before
-  compacting.
+- **May upgrade the schema.** Like every musefs command that opens the store,
+  `vacuum` applies any pending *transparent* migration before compacting. A
+  store needing a **gated** one — a schema change invasive enough that it is
+  never applied as a side effect of opening the store — is refused instead, and
+  the error names `musefs migrate`.

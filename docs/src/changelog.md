@@ -152,6 +152,25 @@ see the [Release notes](release-notes.md).
   with an older musefs
   ([#691](https://github.com/Sohex/musefs/issues/691)).
 
+- **Migrations are classified transparent or gated.** Every schema step up to
+  1.3.0 was applied as a side effect of opening the store. That is right for a
+  step whose cost and consequences nobody notices, and wrong for one that
+  rewrites data the user did not ask to have rewritten, transiently needs the
+  store's size again in free disk, or ends compatibility with the binary they
+  were running yesterday. Each entry in `MIGRATIONS` now declares which it is.
+  An open applies the transparent steps and stops at the first gated one,
+  refusing with `DbError::StoreNeedsMigration`, which names the `musefs migrate`
+  command. That is the opposite direction from `StoreTooNew` and carries the
+  opposite remedy — upgrade the store, not the binary — so the two are separate
+  variants with separate messages. Nothing is stored: the binary owns the
+  classification, so a user jumping from 1.2 straight to 2.1 is still gated on
+  the step that needs it. A store being *created* is exempt, having no data to
+  endanger, or `scan` could never build a new library. The consequence for two
+  callers is visible: `mount` and `vacuum` stop upgrading an older store
+  implicitly, and `vacuum`'s help text, which advertised that it did, no longer
+  says so. `MIGRATION_V4` is the first gated step
+  ([#706](https://github.com/Sohex/musefs/issues/706)).
+
 - The `tags.value` cap rises from 256 KiB to 16 MiB − 1, and
   `track_art.description` from 1 KiB to 8 KiB (schema `MIGRATION_V3`). The new
   tag cap is FLAC's 24-bit metadata-block ceiling — the largest tag synthesis

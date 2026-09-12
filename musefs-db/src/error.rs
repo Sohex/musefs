@@ -22,6 +22,19 @@ pub enum DbError {
          (max {supported}); upgrade musefs to read this store"
     )]
     StoreTooNew { found: i64, supported: i64 },
+    /// The store is older than this build and the next step up is gated: it
+    /// rewrites data, needs disk headroom, or ends compatibility with older
+    /// binaries, so it is not something to do as a side effect of `mount`
+    /// (#706). The opposite direction from [`DbError::StoreTooNew`], and the
+    /// opposite remedy — upgrade the store, not the binary — which is why the
+    /// two are separate variants rather than one message.
+    #[error(
+        "store schema version {found} needs an explicit upgrade to version {target} \
+         before this musefs build can open it; run `musefs migrate --db <store>`. \
+         The upgrade rewrites the store in place and older musefs builds will no \
+         longer open it, which is why it is not applied automatically"
+    )]
+    StoreNeedsMigration { found: i64, target: i64 },
     #[error("the store is in use — unmount the filesystem or stop any scan before vacuuming")]
     StoreInUse(#[source] rusqlite::Error),
     #[error("{table}.{field} is {len} {unit}, over the {max}-{unit} cap (crafted or corrupt DB)")]

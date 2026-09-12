@@ -396,7 +396,54 @@ UPDATE tracks SET fingerprint = NULL;
 #[allow(dead_code)]
 pub const CHANGELOG_CAP: i64 = 8192;
 
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
+/// Whether an ordinary open of the store may apply a migration.
+///
+/// Every migration up to and including 1.3.0 was transparent: opening the store
+/// applied it, and nobody running `mount` or `scan` learned it had happened.
+/// That is the right behaviour for a step whose cost and consequences the user
+/// would not notice, and the wrong one for a step that rewrites every row,
+/// transiently needs the store's size again in free disk, or ends compatibility
+/// with the binary they were running yesterday. A gated step is refused on open
+/// and applied only by `musefs migrate`, which says what it is about to do
+/// before it does it (#706).
+///
+/// The binary owns this classification rather than the store, so a user jumping
+/// from 1.2 straight to 2.1 is still gated on the step that needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// Applied as a side effect of any open, exactly as before.
+    Transparent,
+    /// Applied only by `musefs migrate`.
+    Gated,
+}
+
+/// One numbered schema step: the SQL, and whether an ordinary open may run it.
+struct Migration {
+    sql: &'static str,
+    gate: Gate,
+}
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        sql: MIGRATION_V1,
+        gate: Gate::Transparent,
+    },
+    Migration {
+        sql: MIGRATION_V2,
+        gate: Gate::Transparent,
+    },
+    Migration {
+        sql: MIGRATION_V3,
+        gate: Gate::Transparent,
+    },
+    // The 2.0.0 store change. It rewrites data the user did not ask to have
+    // rewritten and ends compatibility with every older musefs build, which is
+    // more than anyone running `mount` can reasonably expect (#705).
+    Migration {
+        sql: MIGRATION_V4,
+        gate: Gate::Gated,
+    },
+];
 
 /// The `user_version` a fully-migrated store carries. Exported so callers and
 /// tests assert "the latest schema" rather than a literal that has to be chased
@@ -431,13 +478,68 @@ fn clear_before_lock_hook() {
     BEFORE_LOCK_HOOK.with(|h| *h.borrow_mut() = None);
 }
 
+/// Whether a run of the schema runner may apply gated steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatePolicy {
+    /// Stop at the first gated step and refuse. Every open of the store takes
+    /// this path.
+    Enforce,
+    /// Apply every pending step. Only `musefs migrate` takes this path, after
+    /// the user has been told what the gated step does and has agreed to it.
+    Bypass,
+}
+
+/// The highest version a run under `policy` may take a store sitting at
+/// `current`, which is `current` itself when the very next step is gated.
+///
+/// A store at version 0 is one this binary is *creating*: it has no data to
+/// endanger, and gating it would stop `scan` from ever building a new library.
+/// That is the same "creating versus upgrading" distinction the announcement
+/// below already draws for its log level (#706).
+fn reachable(current: i64, policy: GatePolicy) -> i64 {
+    if current == 0 || policy == GatePolicy::Bypass {
+        return LATEST_VERSION;
+    }
+    for (target, migration) in (1i64..).zip(MIGRATIONS) {
+        if target > current && migration.gate == Gate::Gated {
+            return target - 1;
+        }
+    }
+    LATEST_VERSION
+}
+
+/// The refusal a gated step raises, naming the version reached and the command
+/// that finishes the job.
+fn gated(found: i64) -> crate::error::DbError {
+    crate::error::DbError::StoreNeedsMigration {
+        found,
+        target: LATEST_VERSION,
+    }
+}
+
+/// Bring the store up to the latest version it may transparently reach, and
+/// refuse if a gated step stands between that and [`LATEST_VERSION`].
 pub fn migrate(conn: &mut Connection) -> Result<()> {
+    run(conn, GatePolicy::Enforce)
+}
+
+/// Bring the store all the way to [`LATEST_VERSION`], gated steps included.
+///
+/// The intended caller is `musefs migrate` and nothing else: a gated step is
+/// gated because it does something the user has to be told about first, and
+/// this function is the point at which they already have been.
+pub fn migrate_all(conn: &mut Connection) -> Result<()> {
+    run(conn, GatePolicy::Bypass)
+}
+
+fn run(conn: &mut Connection, policy: GatePolicy) -> Result<()> {
     let latest = LATEST_VERSION;
     let current = conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))?;
     // A store at a user_version past anything this binary knows about was written
     // by a newer (or third-party) tool that bumped the schema. Refuse it loudly
     // rather than treating it as already-migrated and silently misreading the
-    // external-writer contract.
+    // external-writer contract. Distinct from the gated refusal below, and with
+    // the opposite remedy: upgrade the binary, not the store.
     if current > latest {
         return Err(crate::error::DbError::StoreTooNew {
             found: current,
@@ -460,12 +562,19 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     // sees the updated version and skips re-applying the migration.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    // The version this run will actually reach: short of `latest` when a gated
+    // step stops it. Both the gate decision and the announcement are taken from
+    // the version read under the lock, so neither can be decided on a reading
+    // another process has already invalidated — a `mount` racing `musefs
+    // migrate` waits here and then finds the store current, rather than being
+    // refused for a gate that is no longer there.
+    let stop = reachable(current, policy);
+    let mut work = None;
     // Announce only an upgrade this call actually performs: another process may
     // have migrated the store while we waited for the write lock, in which case
-    // the version read under the lock is already the latest and the loop below
+    // the version read under the lock is already `stop` and the loop below
     // applies nothing.
-    let mut work = None;
-    if current < latest {
+    if current < stop {
         // `Connection::path` is `Some("")` for an in-memory or temporary store.
         let at = match tx.path().filter(|p| !p.is_empty()) {
             Some(path) => format!(" at {path}"),
@@ -475,29 +584,35 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             // A store this binary is creating from scratch — nothing is being
             // taken anywhere it cannot come back from, so this stays quiet at
             // the default filter.
-            log::info!("creating store schema{at} at version {latest}");
+            log::info!("creating store schema{at} at version {stop}");
         } else {
             // A pre-existing store is about to be rewritten in place, one way.
             // The user gets this once per store, and wants it in their
             // scrollback if they ever try to roll musefs back.
             log::warn!(
-                "upgrading store schema{at} from version {current} to version {latest}; \
+                "upgrading store schema{at} from version {current} to version {stop}; \
                  this is irreversible and the store will no longer open with musefs \
                  builds older than this one"
             );
         }
         work = Some((at, std::time::Instant::now()));
     }
-    for (target, sql) in (1i64..).zip(MIGRATIONS) {
-        if current < target {
-            tx.execute_batch(sql)?;
+    for (target, migration) in (1i64..).zip(MIGRATIONS) {
+        if current < target && target <= stop {
+            tx.execute_batch(migration.sql)?;
             tx.pragma_update(None, "user_version", target)?;
         }
     }
     tx.commit()?;
     if let Some((at, started)) = work {
         let secs = started.elapsed().as_secs_f64();
-        log::info!("store schema{at} is now at version {latest} (took {secs:.1}s)");
+        log::info!("store schema{at} is now at version {stop} (took {secs:.1}s)");
+    }
+    // The transparent steps are committed either way: a step is transparent
+    // because applying it needs no permission, and the gated step that follows
+    // it does not retroactively make it need one.
+    if stop < latest {
+        return Err(gated(stop));
     }
     Ok(())
 }
@@ -615,7 +730,7 @@ mod migration_logging_tests {
         let captured = capture();
         super::set_before_lock_hook(move || {
             let mut racer = Connection::open(&racer_path).unwrap();
-            super::migrate(&mut racer).unwrap();
+            super::migrate_all(&mut racer).unwrap();
             // The racer re-enters `migrate` on this thread, so its own — entirely
             // correct — announcement lands in the same capture buffer. Drop it,
             // leaving only whatever the call that lost the race goes on to say.
@@ -647,7 +762,7 @@ mod migration_logging_tests {
         store_at_v1(&conn);
         captured.clear();
 
-        super::migrate(&mut conn).unwrap();
+        super::migrate_all(&mut conn).unwrap();
 
         let records = captured.records();
         let warnings: Vec<&String> = records
@@ -684,7 +799,7 @@ mod migration_logging_tests {
         }
         let captured = capture();
         let mut conn = Connection::open(&path).unwrap();
-        super::migrate(&mut conn).unwrap();
+        super::migrate_all(&mut conn).unwrap();
 
         let records = captured.records();
         let path = path.to_str().unwrap();
@@ -713,6 +828,35 @@ mod migration_logging_tests {
         );
     }
 
+    /// A run the gate cuts short must announce the version it actually reached.
+    /// The warning is the user's record of an irreversible change; naming the
+    /// latest version there would claim an upgrade that is about to be refused
+    /// in the same breath.
+    #[test]
+    fn a_gated_stop_announces_the_version_it_reached() {
+        let captured = capture();
+        let mut conn = Connection::open_in_memory().unwrap();
+        store_at_v1(&conn);
+        captured.clear();
+
+        super::migrate(&mut conn).expect_err("V4 is gated, so a V1 store cannot open");
+
+        let records = captured.records();
+        let warning = records
+            .iter()
+            .find(|(level, _)| *level == Level::Warn)
+            .map(|(_, msg)| msg)
+            .expect("the transparent steps were applied, so the upgrade is announced");
+        assert!(
+            warning.contains("from version 1") && warning.contains("to version 3"),
+            "the warning must name the version the gate stopped at, not the latest: {warning}"
+        );
+        assert!(
+            !warning.contains(&format!("to version {}", super::LATEST_VERSION)),
+            "the run did not reach the latest version: {warning}"
+        );
+    }
+
     #[test]
     fn creating_a_fresh_store_does_not_warn() {
         let captured = capture();
@@ -729,6 +873,207 @@ mod migration_logging_tests {
             records.iter().any(|(level, _)| *level == Level::Info),
             "creating a store should still be visible under -v: {records:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use rusqlite::Connection;
+
+    use super::{Gate, GatePolicy, LATEST_VERSION, MIGRATIONS};
+    use crate::error::DbError;
+
+    /// The version an ordinary open of an existing store can reach today: the
+    /// step before the first gated one. Every literal below leans on this, and
+    /// `the_gated_step_is_v4_and_nothing_before_it_is` is what keeps it honest.
+    const WALL: i64 = 3;
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Apply migrations 1..=`upto` by hand and stamp the version, the way an
+    /// older musefs build left the store behind.
+    fn store_at(conn: &Connection, upto: i64) {
+        for (target, migration) in (1i64..).zip(MIGRATIONS) {
+            if target > upto {
+                break;
+            }
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", target).unwrap();
+        }
+        assert_eq!(user_version(conn), upto);
+    }
+
+    /// The classification itself, stated once. Every other test here reads
+    /// `WALL` as 3, which is only meaningful while V4 is the first gated step —
+    /// so a change to the table has to come through this assertion first.
+    #[test]
+    fn the_gated_step_is_v4_and_nothing_before_it_is() {
+        let gates: Vec<Gate> = MIGRATIONS.iter().map(|m| m.gate).collect();
+        assert_eq!(
+            gates,
+            vec![
+                Gate::Transparent,
+                Gate::Transparent,
+                Gate::Transparent,
+                Gate::Gated
+            ]
+        );
+    }
+
+    #[test]
+    fn reachable_stops_at_the_step_before_the_gate() {
+        // An existing store walks up to the wall and no further, from wherever
+        // it starts. The `> current` filter is what keeps an already-applied
+        // gated step from pulling the answer backwards.
+        for current in [1, 2, 3] {
+            assert_eq!(super::reachable(current, GatePolicy::Enforce), WALL);
+        }
+        // A store being created has no data to endanger, so it is exempt.
+        assert_eq!(super::reachable(0, GatePolicy::Enforce), LATEST_VERSION);
+        // `musefs migrate` runs the lot.
+        for current in [0, 1, 2, 3] {
+            assert_eq!(
+                super::reachable(current, GatePolicy::Bypass),
+                LATEST_VERSION
+            );
+        }
+    }
+
+    /// A store whose next step is gated is refused, and the transparent steps
+    /// ahead of it are applied and committed on the way — a step is transparent
+    /// because it needs no permission, and a later gated step does not
+    /// retroactively give it one.
+    #[test]
+    fn an_existing_store_stops_at_the_gate_with_the_transparent_steps_applied() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        store_at(&conn, 1);
+
+        let err = super::migrate(&mut conn).expect_err("V4 is gated");
+
+        assert!(
+            matches!(
+                err,
+                DbError::StoreNeedsMigration { found, target }
+                    if found == WALL && target == LATEST_VERSION
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            user_version(&conn),
+            WALL,
+            "the transparent steps must be committed, not rolled back with the refusal"
+        );
+    }
+
+    /// A store already sitting at the wall has nothing to apply, so the refusal
+    /// is all that happens and it is idempotent.
+    #[test]
+    fn a_store_at_the_gate_applies_nothing_and_keeps_refusing() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        store_at(&conn, WALL);
+
+        for _ in 0..2 {
+            let err = super::migrate(&mut conn).expect_err("V4 is gated");
+            assert!(
+                matches!(err, DbError::StoreNeedsMigration { .. }),
+                "{err:?}"
+            );
+            assert_eq!(user_version(&conn), WALL);
+        }
+    }
+
+    /// A store this binary is creating has no data to endanger and must run
+    /// straight to the latest version — gating it would stop `scan` from ever
+    /// building a new library.
+    #[test]
+    fn a_fresh_store_runs_through_the_gate() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert_eq!(user_version(&conn), 0);
+
+        super::migrate(&mut conn).expect("creating a store is never gated");
+
+        assert_eq!(user_version(&conn), LATEST_VERSION);
+    }
+
+    #[test]
+    fn migrate_all_applies_the_gated_step() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        store_at(&conn, WALL);
+
+        super::migrate_all(&mut conn).expect("the gated step is what this call is for");
+
+        assert_eq!(user_version(&conn), LATEST_VERSION);
+    }
+
+    /// The whole point of the refusal is that it tells the user what to run.
+    #[test]
+    fn the_refusal_names_the_command_and_both_versions() {
+        let msg = super::gated(WALL).to_string();
+        assert!(msg.contains("musefs migrate"), "{msg}");
+        assert!(msg.contains(&WALL.to_string()), "{msg}");
+        assert!(msg.contains(&LATEST_VERSION.to_string()), "{msg}");
+    }
+
+    /// The gate is decided under the write lock, not from the version read
+    /// before it. A `mount` that starts while `musefs migrate` is running waits
+    /// for the lock and then finds the store current — refusing it for a gate
+    /// that was lifted while it waited would be a spurious outage on exactly
+    /// the day the user did the right thing.
+    ///
+    /// Only reachable through the before-lock seam: no single-threaded test can
+    /// otherwise arrange for the pre-lock read to see the old version and the
+    /// post-lock read the new one.
+    #[test]
+    fn a_gate_lifted_while_we_waited_for_the_lock_is_not_refused() {
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                super::clear_before_lock_hook();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        let mut conn = Connection::open(&path).unwrap();
+        store_at(&conn, WALL);
+
+        let racer_path = path.clone();
+        super::set_before_lock_hook(move || {
+            let mut racer = Connection::open(&racer_path).unwrap();
+            super::migrate_all(&mut racer).unwrap();
+        });
+        let _guard = HookGuard;
+
+        super::migrate(&mut conn)
+            .expect("the store is at the latest version by the time we hold the lock");
+        assert_eq!(user_version(&conn), LATEST_VERSION);
+    }
+
+    /// Two directions, two remedies. A store from a newer binary wants a newer
+    /// binary; a store from an older one wants the command. Telling them apart
+    /// is the reason they are separate variants.
+    #[test]
+    fn the_two_refusals_carry_different_remedies() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        store_at(&conn, WALL);
+        let old = super::migrate(&mut conn)
+            .expect_err("V4 is gated")
+            .to_string();
+
+        let mut newer = Connection::open_in_memory().unwrap();
+        newer
+            .pragma_update(None, "user_version", LATEST_VERSION + 1)
+            .unwrap();
+        let new = super::migrate(&mut newer)
+            .expect_err("a store from the future")
+            .to_string();
+
+        assert!(old.contains("musefs migrate"), "{old}");
+        assert!(new.contains("upgrade musefs"), "{new}");
+        assert_ne!(old, new);
     }
 }
 
@@ -890,8 +1235,8 @@ mod baseline_tests {
     fn migration_v4_clears_stale_fingerprints_and_keeps_content_hashes() {
         let mut conn = Connection::open_in_memory().unwrap();
         // Stop at V3 and seed a row the way a V3-era scanner would have.
-        for (target, sql) in (1i64..).zip(super::MIGRATIONS).take(3) {
-            conn.execute_batch(sql).unwrap();
+        for (target, migration) in (1i64..).zip(super::MIGRATIONS).take(3) {
+            conn.execute_batch(migration.sql).unwrap();
             conn.pragma_update(None, "user_version", target).unwrap();
         }
         conn.execute(
@@ -903,7 +1248,10 @@ mod baseline_tests {
         )
         .unwrap();
 
-        super::migrate(&mut conn).unwrap();
+        // `migrate_all`, not `migrate`: V4 is gated, so an ordinary open of a
+        // V3 store stops short of it. What this test is about is what the step
+        // does once `musefs migrate` runs it.
+        super::migrate_all(&mut conn).unwrap();
 
         let (fp, ch): (Option<String>, Option<String>) = conn
             .query_row(
@@ -1132,7 +1480,7 @@ mod schema_py_tests {
             // pedantic clippy lints deny format_push_string, and a bare
             // write! ending in '\n' would trip write_with_newline.
             let _ = write!(sql, "-- ── MIGRATION_V{n} ──");
-            sql.push_str(migration); // every MIGRATION_Vn starts and ends with '\n'
+            sql.push_str(migration.sql); // every MIGRATION_Vn starts and ends with '\n'
             let _ = writeln!(sql, "PRAGMA user_version = {n};");
         }
         sql
@@ -1200,9 +1548,10 @@ mod schema_py_tests {
         // the loop never re-applies a step it already ran. (The current==latest
         // case can't exercise this — migrate fast-paths out before the loop.)
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(MIGRATIONS[0]).unwrap(); // apply V1 only
+        conn.execute_batch(MIGRATIONS[0].sql).unwrap(); // apply V1 only
         conn.pragma_update(None, "user_version", 1i64).unwrap();
-        super::migrate(&mut conn).expect("upgrading from v1 must apply only the remaining steps");
+        super::migrate_all(&mut conn)
+            .expect("upgrading from v1 must apply only the remaining steps");
         assert_eq!(user_version(&conn), super::LATEST_VERSION);
     }
 
@@ -1212,7 +1561,7 @@ mod schema_py_tests {
         // store, plant an over-cap multibyte value (legal under V1's char-counting
         // CHECK: 150_000 chars / 300_000 bytes) plus a normal one, then upgrade.
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(MIGRATIONS[0]).unwrap(); // V1 only
+        conn.execute_batch(MIGRATIONS[0].sql).unwrap(); // V1 only
         conn.pragma_update(None, "user_version", 1i64).unwrap();
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
@@ -1236,7 +1585,7 @@ mod schema_py_tests {
         // V2 only, applied directly. `migrate()` would run on through V3, whose
         // widened cap (#644) accepts this value — that is the later step's
         // business, asserted separately below. This test is about what V2 did.
-        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.execute_batch(MIGRATIONS[1].sql).unwrap();
         conn.pragma_update(None, "user_version", 2i64).unwrap();
 
         // The over-cap row is dropped; the valid row survives.
@@ -1284,8 +1633,8 @@ mod schema_py_tests {
     fn v3_rebuild_widens_caps_and_preserves_rows() {
         use crate::limits::{MAX_ART_DESCRIPTION_LEN, MAX_TAG_VALUE_LEN};
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(MIGRATIONS[0]).unwrap();
-        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.execute_batch(MIGRATIONS[0].sql).unwrap();
+        conn.execute_batch(MIGRATIONS[1].sql).unwrap();
         conn.pragma_update(None, "user_version", 2i64).unwrap();
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
@@ -1312,7 +1661,7 @@ mod schema_py_tests {
         )
         .unwrap();
 
-        super::migrate(&mut conn).expect("upgrade to v3");
+        super::migrate_all(&mut conn).expect("upgrade to v3");
 
         assert_eq!(
             conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))

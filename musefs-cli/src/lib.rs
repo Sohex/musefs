@@ -270,8 +270,9 @@ pub enum Command {
     /// Mount a read-only FUSE view of the store.
     Mount(MountArgs),
     /// Compact the SQLite store, reclaiming free pages left by deletions
-    /// (prunes, orphan-art GC, the schema migration). Run while unmounted; this
-    /// may also upgrade an older store's schema to the current version.
+    /// (prunes, orphan-art GC, the schema migration). Run while unmounted. A
+    /// store needing a gated schema upgrade is refused: run `musefs migrate`
+    /// first.
     Vacuum {
         /// Path to the SQLite database.
         #[arg(long, env = "MUSEFS_DB")]
