@@ -91,11 +91,24 @@ represents the spliced bytes, so passthrough never applies.
 
 ## Directory listings
 
-`opendir` builds a directory's entries once and snapshots them, so a paginated
+`opendir` builds a directory's entries once and holds them, so a paginated
 `readdir` is a map lookup rather than a fresh tree walk per call — enumeration
-stays O(n) in the directory, not O(n²). Snapshots are capped at 1024 concurrent
-handles so a client that opens directories without closing them cannot pin
-unbounded memory.
+stays O(n) in the directory, not O(n²). Handles are capped at 1024 concurrent
+so a client that opens directories without closing them cannot pin unbounded
+memory.
+
+Handles do not each pay for their own copy. A listing is keyed by the directory
+and the virtual-tree generation it was built from, and every handle that agrees
+on both shares it: a thousand opens of one directory cost one listing and a
+thousand refcounts, not a thousand copies of a listing whose size scales with
+the directory's width. All but the first also skip the tree walk outright,
+which is what an over-cap `readdir` consults before rebuilding. `opendir` pins
+the generation it read, so the address that identifies it cannot be reused
+while any handle still names it, and a refresh simply means the next `opendir`
+builds against the new generation while open handles keep serving the view they
+were opened on. `musefs_dir_listings` is the distinct-listing count behind
+`musefs_dir_handles`: the gap between them is the sharing, and equality means
+every open handle is on a different directory.
 
 Over that cap, `opendir` degrades rather than failing: it returns the stateless
 handle, and `readdir` falls back to rebuilding the listing on each call (on the
@@ -106,6 +119,35 @@ rebuild. `musefs_dir_handle_rejections_total` counts the opens that took the
 fallback; the `musefs_dir_handles` gauge cannot show this, because
 saturation is bursty enough to read healthy in every sample while thousands of
 opens are degraded between them.
+
+`readdirplus` answers the same listing with each entry's attributes inline, so
+a client that stats what it lists — `ls -l`, and every media scanner — spends
+one round trip on the directory rather than one more per entry. The mount
+requests `FUSE_READDIRPLUS_AUTO` alongside it, which lets the kernel fall back
+to plain `readdir` when the caller is not statting: an attribute-laden entry is
+several times the size of a bare one, so fewer fit in a reply page, and for a
+bare `ls` that is a pessimization rather than a saving.
+
+Directories cost nothing to answer — `getattr` returns immediately for one
+without touching the store — and the synthetic entries have static attributes,
+so only the file entries need work. Those fan out across the worker pool, in
+rounds of 64, and the reply is assembled by whichever resolution finishes last.
+The fan-out is the point: concurrent `lookup`s already spread across the pool,
+so resolving a page serially would be slower for a threaded scanner than the
+round trips it removes. It is also why nothing here waits — a worker blocking
+on tasks it queued to its own bounded pool could deadlock behind them, so a
+round is a countdown rather than a join. Rounds exist because the reply buffer's
+size is not visible to the handler: resolving a whole wide directory to fill one
+page would front-load enormous latency onto the first call, and anything
+over-resolved lands in the size cache for the page that does ask for it.
+
+An entry whose attributes cannot be resolved is still listed, with placeholder
+attributes and a zero TTL: the kernel caches neither, so the client's next
+access goes back to `lookup` and gets the real error — the same thing it sees
+today, rather than the file silently vanishing from the listing.
+`musefs_readdirplus_total` counts the calls; zero means the kernel is not using
+the op, which is otherwise invisible from the daemon since the capability is
+negotiated at mount.
 
 ## Synthetic telemetry namespace
 

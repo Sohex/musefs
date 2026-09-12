@@ -213,6 +213,7 @@ fn bench_read_under_latency() {
         read_ahead_budget: ra_mib.saturating_mul(1024 * 1024),
         read_ahead_prefetch: ra_prefetch,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     };
     fn first_inode(fs: &Musefs, dir: u64) -> Option<u64> {
         for (_, ino, is_dir) in fs.readdir(dir).unwrap() {

@@ -14,6 +14,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `readdirplus` is implemented, folding the per-entry `lookup` into the
+  directory read: a client that stats what it lists — `ls -l`, every media
+  scanner — spends one round trip on the directory instead of one more per
+  entry. Expect a few tens of percent off a repeat traversal rather than a
+  multiple; a cold one is dominated by synthesis, where the round trip is a
+  few percent. Directories and the synthetic entries are answered inline, and
+  the file entries fan out across the worker pool in rounds, because concurrent
+  `lookup`s already spread across that pool and a serially resolved page would
+  be slower for a threaded scanner than what it replaces.
+  `FUSE_READDIRPLUS_AUTO` is requested too, so the kernel keeps using plain
+  `readdir` for a listing nobody stats, where the larger entries would only cost
+  reply pages. `musefs_readdirplus_total` reports whether the kernel is sending
+  the op at all
+  ([#667](https://github.com/Sohex/musefs/issues/667)).
+
+- `--trust-backing-mtime` skips the backing re-stat that `getattr` performs on
+  a metadata-cache hit, serving the cached size and mtime instead. Off by
+  default. It is for backings where a `stat` is a network round trip or a head
+  seek rather than a microsecond: the hit path otherwise pays one per track on
+  every traversal after the first, and the kernel attr TTL cannot debounce
+  across a traversal. `open` and the read paths validate unconditionally either
+  way, so a replaced backing file is still caught before any byte is served;
+  what the flag trades away is the freshness of the size and mtime a `stat`
+  reports between such a change and the next `open`.
+  `musefs_trust_backing_mtime` reports the flag state alongside
+  `musefs_backing_stats_total`
+  ([#668](https://github.com/Sohex/musefs/issues/668)).
+
 - Chaptered `.m4b` files are supported. A `moov` may now hold chapter tracks
   (`text`, `sbtl`) alongside its single audio (`soun`) track, and every track's
   `stco`/`co64` chunk offsets are relocated when the `moov` is regenerated, not
@@ -57,6 +85,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   much memory is this using" honestly.
 
 ### Changed
+
+- Directory handles on the same directory share one listing instead of copying
+  it each. `opendir` took a private snapshot per handle, so the table's memory
+  was the directory's width times the handle count: on a template that
+  collapses a library into one directory, a client opening the 1,024-handle cap
+  on it — which needs no privilege — pinned tens of gigabytes. A listing is now
+  keyed by directory and virtual-tree generation, and handles that agree on
+  both share it. All but the first also skip the tree walk that builds one,
+  which an over-cap `readdir` consults before rebuilding as well.
+  `musefs_dir_listings` reports the distinct-listing count behind
+  `musefs_dir_handles`
+  ([#675](https://github.com/Sohex/musefs/issues/675)).
 
 - An MP4 file skipped for its track layout now reports the handler types found
   (`unsupported MP4 track layout: expected one audio (soun) track, optionally

@@ -236,6 +236,7 @@ fn parse_mount_config_defaults_are_sensible() {
         read_ahead_budget_mib: 64,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
         expose_metrics: false,
         dry_run: false,
     };
@@ -275,6 +276,7 @@ fn parse_mount_config_keep_cache_sets_flag() {
         read_ahead_budget_mib: 64,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
         expose_metrics: false,
         dry_run: false,
     };
@@ -310,6 +312,7 @@ fn parse_mount_config_saturating_readahead() {
         read_ahead_budget_mib: 64,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
         expose_metrics: false,
         dry_run: false,
     };
@@ -370,6 +373,7 @@ fn parse_mount_config_populates_per_field_fallbacks() {
         read_ahead_budget_mib: 64,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
         expose_metrics: false,
         dry_run: false,
     };

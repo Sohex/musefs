@@ -26,6 +26,7 @@ fn config() -> MountConfig {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
     }
 }
 
@@ -35,6 +36,7 @@ fn config_ci() -> MountConfig {
         read_ahead_budget: 64 * 1024 * 1024,
         read_ahead_prefetch: false,
         skip_on_missing: false,
+        trust_backing_mtime: false,
         ..config()
     }
 }
@@ -42,6 +44,7 @@ fn config_ci() -> MountConfig {
 fn config_skip() -> MountConfig {
     MountConfig {
         skip_on_missing: true,
+        trust_backing_mtime: false,
         ..config()
     }
 }

@@ -26,6 +26,7 @@ pub struct CoreTelemetry {
     pub refresh_gap_fallbacks: u64,
     pub refresh_needs_rebuild: bool,
     pub serve_warns_suppressed: u64,
+    pub trust_backing_mtime: bool,
 }
 
 /// Passthrough sub-telemetry; `None` (in [`FuseTelemetry`]) off Linux.
@@ -44,8 +45,14 @@ pub struct FuseTelemetry {
     pub reads_inflight_max: u64,
     pub read_errors: u64,
     pub dir_handles: u64,
+    /// Distinct directory listings those handles hold between them (#675).
+    pub dir_listings: u64,
     pub dir_handles_max: u64,
     pub dir_handle_rejections: u64,
+    /// `readdirplus` calls served. Zero means the kernel is not sending the op
+    /// — it is negotiated at mount, and `FUSE_READDIRPLUS_AUTO` also lets the
+    /// kernel fall back per listing (#667).
+    pub readdirplus_calls: u64,
     pub pool_workers: u64,
     pub pool_active: u64,
     pub pool_queued: u64,
@@ -167,6 +174,16 @@ pub fn render_prometheus(
         "Open directory-listing snapshots.",
         fuse.dir_handles,
     );
+    // Reads against musefs_dir_handles: handles on one directory at one tree
+    // generation share a listing, so the gap between the two is the sharing
+    // doing its job, and equality means every open handle is on a distinct
+    // directory (#675).
+    gauge(
+        &mut out,
+        "musefs_dir_listings",
+        "Distinct directory listings held by the open directory handles.",
+        fuse.dir_listings,
+    );
     gauge(
         &mut out,
         "musefs_dir_handles_max",
@@ -178,6 +195,12 @@ pub fn render_prometheus(
         "musefs_dir_handle_rejections_total",
         "opendir calls that found the dir-handle table full and were served statelessly.",
         fuse.dir_handle_rejections,
+    );
+    counter(
+        &mut out,
+        "musefs_readdirplus_total",
+        "readdirplus calls served; 0 means the kernel is serving listings as plain readdir.",
+        fuse.readdirplus_calls,
     );
     counter(
         &mut out,
@@ -285,6 +308,15 @@ pub fn render_prometheus(
         "musefs_refresh_needs_rebuild",
         "1 if a poisoned-lock recovery left a full rebuild pending.",
         u64::from(core.refresh_needs_rebuild),
+    );
+    // Reads alongside musefs_backing_stats_total: with the flag at 1 that
+    // counter stops moving on repeat traversals, and the gauge is what tells a
+    // quiet counter from a disabled one (#668).
+    gauge(
+        &mut out,
+        "musefs_trust_backing_mtime",
+        "1 if --trust-backing-mtime is skipping the getattr backing re-stat.",
+        u64::from(core.trust_backing_mtime),
     );
 
     if let Some(pt) = fuse.passthrough {
@@ -450,6 +482,7 @@ mod tests {
             refresh_gap_fallbacks: 1,
             refresh_needs_rebuild: false,
             serve_warns_suppressed: 13,
+            trust_backing_mtime: false,
         }
     }
 
@@ -460,8 +493,10 @@ mod tests {
             reads_inflight_max: 1024,
             read_errors: 7,
             dir_handles: 2,
+            dir_listings: 1,
             dir_handles_max: 1024,
             dir_handle_rejections: 11,
+            readdirplus_calls: 17,
             pool_workers: 8,
             pool_active: 1,
             pool_queued: 0,
@@ -534,6 +569,9 @@ mod tests {
         assert!(out.contains(
             "# TYPE musefs_dir_handle_rejections_total counter\nmusefs_dir_handle_rejections_total 11\n"
         ));
+        assert!(
+            out.contains("# TYPE musefs_readdirplus_total counter\nmusefs_readdirplus_total 17\n")
+        );
         assert!(out.contains(
             "# TYPE musefs_serve_warns_suppressed_total counter\nmusefs_serve_warns_suppressed_total 13\n"
         ));
@@ -633,5 +671,15 @@ mod tests {
         c.refresh_needs_rebuild = true;
         let out = render_prometheus(&c, &sample_fuse(), &sample_process(), None, None);
         assert!(out.contains("musefs_refresh_needs_rebuild 1\n"));
+    }
+
+    #[test]
+    fn trust_backing_mtime_renders_the_flag_state() {
+        let mut c = sample_core();
+        let out = render_prometheus(&c, &sample_fuse(), &sample_process(), None, None);
+        assert!(out.contains("musefs_trust_backing_mtime 0\n"));
+        c.trust_backing_mtime = true;
+        let out = render_prometheus(&c, &sample_fuse(), &sample_process(), None, None);
+        assert!(out.contains("musefs_trust_backing_mtime 1\n"));
     }
 }

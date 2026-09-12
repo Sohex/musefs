@@ -14,6 +14,40 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- `readdirplus` is implemented, folding the per-entry `lookup` into the
+  directory read: a client that stats what it lists — `ls -l`, every media
+  scanner — spends one round trip on the directory instead of one more per
+  entry. Expect a few tens of percent off a repeat traversal rather than a
+  multiple; a cold one is dominated by synthesis, where the round trip is a
+  few percent. Directories and the synthetic entries are answered inline, and
+  the file entries fan out across the worker pool in rounds, because concurrent
+  `lookup`s already spread across that pool and a serially resolved page would
+  be slower for a threaded scanner than what it replaces.
+  `FUSE_READDIRPLUS_AUTO` is requested too, so the kernel keeps using plain
+  `readdir` for a listing nobody stats, where the larger entries would only cost
+  reply pages. `musefs_readdirplus_total` reports whether the kernel is sending
+  the op at all
+  ([#667](https://github.com/Sohex/musefs/issues/667)).
+
+- `--trust-backing-mtime` skips the backing re-stat that `getattr` performs on
+  a metadata-cache hit, serving the cached size and mtime instead. Off by
+  default, and scoped to `getattr` alone. The re-stat exists to catch an
+  on-disk change that left `content_version` untouched
+  ([#279](https://github.com/Sohex/musefs/issues/279)), which is the right
+  default and stays the default; it has no escape hatch for backings where a
+  `stat` is not roughly a microsecond. On NFS, SMB, or a spun-down array it is
+  a network round trip or a head seek, and a warm cache does not help: a
+  scanner walking ten thousand tracks pays ten thousand synchronous stats on
+  every pass, and `--attr-ttl-ms` cannot debounce them because each track is
+  stated once per traversal and a traversal outlives any TTL worth setting.
+  `open` and the read paths validate unconditionally either way, so a replaced
+  backing file is still caught before a byte is served, and the cold traversal
+  that populates the cache stats regardless — the hit-path stat is the cost of
+  every pass *after* the first, not of the first.
+  `musefs_trust_backing_mtime` reports the flag state, which is what tells a
+  quiet `musefs_backing_stats_total` from a disabled counter
+  ([#668](https://github.com/Sohex/musefs/issues/668)).
+
 - Chaptered `.m4b` files are supported. A `moov` may now hold chapter tracks
   (`text`, `sbtl`) alongside its single audio (`soun`) track, and every track's
   `stco`/`co64` chunk offsets are relocated when the `moov` is regenerated, not
@@ -62,6 +96,18 @@ see the [Release notes](release-notes.md).
   synthesis warns too, not just the FUSE errno path.
 
 ### Changed
+
+- Directory handles on the same directory share one listing instead of copying
+  it each. `opendir` took a private snapshot per handle, so the table's memory
+  was the directory's width times the handle count: on a template that
+  collapses a library into one directory, a client opening the 1,024-handle cap
+  on it — which needs no privilege — pinned tens of gigabytes. A listing is now
+  keyed by directory and virtual-tree generation, and handles that agree on
+  both share it. All but the first also skip the tree walk that builds one,
+  which an over-cap `readdir` consults before rebuilding as well.
+  `musefs_dir_listings` reports the distinct-listing count behind
+  `musefs_dir_handles`
+  ([#675](https://github.com/Sohex/musefs/issues/675)).
 
 - An MP4 file skipped for its track layout now reports the handler types found
   (`unsupported MP4 track layout: expected one audio (soun) track, optionally

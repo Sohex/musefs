@@ -6,21 +6,22 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use threadpool::ThreadPool;
 
-use crate::convert::{assemble_dir_listing, to_file_attr};
+use crate::convert::{assemble_dir_listing, make_attr, to_file_attr};
 use fuser::{
-    AccessFlags, BackgroundSession, Config, FileHandle, FileType, Filesystem, FopenFlags,
+    AccessFlags, BackgroundSession, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, InitFlags, KernelConfig, LockOwner, Notifier, OpenAccMode, OpenFlags,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyXattr, Request, Session,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyXattr, Request, Session,
 };
 use musefs_core::CoreError;
 use musefs_core::Fh;
 use musefs_core::Musefs;
+use musefs_core::TreeSnapshot;
 use musefs_core::convert::usize_from;
 use musefs_core::serve_warn;
 use std::num::NonZeroU64;
@@ -294,10 +295,68 @@ where
 /// `clippy::type_complexity`).
 type DirListing = Vec<(u64, FileType, String)>;
 
-/// Cap on concurrently-open directory handles (#307). Each `opendir` snapshots a
-/// full `DirListing`, so an unreleased handle pins memory ~ (entries × name
-/// length); the cap bounds the *number* of snapshots, not their inherent size (a
-/// single `ls` of the widest directory already allocates one).
+/// What one `DirListing` describes: a directory, as of one virtual-tree
+/// generation. `(TreeSnapshot::id(), inode)`.
+///
+/// Two handles that agree on both are asking for byte-identical listings, which
+/// is what lets them share one (#675). The generation half is a heap address and
+/// so is unique only among *live* snapshots — see [`DirHandles::shared`] for why
+/// that is sound here.
+type DirListingKey = (usize, u64);
+
+/// One open directory handle: the listing `readdir` serves, plus which shared
+/// entry it is holding.
+struct DirHandle {
+    /// Identifies `listing` in [`DirHandles::shared`], so `releasedir` can
+    /// release its share of the index entry.
+    key: DirListingKey,
+    listing: Arc<DirListing>,
+}
+
+/// One directory's listing as shared by every handle on it.
+struct SharedListing {
+    /// `Weak`, so the index never keeps a listing alive by itself: a handle
+    /// dropping its `Arc` while an in-flight `readdir` still serves a clone
+    /// leaves that clone valid and this entry harmless.
+    listing: Weak<DirListing>,
+    /// The generation this entry's key names, pinned for exactly as long as the
+    /// entry lives.
+    ///
+    /// Load-bearing, not decorative. The key's generation half is a heap
+    /// address, unique only among *live* snapshots, so an entry that outlived
+    /// its generation could be matched by a later tree allocated at the same
+    /// address and serve that new generation a listing of the old one. Pinning
+    /// here rather than in [`DirHandle`] is what forecloses it: a handle's
+    /// listing can outlive the handle by way of an in-flight `readdir`, but
+    /// nothing outlives this entry, because the entry outlives every handle on
+    /// it by construction (`handles` below).
+    _snapshot: TreeSnapshot,
+    /// Open handles on this key. The entry is created with the first and removed
+    /// with the last, so `shared` holds an entry exactly while `open` holds a
+    /// handle for it — and its `listing` is therefore always upgradeable.
+    handles: usize,
+}
+
+/// The `opendir` handle table and the index that lets handles share listings.
+#[derive(Default)]
+struct DirHandles {
+    /// Live handles, keyed by the fh handed out by `opendir`.
+    open: std::collections::HashMap<u64, DirHandle>,
+    /// The listing each open directory currently has, keyed by what it is a
+    /// listing of (#675).
+    shared: std::collections::HashMap<DirListingKey, SharedListing>,
+}
+
+/// Cap on concurrently-open directory handles (#307). Each `opendir` takes a
+/// `DirListing`, so an unreleased handle pins memory ~ (entries × name length);
+/// the cap bounds the *number* of handles, not the inherent size of one (a
+/// single `ls` of the widest directory already allocates it).
+///
+/// Since #675 the cap no longer bounds a *product*. Handles on one directory at
+/// one tree generation share a single listing through [`DirHandles::shared`], so
+/// 1,024 opens of a 300,000-entry directory cost one listing and 1,024 refcount
+/// bumps rather than 1,024 copies of it — and all but the first skip the tree
+/// walk that builds one.
 ///
 /// The cap bounds memory, not correctness: an ordinary parallel walker (`bfs`,
 /// the default `find` on some distributions) blows past 1024 concurrent dir
@@ -329,17 +388,23 @@ fn dir_open_fh(admitted: Option<u64>) -> FileHandle {
 /// closing cannot grow it without bound. An over-cap `open` returns `ENFILE`.
 const MAX_METRICS_HANDLES: usize = 1024;
 
-/// Build a directory's full readdir listing once. Shared by `opendir`
-/// (snapshotted per fh) and the `readdir` fallback for an unknown fh. When
-/// `expose_metrics` is on, the synthetic `.musefs-metrics` entry is appended to
-/// the root listing (append-without-dedup, matching the Spotlight marker; #394).
+/// Build a directory's full readdir listing once, from one pinned tree
+/// generation. Shared by `opendir` (held per fh) and the `readdir` fallback for
+/// an unknown fh. When `expose_metrics` is on, the synthetic `.musefs-metrics`
+/// entry is appended to the root listing (append-without-dedup, matching the
+/// Spotlight marker; #394).
+///
+/// Reading the children and the parent from one [`TreeSnapshot`] rather than
+/// two `Musefs` calls is what lets the result be keyed by generation and shared
+/// (#675); it also means a refresh landing mid-build can no longer splice a
+/// `..` from one tree onto children from another.
 fn build_dir_listing(
-    core: &Musefs,
+    tree: &TreeSnapshot,
     ino: u64,
     expose_metrics: bool,
 ) -> Result<Vec<(u64, FileType, String)>, CoreError> {
-    let entries = core.readdir(ino)?;
-    let parent = core.parent(ino).unwrap_or(ino);
+    let entries = tree.readdir(ino)?;
+    let parent = tree.parent(ino).unwrap_or(ino);
     let marker = platform::spotlight::marker_dir_entry(ino);
     let mut listing = assemble_dir_listing(ino, parent, entries, marker);
     if expose_metrics && let Some(entry) = metrics_dir::root_dir_entry(ino) {
@@ -362,6 +427,283 @@ fn reply_dir_page(mut reply: ReplyDirectory, listing: &[(u64, FileType, String)]
     reply.ok();
 }
 
+/// The listing already held for `key`, if any handle still holds it (#675). A
+/// hit spares the caller the tree walk *and* the allocation; a miss means no
+/// open handle describes that directory at that generation.
+fn shared_listing(handles: &DirHandles, key: DirListingKey) -> Option<Arc<DirListing>> {
+    handles
+        .shared
+        .get(&key)
+        .and_then(|shared| shared.listing.upgrade())
+}
+
+/// Entries one `readdirplus` round resolves before it tries to fill the reply
+/// (#667).
+///
+/// fuser does not expose the reply buffer's size, so the handler cannot know
+/// where the kernel's page ends until it has filled it: a `DirEntryPlus` is a
+/// 152-byte header plus the name, so a 4 KiB buffer holds roughly 25 entries and
+/// a 32 KiB one roughly 200. Rounds bound the over-resolution to less than one
+/// round per page, and even that is not wasted — a resolved attr lands in the
+/// size cache, so the page that does ask for it finds it warm.
+const READDIRPLUS_BATCH: usize = 64;
+
+/// A round must be able to fill the smallest reply buffer the kernel will send
+/// on its own, or every listing pays extra rounds to reach the end of one page.
+const _: () = assert!(READDIRPLUS_BATCH * 160 >= 4096);
+
+/// The mount-wide constants every attr reply is built from.
+#[derive(Clone, Copy)]
+struct AttrStyle {
+    uid: u32,
+    gid: u32,
+    file_mode: u16,
+    dir_mode: u16,
+    mount_time: SystemTime,
+    ttl: Duration,
+}
+
+/// One entry's attrs and how long the kernel may trust them. The TTL is the
+/// mount's, except for an entry whose attrs could not be resolved: see
+/// [`unresolved_plus_entry`].
+#[derive(Clone, Copy)]
+struct PlusEntry {
+    attr: FileAttr,
+    ttl: Duration,
+}
+
+/// A `readdirplus` reply being filled (#667). Rounds run strictly one after
+/// another — the round that finishes starts the next — so nothing here is
+/// contended except by the resolutions within one round.
+struct PlusFill {
+    /// The listing being paged, shared with the directory handle (#675).
+    listing: Arc<DirListing>,
+    /// The reply, until the round that fills or exhausts it sends it. `None`
+    /// afterwards, so a stray second finish cannot double-reply.
+    reply: Mutex<Option<ReplyDirectoryPlus>>,
+    core: Arc<Musefs>,
+    pool: ThreadPool,
+    style: AttrStyle,
+    expose_metrics: bool,
+}
+
+/// One round's resolutions: a slice of the listing, a slot per entry, and the
+/// countdown that decides who assembles it.
+struct PlusRound {
+    fill: Arc<PlusFill>,
+    /// Index into `fill.listing` of the first entry this round covers; the
+    /// round covers `slots.len()` entries from there.
+    start: usize,
+    /// One slot per entry, each set exactly once by the task that owns it.
+    slots: Vec<OnceLock<PlusEntry>>,
+    /// Resolutions still to come, plus one held by the dispatcher until every
+    /// task is queued.
+    outstanding: AtomicUsize,
+}
+
+/// Counts one resolution out of its round on every exit path: normal
+/// completion, a panic caught by [`execute_guarded`], and a task a dead pool
+/// dropped without running (the shape [`PollPendingGuard`] guards against,
+/// #369). The last one out assembles the round, so a lost task costs that
+/// entry's attrs and never the reply — which, dropped unsent, would hang the
+/// syscall (#359).
+struct PlusSlot(Arc<PlusRound>);
+
+impl Drop for PlusSlot {
+    fn drop(&mut self) {
+        // AcqRel: the assembling thread must see every slot written by the
+        // tasks it is counting out.
+        if self.0.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            finish_plus_round(&self.0);
+        }
+    }
+}
+
+/// Attrs for an entry that needs no DB work, or `None` when it has to go to the
+/// pool. Directories are free — `Musefs::getattr` returns immediately for one
+/// without touching the DB — and the synthetic entries carry static attrs
+/// already (#667).
+fn inline_plus_entry(
+    child: u64,
+    kind: FileType,
+    expose_metrics: bool,
+    style: &AttrStyle,
+) -> Option<PlusEntry> {
+    let attr = if kind == FileType::Directory {
+        // What `getattr` reports for a directory: size 0, and the mount time
+        // standing in for its absent mtime.
+        make_attr(
+            child,
+            0,
+            (FileType::Directory, style.dir_mode, 2),
+            style.uid,
+            style.gid,
+            style.mount_time,
+        )
+    } else if platform::spotlight::is_marker(child) {
+        platform::spotlight::marker_attr(style.uid, style.gid, style.file_mode, style.mount_time)
+    } else if expose_metrics && child == metrics_dir::METRICS_FILE_INO {
+        metrics_dir::file_attr(style.uid, style.gid, style.file_mode, style.mount_time)
+    } else {
+        return None;
+    };
+    Some(PlusEntry {
+        attr,
+        ttl: style.ttl,
+    })
+}
+
+/// Stand-in attrs for an entry whose synthesis failed, or whose resolution was
+/// lost with a dropped task.
+///
+/// The entry still has to appear, or the file vanishes from the listing — which
+/// is a worse answer than today's, where `readdir` lists it and the client's own
+/// `lookup` reports the error. A zero TTL is what preserves that: the kernel
+/// caches neither the entry nor these attrs, so the next access goes back to
+/// `lookup`/`getattr` and gets the real error. The protocol's own way of saying
+/// "no attrs for this one" — a zero `nodeid` — is not reachable through fuser's
+/// API, which derives both the nodeid and the dirent's inode from `attr.ino`,
+/// and a zero inode makes `readdir` skip the name entirely.
+fn unresolved_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusEntry {
+    let node = if kind == FileType::Directory {
+        (FileType::Directory, style.dir_mode, 2)
+    } else {
+        (FileType::RegularFile, style.file_mode, 1)
+    };
+    PlusEntry {
+        attr: make_attr(child, 0, node, style.uid, style.gid, style.mount_time),
+        ttl: Duration::ZERO,
+    }
+}
+
+/// Start filling `reply` with `listing` from `offset` (#667).
+fn start_plus_fill(
+    core: &Arc<Musefs>,
+    pool: &ThreadPool,
+    style: AttrStyle,
+    expose_metrics: bool,
+    listing: Arc<DirListing>,
+    offset: u64,
+    reply: ReplyDirectoryPlus,
+) {
+    let start = usize_from(offset).min(listing.len());
+    let fill = Arc::new(PlusFill {
+        listing,
+        reply: Mutex::new(Some(reply)),
+        core: Arc::clone(core),
+        pool: pool.clone(),
+        style,
+        expose_metrics,
+    });
+    spawn_plus_round(&fill, start);
+}
+
+/// Resolve the round starting at `start`: fill what needs no DB work inline,
+/// fan the rest across the pool, and let the last one out assemble the reply.
+///
+/// Nothing waits here. A worker that blocked on tasks it queued to its own
+/// bounded pool could deadlock behind them, so the round is a countdown rather
+/// than a join — the reason this op is shaped unlike every other one in this
+/// file. Fanning out is the point: concurrent `lookup`s already spread across
+/// the pool, so a handler that resolved a page serially would be slower than the
+/// round trips it removes for a threaded scanner (#667).
+fn spawn_plus_round(fill: &Arc<PlusFill>, start: usize) {
+    let end = start
+        .saturating_add(READDIRPLUS_BATCH)
+        .min(fill.listing.len());
+    let round = Arc::new(PlusRound {
+        fill: Arc::clone(fill),
+        start,
+        slots: (start..end).map(|_| OnceLock::new()).collect(),
+        // The dispatcher's own count, released below: without it a task that
+        // finishes while later ones are still being queued would assemble a
+        // half-resolved round.
+        outstanding: AtomicUsize::new(1),
+    });
+    let dispatching = PlusSlot(Arc::clone(&round));
+    for (idx, (child, kind, _)) in fill.listing[start..end].iter().enumerate() {
+        let (child, kind) = (*child, *kind);
+        if let Some(entry) = inline_plus_entry(child, kind, fill.expose_metrics, &fill.style) {
+            let _ = round.slots[idx].set(entry);
+            continue;
+        }
+        round.outstanding.fetch_add(1, Ordering::Relaxed);
+        let slot = PlusSlot(Arc::clone(&round));
+        let style = fill.style;
+        execute_guarded(&fill.pool, "readdirplus", move || {
+            let round = &slot.0;
+            let entry = match synth_outcome(
+                "readdirplus",
+                child,
+                std::panic::AssertUnwindSafe(|| round.fill.core.getattr(child)),
+            ) {
+                Ok(attr) => PlusEntry {
+                    attr: to_file_attr(
+                        &attr,
+                        style.uid,
+                        style.gid,
+                        style.file_mode,
+                        style.dir_mode,
+                        style.mount_time,
+                    ),
+                    ttl: style.ttl,
+                },
+                Err(_) => unresolved_plus_entry(child, kind, &style),
+            };
+            let _ = round.slots[idx].set(entry);
+            // `slot` drops here, counting this resolution out and, if it is the
+            // last, assembling the round.
+        });
+    }
+    drop(dispatching);
+}
+
+/// Emit a finished round into the reply, then send it or start the next one.
+///
+/// Runs exactly once per round, on whichever thread counted the last resolution
+/// out, so it needs no lock of its own beyond taking the reply.
+fn finish_plus_round(round: &PlusRound) {
+    let fill = &round.fill;
+    let Some(mut reply) = fill
+        .reply
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    let next = round.start + round.slots.len();
+    for (i, slot) in (round.start..).zip(&round.slots) {
+        let (child, kind, name) = &fill.listing[i];
+        let entry = slot
+            .get()
+            .copied()
+            .unwrap_or_else(|| unresolved_plus_entry(*child, *kind, &fill.style));
+        // The stored offset is the index of the *next* entry, as in
+        // `reply_dir_page`: the kernel hands it back to resume from here.
+        if reply.add(
+            INodeNo(*child),
+            (i + 1) as u64,
+            name,
+            &entry.ttl,
+            &entry.attr,
+            Generation(0),
+        ) {
+            // Buffer full: what fits is the page, and the kernel asks again
+            // from the last accepted offset.
+            return reply.ok();
+        }
+    }
+    if next >= fill.listing.len() {
+        return reply.ok();
+    }
+    *fill
+        .reply
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reply);
+    spawn_plus_round(fill, next);
+}
+
 /// Admit a directory handle under the caller's `dir_handles` lock, enforcing
 /// `MAX_DIR_HANDLES` (#307). Returns the freshly allocated handle id on admit, or
 /// `None` when the table is at `cap` and the caller falls back to the stateless
@@ -370,26 +712,69 @@ fn reply_dir_page(mut reply: ReplyDirectory, listing: &[(u64, FileType, String)]
 /// holds, so concurrent `opendir` closures cannot race the count past the cap
 /// and a rejected open burns no id.
 ///
-/// The miss path bumps `rejections`, surfaced as
+/// `listing` is what the caller built or found; the admitted handle may end up
+/// holding a *different* `Arc` with the same contents, because a live listing
+/// already indexed under `key` wins over the caller's. Two `opendir` workers
+/// that both missed [`shared_listing`] before building would otherwise store one
+/// copy each, which is the amplification this exists to remove (#675).
+///
+/// The reject path bumps `rejections`, surfaced as
 /// `musefs_dir_handle_rejections_total`. Saturation is bursty — a parallel walk
 /// can rack up thousands of rejections between two samples of the
 /// `musefs_dir_handles` gauge, which reads healthy the whole time — so the
 /// monotonic counter is the only after-the-fact signal that the cap was hit
 /// (#626).
 fn try_admit_dir_handle(
-    handles: &mut std::collections::HashMap<u64, Arc<DirListing>>,
+    handles: &mut DirHandles,
     counter: &AtomicU64,
     rejections: &AtomicU64,
     cap: usize,
-    listing: DirListing,
+    key: DirListingKey,
+    snapshot: TreeSnapshot,
+    listing: Arc<DirListing>,
 ) -> Option<u64> {
-    if handles.len() >= cap {
+    if handles.open.len() >= cap {
         rejections.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let fh = counter.fetch_add(1, Ordering::Relaxed);
-    handles.insert(fh, Arc::new(listing));
+    let shared = handles.shared.entry(key).or_insert(SharedListing {
+        listing: Arc::downgrade(&listing),
+        _snapshot: snapshot,
+        handles: 0,
+    });
+    // An entry that was already there carries the listing every other handle on
+    // this key is serving; take that one and drop the caller's.
+    let listing = shared.listing.upgrade().unwrap_or(listing);
+    shared.handles += 1;
+    handles.open.insert(fh, DirHandle { key, listing });
     Some(fh)
+}
+
+/// Release one directory handle and, with the last one on its key, the index
+/// entry they shared (#675).
+///
+/// Counting handles rather than testing the `Weak` is what keeps that entry's
+/// lifetime exact. An in-flight `readdir` that cloned the `Arc` under the lock
+/// and is serving it outside the lock would otherwise keep a released key's
+/// entry alive for as long as it ran, and with it the tree generation the entry
+/// pins. The clone it is serving stays valid either way: the index hands out
+/// listings, it never gates access to one.
+///
+/// An unknown fh — the stateless sentinel, a duplicate `releasedir` — releases
+/// nothing.
+fn release_dir_handle(handles: &mut DirHandles, fh: u64) {
+    let Some(handle) = handles.open.remove(&fh) else {
+        return;
+    };
+    let key = handle.key;
+    drop(handle);
+    if let Some(shared) = handles.shared.get_mut(&key) {
+        shared.handles -= 1;
+        if shared.handles == 0 {
+            handles.shared.remove(&key);
+        }
+    }
 }
 
 /// Clears the `fire_poll_refresh` single-flight gate when the poll task ends,
@@ -460,10 +845,12 @@ pub struct MusefsFs {
     /// Per-OS kernel-passthrough state (live backing registrations + sticky
     /// disable on Linux; a no-op marker elsewhere).
     passthrough: platform::passthrough::PassthroughState,
-    /// Per-open directory listing snapshots, keyed by the fh handed out by
-    /// `opendir`. A paginated `readdir` clones the `Arc` under the lock and
-    /// serves it lock-free, so building the listing is O(N) per `ls`, not per
-    /// `readdir` call (#176).
+    /// Per-open directory listings, keyed by the fh handed out by `opendir`,
+    /// plus the index that lets handles on the same directory and tree
+    /// generation share one listing instead of copying it each (#675). A
+    /// paginated `readdir` clones the `Arc` under the lock and serves it
+    /// lock-free, so building the listing is O(N) per `ls`, not per `readdir`
+    /// call (#176).
     ///
     /// All three lock sites recover a poisoned mutex via `into_inner` rather than
     /// propagating (#194). Every op under the lock is a `HashMap` insert/remove
@@ -471,8 +858,7 @@ pub struct MusefsFs {
     /// rather than unwinding, so it can't poison), and a `HashMap` mutation cannot
     /// leave a partially-observable map across a single lock acquisition. So even a
     /// poisoning panic can't tear a later `readdir`'s view; recovery is deliberate.
-    #[allow(clippy::type_complexity)]
-    dir_handles: Arc<Mutex<std::collections::HashMap<u64, Arc<Vec<(u64, FileType, String)>>>>>,
+    dir_handles: Arc<Mutex<DirHandles>>,
     /// Monotonic dir-handle id (starts at 1; 0 stays [`DIR_FH_STATELESS`]).
     ///
     /// Unlike the file slab's generation-encoded keys (`facade.rs`, ABA-safe by
@@ -490,6 +876,11 @@ pub struct MusefsFs {
     /// this is also the only signal that directories are being re-listed on every
     /// `readdir` — worth knowing before it shows up as CPU.
     dir_handle_rejections: Arc<AtomicU64>,
+    /// `readdirplus` calls served, surfaced as `musefs_readdirplus_total`. The
+    /// op is negotiated at mount and `FUSE_READDIRPLUS_AUTO` lets the kernel
+    /// choose per listing, so whether a mount is getting the folded-in lookups
+    /// at all is otherwise unobservable from the daemon (#667).
+    readdirplus_calls: Arc<AtomicU64>,
     /// In-flight foreground-read counter. `read` reserves a slot before enqueuing;
     /// over `MAX_INFLIGHT_READS` the read is rejected with `EAGAIN`, capping the
     /// otherwise-unbounded pool queue (#308).
@@ -534,9 +925,10 @@ impl MusefsFs {
             notifier: Arc::new(OnceLock::new()),
             poll_pending: Arc::new(AtomicBool::new(false)),
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
-            dir_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            dir_handles: Arc::new(Mutex::new(DirHandles::default())),
             dir_fh: Arc::new(AtomicU64::new(1)),
             dir_handle_rejections: Arc::new(AtomicU64::new(0)),
+            readdirplus_calls: Arc::new(AtomicU64::new(0)),
             inflight_reads: Arc::new(AtomicUsize::new(0)),
             read_errors: Arc::new(AtomicU64::new(0)),
             metrics_handles: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -597,21 +989,37 @@ impl MusefsFs {
     /// Assemble and render the `.musefs-metrics/metrics` body (#394). Best-effort:
     /// every source is an atomic load, a brief lock, or a fallible probe mapped to
     /// `None`/0; nothing here can panic the daemon or perturb a read.
+    /// The mount-wide constants every attr reply is built from.
+    fn attr_style(&self) -> AttrStyle {
+        AttrStyle {
+            uid: self.uid,
+            gid: self.gid,
+            file_mode: self.config.file_mode,
+            dir_mode: self.config.dir_mode,
+            mount_time: self.mount_time,
+            ttl: self.config.ttl,
+        }
+    }
+
     fn render_metrics(&self) -> Vec<u8> {
         let core = self.core.telemetry();
-        let dir_handles = self
-            .dir_handles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len() as u64;
+        let (dir_handles, dir_listings) = {
+            let handles = self
+                .dir_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (handles.open.len() as u64, handles.shared.len() as u64)
+        };
         let fuse = musefs_core::FuseTelemetry {
             uptime_seconds: self.mount_time.elapsed().map_or(0, |d| d.as_secs()),
             reads_inflight: self.inflight_reads.load(Ordering::Relaxed) as u64,
             reads_inflight_max: MAX_INFLIGHT_READS as u64,
             read_errors: self.read_errors.load(Ordering::Relaxed),
             dir_handles,
+            dir_listings,
             dir_handles_max: MAX_DIR_HANDLES as u64,
             dir_handle_rejections: self.dir_handle_rejections.load(Ordering::Relaxed),
+            readdirplus_calls: self.readdirplus_calls.load(Ordering::Relaxed),
             pool_workers: self.pool.max_count() as u64,
             pool_active: self.pool.active_count() as u64,
             pool_queued: self.pool.queued_count() as u64,
@@ -642,6 +1050,15 @@ impl Filesystem for MusefsFs {
         // default; PARALLEL_DIROPS may be unsupported on older kernels (ignored).
         let _ = config.add_capabilities(InitFlags::FUSE_ASYNC_READ);
         let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+        // READDIRPLUS folds the per-entry `lookup` into the directory read, and
+        // AUTO lets the kernel drop back to plain `readdir` when the caller is
+        // not stat-ing what it lists — an attr-laden reply is a pessimization
+        // for a bare `ls`, since each entry carries ~128 bytes of attrs and so
+        // fewer of them fit in a page (#667). Requested separately: without the
+        // handler below the kernel would never send the op anyway, and without
+        // AUTO it would send it for every listing.
+        let _ = config.add_capabilities(InitFlags::FUSE_DO_READDIRPLUS);
+        let _ = config.add_capabilities(InitFlags::FUSE_READDIRPLUS_AUTO);
         // Kernel passthrough (Linux-only) is requested by the platform module;
         // off Linux this is a no-op and reads are served through the daemon.
         platform::passthrough::request_capabilities(config);
@@ -820,23 +1237,49 @@ impl Filesystem for MusefsFs {
         let rejections = Arc::clone(&self.dir_handle_rejections);
         let expose_metrics = self.config.expose_metrics;
         execute_guarded(&self.pool, "opendir", move || {
+            // Pin the tree generation first: it names what a listing of this
+            // directory would contain, so it is both what the build reads and
+            // what the result is keyed by (#675).
+            let snapshot = core.tree_snapshot();
+            let key = (snapshot.id(), ino.0);
+            let cached = shared_listing(
+                &handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                key,
+            );
             // `build_dir_listing` walks the virtual tree and resolves the parent,
             // so guard it like every other synthesis: a residual panic replies EIO
             // instead of unwinding the worker (#359, #533, #669). `reply` stays
             // outside the boundary so the answer is always sent.
-            let listing = match synth_outcome(
-                "opendir",
-                ino.0,
-                std::panic::AssertUnwindSafe(|| build_dir_listing(&core, ino.0, expose_metrics)),
-            ) {
-                Ok(l) => l,
-                Err(e) => return reply.error(e),
+            let listing = match cached {
+                // Another handle already has this exact listing: no walk, no
+                // second copy, just a refcount bump.
+                Some(listing) => listing,
+                None => match synth_outcome(
+                    "opendir",
+                    ino.0,
+                    std::panic::AssertUnwindSafe(|| {
+                        build_dir_listing(&snapshot, ino.0, expose_metrics)
+                    }),
+                ) {
+                    Ok(l) => Arc::new(l),
+                    Err(e) => return reply.error(e),
+                },
             };
             let admitted = {
                 let mut guard = handles
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                try_admit_dir_handle(&mut guard, &counter, &rejections, MAX_DIR_HANDLES, listing)
+                try_admit_dir_handle(
+                    &mut guard,
+                    &counter,
+                    &rejections,
+                    MAX_DIR_HANDLES,
+                    key,
+                    snapshot,
+                    listing,
+                )
             };
             if admitted.is_none() {
                 // Debug, not warn: a parallel walk over a large mount produces
@@ -886,10 +1329,13 @@ impl Filesystem for MusefsFs {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        self.dir_handles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&fh.0);
+        release_dir_handle(
+            &mut self
+                .dir_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            fh.0,
+        );
         reply.ok();
     }
 
@@ -1060,14 +1506,15 @@ impl Filesystem for MusefsFs {
         if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
             return reply_dir_page(reply, &metrics_dir::dir_listing(), offset);
         }
-        let snapshot = self
+        let held = self
             .dir_handles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .open
             .get(&fh.0)
-            .map(Arc::clone);
+            .map(|handle| Arc::clone(&handle.listing));
         // Lock released; the reply below runs without holding it.
-        let Some(listing) = snapshot else {
+        let Some(listing) = held else {
             // Unknown fh — the stateless sentinel, from a synthetic directory or
             // an over-cap `opendir` (#616). Rebuilding walks the virtual tree and
             // resolves the parent, so it is offloaded like every other blocking
@@ -1075,13 +1522,29 @@ impl Filesystem for MusefsFs {
             // is the normal path for exactly the wide directories that make it
             // expensive (#623). `ReplyDirectory` is `Send`, so the worker answers.
             let core = Arc::clone(&self.core);
+            let handles = Arc::clone(&self.dir_handles);
             let expose_metrics = self.config.expose_metrics;
             return execute_guarded(&self.pool, "readdir", move || {
+                // An over-cap open is exactly the case where some *other* handle
+                // usually holds this directory's listing already, so probe the
+                // index before walking the tree again (#675). A hit is the same
+                // listing the rebuild would produce: same directory, same
+                // generation.
+                let snapshot = core.tree_snapshot();
+                let cached = shared_listing(
+                    &handles
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    (snapshot.id(), ino.0),
+                );
+                if let Some(listing) = cached {
+                    return reply_dir_page(reply, &listing, offset);
+                }
                 match synth_outcome(
                     "readdir",
                     ino.0,
                     std::panic::AssertUnwindSafe(|| {
-                        build_dir_listing(&core, ino.0, expose_metrics)
+                        build_dir_listing(&snapshot, ino.0, expose_metrics)
                     }),
                 ) {
                     Ok(listing) => reply_dir_page(reply, &listing, offset),
@@ -1090,6 +1553,91 @@ impl Filesystem for MusefsFs {
             });
         };
         reply_dir_page(reply, &listing, offset);
+    }
+
+    /// `readdir` with each entry's attrs inline, so a client that stats what it
+    /// lists — `ls -l`, every media scanner — spends one round trip on the
+    /// directory instead of one more per entry (#667).
+    ///
+    /// The listing is found exactly as `readdir` finds it. What is new is the
+    /// attrs: directories and the synthetic entries are filled inline, and the
+    /// file entries fan out across the worker pool in rounds, since resolving a
+    /// page serially on one worker would be slower for a threaded scanner than
+    /// the `lookup`s it replaces. See [`spawn_plus_round`].
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectoryPlus,
+    ) {
+        self.fire_poll_refresh();
+        self.readdirplus_calls.fetch_add(1, Ordering::Relaxed);
+        let style = self.attr_style();
+        if self.config.expose_metrics && ino.0 == metrics_dir::METRICS_DIR_INO {
+            // Every entry here is inline, so this fills and replies without
+            // touching the pool at all.
+            return start_plus_fill(
+                &self.core,
+                &self.pool,
+                style,
+                true,
+                Arc::new(metrics_dir::dir_listing()),
+                offset,
+                reply,
+            );
+        }
+        let held = self
+            .dir_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .open
+            .get(&fh.0)
+            .map(|handle| Arc::clone(&handle.listing));
+        // Lock released; the fill below runs without holding it.
+        let expose_metrics = self.config.expose_metrics;
+        let Some(listing) = held else {
+            // Unknown fh — the stateless sentinel, from a synthetic directory or
+            // an over-cap `opendir` (#616). Rebuilding walks the tree, so it is
+            // offloaded like every other blocking op; the shared index usually
+            // spares it even that (#675).
+            let core = Arc::clone(&self.core);
+            let handles = Arc::clone(&self.dir_handles);
+            let pool = self.pool.clone();
+            return execute_guarded(&self.pool, "readdirplus", move || {
+                let snapshot = core.tree_snapshot();
+                let cached = shared_listing(
+                    &handles
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    (snapshot.id(), ino.0),
+                );
+                let listing = match cached {
+                    Some(listing) => listing,
+                    None => match synth_outcome(
+                        "readdirplus",
+                        ino.0,
+                        std::panic::AssertUnwindSafe(|| {
+                            build_dir_listing(&snapshot, ino.0, expose_metrics)
+                        }),
+                    ) {
+                        Ok(listing) => Arc::new(listing),
+                        Err(e) => return reply.error(e),
+                    },
+                };
+                start_plus_fill(&core, &pool, style, expose_metrics, listing, offset, reply);
+            });
+        };
+        start_plus_fill(
+            &self.core,
+            &self.pool,
+            style,
+            expose_metrics,
+            listing,
+            offset,
+            reply,
+        );
     }
 }
 
@@ -1398,6 +1946,7 @@ mod tests {
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
             skip_on_missing: false,
+            trust_backing_mtime: false,
         };
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("m.db")).unwrap(), cfg).unwrap();
@@ -1418,6 +1967,7 @@ mod tests {
             read_ahead_budget: 64 * 1024 * 1024,
             read_ahead_prefetch: false,
             skip_on_missing: false,
+            trust_backing_mtime: false,
         };
         let core =
             Musefs::open(musefs_db::Db::open(dir.path().join("w.db")).unwrap(), cfg).unwrap();
@@ -1491,23 +2041,71 @@ mod tests {
         );
     }
 
-    fn empty_dir_handles() -> std::collections::HashMap<u64, Arc<DirListing>> {
-        std::collections::HashMap::new()
+    /// A real tree snapshot to key handles by. Cheap — the tree behind it is
+    /// the empty one `test_fs` mounts — and real, so [`TreeSnapshot::id`] means
+    /// what it means in production: an address that stays unique while the
+    /// snapshot is held.
+    fn test_snapshot() -> (tempfile::TempDir, MusefsFs, TreeSnapshot) {
+        let (dir, fs) = test_fs();
+        let snapshot = fs.core.tree_snapshot();
+        (dir, fs, snapshot)
+    }
+
+    fn listing(names: &[&str]) -> Arc<DirListing> {
+        Arc::new(
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (i as u64 + 2, FileType::RegularFile, (*name).to_string()))
+                .collect(),
+        )
+    }
+
+    fn empty_dir_handles() -> DirHandles {
+        DirHandles::default()
+    }
+
+    /// Fill `handles` with `n` handles on distinct directories, so a cap test
+    /// starts at the occupancy it means to test.
+    fn fill_dir_handles(handles: &mut DirHandles, snapshot: &TreeSnapshot, n: u64) {
+        let counter = AtomicU64::new(1);
+        let rejections = AtomicU64::new(0);
+        for ino in 0..n {
+            try_admit_dir_handle(
+                handles,
+                &counter,
+                &rejections,
+                usize_from(n),
+                (snapshot.id(), ino),
+                snapshot.clone(),
+                listing(&["a"]),
+            )
+            .expect("fixture admits below its own cap");
+        }
     }
 
     #[test]
     fn try_admit_dir_handle_admits_and_allocates_id_below_cap() {
+        let (_d, _fs, snapshot) = test_snapshot();
         let mut handles = empty_dir_handles();
         let counter = AtomicU64::new(1); // matches the live `dir_fh` start
         let rejections = AtomicU64::new(0);
-        let fh = try_admit_dir_handle(&mut handles, &counter, &rejections, 2, Vec::new());
+        let fh = try_admit_dir_handle(
+            &mut handles,
+            &counter,
+            &rejections,
+            2,
+            (snapshot.id(), 1),
+            snapshot.clone(),
+            listing(&["a"]),
+        );
         assert_eq!(
             fh,
             Some(1),
             "first admit uses the pre-increment counter value"
         );
-        assert_eq!(handles.len(), 1);
-        assert!(handles.contains_key(&1));
+        assert_eq!(handles.open.len(), 1);
+        assert!(handles.open.contains_key(&1));
         assert_eq!(counter.load(Ordering::Relaxed), 2, "id allocated on admit");
         assert_eq!(
             rejections.load(Ordering::Relaxed),
@@ -1518,14 +2116,22 @@ mod tests {
 
     #[test]
     fn try_admit_dir_handle_rejects_at_cap_without_inserting_or_advancing_id() {
+        let (_d, _fs, snapshot) = test_snapshot();
         let mut handles = empty_dir_handles();
-        handles.insert(10, Arc::new(Vec::new()));
-        handles.insert(11, Arc::new(Vec::new()));
+        fill_dir_handles(&mut handles, &snapshot, 2);
         let counter = AtomicU64::new(12);
         let rejections = AtomicU64::new(0);
-        let fh = try_admit_dir_handle(&mut handles, &counter, &rejections, 2, Vec::new());
+        let fh = try_admit_dir_handle(
+            &mut handles,
+            &counter,
+            &rejections,
+            2,
+            (snapshot.id(), 9),
+            snapshot.clone(),
+            listing(&["a"]),
+        );
         assert_eq!(fh, None, "at cap must reject");
-        assert_eq!(handles.len(), 2, "must not insert on reject");
+        assert_eq!(handles.open.len(), 2, "must not insert on reject");
         assert_eq!(
             counter.load(Ordering::Relaxed),
             12,
@@ -1535,6 +2141,190 @@ mod tests {
             rejections.load(Ordering::Relaxed),
             1,
             "the reject must be metered (#626)"
+        );
+    }
+
+    /// The point of #675: the cap bounds handles, and handles on one directory
+    /// at one generation cost one listing between them. Before this, 1,024
+    /// opens of a 300,000-entry directory pinned 1,024 copies of it.
+    #[test]
+    fn handles_on_one_directory_and_generation_share_one_listing() {
+        let (_d, _fs, snapshot) = test_snapshot();
+        let mut handles = empty_dir_handles();
+        let counter = AtomicU64::new(1);
+        let rejections = AtomicU64::new(0);
+        let key = (snapshot.id(), 1);
+        let mut fhs = Vec::new();
+        for _ in 0..8 {
+            // Each open builds its own listing, as two racing `opendir` workers
+            // that both missed the probe would.
+            fhs.push(
+                try_admit_dir_handle(
+                    &mut handles,
+                    &counter,
+                    &rejections,
+                    16,
+                    key,
+                    snapshot.clone(),
+                    listing(&["a", "b"]),
+                )
+                .expect("below cap"),
+            );
+        }
+        let first = Arc::clone(&handles.open[&fhs[0]].listing);
+        for fh in &fhs {
+            assert!(
+                Arc::ptr_eq(&first, &handles.open[fh].listing),
+                "every handle on the same key must hold the same allocation"
+            );
+        }
+        assert_eq!(
+            handles.shared.len(),
+            1,
+            "one directory at one generation indexes one listing"
+        );
+        assert_eq!(Arc::strong_count(&first), 9, "8 handles plus this clone");
+    }
+
+    /// A different directory, or the same directory at a different tree
+    /// generation, is a different listing — sharing must not outlive a refresh.
+    #[test]
+    fn a_different_directory_or_generation_does_not_share() {
+        let (_d, fs, snapshot) = test_snapshot();
+        let mut handles = empty_dir_handles();
+        let counter = AtomicU64::new(1);
+        let rejections = AtomicU64::new(0);
+        let admit = |handles: &mut DirHandles, key: DirListingKey, snap: TreeSnapshot| {
+            try_admit_dir_handle(
+                handles,
+                &counter,
+                &rejections,
+                16,
+                key,
+                snap,
+                listing(&["a"]),
+            )
+            .expect("below cap")
+        };
+        let a = admit(&mut handles, (snapshot.id(), 1), snapshot.clone());
+        let b = admit(&mut handles, (snapshot.id(), 2), snapshot.clone());
+        assert!(
+            !Arc::ptr_eq(&handles.open[&a].listing, &handles.open[&b].listing),
+            "two directories are two listings"
+        );
+
+        // A snapshot taken later is a distinct generation even when the tree
+        // behind it has not changed, because it is a distinct allocation.
+        let later = fs.core.tree_snapshot();
+        let c = admit(&mut handles, (later.id(), 1), later.clone());
+        if later.id() != snapshot.id() {
+            assert!(
+                !Arc::ptr_eq(&handles.open[&a].listing, &handles.open[&c].listing),
+                "a new generation must not serve the old generation's listing"
+            );
+        }
+    }
+
+    #[test]
+    fn releasedir_drops_the_index_entry_with_the_last_handle() {
+        let (_d, _fs, snapshot) = test_snapshot();
+        let mut handles = empty_dir_handles();
+        let counter = AtomicU64::new(1);
+        let rejections = AtomicU64::new(0);
+        let key = (snapshot.id(), 1);
+        let first = try_admit_dir_handle(
+            &mut handles,
+            &counter,
+            &rejections,
+            16,
+            key,
+            snapshot.clone(),
+            listing(&["a"]),
+        )
+        .unwrap();
+        let second = try_admit_dir_handle(
+            &mut handles,
+            &counter,
+            &rejections,
+            16,
+            key,
+            snapshot.clone(),
+            listing(&["a"]),
+        )
+        .unwrap();
+
+        release_dir_handle(&mut handles, first);
+        assert_eq!(handles.open.len(), 1, "the other handle stays open");
+        assert!(
+            shared_listing(&handles, key).is_some(),
+            "the listing outlives the first release: a handle still serves it"
+        );
+
+        release_dir_handle(&mut handles, second);
+        assert!(handles.open.is_empty());
+        assert!(
+            handles.shared.is_empty(),
+            "the index must not outlive the last handle on the key"
+        );
+
+        release_dir_handle(&mut handles, DIR_FH_STATELESS);
+        release_dir_handle(&mut handles, second);
+        assert!(
+            handles.open.is_empty() && handles.shared.is_empty(),
+            "an unknown or repeated releasedir removes nothing"
+        );
+    }
+
+    /// The index entry must live exactly as long as the handles on it, which is
+    /// why it counts them rather than testing the `Weak`. A listing outlives its
+    /// handle whenever an in-flight `readdir` is serving a clone of it, and an
+    /// entry kept alive by that clone would pin the tree generation it names —
+    /// leaving the key matchable by a later tree allocated at the same address,
+    /// which would then be served a listing of the old generation.
+    #[test]
+    fn shared_index_entry_lives_exactly_as_long_as_its_handles() {
+        let (_d, _fs, snapshot) = test_snapshot();
+        let mut handles = empty_dir_handles();
+        let counter = AtomicU64::new(1);
+        let rejections = AtomicU64::new(0);
+        let key = (snapshot.id(), 1);
+        let admit = |handles: &mut DirHandles| {
+            try_admit_dir_handle(
+                handles,
+                &counter,
+                &rejections,
+                16,
+                key,
+                snapshot.clone(),
+                listing(&["a", "b"]),
+            )
+            .expect("below cap")
+        };
+        let first = admit(&mut handles);
+        let second = admit(&mut handles);
+
+        // What an in-flight `readdir` holds: a clone taken under the lock and
+        // served outside it.
+        let in_flight = Arc::clone(&handles.open[&first].listing);
+
+        release_dir_handle(&mut handles, first);
+        assert_eq!(
+            handles.shared.len(),
+            1,
+            "the entry stays while another handle is open on it"
+        );
+
+        release_dir_handle(&mut handles, second);
+        assert!(
+            handles.shared.is_empty(),
+            "the last handle takes the entry with it, even though a readdir is \
+             still serving the listing"
+        );
+        assert_eq!(
+            in_flight.len(),
+            2,
+            "and that readdir's listing stays valid: the index hands listings \
+             out, it does not gate access to them"
         );
     }
 
@@ -1561,18 +2351,27 @@ mod tests {
         // The gauge cannot substitute for this: occupancy sits pinned at the cap
         // while the counter climbs, so only the counter records how many opens
         // were turned away (#626).
+        let (_d, _fs, snapshot) = test_snapshot();
         let mut handles = empty_dir_handles();
         let counter = AtomicU64::new(1);
         let rejections = AtomicU64::new(0);
+        let admit = |handles: &mut DirHandles, ino: u64| {
+            try_admit_dir_handle(
+                handles,
+                &counter,
+                &rejections,
+                1,
+                (snapshot.id(), ino),
+                snapshot.clone(),
+                listing(&["a"]),
+            )
+        };
         assert!(
-            try_admit_dir_handle(&mut handles, &counter, &rejections, 1, Vec::new()).is_some(),
+            admit(&mut handles, 1).is_some(),
             "the first open fits cap 1"
         );
-        for _ in 0..3 {
-            assert!(
-                try_admit_dir_handle(&mut handles, &counter, &rejections, 1, Vec::new()).is_none(),
-                "the table is full"
-            );
+        for ino in 2..5 {
+            assert!(admit(&mut handles, ino).is_none(), "the table is full");
         }
         assert_eq!(
             rejections.load(Ordering::Relaxed),
@@ -1583,18 +2382,30 @@ mod tests {
 
     #[test]
     fn try_admit_dir_handle_frees_slot_after_removal() {
+        let (_d, _fs, snapshot) = test_snapshot();
         let mut handles = empty_dir_handles();
-        handles.insert(10, Arc::new(Vec::new()));
-        handles.insert(11, Arc::new(Vec::new()));
+        fill_dir_handles(&mut handles, &snapshot, 2);
+        let freed = *handles.open.keys().min().expect("fixture admitted two");
         let counter = AtomicU64::new(12);
         let rejections = AtomicU64::new(0);
-        handles.remove(&10); // releasedir frees a slot
-        let fh = try_admit_dir_handle(&mut handles, &counter, &rejections, 2, Vec::new());
+        release_dir_handle(&mut handles, freed); // releasedir frees a slot
+        let fh = try_admit_dir_handle(
+            &mut handles,
+            &counter,
+            &rejections,
+            2,
+            (snapshot.id(), 9),
+            snapshot.clone(),
+            listing(&["a"]),
+        );
         assert_eq!(fh, Some(12), "a freed slot admits again");
-        assert_eq!(handles.len(), 2);
-        assert!(!handles.contains_key(&10), "the freed handle stays gone");
+        assert_eq!(handles.open.len(), 2);
         assert!(
-            handles.contains_key(&12),
+            !handles.open.contains_key(&freed),
+            "the freed handle stays gone"
+        );
+        assert!(
+            handles.open.contains_key(&12),
             "the new handle fills the freed slot"
         );
         assert_eq!(
@@ -1602,6 +2413,86 @@ mod tests {
             0,
             "re-admitting into a freed slot is not a rejection"
         );
+    }
+
+    fn test_style() -> AttrStyle {
+        AttrStyle {
+            uid: 501,
+            gid: 20,
+            file_mode: 0o444,
+            dir_mode: 0o555,
+            mount_time: SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
+            ttl: Duration::from_secs(1),
+        }
+    }
+
+    /// What `readdirplus` must not send to the pool: directories (free —
+    /// `Musefs::getattr` answers them without touching the DB) and the
+    /// synthetic entries, whose attrs are static (#667).
+    #[test]
+    fn inline_plus_entry_covers_dirs_and_synthetic_entries() {
+        let style = test_style();
+
+        let dir = inline_plus_entry(7, FileType::Directory, false, &style).expect("dirs are free");
+        assert_eq!(dir.attr.ino, INodeNo(7));
+        assert_eq!(dir.attr.kind, FileType::Directory);
+        assert_eq!(dir.attr.perm, style.dir_mode);
+        assert_eq!(dir.attr.nlink, 2);
+        assert_eq!(dir.attr.size, 0);
+        assert_eq!(dir.attr.mtime, style.mount_time, "no mtime: the mount's");
+        assert_eq!(dir.ttl, style.ttl);
+
+        let metrics = inline_plus_entry(
+            metrics_dir::METRICS_FILE_INO,
+            FileType::RegularFile,
+            true,
+            &style,
+        )
+        .expect("the metrics file has static attrs");
+        assert_eq!(metrics.attr.ino, INodeNo(metrics_dir::METRICS_FILE_INO));
+        assert_eq!(metrics.ttl, style.ttl);
+
+        assert!(
+            inline_plus_entry(9, FileType::RegularFile, true, &style).is_none(),
+            "a real file needs the DB, so it belongs on the pool"
+        );
+        assert!(
+            inline_plus_entry(
+                metrics_dir::METRICS_FILE_INO,
+                FileType::RegularFile,
+                false,
+                &style
+            )
+            .is_none(),
+            "without --expose-metrics that inode is not ours to answer for"
+        );
+    }
+
+    /// An entry whose attrs could not be resolved still has to appear, or the
+    /// file drops out of the listing entirely — worse than today, where
+    /// `readdir` lists it and the client's own `lookup` reports the error. The
+    /// zero TTL is what keeps that: the kernel caches neither the entry nor the
+    /// placeholder attrs, so the next access goes back to `lookup` (#667).
+    #[test]
+    fn unresolved_plus_entry_is_placeholder_attrs_the_kernel_may_not_cache() {
+        let style = test_style();
+        let file = unresolved_plus_entry(9, FileType::RegularFile, &style);
+        assert_eq!(file.ttl, Duration::ZERO, "the kernel must not cache these");
+        assert_eq!(
+            file.attr.ino,
+            INodeNo(9),
+            "a zero inode would hide the name"
+        );
+        assert_eq!(file.attr.kind, FileType::RegularFile);
+        assert_eq!(file.attr.size, 0);
+
+        let dir = unresolved_plus_entry(7, FileType::Directory, &style);
+        assert_eq!(
+            dir.attr.kind,
+            FileType::Directory,
+            "type comes from readdir"
+        );
+        assert_eq!(dir.ttl, Duration::ZERO);
     }
 
     #[test]

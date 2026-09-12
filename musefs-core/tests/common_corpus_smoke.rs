@@ -255,6 +255,7 @@ fn write_ogg_vorbis_renumbers_every_audio_page_on_serve() {
             read_ahead_budget: 0,
             read_ahead_prefetch: false,
             skip_on_missing: false,
+            trust_backing_mtime: false,
         },
     )
     .unwrap();
