@@ -34,6 +34,11 @@ pub const MAX_TAG_KEY_LEN: i64 = 256;
 pub const MAX_TAG_VALUE_LEN: i64 = 0x00FF_FFFF;
 /// Max `art.mime` length.
 pub const MAX_ART_MIME_LEN: i64 = 255;
+/// Exact `art.sha256` length: a hex-encoded SHA-256 digest. The schema `CHECK`
+/// pins it to equality; the reader guard in [`crate::art`] bounds only the
+/// upper side, since a short digest is a correctness problem for the caller
+/// rather than an allocation one.
+pub const ART_SHA256_LEN: i64 = 64;
 /// Max `track_art.description` length — 8 KiB. Raised from 1 KiB in #644: a
 /// picture description is free-form UTF-8 with a 32-bit length in both FLAC
 /// `PICTURE` and ID3 `APIC`, and a tagger pasting a paragraph of provenance
@@ -61,8 +66,11 @@ pub const STRUCTURAL_KINDS: [&str; 2] = ["STREAMINFO", "SEEKTABLE"];
 /// blob streams at read time, so no reader guard). Mirrors `musefs-core`'s
 /// `MAX_BINARY_TAG_BYTES`.
 pub const MAX_BINARY_TAG_BYTES: i64 = 16_711_680;
-/// `art.byte_len` cap in bytes — defense-in-depth `CHECK` only. Mirrors
-/// `musefs-core`'s `MAX_ART_BYTES`.
+/// `art.byte_len` cap in bytes. Mirrors `musefs-core`'s `MAX_ART_BYTES`. The
+/// serve path streams the blob and needs no guard, but `get_art` materializes
+/// it whole, so that reader bounds `length(data)` against this before the read
+/// — a crafted store can disagree with both the cap and the
+/// `byte_len = length(data)` `CHECK` (#693).
 pub const MAX_ART_BYTES: i64 = 16_711_680;
 
 #[cfg(test)]
@@ -82,5 +90,6 @@ mod tests {
         assert_eq!(MAX_ART_BYTES, 16 * 1024 * 1024 - 64 * 1024);
         assert_eq!(STRUCTURAL_KINDS, ["STREAMINFO", "SEEKTABLE"]);
         assert_eq!(MAX_ART_ROWS_PER_TRACK, 4096);
+        assert_eq!(ART_SHA256_LEN, 64);
     }
 }

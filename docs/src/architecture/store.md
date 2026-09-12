@@ -133,6 +133,15 @@ four-byte characters sits exactly on both bounds and reads back intact. Nor is
 it a ban on NUL — a short NUL-bearing value still reads. Forbidding NUL outright
 in the `CHECK`s is a schema change, and rides the 2.0.0 store migration.
 
+`get_art` is the one reader that materializes a whole `art` row, image blob
+included, rather than streaming it. It therefore guards all three of its
+unbounded columns from lengths first — `mime` and `sha256` as above, and
+`length(data)` against the `art.byte_len` cap, which a crafted store can have
+been written without since both that cap and `byte_len = length(data)` are
+`CHECK`s. `art.sha256` is the identity case the character cap never really
+guaranteed: `length(sha256) = 64` is satisfied by 64 hex characters, a NUL, and
+any amount of suffix.
+
 **One ordinal space per key.** `tags`' primary key is `(track_id, key,
 ordinal)`, which does not discriminate on `value_blob`: a track's text rows and
 its binary rows are numbered in the *same* space per key. A writer that holds a

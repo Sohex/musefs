@@ -370,7 +370,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rejected before the allocation rather than after. The ceiling is four bytes
   per character, which is what UTF-8 already guarantees, so no legitimate value
   is narrowed. Forbidding NUL outright in the constraints themselves is a schema
-  change and rides the 2.0.0 store migration.
+  change and rides the 2.0.0 store migration. `get_art`, the one reader that
+  materializes a whole `art` row rather than streaming its blob, gained the same
+  treatment for `mime`, for `sha256` — whose `length(sha256) = 64` constraint a
+  NUL likewise satisfies, so it never guaranteed a 64-character stored identity
+  — and for the image blob itself.
 
 ## [1.3.0] - 2026-08-19
 
