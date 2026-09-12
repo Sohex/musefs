@@ -211,7 +211,8 @@ the row of a removed backing file — is a deliberate act owned by `musefs
 revalidate --prune`; the plugin never prunes on its own (it exposes the
 revalidate pass via `beet musefs --revalidate`). The `prune_missing` helper in
 `musefs_common` implements the same by-existence delete for writers that prefer
-to own pruning themselves. Link-tree writers (e.g. the Lidarr integration) never
+to own pruning themselves; like `revalidate --prune` it deletes only on a
+confirmed "not found" and keeps any row whose path it merely failed to stat. Link-tree writers (e.g. the Lidarr integration) never
 delete the backing files they point at, so they prune by identity instead: a
 source-reported album/artist deletion removes the rows carrying the matching
 MusicBrainz id.

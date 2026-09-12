@@ -183,10 +183,22 @@ def sync_records(
         conn.close()
 
 
-def sync_rename_prune(*, config: SyncConfig, previous_paths: list[str]) -> int:
+def _log_unreadable(unreadable, *, warning_printer) -> None:
+    for _track_id, path, message in unreadable:
+        warning_printer(
+            f"musefs-lidarr-sync: kept store row for {path}: cannot stat it ({message})",
+            file=sys.stderr,
+        )
+
+
+def sync_rename_prune(
+    *, config: SyncConfig, previous_paths: list[str], warning_printer=print
+) -> int:
     """Prune store rows for a rename's old paths; return the count pruned.
 
-    No-op in symlink mode (the backing path is the unchanged real file).
+    No-op in symlink mode (the backing path is the unchanged real file). A path
+    that cannot be stat'd keeps its row and is logged, so a rename that pruned
+    nothing because the mount was unreachable is not silent (#692).
     """
     if config.link_mode is LinkMode.SYMLINK or not previous_paths:
         return 0
@@ -196,8 +208,10 @@ def sync_rename_prune(*, config: SyncConfig, previous_paths: list[str]) -> int:
     try:
         check_schema_version(conn)  # never prune a store schema we don't understand (#545)
         ids = track_ids_for_paths(conn, previous_keys)
-        pruned = prune_missing(conn, list(ids.values()))
+        unreadable = []
+        pruned = prune_missing(conn, list(ids.values()), unreadable=unreadable)
         conn.commit()
+        _log_unreadable(unreadable, warning_printer=warning_printer)
         return pruned
     except Exception:
         conn.rollback()

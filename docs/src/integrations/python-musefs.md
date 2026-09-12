@@ -220,8 +220,15 @@ for a custom write loop)
   rows; `arts` is `[(art_id, picture_type, description), …]`.
 - `sniff_mime(data, path)` — image mime from magic bytes, falling back to file
   extension.
-- `prune_missing(conn, track_ids=None)` → count — delete tracks whose backing
-  file no longer exists (every track, or just `track_ids`).
+- `prune_missing(conn, track_ids=None, *, unreadable=None)` → count — delete
+  tracks whose backing file is *confirmed* gone (every track, or just
+  `track_ids`). Only a `FileNotFoundError` from `os.stat` counts as gone: a path
+  that cannot be stat'd for any other reason (a parent directory's permissions,
+  an unreachable network or removable mount) keeps its row, because the cascade
+  would take that track's plugin-written tags and art with it. Pass a list as
+  `unreadable` to collect `(track_id, backing_path, message)` for every row kept
+  that way, so a pass that pruned nothing can be told from one that could not
+  look.
 - `delete_tracks(conn, track_ids)` → count — unconditionally delete the given
   track rows (intent-based, unlike `prune_missing`'s on-disk existence check);
   their `tags` and `track_art` rows cascade away.
