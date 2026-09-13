@@ -77,7 +77,7 @@ def test_replace_track_art_sets_and_replaces_front_cover(db_path):
         tid = insert_track(conn, "/m/a.flac")
         first = upsert_art(conn, JPEG, "image/jpeg")
         before = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
-        replace_track_art(conn, tid, [(first, 3, "")])
+        replace_track_art(conn, tid, [(first, 3, "", "image/png")])
         conn.commit()
         row = conn.execute(
             "SELECT art_id, picture_type, ordinal FROM track_art WHERE track_id=?", (tid,)
@@ -86,7 +86,7 @@ def test_replace_track_art_sets_and_replaces_front_cover(db_path):
         after = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         assert after > before
         second = upsert_art(conn, PNG, "image/png")
-        replace_track_art(conn, tid, [(second, 3, "")])
+        replace_track_art(conn, tid, [(second, 3, "", "image/png")])
         conn.commit()
         rows = conn.execute("SELECT art_id FROM track_art WHERE track_id=?", (tid,)).fetchall()
         assert rows == [(second,)]
@@ -100,15 +100,17 @@ def test_replace_track_art_multiple_rows_ordered(db_path):
         tid = insert_track(conn, "/m/a.flac")
         a = upsert_art(conn, JPEG, "image/jpeg")
         b = upsert_art(conn, PNG, "image/png")
-        replace_track_art(conn, tid, [(a, 3, ""), (b, 4, "back")])
+        replace_track_art(conn, tid, [(a, 3, "", "image/jpeg"), (b, 4, "back", "image/png")])
         conn.commit()
         rows = conn.execute(
-            "SELECT art_id, picture_type, description, ordinal FROM track_art "
+            "SELECT art_id, picture_type, description, mime, ordinal FROM track_art "
             "WHERE track_id=? ORDER BY ordinal",
             (tid,),
         ).fetchall()
-        assert rows == [(a, 3, "", 0), (b, 4, "back", 1)]
-        replace_track_art(conn, tid, [(b, 3, "")])
+        # Each link carries the mime of the picture it links, which is the whole
+        # point of the column living here rather than on the shared `art` row.
+        assert rows == [(a, 3, "", "image/jpeg", 0), (b, 4, "back", "image/png", 1)]
+        replace_track_art(conn, tid, [(b, 3, "", "image/png")])
         conn.commit()
         rows = conn.execute("SELECT art_id FROM track_art WHERE track_id=?", (tid,)).fetchall()
         assert rows == [(b,)]

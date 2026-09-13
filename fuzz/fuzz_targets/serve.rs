@@ -220,9 +220,6 @@ fuzz_target!(|data: &[u8]| {
         let blob = vec![0xABu8; usize::try_from(a.data_len.get().min(4096)).unwrap_or(0)];
         if !blob.is_empty()
             && let Ok(art_id) = db.upsert_art(&NewArt {
-                mime: a.mime.clone(),
-                width: Some(8),
-                height: Some(8),
                 data: blob,
             })
         {
@@ -232,6 +229,11 @@ fuzz_target!(|data: &[u8]| {
                     art_id,
                     picture_type: 3,
                     description: String::new(),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                    depth: 0,
+                    colors: 0,
                     ordinal: 0,
                 }],
             );

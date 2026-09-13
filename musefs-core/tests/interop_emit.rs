@@ -184,9 +184,6 @@ fn emit(
         .map(|(i, (data, mime))| {
             let art_id = db
                 .upsert_art(&NewArt {
-                    mime: (*mime).to_string(),
-                    width: None,
-                    height: None,
                     data: data.to_vec(),
                 })
                 .unwrap();
@@ -194,6 +191,14 @@ fn emit(
                 art_id,
                 picture_type: 3,
                 description: String::new(),
+                // The interop corpus declares a mime per picture on purpose:
+                // mutagen reads it back off the synthesized block, which is the
+                // round trip this suite exists to prove.
+                mime: (*mime).to_string(),
+                width: None,
+                height: None,
+                depth: 0,
+                colors: 0,
                 ordinal: i as u64,
             }
         })

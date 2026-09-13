@@ -12,6 +12,7 @@ import mutagen
 
 CONTRACT_TITLE = "Contract Roundtrip Title"
 CONTRACT_ARTIST = "Contract Roundtrip Artist"
+CONTRACT_ART_MIME = "image/jpeg"
 
 
 def _audio_files() -> list[str]:
@@ -34,10 +35,23 @@ def test_python_written_tags_survive_synthesis() -> None:
 
 
 def test_synthesized_files_carry_embedded_art() -> None:
-    """Cover art written via the python store survives into the synthesized file."""
+    """Cover art written via the python store survives into the synthesized file.
+
+    Including what it *declares*. The mime lives on the ``track_art`` link from
+    schema v4 on, and synthesis writes that value into the picture block — so a
+    writer that stores a link without one produces art whose type is the empty
+    string. Asserting only that art is present would not notice.
+    """
     for path in _audio_files():
         f = mutagen.File(path)
-        has_art = bool(getattr(f, "pictures", None)) or (
-            f.tags is not None and any(str(k).startswith("APIC") for k in f.tags.keys())
-        )
-        assert has_art, f"no embedded art in {path}"
+        pictures = list(getattr(f, "pictures", None) or [])
+        apics = [
+            f.tags[k]
+            for k in (f.tags.keys() if f.tags is not None else [])
+            if str(k).startswith("APIC")
+        ]
+        assert pictures or apics, f"no embedded art in {path}"
+        for pic in pictures:
+            assert pic.mime == CONTRACT_ART_MIME, f"wrong picture mime in {path}: {pic.mime!r}"
+        for apic in apics:
+            assert apic.mime == CONTRACT_ART_MIME, f"wrong APIC mime in {path}: {apic.mime!r}"

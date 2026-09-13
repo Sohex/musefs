@@ -108,13 +108,13 @@ def test_replace_track_art_atomic_on_fk_violation(db_path):
     try:
         tid = insert_track(conn, "/m/a.flac")
         art_id = upsert_art(conn, JPEG, "image/jpeg")
-        replace_track_art(conn, tid, [(art_id, 3, "")])
+        replace_track_art(conn, tid, [(art_id, 3, "", "image/png")])
         before_cv = conn.execute(
             "SELECT content_version FROM tracks WHERE id = ?", (tid,)
         ).fetchone()[0]
         # 999999 has no row in `art`: the INSERT (after the DELETE) trips the FK.
         with pytest.raises(sqlite3.IntegrityError):
-            replace_track_art(conn, tid, [(999999, 3, "")])
+            replace_track_art(conn, tid, [(999999, 3, "", "image/png")])
         rows = conn.execute(
             "SELECT art_id, picture_type, ordinal FROM track_art WHERE track_id = ?", (tid,)
         ).fetchall()

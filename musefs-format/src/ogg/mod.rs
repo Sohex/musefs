@@ -1663,6 +1663,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 64,
             height: 64,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(image.len() as u64).unwrap(),
         };
         let src = MapArtSource::new([(meta.art_id, image.clone())]);
@@ -1756,6 +1758,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 10,
             height: 10,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(len as u64).unwrap(),
         }
     }
@@ -1907,6 +1911,8 @@ mod tests {
             art_id: 0,
             mime: "image/jpeg".to_string(),
             description: String::new(),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(u64::from(u32::MAX)).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -1932,6 +1938,8 @@ mod tests {
             art_id: 0,
             mime: "image/png".to_string(),
             description: "x".repeat(256),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(3_221_225_470).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -1964,6 +1972,8 @@ mod tests {
             art_id: 0,
             mime: "image/png".to_string(),
             description: String::new(),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(3_221_225_412).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -1993,6 +2003,8 @@ mod tests {
             art_id: 0,
             mime: "image/jpeg".to_string(),
             description: String::new(),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(u64::MAX).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -2022,6 +2034,8 @@ mod tests {
             art_id: 0,
             mime: "image/jpeg".to_string(),
             description: String::new(),
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(u64::MAX).unwrap(),
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
@@ -2049,6 +2063,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 1,
             height: 1,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(12345).unwrap(),
         };
         let p = picture_prefix(&art).unwrap();
@@ -2152,6 +2168,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(data_len).unwrap(),
         };
         let framing_len = picture_prefix(&mk(1)).unwrap().len() as u64;
@@ -2220,6 +2238,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 1,
             height: 1,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(100).unwrap(),
         };
         let prefix = picture_prefix(&art).unwrap();
@@ -2265,6 +2285,8 @@ mod tests {
             picture_type: crate::input::PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: crate::input::BlobLen::new(image.len() as u64).unwrap(),
         };
         let max = Cell::new(0usize);

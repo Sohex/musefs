@@ -251,9 +251,6 @@ pub struct NewTrack {
 
 #[derive(Debug, Clone)]
 pub struct NewArt {
-    pub mime: String,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
     pub data: Vec<u8>,
 }
 
@@ -280,9 +277,6 @@ impl Tag {
 pub struct Art {
     pub id: i64,
     pub sha256: String,
-    pub mime: String,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
     pub byte_len: u64,
     pub data: Vec<u8>,
 }
@@ -290,9 +284,6 @@ pub struct Art {
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtMeta {
-    pub mime: String,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
     pub byte_len: u64,
 }
 
@@ -302,6 +293,21 @@ pub struct TrackArt {
     pub art_id: i64,
     pub picture_type: u32,
     pub description: String,
+    /// The MIME type *this file's* picture block declares. It lives here rather
+    /// than on `art` because it describes the embedding, not the bytes: two
+    /// files can hold byte-identical art and describe it differently, and when
+    /// `art` owned this the first one ingested chose it for every track sharing
+    /// the blob (#716).
+    pub mime: String,
+    /// Dimensions as this file declares them, `None` when it declares none —
+    /// which is every ID3 `APIC` and every MP4 `covr`, since neither format has
+    /// a field for them.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Bits per pixel and indexed-colour count, 0 for "not stated". Only FLAC's
+    /// `PICTURE` block carries them; the parser used to read and discard both.
+    pub depth: u32,
+    pub colors: u32,
     pub ordinal: u64,
 }
 

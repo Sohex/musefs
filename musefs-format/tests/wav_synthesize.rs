@@ -62,6 +62,8 @@ fn embeds_full_fidelity_id3_tag_with_art() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(art_bytes.len() as u64).unwrap(),
     }];
 
@@ -186,6 +188,8 @@ fn keeps_real_art_when_mixed_with_empty() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(art_bytes.len() as u64).unwrap(),
     }];
 

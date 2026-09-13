@@ -687,11 +687,12 @@ DROP TABLE art;
 CREATE TABLE art (
     id       INTEGER PRIMARY KEY,
     sha256   TEXT NOT NULL UNIQUE,
-    -- mime/width/height still live here. #716 moves them to `track_art`, which
-    -- happened above, but the readers do not switch over until the Rust half --
-    -- and a column cannot be dropped while the code still selects it. They go
-    -- when that lands.
-    mime     TEXT NOT NULL,
+    -- Vestigial. #716 moved these to `track_art`, and nothing in Rust reads or
+    -- writes them any more -- but the `contrib` plugins still insert `mime`, so
+    -- the column cannot go until they move too. The default is what lets the
+    -- two writers coexist for that one step: musefs omits the column, a plugin
+    -- still supplies it, and nothing reads either value.
+    mime     TEXT NOT NULL DEFAULT '',
     width    INTEGER,
     height   INTEGER,
     byte_len INTEGER NOT NULL,

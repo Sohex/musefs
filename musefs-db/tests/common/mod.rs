@@ -15,10 +15,5 @@ pub fn new_track(path: &str) -> NewTrack {
 }
 
 pub fn jpeg(data: Vec<u8>) -> NewArt {
-    NewArt {
-        mime: "image/jpeg".to_string(),
-        width: None,
-        height: None,
-        data,
-    }
+    NewArt { data }
 }

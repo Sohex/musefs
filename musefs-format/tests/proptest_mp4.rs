@@ -31,6 +31,8 @@ proptest! {
                 picture_type: PictureType::new(3).unwrap(),
                 width: 0,
                 height: 0,
+                depth: 0,
+                colors: 0,
                 data_len: BlobLen::new(*len).unwrap(),
             })
             .collect();

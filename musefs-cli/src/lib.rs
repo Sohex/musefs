@@ -1881,9 +1881,6 @@ mod tests {
             let db = musefs_db::Db::open(&path).unwrap();
             for i in 0..16u8 {
                 db.upsert_art(&musefs_db::NewArt {
-                    mime: "image/png".into(),
-                    width: None,
-                    height: None,
                     data: vec![i; 256 * 1024],
                 })
                 .unwrap();

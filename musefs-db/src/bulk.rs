@@ -190,9 +190,6 @@ mod tests {
                     .unwrap();
                 let art_id = bw
                     .upsert_art(&NewArt {
-                        mime: "image/png".into(),
-                        width: None,
-                        height: None,
                         data: vec![1, 2, 3, 4],
                     })
                     .unwrap();
@@ -202,6 +199,11 @@ mod tests {
                         art_id,
                         picture_type: 3,
                         description: String::new(),
+                        mime: "image/png".into(),
+                        width: None,
+                        height: None,
+                        depth: 0,
+                        colors: 0,
                         ordinal: 0,
                     }],
                 )

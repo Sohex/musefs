@@ -77,6 +77,8 @@ fn payload_weight_sums_all_buffered_payloads() {
         description: String::new(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data: vec![0u8; n],
     };
     let probed = Probed {
@@ -716,6 +718,8 @@ fn refresh_structural_into_preserves_tags_and_art() {
             description: "Original art".into(),
             width: 1,
             height: 1,
+            depth: 0,
+            colors: 0,
             data: vec![1, 2, 3],
         }],
         binary_tags: vec![EmbeddedBinaryTag {
@@ -746,6 +750,8 @@ fn refresh_structural_into_preserves_tags_and_art() {
             description: "Changed art".into(),
             width: 2,
             height: 2,
+            depth: 0,
+            colors: 0,
             data: vec![9, 9, 9],
         }],
         binary_tags: vec![EmbeddedBinaryTag {
@@ -814,6 +820,8 @@ fn fingerprint_changes_with_picture_description() {
         description: desc.into(),
         width: 10,
         height: 10,
+        depth: 0,
+        colors: 0,
         data: vec![1, 2, 3],
     };
     let base = Probed {

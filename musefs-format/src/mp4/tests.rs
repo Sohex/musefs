@@ -381,6 +381,8 @@ fn build_udta_with_art_reserves_size_without_image() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(100).unwrap(),
     };
     let (segs, streamed) = build_udta(&[TagInput::new("title", "T")], &[], &[art], None).unwrap();
@@ -415,6 +417,8 @@ fn build_udta_rejects_oversize_art() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(u64::from(u32::MAX) + 1).unwrap(),
     };
     assert!(matches!(
@@ -850,6 +854,8 @@ fn synthesize_with_art_splits_for_streaming() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(50).unwrap(),
     };
     let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[art]).unwrap();
@@ -871,6 +877,8 @@ fn synthesize_picks_first_nonempty_art() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(40).unwrap(),
     };
     let layout = synthesize_layout(&scan, &[TagInput::new("title", "T")], &[], &[real]).unwrap();
@@ -1458,6 +1466,8 @@ fn build_udta_png_art_uses_type_code_14() {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(10).unwrap(),
         };
         let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art], None).unwrap();
@@ -1481,6 +1491,8 @@ fn build_udta_art_box_sizes_are_exact() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(10).unwrap(),
     };
     let (segs, _) = build_udta(&[TagInput::new("title", "T")], &[], &[art], None).unwrap();
@@ -1501,6 +1513,8 @@ fn build_udta_multiple_arts_one_covr_n_data_atoms() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(len).unwrap(),
     };
     let arts = [art(1, "image/jpeg", 10), art(2, "image/png", 20)];
@@ -1563,6 +1577,8 @@ fn build_udta_two_arts_round_trips_through_read_pictures() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(len).unwrap(),
     };
     let arts = [art(1, "image/jpeg", 5), art(2, "image/png", 9)];
@@ -1595,6 +1611,8 @@ fn build_udta_udta_size_exactly_u32_max_is_ok() {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(data_len).unwrap(),
         }
     }
@@ -1994,6 +2012,8 @@ fn synthesize_new_moov_size_exactly_u32_max_is_ok() {
             picture_type: PictureType::new(3).unwrap(),
             width: 0,
             height: 0,
+            depth: 0,
+            colors: 0,
             data_len: BlobLen::new(data_len).unwrap(),
         }
     }
@@ -2030,6 +2050,8 @@ fn synthesize_layout_emits_all_nonzero_arts() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(len).unwrap(),
     };
     let buf = mk_mp4(true, b"AUDIO", &[0]);
@@ -2115,6 +2137,8 @@ fn build_udta_checked_art_len_rejects_overflow() {
         picture_type: PictureType::new(3).unwrap(),
         width: 0,
         height: 0,
+        depth: 0,
+        colors: 0,
         data_len: BlobLen::new(data_len).unwrap(),
     };
     assert_eq!(
