@@ -193,6 +193,7 @@ fn plant_stored_row(db: &musefs_db::Db, path: &std::path::Path) {
 /// keeps its row.
 #[test]
 fn revalidate_prunes_a_stored_chained_ogg_only_when_asked() {
+    crate::warn_limit::log_capture::install();
     let dir = tempfile::tempdir().unwrap();
     let chained = dir.path().join("stuck-chained.opus");
     std::fs::write(&chained, chained_opus_bytes()).unwrap();
@@ -212,6 +213,12 @@ fn revalidate_prunes_a_stored_chained_ogg_only_when_asked() {
         );
         assert_eq!(db.list_tracks().unwrap().len(), 2);
     }
+    // Unasked, the run says what `--prune` would remove. The count is this
+    // test's own: no other test stores a refused file, so no other can log it.
+    let told = crate::warn_limit::log_capture::messages_containing(
+        "1 stored track(s) are in a form this version refuses to serve",
+    );
+    assert!(!told.is_empty(), "an unpruned refusal is reported");
 
     let opts = ScanOptions {
         prune: true,

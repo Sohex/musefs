@@ -451,6 +451,7 @@ mod guard_tests {
             .refresh_embedded_art(track, &[file_art(b"COVER", "image/webp", 1200, 24, 0)])
             .unwrap();
         assert_eq!(changed, 1, "the bulk writer runs the same body");
+        assert_eq!(described(0).0, "image/webp", "and writes, not just counts");
     }
 
     /// #724: a row filed under the digest of bytes it does not hold is refused

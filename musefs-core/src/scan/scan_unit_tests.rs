@@ -714,6 +714,61 @@ fn ingest_unit_db_path_skips_unstatable_candidate() {
     );
 }
 
+/// #746: a structural refresh restores what the file declares about its own
+/// picture through a plain `Db` sink too, not only the pipeline's bulk writer.
+#[test]
+fn refresh_structural_into_restores_the_files_picture_metadata_through_a_db() {
+    let db = Db::open_in_memory().unwrap();
+    let stamp = BackingStamp {
+        size: 10,
+        mtime_ns: 1,
+        ctime_ns: 1,
+        ino: None,
+    };
+    let probed = |mime: &str, depth: u32| Probed {
+        format: Format::Flac,
+        audio_offset: 4,
+        audio_length: 6,
+        tags: Vec::new(),
+        pictures: vec![EmbeddedPicture {
+            mime: mime.into(),
+            picture_type: PictureType::new(3).unwrap(),
+            description: String::new(),
+            width: 8,
+            height: 8,
+            depth,
+            colors: 0,
+            data: vec![7, 7, 7],
+        }],
+        binary_tags: Vec::new(),
+        structural_blocks: Vec::new(),
+    };
+    let path = Path::new("/m/a.flac");
+    ingest_into(
+        &db,
+        path,
+        stamp,
+        probed("image/png", 0),
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
+    )
+    .unwrap();
+    let id = db.list_tracks().unwrap()[0].id;
+
+    refresh_structural_into(
+        &db,
+        path,
+        stamp,
+        probed("image/jpeg", 24),
+        ChecksumWrite::Keep,
+        ChecksumWrite::Keep,
+    )
+    .unwrap();
+
+    let link = &db.get_track_art(id).unwrap()[0];
+    assert_eq!((link.mime.as_str(), link.depth), ("image/jpeg", 24));
+}
+
 #[test]
 fn refresh_structural_into_preserves_tags_and_art() {
     let db = Db::open_in_memory().unwrap();
