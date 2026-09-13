@@ -258,10 +258,12 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 /// `musefs_pool_workers` keeps reading healthy (#669). Catching here keeps the
 /// worker, and therefore its connection, alive.
 ///
-/// This is a backstop, not the reply guarantee: fuser's reply objects send
-/// nothing when dropped, so a task that panics before replying still hangs the
-/// syscall. Reply-bearing tasks guard their synthesis with [`synth_outcome`] and
-/// reply *outside* that boundary, which is what answers the caller (#359, #533).
+/// This is a backstop, not the reply guarantee. fuser answers a reply dropped
+/// unsent with a bare `EIO` and a warning that names only the request id, so a
+/// task that panics before replying fails its syscall with the wrong errno and
+/// no record of what failed. Reply-bearing tasks guard their synthesis with
+/// [`synth_outcome`] and reply *outside* that boundary, which is what gives the
+/// caller the real errno and the log its cause (#359, #533).
 /// What reaches this boundary is the rest of the task body — the reply call
 /// itself, handle bookkeeping — and the poll-refresh tasks, which carry no reply
 /// at all. `op` labels the syscall in the log line.
@@ -279,9 +281,9 @@ fn execute_guarded(pool: &ThreadPool, op: &'static str, work: impl FnOnce() + Se
 /// Run metadata/handle/read synthesis under a panic boundary so a residual
 /// parser panic — one the format-layer alloc guards (`id3v2_alloc_safe` and
 /// friends) don't catch — becomes an errno reply instead of unwinding the pool
-/// worker. fuser's reply objects send nothing when dropped, so an unwound worker
-/// leaves the kernel waiting forever and the syscall hangs at 0% CPU with no
-/// error logged (#359). The same metadata synthesis runs behind `read`,
+/// worker. An unwound worker drops its reply unsent, which fuser answers with a
+/// bare `EIO` and a warning naming only the request id, so the caller gets no
+/// real errno and the log no cause (#359). The same metadata synthesis runs behind `read`,
 /// `lookup`, `getattr`, and `open` (all resolve a layout via `cache.resolve`),
 /// so every one of them must guard it, not just `read` (#533). The caller makes
 /// the reply *outside* this boundary on the returned outcome. A `CoreError` maps
@@ -684,8 +686,8 @@ struct PlusRound {
 /// completion, a panic caught by [`execute_guarded`], and a task a dead pool
 /// dropped without running (the shape [`PollPendingGuard`] guards against,
 /// #369). The last one out assembles the round, so a lost task costs that
-/// entry's attrs and never the reply — which, dropped unsent, would hang the
-/// syscall (#359).
+/// entry's attrs and never the reply — which, dropped unsent, fuser would
+/// answer with a bare `EIO` for the whole listing (#359).
 struct PlusSlot(Arc<PlusRound>);
 
 impl Drop for PlusSlot {
