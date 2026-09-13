@@ -98,8 +98,6 @@ MUSEFS_DB=/home/youruser/.local/share/musefs/library.db
 
 # Probe worker threads (0 = available parallelism).
 #MUSEFS_JOBS=0
-# Re-validate on scan: skip unchanged, prune missing, GC orphaned art.
-#MUSEFS_REVALIDATE=false
 # Follow symlinks while walking.
 #MUSEFS_FOLLOW_SYMLINKS=false
 # Suppress the per-target scan summary.

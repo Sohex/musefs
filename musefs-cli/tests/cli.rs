@@ -42,7 +42,7 @@ fn parses_scan_and_mount_invocations() {
 }
 
 #[test]
-fn parses_mode_and_revalidate_flags() {
+fn parses_mode_and_tuning_flags() {
     use musefs_cli::CliMode;
 
     let cli = Cli::parse_from([
@@ -105,31 +105,6 @@ fn parses_mode_and_revalidate_flags() {
             assert!(args.keep_cache);
         }
         Command::Scan { .. } => panic!("expected mount"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } | Command::Migrate(..) => {
-            unreachable!()
-        }
-    }
-
-    // Scan --revalidate flag.
-    let cli = Cli::parse_from([
-        "musefs",
-        "scan",
-        "/music",
-        "--db",
-        "/tmp/m.db",
-        "--revalidate",
-    ]);
-    match cli.command {
-        Command::Scan { revalidate, .. } => assert!(revalidate),
-        Command::Mount(..) => panic!("expected scan"),
-        Command::Vacuum { .. } | Command::Revalidate { .. } | Command::Migrate(..) => {
-            unreachable!()
-        }
-    }
-    let cli = Cli::parse_from(["musefs", "scan", "/music", "--db", "/tmp/m.db"]);
-    match cli.command {
-        Command::Scan { revalidate, .. } => assert!(!revalidate),
-        Command::Mount(..) => panic!("expected scan"),
         Command::Vacuum { .. } | Command::Revalidate { .. } | Command::Migrate(..) => {
             unreachable!()
         }

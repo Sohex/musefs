@@ -542,6 +542,19 @@ see the [Release notes](release-notes.md).
   every healthy scan only teaches operators to tune warnings out. The `skipped`
   count itself is unchanged and still printed in the per-target summary.
 
+### Removed
+
+- **`scan --revalidate`**, deprecated since 1.1.0 in favour of the `revalidate`
+  subcommand, and its `MUSEFS_REVALIDATE` variable
+  ([#707](https://github.com/Sohex/musefs/issues/707)). The flag is now a usage
+  error. The variable is refused rather than ignored: clap never reads an
+  environment variable no flag declares, so a unit file still setting it would
+  have gone on running a full scan where it used to revalidate, and said
+  nothing. `scan` stops with a message naming the subcommand instead.
+  `musefs_cli::run_scan` loses its `revalidate` parameter. The `contrib`
+  packages have called the subcommand since their 1.1.0, so only a copy older
+  than that is affected.
+
 ### Fixed
 
 - **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch
@@ -631,7 +644,7 @@ see the [Release notes](release-notes.md).
   every row in an upgraded store starts in — and such a row is compared on the
   other three fields alone. Failing closed on a field the store has nothing to
   say about would take an entire library offline on the first serve after an
-  upgrade. `musefs scan --revalidate` re-probes exactly the rows still holding
+  upgrade. `musefs revalidate` re-probes exactly the rows still holding
   the sentinel and fills it in, which makes it the complete repopulation path
   for an upgraded store alongside the structural-block and checksum backfills it
   already covered.

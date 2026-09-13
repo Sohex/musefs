@@ -26,7 +26,7 @@ almost every tagger actually produces, writing a temporary file and renaming
 over the original.
 
 A stored inode of zero means "not recorded" — every row a store migrated into
-v4 carries, until a scan or `musefs scan --revalidate` fills it in — and such a
+v4 carries, until a scan or `musefs revalidate` fills it in — and such a
 row is compared on the other three fields alone rather than failing closed on a
 field the store has nothing to say about. `revalidate` re-probes exactly those
 rows, which is what makes it the repopulation path for an upgraded store. The

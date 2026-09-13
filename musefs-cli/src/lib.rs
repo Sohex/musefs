@@ -211,10 +211,6 @@ pub enum Command {
         /// Path to the SQLite database (created if absent).
         #[arg(long, env = "MUSEFS_DB")]
         db: PathBuf,
-        /// DEPRECATED: use the `revalidate` subcommand. Forwards to it (now
-        /// non-pruning). Removed next release.
-        #[arg(long, env = "MUSEFS_REVALIDATE", value_parser = clap::builder::BoolishValueParser::new())]
-        revalidate: bool,
         /// Re-ingest files already present in the DB, overwriting curated tags
         /// and art with the file's embedded metadata.
         #[arg(long, env = "MUSEFS_FORCE", value_parser = clap::builder::BoolishValueParser::new())]
@@ -326,9 +322,8 @@ pub struct MigrateArgs {
 }
 
 /// Open (creating/migrating) the DB at `db_path` once, then scan each target in
-/// `targets` (a file or a directory; directories recurse). With `revalidate`,
-/// run the maintenance pass (skip-unchanged, prune, GC) instead of a full
-/// ingest. With `quiet`, suppress the per-target summary on stdout. Fails fast:
+/// `targets` (a file or a directory; directories recurse). With `quiet`,
+/// suppress the per-target summary on stdout. Fails fast:
 /// the first failing target aborts the batch; targets already scanned stay
 /// committed (ingest is an idempotent upsert).
 ///
@@ -340,7 +335,6 @@ pub struct MigrateArgs {
 pub fn run_scan(
     db_path: &Path,
     targets: &[PathBuf],
-    revalidate: bool,
     force: bool,
     jobs: usize,
     follow_symlinks: bool,
@@ -349,26 +343,6 @@ pub fn run_scan(
     fast: bool,
     strict: bool,
 ) -> Result<u64> {
-    if revalidate {
-        if force {
-            anyhow::bail!("--force and --revalidate are mutually exclusive");
-        }
-        if fast || strict {
-            anyhow::bail!("--fast/--strict are scan-only and cannot be combined with --revalidate");
-        }
-        log::warn!(
-            "`scan --revalidate` is deprecated; use `revalidate` (now non-pruning — add `--prune` to delete gone tracks). This alias will be removed next release."
-        );
-        return run_revalidate(
-            db_path,
-            targets,
-            false,
-            jobs,
-            follow_symlinks,
-            quiet,
-            checksum,
-        );
-    }
     let strictness = match (fast, strict) {
         (true, true) => anyhow::bail!("--fast and --strict are mutually exclusive"),
         (true, false) => musefs_core::MatchStrictness::Fast,
@@ -459,6 +433,26 @@ pub fn run_revalidate(
     }
     reporter.finish();
     Ok(total_failed)
+}
+
+/// Environment variables for `scan` flags that 2.0.0 removed, each with what to
+/// use instead. clap rejects a removed flag, but it never reads a variable no
+/// flag declares, so without this a unit file still setting one would carry on
+/// doing something different from what it asks for, and say nothing.
+const RETIRED_SCAN_ENV: &[(&str, &str)] = &[(
+    "MUSEFS_REVALIDATE",
+    "run the `revalidate` subcommand instead",
+)];
+
+/// Refuse to run while any of `retired` is set. An empty value counts as unset,
+/// which is how clap treats a declared variable too.
+fn refuse_retired_env(retired: &[(&str, &str)]) -> Result<()> {
+    for (var, instead) in retired {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
+            anyhow::bail!("{var} was removed in musefs 2.0.0; {instead}");
+        }
+    }
+    Ok(())
 }
 
 /// Split a `--fallback FIELD=VALUE` argument. The value may contain '=' (only
@@ -1095,7 +1089,6 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Scan {
             targets,
             db,
-            revalidate,
             force,
             jobs,
             follow_symlinks,
@@ -1104,10 +1097,10 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             fast,
             strict,
         } => {
+            refuse_retired_env(RETIRED_SCAN_ENV)?;
             let failed = run_scan(
                 &db,
                 &targets,
-                revalidate,
                 force,
                 jobs,
                 follow_symlinks,
