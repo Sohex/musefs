@@ -204,10 +204,11 @@ impl PendingMigration {
                     .to_string(),
             ),
             (
-                // Its shape does not change, but the migration still copies it
-                // out and back, so a row an older writer smuggled past this
-                // table's own constraints fails the refill exactly like any
-                // other. Omitting it would let that row miss the report, miss
+                // Rebuilt like the rest (#732), and probed for the same reason:
+                // a row the new storage-class checks refuse -- or one an older
+                // writer smuggled past the checks this table always had --
+                // fails the refill. Omitting it would let that row miss the
+                // report, miss
                 // --repair, and then fail the upgrade after the snapshot.
                 "structural_blocks",
                 "(rowid, track_id, kind, ordinal, body) \

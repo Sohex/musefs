@@ -579,9 +579,10 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            0
     FROM tracks_hold_v4;
 
--- 5. Rebuild `tags` and `track_art`. Both are empty right now -- the cascade
--- above took them -- so this is a drop and a create, with the holding tables as
--- the source. `structural_blocks` keeps its shape and is simply refilled.
+-- 5. Rebuild the three child tables. All are empty right now -- the cascade
+-- above took them -- so each is a drop and a create, with the holding tables as
+-- the source. `tags` and `track_art` change shape; `structural_blocks` keeps
+-- its columns and gains only the storage classes every other table now pins.
 
 -- `tags` loses its primary key in favour of two partial unique indexes split on
 -- `value_blob IS NULL` (#663). The PK numbered a track's text rows and its
@@ -729,6 +730,28 @@ INSERT INTO track_art (track_id, art_id, picture_type, description,
     SELECT h.track_id, h.art_id, h.picture_type, h.description,
            a.mime, a.width, a.height, 0, 0, h.ordinal
     FROM track_art_hold_v4 h LEFT JOIN art a ON a.id = h.art_id;
+-- `structural_blocks` is the one core table whose *shape* this migration would
+-- otherwise leave alone, which is what left it the only one with affinity-only
+-- columns once the other three gained storage classes (#732). Its rows are
+-- already held and the table is already empty, so replacing it here costs a
+-- drop and a create and no extra copy of anything -- which is the whole reason
+-- it is worth doing in this release rather than buying a gated migration of its
+-- own for it later.
+DROP TABLE structural_blocks;
+CREATE TABLE structural_blocks (
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    ordinal  INTEGER NOT NULL DEFAULT 0,
+    body     BLOB NOT NULL,
+    PRIMARY KEY (track_id, kind, ordinal),
+    CHECK (typeof(track_id) = 'integer'),
+    -- No typeof on `kind`: the IN list is strictly stronger, since no non-TEXT
+    -- value compares equal to either name. Same call as `tracks.format`, which
+    -- is the only other column in the schema whose values are enumerated.
+    CHECK (kind IN ('STREAMINFO','SEEKTABLE')),
+    CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    CHECK (typeof(body) = 'blob' AND length(body) <= 16777215)
+);
 INSERT INTO structural_blocks (track_id, kind, ordinal, body)
     SELECT track_id, kind, ordinal, body FROM structural_blocks_hold_v4;
 
