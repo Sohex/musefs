@@ -58,13 +58,19 @@ into a compact form.
 
 ### Run it while unmounted
 
-`VACUUM` needs a write lock on the store and rewrites the whole file. Run it when
-nothing else is using the database — no mount, no scan. If the store is in use,
-the command fails with an actionable error rather than fighting for the lock:
+`VACUUM` rewrites the whole file, so it takes the store for itself first, the
+same way [`musefs migrate`](#upgrading-the-store-musefs-migrate) does. Anything
+else with the store open — a mount, including one sitting idle between reads, or
+a scan — makes it refuse before anything is rewritten:
 
 ```text
 error: the store is in use — unmount the filesystem or stop any scan before vacuuming
 ```
+
+Once it has the store, nothing else can attach until it finishes. One case it
+cannot see is a process that has opened the store and not yet read from it:
+SQLite only registers a connection on its first statement, so that process is
+kept out from the moment it tries rather than detected in advance.
 
 ### Notes
 

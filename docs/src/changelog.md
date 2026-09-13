@@ -634,6 +634,16 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **`musefs vacuum` refuses a store a mount has open, as it always said it did**
+  ([#721](https://github.com/Sohex/musefs/issues/721)). It relied on `VACUUM`
+  failing on a busy lock, and in WAL mode a mount idle between reads holds none,
+  so it compacted the store underneath a live mount. It now claims the store the
+  way `musefs migrate` does — a claim that needs SQLite's shared-memory index to
+  itself, so an idle mount and a read-only connection both count — and holds it
+  until it is done. The one case it cannot see in advance is a process that has
+  opened the store but not yet read from it; that process is kept out from the
+  moment it tries.
+
 - **A crafted `structural_blocks.kind` is refused before it is read**
   ([#715](https://github.com/Sohex/musefs/issues/715)). The reader checked the
   value against its two-name allowlist only after materializing it, and a store

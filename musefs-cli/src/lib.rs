@@ -722,8 +722,9 @@ fn vacuum_summary(path: &Path, before: u64, after: u64) -> String {
     }
 }
 
-/// Compact the SQLite store at `db`. Best-effort: a store in use (a live mount
-/// or a running scan) surfaces `DbError::StoreInUse`'s actionable message.
+/// Compact the SQLite store at `db`. A store anything else has open — a mount,
+/// even one idle between reads, or a scan — is refused with
+/// `DbError::StoreInUse`'s actionable message before anything is rewritten.
 pub fn run_vacuum(db: &Path) -> Result<()> {
     if !db.exists() {
         anyhow::bail!("database not found: {} (nothing to vacuum)", db.display());

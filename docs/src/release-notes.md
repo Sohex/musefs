@@ -37,6 +37,12 @@ switching it off. An empty value is treated as unset. `mount` does not read
 these variables and is unaffected, so an environment file shared by the mount
 and scan units only matters to the scan.
 
+**`vacuum` refuses a store that is in use.** It always said it did, but it only
+noticed a mount that was actively reading, and compacted the store underneath
+one sitting idle. It now refuses while any mount or scan has the store open
+([#721]). A scheduled `vacuum` that used to run while the library was mounted
+will start failing with *the store is in use*; stop the mount around it.
+
 **External writers.** No update is needed for these changes: the `contrib/`
 packages have called the `revalidate` subcommand since their 1.2.0 and pass
 neither `--fast` nor `--strict`.
@@ -69,6 +75,7 @@ directly.
 [#708]: https://github.com/Sohex/musefs/issues/708
 [#709]: https://github.com/Sohex/musefs/issues/709
 [#710]: https://github.com/Sohex/musefs/issues/710
+[#721]: https://github.com/Sohex/musefs/issues/721
 [#743]: https://github.com/Sohex/musefs/issues/743
 
 ## v1.3.0
