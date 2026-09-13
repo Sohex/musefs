@@ -647,6 +647,14 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **Metadata work can no longer grow the worker-pool queue without bound.**
+  Reads were capped; `lookup`, `getattr`, `open`, `opendir` and directory
+  listings queued without limit. They now pass an admission gate of 4096 jobs,
+  and over it run on the submitting thread, which throttles the kernel instead
+  of refusing the call; a `readdirplus` entry over the cap is listed with
+  uncached attributes. Store refreshes moved to a thread of their own. The new
+  `musefs_pool_over_cap_total` counter shows when the cap is met.
+  ([#694](https://github.com/Sohex/musefs/issues/694))
 - **A directory listed without a handle can no longer repeat or skip entries
   when the library changes mid-listing**
   ([#695](https://github.com/Sohex/musefs/issues/695)). Past the 1,024

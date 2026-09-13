@@ -154,6 +154,26 @@ An entry whose attributes cannot be resolved is still listed, with placeholder
 attributes and a zero TTL: the kernel caches neither, so the client's next
 access goes back to `lookup` and gets the real error — the same thing it sees
 today, rather than the file silently vanishing from the listing.
+
+### Admission to the worker pool
+
+The pool's queue is unbounded, so nothing reaches it ungated. Reads reserve one
+of 1024 in-flight slots first and are refused with `EAGAIN` over that. Every
+other job — `lookup`, `getattr`, `open`, `opendir`, a stateless listing, a
+`readdirplus` round's resolutions — passes one admission gate capped at 4096
+queued or running ([#694](https://github.com/Sohex/musefs/issues/694)), and none
+of it is refused. A job that finds the gate full runs on the thread that
+submitted it. From the dispatch thread that is the backpressure: fuser reads no
+further request until the job is done, so the backlog waits in the kernel
+rather than in musefs' memory. The one exception is a `readdirplus` entry's
+attributes, which are left unresolved over the cap instead, with the zero-TTL
+placeholder above — running them in place would let a wide directory chain
+round after round on one thread. `musefs_pool_over_cap_total` counts the jobs
+that met the cap; on a healthy mount it stays at zero.
+
+Store refreshes run on a lane of their own, a single thread, so a metadata
+backlog never delays freshness and a refresh never runs in place on the
+dispatch thread, where its kernel invalidations are written.
 `musefs_readdirplus_total` counts the calls; zero means the kernel is not using
 the op, which is otherwise invisible from the daemon since the capability is
 negotiated at mount.

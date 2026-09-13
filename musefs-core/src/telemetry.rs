@@ -57,6 +57,9 @@ pub struct FuseTelemetry {
     pub pool_workers: u64,
     pub pool_active: u64,
     pub pool_queued: u64,
+    /// Metadata jobs that found the pool queue at its cap, and ran on the
+    /// submitting thread or, for `readdirplus` attrs, were left unresolved (#694).
+    pub pool_over_cap: u64,
     pub passthrough: Option<PassthroughTelemetry>,
 }
 
@@ -228,6 +231,12 @@ pub fn render_prometheus(
         "musefs_pool_queued",
         "Jobs waiting in the worker-pool queue.",
         fuse.pool_queued,
+    );
+    counter(
+        &mut out,
+        "musefs_pool_over_cap_total",
+        "Metadata jobs that found the worker-pool queue full and ran in place instead.",
+        fuse.pool_over_cap,
     );
 
     gauge(
@@ -502,6 +511,7 @@ mod tests {
             pool_workers: 8,
             pool_active: 1,
             pool_queued: 0,
+            pool_over_cap: 19,
             passthrough: Some(PassthroughTelemetry {
                 disabled: false,
                 active: 4,
@@ -578,6 +588,9 @@ mod tests {
             "# TYPE musefs_serve_warns_suppressed_total counter\nmusefs_serve_warns_suppressed_total 13\n"
         ));
         assert!(out.contains("musefs_pool_queued 0\n"));
+        assert!(out.contains(
+            "# TYPE musefs_pool_over_cap_total counter\nmusefs_pool_over_cap_total 19\n"
+        ));
         assert!(out.contains("musefs_readahead_budget_bytes 67108864\n"));
         assert!(out.contains("musefs_readahead_charged_bytes 8192\n"));
         assert!(out.contains("musefs_tree_nodes 42\n"));

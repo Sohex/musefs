@@ -268,14 +268,127 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 /// itself, handle bookkeeping — and the poll-refresh tasks, which carry no reply
 /// at all. `op` labels the syscall in the log line.
 fn execute_guarded(pool: &ThreadPool, op: &'static str, work: impl FnOnce() + Send + 'static) {
-    pool.execute(move || {
-        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
-            log::error!(
-                "{op} worker task panicked outside the synthesis boundary: {}; worker retained",
-                panic_message(&*payload)
-            );
+    pool.execute(move || run_guarded(op, work));
+}
+
+/// Run `work` behind [`execute_guarded`]'s panic boundary on the calling thread,
+/// for a job [`Workers::submit`] runs in place because the queue is full.
+fn run_guarded(op: &'static str, work: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        log::error!(
+            "{op} worker task panicked outside the synthesis boundary: {}; worker retained",
+            panic_message(&*payload)
+        );
+    }
+}
+
+/// Cap on metadata jobs queued or running on the worker pool at once (#694).
+///
+/// `ThreadPool`'s queue is unbounded. Reads reserve against their own cap before
+/// queueing ([`MAX_INFLIGHT_READS`], #308); every other job used to queue with
+/// no bound at all. 4096 is many times what a pool of any sensible size drains
+/// between two kernel round trips, so an ordinary workload never meets it; what
+/// meets it is a backlog already too deep to be worth growing.
+const MAX_QUEUED_JOBS: usize = 4096;
+
+/// The worker pool behind one admission gate for everything but reads (#694).
+/// Cloning shares the pool, the count and the counter.
+#[derive(Clone)]
+struct Workers {
+    pool: ThreadPool,
+    /// Metadata jobs queued or running.
+    admitted: Arc<AtomicUsize>,
+    /// Jobs that found `admitted` at the cap: run in place, or for a
+    /// `readdirplus` entry's attrs, not run at all (`musefs_pool_over_cap_total`).
+    over_cap: Arc<AtomicU64>,
+    cap: usize,
+}
+
+/// Gives one [`Workers::admitted`] slot back when dropped: when its job ends,
+/// when it panics, or when a dead pool drops it without running it.
+struct AdmittedSlot(Arc<AtomicUsize>);
+
+impl Drop for AdmittedSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Workers {
+    fn new(pool: ThreadPool, cap: usize) -> Workers {
+        Workers {
+            pool,
+            admitted: Arc::new(AtomicUsize::new(0)),
+            over_cap: Arc::new(AtomicU64::new(0)),
+            cap,
         }
-    });
+    }
+
+    /// Take a slot if the queue has room, counting the refusal if not.
+    fn admit(&self) -> Option<AdmittedSlot> {
+        let count = self.admitted.fetch_add(1, Ordering::Relaxed) + 1;
+        let slot = AdmittedSlot(Arc::clone(&self.admitted));
+        if count > self.cap {
+            self.over_cap.fetch_add(1, Ordering::Relaxed);
+            None // `slot` drops here, giving the increment back
+        } else {
+            Some(slot)
+        }
+    }
+
+    /// Queue a metadata job, or — with the queue at its cap — run it on this
+    /// thread instead (#694).
+    ///
+    /// Running it here is the backpressure. From the dispatch thread it stops
+    /// fuser reading the next request until the job is done, so a backlog waits
+    /// in the kernel, which bounds it, rather than in an unbounded queue here.
+    /// Nothing is refused: a failed `lookup` or `getattr` fails the caller's
+    /// syscall outright, and refusing directory work is what #616 walked back.
+    fn submit(&self, op: &'static str, work: impl FnOnce() + Send + 'static) {
+        match self.admit() {
+            Some(slot) => execute_guarded(&self.pool, op, move || {
+                let _slot = slot;
+                work();
+            }),
+            None => run_guarded(op, work),
+        }
+    }
+
+    /// Queue a job only if the queue has room, dropping it unrun otherwise, and
+    /// report which (#694). For work with a cheaper answer than running in place.
+    fn try_submit(&self, op: &'static str, work: impl FnOnce() + Send + 'static) -> bool {
+        let Some(slot) = self.admit() else {
+            return false;
+        };
+        execute_guarded(&self.pool, op, move || {
+            let _slot = slot;
+            work();
+        });
+        true
+    }
+
+    /// Queue a read. Reads are admitted against their own cap before they get
+    /// here (#308), so they bypass this gate.
+    fn submit_read(&self, work: impl FnOnce() + Send + 'static) {
+        execute_guarded(&self.pool, "read", work);
+    }
+
+    fn max_count(&self) -> usize {
+        self.pool.max_count()
+    }
+
+    fn active_count(&self) -> usize {
+        self.pool.active_count()
+    }
+
+    fn queued_count(&self) -> usize {
+        self.pool.queued_count()
+    }
+
+    #[cfg(test)]
+    fn join(&self) {
+        self.pool.join();
+    }
 }
 
 /// Run metadata/handle/read synthesis under a panic boundary so a residual
@@ -661,7 +774,7 @@ struct PlusFill {
     /// afterwards, so a stray second finish cannot double-reply.
     reply: Mutex<Option<ReplyDirectoryPlus>>,
     core: Arc<Musefs>,
-    pool: ThreadPool,
+    pool: Workers,
     style: AttrStyle,
     expose_metrics: bool,
     /// The generation tag every cookie of this fill carries (#695).
@@ -760,7 +873,7 @@ fn unresolved_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusE
 /// Start filling `reply` with `listing` from `page` (#667).
 fn start_plus_fill(
     core: &Arc<Musefs>,
-    pool: &ThreadPool,
+    pool: &Workers,
     style: AttrStyle,
     expose_metrics: bool,
     listing: Arc<DirListing>,
@@ -812,7 +925,12 @@ fn spawn_plus_round(fill: &Arc<PlusFill>, start: usize) {
         round.outstanding.fetch_add(1, Ordering::Relaxed);
         let slot = PlusSlot(Arc::clone(&round));
         let style = fill.style;
-        execute_guarded(&fill.pool, "readdirplus", move || {
+        // Over the pool's admission cap the job is dropped unrun rather than run
+        // here (#694): its slot counts it out, and the entry gets the zero-TTL
+        // placeholder a lost task gets, so the client's own `lookup` fetches the
+        // attrs. Running it in place instead would let a very wide directory
+        // recurse through round after round on this one thread.
+        fill.pool.try_submit("readdirplus", move || {
             let round = &slot.0;
             let entry = match synth_outcome(
                 "readdirplus",
@@ -1013,7 +1131,13 @@ fn reserve_read_slot(inflight: &Arc<AtomicUsize>, cap: usize) -> Option<ReadSlot
 /// backing read never stalls the dispatch thread or unrelated metadata ops.
 pub struct MusefsFs {
     core: Arc<Musefs>,
-    pool: ThreadPool,
+    /// Offloaded ops, behind the metadata admission gate (#694).
+    pool: Workers,
+    /// Store-refresh tasks, on a lane of their own (#694). A metadata backlog on
+    /// `pool` cannot delay them, and they never run in place on the dispatch
+    /// thread, where `poll_refresh_notify`'s `inval_inode` notifications would be
+    /// written to the very channel fuser is reading.
+    refresh: ThreadPool,
     uid: u32,
     gid: u32,
     mount_time: SystemTime,
@@ -1095,13 +1219,18 @@ impl MusefsFs {
         let structure_only = core.mode() == musefs_core::Mode::StructureOnly;
         MusefsFs {
             core: Arc::new(core),
-            // `ThreadPool`'s queue is unbounded, so foreground reads are gated by
-            // `inflight_reads`/`MAX_INFLIGHT_READS` before submission (#308) and
-            // directory handles are capped at `MAX_DIR_HANDLES` (#307); both reject
-            // over-cap work rather than letting it grow process memory.
-            // `max_background` (set in `init`) separately caps the kernel's
-            // background/readahead requests.
-            pool: ThreadPool::new(workers),
+            // `ThreadPool`'s queue is unbounded, so nothing reaches it ungated:
+            // reads reserve against `MAX_INFLIGHT_READS` and get EAGAIN over it
+            // (#308); every other job goes through `Workers`' admission gate and
+            // runs in place over it (#694); directory handles are capped at
+            // `MAX_DIR_HANDLES` and degrade to the stateless fh over it (#307,
+            // #616). `max_background` (set in `init`) separately caps the
+            // kernel's background/readahead requests.
+            pool: Workers::new(ThreadPool::new(workers), MAX_QUEUED_JOBS),
+            refresh: threadpool::Builder::new()
+                .num_threads(1)
+                .thread_name("musefs-refresh".to_string())
+                .build(),
             uid: config.uid,
             gid: config.gid,
             mount_time: SystemTime::now(),
@@ -1125,7 +1254,7 @@ impl MusefsFs {
         Arc::clone(&self.notifier)
     }
 
-    /// Fire `poll_refresh` on the worker pool (off the dispatch thread), but only
+    /// Fire `poll_refresh` on the refresh lane (off the dispatch thread), but only
     /// when due: a cheap synchronous `poll_due()` check gates submission so a
     /// metadata-op storm doesn't flood the pool, and a `poll_pending` single-flight
     /// gate bounds in-flight poll tasks to one (#89). When keep-cache is enabled,
@@ -1149,7 +1278,7 @@ impl MusefsFs {
         let core = Arc::clone(&self.core);
         if self.config.keep_cache {
             let notifier = Arc::clone(&self.notifier);
-            execute_guarded(&self.pool, "poll_refresh_notify", move || {
+            execute_guarded(&self.refresh, "poll_refresh_notify", move || {
                 let _guard = guard;
                 if let Err(e) = core.poll_refresh_notify(|ino| {
                     if let Some(n) = notifier.get()
@@ -1162,7 +1291,7 @@ impl MusefsFs {
                 }
             });
         } else {
-            execute_guarded(&self.pool, "poll_refresh", move || {
+            execute_guarded(&self.refresh, "poll_refresh", move || {
                 let _guard = guard;
                 if let Err(e) = core.poll_refresh() {
                     log::warn!("poll_refresh failed: {e}");
@@ -1208,6 +1337,7 @@ impl MusefsFs {
             pool_workers: self.pool.max_count() as u64,
             pool_active: self.pool.active_count() as u64,
             pool_queued: self.pool.queued_count() as u64,
+            pool_over_cap: self.pool.over_cap.load(Ordering::Relaxed),
             passthrough: self
                 .passthrough
                 .telemetry()
@@ -1291,7 +1421,7 @@ impl Filesystem for MusefsFs {
         // `reply` stays outside the panic boundary so a residual synthesis panic
         // is answered (EIO) instead of unwinding the worker and hanging the
         // syscall (#359, #533).
-        execute_guarded(&self.pool, "lookup", move || {
+        self.pool.submit("lookup", move || {
             match synth_outcome(
                 "lookup",
                 child,
@@ -1338,7 +1468,7 @@ impl Filesystem for MusefsFs {
         // `reply` stays outside the panic boundary so a residual synthesis panic
         // is answered (EIO) instead of unwinding the worker and hanging the
         // syscall (#359, #533).
-        execute_guarded(&self.pool, "getattr", move || {
+        self.pool.submit("getattr", move || {
             match synth_outcome(
                 "getattr",
                 ino.0,
@@ -1387,7 +1517,7 @@ impl Filesystem for MusefsFs {
         let core = Arc::clone(&self.core);
         let flags = open_flags(self.config.keep_cache);
         let passthrough = self.passthrough.clone();
-        execute_guarded(&self.pool, "open", move || {
+        self.pool.submit("open", move || {
             // `open_handle` runs the same layout synthesis as `read`; guard it so a
             // residual panic replies EIO instead of unwinding the worker and hanging
             // `open` (#359, #533). `reply_open` below stays outside the boundary.
@@ -1421,7 +1551,7 @@ impl Filesystem for MusefsFs {
         let counter = Arc::clone(&self.dir_fh);
         let rejections = Arc::clone(&self.dir_handle_rejections);
         let expose_metrics = self.config.expose_metrics;
-        execute_guarded(&self.pool, "opendir", move || {
+        self.pool.submit("opendir", move || {
             // Pin the tree generation first: it names what a listing of this
             // directory would contain, so it is both what the build reads and
             // what the result is keyed by (#675).
@@ -1626,7 +1756,7 @@ impl Filesystem for MusefsFs {
             return reply.data(&body[start..end]);
         }
         // Reserve a slot on the dispatch thread before enqueuing; over the cap,
-        // reject with EAGAIN so the unbounded pool queue can't grow (#308).
+        // reject with EAGAIN so reads cannot grow the pool queue (#308).
         let Some(slot) = reserve_read_slot(&self.inflight_reads, MAX_INFLIGHT_READS) else {
             self.read_errors.fetch_add(1, Ordering::Relaxed);
             // Rate-limited: a saturated client retries rejected reads in a tight
@@ -1639,7 +1769,7 @@ impl Filesystem for MusefsFs {
         };
         let core = Arc::clone(&self.core);
         let read_errors = Arc::clone(&self.read_errors);
-        execute_guarded(&self.pool, "read", move || {
+        self.pool.submit_read(move || {
             // `_slot` (named) holds the guard until the read completes or the
             // worker panics, then releases it. Do NOT simplify to bare `_`: that
             // drops the guard immediately, releasing the slot before the work
@@ -1710,7 +1840,7 @@ impl Filesystem for MusefsFs {
             let handles = Arc::clone(&self.dir_handles);
             let stateless = Arc::clone(&self.stateless_listings);
             let expose_metrics = self.config.expose_metrics;
-            return execute_guarded(&self.pool, "readdir", move || {
+            return self.pool.submit("readdir", move || {
                 let snapshot = core.tree_snapshot();
                 let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
                     // An over-cap open is exactly the case where some *other*
@@ -1795,7 +1925,7 @@ impl Filesystem for MusefsFs {
             let handles = Arc::clone(&self.dir_handles);
             let stateless = Arc::clone(&self.stateless_listings);
             let pool = self.pool.clone();
-            return execute_guarded(&self.pool, "readdirplus", move || {
+            return self.pool.submit("readdirplus", move || {
                 let snapshot = core.tree_snapshot();
                 let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
                     if let Some(listing) = shared_listing(
@@ -2166,6 +2296,64 @@ mod tests {
         assert_eq!(fs.pool.max_count(), auto);
     }
 
+    /// #694: under the cap a job runs on a pool thread and holds its slot until
+    /// it ends; at the cap the next job runs on the caller, and `try_submit`
+    /// drops its job unrun — both counted.
+    #[test]
+    fn workers_queue_under_the_cap_and_run_in_place_over_it() {
+        let workers = Workers::new(ThreadPool::new(1), 1);
+        let (ids_tx, ids) = std::sync::mpsc::channel();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let tx = ids_tx.clone();
+        workers.submit("test", move || {
+            tx.send(std::thread::current().id()).unwrap();
+            parked.recv().unwrap();
+        });
+        assert_ne!(ids.recv().unwrap(), std::thread::current().id(), "queued");
+        assert_eq!(workers.admitted.load(Ordering::Relaxed), 1);
+
+        let tx = ids_tx.clone();
+        workers.submit("test", move || {
+            tx.send(std::thread::current().id()).unwrap();
+        });
+        assert_eq!(
+            ids.recv().unwrap(),
+            std::thread::current().id(),
+            "at the cap, run on the caller"
+        );
+        assert_eq!(workers.over_cap.load(Ordering::Relaxed), 1);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        assert!(!workers.try_submit("test", move || flag.store(true, Ordering::SeqCst)));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "try_submit drops the job unrun"
+        );
+        assert_eq!(workers.over_cap.load(Ordering::Relaxed), 2);
+
+        release.send(()).unwrap();
+        workers.join();
+        assert_eq!(
+            workers.admitted.load(Ordering::Relaxed),
+            0,
+            "the slot comes back when its job ends"
+        );
+    }
+
+    #[test]
+    fn an_admitted_slot_comes_back_when_its_job_panics() {
+        let workers = Workers::new(ThreadPool::new(1), 4);
+        workers.submit("test", || panic!("boom"));
+        workers.join();
+        assert_eq!(workers.admitted.load(Ordering::Relaxed), 0);
+        assert!(
+            workers.try_submit("test", || {}),
+            "and the gate admits again"
+        );
+        workers.join();
+    }
+
     #[test]
     fn poll_pending_guard_clears_flag_on_panic() {
         let flag = Arc::new(AtomicBool::new(true));
@@ -2198,13 +2386,21 @@ mod tests {
         let (_d, fs) = test_fs();
         // Simulate a poll already in flight; the gate must reject new submissions.
         fs.poll_pending.store(true, Ordering::SeqCst);
-        let queued = fs.pool.queued_count();
-        let active = fs.pool.active_count();
+        let queued = fs.refresh.queued_count();
+        let active = fs.refresh.active_count();
         for _ in 0..50 {
             fs.fire_poll_refresh();
         }
-        assert_eq!(fs.pool.queued_count(), queued, "no task should be queued");
-        assert_eq!(fs.pool.active_count(), active, "no task should be started");
+        assert_eq!(
+            fs.refresh.queued_count(),
+            queued,
+            "no task should be queued"
+        );
+        assert_eq!(
+            fs.refresh.active_count(),
+            active,
+            "no task should be started"
+        );
     }
 
     #[test]
@@ -2212,7 +2408,7 @@ mod tests {
         let (_d, fs) = test_fs();
         assert!(!fs.poll_pending.load(Ordering::SeqCst));
         fs.fire_poll_refresh(); // poll_due() true (zero interval): gate taken, task runs
-        fs.pool.join(); // block until the poll task completes
+        fs.refresh.join(); // block until the poll task completes
         assert!(
             !fs.poll_pending.load(Ordering::SeqCst),
             "guard must clear the gate after the task finishes"
