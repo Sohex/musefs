@@ -196,6 +196,7 @@ mod tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let nonempty = db
@@ -252,6 +253,7 @@ mod tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.set_binary_tags(
@@ -285,6 +287,7 @@ mod tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(tid, &[Tag::new("artist", "A", 0)]).unwrap();
@@ -322,6 +325,7 @@ mod tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let good = db
@@ -411,6 +415,7 @@ mod tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         let orphan_id = db
@@ -487,6 +492,7 @@ mod tests {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
 

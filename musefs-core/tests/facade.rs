@@ -297,6 +297,7 @@ fn poll_refresh_picks_up_external_db_edits() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(
@@ -322,6 +323,7 @@ fn poll_refresh_picks_up_external_db_edits() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
@@ -424,6 +426,7 @@ fn poll_refresh_keeps_unchanged_entries_and_prunes_vanished() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
@@ -455,6 +458,7 @@ fn poll_refresh_debounces_within_interval() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(
@@ -479,6 +483,7 @@ fn poll_refresh_debounces_within_interval() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
@@ -507,6 +512,7 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(
@@ -536,6 +542,7 @@ fn unchanged_refresh_poll_consumes_debounce_window() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
@@ -568,6 +575,7 @@ fn failed_refresh_retries_after_backoff_not_every_call() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(
@@ -593,6 +601,7 @@ fn failed_refresh_retries_after_backoff_not_every_call() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
@@ -628,6 +637,7 @@ fn poll_refresh_single_flights_concurrent_callers() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(
@@ -652,6 +662,7 @@ fn poll_refresh_single_flights_concurrent_callers() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
@@ -689,6 +700,7 @@ fn inode_is_stable_across_refresh() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(
@@ -715,6 +727,7 @@ fn inode_is_stable_across_refresh() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
@@ -1094,6 +1107,7 @@ fn refresh_picks_up_externally_added_track() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(
@@ -1115,6 +1129,7 @@ fn refresh_picks_up_externally_added_track() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db2.replace_tags(
@@ -1313,6 +1328,7 @@ fn forced_refresh_and_poll_refresh_never_publish_stale_tree() {
                 backing_size: 0,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(

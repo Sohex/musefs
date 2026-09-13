@@ -168,6 +168,7 @@ fn emit(
             backing_size: std::fs::metadata(src).unwrap().len(),
             backing_mtime_ns: real_mtime_ns(src),
             backing_ctime_ns: real_ctime_ns(src),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(
@@ -237,6 +238,7 @@ fn emit_binary(
             backing_size: std::fs::metadata(src).unwrap().len(),
             backing_mtime_ns: real_mtime_ns(src),
             backing_ctime_ns: real_ctime_ns(src),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, text).unwrap();

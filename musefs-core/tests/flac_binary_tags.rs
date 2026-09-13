@@ -136,6 +136,7 @@ fn legacy_flac_without_structural_rows_serves_via_front_read_fallback() {
             backing_size: meta.len(),
             backing_mtime_ns: common::real_mtime_ns(&path),
             backing_ctime_ns: common::real_ctime_ns(&path),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(

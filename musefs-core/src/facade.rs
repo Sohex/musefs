@@ -192,7 +192,10 @@ fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Res
     let meta = file
         .metadata()
         .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
-    if BackingStamp::from_metadata(&meta) != resolved.stamp {
+    if !resolved
+        .stamp
+        .matches_live(&BackingStamp::from_metadata(&meta))
+    {
         return Err(CoreError::BackingChanged(
             resolved.backing_path.to_string_lossy().into_owned(),
         ));
@@ -422,6 +425,10 @@ impl Musefs {
                 // own: the re-stat below reads the live path, and an entry
                 // agreeing on both versions describes the same bytes wherever
                 // they now live.
+                // `==` and not `matches_live`: both sides are stored stamps read
+                // from this store, so an unrecorded inode on one is a real
+                // difference from a recorded one rather than a field with
+                // nothing to say. The sentinel rule is for stored-vs-live only.
                 && e.stamp == BackingStamp::from_identity(&identity)
             {
                 // Hit. `--trust-backing-mtime` takes the cached attrs as-is and
@@ -440,7 +447,7 @@ impl Musefs {
                 crate::metrics::on_stat();
                 let meta = std::fs::metadata(&identity.backing_path)
                     .map_err(|err| CoreError::backing_io(&identity.backing_path, err))?;
-                if BackingStamp::from_metadata(&meta) != e.stamp {
+                if !e.stamp.matches_live(&BackingStamp::from_metadata(&meta)) {
                     // Proved wrong: drop it rather than re-stat and re-reject it
                     // on every later call. The next `getattr` takes the miss
                     // path, which resolves against the live file.

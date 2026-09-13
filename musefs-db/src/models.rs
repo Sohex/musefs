@@ -122,6 +122,22 @@ impl TrackBounds {
     }
 }
 
+/// `tracks.backing_ino` is `INTEGER NOT NULL DEFAULT 0`, and 0 is the column's
+/// "not recorded" value: every row V4 migrated carries it, as does every row a
+/// build older than #674 wrote. Linux never assigns inode 0 to a file, so the
+/// sentinel cannot collide with a real one — but the *model* says `Option<u64>`
+/// rather than making every reader remember that, the same translation
+/// `track_art`'s geometry does at its own boundary.
+pub(crate) fn ino_from_col(stored: u64) -> Option<u64> {
+    (stored != 0).then_some(stored)
+}
+
+/// The inverse. An unknown inode stores as the sentinel, never as NULL: the
+/// column is NOT NULL and the invalidation trigger compares it with `<>`.
+pub(crate) fn ino_to_col(ino: Option<u64>) -> u64 {
+    ino.unwrap_or(0)
+}
+
 #[cfg_attr(feature = "mutants", derive(Default))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
@@ -132,6 +148,9 @@ pub struct Track {
     pub backing_size: u64,
     pub backing_mtime_ns: i64,
     pub backing_ctime_ns: i64,
+    /// The backing file's inode, or `None` for a row written before #674 or
+    /// migrated into V4. See [`ino_from_col`]: the column spells it 0.
+    pub backing_ino: Option<u64>,
     pub content_version: i64,
     pub updated_at: i64,
     pub fingerprint: Option<String>,
@@ -236,6 +255,7 @@ pub struct TrackIdentity {
     pub backing_size: u64,
     pub backing_mtime_ns: i64,
     pub backing_ctime_ns: i64,
+    pub backing_ino: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +267,7 @@ pub struct NewTrack {
     pub backing_size: u64,
     pub backing_mtime_ns: i64,
     pub backing_ctime_ns: i64,
+    pub backing_ino: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

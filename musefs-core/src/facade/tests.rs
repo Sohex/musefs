@@ -986,6 +986,7 @@ fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
             backing_size: 1,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     let id_b = db
@@ -997,6 +998,7 @@ fn full_rebuild_gives_bare_colliding_name_to_lower_id() {
             backing_size: 1,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     assert!(id_a < id_b, "insertion assigns ascending ids");
@@ -1052,6 +1054,7 @@ fn entry_counts_reports_files_and_dirs() {
                 backing_size: 1,
                 backing_mtime_ns: 0,
                 backing_ctime_ns: 0,
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(

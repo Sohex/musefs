@@ -20,6 +20,7 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
             backing_size: meta.len(),
             backing_mtime_ns: common::real_mtime_ns(&flac),
             backing_ctime_ns: common::real_ctime_ns(&flac),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", "Real Title", 0)])
@@ -76,6 +77,7 @@ fn bounds_check_rejects_audio_region_overrunning_the_file() {
         backing_size: meta.len(),
         backing_mtime_ns: mtime_ns,
         backing_ctime_ns: ctime_ns,
+        backing_ino: None,
     });
     assert!(
         overrun.is_err(),

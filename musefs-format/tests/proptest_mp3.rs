@@ -105,7 +105,8 @@ proptest! {
             backing_size: 0,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
-        }).unwrap();
+            backing_ino: None,
+}).unwrap();
         let db_tags: Vec<musefs_db::BinaryTag> = opaque.iter().enumerate().map(|(i, e)| {
             musefs_db::BinaryTag { key: e.key.clone(), payload: e.payload.clone(), ordinal: u64::try_from(i).unwrap() }
         }).collect();

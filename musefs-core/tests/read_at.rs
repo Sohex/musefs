@@ -23,6 +23,7 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
             backing_size: meta.len(),
             backing_mtime_ns: common::real_mtime_ns(&flac),
             backing_ctime_ns: common::real_ctime_ns(&flac),
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("title", "Real", 0)])
@@ -100,6 +101,7 @@ fn read_at_streams_art_image_segments() {
             size: 0,
             mtime_ns: 0,
             ctime_ns: 0,
+            ino: None,
         },
         mtime_secs: 0,
         last_page: std::sync::Mutex::new(None),

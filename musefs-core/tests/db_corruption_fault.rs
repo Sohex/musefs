@@ -20,6 +20,7 @@ fn corrupt_db_header_errors_instead_of_panicking() {
             backing_size: 1,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     } // connection dropped, file flushed

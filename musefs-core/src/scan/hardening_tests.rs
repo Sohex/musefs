@@ -756,6 +756,7 @@ fn revalidate_does_not_prune_on_non_notfound_error() {
         backing_size: 0,
         backing_mtime_ns: 0,
         backing_ctime_ns: 0,
+        backing_ino: None,
     })
     .unwrap();
 
@@ -931,6 +932,7 @@ fn ingest_bulk_filters_empty_binary_tags() {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             probed_with_mixed_binary_tags(),
         )
@@ -959,6 +961,7 @@ fn ingest_bulk_rejects_a_file_with_an_oversize_binary_tag() {
             size: 1,
             mtime_ns: 0,
             ctime_ns: 0,
+            ino: None,
         },
         probed_with_oversize_binary_tag(),
     )
@@ -1225,6 +1228,7 @@ fn ingest_bulk_skips_empty_and_control_char_keys() {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             probed_with_text_tags(&[
                 ("artist", "Alice"),
@@ -1355,6 +1359,7 @@ fn ingest_bulk_assigns_sequential_structural_ordinals_per_kind() {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             probed_with_duplicate_structural_kind(),
         )
@@ -1442,6 +1447,7 @@ fn ingest_bulk_keeps_text_and_binary_rows_of_one_key_apart() {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             probed_with_key_in_both_tag_classes(),
         )
@@ -1467,6 +1473,7 @@ fn ingest_numbers_binary_tags_per_key() {
                 size: 1,
                 mtime_ns: 0,
                 ctime_ns: 0,
+                ino: None,
             },
             Probed {
                 format: musefs_db::Format::Mp3,

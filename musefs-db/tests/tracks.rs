@@ -58,6 +58,7 @@ fn track_identity_returns_content_version_and_backing_identity() {
             backing_size: track.backing_size,
             backing_mtime_ns: track.backing_mtime_ns,
             backing_ctime_ns: track.backing_ctime_ns,
+            backing_ino: track.backing_ino,
         }),
     );
     assert!(db.track_identity(999_999).unwrap().is_none());
@@ -129,6 +130,7 @@ fn delete_track_cascades_tags_and_track_art() {
             backing_size: 0,
             backing_mtime_ns: 0,
             backing_ctime_ns: 0,
+            backing_ino: None,
         })
         .unwrap();
     db.replace_tags(id, &[Tag::new("artist", "A", 0)]).unwrap();
@@ -176,6 +178,7 @@ fn upsert_conflict_updates_all_mutable_columns() {
         backing_size: 555,
         backing_mtime_ns: 555,
         backing_ctime_ns: 666,
+        backing_ino: None,
     };
     let id2 = db.upsert_track(&changed).unwrap();
     assert_eq!(id, id2, "conflict update must keep the same id");

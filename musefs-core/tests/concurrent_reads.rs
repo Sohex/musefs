@@ -43,6 +43,7 @@ fn build_store(n: usize) -> (std::path::PathBuf, Vec<i64>, tempfile::TempDir) {
                 backing_size: std::fs::metadata(&src).unwrap().len(),
                 backing_mtime_ns: common::real_mtime_ns(&src),
                 backing_ctime_ns: common::real_ctime_ns(&src),
+                backing_ino: None,
             })
             .unwrap();
         db.replace_tags(id, &[musefs_db::Tag::new("title", &format!("T{i}"), 0)])

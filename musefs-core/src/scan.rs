@@ -1753,6 +1753,7 @@ impl TrackSink for &Db {
             stamp.size,
             stamp.mtime_ns,
             stamp.ctime_ns,
+            stamp.ino,
             audio_offset,
             audio_length,
             fingerprint,
@@ -1819,6 +1820,7 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
             stamp.size,
             stamp.mtime_ns,
             stamp.ctime_ns,
+            stamp.ino,
             audio_offset,
             audio_length,
             fingerprint,
@@ -1855,6 +1857,7 @@ fn ingest_into(
         backing_size: stamp.size,
         backing_mtime_ns: stamp.mtime_ns,
         backing_ctime_ns: stamp.ctime_ns,
+        backing_ino: stamp.ino,
     })?;
     w.set_track_checksums(track_id, fingerprint, content_hash)?;
 
@@ -1920,6 +1923,7 @@ fn refresh_structural_into(
         backing_size: stamp.size,
         backing_mtime_ns: stamp.mtime_ns,
         backing_ctime_ns: stamp.ctime_ns,
+        backing_ino: stamp.ino,
     })?;
     w.set_track_checksums(track_id, fingerprint, content_hash)?;
     let structural_blocks = structural_blocks_from(probed.structural_blocks);
@@ -1947,16 +1951,17 @@ fn is_store_rejection(e: &crate::error::CoreError) -> bool {
 /// Do the bytes this unit records look like the ones a stored row already
 /// describes?
 ///
-/// Keyed on the freshness stamp — size plus nanosecond mtime plus ctime, the
-/// same identity serving fails closed on — widened with the parsed geometry, so
-/// a re-parse that moves the audio region also counts as new content.
+/// Keyed on the freshness stamp — size, nanosecond mtime, ctime and inode, the
+/// same identity serving fails closed on, compared the same sentinel-aware way
+/// — widened with the parsed geometry, so a re-parse that moves the audio
+/// region also counts as new content.
 ///
 /// A `false` here is what turns an uncomputed checksum into `Clear` rather than
 /// `Keep`: a pass below the `full` tier must not leave the previous bytes'
 /// `content_hash` sitting beside the new ones (#689).
 fn records_same_bytes(unit: &Unit, existing: Option<&musefs_db::Track>) -> bool {
     existing.is_some_and(|t| {
-        BackingStamp::from_track(t) == unit.stamp
+        BackingStamp::from_track(t).matches_live(&unit.stamp)
             && t.format == unit.probed.format
             && t.bounds.audio_offset() == unit.probed.audio_offset
             && t.bounds.audio_length() == unit.probed.audio_length
@@ -2721,9 +2726,18 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
                 ChecksumTier::Fingerprint => !has_fingerprint,
                 ChecksumTier::Full => !has_fingerprint || !has_content_hash,
             };
-            if crate::freshness::BackingStamp::from_metadata(&meta) == stamp
+            // A row with no recorded inode is one this build cannot fully
+            // validate (#674): `matches_live` has to ignore the field, so the
+            // stamp passes on three columns where it should pass on four. That
+            // is exactly what revalidate is for, so it re-probes rather than
+            // skipping — which makes this the complete repopulation path for a
+            // store migrated into V4, alongside the structural and checksum
+            // backfills it already covered.
+            let needs_ino = stamp.ino.is_none();
+            if stamp.matches_live(&crate::freshness::BackingStamp::from_metadata(&meta))
                 && !needs_backfill
                 && !needs_checksum
+                && !needs_ino
             {
                 unchanged += 1;
                 continue;
