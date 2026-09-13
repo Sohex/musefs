@@ -36,14 +36,15 @@ payload from the DB by rowid — binary tags **and** art (`ArtImage` /
 wraps those reads in a single WAL snapshot with a `content_version` recheck.
 A concurrent retag (delete + reinsert reusing a freed rowid) cannot interleave
 bytes from two generations of a tag or splice the wrong image. Both the
-per-handle fast path and the stateless no-fh fallback apply the guard, and the
-fallback re-validates its freshly opened backing fd against the resolved
-stamp.
+per-handle fast path and the stateless no-fh fallback apply the guard, and both
+validate the backing fd against the resolved stamp *after* acquiring its bytes,
+so a rewrite that lands mid-read fails that read rather than the next one
+([#682](https://github.com/Sohex/musefs/issues/682)).
 
 ### Backing read-ahead
 
 Every backing read — `BackingAudio` splices and the `serve_ogg_window` page walk
-alike — flows through a single `BackingReader::read_exact_at`
+alike — flows through a single `BackingReader` (`read_append` on the splice paths)
 (`musefs-core/src/readahead.rs`). It caches *raw backing-file bytes keyed by
 absolute backing offset* in a per-handle adaptive window: a sequential miss reads
 one large `pread` (geometric growth up to a per-stream cap) instead of the
@@ -52,7 +53,7 @@ the RPCs behind one syscall; a seek resets the window to the floor. All handles
 draw from one process-wide RAM budget (`--read-ahead-budget-mib`, default 64) with
 deadlock-free `try_lock` LRU eviction. Keying on the absolute backing offset (not
 the synthesized output) makes the cache retag-immune, and serving still flows
-through the per-read `validate_opened_backing` re-stat, so the cardinal
+through the post-read `validate_opened_backing` re-stat, so the cardinal
 audio-bytes invariant and freshness semantics are untouched. An optional Phase-2
 background-prefetch layer (`--read-ahead-prefetch`) exists and is off by default:
 amplification alone carries the win on local and low-latency backing, while the

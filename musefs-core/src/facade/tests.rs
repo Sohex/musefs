@@ -113,6 +113,92 @@ fn open_handle_reresolves_after_content_version_bump() {
     fs.release_handle(fh);
 }
 
+/// A mount over one scanned MP3, returning its file inode and backing path.
+fn mount_over_one_mp3() -> (tempfile::TempDir, Musefs, u64, std::path::PathBuf) {
+    use crate::scan::scan_directory;
+    use id3::TagLike;
+    use std::collections::BTreeMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backing = dir.path().join("a.mp3");
+    let mut tag = id3::Tag::new();
+    tag.set_artist("Pix");
+    tag.set_title("Song");
+    let mut bytes = Vec::new();
+    tag.write_to(&mut bytes, id3::Version::Id3v24).unwrap();
+    bytes.extend_from_slice(&[0xFF, 0xFB, 1, 2, 3, 4]);
+    std::fs::write(&backing, &bytes).unwrap();
+
+    let db_path = dir.path().join("m.db");
+    scan_directory(&musefs_db::Db::open(&db_path).unwrap(), dir.path()).unwrap();
+    let cfg = MountConfig {
+        template: "$artist/$title".to_string(),
+        fallbacks: BTreeMap::new(),
+        default_fallback: "Unknown".to_string(),
+        mode: Mode::Synthesis,
+        poll_interval: std::time::Duration::ZERO,
+        case_insensitive: false,
+        read_ahead_budget: 64 * 1024 * 1024,
+        read_ahead_prefetch: false,
+        skip_on_missing: false,
+        trust_backing_mtime: false,
+    };
+    let fs = Musefs::open(musefs_db::Db::open(&db_path).unwrap(), cfg).unwrap();
+    let artist = fs.lookup(VirtualTree::ROOT, "Pix").expect("artist dir");
+    let (_, file_inode, _) = fs.readdir(artist).unwrap().into_iter().next().unwrap();
+    (dir, fs, file_inode, std::fs::canonicalize(backing).unwrap())
+}
+
+/// Rewrite `path` in place: same inode, same size, new bytes and timestamps.
+fn rewrite_in_place(path: std::path::PathBuf) -> impl FnMut() {
+    move || {
+        use std::os::unix::fs::FileExt;
+        let len = std::fs::metadata(&path).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&vec![0x5A; usize::try_from(len).unwrap()], 0)
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_hours(1))
+            .unwrap();
+    }
+}
+
+/// #682: a backing rewrite landing between a handle read acquiring its bytes
+/// and returning them fails that read. With the stat taken before the read, as
+/// the handle path used to, this read succeeded with the new file's bytes
+/// spliced into the old layout, and only the next read noticed.
+#[test]
+fn a_rewrite_during_a_handle_read_fails_that_read() {
+    let (_dir, fs, file_inode, backing) = mount_over_one_mp3();
+    let fh = fs.open_handle(file_inode).unwrap();
+    fs.read(file_inode, Some(fh), 0, 1 << 20)
+        .expect("an untouched file reads");
+
+    set_after_backing_read_hook(rewrite_in_place(backing));
+    let read = fs.read(file_inode, Some(fh), 0, 1 << 20);
+    clear_after_backing_read_hook();
+    assert!(
+        matches!(read, Err(CoreError::BackingChanged(_))),
+        "{:?}",
+        read.map(|b| b.len())
+    );
+    fs.release_handle(fh);
+}
+
+/// #682, the stateless path: it opened the file and checked it before reading,
+/// so the same rewrite slipped past it the same way.
+#[test]
+fn a_rewrite_during_a_stateless_read_fails_that_read() {
+    let (_dir, fs, file_inode, backing) = mount_over_one_mp3();
+    set_after_backing_read_hook(rewrite_in_place(backing));
+    let read = fs.read(file_inode, None, 0, 1 << 20);
+    clear_after_backing_read_hook();
+    assert!(
+        matches!(read, Err(CoreError::BackingChanged(_))),
+        "{:?}",
+        read.map(|b| b.len())
+    );
+}
+
 #[test]
 fn prefetch_workers_created_only_with_budget_and_flag() {
     use std::collections::BTreeMap;

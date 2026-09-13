@@ -52,8 +52,9 @@ Independently of the cache, **every**
 resolve re-stats the backing file and errors with `BackingChanged` if its
 size, mtime, ctime, or inode drifted from the scanned values, so a silently replaced
 backing file is never spliced at stale offsets. The per-handle read path
-re-stats the held descriptor on every read it serves too, so this guarantee holds
-on the hot path and not only through `resolve()`.
+re-stats the held descriptor on every read it serves too — after acquiring the
+bytes, so a rewrite that lands mid-read fails that read — and this guarantee
+holds on the hot path and not only through `resolve()`.
 
 It covers the reads that reach musefs, which is not every read. With
 `--keep-cache`, on by default, a read the kernel can satisfy from its page cache

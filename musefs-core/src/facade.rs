@@ -274,6 +274,31 @@ struct SizeEntry {
     stamp: BackingStamp,
 }
 
+// Runs between a read acquiring its backing bytes and validating the backing
+// file, on both read paths (#682). Thread-local: a read under test runs on the
+// test's own thread.
+#[cfg(test)]
+thread_local! {
+    static AFTER_BACKING_READ: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn fire_after_backing_read() {
+    AFTER_BACKING_READ.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+#[cfg(test)]
+pub(crate) fn set_after_backing_read_hook(f: impl FnMut() + 'static) {
+    AFTER_BACKING_READ.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+#[cfg(test)]
+pub(crate) fn clear_after_backing_read_hook() {
+    AFTER_BACKING_READ.with(|h| *h.borrow_mut() = None);
+}
+
 fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Result<()> {
     let meta = file
         .metadata()
@@ -750,11 +775,6 @@ impl Musefs {
                     }
                     let resolved = h.resolved.load();
                     let r: &ResolvedFile = &resolved;
-                    // Re-stat the held fd every read: a pure in-place backing
-                    // rewrite (same inode) leaves both DB-side staleness signals
-                    // unchanged, so this is the only check that catches it. A
-                    // genuine drift is terminal — propagate, don't retry the loop.
-                    validate_opened_backing(&h.file, r)?;
                     let served = if r.streams_db_rowid {
                         // Snapshot-consistent: version check + DB-rowid reads
                         // (binary tags AND art) see one WAL snapshot, so a reused
@@ -784,16 +804,33 @@ impl Musefs {
                             })();
                             let _ = db.end_read(); // always release the snapshot
                             res
-                        })?
+                        })
                     } else {
                         // No DB-backed segment (the steady state once the header is
                         // served, where the remainder is a single backing/Ogg-audio
                         // segment): the read is pure positioned backing I/O and never
                         // touches the connection, so skip the pool lookup+lock (#520).
-                        self.serve_backing::<musefs_db::ReadOnly>(&h, None, r, offset, size, out)?;
-                        Some(())
+                        self.serve_backing::<musefs_db::ReadOnly>(&h, None, r, offset, size, out)
+                            .map(|()| Some(()))
                     };
-                    if served.is_some() {
+                    #[cfg(test)]
+                    fire_after_backing_read();
+                    // Re-stat the held fd on every read, after its bytes are
+                    // acquired rather than before (#682). A pure in-place backing
+                    // rewrite (same inode) leaves both DB-side staleness signals
+                    // unchanged, so this is the only check that catches it — and
+                    // checking first left the rewrite free to land between the
+                    // check and the pread, so that read spliced new-generation
+                    // bytes into the old layout and only the next one noticed. A
+                    // change that predated or overlapped the read is caught here;
+                    // one that begins after it cannot touch bytes already acquired.
+                    // Read-ahead bytes were acquired by an earlier read whose own
+                    // check covered them, and a later change moves ctime for good,
+                    // so every read after it fails too. The drift outranks whatever
+                    // the read reported, since a rewrite can surface as a short read
+                    // first, and it is terminal — propagate, don't retry the loop.
+                    validate_opened_backing(&h.file, r)?;
+                    if served?.is_some() {
                         return Ok(());
                     }
                     // Stale layout: force a re-resolve next iteration against the live version.

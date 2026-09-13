@@ -440,28 +440,16 @@ pub fn read_at_into<M>(
         .segments()
         .iter()
         .any(|s| matches!(s, Segment::BackingAudio { .. } | Segment::OggAudio { .. }));
-    // Open and re-validate the backing fd against the stamp the layout was
-    // resolved from (#503): between the resolve-time stat and this open the file
-    // can be rename-replaced or rewritten in place, which would otherwise splice
-    // bytes from a different/modified file behind the stamped header (or
-    // short-read against a stale size). The handle fast path validates per read
-    // via `validate_opened_backing`; this stateless fallback must too.
+    // The backing fd is validated against the stamp the layout was resolved
+    // from after the read below, not here (#682).
     let file = if needs_file {
         crate::metrics::on_open();
         // Opens the semi-trusted DB path verbatim — see the trust-boundary note
         // on `ResolvedFile::backing_path` in `HeaderCache::build` (#551).
-        let f = std::fs::File::open(&resolved.backing_path)
-            .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
-        let f_meta = f
-            .metadata()
-            .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
-        if !resolved
-            .stamp
-            .matches_live(&BackingStamp::from_metadata(&f_meta))
-        {
-            return Err(CoreError::BackingChanged(resolved.backing_path.clone()));
-        }
-        Some(f)
+        Some(
+            std::fs::File::open(&resolved.backing_path)
+                .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?,
+        )
     } else {
         None
     };
@@ -470,7 +458,7 @@ pub fn read_at_into<M>(
     // snapshot with a `content_version` recheck so a concurrent rowid-reuse
     // (delete + reinsert reusing a freed rowid) can't splice a wrong blob
     // mid-read (#502). Only the rare rowid-streaming layout pays this cost.
-    if resolved.streams_db_rowid {
+    let served = if resolved.streams_db_rowid {
         db.begin_read()?;
         let res = (|| {
             if db.track_content_version(resolved.track_id)? != resolved.content_version {
@@ -484,7 +472,29 @@ pub fn read_at_into<M>(
         res
     } else {
         read_with_optional_backing(resolved, db, file.as_ref(), offset, size, out)
+    };
+    #[cfg(test)]
+    crate::facade::fire_after_backing_read();
+    // Validate the fd against the stamp the layout was resolved from (#503):
+    // between the resolve-time stat and the read the file can be rename-replaced
+    // or rewritten in place, which would splice bytes from a different or
+    // modified file behind the stamped header, or short-read against a stale
+    // size. After the read rather than before it (#682), so a rewrite that lands
+    // mid-read fails that read instead of the next one — and ahead of whatever
+    // the read reported, since such a rewrite can surface as a short read first.
+    // The handle fast path does the same through `validate_opened_backing`.
+    if let Some(f) = &file {
+        let meta = f
+            .metadata()
+            .map_err(|e| CoreError::backing_io(&resolved.backing_path, e))?;
+        if !resolved
+            .stamp
+            .matches_live(&BackingStamp::from_metadata(&meta))
+        {
+            return Err(CoreError::BackingChanged(resolved.backing_path.clone()));
+        }
     }
+    served
 }
 
 /// Build the optional `BackingReader` from an already-validated `file` and run

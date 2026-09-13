@@ -647,6 +647,18 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **A backing file rewritten mid-read fails that read, not the next one**
+  ([#682](https://github.com/Sohex/musefs/issues/682)). Both read paths checked
+  the backing file against its stored stamp *before* reading from it, so an
+  in-place rewrite landing between the check and the positioned read returned
+  bytes from the new file spliced into the layout synthesized for the old one;
+  only the following read noticed. The check now runs after the bytes are
+  acquired, replacing the earlier one rather than adding a second stat, and a
+  detected change takes precedence over whatever the read itself reported,
+  since a rewrite can surface as a short read first. Bytes served from the
+  read-ahead window were acquired by an earlier read whose own check covered
+  them.
+
 - **A symlink retargeted during a `--follow-symlinks` scan can no longer store
   one file's geometry against another file's path**
   ([#684](https://github.com/Sohex/musefs/issues/684)). The scan probed the
