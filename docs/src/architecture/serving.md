@@ -149,6 +149,47 @@ today, rather than the file silently vanishing from the listing.
 the op, which is otherwise invisible from the daemon since the capability is
 negotiated at mount.
 
+## What a synthesized file's timestamp promises
+
+A served file's bytes come from two places — the backing file, and the tags and
+art in the store — so its mtime has to move when *either* does. The mount
+reports the later of the backing file's second and the row's `updated_at`, which
+covers a backing rewrite and a metadata edit alike.
+
+Whole seconds are not enough on their own. Every trigger stamps `updated_at`
+with `strftime('%s','now')`, so two metadata edits inside one wall-clock second
+leave the same second behind; if they happen to synthesize to the same length —
+which same-length tag rewrites routinely do — the file looks untouched to
+anything comparing size and mtime. And because the reported second is a `max`, a
+backing mtime in the future masks every metadata edit for as long as the skew
+lasts, which a restored archive or a bad clock on a NAS can sustain
+indefinitely.
+
+So the mount reports the row's `content_version` as the timestamp's
+**nanoseconds** ([#725](https://github.com/Sohex/musefs/issues/725)). That
+counter already increments on every change to the served bytes — it is what
+every internal cache keys on — so the guarantee it buys is:
+
+> **The reported mtime changes whenever the synthesized bytes change.**
+
+Two consequences worth being explicit about. The nanosecond field is a change
+counter, not a duration: it does not measure anything, and two versions exactly
+one billion apart report the same one. And a consumer that truncates to whole
+seconds gets exactly what it got before — including the future-backing-mtime
+masking — because the second is unchanged. The precision exists for tools that
+read a full `timespec`.
+
+Nothing in the store holds nanoseconds. `updated_at` is still whole seconds, and
+the sub-second part is derived where the timestamp is built, so no column claims
+a precision nobody wrote.
+
+**A pre-epoch backing file is served as one.** An archival rip or a restored
+backup can carry an mtime before 1970, and the store accepts it from v4 on
+([#696](https://github.com/Sohex/musefs/issues/696)). A synthetic directory has
+no row and therefore no timestamp; it reports the mount time. Those two cases
+used to be the same value — zero — so a file whose mtime really was the Unix
+epoch reported the mount time instead.
+
 ## Synthetic telemetry namespace
 
 When `--expose-metrics` is on, the root directory gains a synthetic

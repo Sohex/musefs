@@ -72,13 +72,74 @@ pub struct MountConfig {
     pub trust_backing_mtime: bool,
 }
 
+/// The modification time of a node that has one, and everything needed to
+/// render it as an OS timestamp.
+///
+/// `secs` is the whole second the mount advertises: the later of the backing
+/// file's second and the row's `updated_at`, because a metadata edit changes
+/// the synthesized bytes without touching the backing file. It may be negative
+/// — a pre-epoch backing file is legitimate (an archival rip, a restored
+/// backup, anything whose mtime came from the original media), and the store
+/// stopped refusing one in v4 (#696).
+///
+/// `content_version` rides alongside because whole seconds are not enough
+/// (#725). Every trigger stamps `updated_at` with `strftime('%s','now')`, so
+/// two metadata edits inside one wall-clock second expose the same
+/// `(size, mtime)` whenever they happen to synthesize to the same length —
+/// which same-length tag rewrites routinely do. Worse, `max` means a backing
+/// mtime in the future masks *every* edit for as long as the skew lasts.
+/// musefs itself is unaffected: every internal cache keys on `content_version`.
+/// What breaks is the contract presented outward, to the size-plus-mtime change
+/// detectors — rsync without `--checksum`, Syncthing, media scanners.
+///
+/// The fix is not a second stored column. `content_version` is already the
+/// store's monotonic counter for exactly this question, so the mount derives
+/// the sub-second part from it rather than recording a nanosecond nobody wrote.
+/// Nothing in the store claims to hold nanoseconds; the precision appears only
+/// where a timestamp does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualMtime {
+    pub secs: i64,
+    pub content_version: i64,
+}
+
+impl VirtualMtime {
+    /// The nanoseconds this timestamp reports: `content_version`, folded into
+    /// the sub-second range.
+    ///
+    /// Not a duration, and not claiming to be one — it is a change counter in
+    /// the only field a `stat` has left to carry one. What it has to do is
+    /// *differ* whenever the synthesized bytes differ, which it does for every
+    /// bump; the value itself means nothing else.
+    ///
+    /// `rem_euclid` rather than `%` so the result is non-negative for any input
+    /// — the column's `CHECK` forbids a negative `content_version`, but a
+    /// reader that trusted that and was wrong would produce a `tv_nsec` the
+    /// kernel rejects rather than a wrong-but-valid one. Two versions one
+    /// billion apart collide; at that point the second has almost certainly
+    /// moved, and nothing is worse off than before this existed.
+    #[must_use]
+    pub fn nanos(&self) -> u32 {
+        const NANOS_PER_SEC: i64 = 1_000_000_000;
+        u32::try_from(self.content_version.rem_euclid(NANOS_PER_SEC))
+            .expect("rem_euclid by 1e9 is in 0..1e9, which fits a u32")
+    }
+}
+
 /// Attributes the FUSE layer maps onto `fuser::FileAttr`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attr {
     pub inode: u64,
     pub is_dir: bool,
     pub size: u64,
-    pub mtime_secs: i64,
+    /// `None` for a synthetic node — a virtual directory, which has no row and
+    /// no timestamp of its own.
+    ///
+    /// This used to be a bare `i64` where `0` meant both "synthetic" and "the
+    /// Unix epoch", and the FUSE layer substituted the mount time for anything
+    /// `<= 0` (#696). That made a legitimate epoch-zero file wrong, and made
+    /// every pre-epoch file wrong the moment the store stopped refusing one.
+    pub mtime: Option<VirtualMtime>,
 }
 
 /// One pinned generation of the virtual tree, handed out by
@@ -395,14 +456,19 @@ impl Musefs {
                             inode,
                             is_dir: true,
                             size: 0,
-                            mtime_secs: 0,
+                            // Synthetic: no row, so no timestamp of its own.
+                            mtime: None,
                         });
                     }
                     NodeKind::File { track_id } => *track_id,
                 },
             }
         };
-        let (size, mtime_secs) = self.pool.with(|db| {
+        // The version travels with the size and second because the mount reports
+        // it as the timestamp's sub-second part (#725); it is taken from
+        // whichever path produced them, so it always describes the bytes being
+        // described.
+        let (size, mtime_secs, content_version) = self.pool.with(|db| {
             // Cheap, indexed: the row's identity columns drive lazy invalidation.
             // Only what the validation needs — no full-row materialization.
             let identity = db
@@ -435,7 +501,7 @@ impl Musefs {
                 // opt-out stops here: the miss path below still stats, and so do
                 // `open` and the read paths, so no stale byte is ever served.
                 if self.config.trust_backing_mtime {
-                    return Ok((e.total_len, e.mtime_secs));
+                    return Ok((e.total_len, e.mtime_secs, e.content_version));
                 }
                 // Re-stat the backing file (no synthesis) and compare to the
                 // stamp the cached attrs were built from. An on-disk change
@@ -452,7 +518,7 @@ impl Musefs {
                     self.size_cache.remove(&track_id);
                     return Err(CoreError::BackingChanged(identity.backing_path));
                 }
-                return Ok((e.total_len, e.mtime_secs));
+                return Ok((e.total_len, e.mtime_secs, e.content_version));
             }
             // Miss: full resolve (validates via stat, builds + caches the layout).
             let resolved = self.cache.resolve(db, track_id)?;
@@ -465,13 +531,20 @@ impl Musefs {
                     stamp: resolved.stamp,
                 },
             );
-            Ok((resolved.total_len, resolved.mtime_secs))
+            Ok((
+                resolved.total_len,
+                resolved.mtime_secs,
+                resolved.content_version,
+            ))
         })?;
         Ok(Attr {
             inode,
             is_dir: false,
             size,
-            mtime_secs,
+            mtime: Some(VirtualMtime {
+                secs: mtime_secs,
+                content_version,
+            }),
         })
     }
 
