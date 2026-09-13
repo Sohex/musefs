@@ -159,6 +159,19 @@ see the [Release notes](release-notes.md).
 
 ### Changed
 
+- **The serve path no longer zero-fills buffers a read is about to overwrite**
+  ([#670](https://github.com/Sohex/musefs/issues/670)). Each backing-audio
+  segment and Ogg audio page a read touched was zero-filled and then overwritten
+  by the positioned read, and each read-ahead window was allocated zeroed and then
+  filled — about 1.7 µs per 128 KiB segment and 69 µs per 8 MiB window as
+  measured in the issue, roughly 18% of a page-cached fill. Those reads now land
+  in the buffer's uninitialized spare capacity instead, committed by one audited
+  `unsafe` `set_len` covering only the bytes `pread` reports initialized, and a
+  read served from a cached window is copied straight into the output. Against
+  high-latency backing the I/O dominates and nothing visible changes; against
+  page-cached or NVMe reads it is one of the few costs left on the path.
+  `musefs-core` now depends on `rustix` directly.
+
 - **The public enums a downstream crate matches on are `#[non_exhaustive]`**
   ([#708](https://github.com/Sohex/musefs/issues/708)). Until now adding a
   variant to any of them was a breaking change, so the next audio format or

@@ -1027,6 +1027,7 @@ dependencies = [
  "proptest",
  "quick_cache",
  "rusqlite",
+ "rustix",
  "sha2",
  "sharded-slab",
  "strum",

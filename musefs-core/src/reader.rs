@@ -570,9 +570,7 @@ fn read_segments_into<M>(
                 }
                 Segment::BackingAudio { offset: bo, .. } => {
                     let br = backing.expect("backing segment requires an open backing reader");
-                    let start = out.len();
-                    out.resize(start + n, 0);
-                    br.read_exact_at(&mut out[start..], bo + within)?;
+                    br.read_append(out, n, bo + within)?;
                 }
                 Segment::ArtImage { art_id, .. } => {
                     let db = db.expect("art segment requires a DB connection");

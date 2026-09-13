@@ -174,6 +174,34 @@ mod imp {
         f.read_exact_at(buf, offset)
     }
 
+    /// Appending twin of [`backing_read_exact_at`] (#670): appends `n` bytes read
+    /// at `offset` to `out` without zero-filling them first, honouring the same
+    /// injected faults. On error `out` is left as it was — the short-read fault
+    /// still performs its prefix read, so the real read path is exercised.
+    pub fn backing_read_append(
+        f: &std::fs::File,
+        out: &mut Vec<u8>,
+        n: usize,
+        offset: u64,
+    ) -> std::io::Result<()> {
+        match BACKING_FAULT_KIND.load(Ordering::SeqCst) {
+            // EIO is 5 on Linux, macOS, and FreeBSD.
+            1 => return Err(std::io::Error::from_raw_os_error(5)),
+            2 => {
+                let p = BACKING_FAULT_PREFIX.load(Ordering::SeqCst).min(n);
+                let start = out.len();
+                crate::readahead::pread_append(f, out, p, offset)?;
+                out.truncate(start);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "injected short backing read",
+                ));
+            }
+            _ => {}
+        }
+        crate::readahead::pread_append(f, out, n, offset)
+    }
+
     /// Sleep for the duration named by `var` (microseconds), parsed once.
     fn fault(var: &'static str, cell: &OnceLock<Option<Duration>>) {
         let d = cell.get_or_init(|| {
@@ -261,6 +289,15 @@ mod imp {
     pub fn on_pread(_bytes: u64) {}
     #[inline(always)]
     pub fn set_fault_pread(_d: Option<std::time::Duration>) {}
+    #[inline(always)]
+    pub fn backing_read_append(
+        f: &std::fs::File,
+        out: &mut Vec<u8>,
+        n: usize,
+        offset: u64,
+    ) -> std::io::Result<()> {
+        crate::readahead::pread_append(f, out, n, offset)
+    }
     #[inline(always)]
     pub fn backing_read_exact_at(
         f: &std::fs::File,
@@ -408,5 +445,30 @@ mod tests {
             b"abc",
             "prefix bytes were filled before the fault"
         );
+    }
+
+    /// #670: the appending read honours both injected faults, and leaves `out`
+    /// exactly as it was when one fires.
+    #[test]
+    fn backing_faults_apply_to_the_appending_read() {
+        use std::io::Write;
+        let _lock = lock_global_state();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"abcdefgh").unwrap();
+        let f = std::fs::File::open(tmp.path()).unwrap();
+
+        let mut out = b"x".to_vec();
+        backing_read_append(&f, &mut out, 3, 0).unwrap();
+        assert_eq!(out, b"xabc");
+        {
+            let _guard = set_backing_fault(BackingFault::Eio);
+            let err = backing_read_append(&f, &mut out, 3, 0).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(5), "EIO == 5");
+            assert_eq!(out, b"xabc");
+        }
+        let _guard = set_backing_fault(BackingFault::ShortRead { prefix: 2 });
+        let err = backing_read_append(&f, &mut out, 3, 3).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(out, b"xabc", "the prefix read is discarded with the fault");
     }
 }
