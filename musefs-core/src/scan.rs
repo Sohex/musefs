@@ -88,6 +88,38 @@ fn clear_after_s1_hook() {
     AFTER_S1_HOOK.with(|h| *h.borrow_mut() = None);
 }
 
+/// A hook that runs on a scan worker after it resolves a walked path and before
+/// it probes it, for the one walked path it names (#684). Process-wide rather
+/// than `thread_local!` like the one above, because the workers are threads the
+/// test never touches; keyed by path so a scan in a parallel test cannot fire it.
+#[cfg(test)]
+type ResolveHook = (PathBuf, Box<dyn FnMut() + Send>);
+#[cfg(test)]
+static AFTER_RESOLVE_HOOK: std::sync::Mutex<Option<ResolveHook>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+fn fire_after_resolve(walked: &Path) {
+    let mut hook = AFTER_RESOLVE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((path, f)) = hook.as_mut()
+        && path == walked
+    {
+        f();
+    }
+}
+#[cfg(test)]
+fn set_after_resolve_hook(walked: PathBuf, f: impl FnMut() + Send + 'static) {
+    *AFTER_RESOLVE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((walked, Box::new(f)));
+}
+#[cfg(test)]
+fn clear_after_resolve_hook() {
+    *AFTER_RESOLVE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 /// A progress event emitted during a scan or revalidate. Borrows the current
 /// path to avoid a per-file allocation in the writer; the saved allocation is
 /// negligible next to the existing per-file `to_string_lossy` + DB write, so do
@@ -2312,26 +2344,32 @@ fn run_pipeline(
             loop {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 let Some(path) = files.get(i) else { break };
-                match probe_file_caught(path, window, tier) {
+                // No-follow paths are canonical by construction (the root was
+                // canonicalized up front); only the opt-in symlink walk can yield a
+                // path with a symlink component to resolve (#440). It is resolved
+                // once, and the probe reads what was resolved: probing the walked
+                // name and canonicalizing it separately were two lookups, and a
+                // retarget between them stored one target's geometry and stamp
+                // against another's path (#684).
+                let abs_path = if follow_symlinks {
+                    match std::fs::canonicalize(path) {
+                        Ok(abs) => abs,
+                        Err(e) => {
+                            failures.record(
+                                SkipReason::Io,
+                                format_args!("skipping {}: {e}", path.display()),
+                            );
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                } else {
+                    path.clone()
+                };
+                #[cfg(test)]
+                fire_after_resolve(path);
+                match probe_file_caught(&abs_path, window, tier) {
                     Ok(ProbeOutcome::Probed(probed, stamp, checksums)) => {
-                        // No-follow paths are canonical by construction (the root
-                        // was canonicalized up front); only the opt-in symlink walk
-                        // can yield a path with a symlink component to resolve (#440).
-                        let abs_path = if follow_symlinks {
-                            match std::fs::canonicalize(path) {
-                                Ok(abs) => abs,
-                                Err(e) => {
-                                    failures.record(
-                                        SkipReason::Io,
-                                        format_args!("skipping {}: {e}", path.display()),
-                                    );
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                            }
-                        } else {
-                            path.clone()
-                        };
                         // Reject an over-cap file here, before its payload is
                         // charged to the budget and buffered into a batch: a
                         // `CHECK` violation discovered at commit time is fatal

@@ -634,6 +634,17 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **A symlink retargeted during a `--follow-symlinks` scan can no longer store
+  one file's geometry against another file's path**
+  ([#684](https://github.com/Sohex/musefs/issues/684)). The scan probed the
+  walked name and then canonicalized it — two lookups of the same symlink — so a
+  retarget between them ingested a row whose stamp and bounds described one file
+  and whose path named another. It failed closed (every read refused it with
+  `BackingChanged`), but the track was permanently unreadable while the file
+  looked fine. The path is now resolved once and the probe reads what was
+  resolved. A probe failure under `--follow-symlinks` therefore names the
+  resolved target rather than the link.
+
 - **The backing-freshness guarantee is documented for the reads it actually
   covers** ([#683](https://github.com/Sohex/musefs/issues/683)). The docs said
   the held descriptor is re-stated on every read, and that re-tags keep cached
