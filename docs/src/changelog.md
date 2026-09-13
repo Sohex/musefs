@@ -890,7 +890,8 @@ see the [Release notes](release-notes.md).
   resolved file's, so a row written by an older binary — or by an external
   writer — fails closed instead of serving renumbered nonsense. The audio
   segment carries the serial for that purpose. Existing rows keep their too-wide
-  bounds until the file is rescanned, which `musefs migrate` offers.
+  bounds. No rescan fixes one, since the scanner now refuses the file;
+  `revalidate --prune` removes it ([#747](https://github.com/Sohex/musefs/issues/747)).
 
 - FLAC-in-Ogg files whose mapping header declares a header-packet count of zero
   now ingest their tags and art, and synthesize correctly
@@ -914,8 +915,9 @@ see the [Release notes](release-notes.md).
   unknown case, so a compliant encoder writing zero is exactly the input this
   fixes rather than an exception to it. Synthesis additionally
   clears `STREAMINFO`'s last-block flag, since the regenerated comment block
-  always follows it. As with chained Ogg, an existing row keeps its wrong
-  `audio_offset` until a rescan.
+  always follows it. An existing row keeps its wrong `audio_offset` until a
+  revalidate re-probes it, and the tags and art 1.3.0 never read from such a
+  file arrive only through `scan --force`.
 
 - Both checksums are now derived inside the probe's stability transaction, from
   the descriptor it already holds, instead of reopening the pathname afterwards.

@@ -115,6 +115,12 @@ error: store schema version 3 needs an explicit upgrade to version 4 before this
 musefs build can open it; run `musefs migrate --db <store>`.
 ```
 
+A command that refuses is not quite hands-off. It still applies the automatic
+steps ahead of the gate, and that alone takes a store past what the previous
+release can open, without a snapshot. So when upgrading, make `musefs migrate`
+the first command the new build runs against the store
+([#749](https://github.com/Sohex/musefs/issues/749)).
+
 `musefs migrate` is where that upgrade happens, deliberately:
 
 ```bash
@@ -126,11 +132,12 @@ schema, takes a snapshot, upgrades the store, and then offers to clean up after
 itself:
 
 ```text
-store library.db is at schema version 3; this build needs 4.
-  v4 — clears every stored fingerprint; a scan or revalidate recomputes them  [needs this command]
+store library.db is at schema version 2; this build needs 4.
+  v3 (musefs 2.0.0) — widens the tags.value and track_art.description caps
+  v4 (musefs 2.0.0) — clears every stored fingerprint; a revalidate recomputes them  [needs this command]
 This rewrites the store in place. Once it is done, musefs builds older than this one will no longer open it.
 store is 412.7 MiB; the upgrade needs about 825.4 MiB free and has 27.7 GiB.
-a snapshot will be written to library.db.v3.bak first.
+a snapshot will be written to library.db.v2.bak first.
 Upgrade library.db now? [y/N]
 ```
 
@@ -200,8 +207,16 @@ An upgrade that rewrites rows leaves the store larger than it was, so `migrate`
 offers a vacuum. It also reports how many tracks lost a scanner-derived value
 the upgrade retired — the fingerprint, in the 2.0.0 upgrade — and offers to run
 a [`revalidate`](#refreshing-the-store-musefs-revalidate) over the directory
-your library shares, which recomputes them. Until that runs, those tracks
-cannot be re-identified after a move; nothing else about the mount is affected.
+your library shares. A plain `scan` does not recompute a stored file's
+fingerprint; the revalidate does. Until it runs, those tracks cannot be
+re-identified after a move.
+
+The 2.0.0 upgrade leaves more than fingerprints for that revalidate: it records
+each file's inode, and restores each file's own picture metadata. The offer
+never prunes, and whatever the revalidate counts as failed, `migrate` still
+exits `0`. The
+[release notes](../release-notes.md#upgrading-from-v130) list what else the
+first revalidate changes, including every synthesized file's modification time.
 
 ### Flags, for scripts
 

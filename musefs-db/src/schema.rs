@@ -1073,7 +1073,7 @@ const MIGRATIONS: &[Migration] = &[
         MIGRATION_V4,
         Gate::Gated,
         "2.0.0",
-        "clears every stored fingerprint; a scan or revalidate recomputes them",
+        "clears every stored fingerprint; a revalidate recomputes them",
     ),
 ];
 

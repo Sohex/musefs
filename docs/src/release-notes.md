@@ -13,6 +13,117 @@ the full list so far.
 
 ### Upgrading from v1.3.0
 
+The store's schema changes in this release, and part of that change is one
+musefs will not make without being asked. Steps 1 to 4 are that upgrade and
+what follows it. Do them in order, and before anything else below.
+
+**1. Run `musefs migrate` first — before any other 2.0.0 command** ([#705],
+[#706]). `mount`, `scan`, `revalidate` and `vacuum` refuse a 1.3.0 store and
+name the command:
+
+```bash
+musefs migrate --db library.db
+```
+
+Run it **first**, with the old mount and any scheduled scan stopped. The
+commands that refuse the store do not leave it untouched: each commits an
+earlier, automatic schema step before refusing, and from then on 1.3.0 no
+longer opens the store, and the snapshot `migrate` takes can no longer take you
+back to it ([#749]). If a 2.0.0 command has already run against the store, the
+only way back to 1.3.0 is a copy you made beforehand.
+
+`migrate` refuses a store anything else has open — a mount, even an idle one, a
+running scan, another `migrate`. In a script it needs `--yes`, since there is no
+terminal to confirm on, and its two follow-up offers (step 4) decline unless
+`--vacuum` / `--revalidate` ask for them. Once the store is upgraded, no musefs
+older than 2.0.0 opens it. The
+[maintenance guide](guide/maintenance.md#upgrading-the-store-musefs-migrate) has
+the full walkthrough and flag table.
+
+**2. Disk space, and the way back** ([#705]). Before asking anything, `migrate`
+checks for free space next to the store: the store's on-disk size (the database
+with its `-wal` and `-shm`) for the rewrite, and the same again for the
+snapshot when it goes beside the store. If that is not there it refuses up
+front, rather than failing part-way.
+
+The snapshot is a single compacted copy at `<db>.v<version>.bak`, where the
+version is the one the store is at when `migrate` runs — `library.db.v2.bak` for
+a store 1.3.0 left. `--snapshot PATH` puts it elsewhere; `--no-snapshot` skips
+it, and the upgrade is then one-way. `migrate` refuses to overwrite an existing
+snapshot. There is no restore command: to go back, stop everything, replace the
+store with the snapshot, delete any leftover `library.db-wal` and
+`library.db-shm`, and run 1.3.0.
+
+The upgraded store is larger than the old one. `migrate` says by how much and
+offers a `vacuum`.
+
+**3. Rows the new schema refuses** ([#731]). This release tightens what a store
+row may hold ([#693], [#716], [#718]). Before anything is copied or written,
+`migrate` offers every row to the new tables. If any are refused, it reports how
+many per table and stops, with nothing changed. The refused shapes are ones a
+writer has to produce by binding the wrong type or by turning the store's
+constraints off:
+
+- a value stored in the wrong class — text in a blob column, bytes in a text
+  column, a fractional number where an integer belongs;
+- an embedded NUL in a tag key, a picture's MIME type or description, or an art
+  row's digest;
+- a picture dimension past `u32`, or an empty `backing_path`;
+- a tag, picture link or structural block whose track is gone, or a link whose
+  image is.
+
+Fix the rows with whatever wrote them, or pass `--repair` to have `migrate`
+delete them. It does so after the confirmation and the snapshot, so the rows are
+still in the copy — which is why `--repair` refuses `--no-snapshot`. Deleting a
+track takes its tags and picture links with it, and the report counts those too.
+
+**4. Revalidate afterwards.** Accept `migrate`'s offer to revalidate your
+library, or run `musefs revalidate /path/to/music --db library.db` yourself. The
+upgrade leaves several things only a revalidate puts right, and it is the
+**first** revalidate that does it:
+
+- **Fingerprints are cleared** ([#691]). Until they are recomputed, a moved file
+  is not recognised: `scan` ingests it as a new track and leaves its curated
+  row behind. A plain `scan` does not recompute them for files already in the
+  store; `revalidate` does.
+- **Stored inodes start unknown** ([#674]). The check that catches a backing
+  file replaced in place cannot use the inode until a revalidate records it.
+- **Picture metadata is copied, not per file** ([#716], [#746]). 1.3.0 kept one
+  MIME type and one set of dimensions per image, so the upgrade copies those
+  onto every file that embeds it, with FLAC's bit depth and colour count at 0.
+  The revalidate restores each file's own values for the pictures the file
+  itself embeds. A picture a plugin linked keeps what the plugin wrote.
+
+A few files need more than that:
+
+- **Ogg FLAC with a zero header-packet count** ([#723]). The revalidate corrects
+  where their audio starts. Tags and art that 1.3.0 never read from those files
+  arrive only through `musefs scan --force <file>`, which replaces that file's
+  curated tags and art with what it embeds.
+- **Chained Ogg** stored by 1.3.0 ([#722], [#747]). 2.0.0 refuses to serve these,
+  so they cannot be refreshed. Each counts as `failed` (reason `unsupported`),
+  and `revalidate` exits `2` while any remain. Until they are removed, reads
+  into a chain's second stream fail with `EIO`. `musefs revalidate --prune`
+  removes them. The run that does so still exits `2`, and the next one does not.
+  `migrate`'s offer never prunes, and it exits `0` whatever its revalidate
+  counted.
+- **Two files whose names differed only in non-UTF-8 bytes** ([#680]). 1.3.0
+  merged them into one track under a mangled path and served neither. A `scan`
+  adds both as new tracks; `revalidate --prune` removes the merged row, along
+  with any tags you had put on it.
+
+**Sync tools will see changed files, twice unless you revalidate first**
+([#725], [#696]). A synthesized file's modification time now carries its
+content version in the nanoseconds, so a tag edit is visible to a tool that
+compares size and mtime. 1.3.0 served whole seconds, so on the first mount
+nearly every synthesized file's mtime changes. The first revalidate then moves
+it again, seconds included, because it rewrites every row. Where it restores
+picture metadata or an Ogg FLAC's bounds, the size changes too. To have rsync
+without `--checksum`, Syncthing or a backup tool re-copy the library once
+rather than twice, revalidate before the first sync from the new mount. A
+whole-second comparison sees only the second change. `--mode structure-only`
+is unaffected.
+
 **Scan flags removed.** Both changes fail loudly rather than quietly doing
 something different, so a script or unit that needs updating will tell you:
 
@@ -43,13 +154,55 @@ one sitting idle. It now refuses while any mount or scan has the store open
 ([#721]). A scheduled `vacuum` that used to run while the library was mounted
 will start failing with *the store is in use*; stop the mount around it.
 
-**External writers.** No update is needed for these changes: the `contrib/`
-packages have called the `revalidate` subcommand since their 1.2.0 and pass
-neither `--fast` nor `--strict`.
+**External writers.** Upgrade the `contrib/` packages together with musefs:
+they open only a store at the new schema version, just as musefs 1.3.0 refuses
+the new one. The [contrib changelog](integrations/overview.md#contrib-changelog)
+has the package side. For anything writing to the store without them, this is
+what changed underneath:
+
+- `tracks.backing_path` is a `BLOB` holding the filesystem's bytes, not text
+  ([#680]). Bind paths as bytes; a text value is refused. The helpers'
+  `path_param` and `path_value` do this, and `realpath_key` returns a non-UTF-8
+  name as the string `os.fsdecode` gives, not a lossy one.
+- A picture's MIME type and dimensions describe one file's embedding, so they
+  moved from `art` to `track_art`, which also gains `depth` and `colors`
+  ([#716]). `upsert_art` takes only the bytes, and `replace_track_art` takes
+  `(art_id, picture_type, description, mime)`. A link written without a MIME type
+  is served with an empty one.
+- `art` rows cannot be changed once written, and a row filed under a digest must
+  hold the bytes that digest names. `upsert_art` raises `ArtDigestMismatch` when
+  it does not ([#724]).
+- A tag or picture link cannot be moved to another track by updating its
+  `track_id`; delete it and insert it under the new one ([#717]).
+
+The scan-flag changes above need no plugin update: the packages have called the
+`revalidate` subcommand since their 1.2.0 and pass neither `--fast` nor
+`--strict`.
 
 **Rust crate API.** This only affects code depending on the musefs crates
 directly.
 
+- The store model follows the schema ([#674], [#680], [#716]).
+  - `Track`, `TrackIdentity` and `NewTrack` carry `backing_path` as a `PathBuf`,
+    and `Track` and `NewTrack` gain `backing_ino`.
+  - `NewArt` is only the bytes, and `Art` and `ArtMeta` lose the MIME type and
+    dimensions.
+  - `TrackArt` gains `mime`, `width`, `height`, `depth` and `colors`.
+  - `NewTrack` and `TrackArt` are write inputs and stay exhaustive, so code that
+    builds them must fill the new fields.
+  - `Db::refresh_embedded_art` and its `EmbeddedArt` input are new ([#746]).
+- `Db::set_track_checksums` and the retarget writer take a `ChecksumWrite`
+  instead of an `Option<&str>` ([#689]).
+- `Db::open` refuses a store that needs a gated step, with
+  `DbError::StoreNeedsMigration`. `PendingMigration` is the API `musefs migrate`
+  drives ([#705], [#706]). `DbError::StoreInUse` now names the operation it
+  refused, and `DbError::ArtDigestMismatch` is new ([#724]).
+- `CoreError::BackingChanged` carries the path as a `PathBuf`. The messages it
+  used to carry in its place are now `CoreError::DerivedStateStale` ([#680]).
+- `Attr::mtime_secs` is replaced by `mtime: Option<VirtualMtime>`, which is
+  `None` only for a virtual directory ([#696], [#725]).
+- `BackingStamp` gains `ino`. Compare a stored stamp with a live one through
+  `matches_live`, not `==` ([#674]).
 - `musefs_cli::run_scan` no longer takes `revalidate`, and takes a
   `musefs_cli::MatchMode` in place of `fast`/`strict`.
 - The public enums a caller matches on — the error types, `Format`, the scan and
@@ -71,12 +224,31 @@ directly.
   (`NewTrack`, `TrackArt`, `ArtInput` and the like) are unchanged, so a new store
   column is still a breaking change for code that writes rows.
 
+[#674]: https://github.com/Sohex/musefs/issues/674
+[#680]: https://github.com/Sohex/musefs/issues/680
+[#689]: https://github.com/Sohex/musefs/issues/689
+[#691]: https://github.com/Sohex/musefs/issues/691
+[#693]: https://github.com/Sohex/musefs/issues/693
+[#696]: https://github.com/Sohex/musefs/issues/696
+[#705]: https://github.com/Sohex/musefs/issues/705
+[#706]: https://github.com/Sohex/musefs/issues/706
 [#707]: https://github.com/Sohex/musefs/issues/707
 [#708]: https://github.com/Sohex/musefs/issues/708
 [#709]: https://github.com/Sohex/musefs/issues/709
 [#710]: https://github.com/Sohex/musefs/issues/710
+[#716]: https://github.com/Sohex/musefs/issues/716
+[#717]: https://github.com/Sohex/musefs/issues/717
+[#718]: https://github.com/Sohex/musefs/issues/718
 [#721]: https://github.com/Sohex/musefs/issues/721
+[#722]: https://github.com/Sohex/musefs/issues/722
+[#723]: https://github.com/Sohex/musefs/issues/723
+[#724]: https://github.com/Sohex/musefs/issues/724
+[#725]: https://github.com/Sohex/musefs/issues/725
+[#731]: https://github.com/Sohex/musefs/issues/731
 [#743]: https://github.com/Sohex/musefs/issues/743
+[#746]: https://github.com/Sohex/musefs/issues/746
+[#747]: https://github.com/Sohex/musefs/issues/747
+[#749]: https://github.com/Sohex/musefs/issues/749
 
 ## v1.3.0
 
