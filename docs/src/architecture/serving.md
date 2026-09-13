@@ -112,11 +112,19 @@ were opened on. `musefs_dir_listings` is the distinct-listing count behind
 every open handle is on a different directory.
 
 Over that cap, `opendir` degrades rather than failing: it returns the stateless
-handle, and `readdir` falls back to rebuilding the listing on each call (on the
-worker pool, like every other blocking operation, not on the single fuser
-dispatch thread). Listings stay complete — parallel walkers routinely exceed
-1024 concurrent directory handles on a large mount — at the cost of that
-rebuild. `musefs_dir_handle_rejections_total` counts the opens that took the
+handle. Listings stay complete — parallel walkers routinely exceed 1024
+concurrent directory handles on a large mount — and they stay stable too. A
+stateless handle cannot tell one enumeration from another, so the first
+`readdir` of an enumeration pins the current generation's listing in a small
+shared cache instead, and tags the cookies it hands out with that generation;
+every later page resolves its cookie back to the same listing. Paging whatever
+generation was current, as it used to, let a refresh landing between two pages
+shift entries under the cursor, so one enumeration could return an entry twice
+or skip one ([#695](https://github.com/Sohex/musefs/issues/695)). The cache
+holds 64 listings; an enumeration whose listing was evicted continues on the
+current generation, which is where every stateless page used to be. The work
+runs on the worker pool, like every other blocking operation, not on the single
+fuser dispatch thread. `musefs_dir_handle_rejections_total` counts the opens that took the
 fallback; the `musefs_dir_handles` gauge cannot show this, because
 saturation is bursty enough to read healthy in every sample while thousands of
 opens are degraded between them.

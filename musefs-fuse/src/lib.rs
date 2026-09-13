@@ -373,16 +373,169 @@ struct DirHandles {
 /// The cap bounds memory, not correctness: an ordinary parallel walker (`bfs`,
 /// the default `find` on some distributions) blows past 1024 concurrent dir
 /// handles on a large mount, so over-cap opens must still *work* (#616). They
-/// are served statelessly via [`DIR_FH_STATELESS`] and counted, never refused.
+/// are served statelessly via [`DIR_FH_STATELESS`] and counted, never refused,
+/// and a stateless enumeration still pages a single generation's listing
+/// through [`StatelessListings`] (#695).
 const MAX_DIR_HANDLES: usize = 1024;
 
-/// The `opendir` fh that stores no snapshot: `readdir` treats an unknown fh as a
-/// cache miss and rebuilds the listing, and `releasedir` on it removes nothing.
-/// Handed out for the synthetic `.musefs-metrics` directory and for any open
-/// over `MAX_DIR_HANDLES` (#616), so a saturated table costs a client a rebuild
-/// per `readdir` rather than the directory itself. `dir_fh` starts at 1, so no
-/// real handle can collide with it.
+/// The `opendir` fh that stores no snapshot: `readdir` pages it through
+/// [`StatelessListings`], which pins the listing each enumeration started on
+/// (#695), and `releasedir` on it removes nothing. Handed out for the synthetic
+/// `.musefs-metrics` directory and for any open over `MAX_DIR_HANDLES` (#616),
+/// so a saturated table costs a client at most a rebuild per enumeration rather
+/// than the directory itself. `dir_fh` starts at 1, so no real handle can
+/// collide with it.
 const DIR_FH_STATELESS: u64 = 0;
+
+/// Bits of a directory cookie that hold the index of the next entry (#695). The
+/// bits above them hold the generation tag of the listing a stateless
+/// enumeration is paging. An admitted handle, whose listing cannot change under
+/// it, uses tag 0, so its cookies are exactly the indexes they always were. A
+/// cookie is opaque to the kernel and to readers; ext4 hands out 63-bit hash
+/// cookies, so a large one is ordinary.
+const COOKIE_INDEX_BITS: u32 = 32;
+
+/// The cookie that resumes a listing tagged `tag` at entry `next`.
+fn dir_cookie(tag: u32, next: usize) -> u64 {
+    let index = u32::try_from(next).expect("a directory listing has fewer than 2^32 entries");
+    (u64::from(tag) << COOKIE_INDEX_BITS) | u64::from(index)
+}
+
+/// Split a cookie into its generation tag and the index it resumes at.
+fn split_dir_cookie(offset: u64) -> (u32, usize) {
+    let tag = u32::try_from(offset >> COOKIE_INDEX_BITS).expect("the high half of a u64 fits u32");
+    (tag, usize_from(offset & u64::from(u32::MAX)))
+}
+
+/// Where a directory page starts: the listing index, and the generation tag its
+/// cookies carry (0 for a listing that cannot change under the cursor).
+#[derive(Clone, Copy)]
+struct PageStart {
+    index: usize,
+    tag: u32,
+}
+
+impl PageStart {
+    /// A page of a listing held for the whole enumeration, where the offset the
+    /// kernel hands back is the index itself.
+    fn untagged(offset: u64) -> PageStart {
+        PageStart {
+            index: usize_from(offset),
+            tag: 0,
+        }
+    }
+}
+
+/// How many listings stateless enumerations keep pinned (#695). Eviction is not
+/// an error: an enumeration whose listing was evicted continues on the current
+/// generation, which is what every stateless page did before.
+const MAX_STATELESS_LISTINGS: usize = 64;
+
+/// Listings pinned for enumerations served without a directory handle (#695).
+///
+/// A stateless fh cannot tell one enumeration from another, so nothing
+/// per-handle can hold the listing it is paging. Rebuilding each page from
+/// whatever generation was current let a refresh between two pages shift the
+/// entries under an index cookie: one enumeration could return an entry twice,
+/// or skip one. Instead the first page of an enumeration tags the current
+/// generation and pins its listing here, and every cookie it hands out carries
+/// the tag, so each later page reads the same listing.
+#[derive(Default)]
+struct StatelessListings {
+    /// The generation new enumerations are tagged with. Held because a
+    /// snapshot's id is a heap address, unique only while the snapshot lives:
+    /// without the pin, a later tree at the same address would inherit the tag.
+    current: Option<(TreeSnapshot, u32)>,
+    /// The last tag minted. Tags start at 1; 0 means untagged.
+    last_tag: u32,
+    /// `((directory inode, tag), listing)`, least recently used first.
+    pinned: std::collections::VecDeque<((u64, u32), Arc<DirListing>)>,
+}
+
+impl StatelessListings {
+    /// The tag for `snapshot`'s generation, minting a new one unless it is the
+    /// generation the current tag stands for.
+    fn tag_for(&mut self, snapshot: &TreeSnapshot) -> u32 {
+        if let Some((held, tag)) = &self.current
+            && held.id() == snapshot.id()
+        {
+            return *tag;
+        }
+        self.last_tag = self.last_tag.checked_add(1).unwrap_or(1);
+        self.current = Some((snapshot.clone(), self.last_tag));
+        self.last_tag
+    }
+
+    /// The listing pinned for `(ino, tag)`, marked most recently used.
+    fn get(&mut self, ino: u64, tag: u32) -> Option<Arc<DirListing>> {
+        let at = self.pinned.iter().position(|(key, _)| *key == (ino, tag))?;
+        let entry = self.pinned.remove(at)?;
+        let listing = Arc::clone(&entry.1);
+        self.pinned.push_back(entry);
+        Some(listing)
+    }
+
+    /// Pin `listing` for `(ino, tag)`, evicting the least recently used past the cap.
+    fn insert(&mut self, ino: u64, tag: u32, listing: Arc<DirListing>) {
+        self.pinned.retain(|(key, _)| *key != (ino, tag));
+        self.pinned.push_back(((ino, tag), listing));
+        while self.pinned.len() > MAX_STATELESS_LISTINGS {
+            self.pinned.pop_front();
+        }
+    }
+}
+
+/// Resolve a stateless `readdir`/`readdirplus` page (#695): the listing to page
+/// and where its page starts.
+///
+/// A tagged cookie resumes the listing its tag pinned, whatever has been
+/// published since. An untagged offset — the first page of an enumeration — or a
+/// tag whose listing has been evicted is served from `snapshot`'s generation,
+/// which is tagged and pinned so the rest of the enumeration stays on it.
+/// `build` supplies that listing when it is not pinned already, and runs without
+/// the cache lock held.
+fn stateless_page<E>(
+    listings: &Mutex<StatelessListings>,
+    ino: u64,
+    offset: u64,
+    snapshot: &TreeSnapshot,
+    build: impl FnOnce() -> Result<Arc<DirListing>, E>,
+) -> Result<(Arc<DirListing>, PageStart), E> {
+    let (tag, index) = split_dir_cookie(offset);
+    let current = {
+        let mut guard = listings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tag != 0
+            && let Some(listing) = guard.get(ino, tag)
+        {
+            return Ok((listing, PageStart { index, tag }));
+        }
+        let current = guard.tag_for(snapshot);
+        if let Some(listing) = guard.get(ino, current) {
+            return Ok((
+                listing,
+                PageStart {
+                    index,
+                    tag: current,
+                },
+            ));
+        }
+        current
+    };
+    let listing = build()?;
+    listings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(ino, current, Arc::clone(&listing));
+    Ok((
+        listing,
+        PageStart {
+            index,
+            tag: current,
+        },
+    ))
+}
 
 /// The fh an `opendir` reply carries, given the [`try_admit_dir_handle`]
 /// outcome: the admitted snapshot id, or the stateless sentinel when the table
@@ -427,14 +580,24 @@ fn build_dir_listing(
     Ok(listing)
 }
 
-/// Answer a `readdir` with the page of `listing` starting at `offset`. Slicing
-/// from `offset` directly keeps a paginated enumeration O(n) rather than O(n^2):
-/// the skipped prefix is never re-walked (#442). The offset stored with each
-/// entry is the index of the *next* entry to return.
-fn reply_dir_page(mut reply: ReplyDirectory, listing: &[(u64, FileType, String)], offset: u64) {
-    let start = usize_from(offset).min(listing.len());
+/// Answer a `readdir` with the page of a listing held for the whole enumeration,
+/// starting at `offset`.
+fn reply_dir_page(reply: ReplyDirectory, listing: &[(u64, FileType, String)], offset: u64) {
+    reply_dir_entries(reply, listing, PageStart::untagged(offset));
+}
+
+/// Answer a `readdir` with the page of `listing` starting at `page`. Slicing from
+/// the start index directly keeps a paginated enumeration O(n) rather than
+/// O(n^2): the skipped prefix is never re-walked (#442). The cookie stored with
+/// each entry resumes at the *next* entry, under the page's tag.
+fn reply_dir_entries(
+    mut reply: ReplyDirectory,
+    listing: &[(u64, FileType, String)],
+    page: PageStart,
+) {
+    let start = page.index.min(listing.len());
     for (i, (child, kind, name)) in (start..).zip(&listing[start..]) {
-        if reply.add(INodeNo(*child), (i + 1) as u64, *kind, name) {
+        if reply.add(INodeNo(*child), dir_cookie(page.tag, i + 1), *kind, name) {
             break;
         }
     }
@@ -499,6 +662,8 @@ struct PlusFill {
     pool: ThreadPool,
     style: AttrStyle,
     expose_metrics: bool,
+    /// The generation tag every cookie of this fill carries (#695).
+    cookie_tag: u32,
 }
 
 /// One round's resolutions: a slice of the listing, a slot per entry, and the
@@ -590,17 +755,17 @@ fn unresolved_plus_entry(child: u64, kind: FileType, style: &AttrStyle) -> PlusE
     }
 }
 
-/// Start filling `reply` with `listing` from `offset` (#667).
+/// Start filling `reply` with `listing` from `page` (#667).
 fn start_plus_fill(
     core: &Arc<Musefs>,
     pool: &ThreadPool,
     style: AttrStyle,
     expose_metrics: bool,
     listing: Arc<DirListing>,
-    offset: u64,
+    page: PageStart,
     reply: ReplyDirectoryPlus,
 ) {
-    let start = usize_from(offset).min(listing.len());
+    let start = page.index.min(listing.len());
     let fill = Arc::new(PlusFill {
         listing,
         reply: Mutex::new(Some(reply)),
@@ -608,6 +773,7 @@ fn start_plus_fill(
         pool: pool.clone(),
         style,
         expose_metrics,
+        cookie_tag: page.tag,
     });
     spawn_plus_round(&fill, start);
 }
@@ -693,11 +859,11 @@ fn finish_plus_round(round: &PlusRound) {
             .get()
             .copied()
             .unwrap_or_else(|| unresolved_plus_entry(*child, *kind, &fill.style));
-        // The stored offset is the index of the *next* entry, as in
-        // `reply_dir_page`: the kernel hands it back to resume from here.
+        // The stored cookie resumes at the *next* entry, as in
+        // `reply_dir_entries`: the kernel hands it back to resume from here.
         if reply.add(
             INodeNo(*child),
-            (i + 1) as u64,
+            dir_cookie(fill.cookie_tag, i + 1),
             name,
             &entry.ttl,
             &entry.attr,
@@ -873,6 +1039,8 @@ pub struct MusefsFs {
     /// leave a partially-observable map across a single lock acquisition. So even a
     /// poisoning panic can't tear a later `readdir`'s view; recovery is deliberate.
     dir_handles: Arc<Mutex<DirHandles>>,
+    /// Listings pinned for enumerations served on the stateless fh (#695).
+    stateless_listings: Arc<Mutex<StatelessListings>>,
     /// Monotonic dir-handle id (starts at 1; 0 stays [`DIR_FH_STATELESS`]).
     ///
     /// Unlike the file slab's generation-encoded keys (`facade.rs`, ABA-safe by
@@ -940,6 +1108,7 @@ impl MusefsFs {
             poll_pending: Arc::new(AtomicBool::new(false)),
             passthrough: platform::passthrough::PassthroughState::new(structure_only),
             dir_handles: Arc::new(Mutex::new(DirHandles::default())),
+            stateless_listings: Arc::new(Mutex::new(StatelessListings::default())),
             dir_fh: Arc::new(AtomicU64::new(1)),
             dir_handle_rejections: Arc::new(AtomicU64::new(0)),
             readdirplus_calls: Arc::new(AtomicU64::new(0)),
@@ -1537,31 +1706,35 @@ impl Filesystem for MusefsFs {
             // expensive (#623). `ReplyDirectory` is `Send`, so the worker answers.
             let core = Arc::clone(&self.core);
             let handles = Arc::clone(&self.dir_handles);
+            let stateless = Arc::clone(&self.stateless_listings);
             let expose_metrics = self.config.expose_metrics;
             return execute_guarded(&self.pool, "readdir", move || {
-                // An over-cap open is exactly the case where some *other* handle
-                // usually holds this directory's listing already, so probe the
-                // index before walking the tree again (#675). A hit is the same
-                // listing the rebuild would produce: same directory, same
-                // generation.
                 let snapshot = core.tree_snapshot();
-                let cached = shared_listing(
-                    &handles
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    (snapshot.id(), ino.0),
-                );
-                if let Some(listing) = cached {
-                    return reply_dir_page(reply, &listing, offset);
-                }
-                match synth_outcome(
-                    "readdir",
-                    ino.0,
-                    std::panic::AssertUnwindSafe(|| {
-                        build_dir_listing(&snapshot, ino.0, expose_metrics)
-                    }),
-                ) {
-                    Ok(listing) => reply_dir_page(reply, &listing, offset),
+                let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
+                    // An over-cap open is exactly the case where some *other*
+                    // handle usually holds this directory's listing already, so
+                    // probe the index before walking the tree again (#675). A hit
+                    // is the listing the rebuild would produce: same directory,
+                    // same generation.
+                    if let Some(listing) = shared_listing(
+                        &handles
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        (snapshot.id(), ino.0),
+                    ) {
+                        return Ok(listing);
+                    }
+                    synth_outcome(
+                        "readdir",
+                        ino.0,
+                        std::panic::AssertUnwindSafe(|| {
+                            build_dir_listing(&snapshot, ino.0, expose_metrics)
+                        }),
+                    )
+                    .map(Arc::new)
+                });
+                match page {
+                    Ok((listing, start)) => reply_dir_entries(reply, &listing, start),
                     Err(e) => reply.error(e),
                 }
             });
@@ -1598,7 +1771,7 @@ impl Filesystem for MusefsFs {
                 style,
                 true,
                 Arc::new(metrics_dir::dir_listing()),
-                offset,
+                PageStart::untagged(offset),
                 reply,
             );
         }
@@ -1618,29 +1791,34 @@ impl Filesystem for MusefsFs {
             // spares it even that (#675).
             let core = Arc::clone(&self.core);
             let handles = Arc::clone(&self.dir_handles);
+            let stateless = Arc::clone(&self.stateless_listings);
             let pool = self.pool.clone();
             return execute_guarded(&self.pool, "readdirplus", move || {
                 let snapshot = core.tree_snapshot();
-                let cached = shared_listing(
-                    &handles
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    (snapshot.id(), ino.0),
-                );
-                let listing = match cached {
-                    Some(listing) => listing,
-                    None => match synth_outcome(
+                let page = stateless_page(&stateless, ino.0, offset, &snapshot, || {
+                    if let Some(listing) = shared_listing(
+                        &handles
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        (snapshot.id(), ino.0),
+                    ) {
+                        return Ok(listing);
+                    }
+                    synth_outcome(
                         "readdirplus",
                         ino.0,
                         std::panic::AssertUnwindSafe(|| {
                             build_dir_listing(&snapshot, ino.0, expose_metrics)
                         }),
-                    ) {
-                        Ok(listing) => Arc::new(listing),
-                        Err(e) => return reply.error(e),
-                    },
-                };
-                start_plus_fill(&core, &pool, style, expose_metrics, listing, offset, reply);
+                    )
+                    .map(Arc::new)
+                });
+                match page {
+                    Ok((listing, start)) => {
+                        start_plus_fill(&core, &pool, style, expose_metrics, listing, start, reply);
+                    }
+                    Err(e) => reply.error(e),
+                }
             });
         };
         start_plus_fill(
@@ -1649,7 +1827,7 @@ impl Filesystem for MusefsFs {
             style,
             expose_metrics,
             listing,
-            offset,
+            PageStart::untagged(offset),
             reply,
         );
     }
@@ -2057,6 +2235,136 @@ mod tests {
                 .map(|(i, name)| (i as u64 + 2, FileType::RegularFile, (*name).to_string()))
                 .collect(),
         )
+    }
+
+    /// #695: tag 0 is the plain index a held listing always used, and a tag
+    /// rides above the index bits without disturbing it.
+    #[test]
+    fn an_untagged_cookie_is_the_index_it_always_was() {
+        assert_eq!(dir_cookie(0, 7), 7);
+        assert_eq!(split_dir_cookie(7), (0, 7));
+        let tagged = dir_cookie(5, 3);
+        assert_eq!(split_dir_cookie(tagged), (5, 3));
+        assert!(
+            tagged > u64::from(u32::MAX),
+            "the tag lives above the index"
+        );
+    }
+
+    #[test]
+    fn stateless_listings_tag_per_generation_and_evict_the_least_recently_used() {
+        let (_d, fs, snapshot) = test_snapshot();
+        let mut listings = StatelessListings::default();
+        let tag = listings.tag_for(&snapshot);
+        assert_ne!(tag, 0, "0 is reserved for untagged cookies");
+        assert_eq!(
+            listings.tag_for(&fs.core.tree_snapshot()),
+            tag,
+            "the same generation keeps its tag"
+        );
+        let cap = u64::try_from(MAX_STATELESS_LISTINGS).unwrap();
+        for ino in 0..cap {
+            listings.insert(ino, tag, listing(&["a"]));
+        }
+        assert!(
+            listings.get(0, tag).is_some(),
+            "touching 0 makes 1 the oldest"
+        );
+        listings.insert(cap, tag, listing(&["a"]));
+        assert!(
+            listings.get(1, tag).is_none(),
+            "the least recently used goes"
+        );
+        assert!(listings.get(0, tag).is_some());
+        assert!(listings.get(cap, tag).is_some());
+    }
+
+    /// #695: a stateless enumeration that a refresh interrupts keeps paging the
+    /// listing it started on, so an entry inserted ahead of its cursor cannot
+    /// shift what the next page returns — no entry twice, none skipped. Paging
+    /// the new generation at the same index, as before, returned "b" again.
+    #[test]
+    fn a_refresh_between_stateless_pages_cannot_shift_the_enumeration() {
+        let (dir, fs) = test_fs();
+        let db = musefs_db::Db::open(dir.path().join("m.db")).unwrap();
+        let add = |title: &str| {
+            let id = db
+                .upsert_track(&musefs_db::NewTrack {
+                    backing_path: dir.path().join(format!("{title}.flac")),
+                    format: musefs_db::Format::Flac,
+                    audio_offset: 0,
+                    audio_length: 1,
+                    backing_size: 1,
+                    backing_mtime_ns: 0,
+                    backing_ctime_ns: 0,
+                    backing_ino: None,
+                })
+                .unwrap();
+            db.replace_tags(
+                id,
+                &[
+                    musefs_db::Tag::new("artist", "Art", 0),
+                    musefs_db::Tag::new("title", title, 0),
+                ],
+            )
+            .unwrap();
+        };
+        let names = |listing: &DirListing, from: usize| -> Vec<String> {
+            listing[from..]
+                .iter()
+                .map(|(_, _, name)| name.clone())
+                .collect()
+        };
+        add("b");
+        add("c");
+        assert!(fs.core.poll_refresh().unwrap());
+        let artist = fs
+            .core
+            .lookup(musefs_core::VirtualTree::ROOT, "Art")
+            .unwrap();
+        let listings = Mutex::new(StatelessListings::default());
+
+        let first = fs.core.tree_snapshot();
+        let (listing, page) = stateless_page(&listings, artist, 0, &first, || {
+            build_dir_listing(&first, artist, false).map(Arc::new)
+        })
+        .unwrap();
+        assert_eq!(page.index, 0);
+        let all = names(&listing, 0);
+        assert_eq!(all.len(), 4, "{all:?}");
+        let (b, c) = (all[2].clone(), all[3].clone());
+        assert!(b.starts_with('b') && c.starts_with('c'), "{all:?}");
+        // The kernel took ".", "..", b, and hands back the cookie after b.
+        let resume = dir_cookie(page.tag, 3);
+
+        add("a");
+        assert!(fs.core.poll_refresh().unwrap());
+        let second = fs.core.tree_snapshot();
+        let (listing, resumed) = stateless_page(&listings, artist, resume, &second, || {
+            build_dir_listing(&second, artist, false).map(Arc::new)
+        })
+        .unwrap();
+        assert_eq!(
+            resumed.tag, page.tag,
+            "the enumeration stays on its generation"
+        );
+        assert_eq!(
+            names(&listing, resumed.index),
+            [c],
+            "no b twice, no c skipped"
+        );
+
+        let (listing, fresh) = stateless_page(&listings, artist, 0, &second, || {
+            build_dir_listing(&second, artist, false).map(Arc::new)
+        })
+        .unwrap();
+        assert_ne!(
+            fresh.tag, page.tag,
+            "a new enumeration takes the new generation"
+        );
+        let now = names(&listing, 0);
+        assert_eq!(now.len(), 5, "{now:?}");
+        assert!(now[2].starts_with('a'), "{now:?}");
     }
 
     fn empty_dir_handles() -> DirHandles {

@@ -647,6 +647,18 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **A directory listed without a handle can no longer repeat or skip entries
+  when the library changes mid-listing**
+  ([#695](https://github.com/Sohex/musefs/issues/695)). Past the 1,024
+  directory-handle cap, which a parallel walker over a large mount routinely
+  reaches, each `readdir` page was rebuilt from whatever tree was current and
+  resumed at a plain index. A store change landing between two pages shifted
+  the entries under that index, so one enumeration could return an entry twice
+  or miss one. The first page of such an enumeration now pins its listing and
+  tags the cookies it returns with that generation, so every later page reads
+  the same listing. Up to 64 listings stay pinned; one evicted before its
+  enumeration finishes falls back to the old behaviour.
+
 - **A crafted `art` row can no longer hand one image's bytes to a file embedding
   another** ([#724](https://github.com/Sohex/musefs/issues/724)). `art` is
   deduplicated by `sha256`, and on a conflict the writers returned the row
