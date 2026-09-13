@@ -16,7 +16,7 @@ def test_accepts_bytes_path(tmp_path):
     f.write_bytes(b"x")
     key = realpath_key(os.fsencode(str(f)))
     assert isinstance(key, str)
-    assert key.endswith("b.flac")
+    assert key == os.path.realpath(str(f))
 
 
 def test_a_non_utf8_byte_survives_the_key_instead_of_being_replaced(tmp_path):

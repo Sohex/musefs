@@ -1,5 +1,6 @@
 import pytest
 from musefs_common import ArtImage, realpath_key
+from musefs_common.contract import normalize_rows
 
 from musefs_lidarr.errors import MappingError
 from musefs_lidarr.mapping import (
@@ -14,19 +15,22 @@ from musefs_lidarr.mapping import (
 def test_build_pairs_maps_core_tags(sample_artist, sample_album, sample_track):
     pairs = build_pairs(track=sample_track, album=sample_album, artist=sample_artist)
 
-    assert ("title", "Wildlife Analysis") in pairs
-    assert ("artist", "Boards of Canada") in pairs
-    assert ("albumartist", "Boards of Canada") in pairs
-    assert ("album", "Music Has the Right to Children") in pairs
-    assert ("tracknumber", "1") in pairs
-    assert ("discnumber", "1") in pairs
-    assert ("date", "1998-04-20") in pairs
-    assert ("musicbrainz_artistid", "artist-mbid") in pairs
-    assert ("musicbrainz_albumid", "release-group-mbid") in pairs
-    assert ("musicbrainz_trackid", "track-mbid") in pairs
-    assert ("musicbrainz_releasetrackid", "recording-mbid") in pairs
-    assert pairs.count(("genre", "Electronic")) == 1
-    assert ("genre", "IDM") in pairs
+    # Set semantics per key (the store's), but the whole set: an extra key or a
+    # repeated value fails, which membership checks let through.
+    assert normalize_rows(pairs) == {
+        "title": ["Wildlife Analysis"],
+        "artist": ["Boards of Canada"],
+        "albumartist": ["Boards of Canada"],
+        "album": ["Music Has the Right to Children"],
+        "tracknumber": ["1"],
+        "discnumber": ["1"],
+        "date": ["1998-04-20"],
+        "musicbrainz_artistid": ["artist-mbid"],
+        "musicbrainz_albumid": ["release-group-mbid"],
+        "musicbrainz_trackid": ["track-mbid"],
+        "musicbrainz_releasetrackid": ["recording-mbid"],
+        "genre": ["Electronic", "IDM"],
+    }
 
 
 def test_match_track_file_by_realpath(sample_track_file):

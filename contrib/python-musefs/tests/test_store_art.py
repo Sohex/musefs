@@ -36,9 +36,7 @@ def test_replace_tags_assigns_incrementing_ordinals(db_path):
         rows = conn.execute(
             "SELECT key, value, ordinal FROM tags WHERE track_id=? ORDER BY key, ordinal", (tid,)
         ).fetchall()
-        assert ("genre", "Rock", 0) in rows
-        assert ("genre", "Pop", 1) in rows
-        assert ("title", "T", 0) in rows
+        assert rows == [("genre", "Rock", 0), ("genre", "Pop", 1), ("title", "T", 0)]
     finally:
         conn.close()
 
@@ -56,9 +54,11 @@ def test_replace_tags_preserves_binary_tags(db_path):
         replace_tags(conn, tid, [("title", "T")])
         conn.commit()
         blobs = conn.execute(
-            "SELECT COUNT(*) FROM tags WHERE track_id=? AND value_blob IS NOT NULL", (tid,)
-        ).fetchone()[0]
-        assert blobs == 1
+            "SELECT key, value, value_blob, ordinal FROM tags "
+            "WHERE track_id=? AND value_blob IS NOT NULL",
+            (tid,),
+        ).fetchall()
+        assert blobs == [("priv", "", b"\x01\x02", 0)]
     finally:
         conn.close()
 
@@ -70,6 +70,10 @@ def test_upsert_art_is_content_addressed(db_path):
         again = upsert_art(conn, JPEG)  # same bytes -> same id
         conn.commit()
         assert first == again
+        # The digest must be the one `musefs scan` computes (lowercase hex SHA-256
+        # of the bytes), or a plugin's row never dedups against a scanner's.
+        row = conn.execute("SELECT sha256, byte_len, data FROM art WHERE id=?", (first,)).fetchone()
+        assert row == (hashlib.sha256(JPEG).hexdigest(), len(JPEG), JPEG)
         # And the row is the bytes and nothing else: everything that describes
         # one file's embedding of them lives on `track_art` (#716).
         cols = {r[1] for r in conn.execute("PRAGMA table_info(art)")}
@@ -84,19 +88,21 @@ def test_replace_track_art_sets_and_replaces_front_cover(db_path):
         tid = insert_track(conn, "/m/a.flac")
         first = upsert_art(conn, JPEG)
         before = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
-        replace_track_art(conn, tid, [(first, 3, "", "image/png")])
+        replace_track_art(conn, tid, [(first, 3, "", "image/jpeg")])
         conn.commit()
         row = conn.execute(
-            "SELECT art_id, picture_type, ordinal FROM track_art WHERE track_id=?", (tid,)
+            "SELECT art_id, picture_type, mime, ordinal FROM track_art WHERE track_id=?", (tid,)
         ).fetchone()
-        assert row == (first, 3, 0)
+        assert row == (first, 3, "image/jpeg", 0)
         after = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         assert after > before
         second = upsert_art(conn, PNG)
         replace_track_art(conn, tid, [(second, 3, "", "image/png")])
         conn.commit()
-        rows = conn.execute("SELECT art_id FROM track_art WHERE track_id=?", (tid,)).fetchall()
-        assert rows == [(second,)]
+        rows = conn.execute(
+            "SELECT art_id, mime FROM track_art WHERE track_id=?", (tid,)
+        ).fetchall()
+        assert rows == [(second, "image/png")]
     finally:
         conn.close()
 
@@ -110,13 +116,18 @@ def test_replace_track_art_multiple_rows_ordered(db_path):
         replace_track_art(conn, tid, [(a, 3, "", "image/jpeg"), (b, 4, "back", "image/png")])
         conn.commit()
         rows = conn.execute(
-            "SELECT art_id, picture_type, description, mime, ordinal FROM track_art "
+            "SELECT art_id, picture_type, description, mime, ordinal, "
+            "width, height, depth, colors FROM track_art "
             "WHERE track_id=? ORDER BY ordinal",
             (tid,),
         ).fetchall()
         # Each link carries the mime of the picture it links, which is the whole
         # point of the column living here rather than on the shared `art` row.
-        assert rows == [(a, 3, "", "image/jpeg", 0), (b, 4, "back", "image/png", 1)]
+        # The geometry is left unset ("not stated"), not guessed.
+        assert rows == [
+            (a, 3, "", "image/jpeg", 0, None, None, 0, 0),
+            (b, 4, "back", "image/png", 1, None, None, 0, 0),
+        ]
         replace_track_art(conn, tid, [(b, 3, "", "image/png")])
         conn.commit()
         rows = conn.execute("SELECT art_id FROM track_art WHERE track_id=?", (tid,)).fetchall()

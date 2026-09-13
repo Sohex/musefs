@@ -8,11 +8,14 @@ from musefs_common import (
     connect,
     path_param,
     realpath_key,
+    track_id_for_path,
 )
+from musefs_common.contract import normalize_rows
 
 from musefs_lidarr.errors import LidarrApiError
 from musefs_lidarr.events import EventType, LidarrEvent
 from musefs_lidarr.import_link import LinkMode
+from musefs_lidarr.mapping import MANAGED_KEY, MANAGED_VALUE
 from musefs_lidarr.sync import (
     SyncConfig,
     _collect_album_art,
@@ -211,8 +214,23 @@ def test_sync_records_writes_tags(
         rows = conn.execute("SELECT key, value FROM tags ORDER BY key, ordinal").fetchall()
     finally:
         conn.close()
-    assert ("title", "Wildlife Analysis") in rows
-    assert ("genre", "Electronic") in rows
+    # The whole row set: a dropped artist or MBID row, a missing ownership
+    # marker, or an album-level tag repeated per track (#539) all fail this.
+    assert normalize_rows(rows) == {
+        "title": ["Wildlife Analysis"],
+        "tracknumber": ["1"],
+        "discnumber": ["1"],
+        "musicbrainz_trackid": ["track-mbid"],
+        "musicbrainz_releasetrackid": ["recording-mbid"],
+        "artist": ["Boards of Canada"],
+        "albumartist": ["Boards of Canada"],
+        "album": ["Music Has the Right to Children"],
+        "date": ["1998-04-20"],
+        "musicbrainz_artistid": ["artist-mbid"],
+        "musicbrainz_albumid": ["release-group-mbid"],
+        "genre": ["Electronic", "IDM"],
+        MANAGED_KEY: [MANAGED_VALUE],
+    }
 
 
 def test_sync_records_counts_and_logs_missing_row_as_skipped(
@@ -308,13 +326,18 @@ def test_symlink_rename_does_not_prune_previous_placeholder(
     db_path, make_track, sample_track_file, tmp_path
 ):
     key = realpath_key(sample_track_file["path"])
-    make_track(key)
+    tid = make_track(key)
     old_placeholder = tmp_path / "old.flac"
     config = SyncConfig(db_path=db_path, link_mode=LinkMode.SYMLINK, autoscan=False)
 
     pruned = sync_rename_prune(config=config, previous_paths=[str(old_placeholder)])
 
     assert pruned == 0
+    conn = connect(db_path)
+    try:
+        assert track_id_for_path(conn, key) == tid
+    finally:
+        conn.close()
 
 
 def test_hardlink_rename_prunes_previous_missing_path(db_path, make_track, tmp_path):
@@ -325,6 +348,11 @@ def test_hardlink_rename_prunes_previous_missing_path(db_path, make_track, tmp_p
     pruned = sync_rename_prune(config=config, previous_paths=[str(old_path)])
 
     assert pruned == 1
+    conn = connect(db_path)
+    try:
+        assert track_id_for_path(conn, realpath_key(old_path)) is None
+    finally:
+        conn.close()
 
 
 def test_hardlink_rename_keeps_a_previous_path_it_cannot_stat(
@@ -374,6 +402,7 @@ def test_sync_event_with_payloads_scans_then_syncs(
         paths=[sample_track_file["path"]],
         artist_id=10,
         album_id=20,
+        previous_paths=["/old/01 - Wildlife Analysis.flac"],
     )
     config = SyncConfig(
         db_path=db_path,
@@ -404,7 +433,7 @@ def test_sync_event_with_payloads_scans_then_syncs(
 
     assert stats.synced == 1
     assert calls[0] == ("scan", "musefs-dev", db_path, [sample_track_file["path"]])
-    assert calls[1][0] == "prune"
+    assert calls[1] == ("prune", config, ["/old/01 - Wildlife Analysis.flac"])
 
 
 def test_collect_event_payloads_queries_by_album_when_available(
@@ -522,12 +551,13 @@ def test_sync_records_writes_album_art(
     conn = connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT a.data, ta.mime, ta.picture_type FROM track_art ta "
+            "SELECT a.data, ta.mime, ta.picture_type, ta.description, ta.ordinal, "
+            "ta.width, ta.height, ta.depth, ta.colors FROM track_art ta "
             "JOIN art a ON a.id = ta.art_id"
         ).fetchall()
     finally:
         conn.close()
-    assert rows == [(b"\xff\xd8\xff\xe0cover", "image/jpeg", 3)]
+    assert rows == [(b"\xff\xd8\xff\xe0cover", "image/jpeg", 3, "", 0, None, None, 0, 0)]
 
 
 def test_collect_event_payloads_fetches_album_art(
@@ -674,6 +704,12 @@ def test_prune_deleted_artist_removes_all_artist_rows(db_path):
         event_type=EventType.ARTIST_DELETED, raw_type="ArtistDeleted", artist_mbid="art-1"
     )
     assert prune_deleted(config=config, event=event) == 2
+    conn = connect(db_path)
+    try:
+        survivors = {row[0] for row in conn.execute("SELECT id FROM tracks")}
+    finally:
+        conn.close()
+    assert survivors == {ids[2]}  # the other artist's track, not any two rows
 
 
 def test_prune_deleted_spares_unmanaged_scanner_seeded_mbid(db_path):

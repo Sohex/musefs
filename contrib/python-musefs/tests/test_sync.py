@@ -38,7 +38,13 @@ def test_sync_one_writes_tags_and_art(db_path):
         assert stats.synced == 1
         assert stats.art_linked == 1
         assert conn.execute("SELECT value FROM tags WHERE key='title'").fetchone()[0] == "T"
-        assert conn.execute("SELECT COUNT(*) FROM track_art").fetchone()[0] == 1
+        # The link, not just its existence: the mime `sync_one` passes is what
+        # synthesis writes into the picture block (#716).
+        rows = conn.execute(
+            "SELECT a.data, ta.mime, ta.picture_type, ta.description FROM track_art ta "
+            "JOIN art a ON a.id = ta.art_id"
+        ).fetchall()
+        assert rows == [(JPEG, "image/jpeg", 3, "")]
     finally:
         conn.close()
 
@@ -196,6 +202,9 @@ def test_art_deduped_across_records(db_path):
         conn.commit()
         assert conn.execute("SELECT COUNT(*) FROM art").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM track_art").fetchone()[0] == 2
+        # Both links name the one deduped row, not two rows that happen to count 1.
+        art_id = conn.execute("SELECT id FROM art").fetchone()[0]
+        assert conn.execute("SELECT DISTINCT art_id FROM track_art").fetchall() == [(art_id,)]
     finally:
         conn.close()
 
@@ -221,11 +230,12 @@ def test_sync_one_multiple_images_written_in_order(db_path):
         conn.commit()
         assert stats.art_linked == 1  # track count, not image count
         rows = conn.execute(
-            "SELECT picture_type, description, ordinal FROM track_art "
-            "WHERE track_id=? ORDER BY ordinal",
+            "SELECT ta.picture_type, ta.description, ta.mime, a.data, ta.ordinal "
+            "FROM track_art ta JOIN art a ON a.id = ta.art_id "
+            "WHERE ta.track_id=? ORDER BY ta.ordinal",
             (tid,),
         ).fetchall()
-        assert rows == [(3, "", 0), (4, "back", 1)]
+        assert rows == [(3, "", "image/jpeg", JPEG, 0), (4, "back", "image/png", PNG, 1)]
     finally:
         conn.close()
 
@@ -247,8 +257,12 @@ def test_sync_one_per_image_cap_keeps_survivors(db_path):
         conn.commit()
         assert stats.skipped_art == 1
         assert stats.art_linked == 1
-        rows = conn.execute("SELECT ordinal FROM track_art WHERE track_id=?", (tid,)).fetchall()
-        assert rows == [(0,)]  # only the survivor, ordinals re-packed from 0
+        rows = conn.execute(
+            "SELECT ta.ordinal, a.data FROM track_art ta JOIN art a ON a.id = ta.art_id "
+            "WHERE ta.track_id=?",
+            (tid,),
+        ).fetchall()
+        assert rows == [(0, JPEG)]  # only the survivor, ordinals re-packed from 0
     finally:
         conn.close()
 
