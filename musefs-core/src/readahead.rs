@@ -673,6 +673,13 @@ pub(crate) fn pread_append(
     result
 }
 
+// Caps each `pread` below, so a test can make a regular file return the short
+// reads a network filesystem can; nothing else reaches the resume path.
+#[cfg(test)]
+thread_local! {
+    static PREAD_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
 fn pread_append_unwound(
     file: &std::fs::File,
     out: &mut Vec<u8>,
@@ -684,6 +691,8 @@ fn pread_append_unwound(
     let mut at = offset;
     while out.len() < end {
         let remaining = end - out.len();
+        #[cfg(test)]
+        let remaining = remaining.min(PREAD_CAP.with(std::cell::Cell::get));
         let spare = &mut out.spare_capacity_mut()[..remaining];
         let read = match rustix::io::pread(file, spare, at) {
             Ok((init, _)) => init.len(),
@@ -1229,6 +1238,20 @@ mod pread_append_tests {
         assert_eq!(out, b"ab3456");
         pread_append(&file, &mut out, 0, 9).unwrap();
         assert_eq!(out, b"ab3456", "a zero-length append changes nothing");
+    }
+
+    /// A `pread` may return fewer bytes than asked — a network filesystem's can —
+    /// and the next one has to resume at the offset just past them, or the
+    /// append splices the wrong bytes in.
+    #[test]
+    fn short_reads_resume_where_the_last_one_ended() {
+        let (_tmp, file) = file_holding(b"0123456789abcdef");
+        super::PREAD_CAP.with(|cap| cap.set(3));
+        let mut out = b"ab".to_vec();
+        let result = pread_append(&file, &mut out, 10, 2);
+        super::PREAD_CAP.with(|cap| cap.set(usize::MAX));
+        result.unwrap();
+        assert_eq!(out, b"ab23456789ab");
     }
 
     /// A read that runs out of file part-way must not leave the bytes it did get

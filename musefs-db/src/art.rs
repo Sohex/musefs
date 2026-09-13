@@ -487,6 +487,95 @@ mod guard_tests {
         assert_eq!(again, honest, "and a verified one dedups again");
     }
 
+    /// #724: a bulk writer compares a row once and trusts it for the rest of the
+    /// batch — the point of `verified`, so a cover shared by every track of an
+    /// album costs one blob comparison rather than one per track. Pinned by
+    /// changing the row's bytes behind the writer after it compared them: the
+    /// next dedup returns the row without looking again.
+    #[test]
+    fn a_bulk_writer_compares_a_shared_row_once() {
+        let (db, _track, _) = db_track_art();
+        let cover = b"ALBUM-COVER".to_vec();
+        let id = db
+            .upsert_art(&NewArt {
+                data: cover.clone(),
+            })
+            .unwrap();
+
+        let mut bulk = db.bulk_writer().unwrap();
+        let first = bulk
+            .upsert_art(&NewArt {
+                data: cover.clone(),
+            })
+            .unwrap();
+        assert_eq!(first, id, "compared, and it holds these bytes");
+        // `art` rows are immutable, so the substitution is a delete and a
+        // re-insert under the same id and digest — what a writer ignoring the
+        // contract could leave. Same length, so only a comparison could notice.
+        db.conn
+            .execute("DELETE FROM art WHERE id = ?1", rusqlite::params![id])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO art (id, sha256, byte_len, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    id,
+                    crate::art::sha256_hex(&cover),
+                    cover.len() as u64,
+                    vec![0u8; cover.len()]
+                ],
+            )
+            .unwrap();
+        let again = bulk.upsert_art(&NewArt { data: cover }).unwrap();
+        assert_eq!(
+            again, id,
+            "already verified by this writer, so not read again"
+        );
+    }
+
+    /// #724: only a row this writer compared is remembered as verified. A fresh
+    /// insert needs no comparison, and must not be recorded as though it had
+    /// one: inside a bulk write its item can roll back, SQLite hands the freed
+    /// id to the next row inserted, and that row would then be linked unchecked.
+    #[test]
+    fn a_rolled_back_insert_leaves_nothing_verified_for_its_id_to_reuse() {
+        struct RolledBack;
+        impl From<DbError> for RolledBack {
+            fn from(_: DbError) -> RolledBack {
+                RolledBack
+            }
+        }
+
+        let (db, _track, _) = db_track_art();
+        let real = b"REAL-IMAGE-Z".to_vec();
+        let mut bulk = db.bulk_writer().unwrap();
+        let mut freed = 0;
+        let rolled_back = bulk.item(|w| -> Result<(), RolledBack> {
+            freed = w.upsert_art(&NewArt { data: real.clone() })?;
+            Err(RolledBack)
+        });
+        assert!(rolled_back.is_err());
+
+        // Another image's bytes, filed under this one's digest, at the freed id.
+        db.conn
+            .execute(
+                "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 3, X'595959')",
+                rusqlite::params![crate::art::sha256_hex(&real)],
+            )
+            .unwrap();
+        assert_eq!(
+            db.conn.last_insert_rowid(),
+            freed,
+            "precondition: the planted row reuses the rolled-back id"
+        );
+
+        let err = bulk.upsert_art(&NewArt { data: real }).unwrap_err();
+        assert!(
+            matches!(err, DbError::ArtDigestMismatch { art_id, .. } if art_id == freed),
+            "{err:?}"
+        );
+    }
+
     /// A value whose SQLite character length is 1 and whose byte length is
     /// `bytes`: SQLite stops counting characters at an embedded NUL, which is
     /// how #693 slips an unbounded payload past a character cap.
