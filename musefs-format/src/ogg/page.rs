@@ -4,6 +4,11 @@ use crate::error::{FormatError, Result};
 
 pub const CAPTURE: &[u8; 4] = b"OggS";
 
+/// The largest an Ogg page can be: 27 fixed header bytes + a 255-entry segment
+/// table + 255 × 255 payload bytes. A window this wide is guaranteed to contain
+/// one whole page wherever it is anchored.
+pub const MAX_PAGE_BYTES: u64 = 27 + 255 + 255 * 255;
+
 /// Header-type flag bits.
 pub const FLAG_CONTINUED: u8 = 0x01;
 pub const FLAG_BOS: u8 = 0x02;
@@ -152,16 +157,24 @@ pub struct ReadPacket {
     pub pages_through_end: u32,
 }
 
-/// Reassemble up to `want` packets from the pages starting at `data[0]`. Stops as
-/// soon as `want` packets have completed (audio for Opus/Vorbis/OggFLAC begins on
-/// a fresh page after the header packets). A packet ends at the first lacing value
-/// < 255.
-pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
+/// Reassemble packets from the pages starting at `data[0]`, asking `more` after
+/// each completed packet whether to take another. A packet ends at the first
+/// lacing value < 255.
+///
+/// Stopping is what bounds the read: audio for Opus/Vorbis/OggFLAC begins on a
+/// fresh page after the header packets, so a caller that stops at the end of the
+/// header run never reads a byte of audio. A caller that asks for more than the
+/// data holds gets `Malformed` from the page parse, which the bounded probe reads
+/// as "widen the window".
+pub fn read_packets_while(
+    data: &[u8],
+    mut more: impl FnMut(&[ReadPacket]) -> Result<bool>,
+) -> Result<Vec<ReadPacket>> {
     let mut out: Vec<ReadPacket> = Vec::new();
     let mut pos = 0usize;
     let mut pages = 0u32;
     let mut cur: Vec<u8> = Vec::new();
-    while out.len() < want {
+    loop {
         let h = parse_page(data, pos)?;
         pages += 1;
         let table_start = pos + 27;
@@ -181,14 +194,22 @@ pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
                     end_offset: pos + h.total_len(),
                     pages_through_end: pages,
                 });
-                if out.len() == want {
-                    break;
+                if !more(&out)? {
+                    return Ok(out);
                 }
             }
         }
         pos += h.total_len();
     }
-    Ok(out)
+}
+
+/// Reassemble up to `want` packets from the pages starting at `data[0]`. Stops as
+/// soon as `want` packets have completed.
+pub fn read_packets(data: &[u8], want: usize) -> Result<Vec<ReadPacket>> {
+    if want == 0 {
+        return Ok(Vec::new());
+    }
+    read_packets_while(data, |out| Ok(out.len() < want))
 }
 
 /// Given the full bytes of one page, return just its header bytes (length

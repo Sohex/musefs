@@ -447,15 +447,18 @@ fn has_ext(path: &Path, ext: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
+/// True if `path` has one of the extensions carrying an Ogg bitstream.
+fn has_ogg_ext(path: &Path) -> bool {
+    has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus")
+}
+
 /// True if `path` has an extension for a format the scanner can probe.
 fn is_supported_audio(path: &Path) -> bool {
     has_ext(path, "flac")
         || has_ext(path, "mp3")
         || has_ext(path, "m4a")
         || has_ext(path, "m4b")
-        || has_ext(path, "ogg")
-        || has_ext(path, "oga")
-        || has_ext(path, "opus")
+        || has_ogg_ext(path)
         || has_ext(path, "wav")
 }
 
@@ -837,7 +840,7 @@ pub(crate) fn probe_full(path: &Path, bytes: &[u8]) -> Option<Probed> {
             binary_tags,
             structural_blocks: Vec::new(),
         })
-    } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
+    } else if has_ogg_ext(path) {
         let scan = ogg::locate_audio(bytes).ok()?;
         let format = match scan.codec {
             ogg::Codec::Opus => Format::Opus,
@@ -1088,13 +1091,20 @@ fn probe_body(
     } else {
         None
     };
+    // Ogg's chain check reads the file's final page; nothing else needs a tail
+    // that wide, and no other format reads one at all.
+    let ogg_tail = if has_ogg_ext(path) {
+        Some(read_ogg_tail(file, file_len)?)
+    } else {
+        None
+    };
     for _ in 0..MAX_WIDEN_RETRIES {
-        match probe_prefix(path, &prefix, file_len, tail.as_ref()) {
+        match probe_prefix(path, &prefix, file_len, tail.as_ref(), ogg_tail.as_ref()) {
             Probe::Done(p) => return Ok(ProbeBody::Parsed(p)),
-            Probe::Skip => {
+            Probe::Skip(why) => {
                 return Ok(ProbeBody::Failed(Failure::new(
                     SkipReason::Unparseable,
-                    format!("skipping {}: no parseable audio metadata", path.display()),
+                    format!("skipping {}: {why}", path.display()),
                 )));
             }
             Probe::NeedMore(up_to) => {
@@ -1149,16 +1159,45 @@ fn unparseable(path: &Path, file_len: u64) -> Failure {
 enum Probe {
     Done(Probed),
     NeedMore(u64),
-    Skip,
+    /// The file is not servable, for the reason named — which reaches the user as
+    /// `skipping <path>: <reason>`.
+    Skip(&'static str),
+}
+
+/// What [`Probe::Skip`] says when nothing about a file parsed at all.
+const UNPARSEABLE: &str = "no parseable audio metadata";
+
+/// The last page-sized window of a file, for the Ogg final-page check (#722).
+struct OggTail {
+    bytes: Vec<u8>,
+    start: u64,
+}
+
+/// Read the last [`ogg::MAX_PAGE_BYTES`] of the file (or all of it, if shorter),
+/// which is wide enough to hold the final page whole whatever its size.
+fn read_ogg_tail(file: &std::fs::File, file_len: u64) -> std::io::Result<OggTail> {
+    use std::os::unix::fs::FileExt;
+    let want = file_len.min(ogg::MAX_PAGE_BYTES);
+    let start = file_len - want;
+    let mut bytes = vec![0u8; usize_from(want)];
+    file.read_exact_at(&mut bytes, start)?;
+    crate::metrics::on_scan_read(want);
+    Ok(OggTail { bytes, start })
 }
 
 /// Dispatch the front-anchored formats against `prefix` + `file_len`.
-fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 128]>) -> Probe {
+fn probe_prefix(
+    path: &Path,
+    prefix: &[u8],
+    file_len: u64,
+    tail: Option<&[u8; 128]>,
+    ogg_tail: Option<&OggTail>,
+) -> Probe {
     if has_ext(path, "flac") {
         match flac::locate_audio_bounded(prefix, file_len, tail) {
             Ok(Extent::Complete(scan)) => Probe::Done(flac_probed(prefix, &scan)),
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
-            Err(_) => Probe::Skip,
+            Err(_) => Probe::Skip(UNPARSEABLE),
         }
     } else if has_ext(path, "mp3") {
         match mp3::locate_audio_bounded(prefix, file_len, tail) {
@@ -1177,11 +1216,19 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
                 })
             }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
-            Err(_) => Probe::Skip,
+            Err(_) => Probe::Skip(UNPARSEABLE),
         }
-    } else if has_ext(path, "ogg") || has_ext(path, "oga") || has_ext(path, "opus") {
+    } else if has_ogg_ext(path) {
         match ogg::read_metadata_bounded(prefix, file_len) {
             Ok(Extent::Complete(header)) => {
+                // The header region only proves the file is not multiplexed. A
+                // chain's second bitstream begins after the first one's audio, so
+                // it is the *final* page that gives it away (#722).
+                if ogg_tail.is_some_and(|t| {
+                    ogg::classify_tail(&t.bytes, t.start, header.serial) == ogg::Chaining::Chained
+                }) {
+                    return Probe::Skip("chained Ogg (more than one logical bitstream)");
+                }
                 let format = match header.codec {
                     ogg::Codec::Opus => Format::Opus,
                     ogg::Codec::Vorbis => Format::Vorbis,
@@ -1201,16 +1248,16 @@ fn probe_prefix(path: &Path, prefix: &[u8], file_len: u64, tail: Option<&[u8; 12
                 })
             }
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
-            Err(_) => Probe::Skip,
+            Err(_) => Probe::Skip(UNPARSEABLE),
         }
     } else if has_ext(path, "wav") {
         match wav::locate_audio_bounded(prefix, file_len) {
             Ok(Extent::Complete(b)) => Probe::Done(wav_probed(prefix, &b)),
             Ok(Extent::NeedMore { up_to }) => Probe::NeedMore(up_to),
-            Err(_) => Probe::Skip,
+            Err(_) => Probe::Skip(UNPARSEABLE),
         }
     } else {
-        Probe::Skip
+        Probe::Skip(UNPARSEABLE)
     }
 }
 

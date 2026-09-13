@@ -271,6 +271,59 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- Chained Ogg is now detected and skipped at scan time, and refused at serve
+  time ([#722](https://github.com/Sohex/musefs/issues/722)). A chain is complete
+  logical bitstreams concatenated end to end, which RFC 3533 allows and the docs
+  claimed musefs rejected. It did not: `validate_single_bitstream` walks pages
+  only up to `audio_offset`, which proves the *header* region carries one serial
+  and one beginning-of-stream page, and a chain's second stream necessarily
+  begins after the first stream's audio does. Everything from `audio_offset` to
+  EOF was taken as one audio region, and the serve path applied one constant
+  sequence delta across all of it with no serial check. That delta is zero only
+  while the synthesized header happens to occupy as many pages as the original,
+  so a tag edit that changed the page count shifted every page of the second
+  stream — whose own numbering restarts at zero by spec — with the first
+  stream's delta, recomputing each CRC to match. The output was corrupt in a way
+  that passed a page-level integrity check.
+
+  Detection is the file's final page: a chain's last page belongs to its last
+  stream, so a serial other than the header's proves chaining for the whole
+  well-formed-chain class. The scanner reads one page-sized window
+  (`ogg::MAX_PAGE_BYTES`) from the end of the file and classifies it
+  (`ogg::classify_tail`) — one bounded read per Ogg file, rather than the walk
+  over the whole audio region that a page-by-page check would cost. A file whose
+  final page does not end on its last byte, which is what truncation looks like,
+  is reported as indeterminate and still scans and serves as before.
+
+  Independently, `serve_ogg_window` now refuses a page whose serial is not the
+  resolved file's, so a row written by an older binary — or by an external
+  writer — fails closed instead of serving renumbered nonsense. The audio
+  segment carries the serial for that purpose. Existing rows keep their too-wide
+  bounds until the file is rescanned, which `musefs migrate` offers.
+
+- FLAC-in-Ogg files whose mapping header declares a header-packet count of zero
+  now ingest their tags and art, and synthesize correctly
+  ([#723](https://github.com/Sohex/musefs/issues/723)). The 16-bit count in
+  packet 0 is the number of metadata packets that follow, but both RFC 9639 and
+  Xiph's mapping define zero as *unknown* — one or more metadata packets still
+  follow. Reading it as "none" ended the header run at packet 0, so the real
+  `VORBIS_COMMENT`, and any `PICTURE`, `SEEKTABLE` or `CUESHEET`, landed inside
+  what the store then recorded as audio. They were never ingested, so the mount
+  served the file with no tags and no art — and worse, synthesis emitted a
+  mapping packet plus one terminal `VORBIS_COMMENT` followed immediately by
+  those same original metadata packets, replayed verbatim as audio and
+  renumbered, so a decoder met metadata blocks where audio frames must be.
+
+  An unknown count is now resolved by the rule the format itself defines:
+  metadata blocks run until one sets the last-block flag, and a `STREAMINFO`
+  flagged last ends the run at packet 0. A run that reaches the audio packet
+  without ever flagging its last block has no discoverable end and is malformed.
+  A *nonzero* count is still taken at its word, which is what every compliant
+  encoder writes and what musefs's own synthesis emits. Synthesis additionally
+  clears `STREAMINFO`'s last-block flag, since the regenerated comment block
+  always follows it. As with chained Ogg, an existing row keeps its wrong
+  `audio_offset` until a rescan.
+
 - Both checksums are now derived inside the probe's stability transaction, from
   the descriptor it already holds, instead of reopening the pathname afterwards.
   The stamp was always captured first, so the skew was one-directional: a row

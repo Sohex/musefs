@@ -214,6 +214,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Chained Ogg — complete logical bitstreams concatenated end to end, which
+  RFC 3533 allows — is now detected and skipped at scan time, and refused at
+  serve time ([#722](https://github.com/Sohex/musefs/issues/722)). The old
+  single-bitstream check only walked the header region, which cannot see a
+  chain: the second stream begins after the first one's audio does. Everything
+  past that point was taken as one audio region, so a tag edit that changed the
+  header's page count renumbered the second stream's pages by the first
+  stream's delta, CRCs recomputed to match — deterministic corruption that
+  passed a page-level integrity check. Detection is the file's final page,
+  whose serial gives a chain away, read in one bounded window from the end of
+  the file; the serve path refuses any page carrying a foreign serial, which
+  fails closed for rows an older binary already wrote. A truncated file, whose
+  final page ends short, is unaffected and still serves.
+
+- FLAC-in-Ogg files whose mapping header declares a header-packet count of zero
+  now ingest their tags and art ([#723](https://github.com/Sohex/musefs/issues/723)).
+  The mapping defines zero as *unknown*, not *none*, and metadata packets still
+  follow; taking it literally put the real `VORBIS_COMMENT` — and any `PICTURE`,
+  `SEEKTABLE` or `CUESHEET` — inside what the store then called audio, where it
+  was never ingested and was replayed verbatim inside the synthesized stream,
+  after a header run the synthesis had already terminated. An unknown count is
+  now resolved by the rule the format defines: metadata blocks run until one
+  sets the last-block flag. A nonzero count is still taken at its word.
+
+  Both fixes correct what a *scan* records, so an existing row keeps its wrong
+  audio bounds until the file is rescanned.
+
 - The mtime `getattr` reports for a backing file dated before 1970 is no longer
   rounded up by a second ([#696](https://github.com/Sohex/musefs/issues/696)).
   The stamp is a signed nanosecond offset from the epoch, and the conversion to
