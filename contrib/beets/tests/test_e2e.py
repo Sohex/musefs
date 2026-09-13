@@ -1,7 +1,7 @@
 """Full end-to-end: generate audio -> `beet import` -> retag in beets ->
 `beet musefs` (auto-scan + sync) -> real FUSE mount -> verify the mount shows
 beets' tags and serves byte-identical audio. Opt-in (marker `e2e`): needs
-ffmpeg, the built `musefs` binary, `/dev/fuse` + fusermount, and beets.
+ffmpeg, the built `musefs` binary, `/dev/fuse` + a fusermount helper, and beets.
 
 Run with: `python -m pytest -m e2e`
 """
@@ -31,6 +31,24 @@ _DEBUG = REPO_ROOT / "target" / "debug" / "musefs"
 _RELEASE = REPO_ROOT / "target" / "release" / "musefs"
 MUSEFS = str(_DEBUG if _DEBUG.exists() else _RELEASE)
 BEET = os.path.join(os.path.dirname(sys.executable), "beet")
+
+
+def _fusermount():
+    """The unprivileged FUSE unmount helper, or None if neither is installed.
+
+    libfuse 3 installs `fusermount3`; only libfuse 2 provides bare `fusermount`,
+    and a fuse3-only system (any current distro) has just the former. Probing
+    for the bare name alone skipped this whole tier on exactly the machines most
+    likely to run it. Same order as the Rust signal handler's unmount ladder
+    (`musefs-cli/src/signal.rs`), minus its `umount` last resort: here a missing
+    helper is a skip, not something to fall back from.
+    """
+    for name in ("fusermount3", "fusermount"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
 
 PLAYBACK_FORMATS = [
     {
@@ -90,8 +108,8 @@ def _require_tools():
     """Skip the test when required external tools are missing."""
     if not (_DEBUG.exists() or _RELEASE.exists()):
         pytest.skip(f"musefs binary not built (looked in {_DEBUG}, {_RELEASE})")
-    if not (os.path.exists("/dev/fuse") and shutil.which("fusermount")):
-        pytest.skip("no /dev/fuse or fusermount")
+    if not (os.path.exists("/dev/fuse") and _fusermount()):
+        pytest.skip("no /dev/fuse, or no fusermount3/fusermount helper")
     if not shutil.which("ffmpeg"):
         pytest.skip("ffmpeg not available")
     if not os.path.exists(BEET):
@@ -339,7 +357,9 @@ def _mounted(mnt, db, template):
             raise AssertionError("musefs mount did not come up within 10s")
         yield
     finally:
-        subprocess.run(["fusermount", "-u", str(mnt)], capture_output=True)
+        # Resolved rather than assumed: the guard above has already established
+        # that one of the two exists.
+        subprocess.run([_fusermount(), "-u", str(mnt)], capture_output=True)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
