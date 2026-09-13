@@ -183,7 +183,7 @@ fn fast_retargets_despite_content_mismatch() {
     assert_ne!(Some(hash), seeded.content_hash.as_deref());
 }
 
-/// The same collision under `--fast` at the fingerprint tier, where no hash for
+/// The same collision under `--match=fast` at the fingerprint tier, where no hash for
 /// the arriving file exists: the retarget still happens, but the candidate's
 /// stored hash describes the file that left, so it must be dropped (#689).
 #[test]

@@ -1,4 +1,4 @@
-use musefs_cli::{ChecksumMode, run_revalidate, run_scan};
+use musefs_cli::{ChecksumMode, MatchMode, run_revalidate, run_scan};
 
 fn flac_block(block_type: u8, body: &[u8], is_last: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -62,8 +62,7 @@ fn scan_ingests_flacs_into_a_fresh_db() {
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -103,8 +102,7 @@ fn scan_ingests_multiple_targets_under_one_db() {
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -134,8 +132,7 @@ fn scan_fails_fast_on_a_bad_target() {
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     );
     assert!(result.is_err());
 }
@@ -163,8 +160,7 @@ fn scan_returns_per_file_failed_count() {
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -199,8 +195,7 @@ fn scan_with_progress_ingests_all_files() {
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -223,8 +218,7 @@ fn quiet_scan_still_ingests_all_files() {
         false,
         true,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
 
@@ -247,8 +241,7 @@ fn revalidate_with_progress_reports_unchanged() {
         false,
         false,
         ChecksumMode::Fingerprint,
-        false,
-        false,
+        MatchMode::Auto,
     )
     .unwrap();
     let failed = run_revalidate(

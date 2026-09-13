@@ -121,24 +121,30 @@ fn scan_parses_checksum_and_strictness_flags() {
         "/tmp/m.db",
         "--checksum",
         "full",
-        "--strict",
+        "--match",
+        "strict",
     ]);
     match cli.command {
         Command::Scan {
             checksum,
-            strict,
-            fast,
+            match_mode,
             ..
         } => {
             assert_eq!(checksum, musefs_cli::ChecksumMode::Full);
-            assert!(strict);
-            assert!(!fast);
+            assert_eq!(match_mode, musefs_cli::MatchMode::Strict);
         }
         Command::Mount(..) => panic!("expected scan"),
         Command::Vacuum { .. } | Command::Revalidate { .. } | Command::Migrate(..) => {
             unreachable!()
         }
     }
+
+    // Unset is `auto`, the escalating default.
+    let cli = Cli::parse_from(["musefs", "scan", "/lib", "--db", "/tmp/m.db"]);
+    let Command::Scan { match_mode, .. } = cli.command else {
+        panic!("expected scan");
+    };
+    assert_eq!(match_mode, musefs_cli::MatchMode::Auto);
 }
 
 #[test]

@@ -555,6 +555,18 @@ see the [Release notes](release-notes.md).
   packages have called the subcommand since their 1.1.0, so only a copy older
   than that is affected.
 
+- **`scan --fast` and `--strict`, replaced by `--match=auto|fast|strict`**, and
+  `MUSEFS_FAST`/`MUSEFS_STRICT` by `MUSEFS_MATCH`
+  ([#709](https://github.com/Sohex/musefs/issues/709)). Match strictness has
+  three states, and two booleans spent a fourth on a combination the CLI had to
+  detect and reject; one value has no such combination, and takes the same
+  shape as `--checksum` beside it. `auto` is the default and behaves exactly as
+  passing neither flag did. The old flags are usage errors, and the old
+  variables are refused with the `MUSEFS_MATCH` value to use — ignoring
+  `MUSEFS_STRICT=true` would have quietly weakened how a moved file is
+  confirmed. `musefs_cli::run_scan` takes a `MatchMode` in place of the two
+  booleans.
+
 ### Fixed
 
 - **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch
@@ -749,7 +761,7 @@ see the [Release notes](release-notes.md).
   write now carries an explicit intent — keep, set, or clear — and a pass below
   the `full` tier clears the column whenever it observes that the recorded bytes
   changed, while still keeping a higher tier's value for a file that has not
-  changed. A `--fast` retarget, which confirms nothing by design, likewise no
+  changed. A `--match=fast` retarget, which confirms nothing by design, likewise no
   longer inherits the departed file's hash
   ([#689](https://github.com/Sohex/musefs/issues/689)).
 

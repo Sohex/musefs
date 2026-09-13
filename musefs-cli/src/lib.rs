@@ -59,6 +59,28 @@ impl From<ChecksumMode> for musefs_core::ChecksumTier {
     }
 }
 
+/// CLI surface for `musefs_core::MatchStrictness`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum MatchMode {
+    /// Confirm with a full hash when the matched row has one; otherwise trust
+    /// the fingerprint (default).
+    Auto,
+    /// Trust a fingerprint match; never read the whole file.
+    Fast,
+    /// Require a full-hash match: a row with no stored hash is not retargeted.
+    Strict,
+}
+
+impl From<MatchMode> for musefs_core::MatchStrictness {
+    fn from(m: MatchMode) -> musefs_core::MatchStrictness {
+        match m {
+            MatchMode::Auto => musefs_core::MatchStrictness::Auto,
+            MatchMode::Fast => musefs_core::MatchStrictness::Fast,
+            MatchMode::Strict => musefs_core::MatchStrictness::Strict,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "musefs",
@@ -229,12 +251,10 @@ pub enum Command {
         /// Which content checksums to compute and store (none|fingerprint|full).
         #[arg(long, value_enum, env = "MUSEFS_CHECKSUM", default_value_t = ChecksumMode::Fingerprint)]
         checksum: ChecksumMode,
-        /// Confirm a move only by fingerprint, never reading the full file.
-        #[arg(long, env = "MUSEFS_FAST", value_parser = clap::builder::BoolishValueParser::new())]
-        fast: bool,
-        /// Require a full-hash match to retarget a moved file.
-        #[arg(long, env = "MUSEFS_STRICT", value_parser = clap::builder::BoolishValueParser::new())]
-        strict: bool,
+        /// How a moved file's fingerprint match is confirmed before its row is
+        /// retargeted (auto|fast|strict).
+        #[arg(long = "match", value_enum, env = "MUSEFS_MATCH", default_value_t = MatchMode::Auto)]
+        match_mode: MatchMode,
     },
     /// Refresh tracks already in the store: re-probe files whose backing bytes
     /// changed while preserving curated tags and art. Files not yet in the
@@ -331,7 +351,7 @@ pub struct MigrateArgs {
 /// failures (an unparseable/uningestible entry) do not abort the batch — only a
 /// hard `Err` does — so the caller inspects the returned count to signal partial
 /// or total ingest failure via the process exit code (#554).
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_scan(
     db_path: &Path,
     targets: &[PathBuf],
@@ -340,15 +360,8 @@ pub fn run_scan(
     follow_symlinks: bool,
     quiet: bool,
     checksum: ChecksumMode,
-    fast: bool,
-    strict: bool,
+    match_mode: MatchMode,
 ) -> Result<u64> {
-    let strictness = match (fast, strict) {
-        (true, true) => anyhow::bail!("--fast and --strict are mutually exclusive"),
-        (true, false) => musefs_core::MatchStrictness::Fast,
-        (false, true) => musefs_core::MatchStrictness::Strict,
-        (false, false) => musefs_core::MatchStrictness::Auto,
-    };
     let db =
         Db::open(db_path).with_context(|| format!("opening database at {}", db_path.display()))?;
     let reporter = ScanReporter::new(quiet);
@@ -357,7 +370,7 @@ pub fn run_scan(
         follow_symlinks,
         progress: reporter.sink(),
         checksum: checksum.into(),
-        strictness,
+        strictness: match_mode.into(),
         force,
         ..Default::default()
     };
@@ -439,10 +452,14 @@ pub fn run_revalidate(
 /// use instead. clap rejects a removed flag, but it never reads a variable no
 /// flag declares, so without this a unit file still setting one would carry on
 /// doing something different from what it asks for, and say nothing.
-const RETIRED_SCAN_ENV: &[(&str, &str)] = &[(
-    "MUSEFS_REVALIDATE",
-    "run the `revalidate` subcommand instead",
-)];
+const RETIRED_SCAN_ENV: &[(&str, &str)] = &[
+    (
+        "MUSEFS_REVALIDATE",
+        "run the `revalidate` subcommand instead",
+    ),
+    ("MUSEFS_FAST", "set `MUSEFS_MATCH=fast` instead"),
+    ("MUSEFS_STRICT", "set `MUSEFS_MATCH=strict` instead"),
+];
 
 /// Refuse to run while any of `retired` is set. An empty value counts as unset,
 /// which is how clap treats a declared variable too.
@@ -1094,8 +1111,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             follow_symlinks,
             quiet,
             checksum,
-            fast,
-            strict,
+            match_mode,
         } => {
             refuse_retired_env(RETIRED_SCAN_ENV)?;
             let failed = run_scan(
@@ -1106,8 +1122,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
                 follow_symlinks,
                 quiet,
                 checksum,
-                fast,
-                strict,
+                match_mode,
             )?;
             // Per-file ingest failures are not a hard error (they don't abort the
             // batch), but a pipeline like `scan && mount` needs a machine-detectable

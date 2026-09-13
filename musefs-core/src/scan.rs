@@ -2080,7 +2080,7 @@ fn ingest_unit(
                     // The candidate's stored hash described the file that left
                     // this row, so unless this retarget produced one for the
                     // file arriving, the column has to go — never `Keep`.
-                    // `--fast` confirms nothing by design and so inherits
+                    // `--match=fast` confirms nothing by design and so inherits
                     // nothing either (#689).
                     ChecksumWrite::from_computed(new_hash.as_deref(), false),
                 )?;

@@ -538,8 +538,10 @@ fn scan_help_lists_env_vars() {
     assert!(stdout.contains("MUSEFS_DB"), "stdout: {stdout}");
     assert!(stdout.contains("MUSEFS_JOBS"), "stdout: {stdout}");
     assert!(stdout.contains("MUSEFS_CHECKSUM"), "stdout: {stdout}");
-    assert!(stdout.contains("MUSEFS_FAST"), "stdout: {stdout}");
-    assert!(stdout.contains("MUSEFS_STRICT"), "stdout: {stdout}");
+    assert!(stdout.contains("MUSEFS_MATCH"), "stdout: {stdout}");
+    // #709: the two booleans the value replaced must not still be advertised.
+    assert!(!stdout.contains("MUSEFS_FAST"), "stdout: {stdout}");
+    assert!(!stdout.contains("MUSEFS_STRICT"), "stdout: {stdout}");
 }
 
 // #370: the SetTrue bools parse the full boolish set from env (case-insensitive
@@ -619,26 +621,77 @@ fn boolish_quiet_env_toggles_the_summary() {
     );
 }
 
+/// #709: `--match` is the one way to ask, and it reaches the scan.
 #[test]
-fn scan_fast_and_strict_are_mutually_exclusive() {
-    let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("library");
-    std::fs::create_dir(&target).unwrap();
-    let db = dir.path().join("mutual.db");
+fn scan_match_takes_a_value_and_rejects_anything_else() {
+    let (_dir, target, db) = library_with_one_flac();
     let out = musefs()
-        .args(["scan", "--fast", "--strict"])
+        .arg("scan")
         .arg(&target)
         .arg("--db")
         .arg(&db)
+        .args(["--match", "strict"])
         .output()
         .unwrap();
     assert!(
-        !out.status.success(),
-        "--fast --strict should fail, but exited successfully"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+
+    let out = musefs()
+        .arg("scan")
+        .arg(&target)
+        .arg("--db")
+        .arg(&db)
+        .args(["--match", "paranoid"])
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(
-        stderr.contains("mutually exclusive"),
-        "stderr should mention 'mutually exclusive', got: {stderr}"
+        stderr.contains("auto") && stderr.contains("fast") && stderr.contains("strict"),
+        "the usage error should list the accepted values, stderr: {stderr}"
+    );
+}
+
+/// #709: the flags `--match` replaced are gone, so they are usage errors, and
+/// their variables are refused with the value to use. Ignoring
+/// `MUSEFS_STRICT=true` would quietly weaken how a moved file is confirmed.
+#[test]
+fn retired_fast_and_strict_are_refused() {
+    let (_dir, target, db) = library_with_one_flac();
+    for flag in ["--fast", "--strict"] {
+        let out = musefs()
+            .arg("scan")
+            .arg(&target)
+            .arg("--db")
+            .arg(&db)
+            .arg(flag)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag}, stderr: {stderr}");
+        assert!(stderr.contains(flag), "{flag}, stderr: {stderr}");
+    }
+    for (var, value) in [("MUSEFS_FAST", "fast"), ("MUSEFS_STRICT", "strict")] {
+        let out = musefs()
+            .arg("scan")
+            .arg(&target)
+            .arg("--db")
+            .arg(&db)
+            .env(var, "true")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{var}, stderr: {stderr}");
+        assert!(
+            stderr.contains(var) && stderr.contains(&format!("MUSEFS_MATCH={value}")),
+            "the refusal should name {var} and its replacement, stderr: {stderr}"
+        );
+    }
+    assert!(
+        !db.exists(),
+        "a refused scan must not have created the store"
     );
 }
