@@ -14,9 +14,8 @@ The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
 - The **baseline schema** (`MIGRATION_V1`): the core tables — `tracks` (one row
-  per backing file: path, format, audio byte range,
-  size/nanosecond-mtime/ctime/inode stamps, `content_version`), `tags`
-  (multi-value key/value rows ordered by
+  per backing file: path, format, audio byte range, size/nanosecond-mtime/ctime
+  stamps, `content_version`), `tags` (multi-value key/value rows ordered by
   `ordinal`, with an optional `value_blob` for binary tags), `art`
   (content-addressed, deduplicated image blobs), `track_art` (per-track art
   links with picture type and ordering), and `structural_blocks` (read-only,
