@@ -12,6 +12,15 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ### Changed
 
+- **`upsert_art` no longer takes a mime.** It is `upsert_art(conn, data)` now.
+  The argument was already being ignored whenever the image had been seen
+  before — the insert is `ON CONFLICT(sha256) DO NOTHING`, so the stored row
+  won — and from schema v4 there is no column on `art` for it to write.
+  `replace_track_art` is where the mime goes now — see the entry below, which
+  is the release that put it there. `sync_files` callers are unaffected; a
+  caller driving `upsert_art` directly must drop the argument, and a caller that
+  was relying on it to record the mime must pass one to `replace_track_art`.
+
 - **`replace_track_art` takes a fourth element per row: the mime.** Rows are now
   `(art_id, picture_type, description, mime)`. From schema v4 the MIME type
   lives on the `track_art` link rather than on the deduplicated `art` row,

@@ -8,6 +8,8 @@ mod migrate;
 mod models;
 mod schema;
 pub use migrate::PendingMigration;
+#[doc(hidden)]
+pub use schema::seed_store_at_version;
 pub use schema::{LATEST_VERSION, PendingStep};
 mod structural;
 mod tags;
@@ -374,9 +376,8 @@ mod tests {
             db.conn
                 .execute_batch(
                     "PRAGMA foreign_keys=OFF; \
-                     INSERT INTO art (sha256, mime, byte_len, data) \
-                     VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
-                             'image/png', 1, X'00'); \
+                     INSERT INTO art (sha256, byte_len, data) \
+                     VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, X'00'); \
                      INSERT INTO track_art (track_id, art_id, picture_type, ordinal) \
                      VALUES (999, 1, 3, 0);",
                 )

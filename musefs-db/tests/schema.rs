@@ -65,17 +65,10 @@ fn a_gated_store_is_refused_on_open_and_upgraded_by_pending_migration() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("musefs.db");
 
-    // Stand in for what an older build left behind. The gated step rewrites
-    // column *values*, not the schema's shape, so rewinding the stamp on a
-    // freshly-created store reproduces the state the runner has to refuse
-    // without reaching into the crate-private migration list.
-    Db::open(&path).unwrap();
+    // Stand in for what an older build left behind: the earlier steps, run for
+    // real, because a current store with its stamp rewound is not one.
     let gated_from = LATEST_VERSION - 1;
-    {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", gated_from)
-            .unwrap();
-    }
+    musefs_db::seed_store_at_version(&path, gated_from).unwrap();
 
     let err = Db::open(&path).unwrap_err();
     assert!(

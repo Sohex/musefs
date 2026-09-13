@@ -628,9 +628,9 @@ CREATE TABLE tags (
 --
 -- The backfill can only copy the shared values to every link -- the true
 -- per-embedding ones were destroyed at ingest and come back on a rescan, which
--- is what `musefs migrate`'s rescan offer is for. Until the Rust half reads
--- from the link and the scanner writes true values, these columns are inert:
--- nothing reads them, and a link written in the meantime takes the defaults.
+-- is what `musefs migrate`'s rescan offer is for. `depth` and `colors` have no
+-- shared value to copy and start at 0, which is what both the format and
+-- synthesis already take to mean unknown.
 DROP TABLE track_art;
 CREATE TABLE track_art (
     track_id     INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
@@ -682,6 +682,9 @@ CREATE TABLE track_art (
 -- recompute, so there is nothing here that the sanitize-only-under-a-flag
 -- policy would let this step null on its own. A row the tightened constraints
 -- reject fails the migration, atomically, the way it does for the rebuilds above.
+-- The holding table keeps the three columns the new `art` drops: it is what the
+-- `track_art` backfill below reads them from, since by then the real table no
+-- longer has them.
 CREATE TABLE art_hold_v4 (
     id INTEGER, sha256 TEXT, mime TEXT, width INTEGER, height INTEGER,
     byte_len INTEGER, data BLOB
@@ -692,38 +695,32 @@ DROP TABLE art;
 CREATE TABLE art (
     id       INTEGER PRIMARY KEY,
     sha256   TEXT NOT NULL UNIQUE,
-    -- Vestigial. #716 moved these to `track_art`, and nothing in Rust reads or
-    -- writes them any more -- but the `contrib` plugins still insert `mime`, so
-    -- the column cannot go until they move too. The default is what lets the
-    -- two writers coexist for that one step: musefs omits the column, a plugin
-    -- still supplies it, and nothing reads either value.
-    mime     TEXT NOT NULL DEFAULT '',
-    width    INTEGER,
-    height   INTEGER,
+    -- No mime, no width, no height: they describe one file's picture block,
+    -- not the bytes every file sharing this row holds, and they live on
+    -- `track_art` now (#716). What is left is the content and its identity.
     byte_len INTEGER NOT NULL,
     data     BLOB NOT NULL,
     CHECK (typeof(sha256) = 'text'
            AND length(sha256) = 64
            AND instr(sha256, char(0)) = 0),
-    CHECK (typeof(mime) = 'text'
-           AND length(mime) <= 255
-           AND instr(mime, char(0)) = 0),
-    CHECK (width IS NULL
-           OR (typeof(width) = 'integer' AND width BETWEEN 0 AND 4294967295)),
-    CHECK (height IS NULL
-           OR (typeof(height) = 'integer' AND height BETWEEN 0 AND 4294967295)),
     CHECK (typeof(byte_len) = 'integer'
            AND byte_len >= 0
            AND byte_len <= 16711680),
     CHECK (typeof(data) = 'blob'),
     CHECK (byte_len = length(data))
 );
-INSERT INTO art (id, sha256, mime, width, height, byte_len, data)
-    SELECT id, sha256, mime, width, height, byte_len, data FROM art_hold_v4;
-DROP TABLE art_hold_v4;
+INSERT INTO art (id, sha256, byte_len, data)
+    SELECT id, sha256, byte_len, data FROM art_hold_v4;
+-- `art_hold_v4` is NOT dropped here: the `track_art` backfill below still needs
+-- the three columns the new `art` gave up. It goes with the other holding
+-- tables once every refill is done.
 
 INSERT INTO tags (track_id, key, value, ordinal, value_blob)
     SELECT track_id, key, value, ordinal, value_blob FROM tags_hold_v4;
+-- Read from `art_hold_v4`, not `art`: the rebuild above has already taken these
+-- three columns off the real table, and the holding copy is the last place the
+-- values exist.
+--
 -- LEFT JOIN, not JOIN: a link whose `art` row is missing is an orphan an
 -- older foreign-keys-off writer could leave behind, and it must fail the
 -- migration loudly on `mime`'s NOT NULL rather than be dropped on the floor by
@@ -733,7 +730,7 @@ INSERT INTO track_art (track_id, art_id, picture_type, description,
                        mime, width, height, depth, colors, ordinal)
     SELECT h.track_id, h.art_id, h.picture_type, h.description,
            a.mime, a.width, a.height, 0, 0, h.ordinal
-    FROM track_art_hold_v4 h LEFT JOIN art a ON a.id = h.art_id;
+    FROM track_art_hold_v4 h LEFT JOIN art_hold_v4 a ON a.id = h.art_id;
 -- `structural_blocks` is the one core table whose *shape* this migration would
 -- otherwise leave alone, which is what left it the only one with affinity-only
 -- columns once the other three gained storage classes (#732). Its rows are
@@ -763,6 +760,7 @@ DROP TABLE tracks_hold_v4;
 DROP TABLE tags_hold_v4;
 DROP TABLE track_art_hold_v4;
 DROP TABLE structural_blocks_hold_v4;
+DROP TABLE art_hold_v4;
 
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
@@ -882,10 +880,7 @@ BEFORE UPDATE ON art
 WHEN NEW.id     <> OLD.id
   OR NEW.data   <> OLD.data
   OR NEW.sha256 <> OLD.sha256
-  OR NEW.mime   <> OLD.mime
   OR NEW.byte_len <> OLD.byte_len
-  OR NEW.width  IS NOT OLD.width
-  OR NEW.height IS NOT OLD.height
 BEGIN
     SELECT RAISE(ABORT,
         'art rows are immutable; insert a new content-addressed row and relink via track_art');

@@ -286,14 +286,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the *old* track serving a stale layout under a `content_version` that still
     matched, because the update triggers bumped only the new owner — those now
     bump both regardless.
-  - `track_art` gains `mime`, `width`, `height`, `depth` and `colors`
+  - `track_art` gains `mime`, `width`, `height`, `depth` and `colors`, and `art`
+    gives up `mime`, `width` and `height`
     ([#716](https://github.com/Sohex/musefs/issues/716)). Those describe one
     file's embedded picture, not the image bytes every file shares, so owning
     them on the deduplicated `art` row meant whichever copy was scanned first
     chose them for every track using that image — including its declared MIME
-    type. **The migration cannot restore what ingest already discarded:** it
-    copies the shared values to every link, and the true per-embedding ones come
-    back on a rescan, which is what `musefs migrate`'s rescan offer is for.
+    type. An `art` row is now the content and its identity and nothing else:
+    `id`, `sha256`, `byte_len`, `data`. **The migration cannot restore what
+    ingest already discarded:** it copies the shared values to every link before
+    dropping them, and the true per-embedding ones come back on a rescan, which
+    is what `musefs migrate`'s rescan offer is for.
   - Both tables gain storage-class constraints
     ([#718](https://github.com/Sohex/musefs/issues/718)), and the tag key and
     art description ban an embedded NUL
@@ -327,9 +330,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whichever copy was scanned first chose them for every track using that image
   — a file whose own block said JPEG could be served one declaring PNG. Those
   now live on the `track_art` link, where they describe the embedding rather
-  than the bytes. FLAC's colour depth and indexed-colour count are stored and
-  round-tripped for the first time; the parser had always read them and thrown
-  them away, and synthesis wrote zeroes.
+  than the bytes, and `art` no longer has them to serve. FLAC's colour depth and
+  indexed-colour count are stored and round-tripped for the first time; the
+  parser had always read them and thrown them away, and synthesis wrote zeroes.
+
+  External writers using the `contrib` Python library see one change:
+  `upsert_art(conn, data, mime)` is now `upsert_art(conn, data)`. The argument
+  was already being ignored whenever the image had been seen before — the stored
+  row won the conflict — and there is no longer a column for it to write.
+  `replace_track_art`, which gained the mime earlier in this same release, is now
+  where it goes.
 
   **An existing store keeps the shared values until a rescan**, because the
   migration can only copy what survived ingest — the true per-file ones were

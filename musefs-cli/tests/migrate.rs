@@ -10,15 +10,11 @@ use std::path::{Path, PathBuf};
 use musefs_cli::{MigrateArgs, run_migrate};
 use musefs_db::{Db, LATEST_VERSION};
 
-/// A store an older musefs build would have left behind. The gated step
-/// rewrites column values rather than the schema's shape, so rewinding the
-/// stamp on a freshly-created store is the whole difference.
+/// A store an older musefs build would have left behind: the earlier steps, run
+/// for real, because a current store with its `user_version` rewound is not one.
 fn gated_store(dir: &Path) -> PathBuf {
     let path = dir.join("library.db");
-    Db::open(&path).unwrap();
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.pragma_update(None, "user_version", LATEST_VERSION - 1)
-        .unwrap();
+    musefs_db::seed_store_at_version(&path, LATEST_VERSION - 1).unwrap();
     path
 }
 

@@ -522,7 +522,7 @@ def test_sync_records_writes_album_art(
     conn = connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT a.data, a.mime, ta.picture_type FROM track_art ta "
+            "SELECT a.data, ta.mime, ta.picture_type FROM track_art ta "
             "JOIN art a ON a.id = ta.art_id"
         ).fetchall()
     finally:

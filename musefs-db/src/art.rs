@@ -305,8 +305,8 @@ mod guard_tests {
             .unwrap();
         db.conn
             .execute(
-                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-                 VALUES (?1, 'image/png', NULL, NULL, 1, X'00')",
+                "INSERT INTO art (sha256, byte_len, data) \
+                 VALUES (?1, 1, X'00')",
                 rusqlite::params![sha],
             )
             .unwrap();
@@ -341,8 +341,8 @@ mod guard_tests {
             .unwrap();
         db.conn
             .execute(
-                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-                 VALUES (?1, 'image/png', NULL, NULL, 1, zeroblob(?2))",
+                "INSERT INTO art (sha256, byte_len, data) \
+                 VALUES (?1, 1, zeroblob(?2))",
                 rusqlite::params!["d".repeat(64), MAX_ART_BYTES + 1],
             )
             .unwrap();

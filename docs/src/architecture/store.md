@@ -8,8 +8,9 @@ scanner-owned `fingerprint`/`content_hash` columns, `MIGRATION_V3`, which
 widens the `tags.value` and `track_art.description` caps, and `MIGRATION_V4`,
 which rebuilds every core table — a never-reused `AUTOINCREMENT` id, the
 path as bytes, an inode stamp, storage-class constraints throughout, independent
-ordinal spaces for text and binary tags, per-embedding picture columns on the art
-link, immutable row ownership, and the retirement of every fingerprint written
+ordinal spaces for text and binary tags, the picture's description moved off the
+shared blob and onto the art link, immutable row ownership, and the retirement of
+every fingerprint written
 before the value included sampled audio); `user_version` records the schema
 version (4).
 The store is the **interface external tools write to** — the beets and Picard
@@ -157,14 +158,14 @@ malformed *shapes* at commit, so an external writer cannot persist them:
   synthesis — others are dropped and logged. MP3/M4A custom keys may use the
   wider set (e.g. `=`, `:`, spaces, non-ASCII).
 - a `value_blob` over `MAX_BINARY_TAG_BYTES`;
-- an `art.mime` over 255 chars or `byte_len` over `MAX_ART_BYTES`;
-- a `track_art.description` over 8 KiB;
+- an `art.byte_len` over `MAX_ART_BYTES`;
+- a `track_art.mime` over 255 chars or `description` over 8 KiB;
 - a `structural_blocks` row with an unknown `kind`, negative `ordinal`, or `body`
   over the FLAC 24-bit block limit.
 
 **The NUL blind spot.** SQLite permits an embedded U+0000 in a TEXT value and
 `length()` counts characters only up to the first one, so every `CHECK` above
-that caps a TEXT column in *characters* — `tags.key`, `art.mime`,
+that caps a TEXT column in *characters* — `tags.key`, `track_art.mime`,
 `track_art.description` — measures 1 for a value of `"X\0"` followed by a
 hundred megabytes ([#693](https://github.com/Sohex/musefs/issues/693)). Blob
 columns are unaffected: `length()` on a BLOB counts bytes, which is why
@@ -187,13 +188,13 @@ it a ban on NUL — a short NUL-bearing value still reads. Forbidding NUL outrig
 in the `CHECK`s is a schema change, and rides the 2.0.0 store migration.
 
 `get_art` is the one reader that materializes a whole `art` row, image blob
-included, rather than streaming it. It therefore guards all three of its
-unbounded columns from lengths first — `mime` and `sha256` as above, and
-`length(data)` against the `art.byte_len` cap, which a crafted store can have
-been written without since both that cap and `byte_len = length(data)` are
-`CHECK`s. `art.sha256` is the identity case the character cap never really
-guaranteed: `length(sha256) = 64` is satisfied by 64 hex characters, a NUL, and
-any amount of suffix.
+included, rather than streaming it. It therefore guards both of its unbounded
+columns from lengths first — `sha256` as above, and `length(data)` against the
+`art.byte_len` cap, which a crafted store can have been written without since
+both that cap and `byte_len = length(data)` are `CHECK`s. `art.sha256` is the
+identity case the character cap never really guaranteed: `length(sha256) = 64`
+is satisfied by 64 hex characters, a NUL, and any amount of suffix. The mime is
+guarded the same way where it now lives, by the `track_art` readers.
 
 **One ordinal space per key.** `tags`' primary key is `(track_id, key,
 ordinal)`, which does not discriminate on `value_blob`: a track's text rows and
@@ -255,14 +256,14 @@ every open and every mount.
 dimensions, colour depth and indexed-colour count live on the link, because they
 describe one file's picture block rather than the image every file shares. While
 `art` owned them, two files holding byte-identical art served whichever one the
-scan reached first — including its declared MIME type. The columns still exist on
-`art` and are vestigial: **nothing reads them**, and musefs no longer writes
-them. The `contrib` plugins still insert `mime`, which is the only reason the
-columns are still there; they go when those writers move.
+scan reached first — including its declared MIME type. An `art` row is now the
+content and its identity and nothing else: `id`, `sha256`, `byte_len`, `data`.
+A writer that supplies no `mime` on the link produces a picture block declaring
+the empty string, which is the writer's to get right.
 
 **Art is immutable once written.** `art` rows are content-addressed by
 `sha256`; a trigger rejects any in-place `UPDATE` of an art row's **key or**
-content columns (`id`, `data`, `sha256`, `mime`, `byte_len`, `width`, `height`)
+content columns (`id`, `data`, `sha256`, `byte_len`)
 with `RAISE(ABORT)` — a multi-row `UPDATE art` touching any of them aborts the
 whole statement. `id` is in that list because changing it changes no content
 column: the guard's `WHEN` was false, so the one write that orphans every link

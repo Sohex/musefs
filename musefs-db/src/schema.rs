@@ -623,9 +623,9 @@ CREATE TABLE tags (
 --
 -- The backfill can only copy the shared values to every link -- the true
 -- per-embedding ones were destroyed at ingest and come back on a rescan, which
--- is what `musefs migrate`'s rescan offer is for. Until the Rust half reads
--- from the link and the scanner writes true values, these columns are inert:
--- nothing reads them, and a link written in the meantime takes the defaults.
+-- is what `musefs migrate`'s rescan offer is for. `depth` and `colors` have no
+-- shared value to copy and start at 0, which is what both the format and
+-- synthesis already take to mean unknown.
 DROP TABLE track_art;
 CREATE TABLE track_art (
     track_id     INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
@@ -677,6 +677,9 @@ CREATE TABLE track_art (
 -- recompute, so there is nothing here that the sanitize-only-under-a-flag
 -- policy would let this step null on its own. A row the tightened constraints
 -- reject fails the migration, atomically, the way it does for the rebuilds above.
+-- The holding table keeps the three columns the new `art` drops: it is what the
+-- `track_art` backfill below reads them from, since by then the real table no
+-- longer has them.
 CREATE TABLE art_hold_v4 (
     id INTEGER, sha256 TEXT, mime TEXT, width INTEGER, height INTEGER,
     byte_len INTEGER, data BLOB
@@ -687,38 +690,32 @@ DROP TABLE art;
 CREATE TABLE art (
     id       INTEGER PRIMARY KEY,
     sha256   TEXT NOT NULL UNIQUE,
-    -- Vestigial. #716 moved these to `track_art`, and nothing in Rust reads or
-    -- writes them any more -- but the `contrib` plugins still insert `mime`, so
-    -- the column cannot go until they move too. The default is what lets the
-    -- two writers coexist for that one step: musefs omits the column, a plugin
-    -- still supplies it, and nothing reads either value.
-    mime     TEXT NOT NULL DEFAULT '',
-    width    INTEGER,
-    height   INTEGER,
+    -- No mime, no width, no height: they describe one file's picture block,
+    -- not the bytes every file sharing this row holds, and they live on
+    -- `track_art` now (#716). What is left is the content and its identity.
     byte_len INTEGER NOT NULL,
     data     BLOB NOT NULL,
     CHECK (typeof(sha256) = 'text'
            AND length(sha256) = 64
            AND instr(sha256, char(0)) = 0),
-    CHECK (typeof(mime) = 'text'
-           AND length(mime) <= 255
-           AND instr(mime, char(0)) = 0),
-    CHECK (width IS NULL
-           OR (typeof(width) = 'integer' AND width BETWEEN 0 AND 4294967295)),
-    CHECK (height IS NULL
-           OR (typeof(height) = 'integer' AND height BETWEEN 0 AND 4294967295)),
     CHECK (typeof(byte_len) = 'integer'
            AND byte_len >= 0
            AND byte_len <= 16711680),
     CHECK (typeof(data) = 'blob'),
     CHECK (byte_len = length(data))
 );
-INSERT INTO art (id, sha256, mime, width, height, byte_len, data)
-    SELECT id, sha256, mime, width, height, byte_len, data FROM art_hold_v4;
-DROP TABLE art_hold_v4;
+INSERT INTO art (id, sha256, byte_len, data)
+    SELECT id, sha256, byte_len, data FROM art_hold_v4;
+-- `art_hold_v4` is NOT dropped here: the `track_art` backfill below still needs
+-- the three columns the new `art` gave up. It goes with the other holding
+-- tables once every refill is done.
 
 INSERT INTO tags (track_id, key, value, ordinal, value_blob)
     SELECT track_id, key, value, ordinal, value_blob FROM tags_hold_v4;
+-- Read from `art_hold_v4`, not `art`: the rebuild above has already taken these
+-- three columns off the real table, and the holding copy is the last place the
+-- values exist.
+--
 -- LEFT JOIN, not JOIN: a link whose `art` row is missing is an orphan an
 -- older foreign-keys-off writer could leave behind, and it must fail the
 -- migration loudly on `mime`'s NOT NULL rather than be dropped on the floor by
@@ -728,7 +725,7 @@ INSERT INTO track_art (track_id, art_id, picture_type, description,
                        mime, width, height, depth, colors, ordinal)
     SELECT h.track_id, h.art_id, h.picture_type, h.description,
            a.mime, a.width, a.height, 0, 0, h.ordinal
-    FROM track_art_hold_v4 h LEFT JOIN art a ON a.id = h.art_id;
+    FROM track_art_hold_v4 h LEFT JOIN art_hold_v4 a ON a.id = h.art_id;
 -- `structural_blocks` is the one core table whose *shape* this migration would
 -- otherwise leave alone, which is what left it the only one with affinity-only
 -- columns once the other three gained storage classes (#732). Its rows are
@@ -758,6 +755,7 @@ DROP TABLE tracks_hold_v4;
 DROP TABLE tags_hold_v4;
 DROP TABLE track_art_hold_v4;
 DROP TABLE structural_blocks_hold_v4;
+DROP TABLE art_hold_v4;
 
 -- 6. Recreate the indexes and the thirteen triggers the drops took with them,
 -- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
@@ -877,10 +875,7 @@ BEFORE UPDATE ON art
 WHEN NEW.id     <> OLD.id
   OR NEW.data   <> OLD.data
   OR NEW.sha256 <> OLD.sha256
-  OR NEW.mime   <> OLD.mime
   OR NEW.byte_len <> OLD.byte_len
-  OR NEW.width  IS NOT OLD.width
-  OR NEW.height IS NOT OLD.height
 BEGIN
     SELECT RAISE(ABORT,
         'art rows are immutable; insert a new content-addressed row and relink via track_art');
@@ -999,11 +994,39 @@ impl Migration {
     }
 }
 
-/// Every migration's SQL, for tests that need to build a store at a released
-/// version rather than the current one.
+/// Build a store at a released schema version — what an older musefs build
+/// would have left behind — by running that version's migrations for real.
+///
+/// The obvious shortcut is to create a current store and rewind its
+/// `user_version`. That does not produce a store at the older version: V4
+/// rebuilds tables by reading the old shape column by column, so a rewound
+/// store is one whose `art` has already given up columns the rebuild selects,
+/// and the migration fails on the missing column. It has to be built.
+///
+/// WAL is set here because every other open of a musefs store leaves it that
+/// way, and the exclusive-claim check `musefs migrate` runs reads other
+/// connections' shared marks, which exist only in that mode.
+///
+/// Exported rather than `#[cfg(test)]` so the integration tests and the CLI's
+/// own tests share this one definition; `#[doc(hidden)]` because it is not part
+/// of the crate's interface.
+/// Every migration's SQL, for the few tests that need one step's text rather
+/// than a store built out of them.
 #[cfg(test)]
 pub(crate) fn migration_sql() -> Vec<&'static str> {
     MIGRATIONS.iter().map(|m| m.sql).collect()
+}
+
+#[doc(hidden)]
+pub fn seed_store_at_version(path: &std::path::Path, version: i64) -> rusqlite::Result<()> {
+    let conn = Connection::open(path)?;
+    let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+    let upto = usize::try_from(version).expect("a schema version fits a usize");
+    for (target, migration) in (1i64..).zip(MIGRATIONS).take(upto) {
+        conn.execute_batch(migration.sql)?;
+        conn.pragma_update(None, "user_version", target)?;
+    }
+    Ok(())
 }
 
 const MIGRATIONS: &[Migration] = &[
@@ -1974,7 +1997,7 @@ mod v4_tracks_rebuild_tests {
         }
         conn.execute(
             "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-             VALUES (?1,'image/png',1,1,1,X'00')",
+             VALUES (?1, 'image/png', 1, 1, 1, X'00')",
             [&"e".repeat(64)],
         )
         .unwrap();
@@ -2743,7 +2766,7 @@ mod v4_art_rebuild_tests {
             );
         }
         // A no-op update is still allowed: the guard is on change, not on touch.
-        conn.execute("UPDATE art SET mime = mime WHERE id = 1", [])
+        conn.execute("UPDATE art SET byte_len = byte_len WHERE id = 1", [])
             .unwrap();
     }
 
@@ -2764,23 +2787,18 @@ mod v4_art_rebuild_tests {
         for (what, sql) in [
             (
                 "a non-numeric byte_len",
-                "INSERT INTO art (sha256, mime, byte_len, data) \
-                                 VALUES (?1, 'image/png', 'abc', X'00')",
+                "INSERT INTO art (sha256, byte_len, data) \
+                                 VALUES (?1, 'abc', X'00')",
             ),
             (
                 "a text blob",
-                "INSERT INTO art (sha256, mime, byte_len, data) \
-                             VALUES (?1, 'image/png', 1, 'x')",
+                "INSERT INTO art (sha256, byte_len, data) \
+                             VALUES (?1, 1, 'x')",
             ),
             (
-                "geometry past u32",
-                "INSERT INTO art (sha256, mime, width, byte_len, data) \
-                                   VALUES (?1, 'image/png', 1099511627776, 1, X'00')",
-            ),
-            (
-                "a NUL-bearing mime",
-                "INSERT INTO art (sha256, mime, byte_len, data) \
-                                    VALUES (?1, 'image/' || char(0) || 'png', 1, X'00')",
+                "a blob sha256",
+                "INSERT INTO art (sha256, byte_len, data) \
+                                 VALUES (CAST(?1 AS BLOB), 1, X'00')",
             ),
         ] {
             assert!(
@@ -2812,7 +2830,9 @@ mod v4_art_rebuild_tests {
     /// A row the tightened constraints reject fails the migration rather than
     /// being quietly repaired. `art` carries no scanner-owned column a rescan
     /// recomputes, so there is nothing here the sanitize-only-under-a-flag
-    /// policy would let the refill null on its own.
+    /// policy would let the refill null on its own. The violation is a text
+    /// `data` -- a storage class V3 never checked and `BLOB` affinity does not
+    /// convert, so it survives the copy and is caught on the way back in.
     #[test]
     fn a_row_the_new_constraints_reject_fails_the_migration() {
         let mut conn = populated_v3();
@@ -2820,7 +2840,7 @@ mod v4_art_rebuild_tests {
             .unwrap();
         conn.execute(
             "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-             VALUES (?1, 'image/png', 1099511627776, NULL, 1, X'00')",
+             VALUES (?1, 'image/png', 64, 64, 1, 'x')",
             [&"c".repeat(64)],
         )
         .unwrap();
@@ -3176,23 +3196,21 @@ mod baseline_tests {
         )));
         assert!(v4.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
         assert!(v4.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
-        // `mime` moved to the link it describes (#716), but `art` keeps its own
-        // copy until the readers switch over, so V4 carries two live
-        // definitions of the cap -- one per table.
+        // One home for the cap now that `art` has given the column up (#716):
+        // the link that describes the embedding.
         assert_eq!(
             v4.matches(&format!("length(mime) <= {MAX_ART_MIME_LEN}"))
                 .count(),
-            2,
-            "track_art and art each cap the mime they own"
+            1,
+            "only `track_art` caps a mime"
         );
         // The picture geometry is Option<u32>/u32 in the Rust model, and the
         // upper bound is what stops a schema-valid row being a conversion
         // failure (#718) -- so it is pinned to the type, not to a magic number.
         assert_eq!(
             v4.matches(&format!("BETWEEN 0 AND {}", u32::MAX)).count(),
-            6,
-            "track_art's width/height/depth/colors and art's width/height each \
-             carry the u32 ceiling"
+            4,
+            "track_art\'s width, height, depth and colors carry the u32 ceiling"
         );
         // V4 rebuilds `art` too (#718, #719), so its literals moved with it.
         assert!(v4.contains(&format!("length(sha256) = {ART_SHA256_LEN}")));
@@ -3693,8 +3711,8 @@ mod constraint_tests {
 
         insert_track(&conn, "/a.flac");
         conn.execute(
-            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-             VALUES (?1,'image/png',1,1,1,X'00')",
+            "INSERT INTO art (sha256, byte_len, data) \
+             VALUES (?1, 1, X'00')",
             [&"a".repeat(64)],
         )
         .unwrap();
@@ -3876,7 +3894,7 @@ mod constraint_tests {
     fn seed_track_and_art(conn: &Connection) {
         insert_track(conn, "/seed.flac");
         conn.execute(
-            "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?1,'image/png',1,X'00')",
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 1, X'00')",
             [&"c".repeat(64)],
         )
         .unwrap();
@@ -3936,9 +3954,8 @@ mod constraint_tests {
         fresh(&mut conn);
         rejected(
             &conn,
-            "INSERT INTO art (sha256, mime, byte_len, data) \
-             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',\
-             'image/png',5,X'00')",
+            "INSERT INTO art (sha256, byte_len, data) \
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 5, X'00')",
         );
     }
 
@@ -3948,46 +3965,36 @@ mod constraint_tests {
         fresh(&mut conn);
         rejected(
             &conn,
-            "INSERT INTO art (sha256, mime, byte_len, data) \
-             VALUES ('tooshort','image/png',1,X'00')",
+            "INSERT INTO art (sha256, byte_len, data) \
+             VALUES ('tooshort', 1, X'00')",
         );
     }
 
+    // The geometry these two guard moved to `track_art` with the rest of what
+    // describes one embedding (#716), so they follow it: the bound is the same
+    // `BETWEEN 0 AND u32::MAX`, only its owner changed.
     #[test]
-    fn v4_art_rejects_negative_width() {
+    fn v4_track_art_rejects_negative_width() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
+        seed_track_and_art(&conn);
         rejected(
             &conn,
-            "INSERT INTO art (sha256, mime, width, byte_len, data) \
-             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',\
-             'image/png',-1,1,X'00')",
+            "INSERT INTO track_art (track_id, art_id, picture_type, ordinal, width) \
+             VALUES (1, 1, 3, 0, -1)",
         );
     }
 
     #[test]
-    fn v4_art_rejects_negative_height() {
+    fn v4_track_art_rejects_negative_height() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
+        seed_track_and_art(&conn);
         rejected(
             &conn,
-            "INSERT INTO art (sha256, mime, height, byte_len, data) \
-             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',\
-             'image/png',-1,1,X'00')",
+            "INSERT INTO track_art (track_id, art_id, picture_type, ordinal, height) \
+             VALUES (1, 1, 3, 0, -1)",
         );
-    }
-
-    #[test]
-    fn v4_art_accepts_null_dimensions() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        fresh(&mut conn);
-        conn.execute(
-            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',\
-             'image/png',NULL,NULL,1,X'00')",
-            [],
-        )
-        .unwrap();
     }
 
     #[test]
@@ -4144,22 +4151,16 @@ mod constraint_tests {
     }
 
     #[test]
-    fn v4_art_rejects_oversize_mime_and_byte_len() {
+    fn v4_art_rejects_oversize_byte_len() {
         let mut conn = Connection::open_in_memory().unwrap();
         fresh(&mut conn);
-        let mime = "x".repeat(256);
-        rejected(
-            &conn,
-            &format!(
-                "INSERT INTO art (sha256, mime, byte_len, data) VALUES ('{}', '{mime}', 1, X'00')",
-                "a".repeat(64)
-            ),
-        );
+        // The mime half of this test went with the column (#716): the cap now
+        // lives on `track_art`, where `v4_track_art_*` covers it.
         // byte_len cap (byte_len must equal length(data), so use a zeroblob).
         rejected(
             &conn,
             &format!(
-                "INSERT INTO art (sha256, mime, byte_len, data) VALUES ('{}', 'image/png', 16711681, zeroblob(16711681))",
+                "INSERT INTO art (sha256, byte_len, data) VALUES ('{}', 16711681, zeroblob(16711681))",
                 "b".repeat(64)
             ),
         );
@@ -4415,9 +4416,8 @@ mod identity_tests {
         let conn = migrated();
         conn.execute_batch(
             "PRAGMA foreign_keys=OFF; \
-             INSERT INTO art (sha256, mime, byte_len, data) \
-             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
-                     'image/png', 1, X'00'); \
+             INSERT INTO art (sha256, byte_len, data) \
+             VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, X'00'); \
              INSERT INTO track_art (track_id, art_id, picture_type, ordinal) VALUES (999, 1, 3, 0);",
         )
         .unwrap();
@@ -4469,8 +4469,8 @@ mod art_immutability_tests {
 
     fn insert_art(conn: &Connection, sha: &str, data: &[u8]) -> i64 {
         conn.execute(
-            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-             VALUES (?1,'image/png',NULL,NULL,?2,?3)",
+            "INSERT INTO art (sha256, byte_len, data) \
+             VALUES (?1, ?2, ?3)",
             params![sha, i64::try_from(data.len()).unwrap(), data],
         )
         .unwrap();
@@ -4519,7 +4519,7 @@ mod art_immutability_tests {
     fn art_noop_update_is_allowed() {
         let conn = migrated();
         let a = insert_art(&conn, &"a".repeat(64), &[1, 2, 3]);
-        conn.execute("UPDATE art SET mime=mime WHERE id=?1", [a])
+        conn.execute("UPDATE art SET sha256=sha256 WHERE id=?1", [a])
             .unwrap();
     }
 

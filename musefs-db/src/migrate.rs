@@ -218,8 +218,13 @@ impl PendingMigration {
             ),
             (
                 "art",
-                "(rowid, id, sha256, mime, width, height, byte_len, data) \
-                 SELECT rowid, id, sha256, mime, width, height, byte_len, data \
+                // The probe table is the *new* shape and `main.art` is the old
+                // one, so this is where the three relocated columns stop being
+                // selected (#716). The `track_art` projection above still reads
+                // them from `main.art`, which is correct: the store being
+                // probed has not been migrated yet, so that is where they are.
+                "(rowid, id, sha256, byte_len, data) \
+                 SELECT rowid, id, sha256, byte_len, data \
                  FROM main.art"
                     .to_string(),
             ),
@@ -454,11 +459,8 @@ mod rejection_tests {
 
     /// A V3 store with one clean track, one tag, one art row and one link.
     fn store_at_v3(path: &std::path::Path) -> Connection {
+        crate::schema::seed_store_at_version(path, 3).unwrap();
         let conn = Connection::open(path).unwrap();
-        for (target, migration) in (1i64..).zip(crate::schema::migration_sql()).take(3) {
-            conn.execute_batch(migration).unwrap();
-            conn.pragma_update(None, "user_version", target).unwrap();
-        }
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
@@ -658,21 +660,33 @@ mod rejection_tests {
         pending.apply().unwrap();
     }
 
-    /// The geometry bound #718 added, reached through the link's backfill: the
-    /// value lives on `art` but the constraint that refuses it is on
-    /// `track_art`, so the probe has to run the refill's own join to see it.
+    /// Two tables refusing the same planted row, and the order the report and
+    /// the repair have to use.
+    ///
+    /// The geometry half is #718's bound reached through the link's backfill:
+    /// the value still lives on `art` in the store being probed but the
+    /// constraint that refuses it is on `track_art`, so the probe has to run the
+    /// refill's own join to see it at all. The blob half is a storage class
+    /// `art` keeps for itself. Together they pin the delete order, which the
+    /// foreign key makes load-bearing rather than cosmetic.
     #[test]
-    fn geometry_past_u32_is_reported_against_both_tables() {
+    fn a_refused_blob_and_its_link_are_reported_link_first() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.db");
         let conn = store_at_v3(&path);
+        // One planted row, refused twice over and in two different tables. Its
+        // `data` is text, which is V4's storage-class check on `art` itself;
+        // its width is past `u32::MAX`, which V4 checks on `track_art` now that
+        // the geometry lives there (#716) and the probe reads it across the
+        // join. That is what makes the delete order observable at all.
+        //
         // Inserted rather than updated: `art_reject_content_update` is a
         // trigger, and `ignore_check_constraints` does not bypass triggers --
         // which is the immutability guard doing its job.
         plant_hostile(
             &conn,
             "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-             VALUES (?1, 'image/png', 1099511627776, 1, 1, X'00')",
+             VALUES (?1, 'image/png', 1099511627776, 1, 1, 'x')",
             &[&"b".repeat(64)],
         );
         conn.execute(
@@ -731,15 +745,11 @@ mod tests {
     use super::PendingMigration;
     use crate::{Db, DbError, LATEST_VERSION};
 
-    /// Rewind a freshly-created store to the version before the gated step —
-    /// the state an older musefs build leaves behind. The gated step rewrites
-    /// column values rather than the schema's shape, so the stamp is the whole
-    /// difference.
+    /// A store at the version before the gated step — the state an older musefs
+    /// build leaves behind. See [`crate::schema::seed_store_at_version`] for why
+    /// it is built rather than stamped.
     fn gated_store(path: &std::path::Path) {
-        Db::open(path).unwrap();
-        let conn = rusqlite::Connection::open(path).unwrap();
-        conn.pragma_update(None, "user_version", LATEST_VERSION - 1)
-            .unwrap();
+        crate::schema::seed_store_at_version(path, LATEST_VERSION - 1).unwrap();
     }
 
     #[test]
@@ -883,8 +893,20 @@ mod tests {
     /// is not ours to rewrite, and the pre-flight has to say so before the user
     /// is asked to agree to anything. Holding no lock is not enough to pass — a
     /// mount idle between reads is still a mount.
+    ///
+    /// Alone among these, this one builds its pending store by rewinding a
+    /// current one's stamp rather than by running the earlier migrations. It
+    /// never migrates: what it needs is a store an ordinary reader can open
+    /// *and* that `claim_exclusive` has something to refuse, and only the
+    /// current shape passes `Db::open_readonly`'s identity check.
     #[test]
     fn a_store_another_connection_has_open_is_refused() {
+        fn gated_store(path: &std::path::Path) {
+            Db::open(path).unwrap();
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.pragma_update(None, "user_version", LATEST_VERSION - 1)
+                .unwrap();
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("library.db");
         gated_store(&path);

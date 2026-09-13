@@ -343,15 +343,19 @@ def sniff_mime(data, path):
     return _EXT_MIME.get(ext, "application/octet-stream")
 
 
-def upsert_art(conn, data, mime):
+def upsert_art(conn, data):
     """Content-address ``data`` by sha256 and return its art id, inserting only
-    if new (mirrors musefs Db::upsert_art). If the sha256 already exists, the
-    stored row (and its mime) is kept and the ``mime`` argument is ignored."""
+    if new (mirrors musefs Db::upsert_art).
+
+    The row is the bytes and nothing else. It used to carry the mime and the
+    dimensions, which made the first writer of a given image choose them for
+    every track that shared it — so they moved to ``track_art``, and this
+    function lost the argument it could not honour: on a sha256 conflict the
+    stored row was kept and the passed mime silently ignored."""
     sha = hashlib.sha256(data).hexdigest()
     conn.execute(
-        "INSERT INTO art (sha256, mime, width, height, byte_len, data) "
-        "VALUES (?, ?, NULL, NULL, ?, ?) ON CONFLICT(sha256) DO NOTHING",
-        (sha, mime, len(data), data),
+        "INSERT INTO art (sha256, byte_len, data) VALUES (?, ?, ?) ON CONFLICT(sha256) DO NOTHING",
+        (sha, len(data), data),
     )
     return conn.execute("SELECT id FROM art WHERE sha256 = ?", (sha,)).fetchone()[0]
 
@@ -367,6 +371,11 @@ def replace_track_art(conn, track_id, arts):
     whichever file was ingested first chose it for every track sharing the blob.
     It is what musefs writes into the synthesized picture block, so a link
     without one serves an empty MIME type.
+
+    The link's ``width``/``height``/``depth``/``colors`` are left unset. They
+    describe the embedding too, but reading them means decoding the image, which
+    no writer using this library does; unset is how both the FLAC picture block
+    and musefs spell "not stated".
 
     Atomic via an internal savepoint (see ``_savepoint``): the DELETE and the
     re-insert either both land or neither does, even on an autocommit
