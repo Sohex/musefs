@@ -3,12 +3,23 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import warnings
 from pathlib import Path
 
 import pytest
 from musefs_common import connect, path_value, realpath_key
 
 pytestmark = pytest.mark.musefs_bin
+
+
+def _newest_rs_mtime(repo_root):
+    newest = 0.0
+    for crate in ("musefs-db", "musefs-format", "musefs-core", "musefs-fuse", "musefs-cli"):
+        src = repo_root / crate / "src"
+        if src.exists():
+            for rs in src.rglob("*.rs"):
+                newest = max(newest, rs.stat().st_mtime)
+    return newest
 
 
 def test_symlink_scan_matches_real_backing_path(tmp_path):
@@ -25,6 +36,15 @@ def test_symlink_scan_matches_real_backing_path(tmp_path):
         if os.environ.get("MUSEFS_REQUIRE_BIN"):
             pytest.fail(msg)
         pytest.skip(msg)
+    if musefs_bin.stat().st_mtime < _newest_rs_mtime(repo_root):
+        # This tier runs by default, so a stale binary is the common hazard
+        # rather than a rare one: it is the only tier that sees the real schema,
+        # and an old binary would pass against the shape it was built for.
+        warnings.warn(
+            f"{musefs_bin} is older than the musefs Rust sources; rebuild with "
+            f"`cargo build` before trusting a pass.",
+            stacklevel=2,
+        )
     if shutil.which("ffmpeg") is None:
         pytest.skip("ffmpeg not installed")
 
