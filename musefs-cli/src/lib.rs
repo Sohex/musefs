@@ -304,7 +304,10 @@ pub struct MigrateArgs {
     pub snapshot: Option<PathBuf>,
     /// Delete rows the upgraded schema refuses, instead of stopping to report
     /// them. Nothing is deleted without this.
-    #[arg(long)]
+    ///
+    /// Refuses alongside `--no-snapshot`: the rows are deleted for good, and the
+    /// snapshot is the only copy they survive in.
+    #[arg(long, conflicts_with = "no_snapshot")]
     pub repair: bool,
     /// Upgrade without taking a snapshot first. The upgrade is then not
     /// reversible.
@@ -946,8 +949,11 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
             removed.total()
         );
         println!(
-            "  deleting a track takes its tags and art links with it, so more rows \
-             than that may have gone."
+            "  they are in the snapshot at {}, if you want them back.",
+            snapshot
+                .as_ref()
+                .expect("--repair refuses --no-snapshot, so there is always one")
+                .display()
         );
     }
 
@@ -1264,6 +1270,30 @@ mod tests {
 
     /// Naming a snapshot and refusing to take one are contradictory, and clap
     /// says so rather than silently honouring one of them.
+    /// `--repair` deletes rows for good, and the snapshot is the only copy they
+    /// survive in — so asking for one without the other is refused rather than
+    /// quietly honoured.
+    #[test]
+    fn migrate_rejects_repair_alongside_no_snapshot() {
+        use clap::Parser;
+        assert!(
+            Cli::try_parse_from([
+                "musefs",
+                "migrate",
+                "--db",
+                "/tmp/x.db",
+                "--repair",
+                "--no-snapshot",
+            ])
+            .is_err()
+        );
+        // Either alone is fine.
+        for flag in ["--repair", "--no-snapshot"] {
+            Cli::try_parse_from(["musefs", "migrate", "--db", "/tmp/x.db", flag])
+                .unwrap_or_else(|e| panic!("{flag} alone must parse: {e}"));
+        }
+    }
+
     #[test]
     fn migrate_rejects_a_named_snapshot_alongside_no_snapshot() {
         use clap::Parser;

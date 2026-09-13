@@ -38,10 +38,23 @@ see the [Release notes](release-notes.md).
   the first time one changed, and there were seven issues' worth of changes to
   drift from.
 
-  Foreign keys are off for the pass, deliberately: the question is per row and
-  per table, and a tag under a refused track would otherwise be counted for a
-  reason of its own that it does not have. Repair then deletes parent-first and
-  lets the cascade take the children, which is what deleting a track means.
+  Foreign keys are off for the pass, because `INSERT OR IGNORE` cannot help with
+  them: conflict resolution does not apply to foreign keys, so a violation
+  aborts the statement rather than skipping the row. That leaves one shape the
+  row-by-row pass cannot see — a child pointing at a parent that is not there,
+  which an external tool can leave behind with enforcement turned off, and which
+  fails the refill when the upgrade puts it back. A second pass covers it, and
+  covers the same question for a child whose parent this repair is about to
+  delete, since to a child those are the same thing.
+
+  So the count is what will actually go, children included, rather than only the
+  rows with something wrong of their own. Deletes run in an order the references
+  require: `tracks` first so its cascade takes what it owns, and `art` last,
+  because `track_art.art_id` references it with no `ON DELETE` clause and
+  deleting a refused blob while a link survives fails outright.
+
+  `--repair` refuses alongside `--no-snapshot`. The rows go for good, and the
+  snapshot is the only copy they survive in.
 
 - **`musefs migrate`.** The command the gate above names: an explicit,
   confirmed store upgrade. It refuses a store anything else has open, reports

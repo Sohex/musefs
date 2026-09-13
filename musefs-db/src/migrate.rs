@@ -153,13 +153,18 @@ impl PendingMigration {
         maintenance::snapshot_into(&self.conn, dest, OP)
     }
 
-    /// The tables V4 rebuilds, in the order a repair must delete from them, with
-    /// the projection the migration's own refill uses.
+    /// The tables V4 refills, **in the order a repair must delete from them**,
+    /// with the projection the migration's own refill uses.
+    ///
+    /// The order is not cosmetic. `tracks` goes first so its cascade takes the
+    /// children it owns. `art` goes last because `track_art.art_id` references
+    /// it with no `ON DELETE` clause, so deleting a refused `art` row while a
+    /// link to it survives fails outright.
     ///
     /// `tracks` is the one whose source shape depends on the version being
     /// upgraded from: the checksum columns arrived in V2, so a V1 store has no
     /// such columns to select.
-    fn probe_projections(&self) -> [(&'static str, String); 4] {
+    fn probe_projections(&self) -> [(&'static str, String); 5] {
         let checksums = self.current >= 2;
         let content_hash = if checksums {
             "CASE WHEN typeof(content_hash) = 'text' \
@@ -183,13 +188,6 @@ impl PendingMigration {
                 ),
             ),
             (
-                "art",
-                "(rowid, id, sha256, mime, width, height, byte_len, data) \
-                 SELECT rowid, id, sha256, mime, width, height, byte_len, data \
-                 FROM main.art"
-                    .to_string(),
-            ),
-            (
                 "tags",
                 "(rowid, track_id, key, value, ordinal, value_blob) \
                  SELECT rowid, track_id, key, value, ordinal, value_blob \
@@ -205,7 +203,72 @@ impl PendingMigration {
                  FROM main.track_art h LEFT JOIN main.art a ON a.id = h.art_id"
                     .to_string(),
             ),
+            (
+                // Its shape does not change, but the migration still copies it
+                // out and back, so a row an older writer smuggled past this
+                // table's own constraints fails the refill exactly like any
+                // other. Omitting it would let that row miss the report, miss
+                // --repair, and then fail the upgrade after the snapshot.
+                "structural_blocks",
+                "(rowid, track_id, kind, ordinal, body) \
+                 SELECT rowid, track_id, kind, ordinal, body \
+                 FROM main.structural_blocks"
+                    .to_string(),
+            ),
+            (
+                "art",
+                "(rowid, id, sha256, mime, width, height, byte_len, data) \
+                 SELECT rowid, id, sha256, mime, width, height, byte_len, data \
+                 FROM main.art"
+                    .to_string(),
+            ),
         ]
+    }
+
+    /// Child rows whose parent will not be there when the migration refills
+    /// them, keyed by child table.
+    ///
+    /// The probe above runs with foreign keys off and so cannot see this: an
+    /// orphan — a child an older foreign-keys-off writer left pointing at a row
+    /// that is not there — satisfies every `CHECK` in its own table and fails
+    /// only when the refill puts it back with enforcement on. `INSERT OR
+    /// IGNORE` is no help either: conflict resolution does not apply to foreign
+    /// keys, so a violation there aborts the statement rather than skipping the
+    /// row (verified).
+    ///
+    /// "Will not be there" covers both shapes at once, because the probe tables
+    /// hold exactly the rows that survive: a parent that never existed and a
+    /// parent this repair is about to delete are the same question to a child.
+    fn orphans(&self) -> Result<Vec<(&'static str, Vec<i64>)>> {
+        let checks: [(&'static str, &'static str); 4] = [
+            (
+                "tags",
+                "SELECT rowid FROM main.tags \
+                 WHERE track_id NOT IN (SELECT id FROM probe.tracks)",
+            ),
+            (
+                "track_art",
+                "SELECT rowid FROM main.track_art \
+                 WHERE track_id NOT IN (SELECT id FROM probe.tracks) \
+                    OR art_id NOT IN (SELECT id FROM probe.art)",
+            ),
+            (
+                "structural_blocks",
+                "SELECT rowid FROM main.structural_blocks \
+                 WHERE track_id NOT IN (SELECT id FROM probe.tracks)",
+            ),
+            // `art` has no parent; listed nowhere rather than as an empty case.
+            ("", ""),
+        ];
+        let mut out = Vec::new();
+        for (table, sql) in checks.iter().filter(|(t, _)| !t.is_empty()) {
+            let mut stmt = self.conn.prepare(sql)?;
+            let rowids: Vec<i64> = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            out.push((*table, rowids));
+        }
+        Ok(out)
     }
 
     /// Build the target shapes in an attached scratch database and run the
@@ -227,7 +290,8 @@ impl PendingMigration {
             schema::migrate_all(&mut scratch)?;
             let mut stmt = scratch.prepare(
                 "SELECT name, sql FROM sqlite_master \
-                 WHERE type = 'table' AND name IN ('tracks','tags','track_art','art')",
+                 WHERE type = 'table' \
+                   AND name IN ('tracks','tags','track_art','art','structural_blocks')",
             )?;
             let rows =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -260,7 +324,7 @@ impl PendingMigration {
                         ))
                     })?;
             }
-            let mut out = Vec::new();
+            let mut out: Vec<(&'static str, Vec<i64>)> = Vec::new();
             for (table, projection) in self.probe_projections() {
                 self.conn
                     .execute_batch(&format!("INSERT OR IGNORE INTO probe.{table} {projection}"))?;
@@ -272,6 +336,21 @@ impl PendingMigration {
                     .query_map([], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 out.push((table, rowids));
+            }
+            // Second pass, once every probe table is populated: a child whose
+            // parent did not survive. Merged into the same per-table answer,
+            // because to the user it is one question -- what will not be there
+            // afterwards -- and a row can fail both ways at once.
+            for (table, orphaned) in self.orphans()? {
+                let slot = out
+                    .iter_mut()
+                    .find(|(t, _)| *t == table)
+                    .expect("every orphan-checked table is probed");
+                for rowid in orphaned {
+                    if !slot.1.contains(&rowid) {
+                        slot.1.push(rowid);
+                    }
+                }
             }
             Ok(out)
         })();
@@ -442,6 +521,7 @@ mod rejection_tests {
 
         let pending = PendingMigration::open(&path).unwrap();
         let found = pending.inspect_rejections().unwrap();
+        assert!(!found.is_empty(), "a store with a refused row is not empty");
         assert_eq!(found.total(), 1);
         assert_eq!(found.tables()[0].table, "tags");
 
@@ -458,11 +538,18 @@ mod rejection_tests {
         assert_eq!(db.get_tags(1).unwrap().len(), 1, "the clean tag survived");
     }
 
-    /// The probe must not blame a child for its parent. Foreign keys are off
-    /// for the pass precisely so a tag under a refused track is not counted for
-    /// a reason of its own that it does not have.
+    /// A child whose parent will not survive is reported too.
+    ///
+    /// The first cut of this counted only the parent, on the grounds that a tag
+    /// under a refused track has nothing wrong with it of its own. That is true
+    /// and beside the point: the number exists to tell the user how many rows
+    /// they are about to lose, and the cascade loses that one. Counting only
+    /// the parent under-reported, and left the same query unable to see a
+    /// genuine orphan -- a child pointing at a track that is not there at all,
+    /// which fails the refill for the same reason and is invisible to a probe
+    /// that runs with foreign keys off.
     #[test]
-    fn a_refused_track_does_not_also_indict_its_children() {
+    fn a_child_of_a_refused_track_is_reported_with_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.db");
         let conn = store_at_v3(&path);
@@ -483,17 +570,91 @@ mod rejection_tests {
 
         let pending = PendingMigration::open(&path).unwrap();
         let found = pending.inspect_rejections().unwrap();
-        assert_eq!(found.total(), 1, "only the track itself: {found:?}");
-        assert_eq!(found.tables()[0].table, "tracks");
+        let named: Vec<(&str, u64)> = found
+            .tables()
+            .iter()
+            .map(|t| (t.table, t.rejected))
+            .collect();
+        assert_eq!(
+            named,
+            vec![("tracks", 1), ("tags", 1)],
+            "the track and the tag that goes with it: {found:?}"
+        );
 
-        // Repairing it takes the child through the cascade, which is what
-        // deleting a track means -- so the report undercounts the rows that go,
-        // deliberately, rather than blaming the child for the parent.
         let removed = pending.repair().unwrap();
-        assert_eq!(removed.total(), 1);
+        assert_eq!(removed.total(), 2);
         let db = pending.apply().unwrap();
         assert_eq!(db.list_tracks().unwrap().len(), 1);
         assert_eq!(db.get_tags(1).unwrap().len(), 1);
+    }
+
+    /// A genuine orphan: a child pointing at a parent that is not there at all.
+    ///
+    /// It satisfies every `CHECK` in its own table, and the probe runs with
+    /// foreign keys off, so nothing about the row itself gives it away —
+    /// `INSERT OR IGNORE` cannot help either, since conflict resolution does
+    /// not apply to foreign keys and a violation aborts the statement rather
+    /// than skipping the row. Without the second pass this reached `apply()`
+    /// and failed the refill *after* the snapshot had been written.
+    #[test]
+    fn an_orphan_left_by_a_foreign_keys_off_writer_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (99, 'artist', 'ghost', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (99, 'STREAMINFO', 0, X'00')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        let named: Vec<(&str, u64)> = found
+            .tables()
+            .iter()
+            .map(|t| (t.table, t.rejected))
+            .collect();
+        assert_eq!(
+            named,
+            vec![("tags", 1), ("structural_blocks", 1)],
+            "{found:?}"
+        );
+
+        pending.repair().unwrap();
+        let db = pending.apply().unwrap();
+        assert_eq!(db.get_tags(1).unwrap().len(), 1, "the real tag survived");
+    }
+
+    /// `structural_blocks` keeps its shape across V4, but the migration still
+    /// copies it out and back — so a row smuggled past its own constraints
+    /// fails the refill like any other, and has to be in the report.
+    #[test]
+    fn a_structural_block_the_refill_would_refuse_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = store_at_v3(&path);
+        plant_hostile(
+            &conn,
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1, 'NOT_A_KIND', 0, X'00')",
+            &[],
+        );
+        drop(conn);
+
+        let pending = PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        assert_eq!(found.total(), 1, "{found:?}");
+        assert_eq!(found.tables()[0].table, "structural_blocks");
+        pending.repair().unwrap();
+        pending.apply().unwrap();
     }
 
     /// The geometry bound #718 added, reached through the link's backfill: the
@@ -524,7 +685,18 @@ mod rejection_tests {
         let pending = PendingMigration::open(&path).unwrap();
         let found = pending.inspect_rejections().unwrap();
         let named: Vec<&str> = found.tables().iter().map(|t| t.table).collect();
-        assert_eq!(named, vec!["art", "track_art"], "{found:?}");
+        assert_eq!(
+            named,
+            vec!["track_art", "art"],
+            "reported -- and deleted -- link before blob: `track_art.art_id` \
+             references `art(id)` with no ON DELETE clause, so the other order \
+             fails on the foreign key: {found:?}"
+        );
+        // Which is the half that was never exercised before: repair it.
+        let removed = pending.repair().unwrap();
+        assert_eq!(removed.total(), 2);
+        assert!(pending.inspect_rejections().unwrap().is_empty());
+        pending.apply().unwrap();
     }
 
     /// A V1 store has no checksum columns at all, so the probe's `tracks`

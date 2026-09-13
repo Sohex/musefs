@@ -146,9 +146,15 @@ rows with whatever wrote them, or pass `--repair` to have `migrate` **delete**
 them. It will not do that on its own: dropping a row an external tool chose to
 write is exactly the kind of thing that should not happen without being asked.
 
-`--repair` deletes after the snapshot is taken, so the rows are still in the
-copy you can go back to. Deleting a track takes its tags and art links with it,
-so more rows may go than the count named.
+`--repair` deletes after the snapshot is taken, so the rows are still in the copy
+you can go back to — which is why it refuses to run alongside `--no-snapshot`.
+The count is what will actually go: a child whose parent does not survive is
+reported with it, rather than left to the cascade to take silently.
+
+The check also catches a row that is fine in itself but points at a parent that
+is not there — the kind an external tool can leave behind with foreign keys
+turned off. Such a row passes every constraint in its own table and fails only
+when the upgrade puts it back.
 
 The check costs one pass over the store and reports what the migration would
 actually do, because it asks the migration's own schema rather than a second
@@ -187,7 +193,7 @@ The two offers decline themselves unless you ask for them:
 | Flag | Effect |
 | ---- | ------ |
 | `--yes` / `-y` | Upgrade without asking. Required off a terminal. |
-| `--repair` | Delete rows the new schema refuses. Nothing is deleted without it. |
+| `--repair` | Delete rows the new schema refuses. Nothing is deleted without it; refuses alongside `--no-snapshot`. |
 | `--snapshot PATH` | Write the snapshot here instead of beside the store. |
 | `--no-snapshot` | Take no snapshot. The upgrade is then not reversible. |
 | `--vacuum` / `--vacuum=false` | Compact afterwards, or do not. Omit to be asked. |
