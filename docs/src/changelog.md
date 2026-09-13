@@ -318,8 +318,10 @@ see the [Release notes](release-notes.md).
   metadata blocks run until one sets the last-block flag, and a `STREAMINFO`
   flagged last ends the run at packet 0. A run that reaches the audio packet
   without ever flagging its last block has no discoverable end and is malformed.
-  A *nonzero* count is still taken at its word, which is what every compliant
-  encoder writes and what musefs's own synthesis emits. Synthesis additionally
+  A *nonzero* count is still taken at its word: the mapping requires a count it
+  gives to be the true number of following packets, and reserves zero for the
+  unknown case, so a compliant encoder writing zero is exactly the input this
+  fixes rather than an exception to it. Synthesis additionally
   clears `STREAMINFO`'s last-block flag, since the regenerated comment block
   always follows it. As with chained Ogg, an existing row keeps its wrong
   `audio_offset` until a rescan.

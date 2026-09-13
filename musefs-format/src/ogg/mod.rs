@@ -61,10 +61,6 @@ const FLAC_LAST_BLOCK: u8 = 0x80;
 /// metadata packet from the first audio packet.
 const FLAC_BLOCK_TYPE_INVALID: u8 = 127;
 
-/// The widest header run a compliant count can express (`u16::MAX` following
-/// packets), used to bound discovery over a run that never flags its last block.
-const MAX_OGGFLAC_HEADER_PACKETS: usize = 1 + u16::MAX as usize;
-
 fn is_flac_metadata_block(packet: &[u8]) -> bool {
     packet
         .first()
@@ -87,10 +83,9 @@ fn read_exactly(data: &[u8], want: usize) -> Result<Vec<page::ReadPacket>> {
 /// Reassemble an OggFLAC header run: the mapping packet plus the metadata-block
 /// packets that follow it.
 ///
-/// A nonzero count is taken at its word — that is what every compliant encoder
-/// writes, and what musefs's own synthesis emits. Zero, though, means the number
-/// of following packets is *unknown*, not that there are none: metadata packets
-/// still follow. Reading it as "none" put a file's real VORBIS_COMMENT (and any
+/// A nonzero count is taken at its word: the mapping requires a count it gives to
+/// be the true number of following packets, and zero is its escape hatch for
+/// *unknown* — not a statement that there are none. Metadata packets still follow. Reading it as "none" put a file's real VORBIS_COMMENT (and any
 /// PICTURE, SEEKTABLE or CUESHEET) past `audio_offset`, so it was never ingested
 /// and was then replayed verbatim inside the synthesized stream, where a decoder
 /// meets metadata blocks in place of audio frames (#723).
@@ -116,9 +111,11 @@ fn oggflac_header_packets(data: &[u8], mapping: &[u8]) -> Result<Vec<page::ReadP
             return Ok(true); // the mapping packet; its followers are what we seek
         }
         // A run that reaches the audio packet without ever flagging its last block
-        // has no discoverable end, and neither does one longer than a count could
-        // have expressed. Both are malformed rather than something to guess at.
-        if !is_flac_metadata_block(&last.data) || out.len() > MAX_OGGFLAC_HEADER_PACKETS {
+        // has no discoverable end: malformed, rather than something to guess at.
+        // That is also what bounds the walk — along with the data itself, since
+        // every page advances the cursor by at least its 27 header bytes and
+        // running off the end is an error.
+        if !is_flac_metadata_block(&last.data) {
             return Err(FormatError::Malformed);
         }
         Ok(!is_last_flac_metadata_block(&last.data))
@@ -1368,6 +1365,69 @@ mod tests {
     }
 
     #[test]
+    fn classify_whole_covers_a_file_that_is_a_single_page() {
+        // The window is the file's LAST `MAX_PAGE_BYTES` bytes, so for a file
+        // shorter than that it has to start at zero. A window anchored one byte
+        // in would miss a page that begins at the very start of the file.
+        let (page, _) = lace_packet(0x1234, 0, true, 0, &[7u8; 40]);
+        assert_eq!(classify_whole(&page, 0x1234), Chaining::Single);
+        assert_eq!(classify_whole(&page, 0x5678), Chaining::Chained);
+    }
+
+    /// One valid page of serial 0x5678 whose payload hides `decoys` fake page
+    /// headers, each declaring a length that lands exactly on EOF so only the CRC
+    /// can reject it. The backward scan meets every decoy before the real page.
+    fn tail_with_decoys(decoys: usize) -> Vec<u8> {
+        let stride = 300usize; // > one decoy's 282-byte maximum header extent
+        let payload = vec![0u8; stride * (decoys + 1)];
+        let (mut page, _) = lace_packet(0x5678, 9, false, 0, &payload);
+        let h = parse_page(&page, 0).unwrap();
+        let len = page.len();
+
+        for k in 1..=decoys {
+            let i = len - k * stride;
+            assert!(
+                i >= h.header_len,
+                "decoys must not overwrite the real header"
+            );
+            page[i..i + 4].copy_from_slice(page::CAPTURE);
+            page[i + 4] = 0; // version
+            page[i + 5] = 0; // header_type
+            // total_len = 27 + seg_count + sum(lacing) must land on EOF.
+            page[i + 26] = 255;
+            let mut left = len - i - 27 - 255;
+            for seg in 0..255usize {
+                let v = left.min(255);
+                page[i + 27 + seg] = u8::try_from(v).expect("v <= 255");
+                left -= v;
+            }
+            assert_eq!(left, 0, "decoy payload must fit one page's lacing table");
+            assert_eq!(page::parse_page(&page, i).unwrap().total_len(), len - i);
+        }
+        // The real page's CRC covers the decoys, so recompute it over them.
+        let patched = patch_page_header(&page, h.seq).unwrap();
+        page[..h.header_len].copy_from_slice(&patched);
+        assert!(page::verify_page_crc(&page).unwrap());
+        page
+    }
+
+    #[test]
+    fn classify_tail_stops_after_a_bounded_number_of_crc_checks() {
+        // Decoys are what a crafted tail costs: without a bound, one file would
+        // pay a whole-page CRC per candidate — the amplification #619 bounded on
+        // the serve path's own backward scan. Just inside the budget the real
+        // page is still found; one decoy more and detection is given up rather
+        // than amplified. The serve path's serial check is what still fails such
+        // a file closed, which is why giving up here is `Unknown`, not an error.
+        let within = tail_with_decoys(MAX_TAIL_CRC_CHECKS - 1);
+        assert_eq!(classify_tail(&within, 0, 0x1234), Chaining::Chained);
+        assert_eq!(classify_tail(&within, 0, 0x5678), Chaining::Single);
+
+        let past = tail_with_decoys(MAX_TAIL_CRC_CHECKS);
+        assert_eq!(classify_tail(&past, 0, 0x1234), Chaining::Unknown);
+    }
+
+    #[test]
     fn truncated_stream_is_not_mistaken_for_a_chain() {
         // A torn final page proves nothing about chaining, and a truncated file
         // still serves — so it must stay accepted.
@@ -1504,6 +1564,29 @@ mod tests {
         assert_eq!(
             locate_audio(&unknown).unwrap(),
             locate_audio(&declared).unwrap()
+        );
+    }
+
+    #[test]
+    fn oggflac_unknown_count_walks_past_blocks_that_are_not_last() {
+        // Discovery must continue through every block whose last-block flag is
+        // clear and stop at the one that sets it — a run of exactly one block
+        // would not tell the two conditions apart.
+        let seektable = {
+            let mut b = Vec::new();
+            crate::flac::push_block_header(&mut b, 3, 18, false).unwrap();
+            b.extend(std::iter::repeat_n(0xEEu8, 18));
+            b
+        };
+        let blocks = vec![seektable, vorbis_comment_block(true, "RealTitle")];
+        let (data, header_len) = oggflac_file(0, false, &blocks);
+
+        let h = read_header(&data).unwrap();
+        assert_eq!(h.packets.len(), 3, "mapping + SEEKTABLE + VORBIS_COMMENT");
+        assert_eq!(h.audio_offset, header_len as u64);
+        assert_eq!(
+            read_tags(&data).unwrap(),
+            vec![("title".to_string(), "RealTitle".to_string())]
         );
     }
 

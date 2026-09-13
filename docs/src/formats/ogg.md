@@ -217,6 +217,7 @@ then fails the rescan and leaves the mount.
   zero as *unknown*, not *none* — blocks still follow. musefs reads a zero
   count by discovering the run the way the format itself defines it: metadata
   blocks continue until one sets the last-block flag (and a `STREAMINFO` flagged
-  last ends the run at packet 0). A *nonzero* count is taken at its word, which
-  is what every compliant encoder writes. As with chained Ogg, a row scanned
-  before this fix keeps its wrong `audio_offset` until a rescan.
+  last ends the run at packet 0). A *nonzero* count is taken at its word — the
+  mapping requires a count it gives to be accurate, and reserves zero for the
+  unknown case. As with chained Ogg, a row scanned before this fix keeps its
+  wrong `audio_offset` until a rescan.

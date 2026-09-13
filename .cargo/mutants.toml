@@ -324,6 +324,13 @@ exclude_re = [
     # (infinite loop). Like the SP2 tree.rs timeouts, it can only ever flag via the
     # timeout budget. The sole `-=` in its function, so anchored line-agnostically.
     'musefs-core/src/ogg_index\.rs:\d+:\d+: replace -= with /= in find_page_start',
+    # The chain check's tail scan is the same backward walk and the same hang
+    # class (#722): `i -= 1` -> `i /= 1` pins the index and spins forever, so it
+    # can only ever flag via the timeout budget. Its behavioral siblings stay in
+    # scope — the CRC budget, the window anchoring and the end-at-EOF filter are
+    # all pinned by the classify_tail tests. The sole `-=` in its function, so
+    # anchored line-agnostically.
+    'musefs-format/src/ogg/mod\.rs:\d+:\d+: replace -= with /= in classify_tail',
     # First-page fast-path bound `abs_target.saturating_sub(audio_offset) < 4`,
     # `<`->`<=`: the only difference is at `delta == 4`, where `<=` shortcuts to
     # `audio_offset` while `<` falls through to the backward scan — but a 4-byte

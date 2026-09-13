@@ -904,4 +904,19 @@ mod tests {
         let truncated = &page[..h.total_len() - 10];
         assert!(verify_page_crc(truncated).is_err());
     }
+
+    #[test]
+    fn max_page_bytes_is_the_rfc_maximum() {
+        // The largest page RFC 3533 can express, and the width of the tail window
+        // the chain check reads: a wrong value silently shrinks that window, so
+        // the constant is pinned rather than left to its own arithmetic.
+        assert_eq!(MAX_PAGE_BYTES, 65_307);
+        // Built from the real page it describes: a packet too large for one page
+        // fills the first page's segment table with 255 lacing values of 255,
+        // which is the maximum-size page.
+        let (pages, _) = lace_packet(1, 0, false, 0, &vec![0u8; 255 * 255 + 1]);
+        let first = parse_page(&pages, 0).unwrap();
+        assert_eq!(first.seg_count, 255);
+        assert_eq!(first.total_len() as u64, MAX_PAGE_BYTES);
+    }
 }

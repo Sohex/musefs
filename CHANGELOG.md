@@ -236,7 +236,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   was never ingested and was replayed verbatim inside the synthesized stream,
   after a header run the synthesis had already terminated. An unknown count is
   now resolved by the rule the format defines: metadata blocks run until one
-  sets the last-block flag. A nonzero count is still taken at its word.
+  sets the last-block flag. A nonzero count is still taken at its word, which
+  the mapping requires to be accurate when one is given.
 
   Both fixes correct what a *scan* records, so an existing row keeps its wrong
   audio bounds until the file is rescanned.
