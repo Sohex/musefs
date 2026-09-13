@@ -727,6 +727,27 @@ INSERT INTO track_art (track_id, art_id, picture_type, description,
     SELECT h.track_id, h.art_id, h.picture_type, h.description,
            a.mime, a.width, a.height, 0, 0, h.ordinal
     FROM track_art_hold_v4 h LEFT JOIN art a ON a.id = h.art_id;
+-- `structural_blocks` is the one core table whose *shape* this migration would
+-- otherwise leave alone, which is what left it the only one with affinity-only
+-- columns once the other three gained storage classes (#732). Its rows are
+-- already held and the table is already empty, so replacing it here costs a
+-- drop and a create and no extra copy of anything -- which is the whole reason
+-- it is worth doing in this release rather than buying a gated migration of its
+-- own for it later.
+DROP TABLE structural_blocks;
+CREATE TABLE structural_blocks (
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    ordinal  INTEGER NOT NULL DEFAULT 0,
+    body     BLOB NOT NULL,
+    PRIMARY KEY (track_id, kind, ordinal),
+    CHECK (typeof(track_id) = 'integer'),
+    -- The IN list already implies TEXT, as on `tracks.format`; spelled out here
+    -- only so every column in the table answers the same question the same way.
+    CHECK (typeof(kind) = 'text' AND kind IN ('STREAMINFO','SEEKTABLE')),
+    CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    CHECK (typeof(body) = 'blob' AND length(body) <= 16777215)
+);
 INSERT INTO structural_blocks (track_id, kind, ordinal, body)
     SELECT track_id, kind, ordinal, body FROM structural_blocks_hold_v4;
 
@@ -2806,6 +2827,125 @@ mod v4_art_rebuild_tests {
     }
 }
 
+/// `structural_blocks` (#732): the table the other three rebuilds left behind.
+#[cfg(test)]
+mod v4_structural_blocks_rebuild_tests {
+    use rusqlite::Connection;
+
+    fn migrated_with_a_block() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for (target, migration) in (1i64..).zip(super::MIGRATIONS).take(3) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", target).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('/lib/a.flac', 'flac', 0, 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+             VALUES (1, 'STREAMINFO', 0, X'0102')",
+            [],
+        )
+        .unwrap();
+        super::migrate_all(&mut conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn the_rows_survive_the_rebuild() {
+        let conn = migrated_with_a_block();
+        let (kind, body): (String, Vec<u8>) = conn
+            .query_row(
+                "SELECT kind, body FROM structural_blocks WHERE track_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "STREAMINFO");
+        assert_eq!(body, vec![1u8, 2]);
+    }
+
+    /// The gap this closes: each of these is a value affinity will not convert,
+    /// so it reached the reader as a `rusqlite` conversion failure — a
+    /// store-wide error rather than the malformed row it is.
+    #[test]
+    fn storage_classes_are_pinned() {
+        let conn = migrated_with_a_block();
+        for (what, sql) in [
+            (
+                "a blob kind",
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (1, X'4142', 1, X'00')",
+            ),
+            (
+                "a real ordinal",
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (1, 'SEEKTABLE', 0.5, X'00')",
+            ),
+            (
+                "a text body",
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (1, 'SEEKTABLE', 1, 'not a blob')",
+            ),
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "{what} must be refused");
+        }
+        // The value checks the table always had are untouched.
+        assert!(
+            conn.execute(
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (1, 'NOT_A_KIND', 1, X'00')",
+                [],
+            )
+            .is_err()
+        );
+    }
+
+    /// And the migration's pre-flight sees them, so a store holding one is told
+    /// before the upgrade starts rather than failing part-way through it.
+    #[test]
+    fn a_violating_row_is_reported_by_the_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for (target, migration) in (1i64..).zip(super::MIGRATIONS).take(3) {
+                conn.execute_batch(migration.sql).unwrap();
+                conn.pragma_update(None, "user_version", target).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+                 VALUES ('/lib/a.flac', 'flac', 0, 0, 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            // A blob `kind` satisfies every CHECK the V1 table has -- the IN
+            // list compares a blob unequal to both names, so it is only the
+            // value check that would have caught it, and that is a CHECK too.
+            conn.pragma_update(None, "ignore_check_constraints", true)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (1, X'4142', 0, X'00')",
+                [],
+            )
+            .unwrap();
+        }
+        let pending = crate::PendingMigration::open(&path).unwrap();
+        let found = pending.inspect_rejections().unwrap();
+        assert_eq!(found.total(), 1, "{found:?}");
+        assert_eq!(found.tables()[0].table, "structural_blocks");
+        pending.repair().unwrap();
+        pending.apply().unwrap();
+    }
+}
+
 #[cfg(test)]
 mod baseline_tests {
     use rusqlite::Connection;
@@ -3007,8 +3147,10 @@ mod baseline_tests {
 
     /// The literals in the *latest* definition of each table are what a fresh
     /// `migrate()` leaves behind, so those are the ones that must track
-    /// `crate::limits`. V4 owns `tags`, `track_art` and `art`; V1 still owns
-    /// `structural_blocks`.
+    /// `crate::limits`. V4 rebuilds every core table, so every assertion here
+    /// reads V4: there is no longer a live definition in a superseded
+    /// migration, and asserting against one would only restate what the
+    /// byte-for-byte digest test already freezes.
     ///
     /// The ownership moves as tables are rebuilt, and pointing this at a
     /// superseded migration is worse than useless: it would assert against text
@@ -3017,7 +3159,6 @@ mod baseline_tests {
     #[test]
     fn check_literals_match_limits_constants() {
         use crate::limits::*;
-        let v1 = super::MIGRATION_V1;
         let v4 = super::MIGRATION_V4;
         // V4 rebuilds `tags` and `track_art` (#663, #716, #718, #693).
         assert!(v4.contains(&format!("length(key) <= {MAX_TAG_KEY_LEN}")));
@@ -3047,14 +3188,16 @@ mod baseline_tests {
         // V4 rebuilds `art` too (#718, #719), so its literals moved with it.
         assert!(v4.contains(&format!("length(sha256) = {ART_SHA256_LEN}")));
         assert!(v4.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
-        // Still V1-owned: nothing recreates `structural_blocks`.
-        assert!(v1.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));
+        // V4 rebuilds `structural_blocks` too (#732), so the last two assertions
+        // that were still reading V1 move with it -- nothing here reads a
+        // superseded migration any more.
+        assert!(v4.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));
         let kinds = STRUCTURAL_KINDS
             .iter()
             .map(|k| format!("'{k}'"))
             .collect::<Vec<_>>()
             .join(",");
-        assert!(v1.contains(&format!("kind IN ({kinds})")));
+        assert!(v4.contains(&format!("kind IN ({kinds})")));
     }
 }
 

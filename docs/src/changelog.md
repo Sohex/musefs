@@ -316,6 +316,25 @@ see the [Release notes](release-notes.md).
   arrives with the column at its new home; `art` keeps its own copy of the
   column, and its own ban, until the readers switch over.
 
+- **`structural_blocks` is rebuilt as well**
+  ([#732](https://github.com/Sohex/musefs/issues/732)), which is what makes
+  "every core table pins its storage classes" true rather than nearly true. It
+  was the one table V4 would otherwise have left alone — its shape does not
+  change — and so the last place a schema-valid row could still reach the reader
+  as a `rusqlite` conversion failure: a blob `kind`, a real `ordinal` or a text
+  `body` is exactly what affinity will not convert, and each surfaced as a
+  store-wide error rather than as the malformed row it is. The value checks were
+  always there and still are; what was missing was the storage class that lets
+  them be the thing that fires.
+
+  Low severity on its own — `structural_blocks` is outside the editable
+  contract, so reaching it needs a writer that ignores that. It is here on
+  timing: the migration **already** holds this table's rows while `tracks` is
+  rebuilt and refills them afterwards, so the empty window and the copy both
+  exist and this cost a drop and a create. Left for a future major it would have
+  cost a gated migration of its own, for a robustness fix nobody would schedule
+  one for.
+
 - **`art` is rebuilt by the same migration**, completing the set — and it is the
   step with an ordering constraint the others did not have. `track_art.art_id`
   references `art(id)` with **no** `ON DELETE CASCADE`, so with foreign keys

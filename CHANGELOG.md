@@ -299,6 +299,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     art description ban an embedded NUL
     ([#693](https://github.com/Sohex/musefs/issues/693)).
 
+- **`structural_blocks` is rebuilt too**, so every core table now pins its
+  storage classes ([#732](https://github.com/Sohex/musefs/issues/732)). It was
+  the one table the migration would otherwise have left alone, which is what
+  made it the last one where a schema-valid row could still reach the Rust side
+  as a conversion failure. The migration already held its rows while `tracks`
+  was rebuilt, so this cost a drop and a create rather than another copy.
+
 - **`art` is rebuilt by the same migration**, completing the set.
 
   - `art_reject_content_update` now covers the row's **key**

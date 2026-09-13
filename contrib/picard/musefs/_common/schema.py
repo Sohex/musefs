@@ -732,6 +732,27 @@ INSERT INTO track_art (track_id, art_id, picture_type, description,
     SELECT h.track_id, h.art_id, h.picture_type, h.description,
            a.mime, a.width, a.height, 0, 0, h.ordinal
     FROM track_art_hold_v4 h LEFT JOIN art a ON a.id = h.art_id;
+-- `structural_blocks` is the one core table whose *shape* this migration would
+-- otherwise leave alone, which is what left it the only one with affinity-only
+-- columns once the other three gained storage classes (#732). Its rows are
+-- already held and the table is already empty, so replacing it here costs a
+-- drop and a create and no extra copy of anything -- which is the whole reason
+-- it is worth doing in this release rather than buying a gated migration of its
+-- own for it later.
+DROP TABLE structural_blocks;
+CREATE TABLE structural_blocks (
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    ordinal  INTEGER NOT NULL DEFAULT 0,
+    body     BLOB NOT NULL,
+    PRIMARY KEY (track_id, kind, ordinal),
+    CHECK (typeof(track_id) = 'integer'),
+    -- The IN list already implies TEXT, as on `tracks.format`; spelled out here
+    -- only so every column in the table answers the same question the same way.
+    CHECK (typeof(kind) = 'text' AND kind IN ('STREAMINFO','SEEKTABLE')),
+    CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    CHECK (typeof(body) = 'blob' AND length(body) <= 16777215)
+);
 INSERT INTO structural_blocks (track_id, kind, ordinal, body)
     SELECT track_id, kind, ordinal, body FROM structural_blocks_hold_v4;
 

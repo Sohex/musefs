@@ -6,7 +6,7 @@
 (`MIGRATIONS`: the `MIGRATION_V1` baseline, `MIGRATION_V2`, which adds the
 scanner-owned `fingerprint`/`content_hash` columns, `MIGRATION_V3`, which
 widens the `tags.value` and `track_art.description` caps, and `MIGRATION_V4`,
-which rebuilds all four core tables — a never-reused `AUTOINCREMENT` id, the
+which rebuilds every core table — a never-reused `AUTOINCREMENT` id, the
 path as bytes, an inode stamp, storage-class constraints throughout, independent
 ordinal spaces for text and binary tags, per-embedding picture columns on the art
 link, immutable row ownership, and the retirement of every fingerprint written
