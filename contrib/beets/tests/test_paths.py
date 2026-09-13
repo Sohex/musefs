@@ -35,14 +35,19 @@ def test_symlink_resolved(tmp_path):
 
 def test_non_utf8_bytes_round_trip_rather_than_being_replaced(tmp_path):
     # A non-UTF-8 filename. From schema v4 the store holds the real bytes
-    # (#680), so the key has to carry them too — as surrogates, which
-    # `os.fsencode` turns back into the exact path. The old form normalized them
-    # to U+FFFD to match the scanner's `to_string_lossy()`; that agreed with the
-    # scanner but collapsed two distinct files onto one key.
+    # (#680), so the key has to carry them too — however the filesystem encoding
+    # spells them — and `os.fsencode` has to turn it back into the exact path.
+    # The old form normalized them to U+FFFD to match the scanner's
+    # `to_string_lossy()`; that agreed with the scanner but collapsed two
+    # distinct files onto one key.
     raw = os.fsencode(str(tmp_path)) + b"/\xff.flac"
     with open(raw, "wb") as fh:
         fh.write(b"x")
     key = realpath_key(raw)
-    assert "�" not in key
-    assert "\udcff" in key
+    assert "�" not in key, "the replacement character is a byte that got lost"
+    # Deliberately not asserting the surrogate form (`\udcff`). That is the
+    # *filesystem encoding's* business, not musefs's: under UTF-8 or ASCII the
+    # byte escapes to a surrogate, but a total codec like Latin-1 decodes it to
+    # an ordinary character and no surrogate appears. What must hold either way
+    # — and what the store actually compares against — is the round trip below.
     assert os.fsencode(key) == os.path.realpath(raw)

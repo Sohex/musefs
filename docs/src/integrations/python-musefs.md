@@ -205,10 +205,12 @@ Everything in `__all__`, imported from the top-level `musefs_common` package.
 - `ArtImage(data, mime, picture_type=3, description="")` — one embedded picture.
 - `realpath_key(path)` — canonical path matching the scanner's `backing_path`;
   accepts `str`/`bytes`, returns `str`. The resolution runs on bytes and is
-  decoded with `surrogateescape`, so a filename that is not valid UTF-8 is
-  carried as surrogates and `os.fsencode` turns the key back into the exact
+  decoded with `os.fsdecode`, so `os.fsencode` turns the key back into the exact
   path on disk — which is what the store holds from schema v4 (#680). Two files
-  differing only in undecodable bytes therefore give two different keys.
+  differing only in undecodable bytes therefore give two different keys. How
+  such a byte is *spelled* in the `str` is the filesystem encoding's business
+  (a surrogate under UTF-8 or ASCII, an ordinary character under a total codec
+  like Latin-1); what holds either way is the round trip.
 
 **Writing**
 
