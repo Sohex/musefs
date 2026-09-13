@@ -1984,7 +1984,15 @@ fn refresh_structural_into(
 /// for, and adding one pre-check per newly discovered constraint does not
 /// converge.
 fn is_store_rejection(e: &crate::error::CoreError) -> bool {
-    matches!(e, crate::error::CoreError::Db(db) if db.is_constraint_violation())
+    // A digest mismatch is the store refusing this file's picture too (#724): the
+    // row it would link holds another image's bytes, and only this file's rows
+    // are affected, so it fails the file like a constraint rather than the scan.
+    matches!(
+        e,
+        crate::error::CoreError::Db(db)
+            if db.is_constraint_violation()
+                || matches!(db, musefs_db::DbError::ArtDigestMismatch { .. })
+    )
 }
 
 /// Do the bytes this unit records look like the ones a stored row already

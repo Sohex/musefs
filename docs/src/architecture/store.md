@@ -286,6 +286,22 @@ existing row. Deleting an `art` row still referenced by `track_art` (possible
 only with `foreign_keys` OFF) bumps every referencing track so the mount serves
 a clean `EIO` on the now-orphaned reference instead of stale bytes.
 
+**A digest has to name its bytes.** Nothing in the schema can tie `art.sha256`
+to `art.data` — SQLite has no hash a `CHECK` could call — so a writer can file a
+row under the digest of an image it does not hold. The writers do not trust
+such a row when they meet one: when an image dedups onto an existing row, that
+row's bytes are compared with the image's before the id is returned, and a
+mismatch is refused rather than linked
+([#724](https://github.com/Sohex/musefs/issues/724)). The scanner fails the one
+file that would have linked it, as it does for a constraint the store refuses,
+and compares each distinct row at most once per scan; the `contrib` helper
+`upsert_art` raises instead of returning the id. A fresh insert needs no check,
+since it just stored those bytes.
+
+What this does not do is audit the table: a poisoned row nothing ever dedups
+onto is never compared, and the readers serve whatever a link points at. Filing
+every row under the digest of its own bytes remains the external writer's job.
+
 **Row ownership is immutable too.** A `tags` or `track_art` row may not move
 between tracks: `tags_reject_reparent` and `track_art_reject_reparent` abort a
 `track_id` change with the same shape of message. Replace by delete-then-insert,

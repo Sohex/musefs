@@ -8,7 +8,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from .constants import EXPECTED_USER_VERSION
-from .errors import SchemaMismatch
+from .errors import ArtDigestMismatch, SchemaMismatch
 
 # SQLite caps a statement's host parameters (SQLITE_MAX_VARIABLE_NUMBER: 999 on
 # the <3.32 floor). Chunk bulk IN-lists below it so large lookups never trip it.
@@ -354,13 +354,27 @@ def upsert_art(conn, data):
     dimensions, which made the first writer of a given image choose them for
     every track that shared it — so they moved to ``track_art``, and this
     function lost the argument it could not honour: on a sha256 conflict the
-    stored row was kept and the passed mime silently ignored."""
+    stored row was kept and the passed mime silently ignored.
+
+    A conflict returns the row already filed under the digest, and a store is
+    only content-addressed if that row holds these bytes. Nothing in the schema
+    ties ``sha256`` to ``data``, so the conflicting row is compared with ``data``
+    — in SQL, nothing re-hashed — and :class:`ArtDigestMismatch` is raised
+    instead of returning an id that points at another image (musefs #724). A
+    fresh insert needs no comparison: it just stored these bytes."""
     sha = hashlib.sha256(data).hexdigest()
-    conn.execute(
+    inserted = conn.execute(
         "INSERT INTO art (sha256, byte_len, data) VALUES (?, ?, ?) ON CONFLICT(sha256) DO NOTHING",
         (sha, len(data), data),
-    )
-    return conn.execute("SELECT id FROM art WHERE sha256 = ?", (sha,)).fetchone()[0]
+    ).rowcount
+    art_id = conn.execute("SELECT id FROM art WHERE sha256 = ?", (sha,)).fetchone()[0]
+    if inserted == 0:
+        (holds_these_bytes,) = conn.execute(
+            "SELECT data = ? FROM art WHERE id = ?", (data, art_id)
+        ).fetchone()
+        if not holds_these_bytes:
+            raise ArtDigestMismatch(art_id, sha)
+    return art_id
 
 
 def replace_track_art(conn, track_id, arts):

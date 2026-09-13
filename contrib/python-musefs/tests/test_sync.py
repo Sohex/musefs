@@ -1,3 +1,5 @@
+import hashlib
+
 from conftest import JPEG, PNG, insert_track, text_tags
 
 from musefs_common import ArtImage, Record, SyncStats, connect, sync_files, sync_one
@@ -384,5 +386,42 @@ def test_invalid_record_mid_batch_does_not_abort_others(db_path):
             == "T"
         )
         assert conn.execute("SELECT COUNT(*) FROM tags WHERE track_id=?", (b,)).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_sync_one_skips_record_whose_art_dedups_onto_a_poisoned_row(db_path):
+    """musefs #724: the store holds a row filed under this image's digest with
+    other bytes. The record is skipped and recorded like a constraint violation,
+    its tags roll back with it, and nothing is linked to the poisoned row."""
+    conn, tid = _seed(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?, 3, ?)",
+            (hashlib.sha256(JPEG).hexdigest(), b"YYY"),
+        )
+        conn.commit()
+        stats = SyncStats()
+        sync_one(
+            conn,
+            Record(
+                key="/m/a.flac",
+                pairs=[("title", "T")],
+                art=[ArtImage(JPEG, "image/jpeg")],
+            ),
+            stats,
+        )
+        conn.commit()
+        assert stats.synced == 0
+        assert stats.art_linked == 0
+        assert stats.skipped_invalid == 1
+        key, reason = stats.invalid[0]
+        assert key == "/m/a.flac"
+        assert "holds different bytes" in reason
+        assert conn.execute("SELECT COUNT(*) FROM tags WHERE track_id=?", (tid,)).fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM track_art WHERE track_id=?", (tid,)).fetchone()[0]
+            == 0
+        )
     finally:
         conn.close()

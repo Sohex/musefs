@@ -647,6 +647,20 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **A crafted `art` row can no longer hand one image's bytes to a file embedding
+  another** ([#724](https://github.com/Sohex/musefs/issues/724)). `art` is
+  deduplicated by `sha256`, and on a conflict the writers returned the row
+  already filed under the digest without looking at its bytes. Nothing in the
+  schema can tie the digest to the data, so a store holding a row whose `sha256`
+  names bytes it does not hold linked that row to every file embedding the real
+  image. Both writers now compare a conflicting row's bytes with the incoming
+  image before using it. `musefs scan` fails only the file that would link it,
+  counted under `rejected`, and compares each distinct row at most once per
+  scan, so a cover shared across an album costs one comparison; the `contrib`
+  helper `upsert_art` raises `ArtDigestMismatch`, which `sync_one` skips like a
+  constraint violation. A poisoned row nothing dedups onto is not detected, and
+  the readers still serve what a link points at.
+
 - **A backing file rewritten mid-read fails that read, not the next one**
   ([#682](https://github.com/Sohex/musefs/issues/682)). Both read paths checked
   the backing file against its stored stamp *before* reading from it, so an

@@ -381,6 +381,44 @@ fn a_symlink_retargeted_after_resolution_cannot_split_path_from_geometry() {
     assert_eq!(track.bounds.audio_offset(), expected.audio_offset);
 }
 
+/// #724: a store holding an `art` row filed under the digest of a file's
+/// picture but holding other bytes refuses that file, rather than linking the
+/// poisoned bytes to it — and fails only that file, not the scan.
+#[test]
+fn a_poisoned_art_row_fails_the_file_that_would_link_it() {
+    use sha2::Digest;
+    let library = tempfile::tempdir().unwrap();
+    write_flac(
+        &library.path().join("with_art.flac"),
+        &["TITLE=A"],
+        Some((8, 8)),
+    );
+    write_flac(&library.path().join("plain.flac"), &["TITLE=B"], None);
+    let store = tempfile::tempdir().unwrap();
+    let db_path = store.path().join("m.db");
+    let db = musefs_db::Db::open(&db_path).unwrap();
+
+    // The picture `write_flac` embeds; its digest, over other bytes.
+    let real = vec![0xAB_u8; 64];
+    let digest = sha2::Sha256::digest(&real);
+    let mut hex = [0u8; 64];
+    let sha = base16ct::lower::encode_str(&digest, &mut hex).unwrap();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 3, X'595959')",
+            rusqlite::params![sha],
+        )
+        .unwrap();
+
+    let stats = crate::scan_directory(&db, library.path()).unwrap();
+    assert_eq!(stats.failed, 1, "the file that would link the row fails");
+    assert_eq!(stats.scanned, 1, "and only that file");
+    let tracks = db.list_tracks().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert!(tracks[0].backing_path.ends_with("plain.flac"));
+}
+
 #[test]
 fn ingest_assigns_sequential_ordinals_per_key() {
     let dir = tempfile::tempdir().unwrap();

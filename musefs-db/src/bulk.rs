@@ -32,6 +32,7 @@ impl Db<ReadWrite> {
     pub fn bulk_writer(&self) -> Result<BulkWriter<'_>> {
         Ok(BulkWriter {
             tx: self.conn.unchecked_transaction()?,
+            verified_art: std::collections::HashSet::new(),
         })
     }
 }
@@ -43,6 +44,10 @@ impl Db<ReadWrite> {
 /// on a single caller-held transaction so a whole batch commits with one fsync.
 pub struct BulkWriter<'c> {
     tx: Transaction<'c>,
+    /// `art` rows this writer has already verified hold the bytes their digest
+    /// names (#724), so a cover shared by every track of an album is compared
+    /// once per batch rather than once per track.
+    verified_art: std::collections::HashSet<i64>,
 }
 
 impl BulkWriter<'_> {
@@ -113,7 +118,7 @@ impl BulkWriter<'_> {
     }
 
     pub fn upsert_art(&mut self, a: &NewArt) -> Result<i64> {
-        upsert_art_in(&self.tx, a)
+        upsert_art_in(&self.tx, a, &mut self.verified_art)
     }
 
     pub fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> Result<()> {

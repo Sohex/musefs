@@ -1,6 +1,11 @@
+import hashlib
+import sqlite3
+
+import pytest
 from conftest import JPEG, PNG, insert_track
 
 from musefs_common import (
+    ArtDigestMismatch,
     connect,
     replace_tags,
     replace_track_art,
@@ -116,5 +121,29 @@ def test_replace_track_art_multiple_rows_ordered(db_path):
         conn.commit()
         rows = conn.execute("SELECT art_id FROM track_art WHERE track_id=?", (tid,)).fetchall()
         assert rows == [(b,)]
+    finally:
+        conn.close()
+
+
+def test_upsert_art_refuses_a_row_whose_digest_names_other_bytes(db_path):
+    """musefs #724: a row filed under the digest of bytes it does not hold is
+    refused rather than returned, while an honest duplicate still dedups."""
+    conn = connect(db_path)
+    try:
+        honest = upsert_art(conn, JPEG)
+        real = b"REAL-IMAGE-X"
+        conn.execute(
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?, 3, ?)",
+            (hashlib.sha256(real).hexdigest(), b"YYY"),
+        )
+        planted = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        with pytest.raises(ArtDigestMismatch) as refused:
+            upsert_art(conn, real)
+        assert refused.value.art_id == planted
+        assert refused.value.sha256 == hashlib.sha256(real).hexdigest()
+        assert isinstance(refused.value, sqlite3.IntegrityError)
+
+        assert upsert_art(conn, JPEG) == honest
     finally:
         conn.close()

@@ -167,18 +167,47 @@ impl<M> Db<M> {
 
 /// Insert `a` (deduplicated by content sha256) and return its `art` id. Runs on
 /// `conn` so `Db<ReadWrite>` and `BulkWriter` share one body.
-pub(crate) fn upsert_art_in(conn: &rusqlite::Connection, a: &NewArt) -> Result<i64> {
+///
+/// A conflict hands back the row already filed under the digest, and a store is
+/// only content-addressed if that row really holds these bytes. Nothing in the
+/// schema ties `sha256` to `data`, so a crafted row can claim a digest it does
+/// not match (#724). A conflicting row is therefore compared with the incoming
+/// bytes — in SQL, so nothing is re-hashed — and a mismatch is an error rather
+/// than a link. A fresh insert needs no comparison: it just stored these bytes.
+///
+/// `verified` records rows already compared, so a writer that meets one cover
+/// on every track of an album pays one blob comparison for it, not one per
+/// track. Only compared rows are recorded; a rolled-back insert cannot leave an
+/// id in it that some other row later reuses.
+pub(crate) fn upsert_art_in(
+    conn: &rusqlite::Connection,
+    a: &NewArt,
+    verified: &mut std::collections::HashSet<i64>,
+) -> Result<i64> {
     let sha = sha256_hex(&a.data);
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT INTO art (sha256, byte_len, data)
          VALUES (?1, ?2, ?3) ON CONFLICT(sha256) DO NOTHING",
         params![sha, a.data.len() as u64, a.data],
     )?;
-    Ok(
-        conn.query_row("SELECT id FROM art WHERE sha256 = ?1", params![sha], |r| {
-            r.get(0)
-        })?,
-    )
+    let id: i64 = conn.query_row("SELECT id FROM art WHERE sha256 = ?1", params![sha], |r| {
+        r.get(0)
+    })?;
+    if inserted == 0 && !verified.contains(&id) {
+        let holds_these_bytes: bool = conn.query_row(
+            "SELECT data = ?2 FROM art WHERE id = ?1",
+            params![id, a.data],
+            |r| r.get(0),
+        )?;
+        if !holds_these_bytes {
+            return Err(crate::error::DbError::ArtDigestMismatch {
+                art_id: id,
+                sha256: sha,
+            });
+        }
+        verified.insert(id);
+    }
+    Ok(id)
 }
 
 /// Replace a track's `track_art` links. Runs on `conn` so `Db<ReadWrite>` (own
@@ -215,8 +244,12 @@ pub(crate) fn set_track_art_in(
 }
 
 impl Db<ReadWrite> {
+    /// Insert `a`, deduplicated by content, and return its `art` id. A row filed
+    /// under the same digest is verified to hold these bytes before it is
+    /// returned (#724); see [`upsert_art_in`]. Each call verifies afresh — a
+    /// bulk scan remembers what it verified through [`crate::BulkWriter`].
     pub fn upsert_art(&self, a: &NewArt) -> Result<i64> {
-        upsert_art_in(&self.conn, a)
+        upsert_art_in(&self.conn, a, &mut std::collections::HashSet::new())
     }
 
     pub fn set_track_art(&self, track_id: i64, items: &[TrackArt]) -> Result<()> {
@@ -266,6 +299,40 @@ mod guard_tests {
             .unwrap();
         let art = db.upsert_art(&NewArt { data: vec![0u8] }).unwrap();
         (db, track, art)
+    }
+
+    /// #724: a row filed under the digest of bytes it does not hold is refused
+    /// rather than linked — through `Db` and through a bulk writer, on every
+    /// attempt, since a refused row is never recorded as verified — while an
+    /// honest duplicate still dedups to the row it matches.
+    #[test]
+    fn a_row_whose_digest_names_other_bytes_is_refused_not_linked() {
+        let (db, _track, honest) = db_track_art();
+        let real = b"REAL-IMAGE-X".to_vec();
+        let planted_sha = crate::art::sha256_hex(&real);
+        db.conn
+            .execute(
+                "INSERT INTO art (sha256, byte_len, data) VALUES (?1, 3, X'595959')",
+                rusqlite::params![planted_sha],
+            )
+            .unwrap();
+        let planted = db.conn.last_insert_rowid();
+
+        let err = db.upsert_art(&NewArt { data: real.clone() }).unwrap_err();
+        assert!(
+            matches!(err, DbError::ArtDigestMismatch { art_id, .. } if art_id == planted),
+            "{err:?}"
+        );
+
+        let mut bulk = db.bulk_writer().unwrap();
+        for _ in 0..2 {
+            let err = bulk.upsert_art(&NewArt { data: real.clone() }).unwrap_err();
+            assert!(matches!(err, DbError::ArtDigestMismatch { .. }), "{err:?}");
+        }
+        let again = bulk.upsert_art(&NewArt { data: vec![0u8] }).unwrap();
+        assert_eq!(again, honest, "an honest duplicate still dedups");
+        let again = bulk.upsert_art(&NewArt { data: vec![0u8] }).unwrap();
+        assert_eq!(again, honest, "and a verified one dedups again");
     }
 
     /// A value whose SQLite character length is 1 and whose byte length is

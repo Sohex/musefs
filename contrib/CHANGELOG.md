@@ -12,6 +12,17 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ### Fixed
 
+- **`upsert_art` refuses an `art` row whose digest names other bytes**
+  (musefs #724). On a `sha256` conflict it returned the row already filed under
+  the digest without looking at it, so a crafted or corrupt store holding a row
+  whose `sha256` does not match its `data` handed that row's image to every
+  track syncing the real one. It now compares the conflicting row's bytes with
+  the incoming image and raises the new `ArtDigestMismatch` on a mismatch. That
+  exception is a `sqlite3.IntegrityError`, so `sync_one` skips the one record
+  and counts it under `skipped_invalid`, exactly as it does for a constraint
+  violation, rather than aborting the sync. `musefs scan` does the same on the
+  Rust side.
+
 - **A backing path that is not valid UTF-8 now resolves to the right track, and
   two such files stay two.** `realpath_key` used to normalize undecodable bytes
   to `U+FFFD`, reproducing what the scanner itself stored back when it wrote a
