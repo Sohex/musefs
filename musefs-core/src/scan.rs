@@ -240,6 +240,10 @@ const SCAN_WARN_BURST: u64 = 10;
 enum SkipReason {
     /// Supported extension, but the bytes did not parse.
     Unparseable,
+    /// Parsed, but in a shape musefs refuses to serve: a chained Ogg (#722). A
+    /// property of the file rather than of the attempt, which is what lets
+    /// `revalidate --prune` act on it (#747).
+    Unsupported,
     /// Metadata over a storage cap — art, tag field, or binary frame (#644).
     Oversize,
     /// The store refused this file's rows on a constraint the scanner does not
@@ -264,8 +268,9 @@ enum SkipReason {
 impl SkipReason {
     /// Every reason, in [`FailureTally`]'s array order (each reason indexes that
     /// array by its discriminant).
-    const ALL: [SkipReason; 9] = [
+    const ALL: [SkipReason; 10] = [
         SkipReason::Unparseable,
+        SkipReason::Unsupported,
         SkipReason::Oversize,
         SkipReason::Rejected,
         SkipReason::Io,
@@ -278,8 +283,9 @@ impl SkipReason {
 
     /// The reasons that increment `ScanStats::failed`. They partition it
     /// exactly, which is what makes the `failed N: ...` breakdown trustworthy.
-    const FAILED: [SkipReason; 6] = [
+    const FAILED: [SkipReason; 7] = [
         SkipReason::Unparseable,
+        SkipReason::Unsupported,
         SkipReason::Oversize,
         SkipReason::Rejected,
         SkipReason::Io,
@@ -295,6 +301,7 @@ impl SkipReason {
     fn label(self) -> &'static str {
         match self {
             SkipReason::Unparseable => "unparseable",
+            SkipReason::Unsupported => "unsupported",
             SkipReason::Oversize => "oversize",
             SkipReason::Rejected => "rejected",
             SkipReason::Io => "io",
@@ -448,11 +455,19 @@ enum ProbeBody {
 struct Failure {
     reason: SkipReason,
     message: String,
+    /// The file's stamp, when the verdict came from a probe that held the file
+    /// still across it (`probe_file`'s fstat sandwich). `revalidate --prune`
+    /// deletes a refused row only while its file still carries this (#747).
+    stamp: Option<BackingStamp>,
 }
 
 impl Failure {
     fn new(reason: SkipReason, message: String) -> Failure {
-        Failure { reason, message }
+        Failure {
+            reason,
+            message,
+            stamp: None,
+        }
     }
 }
 
@@ -990,7 +1005,10 @@ fn probe_file(path: &Path, window: usize, tier: ChecksumTier) -> std::io::Result
     }
     Ok(match settled {
         Ok((p, c)) => ProbeOutcome::Probed(p, s1, c),
-        Err(f) => ProbeOutcome::Failed(f),
+        Err(f) => ProbeOutcome::Failed(Failure {
+            stamp: Some(s1),
+            ..f
+        }),
     })
 }
 
@@ -1143,6 +1161,12 @@ fn probe_body(
                     format!("skipping {}: {why}", path.display()),
                 )));
             }
+            Probe::Unsupported(why) => {
+                return Ok(ProbeBody::Failed(Failure::new(
+                    SkipReason::Unsupported,
+                    format!("skipping {}: {why}", path.display()),
+                )));
+            }
             Probe::NeedMore(up_to) => {
                 // Read everything we're willing to probe? Widening can't help.
                 if want as u64 >= probe_cap {
@@ -1198,6 +1222,9 @@ enum Probe {
     /// The file is not servable, for the reason named — which reaches the user as
     /// `skipping <path>: <reason>`.
     Skip(&'static str),
+    /// The file parsed, but is in a shape musefs refuses to serve. Reported the
+    /// same way as [`Probe::Skip`], under its own reason (#747).
+    Unsupported(&'static str),
 }
 
 /// What [`Probe::Skip`] says when nothing about a file parsed at all.
@@ -1263,7 +1290,7 @@ fn probe_prefix(
                 if ogg_tail.is_some_and(|t| {
                     ogg::classify_tail(&t.bytes, t.start, header.serial) == ogg::Chaining::Chained
                 }) {
-                    return Probe::Skip("chained Ogg (more than one logical bitstream)");
+                    return Probe::Unsupported("chained Ogg (more than one logical bitstream)");
                 }
                 let format = match header.codec {
                     ogg::Codec::Opus => Format::Opus,
@@ -2297,7 +2324,14 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
         });
     }
     db.apply_bulk_pragmas_self()?; // scan-scoped tuning on the caller's connection
-    let mut stats = run_pipeline(db, files, opts, WritePolicy::Full, &failures)?;
+    let mut stats = run_pipeline(
+        db,
+        files,
+        opts,
+        WritePolicy::Full,
+        &failures,
+        &Arc::default(),
+    )?;
     // skipped is tallied during the walk, not the pipeline
     stats.skipped = tally.total;
     stats.already_present = already_present;
@@ -2358,6 +2392,7 @@ fn run_pipeline(
     opts: &ScanOptions,
     policy: WritePolicy,
     failures: &Arc<FailureTally>,
+    unsupported: &Arc<std::sync::Mutex<Vec<(PathBuf, BackingStamp)>>>,
 ) -> Result<ScanStats> {
     use std::sync::atomic::AtomicUsize;
 
@@ -2389,6 +2424,7 @@ fn run_pipeline(
         let failed = Arc::clone(&failed);
         let raced = Arc::clone(&raced);
         let failures = Arc::clone(failures);
+        let unsupported = Arc::clone(unsupported);
         workers.push(std::thread::spawn(move || {
             loop {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
@@ -2454,6 +2490,16 @@ fn run_pipeline(
                         }
                     }
                     Ok(ProbeOutcome::Failed(f)) => {
+                        // A refusal of the file's shape, from a probe that held
+                        // it still: what `revalidate --prune` may act on (#747).
+                        if f.reason == SkipReason::Unsupported
+                            && let Some(stamp) = f.stamp
+                        {
+                            unsupported
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((abs_path.clone(), stamp));
+                        }
                         failures.record(f.reason, format_args!("{}", f.message));
                         failed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2741,6 +2787,11 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
 /// dispatched, so workers remain DB-free. A `stat`/`canonicalize` failure on a
 /// candidate during the skip pass is counted in `failed` (and the file is left
 /// for the next revalidation) rather than re-probed or pruned.
+///
+/// With `prune`, a track whose file is present but refused as unsupported
+/// (chained Ogg an older binary stored) is deleted as well, provided the file
+/// is unchanged since the refusing probe (#747). It still counts in `failed`
+/// for that pass: the file was refused.
 pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<RevalidateStats> {
     // Canonicalize once; see scan_directory_with (#440). The prune pass below reuses
     // this canonical root for its `starts_with` scope check.
@@ -2859,9 +2910,36 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     }
 
     let mut pruned = 0u64;
-    let scan = run_pipeline(db, changed, opts, WritePolicy::StructuralOnly, &failures)?;
+    let unsupported: Arc<std::sync::Mutex<Vec<(PathBuf, BackingStamp)>>> = Arc::default();
+    let scan = run_pipeline(
+        db,
+        changed,
+        opts,
+        WritePolicy::StructuralOnly,
+        &failures,
+        &unsupported,
+    )?;
+    let refused = std::mem::take(
+        &mut *unsupported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
 
     if opts.prune {
+        // A stored file this build refuses to serve — a chained Ogg an older
+        // binary accepted (#722) — can be neither re-probed nor rescanned into a
+        // row, so it failed every revalidate for as long as it existed (#747).
+        // Only that refusal counts, never a file that failed to parse or could
+        // not be read, and only while the file still carries the stamp the
+        // refusing probe saw: one rewritten since deserves the next pass.
+        for (path, stamp) in refused {
+            let as_refused = std::fs::metadata(&path)
+                .is_ok_and(|meta| BackingStamp::from_metadata(&meta) == stamp);
+            if as_refused && let Some(track) = db.get_track_by_path(&path)? {
+                db.delete_track(track.id)?;
+                pruned += 1;
+            }
+        }
         let canon_root = root;
         for track in db.list_tracks()? {
             if !Path::new(&track.backing_path).starts_with(canon_root) {
@@ -2875,6 +2953,12 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             }
         }
         db.gc_orphan_art()?;
+    } else if !refused.is_empty() {
+        log::warn!(
+            "{} stored track(s) are in a form this version refuses to serve and fail every \
+             revalidate; `musefs revalidate --prune` removes them",
+            refused.len()
+        );
     }
 
     log_failure_summaries(&failures);

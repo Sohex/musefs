@@ -647,6 +647,16 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **A chained Ogg file stored by 1.3.0 no longer fails every revalidate for
+  good.** 2.0.0 refuses chained Ogg at scan time, which left the rows an older
+  binary stored with no way out: `revalidate` re-probed each one, was refused,
+  wrote nothing, and counted it in `failed` — exiting `2` — on every run, while
+  neither `scan --force` nor `--prune` (which only removed rows whose file was
+  gone) could remove it. `revalidate --prune` now also deletes a row whose
+  file is present but refused as unsupported, only for that refusal and only
+  while the file is unchanged since; without `--prune` the run says how many
+  there are. The failure breakdown gains an `unsupported` reason
+  ([#747](https://github.com/Sohex/musefs/issues/747)).
 - **A revalidate restores each file's own picture metadata.** The schema v4
   migration can only copy one blob's MIME type and dimensions onto every link
   to it, with FLAC's depth and colour count at 0, and said the real values

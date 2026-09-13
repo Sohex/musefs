@@ -167,6 +167,70 @@ fn scan_skips_a_chained_ogg_and_says_so() {
     assert!(logged[0].contains("chained Ogg"), "{}", logged[0]);
 }
 
+/// Plant the row an older binary stored for `path`: every build since #722
+/// refuses a chained file, so no scan of this one would write it (#747).
+fn plant_stored_row(db: &musefs_db::Db, path: &std::path::Path) {
+    let meta = std::fs::metadata(path).unwrap();
+    let stamp = BackingStamp::from_metadata(&meta);
+    db.upsert_track(&musefs_db::NewTrack {
+        backing_path: std::fs::canonicalize(path).unwrap(),
+        format: Format::Opus,
+        audio_offset: 0,
+        audio_length: meta.len(),
+        backing_size: stamp.size,
+        backing_mtime_ns: stamp.mtime_ns,
+        backing_ctime_ns: stamp.ctime_ns,
+        // As V4 leaves every row, which makes revalidate re-probe it.
+        backing_ino: None,
+    })
+    .unwrap();
+}
+
+/// #747: a chained Ogg row stored before 2.0.0 fails every revalidate — the
+/// probe refuses it and nothing is written — and neither a rescan nor pruning
+/// missing files removes it. `--prune` does, and only for that refusal: a stored
+/// file that merely fails to parse, which a download still in progress can,
+/// keeps its row.
+#[test]
+fn revalidate_prunes_a_stored_chained_ogg_only_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let chained = dir.path().join("stuck-chained.opus");
+    std::fs::write(&chained, chained_opus_bytes()).unwrap();
+    let broken = dir.path().join("stuck-broken.opus");
+    std::fs::write(&broken, b"OggS and nothing after it").unwrap();
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    plant_stored_row(&db, &chained);
+    plant_stored_row(&db, &broken);
+
+    for pass in 0..2 {
+        let stats = crate::revalidate(&db, dir.path()).unwrap();
+        assert_eq!(
+            (stats.failed, stats.pruned),
+            (2, 0),
+            "pass {pass}: both fail, neither is pruned unasked"
+        );
+        assert_eq!(db.list_tracks().unwrap().len(), 2);
+    }
+
+    let opts = ScanOptions {
+        prune: true,
+        ..ScanOptions::default()
+    };
+    let stats = crate::revalidate_with(&db, dir.path(), &opts).unwrap();
+    assert_eq!(stats.pruned, 1, "the chained row, and only it");
+    let left = db.list_tracks().unwrap();
+    assert_eq!(left.len(), 1);
+    assert!(
+        left[0].backing_path.ends_with("stuck-broken.opus"),
+        "the unparseable file keeps its row: {}",
+        left[0].backing_path.display()
+    );
+
+    let stats = crate::revalidate(&db, dir.path()).unwrap();
+    assert_eq!(stats.failed, 1, "the failure count comes back down");
+}
+
 #[test]
 fn scan_ingests_an_oggflac_whose_header_count_is_unknown() {
     // A zero following-packet count means "unknown", not "none": the real

@@ -25,7 +25,12 @@ musefs revalidate /path/to/music --db library.db --prune  # also delete gone tra
 
 By default `revalidate` never deletes anything. Pass `--prune` to delete tracks
 whose backing file is gone from disk (scoped to the revalidated root) and
-garbage-collect any art left unreferenced. Pruning is opt-in because it removes
+garbage-collect any art left unreferenced. It also deletes a track whose file is
+still there but in a form this version refuses to serve — a chained Ogg stored
+by 1.3.0, which no scan can refresh and which otherwise fails every revalidate
+([#747](https://github.com/Sohex/musefs/issues/747)). Only that refusal counts:
+a file that fails to parse, or cannot be read, keeps its row. Without
+`--prune`, a revalidate that meets one says so. Pruning is opt-in because it removes
 a track's curated metadata along with its row, so a transient mount blip or an
 unplugged drive can't silently drop your edits.
 
