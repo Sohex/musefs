@@ -869,6 +869,51 @@ mod checksum_tests {
         assert_eq!(raw, 0);
     }
 
+    /// An inode above `i64::MAX` must reach the store. `st_ino` is a full
+    /// `u64` and FUSE and network filesystems synthesize inode numbers freely,
+    /// so this is a range real backing filesystems reach — and rusqlite's `u64`
+    /// binding refuses it outright (`ToSqlConversionFailure(PosOverflow)`).
+    /// Worse than losing the guard: a bind failure is not a constraint
+    /// violation, so the scanner treats it as fatal and the whole run aborts.
+    #[test]
+    fn an_inode_past_i64_max_is_stored_and_read_back() {
+        let db = Db::open_in_memory().unwrap();
+        let huge = u64::try_from(i64::MAX).unwrap() + 1;
+        let id = db
+            .upsert_track(&NewTrack {
+                backing_ino: Some(huge),
+                ..new_track("/huge.flac")
+            })
+            .expect("an inode past i64::MAX must not fail the write");
+        assert_eq!(db.get_track(id).unwrap().unwrap().backing_ino, Some(huge));
+        assert_eq!(
+            db.track_identity(id).unwrap().unwrap().backing_ino,
+            Some(huge)
+        );
+        // Stored negative, which is what the dropped `>= 0` CHECK was in the
+        // way of: the column holds the bit pattern, not the magnitude.
+        let raw: i64 = db
+            .conn
+            .query_row("SELECT backing_ino FROM tracks WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(raw < 0, "expected a negative bit pattern, got {raw}");
+
+        // And `u64::MAX` — the value whose bit pattern is -1 — is still not the
+        // sentinel, so the busiest edge case does not read back as unrecorded.
+        let max = db
+            .upsert_track(&NewTrack {
+                backing_ino: Some(u64::MAX),
+                ..new_track("/max.flac")
+            })
+            .unwrap();
+        assert_eq!(
+            db.get_track(max).unwrap().unwrap().backing_ino,
+            Some(u64::MAX)
+        );
+    }
+
     /// The upsert half of the same round trip: a re-scan that now knows the
     /// inode must overwrite the sentinel rather than leave the row unrecorded.
     #[test]

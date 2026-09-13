@@ -576,6 +576,18 @@ see the [Release notes](release-notes.md).
   for an upgraded store alongside the structural-block and checksum backfills it
   already covered.
 
+  The column stores the inode's **two's-complement bit pattern**, so a file
+  whose inode is above `i64::MAX` records a negative value. SQLite has no
+  unsigned 64-bit integer and `st_ino` is a full `u64`, so an encoding is
+  forced — and the alternative is not a lost guard but a failed scan: rusqlite
+  refuses the bind, and a bind failure is not a constraint violation, so the
+  scanner classifies it as fatal and the whole run aborts. That range is not
+  theoretical; FUSE and network filesystems synthesize inode numbers freely,
+  and several pooling and cloud-mount filesystems hash to produce them. The
+  encoding is a bijection and the column is only ever compared for equality, so
+  it costs nothing it is used for. The v4 `CHECK` therefore pins the storage
+  class without a lower bound.
+
   The comparison is a named, asymmetric method rather than `==`: one side is
   stored and may know nothing, the other is live and always knows, and the
   sentinel rule is not transitive — a stamp with no recorded inode matches two

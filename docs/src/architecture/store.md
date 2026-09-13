@@ -86,6 +86,17 @@ the binary.
 `updated_at`) and all of `structural_blocks`: those are derived from probing
 the file, and external tools must run `musefs scan` rather than compute them.
 
+**`backing_ino` is a bit pattern, not a magnitude.** From schema v4 `tracks`
+records the backing file's inode as part of the freshness stamp, stored as the
+inode's two's-complement `i64` bit pattern — so a file whose inode is above
+`i64::MAX` has a *negative* value in the column. SQLite has no unsigned 64-bit
+integer and `st_ino` is a full `u64`, so some encoding is forced; this one is a
+bijection, and the column is only ever compared for equality (the invalidation
+trigger, and the Rust freshness stamp), never ordered or summed. Zero is the
+sentinel for "not recorded", which every row in a store upgraded to v4 carries
+until a scan fills it in. A reader decoding this column must cast the bit
+pattern back rather than treat a negative value as invalid.
+
 **`backing_path` is bytes, not text.** From schema v4 it is a `BLOB`, because a
 filesystem path is a byte string and the lossy text round-trip collapsed two
 distinct files onto one row. This matters to a *reader* as much as a writer:

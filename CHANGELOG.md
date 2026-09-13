@@ -336,6 +336,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replacement shape is what almost every tagger produces, writing a temporary
   file and renaming over the original.
 
+  The column stores the inode's two's-complement bit pattern, so an inode above
+  `i64::MAX` reads back negative: SQLite has no unsigned 64-bit integer and
+  `st_ino` is a full `u64`. It is compared only for equality, never ordered, so
+  the encoding costs nothing it is used for.
+
   A row with no recorded inode — every row in a store upgraded to 2.0.0 —
   is compared on the other three fields alone rather than failing closed on a
   field the store has nothing to say about, so an upgrade does not take a

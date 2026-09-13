@@ -519,6 +519,12 @@ CREATE TABLE tracks (
     -- remember that. `musefs scan --revalidate` re-probes exactly the rows
     -- still holding the sentinel, which is what makes it the repopulation path
     -- for an upgraded store.
+    --
+    -- Stored as the inode's two's-complement bit pattern, so a value above
+    -- i64::MAX reads back negative: `st_ino` is a u64 and SQLite has no
+    -- unsigned 64-bit integer. Compared only for equality (the `<>` in
+    -- `tracks_geometry_au`, and the Rust freshness stamp), never ordered or
+    -- summed, so the encoding costs nothing it is used for.
     backing_ino      INTEGER NOT NULL DEFAULT 0,
     CHECK (typeof(backing_path) = 'blob'
            AND length(backing_path) > 0
@@ -536,7 +542,12 @@ CREATE TABLE tracks (
     -- Rust side reads both as i64.
     CHECK (typeof(backing_mtime_ns) = 'integer'),
     CHECK (typeof(backing_ctime_ns) = 'integer'),
-    CHECK (typeof(backing_ino) = 'integer' AND backing_ino >= 0),
+    -- No lower bound: the column holds the inode's two's-complement bit
+    -- pattern, so an inode above i64::MAX is stored negative. SQLite INTEGER is
+    -- signed 64-bit and `st_ino` is a full u64, so the encoding is forced --
+    -- see `models::ino_to_col`. The storage class is still pinned, which is the
+    -- half that stops a Rust-side conversion failure.
+    CHECK (typeof(backing_ino) = 'integer'),
     CHECK (typeof(content_version) = 'integer' AND content_version >= 0),
     CHECK (typeof(updated_at) = 'integer' AND updated_at >= 0),
     CHECK (audio_offset + audio_length <= backing_size),

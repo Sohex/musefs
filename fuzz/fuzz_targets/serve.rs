@@ -32,6 +32,7 @@ fn setup(
             backing_size: meta.len(),
             backing_mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
             backing_ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+            backing_ino: Some(meta.ino()),
         })
         .ok()?;
     db.replace_tags(id, &[Tag::new("title", "T", 0)]).ok()?;
