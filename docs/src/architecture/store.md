@@ -256,8 +256,9 @@ dimensions, colour depth and indexed-colour count live on the link, because they
 describe one file's picture block rather than the image every file shares. While
 `art` owned them, two files holding byte-identical art served whichever one the
 scan reached first — including its declared MIME type. The columns still exist on
-`art` and are vestigial: nothing reads or writes them, and they go when the
-`contrib` plugins stop inserting them.
+`art` and are vestigial: **nothing reads them**, and musefs no longer writes
+them. The `contrib` plugins still insert `mime`, which is the only reason the
+columns are still there; they go when those writers move.
 
 **Art is immutable once written.** `art` rows are content-addressed by
 `sha256`; a trigger rejects any in-place `UPDATE` of an art row's **key or**
