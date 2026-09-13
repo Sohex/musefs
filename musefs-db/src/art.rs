@@ -319,13 +319,26 @@ mod guard_tests {
     /// Plant an `art` row with an arbitrary mime, returning its id. `art` rows
     /// are immutable under the V5 `art_reject_content_update` trigger, so the
     /// row goes in by INSERT rather than by mutating an existing one.
+    /// Plant an `art` row whose mime the schema now refuses.
+    ///
+    /// V4 bans an embedded NUL outright (#693), so this row can only arrive the
+    /// way the threat model says it does — written before the ban, or by a
+    /// writer that turned the constraints off. Guarding it at read time is the
+    /// whole point: no constraint added later can clean a store that already
+    /// holds one.
     fn insert_art_with_mime(db: &Db, mime: &str) -> i64 {
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         db.conn
             .execute(
                 "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
                  VALUES (?1, ?2, NULL, NULL, 1, X'00')",
                 rusqlite::params!["c".repeat(64), mime],
             )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
         db.conn.last_insert_rowid()
     }
@@ -363,12 +376,21 @@ mod guard_tests {
         let mut sha = "a".repeat(usize::try_from(ART_SHA256_LEN).unwrap());
         sha.push('\0');
         sha.push_str(&"b".repeat(usize::try_from(ART_SHA256_LEN).unwrap() * 4));
+        // Planted with the constraints off, like the mime case above: the
+        // schema bans the NUL now, and the read guard is what protects a store
+        // that already holds such a row.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         db.conn
             .execute(
                 "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
                  VALUES (?1, 'image/png', NULL, NULL, 1, X'00')",
                 rusqlite::params![sha],
             )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
         let bad = db.conn.last_insert_rowid();
         let err = db.get_art(bad).unwrap_err();

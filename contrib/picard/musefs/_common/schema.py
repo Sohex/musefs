@@ -563,8 +563,11 @@ CREATE TABLE tracks (
 -- a rescan, while carrying a value the new CHECK rejects would abort the whole
 -- upgrade over a column that rebuilds itself. The other tightened columns are
 -- NOT sanitized here -- they are either structural or NOT NULL, so a row that
--- violates them fails the migration, which is what the row-rejection pre-flight
--- and its repair flag exist to report ahead of time.
+-- violates them fails the migration. That failure is atomic: every step runs in
+-- one transaction, so nothing is half-applied and the store is exactly as it
+-- was. Repairing such a row, or reporting it before the run starts, is the
+-- command's business rather than this SQL's -- rewriting a value an external
+-- writer chose is precisely what must not happen without being asked.
 INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
                     backing_size, backing_mtime_ns, content_version, updated_at,
                     backing_ctime_ns, fingerprint, content_hash, backing_ino)
@@ -661,6 +664,61 @@ CREATE TABLE track_art (
     CHECK (typeof(depth) = 'integer' AND depth BETWEEN 0 AND 4294967295),
     CHECK (typeof(colors) = 'integer' AND colors BETWEEN 0 AND 4294967295)
 );
+
+-- 6. Rebuild `art`. This has to happen *here*, between `track_art` being
+-- recreated and the children being refilled, and the window is narrow for a
+-- reason: `track_art.art_id` references `art(id)` with no ON DELETE CASCADE, so
+-- with foreign keys enforced `DROP TABLE art` fails outright while any link row
+-- exists. Right now none does -- the cascade emptied `track_art` and the refill
+-- below has not run yet -- so this is the one point in the migration where the
+-- table can be replaced at all.
+--
+-- This is also the expensive step: every image blob is copied twice, and the
+-- store transiently holds about its own size again. That cost is what the
+-- command's free-space pre-flight exists to check before starting.
+--
+-- The refill is straight: `art` carries no scanner-owned column a rescan could
+-- recompute, so there is nothing here that the sanitize-only-under-a-flag
+-- policy would let this step null on its own. A row the tightened constraints
+-- reject fails the migration, atomically, the way it does for the rebuilds above.
+CREATE TABLE art_hold_v4 (
+    id INTEGER, sha256 TEXT, mime TEXT, width INTEGER, height INTEGER,
+    byte_len INTEGER, data BLOB
+);
+INSERT INTO art_hold_v4
+    SELECT id, sha256, mime, width, height, byte_len, data FROM art;
+DROP TABLE art;
+CREATE TABLE art (
+    id       INTEGER PRIMARY KEY,
+    sha256   TEXT NOT NULL UNIQUE,
+    -- mime/width/height still live here. #716 moves them to `track_art`, which
+    -- happened above, but the readers do not switch over until the Rust half --
+    -- and a column cannot be dropped while the code still selects it. They go
+    -- when that lands.
+    mime     TEXT NOT NULL,
+    width    INTEGER,
+    height   INTEGER,
+    byte_len INTEGER NOT NULL,
+    data     BLOB NOT NULL,
+    CHECK (typeof(sha256) = 'text'
+           AND length(sha256) = 64
+           AND instr(sha256, char(0)) = 0),
+    CHECK (typeof(mime) = 'text'
+           AND length(mime) <= 255
+           AND instr(mime, char(0)) = 0),
+    CHECK (width IS NULL
+           OR (typeof(width) = 'integer' AND width BETWEEN 0 AND 4294967295)),
+    CHECK (height IS NULL
+           OR (typeof(height) = 'integer' AND height BETWEEN 0 AND 4294967295)),
+    CHECK (typeof(byte_len) = 'integer'
+           AND byte_len >= 0
+           AND byte_len <= 16711680),
+    CHECK (typeof(data) = 'blob'),
+    CHECK (byte_len = length(data))
+);
+INSERT INTO art (id, sha256, mime, width, height, byte_len, data)
+    SELECT id, sha256, mime, width, height, byte_len, data FROM art_hold_v4;
+DROP TABLE art_hold_v4;
 
 INSERT INTO tags (track_id, key, value, ordinal, value_blob)
     SELECT track_id, key, value, ordinal, value_blob FROM tags_hold_v4;
@@ -787,6 +845,28 @@ CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
                       updated_at = CAST(strftime('%s','now') AS INTEGER)
     WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
 END;
+-- `art` rows are content-addressed, so their content columns are immutable. The
+-- DROP TABLE above took this trigger with it; it comes back with `id` in the
+-- guard (#719). Changing the key changes none of the content columns, so the
+-- old WHEN clause was false and the trigger never fired -- and under the
+-- foreign-keys-off writer this store already defends against, that silently
+-- orphaned every link while `art_ad` (AFTER DELETE only) never saw an id
+-- change, so nothing bumped `content_version` and a cached layout kept serving.
+-- `<>` on id rather than IS NOT: it is the rowid alias and cannot be NULL.
+CREATE TRIGGER art_reject_content_update
+BEFORE UPDATE ON art
+WHEN NEW.id     <> OLD.id
+  OR NEW.data   <> OLD.data
+  OR NEW.sha256 <> OLD.sha256
+  OR NEW.mime   <> OLD.mime
+  OR NEW.byte_len <> OLD.byte_len
+  OR NEW.width  IS NOT OLD.width
+  OR NEW.height IS NOT OLD.height
+BEGIN
+    SELECT RAISE(ABORT,
+        'art rows are immutable; insert a new content-addressed row and relink via track_art');
+END;
+
 -- Row ownership is immutable (#717), matching what `art_reject_content_update`
 -- already says about art content. Reparenting a row is not one edit to one
 -- thing -- two tracks change -- and an `AFTER` trigger that has to enumerate

@@ -6,10 +6,10 @@
 (`MIGRATIONS`: the `MIGRATION_V1` baseline, `MIGRATION_V2`, which adds the
 scanner-owned `fingerprint`/`content_hash` columns, `MIGRATION_V3`, which
 widens the `tags.value` and `track_art.description` caps, and `MIGRATION_V4`,
-which rebuilds `tracks`, `tags` and `track_art` — a never-reused
-`AUTOINCREMENT` id, the path as bytes, an inode stamp, storage-class
-constraints, independent ordinal spaces for text and binary tags, per-embedding
-picture columns on the art link, and the retirement of every fingerprint written
+which rebuilds all four core tables — a never-reused `AUTOINCREMENT` id, the
+path as bytes, an inode stamp, storage-class constraints throughout, independent
+ordinal spaces for text and binary tags, per-embedding picture columns on the art
+link, immutable row ownership, and the retirement of every fingerprint written
 before the value included sampled audio); `user_version` records the schema
 version (4).
 The store is the **interface external tools write to** — the beets and Picard
@@ -252,10 +252,12 @@ store already at the latest version — stays silent, since that path runs on
 every open and every mount.
 
 **Art is immutable once written.** `art` rows are content-addressed by
-`sha256`; a trigger rejects any in-place `UPDATE` of an art row's
-content columns (`data`, `sha256`, `mime`, `byte_len`, `width`, `height`) with
-`RAISE(ABORT)` — a multi-row `UPDATE art` touching any content column aborts the
-whole statement. To change a track's art, insert a new content-addressed row
+`sha256`; a trigger rejects any in-place `UPDATE` of an art row's **key or**
+content columns (`id`, `data`, `sha256`, `mime`, `byte_len`, `width`, `height`)
+with `RAISE(ABORT)` — a multi-row `UPDATE art` touching any of them aborts the
+whole statement. `id` is in that list because changing it changes no content
+column: the guard's `WHEN` was false, so the one write that orphans every link
+to the row was the one write it did not stop. To change a track's art, insert a new content-addressed row
 and relink it via `track_art` (which bumps `content_version`); do not mutate an
 existing row. Deleting an `art` row still referenced by `track_art` (possible
 only with `foreign_keys` OFF) bumps every referencing track so the mount serves
