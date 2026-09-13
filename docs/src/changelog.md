@@ -567,7 +567,7 @@ see the [Release notes](release-notes.md).
 
 ### Removed
 
-- **`scan --revalidate`**, deprecated since 1.1.0 in favour of the `revalidate`
+- **`scan --revalidate`**, deprecated since 1.2.0 in favour of the `revalidate`
   subcommand, and its `MUSEFS_REVALIDATE` variable
   ([#707](https://github.com/Sohex/musefs/issues/707)). The flag is now a usage
   error. The variable is refused rather than ignored: clap never reads an
@@ -575,7 +575,7 @@ see the [Release notes](release-notes.md).
   have gone on running a full scan where it used to revalidate, and said
   nothing. `scan` stops with a message naming the subcommand instead.
   `musefs_cli::run_scan` loses its `revalidate` parameter. The `contrib`
-  packages have called the subcommand since their 1.1.0, so only a copy older
+  packages have called the subcommand since their 1.2.0, so only a copy older
   than that is affected.
 
 - **`scan --fast` and `--strict`, replaced by `--match=auto|fast|strict`**, and

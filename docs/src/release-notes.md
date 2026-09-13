@@ -17,7 +17,7 @@ the full list so far.
 something different, so a script or unit that needs updating will tell you:
 
 - **`scan --revalidate` is gone**, with its `MUSEFS_REVALIDATE` variable
-  ([#707]). It has been a deprecated alias since v1.1.0. Run
+  ([#707]). It has been a deprecated alias since v1.2.0. Run
   `musefs revalidate` instead — the alias never pruned, so neither does the
   replacement unless you add `--prune`. The flag is now a usage error (exit `2`).
 - **`scan --fast` and `--strict` are replaced by `--match`** ([#709]):
@@ -38,7 +38,7 @@ these variables and is unaffected, so an environment file shared by the mount
 and scan units only matters to the scan.
 
 **External writers.** No update is needed for these changes: the `contrib/`
-packages have called the `revalidate` subcommand since their 1.1.0 and pass
+packages have called the `revalidate` subcommand since their 1.2.0 and pass
 neither `--fast` nor `--strict`.
 
 **Rust crate API.** This only affects code depending on the musefs crates
