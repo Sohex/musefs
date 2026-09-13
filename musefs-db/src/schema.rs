@@ -574,11 +574,101 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            0
     FROM tracks_hold_v4;
 
+-- 5. Rebuild `tags` and `track_art`. Both are empty right now -- the cascade
+-- above took them -- so this is a drop and a create, with the holding tables as
+-- the source. `structural_blocks` keeps its shape and is simply refilled.
+
+-- `tags` loses its primary key in favour of two partial unique indexes split on
+-- `value_blob IS NULL` (#663). The PK numbered a track's text rows and its
+-- binary rows in one ordinal space per key, and an external writer that
+-- rewrites text rows alone -- which both `contrib` helpers do, scoping their
+-- DELETE to `value_blob IS NULL` so scanner-written binary payloads survive --
+-- could write a text row onto an ordinal a binary row already held. The two
+-- classes now get independent ordinal spaces. The rowid is untouched: binary
+-- tag payloads are addressed by it from the served layout, so it has to keep
+-- meaning what it meant.
+DROP TABLE tags;
+CREATE TABLE tags (
+    track_id   INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    ordinal    INTEGER NOT NULL DEFAULT 0,
+    value_blob BLOB,
+    CHECK (typeof(track_id) = 'integer'),
+    CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    CHECK (value_blob IS NULL OR value = ''),
+    -- instr(key, char(0)) = 0 alongside the character cap (#693): SQLite's
+    -- length() on TEXT stops at the first NUL, so a short prefix plus NUL plus
+    -- a megabyte of anything measured 1 and stored the lot.
+    CHECK (typeof(key) = 'text'
+           AND length(key) <= 256
+           AND length(key) >= 1
+           AND instr(key, char(0)) = 0
+           AND key NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'),
+    CHECK (typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= 16777215),
+    CHECK (value_blob IS NULL
+           OR (typeof(value_blob) = 'blob' AND length(value_blob) <= 16711680))
+);
+
+-- `track_art` gains the per-embedding columns (#716). `mime`, `width` and
+-- `height` describe one file's picture block, not the image bytes every file
+-- shares, so owning them on the deduplicated `art` row was the wrong functional
+-- dependency: whichever occurrence was ingested first chose them for every
+-- track referencing the blob. `depth` and `colors` are new storage for values
+-- FLAC's parser already reads and throws away.
+--
+-- The backfill can only copy the shared values to every link -- the true
+-- per-embedding ones were destroyed at ingest and come back on a rescan, which
+-- is what `musefs migrate`'s rescan offer is for. Until the Rust half reads
+-- from the link and the scanner writes true values, these columns are inert:
+-- nothing reads them, and a link written in the meantime takes the defaults.
+DROP TABLE track_art;
+CREATE TABLE track_art (
+    track_id     INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    art_id       INTEGER NOT NULL REFERENCES art(id),
+    picture_type INTEGER NOT NULL DEFAULT 3,
+    description  TEXT NOT NULL DEFAULT '',
+    mime         TEXT NOT NULL DEFAULT '',
+    width        INTEGER,
+    height       INTEGER,
+    depth        INTEGER NOT NULL DEFAULT 0,
+    colors       INTEGER NOT NULL DEFAULT 0,
+    ordinal      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (track_id, ordinal),
+    CHECK (typeof(track_id) = 'integer'),
+    CHECK (typeof(art_id) = 'integer'),
+    CHECK (typeof(picture_type) = 'integer' AND picture_type BETWEEN 0 AND 20),
+    CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    CHECK (typeof(description) = 'text'
+           AND length(description) <= 8192
+           AND instr(description, char(0)) = 0),
+    -- #693's ban follows the column rather than staying on `art.mime`, which
+    -- the next step removes.
+    CHECK (typeof(mime) = 'text'
+           AND length(mime) <= 255
+           AND instr(mime, char(0)) = 0),
+    -- Upper bounds tie these to the Rust model's width: the geometry is
+    -- Option<u32>, and a schema-valid 2^40 was a conversion failure (#718).
+    CHECK (width IS NULL
+           OR (typeof(width) = 'integer' AND width BETWEEN 0 AND 4294967295)),
+    CHECK (height IS NULL
+           OR (typeof(height) = 'integer' AND height BETWEEN 0 AND 4294967295)),
+    CHECK (typeof(depth) = 'integer' AND depth BETWEEN 0 AND 4294967295),
+    CHECK (typeof(colors) = 'integer' AND colors BETWEEN 0 AND 4294967295)
+);
+
 INSERT INTO tags (track_id, key, value, ordinal, value_blob)
     SELECT track_id, key, value, ordinal, value_blob FROM tags_hold_v4;
-INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal)
-    SELECT track_id, art_id, picture_type, description, ordinal
-    FROM track_art_hold_v4;
+-- LEFT JOIN, not JOIN: a link whose `art` row is missing is an orphan an
+-- older foreign-keys-off writer could leave behind, and it must fail the
+-- migration loudly on `mime`'s NOT NULL rather than be dropped on the floor by
+-- an inner join. `depth`/`colors` start at 0, which is already what both the
+-- format and synthesis take to mean unknown.
+INSERT INTO track_art (track_id, art_id, picture_type, description,
+                       mime, width, height, depth, colors, ordinal)
+    SELECT h.track_id, h.art_id, h.picture_type, h.description,
+           a.mime, a.width, a.height, 0, 0, h.ordinal
+    FROM track_art_hold_v4 h LEFT JOIN art a ON a.id = h.art_id;
 INSERT INTO structural_blocks (track_id, kind, ordinal, body)
     SELECT track_id, kind, ordinal, body FROM structural_blocks_hold_v4;
 
@@ -587,10 +677,24 @@ DROP TABLE tags_hold_v4;
 DROP TABLE track_art_hold_v4;
 DROP TABLE structural_blocks_hold_v4;
 
--- 5. DROP TABLE tracks took its index and its four triggers with it. Recreate
--- the index, and all thirteen triggers verbatim -- with one deliberate
--- exception, noted on tracks_geometry_au below.
+-- 6. Recreate the indexes and the thirteen triggers the drops took with them,
+-- plus what the new shapes add. Verbatim except where noted: `tracks_geometry_au`
+-- gains `backing_ino`, the two `_au` bumps widen to both owners, and two
+-- reparent-refusal triggers are new.
 CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
+
+-- The reverse art -> track_art edge, which went with the DROP TABLE above. Bulk
+-- orphan-GC and the art delete trigger would otherwise scan the whole join
+-- table per deleted row.
+CREATE INDEX track_art_art_id_idx ON track_art(art_id);
+
+-- `tags`' primary key, split in two (#663). The partial indexes give text rows
+-- and binary rows independent ordinal spaces per key, which is the collision an
+-- external writer rewriting one class alone could otherwise provoke.
+CREATE UNIQUE INDEX tags_text_ordinal_idx
+    ON tags(track_id, key, ordinal) WHERE value_blob IS NULL;
+CREATE UNIQUE INDEX tags_binary_ordinal_idx
+    ON tags(track_id, key, ordinal) WHERE value_blob IS NOT NULL;
 
 CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (NEW.id);
@@ -624,10 +728,17 @@ CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
                       updated_at = CAST(strftime('%s','now') AS INTEGER)
     WHERE id = NEW.track_id;
 END;
+-- Both owners, not just the new one (#717). With the refusal below in place the
+-- two are always equal and the set collapses to one row, so this costs a single
+-- identifier in a statement that already runs. The point is that the
+-- invalidation trigger is correct on its own terms rather than correct only
+-- because something else forbids the case it mishandles -- which matters
+-- against a writer that drops triggers through `writable_schema`, a shape this
+-- store's threat model already contemplates.
 CREATE TRIGGER tags_au AFTER UPDATE ON tags BEGIN
     UPDATE tracks SET content_version = content_version + 1,
                       updated_at = CAST(strftime('%s','now') AS INTEGER)
-    WHERE id = NEW.track_id;
+    WHERE id IN (OLD.track_id, NEW.track_id);
 END;
 CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
     UPDATE tracks SET content_version = content_version + 1,
@@ -643,7 +754,7 @@ END;
 CREATE TRIGGER track_art_au AFTER UPDATE ON track_art BEGIN
     UPDATE tracks SET content_version = content_version + 1,
                       updated_at = CAST(strftime('%s','now') AS INTEGER)
-    WHERE id = NEW.track_id;
+    WHERE id IN (OLD.track_id, NEW.track_id);
 END;
 CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
     UPDATE tracks SET content_version = content_version + 1,
@@ -663,6 +774,33 @@ CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
                       updated_at = CAST(strftime('%s','now') AS INTEGER)
     WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
 END;
+-- Row ownership is immutable (#717), matching what `art_reject_content_update`
+-- already says about art content. Reparenting a row is not one edit to one
+-- thing -- two tracks change -- and an `AFTER` trigger that has to enumerate
+-- everything needing invalidation fails silently by serving stale bytes when it
+-- gets that wrong, while a `BEFORE` refusal fails loudly at the write. No
+-- writer needs it: both `contrib` helpers already replace by delete-then-insert.
+--
+-- `<>` rather than `IS NOT` because `track_id` is NOT NULL, matching the
+-- convention `art_reject_content_update` states. The WHEN guard is load-bearing:
+-- `BEFORE UPDATE OF track_id` fires whenever the column appears in a SET list,
+-- so without it a writer rewriting a row wholesale without moving it would be
+-- refused.
+CREATE TRIGGER tags_reject_reparent
+BEFORE UPDATE OF track_id ON tags
+WHEN NEW.track_id <> OLD.track_id
+BEGIN
+    SELECT RAISE(ABORT,
+        'tag ownership is immutable; delete the row and insert it under the new track');
+END;
+CREATE TRIGGER track_art_reject_reparent
+BEFORE UPDATE OF track_id ON track_art
+WHEN NEW.track_id <> OLD.track_id
+BEGIN
+    SELECT RAISE(ABORT,
+        'art link ownership is immutable; delete the row and insert it under the new track');
+END;
+
 ";
 
 /// Ring capacity of the `track_changes` changelog. Must match the literal in
@@ -2044,6 +2182,302 @@ mod v4_tracks_rebuild_tests {
     }
 }
 
+/// The `tags` and `track_art` rebuild: the ordinal split, immutable ownership,
+/// the per-embedding columns, and the constraints both tables gained.
+#[cfg(test)]
+mod v4_tags_and_track_art_rebuild_tests {
+    use rusqlite::Connection;
+
+    /// A V3 store with two tracks that share one deduplicated `art` row -- the
+    /// shape #716 is about -- each linking it with its own description.
+    fn populated_v3() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for (target, migration) in (1i64..).zip(super::MIGRATIONS).take(3) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", target).unwrap();
+        }
+        for path in ["/lib/a.flac", "/lib/b.mp3"] {
+            conn.execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+                 VALUES (?1, 'flac', 4, 6, 10, 0, 0, 0)",
+                [path],
+            )
+            .unwrap();
+        }
+        // One blob, one row: the deduplication that made the geometry shared.
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1, 'image/jpeg', 1200, 1200, 1, X'00')",
+            [&"a".repeat(64)],
+        )
+        .unwrap();
+        for (track, desc) in [(1, "front"), (2, "back")] {
+            conn.execute(
+                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+                 VALUES (?1, 1, 3, ?2, 0)",
+                rusqlite::params![track, desc],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'artist', 'A', 0)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn migrated() -> Connection {
+        let mut conn = populated_v3();
+        super::migrate_all(&mut conn).unwrap();
+        conn
+    }
+
+    /// #663: the primary key numbered a track's text rows and its binary rows in
+    /// one ordinal space per key, so an external writer rewriting one class alone
+    /// -- which both `contrib` helpers do -- could land on an ordinal the other
+    /// class already held. The two partial indexes give them separate spaces.
+    #[test]
+    fn text_and_binary_rows_get_independent_ordinal_spaces() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
+             VALUES (1, 'PRIV', '', X'DEADBEEF', 0)",
+            [],
+        )
+        .unwrap();
+        // The collision this issue is about: a text row on an ordinal a binary
+        // row already holds, under the same key.
+        conn.execute(
+            "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'PRIV', 'v', 0)",
+            [],
+        )
+        .expect("text and binary ordinals are separate spaces now");
+
+        // Within one class the uniqueness still holds, which is what the indexes
+        // are for -- the split must not have simply removed the constraint.
+        assert!(
+            conn.execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'PRIV', 'w', 0)",
+                [],
+            )
+            .is_err(),
+            "two text rows may not share one ordinal"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
+                 VALUES (1, 'PRIV', '', X'BEEF', 0)",
+                [],
+            )
+            .is_err(),
+            "two binary rows may not share one ordinal"
+        );
+    }
+
+    /// #717: reparenting left the old owner serving a stale layout with a
+    /// `content_version` that still matched, because the `_au` bump named only
+    /// the new owner. Ownership is now immutable, the way `art` already is.
+    #[test]
+    fn row_ownership_is_immutable() {
+        let conn = migrated();
+        let tag_err = conn
+            .execute("UPDATE tags SET track_id = 2 WHERE track_id = 1", [])
+            .unwrap_err()
+            .to_string();
+        assert!(tag_err.contains("tag ownership is immutable"), "{tag_err}");
+        let art_err = conn
+            .execute("UPDATE track_art SET track_id = 2 WHERE track_id = 1", [])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            art_err.contains("art link ownership is immutable"),
+            "{art_err}"
+        );
+    }
+
+    /// The `WHEN` guard, which is load-bearing: `BEFORE UPDATE OF track_id`
+    /// fires whenever the column appears in a SET list, so without it a writer
+    /// rewriting a row wholesale without moving it would be refused.
+    #[test]
+    fn a_same_owner_rewrite_is_not_a_reparent() {
+        let conn = migrated();
+        conn.execute(
+            "UPDATE tags SET track_id = 1, value = 'B' WHERE track_id = 1 AND key = 'artist'",
+            [],
+        )
+        .expect("naming track_id without changing it is not a reparent");
+    }
+
+    /// The widened bump is correct on its own terms rather than only because the
+    /// refusal forbids the case it used to mishandle -- which is what matters
+    /// against a writer that drops triggers through `writable_schema`. Dropping
+    /// the refusal is how that writer is simulated.
+    #[test]
+    fn the_bump_names_both_owners_when_the_refusal_is_gone() {
+        let conn = migrated();
+        conn.execute_batch("DROP TRIGGER tags_reject_reparent")
+            .unwrap();
+        let cv = |id: i64| -> i64 {
+            conn.query_row(
+                "SELECT content_version FROM tracks WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (before_1, before_2) = (cv(1), cv(2));
+        conn.execute("UPDATE tags SET track_id = 2 WHERE track_id = 1", [])
+            .unwrap();
+        assert_eq!(cv(1), before_1 + 1, "the track that LOST the row must bump");
+        assert_eq!(
+            cv(2),
+            before_2 + 1,
+            "the track that gained it must bump too"
+        );
+    }
+
+    /// #716's adding half: the per-embedding columns exist on the link and are
+    /// backfilled from the shared `art` row. The migration cannot restore what
+    /// ingest destroyed -- both links get the same values, and the true ones
+    /// come back on a rescan -- but the column is where they now live.
+    #[test]
+    fn track_art_gains_the_per_embedding_columns_backfilled_from_art() {
+        /// One `track_art` row's per-embedding columns, as the link now owns them.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Embedding {
+            track_id: i64,
+            description: String,
+            mime: String,
+            width: Option<i64>,
+            height: Option<i64>,
+            depth: i64,
+            colors: i64,
+        }
+
+        let conn = migrated();
+        let mut stmt = conn
+            .prepare(
+                "SELECT track_id, description, mime, width, height, depth, colors \
+                 FROM track_art ORDER BY track_id",
+            )
+            .unwrap();
+        let rows: Vec<Embedding> = stmt
+            .query_map([], |r| {
+                Ok(Embedding {
+                    track_id: r.get(0)?,
+                    description: r.get(1)?,
+                    mime: r.get(2)?,
+                    width: r.get(3)?,
+                    height: r.get(4)?,
+                    depth: r.get(5)?,
+                    colors: r.get(6)?,
+                })
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        // Both links take the same geometry: the backfill can only copy what the
+        // shared `art` row holds. The true per-embedding values come back on a
+        // rescan, which is what the release notes have to say plainly.
+        let shared = |track_id: i64, description: &str| Embedding {
+            track_id,
+            description: description.into(),
+            mime: "image/jpeg".into(),
+            width: Some(1200),
+            height: Some(1200),
+            depth: 0,
+            colors: 0,
+        };
+        assert_eq!(
+            rows,
+            vec![shared(1, "front"), shared(2, "back")],
+            "each link keeps its own description and takes the shared geometry"
+        );
+    }
+
+    /// #693, following the column: the ban lands on `track_art.description` and
+    /// on `tags.key`.
+    #[test]
+    fn a_nul_bearing_key_or_description_is_refused() {
+        let conn = migrated();
+        let key = format!("k{}more", '\0');
+        assert!(
+            conn.execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, ?1, 'v', 9)",
+                [&key],
+            )
+            .is_err(),
+            "a NUL in a tag key is refused"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE track_art SET description = ?1 WHERE track_id = 1",
+                [&key],
+            )
+            .is_err(),
+            "a NUL in an art description is refused"
+        );
+    }
+
+    /// #718 for these two tables: a schema-valid row must not be a Rust
+    /// conversion failure.
+    #[test]
+    fn storage_classes_and_widths_are_pinned() {
+        let conn = migrated();
+        // A REAL ordinal satisfies `ordinal >= 0` but is not an integer.
+        assert!(
+            conn.execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (1, 'k', 'v', 0.5)",
+                [],
+            )
+            .is_err()
+        );
+        // Geometry past u32 is a conversion failure against Option<u32>.
+        assert!(
+            conn.execute(
+                "UPDATE track_art SET width = 1099511627776 WHERE track_id = 1",
+                [],
+            )
+            .is_err()
+        );
+        // NULL geometry stays legal: an ID3 APIC carries no dimensions.
+        conn.execute("UPDATE track_art SET width = NULL WHERE track_id = 1", [])
+            .unwrap();
+    }
+
+    /// The rebuild is still a rebuild: rows, ownership and the reverse-edge
+    /// index survive it.
+    #[test]
+    fn the_rebuild_preserves_rows_and_the_reverse_edge_index() {
+        let conn = migrated();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM track_art", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT value FROM tags WHERE track_id = 1", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "A"
+        );
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'track_art_art_id_idx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx, 1,
+            "the DROP TABLE took it; the rebuild must put it back"
+        );
+    }
+}
+
 #[cfg(test)]
 mod baseline_tests {
     use rusqlite::Connection;
@@ -2192,6 +2626,55 @@ mod baseline_tests {
             super::MIGRATION_V2.contains("length(CAST(value AS BLOB)) <= 262144"),
             "V2's byte-accurate rebuild (#505) shipped at the 256 KiB cap"
         );
+    }
+
+    /// Every superseded migration, byte for byte.
+    ///
+    /// The caps above are the literals most likely to be *meaningfully* edited,
+    /// but they are three lines out of hundreds, and a released migration has to
+    /// stay replayable in its entirety: a store upgrading from V1 replays this
+    /// exact text, so an edit here rewrites history that is already on disk
+    /// somewhere.
+    ///
+    /// The failure mode this exists for is not a deliberate edit — it is an
+    /// accidental one. V1 through V4 carry near-identical trigger bodies, so a
+    /// search-and-replace aimed at the current migration lands in a frozen one
+    /// without a word of warning, and the behavioural tests only notice when the
+    /// edit happens to change the *final* schema. Twice while writing V4's
+    /// `tags`/`track_art` rebuild, they did not.
+    ///
+    /// A digest mismatch here means an edit reached a frozen migration. The fix
+    /// is to move the change to the newest migration, not to update the digest.
+    #[test]
+    fn superseded_migrations_are_byte_for_byte_frozen() {
+        use sha2::{Digest, Sha256};
+        for (name, sql, want) in [
+            (
+                "MIGRATION_V1",
+                super::MIGRATION_V1,
+                "2f7cac01eae5c107c803466a152fa4659f02b6d43e271fa24c4271b9d56b12c1",
+            ),
+            (
+                "MIGRATION_V2",
+                super::MIGRATION_V2,
+                "79d14a1ee3b04f4fa8a5d04196637fe2382d23cee102c9ece9e67c08ae10a128",
+            ),
+            (
+                "MIGRATION_V3",
+                super::MIGRATION_V3,
+                "2eb68a1847c26a8ee862c9c89bdddd2292cbf251145b996dda0a241cc997c035",
+            ),
+        ] {
+            let got = format!(
+                "{:x}",
+                base16ct::HexDisplay(&Sha256::digest(sql.as_bytes()))
+            );
+            assert_eq!(
+                got, want,
+                "{name} is released and replayable, so its text is frozen; put the \
+                 change in the newest migration rather than updating this digest"
+            );
+        }
     }
 
     /// The literals in the *latest* definition of each table are what a fresh
@@ -3240,13 +3723,15 @@ mod constraint_tests {
             "tracks_geometry_au",
             "structural_blocks_ai",
             "structural_blocks_ad",
+            "tags_reject_reparent",
+            "track_art_reject_reparent",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "missing trigger on fresh DB: {expected}"
             );
         }
-        assert_eq!(names.len(), 15, "unexpected trigger count: {names:?}");
+        assert_eq!(names.len(), 17, "unexpected trigger count: {names:?}");
     }
 
     #[test]

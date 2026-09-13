@@ -205,6 +205,66 @@ see the [Release notes](release-notes.md).
   `contrib` helpers gained `path_param`/`path_value` and encode at the boundary;
   third-party writers must do the same.
 
+- **`tags` and `track_art` are rebuilt by the same migration**, for four reasons
+  that each needed a `CHECK` or a key SQLite cannot alter in place.
+
+  **The ordinal space splits in two**
+  ([#663](https://github.com/Sohex/musefs/issues/663)). `tags`' primary key was
+  `(track_id, key, ordinal)`, which did not discriminate on `value_blob`, so a
+  track's text rows and its binary rows were numbered in one space per key. The
+  scanner is not affected — it writes both classes together — but an external
+  writer that rewrites the text rows alone is, and that is exactly what both
+  `contrib` helpers do: they scope their `DELETE` to `value_blob IS NULL` so
+  scanner-written binary payloads survive a sync. Such a writer could land a text
+  row on an ordinal a binary row already held and get
+  `UNIQUE constraint failed`. The primary key is replaced by two partial unique
+  indexes split on `value_blob IS NULL`, giving the two classes independent
+  spaces while keeping uniqueness inside each. The rowid is deliberately
+  untouched: a binary tag payload is addressed by it from the served layout.
+
+  **Row ownership becomes immutable**
+  ([#717](https://github.com/Sohex/musefs/issues/717)). `tags_au` and
+  `track_art_au` bumped only `NEW.track_id`, so moving a row between tracks left
+  the *old* owner serving a stale synthesized header under a `content_version`
+  that still matched — and for binary tags, a cached layout still holding a rowid
+  that had moved to another track, which is the wrong-row class #502 hardened
+  against. Two `BEFORE UPDATE OF track_id` triggers now refuse the reparent, the
+  way `art_reject_content_update` already refuses art mutation. No writer needs
+  it: both `contrib` helpers replace by delete-then-insert, and moving a tag
+  between tracks is not one edit to one thing — two tracks change, and
+  delete-then-insert says so. The two `_au` bumps widen to
+  `WHERE id IN (OLD.track_id, NEW.track_id)` anyway, so the invalidation is
+  correct on its own terms rather than only because something else forbids the
+  case it mishandled — which matters against a writer that drops triggers
+  through `writable_schema`. Naming `track_id` in a `SET` list without changing
+  it is not a reparent and still works.
+
+  **The picture metadata moves to the link**
+  ([#716](https://github.com/Sohex/musefs/issues/716), the adding half).
+  `track_art` gains `mime`, `width`, `height`, `depth` and `colors`. `art` is
+  deduplicated on `sha256(data)` but owned those columns, which is the wrong
+  functional dependency: they describe one file's `PICTURE`/`APIC` block, not the
+  bytes every file shares. Since `upsert_art` is `ON CONFLICT(sha256) DO
+  NOTHING`, whichever occurrence was ingested first permanently chose them for
+  every track referencing the blob — so two files holding byte-identical art
+  served whichever one the scan happened to reach first, *including its declared
+  MIME type*. A library holding the same cover as FLAC and MP3 hits this
+  routinely, because `APIC` carries no dimensions and `PICTURE` does. `depth` and
+  `colors` are new storage for values FLAC's parser already reads and discards.
+
+  The backfill copies the shared `art` values to every link, because the true
+  per-embedding ones were destroyed at ingest; they come back on a rescan. The
+  columns are inert until the Rust half reads from the link and the scanner
+  writes real values, so a link written in the meantime takes the defaults.
+
+  **And both tables gain the constraint work**: storage classes pinned
+  ([#718](https://github.com/Sohex/musefs/issues/718)) — including upper bounds
+  tying the geometry to the Rust model's `Option<u32>` — and an embedded NUL
+  banned in the tag key and the art description
+  ([#693](https://github.com/Sohex/musefs/issues/693)). #693's ban on `art.mime`
+  follows that column to its new home rather than staying where the next step
+  removes it.
+
 - Directory handles on the same directory share one listing instead of copying
   it each. `opendir` took a private snapshot per handle, so the table's memory
   was the directory's width times the handle count: on a template that

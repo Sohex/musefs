@@ -12,6 +12,21 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ### Changed
 
+- **A text-tag sync can no longer collide with a scanner-written binary tag.**
+  Schema v4 splits `tags`' primary key into two partial unique indexes on
+  `value_blob IS NULL`, so the text rows these helpers rewrite and the binary
+  rows they deliberately preserve get independent ordinal spaces per key.
+  `replace_tags` scopes its `DELETE` to `value_blob IS NULL` precisely so
+  scanner-written payloads survive a sync, and that is the shape that could
+  previously fail with `UNIQUE constraint failed: tags.track_id, tags.key,
+  tags.ordinal` against a key a binary row already used. No API change.
+
+- **Tag and art-link ownership is immutable.** `UPDATE tags SET track_id = ...`
+  (and the same on `track_art`) is now refused by a trigger. Neither helper does
+  this — both replace by delete-then-insert — so nothing here changes; it is
+  noted because a third-party writer doing it will now get an abort rather than
+  silently leaving the old track serving stale bytes.
+
 - **`backing_path` is bytes.** Schema v4 changes the column from `TEXT` to
   `BLOB`, because a filesystem path is a byte string. SQLite never compares a
   `TEXT` value equal to a `BLOB`, so every query that matches on a path had to

@@ -476,6 +476,14 @@ mod guard_tests {
     #[test]
     fn get_track_art_rejects_a_nul_truncated_description() {
         let (db, track, art) = db_track_art();
+        // Written with the constraints off. The schema now bans an embedded NUL
+        // outright (#693), so this row can only arrive the way the threat model
+        // says it does -- written before the ban, or by a writer that turned the
+        // constraints off. Guarding it at read time is the whole point: no
+        // constraint added later can clean a store that already has one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         db.set_track_art(
             track,
             &[TrackArt {
@@ -486,6 +494,9 @@ mod guard_tests {
             }],
         )
         .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
         let err = db.get_track_art(track).unwrap_err();
         assert!(
             matches!(
@@ -505,6 +516,14 @@ mod guard_tests {
     #[test]
     fn get_track_art_with_meta_rejects_a_nul_truncated_description() {
         let (db, track, art) = db_track_art();
+        // Written with the constraints off. The schema now bans an embedded NUL
+        // outright (#693), so this row can only arrive the way the threat model
+        // says it does -- written before the ban, or by a writer that turned the
+        // constraints off. Guarding it at read time is the whole point: no
+        // constraint added later can clean a store that already has one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         db.set_track_art(
             track,
             &[TrackArt {
@@ -515,6 +534,9 @@ mod guard_tests {
             }],
         )
         .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
         let err = db.get_track_art_with_meta(track).unwrap_err();
         assert!(
             matches!(
