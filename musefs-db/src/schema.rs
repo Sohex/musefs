@@ -577,9 +577,10 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            0
     FROM tracks_hold_v4;
 
--- 5. Rebuild `tags` and `track_art`. Both are empty right now -- the cascade
--- above took them -- so this is a drop and a create, with the holding tables as
--- the source. `structural_blocks` keeps its shape and is simply refilled.
+-- 5. Rebuild the three child tables. All are empty right now -- the cascade
+-- above took them -- so each is a drop and a create, with the holding tables as
+-- the source. `tags` and `track_art` change shape; `structural_blocks` keeps
+-- its columns and gains only the storage classes every other table now pins.
 
 -- `tags` loses its primary key in favour of two partial unique indexes split on
 -- `value_blob IS NULL` (#663). The PK numbered a track's text rows and its
@@ -742,9 +743,10 @@ CREATE TABLE structural_blocks (
     body     BLOB NOT NULL,
     PRIMARY KEY (track_id, kind, ordinal),
     CHECK (typeof(track_id) = 'integer'),
-    -- The IN list already implies TEXT, as on `tracks.format`; spelled out here
-    -- only so every column in the table answers the same question the same way.
-    CHECK (typeof(kind) = 'text' AND kind IN ('STREAMINFO','SEEKTABLE')),
+    -- No typeof on `kind`: the IN list is strictly stronger, since no non-TEXT
+    -- value compares equal to either name. Same call as `tracks.format`, which
+    -- is the only other column in the schema whose values are enumerated.
+    CHECK (kind IN ('STREAMINFO','SEEKTABLE')),
     CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
     CHECK (typeof(body) = 'blob' AND length(body) <= 16777215)
 );
@@ -2878,11 +2880,6 @@ mod v4_structural_blocks_rebuild_tests {
         let conn = migrated_with_a_block();
         for (what, sql) in [
             (
-                "a blob kind",
-                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
-                 VALUES (1, X'4142', 1, X'00')",
-            ),
-            (
                 "a real ordinal",
                 "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
                  VALUES (1, 'SEEKTABLE', 0.5, X'00')",
@@ -2895,15 +2892,22 @@ mod v4_structural_blocks_rebuild_tests {
         ] {
             assert!(conn.execute(sql, []).is_err(), "{what} must be refused");
         }
-        // The value checks the table always had are untouched.
-        assert!(
-            conn.execute(
-                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
-                 VALUES (1, 'NOT_A_KIND', 1, X'00')",
-                [],
-            )
-            .is_err()
-        );
+        // `kind` needs no storage-class check of its own: the IN list the table
+        // always had is strictly stronger, and refuses a wrong name and a wrong
+        // storage class alike.
+        for bad_kind in ["'NOT_A_KIND'", "X'4142'", "7"] {
+            assert!(
+                conn.execute(
+                    &format!(
+                        "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                         VALUES (1, {bad_kind}, 1, X'00')"
+                    ),
+                    [],
+                )
+                .is_err(),
+                "kind {bad_kind} must be refused"
+            );
+        }
     }
 
     /// And the migration's pre-flight sees them, so a store holding one is told
@@ -2925,14 +2929,14 @@ mod v4_structural_blocks_rebuild_tests {
                 [],
             )
             .unwrap();
-            // A blob `kind` satisfies every CHECK the V1 table has -- the IN
-            // list compares a blob unequal to both names, so it is only the
-            // value check that would have caught it, and that is a CHECK too.
-            conn.pragma_update(None, "ignore_check_constraints", true)
-                .unwrap();
+            // A TEXT `body`: the V1 table bounds its length and nothing else,
+            // and `length()` answers for text as readily as for a blob -- so
+            // this row goes in on the honest write path, with no pragma and no
+            // hostile writer. It is what a buggy tool binding a string instead
+            // of bytes leaves behind, and only V4 refuses it.
             conn.execute(
                 "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
-                 VALUES (1, X'4142', 0, X'00')",
+                 VALUES (1, 'STREAMINFO', 0, 'not a blob')",
                 [],
             )
             .unwrap();

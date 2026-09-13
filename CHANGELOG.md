@@ -306,7 +306,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as a conversion failure. The migration already held its rows while `tracks`
   was rebuilt, so this cost a drop and a create rather than another copy.
 
-- **`art` is rebuilt by the same migration**, completing the set.
+- **`art` is rebuilt by the same migration.**
 
   - `art_reject_content_update` now covers the row's **key**
     ([#719](https://github.com/Sohex/musefs/issues/719)). Changing `art.id`

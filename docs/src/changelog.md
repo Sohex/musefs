@@ -317,8 +317,9 @@ see the [Release notes](release-notes.md).
   column, and its own ban, until the readers switch over.
 
 - **`structural_blocks` is rebuilt as well**
-  ([#732](https://github.com/Sohex/musefs/issues/732)), which is what makes
-  "every core table pins its storage classes" true rather than nearly true. It
+  ([#732](https://github.com/Sohex/musefs/issues/732)) — the fourth and last of
+  the rebuilds, and what makes "every core table pins its storage classes" true
+  rather than nearly true. It
   was the one table V4 would otherwise have left alone — its shape does not
   change — and so the last place a schema-valid row could still reach the reader
   as a `rusqlite` conversion failure: a blob `kind`, a real `ordinal` or a text
@@ -335,8 +336,8 @@ see the [Release notes](release-notes.md).
   cost a gated migration of its own, for a robustness fix nobody would schedule
   one for.
 
-- **`art` is rebuilt by the same migration**, completing the set — and it is the
-  step with an ordering constraint the others did not have. `track_art.art_id`
+- **`art` is rebuilt by the same migration** — the third of the four, and the
+  one with an ordering constraint the others did not have. `track_art.art_id`
   references `art(id)` with **no** `ON DELETE CASCADE`, so with foreign keys
   enforced `DROP TABLE art` fails outright while any link row exists. The only
   point in the migration where the table can be replaced at all is after

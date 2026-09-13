@@ -579,9 +579,10 @@ INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
            0
     FROM tracks_hold_v4;
 
--- 5. Rebuild `tags` and `track_art`. Both are empty right now -- the cascade
--- above took them -- so this is a drop and a create, with the holding tables as
--- the source. `structural_blocks` keeps its shape and is simply refilled.
+-- 5. Rebuild the three child tables. All are empty right now -- the cascade
+-- above took them -- so each is a drop and a create, with the holding tables as
+-- the source. `tags` and `track_art` change shape; `structural_blocks` keeps
+-- its columns and gains only the storage classes every other table now pins.
 
 -- `tags` loses its primary key in favour of two partial unique indexes split on
 -- `value_blob IS NULL` (#663). The PK numbered a track's text rows and its
@@ -744,9 +745,10 @@ CREATE TABLE structural_blocks (
     body     BLOB NOT NULL,
     PRIMARY KEY (track_id, kind, ordinal),
     CHECK (typeof(track_id) = 'integer'),
-    -- The IN list already implies TEXT, as on `tracks.format`; spelled out here
-    -- only so every column in the table answers the same question the same way.
-    CHECK (typeof(kind) = 'text' AND kind IN ('STREAMINFO','SEEKTABLE')),
+    -- No typeof on `kind`: the IN list is strictly stronger, since no non-TEXT
+    -- value compares equal to either name. Same call as `tracks.format`, which
+    -- is the only other column in the schema whose values are enumerated.
+    CHECK (kind IN ('STREAMINFO','SEEKTABLE')),
     CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
     CHECK (typeof(body) = 'blob' AND length(body) <= 16777215)
 );
