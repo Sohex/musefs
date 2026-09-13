@@ -99,9 +99,32 @@ def check_schema_version(conn):
         raise SchemaMismatch(found)
 
 
+def path_param(key):
+    """Encode a ``backing_path`` key for binding.
+
+    The column is a ``BLOB`` from schema v4 on: a filesystem path is bytes, and
+    the lossy ``str`` round-trip collapsed two distinct files onto one row.
+    SQLite never compares a ``TEXT`` value equal to a ``BLOB``, so a ``str``
+    bound as-is matches nothing at all rather than failing — which is why this
+    is a helper and not four inline ``.encode()`` calls. The library's own type
+    stays ``str`` until the byte-honest move; ``surrogateescape`` is what makes
+    the round trip through it lossless in the meantime.
+    """
+    return key.encode("utf-8", "surrogateescape") if isinstance(key, str) else key
+
+
+def path_value(raw):
+    """Decode a ``backing_path`` read back out. The inverse of `path_param`."""
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw).decode("utf-8", "surrogateescape")
+    return raw
+
+
 def track_id_for_path(conn, key):
     """Return the track id whose backing_path equals ``key``, or None."""
-    row = conn.execute("SELECT id FROM tracks WHERE backing_path = ?", (key,)).fetchone()
+    row = conn.execute(
+        "SELECT id FROM tracks WHERE backing_path = ?", (path_param(key),)
+    ).fetchone()
     return row[0] if row else None
 
 
@@ -120,9 +143,10 @@ def track_ids_for_paths(conn, keys):
         placeholders = ",".join("?" for _ in chunk)
         rows = conn.execute(
             f"SELECT backing_path, id FROM tracks WHERE backing_path IN ({placeholders})",
-            chunk,
+            [path_param(k) for k in chunk],
         )
-        for backing_path, track_id in rows:
+        for raw_path, track_id in rows:
+            backing_path = path_value(raw_path)
             if backing_path in out:
                 # backing_path is UNIQUE in the schema, so a duplicate means a
                 # non-conformant DB; collapsing it would silently hide a track
@@ -182,12 +206,13 @@ def _rows_to_prune(conn, track_ids):
     id is considered once, in first-seen order, so a caller that passes
     duplicates neither over-counts the prune nor reports one path twice."""
     if track_ids is None:
-        yield from conn.execute("SELECT id, backing_path FROM tracks")
+        for track_id, raw_path in conn.execute("SELECT id, backing_path FROM tracks"):
+            yield track_id, path_value(raw_path)
         return
     for track_id in dict.fromkeys(track_ids):
         row = conn.execute("SELECT backing_path FROM tracks WHERE id=?", (track_id,)).fetchone()
         if row is not None:
-            yield track_id, row[0]
+            yield track_id, path_value(row[0])
 
 
 def _backing_is_gone(track_id, path, unreadable):

@@ -387,8 +387,282 @@ const MIGRATION_V4: &str = r"
 -- upgrade and the next scan is not move-recovered (it inserts fresh, as an
 -- unfingerprinted row always has). Leaving the old values in place would not
 -- recover it either -- they cannot match a new-algorithm fingerprint -- so this
--- trades nothing away for an honest column.
-UPDATE tracks SET fingerprint = NULL;
+-- trades nothing away for an honest column. It is folded into the rebuild's
+-- refill below rather than run as a statement of its own: the refill rewrites
+-- every row anyway, so a separate UPDATE would rewrite them all twice.
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Rebuild `tracks` (#686). This is the expensive, once-only event of the 2.0.0
+-- migration: `tracks` is the only table with children, and SQLite cannot add
+-- AUTOINCREMENT, change a column's type, or alter a CHECK in place. Everything
+-- wanting a `tracks` schema change therefore rides this one rebuild:
+--
+--   #678  id -> INTEGER PRIMARY KEY AUTOINCREMENT   (what forces the rebuild)
+--   #674  add backing_ino
+--   #680  backing_path TEXT -> BLOB
+--   #696  drop the lower bounds on backing_mtime_ns and backing_ctime_ns
+--   #693  NUL-proof the two checksum columns
+--   #718  storage-class constraints, backing_path above all
+--   #691  the fingerprint reset above, folded into the refill
+--
+-- Foreign keys stay enforced throughout (the pragma is a no-op inside the
+-- migration's transaction in any case), which is what dictates the shape below:
+-- with enforcement on, DROP TABLE performs an implicit DELETE, and that DELETE
+-- cascades into the three child tables. So the children are copied out first
+-- and restored afterwards, rather than the pragma being weakened for the run.
+
+-- 1. Every trigger that is on `tracks` or names it in its body: thirteen, not
+-- the twelve the V4 plan counted -- `art_ad` names `tracks` too, not only
+-- `track_art`. Dropping the eight on the child tables is not tidiness: the
+-- cascade from DROP TABLE below fires the children's AFTER DELETE triggers,
+-- and those UPDATE a `tracks` that is in the middle of being dropped. The
+-- refill would likewise fire the AFTER INSERT triggers and bump
+-- `content_version` on every row in the store -- which the served virtual mtime
+-- now derives from (#725), so an accidental bump is visible outside musefs.
+DROP TRIGGER tracks_changelog_ai;
+DROP TRIGGER tracks_changelog_au;
+DROP TRIGGER tracks_changelog_ad;
+DROP TRIGGER tracks_geometry_au;
+DROP TRIGGER tags_ai;
+DROP TRIGGER tags_au;
+DROP TRIGGER tags_ad;
+DROP TRIGGER track_art_ai;
+DROP TRIGGER track_art_au;
+DROP TRIGGER track_art_ad;
+DROP TRIGGER structural_blocks_ai;
+DROP TRIGGER structural_blocks_ad;
+DROP TRIGGER art_ad;
+
+-- 2. Hold the parent and the three children. The holding tables carry no
+-- constraints and no foreign keys, so nothing in them can abort on the shape
+-- being replaced, and the values round-trip by storage class rather than by
+-- affinity.
+CREATE TABLE tracks_hold_v4 (
+    id               INTEGER,
+    backing_path     TEXT,
+    format           TEXT,
+    audio_offset     INTEGER,
+    audio_length     INTEGER,
+    backing_size     INTEGER,
+    backing_mtime_ns INTEGER,
+    content_version  INTEGER,
+    updated_at       INTEGER,
+    backing_ctime_ns INTEGER,
+    content_hash     TEXT
+);
+INSERT INTO tracks_hold_v4
+    SELECT id, backing_path, format, audio_offset, audio_length, backing_size,
+           backing_mtime_ns, content_version, updated_at, backing_ctime_ns,
+           content_hash
+    FROM tracks;
+
+CREATE TABLE tags_hold_v4 (
+    track_id INTEGER, key TEXT, value TEXT, ordinal INTEGER, value_blob BLOB
+);
+INSERT INTO tags_hold_v4
+    SELECT track_id, key, value, ordinal, value_blob FROM tags;
+
+CREATE TABLE track_art_hold_v4 (
+    track_id INTEGER, art_id INTEGER, picture_type INTEGER,
+    description TEXT, ordinal INTEGER
+);
+INSERT INTO track_art_hold_v4
+    SELECT track_id, art_id, picture_type, description, ordinal FROM track_art;
+
+CREATE TABLE structural_blocks_hold_v4 (
+    track_id INTEGER, kind TEXT, ordinal INTEGER, body BLOB
+);
+INSERT INTO structural_blocks_hold_v4
+    SELECT track_id, kind, ordinal, body FROM structural_blocks;
+
+-- 3. Drop and recreate. The new table is created under its final name rather
+-- than built beside the old one and renamed: ALTER TABLE ... RENAME reparses
+-- the whole schema, and the thirteen triggers above would have to be absent for
+-- that to succeed anyway (the `art_ad` problem V3 hit, at `tracks` scale).
+DROP TABLE tracks;
+
+CREATE TABLE tracks (
+    -- AUTOINCREMENT so a deleted id is never handed back out (#678). The
+    -- incremental refresh treats the id as a persistent identity, and the
+    -- default allocator's max(rowid)+1 let a pruned track and its replacement
+    -- collide on id, format and content_version -- a substitution the refresh
+    -- then blessed as a no-op.
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- BLOB, not TEXT (#680): a filesystem path is bytes, and the lossy
+    -- String round-trip collapsed two distinct files onto one row. The
+    -- typeof CHECK is what makes the column's type a guarantee rather than an
+    -- affinity (#718): SQLite would otherwise accept TEXT here, and UNIQUE
+    -- does not compare a TEXT path equal to the same bytes as a BLOB, so the
+    -- one path could occupy two rows through a second door.
+    backing_path     BLOB NOT NULL UNIQUE,
+    format           TEXT NOT NULL,
+    audio_offset     INTEGER NOT NULL,
+    audio_length     INTEGER NOT NULL,
+    backing_size     INTEGER NOT NULL,
+    backing_mtime_ns INTEGER NOT NULL,
+    content_version  INTEGER NOT NULL DEFAULT 0,
+    updated_at       INTEGER NOT NULL,
+    backing_ctime_ns INTEGER NOT NULL DEFAULT 0,
+    fingerprint      TEXT,
+    content_hash     TEXT,
+    -- The inode, for backing filesystems that do not store sub-second
+    -- timestamps (#674). Zero is the sentinel for `not yet known`, matching the
+    -- backing_ctime_ns precedent: an upgraded store starts every row unknown,
+    -- and each scan arms the guard for the rows it touches.
+    backing_ino      INTEGER NOT NULL DEFAULT 0,
+    CHECK (typeof(backing_path) = 'blob'
+           AND length(backing_path) > 0
+           AND instr(backing_path, x'00') = 0),
+    -- The IN list is strictly stronger than a typeof CHECK would be: no
+    -- non-TEXT value compares equal to any of these, so the storage class is
+    -- already pinned.
+    CHECK (format IN ('flac','mp3','m4a','opus','vorbis','oggflac','wav')),
+    CHECK (typeof(audio_offset) = 'integer' AND audio_offset >= 0),
+    CHECK (typeof(audio_length) = 'integer' AND audio_length >= 0),
+    CHECK (typeof(backing_size) = 'integer' AND backing_size >= 0),
+    -- No lower bound on either stamp (#696): a backing file dated before 1970
+    -- carries a negative nanosecond offset, and rejecting it here kept the file
+    -- out of the mount entirely. The storage class is still pinned, because the
+    -- Rust side reads both as i64.
+    CHECK (typeof(backing_mtime_ns) = 'integer'),
+    CHECK (typeof(backing_ctime_ns) = 'integer'),
+    CHECK (typeof(backing_ino) = 'integer' AND backing_ino >= 0),
+    CHECK (typeof(content_version) = 'integer' AND content_version >= 0),
+    CHECK (typeof(updated_at) = 'integer' AND updated_at >= 0),
+    CHECK (audio_offset + audio_length <= backing_size),
+    -- instr(..., char(0)) = 0 alongside the character cap (#693): SQLite's
+    -- length() on TEXT stops at the first NUL, so `<64 hex chars>` + NUL +
+    -- anything satisfied a bare length() = 64 while storing something else
+    -- entirely. Banning NUL keeps the documented `64 characters` meaning rather
+    -- than quietly converting the field to a byte cap.
+    CHECK (fingerprint IS NULL
+           OR (typeof(fingerprint) = 'text'
+               AND length(fingerprint) = 64
+               AND instr(fingerprint, char(0)) = 0)),
+    CHECK (content_hash IS NULL
+           OR (typeof(content_hash) = 'text'
+               AND length(content_hash) = 64
+               AND instr(content_hash, char(0)) = 0))
+);
+
+-- 4. Refill. CAST(backing_path AS BLOB) is what preserves identity across the
+-- type change: the bytes are unchanged, and without the cast every existing row
+-- would be unreachable to a byte-binding reader while the unique index failed
+-- to fire, silently giving each track a second row.
+--
+-- `fingerprint` is dropped on the floor here -- that is #691's reset, folded in.
+--
+-- `content_hash` is sanitized rather than carried blindly. It is a
+-- scanner-owned derived column that the next scan recomputes, which is exactly
+-- the case the sanitize-only-under-a-flag policy carves out: nulling one costs
+-- a rescan, while carrying a value the new CHECK rejects would abort the whole
+-- upgrade over a column that rebuilds itself. The other tightened columns are
+-- NOT sanitized here -- they are either structural or NOT NULL, so a row that
+-- violates them fails the migration, which is what the row-rejection pre-flight
+-- and its repair flag exist to report ahead of time.
+INSERT INTO tracks (id, backing_path, format, audio_offset, audio_length,
+                    backing_size, backing_mtime_ns, content_version, updated_at,
+                    backing_ctime_ns, fingerprint, content_hash, backing_ino)
+    SELECT id, CAST(backing_path AS BLOB), format, audio_offset, audio_length,
+           backing_size, backing_mtime_ns, content_version, updated_at,
+           backing_ctime_ns,
+           NULL,
+           CASE WHEN typeof(content_hash) = 'text'
+                     AND length(content_hash) = 64
+                     AND instr(content_hash, char(0)) = 0
+                THEN content_hash END,
+           0
+    FROM tracks_hold_v4;
+
+INSERT INTO tags (track_id, key, value, ordinal, value_blob)
+    SELECT track_id, key, value, ordinal, value_blob FROM tags_hold_v4;
+INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal)
+    SELECT track_id, art_id, picture_type, description, ordinal
+    FROM track_art_hold_v4;
+INSERT INTO structural_blocks (track_id, kind, ordinal, body)
+    SELECT track_id, kind, ordinal, body FROM structural_blocks_hold_v4;
+
+DROP TABLE tracks_hold_v4;
+DROP TABLE tags_hold_v4;
+DROP TABLE track_art_hold_v4;
+DROP TABLE structural_blocks_hold_v4;
+
+-- 5. DROP TABLE tracks took its index and its four triggers with it. Recreate
+-- the index, and all thirteen triggers verbatim -- with one deliberate
+-- exception, noted on tracks_geometry_au below.
+CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
+
+CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_au AFTER UPDATE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (NEW.id);
+END;
+CREATE TRIGGER tracks_changelog_ad AFTER DELETE ON tracks BEGIN
+    INSERT INTO track_changes (track_id) VALUES (OLD.id);
+END;
+
+-- The one non-verbatim recreation: `backing_ino` joins the geometry set. A
+-- changed inode means the backing file was replaced, which is the whole reason
+-- the column exists, so it belongs in the WHEN guard that keeps
+-- content_version a true superset of served-byte inputs. Inert until the Rust
+-- half starts writing the column, since every row is the 0 sentinel until then.
+CREATE TRIGGER tracks_geometry_au
+AFTER UPDATE ON tracks
+WHEN NEW.format        <> OLD.format
+  OR NEW.audio_offset  <> OLD.audio_offset
+  OR NEW.audio_length  <> OLD.audio_length
+  OR NEW.backing_size  <> OLD.backing_size
+  OR NEW.backing_mtime_ns <> OLD.backing_mtime_ns
+  OR NEW.backing_ino   <> OLD.backing_ino
+BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tags_ai AFTER INSERT ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_au AFTER UPDATE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER tags_ad AFTER DELETE ON tags BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER track_art_ai AFTER INSERT ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_au AFTER UPDATE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER track_art_ad AFTER DELETE ON track_art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER structural_blocks_ai AFTER INSERT ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = NEW.track_id;
+END;
+CREATE TRIGGER structural_blocks_ad AFTER DELETE ON structural_blocks BEGIN
+    UPDATE tracks SET content_version = content_version + 1 WHERE id = OLD.track_id;
+END;
+
+CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
+    UPDATE tracks SET content_version = content_version + 1,
+                      updated_at = CAST(strftime('%s','now') AS INTEGER)
+    WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
+END;
 ";
 
 /// Ring capacity of the `track_changes` changelog. Must match the literal in
@@ -1401,6 +1675,375 @@ pub(crate) fn validate_identity(conn: &Connection) -> crate::Result<()> {
     Ok(())
 }
 
+/// The `tracks` rebuild (#686): what it must preserve, and what it newly
+/// refuses. Seeded from a real pre-V4 store rather than a hand-built one, so
+/// these exercise the upgrade path an existing library actually takes.
+#[cfg(test)]
+mod v4_tracks_rebuild_tests {
+    use rusqlite::Connection;
+
+    /// A populated store stopped at `upto`, seeded the way a scanner of that era
+    /// would have: two tracks with a tag, an art link and a structural block
+    /// each, plus a checksum pair on the first.
+    fn populated_store_at(upto: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for (target, migration) in (1i64..).zip(super::MIGRATIONS).take(upto) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", target).unwrap();
+        }
+        // V1 has no checksum columns; V2 added them.
+        let checksums = upto >= 2;
+        for (i, path) in ["/lib/a.flac", "/lib/b.flac"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+                 VALUES (?1,'flac',4,6,10,111,222,1700000000)",
+                [path],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1,'artist',?2,0)",
+                rusqlite::params![id, format!("Artist {i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (?1,'STREAMINFO',0,X'0102')",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1,'image/png',1,1,1,X'00')",
+            [&"e".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+             VALUES (1,1,3,'cover',0)",
+            [],
+        )
+        .unwrap();
+        if checksums {
+            conn.execute(
+                "UPDATE tracks SET fingerprint = ?1, content_hash = ?2 WHERE id = 1",
+                rusqlite::params!["f".repeat(64), "c".repeat(64)],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn content_versions(conn: &Connection) -> Vec<(i64, i64)> {
+        conn.prepare("SELECT id, content_version FROM tracks ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn path_of(conn: &Connection, id: i64) -> (String, Vec<u8>) {
+        conn.query_row(
+            "SELECT typeof(backing_path), backing_path FROM tracks WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Every row, every child and every id survives — and the children come back
+    /// attached to the same track.
+    #[test]
+    fn the_rebuild_preserves_every_row_and_its_children() {
+        let mut conn = populated_store_at(3);
+        let before = content_versions(&conn);
+        super::migrate_all(&mut conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM tracks", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM tracks ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "ids are identities, not sequence positions"
+        );
+
+        let tags: Vec<(i64, String)> = conn
+            .prepare("SELECT track_id, value FROM tags ORDER BY track_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            tags,
+            vec![(1, "Artist 0".to_string()), (2, "Artist 1".to_string())]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT description FROM track_art WHERE track_id = 1",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "cover"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT body FROM structural_blocks WHERE track_id = 2",
+                [],
+                |r| r.get::<_, Vec<u8>>(0)
+            )
+            .unwrap(),
+            vec![1u8, 2]
+        );
+        assert_eq!(before, content_versions(&conn));
+    }
+
+    /// The refill must not fire the child triggers. `content_version` is what
+    /// every cache keys on and what the served virtual mtime derives from
+    /// (#725), so a bump here would invalidate every layout in the store and
+    /// move every file's mtime for a migration that changed no bytes.
+    #[test]
+    fn the_rebuild_does_not_bump_content_version() {
+        let mut conn = populated_store_at(3);
+        // Give the rows a non-zero, non-uniform history first, so an accidental
+        // reset to the default would be as visible as an accidental bump.
+        conn.execute("UPDATE tracks SET content_version = 7 WHERE id = 1", [])
+            .unwrap();
+        conn.execute("UPDATE tracks SET content_version = 12 WHERE id = 2", [])
+            .unwrap();
+        super::migrate_all(&mut conn).unwrap();
+        assert_eq!(content_versions(&conn), vec![(1, 7), (2, 12)]);
+    }
+
+    /// The path survives the type change byte for byte, and is reachable by the
+    /// byte-binding lookup the scanner uses.
+    #[test]
+    fn the_refill_casts_the_path_without_changing_its_bytes() {
+        let mut conn = populated_store_at(3);
+        super::migrate_all(&mut conn).unwrap();
+
+        let (kind, bytes) = path_of(&conn, 1);
+        assert_eq!(kind, "blob");
+        assert_eq!(bytes, b"/lib/a.flac");
+        let found: i64 = conn
+            .query_row(
+                "SELECT id FROM tracks WHERE backing_path = ?1",
+                [&b"/lib/a.flac"[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1, "without the CAST every row would be unreachable");
+    }
+
+    /// #678: the whole point of AUTOINCREMENT. Deleting the highest-numbered
+    /// track used to free exactly that id for the next insert, and the
+    /// incremental refresh reads an id as a persistent identity.
+    #[test]
+    fn a_deleted_id_is_never_handed_out_again() {
+        let mut conn = populated_store_at(3);
+        super::migrate_all(&mut conn).unwrap();
+        conn.execute("DELETE FROM tracks WHERE id = 2", []).unwrap();
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, updated_at) VALUES (?1,'flac',0,1,1,0,0)",
+            [&b"/lib/c.flac"[..]],
+        )
+        .unwrap();
+        assert_eq!(conn.last_insert_rowid(), 3, "id 2 is retired, not recycled");
+    }
+
+    /// #674: the column arrives as the `not yet known` sentinel on every
+    /// upgraded row, and joins the geometry bump so that arming it later counts
+    /// as a content change.
+    #[test]
+    fn backing_ino_starts_unknown_and_bumps_content_version_when_it_changes() {
+        let mut conn = populated_store_at(3);
+        super::migrate_all(&mut conn).unwrap();
+        let ino: i64 = conn
+            .query_row("SELECT backing_ino FROM tracks WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ino, 0);
+
+        let before = conn
+            .query_row("SELECT content_version FROM tracks WHERE id = 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        conn.execute("UPDATE tracks SET backing_ino = 4242 WHERE id = 1", [])
+            .unwrap();
+        let after = conn
+            .query_row("SELECT content_version FROM tracks WHERE id = 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(after, before + 1);
+    }
+
+    /// #696: the lower bounds are gone, so an archival rip dated before 1970
+    /// reaches the store instead of dying at a CHECK.
+    #[test]
+    fn a_pre_epoch_stamp_is_accepted() {
+        let mut conn = populated_store_at(3);
+        super::migrate_all(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE tracks SET backing_mtime_ns = -1500000000, \
+             backing_ctime_ns = -1500000000 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// #718: declaring the column BLOB is an affinity, not a guarantee. Without
+    /// the typeof CHECK a TEXT path inserts happily and UNIQUE does not compare
+    /// it equal to the same bytes, so one file occupies two rows.
+    #[test]
+    fn a_text_path_is_refused_even_though_it_spells_the_same_bytes() {
+        let mut conn = populated_store_at(3);
+        super::migrate_all(&mut conn).unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                 backing_size, backing_mtime_ns, updated_at) \
+                 VALUES ('/lib/a.flac','flac',0,1,1,0,0)",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("typeof(backing_path)"), "{err}");
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM tracks", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    /// #718, the other half: an empty path and a NUL-bearing one are not paths.
+    #[test]
+    fn an_empty_or_nul_bearing_path_is_refused() {
+        let mut conn = populated_store_at(3);
+        super::migrate_all(&mut conn).unwrap();
+        for bytes in [&b""[..], &b"/lib/\x00.flac"[..]] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+                     backing_size, backing_mtime_ns, updated_at) VALUES (?1,'flac',0,1,1,0,0)",
+                    [bytes],
+                )
+                .is_err(),
+                "{bytes:?} is not a path"
+            );
+        }
+    }
+
+    /// #693: `length()` on TEXT stops at the first NUL, so a 64-character
+    /// prefix followed by NUL and anything at all satisfied the old CHECK while
+    /// storing something that is not a 64-character identity.
+    #[test]
+    fn a_nul_bearing_checksum_is_refused() {
+        let mut conn = populated_store_at(3);
+        super::migrate_all(&mut conn).unwrap();
+        let hostile = format!("{}\0{}", "a".repeat(64), "junk".repeat(1000));
+        for col in ["fingerprint", "content_hash"] {
+            let err = conn
+                .execute(
+                    &format!("UPDATE tracks SET {col} = ?1 WHERE id = 1"),
+                    [&hostile],
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(col), "{err}");
+        }
+    }
+
+    /// The one column the refill sanitizes rather than aborting on. A
+    /// scanner-owned derived column that a rescan recomputes is outside the
+    /// sanitize-only-under-a-flag policy, and carrying a value the new CHECK
+    /// rejects would fail the whole upgrade over something that rebuilds itself.
+    #[test]
+    fn the_refill_nulls_a_content_hash_the_new_check_would_reject() {
+        let mut conn = populated_store_at(3);
+        let hostile = format!("{}\0{}", "a".repeat(64), "junk");
+        conn.execute(
+            "UPDATE tracks SET content_hash = ?1 WHERE id = 1",
+            [&hostile],
+        )
+        .unwrap();
+        super::migrate_all(&mut conn).unwrap();
+
+        let ch: Option<String> = conn
+            .query_row("SELECT content_hash FROM tracks WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ch, None, "sanitized, not carried and not fatal");
+        let kept: Option<String> = conn
+            .query_row("SELECT content_hash FROM tracks WHERE id = 2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, None, "id 2 never had one");
+    }
+
+    /// #691, folded into the refill: the fingerprint is retired for every row,
+    /// while `content_hash` -- whose meaning did not change -- is kept.
+    #[test]
+    fn the_refill_retires_the_fingerprint_and_keeps_a_good_content_hash() {
+        let mut conn = populated_store_at(3);
+        super::migrate_all(&mut conn).unwrap();
+        let (fp, ch): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT fingerprint, content_hash FROM tracks WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fp, None);
+        assert_eq!(ch.as_deref(), Some(&"c".repeat(64)[..]));
+    }
+
+    /// The upgrade rehearsal: a populated store from every released shape
+    /// reaches the latest version with its rows intact. V1 predates the
+    /// checksum columns entirely, which is the arm that would catch a refill
+    /// naming a column that era does not have.
+    #[test]
+    fn a_populated_store_of_every_earlier_version_upgrades() {
+        for upto in 1..=3 {
+            let mut conn = populated_store_at(upto);
+            super::migrate_all(&mut conn).unwrap();
+            assert_eq!(
+                conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                super::LATEST_VERSION,
+                "V{upto} store"
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM tags", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2,
+                "V{upto} store kept its tags"
+            );
+            assert_eq!(path_of(&conn, 2).1, b"/lib/b.flac");
+        }
+    }
+}
+
 #[cfg(test)]
 mod baseline_tests {
     use rusqlite::Connection;
@@ -1422,7 +2065,7 @@ mod baseline_tests {
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/a.flac','flac',0,1,1,0,0)",
+             VALUES (CAST('/a.flac' AS BLOB),'flac',0,1,1,0,0)",
             [],
         )
         .unwrap();
@@ -1471,13 +2114,14 @@ mod baseline_tests {
             "INSERT INTO tracks
                 (backing_path, format, audio_offset, audio_length, backing_size,
                  backing_mtime_ns, backing_ctime_ns, updated_at)
-             VALUES ('/x.flac','flac',0,10,10,0,0,0)",
+             VALUES (CAST('/x.flac' AS BLOB),'flac',0,10,10,0,0,0)",
             [],
         )
         .unwrap();
         let (fp, ch): (Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT fingerprint, content_hash FROM tracks WHERE backing_path='/x.flac'",
+                "SELECT fingerprint, content_hash FROM tracks \
+                 WHERE backing_path = CAST('/x.flac' AS BLOB)",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1514,7 +2158,8 @@ mod baseline_tests {
 
         let (fp, ch): (Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT fingerprint, content_hash FROM tracks WHERE backing_path='/x.flac'",
+                "SELECT fingerprint, content_hash FROM tracks \
+                 WHERE backing_path = CAST('/x.flac' AS BLOB)",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1588,12 +2233,14 @@ mod changelog_tests {
             .unwrap()
     }
 
+    /// `backing_path` is a `BLOB` from V4 on (#680), so a migrated store takes
+    /// the path's bytes — a TEXT bind fails the storage-class CHECK.
     fn insert_track(conn: &Connection, path: &str) {
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
              VALUES (?1,'flac',0,1,1,0,0)",
-            [path],
+            [path.as_bytes()],
         )
         .unwrap();
     }
@@ -2036,12 +2683,14 @@ mod constraint_tests {
         super::migrate(conn).unwrap();
     }
 
+    /// `backing_path` is a `BLOB` from V4 on (#680), so a migrated store takes
+    /// the path's bytes — a TEXT bind fails the storage-class CHECK.
     fn insert_track(conn: &Connection, path: &str) {
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
              VALUES (?1,'flac',0,1,1,0,0)",
-            [path],
+            [path.as_bytes()],
         )
         .unwrap();
     }
@@ -2133,7 +2782,7 @@ mod constraint_tests {
                 "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
                  backing_size, backing_mtime_ns, updated_at) \
                  VALUES (?1, ?2, 0, 0, 0, 0, 0)",
-                rusqlite::params![format!("/t{i}"), fmt],
+                rusqlite::params![format!("/t{i}").into_bytes(), fmt],
             )
             .unwrap();
         }
@@ -2147,7 +2796,7 @@ mod constraint_tests {
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',-1,0,0,0,0)",
+             VALUES (CAST('/x' AS BLOB),'flac',-1,0,0,0,0)",
         );
     }
 
@@ -2219,12 +2868,12 @@ mod constraint_tests {
             &conn,
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',5,10,14,0,0)",
+             VALUES (CAST('/x' AS BLOB),'flac',5,10,14,0,0)",
         );
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/ok','flac',5,10,15,0,0)",
+             VALUES (CAST('/ok' AS BLOB),'flac',5,10,15,0,0)",
             [],
         )
         .unwrap();
@@ -2607,7 +3256,7 @@ mod constraint_tests {
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
-             VALUES ('/x','flac',0,0,0,0,0)",
+             VALUES (CAST('/x' AS BLOB),'flac',0,0,0,0,0)",
             [],
         )
         .unwrap();
@@ -2635,7 +3284,7 @@ mod constraint_tests {
 
         // NULL is accepted (no fingerprint yet).
         conn.execute(
-            "UPDATE tracks SET fingerprint = NULL WHERE backing_path = '/fp.flac'",
+            "UPDATE tracks SET fingerprint = NULL WHERE backing_path = CAST('/fp.flac' AS BLOB)",
             [],
         )
         .unwrap();
@@ -2643,7 +3292,7 @@ mod constraint_tests {
         // A valid 64-char SHA-256 hex string is accepted.
         conn.execute(
             &format!(
-                "UPDATE tracks SET fingerprint = '{}' WHERE backing_path = '/fp.flac'",
+                "UPDATE tracks SET fingerprint = '{}' WHERE backing_path = CAST('/fp.flac' AS BLOB)",
                 "a".repeat(64)
             ),
             [],
@@ -2653,14 +3302,14 @@ mod constraint_tests {
         // A too-short fingerprint (1 char) is rejected.
         rejected(
             &conn,
-            "UPDATE tracks SET fingerprint = 'x' WHERE backing_path = '/fp.flac'",
+            "UPDATE tracks SET fingerprint = 'x' WHERE backing_path = CAST('/fp.flac' AS BLOB)",
         );
 
         // A too-long fingerprint (65 chars) is also rejected.
         rejected(
             &conn,
             &format!(
-                "UPDATE tracks SET fingerprint = '{}' WHERE backing_path = '/fp.flac'",
+                "UPDATE tracks SET fingerprint = '{}' WHERE backing_path = CAST('/fp.flac' AS BLOB)",
                 "a".repeat(65)
             ),
         );
@@ -2690,7 +3339,8 @@ mod identity_tests {
         let conn = migrated();
         conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
-             backing_size, backing_mtime_ns, updated_at) VALUES ('/a.flac','flac',0,1,1,0,0)",
+             backing_size, backing_mtime_ns, updated_at) \
+             VALUES (CAST('/a.flac' AS BLOB),'flac',0,1,1,0,0)",
             [],
         )
         .unwrap();
@@ -2823,7 +3473,7 @@ mod art_immutability_tests {
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
              backing_size, backing_mtime_ns, updated_at) \
              VALUES (?1,'flac',0,1,1,0,0)",
-            [path],
+            [path.as_bytes()],
         )
         .unwrap();
         conn.last_insert_rowid()

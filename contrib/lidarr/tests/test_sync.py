@@ -6,6 +6,7 @@ from musefs_common import (
     ArtImage,
     ScanResult,
     connect,
+    path_param,
     realpath_key,
 )
 
@@ -615,11 +616,12 @@ def test_prune_deleted_album_removes_matching_rows(db_path, tmp_path):
         a = conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
             "backing_size, backing_mtime_ns, updated_at) VALUES (?, 'flac', 0, 0, 0, 0, 0)",
-            (str(backing),),
+            (path_param(str(backing)),),
         ).lastrowid
         b = conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
-            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/b.flac', 'flac', 0, 0, 0, 0, 0)",
+            "backing_size, backing_mtime_ns, updated_at) VALUES (?, 'flac', 0, 0, 0, 0, 0)",
+            (path_param("/m/b.flac"),),
         ).lastrowid
         replace_tags(conn, a, [("musicbrainz_albumid", "rg-1"), (MANAGED_KEY, MANAGED_VALUE)])
         replace_tags(conn, b, [("musicbrainz_albumid", "rg-2"), (MANAGED_KEY, MANAGED_VALUE)])
@@ -659,7 +661,7 @@ def test_prune_deleted_artist_removes_all_artist_rows(db_path):
             tid = conn.execute(
                 "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
                 "backing_size, backing_mtime_ns, updated_at) VALUES (?, 'flac', 0, 0, 0, 0, 0)",
-                (f"/m/{i}.flac",),
+                (path_param(f"/m/{i}.flac"),),
             ).lastrowid
             replace_tags(conn, tid, [("musicbrainz_artistid", art), (MANAGED_KEY, MANAGED_VALUE)])
             ids.append(tid)
@@ -690,12 +692,12 @@ def test_prune_deleted_spares_unmanaged_scanner_seeded_mbid(db_path):
     try:
         managed = conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
-            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/managed.flac', 'flac', "
+            "backing_size, backing_mtime_ns, updated_at) VALUES (CAST('/m/managed.flac' AS BLOB), 'flac', "
             "0, 0, 0, 0, 0)"
         ).lastrowid
         unmanaged = conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
-            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/unmanaged.flac', 'flac', "
+            "backing_size, backing_mtime_ns, updated_at) VALUES (CAST('/m/unmanaged.flac' AS BLOB), 'flac', "
             "0, 0, 0, 0, 0)"
         ).lastrowid
         replace_tags(
@@ -737,7 +739,7 @@ def test_prune_deleted_refuses_on_schema_mismatch(db_path):
     try:
         tid = conn.execute(
             "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, "
-            "backing_size, backing_mtime_ns, updated_at) VALUES ('/m/a.flac', 'flac', "
+            "backing_size, backing_mtime_ns, updated_at) VALUES (CAST('/m/a.flac' AS BLOB), 'flac', "
             "0, 0, 0, 0, 0)"
         ).lastrowid
         replace_tags(conn, tid, [("musicbrainz_albumid", "rg-1"), (MANAGED_KEY, MANAGED_VALUE)])

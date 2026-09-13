@@ -6,14 +6,17 @@
 (`MIGRATIONS`: the `MIGRATION_V1` baseline, `MIGRATION_V2`, which adds the
 scanner-owned `fingerprint`/`content_hash` columns, `MIGRATION_V3`, which
 widens the `tags.value` and `track_art.description` caps, and `MIGRATION_V4`,
-which retires every fingerprint written before the value included sampled
-audio); `user_version` records the schema version (4).
+which rebuilds `tracks` — a never-reused `AUTOINCREMENT` id, the path as bytes,
+an inode stamp, storage-class constraints, and the retirement of every
+fingerprint written before the value included sampled audio);
+`user_version` records the schema version (4).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
 - The **baseline schema** (`MIGRATION_V1`): the core tables — `tracks` (one row
-  per backing file: path, format, audio byte range, size/nanosecond-mtime/ctime
-  stamps, `content_version`), `tags` (multi-value key/value rows ordered by
+  per backing file: path, format, audio byte range,
+  size/nanosecond-mtime/ctime/inode stamps, `content_version`), `tags`
+  (multi-value key/value rows ordered by
   `ordinal`, with an optional `value_blob` for binary tags), `art`
   (content-addressed, deduplicated image blobs), `track_art` (per-track art
   links with picture type and ordering), and `structural_blocks` (read-only,
@@ -74,9 +77,18 @@ the binary.
 **Ownership.** External tools get full read/write on `tags`, `art`, and
 `track_art`. The scanner owns the structural columns of `tracks` (`id`,
 `backing_path`, `format`, `audio_offset`, `audio_length`, `backing_size`,
-`backing_mtime_ns`, `backing_ctime_ns`, `content_version`, `updated_at`) and
-all of `structural_blocks`: those are derived from probing the file, and
-external tools must run `musefs scan` rather than compute them.
+`backing_mtime_ns`, `backing_ctime_ns`, `backing_ino`, `content_version`,
+`updated_at`) and all of `structural_blocks`: those are derived from probing
+the file, and external tools must run `musefs scan` rather than compute them.
+
+**`backing_path` is bytes, not text.** From schema v4 it is a `BLOB`, because a
+filesystem path is a byte string and the lossy text round-trip collapsed two
+distinct files onto one row. This matters to a *reader* as much as a writer:
+SQLite never compares a `TEXT` value equal to a `BLOB`, so a lookup that binds a
+string matches nothing at all rather than failing, and a `CHECK` pins the
+storage class so the two spellings cannot become two rows for one file. The
+`contrib` helpers encode and decode at the boundary (`path_param` and
+`path_value` in `musefs_common`); a third-party writer must do the same.
 
 `tracks.fingerprint` and `tracks.content_hash` are also scanner-owned,
 read-only-derived columns — like `structural_blocks`, they are never part of

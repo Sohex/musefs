@@ -6,10 +6,19 @@ use rusqlite::{Row, params};
 /// literal, so every track read shares one column list (kept in lockstep with
 /// `row_to_track`) and can be served via `prepare_cached` — no per-call `format!`
 /// allocation and no SQL recompilation on the `getattr`/`read` hot path.
+/// The `tracks` projection every reader shares.
+///
+/// `backing_path` is a `BLOB` in the store (#680) while the Rust model still
+/// holds a `String`, so the column is cast on the way out and every predicate
+/// and write binds bytes. The cast is not lossy: every stored path was written
+/// from a Rust `String`, so it is valid UTF-8, and a row that is not fails
+/// loudly at `Row::get` rather than being silently mangled. #680's Rust half
+/// replaces both halves of this with a byte-typed model.
 macro_rules! track_select {
     ($tail:literal) => {
         concat!(
-            "SELECT id, backing_path, format, audio_offset, audio_length, \
+            "SELECT id, CAST(backing_path AS TEXT) AS backing_path, format, \
+             audio_offset, audio_length, \
              backing_size, backing_mtime_ns, backing_ctime_ns, content_version, updated_at, \
              fingerprint, content_hash \
              FROM tracks ",
@@ -74,7 +83,7 @@ pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Resu
             updated_at=CAST(strftime('%s','now') AS INTEGER)
          RETURNING id",
         params![
-            t.backing_path,
+            t.backing_path.as_bytes(),
             t.format.as_str(),
             t.audio_offset,
             t.audio_length,
@@ -93,7 +102,7 @@ pub(crate) fn get_track_by_path_in(
     crate::query_optional(
         conn,
         track_select!("WHERE backing_path = ?1"),
-        params![path],
+        params![path.as_bytes()],
         |r| Ok(row_to_track(r)?),
     )
 }
@@ -159,7 +168,7 @@ pub(crate) fn retarget_track_in(
          WHERE id = ?1",
         params![
             id,
-            new_backing_path,
+            new_backing_path.as_bytes(),
             backing_size,
             backing_mtime_ns,
             backing_ctime_ns,
@@ -207,7 +216,7 @@ impl<M> Db<M> {
     pub fn list_backing_paths(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT backing_path FROM tracks")?;
+            .prepare_cached("SELECT CAST(backing_path AS TEXT) FROM tracks")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -242,8 +251,8 @@ impl<M> Db<M> {
     pub fn track_identity(&self, id: i64) -> Result<Option<crate::TrackIdentity>> {
         crate::query_optional(
             &self.conn,
-            "SELECT content_version, backing_path, backing_size, backing_mtime_ns, \
-             backing_ctime_ns FROM tracks WHERE id = ?1",
+            "SELECT content_version, CAST(backing_path AS TEXT), backing_size, \
+             backing_mtime_ns, backing_ctime_ns FROM tracks WHERE id = ?1",
             params![id],
             |r| {
                 Ok(crate::TrackIdentity {

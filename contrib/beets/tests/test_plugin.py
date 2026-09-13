@@ -6,7 +6,10 @@ pytest.importorskip("beets")
 
 from beets.library import Item  # noqa: E402
 from conftest import FakeItem, insert_track  # noqa: E402
-from musefs_common import connect  # noqa: E402
+from musefs_common import (
+    connect,  # noqa: E402
+    path_value,
+)
 
 from beetsplug._core import map_fields  # noqa: E402
 from beetsplug.musefs import MusefsPlugin  # noqa: E402
@@ -198,7 +201,7 @@ def test_command_plain_sync_never_prunes(
 
     conn = connect(db_path)
     try:
-        paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
+        paths = [path_value(r[0]) for r in conn.execute("SELECT backing_path FROM tracks")]
         assert "/gone/x.flac" in paths  # NOT pruned — plain sync never prunes
         assert real in paths
     finally:
@@ -281,7 +284,7 @@ def test_reconcile_does_not_prune_only_syncs(db_path, make_track, fake_item, tmp
 
     conn = connect(db_path)
     try:
-        paths = [r[0] for r in conn.execute("SELECT backing_path FROM tracks")]
+        paths = [path_value(r[0]) for r in conn.execute("SELECT backing_path FROM tracks")]
         assert "/old/moved-away.flac" in paths  # NOT pruned — reconcile never prunes
         assert real in paths  # new path kept + synced
         assert (

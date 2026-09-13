@@ -10,8 +10,25 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 
 ## [Unreleased]
 
+### Changed
+
+- **`backing_path` is bytes.** Schema v4 changes the column from `TEXT` to
+  `BLOB`, because a filesystem path is a byte string. SQLite never compares a
+  `TEXT` value equal to a `BLOB`, so every query that matches on a path had to
+  move with it — and the failure mode if it does not is silence, not an error:
+  the lookup simply matches no row. `track_id_for_path`, `track_ids_for_paths`
+  and `prune_missing` encode and decode at the boundary, so their callers are
+  unaffected and keep passing and receiving `str`.
+
+  **A writer that queries `tracks` directly must do the same.** The two helpers
+  doing it are exported for that: `path_param(key)` encodes on the way in and
+  `path_value(raw)` decodes on the way out, both `surrogateescape` so the round
+  trip is lossless.
+
 ### Added
 
+- **`musefs_common.path_param` / `musefs_common.path_value`** — the
+  `backing_path` boundary encode and decode. See the change above.
 - **`musefs_common.ScanResult`** — what a completed `run_scan` did. Carries
   `binary`, `target`, `verb`, `returncode`, `partial` and `stderr`, and renders
   the shared non-fatal message via `.warning()` (`None` for a clean run). See
