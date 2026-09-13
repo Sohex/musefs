@@ -634,6 +634,16 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **The backing-freshness guarantee is documented for the reads it actually
+  covers** ([#683](https://github.com/Sohex/musefs/issues/683)). The docs said
+  the held descriptor is re-stated on every read, and that re-tags keep cached
+  bytes from going stale. Both are true of what reaches musefs; with
+  `--keep-cache`, on by default, a read the kernel serves from its page cache
+  never does. So an in-place rewrite of a backing file behind a file that is
+  already open and cached is caught at the next open — which fails with `EIO` —
+  rather than on those cached reads. The behaviour is unchanged and deliberate;
+  the architecture page and the tuning table now say so.
+
 - **`musefs vacuum` refuses a store a mount has open, as it always said it did**
   ([#721](https://github.com/Sohex/musefs/issues/721)). It relied on `VACUUM`
   failing on a busy lock, and in WAL mode a mount idle between reads holds none,
