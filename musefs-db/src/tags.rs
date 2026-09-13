@@ -524,16 +524,29 @@ mod tags_for_tracks_tests {
         let db = open_mem();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
         let key = nul_truncated_key(key_byte_ceiling() + 1);
+        // Planted with the constraints off. The schema now bans an embedded
+        // NUL outright (#693), so this row can only arrive the way the threat
+        // model says it does -- written before the ban, or by a writer that
+        // turned the constraints off. Guarding it at read time is the whole
+        // point: no constraint added later can clean a store that already has
+        // one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         db.conn
             .execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, 'v', 0)",
                 rusqlite::params![a, key],
             )
             .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
 
-        // The character cap this row sails past the guard on. No
-        // `ignore_check_constraints` is needed: the schema CHECK counts
-        // characters too, so the honest insert above simply succeeded.
+        // The character cap this row sails past the guard on. The schema now
+        // bans an embedded NUL outright (#693), so the row has to be planted
+        // the way the threat model says it arrives -- a store written before
+        // the ban, or a writer that turned the constraints off.
         let chars: i64 = db
             .conn
             .query_row(
@@ -585,11 +598,23 @@ mod tags_for_tracks_tests {
         let db = open_mem();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
         let key = nul_truncated_key(key_byte_ceiling());
+        // Planted with the constraints off. The schema now bans an embedded
+        // NUL outright (#693), so this row can only arrive the way the threat
+        // model says it does -- written before the ban, or by a writer that
+        // turned the constraints off. Guarding it at read time is the whole
+        // point: no constraint added later can clean a store that already has
+        // one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         db.conn
             .execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, 'v', 0)",
                 rusqlite::params![a, key],
             )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
         assert_eq!(db.get_tags(a).unwrap()[0].key, key);
     }
@@ -602,11 +627,23 @@ mod tags_for_tracks_tests {
         let db = open_mem();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
         let key = nul_truncated_key(key_byte_ceiling() + 1);
+        // Planted with the constraints off. The schema now bans an embedded
+        // NUL outright (#693), so this row can only arrive the way the threat
+        // model says it does -- written before the ban, or by a writer that
+        // turned the constraints off. Guarding it at read time is the whole
+        // point: no constraint added later can clean a store that already has
+        // one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         db.conn
             .execute(
                 "INSERT INTO tags (track_id, key, value, ordinal) VALUES (?1, ?2, 'v', 0)",
                 rusqlite::params![a, key],
             )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
         let err = db.tags_for_tracks(&[a]).unwrap_err();
         assert!(
@@ -627,12 +664,24 @@ mod tags_for_tracks_tests {
         let db = open_mem();
         let a = db.upsert_track(&new_track("/a.flac")).unwrap();
         let key = nul_truncated_key(key_byte_ceiling() + 1);
+        // Planted with the constraints off. The schema now bans an embedded
+        // NUL outright (#693), so this row can only arrive the way the threat
+        // model says it does -- written before the ban, or by a writer that
+        // turned the constraints off. Guarding it at read time is the whole
+        // point: no constraint added later can clean a store that already has
+        // one.
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
         db.conn
             .execute(
                 "INSERT INTO tags (track_id, key, value, value_blob, ordinal) \
                  VALUES (?1, ?2, '', X'00', 0)",
                 rusqlite::params![a, key],
             )
+            .unwrap();
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", false)
             .unwrap();
         let err = db.get_binary_tags(a).unwrap_err();
         assert!(

@@ -259,6 +259,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ([#691](https://github.com/Sohex/musefs/issues/691)), which `musefs migrate`
   already reports and offers a `revalidate` for.
 
+- **`tags` and `track_art` are rebuilt by the same migration.**
+
+  - A track's text tags and its binary tags no longer share one ordinal space
+    per key ([#663](https://github.com/Sohex/musefs/issues/663)). `tags`' primary
+    key becomes a unique index that folds the class in as a fourth column, so a
+    writer that rewrites one class alone — as the beets and Picard plugins do,
+    scoping their delete so scanner-written binary payloads survive a sync —
+    can no longer collide with an ordinal the other class holds.
+  - Tag and art-link ownership is immutable
+    ([#717](https://github.com/Sohex/musefs/issues/717)). Moving a row between
+    tracks with `UPDATE ... SET track_id` is refused; replace by
+    delete-then-insert, which both plugins already do. Reparenting used to leave
+    the *old* track serving a stale layout under a `content_version` that still
+    matched, because the update triggers bumped only the new owner — those now
+    bump both regardless.
+  - `track_art` gains `mime`, `width`, `height`, `depth` and `colors`
+    ([#716](https://github.com/Sohex/musefs/issues/716)). Those describe one
+    file's embedded picture, not the image bytes every file shares, so owning
+    them on the deduplicated `art` row meant whichever copy was scanned first
+    chose them for every track using that image — including its declared MIME
+    type. **The migration cannot restore what ingest already discarded:** it
+    copies the shared values to every link, and the true per-embedding ones come
+    back on a rescan, which is what `musefs migrate`'s rescan offer is for.
+  - Both tables gain storage-class constraints
+    ([#718](https://github.com/Sohex/musefs/issues/718)), and the tag key and
+    art description ban an embedded NUL
+    ([#693](https://github.com/Sohex/musefs/issues/693)).
+
 ### Fixed
 
 - Chained Ogg — complete logical bitstreams concatenated end to end, which

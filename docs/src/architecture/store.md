@@ -6,10 +6,12 @@
 (`MIGRATIONS`: the `MIGRATION_V1` baseline, `MIGRATION_V2`, which adds the
 scanner-owned `fingerprint`/`content_hash` columns, `MIGRATION_V3`, which
 widens the `tags.value` and `track_art.description` caps, and `MIGRATION_V4`,
-which rebuilds `tracks` — a never-reused `AUTOINCREMENT` id, the path as bytes,
-an inode stamp, storage-class constraints, and the retirement of every
-fingerprint written before the value included sampled audio);
-`user_version` records the schema version (4).
+which rebuilds `tracks`, `tags` and `track_art` — a never-reused
+`AUTOINCREMENT` id, the path as bytes, an inode stamp, storage-class
+constraints, independent ordinal spaces for text and binary tags, per-embedding
+picture columns on the art link, and the retirement of every fingerprint written
+before the value included sampled audio); `user_version` records the schema
+version (4).
 The store is the **interface external tools write to** — the beets and Picard
 plugins under `contrib/` write tags and art here out-of-band.
 
@@ -31,7 +33,9 @@ plugins under `contrib/` write tags and art here out-of-band.
   bytes: `art_reject_content_update` (art is content-addressed and immutable),
   `art_ad` (a deleted art row bumps referencing tracks so an orphan rebuilds to
   a clean serve-time error), `tracks_geometry_au` (scanner-owned geometry
-  changes), and `structural_blocks_ai`/`_ad`.
+  changes), and `structural_blocks_ai`/`_ad`. `tags_reject_reparent` and
+  `track_art_reject_reparent` make row ownership immutable, for the same reason
+  art content is.
 
 ### Transparent and gated migrations
 
@@ -256,6 +260,33 @@ and relink it via `track_art` (which bumps `content_version`); do not mutate an
 existing row. Deleting an `art` row still referenced by `track_art` (possible
 only with `foreign_keys` OFF) bumps every referencing track so the mount serves
 a clean `EIO` on the now-orphaned reference instead of stale bytes.
+
+**Row ownership is immutable too.** A `tags` or `track_art` row may not move
+between tracks: `tags_reject_reparent` and `track_art_reject_reparent` abort a
+`track_id` change with the same shape of message. Replace by delete-then-insert,
+which is what both `contrib` helpers already do. The reason is the same one that
+makes `art` immutable — an invalidation trigger that has to *enumerate*
+everything needing a bump fails silently by serving stale bytes when it gets
+that wrong, while a refusal fails loudly at the write. (The `UPDATE` triggers
+bump both the old and the new owner regardless, so the accounting is correct on
+its own terms rather than only because the refusal forbids the case.) Naming
+`track_id` in a `SET` list without changing its value is not a reparent and is
+allowed.
+
+**Text and binary tag rows have independent ordinal spaces.** `tags` has no
+primary key; a unique index on `(track_id, key, ordinal, (value_blob IS NULL))`
+enforces uniqueness *within* each class. A writer that rewrites one class alone
+— as both `contrib` helpers do, scoping their `DELETE` to `value_blob IS NULL`
+so scanner-written binary payloads survive a sync — can therefore reuse an
+ordinal the other class holds under the same key, which a single shared key
+space rejected.
+
+The class is a column of one index rather than the predicate of two partial
+ones, because a partial index only serves a query whose `WHERE` implies its
+predicate. A reader that wants *both* classes at once — `tags_for_track` in the
+`contrib` helpers — implies neither, and against two partial indexes it plans as
+a full table scan plus a sort. With `track_id` leading a single index, every
+read shape stays on it.
 
 **What musefs defends at serve time.** CHECKs cannot catch a scanner-owned
 field mutated to a *well-formed* value that no longer matches the real file
