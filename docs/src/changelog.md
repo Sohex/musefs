@@ -634,6 +634,15 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **A crafted `structural_blocks.kind` is refused before it is read**
+  ([#715](https://github.com/Sohex/musefs/issues/715)). The reader checked the
+  value against its two-name allowlist only after materializing it, and a store
+  written under `PRAGMA ignore_check_constraints` can hold any length there, so a
+  hostile row cost its full size twice — once read, once more debug-escaped into
+  the error — before being rejected. The column is now bounded from its
+  character and byte lengths first, like every other text column the readers
+  guard, at a cap pinned by a test to the longest allowlisted kind.
+
 - **A synthesized file's mtime now moves whenever its bytes do, and a pre-epoch
   backing file is served as one.** Two fixes in the same type, because both are
   about what the mount reports as a timestamp

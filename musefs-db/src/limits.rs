@@ -62,6 +62,11 @@ pub const MAX_ART_ROWS_PER_TRACK: usize = 4096;
 /// Valid `structural_blocks.kind` values. Single source for the V4 `CHECK`
 /// (asserted by a drift test) and the `get_structural_blocks` guard.
 pub const STRUCTURAL_KINDS: [&str; 2] = ["STREAMINFO", "SEEKTABLE"];
+
+/// The longest valid `structural_blocks.kind`, in characters: the reader bounds
+/// the column with it before materializing the value (#715). A property of
+/// [`STRUCTURAL_KINDS`], not an invented number — a test pins the two together.
+pub const MAX_STRUCTURAL_KIND_LEN: i64 = 10;
 /// `tags.value_blob` length cap in bytes — defense-in-depth `CHECK` only (the
 /// blob streams at read time, so no reader guard). Mirrors `musefs-core`'s
 /// `MAX_BINARY_TAG_BYTES`.
@@ -89,6 +94,13 @@ mod tests {
         assert_eq!(MAX_BINARY_TAG_BYTES, 16 * 1024 * 1024 - 64 * 1024);
         assert_eq!(MAX_ART_BYTES, 16 * 1024 * 1024 - 64 * 1024);
         assert_eq!(STRUCTURAL_KINDS, ["STREAMINFO", "SEEKTABLE"]);
+        // The reader cap is exactly the longest allowlisted kind: any narrower
+        // and a valid row is refused, any wider and it bounds nothing extra.
+        let longest = STRUCTURAL_KINDS.iter().map(|k| k.chars().count()).max();
+        assert_eq!(
+            i64::try_from(longest.unwrap()).unwrap(),
+            MAX_STRUCTURAL_KIND_LEN
+        );
         assert_eq!(MAX_ART_ROWS_PER_TRACK, 4096);
         assert_eq!(ART_SHA256_LEN, 64);
     }

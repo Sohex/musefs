@@ -19,15 +19,27 @@ impl<M> Db<M> {
     /// front read in that case.
     pub fn get_structural_blocks(&self, track_id: i64) -> Result<Vec<StructuralBlock>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT kind, ordinal, length(body), body FROM structural_blocks \
+            "SELECT length(kind), length(CAST(kind AS BLOB)), kind, ordinal, \
+             length(body), body FROM structural_blocks \
              WHERE track_id = ?1 ORDER BY kind, ordinal",
         )?;
         let mut rows = stmt.query(params![track_id])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            let kind: String = r.get(0)?;
-            let ordinal: i64 = r.get(1)?;
-            let body_len: i64 = r.get(2)?;
+            // Bounded from its projections before it is allocated (#715): the
+            // allowlist below is exact-match, so it rejects a hostile `kind`, but
+            // only after reading it — and the only other bound is a write-time
+            // CHECK a crafted store can have skipped.
+            crate::error::check_text_field(
+                "structural_blocks",
+                "kind",
+                r.get(0)?,
+                r.get(1)?,
+                crate::limits::MAX_STRUCTURAL_KIND_LEN,
+            )?;
+            let kind: String = r.get(2)?;
+            let ordinal: i64 = r.get(3)?;
+            let body_len: i64 = r.get(4)?;
             if !crate::limits::STRUCTURAL_KINDS.contains(&kind.as_str()) {
                 return Err(DbError::InvalidStructuralBlock {
                     track_id,
@@ -49,7 +61,7 @@ impl<M> Db<M> {
             out.push(StructuralBlock {
                 kind,
                 ordinal: u64::try_from(ordinal).expect("ordinal guarded >= 0 above"),
-                body: r.get(3)?,
+                body: r.get(5)?,
             });
         }
         Ok(out)
@@ -153,13 +165,60 @@ mod guard_tests {
         db.conn
             .execute(
                 "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
-                 VALUES (?1, 'APPLICATION', 0, X'00')",
+                 VALUES (?1, 'PADDING', 0, X'00')",
                 rusqlite::params![id],
             )
             .unwrap();
         let err = db.get_structural_blocks(id).unwrap_err();
         assert!(
             matches!(err, DbError::InvalidStructuralBlock { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// #715: an oversized `kind` is refused from its length alone, before the
+    /// value is read — not by the allowlist after allocating it, and then again
+    /// in the error's debug-escaped copy.
+    #[test]
+    fn rejects_oversize_kind_before_reading_it() {
+        let (db, id) = db_with_track();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (?1, replace(hex(zeroblob(1048576)), '00', 'X'), 0, X'00')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        let err = db.get_structural_blocks(id).unwrap_err();
+        assert!(
+            matches!(err, DbError::FieldTooLarge { field: "kind", .. }),
+            "{err:?}"
+        );
+    }
+
+    /// SQLite stops counting a TEXT value's characters at an embedded NUL, so a
+    /// valid kind followed by a NUL and a megabyte reads as ten characters. The
+    /// byte projection is what catches it (#693's shape, on this column).
+    #[test]
+    fn rejects_nul_padded_kind_by_its_bytes() {
+        let (db, id) = db_with_track();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO structural_blocks (track_id, kind, ordinal, body) \
+                 VALUES (?1, 'STREAMINFO' || char(0) || \
+                 replace(hex(zeroblob(1048576)), '00', 'X'), 0, X'00')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        let err = db.get_structural_blocks(id).unwrap_err();
+        assert!(
+            matches!(err, DbError::FieldTooLarge { field: "kind", .. }),
             "{err:?}"
         );
     }
