@@ -48,10 +48,14 @@ impl BackingStamp {
                 .ctime()
                 .saturating_mul(NANOS_PER_SEC)
                 .saturating_add(meta.ctime_nsec()),
-            // A live stat always knows the inode. The `!= 0` guard is not for
-            // Linux, which never hands out inode 0 for a file, but for the
-            // round trip: this is the value the store will hold, and 0 is how
-            // the column spells "not recorded".
+            // The `!= 0` guard is for the round trip: this is the value the
+            // store will hold, and 0 is how the column spells "not recorded",
+            // so a stat reporting 0 must not be written back as a real inode.
+            // Linux hands out no inode 0 for a file on an ordinary filesystem,
+            // but a FUSE server can return whatever it likes under `use_ino`,
+            // so this is not a branch that provably never runs — which is
+            // exactly why `matches_live` treats a *live* `None` as a failure
+            // rather than as a wildcard.
             ino: (meta.ino() != 0).then_some(meta.ino()),
         }
     }
@@ -77,26 +81,39 @@ impl BackingStamp {
     /// Does `live` — a stamp just taken from the file on disk — describe the
     /// same backing bytes this stored stamp was recorded for?
     ///
-    /// Asymmetric on purpose, and deliberately not `==`. The stored side can
-    /// have an unrecorded inode and the live side never does, so the question
-    /// is not "are these equal" but "has anything the stored side actually
-    /// knows about changed". An unrecorded inode is not a mismatch: it is a
-    /// field with nothing to say, and treating it as one would fail every row
+    /// Asymmetric on purpose, and deliberately not `==`. The question is not
+    /// "are these equal" but "has anything the *stored* side actually knows
+    /// about changed". A stored stamp with no recorded inode has nothing to say
+    /// about that field, and treating that as a mismatch would fail every row
     /// in a just-migrated store on its first serve.
     ///
-    /// Written as a method rather than a `PartialEq` impl because the sentinel
-    /// rule is not an equivalence relation — a stored stamp with no inode
-    /// matches two live stamps that do not match each other — and an `==` that
-    /// is not transitive is a trap for the next reader. Fill the gap by
+    /// The wildcard is one-directional, and only the stored side gets it. A
+    /// *live* stat that cannot supply an inode is a failure, not a pass: the
+    /// stored side knowing a value the live side cannot produce is a
+    /// disagreement about the file, and the whole point of this guard is to
+    /// fail closed on anything it cannot rule out. Making the rule symmetric —
+    /// `self.ino.zip(live.ino).is_none_or(...)` reads neatly and does exactly
+    /// that — would let a replaced file pass on equal size and timestamps
+    /// whenever the new stat reported inode 0, which a FUSE server can do.
+    ///
+    /// Written as a method rather than a `PartialEq` impl because the rule is
+    /// not an equivalence relation — a stored stamp with no inode matches two
+    /// live stamps that do not match each other — and an `==` that is not
+    /// transitive is a trap for the next reader. Fill a missing inode by
     /// running `musefs scan --revalidate`, which re-probes exactly the rows
     /// whose inode is missing.
     pub fn matches_live(&self, live: &BackingStamp) -> bool {
         self.size == live.size
             && self.mtime_ns == live.mtime_ns
             && self.ctime_ns == live.ctime_ns
-            // `zip` is the whole sentinel rule: absent on either side yields
-            // `None`, which is not a disagreement.
-            && self.ino.zip(live.ino).is_none_or(|(a, b)| a == b)
+            && match self.ino {
+                // Nothing recorded: this field cannot decide either way.
+                None => true,
+                // Recorded: the live stat has to produce the same value. `None`
+                // here is a live stat that could not supply one at all, and
+                // that is a failure like any other mismatch.
+                Some(stored) => live.ino == Some(stored),
+            }
     }
 
     /// Whole-second mtime for the FUSE `getattr` display surface (never the raw
@@ -272,6 +289,22 @@ mod tests {
                 "a changed {what} must fail the stamp on its own"
             );
         }
+    }
+
+    /// The wildcard belongs to the stored side alone. A live stat that cannot
+    /// supply an inode — `st_ino == 0`, which a FUSE server can return under
+    /// `use_ino` — must not excuse a stored inode that is known: equal size and
+    /// timestamps would then let a replaced file serve different backing bytes,
+    /// which is the exact failure #674 exists to close.
+    #[test]
+    fn a_live_stat_with_no_inode_does_not_excuse_a_recorded_one() {
+        assert!(
+            !stamp(10, Some(111)).matches_live(&stamp(10, None)),
+            "a live stat that cannot produce the recorded inode fails closed"
+        );
+        // The stored-side wildcard is untouched, so the two directions really
+        // are different rather than both being excused.
+        assert!(stamp(10, None).matches_live(&stamp(10, Some(111))));
     }
 
     /// Why this is a method and not a `PartialEq` impl: the sentinel rule is

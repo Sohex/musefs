@@ -2733,6 +2733,12 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
             // skipping — which makes this the complete repopulation path for a
             // store migrated into V4, alongside the structural and checksum
             // backfills it already covered.
+            //
+            // A backing filesystem that can supply no inode at all leaves such
+            // a row re-probed on every pass rather than converging. That is
+            // slower, never wrong, and only reachable on a filesystem whose
+            // stat is already malformed — not worth a third state in the model
+            // to distinguish "not yet known" from "cannot be known".
             let needs_ino = stamp.ino.is_none();
             if stamp.matches_live(&crate::freshness::BackingStamp::from_metadata(&meta))
                 && !needs_backfill

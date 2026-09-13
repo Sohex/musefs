@@ -29,10 +29,13 @@ A stored inode of zero means "not recorded" — every row a store migrated into
 v4 carries, until a scan or `musefs scan --revalidate` fills it in — and such a
 row is compared on the other three fields alone rather than failing closed on a
 field the store has nothing to say about. `revalidate` re-probes exactly those
-rows, which is what makes it the repopulation path for an upgraded store. This
-comparison is deliberately *not* equality: a stamp with no recorded inode
-matches two live files that do not match each other, so it is a named,
-asymmetric check rather than an `==` that would not be transitive. The
+rows, which is what makes it the repopulation path for an upgraded store. The
+wildcard is one-directional: it belongs to the *stored* side only, and a live
+stat that cannot produce an inode fails closed against a row that has one,
+rather than being excused in turn. This comparison is therefore deliberately
+*not* equality — a stamp with no recorded inode matches two live files that do
+not match each other — so it is a named, asymmetric check rather than an `==`
+that would not be transitive. The
 `HeaderCache` (`reader.rs`) — a byte-budgeted concurrent cache (64 MiB
 default) of resolved layouts — keys each entry on it *and* on the
 **backing-source identity** the entry was built from: the row's
