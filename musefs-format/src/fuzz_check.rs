@@ -432,11 +432,13 @@ mod tests {
                 offset: 200,
                 len: 30,
                 seq_delta: 1,
+                serial: 7,
             },
             Segment::OggAudio {
                 offset: 230,
                 len: 70,
                 seq_delta: 1,
+                serial: 7,
             },
         ]);
         assert_backing_covers_audio(200, 100, &layout);

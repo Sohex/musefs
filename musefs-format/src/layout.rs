@@ -33,10 +33,14 @@ pub enum Segment {
     /// A run of original audio pages served with each page's sequence number
     /// shifted by `seq_delta` and its CRC recomputed. The byte length is unchanged
     /// (renumbering patches in place), so `len` equals the backing audio length.
+    /// `serial` is the logical bitstream the run belongs to: a page carrying any
+    /// other serial is a second bitstream the shift would corrupt, and is refused
+    /// at serve time (#722).
     OggAudio {
         offset: u64,
         len: u64,
         seq_delta: i64,
+        serial: u32,
     },
     /// A run of an embedded picture's serialized bytes, served lazily from the art
     /// store (never stored in the layout). When `base64`, the run is `len` chars of

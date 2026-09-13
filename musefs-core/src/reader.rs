@@ -565,6 +565,7 @@ fn read_segments_into<M>(
                     offset: ao,
                     seq_delta,
                     len,
+                    serial,
                 } => {
                     let br = backing.expect("ogg-audio segment requires an open backing reader");
                     serve_ogg_window(
@@ -572,6 +573,7 @@ fn read_segments_into<M>(
                         *ao,
                         *len,
                         *seq_delta,
+                        *serial,
                         within,
                         within + n as u64,
                         &mut *out,
@@ -673,6 +675,7 @@ mod ogg_serve_tests {
                 offset: audio_offset,
                 len: audio.len() as u64,
                 seq_delta: 1, // 3->4, 4->5
+                serial: 0x99,
             },
         ])
         .unwrap();

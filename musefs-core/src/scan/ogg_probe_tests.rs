@@ -119,3 +119,99 @@ fn probe_logs_an_undecodable_picture_and_keeps_the_others() {
     assert!(logged[0].contains("undecodable base64"), "{}", logged[0]);
     assert!(logged[0].contains("16 bytes"), "{}", logged[0]);
 }
+
+/// Stream A (serial 0x1234) complete, then a second logical bitstream under its
+/// own serial: a chain in the shape RFC 3533 defines.
+fn chained_opus_bytes() -> Vec<u8> {
+    let head = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&vorbis_body_empty());
+    let (mut bytes, _) = build_header_pub(0x1234, &[&head, &tags]);
+    let (audio, _) = lace_packet_pub(0x1234, 2, false, 960, &[0u8; 100]);
+    bytes.extend_from_slice(&audio);
+
+    let (b_header, b_pages) = build_header_pub(0x5678, &[&head, &tags]);
+    bytes.extend_from_slice(&b_header);
+    let (b_audio, _) = lace_packet_pub(0x5678, b_pages, false, 960, &[1u8; 100]);
+    bytes.extend_from_slice(&b_audio);
+    bytes
+}
+
+#[test]
+fn scan_skips_a_chained_ogg_and_says_so() {
+    // Chained Ogg was accepted, and a tag edit then renumbered the second
+    // stream's pages into self-consistent corruption (#722). Both probe paths
+    // must now refuse the file, and the operator must be told why.
+    crate::warn_limit::log_capture::install();
+    let bytes = chained_opus_bytes();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chained-scan.opus");
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+
+    assert!(
+        probe_full(&path, &bytes).is_none(),
+        "the oracle path must refuse it too"
+    );
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = crate::scan_directory(&db, &path).unwrap();
+    assert_eq!(stats.scanned, 0);
+    assert_eq!(stats.failed, 1);
+
+    let logged = crate::warn_limit::log_capture::messages_containing("chained-scan.opus");
+    assert_eq!(logged.len(), 1, "one skip, one line: {logged:?}");
+    assert!(logged[0].contains("chained Ogg"), "{}", logged[0]);
+}
+
+#[test]
+fn scan_ingests_an_oggflac_whose_header_count_is_unknown() {
+    // A zero following-packet count means "unknown", not "none": the real
+    // VORBIS_COMMENT still follows. Reading it as "none" left the tags inside
+    // the audio region, un-ingested and replayed by synthesis (#723).
+    let mut streaminfo = Vec::new();
+    streaminfo.push(0u8); // STREAMINFO, not the last block
+    streaminfo.extend_from_slice(&34u32.to_be_bytes()[1..]); // 24-bit length
+    streaminfo.extend(std::iter::repeat_n(0u8, 34));
+
+    let mut mapping = vec![0x7F];
+    mapping.extend_from_slice(b"FLAC");
+    mapping.push(1);
+    mapping.push(0);
+    mapping.extend_from_slice(&0u16.to_be_bytes()); // count: unknown
+    mapping.extend_from_slice(b"fLaC");
+    mapping.extend_from_slice(&streaminfo);
+
+    let body = vorbis_body_with(&[("title", "RealTitle")]);
+    let mut comment = vec![0x80 | 4]; // VORBIS_COMMENT, last block
+    comment.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
+    comment.extend_from_slice(&body);
+
+    let (mut bytes, pages) = build_header_pub(0x4321, &[&mapping, &comment]);
+    let header_len = bytes.len();
+    let (audio, _) = lace_packet_pub(0x4321, pages, false, 4096, &[0xFFu8, 0xF8, 0x69, 0x18]);
+    bytes.extend_from_slice(&audio);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown-count.oga");
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+
+    let probed = probe_full(&path, &bytes).expect("oggflac should probe");
+    assert_eq!(probed.format, Format::OggFlac);
+    assert_eq!(probed.audio_offset, header_len as u64);
+    assert_eq!(
+        probed.tags,
+        vec![("title".to_string(), "RealTitle".to_string())]
+    );
+
+    let db = musefs_db::Db::open_in_memory().unwrap();
+    let stats = crate::scan_directory(&db, &path).unwrap();
+    assert_eq!(stats.scanned, 1);
+    assert_eq!(stats.failed, 0);
+}
