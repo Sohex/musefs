@@ -274,12 +274,19 @@ its own terms rather than only because the refusal forbids the case.) Naming
 allowed.
 
 **Text and binary tag rows have independent ordinal spaces.** `tags` has no
-primary key; two partial unique indexes split on `value_blob IS NULL` enforce
-`(track_id, key, ordinal)` uniqueness *within* each class. A writer that
-rewrites one class alone — as both `contrib` helpers do, scoping their `DELETE`
-to `value_blob IS NULL` so scanner-written binary payloads survive a sync —
-can therefore reuse an ordinal the other class holds under the same key, which
-a single shared key space rejected.
+primary key; a unique index on `(track_id, key, ordinal, (value_blob IS NULL))`
+enforces uniqueness *within* each class. A writer that rewrites one class alone
+— as both `contrib` helpers do, scoping their `DELETE` to `value_blob IS NULL`
+so scanner-written binary payloads survive a sync — can therefore reuse an
+ordinal the other class holds under the same key, which a single shared key
+space rejected.
+
+The class is a column of one index rather than the predicate of two partial
+ones, because a partial index only serves a query whose `WHERE` implies its
+predicate. A reader that wants *both* classes at once — `tags_for_track` in the
+`contrib` helpers — implies neither, and against two partial indexes it plans as
+a full table scan plus a sort. With `track_id` leading a single index, every
+read shape stays on it.
 
 **What musefs defends at serve time.** CHECKs cannot catch a scanner-owned
 field mutated to a *well-formed* value that no longer matches the real file

@@ -217,10 +217,19 @@ see the [Release notes](release-notes.md).
   `contrib` helpers do: they scope their `DELETE` to `value_blob IS NULL` so
   scanner-written binary payloads survive a sync. Such a writer could land a text
   row on an ordinal a binary row already held and get
-  `UNIQUE constraint failed`. The primary key is replaced by two partial unique
-  indexes split on `value_blob IS NULL`, giving the two classes independent
-  spaces while keeping uniqueness inside each. The rowid is deliberately
-  untouched: a binary tag payload is addressed by it from the served layout.
+  `UNIQUE constraint failed`. The primary key is replaced by a unique index on
+  `(track_id, key, ordinal, (value_blob IS NULL))`: the expression yields 0 or 1
+  and never NULL, so uniqueness is per class while one row of each may share a
+  triple. The rowid is deliberately untouched: a binary tag payload is addressed
+  by it from the served layout.
+
+  One index rather than the two partial ones the issue sketched, because a
+  partial index can only serve a query whose `WHERE` implies its predicate.
+  Every Rust reader constrains `value_blob`, but `tags_for_track` in the
+  `contrib` helpers deliberately does not — it reads both classes at once — and
+  against two partial indexes that plans as `SCAN tags` plus a temp B-tree for
+  the `ORDER BY`, where the primary key used to serve it. A query-plan test now
+  pins every read shape to an index.
 
   **Row ownership becomes immutable**
   ([#717](https://github.com/Sohex/musefs/issues/717)). `tags_au` and

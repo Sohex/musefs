@@ -263,7 +263,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   - A track's text tags and its binary tags no longer share one ordinal space
     per key ([#663](https://github.com/Sohex/musefs/issues/663)). `tags`' primary
-    key becomes two partial unique indexes split on `value_blob IS NULL`, so a
+    key becomes a unique index that folds the class in as a fourth column, so a
     writer that rewrites one class alone — as the beets and Picard plugins do,
     scoping their delete so scanner-written binary payloads survive a sync —
     can no longer collide with an ordinal the other class holds.

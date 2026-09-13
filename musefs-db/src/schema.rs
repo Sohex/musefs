@@ -688,13 +688,21 @@ CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 -- table per deleted row.
 CREATE INDEX track_art_art_id_idx ON track_art(art_id);
 
--- `tags`' primary key, split in two (#663). The partial indexes give text rows
--- and binary rows independent ordinal spaces per key, which is the collision an
--- external writer rewriting one class alone could otherwise provoke.
-CREATE UNIQUE INDEX tags_text_ordinal_idx
-    ON tags(track_id, key, ordinal) WHERE value_blob IS NULL;
-CREATE UNIQUE INDEX tags_binary_ordinal_idx
-    ON tags(track_id, key, ordinal) WHERE value_blob IS NOT NULL;
+-- `tags`' primary key, with the class folded in as a fourth column (#663). The
+-- expression yields 0 or 1 and never NULL, so uniqueness is per class: two text
+-- rows may not share (track_id, key, ordinal) and neither may two binary rows,
+-- but one of each may -- which is the collision an external writer rewriting a
+-- single class could otherwise provoke.
+--
+-- One index rather than the two partial ones #663 sketched, because a partial
+-- index can only serve a query whose WHERE implies its predicate. Every Rust
+-- reader constrains `value_blob`, but `tags_for_track` in the `contrib` helpers
+-- deliberately does not -- it reads both classes at once -- and against two
+-- partial indexes that query plans as `SCAN tags` plus a temp B-tree for the
+-- ORDER BY, where the primary key used to serve it. `track_id` leading here
+-- keeps that query on an index.
+CREATE UNIQUE INDEX tags_ordinal_idx
+    ON tags(track_id, key, ordinal, (value_blob IS NULL));
 
 CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (NEW.id);
@@ -2277,6 +2285,54 @@ mod v4_tags_and_track_art_rebuild_tests {
         );
     }
 
+    /// Every shape that reads a track's tags must reach them through an index.
+    ///
+    /// Dropping the primary key for #663 took the only index a query that does
+    /// *not* constrain `value_blob` could use, and the obvious replacement --
+    /// two partial unique indexes -- cannot serve one, because a partial index
+    /// only applies where the query's WHERE implies its predicate. That query
+    /// exists: `tags_for_track` in the `contrib` helpers reads both classes at
+    /// once. Against two partial indexes it planned as `SCAN tags` plus a temp
+    /// B-tree for the ORDER BY, on the path a plugin uses per track.
+    #[test]
+    fn every_tags_read_shape_uses_an_index() {
+        let conn = migrated();
+        for (what, sql) in [
+            (
+                "both classes at once (contrib's tags_for_track)",
+                "SELECT key, value, value_blob FROM tags \
+                 WHERE track_id = 1 ORDER BY key, ordinal",
+            ),
+            (
+                "text rows only",
+                "SELECT key, value FROM tags \
+                 WHERE track_id = 1 AND value_blob IS NULL ORDER BY key, ordinal",
+            ),
+            (
+                "binary rows only",
+                "SELECT key FROM tags \
+                 WHERE track_id = 1 AND value_blob IS NOT NULL ORDER BY key, ordinal",
+            ),
+        ] {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let plan = plan.join(" | ");
+            assert!(
+                plan.contains("USING INDEX") && !plan.contains("SCAN tags"),
+                "{what} must not scan the table: {plan}"
+            );
+            assert!(
+                !plan.contains("TEMP B-TREE"),
+                "{what} must not sort: {plan}"
+            );
+        }
+    }
+
     /// #717: reparenting left the old owner serving a stale layout with a
     /// `content_version` that still matched, because the `_au` bump named only
     /// the new owner. Ownership is now immutable, the way `art` already is.
@@ -2679,22 +2735,38 @@ mod baseline_tests {
 
     /// The literals in the *latest* definition of each table are what a fresh
     /// `migrate()` leaves behind, so those are the ones that must track
-    /// `crate::limits`. V3 owns `tags` and `track_art`; V1 still owns `art` and
+    /// `crate::limits`. V4 owns `tags` and `track_art`; V1 still owns `art` and
     /// `structural_blocks`.
+    ///
+    /// The ownership moves as tables are rebuilt, and pointing this at a
+    /// superseded migration is worse than useless: it would assert against text
+    /// the byte-for-byte digest above already freezes, while the definition a
+    /// fresh store actually gets drifts unwatched.
     #[test]
     fn check_literals_match_limits_constants() {
         use crate::limits::*;
         let v1 = super::MIGRATION_V1;
-        let v3 = super::MIGRATION_V3;
-        // V3 rebuilds `tags` at FLAC's block ceiling and `track_art` at 8 KiB (#644).
-        assert!(v3.contains(&format!("length(key) <= {MAX_TAG_KEY_LEN}")));
-        assert!(v3.contains(&format!(
+        let v4 = super::MIGRATION_V4;
+        // V4 rebuilds `tags` and `track_art` (#663, #716, #718, #693).
+        assert!(v4.contains(&format!("length(key) <= {MAX_TAG_KEY_LEN}")));
+        assert!(v4.contains(&format!(
             "length(CAST(value AS BLOB)) <= {MAX_TAG_VALUE_LEN}"
         )));
-        assert!(v3.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
-        assert!(v3.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
-        // Still V1-owned: no later migration recreates `art` or `structural_blocks`.
+        assert!(v4.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
+        assert!(v4.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
+        // `mime` moved to the link it describes (#716). `art` keeps its own copy
+        // until that table is rebuilt, so both definitions are live right now.
+        assert!(v4.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
         assert!(v1.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
+        // The picture geometry is Option<u32>/u32 in the Rust model, and the
+        // upper bound is what stops a schema-valid row being a conversion
+        // failure (#718) -- so it is pinned to the type, not to a magic number.
+        assert_eq!(
+            v4.matches(&format!("BETWEEN 0 AND {}", u32::MAX)).count(),
+            4,
+            "width, height, depth and colors each carry the u32 ceiling"
+        );
+        // Still V1-owned: no later migration recreates `art` or `structural_blocks`.
         assert!(v1.contains(&format!("length(sha256) = {ART_SHA256_LEN}")));
         assert!(v1.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
         assert!(v1.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));

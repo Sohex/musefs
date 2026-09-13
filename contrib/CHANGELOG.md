@@ -13,9 +13,11 @@ and these packages adhere to [Semantic Versioning](https://semver.org/spec/v2.0.
 ### Changed
 
 - **A text-tag sync can no longer collide with a scanner-written binary tag.**
-  Schema v4 splits `tags`' primary key into two partial unique indexes on
-  `value_blob IS NULL`, so the text rows these helpers rewrite and the binary
-  rows they deliberately preserve get independent ordinal spaces per key.
+  Schema v4 replaces `tags`' primary key with a unique index that folds the
+  row class in as a fourth column, so the text rows these helpers rewrite and
+  the binary rows they deliberately preserve get independent ordinal spaces per
+  key. `tags_for_track`, which reads both classes at once, keeps using an index
+  for the lookup.
   `replace_tags` scopes its `DELETE` to `value_blob IS NULL` precisely so
   scanner-written payloads survive a sync, and that is the shape that could
   previously fail with `UNIQUE constraint failed: tags.track_id, tags.key,

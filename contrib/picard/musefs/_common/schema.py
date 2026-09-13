@@ -693,13 +693,21 @@ CREATE INDEX tracks_fingerprint_idx ON tracks(fingerprint);
 -- table per deleted row.
 CREATE INDEX track_art_art_id_idx ON track_art(art_id);
 
--- `tags`' primary key, split in two (#663). The partial indexes give text rows
--- and binary rows independent ordinal spaces per key, which is the collision an
--- external writer rewriting one class alone could otherwise provoke.
-CREATE UNIQUE INDEX tags_text_ordinal_idx
-    ON tags(track_id, key, ordinal) WHERE value_blob IS NULL;
-CREATE UNIQUE INDEX tags_binary_ordinal_idx
-    ON tags(track_id, key, ordinal) WHERE value_blob IS NOT NULL;
+-- `tags`' primary key, with the class folded in as a fourth column (#663). The
+-- expression yields 0 or 1 and never NULL, so uniqueness is per class: two text
+-- rows may not share (track_id, key, ordinal) and neither may two binary rows,
+-- but one of each may -- which is the collision an external writer rewriting a
+-- single class could otherwise provoke.
+--
+-- One index rather than the two partial ones #663 sketched, because a partial
+-- index can only serve a query whose WHERE implies its predicate. Every Rust
+-- reader constrains `value_blob`, but `tags_for_track` in the `contrib` helpers
+-- deliberately does not -- it reads both classes at once -- and against two
+-- partial indexes that query plans as `SCAN tags` plus a temp B-tree for the
+-- ORDER BY, where the primary key used to serve it. `track_id` leading here
+-- keeps that query on an index.
+CREATE UNIQUE INDEX tags_ordinal_idx
+    ON tags(track_id, key, ordinal, (value_blob IS NULL));
 
 CREATE TRIGGER tracks_changelog_ai AFTER INSERT ON tracks BEGIN
     INSERT INTO track_changes (track_id) VALUES (NEW.id);
