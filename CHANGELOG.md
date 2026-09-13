@@ -14,6 +14,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`musefs migrate --repair`.** Before copying or writing anything, `migrate`
+  now checks that every row in the store survives the schema it is about to
+  become, reports what would be refused per table, and stops. A row gets there
+  by being written before the constraint that now refuses it, or by a tool with
+  the constraints turned off. `--repair` deletes those rows — after the snapshot,
+  so they are still in the copy you can go back to — and nothing deletes them
+  without it: dropping a row an external writer chose is exactly the class of
+  thing that must not happen unasked
+  ([#705](https://github.com/Sohex/musefs/issues/705)). The check asks the
+  migration's own schema rather than a second description of it, so it reports
+  what the upgrade would really do.
+
 - **`musefs migrate`.** An explicit, confirmed store upgrade — the command the
   gated-migration refusal names. It refuses a store anything else has open,
   reports what will change and what it needs in free disk, snapshots the store

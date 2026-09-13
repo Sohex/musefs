@@ -102,8 +102,9 @@ musefs build can open it; run `musefs migrate --db <store>`.
 musefs migrate --db library.db
 ```
 
-It reports what it is about to do, takes a snapshot, upgrades the store, and
-then offers to clean up after itself:
+It reports what it is about to do, checks that every row survives the new
+schema, takes a snapshot, upgrades the store, and then offers to clean up after
+itself:
 
 ```text
 store library.db is at schema version 3; this build needs 4.
@@ -122,6 +123,43 @@ has it open — a mount, a running scan, another `musefs migrate`:
 ```text
 error: the store is in use — unmount the filesystem or stop any scan before migrating
 ```
+
+### Rows the new schema refuses
+
+Before anything is copied or written, `migrate` checks whether every row in the
+store is valid under the schema it is about to become. A row can fail that for
+one of two reasons: it was written before the constraint that now refuses it, or
+it was written by a tool with the constraints turned off.
+
+If any are found, the command reports them per table and stops:
+
+```text
+2 rows in this store are not valid under the new schema:
+  tags: 1 row(s)
+  art: 1 row(s)
+They were written before the constraint that now refuses them, or by a writer with the constraints turned off.
+error: refusing to upgrade library.db: 2 row(s) would be rejected. Pass --repair to delete them, or fix them yourself first. The upgrade changes nothing until this is resolved
+```
+
+Nothing has happened at this point — no snapshot, no rewrite. Either fix the
+rows with whatever wrote them, or pass `--repair` to have `migrate` **delete**
+them. It will not do that on its own: dropping a row an external tool chose to
+write is exactly the kind of thing that should not happen without being asked.
+
+`--repair` deletes after the snapshot is taken, so the rows are still in the copy
+you can go back to — which is why it refuses to run alongside `--no-snapshot`.
+The count is what will actually go: a child whose parent does not survive is
+reported with it, rather than left to the cascade to take silently.
+
+The check also catches a row that is fine in itself but points at a parent that
+is not there — the kind an external tool can leave behind with foreign keys
+turned off. Such a row passes every constraint in its own table and fails only
+when the upgrade puts it back.
+
+The check costs one pass over the store and reports what the migration would
+actually do, because it asks the migration's own schema rather than a second
+description of it: the target tables are built exactly as the upgrade builds
+them, and every row is offered to them.
 
 ### The snapshot
 
@@ -155,6 +193,7 @@ The two offers decline themselves unless you ask for them:
 | Flag | Effect |
 | ---- | ------ |
 | `--yes` / `-y` | Upgrade without asking. Required off a terminal. |
+| `--repair` | Delete rows the new schema refuses. Nothing is deleted without it; refuses alongside `--no-snapshot`. |
 | `--snapshot PATH` | Write the snapshot here instead of beside the store. |
 | `--no-snapshot` | Take no snapshot. The upgrade is then not reversible. |
 | `--vacuum` / `--vacuum=false` | Compact afterwards, or do not. Omit to be asked. |

@@ -14,6 +14,48 @@ see the [Release notes](release-notes.md).
 
 ### Added
 
+- **`musefs migrate --repair`, and the row-rejection pre-flight it exists for.**
+  The 2.0.0 migration tightens constraints an existing store can already
+  violate — an embedded NUL in a tag key or an art mime, a picture dimension
+  past `u32`, a value whose storage class is not what the Rust side reads. Such
+  a row aborts the migration, atomically, which is safe but a poor way to find
+  out: the upgrade can have been copying blobs for a while before it meets one.
+
+  So `migrate` now checks first, before anything is copied or written, and
+  reports what would be refused per table. It does **not** repair on its own —
+  dropping a row an external writer chose is exactly the class of thing that
+  must not happen unasked — so it stops and names `--repair`. With that flag the
+  rows are deleted *after* the snapshot is taken, so they are still in the copy
+  the user can go back to, and the report says plainly that deleting a track
+  takes its tags and art links with it.
+
+  The check does not describe the constraints a second time. It builds the
+  target tables using the migration itself — a scratch store migrated to the
+  target is by definition the shape this one is about to become — attaches them
+  to the store, and offers every row to them with `INSERT OR IGNORE`, which
+  skips exactly what a `CHECK`, `NOT NULL` or `UNIQUE` would refuse. What did
+  not arrive is the answer. A hand-written copy of the rules would have drifted
+  the first time one changed, and there were seven issues' worth of changes to
+  drift from.
+
+  Foreign keys are off for the pass, because `INSERT OR IGNORE` cannot help with
+  them: conflict resolution does not apply to foreign keys, so a violation
+  aborts the statement rather than skipping the row. That leaves one shape the
+  row-by-row pass cannot see — a child pointing at a parent that is not there,
+  which an external tool can leave behind with enforcement turned off, and which
+  fails the refill when the upgrade puts it back. A second pass covers it, and
+  covers the same question for a child whose parent this repair is about to
+  delete, since to a child those are the same thing.
+
+  So the count is what will actually go, children included, rather than only the
+  rows with something wrong of their own. Deletes run in an order the references
+  require: `tracks` first so its cascade takes what it owns, and `art` last,
+  because `track_art.art_id` references it with no `ON DELETE` clause and
+  deleting a refused blob while a link survives fails outright.
+
+  `--repair` refuses alongside `--no-snapshot`. The rows go for good, and the
+  snapshot is the only copy they survive in.
+
 - **`musefs migrate`.** The command the gate above names: an explicit,
   confirmed store upgrade. It refuses a store anything else has open, reports
   the current version, the target version and what each pending step does, and
