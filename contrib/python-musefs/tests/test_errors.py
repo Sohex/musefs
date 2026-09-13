@@ -20,12 +20,14 @@ def test_schema_mismatch_newer_store_says_upgrade_the_plugin():
     assert "upgrade the plugin" in message
 
 
-def test_schema_mismatch_older_store_says_rescan_to_migrate():
-    """A store behind the plugin: `musefs scan` migrates it in place."""
+def test_schema_mismatch_older_store_says_run_migrate():
+    """A store behind the plugin: `musefs migrate` upgrades it in place. Not
+    `scan`, which refuses a store behind a gated step (#744)."""
     message = str(SchemaMismatch(EXPECTED_USER_VERSION - 1))
     assert f"user_version is {EXPECTED_USER_VERSION - 1}" in message
     assert "predates this plugin" in message
-    assert "`musefs scan`" in message
+    assert "`musefs migrate --db <store>`" in message
+    assert "musefs scan" not in message
 
 
 def test_scan_error_not_found():

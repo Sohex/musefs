@@ -274,8 +274,8 @@ for a custom write loop)
 
 - `SchemaMismatch(found)` — schema-version skew; `.found` is the DB's version.
   The message names which side is behind and the fix: a store newer than the
-  plugin means upgrading the plugin, an older one means rescanning with musefs
-  to migrate it.
+  plugin means upgrading the plugin, an older one means upgrading musefs and running
+  `musefs migrate` against the store.
 - `ScanError(kind, *, binary, target, …)` — a `musefs scan` failure; `.kind` ∈
   `{"not_found", "timeout", "failed"}`, with context attributes for messaging.
 

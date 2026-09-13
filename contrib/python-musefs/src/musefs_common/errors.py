@@ -25,7 +25,7 @@ class SchemaMismatch(Exception):  # noqa: N818
         if found < EXPECTED_USER_VERSION:
             return (
                 f"{head}; the store predates this plugin — upgrade musefs and run "
-                f"`musefs scan` against the library, which migrates the store in place"
+                f"`musefs migrate --db <store>`, which upgrades the store in place"
             )
         return head
 
