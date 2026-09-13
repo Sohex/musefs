@@ -1,6 +1,6 @@
-use crate::art::{set_track_art_in, upsert_art_in};
+use crate::art::{refresh_embedded_art_in, set_track_art_in, upsert_art_in};
 use crate::models::{
-    BinaryTag, ChecksumWrite, NewArt, NewTrack, StructuralBlock, Tag, Track, TrackArt,
+    BinaryTag, ChecksumWrite, EmbeddedArt, NewArt, NewTrack, StructuralBlock, Tag, Track, TrackArt,
 };
 use crate::structural::set_structural_blocks_in;
 use crate::tags::{replace_tags_in, set_binary_tags_in};
@@ -123,6 +123,14 @@ impl BulkWriter<'_> {
 
     pub fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> Result<()> {
         set_track_art_in(&self.tx, track_id, items)
+    }
+
+    pub fn refresh_embedded_art(
+        &mut self,
+        track_id: i64,
+        pictures: &[EmbeddedArt],
+    ) -> Result<usize> {
+        refresh_embedded_art_in(&self.tx, track_id, pictures)
     }
 
     /// Run one item's writes inside a `SAVEPOINT`, so an error discards only

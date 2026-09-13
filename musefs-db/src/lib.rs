@@ -18,7 +18,7 @@ mod tracks;
 pub use bulk::BulkWriter;
 pub use error::{DbError, Result};
 pub use models::{
-    Art, ArtMeta, BinaryTag, BinaryTagRow, ChecksumWrite, Format, NewArt, NewTrack,
+    Art, ArtMeta, BinaryTag, BinaryTagRow, ChecksumWrite, EmbeddedArt, Format, NewArt, NewTrack,
     StructuralBlock, Tag, Track, TrackArt, TrackBounds, TrackIdentity,
 };
 pub use tracks::ChangelogRead;

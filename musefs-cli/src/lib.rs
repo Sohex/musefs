@@ -1006,8 +1006,9 @@ pub fn run_migrate(args: &MigrateArgs) -> Result<()> {
 
     if owed > 0 {
         println!(
-            "{owed} track(s) now carry no fingerprint; a revalidate recomputes them, and \
-             until it runs those tracks cannot be recovered by a move."
+            "{owed} track(s) now carry no fingerprint; a revalidate recomputes them and \
+             restores each file's own picture metadata, and until it runs those tracks \
+             cannot be recovered by a move."
         );
         let offer = root
             .as_ref()

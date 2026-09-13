@@ -10,6 +10,14 @@ curated tags, art, and binary tags in the store**. Unchanged files are skipped,
 and files not yet in the store are ignored (ingesting new files is `scan`'s
 job — see [Scanning](scanning.md)).
 
+The one thing about art it does refresh is what a file declares about its own
+pictures. A link to an image the file embeds, under the same picture type and
+description, takes back the file's MIME type, dimensions, bit depth and colour
+count; a link an external writer made to other bytes, or re-described, is left
+as it is. That is how a revalidate restores the per-file picture metadata the
+schema v4 migration could not carry over
+([#746](https://github.com/Sohex/musefs/issues/746)).
+
 ```bash
 musefs revalidate /path/to/music --db library.db          # refresh changed rows
 musefs revalidate /path/to/music --db library.db --prune  # also delete gone tracks

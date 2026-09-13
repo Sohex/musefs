@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use musefs_db::convert::usize_from;
-use musefs_db::{ChecksumWrite, Db, Format, NewArt, NewTrack, Tag, TrackArt};
+use musefs_db::{ChecksumWrite, Db, EmbeddedArt, Format, NewArt, NewTrack, Tag, TrackArt};
 use musefs_format::{EmbeddedBinaryTag, EmbeddedPicture, Extent, flac, mp3, mp4, ogg, wav};
 
 use crate::byte_budget::ByteBudget;
@@ -1710,6 +1710,11 @@ trait TrackSink {
     ) -> musefs_db::Result<()>;
     fn upsert_art(&mut self, a: &NewArt) -> musefs_db::Result<i64>;
     fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()>;
+    fn refresh_embedded_art(
+        &mut self,
+        track_id: i64,
+        pictures: &[EmbeddedArt],
+    ) -> musefs_db::Result<usize>;
     fn set_track_checksums(
         &mut self,
         track_id: i64,
@@ -1760,6 +1765,13 @@ impl TrackSink for &Db {
     }
     fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()> {
         Db::set_track_art(self, track_id, items)
+    }
+    fn refresh_embedded_art(
+        &mut self,
+        track_id: i64,
+        pictures: &[EmbeddedArt],
+    ) -> musefs_db::Result<usize> {
+        Db::refresh_embedded_art(self, track_id, pictures)
     }
     fn set_track_checksums(
         &mut self,
@@ -1827,6 +1839,13 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
     }
     fn set_track_art(&mut self, track_id: i64, items: &[TrackArt]) -> musefs_db::Result<()> {
         musefs_db::BulkWriter::set_track_art(self, track_id, items)
+    }
+    fn refresh_embedded_art(
+        &mut self,
+        track_id: i64,
+        pictures: &[EmbeddedArt],
+    ) -> musefs_db::Result<usize> {
+        musefs_db::BulkWriter::refresh_embedded_art(self, track_id, pictures)
     }
     fn set_track_checksums(
         &mut self,
@@ -1920,21 +1939,17 @@ fn ingest_into(
     w.set_structural_blocks(track_id, &structural_blocks)?;
 
     let mut track_arts = Vec::new();
-    for (ordinal, pic) in probed.pictures.into_iter().enumerate() {
+    for (ordinal, pic) in probed.pictures.into_iter().map(embedded_art).enumerate() {
         let art_id = w.upsert_art(&NewArt { data: pic.data })?;
-        let picture_type = pic.picture_type.get();
         // The picture metadata goes on the link, where it describes this file's
         // block rather than the bytes every file sharing the blob holds (#716).
-        // Zero stays the "not declared" sentinel the formats themselves use:
-        // `None` for the dimensions, which the model makes nullable, and 0 for
-        // depth and colours, which the FLAC block spells that way.
         track_arts.push(TrackArt {
             art_id,
-            picture_type,
+            picture_type: pic.picture_type,
             description: pic.description,
             mime: pic.mime,
-            width: (pic.width != 0).then_some(pic.width),
-            height: (pic.height != 0).then_some(pic.height),
+            width: pic.width,
+            height: pic.height,
             depth: pic.depth,
             colors: pic.colors,
             ordinal: ordinal as u64,
@@ -1944,8 +1959,29 @@ fn ingest_into(
     Ok(())
 }
 
-/// Refresh only the structural serving facts for an already-probed file.
-/// Leaves curated tags, binary tags, and art untouched.
+/// What a file's embedded picture declares, in the store's terms. The one
+/// conversion both ingest and the structural refresh use, so a link a scan
+/// wrote is one the refresh recognises as the file's (#746).
+fn embedded_art(pic: EmbeddedPicture) -> EmbeddedArt {
+    // Zero stays the "not declared" sentinel the formats themselves use: `None`
+    // for the dimensions, which the model makes nullable, and 0 for depth and
+    // colours, which the FLAC block spells that way.
+    EmbeddedArt {
+        picture_type: pic.picture_type.get(),
+        description: pic.description,
+        mime: pic.mime,
+        width: (pic.width != 0).then_some(pic.width),
+        height: (pic.height != 0).then_some(pic.height),
+        depth: pic.depth,
+        colors: pic.colors,
+        data: pic.data,
+    }
+}
+
+/// Refresh only the structural serving facts for an already-probed file, plus
+/// what the file declares about its own embedded pictures. Leaves curated tags,
+/// binary tags, and art untouched: a picture link is restored only where it is
+/// the file's own (see `Db::refresh_embedded_art`).
 fn refresh_structural_into(
     mut w: impl TrackSink,
     abs_path: &Path,
@@ -1967,6 +2003,11 @@ fn refresh_structural_into(
     w.set_track_checksums(track_id, fingerprint, content_hash)?;
     let structural_blocks = structural_blocks_from(probed.structural_blocks);
     w.set_structural_blocks(track_id, &structural_blocks)?;
+    // The V4 migration could only copy each blob's shared metadata onto every
+    // link, with FLAC's depth and colours at 0; this pass is the one `migrate`
+    // offers afterwards, so it is where the file's own values come back (#746).
+    let pictures: Vec<EmbeddedArt> = probed.pictures.into_iter().map(embedded_art).collect();
+    w.refresh_embedded_art(track_id, &pictures)?;
     Ok(())
 }
 
@@ -2383,8 +2424,10 @@ fn run_pipeline(
                         // `CHECK` violation discovered at commit time is fatal
                         // to the whole scan and has lost the path by then
                         // (#644). Full-write policy only — `StructuralOnly`
-                        // (revalidate) writes neither tags nor art, so failing
-                        // a stored track for them would be inventing a failure.
+                        // (revalidate) writes no tags and links no art, so
+                        // failing a stored track for them would be inventing a
+                        // failure. It only restores metadata onto links the file
+                        // already supplied (#746), which the store still checks.
                         if policy == WritePolicy::Full
                             && let Err(e) = check_storable(&abs_path, &probed)
                         {

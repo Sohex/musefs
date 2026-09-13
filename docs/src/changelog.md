@@ -370,7 +370,7 @@ see the [Release notes](release-notes.md).
   `colors` are new storage for values FLAC's parser already reads and discards.
 
   The backfill copies the shared `art` values to every link, because the true
-  per-embedding ones were destroyed at ingest; they come back on a rescan. Then
+  per-embedding ones were destroyed at ingest; a `revalidate` restores them for every picture a file embeds itself — the pass `musefs migrate` offers once it finishes. Then
   `art` is rebuilt without them — see the `art` rebuild below, whose ordering
   constraint is what makes the window for that exist. What is left on the row is
   the content and its identity: `id`, `sha256`, `byte_len`, `data`.
@@ -647,6 +647,15 @@ see the [Release notes](release-notes.md).
 
 ### Fixed
 
+- **A revalidate restores each file's own picture metadata.** The schema v4
+  migration can only copy one blob's MIME type and dimensions onto every link
+  to it, with FLAC's depth and colour count at 0, and said the real values
+  came back on a rescan — but the revalidate `musefs migrate` offers never
+  touched art, so only `scan --force`, which replaces curated tags and art,
+  restored them. A revalidate now restores the MIME type, dimensions, depth
+  and colours of every link whose image, picture type and description are one
+  the file embeds, and leaves every other link alone
+  ([#746](https://github.com/Sohex/musefs/issues/746)).
 - **Metadata work can no longer grow the worker-pool queue without bound.**
   Reads were capped; `lookup`, `getattr`, `open`, `opendir` and directory
   listings queued without limit. They now pass an admission gate of 4096 jobs,
