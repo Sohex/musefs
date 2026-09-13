@@ -95,7 +95,7 @@ def sync_one(conn, record, stats, *, dry_run=False, merge=False):
                 if will_link_art:
                     arts = [
                         (
-                            upsert_art(conn, img.data, img.mime),
+                            upsert_art(conn, img.data),
                             img.picture_type,
                             img.description,
                             img.mime,

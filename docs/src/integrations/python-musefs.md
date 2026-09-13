@@ -158,9 +158,11 @@ that bite plugin authors:
 - **Content-address art** through `upsert_art` (sha256 de-dup) rather than
   inserting `art` rows by hand; `sync_files` does this for you.
 - **Art rows are immutable.** A trigger rejects in-place updates of an
-  `art` row's content columns (`data`, `sha256`, `mime`, `byte_len`, `width`,
-  `height`). To change a track's art, insert a new content-addressed row via
-  `upsert_art` and relink it via `replace_track_art`.
+  `art` row's key or content columns (`id`, `data`, `sha256`, `byte_len`). To
+  change a track's art, insert a new content-addressed row via `upsert_art` and
+  relink it via `replace_track_art`. From schema v4 the row is the content and
+  nothing else: everything describing one file's embedding of it — the mime, the
+  dimensions, the colour depth — lives on the `track_art` link.
 - **Path layout is just a tag.** To drive a reorganized mount, write your
   computed relative path into a custom tag (e.g. `beets_path`) and mount with
   `--template '$!{beets_path}'`. musefs sanitizes each path segment, so a writer
@@ -214,10 +216,10 @@ for a custom write loop)
 - `merge_tags(conn, track_id, managed_pairs, delete_keys)` — per-key replace of
   plugin-managed text tags, leaving unmanaged text rows intact.
 - `replace_tags(conn, track_id, pairs)` — replace all plugin-owned text tags.
-- `upsert_art(conn, data, mime)` → art id — content-address `data` by sha256,
+- `upsert_art(conn, data)` → art id — content-address `data` by sha256,
   inserting only if new.
 - `replace_track_art(conn, track_id, arts)` — replace a track's `track_art`
-  rows; `arts` is `[(art_id, picture_type, description), …]`.
+  rows; `arts` is `[(art_id, picture_type, description, mime), …]`.
 - `sniff_mime(data, path)` — image mime from magic bytes, falling back to file
   extension.
 - `prune_missing(conn, track_ids=None, *, unreadable=None)` → count — delete

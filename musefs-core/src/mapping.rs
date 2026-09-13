@@ -344,8 +344,8 @@ mod tests {
         // under test (length and byte_len disagree, and byte_len is negative) —
         // do not "fix" the mismatch.
         raw.execute(
-            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
-             VALUES (?1, 'image/png', NULL, NULL, -1, X'0909090909')",
+            "INSERT INTO art (sha256, byte_len, data) \
+             VALUES (?1, -1, X'0909090909')",
             [&"9".repeat(64)],
         )
         .unwrap();
@@ -495,7 +495,7 @@ mod tests {
             .unwrap();
         let plant = |byte_len: i64, sha: &str| {
             raw.execute(
-                "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?1, 'image/png', ?2, X'')",
+                "INSERT INTO art (sha256, byte_len, data) VALUES (?1, ?2, X'')",
                 rusqlite::params![sha, byte_len],
             )
             .unwrap();

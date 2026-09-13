@@ -107,7 +107,7 @@ def test_replace_track_art_atomic_on_fk_violation(db_path):
     conn = _autocommit(db_path)  # FK on, autocommit; no failure injection needed
     try:
         tid = insert_track(conn, "/m/a.flac")
-        art_id = upsert_art(conn, JPEG, "image/jpeg")
+        art_id = upsert_art(conn, JPEG)
         replace_track_art(conn, tid, [(art_id, 3, "", "image/png")])
         before_cv = conn.execute(
             "SELECT content_version FROM tracks WHERE id = ?", (tid,)

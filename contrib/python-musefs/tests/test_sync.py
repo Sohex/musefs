@@ -126,7 +126,7 @@ def test_no_art_leaves_existing_track_art_untouched(db_path):
     try:
         sha = "deadbeef" * 8  # 64-char hex to satisfy the length(sha256)=64 CHECK
         conn.execute(
-            "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?, 'image/jpeg', 3, X'aabbcc')",
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?, 3, X'aabbcc')",
             (sha,),
         )
         art_id = conn.execute("SELECT id FROM art WHERE sha256=?", (sha,)).fetchone()[0]
@@ -256,7 +256,7 @@ def test_sync_one_all_images_over_cap_leaves_existing_art(db_path):
     try:
         sha = "deadbeef" * 8  # 64-char hex to satisfy the length(sha256)=64 CHECK
         conn.execute(
-            "INSERT INTO art (sha256, mime, byte_len, data) VALUES (?, 'image/jpeg', 3, X'aabbcc')",
+            "INSERT INTO art (sha256, byte_len, data) VALUES (?, 3, X'aabbcc')",
             (sha,),
         )
         art_id = conn.execute("SELECT id FROM art WHERE sha256=?", (sha,)).fetchone()[0]

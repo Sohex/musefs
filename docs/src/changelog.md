@@ -291,8 +291,9 @@ see the [Release notes](release-notes.md).
   it is not a reparent and still works.
 
   **The picture metadata moves to the link**
-  ([#716](https://github.com/Sohex/musefs/issues/716), the adding half).
-  `track_art` gains `mime`, `width`, `height`, `depth` and `colors`. `art` is
+  ([#716](https://github.com/Sohex/musefs/issues/716)).
+  `track_art` gains `mime`, `width`, `height`, `depth` and `colors`, and `art`
+  gives the first three up in the same step. `art` is
   deduplicated on `sha256(data)` but owned those columns, which is the wrong
   functional dependency: they describe one file's `PICTURE`/`APIC` block, not the
   bytes every file shares. Since `upsert_art` is `ON CONFLICT(sha256) DO
@@ -304,17 +305,23 @@ see the [Release notes](release-notes.md).
   `colors` are new storage for values FLAC's parser already reads and discards.
 
   The backfill copies the shared `art` values to every link, because the true
-  per-embedding ones were destroyed at ingest; they come back on a rescan. The
-  columns are inert until the Rust half reads from the link and the scanner
-  writes real values, so a link written in the meantime takes the defaults.
+  per-embedding ones were destroyed at ingest; they come back on a rescan. Then
+  `art` is rebuilt without them — see the `art` rebuild below, whose ordering
+  constraint is what makes the window for that exist. What is left on the row is
+  the content and its identity: `id`, `sha256`, `byte_len`, `data`.
+
+  External writers using the `contrib` Python library see one change:
+  `upsert_art(conn, data, mime)` is now `upsert_art(conn, data)`. The argument
+  was already ignored whenever the image had been seen before — that is what
+  `ON CONFLICT(sha256) DO NOTHING` means — and there is no longer a column for
+  it to write. `replace_track_art` is where the mime goes, and always was.
 
   **And both tables gain the constraint work**: storage classes pinned
   ([#718](https://github.com/Sohex/musefs/issues/718)) — including upper bounds
   tying the geometry to the Rust model's `Option<u32>` — and an embedded NUL
   banned in the tag key and the art description
-  ([#693](https://github.com/Sohex/musefs/issues/693)). #693's ban on `art.mime`
-  arrives with the column at its new home; `art` keeps its own copy of the
-  column, and its own ban, until the readers switch over.
+  ([#693](https://github.com/Sohex/musefs/issues/693)). #693's ban on the art
+  mime arrives with the column at its new home, and there is only the one home.
 
 - **`structural_blocks` is rebuilt as well**
   ([#732](https://github.com/Sohex/musefs/issues/732)) — the fourth and last of
@@ -364,10 +371,14 @@ see the [Release notes](release-notes.md).
   If the old id were later reused by an unrelated row, that layout would point
   at the wrong image.
 
+  The same rebuild is where `art` sheds `mime`, `width` and `height`
+  ([#716](https://github.com/Sohex/musefs/issues/716)) — the backfill above has
+  already taken their values to the link, and the holding copy of the old table
+  is what it reads them from, since the real one has stopped having them by then.
+
   Storage classes are pinned here too
-  ([#718](https://github.com/Sohex/musefs/issues/718)), with an upper bound on
-  the geometry the range check never had, and `mime` and `sha256` gain the NUL
-  ban ([#693](https://github.com/Sohex/musefs/issues/693)) — `sha256` because a
+  ([#718](https://github.com/Sohex/musefs/issues/718)), and `sha256` gains the
+  NUL ban ([#693](https://github.com/Sohex/musefs/issues/693)), because a
   64-character prefix followed by NUL and anything satisfied a `length() = 64`
   identity check, which for a content address is the whole meaning of the column.
 
@@ -377,10 +388,6 @@ see the [Release notes](release-notes.md).
   the tightened constraints reject fails the migration, atomically, the way it
   does for the rebuilds above.
 
-  `mime`, `width` and `height` **stay** on `art` for now. #716 moves them to the
-  link, and the link has carried them since the previous step, but the readers do
-  not switch over until the Rust half — and a column cannot be dropped while the
-  code still selects it. They go when that lands.
 
 - Directory handles on the same directory share one listing instead of copying
   it each. `opendir` took a private snapshot per handle, so the table's memory

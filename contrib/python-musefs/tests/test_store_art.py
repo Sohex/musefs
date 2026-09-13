@@ -61,12 +61,14 @@ def test_replace_tags_preserves_binary_tags(db_path):
 def test_upsert_art_is_content_addressed(db_path):
     conn = connect(db_path)
     try:
-        first = upsert_art(conn, JPEG, "image/jpeg")
-        again = upsert_art(conn, JPEG, "image/png")  # same bytes -> same id, mime ignored
+        first = upsert_art(conn, JPEG)
+        again = upsert_art(conn, JPEG)  # same bytes -> same id
         conn.commit()
         assert first == again
-        mime = conn.execute("SELECT mime FROM art WHERE id=?", (first,)).fetchone()[0]
-        assert mime == "image/jpeg"
+        # And the row is the bytes and nothing else: everything that describes
+        # one file's embedding of them lives on `track_art` (#716).
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(art)")}
+        assert cols == {"id", "sha256", "byte_len", "data"}
     finally:
         conn.close()
 
@@ -75,7 +77,7 @@ def test_replace_track_art_sets_and_replaces_front_cover(db_path):
     conn = connect(db_path)
     try:
         tid = insert_track(conn, "/m/a.flac")
-        first = upsert_art(conn, JPEG, "image/jpeg")
+        first = upsert_art(conn, JPEG)
         before = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         replace_track_art(conn, tid, [(first, 3, "", "image/png")])
         conn.commit()
@@ -85,7 +87,7 @@ def test_replace_track_art_sets_and_replaces_front_cover(db_path):
         assert row == (first, 3, 0)
         after = conn.execute("SELECT content_version FROM tracks WHERE id=?", (tid,)).fetchone()[0]
         assert after > before
-        second = upsert_art(conn, PNG, "image/png")
+        second = upsert_art(conn, PNG)
         replace_track_art(conn, tid, [(second, 3, "", "image/png")])
         conn.commit()
         rows = conn.execute("SELECT art_id FROM track_art WHERE track_id=?", (tid,)).fetchall()
@@ -98,8 +100,8 @@ def test_replace_track_art_multiple_rows_ordered(db_path):
     conn = connect(db_path)
     try:
         tid = insert_track(conn, "/m/a.flac")
-        a = upsert_art(conn, JPEG, "image/jpeg")
-        b = upsert_art(conn, PNG, "image/png")
+        a = upsert_art(conn, JPEG)
+        b = upsert_art(conn, PNG)
         replace_track_art(conn, tid, [(a, 3, "", "image/jpeg"), (b, 4, "back", "image/png")])
         conn.commit()
         rows = conn.execute(

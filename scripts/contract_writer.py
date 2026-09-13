@@ -33,7 +33,7 @@ def main(db_path):
             raise SystemExit("contract_writer: no tracks in DB (did scan run?)")
         for tid in track_ids:
             replace_tags(conn, tid, [("title", CONTRACT_TITLE), ("artist", CONTRACT_ARTIST)])
-            art_id = upsert_art(conn, CONTRACT_ART, CONTRACT_ART_MIME)
+            art_id = upsert_art(conn, CONTRACT_ART)
             # picture_type 3 == front cover (valid range 0..=20).
             replace_track_art(conn, tid, [(art_id, 3, "front cover", CONTRACT_ART_MIME)])
         conn.commit()
