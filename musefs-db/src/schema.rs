@@ -657,6 +657,61 @@ CREATE TABLE track_art (
     CHECK (typeof(colors) = 'integer' AND colors BETWEEN 0 AND 4294967295)
 );
 
+-- 6. Rebuild `art`. This has to happen *here*, between `track_art` being
+-- recreated and the children being refilled, and the window is narrow for a
+-- reason: `track_art.art_id` references `art(id)` with no ON DELETE CASCADE, so
+-- with foreign keys enforced `DROP TABLE art` fails outright while any link row
+-- exists. Right now none does -- the cascade emptied `track_art` and the refill
+-- below has not run yet -- so this is the one point in the migration where the
+-- table can be replaced at all.
+--
+-- This is also the expensive step: every image blob is copied twice, and the
+-- store transiently holds about its own size again. That cost is what the
+-- command's free-space pre-flight exists to check before starting.
+--
+-- The refill is straight: `art` carries no scanner-owned column a rescan could
+-- recompute, so there is nothing here that the sanitize-only-under-a-flag
+-- policy would let this step null on its own. A row the tightened constraints
+-- reject fails the migration, which is what the row-rejection pre-flight is for.
+CREATE TABLE art_hold_v4 (
+    id INTEGER, sha256 TEXT, mime TEXT, width INTEGER, height INTEGER,
+    byte_len INTEGER, data BLOB
+);
+INSERT INTO art_hold_v4
+    SELECT id, sha256, mime, width, height, byte_len, data FROM art;
+DROP TABLE art;
+CREATE TABLE art (
+    id       INTEGER PRIMARY KEY,
+    sha256   TEXT NOT NULL UNIQUE,
+    -- mime/width/height still live here. #716 moves them to `track_art`, which
+    -- happened above, but the readers do not switch over until the Rust half --
+    -- and a column cannot be dropped while the code still selects it. They go
+    -- when that lands.
+    mime     TEXT NOT NULL,
+    width    INTEGER,
+    height   INTEGER,
+    byte_len INTEGER NOT NULL,
+    data     BLOB NOT NULL,
+    CHECK (typeof(sha256) = 'text'
+           AND length(sha256) = 64
+           AND instr(sha256, char(0)) = 0),
+    CHECK (typeof(mime) = 'text'
+           AND length(mime) <= 255
+           AND instr(mime, char(0)) = 0),
+    CHECK (width IS NULL
+           OR (typeof(width) = 'integer' AND width BETWEEN 0 AND 4294967295)),
+    CHECK (height IS NULL
+           OR (typeof(height) = 'integer' AND height BETWEEN 0 AND 4294967295)),
+    CHECK (typeof(byte_len) = 'integer'
+           AND byte_len >= 0
+           AND byte_len <= 16711680),
+    CHECK (typeof(data) = 'blob'),
+    CHECK (byte_len = length(data))
+);
+INSERT INTO art (id, sha256, mime, width, height, byte_len, data)
+    SELECT id, sha256, mime, width, height, byte_len, data FROM art_hold_v4;
+DROP TABLE art_hold_v4;
+
 INSERT INTO tags (track_id, key, value, ordinal, value_blob)
     SELECT track_id, key, value, ordinal, value_blob FROM tags_hold_v4;
 -- LEFT JOIN, not JOIN: a link whose `art` row is missing is an orphan an
@@ -782,6 +837,28 @@ CREATE TRIGGER art_ad AFTER DELETE ON art BEGIN
                       updated_at = CAST(strftime('%s','now') AS INTEGER)
     WHERE id IN (SELECT track_id FROM track_art WHERE art_id = OLD.id);
 END;
+-- `art` rows are content-addressed, so their content columns are immutable. The
+-- DROP TABLE above took this trigger with it; it comes back with `id` in the
+-- guard (#719). Changing the key changes none of the content columns, so the
+-- old WHEN clause was false and the trigger never fired -- and under the
+-- foreign-keys-off writer this store already defends against, that silently
+-- orphaned every link while `art_ad` (AFTER DELETE only) never saw an id
+-- change, so nothing bumped `content_version` and a cached layout kept serving.
+-- `<>` on id rather than IS NOT: it is the rowid alias and cannot be NULL.
+CREATE TRIGGER art_reject_content_update
+BEFORE UPDATE ON art
+WHEN NEW.id     <> OLD.id
+  OR NEW.data   <> OLD.data
+  OR NEW.sha256 <> OLD.sha256
+  OR NEW.mime   <> OLD.mime
+  OR NEW.byte_len <> OLD.byte_len
+  OR NEW.width  IS NOT OLD.width
+  OR NEW.height IS NOT OLD.height
+BEGIN
+    SELECT RAISE(ABORT,
+        'art rows are immutable; insert a new content-addressed row and relink via track_art');
+END;
+
 -- Row ownership is immutable (#717), matching what `art_reject_content_update`
 -- already says about art content. Reparenting a row is not one edit to one
 -- thing -- two tracks change -- and an `AFTER` trigger that has to enumerate
@@ -2534,6 +2611,191 @@ mod v4_tags_and_track_art_rebuild_tests {
     }
 }
 
+/// The `art` rebuild: the last of the three, and the one with an ordering
+/// constraint the others did not have.
+#[cfg(test)]
+mod v4_art_rebuild_tests {
+    use rusqlite::Connection;
+
+    fn populated_v3() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for (target, migration) in (1i64..).zip(super::MIGRATIONS).take(3) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.pragma_update(None, "user_version", target).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tracks (backing_path, format, audio_offset, audio_length, \
+             backing_size, backing_mtime_ns, backing_ctime_ns, updated_at) \
+             VALUES ('/lib/a.flac', 'flac', 0, 0, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        for (ordinal, sha) in [(0i64, "a"), (1i64, "b")] {
+            conn.execute(
+                "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+                 VALUES (?1, 'image/png', 64, 64, 3, X'ABCDEF')",
+                [&sha.repeat(64)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO track_art (track_id, art_id, picture_type, description, ordinal) \
+                 VALUES (1, ?1, 3, 'cover', ?2)",
+                rusqlite::params![conn.last_insert_rowid(), ordinal],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn migrated() -> Connection {
+        let mut conn = populated_v3();
+        super::migrate_all(&mut conn).unwrap();
+        conn
+    }
+
+    /// The blobs survive, ids and all. `art` is the one table whose rebuild
+    /// copies real payload rather than a handful of scalar columns, so "did the
+    /// data come through" is the first thing to pin.
+    #[test]
+    fn every_blob_survives_the_rebuild() {
+        let conn = migrated();
+        let rows: Vec<(i64, String, Vec<u8>)> = conn
+            .prepare("SELECT id, sha256, data FROM art ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".repeat(64), vec![0xAB, 0xCD, 0xEF]),
+                (2, "b".repeat(64), vec![0xAB, 0xCD, 0xEF]),
+            ]
+        );
+        // The links still resolve, which is what the id preservation is for.
+        let joined: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM track_art t JOIN art a ON a.id = t.art_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined, 2);
+    }
+
+    /// #719: changing the key changed none of the content columns, so the old
+    /// `WHEN` clause was false and the trigger never fired. Under the
+    /// foreign-keys-off writer this store already defends against, that silently
+    /// orphaned every link while nothing bumped `content_version`.
+    #[test]
+    fn the_immutability_trigger_covers_the_key() {
+        let conn = migrated();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        let err = conn
+            .execute("UPDATE art SET id = 99 WHERE id = 1", [])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("art rows are immutable"), "{err}");
+        // And the content columns it always covered still abort.
+        for sql in [
+            "UPDATE art SET data = X'00' WHERE id = 1",
+            "UPDATE art SET sha256 = ?1 WHERE id = 1",
+        ] {
+            assert!(
+                conn.execute(sql, rusqlite::params!["c".repeat(64)])
+                    .is_err()
+            );
+        }
+        // A no-op update is still allowed: the guard is on change, not on touch.
+        conn.execute("UPDATE art SET mime = mime WHERE id = 1", [])
+            .unwrap();
+    }
+
+    /// #718 for this table. `byte_len = length(data)` was always there; what is
+    /// new is that the columns must be the storage class the Rust model reads.
+    ///
+    /// Note what a `typeof` CHECK does *not* catch: column affinity converts a
+    /// numeric-looking string on the way in, so `byte_len = '1'` is stored as
+    /// the integer 1 and is not a violation at all. The constraint is there for
+    /// what affinity cannot convert — text that is not a number, and blobs,
+    /// which are exactly the values that reach the Rust side as a conversion
+    /// failure rather than as a wrong number.
+    #[test]
+    fn storage_classes_are_pinned() {
+        let conn = migrated();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        for (what, sql) in [
+            (
+                "a non-numeric byte_len",
+                "INSERT INTO art (sha256, mime, byte_len, data) \
+                                 VALUES (?1, 'image/png', 'abc', X'00')",
+            ),
+            (
+                "a text blob",
+                "INSERT INTO art (sha256, mime, byte_len, data) \
+                             VALUES (?1, 'image/png', 1, 'x')",
+            ),
+            (
+                "geometry past u32",
+                "INSERT INTO art (sha256, mime, width, byte_len, data) \
+                                   VALUES (?1, 'image/png', 1099511627776, 1, X'00')",
+            ),
+            (
+                "a NUL-bearing mime",
+                "INSERT INTO art (sha256, mime, byte_len, data) \
+                                    VALUES (?1, 'image/' || char(0) || 'png', 1, X'00')",
+            ),
+        ] {
+            assert!(
+                conn.execute(sql, rusqlite::params!["c".repeat(64)])
+                    .is_err(),
+                "{what} must be refused"
+            );
+        }
+    }
+
+    /// The ordering constraint that decides where this step can sit at all:
+    /// `track_art.art_id` references `art(id)` with no ON DELETE CASCADE, so
+    /// with foreign keys enforced the table can only be dropped while no link
+    /// row exists. A migration that rebuilt `art` after refilling the children
+    /// would fail outright.
+    #[test]
+    fn art_cannot_be_dropped_while_a_link_exists() {
+        let conn = migrated();
+        let err = conn
+            .execute_batch("DROP TABLE art")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("FOREIGN KEY"), "{err}");
+        conn.execute("DELETE FROM track_art", []).unwrap();
+        conn.execute_batch("DROP TABLE art")
+            .expect("droppable once nothing references it -- the migration's window");
+    }
+
+    /// A row the tightened constraints reject fails the migration rather than
+    /// being quietly repaired. `art` carries no scanner-owned column a rescan
+    /// recomputes, so there is nothing here the sanitize-only-under-a-flag
+    /// policy would let the refill null on its own.
+    #[test]
+    fn a_row_the_new_constraints_reject_fails_the_migration() {
+        let mut conn = populated_v3();
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO art (sha256, mime, width, height, byte_len, data) \
+             VALUES (?1, 'image/png', 1099511627776, NULL, 1, X'00')",
+            [&"c".repeat(64)],
+        )
+        .unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+        let err = super::migrate_all(&mut conn).unwrap_err().to_string();
+        assert!(err.contains("CHECK constraint failed"), "{err}");
+    }
+}
+
 #[cfg(test)]
 mod baseline_tests {
     use rusqlite::Connection;
@@ -2735,7 +2997,7 @@ mod baseline_tests {
 
     /// The literals in the *latest* definition of each table are what a fresh
     /// `migrate()` leaves behind, so those are the ones that must track
-    /// `crate::limits`. V4 owns `tags` and `track_art`; V1 still owns `art` and
+    /// `crate::limits`. V4 owns `tags`, `track_art` and `art`; V1 still owns
     /// `structural_blocks`.
     ///
     /// The ownership moves as tables are rebuilt, and pointing this at a
@@ -2754,21 +3016,28 @@ mod baseline_tests {
         )));
         assert!(v4.contains(&format!("length(value_blob) <= {MAX_BINARY_TAG_BYTES}")));
         assert!(v4.contains(&format!("length(description) <= {MAX_ART_DESCRIPTION_LEN}")));
-        // `mime` moved to the link it describes (#716). `art` keeps its own copy
-        // until that table is rebuilt, so both definitions are live right now.
-        assert!(v4.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
-        assert!(v1.contains(&format!("length(mime) <= {MAX_ART_MIME_LEN}")));
+        // `mime` moved to the link it describes (#716), but `art` keeps its own
+        // copy until the readers switch over, so V4 carries two live
+        // definitions of the cap -- one per table.
+        assert_eq!(
+            v4.matches(&format!("length(mime) <= {MAX_ART_MIME_LEN}"))
+                .count(),
+            2,
+            "track_art and art each cap the mime they own"
+        );
         // The picture geometry is Option<u32>/u32 in the Rust model, and the
         // upper bound is what stops a schema-valid row being a conversion
         // failure (#718) -- so it is pinned to the type, not to a magic number.
         assert_eq!(
             v4.matches(&format!("BETWEEN 0 AND {}", u32::MAX)).count(),
-            4,
-            "width, height, depth and colors each carry the u32 ceiling"
+            6,
+            "track_art's width/height/depth/colors and art's width/height each \
+             carry the u32 ceiling"
         );
-        // Still V1-owned: no later migration recreates `art` or `structural_blocks`.
-        assert!(v1.contains(&format!("length(sha256) = {ART_SHA256_LEN}")));
-        assert!(v1.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
+        // V4 rebuilds `art` too (#718, #719), so its literals moved with it.
+        assert!(v4.contains(&format!("length(sha256) = {ART_SHA256_LEN}")));
+        assert!(v4.contains(&format!("byte_len <= {MAX_ART_BYTES}")));
+        // Still V1-owned: nothing recreates `structural_blocks`.
         assert!(v1.contains(&format!("length(body) <= {MAX_STRUCTURAL_BODY_LEN}")));
         let kinds = STRUCTURAL_KINDS
             .iter()

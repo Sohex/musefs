@@ -287,6 +287,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     art description ban an embedded NUL
     ([#693](https://github.com/Sohex/musefs/issues/693)).
 
+- **`art` is rebuilt by the same migration**, completing the set.
+
+  - `art_reject_content_update` now covers the row's **key**
+    ([#719](https://github.com/Sohex/musefs/issues/719)). Changing `art.id`
+    changes none of the content columns, so the guard's condition was false and
+    the one write that orphans every link to a row was the one it did not stop.
+    That is only reachable by a writer running with foreign keys off — which is
+    a writer this store already builds defences against.
+  - Storage-class constraints and the NUL ban land here too
+    ([#718](https://github.com/Sohex/musefs/issues/718),
+    [#693](https://github.com/Sohex/musefs/issues/693)), including an upper
+    bound on the geometry that the range check never had.
+
 ### Fixed
 
 - Chained Ogg — complete logical bitstreams concatenated end to end, which

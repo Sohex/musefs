@@ -271,8 +271,47 @@ see the [Release notes](release-notes.md).
   tying the geometry to the Rust model's `Option<u32>` — and an embedded NUL
   banned in the tag key and the art description
   ([#693](https://github.com/Sohex/musefs/issues/693)). #693's ban on `art.mime`
-  follows that column to its new home rather than staying where the next step
-  removes it.
+  arrives with the column at its new home; `art` keeps its own copy of the
+  column, and its own ban, until the readers switch over.
+
+- **`art` is rebuilt by the same migration**, completing the set — and it is the
+  step with an ordering constraint the others did not have. `track_art.art_id`
+  references `art(id)` with **no** `ON DELETE CASCADE`, so with foreign keys
+  enforced `DROP TABLE art` fails outright while any link row exists. The only
+  point in the migration where the table can be replaced at all is after
+  `track_art` has been recreated and before the children are refilled, which is
+  exactly where it sits. It is also the expensive step: every image blob is
+  copied twice and the store transiently holds about its own size again, which
+  is what `musefs migrate`'s free-space pre-flight checks before starting.
+
+  `art_reject_content_update` comes back with the row's **key** in its guard
+  ([#719](https://github.com/Sohex/musefs/issues/719)). `UPDATE art SET id = …`
+  changes none of the content columns, so the `WHEN` clause was false and the
+  trigger never fired. With foreign keys on, the update fails on its own — but
+  this store deliberately defends against writers that turn them off, and under
+  that model the id change orphaned every link while nothing bumped
+  `content_version`: `art_ad` is `AFTER DELETE` only, so the one trigger that
+  fans out to referencing tracks never saw it, and a cached layout kept serving.
+  If the old id were later reused by an unrelated row, that layout would point
+  at the wrong image.
+
+  Storage classes are pinned here too
+  ([#718](https://github.com/Sohex/musefs/issues/718)), with an upper bound on
+  the geometry the range check never had, and `mime` and `sha256` gain the NUL
+  ban ([#693](https://github.com/Sohex/musefs/issues/693)) — `sha256` because a
+  64-character prefix followed by NUL and anything satisfied a `length() = 64`
+  identity check, which for a content address is the whole meaning of the column.
+
+  The refill is straight rather than sanitizing: `art` carries no scanner-owned
+  column a rescan could recompute, so there is nothing the
+  sanitize-only-under-a-flag policy would let this step null on its own. A row
+  the tightened constraints reject fails the migration, which is what the
+  row-rejection pre-flight exists to report before it starts.
+
+  `mime`, `width` and `height` **stay** on `art` for now. #716 moves them to the
+  link, and the link has carried them since the previous step, but the readers do
+  not switch over until the Rust half — and a column cannot be dropped while the
+  code still selects it. They go when that lands.
 
 - Directory handles on the same directory share one listing instead of copying
   it each. `opendir` took a private snapshot per handle, so the table's memory
