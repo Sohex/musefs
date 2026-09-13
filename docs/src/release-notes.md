@@ -5,6 +5,63 @@ per-change list see the [Changelog](changelog.md); for the external-writer
 `contrib/` packages (which version independently) see the
 [contrib changelog](integrations/overview.md#contrib-changelog).
 
+## v2.0.0 (unreleased)
+
+A major release, being assembled on the `v2.0.0` branch; each change adds its
+upgrade steps here as it lands. See the [Changelog](changelog.md#unreleased) for
+the full list so far.
+
+### Upgrading from v1.3.0
+
+**Scan flags removed.** Both changes fail loudly rather than quietly doing
+something different, so a script or unit that needs updating will tell you:
+
+- **`scan --revalidate` is gone**, with its `MUSEFS_REVALIDATE` variable
+  ([#707]). It has been a deprecated alias since v1.1.0. Run
+  `musefs revalidate` instead — the alias never pruned, so neither does the
+  replacement unless you add `--prune`. The flag is now a usage error (exit `2`).
+- **`scan --fast` and `--strict` are replaced by `--match`** ([#709]):
+  `--fast` becomes `--match=fast` and `--strict` becomes `--match=strict`. If you
+  passed neither, there is nothing to change: `--match=auto` is the default and
+  behaves exactly as before. The variables follow: `MUSEFS_FAST=true` becomes
+  `MUSEFS_MATCH=fast`, `MUSEFS_STRICT=true` becomes `MUSEFS_MATCH=strict`. The old
+  flags are usage errors (exit `2`).
+
+**Retired variables stop `scan`.** An environment variable that no flag reads
+any more would otherwise be ignored in silence — turning a revalidate into a full
+scan, or quietly weakening how a moved file is confirmed. So `scan` refuses to
+start (exit `1`) while `MUSEFS_REVALIDATE`, `MUSEFS_FAST` or `MUSEFS_STRICT` is
+set, and names the replacement. That includes a value of `false`: delete the
+line from a systemd `EnvironmentFile=` or container environment rather than
+switching it off. An empty value is treated as unset. `mount` does not read
+these variables and is unaffected, so an environment file shared by the mount
+and scan units only matters to the scan.
+
+**External writers.** No update is needed for these changes: the `contrib/`
+packages have called the `revalidate` subcommand since their 1.1.0 and pass
+neither `--fast` nor `--strict`.
+
+**Rust crate API.** This only affects code depending on the musefs crates
+directly.
+
+- `musefs_cli::run_scan` no longer takes `revalidate`, and takes a
+  `musefs_cli::MatchMode` in place of `fast`/`strict`.
+- The public enums a caller matches on — the error types, `Format`, the scan and
+  mount option enums, and `musefs-cli`'s `Command` and value enums — are
+  `#[non_exhaustive]` ([#708]). A `match` on one outside its crate needs a
+  wildcard arm; in exchange, a new audio format or error case is no longer a
+  breaking change. The changelog lists which enums, and which were deliberately
+  left exhaustive.
+- Test scaffolding is no longer public ([#710]):
+  `musefs_core::scan_directory_full_oracle`, the `*_for_test` methods on `Musefs`
+  and `Db`, and `musefs_format::ogg::page_test_support`. No production code
+  called any of them.
+
+[#707]: https://github.com/Sohex/musefs/issues/707
+[#708]: https://github.com/Sohex/musefs/issues/708
+[#709]: https://github.com/Sohex/musefs/issues/709
+[#710]: https://github.com/Sohex/musefs/issues/710
+
 ## v1.3.0
 
 A compatibility and maintenance release. The headline change makes musefs
