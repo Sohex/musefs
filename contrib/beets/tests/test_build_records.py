@@ -1,4 +1,5 @@
 from musefs_common import SyncStats
+from musefs_common.contract import normalize_rows
 
 from beetsplug import _core
 
@@ -8,22 +9,28 @@ def test_build_records_maps_fields(fake_item):
     stats = SyncStats()
     records, _ = _core.build_records([item], fields=None, stats=stats)
     assert len(records) == 1
-    pairs = records[0].pairs
-    assert ("title", "T") in pairs
-    assert ("genre", "Rock") in pairs
-    assert ("genre", "Pop") in pairs
+    # The whole mapping, so an extra or duplicated pair fails too. Values per
+    # key compare as a set, which is how the store treats them. `beets_path` is
+    # the fake's destination (its own path) with the extension stripped.
+    assert normalize_rows(records[0].pairs) == {
+        "title": ["T"],
+        "artist": ["A"],
+        "genre": ["Pop", "Rock"],
+        "beets_path": ["m/a"],
+    }
     assert records[0].art is None
 
 
 def test_build_records_reads_album_art(fake_item, fake_album, tmp_path):
     cover = tmp_path / "cover.jpg"
-    cover.write_bytes(b"\xff\xd8\xff" + b"\x00" * 16)
+    cover_bytes = b"\xff\xd8\xff" + b"\x00" * 16
+    cover.write_bytes(cover_bytes)
     album = fake_album(artpath=str(cover).encode())
     item = fake_item(b"/m/a.flac", album=album, title="T")
     stats = SyncStats()
     records, _ = _core.build_records([item], fields=None, stats=stats)
-    assert records[0].art is not None
     (img,) = records[0].art
+    assert img.data == cover_bytes
     assert img.mime == "image/jpeg"
     assert img.picture_type == 3
     assert img.description == ""
@@ -95,8 +102,8 @@ def test_build_records_beets_path_is_utf8_safe_for_non_unicode_paths(fake_item):
     records, _ = _core.build_records([item], fields=None, stats=stats)
     value = dict(records[0].pairs)["beets_path"]
     value.encode("utf-8")  # must not raise
-    assert value.startswith("Art")
-    assert value.endswith("/Album/01 Song")
+    # Replaced, not dropped: the byte's position stays visible in the value.
+    assert value == "Art\ufffdist/Album/01 Song"
 
 
 def test_build_records_uses_real_beets_destination(tmp_path):

@@ -73,7 +73,7 @@ def test_track_disc_renamed_and_zero_dropped():
 def test_replaygain_renamed_and_formatted():
     pairs = dict(map_fields(item(rg_track_gain=-7.5, rg_track_peak=0.987654321)))
     assert pairs["replaygain_track_gain"] == "-7.50 dB"
-    assert pairs["replaygain_track_peak"].startswith("0.98")
+    assert pairs["replaygain_track_peak"] == "0.987654"  # six places, truncated input
     assert "rg_track_gain" not in pairs
 
 
