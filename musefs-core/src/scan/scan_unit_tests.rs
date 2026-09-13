@@ -578,7 +578,7 @@ fn empty_probed() -> Probed {
 
 fn unit_with(abs_path: &str, fingerprint: Option<String>) -> Unit {
     Unit {
-        abs_path: abs_path.to_string(),
+        abs_path: std::path::PathBuf::from(abs_path),
         stamp: BackingStamp {
             size: 10,
             mtime_ns: 1,
@@ -621,7 +621,7 @@ fn ingest_unit_db_path_retargets_orphan() {
     let orphan = "/gone/missing-orphan.flac";
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: orphan.to_string(),
+            backing_path: std::path::PathBuf::from(orphan),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 10,
@@ -641,7 +641,7 @@ fn ingest_unit_db_path_retargets_orphan() {
     let tracks = db.list_tracks().unwrap();
     assert_eq!(tracks.len(), 1, "orphan retargeted, not duplicated");
     assert_eq!(tracks[0].id, id, "retarget keeps the id");
-    assert_eq!(tracks[0].backing_path, new_path);
+    assert_eq!(tracks[0].backing_path, std::path::PathBuf::from(new_path));
     // Retarget must refresh the stamp + audio bounds too, not just the path — the
     // orphan was inserted with mtime/ctime 0 and audio_length 10, so a path-only
     // regression would leave these stale.
@@ -668,7 +668,6 @@ fn ingest_unit_db_path_skips_unstatable_candidate() {
     let blocker = dir.path().join("not_a_dir");
     std::fs::write(&blocker, b"x").unwrap();
     let bad_path = blocker.join("under_a_file.flac");
-    let bad_path = bad_path.to_string_lossy().into_owned();
     // Sanity: the candidate path is unstatable for a reason other than NotFound.
     let kind = std::fs::metadata(&bad_path).unwrap_err().kind();
     assert_ne!(
@@ -735,7 +734,7 @@ fn refresh_structural_into_preserves_tags_and_art() {
     };
     ingest_into(
         &db,
-        "/m/a.flac",
+        Path::new("/m/a.flac"),
         stamp,
         seeded,
         ChecksumWrite::Keep,
@@ -773,7 +772,7 @@ fn refresh_structural_into_preserves_tags_and_art() {
     };
     refresh_structural_into(
         &db,
-        "/m/a.flac",
+        Path::new("/m/a.flac"),
         stamp2,
         changed,
         ChecksumWrite::Keep,

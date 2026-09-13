@@ -4,7 +4,7 @@ use musefs_db::{Format, NewArt, NewTrack};
 
 pub fn new_track(path: &str) -> NewTrack {
     NewTrack {
-        backing_path: path.to_string(),
+        backing_path: std::path::PathBuf::from(path),
         format: Format::Flac,
         audio_offset: 100,
         audio_length: 1000,

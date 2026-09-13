@@ -192,9 +192,9 @@ see the [Release notes](release-notes.md).
     was remounted. Reading the ghost returned `EIO` rather than the wrong audio,
     because the backing stamp guard still failed closed.
   - `tracks.backing_path` becomes a `BLOB`
-    ([#680](https://github.com/Sohex/musefs/issues/680)); the Rust model stays a
-    `String` for now, encoding and decoding at the DB boundary, and moves to
-    bytes in a later step. The refill casts, which is what preserves identity:
+    ([#680](https://github.com/Sohex/musefs/issues/680)), and so does the Rust
+    model — see the Fixed entry below for the half that stops the mangling. The
+    refill casts, which is what preserves identity:
     SQLite never compares a `TEXT` value equal to a `BLOB`, so a refill that
     copied the column unchanged would leave every existing row unreachable to a
     byte-binding reader while the unique index failed to fire, silently giving
@@ -543,6 +543,36 @@ see the [Release notes](release-notes.md).
   count itself is unchanged and still printed in the per-target summary.
 
 ### Fixed
+
+- Two audio files whose names differ only in bytes that are not valid UTF-8 are
+  no longer silently merged into one track
+  ([#680](https://github.com/Sohex/musefs/issues/680)). A filename on Unix is an
+  arbitrary byte string, and the scanner stored `to_string_lossy()` as the row's
+  identity — every invalid sequence became `U+FFFD`.
+
+  Two things followed, and the second is the serious one. The stored path did
+  not exist on disk, so the track could never be served: every resolve failed
+  its `metadata` call. And two distinct byte paths converged on the same
+  `U+FFFD`-bearing string, where `ON CONFLICT(backing_path) DO UPDATE` merged
+  them into a single row carrying one file's identity and the other's tags. The
+  scan reported success — nothing in the `skipped` or `failed` counts, no
+  warning, one track simply gone.
+
+  The extension filter offered no protection: `is_supported_audio` looks only at
+  the extension, so `bad\x80name.flac` probed fine and reached the insert with
+  its identity already mangled.
+
+  The models, the scanner's in-flight identity, the already-present set, the
+  retarget writer, the backing-path listing and the error variants that name a
+  file are all byte-typed now (`PathBuf`, which *is* bytes on Unix). Lossy
+  conversion survives only where a path is genuinely rendered for a person to
+  read: log lines, the progress bar's label, error messages.
+
+  One knock-on worth naming: `CoreError::BackingChanged` had been carrying a
+  `String` that was sometimes a path and sometimes a sentence. The sentences
+  moved to a new `CoreError::DerivedStateStale`, which travels with it
+  everywhere it matters — same errno, same retry, same attr-cache drop — but
+  says what it actually means.
 
 - The freshness guard no longer passes on changed bytes when the backing
   filesystem has no sub-second timestamps

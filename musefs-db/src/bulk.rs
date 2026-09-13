@@ -67,7 +67,7 @@ impl BulkWriter<'_> {
     pub fn retarget_track(
         &self,
         id: i64,
-        new_backing_path: &str,
+        new_backing_path: &std::path::Path,
         backing_size: u64,
         backing_mtime_ns: i64,
         backing_ctime_ns: i64,
@@ -92,7 +92,7 @@ impl BulkWriter<'_> {
         )
     }
 
-    pub fn get_track_by_path(&self, path: &str) -> Result<Option<Track>> {
+    pub fn get_track_by_path(&self, path: &std::path::Path) -> Result<Option<Track>> {
         get_track_by_path_in(&self.tx, path)
     }
 
@@ -179,7 +179,7 @@ mod tests {
             for i in 0..3 {
                 let id = bw
                     .upsert_track(&NewTrack {
-                        backing_path: format!("/m/{i}.flac"),
+                        backing_path: std::path::PathBuf::from(format!("/m/{i}.flac")),
                         format: Format::Flac,
                         audio_offset: 100,
                         audio_length: 200,
@@ -279,7 +279,7 @@ mod tests {
             bw.upsert_track(&new_track("/m/after.flac")).unwrap();
             bw.commit().unwrap();
         }
-        let paths: Vec<String> = db
+        let paths: Vec<std::path::PathBuf> = db
             .list_tracks()
             .unwrap()
             .into_iter()
@@ -290,7 +290,10 @@ mod tests {
             2,
             "the doomed item must leave nothing: {paths:?}"
         );
-        assert!(!paths.iter().any(|p| p.contains("doomed")), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.to_string_lossy().contains("doomed")),
+            "{paths:?}"
+        );
     }
 
     /// A successful item releases its savepoint rather than rolling it back, and
@@ -331,7 +334,7 @@ mod tests {
             }
             bw.commit().unwrap();
         }
-        let paths: Vec<String> = db
+        let paths: Vec<std::path::PathBuf> = db
             .list_tracks()
             .unwrap()
             .into_iter()
@@ -375,7 +378,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tid = db
             .upsert_track(&crate::NewTrack {
-                backing_path: "/a.mp3".into(),
+                backing_path: std::path::PathBuf::from("/a.mp3"),
                 format: crate::Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
@@ -418,7 +421,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tid = db
             .upsert_track(&crate::NewTrack {
-                backing_path: "/a.mp3".into(),
+                backing_path: std::path::PathBuf::from("/a.mp3"),
                 format: crate::Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
@@ -461,7 +464,7 @@ mod tests {
             let mut bw = db.bulk_writer().unwrap();
             let id = bw
                 .upsert_track(&NewTrack {
-                    backing_path: "/a.flac".into(),
+                    backing_path: std::path::PathBuf::from("/a.flac"),
                     format: Format::Flac,
                     audio_offset: 0,
                     audio_length: 1,
@@ -503,7 +506,7 @@ mod tests {
         {
             let mut bw = db.bulk_writer().unwrap();
             bw.upsert_track(&NewTrack {
-                backing_path: "/m/ghost.flac".into(),
+                backing_path: std::path::PathBuf::from("/m/ghost.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,

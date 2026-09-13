@@ -1,3 +1,4 @@
+use std::path::Path;
 mod common;
 use common::{jpeg, new_track};
 use musefs_db::{Db, Format, NewArt, NewTrack, Tag, TrackArt};
@@ -9,13 +10,13 @@ fn insert_then_get_by_id_and_path() {
 
     let by_id = db.get_track(id).unwrap().expect("track by id");
     assert_eq!(by_id.id, id);
-    assert_eq!(by_id.backing_path, "/music/a.flac");
+    assert_eq!(by_id.backing_path, Path::new("/music/a.flac"));
     assert_eq!(by_id.format, Format::Flac);
     assert_eq!(by_id.bounds.audio_offset(), 100);
     assert_eq!(by_id.content_version, 0);
 
     let by_path = db
-        .get_track_by_path("/music/a.flac")
+        .get_track_by_path(Path::new("/music/a.flac"))
         .unwrap()
         .expect("track by path");
     assert_eq!(by_path.id, id);
@@ -54,7 +55,7 @@ fn track_identity_returns_content_version_and_backing_identity() {
         db.track_identity(id).unwrap(),
         Some(musefs_db::TrackIdentity {
             content_version: cv,
-            backing_path: "/music/a.flac".to_string(),
+            backing_path: std::path::PathBuf::from("/music/a.flac"),
             backing_size: track.backing_size,
             backing_mtime_ns: track.backing_mtime_ns,
             backing_ctime_ns: track.backing_ctime_ns,
@@ -123,7 +124,7 @@ fn delete_track_cascades_tags_and_track_art() {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: "/x/a.flac".to_string(),
+            backing_path: std::path::PathBuf::from("/x/a.flac"),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 0,
@@ -171,7 +172,7 @@ fn upsert_conflict_updates_all_mutable_columns() {
 
     // Same backing_path => ON CONFLICT update path; change every mutable column.
     let changed = NewTrack {
-        backing_path: "/m/a.flac".to_string(),
+        backing_path: std::path::PathBuf::from("/m/a.flac"),
         format: Format::Mp3,
         audio_offset: 222,
         audio_length: 333,

@@ -415,7 +415,7 @@ fn two_new_files_matching_one_orphan_retarget_one_insert_one() {
     let retargeted: Vec<_> = tracks.iter().filter(|t| t.id == id_a).collect();
     assert_eq!(retargeted.len(), 1, "exactly one row keeps id_a");
     // Both b.flac and c.flac must appear across the two rows.
-    let paths: Vec<_> = tracks.iter().map(|t| t.backing_path.as_str()).collect();
+    let paths: Vec<_> = tracks.iter().map(|t| t.backing_path.as_path()).collect();
     assert!(paths.iter().any(|p| p.ends_with("b.flac")));
     assert!(paths.iter().any(|p| p.ends_with("c.flac")));
     // The non-retargeted row has a new id.

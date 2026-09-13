@@ -324,6 +324,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Two audio files whose names differ only in bytes that are not valid UTF-8 are
+  no longer silently merged into one track
+  ([#680](https://github.com/Sohex/musefs/issues/680)). A filename on Unix is an
+  arbitrary byte string, and the scanner stored a lossy text conversion as the
+  row's identity, so two distinct paths could collapse onto one `U+FFFD`-bearing
+  string and `ON CONFLICT` merged them — one file's identity carrying the
+  other's tags, with nothing in the `skipped` or `failed` counts to say so. The
+  surviving row named a path that did not exist, so it could not be served
+  either. Paths are bytes end to end now; the lossy conversion remains only
+  where a path is rendered for a person to read.
+
 - The freshness guard no longer passes on changed bytes when the backing
   filesystem has no sub-second timestamps
   ([#674](https://github.com/Sohex/musefs/issues/674)). `tracks.backing_ino`

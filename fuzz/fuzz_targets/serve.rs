@@ -25,7 +25,7 @@ fn setup(
     let db = Db::open_in_memory().ok()?;
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().into_owned(),
+            backing_path: path.clone(),
             format,
             audio_offset,
             audio_length,

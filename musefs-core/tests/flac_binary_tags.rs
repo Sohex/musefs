@@ -129,7 +129,7 @@ fn legacy_flac_without_structural_rows_serves_via_front_read_fallback() {
     let db = musefs_db::Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: path.to_string_lossy().into_owned(),
+            backing_path: path.clone(),
             format: Format::Flac,
             audio_offset: scan.audio_offset,
             audio_length: scan.audio_length,

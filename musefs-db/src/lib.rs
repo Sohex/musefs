@@ -401,7 +401,7 @@ mod fuzzing_accessor_tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x".to_string(),
+                backing_path: std::path::PathBuf::from("/x"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,

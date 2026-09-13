@@ -238,7 +238,7 @@ fn layout_cache_survives_unrelated_refresh() {
         let db2 = musefs_db::Db::open(&db_path).unwrap();
         let id = db2
             .upsert_track(&NewTrack {
-                backing_path: "/x/ghost.mp3".to_string(),
+                backing_path: std::path::PathBuf::from("/x/ghost.mp3"),
                 format: Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,

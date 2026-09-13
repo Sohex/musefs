@@ -29,10 +29,22 @@ pub enum CoreError {
         source: std::io::Error,
     },
     #[error("backing file changed since scan: {0}")]
-    BackingChanged(String),
+    BackingChanged(std::path::PathBuf),
+    /// Derived state this build had cached no longer describes the store, so
+    /// the caller should rebuild or re-resolve rather than serve what it holds.
+    ///
+    /// Split from [`CoreError::BackingChanged`] when that variant took a real
+    /// path (#680). The two travel together everywhere it matters — the same
+    /// errno, the same retry, the same attr-cache drop — but they are not the
+    /// same claim: this one is about musefs's own derived state, names no file,
+    /// and had been borrowing `BackingChanged`'s `String` payload to carry a
+    /// sentence. Once that payload became a path there was nothing honest to
+    /// put in it.
+    #[error("derived state is stale: {0}")]
+    DerivedStateStale(String),
     #[error("{path}: {item} is {len} {unit}, over musefs's limit of {cap} {unit}")]
     TrackFieldTooLarge {
-        path: String,
+        path: std::path::PathBuf,
         /// What was too big, in the user's terms — `tag "LYRICS"`,
         /// `binary tag "GEOB"`, `embedded image/jpeg art`, `art description`.
         item: String,
@@ -48,7 +60,7 @@ pub enum CoreError {
          {format} metadata limit — musefs could not serve this file"
     )]
     TrackMetadataTooLarge {
-        path: String,
+        path: std::path::PathBuf,
         format: &'static str,
         len: u64,
         cap: u64,

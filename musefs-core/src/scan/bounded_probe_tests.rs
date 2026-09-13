@@ -46,7 +46,7 @@ fn scan_directory_bounded_matches_full_for_flac() {
     let stats = scan_directory(&db, dir.path()).unwrap();
     assert_eq!(stats.scanned, 1);
     let track = db
-        .get_track_by_path(&std::fs::canonicalize(&path).unwrap().to_string_lossy())
+        .get_track_by_path(&std::fs::canonicalize(&path).unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(track.bounds.audio_offset(), full.audio_offset);
@@ -81,7 +81,7 @@ fn revalidate_skips_unchanged_and_reprobes_changed() {
     assert_eq!(s2.unchanged, 0);
     // The track row now reflects the new (longer) audio length.
     let track = db
-        .get_track_by_path(&std::fs::canonicalize(&p).unwrap().to_string_lossy())
+        .get_track_by_path(&std::fs::canonicalize(&p).unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -136,7 +136,7 @@ fn jobs1_and_jobs_n_produce_equivalent_state() {
             },
         )
         .unwrap();
-        let mut rows: Vec<(String, u64, u64)> = db
+        let mut rows: Vec<(std::path::PathBuf, u64, u64)> = db
             .list_tracks()
             .unwrap()
             .into_iter()

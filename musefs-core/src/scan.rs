@@ -104,7 +104,7 @@ pub enum ScanProgress<'a> {
     Ingested {
         done: u64,
         total: u64,
-        path: &'a str,
+        path: &'a Path,
     },
     /// A dispatched file finished without being committed — it failed to probe
     /// or raced. `done` shares the same 1..=total sequence as [`Self::Ingested`],
@@ -1351,7 +1351,7 @@ fn effective_jobs(jobs: usize) -> usize {
 
 /// One probed file ready to write, plus its art-byte weight for backpressure.
 struct Unit {
-    abs_path: String,
+    abs_path: PathBuf,
     stamp: BackingStamp,
     probed: Probed,
     weight: u64,
@@ -1404,7 +1404,7 @@ fn key_passes_floor(key: &str) -> bool {
 /// counts **characters** on a TEXT column but **bytes** on a blob, and the
 /// schema deliberately uses `length(CAST(value AS BLOB))` for `tags.value` so
 /// its cap is a real memory bound (#505).
-fn check_storable(abs_path: &str, probed: &Probed) -> Result<()> {
+fn check_storable(abs_path: &Path, probed: &Probed) -> Result<()> {
     // The two scanner-owned caps are `usize` consts; the DB's are `i64` because
     // they are compared against SQLite `length()`. Convert once here so the
     // per-field checks below all read the same way.
@@ -1412,7 +1412,7 @@ fn check_storable(abs_path: &str, probed: &Probed) -> Result<()> {
     let binary_cap = i64::try_from(MAX_BINARY_TAG_BYTES).expect("binary tag cap fits i64");
     let too_large = |item: String, len: usize, cap: i64, unit: &'static str| {
         crate::error::CoreError::TrackFieldTooLarge {
-            path: abs_path.to_string(),
+            path: abs_path.to_path_buf(),
             item,
             len: len as u64,
             cap: cap.unsigned_abs(),
@@ -1514,7 +1514,7 @@ fn check_storable(abs_path: &str, probed: &Probed) -> Result<()> {
 /// carry 32-bit lengths and span pages, so they have no ceiling worth checking;
 /// MP4 and WAV use 32-bit box/chunk lengths; and MP3 synthesizes back into the
 /// same 256 MiB ID3v2 container it was read from.
-fn check_metadata_fits_format(abs_path: &str, probed: &Probed) -> Result<()> {
+fn check_metadata_fits_format(abs_path: &Path, probed: &Probed) -> Result<()> {
     let (format_name, cap) = match probed.format {
         Format::Flac => ("FLAC", musefs_format::flac::MAX_BLOCK_BODY),
         Format::OggFlac => ("Ogg FLAC", musefs_format::flac::MAX_BLOCK_BODY),
@@ -1533,7 +1533,7 @@ fn check_metadata_fits_format(abs_path: &str, probed: &Probed) -> Result<()> {
     }
     if total > cap {
         return Err(crate::error::CoreError::TrackMetadataTooLarge {
-            path: abs_path.to_string(),
+            path: abs_path.to_path_buf(),
             format: format_name,
             len: total,
             cap,
@@ -1626,7 +1626,7 @@ fn mp4_oversize_error(
         )
     };
     Some(crate::error::CoreError::TrackFieldTooLarge {
-        path: path.display().to_string(),
+        path: path.to_path_buf(),
         item,
         len: bytes as u64,
         cap: cap as u64,
@@ -1680,13 +1680,13 @@ trait TrackSink {
     /// The row already stored at `path`, if any. Returns the whole row rather
     /// than a bool because the ingest paths decide their [`ChecksumWrite`]
     /// intents by comparing the stored stamp and geometry against the probe's.
-    fn existing_track(&mut self, path: &str) -> musefs_db::Result<Option<musefs_db::Track>>;
+    fn existing_track(&mut self, path: &Path) -> musefs_db::Result<Option<musefs_db::Track>>;
     fn tracks_by_fingerprint(&mut self, fp: &str) -> musefs_db::Result<Vec<musefs_db::Track>>;
     #[allow(clippy::too_many_arguments)]
     fn retarget_track(
         &mut self,
         id: i64,
-        new_backing_path: &str,
+        new_backing_path: &Path,
         stamp: BackingStamp,
         audio_offset: u64,
         audio_length: u64,
@@ -1730,7 +1730,7 @@ impl TrackSink for &Db {
     ) -> musefs_db::Result<()> {
         Db::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
-    fn existing_track(&mut self, path: &str) -> musefs_db::Result<Option<musefs_db::Track>> {
+    fn existing_track(&mut self, path: &Path) -> musefs_db::Result<Option<musefs_db::Track>> {
         Db::get_track_by_path(self, path)
     }
     fn tracks_by_fingerprint(&mut self, fp: &str) -> musefs_db::Result<Vec<musefs_db::Track>> {
@@ -1739,7 +1739,7 @@ impl TrackSink for &Db {
     fn retarget_track(
         &mut self,
         id: i64,
-        new_backing_path: &str,
+        new_backing_path: &Path,
         stamp: BackingStamp,
         audio_offset: u64,
         audio_length: u64,
@@ -1797,7 +1797,7 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
     ) -> musefs_db::Result<()> {
         musefs_db::BulkWriter::set_track_checksums(self, track_id, fingerprint, content_hash)
     }
-    fn existing_track(&mut self, path: &str) -> musefs_db::Result<Option<musefs_db::Track>> {
+    fn existing_track(&mut self, path: &Path) -> musefs_db::Result<Option<musefs_db::Track>> {
         musefs_db::BulkWriter::get_track_by_path(self, path)
     }
     fn tracks_by_fingerprint(&mut self, fp: &str) -> musefs_db::Result<Vec<musefs_db::Track>> {
@@ -1806,7 +1806,7 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
     fn retarget_track(
         &mut self,
         id: i64,
-        new_backing_path: &str,
+        new_backing_path: &Path,
         stamp: BackingStamp,
         audio_offset: u64,
         audio_length: u64,
@@ -1837,7 +1837,7 @@ impl TrackSink for &mut musefs_db::BulkWriter<'_> {
 /// picture/binary-tag/structural-block bytes are moved, not cloned (#68).
 fn ingest_into(
     mut w: impl TrackSink,
-    abs_path: &str,
+    abs_path: &Path,
     stamp: BackingStamp,
     probed: Probed,
     fingerprint: ChecksumWrite<'_>,
@@ -1850,7 +1850,7 @@ fn ingest_into(
     check_storable(abs_path, &probed)?;
 
     let track_id = w.upsert_track(&NewTrack {
-        backing_path: abs_path.to_string(),
+        backing_path: abs_path.to_path_buf(),
         format: probed.format,
         audio_offset: probed.audio_offset,
         audio_length: probed.audio_length,
@@ -1909,14 +1909,14 @@ fn ingest_into(
 /// Leaves curated tags, binary tags, and art untouched.
 fn refresh_structural_into(
     mut w: impl TrackSink,
-    abs_path: &str,
+    abs_path: &Path,
     stamp: BackingStamp,
     probed: Probed,
     fingerprint: ChecksumWrite<'_>,
     content_hash: ChecksumWrite<'_>,
 ) -> Result<()> {
     let track_id = w.upsert_track(&NewTrack {
-        backing_path: abs_path.to_string(),
+        backing_path: abs_path.to_path_buf(),
         format: probed.format,
         audio_offset: probed.audio_offset,
         audio_length: probed.audio_length,
@@ -2018,7 +2018,7 @@ fn ingest_unit(
                 Err(e) => {
                     log::warn!(
                         "skipping retarget candidate {}: cannot stat backing path ({e})",
-                        t.backing_path
+                        t.backing_path.display()
                     );
                     false
                 }
@@ -2045,14 +2045,14 @@ fn ingest_unit(
                     Ok(None) => {
                         log::warn!(
                             "hash confirm for {} saw the file change under it; inserting fresh",
-                            unit.abs_path
+                            unit.abs_path.display()
                         );
                         None
                     }
                     Err(e) => {
                         log::warn!(
                             "hash confirm failed for {}: {e}; inserting fresh",
-                            unit.abs_path
+                            unit.abs_path.display()
                         );
                         None
                     }
@@ -2089,14 +2089,14 @@ fn ingest_unit(
             if !confirmed {
                 log::warn!(
                     "fingerprint match for {} not confirmed (strictness {:?}); inserting fresh",
-                    unit.abs_path,
+                    unit.abs_path.display(),
                     strictness,
                 );
             }
         } else if candidates.len() > 1 {
             log::warn!(
                 "ambiguous fingerprint match for {} ({} missing candidates); inserting fresh",
-                unit.abs_path,
+                unit.abs_path.display(),
                 candidates.len(),
             );
         }
@@ -2114,7 +2114,7 @@ fn ingest_unit(
 /// Upsert a track from a probed backing file through a direct `&Db`. Thin
 /// wrapper over [`ingest_into`]; the `oracle`/non-bulk scan path. Computes no
 /// checksums, so both columns are left exactly as they are.
-fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
+fn ingest(db: &Db, abs_path: &Path, meta: &std::fs::Metadata, probed: Probed) -> Result<()> {
     ingest_into(
         db,
         abs_path,
@@ -2132,7 +2132,7 @@ fn ingest(db: &Db, abs_path: &str, meta: &std::fs::Metadata, probed: Probed) -> 
 #[cfg(test)]
 fn ingest_bulk(
     bw: &mut musefs_db::BulkWriter<'_>,
-    abs_path: &str,
+    abs_path: &Path,
     stamp: BackingStamp,
     probed: Probed,
 ) -> Result<()> {
@@ -2187,16 +2187,16 @@ pub fn scan_directory_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<S
     if !opts.force {
         // Projected to the one column this set needs: a full `list_tracks` would
         // materialize every row's checksum strings just to drop them (#621).
-        let existing: HashSet<String> = db.list_backing_paths()?.into_iter().collect();
+        let existing: HashSet<PathBuf> = db.list_backing_paths()?.into_iter().collect();
         let before = files.len();
         files.retain(|path| {
             let key = if opts.follow_symlinks {
                 match std::fs::canonicalize(path) {
-                    Ok(abs) => abs.to_string_lossy().into_owned(),
+                    Ok(abs) => abs,
                     Err(_) => return true,
                 }
             } else {
-                path.to_string_lossy().into_owned()
+                path.clone()
             };
             !existing.contains(&key)
         });
@@ -2311,7 +2311,7 @@ fn run_pipeline(
                         // can yield a path with a symlink component to resolve (#440).
                         let abs_path = if follow_symlinks {
                             match std::fs::canonicalize(path) {
-                                Ok(abs) => abs.to_string_lossy().into_owned(),
+                                Ok(abs) => abs,
                                 Err(e) => {
                                     failures.record(
                                         SkipReason::Io,
@@ -2322,7 +2322,7 @@ fn run_pipeline(
                                 }
                             }
                         } else {
-                            path.to_string_lossy().into_owned()
+                            path.clone()
                         };
                         // Reject an over-cap file here, before its payload is
                         // charged to the budget and buffered into a batch: a
@@ -2411,7 +2411,7 @@ fn run_pipeline(
         // `Ingested` reports committed files, so buffer the paths and emit only
         // after `bw.commit()` succeeds — a failed commit aborts the scan without
         // having advanced the progress bar past unpersisted files.
-        let mut committed: Vec<String> = Vec::new();
+        let mut committed: Vec<PathBuf> = Vec::new();
         for unit in batch.drain(..) {
             released += unit.weight;
             let abs_path = unit.abs_path.clone();
@@ -2429,7 +2429,10 @@ fn run_pipeline(
                 Err(e) if is_store_rejection(&e) => {
                     failures.record(
                         SkipReason::Rejected,
-                        format_args!("skipping {abs_path}: the store rejected its rows: {e}"),
+                        format_args!(
+                            "skipping {}: the store rejected its rows: {e}",
+                            abs_path.display()
+                        ),
                     );
                     failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -2438,7 +2441,7 @@ fn run_pipeline(
                 // but it must say which file it died on, since issue #644 was
                 // reported as an unattributed `CHECK constraint failed`.
                 Err(e) => {
-                    log::error!("aborting scan while ingesting {abs_path}: {e}");
+                    log::error!("aborting scan while ingesting {}: {e}", abs_path.display());
                     return Err(e);
                 }
             }
@@ -2621,7 +2624,7 @@ pub fn scan_directory_full_oracle(db: &Db, root: &Path) -> Result<ScanStats> {
         };
         let meta = std::fs::metadata(&path)?;
         let abs = std::fs::canonicalize(&path)?;
-        ingest(db, &abs.to_string_lossy(), &meta, probed)?;
+        ingest(db, &abs, &meta, probed)?;
         stats.scanned += 1;
     }
     Ok(stats)
@@ -2666,7 +2669,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
     // Main-thread pre-dispatch skip pass: load existing
     // (path -> stamp, id, format, has_fingerprint, has_content_hash) once,
     // stat each candidate, keep only changed files. Workers stay DB-free.
-    let existing: HashMap<String, (crate::freshness::BackingStamp, i64, Format, bool, bool)> = db
+    let existing: HashMap<PathBuf, (crate::freshness::BackingStamp, i64, Format, bool, bool)> = db
         .list_tracks()?
         .into_iter()
         .map(|t| {
@@ -2704,7 +2707,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
         };
         let key = if opts.follow_symlinks {
             match std::fs::canonicalize(&path) {
-                Ok(abs) => abs.to_string_lossy().into_owned(),
+                Ok(abs) => abs,
                 Err(e) => {
                     failures.record(
                         SkipReason::Io,
@@ -2715,7 +2718,7 @@ pub fn revalidate_with(db: &Db, root: &Path, opts: &ScanOptions) -> Result<Reval
                 }
             }
         } else {
-            path.to_string_lossy().into_owned()
+            path.clone()
         };
         if let Some((stamp, id, format, has_fingerprint, has_content_hash)) =
             existing.get(&key).copied()

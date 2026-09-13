@@ -17,7 +17,7 @@ fn resolve_one_flac() -> (Db, std::sync::Arc<ResolvedFile>, tempfile::TempDir) {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&musefs_db::NewTrack {
-            backing_path: src.to_string_lossy().into_owned(),
+            backing_path: src.to_path_buf(),
             format: musefs_db::Format::Flac,
             audio_offset,
             audio_length,

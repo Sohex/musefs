@@ -354,6 +354,6 @@ fn a_flac_whose_id3_prefix_overflows_the_comment_block_fails_only_itself() {
     assert!(
         tracks[0].backing_path.ends_with("ok.flac"),
         "got {}",
-        tracks[0].backing_path
+        tracks[0].backing_path.display()
     );
 }

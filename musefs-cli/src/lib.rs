@@ -763,8 +763,8 @@ fn default_snapshot_path(db: &Path, from_version: i64) -> PathBuf {
 /// that share nothing above the filesystem root. Revalidating from `/` is never
 /// what anyone meant, so the caller prints the command instead of offering to
 /// run it.
-fn common_library_root(paths: &[String]) -> Option<PathBuf> {
-    let mut dirs = paths.iter().filter_map(|p| Path::new(p).parent());
+fn common_library_root(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut dirs = paths.iter().filter_map(|p| p.parent());
     let mut common: Vec<Component<'_>> = dirs.next()?.components().collect();
     for dir in dirs {
         let shared = common
@@ -1179,9 +1179,9 @@ mod tests {
     #[test]
     fn common_library_root_is_the_deepest_shared_directory() {
         let paths = [
-            "/srv/music/a/one.flac".to_string(),
-            "/srv/music/b/two.mp3".to_string(),
-            "/srv/music/b/c/three.mp3".to_string(),
+            PathBuf::from("/srv/music/a/one.flac"),
+            PathBuf::from("/srv/music/b/two.mp3"),
+            PathBuf::from("/srv/music/b/c/three.mp3"),
         ];
         assert_eq!(
             common_library_root(&paths),
@@ -1189,7 +1189,7 @@ mod tests {
         );
         // One track's own directory is the whole library.
         assert_eq!(
-            common_library_root(&["/srv/music/a/one.flac".to_string()]),
+            common_library_root(&[PathBuf::from("/srv/music/a/one.flac")]),
             Some(PathBuf::from("/srv/music/a"))
         );
     }
@@ -1200,11 +1200,11 @@ mod tests {
     #[test]
     fn common_library_root_declines_to_offer_the_filesystem_root() {
         let split = [
-            "/srv/music/one.flac".to_string(),
-            "/home/u/music/two.mp3".to_string(),
+            PathBuf::from("/srv/music/one.flac"),
+            PathBuf::from("/home/u/music/two.mp3"),
         ];
         assert_eq!(common_library_root(&split), None);
-        assert_eq!(common_library_root(&["/one.flac".to_string()]), None);
+        assert_eq!(common_library_root(&[PathBuf::from("/one.flac")]), None);
         assert_eq!(common_library_root(&[]), None);
     }
 

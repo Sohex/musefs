@@ -8,16 +8,15 @@ use rusqlite::{Row, params};
 /// allocation and no SQL recompilation on the `getattr`/`read` hot path.
 /// The `tracks` projection every reader shares.
 ///
-/// `backing_path` is a `BLOB` in the store (#680) while the Rust model still
-/// holds a `String`, so the column is cast on the way out and every predicate
-/// and write binds bytes. The cast is not lossy: every stored path was written
-/// from a Rust `String`, so it is valid UTF-8, and a row that is not fails
-/// loudly at `Row::get` rather than being silently mangled. #680's Rust half
-/// replaces both halves of this with a byte-typed model.
+/// `backing_path` is a `BLOB` (#680) and the model is a `PathBuf`, so it is read
+/// as the bytes it is — no cast either way. The cast this used to carry was
+/// sound only while every stored path had come from a Rust `String`; a path is
+/// an arbitrary byte string on Unix, and the whole point of the byte-typed
+/// model is that such a path round-trips instead of being mangled.
 macro_rules! track_select {
     ($tail:literal) => {
         concat!(
-            "SELECT id, CAST(backing_path AS TEXT) AS backing_path, format, \
+            "SELECT id, backing_path, format, \
              audio_offset, audio_length, \
              backing_size, backing_mtime_ns, backing_ctime_ns, backing_ino, \
              content_version, updated_at, \
@@ -55,7 +54,7 @@ fn row_to_track(r: &Row) -> rusqlite::Result<Track> {
     })?;
     Ok(Track {
         id: r.get("id")?,
-        backing_path: r.get("backing_path")?,
+        backing_path: crate::models::path_from_col(r.get("backing_path")?),
         format,
         bounds,
         backing_size,
@@ -86,7 +85,7 @@ pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Resu
             updated_at=CAST(strftime('%s','now') AS INTEGER)
          RETURNING id",
         params![
-            t.backing_path.as_bytes(),
+            crate::models::path_to_col(&t.backing_path),
             t.format.as_str(),
             t.audio_offset,
             t.audio_length,
@@ -101,12 +100,12 @@ pub(crate) fn upsert_track_in(conn: &rusqlite::Connection, t: &NewTrack) -> Resu
 
 pub(crate) fn get_track_by_path_in(
     conn: &rusqlite::Connection,
-    path: &str,
+    path: &std::path::Path,
 ) -> Result<Option<Track>> {
     crate::query_optional(
         conn,
         track_select!("WHERE backing_path = ?1"),
-        params![path.as_bytes()],
+        params![crate::models::path_to_col(path)],
         |r| Ok(row_to_track(r)?),
     )
 }
@@ -147,7 +146,7 @@ pub(crate) fn set_track_checksums_in(
 pub(crate) fn retarget_track_in(
     conn: &rusqlite::Connection,
     id: i64,
-    new_backing_path: &str,
+    new_backing_path: &std::path::Path,
     backing_size: u64,
     backing_mtime_ns: i64,
     backing_ctime_ns: i64,
@@ -174,7 +173,7 @@ pub(crate) fn retarget_track_in(
          WHERE id = ?1",
         params![
             id,
-            new_backing_path.as_bytes(),
+            crate::models::path_to_col(new_backing_path),
             backing_size,
             backing_mtime_ns,
             backing_ctime_ns,
@@ -205,7 +204,7 @@ impl<M> Db<M> {
         self.query_optional_track(track_select!("WHERE id = ?1"), params![id])
     }
 
-    pub fn get_track_by_path(&self, path: &str) -> Result<Option<Track>> {
+    pub fn get_track_by_path(&self, path: &std::path::Path) -> Result<Option<Track>> {
         get_track_by_path_in(&self.conn, path)
     }
 
@@ -220,11 +219,11 @@ impl<M> Db<M> {
     /// `fingerprint`/`content_hash` strings) per row — ~40 MB of transient
     /// allocation on a 200k-track store, on a path already holding a connection.
     /// Unordered by design; the caller collects into a set.
-    pub fn list_backing_paths(&self) -> Result<Vec<String>> {
+    pub fn list_backing_paths(&self) -> Result<Vec<std::path::PathBuf>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT CAST(backing_path AS TEXT) FROM tracks")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
+            .prepare_cached("SELECT backing_path FROM tracks")?;
+        let rows = stmt.query_map([], |r| Ok(crate::models::path_from_col(r.get(0)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -258,13 +257,13 @@ impl<M> Db<M> {
     pub fn track_identity(&self, id: i64) -> Result<Option<crate::TrackIdentity>> {
         crate::query_optional(
             &self.conn,
-            "SELECT content_version, CAST(backing_path AS TEXT), backing_size, \
+            "SELECT content_version, backing_path, backing_size, \
              backing_mtime_ns, backing_ctime_ns, backing_ino FROM tracks WHERE id = ?1",
             params![id],
             |r| {
                 Ok(crate::TrackIdentity {
                     content_version: r.get(0)?,
-                    backing_path: r.get(1)?,
+                    backing_path: crate::models::path_from_col(r.get(1)?),
                     backing_size: r.get(2)?,
                     backing_mtime_ns: r.get(3)?,
                     backing_ctime_ns: r.get(4)?,
@@ -429,7 +428,7 @@ impl Db<ReadWrite> {
     pub fn retarget_track(
         &self,
         id: i64,
-        new_backing_path: &str,
+        new_backing_path: &std::path::Path,
         backing_size: u64,
         backing_mtime_ns: i64,
         backing_ctime_ns: i64,
@@ -488,7 +487,7 @@ mod negative_audio_bounds_tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x.flac".into(),
+                backing_path: std::path::PathBuf::from("/x.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 1,
@@ -522,7 +521,7 @@ mod negative_audio_bounds_tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .upsert_track(&NewTrack {
-                backing_path: "/x.flac".into(),
+                backing_path: std::path::PathBuf::from("/x.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 1,
@@ -561,7 +560,7 @@ mod render_key_tests {
 
     fn new_track(path: &str, fmt: Format) -> NewTrack {
         NewTrack {
-            backing_path: path.to_string(),
+            backing_path: std::path::PathBuf::from(path),
             format: fmt,
             audio_offset: 0,
             audio_length: 1,
@@ -702,10 +701,11 @@ mod render_key_tests {
 #[cfg(test)]
 mod checksum_tests {
     use crate::{ChecksumWrite, Db, NewTrack, models::Format};
+    use std::path::Path;
 
     fn new_track(path: &str) -> NewTrack {
         NewTrack {
-            backing_path: path.to_string(),
+            backing_path: std::path::PathBuf::from(path),
             format: Format::Flac,
             audio_offset: 0,
             audio_length: 10,
@@ -805,7 +805,7 @@ mod checksum_tests {
             .unwrap();
         db.retarget_track(
             id,
-            "/new.flac",
+            Path::new("/new.flac"),
             99,
             1234,
             5678,
@@ -818,7 +818,7 @@ mod checksum_tests {
         .unwrap();
         let t = db.get_track(id).unwrap().unwrap();
         assert_eq!(t.id, id);
-        assert_eq!(t.backing_path, "/new.flac");
+        assert_eq!(t.backing_path, Path::new("/new.flac"));
         assert_eq!(t.backing_size, 99);
         assert_eq!(t.backing_mtime_ns, 1234);
         assert_eq!(t.backing_ctime_ns, 5678);
@@ -827,7 +827,11 @@ mod checksum_tests {
         assert_eq!(t.bounds.audio_length(), 50);
         assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..])); // Keep preserves
         assert_eq!(t.content_hash.as_deref(), Some(&"e".repeat(64)[..]));
-        assert!(db.get_track_by_path("/old.flac").unwrap().is_none());
+        assert!(
+            db.get_track_by_path(Path::new("/old.flac"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// `tracks.backing_ino` is NOT NULL with a 0 sentinel and the model is
@@ -946,7 +950,7 @@ mod checksum_tests {
         .unwrap();
         db.retarget_track(
             id,
-            "/new.flac",
+            Path::new("/new.flac"),
             10,
             1,
             2,
@@ -978,7 +982,7 @@ mod checksum_tests {
         assert_eq!(by_fp.len(), 1, "fingerprint match must be returned");
         assert_eq!(by_fp[0].id, id);
 
-        let by_path = bw.get_track_by_path("/x.flac").unwrap();
+        let by_path = bw.get_track_by_path(Path::new("/x.flac")).unwrap();
         assert_eq!(by_path.map(|t| t.id), Some(id), "path lookup must hit");
 
         bw.commit().unwrap();
@@ -994,7 +998,7 @@ mod checksum_tests {
                 .unwrap();
             bw.retarget_track(
                 id,
-                "/new.flac",
+                Path::new("/new.flac"),
                 10,
                 1,
                 2,
@@ -1009,7 +1013,7 @@ mod checksum_tests {
             id
         };
         let t = db.get_track(id).unwrap().unwrap();
-        assert_eq!(t.backing_path, "/new.flac");
+        assert_eq!(t.backing_path, Path::new("/new.flac"));
         assert_eq!(t.fingerprint.as_deref(), Some(&"a".repeat(64)[..]));
     }
 }

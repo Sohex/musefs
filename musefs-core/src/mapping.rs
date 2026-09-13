@@ -189,7 +189,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -246,7 +246,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.mp3".into(),
+                backing_path: std::path::PathBuf::from("/a.mp3"),
                 format: Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
@@ -280,7 +280,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.mp3".into(),
+                backing_path: std::path::PathBuf::from("/a.mp3"),
                 format: Format::Mp3,
                 audio_offset: 0,
                 audio_length: 0,
@@ -318,7 +318,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -408,7 +408,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 0,
@@ -485,7 +485,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let tid = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.opus".into(),
+                backing_path: std::path::PathBuf::from("/a.opus"),
                 format: Format::Opus,
                 audio_offset: 0,
                 audio_length: 0,

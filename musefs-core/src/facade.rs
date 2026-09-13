@@ -196,9 +196,7 @@ fn validate_opened_backing(file: &std::fs::File, resolved: &ResolvedFile) -> Res
         .stamp
         .matches_live(&BackingStamp::from_metadata(&meta))
     {
-        return Err(CoreError::BackingChanged(
-            resolved.backing_path.to_string_lossy().into_owned(),
-        ));
+        return Err(CoreError::BackingChanged(resolved.backing_path.clone()));
     }
     Ok(())
 }
@@ -716,11 +714,7 @@ impl Musefs {
                 // Pathological constant re-tagging raced every attempt; surface a
                 // retryable error rather than risk wrong bytes.
                 return Err(CoreError::BackingChanged(
-                    h.resolved
-                        .load()
-                        .backing_path
-                        .to_string_lossy()
-                        .into_owned(),
+                    h.resolved.load().backing_path.clone(),
                 ));
             }
         }
@@ -749,16 +743,16 @@ impl Musefs {
             let r = self.pool.with(|db| -> Result<()> {
                 let resolved = self.cache.resolve(db, track_id)?;
                 if forced {
-                    return Err(CoreError::BackingChanged(
-                        resolved.backing_path.to_string_lossy().into_owned(),
-                    ));
+                    return Err(CoreError::BackingChanged(resolved.backing_path.clone()));
                 }
                 read_at_into(&resolved, db, offset, size, out)
             });
             match r {
                 Ok(()) => return Ok(()),
                 // Stale layout under the race — re-resolve next iteration.
-                Err(e @ CoreError::BackingChanged(_)) => last = Some(e),
+                Err(e @ (CoreError::BackingChanged(_) | CoreError::DerivedStateStale(_))) => {
+                    last = Some(e);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -802,7 +796,10 @@ impl Musefs {
     /// staleness that flag admits: it ends at the next open of the file, rather
     /// than running until the store is updated (#668).
     fn forget_attrs_on_drift(&self, track_id: i64, err: &CoreError) {
-        if matches!(err, CoreError::BackingChanged(_)) {
+        if matches!(
+            err,
+            CoreError::BackingChanged(_) | CoreError::DerivedStateStale(_)
+        ) {
             self.size_cache.remove(&track_id);
         }
     }

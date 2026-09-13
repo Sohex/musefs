@@ -54,7 +54,7 @@ fn flac_with_big_art(data_len: usize, audio: &[u8]) -> Vec<u8> {
 }
 
 /// Normalize a DB to comparable `(path, audio_offset, audio_length)` rows.
-fn rows(db: &Db) -> Vec<(String, u64, u64)> {
+fn rows(db: &Db) -> Vec<(std::path::PathBuf, u64, u64)> {
     let mut r: Vec<_> = db
         .list_tracks()
         .unwrap()

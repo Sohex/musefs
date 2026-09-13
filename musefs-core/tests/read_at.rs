@@ -16,7 +16,7 @@ fn setup() -> (tempfile::TempDir, Db, i64) {
     let db = Db::open_in_memory().unwrap();
     let id = db
         .upsert_track(&NewTrack {
-            backing_path: flac.to_string_lossy().into_owned(),
+            backing_path: flac.clone(),
             format: Format::Flac,
             audio_offset,
             audio_length,

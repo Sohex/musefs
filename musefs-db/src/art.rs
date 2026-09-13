@@ -254,7 +254,7 @@ mod guard_tests {
         let db = Db::open_in_memory().unwrap();
         let track = db
             .upsert_track(&NewTrack {
-                backing_path: "/a.flac".into(),
+                backing_path: std::path::PathBuf::from("/a.flac"),
                 format: Format::Flac,
                 audio_offset: 0,
                 audio_length: 1,

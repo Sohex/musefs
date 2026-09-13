@@ -191,6 +191,7 @@ pub fn errno(err: &CoreError) -> fuser::Errno {
             fuser::Errno::from_i32(source.raw_os_error().unwrap_or(libc::EIO))
         }
         CoreError::BackingChanged(_)
+        | CoreError::DerivedStateStale(_)
         | CoreError::Db(_)
         | CoreError::DbOpen { .. }
         | CoreError::Mp4MetadataTooLarge { .. }
